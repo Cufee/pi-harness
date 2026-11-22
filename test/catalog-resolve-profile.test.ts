@@ -18,7 +18,13 @@ const profiles: RunnerProfileConfig[] = [
 /** Writes a compiled catalog with amp's provider-prefixed wire IDs and claude's `opus` alias. */
 function setup(): { stateDir: string; config: HarnessConfig; compiler: ModelCatalogCompiler } {
   const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-resolve-"));
-  const config: HarnessConfig = { ...loadConfig(stateDir), stateDir, profiles, defaultOrchestratorProfile: "acp:amp" };
+  const config: HarnessConfig = {
+    ...loadConfig(stateDir),
+    stateDir,
+    profiles,
+    defaultOrchestratorProfile: "acp:claude",
+    catalog: { ttlHours: 24 },
+  };
   const compiler = new ModelCatalogCompiler(config);
   const catalog = compiler.compileFromData({
     enabledProfiles: profiles,
@@ -109,14 +115,14 @@ describe("ModelCatalogCompiler.resolveForProfile", () => {
       const { orchestratorTask } = await orch.startRun({
         goal: "Resolve models",
         repoRoot,
-        profileId: "acp:amp",
-        model: "google/gemini-4-carbon",
+        profileId: "acp:claude",
+        model: "anthropic/claude-opus-5-5",
       });
       for (let i = 0; i < 80 && orch.activeTaskCount() > 0; i++) {
         await new Promise((r) => setTimeout(r, 25));
       }
-      assert.deepEqual(seen, [{ profileId: "acp:amp", model: "google-vertex/gemini-4-carbon" }]);
-      assert.equal(db.getTask(orchestratorTask.id)?.model, "google/gemini-4-carbon");
+      assert.deepEqual(seen, [{ profileId: "acp:claude", model: "opus" }]);
+      assert.equal(db.getTask(orchestratorTask.id)?.model, "anthropic/claude-opus-5-5");
     } finally {
       orch.dispose();
       db.close();
