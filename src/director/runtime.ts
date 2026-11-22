@@ -11,6 +11,7 @@ import { writeCodeOutput, writeTaskDossier } from "../control-plane/dossiers.js"
 import type { ControlPlaneDb } from "../control-plane/db.js";
 import type { CustomRunnerFactory, HarnessOrchestrator } from "../control-plane/orchestrator.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
+import { recordCostInvocation, summarizeCost } from "../cost/ledger.js";
 import type { TimerRecord } from "../control-plane/timers.js";
 import {
   GoalEngine,
@@ -1108,34 +1109,57 @@ export class DirectorRuntime {
         if (this.db.getTask(reviewerTask.id)?.status === "cancelled") abort.abort(new Error("Reviewer cancelled"));
         this.db.updateTask(reviewerTask.id, { status: reviewerSignal.aborted ? "cancelled" : "running" });
         reviewerSignal.throwIfAborted();
-        const res = await runner.run({
+        const cost = recordCostInvocation(this.db, {
+          chatSessionId: goal.chatSessionId ?? undefined,
           runId: reviewRun.id,
           taskId: reviewerTask.id,
-          tier: 3,
-          kind: "verify",
-          cwd: verifyCwd,
-          toolPolicy: "read_only_workspace",
-          allowShellInReadOnly: Boolean(verifyWorktreePath),
-          model: wireModel,
-          effort: reviewerEffort,
-          systemPrompt:
-            "You are an independent read-only Done-Reviewer operating in a disposable verification checkout of the target branch. Inspect the implementation, diffs, and verification evidence for each required criterion — you may run tests, linters, git diff, rg, sg, or tmux checks freely to verify behavior, but never edit tracked repository code or delegate. Call submit_review_verdict if available, or return the requested JSON verdict with concrete sources for every required criterion.",
-          initialPrompt: reviewerPrompt,
-          maxTurns: this.config.rollover.reviewerMaxTurns,
-          tools: [submitTool],
-          executeTool: reviewerExecuteTool,
-          daemonSocketPath: this.config.socketPath,
-          mcpBridgeEntrypoint,
-          externalMcpServers: resolveExternalMcpServers(this.config.stateDir, this.config.externalMcpServers),
-          extraPathDirs: nativeToolsPathDirs(this.config.stateDir),
-          signal: reviewerSignal,
-          callbacks: {
-            onTextDelta: (text) => emit("agent.text_delta", { text }),
-            onThoughtDelta: (text) => emit("agent.thought_delta", { text }),
-            onToolEvent: (ev) => emit("agent.tool", ev),
-            onPassiveQuota: (sig) => this.quota.ingestPassiveSignal(sig),
-          },
+          activity: "done_review",
+          profile,
+          model,
+          wireModel,
         });
+        let res;
+        try {
+          res = await runner.run({
+            runId: reviewRun.id,
+            taskId: reviewerTask.id,
+            tier: 3,
+            kind: "verify",
+            cwd: verifyCwd,
+            toolPolicy: "read_only_workspace",
+            allowShellInReadOnly: Boolean(verifyWorktreePath),
+            model: wireModel,
+            effort: reviewerEffort,
+            systemPrompt:
+              "You are an independent read-only Done-Reviewer operating in a disposable verification checkout of the target branch. Inspect the implementation, diffs, and verification evidence for each required criterion — you may run tests, linters, git diff, rg, sg, or tmux checks freely to verify behavior, but never edit tracked repository code or delegate. Call submit_review_verdict if available, or return the requested JSON verdict with concrete sources for every required criterion.",
+            initialPrompt: reviewerPrompt,
+            maxTurns: this.config.rollover.reviewerMaxTurns,
+            tools: [submitTool],
+            executeTool: reviewerExecuteTool,
+            daemonSocketPath: this.config.socketPath,
+            mcpBridgeEntrypoint,
+            externalMcpServers: resolveExternalMcpServers(this.config.stateDir, this.config.externalMcpServers),
+            extraPathDirs: nativeToolsPathDirs(this.config.stateDir),
+            signal: reviewerSignal,
+            callbacks: {
+              onSessionId: (sid) => {
+                this.db.updateTask(reviewerTask.id, { sessionId: sid });
+                cost.onSessionId(sid);
+              },
+              onTextDelta: (text) => emit("agent.text_delta", { text }),
+              onThoughtDelta: (text) => emit("agent.thought_delta", { text }),
+              onToolEvent: (ev) => emit("agent.tool", ev),
+              onUsage: (usage) => {
+                this.db.updateTask(reviewerTask.id, { contextUsed: usage.used, contextSize: usage.size });
+                emit("agent.usage", usage);
+                cost.onUsage(usage);
+              },
+              onPassiveQuota: (sig) => this.quota.ingestPassiveSignal(sig),
+            },
+          });
+        } finally {
+          cost.finish();
+        }
         reviewerSignal.throwIfAborted();
         assertCurrent();
         if (res.stopReason !== "completed" && res.stopReason !== "max_turns") {
@@ -1346,19 +1370,12 @@ export class DirectorRuntime {
 
   private sumRunCostUsd(runId: string | null): number {
     if (!runId) return 0;
-    const rows = this.db.db
-      .prepare("SELECT payload_json FROM events WHERE run_id = ? AND type = 'agent.usage'")
-      .all(runId) as Array<{ payload_json: string }>;
-    let total = 0;
-    for (const r of rows) {
-      try {
-        const p = JSON.parse(r.payload_json) as { costUsd?: unknown };
-        if (typeof p.costUsd === "number" && Number.isFinite(p.costUsd) && p.costUsd > 0) total += p.costUsd;
-      } catch {
-        // ignore malformed usage payload
-      }
-    }
-    return total;
+    const snap = summarizeCost(
+      this.db,
+      { chatSessionId: null, runIds: [runId], snapshotScope: { kind: "run", id: runId, label: runId } },
+      this.config.profiles,
+    );
+    return snap.totals.find((t) => t.currency === "USD")?.amount ?? 0;
   }
 
   private directorExecutor(session: { id: string; repoRoot: string }, signal: AbortSignal, onToolEvent?: RunnerCallbacks["onToolEvent"]) {
@@ -1509,35 +1526,49 @@ export class DirectorRuntime {
       const runner = this.customRunnerFactory
         ? this.customRunnerFactory(profile)
         : profile.kind === "acp" ? new AcpRunner(profile) : new PiRunner(profile);
-      const res = await runner.run({
-        runId: chatSessionId,
-        taskId: chatSessionId,
-        tier: 1,
-        kind: "orchestrator",
-        cwd: session.repoRoot,
-        toolPolicy: "control_plane_only",
-        systemPrompt: buildDirectorSystemPrompt(mode, this.config.codeExec),
-        initialPrompt: prompt,
-        model: wireModel,
-        effort: session.effort,
-        maxTurns: 0,
-        quotaRetryTimeoutMs: this.config.quotaRetry.nativeRetryTimeoutMs,
-        tools: executor.tools(),
-        executeTool: executor.execute,
-        daemonSocketPath: this.config.socketPath,
-        mcpBridgeEntrypoint,
-        signal: abort.signal,
-        onHandle: (handle) => { if (!(runner instanceof PiRunner)) active.handle = handle; },
-        callbacks: {
-          onTextDelta: (delta) => {
-            if (abort.signal.aborted) return;
-            active.partial += delta;
-            onDelta?.(delta);
-          },
-          onToolEvent,
-          onPassiveQuota: (sig) => this.quota.ingestPassiveSignal(sig),
-        },
+      const cost = recordCostInvocation(this.db, {
+        chatSessionId,
+        activity: "director",
+        profile,
+        model,
+        wireModel,
       });
+      let res;
+      try {
+        res = await runner.run({
+          runId: chatSessionId,
+          taskId: chatSessionId,
+          tier: 1,
+          kind: "orchestrator",
+          cwd: session.repoRoot,
+          toolPolicy: "control_plane_only",
+          systemPrompt: buildDirectorSystemPrompt(mode, this.config.codeExec),
+          initialPrompt: prompt,
+          model: wireModel,
+          effort: session.effort,
+          maxTurns: 0,
+          quotaRetryTimeoutMs: this.config.quotaRetry.nativeRetryTimeoutMs,
+          tools: executor.tools(),
+          executeTool: executor.execute,
+          daemonSocketPath: this.config.socketPath,
+          mcpBridgeEntrypoint,
+          signal: abort.signal,
+          onHandle: (handle) => { if (!(runner instanceof PiRunner)) active.handle = handle; },
+          callbacks: {
+            onSessionId: (sid) => cost.onSessionId(sid),
+            onTextDelta: (delta) => {
+              if (abort.signal.aborted) return;
+              active.partial += delta;
+              onDelta?.(delta);
+            },
+            onToolEvent,
+            onUsage: (usage) => cost.onUsage(usage),
+            onPassiveQuota: (sig) => this.quota.ingestPassiveSignal(sig),
+          },
+        });
+      } finally {
+        cost.finish();
+      }
 
       // ACP returns the whole turn. Pi can return only its last provider response.
       const finalSegment = res.text.startsWith(active.flushedText) ? res.text.slice(active.flushedText.length) : res.text;

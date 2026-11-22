@@ -21,7 +21,7 @@ import {
 } from "./acp-shims.js";
 import { detectQuotaErrorText } from "./quota-detect.js";
 import { validateRunPolicy } from "./types.js";
-import type { ProbedModelInfo, QuotaPauseInfo, RunAgentRequest, RunAgentResult, RunnerUsage } from "./types.js";
+import type { ProbedModelInfo, QuotaPauseInfo, RunAgentRequest, RunAgentResult, RunnerCost, RunnerUsage } from "./types.js";
 
 const terminatingChildren = new WeakSet<ChildProcess>();
 
@@ -219,7 +219,7 @@ export class AcpRunner {
       toolPolicy: req.toolPolicy,
       allowShellInReadOnly: Boolean(req.allowShellInReadOnly),
     });
-    if (allowShell && req.extraPathDirs?.length) {
+    if ((allowShell || !controlOnly) && req.extraPathDirs?.length) {
       const existingPath = prepared.env.PATH ?? process.env.PATH ?? "";
       prepared.env.PATH = [...req.extraPathDirs, existingPath].filter(Boolean).join(process.platform === "win32" ? ";" : ":");
     }
@@ -256,6 +256,17 @@ export class AcpRunner {
     let textSinceLastTool = "";
     let needsParagraphBreak = false;
     let lastUsage: RunnerUsage | undefined;
+    // A cost is delivered once its turn ends so a turn that several models contributed to is not credited to one.
+    let pendingCost: RunnerCost | undefined;
+    const flushCost = (turnModelCount = 0) => {
+      if (!pendingCost || !lastUsage) return;
+      lastUsage = {
+        ...lastUsage,
+        cost: turnModelCount > 1 ? { ...pendingCost, model: undefined } : pendingCost,
+      };
+      pendingCost = undefined;
+      req.callbacks.onUsage?.(lastUsage);
+    };
     let rolloverTriggered = false;
     let rolloverWarningSent = false;
     let maxTurnsTriggered = false;
@@ -498,16 +509,20 @@ export class AcpRunner {
           // Some adapters (e.g. amp-acp) report a default 200k size even for 1M-context models;
           // prefer the larger of adapter-reported size and catalog contextWindow when available.
           const size = Math.max(rawSize > 0 ? rawSize : 0, req.contextWindow ?? 0);
-          const costObj = update.cost as { amount?: number } | null | undefined;
-          lastUsage = {
-            used,
-            size,
-            costUsd: typeof costObj?.amount === "number" ? costObj.amount : undefined,
-          };
+          const costObj = update.cost as { amount?: unknown; currency?: unknown } | null | undefined;
+          const updateMeta = (update._meta ?? {}) as Record<string, unknown>;
+          if (typeof costObj?.amount === "number" && typeof costObj.currency === "string") {
+            pendingCost = {
+              amount: costObj.amount,
+              currency: costObj.currency,
+              basis: "session_cumulative",
+              model: typeof updateMeta["_claude/model"] === "string" ? updateMeta["_claude/model"] : undefined,
+            };
+          }
+          lastUsage = { used, size, cost: lastUsage?.cost };
           req.callbacks.onUsage?.(lastUsage);
 
           // Harvest live passive subscription quota signals (`_claude/rateLimit`, generic `rateLimit`/`rateLimits`)
-          const updateMeta = (update._meta ?? {}) as Record<string, unknown>;
           const rlPayload = (updateMeta["_claude/rateLimit"] ?? updateMeta.rateLimit) as Record<string, unknown> | undefined;
           if (rlPayload && typeof rlPayload === "object") {
             req.callbacks.onPassiveQuota?.({
@@ -1042,7 +1057,7 @@ export class AcpRunner {
             cachedReadTokens: promptUsage.cachedReadTokens == null ? undefined : Number(promptUsage.cachedReadTokens),
             cachedWriteTokens: promptUsage.cachedWriteTokens == null ? undefined : Number(promptUsage.cachedWriteTokens),
             thoughtTokens: promptUsage.thoughtTokens == null ? undefined : Number(promptUsage.thoughtTokens),
-            costUsd: lastUsage?.costUsd,
+            cost: lastUsage?.cost,
           };
           if (!hadUsageUpdate) {
             req.callbacks.onUsage?.(lastUsage);
@@ -1051,6 +1066,8 @@ export class AcpRunner {
             }
           }
         }
+        const turnModels = (promptMeta.quota as { model_usage?: unknown[] } | undefined)?.model_usage;
+        flushCost(Array.isArray(turnModels) ? turnModels.length : 0);
 
         rawStop = String(promptRes.stopReason ?? "end_turn");
 
@@ -1276,6 +1293,7 @@ export class AcpRunner {
       const detail = stderrBuf.trim() ? ` (stderr: ${stderrBuf.trim().slice(-500)})` : "";
       throw new Error(`ACP runner (${this.profile.id}) failed: ${errMsg}${detail}`);
     } finally {
+      flushCost();
       clearIdleWatchdog();
       disarmQuotaWatchdog(false);
       req.signal.removeEventListener("abort", onAbort);

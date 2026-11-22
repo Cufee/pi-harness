@@ -82,7 +82,7 @@ it.each(["research", "plan", "verify"] as const)("lets Tier 1 spawn and await a 
     const spawnTool = orch.toolExecutor.tools(1).find(tool => tool.name === "spawn_task")!;
     const properties = spawnTool.inputSchema.properties as Record<string, { enum?: string[] }>;
     assert.deepEqual(properties.kind?.enum?.toSorted(), ["plan", "research", "verify"]);
-    assert.deepEqual(Object.keys(properties).toSorted(), ["effort", "kind", "model", "objective", "profile_id", "title"]);
+    assert.deepEqual(Object.keys(properties).toSorted(), ["effort", "kind", "max_turns", "model", "objective", "profile_id", "title"]);
     const assignment = { title: "Read deployment notes", objective: "Find how deployment starts" };
     await assert.rejects(() => execute("spawn_task", { ...assignment, kind: "execute" }), /Tier 1.*only permits research, plan, and verify/);
     assert.equal(catalogCalls, 0);

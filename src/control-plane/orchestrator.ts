@@ -8,6 +8,7 @@ import type { QuotaClient } from "../quota/client.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
 import { toolPolicyForTask } from "../runners/types.js";
+import { recordCostInvocation } from "../cost/ledger.js";
 import { resolveLaunchRoute } from "./launch-route.js";
 import type { RunAgentRequest, RunAgentResult, RunnerExecutionHandle } from "../runners/types.js";
 import { BisectingMergeQueue } from "../worktree/merge-queue.js";
@@ -1033,6 +1034,14 @@ export class HarnessOrchestrator {
       let genToolEvents = 0;
       const generation = new AbortController();
       exec.generationSignal = AbortSignal.any([generation.signal, exec.abort.signal]);
+      const cost = recordCostInvocation(this.db, {
+        runId: run.id,
+        taskId: task.id,
+        activity: "task",
+        profile,
+        model,
+        wireModel,
+      });
       const runnerReq: RunAgentRequest = {
         runId: run.id,
         taskId: task.id,
@@ -1063,6 +1072,7 @@ export class HarnessOrchestrator {
         callbacks: {
           onSessionId: (sessionId) => {
             this.db.updateTask(task.id, { sessionId });
+            cost.onSessionId(sessionId);
           },
           onTextDelta: (text) => {
             this.db.emitEvent(run.id, task.id, "agent.text_delta", { text });
@@ -1073,6 +1083,7 @@ export class HarnessOrchestrator {
           onUsage: (usage) => {
             this.db.updateTask(task.id, { contextUsed: usage.used, contextSize: usage.size });
             this.db.emitEvent(run.id, task.id, "agent.usage", usage);
+            cost.onUsage(usage);
           },
           onTurn: (turnsUsed) => {
             this.db.updateTask(task.id, { turnsUsed });
@@ -1274,10 +1285,10 @@ export class HarnessOrchestrator {
         if (isReadOnlyKind(latest.kind) || res.stopReason === "error" || res.stopReason === "max_turns") {
           this.db.updateTask(task.id, {
             status: "failed",
-            summary: isReadOnlyKind(latest.kind)
-              ? "Task ended without a valid sourced handoff."
-              : res.stopReason === "max_turns"
-                ? "Task hit max_turns without completing."
+            summary: res.stopReason === "max_turns"
+              ? `Task hit max_turns (${latest.maxTurns}) without completing.`
+              : isReadOnlyKind(latest.kind)
+                ? "Task ended without a valid sourced handoff."
                 : "Task runner reported an error.",
           });
           return;
@@ -1372,6 +1383,7 @@ export class HarnessOrchestrator {
         this.db.emitEvent(run.id, task.id, "agent.error", { error: msg });
         return;
       } finally {
+        cost.finish();
         generation.abort(); // Outstanding MCP scripts must not survive their runner (including a rollover).
         exec.generationSignal = undefined;
         exec.handle = undefined;
@@ -1456,7 +1468,13 @@ export class HarnessOrchestrator {
     }
 
     const activeRisks: string[] = [
-      `Auto-rollover triggered at context threshold during generation ${input.task.generation} (no explicit request_rollover submitted).`,
+      input.result.stopReason === "error"
+        ? `Generation ${input.task.generation} ended before completing: ${input.result.text.slice(0, 300)}`
+        : input.result.stopReason === "quota_paused"
+          ? `Generation ${input.task.generation} paused on a quota or rate limit.`
+          : input.result.stopReason === "max_turns"
+            ? `Generation ${input.task.generation} reached its max_turns budget (no explicit request_rollover submitted).`
+            : `Auto-rollover triggered at context threshold during generation ${input.task.generation} (no explicit request_rollover submitted).`,
     ];
     const nextActions: string[] = [];
 
