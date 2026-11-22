@@ -2,6 +2,7 @@ import { Markdown, wrapTextWithAnsi, type Component } from "@earendil-works/pi-t
 import type { ChatControlEvent } from "../../protocol/chat-events.js";
 import type { FormattedAgentError } from "./error-format.js";
 import type { HarnessTheme } from "./theme.js";
+import { flattenText, secondary, SPACER, statusGlyph, titleRow, type RowStatus } from "./rows.js";
 import { clampLine, fillLineBg, fitWidth } from "./width.js";
 
 /** Immutable compact session header rendered once at the top of scrollback. */
@@ -24,11 +25,11 @@ export class BannerCard implements Component {
     if (width <= 0) return [];
     if (this.cachedWidth === width) return this.cachedLines;
     const inner = Math.max(1, width - 2);
-    const l1 = ` ${this.theme.accentBold("◆")} ${this.theme.bold(this.title)}  ${this.theme.muted(this.subtitle)}`;
+    const l1 = titleRow(this.theme, { glyph: this.theme.accentBold("◆"), title: this.title, detail: this.subtitle, indent: 1 }, width);
     const hintLines = this.hint ? wrapTextWithAnsi(this.theme.dim(this.hint), inner).map((l) => clampLine(` ${l}`, width)) : [];
     this.cachedWidth = width;
     this.cachedLines = [
-      clampLine(l1, width),
+      l1,
       ...hintLines,
       this.theme.border("─".repeat(width)),
     ];
@@ -60,7 +61,7 @@ export class UserCard implements Component {
     const inner = Math.max(1, width - 4);
     const wrapped = wrapTextWithAnsi(this.text, inner);
     const bar = this.theme.accent("▎");
-    const out: string[] = [""];
+    const out: string[] = [SPACER];
     for (let i = 0; i < wrapped.length; i++) {
       const prefix = i === 0 ? `${bar} ${this.theme.accentBold("›")} ` : `${bar}   `;
       out.push(fillLineBg(`${prefix}${wrapped[i]!}`, width, this.theme.userBg));
@@ -101,7 +102,7 @@ export class AssistantCard implements Component {
   render(width: number): readonly string[] {
     if (width <= 0) return [];
     if (this.cachedWidth === width) return this.cachedLines;
-    const out: string[] = [""];
+    const out: string[] = [SPACER];
     if (this.meta) {
       out.push(clampLine(` ${this.theme.accent("◆")} ${this.theme.muted(this.meta)}`, width));
     }
@@ -114,41 +115,47 @@ export class AssistantCard implements Component {
   }
 }
 
-/** Compact 1-line tool-call pill (`●`/`✓`/`✗`). */
+/** One tool call, with a three-row budget at the terminal width. */
 export class ToolPill implements Component {
+  private args: string;
+  private result = "";
+  private cachedWidth = -1;
+  private cachedLines: readonly string[] = [];
+
   constructor(
     private readonly theme: HarnessTheme,
-    private status: "running" | "ok" | "error" | "called",
+    public status: RowStatus,
     private readonly name: string,
-    private detail = "",
-  ) {}
+    args = "",
+  ) {
+    this.args = flattenText(args);
+  }
 
-  update(status: "running" | "ok" | "error", detail?: string): void {
+  update(status: RowStatus, result?: string, args?: string): void {
     this.status = status;
-    if (detail !== undefined) this.detail = detail;
+    if (args !== undefined) this.args = flattenText(args);
+    if (result !== undefined) this.result = flattenText(result);
+    this.invalidate();
   }
 
   finishCall(): void {
-    if (this.status === "running") {
-      this.status = "called";
-      this.detail = "called";
-    }
+    if (this.status === "running") this.update("called");
   }
 
-  invalidate(): void {}
+  invalidate(): void {
+    this.cachedWidth = -1;
+  }
 
   render(width: number): readonly string[] {
     if (width <= 0) return [];
-    const icon =
-      this.status === "ok"
-        ? this.theme.success("✓")
-        : this.status === "error"
-          ? this.theme.error("✗")
-          : this.status === "called"
-            ? this.theme.muted("·")
-            : this.theme.accent("●");
-    const line = `  ${icon} ${this.theme.bold(this.name)}${this.detail ? `  ${this.theme.muted(this.detail)}` : ""}`;
-    return [fitWidth(line, width)];
+    if (this.cachedWidth === width) return this.cachedLines;
+    this.cachedWidth = width;
+    this.cachedLines = [
+      titleRow(this.theme, { glyph: statusGlyph(this.theme, this.status), title: flattenText(this.name), indent: 4 }, width),
+      ...(this.args ? [fitWidth(`      ${secondary(this.theme, `Args: ${this.args}`)}`, width)] : []),
+      ...(this.result ? [fitWidth(`      ${this.status === "error" ? this.theme.error(`Error: ${this.result}`) : secondary(this.theme, `Result: ${this.result}`)}`, width)] : []),
+    ];
+    return this.cachedLines;
   }
 }
 
@@ -211,7 +218,7 @@ export class ErrorCard implements Component {
     if (this.cachedWidth === width) return this.cachedLines;
     const bar = this.theme.error("▎");
     const inner = Math.max(1, width - 4);
-    const out: string[] = [""];
+    const out: string[] = [SPACER];
 
     const headLines = wrapTextWithAnsi(`${this.theme.error("✗")} ${this.theme.bold(this.formatted.headline)}`, inner);
     for (const l of headLines) out.push(clampLine(` ${bar} ${l}`, width));
@@ -241,7 +248,7 @@ export class GoalNotice implements Component {
   invalidate(): void {}
 
   render(width: number): readonly string[] {
-    return width > 0 ? [clampLine(this.theme.muted(`  ${this.text}`), width)] : [];
+    return width > 0 ? [clampLine(secondary(this.theme, `  ${this.text}`), width)] : [];
   }
 }
 
@@ -282,7 +289,7 @@ export class EventCard implements Component {
     const gutter = paint("┃");
     const tag = `${paint(icon)} ${paint(this.theme.bold(badge))}`;
     const inner = Math.max(1, width - 4);
-    const out: string[] = [""];
+    const out: string[] = [SPACER];
 
     const headLines = wrapTextWithAnsi(`${tag}  ${headline}`, inner);
     for (let i = 0; i < headLines.length; i++) {
@@ -290,7 +297,7 @@ export class EventCard implements Component {
       out.push(fillLineBg(fitWidth(line, width), width, this.theme.surfaceBg));
     }
     if (detail) {
-      for (const l of wrapTextWithAnsi(this.theme.muted(detail), inner)) {
+      for (const l of wrapTextWithAnsi(secondary(this.theme, detail), inner)) {
         out.push(fillLineBg(fitWidth(` ${gutter}   ${l}`, width), width, this.theme.surfaceBg));
       }
     }
