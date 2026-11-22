@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { visibleWidth, type Component } from "@earendil-works/pi-tui";
-import { CommandPaletteOverlay, EffortPickerOverlay, ModelPickerOverlay, RunsOverlay, SessionsOverlay, TreeOverlay } from "../src/tui/overlays.js";
+import { CliPickerOverlay, CommandPaletteOverlay, EffortPickerOverlay, ModelPickerOverlay, RunsOverlay, SessionsOverlay, TreeOverlay } from "../src/tui/overlays.js";
 import {
   AssistantCard,
   BannerCard,
@@ -194,12 +194,13 @@ describe("TUI Primitives Library", () => {
     expect(ran).toBe("quota");
 
     let selectedId = "";
+    let selectedRouteId = "";
     const picker = new ModelPickerOverlay(
       theme,
       {} as never,
       "/tmp",
       {
-        schemaVersion: 2,
+        schemaVersion: 4,
         syncedAt: "2026-11-21T23:55:00Z",
         sources: ["vals_ai", "models.dev"],
         models: [
@@ -217,7 +218,7 @@ describe("TUI Primitives Library", () => {
             timePerTaskSeconds: 2040,
             efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
             preferredRoute: { profileId: "acp:codex", runner: "acp", provider: "openai", wireModelId: "gpt-6.2-astra", billing: "subscription" },
-            alternateRoutes: [],
+            alternateRoutes: [{ profileId: "acp:amp", runner: "acp", provider: "openai", wireModelId: "openai/gpt-6.2-astra", billing: "subscription" }],
             recommendedFor: ["orchestrator", "worker"],
             quota: null,
           },
@@ -235,25 +236,51 @@ describe("TUI Primitives Library", () => {
             timePerTaskSeconds: 1380,
             efforts: ["low", "medium", "high"],
             preferredRoute: { profileId: "acp:codex", runner: "acp", provider: "openai", wireModelId: "gpt-6.2-sol", billing: "subscription" },
-            alternateRoutes: [],
+            alternateRoutes: [{ profileId: "acp:amp", runner: "acp", provider: "openai", wireModelId: "openai/gpt-6.2-sol", billing: "subscription" }],
             recommendedFor: ["task"],
             quota: null,
           },
         ],
       },
       "openai/gpt-6.2-astra",
-      (m) => (selectedId = m.id),
+      "acp:codex",
+      (m, route) => {
+        selectedId = m.id;
+        selectedRouteId = route.profileId;
+      },
       () => {},
       () => {},
     );
     for (const width of [24, 48, 80, 110]) {
       assertWidthSafe(picker.render(width), width, "ModelPickerOverlay");
     }
+    // Filter by "sol", press Tab to cycle from acp:codex -> acp:amp, then Enter!
     picker.handleInput("s");
     picker.handleInput("o");
     picker.handleInput("l");
+    picker.handleInput("\t");
     picker.handleInput("\r");
     expect(selectedId).toBe("openai/gpt-6.2-sol");
+    expect(selectedRouteId).toBe("acp:amp");
+
+    const cliPicker = new CliPickerOverlay(
+      theme,
+      [
+        { id: "acp:codex", kind: "acp", adapter: "codex", command: "npx", args: ["-y", "@agentclientprotocol/codex-acp"], billing: "subscription", enabled: true },
+        { id: "acp:amp", kind: "acp", adapter: "generic", command: "npx", args: ["-y", "amp-acp"], billing: "subscription", enabled: true },
+      ],
+      "acp:codex",
+      [
+        { profileId: "acp:codex", status: "ok", modelCount: 10 },
+        { profileId: "acp:amp", status: "ok", modelCount: 47 },
+      ],
+      () => {},
+      () => {},
+      () => {},
+    );
+    for (const width of [24, 48, 80, 110]) {
+      assertWidthSafe(cliPicker.render(width), width, "CliPickerOverlay");
+    }
 
     const runs = new RunsOverlay(
       theme,

@@ -47,7 +47,7 @@ export interface CompiledModelEntry {
   recommendedFor: string[];
 }
 
-export const CATALOG_SCHEMA_VERSION = 3;
+export const CATALOG_SCHEMA_VERSION = 4;
 
 export interface ProfileProbeStatus {
   profileId: string;
@@ -475,11 +475,29 @@ export class ModelCatalogCompiler {
     });
 
     const preferSub = this.config.catalog.preferSubscription ?? true;
+    const defaultProfile = this.config.defaultOrchestratorProfile;
+    const isNativeCliForCreator = (profileId: string, creator: string): boolean => {
+      const p = profileId.toLowerCase();
+      const c = creator.toLowerCase();
+      if (c === "anthropic" && p.includes("claude")) return true;
+      if (c === "openai" && p.includes("codex")) return true;
+      if (c === "google" && (p.includes("gemini") || p.includes("antigravity"))) return true;
+      return false;
+    };
+
     const compiled: CompiledModelEntry[] = winners.map((w, idx) => {
       const sortedRoutes = [...w.routes].sort((a, b) => {
         if (preferSub && a.billing !== b.billing) {
           if (a.billing === "subscription") return -1;
           if (b.billing === "subscription") return 1;
+        }
+        const aNative = isNativeCliForCreator(a.profileId, w.creator);
+        const bNative = isNativeCliForCreator(b.profileId, w.creator);
+        if (aNative !== bNative) return aNative ? -1 : 1;
+        if (defaultProfile) {
+          const aDef = a.profileId === defaultProfile;
+          const bDef = b.profileId === defaultProfile;
+          if (aDef !== bDef) return aDef ? -1 : 1;
         }
         return a.profileId.localeCompare(b.profileId);
       });

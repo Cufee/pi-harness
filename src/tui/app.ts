@@ -9,6 +9,7 @@ import type { KbCard } from "../kb/store.js";
 import type { DaemonEventFrame } from "../protocol/daemon-rpc.js";
 import type { LiveWorktreeInfo } from "../worktree/manager.js";
 import {
+  CliPickerOverlay,
   CommandPaletteOverlay,
   EffortPickerOverlay,
   formatGoalDetailCard,
@@ -50,8 +51,10 @@ const DIRECTOR_SLASH_COMMANDS: SlashCommand[] = [
   { name: "attach", description: "Switch to & take over another session (detaches other terminal)", argumentHint: "[session-id]" },
   { name: "sessions", description: "Alias for /attach — list & switch active sessions" },
   { name: "new", description: "Start a new concurrent Director Chat session", argumentHint: "[title]" },
-  { name: "model", description: "Searchable ranked model picker (scores, cost/time, live quota)" },
+  { name: "model", description: "Searchable ranked model & ACP route picker (Tab switches CLI)" },
   { name: "models", description: "Alias for /model" },
+  { name: "cli", description: "Switch active ACP CLI (codex / claude / amp / antigravity)", argumentHint: "[profile]" },
+  { name: "acp", description: "Alias for /cli — switch active ACP CLI" },
   { name: "effort", description: "Pick reasoning effort (low / medium / high / xhigh / max / ultra)", argumentHint: "[level]" },
   { name: "quota", description: "Visual subscription & API quota buckets with reset countdowns" },
   { name: "goals", description: "Interactive Goal Dashboard (inspect, review, pause, cancel)" },
@@ -206,6 +209,13 @@ export async function runDirectorChatTui(opts: {
     }
   };
 
+  const activeModelDisplay = () => {
+    const shortCli = session.profileId.replace(/^acp:/, "");
+    if (!session.model) return session.profileId;
+    const bareModel = session.model.includes("/") ? session.model.slice(session.model.indexOf("/") + 1) : session.model;
+    return `${shortCli}:${bareModel}`;
+  };
+
   const refreshStatus = () => {
     const activeGoals = goals.filter((g) => ["executing", "verifying", "reviewing"].includes(g.status));
     const humanNeeded = goals.filter((g) => g.status === "awaiting_human").length;
@@ -220,7 +230,7 @@ export async function runDirectorChatTui(opts: {
     statusBar.update({
       tone: humanNeeded > 0 ? "error" : busy ? "accent" : "success",
       modeLabel: busy ? "thinking" : "director",
-      modelLabel: session.model ?? session.profileId,
+      modelLabel: activeModelDisplay(),
       effortLabel: session.effort,
       goalsSummary: goalSummary,
       alertText: humanNeeded > 0 ? `${humanNeeded} P0!` : null,
@@ -372,10 +382,54 @@ export async function runDirectorChatTui(opts: {
     );
   };
 
+  const switchCliProfile = (targetIdOrShort: string) => {
+    const enabled = config.profiles.filter((p) => p.enabled !== false);
+    const q = targetIdOrShort.toLowerCase();
+    const match =
+      enabled.find((p) => p.id.toLowerCase() === q) ??
+      enabled.find((p) => p.id.toLowerCase() === `acp:${q}`) ??
+      enabled.find((p) => p.id.toLowerCase().includes(q));
+    if (!match) {
+      appendSystem([`No enabled CLI matching "${targetIdOrShort}". Enabled: ${enabled.map((p) => p.id).join(", ")}`], "warning");
+      return;
+    }
+    void opts.client
+      .request<ChatSessionRecord>("chat.update", { chatSessionId: session.id, profileId: match.id, model: null })
+      .then((updated) => {
+        session = updated;
+        appendSystem([`Switched active ACP CLI to ${theme.bold(match.id)} (using CLI default model; run /model to pin a specific model)`], "success");
+        refreshStatus();
+        tui.requestRender();
+      })
+      .catch((err) => appendError(err, "cli.switch"));
+  };
+
+  const openCliPicker = () => {
+    let handle: ReturnType<OverlayManager["push"]> | null = null;
+    const comp = new CliPickerOverlay(
+      theme,
+      config.profiles,
+      session.profileId,
+      cachedCatalog?.profileStatuses,
+      (chosen) => switchCliProfile(chosen.id),
+      () => handle?.close(),
+      () => handle?.rerender(),
+    );
+    handle = overlays.push(
+      {
+        title: "Switch ACP CLI",
+        subtitle: `active: ${session.profileId}`,
+        footer: "↑/↓ move · Enter switch CLI · Esc close",
+      },
+      comp,
+      { width: "80%" },
+    );
+  };
+
   const openModelPicker = () => {
     spinner.start("Loading model catalog…", "Esc to cancel");
     void opts.client
-      .request<CompiledModelCatalog>("models.list", { cwd: opts.repoRoot })
+      .request<CompiledModelCatalog>("models.list", { cwd: activeRepoRoot })
       .then((cat) => {
         spinner.stop();
         cachedCatalog = cat;
@@ -383,27 +437,29 @@ export async function runDirectorChatTui(opts: {
         const comp = new ModelPickerOverlay(
           theme,
           opts.client,
-          opts.repoRoot,
+          activeRepoRoot,
           cat,
           session.model ?? null,
-          (entry) => {
+          session.profileId,
+          (entry, route) => {
             void opts.client
               .request<ChatSessionRecord>("chat.update", {
                 chatSessionId: session.id,
-                profileId: entry.preferredRoute.profileId,
-                model: entry.preferredRoute.wireModelId,
+                profileId: route.profileId,
+                model: route.wireModelId,
               })
               .then((updated) => {
                 session = updated;
                 appendSystem(
                   [
-                    `Selected ${theme.bold(entry.id)} via ${theme.accent(entry.preferredRoute.profileId)} (score: ${entry.codingScore?.toFixed(1) ?? "-"})`,
+                    `Selected ${theme.bold(entry.id)} via ${theme.accent(route.profileId)} (score: ${entry.codingScore?.toFixed(1) ?? "-"})`,
                   ],
                   "success",
                 );
                 refreshStatus();
-                if (entry.efforts.length > 1) {
-                  openEffortPicker(entry.efforts);
+                const routeEfforts = route.supportedEfforts ?? entry.efforts;
+                if (routeEfforts.length > 1) {
+                  openEffortPicker(routeEfforts);
                 } else {
                   tui.requestRender();
                 }
@@ -415,9 +471,9 @@ export async function runDirectorChatTui(opts: {
         );
         handle = overlays.push(
           {
-            title: "Model Catalog & Picker",
+            title: "Model Catalog & ACP Route Picker",
             subtitle: `${cat.models.length} models · synced ${cat.syncedAt.slice(0, 16).replace("T", " ")}`,
-            footer: "Type to filter · Enter select · Ctrl+R live sync · Esc close",
+            footer: "Type to filter · Tab switch CLI route · Enter select · Ctrl+R sync · Esc close",
           },
           comp,
           { width: "92%" },
@@ -667,7 +723,8 @@ export async function runDirectorChatTui(opts: {
         theme.bold("Commands & Shortcuts"),
         `${theme.accent("/attach")} [id]          Switch to & take over another session (detaches other terminal)`,
         `${theme.accent("/new")} [title]          Start a new concurrent Director Chat session`,
-        `${theme.accent("/model")} (/models)      Searchable ranked model picker (scores, cost/time, quota)`,
+        `${theme.accent("/model")} (/models)      Searchable model & ACP route picker (Tab switches CLI route)`,
+        `${theme.accent("/cli")} [name] (/acp)    Switch active ACP CLI (codex / claude / amp / antigravity)`,
         `${theme.accent("/effort")} [level]       Pick reasoning effort (low / medium / high / xhigh / max / ultra)`,
         `${theme.accent("/quota")}                Subscription & API quota buckets with reset timers`,
         `${theme.accent("/goals")}                Goal Dashboard (inspect, review, pause, cancel)`,
@@ -688,7 +745,8 @@ export async function runDirectorChatTui(opts: {
     const commands: PaletteCommand[] = [
       { id: "attach", label: "Attach / Switch Session", shortcut: "/attach", description: "Take over another chat or run session", run: openSessionsPicker },
       { id: "new", label: "New Chat Session", shortcut: "/new", description: "Start a new concurrent Director chat", run: () => createNewChatSession() },
-      { id: "model", label: "Select Model", shortcut: "/model", description: "Ranked catalog with coding scores & quota", run: openModelPicker },
+      { id: "model", label: "Select Model & Route", shortcut: "/model", description: "Ranked catalog + Tab to pick ACP CLI route", run: openModelPicker },
+      { id: "cli", label: "Switch ACP CLI", shortcut: "/cli", description: "Switch active CLI (codex / claude / amp / agy)", run: openCliPicker },
       { id: "effort", label: "Reasoning Effort", shortcut: "/effort", description: "Adjust reasoning budget", run: () => openEffortPicker() },
       { id: "quota", label: "View Quotas", shortcut: "/quota", description: "Live subscription & API bucket bars", run: openQuota },
       { id: "goals", label: "Goals Dashboard", shortcut: "/goals", description: "Inspect, review, pause, or cancel goals", run: () => void refreshGoals().then(openGoals) },
@@ -854,6 +912,11 @@ export async function runDirectorChatTui(opts: {
       return;
     }
     if (text === "/settings" || text === "/profiles") return openSettings();
+    if (text === "/cli" || text === "/acp" || text === "/profile") return openCliPicker();
+    if (text.startsWith("/cli ") || text.startsWith("/acp ") || text.startsWith("/profile ")) {
+      switchCliProfile(text.slice(text.indexOf(" ") + 1).trim());
+      return;
+    }
     if (text === "/model" || text === "/models") return openModelPicker();
     if (text === "/effort" || text.startsWith("/effort ")) {
       const direct = text.slice("/effort".length).trim();

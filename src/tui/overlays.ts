@@ -7,7 +7,9 @@ import {
   type Focusable,
   type SelectItem,
 } from "@earendil-works/pi-tui";
-import type { CompiledModelCatalog, CompiledModelEntry } from "../catalog/compiler.js";
+import type { CompiledModelCatalog, CompiledModelEntry, ProfileProbeStatus } from "../catalog/compiler.js";
+import type { ModelRoute } from "../catalog/deduplicate.js";
+import type { RunnerProfileConfig } from "../config.js";
 import type { EscalationRecord, RunRecord, TaskRecord } from "../control-plane/db.js";
 import type { DaemonClient } from "../daemon/remote.js";
 import type { GoalRecord, GoalReviewVerdict } from "../goals/engine.js";
@@ -191,16 +193,18 @@ export class CommandPaletteOverlay implements Component, Focusable {
 }
 
 /**
- * Interactive Searchable Tabular Model Picker (`/model` or `/models`):
- * - Live fuzzy filter (just type to filter by model ID, score source, or CLI profile)
- * - Crisp aligned columns: RANK, MODEL, SCORE, COST/TASK, TIME, QUOTA, ROUTE
- * - Bottom inspector strip showing supported reasoning efforts & billing route
- * - `Ctrl+R` (or `s` when filter is empty) runs live benchmark sync
+ * Interactive Searchable Tabular Model & ACP Route Picker (`/model` or `/models`):
+ * - Live fuzzy filter (type model name OR CLI like `codex`, `claude`, `amp` — auto-selects matching route!)
+ * - `Tab` (or `←`/`→`) cycles the ACP CLI route when a model is offered by multiple CLIs
+ * - Crisp aligned columns: RANK, MODEL, SCORE, COST/TASK, TIME, CLI / QUOTA
+ * - Bottom inspector strip showing selectable routes, supported reasoning efforts & quota
+ * - `Ctrl+R` runs live benchmark sync
  */
 export class ModelPickerOverlay implements Component, Focusable {
   private input: Input;
   private selected = 0;
   private filtered: CompiledModelEntry[] = [];
+  private routeIdxByModel = new Map<string, number>();
   private statusNote = "";
   private syncing = false;
   private _focused = true;
@@ -211,18 +215,24 @@ export class ModelPickerOverlay implements Component, Focusable {
     private readonly repoRoot: string,
     private catalog: CompiledModelCatalog,
     private readonly currentModel: string | null,
-    private readonly onSelectModel: (entry: CompiledModelEntry) => void,
+    private readonly currentProfileId: string | null,
+    private readonly onSelectModel: (entry: CompiledModelEntry, route: ModelRoute) => void,
     private readonly onClose: () => void,
     private readonly rerender: () => void,
   ) {
     this.input = new Input();
     this.input.focused = true;
     this.applyFilter();
-    // Pre-select current model if present
     const curIdx = this.filtered.findIndex(
-      (m) => this.currentModel && (m.id === this.currentModel || m.preferredRoute.wireModelId === this.currentModel),
+      (m) => this.currentModel && (m.id === this.currentModel || this.allRoutes(m).some((r) => r.wireModelId === this.currentModel)),
     );
-    if (curIdx >= 0) this.selected = curIdx;
+    if (curIdx >= 0) {
+      this.selected = curIdx;
+      const m = this.filtered[curIdx]!;
+      const routes = this.allRoutes(m);
+      const rIdx = routes.findIndex((r) => r.profileId === this.currentProfileId);
+      if (rIdx >= 0) this.routeIdxByModel.set(m.id, rIdx);
+    }
   }
 
   get focused(): boolean {
@@ -234,6 +244,27 @@ export class ModelPickerOverlay implements Component, Focusable {
     this.input.focused = val;
   }
 
+  private allRoutes(m: CompiledModelEntry): ModelRoute[] {
+    return [m.preferredRoute, ...(m.alternateRoutes ?? [])];
+  }
+
+  private activeRoute(m: CompiledModelEntry): { route: ModelRoute; idx: number; all: ModelRoute[] } {
+    const all = this.allRoutes(m);
+    const idx = Math.max(0, Math.min(this.routeIdxByModel.get(m.id) ?? 0, all.length - 1));
+    return { route: all[idx]!, idx, all };
+  }
+
+  private cycleRoute(delta: number): void {
+    const cur = this.filtered[this.selected];
+    if (!cur) return;
+    const all = this.allRoutes(cur);
+    if (all.length <= 1) return;
+    const prev = this.routeIdxByModel.get(cur.id) ?? 0;
+    const next = (prev + delta + all.length) % all.length;
+    this.routeIdxByModel.set(cur.id, next);
+    this.rerender();
+  }
+
   private applyFilter(): void {
     const q = this.input.getValue().trim().toLowerCase();
     this.filtered = !q
@@ -241,10 +272,19 @@ export class ModelPickerOverlay implements Component, Focusable {
       : this.catalog.models.filter(
           (m) =>
             m.id.toLowerCase().includes(q) ||
-            m.preferredRoute.profileId.toLowerCase().includes(q) ||
-            m.alternateRoutes.some((r) => r.profileId.toLowerCase().includes(q)) ||
+            this.allRoutes(m).some((r) => r.profileId.toLowerCase().includes(q)) ||
             (m.scoreSource?.toLowerCase().includes(q) ?? false),
         );
+    // When user filters by a CLI name (e.g. `codex`, `claude`, `amp`), auto-select that matching route on each row!
+    if (q) {
+      for (const m of this.filtered) {
+        const all = this.allRoutes(m);
+        const matchIdx = all.findIndex((r) => r.profileId.toLowerCase().includes(q));
+        if (matchIdx >= 0) {
+          this.routeIdxByModel.set(m.id, matchIdx);
+        }
+      }
+    }
     this.selected = Math.min(this.selected, Math.max(0, this.filtered.length - 1));
   }
 
@@ -284,6 +324,22 @@ export class ModelPickerOverlay implements Component, Focusable {
       this.triggerSync();
       return;
     }
+    if (matchesKey(data, "tab")) {
+      this.cycleRoute(1);
+      return;
+    }
+    if (matchesKey(data, "shift+tab")) {
+      this.cycleRoute(-1);
+      return;
+    }
+    if (this.input.getValue().length === 0 && matchesKey(data, "right")) {
+      this.cycleRoute(1);
+      return;
+    }
+    if (this.input.getValue().length === 0 && matchesKey(data, "left")) {
+      this.cycleRoute(-1);
+      return;
+    }
     if (matchesKey(data, "up") || matchesKey(data, "ctrl+p")) {
       this.selected = Math.max(0, this.selected - 1);
       this.rerender();
@@ -297,7 +353,8 @@ export class ModelPickerOverlay implements Component, Focusable {
     if (matchesKey(data, "enter")) {
       const chosen = this.filtered[this.selected];
       if (chosen) {
-        this.onSelectModel(chosen);
+        const { route } = this.activeRoute(chosen);
+        this.onSelectModel(chosen, route);
       }
       this.onClose();
       return;
@@ -313,7 +370,7 @@ export class ModelPickerOverlay implements Component, Focusable {
 
   render(width: number): readonly string[] {
     const out: string[] = [];
-    out.push(renderCleanSearchLine(this.input, "⌕", "Filter by model or CLI…  (Ctrl+R to sync)", width, this.theme));
+    out.push(renderCleanSearchLine(this.input, "⌕", "Filter by model or CLI (codex/claude/amp)…  Tab switches CLI", width, this.theme));
     if (this.statusNote) {
       out.push(fitWidth(this.theme.warning(this.statusNote), width));
     }
@@ -326,7 +383,7 @@ export class ModelPickerOverlay implements Component, Focusable {
     out.push(this.theme.border("─".repeat(width)));
 
     if (this.filtered.length === 0) {
-      out.push(fitWidth(this.theme.muted("  No models match. Press 's' to sync benchmarks or check /settings."), width));
+      out.push(fitWidth(this.theme.muted("  No models match. Press Ctrl+R to sync benchmarks or check /settings."), width));
       return out;
     }
 
@@ -335,14 +392,14 @@ export class ModelPickerOverlay implements Component, Focusable {
     const slice = this.filtered.slice(start, start + maxRows);
 
     // Responsive column widths
-    const showRoute = width >= 88;
+    const showRoute = width >= 86;
     const showTime = width >= 74;
     const showCost = width >= 62;
     const rankW = 4;
     const scoreW = 15;
     const costW = showCost ? 16 : 0;
     const timeW = showTime ? 6 : 0;
-    const routeW = showRoute ? 14 : 0;
+    const routeW = showRoute ? 16 : 0;
     const gaps = 2 * (2 + (showCost ? 1 : 0) + (showTime ? 1 : 0) + (showRoute ? 1 : 0));
     const modelW = Math.max(14, width - 2 - rankW - scoreW - costW - timeW - routeW - gaps);
 
@@ -354,7 +411,7 @@ export class ModelPickerOverlay implements Component, Focusable {
     ];
     if (showCost) hdrParts.push(fitWidth(this.theme.dim("COST / TASK"), costW));
     if (showTime) hdrParts.push(fitWidth(this.theme.dim("TIME"), timeW, { align: "right" }));
-    if (showRoute) hdrParts.push(fitWidth(this.theme.dim("CLI / QUOTA"), routeW));
+    if (showRoute) hdrParts.push(fitWidth(this.theme.dim("ACP CLI / QUOTA"), routeW));
     out.push(clampLine(hdrParts.join("  ").replace(/^  \s{2}/, "  "), width));
     out.push(this.theme.border("─".repeat(width)));
 
@@ -362,8 +419,11 @@ export class ModelPickerOverlay implements Component, Focusable {
       const idx = start + i;
       const m = slice[i]!;
       const active = idx === this.selected;
+      const { route, all } = this.activeRoute(m);
       const isCurrent =
-        Boolean(this.currentModel) && (m.id === this.currentModel || m.preferredRoute.wireModelId === this.currentModel);
+        Boolean(this.currentModel) &&
+        (m.id === this.currentModel || route.wireModelId === this.currentModel) &&
+        (!this.currentProfileId || route.profileId === this.currentProfileId);
 
       const marker = active ? this.theme.accentBold("▸ ") : isCurrent ? this.theme.success("★ ") : "  ";
       const rankCell = fitWidth(active ? this.theme.accentBold(`#${m.codingRank}`) : this.theme.dim(`#${m.codingRank}`), rankW);
@@ -378,7 +438,7 @@ export class ModelPickerOverlay implements Component, Focusable {
       const cells = [rankCell, modelCell, scoreCell];
       if (showCost) {
         const costText =
-          m.preferredRoute.billing === "subscription"
+          route.billing === "subscription"
             ? `${this.theme.success("$0 sub")} ${this.theme.dim(`($${m.apiEquivCostUsd?.toFixed(2) ?? "?"})`)}`
             : `$${m.costPerTaskUsd?.toFixed(2) ?? "?"}/task`;
         cells.push(fitWidth(costText, costW));
@@ -387,39 +447,132 @@ export class ModelPickerOverlay implements Component, Focusable {
         cells.push(fitWidth(this.theme.muted(formatDuration(m.timePerTaskSeconds)), timeW, { align: "right" }));
       }
       if (showRoute) {
-        const qText = m.quota
-          ? m.quota.exhausted
-            ? badge("EXHAUSTED", "error", this.theme)
-            : `${m.preferredRoute.profileId.replace(/^acp:/, "")} ${Math.round((m.quota.effectiveRemainingRatio ?? 1) * 100)}%`
-          : m.preferredRoute.profileId;
-        cells.push(fitWidth(this.theme.muted(qText), routeW));
+        const extra = all.length > 1 ? this.theme.accent(` +${all.length - 1}`) : "";
+        const qText =
+          m.quota && route.profileId === m.preferredRoute.profileId
+            ? m.quota.exhausted
+              ? badge("EXHAUSTED", "error", this.theme)
+              : `${route.profileId.replace(/^acp:/, "")} ${Math.round((m.quota.effectiveRemainingRatio ?? 1) * 100)}%${extra}`
+            : `${route.profileId}${extra}`;
+        cells.push(fitWidth(active ? this.theme.text(qText) : this.theme.muted(qText), routeW));
       }
 
       const row = `${marker}${cells.join("  ")}`;
       out.push(active ? fillLineBg(row, width, this.theme.badgeBg) : clampLine(row, width));
     }
 
-    // Inspector strip for currently highlighted model
+    // Inspector strip for currently highlighted model (with live route selector!)
     const cur = this.filtered[this.selected];
     if (cur) {
       out.push(this.theme.border("─".repeat(width)));
-      const effortsStr = cur.efforts.length > 0 ? cur.efforts.join(" · ") : "default";
-      const quotaDetail = cur.quota
-        ? cur.quota.exhausted
-          ? `${badge("EXHAUSTED", "error", this.theme)} ${formatResetCountdown(cur.quota.nextAvailableAt)}`
-          : `${cur.quota.availabilityName} ${renderProgressBar(cur.quota.effectiveRemainingRatio, this.theme, { barWidth: 8 })}`
-        : `${cur.preferredRoute.billing} via ${[cur.preferredRoute.profileId, ...cur.alternateRoutes.map((r) => r.profileId)].join(" · ")}`;
+      const { route, all } = this.activeRoute(cur);
+      const efforts = route.supportedEfforts ?? cur.efforts;
+      const effortsStr = efforts.length > 0 ? efforts.join(" · ") : "default";
+      const routesStr = all
+        .map((r) => (r.profileId === route.profileId ? this.theme.accentBold(`[${r.profileId}]`) : this.theme.dim(r.profileId)))
+        .join(" · ");
+      const routeLabel = all.length > 1 ? `${this.theme.dim("CLI [Tab]:")} ${routesStr}` : `${this.theme.dim("CLI:")} ${routesStr}`;
       out.push(
         renderFlexRow(
           `${this.theme.dim("Efforts:")} ${this.theme.muted(effortsStr)}`,
-          quotaDetail,
+          routeLabel,
           width,
-          { minGap: 2, priority: "left" },
+          { minGap: 2, priority: "right" },
         ),
       );
     }
 
     return out;
+  }
+}
+
+/**
+ * Interactive ACP CLI Quick-Switcher (`/cli`, `/acp`, or `/profile`):
+ * Switch your active Director Chat between enabled ACP CLIs (e.g. `acp:codex`, `acp:claude`, `acp:amp`)
+ * in a single keypress without digging into `/settings`.
+ */
+export class CliPickerOverlay implements Component {
+  private selected = 0;
+  private readonly profiles: RunnerProfileConfig[];
+
+  constructor(
+    private readonly theme: HarnessTheme,
+    profiles: RunnerProfileConfig[],
+    private readonly currentProfileId: string | null,
+    private readonly probeStatuses: ProfileProbeStatus[] | undefined,
+    private readonly onSelectProfile: (profile: RunnerProfileConfig) => void,
+    private readonly onClose: () => void,
+    private readonly rerender: () => void,
+  ) {
+    this.profiles = profiles.filter((p) => p.enabled !== false);
+    const curIdx = this.profiles.findIndex((p) => p.id === currentProfileId);
+    if (curIdx >= 0) this.selected = curIdx;
+  }
+
+  handleInput(data: string): void {
+    if (matchesKey(data, "escape") || data === "q") {
+      this.onClose();
+      return;
+    }
+    if (matchesKey(data, "up") || data === "k") {
+      this.selected = Math.max(0, this.selected - 1);
+      this.rerender();
+    } else if (matchesKey(data, "down") || data === "j") {
+      this.selected = Math.min(Math.max(0, this.profiles.length - 1), this.selected + 1);
+      this.rerender();
+    } else if (matchesKey(data, "enter")) {
+      const chosen = this.profiles[this.selected];
+      this.onClose();
+      if (chosen) this.onSelectProfile(chosen);
+    }
+  }
+
+  invalidate(): void {}
+
+  render(width: number): readonly string[] {
+    if (this.profiles.length === 0) {
+      return [fitWidth(this.theme.muted("No enabled CLIs. Open /settings (Ctrl+,) to add or enable an ACP CLI."), width)];
+    }
+
+    const statusById = new Map((this.probeStatuses ?? []).map((s) => [s.profileId, s]));
+    return renderTable(
+      this.profiles.map((p, idx) => ({ p, idx })),
+      [
+        {
+          header: "ACP CLI",
+          width: 20,
+          priority: 0,
+          render: ({ p, idx }) => {
+            const active = idx === this.selected;
+            const isCur = p.id === this.currentProfileId;
+            const marker = active ? this.theme.accentBold("▸ ") : isCur ? this.theme.success("★ ") : "  ";
+            return `${marker}${active ? this.theme.accentBold(p.id) : this.theme.bold(p.id)}`;
+          },
+        },
+        {
+          header: "STATUS",
+          width: 18,
+          priority: 0,
+          render: ({ p }) => {
+            const st = statusById.get(p.id);
+            if (!st) return this.theme.muted(p.billing);
+            return st.status === "ok"
+              ? badge(`${st.modelCount} models`, "success", this.theme)
+              : badge(st.error ?? "probe error", "warning", this.theme);
+          },
+        },
+        {
+          header: "COMMAND",
+          width: "flex",
+          minWidth: 16,
+          priority: 1,
+          render: ({ p }) =>
+            this.theme.dim(p.kind === "acp" ? `${p.command} ${(p.args ?? []).join(" ")}` : `pi:${p.provider}`),
+        },
+      ],
+      width,
+      this.theme,
+    );
   }
 }
 
