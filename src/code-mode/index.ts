@@ -1,5 +1,6 @@
 import type { ToolDefinition } from "../runners/types.js";
 import { runCodeExec, timeoutMs, type CodeExecOptions, type CodeExecToolEvent } from "./runner.js";
+import { sandboxAvailable } from "./sandbox.js";
 import { CODE_EXEC_TOOL_NAME, TOOL_SEARCH_TOOL_NAME, exposedTools, toolSearch, type CodeMode } from "./sdk.js";
 
 export * from "./sdk.js";
@@ -8,6 +9,8 @@ export { runCodeExec, type CodeExecOptions, type CodeExecResult, type CodeExecTo
 type Context = Omit<CodeExecOptions, "code" | "timeoutMs">;
 
 function dispatch(name: string, args: Record<string, unknown>, ctx: Context, defaultMs?: number, maxMs?: number): Promise<unknown> | undefined {
+  if (name !== TOOL_SEARCH_TOOL_NAME && name !== CODE_EXEC_TOOL_NAME) return undefined;
+  if (!sandboxAvailable()) return Promise.reject(new Error("Code Mode sandbox unavailable on this host"));
   if (name === TOOL_SEARCH_TOOL_NAME) {
     if ((args.query !== undefined && typeof args.query !== "string") ||
         (args.names !== undefined && !(Array.isArray(args.names) && args.names.every(n => typeof n === "string")))) {
@@ -15,7 +18,6 @@ function dispatch(name: string, args: Record<string, unknown>, ctx: Context, def
     }
     return Promise.resolve(toolSearch(ctx.tools, args));
   }
-  if (name !== CODE_EXEC_TOOL_NAME) return undefined;
   if (typeof args.code !== "string") return Promise.reject(new Error("code_exec expects a code string"));
   if (args.timeout_s !== undefined && (typeof args.timeout_s !== "number" || !Number.isFinite(args.timeout_s) || args.timeout_s <= 0)) {
     return Promise.reject(new Error("timeout_s must be a positive number"));
@@ -33,6 +35,7 @@ export interface CodeModeExecutorOptions {
   allowedTools: () => ToolDefinition[];
   execute: CodeExecOptions["callTool"];
   artifactsDir: string;
+  saveOutput?: CodeExecOptions["saveOutput"];
   signal?: AbortSignal;
   defaultTimeoutMs?: number; maxTimeoutMs?: number; maxOutputChars?: number;
   onToolEvent?: (ev: CodeExecToolEvent) => void;
@@ -45,7 +48,7 @@ export function createCodeModeExecutor(opts: CodeModeExecutorOptions) {
       if (opts.mode !== "off" && (name === CODE_EXEC_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME)) {
         return dispatch(name, args, {
           tools: opts.allowedTools(), callTool: opts.execute, artifactsDir: opts.artifactsDir,
-          signal: opts.signal, maxOutputChars: opts.maxOutputChars, onToolEvent: opts.onToolEvent,
+          saveOutput: opts.saveOutput, signal: opts.signal, maxOutputChars: opts.maxOutputChars, onToolEvent: opts.onToolEvent,
         }, opts.defaultTimeoutMs, opts.maxTimeoutMs);
       }
       return opts.execute(name, args);

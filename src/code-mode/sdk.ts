@@ -1,6 +1,12 @@
 import type { ToolDefinition } from "../runners/types.js";
 
+import { sandboxAvailable } from "./sandbox.js";
+
 export type CodeMode = "collapsed" | "hybrid" | "off";
+
+export function effectiveCodeMode(requested: CodeMode): CodeMode {
+  return requested !== "off" && sandboxAvailable() ? requested : "off";
+}
 
 export const CODE_EXEC_TOOL_NAME = "code_exec";
 export const TOOL_SEARCH_TOOL_NAME = "tool_search";
@@ -31,7 +37,7 @@ export const TOOL_SEARCH_TOOL: ToolDefinition = {
 };
 
 export function exposedTools(allowed: ToolDefinition[], mode: CodeMode): ToolDefinition[] {
-  if (mode === "off") return allowed;
+  if (effectiveCodeMode(mode) === "off") return allowed;
   if (mode === "collapsed") return [TOOL_SEARCH_TOOL, CODE_EXEC_TOOL];
   return [...allowed.filter((tool) => !isCodeModeTool(tool.name)), TOOL_SEARCH_TOOL, CODE_EXEC_TOOL];
 }
@@ -116,7 +122,7 @@ export function toolSearch(allowed: ToolDefinition[], args: { query?: string; na
 }
 
 export function codeModePromptSection(mode: CodeMode): string {
-  if (mode === "off") return "";
+  if (effectiveCodeMode(mode) === "off") return "";
   return [
     "## Code Mode",
     mode === "hybrid" ? "Call harness tools directly for single calls, or use code_exec to combine calls in a script." :

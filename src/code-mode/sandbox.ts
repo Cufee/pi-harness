@@ -1,31 +1,94 @@
-import { existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-/** The kernel boundary matters: Bun exposes native code, so JS stubs alone cannot enforce policy. */
+const launcher = "/usr/bin/sandbox-exec";
+
+function sandboxArgs(bun: string, dir: string, socket: string): string[] {
+  const q = JSON.stringify;
+  const profile = `(version 1)
+    (deny default)
+    (import "dyld-support.sb")
+    (allow sysctl-read file-read-metadata)
+    (allow file-read* file-map-executable (subpath "/System/Library") (subpath "/usr/lib") (literal ${q(bun)}))
+    (allow file-read* (subpath "/usr/share/icu")
+      (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random")
+      (subpath ${q(dir)}))
+    (allow process-exec (literal ${q(bun)}))
+    (allow signal (target self))
+    (allow network-outbound (remote unix-socket (path-literal ${q(socket)})))`;
+  return ["-p", profile, bun, "--no-install", "--no-env-file"];
+}
+
+export function sandboxEnv(dir: string) {
+  return { HOME: dir, TMPDIR: dir, PATH: "/usr/bin:/bin" };
+}
+
+// Run before installing the JS guard so these checks exercise the OS profile.
+const probe = (port: number, socketPath: string) => `
+import { writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { connect } from "node:net";
+function denied(error) {
+  return error?.code === "EPERM" || error?.code === "EACCES";
+}
+function mustDeny(action) {
+  try { action(); } catch (error) { if (denied(error)) return; throw error; }
+  throw new Error("Sandbox permitted a restricted operation");
+}
+mustDeny(() => writeFileSync("write-probe", ""));
+mustDeny(() => execFileSync(process.execPath, ["--version"]));
+await new Promise((resolve, reject) => {
+  const socket = connect(${port}, "127.0.0.1");
+  socket.on("connect", () => { socket.destroy(); reject(new Error("TCP permitted")); });
+  socket.on("error", error => {
+    // Bun can report a denied connect to the listening parent as ECONNREFUSED.
+    if (denied(error) || error.code === "ECONNREFUSED") resolve();
+    else reject(error);
+  });
+});
+await new Promise((resolve, reject) => {
+  const socket = connect(${JSON.stringify(socketPath)});
+  socket.on("connect", () => { socket.end(); resolve(); });
+  socket.on("error", reject);
+});
+console.log("sandbox probe complete");
+`;
+
+let available: boolean | undefined;
+export function sandboxAvailable(): boolean {
+  if (available !== undefined) return available;
+  // Bubblewrap namespaces alone permit spawning children and using loopback.
+  // Linux (including NixOS) needs an additional verified kernel policy.
+  if (process.platform !== "darwin") return false;
+  let dir: string | undefined;
+  let listener: Bun.UnixSocketListener<undefined> | undefined;
+  let tcp: Bun.TCPSocketListener<undefined> | undefined;
+  try {
+    dir = realpathSync(mkdtempSync(join(tmpdir(), "cm-")));
+    const socket = join(dir, "ipc");
+    if (Buffer.byteLength(socket) >= 104) throw new Error("Code Mode IPC path too long");
+    listener = Bun.listen({ unix: socket, socket: { data() {} } });
+    tcp = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+    const args = sandboxArgs(realpathSync(process.execPath), dir, socket);
+    const result = spawnSync(launcher, [...args, "-e", probe(tcp.port, socket)], {
+      cwd: dir, env: sandboxEnv(dir), timeout: 3000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+    });
+    available = result.status === 0 && result.stdout.trim() === "sandbox probe complete";
+  } catch {
+    available = false;
+  } finally {
+    tcp?.stop(true);
+    listener?.stop(true);
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+  return available;
+}
+
 export function sandboxCommand(bun: string, dir: string, socket: string): string[] {
-  const args = ["--no-install", "--no-env-file", "--preload", "./guard.mjs", "./script.ts"];
-  if (process.platform === "darwin" && existsSync("/usr/bin/sandbox-exec")) {
-    const q = JSON.stringify;
-    const profile = `(version 1)
-      (deny default)
-      (import "dyld-support.sb")
-      (allow sysctl-read file-read-metadata)
-      (allow file-read* file-map-executable (subpath "/System/Library") (subpath "/usr/lib") (literal ${q(bun)}))
-      (allow file-read* (subpath "/usr/share/icu")
-        (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random")
-        (subpath ${q(dir)}))
-      (allow process-exec (literal ${q(bun)}))
-      (allow signal (target self))
-      (allow network-outbound (remote unix-socket (path-literal ${q(socket)})))`;
-    return ["/usr/bin/sandbox-exec", "-p", profile, bun, ...args];
-  }
-  if (process.platform === "linux" && existsSync("/usr/bin/bwrap")) {
-    // Mount runtime libraries, Bun and the scratch socket in private network/PID namespaces.
-    return ["/usr/bin/bwrap", "--die-with-parent", "--unshare-all", "--disable-userns", "--cap-drop", "ALL",
-      ...["/lib", "/lib64", "/usr/lib", "/usr/lib64"].filter(existsSync).flatMap(p => ["--ro-bind", p, p]),
-      "--dev", "/dev", "--proc", "/proc", "--ro-bind", bun, bun, "--ro-bind", dir, dir,
-      "--remount-ro", "/", "--chdir", dir, bun, ...args];
-  }
-  throw new Error("Code Mode requires macOS sandbox-exec or Linux bubblewrap (/usr/bin/bwrap)");
+  if (!sandboxAvailable()) throw new Error("Code Mode sandbox unavailable on this host");
+  return [launcher, ...sandboxArgs(bun, dir, socket), "--preload", "./guard.mjs", "./script.ts"];
 }
 
 // Import the bridge first: it opens the one authorized socket before networking is disabled.

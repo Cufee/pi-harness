@@ -7,6 +7,7 @@ import {
   TOOL_SEARCH_TOOL,
   codeModePromptSection,
   createCodeModeExecutor,
+  effectiveCodeMode,
   exposedTools,
   generateSdkDeclarations,
   handleCodeModeTool,
@@ -16,6 +17,9 @@ import {
   type CodeExecToolEvent,
 } from "../src/code-mode/index.js";
 import type { ToolDefinition } from "../src/runners/types.js";
+
+const sandboxEnabled = effectiveCodeMode("collapsed") === "collapsed";
+const itWithSandbox = it.skipIf(!sandboxEnabled);
 
 const lookup: ToolDefinition = {
   name: "lookup_gizmo",
@@ -63,9 +67,13 @@ describe("Code Mode discovery", () => {
   it("exposes the mode's surface and searches only the supplied tools", () => {
     const allowed = [lookup, reserve];
     const names = (tools: ToolDefinition[]) => tools.map((tool) => tool.name);
-    assert.deepEqual(names(exposedTools(allowed, "collapsed")).sort(), ["code_exec", "tool_search"]);
-    const hybrid = names(exposedTools(allowed, "hybrid")).filter((name) => name !== "tool_search");
-    assert.deepEqual(hybrid.sort(), ["code_exec", "lookup_gizmo", "reserve_bin"]);
+    if (sandboxEnabled) {
+      assert.deepEqual(names(exposedTools(allowed, "collapsed")).sort(), ["code_exec", "tool_search"]);
+      const hybrid = names(exposedTools(allowed, "hybrid")).filter((name) => name !== "tool_search");
+      assert.deepEqual(hybrid.sort(), ["code_exec", "lookup_gizmo", "reserve_bin"]);
+    } else {
+      for (const mode of ["collapsed", "hybrid"] as const) assert.deepEqual(exposedTools(allowed, mode), allowed);
+    }
     assert.deepEqual(exposedTools(allowed, "off"), allowed);
 
     const byDescription = toolSearch(allowed, { query: "warehouse" });
@@ -83,6 +91,10 @@ describe("Code Mode discovery", () => {
     assert.equal(codeModePromptSection("off"), "");
     for (const mode of ["collapsed", "hybrid"] as const) {
       const prompt = codeModePromptSection(mode);
+      if (!sandboxEnabled) {
+        assert.equal(prompt, "");
+        continue;
+      }
       for (const pattern of [/tool_search/, /code_exec/, /from\s+["']harness["']/, /top.level.{0,80}await|await.{0,80}top.level/i, /output\s*\(/, /timeout/i, /preview|truncat|externaliz/i]) {
         assert.match(prompt, pattern);
       }
@@ -116,10 +128,6 @@ describe("Code Mode execution", () => {
 
   it("dispatches only Code Mode operations and preserves scoped delegation", async () => {
     assert.equal(handleCodeModeTool(lookup.name, { id: "g9" }, context()), undefined);
-    assert.deepEqual(
-      await handleCodeModeTool("tool_search", { names: [lookup.name, reserve.name] }, { ...context(), tools: [lookup] }),
-      toolSearch([lookup], { names: [lookup.name, reserve.name] }),
-    );
 
     let allowed = [lookup];
     const delegated: unknown[] = [];
@@ -133,6 +141,18 @@ describe("Code Mode execution", () => {
       defaultTimeoutMs: 2_000,
     };
     const executor = createCodeModeExecutor({ ...options, mode: "collapsed" });
+    if (!sandboxEnabled) {
+      assert.deepEqual(executor.tools(), allowed);
+      assert.deepEqual(await executor.execute(lookup.name, { id: "g9" }), { bin: 13 });
+      await assert.rejects(executor.execute("code_exec", { code: "output(1)" }), /sandbox unavailable/);
+      assert.equal((await run("output(1)")).ok, false);
+      assert.deepEqual(delegated, [{ name: lookup.name, args: { id: "g9" } }]);
+      return;
+    }
+    assert.deepEqual(
+      await handleCodeModeTool("tool_search", { names: [lookup.name, reserve.name] }, { ...context(), tools: [lookup] }),
+      toolSearch([lookup], { names: [lookup.name, reserve.name] }),
+    );
     assert.deepEqual(executor.tools().map((tool) => tool.name).sort(), ["code_exec", "tool_search"]);
     assert.deepEqual(await executor.execute("tool_search", { names: [lookup.name] }), toolSearch([lookup], { names: [lookup.name] }));
     allowed = [reserve];
@@ -156,7 +176,7 @@ describe("Code Mode execution", () => {
     ]);
   });
 
-  it("chains real Bun SDK calls through the parent, emitting events, output, and logs", async () => {
+  itWithSandbox("chains real Bun SDK calls through the parent, emitting events, output, and logs", async () => {
     const events: CodeExecToolEvent[] = [];
     const calls: unknown[] = [];
     const result = await run(`
@@ -192,7 +212,7 @@ describe("Code Mode execution", () => {
     assert.deepEqual(readdirSync(scratchRoot), []);
   });
 
-  it("propagates a caller's inner permission denial to the script and end event", async () => {
+  itWithSandbox("propagates a caller's inner permission denial to the script and end event", async () => {
     const events: CodeExecToolEvent[] = [];
     const result = await run('import { reserve_bin } from "harness"; await reserve_bin({bin: 3, quantity: 2});', {
       tools: [reserve],
@@ -207,7 +227,7 @@ describe("Code Mode execution", () => {
     assert.deepEqual(readdirSync(scratchRoot), []);
   });
 
-  it("never delegates recursive operations even when passed in the tool list", async () => {
+  itWithSandbox("never delegates recursive operations even when passed in the tool list", async () => {
     const delegated: string[] = [];
     for (const [name, args] of [["code_exec", { code: "console.log(1)" }], ["tool_search", { names: [] }]] as const) {
       const result = await run(`import { ${name} } from "harness"; await ${name}(${JSON.stringify(args)});`, {
@@ -220,7 +240,7 @@ describe("Code Mode execution", () => {
     assert.deepEqual(delegated, []);
   });
 
-  it("starts in a fresh scratch directory with credential-like env keys removed", async () => {
+  itWithSandbox("starts in a fresh scratch directory with credential-like env keys removed", async () => {
     const keys = ["CM_TEST_API_KEY", "CM_TEST_TOKEN", "CM_TEST_SECRET", "CM_TEST_PASSWORD", "AWS_CM_TEST_KEY"];
     const saved = keys.map((key) => process.env[key]);
     try {
@@ -245,7 +265,7 @@ describe("Code Mode execution", () => {
     }
   });
 
-  it("rejects filesystem writes and child process launches", async () => {
+  itWithSandbox("rejects filesystem writes and child process launches", async () => {
     const fsTarget = join(root, "fs-write");
     const bunTarget = join(root, "bun-write");
     const result = await run(`
@@ -273,7 +293,7 @@ describe("Code Mode execution", () => {
     assert.equal(existsSync(bunTarget), false);
   });
 
-  it("times out a busy child and removes its scratch directory", async () => {
+  itWithSandbox("times out a busy child and removes its scratch directory", async () => {
     const result = await run("while (true) {}", { timeoutMs: 150 });
     assert.equal(result.ok, false);
     assert.equal(result.timedOut, true, result.error);
@@ -281,7 +301,7 @@ describe("Code Mode execution", () => {
     assert.deepEqual(readdirSync(scratchRoot), []);
   });
 
-  it("bounds the serialized IPC frame in bytes, not string length", async () => {
+  itWithSandbox("bounds the serialized IPC frame in bytes, not string length", async () => {
     const result = await run('output("界".repeat(6 * 1024 * 1024))');
     assert.equal(result.ok, false);
     assert.match(result.error ?? "", /16 MiB/);
@@ -289,7 +309,7 @@ describe("Code Mode execution", () => {
     assert.deepEqual(readdirSync(scratchRoot), []);
   });
 
-  it("aborts an already running child rather than waiting for its timeout", async () => {
+  itWithSandbox("aborts an already running child rather than waiting for its timeout", async () => {
     const controller = new AbortController();
     let called = false;
     const result = await run('import { lookup_gizmo } from "harness"; await lookup_gizmo({id: "g9"}); while (true) {}', {
@@ -308,7 +328,7 @@ describe("Code Mode execution", () => {
     assert.deepEqual(readdirSync(scratchRoot), []);
   });
 
-  it("externalizes oversized output under the artifact directory and keeps a short preview", async () => {
+  itWithSandbox("externalizes oversized output under the artifact directory and keeps a short preview", async () => {
     const payload = `preview marker ${"x".repeat(4_096)} tail marker`;
     const result = await run(`import { output } from "harness"; output(${JSON.stringify(payload)});`, { maxOutputChars: 128 });
     assert.equal(result.ok, true, result.error);
