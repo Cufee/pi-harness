@@ -5,7 +5,7 @@ import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ToolDefinition } from "../runners/types.js";
-import { guard, sandboxCommand } from "./sandbox.js";
+import { guard, sandboxCommand, sandboxEnv } from "./sandbox.js";
 import { generateSdkDeclarations } from "./sdk.js";
 
 export interface CodeExecToolEvent {
@@ -16,6 +16,7 @@ export interface CodeExecOptions {
   callTool: (name: string, args: Record<string, unknown>) => Promise<unknown>;
   signal?: AbortSignal; timeoutMs?: number; maxOutputChars?: number;
   artifactsDir: string; scratchRoot?: string;
+  saveOutput?: (name: string, json: string) => string | Promise<string>;
   onToolEvent?: (event: CodeExecToolEvent) => void;
 }
 export interface CodeExecResult {
@@ -145,7 +146,7 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     ]);
     await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socket, resolve); });
     if (stopped) return result;
-    child = spawn(cmd!, args, { cwd: dir, env: { HOME: dir, TMPDIR: dir, PATH: "/usr/bin:/bin" }, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    child = spawn(cmd!, args, { cwd: dir, env: sandboxEnv(dir), detached: true, stdio: ["ignore", "pipe", "pipe"] });
     let tail = "";
     for (const stream of [child.stdout!, child.stderr!]) {
       stream.setEncoding("utf8");
@@ -160,10 +161,15 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     const limit = Math.max(0, opts.maxOutputChars ?? 20_000);
     result.preview = json.slice(0, limit);
     if (json.length > limit) {
-      await mkdir(opts.artifactsDir, { recursive: true });
-      const path = join(opts.artifactsDir, `code-exec-${randomUUID()}.json`);
-      await writeFile(path, json, { flag: "wx", mode: 0o600 });
-      result.artifactPath = path;
+      const name = `code-exec-${randomUUID()}.json`;
+      if (opts.saveOutput) {
+        result.artifactPath = await opts.saveOutput(name, json);
+      } else {
+        await mkdir(opts.artifactsDir, { recursive: true });
+        const path = join(opts.artifactsDir, name);
+        await writeFile(path, json, { flag: "wx", mode: 0o600 });
+        result.artifactPath = path;
+      }
     } else if (output !== undefined) result.output = output;
     result.ok = true;
   } catch (e) { result.error ??= message(e); }
