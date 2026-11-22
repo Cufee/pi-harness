@@ -5,6 +5,7 @@ import {
   type SlashCommand,
   type TUI,
   type TuiMouseEvent,
+  matchesKey,
 } from "@earendil-works/pi-tui";
 import type { HarnessTheme } from "./theme.js";
 import { clampLine, fitWidth } from "./width.js";
@@ -29,6 +30,12 @@ export interface ComposerConfirmBanner {
   /** Remaining fraction from 1 (full width) down to 0 (expired). */
   progress: number;
 }
+
+/** Composer-owned `[key, description]` shortcut rows for `/help` (same shape as the shortcut table in `commands.ts`). */
+export const COMPOSER_SHORTCUT_HELP: ReadonlyArray<readonly [string, string]> = [
+  ["Ctrl+U / Ctrl+K / Ctrl+W", "Delete to line start / line end / word; repeated deletes undo as one edit"],
+  ["Ctrl+- / Ctrl+Z", "Undo last edit (restores text and cursor, even after clearing the whole input)"],
+];
 
 export class Composer extends Editor {
   private placeholder: string;
@@ -85,6 +92,22 @@ export class Composer extends Editor {
 
   isAutocompleteOpen(): boolean {
     return this.isShowingAutocomplete();
+  }
+
+  override handleInput(data: string): void {
+    // Ctrl+- is often claimed by the host terminal/IDE; Ctrl+Z reaches the app as a plain 0x1a.
+    if (matchesKey(data, "ctrl+z")) {
+      this["undo"]();
+      return;
+    }
+    // `Editor` snapshots before every line/word kill, so a repeated one (Cmd+Backspace's Ctrl+U
+    // tapped until the input is empty) would need one undo per press. Keep only the snapshot taken
+    // before the first kill of an unbroken run; the kill ring accumulates the same way.
+    const stack = this["undoStack"];
+    const continuing = this["lastAction"] === "kill";
+    const depth = stack.length;
+    super.handleInput(data);
+    if (continuing && this["lastAction"] === "kill" && stack.length === depth + 1) stack.pop();
   }
 
   protected override renderTopBorder(width: number, hiddenLineCount: number): string {
