@@ -111,14 +111,23 @@ export function generateSdkDeclarations(tools: ToolDefinition[]): string {
   return ['declare module "harness" {', ...signatures, "  export function output(value: unknown): void;", "}", ""].join("\n");
 }
 
-export function toolSearch(allowed: ToolDefinition[], args: { query?: string; names?: string[] }): { signatures: string; matched: string[] } {
+// Clients such as Amp expose MCP tools as `mcp__<server>__<tool>`; script functions use the bare name.
+const clientPrefix = /^mcp__harness__/;
+
+const SCRIPT_FUNCTION_NOTE =
+  'These are functions for code_exec scripts: `import { name } from "harness"`. They are callable as direct tools only if your own tool list contains that exact name. Otherwise call them only inside a code_exec script.';
+
+export function toolSearch(
+  allowed: ToolDefinition[],
+  args: { query?: string; names?: string[] },
+): { signatures: string; matched: string[]; note: string } {
   const terms = args.query?.trim().toLowerCase().split(/\s+/).filter(Boolean) ?? [];
-  const names = new Set(args.names);
+  const names = new Set(args.names?.map((name) => name.replace(clientPrefix, "")));
   const tools = scriptTools(allowed).filter((tool) => {
     const text = `${tool.name} ${tool.description}`.toLowerCase();
     return (!names.size || names.has(tool.name)) && terms.every((term) => text.includes(term));
   });
-  return { signatures: generateSdkDeclarations(tools), matched: tools.map(({ name }) => name) };
+  return { signatures: generateSdkDeclarations(tools), matched: tools.map(({ name }) => name), note: SCRIPT_FUNCTION_NOTE };
 }
 
 export function codeModePromptSection(mode: CodeMode): string {
@@ -126,8 +135,9 @@ export function codeModePromptSection(mode: CodeMode): string {
   return [
     "## Code Mode",
     mode === "hybrid" ? "Call harness tools directly for single calls, or use code_exec to combine calls in a script." :
-      "Use code_exec to call harness tools from a script.",
+      "The only callable harness tools are tool_search and code_exec. Every other harness tool named in these instructions (return_task, wait_children, spawn_worker, and so on) is a function inside a code_exec script. Calling it as a tool fails because it is not in your tool list.",
     'Find allowed tools with tool_search. In code_exec, use `import { ... } from "harness"`, top-level await, and output(value) for the final JSON result.',
+    'Your client may prefix tool names (for example mcp__harness__code_exec) or wrap this server behind its own tool_search and code_exec. Then `harness` in the client\'s own script exports only code_exec and tool_search, so importing return_task or any other harness function there fails. Call the harness code_exec with `{ code }` and put the `import { ... } from "harness"` line inside that code string.',
     "Set timeout_s for long waits (default 60s, maximum 600s unless configured lower). Results over the inline limit (default 20,000 characters) return a preview and artifact path.",
   ].join("\n\n");
 }
