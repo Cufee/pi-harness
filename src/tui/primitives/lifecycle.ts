@@ -9,6 +9,9 @@ export interface TerminalSessionCallbacks {
   isAutocompleteOpen: () => boolean;
   isBusy: () => boolean;
   onAbortGeneration: (key: "escape" | "ctrl+c") => void;
+  /** Optional Esc confirmation handler (when set, Esc while busy requires a second Esc within the countdown window). */
+  onEscConfirmChange?: (state: { text: string; progress: number } | null) => void;
+  escConfirmDurationMs?: number;
   onSteer?: () => void;
   onEnqueue?: () => boolean;
   onRecallQueued?: () => boolean;
@@ -36,6 +39,9 @@ export class TerminalSession {
   private shuttingDown = false;
   private ctrlCArmedUntil = 0;
   private ctrlCTimer: ReturnType<typeof setTimeout> | null = null;
+  private escArmedUntil = 0;
+  private escInterval: ReturnType<typeof setInterval> | null = null;
+  private escDisarmCallback: (() => void) | null = null;
   private exitResolve: (() => void) | null = null;
   private readonly exitPromise: Promise<void>;
   private readonly signalHandlers: Array<[NodeJS.Signals, () => void]> = [];
@@ -62,6 +68,42 @@ export class TerminalSession {
     detachBanner: string;
   }): void {
     const { overlays, spinner, footerHint, callbacks, detachBanner } = opts;
+
+    const disarmEsc = () => {
+      const wasArmed = this.escArmedUntil > 0 || this.escInterval !== null;
+      this.escArmedUntil = 0;
+      if (this.escInterval) {
+        clearInterval(this.escInterval);
+        this.escInterval = null;
+      }
+      this.escDisarmCallback = null;
+      if (wasArmed) {
+        callbacks.onEscConfirmChange?.(null);
+      }
+    };
+
+    const armEscConfirm = () => {
+      const durationMs = Math.max(200, callbacks.escConfirmDurationMs ?? 2500);
+      const startedAt = Date.now();
+      this.escArmedUntil = startedAt + durationMs;
+      this.escDisarmCallback = disarmEsc;
+      const text = "Press Esc again to stop Director";
+      callbacks.onEscConfirmChange?.({ text, progress: 1 });
+      if (this.escInterval) clearInterval(this.escInterval);
+      this.escInterval = setInterval(() => {
+        if (!callbacks.isBusy() || overlays.isOpen) {
+          disarmEsc();
+          return;
+        }
+        const remaining = this.escArmedUntil - Date.now();
+        if (remaining <= 0) {
+          disarmEsc();
+          return;
+        }
+        callbacks.onEscConfirmChange?.({ text, progress: remaining / durationMs });
+      }, 50);
+      this.escInterval.unref?.();
+    };
 
     const disarmCtrlC = () => {
       this.ctrlCArmedUntil = 0;
@@ -191,24 +233,39 @@ export class TerminalSession {
         }
       }
 
-      // Esc: autocomplete -> overlay -> abort busy turn
+      // Esc: autocomplete -> overlay -> confirm/abort busy turn
       if (data === "\x1b" || matchesKey(data, "escape")) {
         disarmCtrlC();
         if (overlays.isOpen) {
+          disarmEsc();
           // Let topmost overlay handle inner submenu Escape if it wants; if unhandled, overlay calls pop()
           return undefined;
         }
         if (callbacks.isAutocompleteOpen()) {
+          disarmEsc();
           return undefined; // Let Editor dismiss autocomplete
         }
         if (callbacks.isBusy()) {
-          callbacks.onAbortGeneration("escape");
+          if (callbacks.onEscConfirmChange) {
+            if (Date.now() < this.escArmedUntil) {
+              disarmEsc();
+              callbacks.onAbortGeneration("escape");
+            } else {
+              armEscConfirm();
+            }
+          } else {
+            callbacks.onAbortGeneration("escape");
+          }
           return { consume: true };
         }
+        disarmEsc();
         return undefined;
       }
 
-      // Any other key clears the Ctrl+C arm banner
+      // Any other key clears Esc confirmation and Ctrl+C arm banner
+      if (this.escArmedUntil > 0) {
+        disarmEsc();
+      }
       if (this.ctrlCArmedUntil > 0) {
         disarmCtrlC();
       }
@@ -260,6 +317,12 @@ export class TerminalSession {
       clearTimeout(this.ctrlCTimer);
       this.ctrlCTimer = null;
     }
+    this.escDisarmCallback?.();
+    if (this.escInterval) {
+      clearInterval(this.escInterval);
+      this.escInterval = null;
+    }
+    this.escArmedUntil = 0;
     for (const [sig, fn] of this.signalHandlers) {
       process.off(sig, fn);
     }

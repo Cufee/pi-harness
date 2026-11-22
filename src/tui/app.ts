@@ -200,10 +200,10 @@ export function openRunsOverlay(ctx: {
       requestRender: ctx.requestRender,
     });
     const modelBase = row.model || row.profileId || "";
-    const modelTag = modelBase ? (row.effort ? `${modelBase} (${row.effort})` : modelBase) : "";
+    const modelTag = modelBase ? (row.effort ? `${modelBase} (thinking: ${row.effort})` : modelBase) : "";
     handle = ctx.overlays.push(
       {
-        title: "Agent Transcript",
+        title: `Agent Transcript${row.effort ? ` · thinking: ${row.effort}` : ""}`,
         subtitle: `${row.runId} · ${row.taskId}${modelTag ? ` · ${modelTag}` : ""}`,
         footer: "mouse wheel / ↑↓ scroll · read-only · Esc back to /runs",
       },
@@ -1195,6 +1195,7 @@ export async function runDirectorChatTui(opts: {
     }
     activeTurnId = null;
     busy = false;
+    composer.clearConfirmBanner();
     spinner.stop();
     finishTranscript(end.assistantTurn?.content);
     if (end.cancelled) appendSystem(["Cancelled current response."], "warning");
@@ -1288,6 +1289,7 @@ export async function runDirectorChatTui(opts: {
       isAutocompleteOpen: () => composer.isAutocompleteOpen(),
       isBusy: () => busy,
       onAbortGeneration: (key) => void controlTurn(key),
+      onEscConfirmChange: (state) => composer.setConfirmBanner(state),
       onSteer: () => void controlTurn("steer"),
       onEnqueue: () => {
         if (buffering) return false;
@@ -1583,10 +1585,19 @@ export async function runNativeScrollbackTui(opts: {
   const pendingContainer = new Container();
   const pendingMarkdown = new Markdown("", 1, 0, theme.toMarkdownTheme());
   const spinner = new TimedSpinner(tui, theme);
+  const focusedOrRootTask = () =>
+    (focusedTaskId ? tasks.find((t) => t.id === focusedTaskId) : undefined) ??
+    tasks.find((t) => t.tier === 1) ??
+    tasks[0];
+  const initialTask = focusedOrRootTask();
+  const initialModel = initialTask?.model ?? initialTask?.profileId ?? null;
+  const initialEffort = initialTask?.effort ?? null;
+
   const statusBar = new StatusBar(theme, {
     tone: "accent",
     modeLabel: opts.runId,
-    modelLabel: focusedTaskId ?? "ALL",
+    modelLabel: initialModel ? `${focusedTaskId ?? "ALL"} · ${initialModel}` : (focusedTaskId ?? "ALL"),
+    effortLabel: initialEffort,
     goalsSummary: `${tasks.filter((t) => t.status === "running").length} running`,
   });
   const composer = new Composer(tui, theme, {
@@ -1596,11 +1607,18 @@ export async function runNativeScrollbackTui(opts: {
   const footerHint = new FooterHint(theme);
   const overlays = new OverlayManager(tui, theme, composer);
 
+  const bannerMeta = [
+    `status: ${run.status}`,
+    `focus: ${focusedTaskId ?? "ALL"}`,
+    ...(initialModel ? [`model: ${initialModel}`] : []),
+    ...(initialEffort ? [`thinking: ${initialEffort}`] : []),
+  ].join(" · ");
+
   streamContainer.addChild(
     new BannerCard(
       theme,
-      `pi-harness run ${opts.runId}`,
-      `status: ${run.status} · focus: ${focusedTaskId ?? "ALL"}`,
+      `pi-harness run ${opts.runId}${initialEffort ? ` [thinking: ${initialEffort}]` : ""}`,
+      bannerMeta,
     ),
   );
 
@@ -1623,10 +1641,13 @@ export async function runNativeScrollbackTui(opts: {
         : "⏸ quota (Ctrl+T, then w)"
       : null;
 
+    const activeTask = focusedOrRootTask();
+    const activeModel = activeTask?.model ?? activeTask?.profileId ?? null;
     statusBar.update({
       tone: escalations.length > 0 ? "error" : isQuotaPaused ? "warning" : running > 0 ? "accent" : "success",
       modeLabel: `${opts.runId} (${run.status})`,
-      modelLabel: `focus:${focusedTaskId ?? "ALL"}`,
+      modelLabel: activeModel ? `focus:${focusedTaskId ?? "ALL"} · ${activeModel}` : `focus:${focusedTaskId ?? "ALL"}`,
+      effortLabel: activeTask?.effort ?? null,
       goalsSummary: isQuotaPaused ? `${pausedQuota} paused` : `${running} running`,
       alertText: escalations.length > 0 ? `${escalations.length} esc` : quotaAlert,
     });

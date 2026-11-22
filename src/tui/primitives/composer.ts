@@ -24,10 +24,17 @@ export interface ComposerOptions {
  * - Native `/` slash-command and `@` workspace-file autocomplete via `CombinedAutocompleteProvider`
  * - Prompt history (`Up`/`Down`), multiline (`Shift+Enter`), paste folding, undo, and kill-ring
  */
+export interface ComposerConfirmBanner {
+  text: string;
+  /** Remaining fraction from 1 (full width) down to 0 (expired). */
+  progress: number;
+}
+
 export class Composer extends Editor {
   private placeholder: string;
   private sourceRows?: number[];
   private selectedLine = "";
+  private confirmBanner: ComposerConfirmBanner | null = null;
 
   constructor(
     tui: TUI,
@@ -54,6 +61,21 @@ export class Composer extends Editor {
 
   setPlaceholder(text: string): void {
     this.placeholder = text;
+    this.tui.requestRender();
+  }
+
+  /**
+   * Temporarily replaces the composer visual with an exact-height confirmation view
+   * (decreasing top line + confirmation text) without losing draft text or shifting UI height.
+   */
+  setConfirmBanner(banner: ComposerConfirmBanner | null): void {
+    this.confirmBanner = banner;
+    this.tui.requestRender();
+  }
+
+  clearConfirmBanner(): void {
+    if (!this.confirmBanner) return;
+    this.confirmBanner = null;
     this.tui.requestRender();
   }
 
@@ -109,6 +131,29 @@ export class Composer extends Editor {
       }
       lines = this.sourceRows.map((i) => lines[i]!);
     }
+
+    if (this.confirmBanner) {
+      const targetHeight = lines.length;
+      const frac = Math.max(0, Math.min(1, this.confirmBanner.progress));
+      const filled = Math.max(0, Math.min(width, Math.round(width * frac)));
+      const barLine = clampLine(
+        `${this.harnessTheme.warning("━".repeat(filled))}${" ".repeat(Math.max(0, width - filled))}`,
+        width,
+      );
+      const msgLine = fitWidth(
+        ` ${this.harnessTheme.warning("!")} ${this.harnessTheme.bold(this.confirmBanner.text)}`,
+        width,
+      );
+      if (targetHeight <= 1) return [msgLine];
+      if (targetHeight === 2) return [barLine, msgLine];
+      const out: string[] = [barLine, msgLine];
+      for (let i = 2; i < targetHeight - 1; i++) {
+        out.push(" ".repeat(width));
+      }
+      out.push(this.harnessTheme.border("─".repeat(width)));
+      return out;
+    }
+
     const firstInput = this.sourceRows ? 0 : 1;
     const chevron = this.focused ? this.harnessTheme.accentBold("›") : this.harnessTheme.muted("›");
     const isEmpty = this.getText().length === 0;

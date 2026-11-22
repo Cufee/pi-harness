@@ -1,8 +1,9 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { ProcessTerminal } from "@earendil-works/pi-tui";
+import { ProcessTerminal, type TUI } from "@earendil-works/pi-tui";
 import type { DaemonClient } from "../src/daemon/remote.js";
 import type { DaemonEventFrame } from "../src/protocol/daemon-rpc.js";
 import { runDirectorChatTui } from "../src/tui/app.js";
+import { Composer, createTheme } from "../src/tui/primitives/index.js";
 
 // Replace only terminal I/O and daemon transport. Keys still go through pi-tui,
 // TerminalSession's controls, the focused composer and the Director chat loop.
@@ -81,12 +82,22 @@ describe("Director chat input", () => {
     } finally { await chat.close(); }
   });
 
-  test("Esc waits for cancel acknowledgement, sends the queue head once, then drains FIFO", async () => {
+  test("Esc requires double-press confirmation (typing another key disarms without stopping), then drains queue FIFO", async () => {
     const chat = await openChat();
     try {
       chat.submit("active");
       chat.enqueue("first");
       chat.enqueue("second");
+      // First Esc only arms confirmation — must NOT cancel yet!
+      chat.key("\x1b");
+      expect(chat.requests.length).toBe(1);
+      // Typing another key disarms confirmation without cancelling
+      chat.key("a");
+      chat.key("\x7f");
+      expect(chat.requests.length).toBe(1);
+      // Now press Esc twice to confirm stop
+      chat.key("\x1b");
+      expect(chat.requests.length).toBe(1);
       chat.key("\x1b");
       const [active, cancel] = chat.requests;
       expect(cancel?.op).toBe("chat.cancel");
@@ -103,6 +114,37 @@ describe("Director chat input", () => {
       await Promise.resolve();
       expect(chat.sends()).toEqual(["active", "first", "second"]);
     } finally { await chat.close(); }
+  });
+
+  test("Composer Esc confirmation replaces input with shrinking progress bar at exact same height (zero UI jump)", () => {
+    const fakeTui = { requestRender() {}, terminal: { rows: 40, columns: 100 } } as unknown as TUI;
+    const theme = createTheme();
+    const composer = new Composer(fakeTui, theme, { placeholder: "Message Director…" });
+    const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+
+    for (const draft of ["", "single line draft", "line one\nline two\nline three"]) {
+      composer.setText(draft);
+      for (const width of [48, 80, 120]) {
+        const normalLines = composer.render(width);
+        composer.setConfirmBanner({ text: "Press Esc again to stop Director", progress: 1 });
+        const fullLines = composer.render(width);
+        composer.setConfirmBanner({ text: "Press Esc again to stop Director", progress: 0.4 });
+        const midLines = composer.render(width);
+        composer.clearConfirmBanner();
+        const restoredLines = composer.render(width);
+
+        expect(fullLines.length).toBe(normalLines.length);
+        expect(midLines.length).toBe(normalLines.length);
+        expect(restoredLines.length).toBe(normalLines.length);
+        // Progress line shrinks monotonically
+        const fullBarCount = (strip(fullLines[0]!).match(/━/g) ?? []).length;
+        const midBarCount = (strip(midLines[0]!).match(/━/g) ?? []).length;
+        expect(fullBarCount).toBe(width);
+        expect(midBarCount).toBeLessThan(fullBarCount);
+        expect(midBarCount).toBeGreaterThan(0);
+        expect(strip(midLines[1]!)).toContain("Press Esc again to stop Director");
+      }
+    }
   });
 
   for (const native of [true, false]) {
