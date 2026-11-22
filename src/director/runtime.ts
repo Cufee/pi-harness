@@ -378,7 +378,74 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
       properties: { timer_id: { type: "string" }, reason: { type: "string" } },
     },
   },
+  {
+    name: "remote_list",
+    description: "List configured and connected remote peer hosts, their connection statuses, and queued outbound message counts.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "session_list",
+    description: "List active Director chat sessions across this host AND all connected remote peer hosts. Each entry includes a unified `address` (`local:chat-1` or `gpu-box:chat-4`) usable directly in `session_send` and `session_read`.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        host: { type: "string", description: "Optional filter: 'local' or a specific remote host alias." },
+      },
+    },
+  },
+  {
+    name: "session_create",
+    description: "Create a new Director chat session on this host or a connected remote peer host (optionally bound to a project on that host).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        host: { type: "string", description: "Target host ('local' or a connected remote host alias; defaults to local)." },
+        project: { type: "string", description: "Optional project ID, name, or path on the target host." },
+        title: { type: "string", description: "Optional session title." },
+      },
+    },
+  },
+  {
+    name: "session_send",
+    description: "Unified cross-session messaging primitive. Send a message to another local session (`chat-2` or `local:chat-2`) or a remote peer host session (`gpu-box:chat-4`). Delivers immediately and wakes the recipient if online, or queues durably in SQLite if the remote host is offline.",
+    inputSchema: {
+      type: "object",
+      required: ["target", "message"],
+      properties: {
+        target: { type: "string", description: "Target session address: `chat-2`, `local:chat-2`, or `<remote-host>:<chat-id>`." },
+        message: { type: "string", description: "Message body to deliver to the target session." },
+        expect_reply: { type: "boolean", description: "Set to false when sending a final answer/update so the recipient does not ping-pong back." },
+        reply_to_id: { type: "string", description: "Optional message ID being replied to." },
+      },
+    },
+  },
+  {
+    name: "session_read",
+    description: "Read recent transcript turns and peer message history from a local (`chat-2`) or remote (`gpu-box:chat-4`) session.",
+    inputSchema: {
+      type: "object",
+      required: ["target"],
+      properties: {
+        target: { type: "string", description: "Target session address: `chat-2`, `local:chat-2`, or `<remote-host>:<chat-id>`." },
+        limit: { type: "number", description: "Max recent turns to return (default 12, max 50)." },
+      },
+    },
+  },
 ];
+
+export interface DirectorPeerBridge {
+  listRemotes(): unknown[];
+  listSessions(host?: string): Promise<unknown[]>;
+  createSession(input: { host?: string; project?: string; title?: string }): Promise<unknown>;
+  sendMessage(input: {
+    fromSessionId: string;
+    target: string;
+    body: string;
+    expectReply?: boolean;
+    replyToId?: string;
+  }): Promise<unknown>;
+  readSession(input: { target: string; limit?: number }): Promise<unknown>;
+}
 
 interface ChatSelection {
   repoRoot: string;
@@ -416,6 +483,7 @@ export class DirectorRuntime {
   private unsubRunEvents: (() => void) | null = null;
   private disposed = false;
   private wakeHandler: ((chatSessionId: string, event: ChatControlEvent) => void) | null = null;
+  private peerBridge: DirectorPeerBridge | null = null;
   private notifiedSettledGoals = new Set<string>();
 
   constructor(
@@ -440,6 +508,10 @@ export class DirectorRuntime {
 
   setWakeHandler(handler: (chatSessionId: string, event: ChatControlEvent) => void): void {
     this.wakeHandler = handler;
+  }
+
+  setPeerBridge(bridge: DirectorPeerBridge): void {
+    this.peerBridge = bridge;
   }
 
   hasActiveReviewer(taskId: string): boolean {
@@ -1834,6 +1906,68 @@ export class DirectorRuntime {
           sessionId: switched.session.id,
           repoRoot: switched.session.repoRoot,
         };
+      }
+
+      case "remote_list": {
+        if (!this.peerBridge) return { remotes: [] };
+        return { remotes: this.peerBridge.listRemotes() };
+      }
+
+      case "session_list": {
+        if (!this.peerBridge) {
+          const chats = this.chats.listSessions(25).map((c) => ({
+            host: "local",
+            address: `local:${c.id}`,
+            id: c.id,
+            title: c.title,
+            projectId: c.projectId,
+            repoRoot: c.repoRoot,
+            updatedAt: c.updatedAt,
+          }));
+          return { sessions: chats };
+        }
+        const host = typeof args.host === "string" && args.host.trim() ? args.host.trim() : undefined;
+        return { sessions: await this.peerBridge.listSessions(host) };
+      }
+
+      case "session_create": {
+        if (!this.peerBridge) {
+          const created = await this.createChat({
+            repoRoot,
+            title: typeof args.title === "string" ? args.title : undefined,
+          });
+          return { host: "local", address: `local:${created.id}`, session: created };
+        }
+        return await this.peerBridge.createSession({
+          host: typeof args.host === "string" && args.host.trim() ? args.host.trim() : undefined,
+          project: typeof args.project === "string" && args.project.trim() ? args.project.trim() : undefined,
+          title: typeof args.title === "string" && args.title.trim() ? args.title.trim() : undefined,
+        });
+      }
+
+      case "session_send": {
+        if (!this.peerBridge) throw new Error("Cross-session messaging is unavailable in this runtime");
+        const target = String(args.target ?? "").trim();
+        const body = String(args.message ?? "").trim();
+        if (!target) throw new Error("target is required (e.g. 'chat-2', 'local:chat-2', or 'gpu-box:chat-4')");
+        if (!body) throw new Error("message is required");
+        return await this.peerBridge.sendMessage({
+          fromSessionId: chatSessionId,
+          target,
+          body,
+          expectReply: args.expect_reply === undefined ? true : Boolean(args.expect_reply),
+          replyToId: typeof args.reply_to_id === "string" && args.reply_to_id.trim() ? args.reply_to_id.trim() : undefined,
+        });
+      }
+
+      case "session_read": {
+        if (!this.peerBridge) throw new Error("Cross-session reading is unavailable in this runtime");
+        const target = String(args.target ?? "").trim();
+        if (!target) throw new Error("target is required");
+        return await this.peerBridge.readSession({
+          target,
+          limit: typeof args.limit === "number" ? args.limit : undefined,
+        });
       }
 
       case "report_goal_progress": {

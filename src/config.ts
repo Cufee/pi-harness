@@ -160,10 +160,23 @@ export interface ExternalMcpServerConfig {
   enabled?: boolean;
 }
 
+export interface RemoteHostConfig {
+  /** Short unique alias for this remote host (e.g. `gpu-box`, `dev-linux`). */
+  name: string;
+  /** SSH target (`ssh://[user@]host[:port]` or local socket path for tests). */
+  sshTarget: string;
+  /** Optional remote bridge command override (defaults to `pi-harness bridge`). */
+  bridgeCommand?: string;
+  /** Whether the local daemon auto-connects a persistent PeerLink on startup (default: true). */
+  autoConnect?: boolean;
+}
+
 export interface HarnessConfig {
   stateDir: string;
   socketPath: string;
   profiles: RunnerProfileConfig[];
+  /** Configured remote harnessd hosts for federated projects, remote sessions, and bidirectional peering. */
+  remotes?: RemoteHostConfig[];
   /** Optional external stdio MCP servers forwarded automatically to shell-enabled ACP agents (Tier 2 workers, Tier 3 verify/execute, and isolated Done-Reviewers). */
   externalMcpServers?: ExternalMcpServerConfig[];
   codeMode: CodeMode;
@@ -317,6 +330,7 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
     stateDir,
     socketPath: merged.socketPath ? resolve(merged.socketPath) : defaultSocketPath(stateDir),
     profiles,
+    ...(merged.remotes?.length ? { remotes: merged.remotes } : {}),
     ...(merged.externalMcpServers?.length ? { externalMcpServers: merged.externalMcpServers } : {}),
     codeMode,
     codeExec: {
@@ -346,6 +360,7 @@ export function saveGlobalConfig(config: HarnessConfig): string {
   const filePath = join(config.stateDir, "config.json");
   const serialized = {
     profiles: config.profiles,
+    ...(config.remotes?.length ? { remotes: config.remotes } : {}),
     ...(config.externalMcpServers?.length ? { externalMcpServers: config.externalMcpServers } : {}),
     codeMode: config.codeMode,
     codeExec: config.codeExec,

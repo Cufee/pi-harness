@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { Database } from "bun:sqlite";
 import { friendlyIdCandidates, nextFriendlyId } from "./ids.js";
 import { ProjectStore } from "./projects.js";
+import { SessionMessageStore } from "./session-messages.js";
 import { TimerManager } from "./timers.js";
 import { KnowledgeBaseStore } from "../kb/store.js";
 
@@ -506,6 +507,7 @@ export class ControlPlaneDb {
   readonly kb: KnowledgeBaseStore;
   readonly timers: TimerManager;
   readonly projects: ProjectStore;
+  readonly sessionMessages: SessionMessageStore;
   private listeners = new Set<(event: EventRecord) => void>();
 
   constructor(dbPath: string) {
@@ -517,6 +519,7 @@ export class ControlPlaneDb {
     this.kb = new KnowledgeBaseStore(this.db);
     this.timers = new TimerManager(this.db);
     this.projects = new ProjectStore(this.db);
+    this.sessionMessages = new SessionMessageStore(this.db);
   }
 
   close(): void {

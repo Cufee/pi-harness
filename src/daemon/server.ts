@@ -4,7 +4,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const DAEMON_PROTOCOL_REV = 7;
+export const DAEMON_PROTOCOL_REV = 8;
 
 export function currentDaemonBuildId(): string {
   try {
@@ -15,11 +15,12 @@ export function currentDaemonBuildId(): string {
   }
 }
 import { ModelCatalogCompiler } from "../catalog/compiler.js";
-import { saveGlobalConfig, type HarnessConfig, type RunnerProfileConfig } from "../config.js";
+import { saveGlobalConfig, type HarnessConfig, type RemoteHostConfig, type RunnerProfileConfig } from "../config.js";
 import { ControlPlaneDb, type ReplayCursor, type EventRecord } from "../control-plane/db.js";
 import { readRunDossier, readWorkspaceArtifact } from "../control-plane/dossiers.js";
 import { compactTaskHandoff } from "../control-plane/handoffs.js";
 import { HarnessOrchestrator, type CustomRunnerFactory } from "../control-plane/orchestrator.js";
+import { loadOrCreateNodeId, parseSessionAddress, type SessionMessageRecord } from "../control-plane/session-messages.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { summarizeCost } from "../cost/ledger.js";
 import { DirectorRuntime } from "../director/runtime.js";
@@ -27,6 +28,7 @@ import type { GoalCriterion } from "../goals/engine.js";
 import { formatChatEventSummary, type ChatControlEvent } from "../protocol/chat-events.js";
 import type {
   DaemonEventFrame,
+  DaemonOp,
   InboxItem,
   RpcRequest,
   RpcResponse,
@@ -39,6 +41,7 @@ import { ensureOctofs } from "../tools/native-tools.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
 import { runGit } from "../worktree/manager.js";
+import { PeerManager, type PeerIdentity, type PeerLink, type RemoteHostStatus } from "./peer.js";
 import { PtyHost } from "./pty-host.js";
 
 interface ClientAttachment {
@@ -81,6 +84,8 @@ function isRunsWatchEvent(type: string): boolean {
   );
 }
 
+export const MAX_PEER_MESSAGE_HOPS = 10;
+
 /**
  * `harnessd`: persistent headless daemon owning SQLite state, running agents,
  * worktree GC, model catalog + quota sync, and optional raw PTY shells.
@@ -88,6 +93,8 @@ function isRunsWatchEvent(type: string): boolean {
  */
 export class HarnessDaemon {
   readonly db: ControlPlaneDb;
+  readonly nodeId: string;
+  readonly peers: PeerManager;
   quota: QuotaClient;
   catalog: ModelCatalogCompiler;
   readonly orchestrator: HarnessOrchestrator;
@@ -116,18 +123,35 @@ export class HarnessDaemon {
 
   constructor(
     public config: HarnessConfig,
-    opts?: { dbPath?: string; customRunnerFactory?: CustomRunnerFactory; autoQuitWhenIdle?: boolean },
+    opts?: { dbPath?: string; customRunnerFactory?: CustomRunnerFactory; autoQuitWhenIdle?: boolean; hostName?: string },
   ) {
     this.autoQuitWhenIdle = Boolean(opts?.autoQuitWhenIdle);
     this.hasCustomRunner = Boolean(opts?.customRunnerFactory);
     const dbPath = opts?.dbPath ?? join(config.stateDir, "control-plane.sqlite");
     this.db = new ControlPlaneDb(dbPath);
+    this.nodeId = dbPath === ":memory:" ? `node-${randomBytes(6).toString("hex")}` : loadOrCreateNodeId(config.stateDir);
     this.quota = new QuotaClient(config.quotaEndpoint);
     this.catalog = new ModelCatalogCompiler(config, this.quota);
     this.orchestrator = new HarnessOrchestrator(this.db, config, this.catalog, this.quota, opts?.customRunnerFactory);
     this.director = new DirectorRuntime(this.db, config, this.catalog, this.quota, this.orchestrator, opts?.customRunnerFactory);
+    this.peers = new PeerManager(
+      this.nodeId,
+      DAEMON_PROTOCOL_REV,
+      (op, params, peer) => this.dispatchPeerRequest(op, params, peer),
+      (peer) => {
+        void this.flushOutboxForPeer(peer);
+      },
+      opts?.hostName,
+    );
     this.director.setWakeHandler((chatSessionId, event) => {
       this.scheduleDirectorWakeup(chatSessionId, event);
+    });
+    this.director.setPeerBridge({
+      listRemotes: () => this.listRemoteStatuses(),
+      listSessions: (host) => this.listFederatedSessions(null, { includeRemotes: true, host }),
+      createSession: (input) => this.createSessionOnHost(input),
+      sendMessage: (input) => this.sendSessionMessage(input),
+      readSession: (input) => this.readSessionOnHost(input),
     });
   }
 
@@ -321,6 +345,9 @@ export class HarnessDaemon {
       void ensureOctofs(this.config.stateDir).catch(() => {});
     }
 
+    // Start auto-connect peer links for any configured remote hosts
+    this.peers.syncRemotes(this.config.remotes ?? []);
+
     return sockPath;
   }
 
@@ -333,6 +360,7 @@ export class HarnessDaemon {
       clearInterval(this.sweepTimer);
       this.sweepTimer = null;
     }
+    this.peers.dispose();
     this.director.dispose();
     this.orchestrator.dispose();
     this.pendingWakeups.clear();
@@ -539,6 +567,7 @@ export class HarnessDaemon {
     scheduledQuotaResumes: number;
     pendingTimers: number;
     pendingWakeups: number;
+    queuedPeerMessages: number;
     activeReviews: number;
     activePtys: number;
     otherTuiClients: number;
@@ -549,6 +578,7 @@ export class HarnessDaemon {
     const scheduledQuotaResumes = this.orchestrator.scheduledQuotaResumeCount();
     const pendingTimers = this.db.timers.list({ status: "pending" }).length;
     const pendingWakeups = [...this.pendingWakeups.values()].reduce((sum, q) => sum + q.length, 0);
+    const queuedPeerMessages = this.db.sessionMessages.countQueuedOutbound();
     const activeReviews = this.director.activeReviewCount();
     const activePtys = this.ptyHost.activePtyCount();
     const otherTuiClients = this.tuiSockets.size;
@@ -557,6 +587,7 @@ export class HarnessDaemon {
     if (scheduledQuotaResumes > 0) parts.push(`${scheduledQuotaResumes} scheduled quota resume${scheduledQuotaResumes === 1 ? "" : "s"}`);
     if (pendingTimers > 0) parts.push(`${pendingTimers} pending timer${pendingTimers === 1 ? "" : "s"}`);
     if (pendingWakeups > 0) parts.push(`${pendingWakeups} pending wakeup${pendingWakeups === 1 ? "" : "s"}`);
+    if (queuedPeerMessages > 0) parts.push(`${queuedPeerMessages} queued peer message${queuedPeerMessages === 1 ? "" : "s"}`);
     if (activeChats > 0) parts.push(`${activeChats} in-flight chat${activeChats === 1 ? "" : "s"}`);
     if (activeReviews > 0) parts.push(`${activeReviews} goal review${activeReviews === 1 ? "" : "s"}`);
     if (activePtys > 0) parts.push(`${activePtys} open shell${activePtys === 1 ? "" : "s"}`);
@@ -567,6 +598,7 @@ export class HarnessDaemon {
         scheduledQuotaResumes +
         pendingTimers +
         pendingWakeups +
+        queuedPeerMessages +
         activeReviews +
         activePtys +
         otherTuiClients >
@@ -578,6 +610,7 @@ export class HarnessDaemon {
       scheduledQuotaResumes,
       pendingTimers,
       pendingWakeups,
+      queuedPeerMessages,
       activeReviews,
       activePtys,
       otherTuiClients,
@@ -711,6 +744,12 @@ export class HarnessDaemon {
     this.cancelIdleShutdown();
     const detach = attachNdjsonReader(socket, {
       onMessage: (raw) => {
+        // If this socket was upgraded via `peer.hello`, forward RPC responses back to the PeerLink
+        const inboundPeer = this.peers.getInboundLinkForSocket(socket);
+        if (inboundPeer && (raw as { kind?: string })?.kind === "res") {
+          inboundPeer.handleWireFrame(raw);
+          return;
+        }
         const req = raw as RpcRequest;
         if (req?.kind !== "req") return;
         void this.dispatch(socket, req).then(
@@ -763,6 +802,541 @@ export class HarnessDaemon {
     }
   }
 
+  private listRemoteStatuses(): RemoteHostStatus[] {
+    return this.peers.listStatuses(this.db.sessionMessages.queuedCountsByHost());
+  }
+
+  private isLocalHostTarget(host: string | null | undefined): boolean {
+    if (!host) return true;
+    const h = host.trim();
+    if (!h || h.toLowerCase() === "local" || h === this.nodeId) return true;
+    // Only match localHostName if no configured or connected remote peer has that exact alias
+    if (h.toLowerCase() === this.peers.localHostName.toLowerCase() && !this.peers.findLink(h) && !this.peers.getRemoteConfig(h)) {
+      return true;
+    }
+    return false;
+  }
+
+  private async listFederatedProjects(opts?: { includeRemotes?: boolean; host?: string }): Promise<Array<Record<string, unknown>>> {
+    const requestedHost = opts?.host?.trim();
+    if (requestedHost && !this.isLocalHostTarget(requestedHost)) {
+      const remoteProjects = (await this.peers.callRemote<Array<Record<string, unknown>>>(
+        requestedHost,
+        "project.list",
+        { includeRemotes: false },
+        10_000,
+      )) ?? [];
+      return remoteProjects.map((pr) => ({ ...pr, host: requestedHost }));
+    }
+
+    const local = (await this.db.projects.listProjects()).map((pr) => ({ ...pr, host: "local" }));
+    if (!opts?.includeRemotes || (requestedHost && this.isLocalHostTarget(requestedHost))) {
+      return local;
+    }
+
+    const links = this.peers.connectedLinks();
+    if (links.length === 0) return local;
+    const settled = await Promise.allSettled(
+      links.map(async (link) => {
+        const items = (await link.request<Array<Record<string, unknown>>>("project.list", { includeRemotes: false }, 5_000)) ?? [];
+        const hostName = link.alias;
+        return items.map((pr) => ({ ...pr, host: hostName }));
+      }),
+    );
+    const out: Array<Record<string, unknown>> = [...local];
+    for (const s of settled) {
+      if (s.status === "fulfilled") out.push(...s.value);
+    }
+    return out;
+  }
+
+  private async listLocalSessions(socket: Socket | null) {
+    const allProjects = await this.db.projects.listProjects();
+    const projById = new Map(allProjects.map((pr) => [pr.id, pr]));
+    const projByPath = new Map(allProjects.map((pr) => [pr.rootPath, pr]));
+    const chats = this.director.chats.listSessions(25).map((c) => {
+      const bound = this.chatBindings.get(c.id);
+      const busy = this.director.isChatBusy(c.id);
+      const activeGoals = this.director.goals
+        .listGoals({ chatSessionId: c.id })
+        .filter((g) => ["executing", "verifying", "reviewing"].includes(g.status)).length;
+      const proj = (c.projectId ? projById.get(c.projectId) : undefined) ?? projByPath.get(c.repoRoot);
+      return {
+        id: c.id,
+        host: "local",
+        address: `local:${c.id}`,
+        kind: "chat" as const,
+        title: c.title,
+        projectId: proj?.id ?? c.projectId ?? null,
+        projectName: proj?.name ?? null,
+        repoRoot: c.repoRoot,
+        status: busy ? "busy" : activeGoals > 0 ? `${activeGoals} active goal${activeGoals === 1 ? "" : "s"}` : "idle",
+        running: busy || activeGoals > 0,
+        attached: Boolean(bound),
+        attachedByMe: socket !== null && bound === socket,
+        model: c.model ?? c.profileId,
+        effort: c.effort,
+        updatedAt: c.updatedAt,
+      };
+    });
+    const runs = this.db.listRuns(20).map((raw) => {
+      const r = this.orchestrator.getEffectiveRun(raw.id) ?? raw;
+      const bound = this.runBindings.get(r.id);
+      const live = this.orchestrator.isRunActiveInMemory(r.id);
+      const quotaSt = this.orchestrator.getRunQuotaStatus(r.id);
+      const proj = projByPath.get(r.repoRoot);
+      return {
+        id: r.id,
+        host: "local",
+        address: `local:${r.id}`,
+        kind: "run" as const,
+        title: (r.goal.split("\n")[0] ?? r.goal).slice(0, 80),
+        projectId: proj?.id ?? null,
+        projectName: proj?.name ?? null,
+        repoRoot: r.repoRoot,
+        status: live ? "running" : quotaSt ? (quotaSt.resumeAt ? "quota (timer)" : "paused_quota") : r.status,
+        running: live || Boolean(quotaSt),
+        attached: Boolean(bound),
+        attachedByMe: socket !== null && bound === socket,
+        model: null,
+        effort: null,
+        updatedAt: r.updatedAt,
+      };
+    });
+    return [...chats, ...runs].sort((a, b) => Number(b.running) - Number(a.running) || b.updatedAt - a.updatedAt);
+  }
+
+  private async listFederatedSessions(
+    socket: Socket | null,
+    opts?: { includeRemotes?: boolean; host?: string },
+  ): Promise<Array<Record<string, unknown>>> {
+    const requestedHost = opts?.host?.trim();
+    if (requestedHost && !this.isLocalHostTarget(requestedHost)) {
+      const remote = (await this.peers.callRemote<Array<Record<string, unknown>>>(
+        requestedHost,
+        "sessions.list",
+        { includeRemotes: false },
+        10_000,
+      )) ?? [];
+      return remote.map((s) => ({ ...s, host: requestedHost, address: `${requestedHost}:${String(s.id)}`, attachedByMe: false }));
+    }
+
+    const local = await this.listLocalSessions(socket);
+    if (!opts?.includeRemotes || (requestedHost && this.isLocalHostTarget(requestedHost))) {
+      return local;
+    }
+
+    const links = this.peers.connectedLinks();
+    if (links.length === 0) return local;
+    const settled = await Promise.allSettled(
+      links.map(async (link) => {
+        const items = (await link.request<Array<Record<string, unknown>>>("sessions.list", { includeRemotes: false }, 5_000)) ?? [];
+        const hostName = link.alias;
+        return items.map((s) => ({ ...s, host: hostName, address: `${hostName}:${String(s.id)}`, attachedByMe: false }));
+      }),
+    );
+    const out: Array<Record<string, unknown>> = [...local];
+    for (const s of settled) {
+      if (s.status === "fulfilled") out.push(...s.value);
+    }
+    return out.sort(
+      (a, b) => Number(Boolean(b.running)) - Number(Boolean(a.running)) || Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0),
+    );
+  }
+
+  private async createSessionOnHost(input: { host?: string; project?: string; title?: string }): Promise<Record<string, unknown>> {
+    const targetHost = input.host?.trim();
+    if (targetHost && !this.isLocalHostTarget(targetHost)) {
+      const res = await this.peers.callRemote<{ session: { id: string; repoRoot: string; title: string }; project?: unknown }>(
+        targetHost,
+        "chat.create",
+        { projectId: input.project, title: input.title, headless: true },
+        15_000,
+      );
+      return {
+        host: targetHost,
+        address: `${targetHost}:${res.session.id}`,
+        session: res.session,
+        project: res.project ?? null,
+      };
+    }
+
+    const explicitProject = input.project ? this.db.projects.resolveProject(input.project) : null;
+    if (input.project && !explicitProject) {
+      throw new Error(`Unknown project "${input.project}"`);
+    }
+    const session = await this.director.createChat({
+      repoRoot: explicitProject?.rootPath ?? process.cwd(),
+      projectId: explicitProject?.id ?? undefined,
+      title: input.title,
+    });
+    const boundProject =
+      (session.projectId ? this.db.projects.getById(session.projectId) : null) ??
+      this.db.projects.ensureProjectForPath(session.repoRoot);
+    return {
+      host: "local",
+      address: `local:${session.id}`,
+      session,
+      project: boundProject,
+    };
+  }
+
+  private async readSessionOnHost(input: { target: string; limit?: number }): Promise<Record<string, unknown>> {
+    const { host, sessionId } = parseSessionAddress(input.target);
+    const limit = Math.min(50, Math.max(1, input.limit ?? 12));
+    if (host && !this.isLocalHostTarget(host)) {
+      const res = await this.peers.callRemote<Record<string, unknown>>(
+        host,
+        "session.read",
+        { target: sessionId, limit },
+        15_000,
+      );
+      return { ...res, host, address: `${host}:${sessionId}` };
+    }
+
+    const session = this.director.chats.getSession(sessionId);
+    if (!session) throw new Error(`Unknown chat session: ${sessionId}`);
+    const project = session.projectId ? this.db.projects.getById(session.projectId) : null;
+    const allHistory = this.director.chats.getHistory(sessionId, 0, 500);
+    const turns = allHistory.slice(-limit).map((t) => ({
+      seq: t.seq,
+      role: t.role,
+      content: t.content,
+      createdAt: t.createdAt,
+    }));
+    const messages = this.db.sessionMessages.listForSession(sessionId, 20);
+    return {
+      host: "local",
+      address: `local:${session.id}`,
+      session: {
+        id: session.id,
+        title: session.title,
+        projectId: session.projectId,
+        projectName: project?.name ?? null,
+        repoRoot: session.repoRoot,
+        model: session.model ?? session.profileId,
+        busy: this.director.isChatBusy(session.id),
+      },
+      turns,
+      messages,
+    };
+  }
+
+  private lastUserTurnTimestamp(chatSessionId: string): number {
+    const row = this.db.db
+      .prepare("SELECT COALESCE(MAX(created_at), 0) AS ts FROM chat_turns WHERE chat_session_id = ? AND role = 'user'")
+      .get(chatSessionId) as { ts: number } | undefined;
+    return Number(row?.ts ?? 0);
+  }
+
+  private deliverLocalSessionMessage(input: {
+    id: string;
+    fromNode: string;
+    fromHost: string;
+    fromSessionId: string;
+    fromProjectName?: string | null;
+    toSessionId: string;
+    body: string;
+    replyToId?: string | null;
+    expectReply?: boolean;
+    hopCount?: number;
+  }): { record: SessionMessageRecord; duplicate: boolean; woke: boolean; circuitBreakerTripped: boolean } {
+    const targetSession = this.director.chats.getSession(input.toSessionId);
+    if (!targetSession) {
+      throw new Error(`Unknown target chat session "${input.toSessionId}" on host "${this.peers.localHostName}"`);
+    }
+
+    const { record, inserted } = this.db.sessionMessages.recordInbound({
+      id: input.id,
+      fromNode: input.fromNode,
+      fromHost: input.fromHost,
+      fromSessionId: input.fromSessionId,
+      fromProjectName: input.fromProjectName ?? null,
+      toNode: this.nodeId,
+      toHost: this.peers.localHostName,
+      toSessionId: input.toSessionId,
+      body: input.body,
+      replyToId: input.replyToId ?? null,
+      expectReply: input.expectReply !== false,
+      hopCount: input.hopCount ?? 1,
+    });
+
+    if (!inserted) {
+      return { record, duplicate: true, woke: false, circuitBreakerTripped: false };
+    }
+
+    const sinceUser = this.lastUserTurnTimestamp(input.toSessionId);
+    const inboundSinceUser = this.db.sessionMessages.countInboundSince(input.toSessionId, sinceUser);
+    const hopCount = Math.max(record.hopCount, inboundSinceUser);
+    const circuitBreakerTripped = hopCount > MAX_PEER_MESSAGE_HOPS;
+
+    // Emit live event to attached TUI socket (if any) so the user immediately sees peer traffic
+    const bound = this.chatBindings.get(input.toSessionId);
+    if (bound) {
+      writeDaemonMessage(bound, {
+        kind: "event",
+        seq: 0,
+        runId: input.toSessionId,
+        taskId: input.toSessionId,
+        type: "session.message_received",
+        payload: {
+          messageId: record.id,
+          fromHost: record.fromHost,
+          fromSessionId: record.fromSessionId,
+          fromProjectName: record.fromProjectName,
+          toSessionId: record.toSessionId,
+          body: record.body,
+          expectReply: record.expectReply,
+          hopCount,
+          circuitBreakerTripped,
+        },
+        createdAt: Date.now(),
+      } satisfies DaemonEventFrame);
+    }
+
+    if (circuitBreakerTripped) {
+      this.director.chats.appendTurn(
+        input.toSessionId,
+        "system_notice",
+        `[PEER MESSAGE from ${record.fromHost}:${record.fromSessionId}] Auto-wakeup paused by anti-loop circuit breaker (${hopCount}/${MAX_PEER_MESSAGE_HOPS} consecutive peer hops without human input). Message: ${record.body}`,
+      );
+      return { record, duplicate: false, woke: false, circuitBreakerTripped: true };
+    }
+
+    const event: ChatControlEvent = {
+      kind: "session.message_received",
+      messageId: record.id,
+      fromHost: record.fromHost,
+      fromSessionId: record.fromSessionId,
+      fromProjectName: record.fromProjectName,
+      body: record.body,
+      expectReply: record.expectReply,
+      hopCount,
+    };
+    this.scheduleDirectorWakeup(input.toSessionId, event);
+    return { record, duplicate: false, woke: true, circuitBreakerTripped: false };
+  }
+
+  private async sendSessionMessage(input: {
+    fromSessionId: string;
+    target: string;
+    body: string;
+    expectReply?: boolean;
+    replyToId?: string;
+  }): Promise<Record<string, unknown>> {
+    const { host, sessionId: toSessionId } = parseSessionAddress(input.target);
+    if (!toSessionId) throw new Error(`Invalid target session address: "${input.target}"`);
+
+    const fromSess = this.director.chats.getSession(input.fromSessionId);
+    const fromProject = fromSess?.projectId ? this.db.projects.getById(fromSess.projectId) : null;
+    const prevMsg = input.replyToId ? this.db.sessionMessages.getById(input.replyToId) : null;
+    const hopCount = prevMsg ? prevMsg.hopCount + 1 : 1;
+
+    // Unified local delivery (same host, same or different project)
+    if (this.isLocalHostTarget(host)) {
+      const id = `smsg-${randomBytes(6).toString("hex")}`;
+      const delivered = this.deliverLocalSessionMessage({
+        id,
+        fromNode: this.nodeId,
+        fromHost: "local",
+        fromSessionId: input.fromSessionId,
+        fromProjectName: fromProject?.name ?? null,
+        toSessionId,
+        body: input.body,
+        replyToId: input.replyToId ?? null,
+        expectReply: input.expectReply !== false,
+        hopCount,
+      });
+      return {
+        messageId: delivered.record.id,
+        target: `local:${toSessionId}`,
+        status: "delivered",
+        woke: delivered.woke,
+        circuitBreakerTripped: delivered.circuitBreakerTripped,
+      };
+    }
+
+    // Remote delivery: persist durably in outbox first so SSH drops or offline hosts never lose messages
+    const targetHost = host!;
+    const link = this.peers.findLink(targetHost);
+    const resolvedToNode =
+      link?.remoteIdentity?.nodeId ??
+      (prevMsg && prevMsg.fromHost.toLowerCase() === targetHost.toLowerCase() ? prevMsg.fromNode : null);
+
+    const record = this.db.sessionMessages.enqueueOutbound({
+      fromNode: this.nodeId,
+      fromHost: this.peers.localHostName,
+      fromSessionId: input.fromSessionId,
+      fromProjectName: fromProject?.name ?? null,
+      toNode: resolvedToNode,
+      toHost: targetHost,
+      toSessionId,
+      body: input.body,
+      replyToId: input.replyToId ?? null,
+      expectReply: input.expectReply !== false,
+      hopCount,
+    });
+
+    if (!link) {
+      return {
+        messageId: record.id,
+        target: `${targetHost}:${toSessionId}`,
+        status: "queued",
+        woke: false,
+        note: `Remote host "${targetHost}" is offline; message queued durably and will auto-deliver on reconnect.`,
+      };
+    }
+
+    try {
+      const res = await link.request<{ woke?: boolean; circuitBreakerTripped?: boolean }>(
+        "session.deliver_message",
+        {
+          id: record.id,
+          fromNode: record.fromNode,
+          fromHost: record.fromHost,
+          fromSessionId: record.fromSessionId,
+          fromProjectName: record.fromProjectName,
+          toSessionId: record.toSessionId,
+          body: record.body,
+          replyToId: record.replyToId,
+          expectReply: record.expectReply,
+          hopCount: record.hopCount,
+        },
+        15_000,
+      );
+      this.db.sessionMessages.markDelivered(record.id);
+      return {
+        messageId: record.id,
+        target: `${targetHost}:${toSessionId}`,
+        status: "delivered",
+        woke: Boolean(res?.woke),
+        circuitBreakerTripped: Boolean(res?.circuitBreakerTripped),
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Permanent remote error (e.g. unknown session) -> fail; transient transport/timeout -> stay queued
+      if (/Unknown target chat session/i.test(msg)) {
+        this.db.sessionMessages.markFailed(record.id, msg);
+        throw new Error(msg);
+      }
+      return {
+        messageId: record.id,
+        target: `${targetHost}:${toSessionId}`,
+        status: "queued",
+        woke: false,
+        note: `Delivery deferred (${msg}); message remains queued and will auto-flush on reconnect.`,
+      };
+    }
+  }
+
+  private async flushOutboxForPeer(peer: PeerLink): Promise<number> {
+    const targets = [peer.alias];
+    if (peer.remoteIdentity?.hostName) targets.push(peer.remoteIdentity.hostName);
+    if (peer.remoteIdentity?.nodeId) targets.push(peer.remoteIdentity.nodeId);
+    const queued = this.db.sessionMessages.listQueuedOutbound(targets);
+    let flushed = 0;
+    for (const msg of queued) {
+      if (!peer.isOpen) break;
+      try {
+        await peer.request(
+          "session.deliver_message",
+          {
+            id: msg.id,
+            fromNode: msg.fromNode,
+            fromHost: msg.fromHost,
+            fromSessionId: msg.fromSessionId,
+            fromProjectName: msg.fromProjectName,
+            toSessionId: msg.toSessionId,
+            body: msg.body,
+            replyToId: msg.replyToId,
+            expectReply: msg.expectReply,
+            hopCount: msg.hopCount,
+          },
+          15_000,
+        );
+        this.db.sessionMessages.markDelivered(msg.id);
+        flushed++;
+      } catch (err) {
+        const text = err instanceof Error ? err.message : String(err);
+        if (/Unknown target chat session/i.test(text)) {
+          this.db.sessionMessages.markFailed(msg.id, text);
+        } else {
+          break; // Link dropped mid-flush; remaining items stay queued
+        }
+      }
+    }
+    return flushed;
+  }
+
+  /** Handles inbound RPCs arriving over an outbound `PeerLink` (reverse direction: remote server calling laptop). */
+  private async dispatchPeerRequest(op: DaemonOp, p: Record<string, unknown>, peer: PeerLink): Promise<unknown> {
+    switch (op) {
+      case "ping": {
+        const live = this.getLiveWorkSummary();
+        return {
+          pong: true,
+          pid: process.pid,
+          nodeId: this.nodeId,
+          hostName: this.peers.localHostName,
+          protocolRev: DAEMON_PROTOCOL_REV,
+          running: live.running,
+        };
+      }
+      case "project.list":
+        return await this.db.projects.listProjects();
+      case "project.get": {
+        const ref = String(p.projectId ?? p.id ?? p.name ?? p.path ?? "");
+        const proj = this.db.projects.resolveProject(ref);
+        if (!proj) throw new Error(`Unknown project: ${ref}`);
+        return proj;
+      }
+      case "project.create":
+        return await this.db.projects.createProject({
+          path: String(p.path ?? ""),
+          name: typeof p.name === "string" ? p.name : undefined,
+          description: typeof p.description === "string" ? p.description : undefined,
+          createDir: p.createDir === undefined ? true : Boolean(p.createDir),
+          gitInit: Boolean(p.gitInit),
+          cloneUrl: typeof p.cloneUrl === "string" && p.cloneUrl.trim() ? p.cloneUrl.trim() : undefined,
+        });
+      case "project.browse":
+        return this.db.projects.browseDirectory(typeof p.path === "string" ? p.path : undefined);
+      case "sessions.list":
+        return await this.listLocalSessions(null);
+      case "chat.create":
+        return await this.createSessionOnHost({
+          project: typeof p.projectId === "string" ? p.projectId : undefined,
+          title: typeof p.title === "string" ? p.title : undefined,
+        });
+      case "session.deliver_message":
+        return this.deliverLocalSessionMessage({
+          id: String(p.id),
+          fromNode: String(p.fromNode ?? peer.remoteIdentity?.nodeId ?? "unknown"),
+          fromHost: String(p.fromHost ?? peer.alias),
+          fromSessionId: String(p.fromSessionId),
+          fromProjectName: typeof p.fromProjectName === "string" ? p.fromProjectName : null,
+          toSessionId: String(p.toSessionId),
+          body: String(p.body ?? ""),
+          replyToId: typeof p.replyToId === "string" ? p.replyToId : null,
+          expectReply: p.expectReply === undefined ? true : Boolean(p.expectReply),
+          hopCount: typeof p.hopCount === "number" ? p.hopCount : 1,
+        });
+      case "session.list_messages":
+        return this.db.sessionMessages.listForSession(String(p.sessionId), typeof p.limit === "number" ? p.limit : 50);
+      case "session.read":
+        return await this.readSessionOnHost({
+          target: String(p.target ?? p.sessionId ?? ""),
+          limit: typeof p.limit === "number" ? p.limit : undefined,
+        });
+      case "peer.sync_outbox": {
+        const flushed = await this.flushOutboxForPeer(peer);
+        return { flushed };
+      }
+      default:
+        throw new Error(`RPC "${op}" is not permitted over reverse peer link`);
+    }
+  }
+
   private async dispatch(socket: Socket, req: RpcRequest): Promise<unknown> {
     if (this.takenOverSockets.has(socket)) throw new Error("Session taken over by another terminal");
     const p = req.params ?? {};
@@ -773,11 +1347,14 @@ export class HarnessDaemon {
         return {
           pong: true,
           pid: process.pid,
+          nodeId: this.nodeId,
+          hostName: this.peers.localHostName,
           uptimeMs: Date.now() - this.startedAt,
           protocolRev: DAEMON_PROTOCOL_REV,
           buildId: currentDaemonBuildId(),
           running: live.running,
           liveWork: live.description,
+          remotes: this.listRemoteStatuses(),
         };
       }
 
@@ -790,13 +1367,118 @@ export class HarnessDaemon {
       case "status":
         return {
           pid: process.pid,
+          nodeId: this.nodeId,
+          hostName: this.peers.localHostName,
           uptimeMs: Date.now() - this.startedAt,
           socketPath: this.config.socketPath,
           hasLibghosttyVt: this.ptyHost.hasLibghosttyVt,
           runs: this.db.listRuns(20),
           goals: this.director.goals.listGoals(),
           profiles: this.config.profiles.map((pr) => ({ id: pr.id, kind: pr.kind, billing: pr.billing, enabled: pr.enabled !== false })),
+          remotes: this.listRemoteStatuses(),
         };
+
+      case "remote.list":
+        return this.listRemoteStatuses();
+
+      case "remote.add": {
+        const name = String(p.name ?? "").trim();
+        if (!name || !/^[A-Za-z0-9._-]+$/.test(name)) {
+          throw new Error("Remote host name must be non-empty alphanumeric (letters, digits, '.', '_', '-')");
+        }
+        if (name.toLowerCase() === "local") {
+          throw new Error('Remote host name cannot be "local"');
+        }
+        const rawTarget = String(p.sshTarget ?? p.target ?? "").trim();
+        if (!rawTarget) throw new Error("sshTarget is required (e.g. 'ssh://user@gpu-box' or 'user@gpu-box')");
+        const sshTarget =
+          rawTarget.startsWith("ssh://") || rawTarget.startsWith("/") || rawTarget.startsWith("./")
+            ? rawTarget
+            : `ssh://${rawTarget}`;
+        const entry: RemoteHostConfig = {
+          name,
+          sshTarget,
+          ...(typeof p.bridgeCommand === "string" && p.bridgeCommand.trim() ? { bridgeCommand: p.bridgeCommand.trim() } : {}),
+          autoConnect: p.autoConnect === undefined ? true : Boolean(p.autoConnect),
+        };
+        const existing = (this.config.remotes ?? []).filter((r) => r.name.toLowerCase() !== name.toLowerCase());
+        const nextRemotes = [...existing, entry];
+        this.config = { ...this.config, remotes: nextRemotes };
+        saveGlobalConfig(this.config);
+        this.peers.syncRemotes(nextRemotes);
+        if (p.connectNow !== false) {
+          try {
+            return await this.peers.connectRemote(name);
+          } catch {
+            // Return status with lastError populated instead of failing remote.add when host is asleep/offline
+          }
+        }
+        return this.listRemoteStatuses().find((r) => r.name.toLowerCase() === name.toLowerCase()) ?? entry;
+      }
+
+      case "remote.remove": {
+        const name = String(p.name ?? "").trim();
+        if (!name) throw new Error("Remote name is required");
+        const before = this.config.remotes ?? [];
+        const nextRemotes = before.filter((r) => r.name.toLowerCase() !== name.toLowerCase());
+        if (nextRemotes.length === before.length) throw new Error(`Unknown remote host: ${name}`);
+        this.config = { ...this.config, remotes: nextRemotes };
+        saveGlobalConfig(this.config);
+        this.peers.syncRemotes(nextRemotes);
+        return { removed: name };
+      }
+
+      case "remote.connect": {
+        const name = String(p.name ?? "").trim();
+        if (!name) throw new Error("Remote name is required");
+        return await this.peers.connectRemote(name);
+      }
+
+      case "remote.disconnect": {
+        const name = String(p.name ?? "").trim();
+        if (!name) throw new Error("Remote name is required");
+        return this.peers.disconnectRemote(name);
+      }
+
+      case "peer.hello": {
+        const identity: PeerIdentity = {
+          nodeId: String(p.nodeId ?? ""),
+          hostName: String(p.hostName ?? "remote"),
+          protocolRev: Number(p.protocolRev ?? 0),
+        };
+        if (!identity.nodeId) throw new Error("peer.hello requires nodeId");
+        this.peers.registerInboundSocket(socket, identity);
+        return {
+          nodeId: this.nodeId,
+          hostName: this.peers.localHostName,
+          protocolRev: DAEMON_PROTOCOL_REV,
+        } satisfies PeerIdentity;
+      }
+
+      case "peer.proxy": {
+        const host = String(p.host ?? "").trim();
+        const op = String(p.op ?? "") as DaemonOp;
+        const params = (p.params ?? {}) as Record<string, unknown>;
+        if (!host) throw new Error("host is required");
+        if (!op) throw new Error("op is required");
+        if (op === "daemon.shutdown" || op === "peer.hello") {
+          throw new Error(`Op "${op}" cannot be proxied`);
+        }
+        return await this.peers.callRemote(host, op, params, typeof p.timeoutMs === "number" ? p.timeoutMs : 30_000);
+      }
+
+      case "peer.sync_outbox": {
+        const inbound = this.peers.getInboundLinkForSocket(socket);
+        if (inbound) {
+          const flushed = await this.flushOutboxForPeer(inbound);
+          return { flushed };
+        }
+        let total = 0;
+        for (const link of this.peers.connectedLinks()) {
+          total += await this.flushOutboxForPeer(link);
+        }
+        return { flushed: total };
+      }
 
       case "config.get":
         return this.config;
@@ -860,17 +1542,30 @@ export class HarnessDaemon {
       }
 
       case "project.list":
-        return await this.db.projects.listProjects();
+        return await this.listFederatedProjects({
+          includeRemotes: Boolean(p.includeRemotes),
+          host: typeof p.host === "string" ? p.host : undefined,
+        });
 
       case "project.get": {
+        const host = typeof p.host === "string" ? p.host.trim() : undefined;
+        if (host && !this.isLocalHostTarget(host)) {
+          const remote = (await this.peers.callRemote<Record<string, unknown>>(host, "project.get", { ...p, host: undefined })) ?? {};
+          return { ...remote, host };
+        }
         const ref = String(p.projectId ?? p.id ?? p.name ?? p.path ?? "");
         const proj = this.db.projects.resolveProject(ref);
         if (!proj) throw new Error(`Unknown project: ${ref}`);
         const all = await this.db.projects.listProjects();
-        return all.find((x) => x.id === proj.id) ?? proj;
+        return { ...(all.find((x) => x.id === proj.id) ?? proj), host: "local" };
       }
 
       case "project.create": {
+        const host = typeof p.host === "string" ? p.host.trim() : undefined;
+        if (host && !this.isLocalHostTarget(host)) {
+          const remote = (await this.peers.callRemote<Record<string, unknown>>(host, "project.create", { ...p, host: undefined })) ?? {};
+          return { ...remote, host };
+        }
         const created = await this.db.projects.createProject({
           path: String(p.path ?? ""),
           name: typeof p.name === "string" ? p.name : undefined,
@@ -883,10 +1578,15 @@ export class HarnessDaemon {
           defaultEffort: typeof p.defaultEffort === "string" ? p.defaultEffort : undefined,
         });
         const all = await this.db.projects.listProjects();
-        return all.find((x) => x.id === created.id) ?? created;
+        return { ...(all.find((x) => x.id === created.id) ?? created), host: "local" };
       }
 
       case "project.update": {
+        const host = typeof p.host === "string" ? p.host.trim() : undefined;
+        if (host && !this.isLocalHostTarget(host)) {
+          const remote = (await this.peers.callRemote<Record<string, unknown>>(host, "project.update", { ...p, host: undefined })) ?? {};
+          return { ...remote, host };
+        }
         const ref = String(p.projectId ?? p.id ?? "");
         const updated = this.db.projects.updateProject(ref, {
           name: typeof p.name === "string" ? p.name : undefined,
@@ -896,16 +1596,25 @@ export class HarnessDaemon {
           defaultEffort: p.defaultEffort === null ? null : typeof p.defaultEffort === "string" ? p.defaultEffort : undefined,
         });
         const all = await this.db.projects.listProjects();
-        return all.find((x) => x.id === updated.id) ?? updated;
+        return { ...(all.find((x) => x.id === updated.id) ?? updated), host: "local" };
       }
 
       case "project.remove": {
+        const host = typeof p.host === "string" ? p.host.trim() : undefined;
+        if (host && !this.isLocalHostTarget(host)) {
+          return await this.peers.callRemote(host, "project.remove", { ...p, host: undefined });
+        }
         const ref = String(p.projectId ?? p.id ?? "");
         return this.db.projects.removeProject(ref);
       }
 
-      case "project.browse":
+      case "project.browse": {
+        const host = typeof p.host === "string" ? p.host.trim() : undefined;
+        if (host && !this.isLocalHostTarget(host)) {
+          return await this.peers.callRemote(host, "project.browse", { path: typeof p.path === "string" ? p.path : undefined });
+        }
         return this.db.projects.browseDirectory(typeof p.path === "string" ? p.path : undefined);
+      }
 
       case "chat.set_project": {
         const chatSessionId = String(p.chatSessionId);
@@ -993,7 +1702,9 @@ export class HarnessDaemon {
         const boundProject =
           (session.projectId ? this.db.projects.getById(session.projectId) : null) ??
           this.db.projects.ensureProjectForPath(session.repoRoot);
-        this.bindChatSocket(socket, session.id);
+        if (!p.headless) {
+          this.bindChatSocket(socket, session.id);
+        }
         return {
           session,
           project: boundProject,
@@ -1010,58 +1721,62 @@ export class HarnessDaemon {
         };
       }
 
-      case "sessions.list": {
-        const allProjects = await this.db.projects.listProjects();
-        const projById = new Map(allProjects.map((pr) => [pr.id, pr]));
-        const projByPath = new Map(allProjects.map((pr) => [pr.rootPath, pr]));
-        const chats = this.director.chats.listSessions(25).map((c) => {
-          const bound = this.chatBindings.get(c.id);
-          const busy = this.director.isChatBusy(c.id);
-          const activeGoals = this.director.goals
-            .listGoals({ chatSessionId: c.id })
-            .filter((g) => ["executing", "verifying", "reviewing"].includes(g.status)).length;
-          const proj = (c.projectId ? projById.get(c.projectId) : undefined) ?? projByPath.get(c.repoRoot);
-          return {
-            id: c.id,
-            kind: "chat" as const,
-            title: c.title,
-            projectId: proj?.id ?? c.projectId ?? null,
-            projectName: proj?.name ?? null,
-            repoRoot: c.repoRoot,
-            status: busy ? "busy" : activeGoals > 0 ? `${activeGoals} active goal${activeGoals === 1 ? "" : "s"}` : "idle",
-            running: busy || activeGoals > 0,
-            attached: Boolean(bound),
-            attachedByMe: bound === socket,
-            model: c.model ?? c.profileId,
-            effort: c.effort,
-            updatedAt: c.updatedAt,
-          };
+      case "sessions.list":
+        return await this.listFederatedSessions(socket, {
+          includeRemotes: Boolean(p.includeRemotes),
+          host: typeof p.host === "string" ? p.host : undefined,
         });
-        const runs = this.db.listRuns(20).map((raw) => {
-          const r = this.orchestrator.getEffectiveRun(raw.id) ?? raw;
-          const bound = this.runBindings.get(r.id);
-          const live = this.orchestrator.isRunActiveInMemory(r.id);
-          const quotaSt = this.orchestrator.getRunQuotaStatus(r.id);
-          const proj = projByPath.get(r.repoRoot);
-          return {
-            id: r.id,
-            kind: "run" as const,
-            title: (r.goal.split("\n")[0] ?? r.goal).slice(0, 80),
-            projectId: proj?.id ?? null,
-            projectName: proj?.name ?? null,
-            repoRoot: r.repoRoot,
-            status: live ? "running" : quotaSt ? (quotaSt.resumeAt ? "quota (timer)" : "paused_quota") : r.status,
-            running: live || Boolean(quotaSt),
-            attached: Boolean(bound),
-            attachedByMe: bound === socket,
-            model: null,
-            effort: null,
-            updatedAt: r.updatedAt,
-          };
+
+      case "session.send_message": {
+        const fromSessionId = String(p.fromSessionId ?? this.socketToChatId.get(socket) ?? "").trim();
+        if (!fromSessionId) throw new Error("fromSessionId is required");
+        const target = String(p.target ?? "").trim();
+        const body = String(p.body ?? p.message ?? "").trim();
+        if (!target) throw new Error("target is required");
+        if (!body) throw new Error("body is required");
+        return await this.sendSessionMessage({
+          fromSessionId,
+          target,
+          body,
+          expectReply: p.expectReply === undefined ? true : Boolean(p.expectReply),
+          replyToId: typeof p.replyToId === "string" ? p.replyToId : undefined,
         });
-        return [...chats, ...runs].sort(
-          (a, b) => Number(b.running) - Number(a.running) || b.updatedAt - a.updatedAt,
-        );
+      }
+
+      case "session.deliver_message": {
+        const inboundPeer = this.peers.getInboundLinkForSocket(socket);
+        return this.deliverLocalSessionMessage({
+          id: String(p.id),
+          fromNode: String(p.fromNode ?? inboundPeer?.remoteIdentity?.nodeId ?? "unknown"),
+          fromHost: String(p.fromHost ?? inboundPeer?.alias ?? "remote"),
+          fromSessionId: String(p.fromSessionId),
+          fromProjectName: typeof p.fromProjectName === "string" ? p.fromProjectName : null,
+          toSessionId: String(p.toSessionId),
+          body: String(p.body ?? ""),
+          replyToId: typeof p.replyToId === "string" ? p.replyToId : null,
+          expectReply: p.expectReply === undefined ? true : Boolean(p.expectReply),
+          hopCount: typeof p.hopCount === "number" ? p.hopCount : 1,
+        });
+      }
+
+      case "session.list_messages": {
+        const target = String(p.target ?? p.sessionId ?? this.socketToChatId.get(socket) ?? "").trim();
+        if (!target) throw new Error("sessionId or target is required");
+        const { host, sessionId } = parseSessionAddress(target);
+        const limit = typeof p.limit === "number" ? p.limit : 50;
+        if (host && !this.isLocalHostTarget(host)) {
+          return await this.peers.callRemote(host, "session.list_messages", { sessionId, limit });
+        }
+        return this.db.sessionMessages.listForSession(sessionId, limit);
+      }
+
+      case "session.read": {
+        const target = String(p.target ?? p.sessionId ?? "").trim();
+        if (!target) throw new Error("target is required");
+        return await this.readSessionOnHost({
+          target,
+          limit: typeof p.limit === "number" ? p.limit : undefined,
+        });
       }
 
       case "session.leave": {

@@ -64,6 +64,17 @@ export type ChatControlEvent =
       wakeReason: string;
       goalId?: string | null;
       resumedGoal?: boolean;
+    }
+  | {
+      kind: "session.message_received";
+      messageId: string;
+      fromHost: string;
+      fromSessionId: string;
+      fromProjectName?: string | null;
+      body: string;
+      expectReply?: boolean;
+      hopCount: number;
+      circuitBreakerTripped?: boolean;
     };
 
 /** Validates an untrusted wire or SQLite JSON value into a typed `ChatControlEvent` or `null`. */
@@ -187,6 +198,27 @@ export function parseChatControlEvent(raw: unknown): ChatControlEvent | null {
         ...(typeof r.resumedGoal === "boolean" ? { resumedGoal: r.resumedGoal } : {}),
       };
     }
+    case "session.message_received": {
+      if (
+        typeof r.messageId !== "string" ||
+        typeof r.fromHost !== "string" ||
+        typeof r.fromSessionId !== "string" ||
+        typeof r.body !== "string"
+      ) {
+        return null;
+      }
+      return {
+        kind: "session.message_received",
+        messageId: r.messageId,
+        fromHost: r.fromHost,
+        fromSessionId: r.fromSessionId,
+        ...(typeof r.fromProjectName === "string" ? { fromProjectName: r.fromProjectName } : {}),
+        body: r.body,
+        ...(typeof r.expectReply === "boolean" ? { expectReply: r.expectReply } : {}),
+        hopCount: typeof r.hopCount === "number" ? r.hopCount : 1,
+        ...(typeof r.circuitBreakerTripped === "boolean" ? { circuitBreakerTripped: r.circuitBreakerTripped } : {}),
+      };
+    }
     default:
       return null;
   }
@@ -209,6 +241,11 @@ export function formatChatEventSummary(event: ChatControlEvent): string {
       return `Scheduled timer ${event.timerId} for ${new Date(event.wakeAt).toISOString()}${event.goalId ? ` (${event.goalId})` : ""}: ${event.reason}`;
     case "timer.fired":
       return `Timer ${event.timerId} fired (${event.wakeReason})${event.goalId ? ` for ${event.goalId}` : ""}: ${event.reason}`;
+    case "session.message_received": {
+      const origin = `${event.fromHost}:${event.fromSessionId}${event.fromProjectName ? ` [${event.fromProjectName}]` : ""}`;
+      const preview = event.body.replace(/\s+/g, " ").trim().slice(0, 160);
+      return `Message from ${origin}: ${preview}${event.circuitBreakerTripped ? " (auto-wakeup paused: hop limit reached)" : ""}`;
+    }
   }
 }
 
@@ -232,6 +269,17 @@ export function formatChatEventForModel(event: ChatControlEvent): string {
           ? `Your scheduled timer (${event.timerId}) for Goal ${event.goalId} has fired (${event.wakeReason}). Check live quota/models via \`list_models\` if needed and continue or resume the planned work.`
           : `Your scheduled timer (${event.timerId}) has fired (${event.wakeReason}). Continue the planned action or update the user concisely.`,
       ].join("\n");
+    case "session.message_received": {
+      const replyTarget = `${event.fromHost}:${event.fromSessionId}`;
+      return [
+        `Peer message (${event.messageId}) from ${replyTarget}${event.fromProjectName ? ` [${event.fromProjectName}]` : ""}:`,
+        event.body,
+        "",
+        event.expectReply === false
+          ? "The sender marked this as informational (no reply needed). Update the user or act on the information; do NOT send an acknowledgment reply."
+          : `Act on the message and reply via \`session_send({ target: "${replyTarget}", message: "..." })\` ONLY when a substantive answer, result, or follow-up is needed — never send pure acknowledgment loops.`,
+      ].join("\n");
+    }
     default:
       return summary;
   }

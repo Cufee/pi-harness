@@ -34,7 +34,7 @@ function makeFakeTerminal(): Terminal {
 
 describe("SSH-first Projects Registry, Session Switching, Non-Git Folders & TUI Picker", () => {
   it("creates git & plain-folder projects, binds sessions, switches session projects in-place, and renders ProjectsScreen width-safely", async () => {
-    assert.equal(DAEMON_PROTOCOL_REV, 7);
+    assert.equal(DAEMON_PROTOCOL_REV, 8);
     const root = realpathSync(mkdtempSync("/tmp/pi-proj-"));
     const stateDir = join(root, "state");
     const sockPath = join(stateDir, "d.sock");
