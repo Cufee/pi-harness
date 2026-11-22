@@ -31,7 +31,7 @@ async function withDaemon(
   const factory: CustomRunnerFactory = () => ({
     run: async (req) => ({ text: await script(req), stopReason: "completed" }),
   });
-  const daemon = new HarnessDaemon({ ...loadConfig(repoRoot), stateDir, socketPath: sockPath }, { dbPath: ":memory:", customRunnerFactory: factory });
+  const daemon = new HarnessDaemon({ ...loadConfig(repoRoot), codeMode: "off", stateDir, socketPath: sockPath }, { dbPath: ":memory:", customRunnerFactory: factory });
   await daemon.start();
   const client = new DaemonClient(sockPath);
   await client.connect();

@@ -1,5 +1,17 @@
+import { randomUUID } from "node:crypto";
+import type { CodeExecToolEvent } from "../code-mode/index.js";
 import type { EscalationRecord, TaskRecord } from "../control-plane/db.js";
 import type { GoalRecord, GoalReviewVerdict } from "../goals/engine.js";
+
+/** Pair each inner call's start and end for live pills and replay, even for parallel calls of the same tool. */
+export function codeExecEventSink(emit: (event: { id: string; name: string; status: string; via: "code_exec" }) => void) {
+  const ids = new WeakMap<CodeExecToolEvent["args"], string>();
+  return ({ name, args, phase, ok, via }: CodeExecToolEvent) => {
+    const id = ids.get(args) ?? randomUUID();
+    if (phase === "start") ids.set(args, id);
+    emit({ id, name, status: phase === "start" ? "in_progress" : ok ? "completed" : "failed", via });
+  };
+}
 
 /** Structured tool-output display (contract/tool-display-v1). Rendered by the TUI instead of a compact tool pill. */
 export interface ToolDisplayPayload {

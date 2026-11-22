@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ModelCatalogCompiler } from "../catalog/compiler.js";
+import { createCodeModeExecutor } from "../code-mode/index.js";
 import type { HarnessConfig, RunnerProfileConfig } from "../config.js";
 import type { ControlPlaneDb } from "../control-plane/db.js";
 import type { CustomRunnerFactory, HarnessOrchestrator } from "../control-plane/orchestrator.js";
@@ -13,7 +14,7 @@ import {
   type GoalRecord,
   type GoalReviewVerdict,
 } from "../goals/engine.js";
-import { buildGoalDetailDisplay, buildGoalsTableDisplay, summarizeToolDisplay, type ToolDisplayPayload } from "../protocol/tool-display.js";
+import { buildGoalDetailDisplay, buildGoalsTableDisplay, codeExecEventSink, summarizeToolDisplay, type ToolDisplayPayload } from "../protocol/tool-display.js";
 import type { QuotaClient } from "../quota/client.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
@@ -167,10 +168,12 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
 export class DirectorRuntime {
   readonly chats: DirectorSessionStore;
   readonly goals: GoalEngine;
-  private activeChatAborts = new Map<string, AbortController>();
+  private activeChats = new Map<string, {
+    abort: AbortController;
+    executor: ReturnType<typeof createCodeModeExecutor>;
+    onToolEvent: RunnerCallbacks["onToolEvent"];
+  }>();
   private activeReviewGoalIds = new Set<string>();
-  /** onToolEvent sinks of in-flight sendChatMessage turns, so tool displays reach the UI from both PiRunner and the ACP MCP bridge. */
-  private chatToolSinks = new Map<string, NonNullable<RunnerCallbacks["onToolEvent"]>>();
 
   constructor(
     private readonly db: ControlPlaneDb,
@@ -189,7 +192,7 @@ export class DirectorRuntime {
   }
 
   activeChatCount(): number {
-    return this.activeChatAborts.size;
+    return this.activeChats.size;
   }
 
   activeReviewCount(): number {
@@ -197,7 +200,7 @@ export class DirectorRuntime {
   }
 
   isChatBusy(chatSessionId: string): boolean {
-    return this.activeChatAborts.has(chatSessionId);
+    return this.activeChats.has(chatSessionId);
   }
 
   private resolveProfile(profileId?: string): RunnerProfileConfig {
@@ -537,19 +540,35 @@ export class DirectorRuntime {
 
   /** Cancels an in-flight Tier 0 Director turn immediately (e.g. when user presses Esc). */
   cancelChat(chatSessionId: string): boolean {
-    const ctrl = this.activeChatAborts.get(chatSessionId);
-    if (!ctrl) return false;
-    ctrl.abort();
-    this.activeChatAborts.delete(chatSessionId);
+    const active = this.activeChats.get(chatSessionId);
+    if (!active) return false;
+    active.abort.abort();
+    this.activeChats.delete(chatSessionId);
     return true;
   }
 
-  /** Bridges stdio MCP `tool.call` from external ACP Directors (Codex/Claude/Antigravity) to `DIRECTOR_TOOLS`. */
+  private directorExecutor(session: { id: string; repoRoot: string }, signal: AbortSignal, onToolEvent?: RunnerCallbacks["onToolEvent"]) {
+    return createCodeModeExecutor({
+      ...this.config.codeExec,
+      mode: this.config.codeMode,
+      allowedTools: () => DIRECTOR_TOOLS,
+      execute: (name, args) => this.executeDirectorTool(session.id, session.repoRoot, name, args),
+      artifactsDir: join(session.repoRoot, ".harness", "artifacts"),
+      signal,
+      onToolEvent: onToolEvent && codeExecEventSink(onToolEvent),
+    });
+  }
+
+  /** Reuse the active turn's executor so MCP and in-process calls share cancellation and tool events. */
   async executeDirectorMcpTool(chatSessionId: string, name: string, args: Record<string, unknown>): Promise<unknown> {
-    if (name === "__list_tools") return DIRECTOR_TOOLS;
-    const session = this.chats.getSession(chatSessionId);
-    if (!session) throw new Error(`Unknown chat session ${chatSessionId}`);
-    return await this.executeDirectorTool(session.id, session.repoRoot, name, args);
+    let executor = this.activeChats.get(chatSessionId)?.executor;
+    if (!executor) {
+      const session = this.chats.getSession(chatSessionId);
+      if (!session) throw new Error(`Unknown chat session ${chatSessionId}`);
+      // Idle chats support discovery and legacy direct calls, but cannot launch a script outside a turn.
+      executor = this.directorExecutor(session, AbortSignal.abort());
+    }
+    return name === "__list_tools" ? executor.tools() : executor.execute(name, args);
   }
 
   /** Executes a single interactive Tier 0 conversational turn and persists both user & assistant messages. */
@@ -593,8 +612,10 @@ export class DirectorRuntime {
         : new PiRunner(profile);
 
     const abort = new AbortController();
-    this.activeChatAborts.set(chatSessionId, abort);
-    if (onToolEvent) this.chatToolSinks.set(chatSessionId, onToolEvent);
+    const mode = this.config.codeMode;
+    const executor = this.directorExecutor(session, abort.signal, onToolEvent);
+    const active = { abort, executor, onToolEvent };
+    this.activeChats.set(chatSessionId, active);
     const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", "mcp-bridge.ts");
 
     try {
@@ -605,14 +626,14 @@ export class DirectorRuntime {
         kind: "orchestrator",
         cwd: session.repoRoot,
         readOnly: true,
-        systemPrompt: buildDirectorSystemPrompt(),
+        systemPrompt: buildDirectorSystemPrompt(mode),
         initialPrompt: prompt,
         model: (session.model && this.catalog?.resolveForProfile(profile.id, session.model)?.wireModelId) || session.model,
         effort: session.effort,
         maxTurns: 12,
         quotaRetryTimeoutMs: this.config.quotaRetry.nativeRetryTimeoutMs,
-        tools: DIRECTOR_TOOLS,
-        executeTool: (name, args) => this.executeDirectorTool(session.id, session.repoRoot, name, args),
+        tools: executor.tools(),
+        executeTool: executor.execute,
         daemonSocketPath: this.config.socketPath,
         mcpBridgeEntrypoint,
         signal: abort.signal,
@@ -638,11 +659,9 @@ export class DirectorRuntime {
       const assistantTurn = this.chats.appendTurn(chatSessionId, "assistant", content);
       return { userTurn, assistantTurn };
     } finally {
-      if (this.activeChatAborts.get(chatSessionId) === abort) {
-        this.activeChatAborts.delete(chatSessionId);
-      }
-      if (onToolEvent && this.chatToolSinks.get(chatSessionId) === onToolEvent) {
-        this.chatToolSinks.delete(chatSessionId);
+      abort.abort();
+      if (this.activeChats.get(chatSessionId) === active) {
+        this.activeChats.delete(chatSessionId);
       }
     }
   }
@@ -650,7 +669,7 @@ export class DirectorRuntime {
   /** Persists a tool_output turn and forwards the display to the chat's active UI sink, if any. */
   private emitToolDisplay(chatSessionId: string, toolName: string, display: ToolDisplayPayload): void {
     this.chats.appendTurn(chatSessionId, "tool_output", summarizeToolDisplay(toolName, display), { toolName, display });
-    this.chatToolSinks.get(chatSessionId)?.({ id: `display-${randomUUID()}`, name: toolName, status: "completed", display });
+    this.activeChats.get(chatSessionId)?.onToolEvent?.({ id: `display-${randomUUID()}`, name: toolName, status: "completed", display });
   }
 
   private async executeDirectorTool(

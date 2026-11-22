@@ -1,3 +1,4 @@
+import { codeModePromptSection, type CodeMode } from "../code-mode/sdk.js";
 import type { KbCard } from "../kb/store.js";
 import type { ArtifactRecord, EscalationRecord, TaskRecord } from "./db.js";
 
@@ -6,7 +7,11 @@ import type { ArtifactRecord, EscalationRecord, TaskRecord } from "./db.js";
  * NEVER embed live timestamps, dynamic tree dumps, or mutable counters here—
  * dynamic state is injected in turn messages or fetched via deterministic tools.
  */
-export function buildImmutableSystemPrompt(tier: 1 | 2 | 3, kind: TaskRecord["kind"]): string {
+export function buildImmutableSystemPrompt(tier: 1 | 2 | 3, kind: TaskRecord["kind"], mode: CodeMode): string {
+  return [tierInstructions(tier, kind), codeModePromptSection(mode)].filter(Boolean).join("\n\n");
+}
+
+function tierInstructions(tier: 1 | 2 | 3, kind: TaskRecord["kind"]): string {
   if (tier === 1) {
     return [
       "You are the Tier 1 ORCHESTRATOR in pi-harness.",

@@ -15,6 +15,7 @@ it("lets Tier 1 spawn and await a quota-routed, read-only Tier 3 task, but not e
   const finish = Promise.withResolvers<void>();
   try {
     const config = loadConfig(repoRoot);
+    config.codeMode = "off"; // This test asserts the individual Tier 1 tool surface.
     const profileId = "acp:research-fixture";
     config.profiles = [{ id: profileId, kind: "acp", adapter: "generic", command: "unused", billing: "subscription" }];
     const quota = new QuotaClient();

@@ -10,11 +10,12 @@ import { BisectingMergeQueue } from "../worktree/merge-queue.js";
 import { WorktreeManager } from "../worktree/manager.js";
 import type { AgentTier, ControlPlaneDb, RunRecord, TaskKind, TaskRecord } from "./db.js";
 import { buildHydrationTurn, buildImmutableSystemPrompt, type AnchoredHandoff } from "./prompts.js";
-import { ControlPlaneToolExecutor, toolsForTier } from "./tools.js";
+import { ControlPlaneToolExecutor } from "./tools.js";
 
 interface ActiveTaskExecution {
   taskId: string;
   abort: AbortController;
+  generationSignal?: AbortSignal;
   handle?: RunnerExecutionHandle;
   promise: Promise<void>;
 }
@@ -81,7 +82,8 @@ export class HarnessOrchestrator {
       },
       getWorktreeManager: (repoRoot) => this.getWorktreeManager(repoRoot),
       getMergeQueue: (repoRoot) => this.getMergeQueue(repoRoot),
-    });
+      getTaskSignal: (taskId) => this.active.get(taskId)?.generationSignal,
+    }, config);
   }
 
   activeTaskCount(): number {
@@ -281,6 +283,7 @@ export class HarnessOrchestrator {
       abort,
       promise: Promise.resolve(),
     };
+    this.active.set(taskId, entry);
     entry.promise = this.runTaskWithRollovers(taskId, entry).finally(() => {
       this.active.delete(taskId);
       // Kick any newly unblocked dependent tasks in the same run
@@ -301,7 +304,6 @@ export class HarnessOrchestrator {
         }
       }
     });
-    this.active.set(taskId, entry);
   }
 
   /**
@@ -546,7 +548,7 @@ export class HarnessOrchestrator {
       const quotaResumeNote = this.taskResumeNotes.get(task.id) ?? null;
       if (quotaResumeNote) this.taskResumeNotes.delete(task.id);
 
-      const systemPrompt = buildImmutableSystemPrompt(task.tier, task.kind);
+      const systemPrompt = buildImmutableSystemPrompt(task.tier, task.kind, this.config.codeMode);
       const scopedKbHints =
         task.tier === 2 ? this.db.kb.getScopedAmbientIndex(run.repoRoot, this.db.listActiveWriteScopes(run.id), 5) : [];
 
@@ -572,6 +574,8 @@ export class HarnessOrchestrator {
 
       const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", "mcp-bridge.ts");
 
+      const generation = new AbortController();
+      exec.generationSignal = AbortSignal.any([generation.signal, exec.abort.signal]);
       const runnerReq: RunAgentRequest = {
         runId: run.id,
         taskId: task.id,
@@ -587,11 +591,11 @@ export class HarnessOrchestrator {
         maxTurns: task.maxTurns,
         rolloverThreshold,
         quotaRetryTimeoutMs: this.config.quotaRetry.nativeRetryTimeoutMs,
-        tools: toolsForTier(task.tier),
+        tools: this.toolExecutor.tools(task.tier),
         executeTool: (name, args) => this.toolExecutor.execute(run.id, task.id, name, args),
         daemonSocketPath: this.config.socketPath,
         mcpBridgeEntrypoint,
-        signal: exec.abort.signal,
+        signal: exec.generationSignal,
         onHandle: (h) => {
           exec.handle = h;
         },
@@ -750,6 +754,9 @@ export class HarnessOrchestrator {
           this.db.updateRunStatus(run.id, "failed");
         }
         return;
+      } finally {
+        generation.abort(); // Outstanding MCP scripts must not survive their runner (including a rollover).
+        exec.generationSignal = undefined;
       }
     }
   }
