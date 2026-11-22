@@ -236,55 +236,71 @@ export function prepareAcpSpawn(
     const mdPath = join(dir, "system.md");
     writeFileSync(mdPath, opts.systemPrompt, "utf8");
     env.GEMINI_SYSTEM_MD = mdPath;
+    if (
+      opts.toolPolicy === "read_write_workspace" &&
+      !args.some((a) => a === "--yolo" || a === "-y" || a.startsWith("--approval-mode"))
+    ) {
+      args.push("--approval-mode=yolo");
+    }
   } else {
     prependSystemPromptToTurn1 = true;
-    // Amp ACP (`amp-acp`) never sends `session/request_permission` callbacks; enforce control-plane / read-only
-    // tool boundaries cleanly via a temporary AMP_SETTINGS_FILE!
-    if (isAmpAcpProfile(profile) && opts.toolPolicy !== "read_write_workspace") {
+    // Amp ACP (`amp-acp`) never sends `session/request_permission` callbacks; configure unattended permissions
+    // and control-plane / read-only boundaries cleanly via a temporary AMP_SETTINGS_FILE!
+    if (isAmpAcpProfile(profile)) {
       const dir = mkdtempSync(join(tmpdir(), "pi-harness-amp-"));
       tempDirs.push(dir);
       const settingsPath = join(dir, "settings.json");
       const ampSettings: Record<string, unknown> =
-        opts.toolPolicy === "control_plane_only"
+        opts.toolPolicy === "read_write_workspace"
           ? {
-              "amp.dangerouslyAllowAll": false,
-              "amp.tools.enable": ["mcp__harness__*"],
-              "amp.tools.disable": [
-                "Bash",
-                "shell_command",
-                "shell_command_status",
-                "shell_command_kill",
-                "Read",
-                "Grep",
-                "glob",
-                ...AMP_READ_ONLY_DISABLED_TOOLS,
-              ],
+              "amp.dangerouslyAllowAll": true,
             }
-          : opts.allowShellInReadOnly
+          : opts.toolPolicy === "control_plane_only"
             ? {
-                // Disposable verification checkout (verify / Done-Review): keep shell unrestricted for tests/linters/tmux,
-                // while hiding and rejecting file-editing and subagent tools.
                 "amp.dangerouslyAllowAll": false,
-                "amp.tools.disable": AMP_READ_ONLY_DISABLED_TOOLS,
-                "amp.permissions": AMP_READ_ONLY_DISABLED_TOOLS.map((tool) => ({ tool, action: "reject" })),
-              }
-            : {
-                // Modern Amp CLI exposes no native Read/Grep/glob tools — file inspection goes through `shell_command`.
-                // Instead of disabling `shell_command` (which blinds read-only Amp agents, see esc-19/esc-20), keep
-                // write/subagent tools disabled/rejected and enforce a strict read-only `amp.permissions` allowlist for shell tools.
-                "amp.dangerouslyAllowAll": false,
-                "amp.tools.disable": AMP_READ_ONLY_DISABLED_TOOLS,
-                "amp.permissions": [
-                  { tool: "mcp__harness__*", action: "allow" },
-                  ...AMP_READ_ONLY_DISABLED_TOOLS.map((tool) => ({ tool, action: "reject" })),
-                  { tool: "shell_command", action: "reject", matches: { command: AMP_READ_ONLY_SHELL_REJECT_PATTERNS } },
-                  { tool: "shell_command", action: "allow", matches: { command: AMP_READ_ONLY_SHELL_ALLOW_PATTERNS } },
-                  { tool: "shell_command", action: "reject" },
-                  { tool: "Bash", action: "reject", matches: { cmd: AMP_READ_ONLY_SHELL_REJECT_PATTERNS } },
-                  { tool: "Bash", action: "allow", matches: { cmd: AMP_READ_ONLY_SHELL_ALLOW_PATTERNS } },
-                  { tool: "Bash", action: "reject" },
+                "amp.tools.enable": ["mcp__harness__*"],
+                "amp.tools.disable": [
+                  "Bash",
+                  "shell_command",
+                  "shell_command_status",
+                  "shell_command_kill",
+                  "Read",
+                  "Grep",
+                  "glob",
+                  ...AMP_READ_ONLY_DISABLED_TOOLS,
                 ],
-              };
+                "amp.permissions": [{ tool: "mcp__harness__*", action: "allow" }],
+              }
+            : opts.allowShellInReadOnly
+              ? {
+                  // Disposable verification checkout (verify / Done-Review): keep shell and harness MCP unrestricted
+                  // for tests/linters/tmux while hiding and rejecting file-editing and subagent tools.
+                  "amp.dangerouslyAllowAll": false,
+                  "amp.tools.disable": AMP_READ_ONLY_DISABLED_TOOLS,
+                  "amp.permissions": [
+                    { tool: "mcp__harness__*", action: "allow" },
+                    ...AMP_READ_ONLY_DISABLED_TOOLS.map((tool) => ({ tool, action: "reject" })),
+                    { tool: "shell_command", action: "allow" },
+                    { tool: "Bash", action: "allow" },
+                  ],
+                }
+              : {
+                  // Modern Amp CLI exposes no native Read/Grep/glob tools — file inspection goes through `shell_command`.
+                  // Instead of disabling `shell_command` (which blinds read-only Amp agents, see esc-19/esc-20), keep
+                  // write/subagent tools disabled/rejected and enforce a strict read-only `amp.permissions` allowlist for shell tools.
+                  "amp.dangerouslyAllowAll": false,
+                  "amp.tools.disable": AMP_READ_ONLY_DISABLED_TOOLS,
+                  "amp.permissions": [
+                    { tool: "mcp__harness__*", action: "allow" },
+                    ...AMP_READ_ONLY_DISABLED_TOOLS.map((tool) => ({ tool, action: "reject" })),
+                    { tool: "shell_command", action: "reject", matches: { command: AMP_READ_ONLY_SHELL_REJECT_PATTERNS } },
+                    { tool: "shell_command", action: "allow", matches: { command: AMP_READ_ONLY_SHELL_ALLOW_PATTERNS } },
+                    { tool: "shell_command", action: "reject" },
+                    { tool: "Bash", action: "reject", matches: { cmd: AMP_READ_ONLY_SHELL_REJECT_PATTERNS } },
+                    { tool: "Bash", action: "allow", matches: { cmd: AMP_READ_ONLY_SHELL_ALLOW_PATTERNS } },
+                    { tool: "Bash", action: "reject" },
+                  ],
+                };
       writeFileSync(settingsPath, JSON.stringify(ampSettings, null, 2), "utf8");
       env.AMP_SETTINGS_FILE = settingsPath;
     }
@@ -357,20 +373,23 @@ export function buildNewSessionParams(
       if (!opts.allowShellInReadOnly) disallowed.push("Bash");
     }
     if (opts.toolPolicy === "control_plane_only") {
-      disallowed.push("Read", "Grep", "Glob");
+      disallowed.push("Read", "Grep", "Glob", "WebFetch", "WebSearch", "Skill");
       if (!disallowed.includes("Bash")) disallowed.push("Bash");
     }
     const effectiveEffort =
       opts.effort && opts.effort.toLowerCase() !== "default" ? opts.effort : undefined;
+    const hasHarnessMcp = opts.mcpServers.some((s) => s.name === "harness");
     const claudeOptions: Record<string, unknown> = {
       disallowedTools: disallowed,
+      ...(hasHarnessMcp ? { allowedTools: ["ToolSearch", "mcp__harness__*"] } : {}),
       ...(opts.toolPolicy !== "read_write_workspace" ? {
         settingSources: [],
         strictMcpConfig: true,
         allowDangerouslySkipPermissions: false,
       } : {}),
+      // Keep ToolSearch available in control_plane_only so Claude Code can load deferred MCP tools (mcp__harness__*)!
       ...(opts.toolPolicy === "control_plane_only" ? {
-        tools: [],
+        tools: ["ToolSearch"],
       } : {}),
       settings: { autoCompactEnabled: false },
     };
@@ -403,13 +422,52 @@ export function buildNewSessionParams(
 }
 
 export interface PostSessionAction {
-  method: "session/set_config_option" | "session/set_model";
+  method: "session/set_config_option" | "session/set_model" | "session/set_mode";
   params: Record<string, unknown>;
   /** Prompting is unsafe unless this setter succeeds for the exact wire ID. */
   requiredModel?: string;
 }
 
 interface SelectValue { value: string; name?: string }
+
+const CLAUDE_VERSIONED_MODEL_RE = /^claude-(opus|sonnet|haiku|fable)-(\d+(?:[.-]\d+)*)(?:-\d{8})?$/i;
+const CLAUDE_OPTION_NAME_VERSION_RE = /\b(?:claude\s+)?(opus|sonnet|haiku|fable)\s+(\d+(?:[.-]\d+)*)\b/i;
+
+/**
+ * Checks whether a Claude ACP configOption entry (`{ value: "opus", name: "Opus 5.5" }`)
+ * proves exact compatibility with a specific requested wire model ID (`"claude-opus-5-5"`).
+ * Never matches an unversioned display name (`"Opus"`) or a different version (`"Opus 5.0"`).
+ */
+export function claudeOptionMatchesExactModel(opt: SelectValue, requestedModel: string): boolean {
+  if (opt.value === requestedModel) return true;
+  const reqMatch = requestedModel.trim().match(CLAUDE_VERSIONED_MODEL_RE);
+  if (!reqMatch || !opt.name) return false;
+  const optMatch = opt.name.match(CLAUDE_OPTION_NAME_VERSION_RE);
+  if (!optMatch) return false;
+  const reqFamily = reqMatch[1]!.toLowerCase();
+  const reqVer = reqMatch[2]!.replace(/\./g, "-");
+  const optFamily = optMatch[1]!.toLowerCase();
+  const optVer = optMatch[2]!.replace(/\./g, "-");
+  return reqFamily === optFamily && reqVer === optVer;
+}
+
+/** Checks whether a reported current model value satisfies `requestedModel` given advertised options. */
+export function reportedModelSatisfies(
+  adapter: AcpAdapterKind,
+  state: AcpModelState,
+  reportedValue: unknown,
+  requestedModel: string,
+  fallbackState?: AcpModelState,
+): boolean {
+  if (reportedValue === requestedModel) return true;
+  if (adapter !== "claude" || typeof reportedValue !== "string") return false;
+  const findOpt = (st?: AcpModelState) =>
+    selectValues(st?.configOptions?.find((c) => c.category === "model" || c.id === "model"))?.find(
+      (o) => o.value === reportedValue,
+    );
+  const opt = findOpt(state) ?? findOpt(fallbackState);
+  return opt ? claudeOptionMatchesExactModel(opt, requestedModel) : false;
+}
 
 export interface AcpConfigOption {
   id: string;
@@ -425,6 +483,7 @@ export function selectValues(option?: AcpConfigOption): SelectValue[] | undefine
 export interface AcpModelState {
   configOptions?: AcpConfigOption[];
   models?: { currentModelId?: string; availableModels?: Array<{ modelId: string }> };
+  modes?: { currentModeId?: string; availableModes?: Array<{ id: string; name?: string }> };
 }
 
 export function reportedModels(state: AcpModelState, modelConfigIds = new Set(["model"])): unknown[] {
@@ -469,14 +528,19 @@ export function buildPostSessionActions(
   // Never translate the catalog's selected wire ID. Check the list belonging to
   // the setter we will use, not the union of two potentially different lists.
   const useConfig = modelOpt !== undefined || adapter === "codex" || (adapter === "claude" && !legacyModels);
-  const configIds = selectValues(modelOpt)?.map((o) => o.value);
+  const configOptionsList = selectValues(modelOpt);
+  const configIds = configOptionsList?.map((o) => o.value);
   const legacyIds = legacyModels?.availableModels?.map((m) => m.modelId);
   const advertised = useConfig ? configIds ?? legacyIds : legacyIds ?? configIds;
-  if (advertised && !advertised.includes(model)) {
+  const claudeExactOptionMatch =
+    adapter === "claude" && useConfig && configOptionsList
+      ? configOptionsList.some((o) => claudeOptionMatchesExactModel(o, model))
+      : false;
+  if (advertised && !advertised.includes(model) && !claudeExactOptionMatch) {
     throw new Error(`${adapter}: requested model '${model}' is not advertised by this session`);
   }
   const current = reportedModels(newSessionResponse, modelConfigIds);
-  if (!current.length || current.some((value) => value !== model)) {
+  if (!current.length || current.some((value) => !reportedModelSatisfies(adapter, newSessionResponse, value, model))) {
     actions.push(useConfig
       ? { method: "session/set_config_option", params: { sessionId, configId: modelOpt?.id ?? "model", value: model }, requiredModel: model }
       : { method: "session/set_model", params: { sessionId, modelId: model }, requiredModel: model });
@@ -502,6 +566,40 @@ export function buildPostSessionActions(
         method: "session/set_config_option",
         params: { sessionId, configId: effortOpt?.id ?? "reasoning_effort", value: opts.effort },
       });
+    }
+  }
+
+  // Unattended approval / yolo mode for writable workers (`read_write_workspace`):
+  // if the ACP adapter advertises a `mode` option with a yolo/bypass value (Claude, Gemini, Antigravity, Codex),
+  // switch into it automatically so unattended runs never stall waiting on manual permission prompts.
+  if (opts.toolPolicy === "read_write_workspace") {
+    const YOLO_PRIORITY = ["bypasspermissions", "yolo", "full-access", "full_access", "dontask", "auto"];
+    const modeOpt = configOptions.find((c) => c.category === "mode" || c.id === "mode");
+    const modeValues = selectValues(modeOpt);
+    if (modeOpt && modeValues?.length) {
+      const currentMode = String(modeOpt.currentValue ?? "").toLowerCase();
+      if (!YOLO_PRIORITY.includes(currentMode)) {
+        const picked = YOLO_PRIORITY.map((p) => modeValues.find((o) => o.value.toLowerCase() === p)).find(Boolean);
+        if (picked && picked.value !== modeOpt.currentValue) {
+          actions.push({
+            method: "session/set_config_option",
+            params: { sessionId, configId: modeOpt.id, value: picked.value },
+          });
+        }
+      }
+    } else if (newSessionResponse.modes?.availableModes?.length) {
+      const currentMode = String(newSessionResponse.modes.currentModeId ?? "").toLowerCase();
+      if (!YOLO_PRIORITY.includes(currentMode)) {
+        const picked = YOLO_PRIORITY.map((p) =>
+          newSessionResponse.modes!.availableModes!.find((m) => m.id.toLowerCase() === p),
+        ).find(Boolean);
+        if (picked && picked.id !== newSessionResponse.modes.currentModeId) {
+          actions.push({
+            method: "session/set_mode",
+            params: { sessionId, modeId: picked.id },
+          });
+        }
+      }
     }
   }
 

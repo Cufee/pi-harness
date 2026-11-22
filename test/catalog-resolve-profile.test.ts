@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "bun:test";
-import { ModelCatalogCompiler } from "../src/catalog/compiler.js";
+import { ModelCatalogCompiler, resolveProbedCanonicalId } from "../src/catalog/compiler.js";
 import { loadConfig, type HarnessConfig, type RunnerProfileConfig } from "../src/config.js";
 import { ControlPlaneDb } from "../src/control-plane/db.js";
 import { resolveLaunchRoute } from "../src/control-plane/launch-route.js";
@@ -38,7 +38,7 @@ function setup(): { stateDir: string; config: HarnessConfig; compiler: ModelCata
           { wireModelId: "zhipuai/glm-5.3" },
         ],
       ],
-      ["acp:claude", [{ wireModelId: "opus" }]],
+      ["acp:claude", [{ wireModelId: "opus", name: "Opus 5.5" }]],
     ]),
     modelsDev: [
       { id: "claude-opus-5-5", provider: "anthropic", name: "Claude Opus 5.5", family: "claude-opus", releaseDate: "2026-10-01" },
@@ -62,7 +62,7 @@ describe("ModelCatalogCompiler.resolveForProfile", () => {
       assert.equal(wire("acp:amp", "google/gemini-4-carbon"), "google-vertex/gemini-4-carbon");
       assert.equal(wire("acp:amp", "zai/glm-5.3"), "zhipuai/glm-5.3");
       assert.equal(wire("acp:amp", "anthropic/claude-opus-5-5"), "anthropic/claude-opus-5-5");
-      assert.equal(wire("acp:claude", "anthropic/claude-opus-5-5"), "opus");
+      assert.equal(wire("acp:claude", "anthropic/claude-opus-5-5"), "claude-opus-5-5");
       assert.deepEqual(compiler.resolveForProfile("acp:amp", "zai/glm-5.3"), {
         wireModelId: "zhipuai/glm-5.3",
         canonicalId: "zai/glm-5.3",
@@ -73,7 +73,9 @@ describe("ModelCatalogCompiler.resolveForProfile", () => {
       assert.equal(wire("acp:amp", "glm-5.3"), "zhipuai/glm-5.3");
       assert.equal(wire("acp:amp", "google-vertex/gemini-4-carbon"), "google-vertex/gemini-4-carbon");
       assert.equal(wire("acp:amp", "zhipuai/glm-5.3"), "zhipuai/glm-5.3");
-      assert.equal(wire("acp:claude", "opus"), "opus");
+      assert.equal(wire("acp:claude", "claude-opus-5-5"), "claude-opus-5-5");
+      // Bare unversioned family alias does NOT silently resolve to a specific versioned model
+      assert.equal(wire("acp:claude", "opus"), null);
 
       // unknown model, a model the profile has no route for, or unknown profile -> null (caller falls back)
       assert.equal(compiler.resolveForProfile("acp:amp", "openai/gpt-6.2-astra"), null);
@@ -122,7 +124,7 @@ describe("ModelCatalogCompiler.resolveForProfile", () => {
       for (let i = 0; i < 80 && orch.activeTaskCount() > 0; i++) {
         await new Promise((r) => setTimeout(r, 25));
       }
-      assert.deepEqual(seen, [{ profileId: "acp:claude", model: "opus" }]);
+      assert.deepEqual(seen, [{ profileId: "acp:claude", model: "claude-opus-5-5" }]);
       assert.equal(db.getTask(orchestratorTask.id)?.model, "anthropic/claude-opus-5-5");
     } finally {
       orch.dispose();
@@ -199,6 +201,70 @@ describe("ModelCatalogCompiler.resolveForProfile", () => {
         () => resolveLaunchRoute(config, { tier: 1, catalog: compiler, quota, model: "anthropic/claude-opus-5-5" }),
         /No eligible current catalog route/,
       );
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("canonicalizes Claude ACP versioned names to exact versioned wire/canonical IDs without silently guessing unversioned aliases", () => {
+    assert.equal(resolveProbedCanonicalId("default", "claude", "Default (recommended)"), null);
+    assert.equal(resolveProbedCanonicalId("opus", "claude", "Opus 5.5"), "anthropic/claude-opus-5-5");
+    assert.equal(resolveProbedCanonicalId("fable", "claude", "Fable 5.2"), "anthropic/claude-fable-5-2");
+    assert.equal(resolveProbedCanonicalId("opus", "claude", "Opus 6.0"), "anthropic/claude-opus-6-0");
+    // Unversioned alias without concrete version in `name` is NEVER silently guessed to a specific release!
+    assert.equal(resolveProbedCanonicalId("sonnet", "claude"), "anthropic/sonnet");
+
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-claude-alias-"));
+    try {
+      const config = loadConfig();
+      config.stateDir = stateDir;
+      config.profiles = profiles;
+      const compiler = new ModelCatalogCompiler(config);
+      const catalog = compiler.compileFromData({
+        enabledProfiles: profiles,
+        inventory: new Map([
+          [
+            "acp:claude",
+            [
+              { wireModelId: "default", name: "Default (recommended)" },
+              { wireModelId: "opus", name: "Opus 5.5", supportedEfforts: ["low", "medium", "high", "xhigh"] },
+              { wireModelId: "sonnet", name: "Sonnet 5.5", supportedEfforts: ["low", "medium", "high"] },
+              { wireModelId: "fable", name: "Fable 5.2", supportedEfforts: ["medium", "high", "xhigh"] },
+              { wireModelId: "haiku", name: "Haiku 5.5" },
+              { wireModelId: "claude-haiku-4-5-20251001", name: "Haiku 4.5" },
+            ],
+          ],
+          [
+            "acp:amp",
+            [
+              { wireModelId: "anthropic/claude-opus-5-5" },
+              { wireModelId: "anthropic/claude-fable-5-2" },
+            ],
+          ],
+        ]),
+        modelsDev: [],
+        openRouter: [],
+        litellmDep: new Map(),
+        benchmarks: [],
+        sources: [],
+      });
+
+      const ids = catalog.models.map((m) => m.id).sort();
+      assert.deepEqual(ids, [
+        "anthropic/claude-fable-5-2",
+        "anthropic/claude-haiku-5-5",
+        "anthropic/claude-opus-5-5",
+        "anthropic/claude-sonnet-5-5",
+      ]);
+      // No bare family entries or synthetic default entry
+      assert.equal(ids.includes("anthropic/opus"), false);
+      assert.equal(ids.includes("anthropic/default"), false);
+
+      // acp:claude merges onto anthropic/claude-opus-5-5 with EXPLICIT wireModelId "claude-opus-5-5" (never "opus"!)
+      const opus = catalog.models.find((m) => m.id === "anthropic/claude-opus-5-5")!;
+      assert.equal(opus.preferredRoute.profileId, "acp:claude");
+      assert.equal(opus.preferredRoute.wireModelId, "claude-opus-5-5");
+      assert.ok(opus.alternateRoutes.some((r) => r.profileId === "acp:amp" && r.wireModelId === "anthropic/claude-opus-5-5"));
     } finally {
       rmSync(stateDir, { recursive: true, force: true });
     }

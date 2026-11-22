@@ -14,6 +14,7 @@ import {
   isAmpAcpProfile,
   prepareAcpSpawn,
   reportedModels,
+  reportedModelSatisfies,
   selectValues,
   type AcpModelState,
   type AcpConfigOption,
@@ -694,7 +695,9 @@ export class AcpRunner {
         const toolKind = p.toolCall?.kind;
         const options = p.options ?? [];
 
-        const allowOpt = options.find((o) => o.kind === "allow_once");
+        const allowOpt =
+          options.find((o) => o.kind === "allow_once") ??
+          options.find((o) => o.kind === "allow_always");
         const denyOpt = options.find((o) => o.kind === "reject_once") ?? options.find((o) => o.kind === "reject_always");
         const externalMcpNames = new Set(
           allowShell
@@ -702,28 +705,68 @@ export class AcpRunner {
             : [],
         );
         const claude = p.toolCall?._meta?.claudeCode;
+        const claudeUntrustedSource =
+          claude?.mcpServer?.source === "project" ||
+          claude?.mcpServer?.source === "user" ||
+          claude?.mcpServer?.source === "local";
         const claudeExternalMcp =
           this.profile.adapter === "claude" &&
           claude?.mcpServer?.name !== undefined &&
+          !claudeUntrustedSource &&
           externalMcpNames.has(claude.mcpServer.name);
-        const claudeCall = this.profile.adapter === "claude" && toolKind === "other" &&
-          ((claude?.mcpServer?.name === "harness" && claude.mcpServer.source === "dynamic" &&
-            claude.toolName !== undefined && claudeToolNames.has(claude.toolName)) ||
-            claudeExternalMcp);
+        // Allow Claude's built-in ToolSearch (required to load deferred MCP tools) and harness MCP calls across
+        // any non-user/project/local MCP server source (`dynamic`, `sdk`, `acp`, `inline`, etc.) and any toolKind.
+        const claudeToolSearch =
+          this.profile.adapter === "claude" && claude?.toolName === "ToolSearch";
+        const claudeHarnessMcp =
+          this.profile.adapter === "claude" &&
+          !claudeUntrustedSource &&
+          claude?.toolName !== undefined &&
+          claudeToolNames.has(claude.toolName) &&
+          (claude.mcpServer === undefined || claude.mcpServer.name === "harness");
+        const claudeCall = claudeToolSearch || claudeHarnessMcp || claudeExternalMcp;
+
         const codexCall = this.profile.adapter === "codex" && toolKind === "execute" &&
           p._meta?.is_mcp_tool_approval === true && callId !== undefined && codexHarnessCalls.has(callId);
+
+        // Normalize MCP tool names emitted by Gemini / Antigravity / generic ACP adapters:
+        // e.g. `mcp__harness__code_exec`, `harness__code_exec`, `harness:code_exec`, `harness/code_exec`, or bare `code_exec`
+        const rawCandidateName = p.toolCall?.name ?? p.toolCall?.title ?? "";
+        const normalizedHarnessTool = rawCandidateName
+          .trim()
+          .split(/\s+/)[0]
+          ?.replace(/^mcp__harness__/, "")
+          .replace(/^harness(?:__|:|\/)/, "") ?? "";
+        const nonFileToolKind =
+          toolKind !== "read" && toolKind !== "edit" && toolKind !== "delete" && toolKind !== "move";
+        const noFileLocations = !p.toolCall?.locations?.length;
+        const matchesNormalizedHarness =
+          nonFileToolKind &&
+          noFileLocations &&
+          normalizedHarnessTool.length > 0 &&
+          harnessToolNames.has(normalizedHarnessTool);
+        const matchesNormalizedExternal =
+          nonFileToolKind &&
+          [...externalMcpNames].some((srv) =>
+            rawCandidateName.startsWith(`mcp__${srv}__`) ||
+            rawCandidateName.startsWith(`${srv}__`) ||
+            rawCandidateName.startsWith(`${srv}:`) ||
+            rawCandidateName.startsWith(`${srv}/`),
+          );
+
         const geminiMcp = p.toolCall?._meta?.["gemini-cli"]?.mcp;
         const geminiExternalMcp =
           this.profile.adapter === "gemini" &&
-          geminiMcp?.server_name !== undefined &&
-          externalMcpNames.has(geminiMcp.server_name);
+          ((geminiMcp?.server_name !== undefined && externalMcpNames.has(geminiMcp.server_name)) ||
+            matchesNormalizedExternal);
         const geminiCall = this.profile.adapter === "gemini" &&
           ((geminiMcp?.server_name === "harness" &&
             geminiMcp.tool_name !== undefined && harnessToolNames.has(geminiMcp.tool_name)) ||
+            matchesNormalizedHarness ||
             geminiExternalMcp);
-        const genericCall = this.profile.adapter === "generic" && toolKind === "other" &&
-          p.toolCall?.name !== undefined &&
-          (harnessToolNames.has(p.toolCall.name) || [...externalMcpNames].some((srv) => p.toolCall?.name?.startsWith(`${srv}__`)));
+
+        const genericCall = this.profile.adapter === "generic" &&
+          (matchesNormalizedHarness || matchesNormalizedExternal);
         const isRead = toolKind === "read" || toolKind === "search";
         const isWrite = toolKind === "edit" || toolKind === "delete" || toolKind === "move";
         const isExecute = toolKind === "execute";
@@ -737,11 +780,13 @@ export class AcpRunner {
               for (const location of locations) {
                 await workspaceTarget(workspace, location.path, toolKind === "edit" || toolKind === "move");
               }
-              workspaceCall = locations.length > 0;
+              workspaceCall = locations.length > 0 || (canWrite && isRead);
             } catch {
               workspaceCall = false;
             }
           } else if (isExecute && allowShell) {
+            workspaceCall = true;
+          } else if (canWrite && (toolKind === "fetch" || toolKind === "other" || toolKind === "think" || toolKind === undefined)) {
             workspaceCall = true;
           }
         }
@@ -922,7 +967,7 @@ export class AcpRunner {
           throw new Error(`Could not select model ${req.model}: ${action.method} returned no current model`);
         }
         for (const current of currentModels) {
-          if (current !== req.model) {
+          if (!reportedModelSatisfies(this.profile.adapter, reply, current, req.model, newSessionRes)) {
             throw new Error(`Could not select model ${req.model}: ${action.method} reported ${current}`);
           }
         }

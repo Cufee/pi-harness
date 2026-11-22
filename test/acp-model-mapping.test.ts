@@ -34,12 +34,32 @@ describe("ACP adapter-native model matching", () => {
     assert.deepEqual(buildPostSessionActions("claude", "s1", { configOptions: [{ ...config, currentValue: "opus" }] }, opts), []);
   });
 
-  it("does not substitute a Claude family alias, display name or sibling revision", () => {
+  it("accepts Claude exact versioned model when option name proves exact version, and rejects unversioned alias or version mismatch", () => {
     const model = "claude-opus-5-5";
-    const res = { configOptions: [{ id: "model", currentValue: "opus", options: [
+    // Exact version in advertised option name -> satisfies without rewriting wire value to "opus"
+    const exactMatchRes = { configOptions: [{ id: "model", currentValue: "opus", options: [
       { value: "opus", name: "Claude Opus 5.5" }, { value: "claude-opus-5" },
     ] }] };
-    assert.throws(() => buildPostSessionActions("claude", "s1", res, { toolPolicy, model }), /claude-opus-5-5.*not advertised/);
+    assert.deepEqual(buildPostSessionActions("claude", "s1", exactMatchRes, { toolPolicy, model }), []);
+
+    // When another option is currently active, sends explicit "claude-opus-5-5" on the wire (never "opus")
+    const switchRes = { configOptions: [{ id: "model", currentValue: "sonnet", options: [
+      { value: "opus", name: "Opus 5.5" }, { value: "sonnet", name: "Sonnet 5.5" },
+    ] }] };
+    assert.deepEqual(buildPostSessionActions("claude", "s1", switchRes, { toolPolicy, model }), [
+      { method: "session/set_config_option", params: { sessionId: "s1", configId: "model", value: "claude-opus-5-5" }, requiredModel: "claude-opus-5-5" },
+    ]);
+
+    // Unversioned family alias ("Opus") or wrong version ("Opus 5.0") or sibling revision MUST throw!
+    const unversionedRes = { configOptions: [{ id: "model", currentValue: "opus", options: [
+      { value: "opus", name: "Opus" }, { value: "claude-opus-5" },
+    ] }] };
+    assert.throws(() => buildPostSessionActions("claude", "s1", unversionedRes, { toolPolicy, model }), /claude-opus-5-5.*not advertised/);
+
+    const wrongVersionRes = { configOptions: [{ id: "model", currentValue: "opus", options: [
+      { value: "opus", name: "Opus 5.0" }, { value: "claude-opus-5" },
+    ] }] };
+    assert.throws(() => buildPostSessionActions("claude", "s1", wrongVersionRes, { toolPolicy, model }), /claude-opus-5-5.*not advertised/);
   });
 
   it("sets the exact Codex model with or without advertised options", () => {

@@ -183,14 +183,49 @@ export interface CompiledModelCatalog {
   models: CompiledModelEntry[];
 }
 
-// Defaults for the native Claude CLI, verified 2026-11-21.
-// https://code.claude.com/docs/en/model-config#model-aliases
-const CLAUDE_ROUTE_ALIASES = new Map([
-  ["anthropic/claude-opus-5-5", "opus"],
-  ["anthropic/claude-sonnet-5-5", "sonnet"],
-  ["anthropic/claude-haiku-5-5", "haiku"],
-  ["anthropic/claude-fable-5-2", "fable"],
-]);
+const CLAUDE_BARE_FAMILY_RE = /^(?:anthropic\/)?(?:claude-)?(opus|sonnet|haiku|fable)(?:\[[^\]]+\])?$/i;
+const CLAUDE_PROBED_NAME_VERSION_RE = /\b(?:claude\s+)?(opus|sonnet|haiku|fable)\s+(\d+(?:[.-]\d+)*)\b/i;
+
+/**
+ * Resolves a probed wire model ID + human display name into a specific versioned canonical ID and wire ID.
+ * Returns `null` for synthetic meta-aliases like `"default"` (already surfaced as a CLI-default row).
+ *
+ * For Claude ACP (`claude-agent-acp`), wire values are family aliases (`"opus"`, `"sonnet"`, `"fable"`, `"haiku"`)
+ * while the probed `name` carries the exact release (`"Opus 5.5"`, `"Fable 5.2"`). Only when `name` explicitly
+ * states a concrete version do we promote BOTH `canonicalId` (`"anthropic/claude-opus-5-5"`) and `wireModelId`
+ * (`"claude-opus-5-5"`), so `claude-agent-acp` enforces exact version compatibility on the wire and never
+ * silently converts a specific user model selection into an unversioned/unknown alias under the hood.
+ */
+export function resolveProbedModelIdentity(
+  wireModelId: string,
+  providerName: string,
+  probedName?: string,
+): { canonicalId: string; wireModelId: string } | null {
+  const trimmed = wireModelId.trim();
+  if (!trimmed) return null;
+  if (trimmed.toLowerCase() === "default") return null;
+
+  const inventoryId = canonicalModelId(trimmed, providerName);
+  const bareMatch = inventoryId.match(CLAUDE_BARE_FAMILY_RE);
+  if (bareMatch && (providerName.toLowerCase().includes("claude") || inventoryId.startsWith("anthropic/"))) {
+    const family = bareMatch[1]!.toLowerCase();
+    const nameMatch = probedName?.match(CLAUDE_PROBED_NAME_VERSION_RE);
+    if (nameMatch && nameMatch[1]!.toLowerCase() === family) {
+      const ver = nameMatch[2]!.replace(/\./g, "-");
+      const exactWire = `claude-${family}-${ver}`;
+      return { canonicalId: `anthropic/${exactWire}`, wireModelId: exactWire };
+    }
+  }
+  return { canonicalId: inventoryId, wireModelId: trimmed };
+}
+
+export function resolveProbedCanonicalId(
+  wireModelId: string,
+  providerName: string,
+  probedName?: string,
+): string | null {
+  return resolveProbedModelIdentity(wireModelId, providerName, probedName)?.canonicalId ?? null;
+}
 
 const EVIDENCE_STALE_AGE_MS = 30 * 86_400_000;
 const BROKEN_CATALOG_RETRY_TTL_MS = 2 * 60_000;
@@ -418,13 +453,9 @@ export class ModelCatalogCompiler {
 
     const lower = model.toLowerCase();
     const requestKeys = new Set(buildMatchKeys(model));
-    const claudeAlias = CLAUDE_ROUTE_ALIASES.get(lower);
-    const aliasRoute = candidates.find(({ route }) => route.runner === "acp" && route.provider === "claude" &&
-      route.wireModelId === claudeAlias);
     const pick =
       candidates.find((c) => c.route.wireModelId.toLowerCase() === lower) ??
       candidates.find((c) => c.entry.id.toLowerCase() === lower) ??
-      aliasRoute ??
       candidates
         .map((c) => {
           const keys = new Set([...buildMatchKeys(c.entry.id), ...buildMatchKeys(c.route.wireModelId)]);
@@ -438,7 +469,7 @@ export class ModelCatalogCompiler {
     const validEffort = effort && effort.toLowerCase() !== "default" ? effort : undefined;
     return {
       wireModelId: pick.route.wireModelId,
-      canonicalId: pick === aliasRoute ? lower : pick.entry.id,
+      canonicalId: pick.entry.id,
       ...(validEffort && (!efforts?.length || efforts.includes(validEffort)) ? { effort: validEffort } : {}),
     };
   }
@@ -601,8 +632,11 @@ export class ModelCatalogCompiler {
       const models = input.inventory.get(profile.id) ?? [];
       const providerName = profile.kind === "pi" ? profile.provider : profile.adapter;
       for (const m of models) {
-        const routeMd = routeMetadata.get(`${providerName}/${m.wireModelId}`);
-        const inventoryId = canonicalModelId(m.wireModelId, providerName);
+        const resolved = resolveProbedModelIdentity(m.wireModelId, providerName, m.name);
+        if (!resolved) continue;
+        const inventoryId = resolved.canonicalId;
+        const effectiveWireModelId = resolved.wireModelId;
+        const routeMd = routeMetadata.get(`${providerName}/${effectiveWireModelId}`) ?? routeMetadata.get(`${providerName}/${m.wireModelId}`);
         const linkedId = routeMd?.canonicalId ? canonicalModelId(routeMd.canonicalId, providerName) : undefined;
         // Some provider listings link dated or preview routes to an undated product page.
         // An exact provider route may identify its publisher only if its model ID is unchanged.
@@ -630,7 +664,7 @@ export class ModelCatalogCompiler {
           profileId: profile.id,
           runner: profile.kind,
           provider: providerName,
-          wireModelId: m.wireModelId, // keep original wire ID so ACP/Pi accepts it verbatim
+          wireModelId: effectiveWireModelId, // explicit concrete model ID when versioned, never silent family alias
           billing: profile.billing,
           supportedEfforts: m.supportedEfforts ?? routeMd?.supportedEfforts ?? md?.supportedEfforts ?? or?.supportedEfforts,
         };

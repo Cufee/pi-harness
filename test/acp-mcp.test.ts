@@ -67,7 +67,7 @@ describe("ACP role policies", () => {
           return { protocolVersion: 1, agentCapabilities: {}, agentInfo: claudeAgent };
         }).onRequest("session/new", async ({ params }) => {
           const options = (params._meta?.claudeCode as { options: { tools: string[]; disallowedTools: string[]; strictMcpConfig: boolean } }).options;
-          assert.deepEqual(options.tools, []);
+          assert.deepEqual(options.tools, ["ToolSearch"]);
           assert.equal(options.strictMcpConfig, true);
           for (const tool of ["Read", "Grep", "Glob", "Bash", "Write", "Edit", "Agent", "Task"]) assert.ok(options.disallowedTools.includes(tool), tool);
           assert.deepEqual(params.mcpServers.map(s => s.name), bridge ? ["harness"] : []);
@@ -229,7 +229,8 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
     assert.equal(ampVerifyCfg["amp.dangerouslyAllowAll"], false);
     const verifyPerms = ampVerifyCfg["amp.permissions"] as Array<{ tool: string; action: string }>;
     assert.ok(verifyPerms.some((r) => r.tool === "edit_file" && r.action === "reject"));
-    assert.ok(!verifyPerms.some((r) => r.tool === "shell_command"));
+    assert.ok(verifyPerms.some((r) => r.tool === "shell_command" && r.action === "allow"));
+    assert.ok(!verifyPerms.some((r) => r.tool === "shell_command" && r.action === "reject"));
     assert.ok((ampVerifyCfg["amp.tools.disable"] as string[]).includes("apply_patch"));
     assert.ok(!(ampVerifyCfg["amp.tools.disable"] as string[]).includes("shell_command"));
     ampVerifySpawn.cleanup();
@@ -759,6 +760,136 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
     } finally {
       rmSync(cwd, { recursive: true, force: true });
       rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("enables unattended yolo/bypass modes for writable ACPs and allows harness MCP tools across Claude, Gemini, and Antigravity/generic", async () => {
+    // 1. Gemini writable spawn adds --approval-mode=yolo; Amp writable sets dangerouslyAllowAll=true; Amp control_plane_only explicitly allows mcp__harness__*
+    const geminiSpawn = prepareAcpSpawn(
+      { id: "acp:gemini", kind: "acp", adapter: "gemini", command: "gemini", args: ["--acp"], billing: "subscription" },
+      { systemPrompt: "Worker", toolPolicy: "read_write_workspace" },
+    );
+    assert.ok(geminiSpawn.args.includes("--approval-mode=yolo"));
+    geminiSpawn.cleanup();
+
+    const ampWrite = prepareAcpSpawn(
+      { id: "acp:amp", kind: "acp", adapter: "generic", command: "npx", args: ["-y", "amp-acp"], billing: "subscription" },
+      { systemPrompt: "Worker", toolPolicy: "read_write_workspace" },
+    );
+    const ampWriteSettings = JSON.parse(readFileSync(ampWrite.env.AMP_SETTINGS_FILE!, "utf8")) as Record<string, unknown>;
+    assert.equal(ampWriteSettings["amp.dangerouslyAllowAll"], true);
+    ampWrite.cleanup();
+
+    const ampDir = prepareAcpSpawn(
+      { id: "acp:amp", kind: "acp", adapter: "generic", command: "npx", args: ["-y", "amp-acp"], billing: "subscription" },
+      { systemPrompt: "Director", toolPolicy: "control_plane_only" },
+    );
+    const ampDirSettings = JSON.parse(readFileSync(ampDir.env.AMP_SETTINGS_FILE!, "utf8")) as {
+      "amp.permissions"?: Array<{ tool: string; action: string }>;
+    };
+    assert.ok(ampDirSettings["amp.permissions"]?.some((r) => r.tool === "mcp__harness__*" && r.action === "allow"));
+    ampDir.cleanup();
+
+    // 2. Claude control_plane_only keeps ToolSearch + allowedTools for harness MCP
+    const claudeDir = buildNewSessionParams("claude", {
+      cwd: "/tmp",
+      systemPrompt: "Director",
+      toolPolicy: "control_plane_only",
+      model: "claude-opus-5-5",
+      mcpServers: [{ name: "harness", command: "bun", args: ["bridge.ts"], env: [] }],
+    });
+    const claudeOpts = (claudeDir.params._meta as { claudeCode: { options: { tools: string[]; allowedTools?: string[] } } }).claudeCode.options;
+    assert.deepEqual(claudeOpts.tools, ["ToolSearch"]);
+    assert.deepEqual(claudeOpts.allowedTools, ["ToolSearch", "mcp__harness__*"]);
+
+    // 3. Post-session mode auto-selection switches writable sessions into bypassPermissions / yolo
+    const modeActions = buildPostSessionActions(
+      "claude",
+      "s1",
+      {
+        configOptions: [
+          { id: "model", category: "model", currentValue: "opus", options: [{ value: "opus", name: "Opus 5.5" }] },
+          {
+            id: "mode",
+            category: "mode",
+            currentValue: "default",
+            options: [{ value: "default" }, { value: "acceptEdits" }, { value: "bypassPermissions" }],
+          },
+        ],
+      },
+      { toolPolicy: "read_write_workspace", model: "claude-opus-5-5" },
+    );
+    assert.deepEqual(modeActions, [
+      { method: "session/set_config_option", params: { sessionId: "s1", configId: "mode", value: "bypassPermissions" } },
+    ]);
+
+    const legacyModeActions = buildPostSessionActions(
+      "generic",
+      "s2",
+      {
+        models: { currentModelId: "gemini-4-neon", availableModels: [{ modelId: "gemini-4-neon" }] },
+        modes: { currentModeId: "manual", availableModes: [{ id: "manual" }, { id: "yolo" }] },
+      },
+      { toolPolicy: "read_write_workspace", model: "gemini-4-neon" },
+    );
+    assert.deepEqual(legacyModeActions, [{ method: "session/set_mode", params: { sessionId: "s2", modeId: "yolo" } }]);
+
+    // 4. Generic / Antigravity (`agy acp`) control_plane_only allows prefixed harness MCP calls (`mcp__harness__code_exec`, kind: "fetch")
+    // while still denying spoofed file reads with locations!
+    const cwd = mkdtempSync(join(tmpdir(), "acp-generic-mcp-"));
+    try {
+      const fixture = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {}, agentInfo: { name: "agy", version: "1.5" } }))
+        .onRequest("session/new", async () => ({
+          sessionId: "s-agy",
+          models: { currentModelId: "gemini-4-neon", availableModels: [{ modelId: "gemini-4-neon" }] },
+        }))
+        .onRequest("session/prompt", async ({ client, params: { sessionId } }) => {
+          const ask = async (toolCall: Record<string, unknown>) => {
+            const res = (await client.request("session/request_permission", {
+              sessionId,
+              toolCall,
+              options: [{ kind: "allow_always", optionId: "allow", name: "Allow" }, { kind: "reject_once", optionId: "deny", name: "Deny" }],
+            })) as { outcome: { outcome: string; optionId?: string } };
+            return res.outcome.outcome === "selected" ? res.outcome.optionId : res.outcome.outcome;
+          };
+          assert.equal(await ask({ toolCallId: "1", name: "mcp__harness__code_exec", kind: "fetch" }), "allow");
+          assert.equal(await ask({ toolCallId: "2", title: "harness:goal_list", kind: "execute" }), "allow");
+          assert.equal(await ask({ toolCallId: "3", title: "code_exec", kind: "read", locations: [{ path: join(cwd, "a.txt") }] }), "deny");
+          await client.notify("session/update", {
+            sessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "checked" } },
+          });
+          return { stopReason: "end_turn" };
+        });
+      const res = await new AcpRunner(profile("generic")).run(
+        {
+          runId: "run-agy",
+          taskId: "t-agy",
+          tier: 1,
+          kind: "orchestrator",
+          cwd,
+          model: "gemini-4-neon",
+          systemPrompt: "Director",
+          initialPrompt: "test",
+          maxTurns: 1,
+          toolPolicy: "control_plane_only",
+          daemonSocketPath: "/unused/socket",
+          mcpBridgeEntrypoint: "/unused/bridge",
+          tools: [
+            { name: "code_exec", description: "code_exec", inputSchema: {} },
+            { name: "goal_list", description: "goal_list", inputSchema: {} },
+          ],
+          executeTool: async () => ({}),
+          signal: new AbortController().signal,
+          callbacks: {},
+        },
+        fixture,
+      );
+      assert.equal(res.stopReason, "completed");
+      assert.equal(res.text, "checked");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
     }
   });
 });
