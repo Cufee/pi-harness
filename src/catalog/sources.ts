@@ -1,9 +1,10 @@
-import { inflateRawSync } from "node:zlib";
-
 export interface ModelsDevEntry {
   id: string;
   provider: string;
   name: string;
+  canonicalId?: string;
+  isCanonical?: boolean;
+  lastUpdated?: string;
   family?: string;
   releaseDate?: string;
   status?: string;
@@ -31,7 +32,31 @@ export type BenchmarkSourceName =
   | "openrouter_eng"
   | "openrouter_intel";
 
+export const RANKING_COHORT = {
+  source: "vals_tb4",
+  benchmark: "Terminal-Bench",
+  version: "4.0",
+  harness: "Mini-SWE-agent",
+  metric: "Overall accuracy (avg@3 pass@1)",
+  unit: "percent",
+  sourceUrl: "https://www.vals.ai/benchmarks/terminal-bench-4",
+  settings: "66 tasks, 3 runs, 8-hour task limit, Vals headline effort per model",
+} as const;
+
+export interface BenchmarkEvidence {
+  benchmark: string;
+  version: string;
+  harness: string;
+  metric: string;
+  unit: string;
+  sourceUrl: string;
+  revision: string;
+  asOf: string;
+  settings?: string;
+}
+
 export interface BenchmarkMetricRow {
+  evidence?: BenchmarkEvidence;
   source: BenchmarkSourceName;
   rawModelName: string;
   canonicalKeyHint?: string;
@@ -45,7 +70,8 @@ export interface BenchmarkMetricRow {
 export interface OpenRouterModelMeta {
   id: string;
   canonicalSlug?: string;
-  created?: number;
+  created?: number; // OpenRouter listing timestamp
+  expirationDate?: string;
   contextLength?: number;
   supportedEfforts?: string[];
   aaIntelligenceIndex?: number;
@@ -83,356 +109,242 @@ async function fetchText(url: string, timeoutMs = 15_000): Promise<string | null
   }
 }
 
+type JsonObject = Record<string, unknown>;
+
+function object(value: unknown): value is JsonObject {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function string(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function nonNegative(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function strings(value: unknown): string[] | undefined {
+  return Array.isArray(value) && value.every((v) => typeof v === "string") ? value : undefined;
+}
+
+function isoDate(value: unknown): string | undefined {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return undefined;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) && date.toISOString().startsWith(value) ? value : undefined;
+}
+
+function modelEntry(id: string, provider: string, m: JsonObject, isCanonical: boolean): ModelsDevEntry {
+  const limit = object(m.limit) ? m.limit : {};
+  const cost = object(m.cost) ? m.cost : {};
+  const input = nonNegative(cost.input);
+  const output = nonNegative(cost.output);
+  const effort = Array.isArray(m.reasoning_options)
+    ? m.reasoning_options.find((option) => object(option) && option.type === "effort")
+    : undefined;
+  return {
+    id,
+    provider,
+    isCanonical,
+    canonicalId: isCanonical ? provider + "/" + id : string(m.canonical_model_id),
+    name: string(m.name) ?? id,
+    family: string(m.family),
+    releaseDate: string(m.release_date),
+    lastUpdated: string(m.last_updated),
+    status: string(m.status),
+    toolCall: typeof m.tool_call === "boolean" ? m.tool_call : undefined,
+    reasoning: typeof m.reasoning === "boolean" ? m.reasoning : undefined,
+    supportedEfforts: strings(effort?.values),
+    contextWindow: nonNegative(limit.context),
+    maxOutput: nonNegative(limit.output),
+    cost: input !== undefined && output !== undefined
+      ? { input, output, cacheRead: nonNegative(cost.cache_read), cacheWrite: nonNegative(cost.cache_write) }
+      : undefined,
+    modalities: object(m.modalities) ? { input: strings(m.modalities.input), output: strings(m.modalities.output) } : undefined,
+  };
+}
+
 export async function fetchModelsDev(): Promise<ModelsDevEntry[]> {
-  const data = await fetchJson<Record<string, { models?: Record<string, Record<string, unknown>> }>>(
-    "https://models.dev/api.json",
-  );
+  const data = await fetchJson<JsonObject>("https://models.dev/catalog.json");
   if (!data) return [];
-
   const entries: ModelsDevEntry[] = [];
-  for (const [provider, provObj] of Object.entries(data)) {
-    const models = provObj?.models;
-    if (!models) continue;
-    for (const [id, m] of Object.entries(models)) {
-      const cost = m.cost as Record<string, number> | undefined;
-      const limit = m.limit as Record<string, number> | undefined;
-      const modalities = m.modalities as { input?: string[]; output?: string[] } | undefined;
-      const reasoningOpts = m.reasoning_options as { effort?: string[] } | undefined;
-
-      entries.push({
-        id,
-        provider,
-        name: String(m.name ?? id),
-        family: typeof m.family === "string" ? m.family : undefined,
-        releaseDate: typeof m.release_date === "string" ? m.release_date : undefined,
-        status: typeof m.status === "string" ? m.status : undefined,
-        toolCall: m.tool_call === undefined ? true : Boolean(m.tool_call),
-        reasoning: Boolean(m.reasoning),
-        supportedEfforts: Array.isArray(reasoningOpts?.effort) ? reasoningOpts.effort : undefined,
-        contextWindow: limit?.context,
-        maxOutput: limit?.output,
-        cost: cost
-          ? { input: cost.input ?? 0, output: cost.output ?? 0, cacheRead: cost.cache_read, cacheWrite: cost.cache_write }
-          : undefined,
-        modalities,
-      });
+  for (const [provider, route] of Object.entries(data.providers ?? {})) {
+    if (!object(route) || !object(route.models)) continue;
+    for (const [id, m] of Object.entries(route.models)) {
+      if (object(m)) entries.push(modelEntry(id, provider, m, false));
     }
+  }
+  for (const [key, m] of Object.entries(data.models ?? {})) {
+    const slash = key.indexOf("/");
+    if (slash > 0 && object(m)) entries.push(modelEntry(key.slice(slash + 1), key.slice(0, slash), m, true));
   }
   return entries;
 }
 
-export async function fetchOpenRouterMetadata(): Promise<OpenRouterModelMeta[]> {
-  const raw = await fetchJson<{ data?: Array<Record<string, unknown>> }>("https://openrouter.ai/api/v1/models");
-  if (!raw?.data) return [];
-  return raw.data.map((m) => {
-    const pricing = m.pricing as Record<string, string> | undefined;
-    const reasoning = m.reasoning as { supported_efforts?: string[] } | undefined;
-    const benchmarks = m.benchmarks as
-      | {
-          artificial_analysis?: { intelligence_index?: number; engineering_index?: number };
-          design_arena?: Array<{ category?: string; win_rate?: number }>;
-        }
-      | undefined;
-    const codeArena = benchmarks?.design_arena?.find((d) => d.category === "codecategories")?.win_rate;
-    return {
-      id: String(m.id ?? ""),
-      canonicalSlug: typeof m.canonical_slug === "string" ? m.canonical_slug : undefined,
-      created: typeof m.created === "number" ? m.created : undefined,
-      contextLength: typeof m.context_length === "number" ? m.context_length : undefined,
-      supportedEfforts: reasoning?.supported_efforts,
-      aaIntelligenceIndex:
-        typeof benchmarks?.artificial_analysis?.intelligence_index === "number"
-          ? benchmarks.artificial_analysis.intelligence_index
-          : undefined,
-      aaEngineeringIndex:
-        typeof benchmarks?.artificial_analysis?.engineering_index === "number"
-          ? benchmarks.artificial_analysis.engineering_index
-          : undefined,
-      codeArenaWinRate: typeof codeArena === "number" ? codeArena : undefined,
-      costPer1mInput: pricing?.prompt ? Number(pricing.prompt) * 1_000_000 : undefined,
-      costPer1mOutput: pricing?.completion ? Number(pricing.completion) * 1_000_000 : undefined,
-    };
-  });
+function pricePerMillion(value: unknown): number | undefined {
+  return typeof value === "string" && value.trim() ? nonNegative(Number(value) * 1_000_000) : undefined;
 }
 
-export async function fetchLiteLlmDeprecations(): Promise<Map<string, { deprecationDate?: string; successorModel?: string }>> {
-  const raw = await fetchJson<Record<string, Record<string, unknown>>>(
+export async function fetchOpenRouterMetadata(): Promise<OpenRouterModelMeta[]> {
+  const url = "https://openrouter.ai/api/v1/models";
+  const rows: OpenRouterModelMeta[] = [];
+  let page = url;
+  const seen = new Set<string>();
+  while (!seen.has(page)) {
+    seen.add(page);
+    const raw: JsonObject | null = await fetchJson<JsonObject>(page);
+    if (!Array.isArray(raw?.data)) return [];
+    for (const m of raw.data) {
+      if (!object(m) || typeof m.id !== "string") continue;
+      const pricing = object(m.pricing) ? m.pricing : {};
+      rows.push({
+        id: m.id,
+        canonicalSlug: string(m.canonical_slug),
+        created: nonNegative(m.created),
+        expirationDate: isoDate(m.expiration_date),
+        contextLength: nonNegative(m.context_length),
+        supportedEfforts: object(m.reasoning) ? strings(m.reasoning.supported_efforts) : undefined,
+        costPer1mInput: pricePerMillion(pricing.prompt),
+        costPer1mOutput: pricePerMillion(pricing.completion),
+      });
+    }
+    const next: unknown = object(raw.links) ? raw.links.next : null;
+    if (!next) return rows;
+    if (typeof next !== "string" || !URL.canParse(next, url)) return [];
+    const resolved = new URL(next, url);
+    if (resolved.origin + resolved.pathname !== url) return [];
+    page = resolved.href;
+  }
+  return [];
+}
+
+interface Deprecation {
+  deprecationDate?: string;
+  successorModel?: string;
+  deprecationSource?: string;
+}
+
+export async function fetchLiteLlmDeprecations(): Promise<Map<string, Deprecation>> {
+  const raw = await fetchJson<JsonObject>(
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
   );
-  const out = new Map<string, { deprecationDate?: string; successorModel?: string }>();
-  if (!raw) return out;
-  for (const [k, v] of Object.entries(raw)) {
-    if (typeof v !== "object" || !v) continue;
-    const dep = typeof v.deprecation_date === "string" ? v.deprecation_date : undefined;
-    const succ = typeof v.successor_model === "string" ? v.successor_model : undefined;
-    if (dep || succ) out.set(k.toLowerCase(), { deprecationDate: dep, successorModel: succ });
-  }
-  return out;
-}
-
-/**
- * Vals.ai standardized Mini-SWE-agent leaderboards (Terminal-Bench 4.0 + SWE-bench).
- * Provides 70–88 models keyed directly by canonical `provider/model` IDs with
- * `accuracy`, `cost_per_test`, `latency`, and `avg_turns`.
- */
-export async function fetchValsAiBenchmarks(): Promise<BenchmarkMetricRow[]> {
-  const specs: Array<{ url: string; source: BenchmarkSourceName }> = [
-    { url: "https://www.vals.ai/benchmarks/terminal-bench-4", source: "vals_tb4" },
-    { url: "https://www.vals.ai/benchmarks/swebench", source: "vals_swebench" },
-  ];
-
-  const all: BenchmarkMetricRow[] = [];
-  await Promise.all(
-    specs.map(async ({ url, source }) => {
-      const html = await fetchText(url);
-      if (!html) return;
-      const assetMatch = html.match(/\/_astro\/benchmark_view_[^"']+\.json/);
-      if (!assetMatch) return;
-      const json = await fetchJson<{ tasks?: { overall?: Record<string, Record<string, unknown>> } }>(
-        `https://www.vals.ai${assetMatch[0]}`,
-      );
-      const overall = json?.tasks?.overall;
-      if (!overall) return;
-      for (const [modelKey, row] of Object.entries(overall)) {
-        const acc = typeof row.accuracy === "number" ? row.accuracy : undefined;
-        if (acc === undefined) continue;
-        const turnMetrics = row.turn_metrics as { avg_turns?: number } | undefined;
-        all.push({
-          source,
-          rawModelName: modelKey,
-          canonicalKeyHint: modelKey,
-          effort:
-            typeof row.compute_effort === "string"
-              ? row.compute_effort
-              : typeof row.reasoning_effort === "string"
-                ? row.reasoning_effort
-                : null,
-          codingScore: acc <= 1 ? acc * 100 : acc,
-          costPerTaskUsd: typeof row.cost_per_test === "number" ? row.cost_per_test : undefined,
-          timePerTaskSeconds: typeof row.latency === "number" ? row.latency : undefined,
-          turnsPerTask: typeof turnMetrics?.avg_turns === "number" ? turnMetrics.avg_turns : undefined,
-        });
-      }
-    }),
-  );
-  return all;
-}
-
-/** Harbor Hub / Terminal-Bench 4.1 (zero-auth, updated continuously with accuracy, cost/task, time/task). */
-export async function fetchHarborTerminalBench(): Promise<BenchmarkMetricRow[]> {
-  const raw = await fetchJson<
-    Array<Record<string, unknown>> | { rows?: Array<Record<string, unknown>>; data?: Array<Record<string, unknown>> }
-  >("https://ofhuhcpkvzjlejydnvyd.supabase.co/functions/v1/leaderboard-read", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ package: "terminal-bench/terminal-bench", name: "4-1-0" }),
-  });
-  const rows = Array.isArray(raw) ? raw : raw?.rows ?? raw?.data ?? [];
-  const out: BenchmarkMetricRow[] = [];
-  for (const r of rows) {
-    const meta = (r.metadata ?? {}) as Record<string, unknown>;
-    const metrics = (r.metrics ?? {}) as Record<string, unknown>;
-    const modelDisplay = (meta.model_display as { label?: string } | undefined)?.label ?? String(meta.model ?? "");
-    const modelOrg = (meta.model_org as { label?: string } | undefined)?.label ?? "";
-    const nTrials = Number(r.n_trials ?? 0);
-    const totalCost = typeof metrics.total_cost_usd === "number" ? metrics.total_cost_usd : undefined;
-    const accuracy = typeof metrics.accuracy === "number" ? metrics.accuracy : undefined;
-    const duration = typeof metrics.avg_trial_duration_sec === "number" ? metrics.avg_trial_duration_sec : undefined;
-    if (!modelDisplay || accuracy === undefined) continue;
-    out.push({
-      source: "harbor_tb4",
-      rawModelName: modelDisplay,
-      canonicalKeyHint: modelOrg ? `${modelOrg.toLowerCase()}/${modelDisplay}` : undefined,
-      effort: typeof meta.reasoning_effort === "string" ? meta.reasoning_effort : null,
-      codingScore: accuracy <= 1 ? accuracy * 100 : accuracy,
-      costPerTaskUsd: totalCost !== undefined && nTrials > 0 ? totalCost / nTrials : undefined,
-      timePerTaskSeconds: duration,
-    });
-  }
-  return out;
-}
-
-/** PinchBench official agentic leaderboard (zero-auth). */
-export async function fetchPinchBench(): Promise<BenchmarkMetricRow[]> {
-  const raw = await fetchJson<{ leaderboard?: Array<Record<string, unknown>>; data?: Array<Record<string, unknown>> }>(
-    "https://api.pinchbench.com/api/leaderboard?official=true&limit=200",
-  );
-  const rows = raw?.leaderboard ?? raw?.data ?? [];
-  const out: BenchmarkMetricRow[] = [];
-  for (const r of rows) {
-    const model = typeof r.model === "string" ? r.model : "";
-    const score =
-      typeof r.average_score_percentage === "number"
-        ? r.average_score_percentage
-        : typeof r.best_score_percentage === "number"
-          ? r.best_score_percentage
-          : undefined;
-    if (!model || score === undefined) continue;
-    out.push({
-      source: "pinchbench",
-      rawModelName: model,
-      canonicalKeyHint: model,
-      codingScore: score <= 1 ? score * 100 : score,
-    });
-  }
-  return out;
-}
-
-/** Optional Artificial Analysis V2 Pro `/api/v2/language/agents/coding` enrichment. */
-export async function fetchArtificialAnalysisPro(apiKey?: string): Promise<BenchmarkMetricRow[]> {
-  if (!apiKey) return [];
-  const raw = await fetchJson<{ data?: Array<Record<string, unknown>> }>(
-    "https://artificialanalysis.ai/api/v2/language/agents/coding",
-    { headers: { "x-api-key": apiKey } },
-  );
-  if (!raw?.data) return [];
-  const out: BenchmarkMetricRow[] = [];
-  for (const row of raw.data) {
-    const model = (row.model ?? {}) as Record<string, unknown>;
-    const score = typeof row.coding_agent_index === "number" ? row.coding_agent_index : undefined;
-    if (score === undefined) continue;
-    out.push({
-      source: "aa_pro",
-      rawModelName: String(model.release_name ?? model.name ?? model.slug ?? ""),
-      canonicalKeyHint: typeof model.release_slug === "string" ? `${row.provider ?? ""}/${model.release_slug}` : undefined,
-      effort: typeof model.effort === "string" ? model.effort : null,
-      codingScore: score,
-      costPerTaskUsd: typeof row.cost_per_task === "number" ? row.cost_per_task : undefined,
-      timePerTaskSeconds: typeof row.time_per_task_seconds === "number" ? row.time_per_task_seconds : undefined,
-      turnsPerTask: typeof row.turns_per_task === "number" ? row.turns_per_task : undefined,
-    });
-  }
-  return out;
-}
-
-/**
- * Reliable ZIP Central Directory extractor for Epoch AI `benchmark_data.zip`
- * (works on streaming data-descriptor ZIPs where local headers have compSize=0!).
- * Extracts all 6 coding benchmarks in a single download.
- */
-export async function fetchEpochAiCodingBenchmarks(): Promise<BenchmarkMetricRow[]> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 20_000);
-  try {
-    const res = await fetch("https://epoch.ai/data/benchmark_data.zip", { signal: ctrl.signal });
-    if (!res.ok) return [];
-    const buf = Buffer.from(await res.arrayBuffer());
-    const targets: Array<{ file: string; source: BenchmarkSourceName }> = [
-      { file: "frontierswe_external.csv", source: "epoch_frontierswe" },
-      { file: "terminalbench_external.csv", source: "epoch_terminalbench" },
-      { file: "cursorbench_external.csv", source: "epoch_cursorbench" },
-      { file: "frontiercode_external.csv", source: "epoch_frontiercode" },
-      { file: "deepswe_external.csv", source: "epoch_deepswe" },
-      { file: "swe_bench_verified.csv", source: "epoch_swebench" },
-    ];
-    const extracted = extractFilesFromZipCentralDir(
-      buf,
-      targets.map((t) => t.file),
-    );
-    const all: BenchmarkMetricRow[] = [];
-    for (const { file, source } of targets) {
-      const csv = extracted.get(file);
-      if (csv) all.push(...parseEpochCsv(csv, source));
-    }
-    return all;
-  } catch {
-    return [];
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function extractFilesFromZipCentralDir(buf: Buffer, suffixes: string[]): Map<string, string> {
-  const out = new Map<string, string>();
-  let eocd = -1;
-  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65558); i--) {
-    if (buf.readUInt32LE(i) === 0x06054b50) {
-      eocd = i;
-      break;
+  const out = new Map<string, Deprecation>();
+  for (const [k, v] of Object.entries(raw ?? {})) {
+    if (k === "sample_spec" || !object(v)) continue;
+    const deprecationDate = isoDate(v.deprecation_date);
+    const successorModel = string(v.successor_model);
+    if (deprecationDate || successorModel) {
+      out.set(k.toLowerCase(), { deprecationDate, successorModel, deprecationSource: string(v.deprecation_source) });
     }
   }
-  if (eocd === -1) return out;
+  return out;
+}
 
-  const cdCount = buf.readUInt16LE(eocd + 10);
-  const cdOffset = buf.readUInt32LE(eocd + 16);
-  let pos = cdOffset;
+// Vals model cards link their internal selectedModel keys to these public names.
+// The Mistral preview and release have distinct cards despite the unsuffixed preview key.
+const valsModelAliases: Record<string, { card?: string; name: string; id: string }> = {
+  "google/cobalt-c-high-1p00": { card: "google_gemini-4-neon", name: "Gemini 4 Neon", id: "google/gemini-4-neon" },
+  "alibaba/qwen3.8-max-internal": { card: "alibaba_qwen3.8-max-0902", name: "Qwen 3.8 Max 0902", id: "alibaba/qwen3.8-max-0902" },
+  "thinkingmachines/inkling-mini-1117": { card: "thinkingmachines_inkling-2-mini", name: "Inkling 2 Mini", id: "thinkingmachines/inkling-2-mini" },
+  "mistralai/mistral-large-4-oss": { name: "Mistral Large 4", id: "mistralai/mistral-large-4-oss" },
+  "kimi/kimi-k3": { name: "Kimi K3", id: "moonshotai/kimi-k3" },
+  "kimi/kimi-k3.1-pro": { name: "Kimi K3.1 Pro", id: "moonshotai/kimi-k3.1-pro" },
+  "meta/muse-wonder": { name: "Wonder", id: "meta/muse-wonder-1.0" },
+  "meta/muse-wonder-full": { name: "Wonder Full", id: "meta/muse-wonder-full" },
+  "meta/muse-ember": { name: "Muse Ember", id: "meta/muse-ember-1.0" },
+  "meta/muse_spark_1_2": { name: "Muse Spark 1.2", id: "meta/muse-spark-1.2" },
+  "meta/muse_spark_1_3": { name: "Muse Spark 1.3", id: "meta/muse-spark-1.3" },
+  "meta/muse_spark_1_3_max": { name: "Muse Spark 1.3 Max", id: "meta/muse-spark-1.3-max" },
+  "grok/grok-4.5": { name: "Grok 4.5", id: "xai/grok-4.5" },
+  "grok/grok-4.6": { name: "Grok 4.6", id: "xai/grok-4.6" },
+  "grok/grok-4.7": { name: "Grok 4.7", id: "xai/grok-4.7" },
+};
 
-  for (let i = 0; i < cdCount && pos + 46 <= buf.length; i++) {
-    if (buf.readUInt32LE(pos) !== 0x02014b50) break;
-    const compression = buf.readUInt16LE(pos + 10);
-    const compSize = buf.readUInt32LE(pos + 20);
-    const nameLen = buf.readUInt16LE(pos + 28);
-    const extraLen = buf.readUInt16LE(pos + 30);
-    const commentLen = buf.readUInt16LE(pos + 32);
-    const localHeaderOffset = buf.readUInt32LE(pos + 42);
-    const name = buf.subarray(pos + 46, pos + 46 + nameLen).toString("utf8");
-    pos += 46 + nameLen + extraLen + commentLen;
+function labelWords(label: string): string {
+  return label.toLowerCase().match(/[a-z]+|[0-9]+/g)?.join("-") ?? "";
+}
 
-    const matchedSuffix = suffixes.find((s) => name === s || name.endsWith(`/${s}`));
-    if (!matchedSuffix) continue;
-
-    if (localHeaderOffset + 30 > buf.length || buf.readUInt32LE(localHeaderOffset) !== 0x04034b50) continue;
-    const lhNameLen = buf.readUInt16LE(localHeaderOffset + 26);
-    const lhExtraLen = buf.readUInt16LE(localHeaderOffset + 28);
-    const dataStart = localHeaderOffset + 30 + lhNameLen + lhExtraLen;
-    const payload = buf.subarray(dataStart, dataStart + compSize);
+function hasPublishedDate(html: string, asOf: string): boolean {
+  for (const [, json] of html.matchAll(/<script type="application\/ld\+json">([^<]+)<\/script>/g)) {
     try {
-      if (compression === 0) out.set(matchedSuffix, payload.toString("utf8"));
-      else if (compression === 8) out.set(matchedSuffix, inflateRawSync(payload).toString("utf8"));
+      const data: unknown = JSON.parse(json!);
+      const entries = Array.isArray(data) ? data : [data];
+      if (entries.some((entry) => object(entry) && entry["@type"] === "Dataset" &&
+          entry.url === RANKING_COHORT.sourceUrl && entry.name === "Terminal-Bench 4.0 leaderboard" &&
+          entry.dateModified === asOf)) return true;
     } catch {
-      // skip corrupt entry
+      continue;
     }
   }
-  return out;
+  return false;
 }
 
-function parseEpochCsv(csv: string, source: BenchmarkSourceName): BenchmarkMetricRow[] {
-  const lines = csv.split(/\r?\n/).filter((l) => l.trim().length > 0);
-  if (lines.length < 2) return [];
-  const headers = splitCsvLine(lines[0]!).map((h) => h.toLowerCase());
-  const idxModel = headers.findIndex((h) => h.includes("model"));
-  const idxScore = headers.findIndex(
-    (h) => h === "score" || h.includes("resolved") || h.includes("pass@1") || h.includes("accuracy") || h.includes("mean score"),
-  );
-  const idxCost = headers.findIndex((h) => h.includes("cost"));
-  const idxDur = headers.findIndex((h) => h.includes("duration") || h.includes("seconds"));
-  if (idxModel === -1 || idxScore === -1) return [];
+function publishedScores(html: string) {
+  const cards = new Map<string, { name: string; percent: number }>();
+  const pattern = /<th scope="row">\s*<a href="\/models\/([^"]+)">([^<]+)<\/a>\s*<\/th>\s*<td>Mini-SWE-agent<\/td>\s*<td>(\d+(?:\.\d+)?)%<\/td>/g;
+  for (const [, card, name, percent] of html.matchAll(pattern)) {
+    if (card && name) cards.set(card, { name, percent: Number(percent) });
+  }
+  return cards;
+}
 
-  const durIsHours = idxDur >= 0 && headers[idxDur]!.includes("hour");
-  const out: BenchmarkMetricRow[] = [];
-  for (let i = 1; i < lines.length; i++) {
-    const cols = splitCsvLine(lines[i]!);
-    const name = cols[idxModel];
-    const score = Number(cols[idxScore]?.replace("%", ""));
-    if (!name || !Number.isFinite(score)) continue;
-    const cost = idxCost >= 0 ? Number(cols[idxCost]?.replace("$", "")) : NaN;
-    const dur = idxDur >= 0 ? Number(cols[idxDur]) : NaN;
-    out.push({
-      source,
-      rawModelName: name,
-      codingScore: score <= 1 ? score * 100 : score,
-      costPerTaskUsd: Number.isFinite(cost) ? cost : undefined,
-      timePerTaskSeconds: Number.isFinite(dur) ? (durIsHours ? dur * 3600 : dur) : undefined,
+export async function fetchValsAiBenchmarks(): Promise<BenchmarkMetricRow[]> {
+  const cohort = RANKING_COHORT;
+  const html = await fetchText(cohort.sourceUrl);
+  if (!html ||
+      !html.includes("All results reported are avg@3: each model is run through the full benchmark three times, each run scored as pass@1 (one attempt per task)") ||
+      !html.includes("Each task has an 8-hour agent time limit,") ||
+      !html.includes("All 66 tasks are new")) return [];
+  const assets = new Set(Array.from(
+    html.matchAll(/href="(\/_astro\/benchmark_view_terminal_bench_4\.[a-zA-Z0-9_-]+\.json)"/g),
+    (match) => match[1]!,
+  ));
+  if (assets.size !== 1) return [];
+  const revision = new URL([...assets][0]!, cohort.sourceUrl).href;
+  const data = await fetchJson<JsonObject>(revision);
+  const meta = data?.metadata;
+  if (!object(meta) || meta.benchmark_id !== "terminal_bench_4" || meta.version !== cohort.version ||
+      meta.benchmark !== "Terminal-Bench 4.0" || meta.family !== "terminal_bench" || meta.mode !== "agentic" ||
+      meta.harness !== cohort.harness || meta.slug !== "terminal-bench-4" || meta.runner !== "external" ||
+      meta.token_tasks_measured !== 66 || meta.archived !== false) return [];
+  const asOf = isoDate(meta.updated);
+  if (!asOf || !hasPublishedDate(html, asOf)) return [];
+  const overall = object(data?.tasks) ? data.tasks.overall : null;
+  if (!object(overall) || !Array.isArray(meta.models) || meta.total_models !== Object.keys(overall).length) return [];
+  const models = new Set(meta.models);
+  const published = publishedScores(html);
+  const evidence: BenchmarkEvidence = { ...cohort, revision, asOf };
+  const rows: BenchmarkMetricRow[] = [];
+  for (const [key, row] of Object.entries(overall)) {
+    if (!models.has(key) || !object(row) || row.token_tasks_measured !== 66 ||
+        (row.harness !== null && row.harness !== cohort.harness)) continue;
+    const score = nonNegative(row.accuracy);
+    const alias = valsModelAliases[key];
+    const card = published.get(alias?.card ?? key.replace("/", "_"));
+    if (!card || score === undefined || score > 100 || Math.abs(card.percent - score) > 0.00501) continue;
+    const model = key.split("/")[1];
+    if (!model || (alias ? card.name !== alias.name : labelWords(model) !== labelWords(card.name))) continue;
+    const computeEffort = string(row.compute_effort);
+    const reasoningEffort = string(row.reasoning_effort);
+    if (computeEffort && reasoningEffort && computeEffort !== reasoningEffort) continue;
+    const effort = computeEffort ?? reasoningEffort;
+    if (!effort?.trim()) continue;
+    rows.push({
+      source: cohort.source,
+      rawModelName: key,
+      canonicalKeyHint: alias?.id ?? key,
+      effort,
+      codingScore: score,
+      evidence,
+      costPerTaskUsd: nonNegative(row.cost_per_test),
+      timePerTaskSeconds: nonNegative(row.latency),
+      turnsPerTask: object(row.turn_metrics) ? nonNegative(row.turn_metrics.avg_turns) : undefined,
     });
   }
-  return out;
+  return rows;
 }
 
-function splitCsvLine(line: string): string[] {
-  const out: string[] = [];
-  let cur = "";
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i]!;
-    if (ch === '"') {
-      inQuotes = !inQuotes;
-    } else if (ch === "," && !inQuotes) {
-      out.push(cur.trim());
-      cur = "";
-    } else {
-      cur += ch;
-    }
-  }
-  out.push(cur.trim());
-  return out;
-}
+// These exported entry points have no observations in the selected ranking protocol.
+export async function fetchHarborTerminalBench(): Promise<BenchmarkMetricRow[]> { return []; }
+export async function fetchEpochAiCodingBenchmarks(): Promise<BenchmarkMetricRow[]> { return []; }
+export async function fetchPinchBench(): Promise<BenchmarkMetricRow[]> { return []; }
+export async function fetchArtificialAnalysisPro(_apiKey?: string): Promise<BenchmarkMetricRow[]> { return []; }
