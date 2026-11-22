@@ -497,9 +497,12 @@ export class HarnessDaemon {
       ev.type === "worktree.created" ||
       ev.type === "worktree.removed" ||
       ev.type === "quota.agent_paused" ||
+      ev.type === "quota.agent_retrying" ||
       ev.type === "quota.run_paused" ||
       ev.type === "quota.run_scheduled" ||
-      ev.type === "quota.run_resumed"
+      ev.type === "quota.run_resumed" ||
+      ev.type === "agent.timer_sleep" ||
+      ev.type === "agent.rollover"
     ) {
       const evRepoRoot = this.db.getRun(ev.runId)?.repoRoot ?? null;
       for (const sock of this.chatSubscribers) {

@@ -748,10 +748,15 @@ function createSharedShell(spec: SharedShellContext) {
     }
   };
 
+  const initialHud = store.buildLiveHud();
   dock = new FixedDock(session.tui, theme, {
     autocomplete: createCommandAutocomplete(spec.mode),
     initialState: {
-      slots: [],
+      slots: initialHud.slots,
+      agentCounts: initialHud.agentCounts,
+      hudItems: initialHud.hudItems,
+      hudSecondaryLine: initialHud.hudSecondaryLine,
+      activeGoalsCount: initialHud.activeGoalsCount,
       idleBanner: spec.getIdleBanner(),
       busy: false,
       phaseText: "Ready",
@@ -787,8 +792,13 @@ function createSharedShell(spec: SharedShellContext) {
   });
 
   const syncDock = () => {
+    const hud = store.buildLiveHud();
     dock.update({
-      slots: store.buildAttentionSlots(5),
+      slots: hud.slots,
+      agentCounts: hud.agentCounts,
+      hudItems: hud.hudItems,
+      hudSecondaryLine: hud.hudSecondaryLine,
+      activeGoalsCount: hud.activeGoalsCount,
       idleBanner: spec.getIdleBanner(),
       busy,
       phaseText,
@@ -827,6 +837,12 @@ function createSharedShell(spec: SharedShellContext) {
     if (dock.tickSpinner()) session.tui.requestRender();
   }, 120);
   spinTimer.unref?.();
+
+  // Gentle live telemetry poll ONLY while goals/agents are in flight so currentAction stays fresh between status transitions.
+  const hudPollTimer = setInterval(() => {
+    if (store.hasLiveWork()) void store.refresh();
+  }, 3000);
+  hudPollTimer.unref?.();
 
   // Global keyboard shortcuts when no overlay is open
   session.start((data) => {
@@ -927,6 +943,7 @@ function createSharedShell(spec: SharedShellContext) {
     async waitAndCleanup(): Promise<TuiExitAction> {
       await session.done;
       clearInterval(spinTimer);
+      clearInterval(hudPollTimer);
       unsubStore();
       store.dispose();
       return exitAction;
