@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "bun:test";
@@ -19,8 +19,10 @@ import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import { DirectorSessionStore } from "../src/director/session.js";
 import { GoalEngine, shouldRunIndependentReview, type GoalRecord } from "../src/goals/engine.js";
+import { QuotaClient } from "../src/quota/client.js";
+import { parseCodexRateLimitsFromJsonl } from "../src/quota/local-harvest.js";
 import { isSubagentWaitTool } from "../src/tui/app.js";
-import { ModelConfigOverlay, ModelPickerOverlay } from "../src/tui/overlays.js";
+import { ModelConfigOverlay, ModelPickerOverlay, QuotaOverlay } from "../src/tui/overlays.js";
 import { effectiveRunStatus } from "../src/tui/runs-tree.js";
 import { renderToolOutput, type ToolDisplayPayload } from "../src/tui/tool-output/index.js";
 import {
@@ -842,6 +844,188 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
       assert.equal(behRes.goal.status, "achieved");
       assert.equal(reviewerRuns, 1);
     } finally {
+      await daemon.stop();
+      rmSync(repoDir, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("harvests local/passive ACP quota without an endpoint and displays it alongside the settings note", () => {
+    const codexHome = mkdtempSync(join(tmpdir(), "pi-harness-codex-quota-"));
+    try {
+      const sessDir = join(codexHome, "sessions", "2026", "11", "22");
+      mkdirSync(sessDir, { recursive: true });
+      const futureResetSec = Math.floor((Date.now() + 3 * 3600_000) / 1000);
+      const jsonl = [
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          type: "event_msg",
+          payload: {
+            type: "token_count",
+            rate_limits: {
+              limit_id: "codex",
+              primary: { used_percent: 42.5, window_minutes: 300, resets_at: futureResetSec },
+              secondary: { used_percent: 90.0, window_minutes: 10080, resets_at: futureResetSec + 86400 },
+              credits: { has_credits: true, unlimited: false, balance: null },
+            },
+          },
+        }),
+      ].join("\n");
+      writeFileSync(join(sessDir, "rollout-2026-11-22T09-00-00-test.jsonl"), jsonl, "utf8");
+
+      const parsed = parseCodexRateLimitsFromJsonl(jsonl);
+      assert.ok(parsed);
+      assert.equal(parsed!.snapshots.length, 1);
+      assert.equal(parsed!.snapshots[0]!.primary?.used_percent, 42.5);
+
+      const profiles = [
+        { id: "acp:codex", kind: "acp" as const, adapter: "codex" as const, command: "codex-acp", billing: "subscription" as const, enabled: true },
+        { id: "acp:claude", kind: "acp" as const, adapter: "claude" as const, command: "claude-agent-acp", billing: "subscription" as const, enabled: true },
+        { id: "acp:amp", kind: "acp" as const, adapter: "generic" as const, command: "amp-acp", billing: "subscription" as const, enabled: true },
+      ];
+
+      // No endpoint configured!
+      const quota = new QuotaClient();
+      assert.equal(quota.isConfigured(), false);
+      const count = quota.harvestLocal(profiles, { codexHome, force: true });
+      assert.equal(count, 1);
+
+      // Also ingest a live Claude passive ACP signal
+      quota.ingestPassiveSignal({
+        profileId: "acp:claude",
+        model: "opus",
+        raw: { status: "allowed", rateLimitType: "five_hour", utilization: 0.35, resetsAt: futureResetSec },
+        observedAt: Date.now(),
+      });
+
+      const effJson = quota.getEffectiveSnapshotJson() as {
+        metadata?: Record<string, string>;
+        buckets?: Array<{ bucketId: string; displayName?: string; windows?: Array<{ label?: string; usedPercent?: number }> }>;
+      };
+      assert.ok(effJson);
+      assert.equal(effJson.metadata?.source, "passive_local");
+      assert.ok(effJson.buckets?.some((b) => b.bucketId === "acp:codex:codex"));
+      assert.ok(effJson.buckets?.some((b) => b.bucketId === "acp:claude:all"));
+
+      const coverage = quota.getProfileQuotaCoverage(profiles);
+      assert.equal(coverage.find((c) => c.profileId === "acp:codex")?.source, "local_session");
+      assert.equal(coverage.find((c) => c.profileId === "acp:claude")?.source, "acp_passive");
+      assert.equal(coverage.find((c) => c.profileId === "acp:amp")?.source, "none");
+
+      // QuotaOverlay renders BOTH the endpoint-in-settings note AND the live harvested quota table + profile coverage!
+      const theme = createTheme();
+      const overlay = new QuotaOverlay(
+        theme,
+        {} as unknown as DaemonClient,
+        { configured: false, snapshot: effJson as unknown as Record<string, unknown>, coverage },
+        () => {},
+        () => {},
+      );
+      for (const w of [60, 90, 120]) {
+        const lines = overlay.render(w);
+        const plain = lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+        const flat = plain.replace(/\s+/g, " ");
+        assert.ok(flat.includes("Quota Endpoint URL"));
+        assert.ok(flat.includes("/settings"));
+        assert.ok(plain.includes("Codex"));
+        assert.ok(plain.includes("acp:amp"));
+        for (const l of lines) {
+          assert.ok(visibleWidth(l) <= w, `QuotaOverlay overflowed ${w}: ${visibleWidth(l)}`);
+        }
+      }
+    } finally {
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("drives Director & child waits via events with long configurable fallback watchdog instead of polling", async () => {
+    const repoDir = initTempGitRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-events-wake-"));
+    const sockPath = join(stateDir, "d.sock");
+    const cfg = loadConfig(repoDir);
+    cfg.stateDir = stateDir;
+    cfg.socketPath = sockPath;
+    // Default fallback interval is long (600s = 10m) so agents don't thrash/poll
+    assert.equal(cfg.events.fallbackWakeupIntervalSec, 600);
+    assert.equal(cfg.events.wakeDirectorOnGoalSettle, true);
+
+    const directorWakePrompts: string[] = [];
+    const daemon = new HarnessDaemon(cfg, {
+      dbPath: join(stateDir, "cp.sqlite"),
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          if (req.taskId.startsWith("chat-")) {
+            directorWakePrompts.push(req.initialPrompt);
+            return { text: "Goal completed and reported via event wakeup.", stopReason: "completed" };
+          }
+          return { text: "ok", stopReason: "completed" };
+        },
+      }),
+    });
+    await daemon.start();
+    const client = new DaemonClient(sockPath);
+    await client.connect();
+
+    try {
+      // 1. Event-driven waitForChildren wakes immediately on task.status event (zero polling)
+      const run = daemon.db.createRun({ goal: "Event wait test", repoRoot: repoDir, baseBranch: "main", baseSha: "abc" });
+      const parent = daemon.db.createTask({
+        runId: run.id, tier: 1, kind: "orchestrator", title: "Parent", objective: "Wait", profileId: "acp:codex", model: "openai/gpt-6.2-astra",
+      });
+      const child = daemon.db.createTask({
+        runId: run.id, parentId: parent.id, tier: 2, kind: "worker", title: "Child", objective: "Work", profileId: "acp:codex", model: "openai/gpt-6.2-sol",
+      });
+      daemon.db.updateTask(child.id, { status: "running" });
+
+      const waitPromise = daemon.orchestrator.waitForChildrenEventDriven(parent.id, [child.id], "all", 60_000);
+      setTimeout(() => {
+        daemon.db.updateTask(child.id, { status: "completed", summary: "Done quickly" });
+      }, 25);
+      const t0 = Date.now();
+      const waitRes = await waitPromise;
+      assert.equal(waitRes.wakeReason, "event");
+      assert.ok(Date.now() - t0 < 2000, "Event-driven wait must wake immediately, not at fallback interval");
+
+      // 2. Fallback watchdog detects a dead child stuck in `running` with no active runner!
+      const deadChild = daemon.db.createTask({
+        runId: run.id, parentId: parent.id, tier: 2, kind: "worker", title: "Dead child", objective: "Hung", profileId: "acp:codex", model: "openai/gpt-6.2-sol",
+      });
+      daemon.db.updateTask(deadChild.id, { status: "running" });
+      const fallbackRes = await daemon.orchestrator.waitForChildrenEventDriven(parent.id, [deadChild.id], "all", 60);
+      assert.equal(fallbackRes.wakeReason, "child_inactive");
+      assert.deepEqual(fallbackRes.inactiveTaskIds, [deadChild.id]);
+
+      // 3. Automatic Director wakeup when a linked Goal's run completes (AND goal_wait event wake)!
+      const chat = await client.request<{ session: { id: string } }>("chat.create", {
+        repoRoot: repoDir,
+        title: "Event Wake Session",
+      });
+      const goal = daemon.director.goals.createGoal({
+        repoRoot: repoDir,
+        chatSessionId: chat.session.id,
+        title: "Wake Director on Completion",
+        description: "Verify event-driven director wake",
+        criteria: [{ id: "c1", kind: "deterministic", description: "Pass", command: "true" }],
+      });
+      const goalRun = daemon.db.createRun({ goal: "Goal run", repoRoot: repoDir, baseBranch: "main", baseSha: "abc" });
+      daemon.director.goals.linkRunAndStart(goal.id, goalRun.id);
+
+      const goalWaitPromise = daemon.director.waitForGoalEvent(goal.id, 60_000);
+      setTimeout(() => {
+        daemon.db.updateRunStatus(goalRun.id, "completed");
+      }, 25);
+      const goalWaitRes = await goalWaitPromise;
+      assert.equal(goalWaitRes.wakeReason, "event");
+      assert.equal(goalWaitRes.runStatus, "completed");
+
+      // Wait briefly for the async Director wakeup turn to complete
+      for (let i = 0; i < 40 && directorWakePrompts.length === 0; i++) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(directorWakePrompts.length, 1, "Director must be woken automatically by Goal run settlement event");
+      assert.ok(directorWakePrompts[0]!.includes(goal.id));
+    } finally {
+      client.close();
       await daemon.stop();
       rmSync(repoDir, { recursive: true, force: true });
       rmSync(stateDir, { recursive: true, force: true });

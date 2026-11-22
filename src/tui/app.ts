@@ -80,9 +80,10 @@ export type RunsAction = "resume" | "wait" | "stop";
 /** Returns true when a Director tool call is waiting on delegated subagent(s) rather than Director reasoning. */
 export function isSubagentWaitTool(name?: string, title?: string): boolean {
   const hay = `${name ?? ""} ${title ?? ""}`.toLowerCase();
-  return /\b(wait_tasks|wait_children|goal_trigger_review)\b/.test(hay) ||
+  return /\b(wait_tasks|wait_children|goal_wait|goal_trigger_review)\b/.test(hay) ||
     hay.includes("mcp__harness__wait_tasks") ||
     hay.includes("mcp__harness__wait_children") ||
+    hay.includes("mcp__harness__goal_wait") ||
     hay.includes("mcp__harness__goal_trigger_review");
 }
 
@@ -815,7 +816,11 @@ export async function runDirectorChatTui(opts: {
 
   const openQuota = () => {
     void opts.client
-      .request<{ configured: boolean; snapshot: Record<string, unknown> | null }>("quota.get")
+      .request<{
+        configured: boolean;
+        snapshot: Record<string, unknown> | null;
+        coverage?: Array<{ profileId: string; adapter: string; hasData: boolean; source: string; note: string }>;
+      }>("quota.get")
       .then((data) => {
         let handle: ReturnType<OverlayManager["push"]> | null = null;
         const comp = new QuotaOverlay(
@@ -828,7 +833,11 @@ export async function runDirectorChatTui(opts: {
         handle = overlays.push(
           {
             title: "Live Subscription & API Quotas",
-            subtitle: data.configured ? "endpoint active" : "passive ACP mode",
+            subtitle: data.configured
+              ? "endpoint + passive"
+              : data.snapshot
+                ? "passive / local harvest"
+                : "no endpoint configured",
             footer: "r refresh now · Esc close",
           },
           comp,
@@ -1316,8 +1325,20 @@ export async function runDirectorChatTui(opts: {
       return;
     }
     if (ev.type.startsWith("chat.")) {
-      const p = ev.payload as TurnEnd & { chatSessionId: string; turnId: string };
-      if (!activeTurnId || p.chatSessionId !== session.id || p.turnId !== activeTurnId) return;
+      const p = ev.payload as TurnEnd & { chatSessionId: string; turnId: string; summary?: string };
+      if (p.chatSessionId !== session.id) return;
+      if (ev.type === "chat.turn.start") {
+        if (activeTurnId || busy) return;
+        activeTurnId = p.turnId;
+        busy = true;
+        clearPending();
+        if (p.summary) appendSystem([p.summary], "info");
+        refreshStatus();
+        spinner.start(`Thinking (${session.model ?? session.profileId})…`);
+        tui.requestRender();
+        return;
+      }
+      if (!activeTurnId || p.turnId !== activeTurnId) return;
       if (ev.type === "chat.steered") {
         chatContainer.addChild(new UserCard(theme, String((ev.payload as { message: string }).message)));
         appendSystem(["Steered current response."], "info");

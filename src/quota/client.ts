@@ -1,7 +1,7 @@
 import { request as httpRequest } from "node:http";
 import { clone, create, fromBinary, fromJsonString, toJson } from "@bufbuild/protobuf";
 import { timestampFromMs, timestampMs } from "@bufbuild/protobuf/wkt";
-import { interpolateEnv, type QuotaEndpointConfig } from "../config.js";
+import { interpolateEnv, type QuotaEndpointConfig, type RunnerProfileConfig } from "../config.js";
 import {
   AvailabilityStatus,
   BucketBindingSchema,
@@ -19,7 +19,60 @@ import {
   type QuotaSnapshot,
 } from "../gen/quota_pb.js";
 import type { PassiveQuotaSignal } from "../runners/types.js";
+import { harvestLocalQuotaSignals, type CodexRateLimitsRaw, type CodexRateLimitWindowRaw } from "./local-harvest.js";
 import { resolveModelCapacity, type ResolvedModelQuota } from "./schema.js";
+
+export interface ProfileQuotaCoverage {
+  profileId: string;
+  adapter: string;
+  hasData: boolean;
+  source: "endpoint" | "acp_passive" | "local_session" | "error_signal" | "none";
+  note: string;
+}
+
+function formatCodexWindowLabel(windowMinutes?: number, fallback = "window"): string {
+  if (!windowMinutes || !Number.isFinite(windowMinutes) || windowMinutes <= 0) return fallback;
+  if (windowMinutes % 1440 === 0) {
+    const days = windowMinutes / 1440;
+    return days === 7 ? "7d weekly" : `${days}d rolling`;
+  }
+  if (windowMinutes % 60 === 0) {
+    return `${windowMinutes / 60}h rolling`;
+  }
+  return `${windowMinutes}m`;
+}
+
+function codexWindowToProto(
+  windowId: string,
+  raw: CodexRateLimitWindowRaw,
+  observedAt: number,
+) {
+  const usedPercent = typeof raw.used_percent === "number" && Number.isFinite(raw.used_percent) ? raw.used_percent : undefined;
+  const remainingRatio =
+    usedPercent === undefined ? undefined : Math.max(0, Math.min(1, 1 - usedPercent / 100));
+  const resetAt = typeof raw.resets_at === "number" && raw.resets_at > 0 ? timestampFromMs(raw.resets_at * 1000) : undefined;
+  const status =
+    usedPercent !== undefined && usedPercent >= 100
+      ? QuotaStatus.EXHAUSTED
+      : usedPercent !== undefined && usedPercent >= 85
+        ? QuotaStatus.WARNING
+        : QuotaStatus.AVAILABLE;
+  return create(QuotaWindowSchema, {
+    windowId,
+    label: formatCodexWindowLabel(raw.window_minutes, windowId),
+    windowSeconds: raw.window_minutes ? BigInt(Math.round(raw.window_minutes * 60)) : undefined,
+    usedPercent,
+    remainingRatio,
+    resetAt,
+    binding: true,
+    status,
+    observation: create(ObservationMetaSchema, {
+      observedAt: timestampFromMs(observedAt),
+      source: SignalSource.RUNNER_NATIVE,
+      confidence: DataConfidence.AUTHORITATIVE,
+    }),
+  });
+}
 
 /**
  * Fetches optional user-configured Quota Endpoint (ProtoJSON or binary Protobuf over
@@ -29,6 +82,7 @@ import { resolveModelCapacity, type ResolvedModelQuota } from "./schema.js";
 export class QuotaClient {
   private snapshot: QuotaSnapshot | null = null;
   private lastFetchMs = 0;
+  private lastLocalHarvestMs = 0;
   private passiveBuckets = new Map<string, QuotaBucket>();
   private passiveExhaustedProfiles = new Map<string, { resetAt?: string; observedAt: number; reason: string }>();
 
@@ -36,6 +90,21 @@ export class QuotaClient {
 
   isConfigured(): boolean {
     return Boolean(this.config?.url);
+  }
+
+  /**
+   * Passively harvests locally available quota telemetry (e.g. Codex session `rate_limits`)
+   * without requiring a Quota Endpoint. Throttled to every 15s unless `force: true`.
+   */
+  harvestLocal(profiles: RunnerProfileConfig[], opts?: { codexHome?: string; force?: boolean }): number {
+    const now = Date.now();
+    if (!opts?.force && now - this.lastLocalHarvestMs < 15_000) return 0;
+    this.lastLocalHarvestMs = now;
+    const signals = harvestLocalQuotaSignals(profiles, { codexHome: opts?.codexHome });
+    for (const sig of signals) {
+      this.ingestPassiveSignal(sig);
+    }
+    return signals.length;
   }
 
   /**
@@ -188,8 +257,235 @@ export class QuotaClient {
     return this.snapshot ? toJson(QuotaSnapshotSchema, this.snapshot) : null;
   }
 
+  /**
+   * Builds a unified `QuotaSnapshot` merging any external Quota Endpoint data WITH locally harvested
+   * passive ACP / CLI quota buckets so `/quota` and `pi-harness quota` show live capacity even when
+   * no external Quota Endpoint is configured.
+   */
+  getEffectiveSnapshot(): QuotaSnapshot | null {
+    const now = Date.now();
+    const mergedBuckets = new Map<string, QuotaBucket>();
+    for (const b of this.snapshot?.buckets ?? []) {
+      mergedBuckets.set(b.bucketId, clone(QuotaBucketSchema, b));
+    }
+    for (const [id, passive] of this.passiveBuckets) {
+      const existing = mergedBuckets.get(id);
+      if (!existing) {
+        mergedBuckets.set(id, clone(QuotaBucketSchema, passive));
+      } else {
+        const byWin = new Map(existing.windows.map((w) => [w.windowId, w]));
+        for (const pw of passive.windows) {
+          const ew = byWin.get(pw.windowId);
+          const pTs = pw.observation?.observedAt ? timestampMs(pw.observation.observedAt) : 0;
+          const eTs = ew?.observation?.observedAt ? timestampMs(ew.observation.observedAt) : 0;
+          if (!ew || pTs >= eTs) byWin.set(pw.windowId, clone(QuotaWindowSchema, pw));
+        }
+        existing.windows = [...byWin.values()];
+        if (passive.overage) existing.overage = clone(OveragePolicySchema, passive.overage);
+      }
+    }
+
+    const activeErrors = [...this.passiveExhaustedProfiles.entries()].filter(
+      ([, fail]) => now - fail.observedAt < 15 * 60_000,
+    );
+
+    if (!this.snapshot && mergedBuckets.size === 0 && activeErrors.length === 0) {
+      return null;
+    }
+
+    const models: ModelCapacity[] = (this.snapshot?.models ?? []).map((m) => clone(ModelCapacitySchema, m));
+    const coveredProfiles = new Set(models.map((m) => `${m.profile}:${m.modelId}`));
+
+    // Synthesize visible model rows for passive/local buckets when not already covered by endpoint models
+    for (const [bucketId, bucket] of mergedBuckets) {
+      if (this.snapshot?.buckets?.some((b) => b.bucketId === bucketId)) continue;
+      const sep = bucketId.lastIndexOf(":");
+      const profileId = bucket.provider || (sep > 0 ? bucketId.slice(0, sep) : bucketId);
+      const scope = sep > 0 ? bucketId.slice(sep + 1) : "*";
+      const modelLabel = scope === "all" || scope === "codex" ? `${profileId} (*)` : `${profileId} (${scope})`;
+      if (coveredProfiles.has(`${profileId}:${modelLabel}`)) continue;
+      coveredProfiles.add(`${profileId}:${modelLabel}`);
+      const synth = create(ModelCapacitySchema, {
+        provider: profileId,
+        profile: profileId,
+        modelId: modelLabel,
+        bucketBindings: [create(BucketBindingSchema, { bucketId, required: true })],
+      });
+      const resolved = resolveModelCapacity(synth, mergedBuckets, now);
+      synth.exhausted = resolved.exhausted;
+      synth.availability = resolved.availability;
+      if (resolved.effectiveRemainingRatio !== null) synth.effectiveRemainingRatio = resolved.effectiveRemainingRatio;
+      models.push(synth);
+    }
+
+    for (const [key, fail] of activeErrors) {
+      const idx = key.lastIndexOf(":");
+      const profileId = idx > 0 ? key.slice(0, idx) : key;
+      const modelId = idx > 0 ? key.slice(idx + 1) : "*";
+      if (coveredProfiles.has(`${profileId}:${modelId}`)) continue;
+      coveredProfiles.add(`${profileId}:${modelId}`);
+      models.push(
+        create(ModelCapacitySchema, {
+          provider: profileId,
+          profile: profileId,
+          modelId,
+          exhausted: fail.reason !== "rate_limited",
+          availability:
+            fail.reason === "rate_limited" ? AvailabilityStatus.THROTTLED : AvailabilityStatus.EXHAUSTED,
+          effectiveRemainingRatio: 0,
+          nextAvailableAt: fail.resetAt && Number.isFinite(Date.parse(fail.resetAt))
+            ? timestampFromMs(Date.parse(fail.resetAt))
+            : undefined,
+          reason: `Recent passive ACP failure: ${fail.reason}`,
+        }),
+      );
+    }
+
+    const sourceMode =
+      this.snapshot && (this.passiveBuckets.size > 0 || activeErrors.length > 0)
+        ? "endpoint+passive"
+        : this.snapshot
+          ? "endpoint"
+          : "passive_local";
+
+    return create(QuotaSnapshotSchema, {
+      schemaVersion: this.snapshot?.schemaVersion || "1",
+      generatedAt: this.snapshot?.generatedAt ?? timestampFromMs(now),
+      ttlSeconds: this.snapshot?.ttlSeconds,
+      accounts: this.snapshot?.accounts ?? [],
+      buckets: [...mergedBuckets.values()],
+      models,
+      errors: this.snapshot?.errors ?? [],
+      metadata: {
+        ...(this.snapshot?.metadata ?? {}),
+        source: sourceMode,
+      },
+    });
+  }
+
+  getEffectiveSnapshotJson(): unknown {
+    const eff = this.getEffectiveSnapshot();
+    return eff ? toJson(QuotaSnapshotSchema, eff) : null;
+  }
+
+  /** Summarizes which enabled profiles currently have quota telemetry and where it came from. */
+  getProfileQuotaCoverage(profiles: RunnerProfileConfig[]): ProfileQuotaCoverage[] {
+    const now = Date.now();
+    return profiles
+      .filter((p) => p.enabled !== false)
+      .map((p) => {
+        const adapter = p.kind === "acp" ? p.adapter : p.provider;
+        const hasEndpoint = Boolean(
+          this.snapshot?.models?.some(
+            (m) => m.profile === p.id || m.provider.toLowerCase() === adapter.toLowerCase(),
+          ) ||
+            this.snapshot?.buckets?.some(
+              (b) => b.provider === p.id || b.provider.toLowerCase() === adapter.toLowerCase(),
+            ),
+        );
+        if (hasEndpoint) {
+          return { profileId: p.id, adapter, hasData: true, source: "endpoint", note: "Quota Endpoint" };
+        }
+        const passiveMatches = [...this.passiveBuckets.values()].filter(
+          (b) => b.bucketId.startsWith(`${p.id}:`) || b.provider === p.id,
+        );
+        if (passiveMatches.length > 0) {
+          const isLocal = passiveMatches.some(
+            (b) =>
+              b.observation?.source === SignalSource.RUNNER_NATIVE ||
+              b.windows.some((w) => w.observation?.source === SignalSource.RUNNER_NATIVE),
+          );
+          return {
+            profileId: p.id,
+            adapter,
+            hasData: true,
+            source: isLocal ? "local_session" : "acp_passive",
+            note: isLocal ? "harvested from local CLI session" : "harvested from live ACP telemetry",
+          };
+        }
+        const hasErr = [...this.passiveExhaustedProfiles.entries()].some(
+          ([k, v]) => k.startsWith(`${p.id}:`) && now - v.observedAt < 15 * 60_000,
+        );
+        if (hasErr) {
+          return {
+            profileId: p.id,
+            adapter,
+            hasData: true,
+            source: "error_signal",
+            note: "recent rate-limit / exhaustion signal",
+          };
+        }
+        const hint =
+          adapter === "claude"
+            ? "awaiting live ACP turn (_claude/rateLimit)"
+            : adapter === "codex"
+              ? "no recent local Codex session rate_limits found"
+              : "no local quota telemetry reported by this ACP";
+        return { profileId: p.id, adapter, hasData: false, source: "none", note: hint };
+      });
+  }
+
   ingestPassiveSignal(signal: PassiveQuotaSignal): void {
     const raw = signal.raw;
+
+    // 0. Codex CLI / `codex-acp` rate_limits (primary / secondary windows + credits)
+    if (Array.isArray(raw.codexRateLimits) || (raw.codexRateLimits && typeof raw.codexRateLimits === "object")) {
+      const list = (Array.isArray(raw.codexRateLimits) ? raw.codexRateLimits : [raw.codexRateLimits]) as CodexRateLimitsRaw[];
+      for (const snap of list) {
+        if (!snap || typeof snap !== "object") continue;
+        const limitId = (typeof snap.limit_id === "string" && snap.limit_id.trim()) || "codex";
+        const bucketId = `${signal.profileId}:${limitId}`;
+        const existing = this.passiveBuckets.get(bucketId);
+        const existingTs = existing?.observation?.observedAt ? timestampMs(existing.observation.observedAt) : 0;
+        if (existing && existingTs > signal.observedAt) continue;
+
+        const windows = [];
+        if (snap.primary && typeof snap.primary === "object") {
+          windows.push(codexWindowToProto("primary", snap.primary, signal.observedAt));
+        }
+        if (snap.secondary && typeof snap.secondary === "object") {
+          windows.push(codexWindowToProto("secondary", snap.secondary, signal.observedAt));
+        }
+        if (windows.length === 0 && !snap.credits) continue;
+
+        const overage =
+          snap.credits && typeof snap.credits === "object"
+            ? create(OveragePolicySchema, {
+                enabled: Boolean(snap.credits.has_credits || snap.credits.unlimited),
+                inUse: false,
+                status: snap.credits.unlimited || snap.credits.has_credits ? QuotaStatus.AVAILABLE : QuotaStatus.DISABLED,
+              })
+            : existing?.overage;
+
+        const displayName =
+          typeof snap.limit_name === "string" && snap.limit_name.trim()
+            ? `Codex ${snap.limit_name.trim()}`
+            : limitId === "codex"
+              ? "Codex (local session)"
+              : `Codex ${limitId} (local)`;
+
+        this.passiveBuckets.set(
+          bucketId,
+          create(QuotaBucketSchema, {
+            bucketId,
+            provider: signal.profileId,
+            displayName,
+            windows,
+            overage,
+            observation: create(ObservationMetaSchema, {
+              observedAt: timestampFromMs(signal.observedAt),
+              source: SignalSource.RUNNER_NATIVE,
+              confidence: DataConfidence.AUTHORITATIVE,
+            }),
+            labels: {
+              source: "local_session",
+              ...(snap.plan_type ? { plan: String(snap.plan_type) } : {}),
+            },
+          }),
+        );
+      }
+      return;
+    }
 
     // 1. Live Claude ACP `_claude/rateLimit` (`SDKRateLimitInfo`)
     if (typeof raw.status === "string" && ("rateLimitType" in raw || "utilization" in raw || "resetsAt" in raw)) {

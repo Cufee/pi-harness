@@ -323,10 +323,22 @@ export class HarnessOrchestrator {
     const owner = this.db.listTasks(run.id, { parentId: null })[0]!;
     if (name === "wait_tasks" || name === "wait_children") {
       const ids = Array.isArray(args.ids) ? args.ids.map(String) : undefined;
-      const timeout = (typeof args.timeout_s === "number" ? args.timeout_s : 300) * 1000;
-      const tasks = await this.waitForChildren(owner.id, ids, args.mode === "any" ? "any" : "all", timeout, signal);
+      const fallbackSec =
+        typeof args.fallback_interval_s === "number"
+          ? args.fallback_interval_s
+          : typeof args.timeout_s === "number"
+            ? args.timeout_s
+            : this.config.events.fallbackWakeupIntervalSec;
+      const timeout = Math.max(1, fallbackSec) * 1000;
+      const res = await this.waitForChildrenEventDriven(owner.id, ids, args.mode === "any" ? "any" : "all", timeout, signal);
       const escalations = this.db.listEscalations(run.id);
-      return { children: tasks.map((task) => compactTaskHandoff(task, escalations)) };
+      return {
+        children: res.children.map((task) => compactTaskHandoff(task, escalations)),
+        ...(res.wakeReason === "fallback_interval" || res.wakeReason === "child_inactive"
+          ? { wakeReason: res.wakeReason }
+          : {}),
+        ...(res.inactiveTaskIds.length > 0 ? { inactiveTaskIds: res.inactiveTaskIds } : {}),
+      };
     }
     return this.toolExecutor.execute(run.id, owner.id, name, args);
   }
@@ -1124,12 +1136,32 @@ export class HarnessOrchestrator {
     timeoutMs: number,
     signal = this.active.get(parentId)?.generationSignal,
   ): Promise<TaskRecord[]> {
+    const res = await this.waitForChildrenEventDriven(parentId, ids, mode, timeoutMs, signal);
+    return res.children;
+  }
+
+  /**
+   * Event-driven child wait: subscribes directly to SQLite task/escalation events (zero polling)
+   * and wakes immediately on settlement or escalation, with a configurable long fallback interval
+   * that also checks whether any running child process died silently without emitting a terminal event.
+   */
+  async waitForChildrenEventDriven(
+    parentId: string,
+    ids: string[] | undefined,
+    mode: "any" | "all",
+    fallbackIntervalMs = this.config.events.fallbackWakeupIntervalSec * 1000,
+    signal = this.active.get(parentId)?.generationSignal,
+  ): Promise<{
+    children: TaskRecord[];
+    wakeReason: "already_settled" | "event" | "fallback_interval" | "child_inactive";
+    inactiveTaskIds: string[];
+  }> {
     signal?.throwIfAborted();
     const parent = this.db.getTask(parentId);
     if (!parent) throw new Error(`Unknown parent task ${parentId}`);
 
     const terminal = new Set(["completed", "failed", "cancelled", "returned_for_rescope", "blocked", "paused_quota"]);
-    const deadline = Date.now() + timeoutMs;
+    const deadline = Date.now() + Math.max(50, fallbackIntervalMs);
 
     const getTargets = () => {
       const kids = this.db.listTasks(parent.runId, { parentId });
@@ -1141,32 +1173,55 @@ export class HarnessOrchestrator {
       return mode === "any" ? targets.some((t) => terminal.has(t.status)) : targets.every((t) => terminal.has(t.status));
     };
 
+    const findInactiveLiveChildren = (targets: TaskRecord[]) =>
+      targets
+        .filter((t) => LIVE_TASK_STATUSES.has(t.status) && !this.active.has(t.id) && !this.allocatingWorktrees.has(t.id))
+        .map((t) => t.id);
+
     let targets = getTargets();
-    if (isDone(targets)) return targets;
+    if (isDone(targets)) {
+      return { children: targets, wakeReason: "already_settled", inactiveTaskIds: [] };
+    }
 
     if (parent.status === "running") this.db.updateTask(parentId, { status: "waiting_children" });
     return new Promise((resolve, reject) => {
-      const finish = () => {
+      let settled = false;
+      const finish = (wakeReason: "event" | "fallback_interval" | "child_inactive", inactiveTaskIds: string[] = []) => {
+        if (settled) return;
+        settled = true;
         unsub();
         clearTimeout(timer);
-        signal?.removeEventListener("abort", finish);
+        signal?.removeEventListener("abort", onAbort);
         if (parent.status === "running" && this.db.getTask(parentId)?.status === "waiting_children") {
           this.db.updateTask(parentId, { status: "running" });
         }
         if (signal?.aborted) reject(signal.reason);
-        else resolve(targets);
+        else resolve({ children: targets, wakeReason, inactiveTaskIds });
       };
-      const check = () => {
+      const onAbort = () => finish("event");
+      const checkEvent = () => {
         targets = getTargets();
-        if (isDone(targets) || Date.now() >= deadline) finish();
+        if (isDone(targets)) finish("event");
+      };
+      const onFallbackTimer = () => {
+        targets = getTargets();
+        if (isDone(targets)) {
+          finish("event");
+          return;
+        }
+        const inactive = findInactiveLiveChildren(targets);
+        finish(inactive.length > 0 ? "child_inactive" : "fallback_interval", inactive);
       };
       const unsub = this.db.onEvent((ev) => {
-        if (ev.runId === parent.runId && (ev.type === "task.status" || ev.type === "escalation.created")) check();
+        if (ev.runId === parent.runId && (ev.type === "task.status" || ev.type === "escalation.created" || ev.type === "run.status")) {
+          checkEvent();
+        }
       });
-      const timer = setTimeout(check, Math.max(50, deadline - Date.now()));
-      signal?.addEventListener("abort", finish, { once: true });
-      if (signal?.aborted) finish();
-      else check();
+      const timer = setTimeout(onFallbackTimer, Math.max(50, deadline - Date.now()));
+      timer.unref?.();
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+      else checkEvent();
     });
   }
 }

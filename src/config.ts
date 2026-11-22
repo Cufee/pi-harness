@@ -77,6 +77,17 @@ export interface GoalsConfig {
   gateTimeoutMs: number;
 }
 
+export interface EventsConfig {
+  /**
+   * Fallback wakeup interval (seconds) for event-driven waits (`wait_children`, `wait_tasks`, `goal_wait`)
+   * in case a child agent process hangs or dies without emitting a terminal event.
+   * Default is intentionally long (600s = 10m) so agents rely on events and never thrash/token-poll.
+   */
+  fallbackWakeupIntervalSec: number;
+  /** Automatically wake an idle Director chat session when one of its Goal runs settles (default true). */
+  wakeDirectorOnGoalSettle: boolean;
+}
+
 export interface RolloverConfig {
   /** Context ratio triggering Tier 1 Orchestrator clean relay (default 0.72) */
   orchestratorThreshold: number;
@@ -148,6 +159,7 @@ export interface HarnessConfig {
   rollover: RolloverConfig;
   worktree: WorktreeConfig;
   goals: GoalsConfig;
+  events: EventsConfig;
   catalog: CatalogConfig;
   quotaRetry: QuotaRetryConfig;
   quotaEndpoint?: QuotaEndpointConfig;
@@ -250,6 +262,13 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
     ...(repoCfg.goals as Partial<GoalsConfig> | undefined),
   };
 
+  const events: EventsConfig = {
+    fallbackWakeupIntervalSec: 600,
+    wakeDirectorOnGoalSettle: true,
+    ...(globalCfg.events as Partial<EventsConfig> | undefined),
+    ...(repoCfg.events as Partial<EventsConfig> | undefined),
+  };
+
   const catalog: CatalogConfig = {
     ttlHours: 24,
     artificialAnalysisKeyEnv: "ARTIFICIAL_ANALYSIS_API_KEY",
@@ -292,6 +311,7 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
     rollover,
     worktree,
     goals,
+    events,
     catalog,
     quotaRetry,
     quotaEndpoint: merged.quotaEndpoint,

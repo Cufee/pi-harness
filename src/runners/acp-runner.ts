@@ -286,25 +286,34 @@ export class AcpRunner {
           };
           req.callbacks.onUsage?.(lastUsage);
 
-          // Harvest live passive subscription quota signal (e.g. Claude ACP `_claude/rateLimit`)
+          // Harvest live passive subscription quota signals (`_claude/rateLimit`, generic `rateLimit`/`rateLimits`)
           const updateMeta = (update._meta ?? {}) as Record<string, unknown>;
-          if (updateMeta["_claude/rateLimit"] && typeof updateMeta["_claude/rateLimit"] === "object") {
-            const rl = updateMeta["_claude/rateLimit"] as Record<string, unknown>;
+          const rlPayload = (updateMeta["_claude/rateLimit"] ?? updateMeta.rateLimit) as Record<string, unknown> | undefined;
+          if (rlPayload && typeof rlPayload === "object") {
             req.callbacks.onPassiveQuota?.({
               profileId: this.profile.id,
               model: typeof updateMeta["_claude/model"] === "string" ? updateMeta["_claude/model"] : req.model,
-              raw: rl,
+              raw: rlPayload,
               observedAt: Date.now(),
             });
-            if (rl.status === "rejected" || rl.overageStatus === "rejected") {
+            if (rlPayload.status === "rejected" || rlPayload.overageStatus === "rejected") {
               const resetIso =
-                typeof rl.resetsAt === "number" ? new Date(rl.resetsAt * 1000).toISOString() : null;
+                typeof rlPayload.resetsAt === "number" ? new Date(rlPayload.resetsAt * 1000).toISOString() : null;
               noteQuotaSignal({
-                reason: `Rate limit rejected (${String(rl.rateLimitType ?? "quota")})`,
+                reason: `Rate limit rejected (${String(rlPayload.rateLimitType ?? "quota")})`,
                 resetAt: resetIso,
                 isHardExhaustion: true,
               });
             }
+          }
+          const codexRl = (updateMeta["_codex/rateLimits"] ?? updateMeta.rateLimits) as Record<string, unknown> | undefined;
+          if (codexRl && typeof codexRl === "object") {
+            req.callbacks.onPassiveQuota?.({
+              profileId: this.profile.id,
+              model: req.model,
+              raw: { codexRateLimits: codexRl },
+              observedAt: Date.now(),
+            });
           }
 
           const ratio = size > 0 ? used / size : 0;
@@ -815,10 +824,27 @@ export class AcpRunner {
       }
       const primary = spawnErr ?? err;
       const errMsg = primary instanceof Error ? primary.message : String(primary);
+      // Harvest structured `rateLimit` info from ACP JSON-RPC error data (e.g. Claude `turnErrorData` when refused before first usage)
+      const errData = (primary && typeof primary === "object" ? (primary as { data?: Record<string, unknown> }).data : undefined);
+      const errRateLimit =
+        errData && typeof errData === "object" && errData.rateLimit && typeof errData.rateLimit === "object"
+          ? (errData.rateLimit as Record<string, unknown>)
+          : null;
+      if (errRateLimit) {
+        req.callbacks.onPassiveQuota?.({
+          profileId: this.profile.id,
+          model: req.model,
+          raw: errRateLimit,
+          observedAt: Date.now(),
+        });
+        if (typeof errRateLimit.resetsAt === "number" && !lastQuotaResetAt) {
+          lastQuotaResetAt = new Date(errRateLimit.resetsAt * 1000).toISOString();
+        }
+      }
       const combined = `${errMsg}\n${stderrBuf}`;
       const detected = detectQuotaErrorText(combined);
 
-      if (quotaWatchdogTriggered || detected.isQuota) {
+      if (quotaWatchdogTriggered || detected.isQuota || errData?.errorKind === "rate_limit" || Boolean(errRateLimit)) {
         const reason = lastQuotaReason || detected.summary || errMsg;
         const resetAt = lastQuotaResetAt ?? detected.resetAtIso ?? null;
         const isHard = lastQuotaHard || detected.isHardExhaustion;

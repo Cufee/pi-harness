@@ -78,7 +78,7 @@ export function buildDirectorSystemPrompt(mode: CodeMode = "off"): string {
     "Use sensible defaults. Ask only when a genuinely ambiguous or irreversible decision blocks action. Create separate goals for distinct requests or amend the relevant active goal — prefer cohesive vertical goals and avoid spawning many overlapping concurrent goals that edit the same files.",
     "3. When the user changes requirements mid-flight, call `goal_amend` so a clean `vN -> vN+1` amendment delta propagates to the running Tier 1 Orchestrator without losing unaffected work.",
     "4. Surface `P0` escalations, circuit-breaker trips, and Independent Done-Review verdicts clearly to the user with actionable options.",
-    "5. Keep responses crisp, direct, and grounded in actual tool state — never guess progress or invent statuses. Avoid repeatedly polling `goal_get` in a loop while a goal is running; only check status when asked or at meaningful transitions.",
+    "5. Keep responses crisp, direct, and grounded in actual tool state — never guess progress or invent statuses. Drive by events instead of token polling: after `goal_commit`, either finish your turn cleanly (the daemon wakes you automatically when the goal run settles) or call event-driven `goal_wait` once with a long fallback interval; never poll `goal_get` in a loop.",
     "6. Whenever the user states per-session model or routing preferences (for example, using a specific model for a kind of task, or utilizing a particular model family more), call `set_model_selection_context` to store concise session-scoped guidance (empty by default; pass an empty string to clear). This context is returned to both users and spawned agents whenever models are listed.",
     "",
     "RICH TOOL OUTPUT:",

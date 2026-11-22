@@ -86,6 +86,7 @@ export class HarnessDaemon {
   private runBindings = new Map<string, Socket>();
   private chatBindings = new Map<string, Socket>();
   private chatTurns = new Map<string, { id: string; text: string; cancelling: boolean }>();
+  private pendingWakeups = new Map<string, Array<{ summary: string; prompt: string }>>();
   private socketToChatId = new Map<Socket, string>();
   private chatSubscribers = new Set<Socket>();
   private tuiSockets = new Set<Socket>();
@@ -109,6 +110,67 @@ export class HarnessDaemon {
     this.catalog = new ModelCatalogCompiler(config, this.quota);
     this.orchestrator = new HarnessOrchestrator(this.db, config, this.catalog, this.quota, opts?.customRunnerFactory);
     this.director = new DirectorRuntime(this.db, config, this.catalog, this.quota, this.orchestrator, opts?.customRunnerFactory);
+    this.director.setWakeHandler((chatSessionId, summary, prompt) => {
+      this.scheduleDirectorWakeup(chatSessionId, summary, prompt);
+    });
+  }
+
+  /**
+   * Event-driven wakeup for Tier 0 Director when an autonomous Goal run settles (zero polling!).
+   * - If the Director is idle: starts a live wakeup turn immediately so the Director settles/reports the Goal.
+   * - If the Director is currently busy (e.g. already inside `goal_wait` or mid-turn): avoids spawning a
+   *   duplicate follow-up turn and delivers a best-effort steer notification instead.
+   */
+  private scheduleDirectorWakeup(chatSessionId: string, summary: string, prompt: string): void {
+    if (this.chatTurns.has(chatSessionId)) {
+      void this.director.steerChat(chatSessionId, summary).catch(() => {});
+      return;
+    }
+    void this.runDirectorWakeupTurn(chatSessionId, summary, prompt);
+  }
+
+  private drainPendingWakeup(chatSessionId: string): void {
+    if (this.chatTurns.has(chatSessionId)) return;
+    const q = this.pendingWakeups.get(chatSessionId);
+    const next = q?.shift();
+    if (!next) return;
+    if (q && q.length === 0) this.pendingWakeups.delete(chatSessionId);
+    void this.runDirectorWakeupTurn(chatSessionId, next.summary, next.prompt);
+  }
+
+  private async runDirectorWakeupTurn(chatSessionId: string, summary: string, prompt: string): Promise<void> {
+    if (this.chatTurns.has(chatSessionId)) return;
+    if (!this.director.chats.getSession(chatSessionId)) return;
+    const id = `wake-${randomBytes(4).toString("hex")}`;
+    const turn = { id, text: "", cancelling: false };
+    this.chatTurns.set(chatSessionId, turn);
+    this.sendChatEvent(chatSessionId, id, "chat.turn.start", { reason: "goal_settled", summary });
+    try {
+      const result = await this.director.sendChatMessage(
+        chatSessionId,
+        prompt,
+        (delta) => {
+          turn.text += delta;
+          this.sendChatEvent(chatSessionId, id, "chat.delta", { delta });
+        },
+        (tool) => {
+          this.sendChatEvent(chatSessionId, id, "chat.tool", tool);
+        },
+        { turnRole: "system_notice" },
+      );
+      this.sendChatEvent(chatSessionId, id, "chat.turn.end", {
+        assistantTurn: result.assistantTurn,
+        cancelled: turn.cancelling,
+      });
+    } catch (err) {
+      this.sendChatEvent(chatSessionId, id, "chat.turn.end", {
+        error: err instanceof Error ? err.message : String(err),
+        cancelled: turn.cancelling,
+      });
+    } finally {
+      this.chatTurns.delete(chatSessionId);
+      this.drainPendingWakeup(chatSessionId);
+    }
   }
 
   private applyConfigMutation(next: HarnessConfig, opts?: { profilesChanged?: boolean }): HarnessConfig {
@@ -178,7 +240,12 @@ export class HarnessDaemon {
     }, 3_600_000);
     this.sweepTimer.unref();
 
-    // Non-blocking initial quota sync if configured
+    // Non-blocking initial quota sync (endpoint if configured + passive local CLI harvest)
+    try {
+      this.quota.harvestLocal(this.config.profiles, { force: true });
+    } catch {
+      // ignore local harvest errors on startup
+    }
     void this.quota.sync(false).catch(() => {});
 
     return sockPath;
@@ -193,7 +260,9 @@ export class HarnessDaemon {
       clearInterval(this.sweepTimer);
       this.sweepTimer = null;
     }
+    this.director.dispose();
     this.orchestrator.dispose();
+    this.pendingWakeups.clear();
     this.unsubEvents?.();
     this.ptyHost.closeAll();
     for (const sock of this.allSockets) {
@@ -612,6 +681,7 @@ export class HarnessDaemon {
           ...(patch.rollover ? { rollover: { ...this.config.rollover, ...(patch.rollover as HarnessConfig["rollover"]) } } : {}),
           ...(patch.worktree ? { worktree: { ...this.config.worktree, ...(patch.worktree as HarnessConfig["worktree"]) } } : {}),
           ...(patch.goals ? { goals: { ...this.config.goals, ...(patch.goals as HarnessConfig["goals"]) } } : {}),
+          ...(patch.events ? { events: { ...this.config.events, ...(patch.events as HarnessConfig["events"]) } } : {}),
           ...(patch.catalog ? { catalog: { ...this.config.catalog, ...(patch.catalog as HarnessConfig["catalog"]) } } : {}),
           ...(patch.quotaRetry
             ? { quotaRetry: { ...this.config.quotaRetry, ...(patch.quotaRetry as HarnessConfig["quotaRetry"]) } }
@@ -800,6 +870,7 @@ export class HarnessDaemon {
           throw err;
         } finally {
           this.chatTurns.delete(chatSessionId);
+          this.drainPendingWakeup(chatSessionId);
         }
       }
 
@@ -1123,6 +1194,7 @@ export class HarnessDaemon {
         return this.db.ackEscalation(String(p.escalationId), String(p.resolution ?? "Resolved"), true);
 
       case "models.list": {
+        this.quota.harvestLocal(this.config.profiles);
         const chatSessionId =
           typeof p.chatSessionId === "string" && p.chatSessionId
             ? p.chatSessionId
@@ -1138,6 +1210,7 @@ export class HarnessDaemon {
       }
 
       case "models.sync": {
+        this.quota.harvestLocal(this.config.profiles, { force: true });
         const chatSessionId =
           typeof p.chatSessionId === "string" && p.chatSessionId
             ? p.chatSessionId
@@ -1148,12 +1221,24 @@ export class HarnessDaemon {
       }
 
       case "quota.get":
+        this.quota.harvestLocal(this.config.profiles);
         await this.quota.sync(false).catch(() => {});
-        return { snapshot: this.quota.getCurrentSnapshotJson(), configured: Boolean(this.config.quotaEndpoint?.url) };
+        return {
+          snapshot: this.quota.getEffectiveSnapshotJson(),
+          configured: Boolean(this.config.quotaEndpoint?.url),
+          coverage: this.quota.getProfileQuotaCoverage(this.config.profiles),
+        };
 
       case "quota.sync":
-        await this.quota.sync(true);
-        return { snapshot: this.quota.getCurrentSnapshotJson(), configured: Boolean(this.config.quotaEndpoint?.url) };
+        this.quota.harvestLocal(this.config.profiles, { force: true });
+        if (this.config.quotaEndpoint?.url) {
+          await this.quota.sync(true);
+        }
+        return {
+          snapshot: this.quota.getEffectiveSnapshotJson(),
+          configured: Boolean(this.config.quotaEndpoint?.url),
+          coverage: this.quota.getProfileQuotaCoverage(this.config.profiles),
+        };
 
       case "worktrees.list": {
         const repoRoot = String(p.repoRoot ?? process.cwd());

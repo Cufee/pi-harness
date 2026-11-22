@@ -63,13 +63,21 @@ function optionalProfile(value: unknown): string | undefined {
 
 const waitChildrenTool: ToolDefinition = {
   name: "wait_children",
-  description: "Wait for child tasks and read their summaries, sources, artifact paths, and escalations.",
+  description:
+    "Event-driven wait for child tasks (zero polling; wakes immediately on completion or escalation). Optional fallback_interval_s configures a dead-agent watchdog wakeup (defaults to a long interval so you never thrash).",
   inputSchema: {
     type: "object",
     properties: {
       ids: { type: "array", items: { type: "string" } },
       mode: { type: "string", enum: ["any", "all"] },
-      timeout_s: { type: "number" },
+      fallback_interval_s: {
+        type: "number",
+        description: "Optional fallback wakeup interval in seconds in case a child hangs or dies (default: config.events.fallbackWakeupIntervalSec, 600s).",
+      },
+      timeout_s: {
+        type: "number",
+        description: "Alias for fallback_interval_s.",
+      },
     },
   },
 };
@@ -722,11 +730,25 @@ export class ControlPlaneToolExecutor {
       case "wait_children": {
         const ids = Array.isArray(args.ids) ? (args.ids as string[]) : undefined;
         const mode = args.mode === "any" ? "any" : "all";
-        const timeoutMs = (typeof args.timeout_s === "number" ? args.timeout_s : 300) * 1000;
+        const defaultSec = this.config.events?.fallbackWakeupIntervalSec ?? 600;
+        const requestedSec =
+          typeof args.fallback_interval_s === "number"
+            ? args.fallback_interval_s
+            : typeof args.timeout_s === "number"
+              ? args.timeout_s
+              : defaultSec;
+        const timeoutMs = Math.max(1, requestedSec) * 1000;
         const settled = await this.hooks.waitForChildren(taskId, ids, mode, timeoutMs);
         const escalations = this.db.listEscalations(runId);
+        const stillRunning = settled.filter((c) => ["running", "ready", "pending", "draining", "waiting_children", "merging"].includes(c.status));
         return {
           children: settled.map((child) => compactTaskHandoff(child, escalations)),
+          ...(stillRunning.length > 0
+            ? {
+                wakeReason: "fallback_interval",
+                hint: "Fallback wakeup fired while child task(s) are still in progress; wait again with wait_children rather than short-polling.",
+              }
+            : {}),
         };
       }
 

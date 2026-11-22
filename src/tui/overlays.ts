@@ -957,14 +957,18 @@ export class EffortPickerOverlay implements Component {
   }
 }
 
-/** Visual Quota Dashboard (`/quota`): shared vs. separate buckets with bars & reset countdowns. */
+/** Visual Quota Dashboard (`/quota`): endpoint + passively harvested local/ACP buckets with bars & reset countdowns. */
 export class QuotaOverlay implements Component {
   private note = "";
 
   constructor(
     private readonly theme: HarnessTheme,
     private readonly client: DaemonClient,
-    private data: { configured: boolean; snapshot: Record<string, unknown> | null },
+    private data: {
+      configured: boolean;
+      snapshot: Record<string, unknown> | null;
+      coverage?: Array<{ profileId: string; adapter: string; hasData: boolean; source: string; note: string }>;
+    },
     private readonly onClose: () => void,
     private readonly rerender: () => void,
   ) {}
@@ -977,17 +981,23 @@ export class QuotaOverlay implements Component {
     if (data === "r" || data === "R") {
       this.note = "Refreshing quota snapshot…";
       this.rerender();
-      void this.client.request<{ configured: boolean; snapshot: Record<string, unknown> | null }>("quota.sync").then(
-        (fresh) => {
-          this.data = fresh;
-          this.note = "Refreshed.";
-          this.rerender();
-        },
-        (err) => {
-          this.note = `Refresh failed: ${err instanceof Error ? err.message : String(err)}`;
-          this.rerender();
-        },
-      );
+      void this.client
+        .request<{
+          configured: boolean;
+          snapshot: Record<string, unknown> | null;
+          coverage?: Array<{ profileId: string; adapter: string; hasData: boolean; source: string; note: string }>;
+        }>("quota.sync")
+        .then(
+          (fresh) => {
+            this.data = fresh;
+            this.note = "Refreshed.";
+            this.rerender();
+          },
+          (err) => {
+            this.note = `Refresh failed: ${err instanceof Error ? err.message : String(err)}`;
+            this.rerender();
+          },
+        );
     }
   }
 
@@ -1001,29 +1011,18 @@ export class QuotaOverlay implements Component {
     }
 
     if (!this.data.configured) {
-      lines.push(...wrapTextWithAnsi(this.theme.text("No external Quota Endpoint configured yet."), width));
       lines.push(
         ...wrapTextWithAnsi(
-          this.theme.muted("Open /settings (Ctrl+,) → 'Quota Endpoint URL' to connect your proto/quota.proto endpoint."),
+          `${this.theme.accentBold("ℹ")} ${this.theme.muted("No external Quota Endpoint configured — showing passively harvested ACP/local quota where available. Define 'Quota Endpoint URL' in /settings (Ctrl+,) for unified quota data.")}`,
           width,
         ),
       );
-      lines.push(
-        ...wrapTextWithAnsi(
-          this.theme.dim("Passive ACP rate-limit signals (e.g. Claude _claude/rateLimit) are still harvested automatically."),
-          width,
-        ),
-      );
-      return lines.map((l) => clampLine(l, width));
-    }
-
-    if (!this.data.snapshot) {
-      lines.push(fitWidth(this.theme.muted("Quota Endpoint configured, but no snapshot fetched yet. Press 'r' to sync."), width));
-      return lines;
+      lines.push("");
     }
 
     const snap = this.data.snapshot as {
       generatedAt?: string;
+      metadata?: Record<string, string>;
       buckets?: Array<{
         bucketId: string;
         displayName?: string;
@@ -1040,84 +1039,107 @@ export class QuotaOverlay implements Component {
         exhausted?: boolean;
         bucketBindings?: Array<{ bucketId: string; multiplier?: number }>;
       }>;
-    };
+    } | null;
 
-    if (snap.generatedAt) {
-      lines.push(fitWidth(this.theme.dim(`Snapshot generated: ${snap.generatedAt}`), width));
-      lines.push("");
-    }
+    if (!snap || (!(snap.buckets?.length) && !(snap.models?.length))) {
+      lines.push(
+        fitWidth(
+          this.theme.muted(
+            this.data.configured
+              ? "Quota Endpoint configured, but no snapshot fetched yet. Press 'r' to sync."
+              : "No passive/local quota telemetry observed yet. Run a turn or press 'r' to rescan local CLI sessions.",
+          ),
+          width,
+        ),
+      );
+    } else {
+      const srcTag = snap.metadata?.source ? ` · source: ${snap.metadata.source}` : "";
+      if (snap.generatedAt) {
+        lines.push(fitWidth(this.theme.dim(`Snapshot: ${snap.generatedAt}${srcTag}`), width));
+        lines.push("");
+      }
 
-    const bucketRows: Array<{ bucket: string; window: string; ratio: number | null; reset: string }> = [];
-    for (const b of snap.buckets ?? []) {
-      const wins = b.windows ?? [];
-      for (let i = 0; i < wins.length; i++) {
-        const w = wins[i]!;
-        const ratio =
-          typeof w.remainingRatio === "number"
-            ? w.remainingRatio
-            : typeof w.usedPercent === "number"
-              ? Math.max(0, 1 - w.usedPercent / 100)
-              : null;
-        bucketRows.push({
-          bucket: i === 0 ? b.displayName || b.bucketId : "",
-          window: w.label || w.windowId,
-          ratio,
-          reset: formatResetCountdown(w.resetAt),
-        });
+      const bucketRows: Array<{ bucket: string; window: string; ratio: number | null; reset: string }> = [];
+      for (const b of snap.buckets ?? []) {
+        const wins = b.windows ?? [];
+        for (let i = 0; i < wins.length; i++) {
+          const w = wins[i]!;
+          const ratio =
+            typeof w.remainingRatio === "number"
+              ? w.remainingRatio
+              : typeof w.usedPercent === "number"
+                ? Math.max(0, 1 - w.usedPercent / 100)
+                : null;
+          bucketRows.push({
+            bucket: i === 0 ? b.displayName || b.bucketId : "",
+            window: w.label || w.windowId,
+            ratio,
+            reset: formatResetCountdown(w.resetAt),
+          });
+        }
+      }
+
+      if (bucketRows.length > 0) {
+        lines.push(
+          ...renderTable(
+            bucketRows,
+            [
+              { header: "BUCKET", width: "flex", minWidth: 14, priority: 0, render: (r) => this.theme.accent(r.bucket) },
+              { header: "WINDOW", width: 14, priority: 1, render: (r) => this.theme.text(r.window) },
+              {
+                header: "CAPACITY",
+                width: 17,
+                priority: 0,
+                render: (r) => renderProgressBar(r.ratio, this.theme, { barWidth: 10 }),
+              },
+              { header: "RESET", width: 16, align: "right", priority: 2, render: (r) => this.theme.muted(r.reset) },
+            ],
+            width,
+            this.theme,
+          ),
+        );
+      }
+
+      if (snap.models?.length) {
+        lines.push("");
+        lines.push(
+          ...renderTable(
+            snap.models.slice(0, 10),
+            [
+              { header: "MODEL", width: "flex", minWidth: 16, priority: 0, render: (m) => this.theme.bold(m.modelId) },
+              {
+                header: "STATE",
+                width: 10,
+                priority: 1,
+                render: (m) => (m.exhausted ? badge("EXHAUSTED", "error", this.theme) : badge("OK", "success", this.theme)),
+              },
+              {
+                header: "BOUND BUCKETS",
+                width: "flex",
+                minWidth: 14,
+                priority: 2,
+                render: (m) =>
+                  this.theme.muted(
+                    (m.bucketBindings ?? [])
+                      .map((bb) => `${bb.bucketId}${bb.multiplier !== undefined && bb.multiplier !== 1 ? ` (${bb.multiplier}x)` : ""}`)
+                      .join(" ∩ "),
+                  ),
+              },
+            ],
+            width,
+            this.theme,
+          ),
+        );
       }
     }
 
-    if (bucketRows.length > 0) {
-      lines.push(
-        ...renderTable(
-          bucketRows,
-          [
-            { header: "BUCKET", width: "flex", minWidth: 14, priority: 0, render: (r) => this.theme.accent(r.bucket) },
-            { header: "WINDOW", width: 14, priority: 1, render: (r) => this.theme.text(r.window) },
-            {
-              header: "CAPACITY",
-              width: 17,
-              priority: 0,
-              render: (r) => renderProgressBar(r.ratio, this.theme, { barWidth: 10 }),
-            },
-            { header: "RESET", width: 16, align: "right", priority: 2, render: (r) => this.theme.muted(r.reset) },
-          ],
-          width,
-          this.theme,
-        ),
-      );
-    }
-
-    if (snap.models?.length) {
+    if (this.data.coverage?.length) {
       lines.push("");
-      lines.push(
-        ...renderTable(
-          snap.models.slice(0, 10),
-          [
-            { header: "MODEL", width: "flex", minWidth: 16, priority: 0, render: (m) => this.theme.bold(m.modelId) },
-            {
-              header: "STATE",
-              width: 10,
-              priority: 1,
-              render: (m) => (m.exhausted ? badge("EXHAUSTED", "error", this.theme) : badge("OK", "success", this.theme)),
-            },
-            {
-              header: "BOUND BUCKETS",
-              width: "flex",
-              minWidth: 14,
-              priority: 2,
-              render: (m) =>
-                this.theme.muted(
-                  (m.bucketBindings ?? [])
-                    .map((bb) => `${bb.bucketId}${bb.multiplier !== undefined && bb.multiplier !== 1 ? ` (${bb.multiplier}x)` : ""}`)
-                    .join(" ∩ "),
-                ),
-            },
-          ],
-          width,
-          this.theme,
-        ),
-      );
+      lines.push(fitWidth(this.theme.dim("Enabled profile telemetry:"), width));
+      for (const c of this.data.coverage) {
+        const dot = c.hasData ? this.theme.success("●") : this.theme.dim("○");
+        lines.push(fitWidth(`  ${dot} ${this.theme.bold(c.profileId)} ${this.theme.muted(`— ${c.note}`)}`, width));
+      }
     }
 
     return lines.map((l) => clampLine(l, width));

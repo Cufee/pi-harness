@@ -116,6 +116,22 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
     },
   },
   {
+    name: "goal_wait",
+    description:
+      "Event-driven wait for a Goal's linked autonomous run to settle (or raise a P0 escalation) without token polling. Optional fallback_interval_s configures a long dead-agent watchdog wakeup (default 600s).",
+    inputSchema: {
+      type: "object",
+      required: ["goal_id"],
+      properties: {
+        goal_id: { type: "string" },
+        fallback_interval_s: {
+          type: "number",
+          description: "Optional fallback wakeup interval in seconds in case the run dies silently (default: config.events.fallbackWakeupIntervalSec, 600s).",
+        },
+      },
+    },
+  },
+  {
     name: "goal_trigger_review",
     description:
       "Verify and settle a Goal at the chosen verification depth (defaults to the Goal's verification_mode: 'auto' runs deterministic checks and only spawns an independent LLM reviewer when required behavioral/architectural criteria exist; 'deterministic' runs checks only; 'none' approves directly).",
@@ -224,6 +240,9 @@ export class DirectorRuntime {
   readonly goals: GoalEngine;
   private activeChats = new Map<string, ActiveChat>();
   private activeReviews = new Map<string, AbortController>();
+  private unsubRunEvents: (() => void) | null = null;
+  private wakeHandler: ((chatSessionId: string, eventSummary: string, prompt: string) => void) | null = null;
+  private notifiedSettledGoals = new Set<string>();
 
   constructor(
     private readonly db: ControlPlaneDb,
@@ -239,6 +258,47 @@ export class DirectorRuntime {
       (id) => this.activeReviews.get(id)?.abort(new Error("Goal changed during review")),
       config.goals,
     );
+    this.unsubRunEvents = this.db.onEvent((ev) => this.handleControlPlaneEvent(ev));
+  }
+
+  setWakeHandler(handler: (chatSessionId: string, eventSummary: string, prompt: string) => void): void {
+    this.wakeHandler = handler;
+  }
+
+  dispose(): void {
+    this.unsubRunEvents?.();
+    this.unsubRunEvents = null;
+  }
+
+  private handleControlPlaneEvent(ev: { runId: string; type: string; payload: unknown }): void {
+    if (!this.config.events?.wakeDirectorOnGoalSettle) return;
+    if (ev.type !== "run.status") return;
+    const status = String((ev.payload as { status?: string } | null)?.status ?? "");
+    if (!["completed", "failed", "stopped"].includes(status)) return;
+
+    // Find any active Goal linked to this run and wake its owning Director session automatically!
+    const row = this.db.db
+      .prepare("SELECT id FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1")
+      .get(ev.runId) as { id: string } | undefined;
+    if (!row) return;
+    const goal = this.goals.getGoal(row.id);
+    if (!goal?.chatSessionId) return;
+    if (["achieved", "cancelled", "paused"].includes(goal.status)) return;
+
+    const dedupeKey = `${goal.id}:v${goal.version}:${ev.runId}:${status}`;
+    if (this.notifiedSettledGoals.has(dedupeKey)) return;
+    this.notifiedSettledGoals.add(dedupeKey);
+
+    const openEsc = this.db.listEscalations(ev.runId, "open");
+    const summary = `[Event] Goal ${goal.id} v${goal.version} ("${goal.title}") run ${ev.runId} ${status}${openEsc.length ? ` (${openEsc.length} open escalation(s))` : ""}.`;
+    const wakePrompt = [
+      summary,
+      status === "completed"
+        ? `The autonomous run for Goal ${goal.id} finished. Inspect/settle the goal with \`goal_trigger_review\` (using the appropriate \`verification_mode\` for this task) or report the outcome concisely to the user.`
+        : `The autonomous run for Goal ${goal.id} ended with status '${status}'. Inspect the goal via \`goal_get\` and report the status, any blockers, and recommended next steps to the user.`,
+    ].join("\n");
+
+    this.wakeHandler?.(goal.chatSessionId, summary, wakePrompt);
   }
 
   updateConfig(next: HarnessConfig, catalog = this.orchestrator.catalog, quota = this.orchestrator.quota): void {
@@ -783,12 +843,13 @@ export class DirectorRuntime {
     userMessage: string,
     onDelta?: (delta: string) => void,
     onToolEvent?: RunnerCallbacks["onToolEvent"],
+    opts?: { turnRole?: "user" | "system_notice" },
   ): Promise<{ userTurn: ChatTurnRecord; assistantTurn: ChatTurnRecord | null }> {
     const session = this.chats.getSession(chatSessionId);
     if (!session) throw new Error(`Unknown chat session ${chatSessionId}`);
 
     if (this.activeChats.has(chatSessionId)) throw new Error(`Chat ${chatSessionId} already has an active turn`);
-    const userTurn = this.chats.appendTurn(chatSessionId, "user", userMessage);
+    const userTurn = this.chats.appendTurn(chatSessionId, opts?.turnRole ?? "user", userMessage);
     const history = this.chats.getRecentHistory(chatSessionId, 40);
     const activeGoals = this.goals.listGoals({ repoRoot: session.repoRoot, chatSessionId });
 
@@ -1023,6 +1084,18 @@ export class DirectorRuntime {
         return { ...detail, tasks: detail.tasks.map((t) => compactTaskHandoff(t, detail.openEscalations)), rendered_in_ui: "Goal detail shown to the user; do not repeat it." };
       }
 
+      case "goal_wait": {
+        const goalId = String(args.goal_id);
+        const goal = this.goals.getGoal(goalId);
+        if (!goal) throw new Error(`Unknown goal ${goalId}`);
+        const defaultSec = this.config.events?.fallbackWakeupIntervalSec ?? 600;
+        const fallbackMs = Math.max(
+          1,
+          typeof args.fallback_interval_s === "number" ? args.fallback_interval_s : defaultSec,
+        ) * 1000;
+        return await this.waitForGoalEvent(goalId, fallbackMs, signal);
+      }
+
       case "goal_trigger_review": {
         const reviewed = await this.verifyAndReviewGoal(String(args.goal_id), signal, {
           verificationMode:
@@ -1120,5 +1193,89 @@ export class DirectorRuntime {
       default:
         throw new Error(`Unknown Director tool: ${name}`);
     }
+  }
+
+  /**
+   * Event-driven wait for a Goal's linked run to settle (or raise a P0 escalation), with a
+   * long configurable fallback watchdog interval that checks live execution health without polling.
+   */
+  async waitForGoalEvent(
+    goalId: string,
+    fallbackIntervalMs = (this.config.events?.fallbackWakeupIntervalSec ?? 600) * 1000,
+    signal?: AbortSignal,
+  ): Promise<{
+    goal: GoalRecord;
+    runStatus: string | null;
+    wakeReason: "already_settled" | "event" | "fallback_interval" | "run_inactive";
+    openEscalations: ReturnType<ControlPlaneDb["listEscalations"]>;
+  }> {
+    signal?.throwIfAborted();
+    const initial = this.goals.getGoal(goalId);
+    if (!initial) throw new Error(`Unknown goal ${goalId}`);
+
+    const snapshot = () => {
+      const g = this.goals.getGoal(goalId) ?? initial;
+      const run = g.linkedRunId ? this.orchestrator.getEffectiveRun(g.linkedRunId) : null;
+      const openEscalations = g.linkedRunId ? this.db.listEscalations(g.linkedRunId, "open") : [];
+      const settledGoal = ["achieved", "awaiting_human", "paused", "cancelled"].includes(g.status);
+      const settledRun = !run || ["completed", "failed", "stopped", "paused_quota"].includes(run.status);
+      const hasP0 = openEscalations.some((e) => e.severity === "P0");
+      return { g, run, openEscalations, done: settledGoal || settledRun || hasP0 };
+    };
+
+    const first = snapshot();
+    if (first.done) {
+      return {
+        goal: first.g,
+        runStatus: first.run?.status ?? null,
+        wakeReason: "already_settled",
+        openEscalations: first.openEscalations,
+      };
+    }
+
+    return new Promise((resolve, reject) => {
+      let done = false;
+      const finish = (wakeReason: "event" | "fallback_interval" | "run_inactive") => {
+        if (done) return;
+        done = true;
+        unsub();
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        if (signal?.aborted) {
+          reject(signal.reason);
+          return;
+        }
+        const cur = snapshot();
+        resolve({
+          goal: cur.g,
+          runStatus: cur.run?.status ?? null,
+          wakeReason,
+          openEscalations: cur.openEscalations,
+        });
+      };
+      const onAbort = () => finish("event");
+      const unsub = this.db.onEvent((ev) => {
+        const cur = snapshot();
+        if (ev.runId && cur.g.linkedRunId && ev.runId !== cur.g.linkedRunId) return;
+        if (cur.done) finish("event");
+      });
+      const timer = setTimeout(() => {
+        const cur = snapshot();
+        if (cur.done) {
+          finish("event");
+          return;
+        }
+        const runId = cur.g.linkedRunId;
+        if (runId && !this.orchestrator.isRunActiveInMemory(runId)) {
+          this.orchestrator.reconcileRunStatus(runId);
+          finish("run_inactive");
+          return;
+        }
+        finish("fallback_interval");
+      }, Math.max(50, fallbackIntervalMs));
+      timer.unref?.();
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+    });
   }
 }
