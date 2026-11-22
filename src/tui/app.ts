@@ -1,4 +1,4 @@
-import { Container, Markdown, Spacer } from "@earendil-works/pi-tui";
+import { type Component, Container, Markdown, Spacer } from "@earendil-works/pi-tui";
 import type { CompiledModelCatalog } from "../catalog/compiler.js";
 import type { HarnessConfig } from "../config.js";
 import type { EscalationRecord, EventRecord, RunRecord, TaskRecord } from "../control-plane/db.js";
@@ -50,6 +50,7 @@ import {
   UserCard,
 } from "./primitives/index.js";
 import { RunsTreeOverlay, type RunsTreesResult } from "./runs-tree.js";
+import { componentForHistoryTurn, extractDisplay, ToolOutputCard } from "./tool-output/index.js";
 import { SettingsOverlay } from "./settings-overlay.js";
 import { AgentTranscriptOverlay } from "./transcript-overlay.js";
 
@@ -189,6 +190,57 @@ async function resolveLeaveNote(client: DaemonClient): Promise<string> {
   }
 }
 
+/** Transcript component for one persisted chat turn (history replay on chat.open / session switch). */
+export function historyTurnComponent(t: ChatTurnRecord, theme: HarnessTheme, modelLabel: string): Component {
+  if (t.role === "user") return new UserCard(theme, t.content);
+  if (t.role === "assistant") return new AssistantCard(theme, t.content, modelLabel);
+  return componentForHistoryTurn(t, theme) ?? new SystemCard(theme, [t.content], "muted");
+}
+
+/** Live tool components of the in-flight chat turn, keyed by tool event id, in arrival order. */
+export type PendingTools = Map<string, ToolPill | ToolOutputCard>;
+
+/**
+ * Applies one `chat.tool` event to the pending tools area: a `ToolOutputCard` when the event carries a
+ * structured display (contract/tool-display-v1), otherwise the compact `ToolPill` created or updated in place.
+ */
+export function applyChatToolEvent(payload: unknown, pending: PendingTools, container: Container, theme: HarnessTheme): void {
+  const p = (payload ?? {}) as { id?: string; name?: string; status?: string; title?: string };
+  const display = extractDisplay(payload);
+  if (display) {
+    const key = p.id || `display-${pending.size}`;
+    if (pending.get(key) instanceof ToolOutputCard) return;
+    const card = new ToolOutputCard(theme, display);
+    pending.set(key, card);
+    container.addChild(card);
+    return;
+  }
+  const rawLabel = p.title ?? p.name ?? "tool";
+  const displayLabel = rawLabel.replace(/^mcp[._/]harness[._/]+/i, "harness:").replace(/^mcp__harness__/i, "harness:");
+  const key = p.id || displayLabel;
+  const st = p.status === "completed" ? "ok" : p.status === "failed" ? "error" : "running";
+  const detail = st === "ok" ? "" : st === "error" ? "failed" : "running…";
+  const existing = pending.get(key);
+  if (existing instanceof ToolPill) {
+    existing.update(st, detail);
+  } else if (!existing) {
+    const pill = new ToolPill(theme, st, displayLabel, detail);
+    pending.set(key, pill);
+    container.addChild(pill);
+  }
+}
+
+/**
+ * Moves pending tool components into scrollback in arrival order. With `cardsOnly` (cancel / error
+ * paths) only structured cards are kept, since the daemon already persisted them as tool_output turns.
+ */
+export function preservePendingTools(pending: PendingTools, scrollback: Container, opts: { cardsOnly?: boolean } = {}): void {
+  for (const c of pending.values()) {
+    if (opts.cardsOnly && !(c instanceof ToolOutputCard)) continue;
+    scrollback.addChild(c);
+  }
+}
+
 /**
  * Primary zero-arg interactive TUI: Persistent Tier 0 Director Chat on native terminal scrollback
  * (`@earendil-works/pi-tui` `TuiMainScreen`) built on `src/tui/primitives/`:
@@ -231,7 +283,7 @@ export async function runDirectorChatTui(opts: {
   let exitAction: TuiExitAction = { kind: "exit" };
   let evictedByTakeover = false;
   const queuedMessages: string[] = [];
-  const activeToolPills = new Map<string, ToolPill>();
+  const activeToolPills: PendingTools = new Map();
 
   const theme = createTheme();
   const term = new TerminalSession();
@@ -263,15 +315,8 @@ export async function runDirectorChatTui(opts: {
     chatContainer.addChild(
       new BannerCard(theme, "pi-harness", `${payload.session.title} · ${payload.session.id} (${dirLabel})`),
     );
-    for (const t of payload.history) {
-      if (t.role === "user") {
-        chatContainer.addChild(new UserCard(theme, t.content));
-      } else if (t.role === "assistant") {
-        chatContainer.addChild(new AssistantCard(theme, t.content, payload.session.model ?? payload.session.profileId));
-      } else {
-        chatContainer.addChild(new SystemCard(theme, [t.content], "muted"));
-      }
-    }
+    const modelLabel = payload.session.model ?? payload.session.profileId;
+    for (const t of payload.history) chatContainer.addChild(historyTurnComponent(t, theme, modelLabel));
     if (payload.tookOver) {
       chatContainer.addChild(
         new SystemCard(theme, [`Took over ${payload.session.id} (previous terminal was detached).`], "info"),
@@ -911,10 +956,8 @@ export async function runDirectorChatTui(opts: {
           if (reqId !== activeRequestId) return;
           busy = false;
           spinner.stop();
-          // Preserve finalized tool pills into immutable scrollback before clearing pending
-          for (const pill of activeToolPills.values()) {
-            chatContainer.addChild(pill);
-          }
+          // Preserve finalized tool pills and output cards into immutable scrollback before clearing pending
+          preservePendingTools(activeToolPills, chatContainer);
           clearPending();
           chatContainer.addChild(
             new AssistantCard(theme, res.assistantTurn.content, session.model ?? session.profileId),
@@ -930,6 +973,7 @@ export async function runDirectorChatTui(opts: {
           if (reqId !== activeRequestId) return;
           busy = false;
           spinner.stop();
+          preservePendingTools(activeToolPills, chatContainer, { cardsOnly: true });
           clearPending();
           appendError(err, `chat.send:${session.profileId}`);
           refreshStatus();
@@ -956,6 +1000,7 @@ export async function runDirectorChatTui(opts: {
         queuedMessages.length = 0;
         spinner.stop();
         void opts.client.request("chat.cancel", { chatSessionId: session.id }).catch(() => {});
+        preservePendingTools(activeToolPills, chatContainer, { cardsOnly: true });
         if (streamingText.trim()) {
           chatContainer.addChild(new AssistantCard(theme, streamingText, `${session.model ?? session.profileId} · cancelled`));
         }
@@ -1015,20 +1060,7 @@ export async function runDirectorChatTui(opts: {
       pendingMarkdown.setText(streamingText);
       tui.requestRender();
     } else if (ev.type === "chat.tool" && busy) {
-      const p = ev.payload as { id?: string; name?: string; status?: string; title?: string };
-      const rawLabel = p.title ?? p.name ?? "tool";
-      const displayLabel = rawLabel.replace(/^mcp[._/]harness[._/]+/i, "harness:").replace(/^mcp__harness__/i, "harness:");
-      const key = p.id || displayLabel;
-      const st = p.status === "completed" ? "ok" : p.status === "failed" ? "error" : "running";
-      const detail = st === "ok" ? "" : st === "error" ? "failed" : "running…";
-      const existing = activeToolPills.get(key);
-      if (existing) {
-        existing.update(st, detail);
-      } else {
-        const pill = new ToolPill(theme, st, displayLabel, detail);
-        activeToolPills.set(key, pill);
-        pendingToolsContainer.addChild(pill);
-      }
+      applyChatToolEvent(ev.payload, activeToolPills, pendingToolsContainer, theme);
       tui.requestRender();
     } else if (ev.type === "goal.reviewed") {
       const p = ev.payload as { goalId: string; version: number; cycle: number; verdict: string; status: string; summary: string };
