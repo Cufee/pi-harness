@@ -17,8 +17,8 @@ CLI-first, daemonized **Tier 0 Interactive Director + 3-Tier Multi-Agent Coding 
 - **Curated Knowledge Base & Cross-Run Coordination (`src/kb/`, `src/control-plane/db.ts`)**:
   - `bun:sqlite` FTS5 BM25 2-stage discovery + `$0`-token `git diff` staleness pre-check for Maintainer GC.
   - Repo-scoped write leases, versioned single-writer shared contracts, target-branch-serialized merge queues, and DFS deadlock detection for bounded peer requests.
-- **Automated Latest-Per-Family Model Catalog (`src/catalog/`)**:
-  - Joins enabled harness profiles with `models.dev`, OpenRouter, LiteLLM deprecations, Vals.ai TB4/SWE, Harbor Terminal-Bench 4.1, Epoch AI ZIP, PinchBench, and optional Artificial Analysis Pro — deduplicated to the latest generation per capability family.
+- **Model catalog** (`src/catalog/`)
+  - The catalog combines routes from enabled profiles with models.dev, OpenRouter, and LiteLLM metadata to select current coding models. The CLI, picker, and automatic selection share one ranking from fresh Vals Terminal-Bench 4.0 results. Eligible models without a comparable measurement remain available with no rank. [Ranking evidence and offline reproduction](docs/model-catalog-ranking.md)
 - **Native Quota Endpoint (`proto/quota.proto`, `src/gen/quota_pb.ts`, `src/quota/`)**:
   - Generated directly via `@bufbuild/protoc-gen-es` (`bun run proto:gen`). Models shared vs. separate multi-window quota buckets (e.g., Antigravity Gemini vs. Opus 5.5, Claude 5h ∩ 7d ∩ 7d-Opus, Copilot multipliers, API spend caps) merged with passive ACP rate-limit signals.
 - **Native-Scrollback TUI Primitives & Zero-Port Remote Daemon (`src/tui/primitives/`, `src/daemon/`)**:
