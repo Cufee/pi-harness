@@ -182,12 +182,11 @@ export class ListView<T> {
     let bodyHeight = h;
     if (this.filterActive || this.filterQuery) {
       bodyHeight = Math.max(1, h - 1);
-      const prefix = theme.accentBold("/ ");
       if (this.filterActive) {
-        const rendered = this.filterInput.render(Math.max(4, w - 3))[0] ?? "";
-        out.push(clamp(`${prefix}${rendered}`, w));
+        const rendered = (this.filterInput.render(Math.max(4, w - 3))[0] ?? "").replace(/^>\s?/, "");
+        out.push(clamp(`${theme.accentBold("/ ")}${rendered}`, w));
       } else {
-        out.push(clamp(`${prefix}${this.filterQuery} ${theme.muted(`(${this.filtered.length}/${this.allItems.length})`)}`, w));
+        out.push(clamp(`${theme.accentBold("/ ")}${this.filterQuery} ${theme.muted(`(${this.filtered.length}/${this.allItems.length})`)}`, w));
       }
     }
 

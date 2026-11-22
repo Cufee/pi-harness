@@ -84,11 +84,11 @@ export class GoToPaletteScreen implements Screen {
         label: item.ref.label ?? item.title,
       };
       add({
-        id: `inbox:${ref.kind}:${ref.id}`,
+        id: `${ref.kind}:${ref.id}`,
         searchText: `inbox ${item.severity} ${item.title} ${item.detail} ${ref.id}`,
         badge: item.severity,
         badgeTone: item.severity === "P0" ? "danger" : "warn",
-        title: sanitizeLine(item.title),
+        title: sanitizeLine(item.title).replace(/^\[P[0-2]\/[^\]]+\]\s*/i, ""),
         detail: firstLine(item.detail, 45),
         run: (ctx) => {
           ctx.navigator.pop();
@@ -99,7 +99,7 @@ export class GoToPaletteScreen implements Screen {
 
     for (const ref of this.recentRefs.allNewestFirst()) {
       add({
-        id: `ref:${ref.kind}:${ref.id}`,
+        id: `${ref.kind}:${ref.id}`,
         searchText: `recent ${ref.kind} ${ref.id} ${ref.label}`,
         badge: ref.kind,
         badgeTone: "accent",
@@ -131,7 +131,7 @@ export class GoToPaletteScreen implements Screen {
     for (const e of snap.escalations) {
       const ref: EntityRef = { kind: "escalation", id: e.id, runId: e.runId, label: `${e.id} ${e.title}` };
       add({
-        id: `esc:${e.id}`,
+        id: `escalation:${e.id}`,
         searchText: `escalation ${e.id} ${e.severity} ${e.status} ${e.title} ${e.runId}`,
         badge: e.severity,
         badgeTone: e.status === "open" ? "danger" : "muted",
