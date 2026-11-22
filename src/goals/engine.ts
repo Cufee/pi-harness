@@ -548,10 +548,10 @@ export class GoalEngine {
     return { goal: this.getGoal(cur.id)!, delta };
   }
 
-  /** Reconciles any goals stranded in `verifying` or `reviewing` after a daemon crash/restart. */
+  /** Reconciles goals stranded in `verifying`/`reviewing` or `executing` with dead runs after a daemon restart. */
   reconcileStaleGoalsOnStartup(): number {
     const now = Date.now();
-    const res = this.db
+    const res1 = this.db
       .prepare(
         `UPDATE goals
          SET status = 'awaiting_human',
@@ -560,7 +560,24 @@ export class GoalEngine {
          WHERE status IN ('verifying', 'reviewing')`,
       )
       .run(now);
-    return res.changes;
+    let res2Changes = 0;
+    try {
+      const res2 = this.db
+        .prepare(
+          `UPDATE goals
+           SET status = 'awaiting_human',
+               last_review_summary = COALESCE(last_review_summary, 'Linked run ended before goal verification; resume or review.'),
+               updated_at = ?
+           WHERE status = 'executing'
+             AND linked_run_id IS NOT NULL
+             AND EXISTS (SELECT 1 FROM runs r WHERE r.id = goals.linked_run_id AND r.status IN ('failed', 'stopped'))`,
+        )
+        .run(now);
+      res2Changes = res2.changes;
+    } catch {
+      // runs table may not exist in standalone GoalEngine unit tests
+    }
+    return res1.changes + res2Changes;
   }
 
   /** Executes all `deterministic` criteria commands at $0 LLM cost and hashes repo diff for progress tracking. */

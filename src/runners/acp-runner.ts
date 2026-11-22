@@ -5,7 +5,7 @@ import { lstat, mkdir, open, realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { client, ndJsonStream, PROTOCOL_VERSION, type AgentApp, type ClientConnection } from "@agentclientprotocol/sdk/unstable";
-import type { AcpProfileConfig } from "../config.js";
+import { interpolateEnv, type AcpProfileConfig } from "../config.js";
 import {
   buildNewSessionParams,
   buildPostSessionActions,
@@ -25,34 +25,36 @@ import type { ProbedModelInfo, QuotaPauseInfo, RunAgentRequest, RunAgentResult, 
 const terminatingChildren = new WeakSet<ChildProcess>();
 
 function terminateChild(child: ChildProcess | null | undefined): void {
-  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  if (!child) return;
   if (terminatingChildren.has(child)) return;
   terminatingChildren.add(child);
 
-  const sendSignal = (sig: NodeJS.Signals) => {
-    if (process.platform !== "win32" && child.pid) {
+  const pid = child.pid;
+  const signalGroupOrChild = (sig: NodeJS.Signals) => {
+    if (process.platform !== "win32" && pid) {
       try {
-        process.kill(-child.pid, sig);
+        process.kill(-pid, sig);
         return;
       } catch {
-        // Fallback to direct child signal if process group already exited
+        // Group may already be gone (ESRCH) or not a process group leader; fall through to direct child
       }
     }
-    try {
-      child.kill(sig);
-    } catch {
-      // ignore
+    if (child.exitCode === null && child.signalCode === null) {
+      try {
+        child.kill(sig);
+      } catch {
+        // ignore
+      }
     }
   };
 
-  sendSignal("SIGTERM");
+  signalGroupOrChild("SIGTERM");
+  // Keep the SIGKILL grace timer active even if the leader (e.g. `npx`) already exited,
+  // so SIGTERM-ignoring descendants in the same process group are reliably reaped.
   const killTimer = setTimeout(() => {
-    if (child.exitCode === null && child.signalCode === null) {
-      sendSignal("SIGKILL");
-    }
+    signalGroupOrChild("SIGKILL");
   }, 2000);
   killTimer.unref?.();
-  child.once("exit", () => clearTimeout(killTimer));
 }
 
 function withTimeout<T>(
@@ -259,32 +261,54 @@ export class AcpRunner {
     let activeConnection: ClientConnection | null = null;
     const toolTitlesById = new Map<string, string>();
 
-    // Inactivity watchdog for active `session/prompt` calls
+    // Inactivity watchdog + bounded cancellation grace timer for active `session/prompt` calls
     let idleTimedOut = false;
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    let cancelGraceTimer: ReturnType<typeof setTimeout> | null = null;
+    let resolveActivePromptOnGrace: ((val: Record<string, unknown>) => void) | null = null;
     let rejectActivePromptOnIdle: ((err: Error) => void) | null = null;
     const clearIdleWatchdog = () => {
       if (idleTimer) {
         clearTimeout(idleTimer);
         idleTimer = null;
       }
+      if (cancelGraceTimer) {
+        clearTimeout(cancelGraceTimer);
+        cancelGraceTimer = null;
+      }
+      resolveActivePromptOnGrace = null;
       rejectActivePromptOnIdle = null;
+    };
+    const armCancelGraceTimer = (stopReason: string) => {
+      if (cancelGraceTimer || !resolveActivePromptOnGrace) return;
+      const graceMs = idleTimeoutMs > 0 ? Math.min(5_000, Math.max(100, idleTimeoutMs * 2)) : 5_000;
+      cancelGraceTimer = setTimeout(() => {
+        cancelGraceTimer = null;
+        const cb = resolveActivePromptOnGrace;
+        clearIdleWatchdog();
+        terminateChild(child);
+        cb?.({ stopReason });
+      }, graceMs);
+      cancelGraceTimer.unref?.();
     };
     const resetIdleWatchdog = () => {
       if (!rejectActivePromptOnIdle || idleTimeoutMs <= 0 || idleTimedOut) return;
       if (idleTimer) clearTimeout(idleTimer);
+      // When an acknowledged tool call (e.g. `wait_children`, `wait_timer`, `submit_for_merge`) is in flight,
+      // give it a generous ceiling instead of tripping the short model-inactivity timer.
+      const effectiveMs = inFlightToolCalls.size > 0 ? Math.max(idleTimeoutMs, 1_800_000) : idleTimeoutMs;
       idleTimer = setTimeout(() => {
         idleTimer = null;
         if (quotaWatchdogTriggered || rolloverTriggered || maxTurnsTriggered || req.signal.aborted) return;
         idleTimedOut = true;
         const cb = rejectActivePromptOnIdle;
-        rejectActivePromptOnIdle = null;
+        clearIdleWatchdog();
         if (sessionId && activeConnection) {
           void activeConnection.agent.notify("session/cancel", { sessionId }).catch(() => {});
         }
         terminateChild(child);
-        cb?.(new Error(`ACP session timed out after ${idleTimeoutMs}ms of inactivity`));
-      }, idleTimeoutMs);
+        cb?.(new Error(`ACP session timed out after ${effectiveMs}ms of inactivity`));
+      }, effectiveMs);
       idleTimer.unref?.();
     };
 
@@ -296,9 +320,11 @@ export class AcpRunner {
         if (sessionId && activeConnection) {
           void activeConnection.agent.notify("session/cancel", { sessionId }).catch(() => {});
         }
+        armCancelGraceTimer("max_turn_requests");
         return;
       }
       turnsUsed += 1;
+      req.callbacks.onTurn?.(turnsUsed);
     };
 
     // Per-turn & cumulative tool-failure / read-only-denial tracking (for continuation recovery + robust circuit breaker)
@@ -462,7 +488,9 @@ export class AcpRunner {
         } else if (kind === "usage_update") {
           const used = Number(update.used ?? 0);
           const rawSize = Number(update.size ?? 0);
-          const size = rawSize > 0 ? rawSize : (req.contextWindow ?? 0);
+          // Some adapters (e.g. amp-acp) report a default 200k size even for 1M-context models;
+          // prefer the larger of adapter-reported size and catalog contextWindow when available.
+          const size = Math.max(rawSize > 0 ? rawSize : 0, req.contextWindow ?? 0);
           const costObj = update.cost as { amount?: number } | null | undefined;
           lastUsage = {
             used,
@@ -549,6 +577,7 @@ export class AcpRunner {
           ) {
             rolloverTriggered = true;
             void activeConnection.agent.notify("session/cancel", { sessionId }).catch(() => {});
+            armCancelGraceTimer("cancelled");
           }
         } else if (kind === "tool_call" || kind === "tool_call_update") {
           if (accumulatedText.length > 0) needsParagraphBreak = true;
@@ -582,6 +611,7 @@ export class AcpRunner {
           const resolvedTitle = rawTitle ?? (callId ? toolTitlesById.get(callId) : undefined) ?? "tool";
           if (status === "completed") {
             if (callId) inFlightToolCalls.delete(callId);
+            resetIdleWatchdog();
             completedToolInWave = true;
             quotaRejected = false;
             textSinceQuotaRejection = "";
@@ -592,6 +622,7 @@ export class AcpRunner {
             lastIdenticalFailureKey = "";
           } else if (status === "failed") {
             if (callId) inFlightToolCalls.delete(callId);
+            resetIdleWatchdog();
             completedToolInWave = true;
             const detail = extractToolErrorSnippet(update);
             turnFailedTools.push({ title: resolvedTitle, detail });
@@ -641,32 +672,53 @@ export class AcpRunner {
 
         const allowOpt = options.find((o) => o.kind === "allow_once");
         const denyOpt = options.find((o) => o.kind === "reject_once") ?? options.find((o) => o.kind === "reject_always");
+        const externalMcpNames = new Set(
+          !controlOnly
+            ? (req.externalMcpServers ?? []).filter((s) => s.enabled !== false && s.name.trim()).map((s) => s.name.trim())
+            : [],
+        );
         const claude = p.toolCall?._meta?.claudeCode;
+        const claudeExternalMcp =
+          this.profile.adapter === "claude" &&
+          claude?.mcpServer?.name !== undefined &&
+          externalMcpNames.has(claude.mcpServer.name);
         const claudeCall = this.profile.adapter === "claude" && toolKind === "other" &&
-          claude?.mcpServer?.name === "harness" && claude.mcpServer.source === "dynamic" &&
-          claude.toolName !== undefined && claudeToolNames.has(claude.toolName);
+          ((claude?.mcpServer?.name === "harness" && claude.mcpServer.source === "dynamic" &&
+            claude.toolName !== undefined && claudeToolNames.has(claude.toolName)) ||
+            claudeExternalMcp);
         const codexCall = this.profile.adapter === "codex" && toolKind === "execute" &&
           p._meta?.is_mcp_tool_approval === true && callId !== undefined && codexHarnessCalls.has(callId);
         const geminiMcp = p.toolCall?._meta?.["gemini-cli"]?.mcp;
-        const geminiCall = this.profile.adapter === "gemini" && geminiMcp?.server_name === "harness" &&
-          geminiMcp.tool_name !== undefined && harnessToolNames.has(geminiMcp.tool_name);
+        const geminiExternalMcp =
+          this.profile.adapter === "gemini" &&
+          geminiMcp?.server_name !== undefined &&
+          externalMcpNames.has(geminiMcp.server_name);
+        const geminiCall = this.profile.adapter === "gemini" &&
+          ((geminiMcp?.server_name === "harness" &&
+            geminiMcp.tool_name !== undefined && harnessToolNames.has(geminiMcp.tool_name)) ||
+            geminiExternalMcp);
         const genericCall = this.profile.adapter === "generic" && toolKind === "other" &&
-          p.toolCall?.name !== undefined && harnessToolNames.has(p.toolCall.name);
+          p.toolCall?.name !== undefined &&
+          (harnessToolNames.has(p.toolCall.name) || [...externalMcpNames].some((srv) => p.toolCall?.name?.startsWith(`${srv}__`)));
         const isRead = toolKind === "read" || toolKind === "search";
         const isWrite = toolKind === "edit" || toolKind === "delete" || toolKind === "move";
+        const isExecute = toolKind === "execute";
         let workspaceCall = false;
-        // Native commands may run inside the CLI sandbox. An opaque command approval
-        // can request elevation and supplies no checkable set of filesystem targets.
-        if (!controlOnly && !claude?.mcpServer && !p._meta?.is_mcp_tool_approval && !geminiMcp &&
-            (isRead || (canWrite && isWrite))) {
-          try {
-            const locations = p.toolCall?.locations ?? [];
-            for (const location of locations) {
-              await workspaceTarget(workspace, location.path, toolKind === "edit" || toolKind === "move");
+        // Allow native workspace reads/searches, writes (when canWrite), and shell commands (e.g. tests, git diff, rg, sg, tmux)
+        // for non-control-plane agents so verification and coding are not blocked by overly strict sandboxes.
+        if (!controlOnly && !claude?.mcpServer && !p._meta?.is_mcp_tool_approval && !geminiMcp) {
+          if (isRead || (canWrite && isWrite)) {
+            try {
+              const locations = p.toolCall?.locations ?? [];
+              for (const location of locations) {
+                await workspaceTarget(workspace, location.path, toolKind === "edit" || toolKind === "move");
+              }
+              workspaceCall = locations.length > 0;
+            } catch {
+              workspaceCall = false;
             }
-            workspaceCall = locations.length > 0;
-          } catch {
-            workspaceCall = false;
+          } else if (isExecute) {
+            workspaceCall = true;
           }
         }
         if (!sessionId || params.sessionId !== sessionId || !(workspaceCall || (hasHarnessBridge && (claudeCall || codexCall || geminiCall || genericCall)))) {
@@ -777,7 +829,8 @@ export class AcpRunner {
       const agentCapabilities = (initRes.agentCapabilities ?? {}) as Record<string, unknown>;
       const sessionCaps = (agentCapabilities.sessionCapabilities ?? {}) as Record<string, unknown>;
 
-      // Wire Harness MCP server via stdio when daemonSocketPath + bridge are configured
+      // Wire Harness MCP server via stdio when daemonSocketPath + bridge are configured,
+      // plus any user-configured external MCP servers (e.g. ast-grep-mcp, octofs, serena) for non-control-plane agents.
       const mcpServers: AcpMcpServerEntry[] = [];
       if (req.daemonSocketPath && req.mcpBridgeEntrypoint) {
         mcpServers.push({
@@ -790,6 +843,17 @@ export class AcpRunner {
             { name: "PI_HARNESS_TASK_ID", value: req.taskId },
           ],
         });
+      }
+      if (!controlOnly && req.externalMcpServers?.length) {
+        for (const ext of req.externalMcpServers) {
+          if (ext.enabled === false || !ext.name?.trim() || !ext.command?.trim() || ext.name.trim() === "harness") continue;
+          mcpServers.push({
+            name: ext.name.trim(),
+            command: ext.command.trim(),
+            args: ext.args ?? [],
+            env: Object.entries(ext.env ?? {}).map(([name, val]) => ({ name, value: interpolateEnv(val) })),
+          });
+        }
       }
 
       const { params: newSessionParams, needsTurn1SystemPrompt } = buildNewSessionParams(this.profile.adapter, {
@@ -874,6 +938,9 @@ export class AcpRunner {
           if (sessionId) {
             await conn.agent.notify("session/cancel", { sessionId }).catch(() => {});
           }
+          if (reason === "clean_rollover") {
+            armCancelGraceTimer("cancelled");
+          }
         },
       });
 
@@ -896,6 +963,7 @@ export class AcpRunner {
           break;
         }
         turnsUsed += 1;
+        req.callbacks.onTurn?.(turnsUsed);
         completedToolInWave = false;
         inFlightToolCalls.clear();
         turnFailedTools = [];
@@ -908,24 +976,23 @@ export class AcpRunner {
           prompt: [{ type: "text", text: nextPromptText }],
         } as never) as unknown as Promise<Record<string, unknown>>;
 
-        if (idleTimeoutMs > 0) {
-          promptRes = await new Promise<Record<string, unknown>>((resolvePrompt, rejectPrompt) => {
+        promptRes = await new Promise<Record<string, unknown>>((resolvePrompt, rejectPrompt) => {
+          resolveActivePromptOnGrace = resolvePrompt;
+          if (idleTimeoutMs > 0) {
             rejectActivePromptOnIdle = rejectPrompt;
             resetIdleWatchdog();
-            promptPromise.then(
-              (val) => {
-                clearIdleWatchdog();
-                resolvePrompt(val);
-              },
-              (err) => {
-                clearIdleWatchdog();
-                rejectPrompt(err);
-              },
-            );
-          });
-        } else {
-          promptRes = await promptPromise;
-        }
+          }
+          promptPromise.then(
+            (val) => {
+              clearIdleWatchdog();
+              resolvePrompt(val);
+            },
+            (err) => {
+              clearIdleWatchdog();
+              rejectPrompt(err);
+            },
+          );
+        });
 
         // Harvest passive quota & terminal sessionFailure signals
         const promptMeta = (promptRes._meta ?? {}) as Record<string, unknown>;
@@ -978,9 +1045,11 @@ export class AcpRunner {
         rawStop = String(promptRes.stopReason ?? "end_turn");
 
         const turnQuotaDetected = detectQuotaErrorText(quotaRejected ? textSinceQuotaRejection || accumulatedText : accumulatedText);
+        // Require a real provider/adapter rejection or observed rate-limit signal before classifying assistant text as quota_paused,
+        // so ordinary prose mentioning "rate limiting" never falsely pauses healthy turns.
         const turnQuotaFalseCompletion =
           (quotaRejected && (textSinceQuotaRejection.trim().length === 0 || turnQuotaDetected.isQuota)) ||
-          (turnSucceededTools === 0 && turnQuotaDetected.isQuota);
+          (quotaRetryHits > 0 && turnSucceededTools === 0 && turnQuotaDetected.isQuota);
 
         // Never continue if rollover, maxTurns, quota watchdog, quota rejection, user abort, or quota failure occurred
         if (
@@ -1051,7 +1120,7 @@ export class AcpRunner {
       const finalQuotaDetected = detectQuotaErrorText(quotaRejected ? textSinceQuotaRejection || accumulatedText : accumulatedText);
       const quotaFalseCompletion =
         (quotaRejected && (textSinceQuotaRejection.trim().length === 0 || finalQuotaDetected.isQuota)) ||
-        (turnSucceededTools === 0 && finalQuotaDetected.isQuota);
+        (quotaRetryHits > 0 && turnSucceededTools === 0 && finalQuotaDetected.isQuota);
 
       if (
         quotaWatchdogTriggered ||

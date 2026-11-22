@@ -446,4 +446,81 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
       rmSync(repo, { recursive: true, force: true });
     }
   });
+
+  it("blocks rename bypass of write_scopes, aborts cancelled merges during CI, and re-acquires leases on resume", async () => {
+    const repo = await initTempRepo();
+    try {
+      const { mkdirSync } = await import("node:fs");
+      mkdirSync(join(repo, "private"), { recursive: true });
+      mkdirSync(join(repo, "allowed"), { recursive: true });
+      writeFileSync(join(repo, "private/secret.txt"), "do not move\n", "utf8");
+      await runGit(repo, ["add", "-A"]);
+      await runGit(repo, ["-c", "user.name=test", "-c", "user.email=test@local", "commit", "-m", "add private file"]);
+
+      const db = new ControlPlaneDb(":memory:");
+      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
+      const run = db.createRun({ goal: "Rename & cancel guards", repoRoot: repo, baseBranch, baseSha });
+
+      // 1. Rename bypass: moving private/secret.txt -> allowed/moved.txt MUST bounce under scope `allowed/**`
+      const wRename = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Rename escape",
+        objective: "Try moving private file",
+        profileId: "acp:claude",
+        writeScopes: ["allowed/**"],
+      });
+      const wtRename = await mgr.createForWorker(run.id, wRename.id, baseSha);
+      mkdirSync(join(wtRename.path, "allowed"), { recursive: true });
+      await runGit(wtRename.path, ["mv", "private/secret.txt", "allowed/moved.txt"]);
+      await runGit(wtRename.path, ["-c", "user.name=w", "-c", "user.email=w@local", "commit", "-m", "sneaky rename"]);
+
+      // Even if task was blocked (deactivating leases), listAssignedWriteScopes still enforces `allowed/**`!
+      db.updateTask(wRename.id, { status: "blocked" });
+      assert.deepEqual(db.listActiveWriteScopes(run.id, wRename.id), []);
+      assert.deepEqual(db.listAssignedWriteScopes(run.id, wRename.id), ["allowed/**"]);
+      assert.deepEqual(db.reacquireWriteLeasesForTask(run.id, wRename.id), ["allowed/**"]);
+
+      const mq = new BisectingMergeQueue(db, mgr, repo, {});
+      const itemRename = db.enqueueMerge({ runId: run.id, taskId: wRename.id, worktreeId: wtRename.id, branch: wtRename.branch });
+      const renameOut = await mq.submitAndDrain(run.id, itemRename.id, { preserveLiveTask: true });
+      assert.equal(renameOut.item.status, "ci_failed");
+      assert.match(renameOut.bouncedReason ?? "", /private\/secret\.txt/);
+      assert.equal(existsSync(join(repo, "private/secret.txt")), true, "Protected source must remain intact on main");
+
+      // 2. Cancelling a task mid-CI must abort merge and never resurrect task to `running` or land on `main`
+      const wCancel = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Cancelled during CI",
+        objective: "Add cancelled.txt",
+        profileId: "acp:codex",
+        writeScopes: ["cancelled.txt"],
+      });
+      const wtCancel = await mgr.createForWorker(run.id, wCancel.id, baseSha);
+      writeFileSync(join(wtCancel.path, "cancelled.txt"), "should not land\n", "utf8");
+      await runGit(wtCancel.path, ["add", "cancelled.txt"]);
+      await runGit(wtCancel.path, ["-c", "user.name=w", "-c", "user.email=w@local", "commit", "-m", "add cancelled"]);
+
+      const slowMq = new BisectingMergeQueue(db, mgr, repo, { ciCommands: ["sleep 2"] });
+      const abortCtrl = new AbortController();
+      const itemCancel = db.enqueueMerge({ runId: run.id, taskId: wCancel.id, worktreeId: wtCancel.id, branch: wtCancel.branch });
+      const mergePromise = slowMq.submitAndDrain(run.id, itemCancel.id, { preserveLiveTask: true, signal: abortCtrl.signal });
+      setTimeout(() => {
+        db.updateTask(wCancel.id, { status: "cancelled", summary: "Cancelled mid-CI" });
+        abortCtrl.abort(new Error("Cancelled mid-CI"));
+      }, 80);
+      const cancelOut = await mergePromise;
+      assert.equal(cancelOut.item.status, "ci_failed");
+      assert.equal(db.getTask(wCancel.id)?.status, "cancelled", "Cancelled task must NOT be resurrected to running");
+      assert.equal(existsSync(join(repo, "cancelled.txt")), false, "Cancelled branch must NOT land on main");
+
+      db.close();
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
 });

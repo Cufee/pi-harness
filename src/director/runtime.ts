@@ -714,6 +714,10 @@ export class DirectorRuntime {
       // Steer active Tier 1 Orchestrator (or relaunch in-place if settled!) with the structured vN -> vN+1 delta
       const orch = this.db.listTasks(goal.linkedRunId).find((t) => t.tier === 1);
       if (orch) {
+        this.db.updateTask(orch.id, {
+          title: `Goal ${goal.id} v${goal.version}: ${goal.title}`,
+          objective: updatedObjective,
+        });
         this.db.blackboardSet(
           goal.linkedRunId,
           `goal_contract_v${goal.version}`,
@@ -850,261 +854,308 @@ export class DirectorRuntime {
     }
 
     const targetRef = run?.baseBranch || "HEAD";
-    const gateResult = await this.goals.runDeterministicGates(goal.id, run?.baseSha, signal, { targetRef });
-    assertCurrent();
-
-    // If deterministic gates failed, record immediately without burning LLM review tokens!
-    if (!gateResult.allPassed) {
-      const outcome = this.goals.recordReviewVerdict(goal.id, {
-        verdict: "changes_requested",
-        criteriaResults: gateResult.results,
-        blockingIssues: gateResult.results.filter((r) => !r.passed).map((r) => r.evidence),
-        summary: "Deterministic verification gates failed; bouncing back to Tier 1 before LLM review.",
-        diffHash: gateResult.diffHash,
-      });
-      await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
-      return outcome;
-    }
-
-    // Agent-chosen verification depth: when deterministic checks already cover the goal (or mode='deterministic'),
-    // approve cleanly at $0 LLM cost without spawning a redundant independent reviewer session!
-    if (!shouldRunIndependentReview(goal, effectiveMode)) {
-      const coveredIds = new Set(gateResult.results.map((r) => r.criterionId));
-      const allResults: CriterionEvaluation[] = [
-        ...gateResult.results,
-        ...goal.criteria
-          .filter((c) => !coveredIds.has(c.id))
-          .map((c) => ({
-            criterionId: c.id,
-            passed: true,
-            evidence: opts?.summary?.trim() || `Verified without separate LLM review (${effectiveMode}).`,
-          })),
-      ];
-      const outcome = this.goals.recordReviewVerdict(goal.id, {
-        verdict: "approved",
-        criteriaResults: allResults,
-        blockingIssues: [],
-        summary:
-          opts?.summary?.trim() ||
-          (gateResult.results.length > 0
-            ? `All ${gateResult.results.length} deterministic check(s) passed; approved without redundant LLM review.`
-            : "Approved cleanly without redundant LLM review."),
-        diffHash: gateResult.diffHash,
-      });
-      await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
-      return outcome;
-    }
-
-    // All deterministic checks passed -> spawn fresh read-only Independent Skeptical Reviewer
-    let diffStat = "";
-    let diffPatch = "";
-    try {
-      diffStat = (
-        await runGit(goal.repoRoot, run?.baseSha ? ["diff", "--stat", `${run.baseSha}..${targetRef}`] : ["status", "--short"])
-      ).stdout;
-      if (run?.baseSha) {
-        const rawPatch = (await runGit(goal.repoRoot, ["diff", `${run.baseSha}..${targetRef}`])).stdout;
-        diffPatch = rawPatch.length > 24_000 ? `${rawPatch.slice(0, 24_000)}\n... [diff truncated at 24KB]` : rawPatch;
-      }
-    } catch {
-      diffStat = "";
-      diffPatch = "";
-    }
-
-    const reviewerPrompt = this.goals.buildReviewerPrompt(goal, gateResult, diffStat, diffPatch);
-    // Prefer an independent model family different from the authoring run's Tier 1/Tier 2 model
-    const runTasks = run ? this.db.listTasks(run.id) : [];
-    const authorModel =
-      runTasks.find((t) => t.tier === 2 && t.model)?.model ??
-      runTasks.find((t) => t.tier === 1 && t.model)?.model ??
-      undefined;
-    const cachedCat = this.catalog.loadCached();
-    const recVerify = cachedCat
-      ? recommendModelsByTaskKind(cachedCat.models, { avoidModelId: authorModel }).verify
-      : null;
-    const { profile, model, wireModel } = await resolveLaunchRoute(this.config, {
-      tier: 3,
-      cwd: goal.repoRoot,
-      profileId: recVerify?.profile,
-      model: recVerify?.model,
-      catalog: this.catalog,
-      quota: this.quota,
-    });
-    const reviewerEffort = recVerify?.effort && recVerify.effort !== "default" ? recVerify.effort : undefined;
-    const runner = this.customRunnerFactory
-      ? this.customRunnerFactory(profile)
-      : profile.kind === "acp"
-        ? new AcpRunner(profile)
-        : new PiRunner(profile);
-
-    type SubmittedVerdict = {
-      verdict: "approved" | "changes_requested" | "escalate_human";
-      criteriaResults: CriterionEvaluation[];
-      blockingIssues?: string[];
-      summary: string;
-    };
-    const verdictBox: { value: SubmittedVerdict | null } = { value: null };
-
-    const submitTool: ToolDefinition = {
-      name: "submit_review_verdict",
-      description: "Submit the structured Independent Done-Review verdict.",
-      inputSchema: {
-        type: "object",
-        required: ["verdict", "criteriaResults", "summary"],
-        properties: {
-          verdict: { type: "string", enum: ["approved", "changes_requested", "escalate_human"] },
-          criteriaResults: { type: "array", items: { type: "object" } },
-          blockingIssues: { type: "array", items: { type: "string" } },
-          summary: { type: "string" },
-        },
-      },
-    };
-
-    // Persist the reviewer as a Tier 3 verify task under the goal's linked run so it shows up in
-    // runs.trees and its transcript is replayable / watchable like any orchestrator agent.
-    const cycle = goal.reviewCycle + 1;
-    const reviewRun = run ?? await this.orchestrator.ensureDirectorTaskRun(goal.chatSessionId ?? goal.id, goal.repoRoot);
-    assertCurrent();
-    this.goals.setStatus(goal.id, "reviewing");
-    const reviewerTask = this.db.createTask({
-      runId: reviewRun.id,
-      parentId: this.db.listTasks(reviewRun.id).find((t) => t.tier === 1)?.id ?? null,
-      tier: 3,
-      kind: "verify",
-      title: `Done-Review: ${goal.title} (cycle ${cycle})`,
-      objective: reviewerPrompt,
-      readOnly: true,
-      profileId: profile.id,
-      model,
-      maxTurns: this.config.rollover.reviewerMaxTurns,
-    });
-    const abort = new AbortController();
-    const reviewerSignal = AbortSignal.any([signal, abort.signal]);
-    const unsubscribe = this.db.onEvent(ev => {
-      if (ev.runId !== reviewRun.id) return;
-      if ((ev.taskId === reviewerTask.id && ev.type === "task.status" && (ev.payload as { to: string }).to === "cancelled") ||
-          (ev.type === "run.status" && (ev.payload as { status: string }).status === "stopped")) {
-        abort.abort(new Error("Reviewer cancelled"));
-      }
-    });
-    const emit = (type: string, payload: unknown) => {
-      if (!reviewerSignal.aborted) this.db.emitEvent(reviewRun.id, reviewerTask.id, type, payload);
-    };
-
-    const failedSummary = "Independent reviewer failed before completing verification.";
-    const failReviewer = (msg: string) => {
-      if (this.db.getTask(reviewerTask.id)?.status !== "running") return;
-      if (reviewerSignal.aborted) {
-        this.db.updateTask(reviewerTask.id, { status: "cancelled", summary: "Reviewer cancelled" });
-        return;
-      }
-      emit("agent.error", { error: msg });
-      this.db.updateTask(reviewerTask.id, { status: "failed", summary: failedSummary });
-    };
-
-    let outcome: ReturnType<GoalEngine["recordReviewVerdict"]>;
-    const bridgeExt = import.meta.url.endsWith(".js") ? "mcp-bridge.js" : "mcp-bridge.ts";
-    const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", bridgeExt);
-    const reviewerExecuteTool = async (name: string, args: Record<string, unknown>) => {
-      if (name === "submit_review_verdict") {
-        verdictBox.value = {
-          verdict: String(args.verdict) as SubmittedVerdict["verdict"],
-          criteriaResults: Array.isArray(args.criteriaResults) ? (args.criteriaResults as CriterionEvaluation[]) : [],
-          blockingIssues: Array.isArray(args.blockingIssues) ? (args.blockingIssues as string[]) : [],
-          summary: String(args.summary ?? ""),
-        };
-        return { recorded: true };
-      }
-      throw new Error(`Unknown reviewer tool ${name}`);
-    };
-    this.activeReviewerTools.set(reviewerTask.id, { tools: [submitTool], execute: reviewerExecuteTool });
-    const reviewerTimeout = setTimeout(() => {
-      abort.abort(new Error("Independent Done-Reviewer timed out after 10 minutes"));
-    }, 600_000);
-    reviewerTimeout.unref?.();
-    try {
-      if (this.db.getTask(reviewerTask.id)?.status === "cancelled") abort.abort(new Error("Reviewer cancelled"));
-      this.db.updateTask(reviewerTask.id, { status: reviewerSignal.aborted ? "cancelled" : "running" });
-      reviewerSignal.throwIfAborted();
-      const res = await runner.run({
-        runId: reviewRun.id,
-        taskId: reviewerTask.id,
-        tier: 3,
-        kind: "verify",
-        cwd: goal.repoRoot,
-        toolPolicy: "read_only_workspace",
-        model: wireModel,
-        effort: reviewerEffort,
-        systemPrompt:
-          "You are an independent read-only Done-Reviewer. Inspect the implementation and verification evidence for each required criterion. Never edit files, run mutating commands, or delegate. Call submit_review_verdict if available, or return the requested JSON verdict with concrete sources for every required criterion.",
-        initialPrompt: reviewerPrompt,
-        maxTurns: this.config.rollover.reviewerMaxTurns,
-        tools: [submitTool],
-        executeTool: reviewerExecuteTool,
-        daemonSocketPath: this.config.socketPath,
-        mcpBridgeEntrypoint,
-        signal: reviewerSignal,
-        callbacks: {
-          onTextDelta: (text) => emit("agent.text_delta", { text }),
-          onThoughtDelta: (text) => emit("agent.thought_delta", { text }),
-          onToolEvent: (ev) => emit("agent.tool", ev),
-          onPassiveQuota: (sig) => this.quota.ingestPassiveSignal(sig),
-        },
-      });
-      reviewerSignal.throwIfAborted();
-      assertCurrent();
-      if (res.stopReason !== "completed" && res.stopReason !== "max_turns") {
-        throw new Error(`Reviewer stopped: ${res.stopReason}. ${res.text}`);
-      }
-
-      // Fallback JSON parse if reviewer returned JSON text instead of calling submit_review_verdict
-      if (!verdictBox.value) {
-        verdictBox.value = parseReviewerVerdictJson<SubmittedVerdict>(res.text);
-      }
-
-      const submittedVerdict = verdictBox.value;
-
-      // Merge deterministic gate pass results with reviewer evaluations so deterministic criteria stay evidenced
-      const mergedResults: CriterionEvaluation[] = [...gateResult.results];
-      for (const r of submittedVerdict?.criteriaResults ?? []) {
-        if (!mergedResults.some((m) => m.criterionId === r.criterionId)) {
-          mergedResults.push(r);
+    // Prepare an isolated detached verification worktree at exact targetSha whenever verifying a git branch,
+    // so gates and Done-Reviewers (which can run `bun test`, `tmux`, etc.) always test the real target branch
+    // without colliding with dirty edits or a different checked-out branch in `goal.repoRoot`.
+    let verifyCwd = goal.repoRoot;
+    let verifyRef = targetRef;
+    let verifyWorktreePath: string | null = null;
+    if (run?.baseBranch) {
+      const targetSha = await runGit(goal.repoRoot, ["rev-parse", "--verify", `${run.baseBranch}^{commit}`])
+        .then((r) => r.stdout)
+        .catch(() => null);
+      if (targetSha) {
+        const wtMgr = this.orchestrator.getWorktreeManager(goal.repoRoot);
+        const candidatePath = join(wtMgr.baseDir, "_verify", `${goal.id}-${randomUUID().slice(0, 8)}`);
+        try {
+          const { mkdirSync } = await import("node:fs");
+          mkdirSync(join(wtMgr.baseDir, "_verify"), { recursive: true });
+          await runGit(goal.repoRoot, ["worktree", "add", "--detach", candidatePath, targetSha]);
+          await wtMgr.bootstrapWorktree(candidatePath).catch(() => {});
+          verifyWorktreePath = candidatePath;
+          verifyCwd = candidatePath;
+          verifyRef = targetSha;
+        } catch {
+          verifyWorktreePath = null;
+          verifyCwd = goal.repoRoot;
         }
       }
-
-      outcome = this.db.transaction(() => {
-        const recorded = this.goals.recordReviewVerdict(goal.id, {
-          verdict: submittedVerdict?.verdict ?? "changes_requested",
-          criteriaResults: mergedResults,
-          blockingIssues:
-            submittedVerdict?.blockingIssues ?? (submittedVerdict ? [] : ["Reviewer did not return a structured verdict"]),
-          summary: submittedVerdict?.summary ?? "Incomplete review output",
-          diffHash: gateResult.diffHash,
-        });
-        const summary = `${recorded.review.verdict}: ${recorded.review.summary}`.slice(0, 2000);
-        const dossier = writeTaskDossier(this.db, reviewRun, reviewerTask.id, "review.json",
-          JSON.stringify(recorded.review, null, 2), `Independent review of ${goal.id} v${goal.version}`);
-        this.db.updateTask(reviewerTask.id, {
-          status: "completed", summary,
-          resultJson: JSON.stringify({
-            summary, sources: [{ path: dossier.path, symbol: "criteriaResults" }], artifact_paths: [dossier.path],
-          }),
-        });
-        return recorded;
-      });
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      failReviewer(detail);
-      reviewerSignal.throwIfAborted();
-      throw new Error(`${failedSummary} (${detail})`);
-    } finally {
-      clearTimeout(reviewerTimeout);
-      this.activeReviewerTools.delete(reviewerTask.id);
-      unsubscribe();
     }
 
-    await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
-    return outcome;
+    const cleanupVerifyWorktree = async () => {
+      if (!verifyWorktreePath) return;
+      const p = verifyWorktreePath;
+      verifyWorktreePath = null;
+      await runGit(goal.repoRoot, ["worktree", "remove", "--force", p]).catch(async () => {
+        const { rmSync } = await import("node:fs");
+        rmSync(p, { recursive: true, force: true });
+      });
+      await runGit(goal.repoRoot, ["worktree", "prune"]).catch(() => {});
+    };
+
+    try {
+      const gateResult = await this.goals.runDeterministicGates(goal.id, run?.baseSha, signal, {
+        cwd: verifyCwd,
+        targetRef: verifyRef,
+      });
+      assertCurrent();
+
+      // If deterministic gates failed, record immediately without burning LLM review tokens!
+      if (!gateResult.allPassed) {
+        const outcome = this.goals.recordReviewVerdict(goal.id, {
+          verdict: "changes_requested",
+          criteriaResults: gateResult.results,
+          blockingIssues: gateResult.results.filter((r) => !r.passed).map((r) => r.evidence),
+          summary: "Deterministic verification gates failed; bouncing back to Tier 1 before LLM review.",
+          diffHash: gateResult.diffHash,
+        });
+        await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
+        return outcome;
+      }
+
+      // Agent-chosen verification depth: when deterministic checks already cover the goal (or mode='deterministic'),
+      // approve cleanly at $0 LLM cost without spawning a redundant independent reviewer session!
+      if (!shouldRunIndependentReview(goal, effectiveMode)) {
+        const coveredIds = new Set(gateResult.results.map((r) => r.criterionId));
+        const allResults: CriterionEvaluation[] = [
+          ...gateResult.results,
+          ...goal.criteria
+            .filter((c) => !coveredIds.has(c.id))
+            .map((c) => ({
+              criterionId: c.id,
+              passed: true,
+              evidence: opts?.summary?.trim() || `Verified without separate LLM review (${effectiveMode}).`,
+            })),
+        ];
+        const outcome = this.goals.recordReviewVerdict(goal.id, {
+          verdict: "approved",
+          criteriaResults: allResults,
+          blockingIssues: [],
+          summary:
+            opts?.summary?.trim() ||
+            (gateResult.results.length > 0
+              ? `All ${gateResult.results.length} deterministic check(s) passed; approved without redundant LLM review.`
+              : "Approved cleanly without redundant LLM review."),
+          diffHash: gateResult.diffHash,
+        });
+        await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
+        return outcome;
+      }
+
+      // All deterministic checks passed -> spawn fresh read-only Independent Skeptical Reviewer
+      let diffStat = "";
+      let diffPatch = "";
+      try {
+        diffStat = (
+          await runGit(verifyCwd, run?.baseSha ? ["diff", "--stat", `${run.baseSha}..${verifyRef}`] : ["status", "--short"])
+        ).stdout;
+        if (run?.baseSha) {
+          const rawPatch = (await runGit(verifyCwd, ["diff", `${run.baseSha}..${verifyRef}`])).stdout;
+          diffPatch = rawPatch.length > 24_000 ? `${rawPatch.slice(0, 24_000)}\n... [diff truncated at 24KB]` : rawPatch;
+        }
+      } catch {
+        diffStat = "";
+        diffPatch = "";
+      }
+
+      const reviewerPrompt = this.goals.buildReviewerPrompt(goal, gateResult, diffStat, diffPatch);
+      // Prefer an independent model family different from the authoring run's Tier 1/Tier 2 model
+      const runTasks = run ? this.db.listTasks(run.id) : [];
+      const authorModel =
+        runTasks.find((t) => t.tier === 2 && t.model)?.model ??
+        runTasks.find((t) => t.tier === 1 && t.model)?.model ??
+        undefined;
+      const cachedCat = this.catalog.loadCached();
+      const recVerify = cachedCat
+        ? recommendModelsByTaskKind(cachedCat.models, { avoidModelId: authorModel }).verify
+        : null;
+      const { profile, model, wireModel } = await resolveLaunchRoute(this.config, {
+        tier: 3,
+        cwd: verifyCwd,
+        profileId: recVerify?.profile,
+        model: recVerify?.model,
+        catalog: this.catalog,
+        quota: this.quota,
+      });
+      const reviewerEffort = recVerify?.effort && recVerify.effort !== "default" ? recVerify.effort : undefined;
+      const runner = this.customRunnerFactory
+        ? this.customRunnerFactory(profile)
+        : profile.kind === "acp"
+          ? new AcpRunner(profile)
+          : new PiRunner(profile);
+
+      type SubmittedVerdict = {
+        verdict: "approved" | "changes_requested" | "escalate_human";
+        criteriaResults: CriterionEvaluation[];
+        blockingIssues?: string[];
+        summary: string;
+      };
+      const verdictBox: { value: SubmittedVerdict | null } = { value: null };
+
+      const submitTool: ToolDefinition = {
+        name: "submit_review_verdict",
+        description: "Submit the structured Independent Done-Review verdict.",
+        inputSchema: {
+          type: "object",
+          required: ["verdict", "criteriaResults", "summary"],
+          properties: {
+            verdict: { type: "string", enum: ["approved", "changes_requested", "escalate_human"] },
+            criteriaResults: { type: "array", items: { type: "object" } },
+            blockingIssues: { type: "array", items: { type: "string" } },
+            summary: { type: "string" },
+          },
+        },
+      };
+
+      // Persist the reviewer as a Tier 3 verify task under the goal's linked run so it shows up in
+      // runs.trees and its transcript is replayable / watchable like any orchestrator agent.
+      const cycle = goal.reviewCycle + 1;
+      const reviewRun = run ?? await this.orchestrator.ensureDirectorTaskRun(goal.chatSessionId ?? goal.id, goal.repoRoot);
+      assertCurrent();
+      this.goals.setStatus(goal.id, "reviewing");
+      const reviewerTask = this.db.createTask({
+        runId: reviewRun.id,
+        parentId: this.db.listTasks(reviewRun.id).find((t) => t.tier === 1)?.id ?? null,
+        tier: 3,
+        kind: "verify",
+        title: `Done-Review: ${goal.title} (cycle ${cycle})`,
+        objective: reviewerPrompt,
+        readOnly: true,
+        profileId: profile.id,
+        model,
+        maxTurns: this.config.rollover.reviewerMaxTurns,
+      });
+      const abort = new AbortController();
+      const reviewerSignal = AbortSignal.any([signal, abort.signal]);
+      const unsubscribe = this.db.onEvent(ev => {
+        if (ev.runId !== reviewRun.id) return;
+        if ((ev.taskId === reviewerTask.id && ev.type === "task.status" && (ev.payload as { to: string }).to === "cancelled") ||
+            (ev.type === "run.status" && (ev.payload as { status: string }).status === "stopped")) {
+          abort.abort(new Error("Reviewer cancelled"));
+        }
+      });
+      const emit = (type: string, payload: unknown) => {
+        if (!reviewerSignal.aborted) this.db.emitEvent(reviewRun.id, reviewerTask.id, type, payload);
+      };
+
+      const failedSummary = "Independent reviewer failed before completing verification.";
+      const failReviewer = (msg: string) => {
+        if (this.db.getTask(reviewerTask.id)?.status !== "running") return;
+        if (reviewerSignal.aborted) {
+          this.db.updateTask(reviewerTask.id, { status: "cancelled", summary: "Reviewer cancelled" });
+          return;
+        }
+        emit("agent.error", { error: msg });
+        this.db.updateTask(reviewerTask.id, { status: "failed", summary: failedSummary });
+      };
+
+      let outcome: ReturnType<GoalEngine["recordReviewVerdict"]>;
+      const bridgeExt = import.meta.url.endsWith(".js") ? "mcp-bridge.js" : "mcp-bridge.ts";
+      const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", bridgeExt);
+      const reviewerExecuteTool = async (name: string, args: Record<string, unknown>) => {
+        if (name === "submit_review_verdict") {
+          verdictBox.value = {
+            verdict: String(args.verdict) as SubmittedVerdict["verdict"],
+            criteriaResults: Array.isArray(args.criteriaResults) ? (args.criteriaResults as CriterionEvaluation[]) : [],
+            blockingIssues: Array.isArray(args.blockingIssues) ? (args.blockingIssues as string[]) : [],
+            summary: String(args.summary ?? ""),
+          };
+          return { recorded: true };
+        }
+        throw new Error(`Unknown reviewer tool ${name}`);
+      };
+      this.activeReviewerTools.set(reviewerTask.id, { tools: [submitTool], execute: reviewerExecuteTool });
+      const reviewerTimeout = setTimeout(() => {
+        abort.abort(new Error("Independent Done-Reviewer timed out after 10 minutes"));
+      }, 600_000);
+      reviewerTimeout.unref?.();
+      try {
+        if (this.db.getTask(reviewerTask.id)?.status === "cancelled") abort.abort(new Error("Reviewer cancelled"));
+        this.db.updateTask(reviewerTask.id, { status: reviewerSignal.aborted ? "cancelled" : "running" });
+        reviewerSignal.throwIfAborted();
+        const res = await runner.run({
+          runId: reviewRun.id,
+          taskId: reviewerTask.id,
+          tier: 3,
+          kind: "verify",
+          cwd: verifyCwd,
+          toolPolicy: "read_only_workspace",
+          model: wireModel,
+          effort: reviewerEffort,
+          systemPrompt:
+            "You are an independent read-only Done-Reviewer operating in a disposable verification checkout of the target branch. Inspect the implementation, diffs, and verification evidence for each required criterion — you may run tests, linters, git diff, rg, sg, or tmux checks freely to verify behavior, but never edit tracked repository code or delegate. Call submit_review_verdict if available, or return the requested JSON verdict with concrete sources for every required criterion.",
+          initialPrompt: reviewerPrompt,
+          maxTurns: this.config.rollover.reviewerMaxTurns,
+          tools: [submitTool],
+          executeTool: reviewerExecuteTool,
+          daemonSocketPath: this.config.socketPath,
+          mcpBridgeEntrypoint,
+          externalMcpServers: this.config.externalMcpServers,
+          signal: reviewerSignal,
+          callbacks: {
+            onTextDelta: (text) => emit("agent.text_delta", { text }),
+            onThoughtDelta: (text) => emit("agent.thought_delta", { text }),
+            onToolEvent: (ev) => emit("agent.tool", ev),
+            onPassiveQuota: (sig) => this.quota.ingestPassiveSignal(sig),
+          },
+        });
+        reviewerSignal.throwIfAborted();
+        assertCurrent();
+        if (res.stopReason !== "completed" && res.stopReason !== "max_turns") {
+          throw new Error(`Reviewer stopped: ${res.stopReason}. ${res.text}`);
+        }
+
+        // Fallback JSON parse if reviewer returned JSON text instead of calling submit_review_verdict
+        if (!verdictBox.value) {
+          verdictBox.value = parseReviewerVerdictJson<SubmittedVerdict>(res.text);
+        }
+
+        const submittedVerdict = verdictBox.value;
+
+        // Merge deterministic gate pass results with reviewer evaluations so deterministic criteria stay evidenced
+        const mergedResults: CriterionEvaluation[] = [...gateResult.results];
+        for (const r of submittedVerdict?.criteriaResults ?? []) {
+          if (!mergedResults.some((m) => m.criterionId === r.criterionId)) {
+            mergedResults.push(r);
+          }
+        }
+
+        outcome = this.db.transaction(() => {
+          const recorded = this.goals.recordReviewVerdict(goal.id, {
+            verdict: submittedVerdict?.verdict ?? "changes_requested",
+            criteriaResults: mergedResults,
+            blockingIssues:
+              submittedVerdict?.blockingIssues ?? (submittedVerdict ? [] : ["Reviewer did not return a structured verdict"]),
+            summary: submittedVerdict?.summary ?? "Incomplete review output",
+            diffHash: gateResult.diffHash,
+          });
+          const summary = `${recorded.review.verdict}: ${recorded.review.summary}`.slice(0, 2000);
+          const dossier = writeTaskDossier(this.db, reviewRun, reviewerTask.id, "review.json",
+            JSON.stringify(recorded.review, null, 2), `Independent review of ${goal.id} v${goal.version}`);
+          this.db.updateTask(reviewerTask.id, {
+            status: "completed", summary,
+            resultJson: JSON.stringify({
+              summary, sources: [{ path: dossier.path, symbol: "criteriaResults" }], artifact_paths: [dossier.path],
+            }),
+          });
+          return recorded;
+        });
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        failReviewer(detail);
+        reviewerSignal.throwIfAborted();
+        throw new Error(`${failedSummary} (${detail})`);
+      } finally {
+        clearTimeout(reviewerTimeout);
+        this.activeReviewerTools.delete(reviewerTask.id);
+        unsubscribe();
+      }
+
+      await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
+      return outcome;
+    } finally {
+      await cleanupVerifyWorktree();
+    }
   }
 
   private async handlePostReviewTransition(
@@ -1295,11 +1346,18 @@ export class DirectorRuntime {
     const turnRole = typedEvent ? "system_notice" : (opts?.turnRole ?? "user");
     const storedContent = typedEvent ? formatChatEventSummary(typedEvent) : userMessage;
     const userTurn = this.chats.appendTurn(chatSessionId, turnRole, storedContent, undefined, typedEvent);
-    const history = this.chats.getRecentHistory(chatSessionId, 40);
-    const activeGoals = this.goals.listGoals({ repoRoot: session.repoRoot, chatSessionId });
+    const priorHistory = this.chats.getPromptHistory(chatSessionId, {
+      conversationLimit: 24,
+      systemLimit: 16,
+      excludeSeq: userTurn.seq,
+    });
+    const allSessionGoals = this.goals.listGoals({ repoRoot: session.repoRoot, chatSessionId });
+    const nonArchivedGoals = allSessionGoals.filter((g) => g.status !== "achieved" && g.status !== "cancelled");
+    const archivedGoals = allSessionGoals.filter((g) => g.status === "achieved" || g.status === "cancelled");
+    const bannerGoals = [...nonArchivedGoals, ...archivedGoals.slice(0, 6)];
+    const omittedArchived = Math.max(0, archivedGoals.length - 6);
 
-    const contextTranscript = history
-      .slice(0, -1)
+    const contextTranscript = priorHistory
       .map((t) => {
         const speaker = t.event
           ? `Event (${t.event.kind})`
@@ -1316,14 +1374,17 @@ export class DirectorRuntime {
       .join("\n\n");
 
     const goalBanner =
-      activeGoals.length > 0
-        ? `\n\nActive/Recent Goals:\n${activeGoals
-            .slice(0, 8)
+      bannerGoals.length > 0
+        ? `\n\nActive/Recent Goals:\n${bannerGoals
             .map((g) => {
               const ver = g.reviewCycle > 0 ? `${g.reviewCycle} rev` : g.liveProgress?.verificationStatus ?? g.status;
               return `- ${g.id} v${g.version} [${g.status}] "${g.title}" (${ver})`;
             })
-            .join("\n")}`
+            .join("\n")}${
+            omittedArchived > 0
+              ? `\n- ... and ${omittedArchived} older completed/cancelled goal${omittedArchived === 1 ? "" : "s"} (use goal_list for all)`
+              : ""
+          }`
         : "";
 
     const currentTurnBlock = typedEvent
@@ -1628,7 +1689,9 @@ export class DirectorRuntime {
       }
 
       case "goal_trigger_review": {
-        const reviewed = await this.verifyAndReviewGoal(String(args.goal_id), signal, {
+        // Decouple Done-Reviewer lifecycle from the Director chat turn's AbortSignal so ending the turn
+        // or a Code Mode script timeout NEVER kills an in-flight verification review (cancel only via goal amend/stop/shutdown).
+        const reviewed = await this.verifyAndReviewGoal(String(args.goal_id), undefined, {
           verificationMode:
             typeof args.verification_mode === "string" &&
             ["auto", "none", "deterministic", "independent_review"].includes(args.verification_mode)

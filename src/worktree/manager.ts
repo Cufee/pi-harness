@@ -84,11 +84,16 @@ export class WorktreeManager {
   }
 
   async createForWorker(runId: string, taskId: string, baseSha?: string): Promise<WorktreeRecord> {
-    const active = this.db.listWorktrees(runId).filter((w) => {
+    const repoCanon = canonicalPath(this.repoRoot);
+    const active = this.db.listWorktrees().filter((w) => {
       if (w.status !== "active" && w.status !== "queued" && w.status !== "bounced") return false;
+      const run = this.db.getRun(w.runId);
+      if (run && canonicalPath(run.repoRoot) !== repoCanon) return false;
       const ownerTask = this.db.getTask(w.taskId);
-      if (ownerTask && (ownerTask.status === "failed" || ownerTask.status === "cancelled")) return false;
-      return true;
+      if (ownerTask && (ownerTask.status === "failed" || ownerTask.status === "cancelled" || ownerTask.status === "completed")) {
+        return false;
+      }
+      return existsSync(w.path);
     });
     const limit = this.config.maxConcurrentWorkers ?? 4;
     if (active.length >= limit) {
@@ -309,6 +314,23 @@ export class WorktreeManager {
         }
       } catch (err) {
         report.errors.push({ target: item.path, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    // Also reconcile DB worktree rows in active/queued/bounced whose directory disappeared or whose task settled
+    const repoCanon = canonicalPath(this.repoRoot);
+    for (const rec of this.db.listWorktrees(opts?.runId)) {
+      if (rec.status !== "active" && rec.status !== "queued" && rec.status !== "bounced") continue;
+      const run = this.db.getRun(rec.runId);
+      if (run && canonicalPath(run.repoRoot) !== repoCanon) continue;
+      const task = this.db.getTask(rec.taskId);
+      const missingDir = !existsSync(rec.path);
+      const taskTerminal = task != null && ["completed", "failed", "cancelled", "returned_for_rescope"].includes(task.status);
+      if (missingDir || taskTerminal) {
+        this.db.updateWorktree(rec.id, {
+          status: missingDir ? "removed" : "archived",
+          cleanedAt: Date.now(),
+        });
       }
     }
 

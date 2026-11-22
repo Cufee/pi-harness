@@ -155,10 +155,22 @@ export class HarnessDaemon {
   private drainPendingWakeup(chatSessionId: string): void {
     if (this.chatTurns.has(chatSessionId)) return;
     const q = this.pendingWakeups.get(chatSessionId);
-    const next = q?.shift();
-    if (!next) return;
-    if (q && q.length === 0) this.pendingWakeups.delete(chatSessionId);
-    void this.runDirectorWakeupTurn(chatSessionId, next);
+    if (!q || q.length === 0) return;
+
+    while (q.length > 0) {
+      const next = q.shift()!;
+      if (q.length === 0) this.pendingWakeups.delete(chatSessionId);
+      // Drop stale queued `goal.settled` snapshots whose run has since been resumed/reactivated
+      // or whose goal has already reached a newer terminal/reviewing state.
+      if (next.kind === "goal.settled") {
+        const curRun = this.db.getRun(next.runId);
+        const curGoal = this.director.goals.getGoal(next.goalId);
+        if (curRun?.status === "active") continue;
+        if (curGoal && ["achieved", "cancelled", "reviewing", "verifying"].includes(curGoal.status)) continue;
+      }
+      void this.runDirectorWakeupTurn(chatSessionId, next);
+      return;
+    }
   }
 
   private async runDirectorWakeupTurn(chatSessionId: string, event: ChatControlEvent): Promise<void> {

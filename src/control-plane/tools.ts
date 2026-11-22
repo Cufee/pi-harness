@@ -7,7 +7,7 @@ import { codeExecEventSink } from "../protocol/tool-display.js";
 import type { ToolDefinition } from "../runners/types.js";
 import type { KbKind } from "../kb/store.js";
 import type { BisectingMergeQueue } from "../worktree/merge-queue.js";
-import type { WorktreeManager } from "../worktree/manager.js";
+import { runGit, type WorktreeManager } from "../worktree/manager.js";
 import { nextUniqueFileName } from "./ids.js";
 import type {
   AgentTier,
@@ -388,6 +388,7 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
         path: { type: "string" },
         task_id: { type: "string" },
         max_chars: { type: "number" },
+        offset: { type: "number", description: "Character offset for paginating large artifacts (default 0)." },
       },
     },
   },
@@ -510,6 +511,36 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
       type: "object",
       required: ["id", "reason"],
       properties: { id: { type: "string" }, reason: { type: "string" } },
+    },
+  },
+  {
+    name: "kb_promote",
+    tiers: [1],
+    description: "Promote a candidate or stale KB entry in this repository to active/verified status.",
+    inputSchema: {
+      type: "object",
+      required: ["id"],
+      properties: {
+        id: { type: "string" },
+        title: { type: "string" },
+        summary: { type: "string" },
+        context_md: { type: "string" },
+        verified_sha: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "kb_archive",
+    tiers: [1],
+    description: "Archive an obsolete or superseded KB entry in this repository (bi-temporal; preserves history).",
+    inputSchema: {
+      type: "object",
+      required: ["id"],
+      properties: {
+        id: { type: "string" },
+        reason: { type: "string" },
+        superseded_by: { type: "string" },
+      },
     },
   },
   // ---- Cross-Run Coordination (strictly Tier 1 Orchestrator-to-Orchestrator) ----
@@ -721,6 +752,8 @@ export class ControlPlaneToolExecutor {
           .filter((t) => includeSettled || !["completed", "cancelled", "failed"].includes(t.status));
         const escalations = this.db.listEscalations(runId, "open");
         const pendingMsgs = this.db.listOpenMessages(taskId);
+        const answeredMsgs = this.db.listAnsweredMessagesFrom(taskId);
+        const openPeerRequests = task.tier === 1 ? this.db.listOpenPeerExchangesForRun(runId) : [];
         return {
           run: { id: run.id, goal: run.goal, status: run.status, baseBranch: run.baseBranch },
           tasks: tasks.map((t) => ({
@@ -742,6 +775,8 @@ export class ControlPlaneToolExecutor {
             from: m.fromTaskId,
             question: `<untrusted_peer_input>${m.question}</untrusted_peer_input>`,
           })),
+          ...(answeredMsgs.length > 0 ? { answeredMessages: answeredMsgs } : {}),
+          ...(openPeerRequests.length > 0 ? { openPeerRequests } : {}),
         };
       }
 
@@ -791,6 +826,15 @@ export class ControlPlaneToolExecutor {
                 }
               : null,
             recommendedFor: m.recommendedFor,
+            ...(m.alternateRoutes.length > 0
+              ? {
+                  alternateRoutes: m.alternateRoutes.map((r) => ({
+                    profile: r.profileId,
+                    wireModel: r.wireModelId,
+                    billing: r.billing,
+                  })),
+                }
+              : {}),
           })),
         };
       }
@@ -801,6 +845,21 @@ export class ControlPlaneToolExecutor {
         }
         const writeScopes = Array.isArray(args.write_scopes) ? (args.write_scopes as string[]) : [];
         if (writeScopes.length === 0) throw new Error("spawn_worker requires non-empty write_scopes");
+        // Avoid starving sibling runs with a blanket repo-root wildcard when other active runs share this target branch
+        const hasBlanketWildcard = writeScopes.some((s) => {
+          const n = s.trim().replace(/^\.\//, "").replace(/\/+$/, "");
+          return n === "" || n === "." || n === "*" || n === "**" || n === "**/*";
+        });
+        if (hasBlanketWildcard) {
+          const otherActiveSameBranch = this.db
+            .listRuns(100)
+            .some((r) => r.id !== runId && r.status === "active" && r.repoRoot === run.repoRoot && r.baseBranch === run.baseBranch);
+          if (otherActiveSameBranch) {
+            throw new Error(
+              `Blanket write_scopes (${writeScopes.join(", ")}) are not allowed while another active run targets (${run.repoRoot}:${run.baseBranch}). Specify scoped module/directory globs instead.`,
+            );
+          }
+        }
         const created = await this.hooks.spawnAndStartTask({
           runId,
           parentId: taskId,
@@ -942,14 +1001,31 @@ export class ControlPlaneToolExecutor {
           }
           if (task.tier === 2 && task.worktreeId) {
             const wt = this.db.getWorktree(task.worktreeId);
-            if (wt && wt.status !== "merged") {
+            if (wt && !wt.cleanedAt) {
+              const wtMgr = this.hooks.getWorktreeManager(run.repoRoot);
+              if (await wtMgr.isDirty(wt.path)) {
+                throw new Error(
+                  `Settlement gate rejected completion: worktree ${wt.path} has uncommitted changes. Commit and call submit_for_merge first.`,
+                );
+              }
               if (wt.status === "queued" || wt.status === "bounced") {
                 throw new Error(
                   `Settlement gate rejected completion: worktree merge status is '${wt.status}'. Resolve issues and complete submit_for_merge before returning completed.`,
                 );
               }
-              if (await this.hooks.getWorktreeManager(run.repoRoot).isDirty(wt.path)) {
-                throw new Error(`Settlement gate rejected completion: worktree ${wt.path} has uncommitted changes. Commit and call submit_for_merge first.`);
+              // Verify any commits on the worker's HEAD are actually contained in targetBranch (catches unmerged commits
+              // AND post-merge commits added after an earlier submit_for_merge!).
+              const wtHead = await runGit(wt.path, ["rev-parse", "HEAD"]).then((r) => r.stdout).catch(() => null);
+              if (wtHead && wtHead !== wt.baseSha) {
+                const contained = await runGit(run.repoRoot, ["merge-base", "--is-ancestor", wtHead, run.baseBranch]).then(
+                  () => true,
+                  () => false,
+                );
+                if (!contained) {
+                  throw new Error(
+                    `Settlement gate rejected completion: worktree HEAD (${wtHead.slice(0, 8)}) has unmerged commits not on ${run.baseBranch}. Call submit_for_merge first.`,
+                  );
+                }
               }
             }
           }
@@ -1073,15 +1149,17 @@ export class ControlPlaneToolExecutor {
       }
 
       case "query_predecessor": {
-        const q = String(args.query).toLowerCase();
-        const limit = typeof args.limit === "number" ? args.limit : 20;
-        const allEvents = this.db.getEventsSince(runId, 0, taskId, 2000);
-        const matches = allEvents
-          .filter((e) => JSON.stringify(e.payload).toLowerCase().includes(q) || e.type.toLowerCase().includes(q))
-          .slice(-limit);
+        const rawQuery = String(args.query ?? "").trim();
+        const q = rawQuery.toLowerCase();
+        const limit = typeof args.limit === "number" && Number.isFinite(args.limit) ? Math.max(1, Math.min(50, Math.floor(args.limit))) : 12;
+        const matches = this.db.searchPredecessorHistory(runId, taskId, rawQuery, limit);
+        const tokens = q.split(/\s+/).filter(Boolean);
         const arts = this.db
           .listArtifacts(runId, taskId, 100)
-          .filter((a) => a.path.toLowerCase().includes(q) || a.summary.toLowerCase().includes(q))
+          .filter((a) => {
+            const hay = `${a.path} ${a.summary}`.toLowerCase();
+            return tokens.length > 0 && tokens.some((tok) => hay.includes(tok));
+          })
           .slice(0, limit);
         return { matchingEvents: matches, matchingArtifacts: arts };
       }
@@ -1097,7 +1175,7 @@ export class ControlPlaneToolExecutor {
         }
         const root = task.worktreeId ? this.db.getWorktree(task.worktreeId)?.path : run.repoRoot;
         if (!root) throw new Error("Task worktree unavailable");
-        return readWorkspaceArtifact(root, args.path, args.max_chars);
+        return readWorkspaceArtifact(root, args.path, args.max_chars, args.offset);
       }
 
       case "blackboard_set": {
@@ -1155,7 +1233,10 @@ export class ControlPlaneToolExecutor {
           throw new Error("Cannot submit_for_merge while worktree has uncommitted changes. Commit first.");
         }
         const item = this.db.enqueueMerge({ runId, taskId, worktreeId: wt.id, branch: wt.branch });
-        const outcome = await this.hooks.getMergeQueue(run.repoRoot).submitAndDrain(runId, item.id, { preserveLiveTask: true });
+        const mergeSig = scriptSignal ?? this.hooks.getTaskSignal(taskId);
+        const outcome = await this.hooks
+          .getMergeQueue(run.repoRoot)
+          .submitAndDrain(runId, item.id, { preserveLiveTask: true, signal: mergeSig });
         return {
           mergeId: item.id,
           status: outcome.item.status,
@@ -1188,6 +1269,9 @@ export class ControlPlaneToolExecutor {
       }
 
       case "kb_propose": {
+        const headSha = await runGit(run.repoRoot, ["rev-parse", "HEAD"])
+          .then((r) => r.stdout || run.baseSha)
+          .catch(() => run.baseSha);
         const entry = this.db.kb.propose({
           repoScope: run.repoRoot,
           kind: String(args.kind) as KbKind,
@@ -1197,15 +1281,61 @@ export class ControlPlaneToolExecutor {
           tags: Array.isArray(args.tags) ? (args.tags as string[]) : [],
           pathGlobs: Array.isArray(args.path_globs) ? (args.path_globs as string[]) : [],
           evidencePaths: Array.isArray(args.evidence_paths) ? (args.evidence_paths as string[]) : [],
-          verifiedSha: run.baseSha,
+          verifiedSha: headSha,
           sourceRunId: runId,
           sourceTaskId: taskId,
         });
         return { id: entry.id, status: entry.status };
       }
 
-      case "kb_flag_stale":
-        return this.db.kb.flagStale(String(args.id), String(args.reason));
+      case "kb_flag_stale": {
+        const id = String(args.id);
+        const existing = this.db.kb.getRaw(id);
+        if (!existing || existing.repoScope !== run.repoRoot) {
+          throw new Error(`KB entry ${id} not found in repository scope ${run.repoRoot}`);
+        }
+        return this.db.kb.flagStale(existing.id, String(args.reason));
+      }
+
+      case "kb_promote": {
+        const id = String(args.id);
+        const existing = this.db.kb.getRaw(id);
+        if (!existing || existing.repoScope !== run.repoRoot) {
+          throw new Error(`KB entry ${id} not found in repository scope ${run.repoRoot}`);
+        }
+        const verifiedSha =
+          typeof args.verified_sha === "string" && args.verified_sha.trim()
+            ? args.verified_sha.trim()
+            : await runGit(run.repoRoot, ["rev-parse", "HEAD"])
+                .then((r) => r.stdout || run.baseSha)
+                .catch(() => run.baseSha);
+        return this.db.kb.promote(existing.id, {
+          title: typeof args.title === "string" ? args.title : undefined,
+          summary: typeof args.summary === "string" ? args.summary : undefined,
+          contextMd: typeof args.context_md === "string" ? args.context_md : undefined,
+          verifiedSha,
+        });
+      }
+
+      case "kb_archive": {
+        const id = String(args.id);
+        const existing = this.db.kb.getRaw(id);
+        if (!existing || existing.repoScope !== run.repoRoot) {
+          throw new Error(`KB entry ${id} not found in repository scope ${run.repoRoot}`);
+        }
+        const supersededBy =
+          typeof args.superseded_by === "string" && args.superseded_by.trim() ? args.superseded_by.trim() : undefined;
+        if (supersededBy) {
+          const sup = this.db.kb.getRaw(supersededBy);
+          if (!sup || sup.repoScope !== run.repoRoot) {
+            throw new Error(`Superseding KB entry ${supersededBy} not found in repository scope ${run.repoRoot}`);
+          }
+        }
+        return this.db.kb.archive(existing.id, {
+          reason: typeof args.reason === "string" ? args.reason : undefined,
+          supersededBy,
+        });
+      }
 
       case "list_peer_runs": {
         const peers = this.db

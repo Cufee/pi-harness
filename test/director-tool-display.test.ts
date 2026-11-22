@@ -340,4 +340,75 @@ describe("Director structured tool display", () => {
       },
     );
   });
+
+  it("preserves last 24 conversational turns past noisy tool/system bursts and lists all active goals plus up to 6 archived goals", async () => {
+    const prompts: string[] = [];
+    await withDaemon(
+      async (req) => {
+        prompts.push(req.initialPrompt);
+        return "noted";
+      },
+      async ({ daemon, client, repoRoot, chatId }) => {
+        // Seed 26 conversational turns (13 user + 13 assistant) followed by 30 noisy tool/system turns.
+        for (let i = 1; i <= 13; i++) {
+          daemon.director.chats.appendTurn(chatId, "user", `req-${i}`);
+          daemon.director.chats.appendTurn(chatId, "assistant", `ack-${i}`);
+        }
+        const display: ToolDisplayPayload = { kind: "goals_table", title: "Goals", data: { goals: [] } };
+        for (let i = 1; i <= 20; i++) {
+          daemon.director.chats.appendTurn(chatId, "tool_output", `tool-burst-${i}`, { toolName: "goal_list", display });
+        }
+        for (let i = 1; i <= 10; i++) {
+          daemon.director.chats.appendTurn(chatId, "system_notice", `notice-burst-${i}`);
+        }
+
+        // Seed 9 active/non-archived goals + 8 archived (achieved/cancelled) goals.
+        const activeIds: string[] = [];
+        for (let i = 1; i <= 9; i++) {
+          const g = daemon.director.goals.createGoal({
+            repoRoot,
+            chatSessionId: chatId,
+            title: `Active Goal ${i}`,
+            description: "d",
+            criteria: [{ id: "c1", description: "c", kind: "behavioral" }],
+          });
+          activeIds.push(g.id);
+        }
+        const archivedIds: string[] = [];
+        for (let i = 1; i <= 8; i++) {
+          const g = daemon.director.goals.createGoal({
+            repoRoot,
+            chatSessionId: chatId,
+            title: `Archived Goal ${i}`,
+            description: "d",
+            criteria: [{ id: "c1", description: "c", kind: "behavioral" }],
+          });
+          daemon.director.goals.setStatus(g.id, i % 2 === 0 ? "achieved" : "cancelled", "done");
+          archivedIds.push(g.id);
+        }
+
+        await client.request("chat.send", { chatSessionId: chatId, text: "current-question" });
+        const prompt = prompts[0]!;
+
+        // Conversational window keeps last 24 user/assistant turns (req-2..req-13, ack-2..ack-13), dropping req-1/ack-1
+        assert.ok(!prompt.includes("User: req-1\n"), "oldest user turn beyond 24 conv turns should be trimmed");
+        assert.ok(prompt.includes("User: req-2"), "user turn #2 must survive 30 tool/system bursts");
+        assert.ok(prompt.includes("User: req-13"));
+        assert.ok(prompt.includes("Director: ack-13"));
+
+        // System/tool window keeps only last 16 (tool-burst-15..20 + notice-burst-1..10)
+        assert.ok(!prompt.includes("tool-burst-14"), "older tool_output beyond 16 should be trimmed");
+        assert.ok(prompt.includes("tool-burst-15"));
+        assert.ok(prompt.includes("notice-burst-10"));
+
+        // All 9 active goals appear in the banner + 6 archived goals + omission note for the 2 older archived goals
+        for (const id of activeIds) {
+          assert.ok(prompt.includes(id), `active goal ${id} must remain visible`);
+        }
+        const archivedShown = archivedIds.filter((id) => prompt.includes(id));
+        assert.equal(archivedShown.length, 6);
+        assert.match(prompt, /and 2 older completed\/cancelled goals/);
+      },
+    );
+  });
 });

@@ -1,8 +1,11 @@
 import { closeSync, existsSync, fstatSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { RunnerProfileConfig } from "../config.js";
+import { interpolateEnv, type RunnerProfileConfig } from "../config.js";
 import type { PassiveQuotaSignal } from "../runners/types.js";
+
+/** Harvested local snapshots older than 6 hours are treated as stale rather than authoritative. */
+export const LOCAL_QUOTA_FRESHNESS_MS = 6 * 60 * 60 * 1000;
 
 export interface CodexRateLimitWindowRaw {
   used_percent?: number;
@@ -21,6 +24,10 @@ export interface CodexRateLimitsRaw {
     balance?: string | number | null;
   } | null;
   plan_type?: string | null;
+  /** Per-snapshot observation timestamp (ms since epoch) when merged across session files */
+  observedAt?: number;
+  /** True when snapshot age exceeds `LOCAL_QUOTA_FRESHNESS_MS` (> 6h) */
+  stale?: boolean;
 }
 
 export interface HarvestedCodexRateLimits {
@@ -50,7 +57,7 @@ export function parseCodexRateLimitsFromJsonl(jsonlText: string, fallbackObserve
       const limitId = (typeof rl.limit_id === "string" && rl.limit_id.trim()) || "codex";
       const prev = byId.get(limitId);
       if (!prev || observedAt >= prev.observedAt) {
-        byId.set(limitId, { observedAt, snapshot: { ...rl, limit_id: limitId } });
+        byId.set(limitId, { observedAt, snapshot: { ...rl, limit_id: limitId, observedAt } });
       }
     } catch {
       // Ignore partial first line when reading from tail offset or malformed lines
@@ -82,17 +89,26 @@ function readFileTail(path: string, maxBytes = 256 * 1024): string {
   }
 }
 
-/** Finds up to `limit` newest `.jsonl` rollout files under `<codexHome>/sessions/YYYY/MM/DD/`. */
-function findRecentCodexSessionFiles(codexHome: string, limit = 4): Array<{ path: string; mtimeMs: number }> {
+/**
+ * Finds up to `limit` newest `.jsonl` rollout files under `<codexHome>/sessions/YYYY/MM/DD/`.
+ * Collects candidate files within `maxAgeMs` across date folders and sorts by `mtimeMs` descending
+ * BEFORE capping so an active session started yesterday is never pruned out by today's sessions.
+ */
+function findRecentCodexSessionFiles(
+  codexHome: string,
+  limit = 12,
+  maxAgeMs = 7 * 24 * 60 * 60 * 1000,
+  now = Date.now(),
+): Array<{ path: string; mtimeMs: number }> {
   const sessionsDir = join(codexHome, "sessions");
   if (!existsSync(sessionsDir)) return [];
 
   const found: Array<{ path: string; mtimeMs: number }> = [];
   const walk = (dir: string, depth: number) => {
-    if (depth > 4 || found.length >= limit * 4) return;
+    if (depth > 4) return;
     let entries: string[];
     try {
-      entries = readdirSync(dir).sort().reverse();
+      entries = readdirSync(dir);
     } catch {
       return;
     }
@@ -103,8 +119,7 @@ function findRecentCodexSessionFiles(codexHome: string, limit = 4): Array<{ path
         const st = statSync(full);
         if (st.isDirectory()) {
           walk(full, depth + 1);
-          if (found.length >= limit && depth >= 2) return;
-        } else if (st.isFile() && name.endsWith(".jsonl")) {
+        } else if (st.isFile() && name.endsWith(".jsonl") && now - st.mtimeMs <= maxAgeMs) {
           found.push({ path: full, mtimeMs: st.mtimeMs });
         }
       } catch {
@@ -115,6 +130,60 @@ function findRecentCodexSessionFiles(codexHome: string, limit = 4): Array<{ path
 
   walk(sessionsDir, 0);
   return found.sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, limit);
+}
+
+function resolveProfileCodexHome(profile: RunnerProfileConfig, fallbackHome?: string): string {
+  const raw = profile.kind === "acp" ? profile.env?.CODEX_HOME?.trim() : undefined;
+  if (raw) {
+    const expanded = interpolateEnv(raw).trim();
+    if (expanded.startsWith("~/")) return join(homedir(), expanded.slice(2));
+    if (expanded === "~") return homedir();
+    if (expanded) return expanded;
+  }
+  return fallbackHome ?? process.env.CODEX_HOME ?? join(homedir(), ".codex");
+}
+
+function harvestCodexHome(codexHome: string, maxAgeMs: number, now: number): HarvestedCodexRateLimits | null {
+  const files = findRecentCodexSessionFiles(codexHome, 12, maxAgeMs, now);
+  const mergedById = new Map<string, { observedAt: number; snapshot: CodexRateLimitsRaw }>();
+
+  for (const f of files) {
+    if (now - f.mtimeMs > maxAgeMs) continue;
+    try {
+      const tail = readFileTail(f.path);
+      const parsed = parseCodexRateLimitsFromJsonl(tail, f.mtimeMs);
+      if (!parsed) continue;
+      for (const snap of parsed.snapshots) {
+        const limitId = (typeof snap.limit_id === "string" && snap.limit_id.trim()) || "codex";
+        const obs = typeof snap.observedAt === "number" && Number.isFinite(snap.observedAt)
+          ? snap.observedAt
+          : parsed.observedAt;
+        const prev = mergedById.get(limitId);
+        if (!prev || obs > prev.observedAt) {
+          mergedById.set(limitId, {
+            observedAt: obs,
+            snapshot: {
+              ...snap,
+              limit_id: limitId,
+              observedAt: obs,
+              stale: now - obs > LOCAL_QUOTA_FRESHNESS_MS,
+            },
+          });
+        }
+      }
+    } catch {
+      // ignore unreadable session file
+    }
+  }
+
+  if (mergedById.size === 0) return null;
+  let newestTs = 0;
+  const snapshots: CodexRateLimitsRaw[] = [];
+  for (const entry of mergedById.values()) {
+    if (entry.observedAt > newestTs) newestTs = entry.observedAt;
+    snapshots.push(entry.snapshot);
+  }
+  return { observedAt: newestTs, snapshots };
 }
 
 /**
@@ -132,31 +201,21 @@ export function harvestLocalQuotaSignals(
   const now = Date.now();
 
   const codexProfiles = profiles.filter((p) => p.enabled !== false && p.kind === "acp" && p.adapter === "codex");
-  if (codexProfiles.length > 0) {
-    const codexHome = opts?.codexHome ?? process.env.CODEX_HOME ?? join(homedir(), ".codex");
-    const files = findRecentCodexSessionFiles(codexHome, 5);
-    let harvested: HarvestedCodexRateLimits | null = null;
-    for (const f of files) {
-      if (now - f.mtimeMs > maxAgeMs) continue;
-      try {
-        const tail = readFileTail(f.path);
-        const parsed = parseCodexRateLimitsFromJsonl(tail, f.mtimeMs);
-        if (parsed) {
-          harvested = parsed;
-          break;
-        }
-      } catch {
-        // ignore unreadable session file
-      }
+  const cacheByHome = new Map<string, HarvestedCodexRateLimits | null>();
+
+  for (const profile of codexProfiles) {
+    const codexHome = resolveProfileCodexHome(profile, opts?.codexHome);
+    let harvested = cacheByHome.get(codexHome);
+    if (harvested === undefined) {
+      harvested = harvestCodexHome(codexHome, maxAgeMs, now);
+      cacheByHome.set(codexHome, harvested);
     }
     if (harvested) {
-      for (const profile of codexProfiles) {
-        signals.push({
-          profileId: profile.id,
-          raw: { codexRateLimits: harvested.snapshots },
-          observedAt: harvested.observedAt,
-        });
-      }
+      signals.push({
+        profileId: profile.id,
+        raw: { codexRateLimits: harvested.snapshots },
+        observedAt: harvested.observedAt,
+      });
     }
   }
 

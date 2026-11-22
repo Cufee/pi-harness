@@ -1,6 +1,6 @@
 import { ModelCatalogCompiler } from "../catalog/compiler.js";
 import type { HarnessConfig, RunnerProfileConfig } from "../config.js";
-import type { QuotaClient } from "../quota/client.js";
+import { isQuotaUnavailable, type QuotaClient } from "../quota/client.js";
 import type { AgentTier } from "./db.js";
 
 const modelPlaceholder = /(?:^|\/)(?:auto|default)$/i;
@@ -29,18 +29,22 @@ export async function resolveLaunchRoute(config: HarnessConfig, selection: Launc
   }
   if (model != null && !model.trim()) throw new Error("Select a nonblank catalog model.");
 
-  const compiler = selection.catalog ?? new ModelCatalogCompiler(config);
+  const compiler = selection.catalog ?? new ModelCatalogCompiler(config, selection.quota);
   const snapshot = await compiler.getCatalog({ cwd, excludeExhausted: model == null && !selection.quota });
   const preferred = tier <= 1 ? config.defaultOrchestratorProfile : tier === 2 ? config.defaultWorkerProfile : config.defaultTaskProfile;
-  const candidates = [];
+  const candidates: Array<{ profile: RunnerProfileConfig; model: string; wireModel: string; unavailable: boolean }> = [];
   for (const entry of snapshot.models) {
     if (!entry.id.trim() || modelPlaceholder.test(entry.id)) continue;
     const bareId = entry.id.slice(entry.id.lastIndexOf("/") + 1);
-    for (const route of [entry.preferredRoute, ...entry.alternateRoutes]) {
+    const allRoutes = [entry.preferredRoute, ...entry.alternateRoutes];
+    const entryMatchesRequestedModel =
+      model != null &&
+      (model === entry.id || model === bareId || allRoutes.some((r) => r.wireModelId === model));
+    for (const route of allRoutes) {
       const profile = profiles.find((p) => p.id === route.profileId);
       if (!profile || !route.wireModelId.trim() || modelPlaceholder.test(route.wireModelId)) continue;
       let canonicalId = entry.id;
-      if (model != null && model !== entry.id && model !== route.wireModelId && model !== bareId) {
+      if (model != null && !entryMatchesRequestedModel) {
         // A versioned selection can use a Claude alias only when the fresh catalog contains
         // that exact revision and its profile resolver maps it to this advertised wire ID.
         if (profile.kind !== "acp" || profile.adapter !== "claude" || !claudeAlias.test(route.wireModelId)) continue;
@@ -50,11 +54,22 @@ export async function resolveLaunchRoute(config: HarnessConfig, selection: Launc
         if (!resolved || resolved.canonicalId !== requested || resolved.wireModelId !== route.wireModelId) continue;
         canonicalId = requested;
       }
-      if ((model == null || profileId == null) && selection.quota?.resolveForModel({ ...route, canonicalModelId: canonicalId })?.exhausted) continue;
-      candidates.push({ profile, model: canonicalId, wireModel: route.wireModelId });
+      const routeQuota = selection.quota?.resolveForModel({
+        profileId: route.profileId,
+        provider: route.provider,
+        wireModelId: route.wireModelId,
+        canonicalModelId: canonicalId,
+      });
+      const unavailable = routeQuota
+        ? isQuotaUnavailable(routeQuota)
+        : route === entry.preferredRoute && isQuotaUnavailable(entry.quota);
+      if ((model == null || profileId == null) && unavailable) continue;
+      candidates.push({ profile, model: canonicalId, wireModel: route.wireModelId, unavailable });
     }
   }
-  const candidate = candidates.find((route) => route.profile.id === preferred) ?? candidates[0];
-  if (candidate) return candidate;
+  const healthyCandidates = candidates.filter((c) => !c.unavailable);
+  const pool = healthyCandidates.length > 0 ? healthyCandidates : candidates;
+  const candidate = pool.find((route) => route.profile.id === preferred) ?? pool[0];
+  if (candidate) return { profile: candidate.profile, model: candidate.model, wireModel: candidate.wireModel };
   throw new Error(`No eligible current catalog route for ${model ?? "an available model"} on ${profileId ?? "enabled profiles"} at tier ${tier}. Refresh the catalog and select an advertised model.`);
 }

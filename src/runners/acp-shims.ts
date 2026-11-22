@@ -110,7 +110,9 @@ export function prepareAcpSpawn(
               ],
             }
           : {
-              "amp.tools.disable": ["Bash", "shell_command", "edit_file", "create_file", "delete_file", "Task"],
+              // Allow shell execution (e.g. `rg`, `sg`/`ast-grep`, `git diff`, `bun test`, `tmux`) for verification
+              // and inspection; only disable direct file-mutation & delegation tools.
+              "amp.tools.disable": ["edit_file", "create_file", "delete_file", "Task"],
             };
       writeFileSync(settingsPath, JSON.stringify(ampSettings, null, 2), "utf8");
       env.AMP_SETTINGS_FILE = settingsPath;
@@ -179,9 +181,10 @@ export function buildNewSessionParams(
   if (adapter === "claude") {
     const disallowed = ["Agent", "Task"];
     if (opts.toolPolicy !== "read_write_workspace") {
-      disallowed.push("Write", "Edit", "MultiEdit", "NotebookEdit", "Bash");
+      // Allow Bash in read_only_workspace so verify/review/research agents can run tests, git diff, rg, sg, and tmux.
+      disallowed.push("Write", "Edit", "MultiEdit", "NotebookEdit");
     }
-    if (opts.toolPolicy === "control_plane_only") disallowed.push("Read", "Grep", "Glob");
+    if (opts.toolPolicy === "control_plane_only") disallowed.push("Read", "Grep", "Glob", "Bash");
     const effectiveEffort =
       opts.effort && opts.effort.toLowerCase() !== "default" ? opts.effort : undefined;
     const claudeOptions: Record<string, unknown> = {

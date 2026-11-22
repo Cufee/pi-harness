@@ -6,6 +6,7 @@ import { describe, it } from "bun:test";
 import { ModelCatalogCompiler } from "../src/catalog/compiler.js";
 import { loadConfig, type HarnessConfig, type RunnerProfileConfig } from "../src/config.js";
 import { ControlPlaneDb } from "../src/control-plane/db.js";
+import { resolveLaunchRoute } from "../src/control-plane/launch-route.js";
 import { HarnessOrchestrator } from "../src/control-plane/orchestrator.js";
 import { QuotaClient } from "../src/quota/client.js";
 import { runGit } from "../src/worktree/manager.js";
@@ -127,6 +128,78 @@ describe("ModelCatalogCompiler.resolveForProfile", () => {
       orch.dispose();
       db.close();
       rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolveLaunchRoute skips throttled/exhausted routes and falls back to a healthy alternateRoute for a requested model", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-launch-failover-"));
+    try {
+      const failoverProfiles: RunnerProfileConfig[] = [
+        { id: "acp:claude-acct1", kind: "acp", adapter: "claude", command: "claude", billing: "subscription", enabled: true },
+        { id: "acp:claude-acct2", kind: "acp", adapter: "claude", command: "claude", billing: "subscription", enabled: true },
+      ];
+      const config: HarnessConfig = {
+        ...loadConfig(stateDir),
+        stateDir,
+        profiles: failoverProfiles,
+        defaultOrchestratorProfile: "acp:claude-acct1",
+        catalog: { ttlHours: 24 },
+      };
+      const quota = new QuotaClient();
+      // Mark acct1 THROTTLED (rate_limited) -> unavailable even though exhausted === false
+      quota.ingestPassiveSignal({
+        profileId: "acp:claude-acct1",
+        model: "claude-opus-5-5",
+        raw: { sessionFailure: "rate_limited", resetAt: new Date(Date.now() + 30 * 60_000).toISOString() },
+        observedAt: Date.now(),
+      });
+
+      const compiler = new ModelCatalogCompiler(config, quota);
+      const catalog = compiler.compileFromData({
+        enabledProfiles: failoverProfiles,
+        inventory: new Map([
+          ["acp:claude-acct1", [{ wireModelId: "claude-opus-5-5" }]],
+          ["acp:claude-acct2", [{ wireModelId: "claude-opus-5-5" }]],
+        ]),
+        modelsDev: [],
+        openRouter: [],
+        litellmDep: new Map(),
+        benchmarks: [],
+        sources: [],
+      });
+      writeFileSync(compiler.cachePath, JSON.stringify(catalog), "utf8");
+
+      // 1. Specific model requested: preferred acct1 is THROTTLED -> falls back to healthy alternate acct2
+      const routeForModel = await resolveLaunchRoute(config, {
+        tier: 1,
+        catalog: compiler,
+        quota,
+        model: "anthropic/claude-opus-5-5",
+      });
+      assert.equal(routeForModel.profile.id, "acp:claude-acct2");
+      assert.equal(routeForModel.model, "anthropic/claude-opus-5-5");
+
+      // 2. Automatic pick (no model specified): skips throttled acct1 and picks healthy acct2
+      const autoRoute = await resolveLaunchRoute(config, {
+        tier: 1,
+        catalog: compiler,
+        quota,
+      });
+      assert.equal(autoRoute.profile.id, "acp:claude-acct2");
+
+      // 3. When ALL routes for the requested model are throttled/exhausted, fails cleanly
+      quota.ingestPassiveSignal({
+        profileId: "acp:claude-acct2",
+        model: "claude-opus-5-5",
+        raw: { sessionFailure: "quota_exhausted", resetAt: new Date(Date.now() + 30 * 60_000).toISOString() },
+        observedAt: Date.now(),
+      });
+      await assert.rejects(
+        () => resolveLaunchRoute(config, { tier: 1, catalog: compiler, quota, model: "anthropic/claude-opus-5-5" }),
+        /No eligible current catalog route/,
+      );
+    } finally {
       rmSync(stateDir, { recursive: true, force: true });
     }
   });

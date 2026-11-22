@@ -103,6 +103,14 @@ export function deriveRunStatus(
 
   const realTasks = tasks.filter((t) => t.profileId !== "director");
   if (realTasks.length === 0) return run.status === "active" ? "completed" : run.status;
+  // For container runs (`director-tasks-<chatId>`), derive status from the most recently updated task
+  // rather than letting an ancient restarted/failed lookup taint all future completed lookups forever.
+  if (run.id.startsWith("director-tasks-")) {
+    const latestTask = [...realTasks].sort((a, b) => b.updatedAt - a.updatedAt)[0]!;
+    if (latestTask.status === "failed") return "failed";
+    if (latestTask.status === "cancelled") return "stopped";
+    return "completed";
+  }
   if (realTasks.some((t) => t.status === "failed")) return "failed";
   if (realTasks.every((t) => t.status === "cancelled")) return "stopped";
   return "completed";
@@ -118,8 +126,10 @@ export class HarnessOrchestrator {
     { handoff: AnchoredHandoff; target?: { profileId?: string; model?: string; effort?: string } }
   >();
   private taskQuotaHints = new Map<string, TaskQuotaPauseMeta>();
-  private taskResumeNotes = new Map<string, { reason?: string; userMessage?: string | null }>();
+  private taskResumeNotes = new Map<string, { kind?: "quota" | "resume"; reason?: string; userMessage?: string | null }>();
   private runQuotaStates = new Map<string, InternalRunQuotaState>();
+  private runConsecutiveQuotaPauses = new Map<string, number>();
+  private taskAutoRolloverProgress = new Map<string, { fp: string; streak: number }>();
   private quiescenceCheckPending = new Set<string>();
   readonly toolExecutor: ControlPlaneToolExecutor;
 
@@ -455,8 +465,9 @@ export class HarnessOrchestrator {
       writeScopes: input.writeScopes,
     });
 
-    // Tier 2 Workers get their own isolated git worktree automatically
-    if (task.tier === 2) {
+    // Tier 2 Workers get their own isolated git worktree automatically when ready (deferred for `pending`
+    // tasks waiting on `depends_on` so they branch off fresh HEAD after their dependency merges!).
+    if (task.tier === 2 && task.status === "ready") {
       const wtMgr = this.getWorktreeManager(run.repoRoot);
       this.allocatingWorktrees.add(task.id);
       try {
@@ -586,22 +597,35 @@ export class HarnessOrchestrator {
       const firstReason =
         stillPaused.map((t) => this.taskQuotaHints.get(t.id)?.reason ?? t.summary).find(Boolean) ?? "Quota limit reached";
       const autoEnabled = this.config.quotaRetry.autoResumeEnabled !== false;
-      const canAutoSchedule = autoEnabled && schedule.resumeAtMs !== null;
+      const prevPauseStreak = this.runConsecutiveQuotaPauses.get(runId) ?? 0;
+      const pauseStreak = prevPauseStreak + 1;
+      this.runConsecutiveQuotaPauses.set(runId, pauseStreak);
+
+      let effectiveResumeAtMs = schedule.resumeAtMs;
+      // Prevent tight 1.5s infinite 429 loops when a lagging Quota Endpoint reports `availableNow: true`
+      // on consecutive quota pauses with no progress in between.
+      if (effectiveResumeAtMs !== null && pauseStreak >= 2 && effectiveResumeAtMs - Date.now() < 15_000) {
+        const baseSec = Math.max(15, this.config.quotaRetry.fallbackCooldownSec ?? 60);
+        const maxSec = Math.max(baseSec, this.config.quotaRetry.maxCooldownSec ?? 900);
+        const backoffMs = Math.min(maxSec, baseSec * Math.pow(2, pauseStreak - 2)) * 1000;
+        effectiveResumeAtMs = Date.now() + backoffMs;
+      }
+      const canAutoSchedule = autoEnabled && effectiveResumeAtMs !== null;
 
       const state: InternalRunQuotaState = {
         runId,
         pausedTaskIds: stillPaused.map((t) => t.id),
         mode: canAutoSchedule ? "auto_timer" : "manual",
         source: canAutoSchedule ? (schedule.source === "unknown" ? "none" : schedule.source) : "none",
-        resumeAt: canAutoSchedule && schedule.resumeAtMs ? new Date(schedule.resumeAtMs).toISOString() : null,
+        resumeAt: canAutoSchedule && effectiveResumeAtMs ? new Date(effectiveResumeAtMs).toISOString() : null,
         reason: firstReason,
         pausedAt: Date.now(),
         timer: null,
         earlyWakePoller: null,
       };
 
-      if (canAutoSchedule && schedule.resumeAtMs) {
-        const deadline = schedule.resumeAtMs;
+      if (canAutoSchedule && effectiveResumeAtMs) {
+        const deadline = effectiveResumeAtMs;
         const delayMs = Math.max(250, deadline - Date.now());
         const armTimer = () => {
           const remaining = deadline - Date.now();
@@ -736,6 +760,7 @@ export class HarnessOrchestrator {
       const hint = this.taskQuotaHints.get(t.id);
       this.taskQuotaHints.delete(t.id);
       this.taskResumeNotes.set(t.id, {
+        kind: "quota",
         reason: hint?.reason ?? t.summary ?? "quota limit",
         userMessage: opts?.userMessage ?? null,
       });
@@ -781,6 +806,13 @@ export class HarnessOrchestrator {
     const toolPolicy = toolPolicyForTask(task.tier, task.kind, task.readOnly);
     let wt = task.worktreeId ? this.db.getWorktree(task.worktreeId) : null;
     if (toolPolicy === "read_write_workspace") {
+      if (wt && wt.status === "merged") {
+        throw new Error(`Cannot resume worker ${task.id}: its worktree ${wt.id} was already merged.`);
+      }
+      // Atomically validate and re-acquire assigned write leases before resuming a Tier 2 worker!
+      if (task.tier === 2) {
+        this.db.reacquireWriteLeasesForTask(run.id, task.id);
+      }
       const wtMgr = this.getWorktreeManager(run.repoRoot);
       if (!wt || wt.runId !== run.id || !existsSync(wt.path)) {
         wt = await wtMgr.createForWorker(run.id, task.id);
@@ -812,8 +844,11 @@ export class HarnessOrchestrator {
 
     this.clearRunQuotaTimers(run.id);
     this.runQuotaStates.delete(run.id);
+    this.runConsecutiveQuotaPauses.delete(run.id);
+    this.taskAutoRolloverProgress.delete(task.id);
     this.taskQuotaHints.delete(task.id);
     this.taskResumeNotes.set(task.id, {
+      kind: "resume",
       reason: priorReason,
       userMessage: opts?.note?.trim() || "Continue from preserved worktree/artifacts without redoing completed steps.",
     });
@@ -905,8 +940,23 @@ export class HarnessOrchestrator {
       const run = this.db.getRun(task.runId);
       if (!run) return;
 
-      const wt = task.worktreeId ? this.db.getWorktree(task.worktreeId) : null;
+      let wt = task.worktreeId ? this.db.getWorktree(task.worktreeId) : null;
       const toolPolicy = toolPolicyForTask(task.tier, task.kind, task.readOnly);
+      // Deferred worktree & write-lease activation for Tier 2 Workers that started `pending` on `depends_on`
+      if (task.tier === 2 && toolPolicy === "read_write_workspace") {
+        if (!this.db.listActiveWriteScopes(run.id, task.id).length && this.db.listAssignedWriteScopes(run.id, task.id).length) {
+          this.db.reacquireWriteLeasesForTask(run.id, task.id);
+        }
+        if (!wt || wt.runId !== task.runId) {
+          const wtMgr = this.getWorktreeManager(run.repoRoot);
+          this.allocatingWorktrees.add(task.id);
+          try {
+            wt = await wtMgr.createForWorker(run.id, task.id);
+          } finally {
+            this.allocatingWorktrees.delete(task.id);
+          }
+        }
+      }
       if (toolPolicy === "read_write_workspace" && (!wt || wt.runId !== task.runId)) {
         throw new Error("A writable agent requires its assigned worktree.");
       }
@@ -934,6 +984,8 @@ export class HarnessOrchestrator {
         openEscalations: this.db.listEscalations(run.id, "open"),
         blackboard: this.db.blackboardGet(run.id),
         scopedKbHints,
+        openPeerRequests: task.tier === 1 ? this.db.listOpenPeerExchangesForRun(run.id) : [],
+        answeredMessages: this.db.listAnsweredMessagesFrom(task.id),
         writeScopes,
         worktreePath: wt?.path ?? null,
         worktreeBranch: wt?.branch ?? null,
@@ -952,6 +1004,7 @@ export class HarnessOrchestrator {
       const catalogEntry = this.catalog.loadCached()?.models.find((m) => m.id === model);
       const maxGenerations = this.config.rollover.maxGenerations ?? 12;
 
+      let genToolEvents = 0;
       const generation = new AbortController();
       exec.generationSignal = AbortSignal.any([generation.signal, exec.abort.signal]);
       const runnerReq: RunAgentRequest = {
@@ -974,6 +1027,7 @@ export class HarnessOrchestrator {
         executeTool: (name, args) => this.toolExecutor.execute(run.id, task.id, name, args),
         daemonSocketPath: this.config.socketPath,
         mcpBridgeEntrypoint,
+        externalMcpServers: this.config.externalMcpServers,
         signal: exec.generationSignal,
         onHandle: (h) => {
           exec.handle = h;
@@ -992,6 +1046,9 @@ export class HarnessOrchestrator {
             this.db.updateTask(task.id, { contextUsed: usage.used, contextSize: usage.size });
             this.db.emitEvent(run.id, task.id, "agent.usage", usage);
           },
+          onTurn: (turnsUsed) => {
+            this.db.updateTask(task.id, { turnsUsed });
+          },
           onArtifact: (art) => {
             this.db.recordArtifact({ runId: run.id, taskId: task.id, ...art });
           },
@@ -1008,6 +1065,7 @@ export class HarnessOrchestrator {
             });
           },
           onToolEvent: (ev) => {
+            genToolEvents += 1;
             this.db.emitEvent(run.id, task.id, "agent.tool", ev);
           },
         },
@@ -1024,12 +1082,65 @@ export class HarnessOrchestrator {
         const latest = this.db.getTask(task.id)!;
         if (exec.abort.signal.aborted || latest.status === "cancelled") return;
 
+        // Honor terminal/settled status from `return_task` or `report_issue` BEFORE rollover/maxTurns/quota
+        // so a task that already completed on its final/threshold turn is NEVER reopened into generation N+1!
+        if (["completed", "returned_for_rescope", "blocked", "cancelled"].includes(latest.status)) {
+          this.pendingRollovers.delete(task.id);
+          this.runConsecutiveQuotaPauses.delete(run.id);
+          this.taskAutoRolloverProgress.delete(task.id);
+          if (isReadOnlyKind(latest.kind) && latest.status === "completed") {
+            try {
+              validateTaskHandoff(latest.kind, JSON.parse(latest.resultJson ?? "{}"));
+            } catch {
+              this.db.updateTask(task.id, { status: "failed", resultJson: null, summary: "Task ended without a valid sourced handoff." });
+            }
+          }
+          if ((latest.tier === 1 || latest.tier === 2) && latest.status === "completed") {
+            const hasPausedChildren = this.db
+              .listTasks(run.id, latest.tier === 2 ? { parentId: latest.id } : undefined)
+              .some((t) => t.id !== latest.id && t.status === "paused_quota");
+            if (hasPausedChildren) {
+              this.db.updateTask(task.id, {
+                status: "paused_quota",
+                summary: "Waiting for quota-paused child task(s) to resume",
+              });
+            }
+          }
+          return;
+        }
+
         // Clean rollover requested either via explicit `request_rollover`, context threshold, or bounded `max_turns` for Tier 1/2
         const explicitRollover = this.pendingRollovers.get(task.id);
         const maxTurnsRollover = res.stopReason === "max_turns" && (latest.tier === 1 || latest.tier === 2);
         if (explicitRollover || res.stopReason === "rollover_requested" || maxTurnsRollover) {
           this.pendingRollovers.delete(task.id);
           const nextGen = latest.generation + 1;
+          // Fail fast after 2 consecutive zero-progress automatic context-threshold rollovers
+          if (!explicitRollover && res.stopReason === "rollover_requested") {
+            const fp = await this.computeAutoRolloverFingerprint(run.id, task.id, wt?.path ?? null);
+            const prev = this.taskAutoRolloverProgress.get(task.id);
+            const streak = prev && prev.fp === fp ? prev.streak + 1 : 1;
+            this.taskAutoRolloverProgress.set(task.id, { fp, streak });
+            if (streak >= 2) {
+              this.db.updateTask(task.id, {
+                status: "failed",
+                summary: `Aborted after ${streak} consecutive zero-progress automatic rollovers (no commits, worktree edits, artifacts, or child tasks).`,
+              });
+              this.db.createEscalation({
+                runId: run.id,
+                fromTaskId: task.id,
+                toTaskId: task.parentId,
+                severity: task.tier === 1 ? "P0" : "P1",
+                category: "budget_exhausted",
+                title: `Task ${task.id} looped ${streak}x on auto-rollover with zero progress`,
+                evidencePaths: [],
+                blocking: true,
+              });
+              return;
+            }
+          } else {
+            this.taskAutoRolloverProgress.delete(task.id);
+          }
           if (nextGen > maxGenerations) {
             this.db.updateTask(task.id, {
               status: "failed",
@@ -1113,29 +1224,6 @@ export class HarnessOrchestrator {
           return;
         }
 
-        // If task already transitioned via `return_task`, keep that status
-        if (["completed", "returned_for_rescope", "blocked", "cancelled"].includes(latest.status)) {
-          if (isReadOnlyKind(latest.kind) && latest.status === "completed") {
-            try {
-              validateTaskHandoff(latest.kind, JSON.parse(latest.resultJson ?? "{}"));
-            } catch {
-              this.db.updateTask(task.id, { status: "failed", resultJson: null, summary: "Task ended without a valid sourced handoff." });
-            }
-          }
-          if ((latest.tier === 1 || latest.tier === 2) && latest.status === "completed") {
-            const hasPausedChildren = this.db
-              .listTasks(run.id, latest.tier === 2 ? { parentId: latest.id } : undefined)
-              .some((t) => t.id !== latest.id && t.status === "paused_quota");
-            if (hasPausedChildren) {
-              this.db.updateTask(task.id, {
-                status: "paused_quota",
-                summary: "Waiting for quota-paused child task(s) to resume",
-              });
-            }
-          }
-          return;
-        }
-
         if (res.stopReason === "cancelled" || exec.abort.signal.aborted) {
           this.db.updateTask(task.id, { status: "cancelled", summary: "Cancelled" });
           return;
@@ -1167,25 +1255,49 @@ export class HarnessOrchestrator {
           return;
         }
 
-        // Enforce settlement safety on natural exit for Tier 2 Workers (dirty or unmerged worktree must not mark completed)
+        // Guard against hallucinated XML tool-call prose exits on Tier 1 Orchestrators (e.g. `<invoke name="tool_search">`)
+        if (
+          latest.tier === 1 &&
+          genToolEvents === 0 &&
+          this.db.listTasks(run.id, { parentId: latest.id }).length === 0 &&
+          /<(?:invoke|tool_call|function_calls)\b/i.test(res.text)
+        ) {
+          this.db.updateTask(task.id, {
+            status: "failed",
+            summary: "Orchestrator exited with unexecuted tool-call XML prose instead of invoking tools.",
+          });
+          return;
+        }
+
+        // Enforce settlement safety on natural exit for Tier 2 Workers (verify clean AND HEAD contained in targetBranch)
         if (latest.tier === 2 && latest.worktreeId) {
           const latestWt = this.db.getWorktree(latest.worktreeId);
-          if (latestWt && latestWt.status !== "merged") {
-            const dirty = await this.getWorktreeManager(run.repoRoot).isDirty(latestWt.path).catch(() => false);
-            if (dirty || latestWt.status === "bounced" || latestWt.status === "queued") {
+          if (latestWt && !latestWt.cleanedAt) {
+            const wtMgr = this.getWorktreeManager(run.repoRoot);
+            const dirty = await wtMgr.isDirty(latestWt.path).catch(() => false);
+            const wtHead = await runGit(latestWt.path, ["rev-parse", "HEAD"]).then((r) => r.stdout).catch(() => null);
+            const hasUnmergedCommits =
+              wtHead != null &&
+              wtHead !== latestWt.baseSha &&
+              !(await runGit(run.repoRoot, ["merge-base", "--is-ancestor", wtHead, run.baseBranch]).then(
+                () => true,
+                () => false,
+              ));
+            if (dirty || hasUnmergedCommits || latestWt.status === "bounced" || latestWt.status === "queued") {
               this.db.updateTask(task.id, {
                 status: "failed",
-                summary: `Worker exited without completing merge (worktree status: ${latestWt.status}, dirty: ${dirty}).`,
+                summary: `Worker exited with unmerged/dirty worktree (status: ${latestWt.status}, dirty: ${dirty}, unmergedCommits: ${hasUnmergedCommits}).`,
               });
               return;
             }
-          } else if (latestWt && latestWt.status === "merged" && !latestWt.cleanedAt) {
-            void this.getWorktreeManager(run.repoRoot)
-              .teardown(latestWt.id, { archiveBeforeRemove: false, finalStatus: "merged" })
-              .catch(() => {});
+            if (latestWt.status === "merged") {
+              void wtMgr.teardown(latestWt.id, { archiveBeforeRemove: false, finalStatus: "merged" }).catch(() => {});
+            }
           }
         }
 
+        this.runConsecutiveQuotaPauses.delete(run.id);
+        this.taskAutoRolloverProgress.delete(task.id);
         // Agent finished its turn naturally without calling `return_task`
         this.db.updateTask(task.id, {
           status: "completed",
@@ -1348,6 +1460,24 @@ export class HarnessOrchestrator {
         `Recently touched artifacts: ${recentArtifacts.map((a) => `${a.kind}:${a.path}`).slice(0, 8).join(", ")}`,
       );
     }
+    // Preserve steered instructions and unanswered peer questions so rollovers NEVER forget mid-flight updates!
+    const steeredRows = this.db.db
+      .prepare("SELECT payload_json FROM events WHERE run_id = ? AND task_id = ? AND type = 'agent.steered' ORDER BY seq DESC LIMIT 6")
+      .all(input.runId, input.task.id) as Array<{ payload_json: string }>;
+    for (const row of steeredRows.reverse()) {
+      try {
+        const p = JSON.parse(row.payload_json) as { message?: string };
+        if (p.message?.trim()) {
+          nextActions.push(`Steered update: ${p.message.trim().slice(0, 400)}`);
+        }
+      } catch {
+        // ignore malformed payload
+      }
+    }
+    const openPeerMsgs = this.db.listOpenMessages(input.task.id);
+    for (const m of openPeerMsgs.slice(0, 5)) {
+      nextActions.push(`Unanswered peer question ${m.id} from ${m.fromTaskId}: ${m.question.slice(0, 260)}`);
+    }
     if (input.result.toolFailures?.length) {
       activeRisks.push(`Recent tool failures: ${input.result.toolFailures.slice(-3).join(" | ")}`);
     }
@@ -1366,6 +1496,20 @@ export class HarnessOrchestrator {
       activeRisks,
       nextActions,
     };
+  }
+
+  private async computeAutoRolloverFingerprint(runId: string, taskId: string, worktreePath: string | null): Promise<string> {
+    let gitState = "no-wt";
+    if (worktreePath && existsSync(worktreePath)) {
+      const [head, status] = await Promise.all([
+        runGit(worktreePath, ["rev-parse", "HEAD"]).then((r) => r.stdout).catch(() => ""),
+        runGit(worktreePath, ["status", "--porcelain"]).then((r) => r.stdout).catch(() => ""),
+      ]);
+      gitState = `${head}|${status}`;
+    }
+    const artCount = this.db.listArtifacts(runId, taskId, 200).length;
+    const childCount = this.db.listTasks(runId, { parentId: taskId }).length;
+    return `${gitState}::art=${artCount}::kids=${childCount}`;
   }
 
   async steerTask(taskId: string, message: string): Promise<boolean> {
@@ -1392,11 +1536,11 @@ export class HarnessOrchestrator {
     if (task && !["completed", "cancelled", "failed"].includes(task.status)) {
       this.db.updateTask(taskId, { status: "cancelled", summary: `Cancelled: ${reason}` });
     }
-    // Archive & tear down a cancelled worker's worktree immediately so it never exhausts maxConcurrentWorkers
+    // Archive & tear down a cancelled worker's worktree immediately — unless a merge is actively draining it
     if (task?.worktreeId) {
       const run = this.db.getRun(task.runId);
       const wt = this.db.getWorktree(task.worktreeId);
-      if (run && wt && !wt.cleanedAt && wt.status !== "merged") {
+      if (run && wt && !wt.cleanedAt && wt.status !== "merged" && wt.status !== "queued" && task.status !== "merging") {
         void this.getWorktreeManager(run.repoRoot)
           .teardown(wt.id, { archiveBeforeRemove: true, finalStatus: "archived" })
           .catch(() => {});

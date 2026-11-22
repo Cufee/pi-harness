@@ -151,10 +151,23 @@ export interface QuotaRetryConfig {
   earlyWakePollMs: number;
 }
 
+export interface ExternalMcpServerConfig {
+  /** Stable MCP server name exposed to all ACP agents (e.g. `ast-grep`, `octofs`, `serena`) */
+  name: string;
+  /** Executable command (e.g. `uvx`, `npx`, `octofs`, `/path/to/bin`) */
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  /** Set false to disable without removing */
+  enabled?: boolean;
+}
+
 export interface HarnessConfig {
   stateDir: string;
   socketPath: string;
   profiles: RunnerProfileConfig[];
+  /** Optional external stdio MCP servers forwarded automatically to all non-control-plane ACP agents (e.g. ast-grep-mcp, octofs, serena). */
+  externalMcpServers?: ExternalMcpServerConfig[];
   codeMode: CodeMode;
   codeExec?: { defaultTimeoutMs?: number; maxTimeoutMs?: number; maxOutputChars?: number };
   defaultOrchestratorProfile?: string;
@@ -307,6 +320,7 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
     stateDir,
     socketPath: merged.socketPath ? resolve(merged.socketPath) : defaultSocketPath(stateDir),
     profiles,
+    ...(merged.externalMcpServers?.length ? { externalMcpServers: merged.externalMcpServers } : {}),
     codeMode,
     codeExec: {
       defaultTimeoutMs: 300_000, maxTimeoutMs: 1_800_000,
@@ -335,6 +349,7 @@ export function saveGlobalConfig(config: HarnessConfig): string {
   const filePath = join(config.stateDir, "config.json");
   const serialized = {
     profiles: config.profiles,
+    ...(config.externalMcpServers?.length ? { externalMcpServers: config.externalMcpServers } : {}),
     codeMode: config.codeMode,
     codeExec: config.codeExec,
     defaultOrchestratorProfile: config.defaultOrchestratorProfile,
@@ -400,6 +415,22 @@ export const ACP_PROFILE_PRESETS: Record<string, Omit<AcpProfileConfig, "id">> =
     command: "agy",
     args: ["acp"],
     billing: "subscription",
+    enabled: true,
+  },
+};
+
+/** Optional presets for battle-tested external MCP code tools forwarded to all non-control-plane ACP agents. */
+export const EXTERNAL_MCP_PRESETS: Record<string, ExternalMcpServerConfig> = {
+  octofs: {
+    name: "octofs",
+    command: "octofs",
+    args: [],
+    enabled: true,
+  },
+  "ast-grep": {
+    name: "ast-grep",
+    command: "uvx",
+    args: ["--from", "git+https://github.com/ast-grep/ast-grep-mcp", "ast-grep-server"],
     enabled: true,
   },
 };

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import type { WorktreeConfig } from "../config.js";
 import type { ControlPlaneDb, MergeQueueRecord } from "../control-plane/db.js";
+import { KnowledgeMaintainer } from "../kb/maintainer.js";
 import { canonicalPath, runGit, type WorktreeManager } from "./manager.js";
 
 const execFileAsync = promisify(execFile);
@@ -16,6 +17,7 @@ export interface MergeOutcome {
 
 export interface MergeProcessOptions {
   preserveLiveTask?: boolean;
+  signal?: AbortSignal;
 }
 
 const ALLOWED_SHARED_METADATA_FILES = new Set([
@@ -80,9 +82,9 @@ async function checkWriteScopes(
     return [];
   }
 
-  const { stdout } = await runGit(repoRoot, ["diff", "--name-only", `${targetBranch}...${branch}`]);
+  const { stdout } = await runGit(repoRoot, ["diff", "--no-renames", "--name-only", "-z", `${targetBranch}...${branch}`]);
   const changedFiles = stdout
-    .split("\n")
+    .split("\0")
     .map((f) => f.trim().replace(/^\.\//, ""))
     .filter(Boolean);
   if (changedFiles.length === 0) return [];
@@ -263,6 +265,17 @@ export class BisectingMergeQueue {
     try {
       const { stdout: targetSha } = await runGit(this.repoRoot, ["rev-parse", targetBranch]);
 
+      const isTaskCancelledOrTerminal = (): boolean => {
+        if (opts?.signal?.aborted) return true;
+        const curTask = this.db.getTask(next.taskId);
+        return Boolean(curTask && ["cancelled", "failed", "completed"].includes(curTask.status));
+      };
+
+      if (isTaskCancelledOrTerminal()) {
+        const finished = this.db.finishMergeItem(next.id, "ci_failed", "Merge aborted: task was cancelled or already settled.");
+        return { item: finished, bouncedReason: "Merge aborted: task was cancelled or already settled." };
+      }
+
       // Verify test integrity before touching integration branch
       const integrityWarnings = await checkTestIntegrity(this.repoRoot, targetBranch, next.branch);
       if (integrityWarnings.length > 0) {
@@ -270,11 +283,11 @@ export class BisectingMergeQueue {
         return this.bounce(next, "ci_failed", log, targetBranch, opts);
       }
 
-      // Enforce active write_leases mechanically before running CI
-      const activeWriteScopes = this.db.listActiveWriteScopes(next.runId, next.taskId);
-      const outOfScopeFiles = await checkWriteScopes(this.repoRoot, targetBranch, next.branch, activeWriteScopes);
+      // Enforce assigned write_leases mechanically before running CI (uses stored scopes even if leases were deactivated on bounce/block)
+      const assignedWriteScopes = this.db.listAssignedWriteScopes(next.runId, next.taskId);
+      const outOfScopeFiles = await checkWriteScopes(this.repoRoot, targetBranch, next.branch, assignedWriteScopes);
       if (outOfScopeFiles.length > 0) {
-        const log = `Write-scope violation: modified files outside assigned write_scopes (${activeWriteScopes.join(", ")}):\n${outOfScopeFiles.join("\n")}`;
+        const log = `Write-scope violation: modified files outside assigned write_scopes (${assignedWriteScopes.join(", ")}):\n${outOfScopeFiles.join("\n")}`;
         return this.bounce(next, "ci_failed", log, targetBranch, opts);
       }
 
@@ -311,21 +324,36 @@ export class BisectingMergeQueue {
         return this.bounce(next, "conflict", log, targetBranch, opts);
       }
 
-      // Run deterministic computational CI gates
+      // Run deterministic computational CI gates (abortable on task cancellation)
       const ciLogs: string[] = [];
       for (const cmd of this.config.ciCommands ?? []) {
+        if (isTaskCancelledOrTerminal()) {
+          const finished = this.db.finishMergeItem(next.id, "ci_failed", "Merge aborted before CI: task cancelled.");
+          return { item: finished, bouncedReason: "Merge aborted before CI: task cancelled." };
+        }
         try {
           const { stdout, stderr } = await execFileAsync("/bin/sh", ["-lc", cmd], {
             cwd: intPath,
             timeout: this.config.ciTimeoutMs ?? 300_000,
             maxBuffer: 16 * 1024 * 1024,
+            signal: opts?.signal,
           });
           ciLogs.push(`$ ${cmd} -> OK\n${stdout.slice(-1000)}${stderr ? "\n" + stderr.slice(-500) : ""}`);
         } catch (err: unknown) {
+          if (isTaskCancelledOrTerminal()) {
+            const finished = this.db.finishMergeItem(next.id, "ci_failed", "Merge aborted during CI: task cancelled.");
+            return { item: finished, bouncedReason: "Merge aborted during CI: task cancelled." };
+          }
           const e = err as { stdout?: string; stderr?: string; message?: string };
           const log = `CI gate failed: ${cmd}\n${(e.stdout ?? "").slice(-2000)}\n${(e.stderr ?? e.message ?? "").slice(-2000)}`;
           return this.bounce(next, "ci_failed", log, targetBranch, opts);
         }
+      }
+
+      // Re-check cancellation right before advancing targetBranch so cancelled work NEVER lands on targetBranch!
+      if (isTaskCancelledOrTerminal()) {
+        const finished = this.db.finishMergeItem(next.id, "ci_failed", "Merge aborted before ref promotion: task cancelled.");
+        return { item: finished, bouncedReason: "Merge aborted before ref promotion: task cancelled." };
       }
 
       // Advance target branch safely without ever leaving the checked-out working tree out of sync with HEAD!
@@ -375,13 +403,26 @@ export class BisectingMergeQueue {
       }
 
       const finished = this.db.finishMergeItem(next.id, "merged", ciLogs.join("\n"));
+      const curTaskAfterMerge = this.db.getTask(next.taskId);
+      const alreadyTerminal = Boolean(curTaskAfterMerge && ["cancelled", "failed", "completed"].includes(curTaskAfterMerge.status));
       if (opts?.preserveLiveTask === true) {
         this.db.updateWorktree(next.worktreeId, { status: "merged" });
-        this.db.updateTask(next.taskId, { status: "running" });
+        if (!alreadyTerminal) {
+          this.db.updateTask(next.taskId, { status: "running" });
+        }
       } else {
-        this.db.updateTask(next.taskId, { status: "completed", summary: `Merged ${next.branch} at ${mergedSha.slice(0, 8)}` });
+        if (!alreadyTerminal) {
+          this.db.updateTask(next.taskId, { status: "completed", summary: `Merged ${next.branch} at ${mergedSha.slice(0, 8)}` });
+        }
         await this.worktrees.teardown(next.worktreeId, { archiveBeforeRemove: false, finalStatus: "merged" });
       }
+
+      // Lightweight $0-token KB staleness check after targetBranch advances; never breaks merges.
+      const run = this.db.getRun(next.runId);
+      const repoScope = run?.repoRoot ?? this.repoRoot;
+      await new KnowledgeMaintainer(this.db.kb)
+        .runDeterministicPreCheck(this.repoRoot, repoScope, mergedSha)
+        .catch(() => {});
 
       return { item: finished, mergedSha };
     } finally {

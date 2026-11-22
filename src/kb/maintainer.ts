@@ -23,6 +23,8 @@ export interface MaintainerPreCheckReport {
   repoRoot: string;
   headSha: string;
   shouldSpawnMaintainer: boolean;
+  staleMarked: number;
+  candidatesPending: number;
   reasons: string[];
   candidates: KbEntry[];
   dirtyEntries: DirtyEntryDiff[];
@@ -31,10 +33,30 @@ export interface MaintainerPreCheckReport {
   duplicateClusters: Array<{ anchorId: string; similarIds: string[] }>;
 }
 
+interface ParsedDiffFile {
+  deleted: boolean;
+  files: string[];
+}
+
+function normalizeRelPath(raw: string): string {
+  return raw.trim().replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/+$/, "");
+}
+
+function matchesWatchedPattern(normFile: string, rawPattern: string, ignoreWildcards: boolean): boolean {
+  const norm = normalizeRelPath(rawPattern);
+  if (!norm) return false;
+  if (ignoreWildcards && (norm === "*" || norm === "**" || norm === "**/*")) return false;
+  if (normFile === norm || normFile.startsWith(`${norm}/`)) return true;
+  if (/[*?[{]/.test(norm)) {
+    return new Bun.Glob(norm).match(normFile);
+  }
+  return false;
+}
+
 /**
  * Deterministic $0-token pre-check pipeline for the Knowledge Maintainer / GC Agent.
- * Inspects git diffs against each active entry's `verified_sha` & `evidence_paths`,
- * auto-marks deleted evidence as `stale`, pre-clusters duplicates via FTS5, and detects
+ * Inspects git diffs against each active entry's `verified_sha` & `evidence_paths` (or `path_globs`),
+ * auto-marks modified/deleted evidence as `stale`, pre-clusters duplicates via FTS5, and detects
  * unused decaying entries — spawning an LLM Maintainer ONLY when real curation work exists.
  */
 export class KnowledgeMaintainer {
@@ -43,8 +65,20 @@ export class KnowledgeMaintainer {
     private readonly cfg: MaintainerTriggerConfig = {},
   ) {}
 
-  async runDeterministicPreCheck(repoRoot: string, repoScope = repoRoot): Promise<MaintainerPreCheckReport> {
-    const { stdout: headSha } = await runGit(repoRoot, ["rev-parse", "HEAD"]);
+  async runDeterministicPreCheck(
+    repoRoot: string,
+    repoScope = repoRoot,
+    headRef = "HEAD",
+  ): Promise<MaintainerPreCheckReport> {
+    let headSha = "";
+    try {
+      const { stdout } = await runGit(repoRoot, ["rev-parse", headRef]);
+      headSha = stdout.trim();
+    } catch {
+      // Non-git, shallow, or unborn-HEAD repo — skip git diff inspection gracefully
+      headSha = "";
+    }
+
     const candidates = this.kb.listByStatus(repoScope, "candidate");
     const active = this.kb.listByStatus(repoScope, "active");
     const alreadyStale = this.kb.listByStatus(repoScope, "stale");
@@ -52,38 +86,76 @@ export class KnowledgeMaintainer {
 
     const dirtyEntries: DirtyEntryDiff[] = [];
     const newlyFlaggedStale: KbEntry[] = [...alreadyStale];
+    let staleMarked = 0;
 
-    for (const entry of active) {
-      if (!entry.verifiedSha || entry.evidencePaths.length === 0) continue;
-      if (entry.lastCheckedSha === headSha) continue;
+    if (headSha) {
+      const diffCache = new Map<string, ParsedDiffFile[] | null>();
 
-      try {
-        const { stdout: nameStatus } = await runGit(repoRoot, [
-          "diff",
-          "--name-status",
-          `${entry.verifiedSha}..${headSha}`,
-          "--",
-          ...entry.evidencePaths,
-        ]);
+      const getDiffFiles = async (verifiedSha: string): Promise<ParsedDiffFile[] | null> => {
+        if (diffCache.has(verifiedSha)) return diffCache.get(verifiedSha) ?? null;
+        try {
+          const { stdout: nameStatus } = await runGit(repoRoot, [
+            "-c",
+            "core.quotepath=false",
+            "diff",
+            "--name-status",
+            `${verifiedSha}..${headSha}`,
+          ]);
+          const parsed: ParsedDiffFile[] = [];
+          for (const line of nameStatus.split("\n").filter(Boolean)) {
+            const parts = line.split(/\t+/);
+            const status = parts[0] ?? "";
+            const files = parts.slice(1).map(normalizeRelPath).filter(Boolean);
+            if (files.length === 0) continue;
+            parsed.push({ deleted: status.startsWith("D"), files });
+          }
+          diffCache.set(verifiedSha, parsed);
+          return parsed;
+        } catch {
+          // Ignore invalid/shallow SHA errors gracefully
+          diffCache.set(verifiedSha, null);
+          return null;
+        }
+      };
 
-        if (!nameStatus) {
+      for (const entry of active) {
+        const useEvidence = entry.evidencePaths.length > 0;
+        const watchedPatterns = useEvidence ? entry.evidencePaths : entry.pathGlobs;
+        if (!entry.verifiedSha || watchedPatterns.length === 0) continue;
+        if (entry.lastCheckedSha === headSha) continue;
+
+        if (entry.verifiedSha === headSha) {
+          this.kb.markCheckedClean(entry.id, headSha);
+          continue;
+        }
+
+        const diffFiles = await getDiffFiles(entry.verifiedSha);
+        if (diffFiles === null) continue;
+
+        const deletedSet = new Set<string>();
+        const changedSet = new Set<string>();
+        for (const item of diffFiles) {
+          for (const file of item.files) {
+            if (watchedPatterns.some((p) => matchesWatchedPattern(file, p, !useEvidence))) {
+              changedSet.add(file);
+              if (item.deleted) deletedSet.add(file);
+            }
+          }
+        }
+
+        if (changedSet.size === 0) {
           // Evidence completely untouched since verified_sha — mark clean at $0 token cost
           this.kb.markCheckedClean(entry.id, headSha);
           continue;
         }
 
-        const lines = nameStatus.split("\n").filter(Boolean);
-        const deletedFiles: string[] = [];
-        const changedFiles: string[] = [];
-        for (const line of lines) {
-          const [status = "", file = ""] = line.split(/\t+/);
-          if (status.startsWith("D")) deletedFiles.push(file);
-          if (file) changedFiles.push(file);
-        }
+        const deletedFiles = [...deletedSet];
+        const changedFiles = [...changedSet];
 
         if (deletedFiles.length > 0) {
           const updated = this.kb.flagStale(entry.id, `evidence_deleted: ${deletedFiles.join(", ")}`);
           newlyFlaggedStale.push(updated);
+          staleMarked++;
           dirtyEntries.push({
             entry: updated,
             changeKind: "deleted",
@@ -96,17 +168,18 @@ export class KnowledgeMaintainer {
             "-U2",
             `${entry.verifiedSha}..${headSha}`,
             "--",
-            ...entry.evidencePaths,
-          ]);
+            ...changedFiles,
+          ]).catch(() => ({ stdout: "" }));
+          const updated = this.kb.flagStale(entry.id, `evidence_modified: ${changedFiles.join(", ")}`);
+          newlyFlaggedStale.push(updated);
+          staleMarked++;
           dirtyEntries.push({
-            entry,
+            entry: updated,
             changeKind: "modified",
             changedFiles,
             diffExcerpt: diff.split("\n").slice(0, 120).join("\n"),
           });
         }
-      } catch {
-        // Ignore invalid/shallow SHA errors gracefully
       }
     }
 
@@ -141,6 +214,8 @@ export class KnowledgeMaintainer {
       repoRoot,
       headSha,
       shouldSpawnMaintainer: reasons.length > 0,
+      staleMarked,
+      candidatesPending: candidates.length,
       reasons,
       candidates,
       dirtyEntries,
@@ -152,15 +227,17 @@ export class KnowledgeMaintainer {
 
   /** Builds the compact review packet passed to a read-only Knowledge Maintainer Task Agent. */
   buildMaintainerPrompt(report: MaintainerPreCheckReport): string {
+    const headLabel = report.headSha ? report.headSha.slice(0, 10) : "unknown";
     const lines: string[] = [
-      `# Knowledge Base Maintenance Pass (HEAD=${report.headSha.slice(0, 10)})`,
+      `# Knowledge Base Maintenance Pass (HEAD=${headLabel})`,
       `Triggers: ${report.reasons.join(", ")}`,
       "",
       "You are the read-only Knowledge Maintainer. Curate, verify against actual code at HEAD, deduplicate, and garbage-collect.",
+      "Tools: `kb_search`, `kb_get`, `kb_promote`, `kb_flag_stale`, `kb_archive`.",
       "Rules:",
-      "- Never promote unverified guesses to active `invariant` entries — inspect the evidence files first.",
-      "- If a rule should be enforced by a linter or unit test instead of prose memory, archive it or note it as a lint recommendation.",
-      "- Archive stale/obsolete entries via `kb_archive` (bi-temporal `superseded_by` when replacing).",
+      "- Inspect full details via `kb_get` and check for duplicates via `kb_search` before mutating entries.",
+      "- Verify evidence files at HEAD before calling `kb_promote`; never promote unverified guesses to active `invariant` entries.",
+      "- Use `kb_flag_stale` for entries needing follow-up and `kb_archive` (with `superseded_by` when replacing) for obsolete or lint-enforceable rules.",
     ];
 
     if (report.candidates.length > 0) {

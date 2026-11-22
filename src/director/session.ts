@@ -299,6 +299,50 @@ export class DirectorSessionStore {
     return this.mapTurns(rows.reverse());
   }
 
+  /**
+   * Builds a balanced prompt-context history window: up to `conversationLimit` most-recent
+   * `user`/`assistant` turns PLUS up to `systemLimit` most-recent `system_notice`/`tool_output`
+   * turns, interleaved in chronological `seq` order so heavy tool/event bursts never evict
+   * user requirements or earlier steering.
+   */
+  getPromptHistory(
+    chatSessionId: string,
+    opts?: { conversationLimit?: number; systemLimit?: number; excludeSeq?: number },
+  ): ChatTurnRecord[] {
+    const convLimit = opts?.conversationLimit ?? 24;
+    const sysLimit = opts?.systemLimit ?? 16;
+    const excludeSeq = opts?.excludeSeq;
+    const convRows = (
+      excludeSeq !== undefined
+        ? this.db
+            .prepare(
+              "SELECT * FROM chat_turns WHERE chat_session_id = ? AND role IN ('user', 'assistant') AND seq != ? ORDER BY seq DESC LIMIT ?",
+            )
+            .all(chatSessionId, excludeSeq, convLimit)
+        : this.db
+            .prepare(
+              "SELECT * FROM chat_turns WHERE chat_session_id = ? AND role IN ('user', 'assistant') ORDER BY seq DESC LIMIT ?",
+            )
+            .all(chatSessionId, convLimit)
+    ) as Record<string, unknown>[];
+    const sysRows = (
+      excludeSeq !== undefined
+        ? this.db
+            .prepare(
+              "SELECT * FROM chat_turns WHERE chat_session_id = ? AND role IN ('system_notice', 'tool_output') AND seq != ? ORDER BY seq DESC LIMIT ?",
+            )
+            .all(chatSessionId, excludeSeq, sysLimit)
+        : this.db
+            .prepare(
+              "SELECT * FROM chat_turns WHERE chat_session_id = ? AND role IN ('system_notice', 'tool_output') ORDER BY seq DESC LIMIT ?",
+            )
+            .all(chatSessionId, sysLimit)
+    ) as Record<string, unknown>[];
+    const merged = [...this.mapTurns(convRows), ...this.mapTurns(sysRows)];
+    merged.sort((a, b) => a.seq - b.seq);
+    return merged;
+  }
+
   private mapTurns(rows: Record<string, unknown>[]): ChatTurnRecord[] {
     return rows.map((r) => {
       let parsedEvent: ChatControlEvent | null = null;

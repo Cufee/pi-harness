@@ -36,7 +36,7 @@ const NON_CODING_RE =
 const SNAPSHOT_RE = /-(20\d{2}(?:-\d{2}-\d{2}|\d{4}))$/;
 
 export function isCodingEligible(c: CandidateModel): boolean {
-  if (c.deprecated || c.successorModel || vendorSuccessors.has(c.canonicalId)) return false;
+  if (c.deprecated) return false;
   if (c.toolCall === false) return false;
   if (NON_CODING_RE.test(c.wireModelId) || NON_CODING_RE.test(c.canonicalId)) return false;
   if (c.modalities?.output && !c.modalities.output.includes("text")) return false;
@@ -100,33 +100,61 @@ function compareVersions(a: number[], b: number[]): number {
 
 export interface DeduplicateOptions {
   allowPreview?: boolean;
+  /** @deprecated Ignored for pruning — deduplication operates strictly over actually available candidates. */
   upstreamModelIds?: Iterable<string>;
 }
 
-export function selectLatestPerFamily(candidates: CandidateModel[], opts?: DeduplicateOptions): CandidateModel[] {
-  const latestVersion = new Map<string, number[]>();
-  const latestSnapshot = new Map<string, string>();
-  for (const id of opts?.upstreamModelIds ?? []) {
-    const info = release(id);
-    if (opts?.allowPreview === false && info.isPreview) continue;
-    if (info.snapshotDate > (latestSnapshot.get(info.base) ?? "")) latestSnapshot.set(info.base, info.snapshotDate);
-    if (compareVersions(info.version, latestVersion.get(info.key) ?? []) > 0) {
-      latestVersion.set(info.key, info.version);
+function hasAvailableSuccessor(
+  candidate: CandidateModel,
+  availableCanonicalIds: Set<string>,
+  availableBareIds: Set<string>,
+): boolean {
+  if (candidate.successorModel) {
+    const normSucc = candidate.successorModel.toLowerCase();
+    const bareSucc = normSucc.includes("/") ? normSucc.slice(normSucc.indexOf("/") + 1) : normSucc;
+    if (availableCanonicalIds.has(normSucc) || availableBareIds.has(bareSucc)) {
+      return true;
     }
   }
+  const start = candidate.canonicalId.toLowerCase();
+  const visited = new Set<string>([start]);
+  let next = vendorSuccessors.get(candidate.canonicalId) ?? vendorSuccessors.get(start);
+  while (next) {
+    const normNext = next.toLowerCase();
+    if (visited.has(normNext)) break;
+    if (availableCanonicalIds.has(normNext)) return true;
+    visited.add(normNext);
+    next = vendorSuccessors.get(next) ?? vendorSuccessors.get(normNext);
+  }
+  return false;
+}
 
-  const byFamily = new Map<string, { model: CandidateModel; info: ReturnType<typeof release> }>();
+export function selectLatestPerFamily(candidates: CandidateModel[], opts?: DeduplicateOptions): CandidateModel[] {
+  const eligible: Array<{ model: CandidateModel; info: ReturnType<typeof release> }> = [];
   for (const candidate of candidates) {
     if (!isCodingEligible(candidate)) continue;
     const info = release(candidate.canonicalId);
-    if (info.snapshotDate && info.snapshotDate < (latestSnapshot.get(info.base) ?? "")) continue;
     if (opts?.allowPreview === false && info.isPreview) continue;
-    if (compareVersions(info.version, latestVersion.get(info.key) ?? []) < 0) continue;
 
     // https://openrouter.ai/docs/guides/routing/model-variants/extended
     const routes = candidate.routes.filter(r => !(r.provider === "openrouter" && /:extended$/i.test(r.wireModelId)));
     if (!routes.length && candidate.routes.length) continue;
     const model = routes.length === candidate.routes.length ? candidate : { ...candidate, routes };
+    eligible.push({ model, info });
+  }
+
+  // Only drop a superseded model when its successor is actually available among the user's candidates.
+  const availableCanonicalIds = new Set(eligible.map(({ model }) => model.canonicalId.toLowerCase()));
+  const availableBareIds = new Set(
+    eligible.map(({ model }) => {
+      const id = model.canonicalId.toLowerCase();
+      return id.includes("/") ? id.slice(id.indexOf("/") + 1) : id;
+    }),
+  );
+
+  const byFamily = new Map<string, { model: CandidateModel; info: ReturnType<typeof release> }>();
+  for (const { model, info } of eligible) {
+    if (hasAvailableSuccessor(model, availableCanonicalIds, availableBareIds)) continue;
     const current = byFamily.get(info.key);
     if (current) {
       const other = current.info;

@@ -39,13 +39,20 @@ export function writeCodeOutput(db: ControlPlaneDb, run: RunRecord, taskId: stri
   }
 }
 
-function readArtifact(path: string, maxChars: unknown) {
+function readArtifact(path: string, maxChars: unknown, offset?: unknown) {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     if (!fstatSync(fd).isFile()) throw new Error(`Expected a regular artifact file: ${path}`);
     const raw = readFileSync(fd, "utf8");
-    const max = typeof maxChars === "number" ? Math.max(0, maxChars) : 8000;
-    return { path, truncated: raw.length > max, content: raw.slice(0, max) };
+    const max = typeof maxChars === "number" && Number.isFinite(maxChars) ? Math.max(0, Math.floor(maxChars)) : 8000;
+    const hasOffset = typeof offset === "number" && Number.isFinite(offset);
+    const start = hasOffset ? Math.max(0, Math.floor(offset)) : 0;
+    const content = raw.slice(start, start + max);
+    const hasMore = start + max < raw.length;
+    if (hasOffset || hasMore) {
+      return { path, offset: start, totalChars: raw.length, truncated: hasMore, hasMore, content };
+    }
+    return { path, truncated: false, content };
   } finally {
     closeSync(fd);
   }
@@ -62,15 +69,15 @@ export function readRunDossier(db: ControlPlaneDb, run: RunRecord, args: Record<
   if (!rel.startsWith(`.harness${sep}artifacts${sep}`) || realpathSync(path) !== resolve(realpathSync(run.repoRoot), rel)) {
     throw new Error(`Dossier must be a non-symlink path under .harness/artifacts: ${path}`);
   }
-  return readArtifact(path, args.max_chars);
+  return readArtifact(path, args.max_chars, args.offset);
 }
 
-export function readWorkspaceArtifact(root: string, requested: string, maxChars: unknown) {
+export function readWorkspaceArtifact(root: string, requested: string, maxChars: unknown, offset?: unknown) {
   const path = realpathSync(resolve(root, requested));
   const rel = relative(realpathSync(root), path);
   const parts = rel.toLowerCase().split(sep);
   if (isAbsolute(rel) || parts[0] === ".." || parts.includes(".git") || parts.includes(".harness")) {
     throw new Error(`Artifact outside the task workspace: ${requested}`);
   }
-  return readArtifact(path, maxChars);
+  return readArtifact(path, maxChars, offset);
 }

@@ -643,6 +643,53 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
       );
       assert.equal(cancelOnMaxTurns, true);
       assert.equal(mtRes.stopReason, "max_turns");
+
+      // Ordinary assistant prose mentioning "rate limiting" without any observed rejection signal MUST NOT trigger quota_paused
+      const proseAgent = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
+        .onRequest("session/new", async () => ({ sessionId: "sess-prose", models: { currentModelId: "fixture" } } as never))
+        .onRequest("session/prompt", async ({ client: acpClient }) => {
+          await acpClient.notify("session/update", {
+            sessionId: "sess-prose",
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "The implementation handles rate limiting correctly. No changes are needed." },
+            },
+          } as never);
+          return { stopReason: "end_turn" } as never;
+        });
+      const proseRes = await new AcpRunner(profile("claude")).run(
+        {
+          runId: "r-prose",
+          taskId: "t-prose",
+          tier: 3,
+          kind: "verify",
+          cwd,
+          toolPolicy: "read_only_workspace",
+          model: "fixture",
+          systemPrompt: "Verify",
+          initialPrompt: "Check rate limiting",
+          maxTurns: 3,
+          tools: [],
+          executeTool: async () => ({}),
+          signal: new AbortController().signal,
+          callbacks: {},
+        },
+        proseAgent,
+      );
+      assert.equal(proseRes.stopReason, "completed");
+
+      // read_only_workspace allows Bash (Claude) and shell_command (Amp) for verification tools like tmux/rg/sg while disabling file edits
+      const roClaude = buildNewSessionParams("claude", {
+        cwd,
+        systemPrompt: "Verify",
+        toolPolicy: "read_only_workspace",
+        model: "claude-fable-5-2",
+        mcpServers: [],
+      });
+      const roDisallowed = (roClaude.params._meta as { claudeCode: { options: { disallowedTools: string[] } } }).claudeCode.options.disallowedTools;
+      assert.ok(!roDisallowed.includes("Bash"), "read_only_workspace must allow Bash for verification tools like tmux/tests");
+      assert.ok(roDisallowed.includes("Edit") && roDisallowed.includes("Write"), "read_only_workspace must still disable direct file edits");
     } finally {
       rmSync(cwd, { recursive: true, force: true });
       rmSync(outside, { recursive: true, force: true });

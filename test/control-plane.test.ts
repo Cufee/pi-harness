@@ -5,12 +5,14 @@ import { join } from "node:path";
 import { describe, it } from "bun:test";
 import { ModelCatalogCompiler } from "../src/catalog/compiler.js";
 import { loadConfig } from "../src/config.js";
-import { ControlPlaneDb } from "../src/control-plane/db.js";
+import { ControlPlaneDb, type MessageRecord, type PeerExchangeRecord, type TaskRecord } from "../src/control-plane/db.js";
 import { HarnessOrchestrator } from "../src/control-plane/orchestrator.js";
-import { buildImmutableSystemPrompt } from "../src/control-plane/prompts.js";
+import { buildHydrationTurn, buildImmutableSystemPrompt } from "../src/control-plane/prompts.js";
+import { buildRunActivitySummary } from "../src/control-plane/telemetry.js";
 import { DirectorRuntime } from "../src/director/runtime.js";
 import { buildDirectorSystemPrompt } from "../src/director/session.js";
 import { QuotaClient } from "../src/quota/client.js";
+import { toolPolicyForTask, validateRunPolicy } from "../src/runners/types.js";
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
 import { runGit } from "../src/worktree/manager.js";
 
@@ -38,11 +40,24 @@ describe("Tier role instructions", () => {
 
   it("assigns implementation and research to distinct tiers", () => {
     const prompt = buildImmutableSystemPrompt(1, "orchestrator", "off");
-    assert.match(prompt, /never read repository files, edit code, or run shell commands/i);
+    assert.match(prompt, /read-only workspace access.*never editing files or running mutating commands/i);
+    assert.match(prompt, /1 cohesive Tier 2 Worker/i);
     assert.match(prompt, /implementation to Tier 2 Workers with disjoint write_scopes.*Blackboard/i);
     assert.match(prompt, /always choose a concrete model ID from list_models/i);
     assert.match(prompt, /spawn_task.*read-only research, planning, and verification/i);
     assert.match(prompt, /wait_children.*summaries.*sources.*artifact_paths.*artifact_read.*more detail/i);
+    assert.match(prompt, /kb_search.*kb_propose.*kb_promote.*kb_archive.*kb_flag_stale/i);
+
+    // Tier 1 is read-only workspace by default, allows narrowing to control_plane_only (Director), and forbids writes.
+    assert.equal(toolPolicyForTask(1, "orchestrator"), "read_only_workspace");
+    const baseReq = {
+      runId: "r", taskId: "t", tier: 1 as const, kind: "orchestrator" as const, cwd: "/tmp",
+      systemPrompt: "sys", initialPrompt: "init", model: "opus", maxTurns: 1,
+      tools: [], executeTool: async () => ({}), signal: new AbortController().signal, callbacks: {},
+    };
+    validateRunPolicy({ ...baseReq, toolPolicy: "read_only_workspace" });
+    validateRunPolicy({ ...baseReq, toolPolicy: "control_plane_only" });
+    assert.throws(() => validateRunPolicy({ ...baseReq, toolPolicy: "read_write_workspace" }), /Invalid tool policy/);
   });
 
   it("gives T2 ownership of a scoped worktree and independent verification", () => {
@@ -83,7 +98,7 @@ describe("Tier role instructions", () => {
           assert.equal(req.kind, "verify");
           assert.equal(req.toolPolicy, "read_only_workspace");
           assert.match(req.systemPrompt, /independent read-only Done-Reviewer/i);
-          assert.match(req.systemPrompt, /never edit files, run mutating commands, or delegate/i);
+          assert.match(req.systemPrompt, /never edit tracked repository code or delegate/i);
           assert.match(req.systemPrompt, /concrete sources for every required criterion/i);
           assert.deepEqual(req.tools.map(tool => tool.name), ["submit_review_verdict"]);
           await req.executeTool("submit_review_verdict", {
@@ -298,6 +313,316 @@ describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () =>
     } finally {
       rmSync(repoRoot, { recursive: true, force: true });
       rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("query_predecessor matches multi-word phrases across token deltas and past 2,000 delta rows (Gen 2+)", async () => {
+    const repoRoot = await makeTempGitRepo();
+    const db = new ControlPlaneDb(":memory:");
+    try {
+      const config = withFixtureCatalog({ ...loadConfig(repoRoot), codeMode: "off" });
+      const quota = new QuotaClient();
+      const orch = new HarnessOrchestrator(db, config, new ModelCatalogCompiler(config, quota), quota);
+      const run = db.createRun({ goal: "Seance coalescing", repoRoot, baseBranch: "main", baseSha: "abc" });
+      const task = db.createTask({
+        runId: run.id,
+        tier: 1,
+        kind: "orchestrator",
+        title: "Orch",
+        objective: "Coordinate",
+        readOnly: true,
+        profileId: "acp:claude",
+      });
+
+      // Emit 2,200 early filler text deltas (simulating heavy Gen 1 streaming past old 2,000-row cap)
+      for (let i = 0; i < 2200; i++) {
+        db.emitEvent(run.id, task.id, "agent.text_delta", { text: `filler-${i} ` });
+      }
+      // Non-delta boundary (rollover into Gen 2)
+      db.emitEvent(run.id, task.id, "agent.rollover", { fromGen: 1, toGen: 2 });
+
+      // Earlier Gen 2 turn mentioning only one token ("retry")
+      db.emitEvent(run.id, task.id, "agent.text_delta", { text: "Single token mention of retry only." });
+      db.emitEvent(run.id, task.id, "agent.tool", { id: "c1", name: "tree_view", status: "completed" });
+
+      // Later Gen 2 turn splitting "retry backoff" across 3 consecutive token deltas with surrounding padding > 500 chars
+      const pad = "x".repeat(300);
+      db.emitEvent(run.id, task.id, "agent.text_delta", { text: `${pad} We chose exponential re` });
+      db.emitEvent(run.id, task.id, "agent.text_delta", { text: "try back" });
+      db.emitEvent(run.id, task.id, "agent.text_delta", { text: `off with jitter for 429s ${pad}` });
+
+      const res = (await orch.toolExecutor.execute(run.id, task.id, "query_predecessor", {
+        query: "retry backoff",
+      })) as { matchingEvents: Array<{ seq: number; type: string; snippet: string; createdAt: number }> };
+
+      assert.ok(res.matchingEvents.length >= 2);
+      // Full two-token match ranks first, matches across chunk boundaries, and snippet is bounded <= 400 chars
+      const top = res.matchingEvents[0]!;
+      assert.equal(top.type, "agent.text");
+      assert.match(top.snippet, /retry backoff with jitter/i);
+      assert.ok(top.snippet.length <= 400, `snippet should be <= 400 chars, got ${top.snippet.length}`);
+    } finally {
+      db.close();
+      rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("artifact_read paginates large dossiers with offset and max_chars", async () => {
+    const repoRoot = await makeTempGitRepo();
+    const db = new ControlPlaneDb(":memory:");
+    try {
+      const config = withFixtureCatalog({ ...loadConfig(repoRoot), codeMode: "off" });
+      const quota = new QuotaClient();
+      const orch = new HarnessOrchestrator(db, config, new ModelCatalogCompiler(config, quota), quota);
+      const run = db.createRun({ goal: "Pagination", repoRoot, baseBranch: "main", baseSha: "abc" });
+      const task = db.createTask({
+        runId: run.id,
+        tier: 1,
+        kind: "orchestrator",
+        title: "Orch",
+        objective: "Read dossiers",
+        readOnly: true,
+        profileId: "acp:claude",
+      });
+
+      const payload = Array.from({ length: 25 }, (_, i) => `CHUNK-${String(i).padStart(2, "0")}-Z`).join(""); // 250 chars
+      assert.equal(payload.length, 250);
+      const written = (await orch.toolExecutor.execute(run.id, task.id, "artifact_write", {
+        name: "large.txt",
+        summary: "Large dossier",
+        content: payload,
+      })) as { path: string };
+
+      const p1 = (await orch.toolExecutor.execute(run.id, task.id, "artifact_read", {
+        path: written.path,
+        max_chars: 100,
+      })) as { path: string; offset: number; totalChars: number; truncated: boolean; hasMore: boolean; content: string };
+      assert.equal(p1.offset, 0);
+      assert.equal(p1.totalChars, 250);
+      assert.equal(p1.truncated, true);
+      assert.equal(p1.hasMore, true);
+      assert.equal(p1.content, payload.slice(0, 100));
+
+      const p2 = (await orch.toolExecutor.execute(run.id, task.id, "artifact_read", {
+        path: written.path,
+        max_chars: 100,
+        offset: 100,
+      })) as typeof p1;
+      assert.equal(p2.offset, 100);
+      assert.equal(p2.totalChars, 250);
+      assert.equal(p2.truncated, true);
+      assert.equal(p2.hasMore, true);
+      assert.equal(p2.content, payload.slice(100, 200));
+
+      const p3 = (await orch.toolExecutor.execute(run.id, task.id, "artifact_read", {
+        path: written.path,
+        max_chars: 100,
+        offset: 200,
+      })) as typeof p1;
+      assert.equal(p3.offset, 200);
+      assert.equal(p3.totalChars, 250);
+      assert.equal(p3.truncated, false);
+      assert.equal(p3.hasMore, false);
+      assert.equal(p3.content, payload.slice(200));
+      assert.equal(p1.content + p2.content + p3.content, payload);
+
+      // Negative offset clamps to 0
+      const neg = (await orch.toolExecutor.execute(run.id, task.id, "artifact_read", {
+        path: written.path,
+        max_chars: 10,
+        offset: -50,
+      })) as typeof p1;
+      assert.equal(neg.offset, 0);
+      assert.equal(neg.content, payload.slice(0, 10));
+    } finally {
+      db.close();
+      rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("buildHydrationTurn keeps active/failed tasks, caps older settled tasks and Blackboard values, and renders peer/message sections", () => {
+    const mkTask = (id: string, status: TaskRecord["status"], updatedAt: number): TaskRecord => ({
+      id,
+      runId: "run-1",
+      parentId: "t-1",
+      tier: 2,
+      kind: "worker",
+      title: `Task ${id}`,
+      objective: "Work",
+      criteria: "",
+      readOnly: false,
+      profileId: "acp:claude",
+      model: "claude/opus",
+      effort: "medium",
+      status,
+      generation: 1,
+      maxTurns: 40,
+      turnsUsed: 0,
+      contextUsed: 0,
+      contextSize: 0,
+      worktreeId: null,
+      sessionId: null,
+      summary: null,
+      handoffJson: null,
+      resultJson: null,
+      createdAt: updatedAt - 10,
+      updatedAt,
+    });
+
+    const orchTask = { ...mkTask("t-1", "running", 1000), parentId: null, tier: 1 as const, kind: "orchestrator" as const, readOnly: true };
+    const settled = Array.from({ length: 12 }, (_, i) =>
+      mkTask(`t-settled-${i + 1}`, i % 2 === 0 ? "completed" : "cancelled", 100 + i * 10),
+    );
+    const activeRunning = mkTask("t-live", "running", 50);
+    const failedTask = mkTask("t-fail", "failed", 40);
+    const blockedTask = mkTask("t-block", "blocked", 30);
+
+    const openPeerRequests: PeerExchangeRecord[] = [
+      {
+        id: "preq-1",
+        fromRunId: "run-2",
+        toRunId: "run-1",
+        kind: "request",
+        topicKey: "api-v2",
+        round: 1,
+        message: "Freeze schema v2?",
+        reply: null,
+        status: "open",
+        createdAt: 500,
+        answeredAt: null,
+      },
+    ];
+    const answeredMessages: MessageRecord[] = [
+      {
+        id: "msg-1",
+        runId: "run-1",
+        fromTaskId: "t-1",
+        toTaskId: "t-live",
+        question: "Ready to merge?",
+        answer: "Tests pass, submitting now.",
+        status: "answered",
+        createdAt: 400,
+        answeredAt: 450,
+      },
+    ];
+
+    const bigContract = "B".repeat(1200);
+    const prompt = buildHydrationTurn({
+      task: orchTask,
+      tasksSnapshot: [orchTask, ...settled, activeRunning, failedTask, blockedTask],
+      artifacts: [],
+      openEscalations: [],
+      blackboard: {
+        small_key: { value: { ok: true }, authorTaskId: "t-1" },
+        huge_contract: { value: bigContract, authorTaskId: "t-1" },
+      },
+      openPeerRequests,
+      answeredMessages,
+    });
+
+    // All active/failed/blocked tasks kept
+    assert.ok(prompt.includes("t-live"));
+    assert.ok(prompt.includes("t-fail"));
+    assert.ok(prompt.includes("t-block"));
+    // 8 most recent settled tasks (5..12) kept; 4 oldest (1..4) omitted with 1-line pointer
+    for (let i = 5; i <= 12; i++) assert.ok(prompt.includes(`t-settled-${i}`), `expected t-settled-${i}`);
+    for (let i = 1; i <= 4; i++) assert.ok(!prompt.includes(`t-settled-${i} `), `expected t-settled-${i} to be omitted`);
+    assert.ok(prompt.includes("... and 4 older settled tasks (use tree_view or task_get for details)"));
+
+    // Blackboard entry bounded to 500 chars with blackboard_get hint
+    assert.ok(prompt.includes("small_key: {\"ok\":true}"));
+    assert.ok(!prompt.includes(bigContract), "huge Blackboard value must be truncated");
+    assert.match(prompt, /huge_contract:.*blackboard_get/);
+
+    // Peer request and answered message sections rendered
+    assert.match(prompt, /Open Cross-Run Peer Requests/);
+    assert.ok(prompt.includes("preq-1"));
+    assert.match(prompt, /Answered Peer Messages/);
+    assert.ok(prompt.includes("msg-1"));
+  });
+
+  it("wires tree_view inbox, repo-scoped KB lifecycle tools with HEAD SHA, and multi-hour telemetry past 400 events", async () => {
+    const repoRoot = await makeTempGitRepo();
+    const otherRepo = await makeTempGitRepo();
+    const db = new ControlPlaneDb(":memory:");
+    try {
+      const headSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout;
+      const config = withFixtureCatalog({ ...loadConfig(repoRoot), codeMode: "off" });
+      const quota = new QuotaClient();
+      const orch = new HarnessOrchestrator(db, config, new ModelCatalogCompiler(config, quota), quota);
+      const run = db.createRun({
+        goal: "Inbox + KB + Telemetry",
+        repoRoot,
+        baseBranch: "main",
+        baseSha: "stale-base-sha",
+        coordinationGroup: "grp-1",
+      });
+      const peerRun = db.createRun({
+        goal: "Peer",
+        repoRoot,
+        baseBranch: "dev",
+        baseSha: "stale-base-sha",
+        coordinationGroup: "grp-1",
+      });
+      const t1 = db.createTask({ runId: run.id, tier: 1, kind: "orchestrator", title: "Orch", objective: "Coord", readOnly: true, profileId: "acp:claude" });
+      const t2 = db.createTask({ runId: run.id, parentId: t1.id, tier: 2, kind: "worker", title: "Worker", objective: "Work", profileId: "acp:claude" });
+
+      // Answered message + open peer request appear in Tier 1 tree_view
+      const msg = db.createMessage(run.id, t1.id, t2.id, "Need schema?");
+      db.replyMessage(msg.id, "Yes, v2");
+      db.createPeerRequest({ fromRunId: peerRun.id, toRunId: run.id, topicKey: "schema", message: "Align v2?" });
+      const tv = (await orch.toolExecutor.execute(run.id, t1.id, "tree_view", {})) as {
+        answeredMessages?: MessageRecord[];
+        openPeerRequests?: PeerExchangeRecord[];
+      };
+      assert.equal(tv.answeredMessages?.length, 1);
+      assert.equal(tv.answeredMessages?.[0]?.id, msg.id);
+      assert.equal(tv.openPeerRequests?.length, 1);
+
+      // KB propose resolves current HEAD SHA instead of stale baseSha
+      const proposed = (await orch.toolExecutor.execute(run.id, t1.id, "kb_propose", {
+        kind: "invariant",
+        title: "WAL required",
+        summary: "Always enable WAL mode",
+        context_md: "SQLite runs in WAL mode for concurrent daemon reads.",
+        evidence_paths: ["src/control-plane/db.ts"],
+      })) as { id: string; status: string };
+      assert.equal(db.kb.getRaw(proposed.id)?.verifiedSha, headSha);
+
+      // kb_promote and kb_archive work in same repo, and cross-repo mutations are rejected
+      const promoted = (await orch.toolExecutor.execute(run.id, t1.id, "kb_promote", { id: proposed.id })) as { status: string };
+      assert.equal(promoted.status, "active");
+      const archived = (await orch.toolExecutor.execute(run.id, t1.id, "kb_archive", { id: proposed.id, reason: "Replaced" })) as { status: string };
+      assert.equal(archived.status, "archived");
+
+      const foreignKb = db.kb.propose({
+        repoScope: otherRepo,
+        kind: "decision",
+        title: "Foreign",
+        summary: "Other repo entry",
+        contextMd: "Scoped elsewhere",
+        evidencePaths: [],
+      });
+      await assert.rejects(() => orch.toolExecutor.execute(run.id, t1.id, "kb_flag_stale", { id: foreignKb.id, reason: "nope" }), /not found in repository scope/);
+      await assert.rejects(() => orch.toolExecutor.execute(run.id, t1.id, "kb_promote", { id: foreignKb.id }), /not found in repository scope/);
+      await assert.rejects(() => orch.toolExecutor.execute(run.id, t1.id, "kb_archive", { id: foreignKb.id }), /not found in repository scope/);
+
+      // Telemetry remains accurate past 450 tool events + 1,000 text deltas
+      db.updateTask(t2.id, { status: "running" });
+      for (let i = 0; i < 450; i++) {
+        db.emitEvent(run.id, t2.id, "agent.tool", { id: `call-${i}`, name: "read", status: "completed", title: `Read #${i}` });
+      }
+      for (let i = 0; i < 1000; i++) {
+        db.emitEvent(run.id, t2.id, "agent.text_delta", { text: "tok " });
+      }
+      const summary = buildRunActivitySummary(db, run.id);
+      const snap = summary.tasks.find((t) => t.id === t2.id)!;
+      assert.equal(snap.toolCalls, 450);
+      assert.equal(snap.currentAction, "✓ Read #449");
+    } finally {
+      db.close();
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(otherRepo, { recursive: true, force: true });
     }
   });
 });

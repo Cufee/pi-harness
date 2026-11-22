@@ -439,6 +439,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_run_seq ON events(run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_events_task_seq ON events(task_id, seq);
+CREATE INDEX IF NOT EXISTS idx_events_run_task_type_seq ON events(run_id, task_id, type, seq);
 `;
 
 export class ControlPlaneDb {
@@ -560,6 +561,192 @@ export class ControlPlaneDb {
   getLatestEventSeq(): number {
     const r = this.db.prepare("SELECT MAX(seq) AS seq FROM events").get() as { seq: number | null } | undefined;
     return Number(r?.seq ?? 0);
+  }
+
+  /**
+   * Searches predecessor event history for a task ("Seance"):
+   *  - Scans the 500 most recent non-delta events for `(runId, taskId)`.
+   *  - Coalesces up to the 20,000 most recent `agent.text_delta` rows into contiguous turn blocks
+   *    delimited by non-delta event boundaries so multi-word phrases match across streaming chunks
+   *    and Generation 2+ traces remain searchable past thousands of deltas.
+   *  - Ranks matches by distinct query-token overlap count, then recency (`seq DESC`), returning
+   *    compact snippets (<= 400 chars centered around the match).
+   */
+  searchPredecessorHistory(
+    runId: string,
+    taskId: string,
+    query: string,
+    limit = 12,
+  ): Array<{ seq: number; type: string; snippet: string; createdAt: number }> {
+    const rawQuery = query.trim().toLowerCase();
+    if (!rawQuery) return [];
+    const tokens = [...new Set(rawQuery.split(/\s+/).filter(Boolean))];
+    if (tokens.length === 0) return [];
+    const maxResults = Math.max(1, Math.floor(limit));
+
+    const extractSnippet = (text: string, maxLen = 400): string => {
+      const clean = text.replace(/\s+/g, " ").trim();
+      if (clean.length <= maxLen) return clean;
+      const lower = clean.toLowerCase();
+      let idx = lower.indexOf(rawQuery);
+      let matchLen = rawQuery.length;
+      if (idx < 0) {
+        for (const tok of tokens) {
+          const pos = lower.indexOf(tok);
+          if (pos >= 0) {
+            idx = pos;
+            matchLen = tok.length;
+            break;
+          }
+        }
+      }
+      if (idx < 0) return clean.slice(0, maxLen);
+      const half = Math.floor((maxLen - matchLen) / 2);
+      let start = Math.max(0, idx - half);
+      let end = start + maxLen;
+      if (end > clean.length) {
+        end = clean.length;
+        start = Math.max(0, end - maxLen);
+      }
+      const prefix = start > 0 ? "…" : "";
+      const suffix = end < clean.length ? "…" : "";
+      const budget = maxLen - prefix.length - suffix.length;
+      return `${prefix}${clean.slice(start, start + budget)}${suffix}`;
+    };
+
+    const candidates: Array<{
+      seq: number;
+      type: string;
+      text: string;
+      searchText: string;
+      createdAt: number;
+    }> = [];
+
+    // 1. Most recent 500 non-delta events
+    const nonDeltaRows = this.db
+      .prepare(
+        `SELECT seq, type, payload_json, created_at FROM events
+         WHERE run_id = ? AND task_id = ? AND type NOT IN ('agent.text_delta', 'agent.thought_delta')
+         ORDER BY seq DESC LIMIT 500`,
+      )
+      .all(runId, taskId) as Array<{ seq: number; type: string; payload_json: string; created_at: number }>;
+
+    for (const r of nonDeltaRows) {
+      const payloadStr = String(r.payload_json ?? "");
+      const typeStr = String(r.type);
+      candidates.push({
+        seq: Number(r.seq),
+        type: typeStr,
+        text: payloadStr,
+        searchText: `${typeStr} ${payloadStr}`.toLowerCase(),
+        createdAt: Number(r.created_at),
+      });
+    }
+
+    // 2. Coalesce up to the 20,000 most recent agent.text_delta rows (from the tail, ordered ASC)
+    const deltaRows = this.db
+      .prepare(
+        `SELECT seq, payload_json, created_at FROM (
+           SELECT seq, payload_json, created_at FROM events
+           WHERE run_id = ? AND task_id = ? AND type = 'agent.text_delta'
+           ORDER BY seq DESC LIMIT 20000
+         ) ORDER BY seq ASC`,
+      )
+      .all(runId, taskId) as Array<{ seq: number; payload_json: string; created_at: number }>;
+
+    if (deltaRows.length > 0) {
+      const minDeltaSeq = Number(deltaRows[0]!.seq);
+      const boundarySeqs = (
+        this.db
+          .prepare(
+            `SELECT seq FROM events
+             WHERE run_id = ? AND task_id = ? AND type NOT IN ('agent.text_delta', 'agent.thought_delta') AND seq >= ?
+             ORDER BY seq ASC`,
+          )
+          .all(runId, taskId, minDeltaSeq) as Array<{ seq: number }>
+      ).map((b) => Number(b.seq));
+
+      let bIdx = 0;
+      let buf: string[] = [];
+      let blockSeq = 0;
+      let blockCreatedAt = 0;
+
+      const flush = () => {
+        if (buf.length === 0) return;
+        const combined = buf.join("");
+        if (combined.trim()) {
+          candidates.push({
+            seq: blockSeq,
+            type: "agent.text",
+            text: combined,
+            searchText: combined.toLowerCase(),
+            createdAt: blockCreatedAt,
+          });
+        }
+        buf = [];
+      };
+
+      for (const row of deltaRows) {
+        const seq = Number(row.seq);
+        const createdAt = Number(row.created_at);
+        let chunk = "";
+        try {
+          const parsed = JSON.parse(String(row.payload_json)) as { text?: unknown } | string | null;
+          if (typeof parsed === "string") chunk = parsed;
+          else if (parsed && typeof parsed.text === "string") chunk = parsed.text;
+        } catch {
+          continue;
+        }
+        if (buf.length > 0) {
+          let crossedBoundary = false;
+          while (bIdx < boundarySeqs.length && boundarySeqs[bIdx]! < seq) {
+            crossedBoundary = true;
+            bIdx++;
+          }
+          if (crossedBoundary) flush();
+        } else {
+          while (bIdx < boundarySeqs.length && boundarySeqs[bIdx]! < seq) bIdx++;
+        }
+        buf.push(chunk);
+        blockSeq = seq;
+        blockCreatedAt = createdAt;
+      }
+      flush();
+    }
+
+    const scored: Array<{
+      seq: number;
+      type: string;
+      snippet: string;
+      createdAt: number;
+      overlap: number;
+      phraseHit: number;
+    }> = [];
+
+    for (const c of candidates) {
+      let overlap = 0;
+      for (const tok of tokens) {
+        if (c.searchText.includes(tok)) overlap++;
+      }
+      if (overlap === 0) continue;
+      const phraseHit = tokens.length > 1 && c.searchText.includes(rawQuery) ? 1 : 0;
+      scored.push({
+        seq: c.seq,
+        type: c.type,
+        snippet: extractSnippet(c.text, 400),
+        createdAt: c.createdAt,
+        overlap,
+        phraseHit,
+      });
+    }
+
+    scored.sort((a, b) => (b.overlap - a.overlap) || (b.phraseHit - a.phraseHit) || (b.seq - a.seq));
+    return scored.slice(0, maxResults).map(({ seq, type, snippet, createdAt }) => ({
+      seq,
+      type,
+      snippet,
+      createdAt,
+    }));
   }
 
   // ---- Runs ----
@@ -743,12 +930,13 @@ export class ControlPlaneDb {
         this.db.prepare("INSERT INTO task_dependencies(task_id, depends_on) VALUES (?, ?)").run(id, dep);
       }
       if (!input.readOnly) {
+        const leaseActive = initialStatus === "pending" ? 0 : 1;
         for (const glob of scopes) {
           this.db
             .prepare(
-              "INSERT INTO write_leases(id, run_id, repo_root, target_branch, task_id, glob_pattern, active, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+              "INSERT INTO write_leases(id, run_id, repo_root, target_branch, task_id, glob_pattern, active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
-            .run(nextFriendlyId(this.db, "lease", "write_leases"), input.runId, run.repoRoot, run.baseBranch, id, glob, now);
+            .run(nextFriendlyId(this.db, "lease", "write_leases"), input.runId, run.repoRoot, run.baseBranch, id, glob, leaseActive, now);
         }
       }
 
@@ -840,6 +1028,8 @@ export class ControlPlaneDb {
   updateTask(
     id: string,
     patch: Partial<{
+      title: string;
+      objective: string;
       status: TaskStatus;
       profileId: string;
       model: string | null;
@@ -862,6 +1052,8 @@ export class ControlPlaneDb {
     const sets: string[] = ["updated_at = ?"];
     const values: (string | number | null)[] = [now];
     const map: Record<string, string> = {
+      title: "title",
+      objective: "objective",
       status: "status",
       profileId: "profile_id",
       model: "model",
@@ -1372,6 +1564,42 @@ export class ControlPlaneDb {
       ? this.db.prepare(query + " AND task_id = ?").all(runId, taskId)
       : this.db.prepare(query).all(runId)) as Array<{ glob_pattern: string }>;
     return rows.map((r) => r.glob_pattern);
+  }
+
+  /** Returns ALL assigned write scopes ever stored for a task (active or deactivated), for merge-time enforcement. */
+  listAssignedWriteScopes(runId: string, taskId: string): string[] {
+    const rows = this.db
+      .prepare("SELECT DISTINCT glob_pattern FROM write_leases WHERE run_id = ? AND task_id = ?")
+      .all(runId, taskId) as Array<{ glob_pattern: string }>;
+    return rows.map((r) => r.glob_pattern);
+  }
+
+  /**
+   * Atomically validates and re-activates a task's assigned write leases before launching or resuming it.
+   * Throws a clear conflict error if another active task on `(repo_root, target_branch)` now owns an overlapping scope.
+   */
+  reacquireWriteLeasesForTask(runId: string, taskId: string): string[] {
+    return this.transaction(() => {
+      const run = this.getRun(runId);
+      if (!run) throw new Error(`Unknown run ${runId}`);
+      const scopes = this.listAssignedWriteScopes(runId, taskId);
+      if (scopes.length === 0) return [];
+
+      const activeLeases = this.db
+        .prepare("SELECT run_id, target_branch, task_id, glob_pattern FROM write_leases WHERE repo_root = ? AND active = 1 AND task_id != ?")
+        .all(run.repoRoot, taskId) as Array<{ run_id: string; target_branch: string; task_id: string; glob_pattern: string }>;
+      for (const requested of scopes) {
+        for (const existing of activeLeases) {
+          if (existing.target_branch !== run.baseBranch) continue;
+          if (!globsOverlap(requested, existing.glob_pattern)) continue;
+          throw new Error(
+            `Write-scope conflict re-acquiring lease on (${run.repoRoot}:${run.baseBranch}): '${requested}' overlaps active lease '${existing.glob_pattern}' held by task ${existing.task_id} (run ${existing.run_id})`,
+          );
+        }
+      }
+      this.db.prepare("UPDATE write_leases SET active = 1 WHERE run_id = ? AND task_id = ?").run(runId, taskId);
+      return scopes;
+    });
   }
 
   publishContract(input: {

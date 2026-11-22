@@ -50,7 +50,7 @@ await new Promise((resolve, reject) => {
 });
 await new Promise((resolve, reject) => {
   const socket = connect(${JSON.stringify(socketPath)});
-  socket.on("connect", () => { socket.end(); resolve(); });
+  socket.on("connect", () => { socket.destroy(); resolve(); });
   socket.on("error", reject);
 });
 console.log("sandbox probe complete");

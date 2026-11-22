@@ -19,8 +19,42 @@ import {
   type QuotaSnapshot,
 } from "../gen/quota_pb.js";
 import type { PassiveQuotaSignal } from "../runners/types.js";
-import { harvestLocalQuotaSignals, type CodexRateLimitsRaw, type CodexRateLimitWindowRaw } from "./local-harvest.js";
+import {
+  harvestLocalQuotaSignals,
+  LOCAL_QUOTA_FRESHNESS_MS,
+  type CodexRateLimitsRaw,
+  type CodexRateLimitWindowRaw,
+} from "./local-harvest.js";
 import { resolveModelCapacity, type ResolvedModelQuota } from "./schema.js";
+
+const PASSIVE_FAILURE_FALLBACK_TTL_MS = 15 * 60_000;
+
+/**
+ * Returns true when resolved quota indicates a route cannot currently serve requests
+ * (exhausted, throttled/rate-limited, or disabled).
+ */
+export function isQuotaUnavailable(quota: ResolvedModelQuota | null | undefined): boolean {
+  if (!quota) return false;
+  return (
+    quota.exhausted ||
+    quota.availability === AvailabilityStatus.EXHAUSTED ||
+    quota.availability === AvailabilityStatus.THROTTLED ||
+    quota.availability === AvailabilityStatus.DISABLED
+  );
+}
+
+function isPassiveFailureActive(
+  fail: { resetAt?: string; observedAt: number; reason: string },
+  now: number,
+): boolean {
+  if (fail.resetAt != null) {
+    const resetMs = Date.parse(fail.resetAt);
+    if (Number.isFinite(resetMs)) {
+      return now < resetMs;
+    }
+  }
+  return now - fail.observedAt < PASSIVE_FAILURE_FALLBACK_TTL_MS;
+}
 
 export interface ProfileQuotaCoverage {
   profileId: string;
@@ -46,6 +80,7 @@ function codexWindowToProto(
   windowId: string,
   raw: CodexRateLimitWindowRaw,
   observedAt: number,
+  confidence: DataConfidence = DataConfidence.AUTHORITATIVE,
 ) {
   const usedPercent = typeof raw.used_percent === "number" && Number.isFinite(raw.used_percent) ? raw.used_percent : undefined;
   const remainingRatio =
@@ -69,7 +104,7 @@ function codexWindowToProto(
     observation: create(ObservationMetaSchema, {
       observedAt: timestampFromMs(observedAt),
       source: SignalSource.RUNNER_NATIVE,
-      confidence: DataConfidence.AUTHORITATIVE,
+      confidence,
     }),
   });
 }
@@ -164,7 +199,7 @@ export class QuotaClient {
     const SAFETY_CUSHION_MS = 3_000;
     const endpointResets: number[] = [];
     const passiveResets: number[] = [];
-    let endpointMatchedAny = false;
+    let endpointMatchedCount = 0;
     let endpointAllAvailable = true;
 
     for (const q of queries) {
@@ -183,12 +218,9 @@ export class QuotaClient {
         }
         const match = findBestModelCapacity(this.snapshot.models ?? [], q);
         if (match) {
-          endpointMatchedAny = true;
-          const resolved = resolveModelCapacity(match, merged);
-          const isAvail =
-            !resolved.exhausted &&
-            resolved.availability !== AvailabilityStatus.EXHAUSTED &&
-            resolved.availability !== AvailabilityStatus.THROTTLED;
+          endpointMatchedCount++;
+          const resolved = resolveModelCapacity(match, merged, now);
+          const isAvail = !isQuotaUnavailable(resolved);
           if (!isAvail) {
             endpointAllAvailable = false;
             if (resolved.nextAvailableAt) {
@@ -201,7 +233,7 @@ export class QuotaClient {
         }
       }
 
-      // Also check passive ACP buckets (`_claude/rateLimit` `resetsAt`)
+      // Also check passive ACP buckets (`_claude/rateLimit` `resetsAt`) and passive exhaustion resetAt
       const passiveResolved = this.resolveForModel(q);
       if (passiveResolved?.nextAvailableAt) {
         const ts = Date.parse(passiveResolved.nextAvailableAt);
@@ -211,7 +243,7 @@ export class QuotaClient {
       }
     }
 
-    if (syncedEndpoint && endpointMatchedAny && endpointAllAvailable && queries.length > 0) {
+    if (syncedEndpoint && queries.length > 0 && endpointMatchedCount === queries.length && endpointAllAvailable) {
       return {
         availableNow: true,
         resumeAtMs: now + 1_500,
@@ -286,7 +318,7 @@ export class QuotaClient {
     }
 
     const activeErrors = [...this.passiveExhaustedProfiles.entries()].filter(
-      ([, fail]) => now - fail.observedAt < 15 * 60_000,
+      ([, fail]) => isPassiveFailureActive(fail, now),
     );
 
     if (!this.snapshot && mergedBuckets.size === 0 && activeErrors.length === 0) {
@@ -377,7 +409,7 @@ export class QuotaClient {
         const adapter = p.kind === "acp" ? p.adapter : p.provider;
         const hasEndpoint = Boolean(
           this.snapshot?.models?.some(
-            (m) => m.profile === p.id || m.provider.toLowerCase() === adapter.toLowerCase(),
+            (m) => m.profile === p.id || (!m.profile && m.provider.toLowerCase() === adapter.toLowerCase()),
           ) ||
             this.snapshot?.buckets?.some(
               (b) => b.provider === p.id || b.provider.toLowerCase() === adapter.toLowerCase(),
@@ -404,7 +436,7 @@ export class QuotaClient {
           };
         }
         const hasErr = [...this.passiveExhaustedProfiles.entries()].some(
-          ([k, v]) => k.startsWith(`${p.id}:`) && now - v.observedAt < 15 * 60_000,
+          ([k, v]) => k.startsWith(`${p.id}:`) && isPassiveFailureActive(v, now),
         );
         if (hasErr) {
           return {
@@ -431,20 +463,28 @@ export class QuotaClient {
     // 0. Codex CLI / `codex-acp` rate_limits (primary / secondary windows + credits)
     if (Array.isArray(raw.codexRateLimits) || (raw.codexRateLimits && typeof raw.codexRateLimits === "object")) {
       const list = (Array.isArray(raw.codexRateLimits) ? raw.codexRateLimits : [raw.codexRateLimits]) as CodexRateLimitsRaw[];
+      const now = Date.now();
       for (const snap of list) {
         if (!snap || typeof snap !== "object") continue;
         const limitId = (typeof snap.limit_id === "string" && snap.limit_id.trim()) || "codex";
         const bucketId = `${signal.profileId}:${limitId}`;
+        const snapObservedAt =
+          typeof snap.observedAt === "number" && Number.isFinite(snap.observedAt)
+            ? snap.observedAt
+            : signal.observedAt;
         const existing = this.passiveBuckets.get(bucketId);
         const existingTs = existing?.observation?.observedAt ? timestampMs(existing.observation.observedAt) : 0;
-        if (existing && existingTs > signal.observedAt) continue;
+        if (existing && existingTs > snapObservedAt) continue;
+
+        const isStale = Boolean(snap.stale) || now - snapObservedAt > LOCAL_QUOTA_FRESHNESS_MS;
+        const confidence = isStale ? DataConfidence.STALE : DataConfidence.AUTHORITATIVE;
 
         const windows = [];
         if (snap.primary && typeof snap.primary === "object") {
-          windows.push(codexWindowToProto("primary", snap.primary, signal.observedAt));
+          windows.push(codexWindowToProto("primary", snap.primary, snapObservedAt, confidence));
         }
         if (snap.secondary && typeof snap.secondary === "object") {
-          windows.push(codexWindowToProto("secondary", snap.secondary, signal.observedAt));
+          windows.push(codexWindowToProto("secondary", snap.secondary, snapObservedAt, confidence));
         }
         if (windows.length === 0 && !snap.credits) continue;
 
@@ -473,12 +513,13 @@ export class QuotaClient {
             windows,
             overage,
             observation: create(ObservationMetaSchema, {
-              observedAt: timestampFromMs(signal.observedAt),
+              observedAt: timestampFromMs(snapObservedAt),
               source: SignalSource.RUNNER_NATIVE,
-              confidence: DataConfidence.AUTHORITATIVE,
+              confidence,
             }),
             labels: {
               source: "local_session",
+              ...(isStale ? { stale: "true" } : {}),
               ...(snap.plan_type ? { plan: String(snap.plan_type) } : {}),
             },
           }),
@@ -607,7 +648,8 @@ export class QuotaClient {
     provider: string;
     wireModelId: string;
     canonicalModelId?: string;
-  }): ResolvedModelQuota | null {
+  }): (ResolvedModelQuota & { unavailable: boolean }) | null {
+    const now = Date.now();
     const mergedBuckets = new Map<string, QuotaBucket>();
     for (const b of this.snapshot?.buckets ?? []) {
       mergedBuckets.set(b.bucketId, clone(QuotaBucketSchema, b));
@@ -636,13 +678,18 @@ export class QuotaClient {
       }
     }
 
+    const specificFail = this.passiveExhaustedProfiles.get(`${query.profileId}:${query.wireModelId}`);
+    const wildcardFail = this.passiveExhaustedProfiles.get(`${query.profileId}:*`);
     const passiveFail =
-      this.passiveExhaustedProfiles.get(`${query.profileId}:${query.wireModelId}`) ??
-      this.passiveExhaustedProfiles.get(`${query.profileId}:*`);
-    if (passiveFail && Date.now() - passiveFail.observedAt < 15 * 60_000) {
+      specificFail && isPassiveFailureActive(specificFail, now)
+        ? specificFail
+        : wildcardFail && isPassiveFailureActive(wildcardFail, now)
+          ? wildcardFail
+          : undefined;
+    if (passiveFail) {
       const avail =
         passiveFail.reason === "rate_limited" ? AvailabilityStatus.THROTTLED : AvailabilityStatus.EXHAUSTED;
-      return {
+      const resolved: ResolvedModelQuota = {
         availability: avail,
         availabilityName: AvailabilityStatus[avail] ?? "EXHAUSTED",
         exhausted: passiveFail.reason !== "rate_limited",
@@ -655,11 +702,13 @@ export class QuotaClient {
         overageActive: false,
         reason: `Recent passive ACP failure: ${passiveFail.reason}`,
       };
+      return { ...resolved, unavailable: isQuotaUnavailable(resolved) };
     }
 
     const match = findBestModelCapacity(this.snapshot?.models ?? [], query);
     if (match) {
-      return resolveModelCapacity(match, mergedBuckets);
+      const resolved = resolveModelCapacity(match, mergedBuckets, now);
+      return { ...resolved, unavailable: isQuotaUnavailable(resolved) };
     }
 
     const passiveBindings = [...mergedBuckets.keys()]
@@ -678,7 +727,8 @@ export class QuotaClient {
         modelId: query.wireModelId,
         bucketBindings: passiveBindings,
       });
-      return resolveModelCapacity(synth, mergedBuckets);
+      const resolved = resolveModelCapacity(synth, mergedBuckets, now);
+      return { ...resolved, unavailable: isQuotaUnavailable(resolved) };
     }
 
     return null;
@@ -701,9 +751,10 @@ function findBestModelCapacity(
     const mProv = norm(m.provider);
     const mId = norm(m.modelId);
 
-    const profileMatches = mProf ? mProf === qProf : true;
-    const providerMatches = mProv === qProv || mProf === qProf || mProv === "*";
-    if (!profileMatches && !providerMatches) continue;
+    // Never assign one account/profile's quota capacity to a different profile
+    if (mProf && qProf && mProf !== qProf) continue;
+    const providerMatches = mProv === qProv || (mProf !== null && mProf === qProf) || mProv === "*";
+    if (!providerMatches) continue;
 
     let score = 0;
     if (mProf === qProf) score += 20;

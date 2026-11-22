@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { CatalogConfig, HarnessConfig, RunnerProfileConfig } from "../config.js";
-import type { QuotaClient } from "../quota/client.js";
+import { isQuotaUnavailable, type QuotaClient } from "../quota/client.js";
 import type { ResolvedModelQuota } from "../quota/schema.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
@@ -62,17 +62,19 @@ export function isModelEnabledInCatalog(modelId: string, catalogCfg?: Partial<Ca
 export interface TaskModelRecommendation {
   model: string;
   profile: string;
-  effort: string;
+  effort?: string;
   rationale: string;
 }
 
-function pickEffort(supported: string[], preferred: string[]): string {
-  const lowerMap = new Map(supported.map((e) => [e.toLowerCase(), e]));
+function pickEffort(supported: string[], preferred: string[]): string | undefined {
+  const real = supported.filter((e) => e.trim() && e.toLowerCase() !== "default");
+  if (real.length === 0) return undefined;
+  const lowerMap = new Map(real.map((e) => [e.toLowerCase(), e]));
   for (const want of preferred) {
     const hit = lowerMap.get(want);
     if (hit) return hit;
   }
-  return supported[0] ?? "medium";
+  return real[0];
 }
 
 /**
@@ -83,8 +85,7 @@ export function recommendModelsByTaskKind(
   models: CompiledModelEntry[],
   opts?: { avoidModelId?: string | null },
 ): Record<"orchestrator" | "worker" | "research" | "plan" | "execute" | "verify", TaskModelRecommendation | null> {
-  const available = models.filter((m) => m.enabled !== false && !m.quota?.exhausted);
-  const pool = available.length > 0 ? available : models.filter((m) => m.enabled !== false);
+  const pool = models.filter((m) => m.enabled !== false && !isQuotaUnavailable(m.quota));
   const byRank = [...pool].sort((a, b) => (b.codingScore ?? -1) - (a.codingScore ?? -1) || a.id.localeCompare(b.id));
 
   const pickByRoles = (
@@ -112,10 +113,11 @@ export function recommendModelsByTaskKind(
             (b.codingScore ?? -1) - (a.codingScore ?? -1),
         )[0]!
       : candidates[0]!;
+    const effort = pickEffort(chosen.preferredRoute.supportedEfforts ?? chosen.efforts, preferredEfforts);
     return {
       model: chosen.id,
       profile: chosen.preferredRoute.profileId,
-      effort: pickEffort(chosen.preferredRoute.supportedEfforts ?? chosen.efforts, preferredEfforts),
+      ...(effort !== undefined ? { effort } : {}),
       rationale,
     };
   };
@@ -172,6 +174,8 @@ export interface CompiledModelCatalog {
   syncedAt: string;
   sources: string[];
   rankingEvidence?: BenchmarkEvidence;
+  /** True when the benchmark evidence `asOf` date is older than 30 days (scores are still retained). */
+  rankingEvidenceStale?: boolean;
   nextLifecycleChangeAt?: string;
   profileStatuses?: ProfileProbeStatus[];
   /** Optional per-session model selection context set by the discovery/director agent (empty/null by default). */
@@ -188,7 +192,14 @@ const CLAUDE_ROUTE_ALIASES = new Map([
   ["anthropic/claude-fable-5-2", "fable"],
 ]);
 
-const EVIDENCE_MAX_AGE_MS = 30 * 86_400_000;
+const EVIDENCE_STALE_AGE_MS = 30 * 86_400_000;
+const BROKEN_CATALOG_RETRY_TTL_MS = 2 * 60_000;
+
+function isEvidenceStale(evidence: BenchmarkEvidence | undefined, now: number): boolean {
+  if (!evidence) return false;
+  const date = Date.parse(evidence.asOf);
+  return Number.isFinite(date) && now - date >= EVIDENCE_STALE_AGE_MS;
+}
 
 function currentEvidence(evidence: BenchmarkEvidence | undefined, now: number): evidence is BenchmarkEvidence {
   if (!evidence || !/^\d{4}-\d{2}-\d{2}$/.test(evidence.asOf)) return false;
@@ -196,7 +207,7 @@ function currentEvidence(evidence: BenchmarkEvidence | undefined, now: number): 
   if (!Number.isFinite(date) || new Date(date).toISOString().slice(0, 10) !== evidence.asOf) return false;
   const age = now - date;
   const { source: _source, ...cohort } = RANKING_COHORT;
-  return age >= 0 && age < EVIDENCE_MAX_AGE_MS &&
+  return age >= 0 &&
     /^https:\/\/www\.vals\.ai\/_astro\/benchmark_view_terminal_bench_4\.[a-zA-Z0-9_-]+\.json$/.test(evidence.revision) &&
     Object.entries(cohort).every(([key, value]) => evidence[key as keyof BenchmarkEvidence] === value);
 }
@@ -273,7 +284,12 @@ export function buildMatchKeys(raw: string): string[] {
   return [...keys];
 }
 
-function inferRoles(entry: { family: string; codingScore: number | null; apiEquivCostUsd: number | null }): string[] {
+function inferRoles(entry: {
+  family: string;
+  codingScore: number | null;
+  apiEquivCostUsd: number | null;
+  topCodingScore?: number | null;
+}): string[] {
   const f = entry.family.toLowerCase();
   if (f.includes("opus") || f.includes("fable") || f.includes("pro") || f.includes("astra") || f.includes("neon")) {
     return ["orchestrator", "complex_architecture", "hard_debugging", "independent_verifier"];
@@ -284,7 +300,22 @@ function inferRoles(entry: { family: string; codingScore: number | null; apiEqui
   if (f.includes("flash") || f.includes("mini") || f.includes("haiku") || f.includes("nano") || f.includes("lite") || f.includes("argon")) {
     return ["codebase_research", "log_triage", "fast_scout"];
   }
+  const score = entry.codingScore;
+  const top = entry.topCodingScore ?? null;
+  const isHighScoringFrontier =
+    score !== null &&
+    (score >= 60 || (top !== null && top >= 40 && score >= top - 5));
+  if (isHighScoringFrontier) {
+    const roles = ["orchestrator", "complex_architecture", "hard_debugging", "independent_verifier", "worker_execution"];
+    if (entry.apiEquivCostUsd !== null && entry.apiEquivCostUsd < 0.15) {
+      roles.push("codebase_research", "fast_scout");
+    }
+    return roles;
+  }
   if ((entry.apiEquivCostUsd ?? 1) < 0.15) return ["codebase_research", "fast_scout"];
+  if (score !== null && score >= 45) {
+    return ["worker_execution", "refactoring", "plan_synthesis", "verification"];
+  }
   return ["worker_execution", "general_coding"];
 }
 
@@ -347,7 +378,21 @@ export class ModelCatalogCompiler {
     if (catalog.models.some((model) => model.codingScore !== null || model.codingRank !== null) &&
         !currentEvidence(catalog.rankingEvidence, now)) return false;
     const ageMs = now - syncedAt;
-    return ageMs >= 0 && ageMs < this.config.catalog.ttlHours * 3_600_000;
+    if (ageMs < 0) return false;
+    const enabledProfileIds = new Set(
+      this.config.profiles.filter((p) => p.enabled !== false).map((p) => p.id),
+    );
+    const hasProbeError = Boolean(
+      catalog.profileStatuses?.some(
+        (s) => s.status === "error" && enabledProfileIds.has(s.profileId),
+      ),
+    );
+    const normalTtlMs = this.config.catalog.ttlHours * 3_600_000;
+    const ttlMs =
+      catalog.models.length === 0 || hasProbeError
+        ? Math.min(BROKEN_CATALOG_RETRY_TTL_MS, normalTtlMs)
+        : normalTtlMs;
+    return ageMs < ttlMs;
   }
 
   /**
@@ -390,10 +435,11 @@ export class ModelCatalogCompiler {
     if (!pick) return null;
 
     const efforts = pick.route.supportedEfforts;
+    const validEffort = effort && effort.toLowerCase() !== "default" ? effort : undefined;
     return {
       wireModelId: pick.route.wireModelId,
       canonicalId: pick === aliasRoute ? lower : pick.entry.id,
-      ...(effort && (!efforts?.length || efforts.includes(effort)) ? { effort } : {}),
+      ...(validEffort && (!efforts?.length || efforts.includes(validEffort)) ? { effort: validEffort } : {}),
     };
   }
 
@@ -411,22 +457,68 @@ export class ModelCatalogCompiler {
         ? await this.sync(opts?.cwd ?? process.cwd())
         : cached;
 
+    this.quotaClient?.harvestLocal(this.config.profiles);
     await this.quotaClient?.sync(false).catch(() => {});
     const enrichedModels = catalog.models
       .map((m) => {
-        const route = m.preferredRoute;
-        const quota = this.quotaClient?.resolveForModel({
-          profileId: route.profileId,
-          provider: route.provider,
-          wireModelId: route.wireModelId,
-          canonicalModelId: m.id,
-        });
+        const allRoutes = [m.preferredRoute, ...m.alternateRoutes];
+        const resolvedRoutes = allRoutes.map((route) => ({
+          route,
+          quota:
+            this.quotaClient?.resolveForModel({
+              profileId: route.profileId,
+              provider: route.provider,
+              wireModelId: route.wireModelId,
+              canonicalModelId: m.id,
+            }) ?? null,
+        }));
+
+        let chosenIndex = 0;
+        if (isQuotaUnavailable(resolvedRoutes[0]?.quota)) {
+          const healthyIdx = resolvedRoutes.findIndex(
+            (r, idx) => idx > 0 && !isQuotaUnavailable(r.quota),
+          );
+          if (healthyIdx > 0) {
+            chosenIndex = healthyIdx;
+          }
+        }
+
+        const chosen = resolvedRoutes[chosenIndex]!;
+        const preferredRoute = chosen.route;
+        const alternateRoutes = resolvedRoutes
+          .filter((_, idx) => idx !== chosenIndex)
+          .map((r) => r.route);
+        const costPerTaskUsd =
+          chosenIndex === 0
+            ? m.costPerTaskUsd
+            : preferredRoute.billing === "subscription" || preferredRoute.billing === "local"
+              ? 0
+              : m.apiEquivCostUsd;
+        const promotedEfforts = preferredRoute.supportedEfforts?.filter(
+          (e) => e.trim() && e.toLowerCase() !== "default",
+        );
+        const efforts =
+          chosenIndex === 0
+            ? m.efforts
+            : promotedEfforts?.length
+              ? promotedEfforts
+              : m.efforts;
+
         const enabled = isModelEnabledInCatalog(m.id, this.config.catalog);
-        return { ...m, quota: quota ?? m.quota ?? null, enabled };
+        const quota = chosen.quota ?? (chosenIndex === 0 ? (m.quota ?? null) : null);
+        return {
+          ...m,
+          preferredRoute,
+          alternateRoutes,
+          costPerTaskUsd,
+          efforts,
+          quota,
+          enabled,
+        };
       })
       .filter((m) => {
         if (!opts?.includeDisabled && m.enabled === false) return false;
-        if (opts?.excludeExhausted && m.quota?.exhausted) return false;
+        if (opts?.excludeExhausted && isQuotaUnavailable(m.quota)) return false;
         if (opts?.role && !m.recommendedFor.includes(opts.role)) return false;
         if (opts?.maxApiEquivUsd !== undefined && m.apiEquivCostUsd !== null && m.apiEquivCostUsd > opts.maxApiEquivUsd) {
           return false;
@@ -579,12 +671,12 @@ export class ModelCatalogCompiler {
 
     const winners = selectLatestPerFamily([...candidateMap.values()], {
       allowPreview: this.config.catalog.allowPreview ?? true,
-      upstreamModelIds: [...canonicalMetadata.entries()]
-        .filter(([, md]) => md.isCanonical && md.status !== "deprecated" && md.status !== "retired" &&
-          md.toolCall !== false && (!md.modalities?.output || md.modalities.output.includes("text")) &&
-          (!md.releaseDate || reached(md.releaseDate)))
-        .map(([id]) => id),
     });
+
+    const scoredValues = winners
+      .map((w) => w.codingScore)
+      .filter((s): s is number => typeof s === "number" && Number.isFinite(s));
+    const topCodingScore = scoredValues.length > 0 ? Math.max(...scoredValues) : null;
 
     const preferSub = this.config.catalog.preferSubscription ?? true;
     const defaultProfile = this.config.defaultOrchestratorProfile;
@@ -619,6 +711,9 @@ export class ModelCatalogCompiler {
       const marginalCost = preferredRoute.billing === "subscription" || preferredRoute.billing === "local" ? 0 : apiEquiv;
       const family = computeRefinedFamilyKey(w.creator, w.wireModelId, w.rawFamily);
       const observation = measurements.get(w.canonicalId);
+      const realEfforts = (preferredRoute.supportedEfforts ?? w.supportedEfforts ?? []).filter(
+        (e) => e.trim() && e.toLowerCase() !== "default",
+      );
 
       return {
         id: w.canonicalId,
@@ -630,13 +725,18 @@ export class ModelCatalogCompiler {
         ...(observation?.effort ? { scoreObservation: { model: observation.rawModelName, effort: observation.effort } } : {}),
         benchmarks: w.codingScore === undefined ? {} : { [RANKING_COHORT.source]: w.codingScore },
         contextK: w.contextWindow ? Math.round(w.contextWindow / 1000) : null,
-        efforts: preferredRoute.supportedEfforts ?? w.supportedEfforts ?? ["default"],
+        efforts: realEfforts,
         preferredRoute,
         alternateRoutes: sortedRoutes.slice(1),
         costPerTaskUsd: marginalCost,
         apiEquivCostUsd: apiEquiv,
         timePerTaskSeconds: w.timePerTaskSeconds === undefined ? null : Math.round(w.timePerTaskSeconds),
-        recommendedFor: inferRoles({ family, codingScore: w.codingScore ?? null, apiEquivCostUsd: apiEquiv }),
+        recommendedFor: inferRoles({
+          family,
+          codingScore: w.codingScore ?? null,
+          apiEquivCostUsd: apiEquiv,
+          topCodingScore,
+        }),
       };
     });
 
@@ -647,13 +747,15 @@ export class ModelCatalogCompiler {
       entry.codingRank = previous?.codingScore === entry.codingScore ? previous.codingRank : index + 1;
     }
 
+    const hasScores = compiled.some((entry) => entry.codingScore !== null);
     return {
       schemaVersion: CATALOG_SCHEMA_VERSION,
       profilesFingerprint: this.computeProfilesFingerprint(),
       syncedAt: new Date().toISOString(),
       sources: input.sources,
       nextLifecycleChangeAt: Number.isFinite(nextLifecycleChange) ? new Date(nextLifecycleChange).toISOString() : undefined,
-      rankingEvidence: compiled.some((entry) => entry.codingScore !== null) ? evidence : undefined,
+      rankingEvidence: hasScores ? evidence : undefined,
+      ...(hasScores && isEvidenceStale(evidence, now) ? { rankingEvidenceStale: true } : {}),
       profileStatuses: input.profileStatuses,
       models: compiled,
     };

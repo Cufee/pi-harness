@@ -231,7 +231,7 @@ export class KnowledgeBaseStore {
     for (const id of ids.slice(0, 10)) {
       const entry = this.getRaw(id);
       if (!entry) continue;
-      this.db.prepare("UPDATE kb_entries SET hit_count = hit_count + 1, last_hit_at = ? WHERE id = ?").run(now, id);
+      this.db.prepare("UPDATE kb_entries SET hit_count = hit_count + 1, last_hit_at = ? WHERE id = ?").run(now, entry.id);
       out.push({ ...entry, hitCount: entry.hitCount + 1, lastHitAt: now });
     }
     return out;
@@ -254,42 +254,61 @@ export class KnowledgeBaseStore {
 
     const limit = Math.min(opts.limit ?? 10, 50);
     const ftsQuery = opts.query ? sanitizeFtsQuery(opts.query) : "";
+    const kinds = opts.kinds?.length ? opts.kinds : null;
+    const needsJsFilter = Boolean(opts.pathGlobs?.length || opts.tags?.length);
+    const sqlLimit = needsJsFilter ? (opts.repoScope ? null : Math.max(limit * 25, 250)) : limit;
 
     let rows: Record<string, unknown>[];
     if (ftsQuery) {
       const placeholders = statuses.map(() => "?").join(",");
       const params: (string | number)[] = [ftsQuery, ...statuses];
-      let scopeSql = "";
+      let extraSql = "";
       if (opts.repoScope) {
-        scopeSql = " AND (e.repo_scope = ? OR e.repo_scope = 'global')";
+        extraSql += " AND (e.repo_scope = ? OR e.repo_scope = 'global')";
         params.push(opts.repoScope);
       }
-      params.push(limit * 4);
+      if (kinds) {
+        const kindPlaceholders = kinds.map(() => "?").join(",");
+        extraSql += ` AND e.kind IN (${kindPlaceholders})`;
+        params.push(...kinds);
+      }
+      let limitSql = "";
+      if (sqlLimit !== null) {
+        limitSql = "\n           LIMIT ?";
+        params.push(sqlLimit);
+      }
       rows = this.db
         .prepare(
           `SELECT e.*, bm25(kb_fts, 10.0, 5.0, 4.0, 1.0) AS rank
            FROM kb_fts
            JOIN kb_entries e ON e.rowid = kb_fts.rowid
-           WHERE kb_fts MATCH ? AND e.status IN (${placeholders})${scopeSql}
-           ORDER BY rank ASC, e.hit_count DESC
-           LIMIT ?`,
+           WHERE kb_fts MATCH ? AND e.status IN (${placeholders})${extraSql}
+           ORDER BY rank ASC, e.hit_count DESC${limitSql}`,
         )
         .all(...params) as Record<string, unknown>[];
     } else {
       const placeholders = statuses.map(() => "?").join(",");
       const params: (string | number)[] = [...statuses];
-      let scopeSql = "";
+      let extraSql = "";
       if (opts.repoScope) {
-        scopeSql = " AND (repo_scope = ? OR repo_scope = 'global')";
+        extraSql += " AND (repo_scope = ? OR repo_scope = 'global')";
         params.push(opts.repoScope);
       }
-      params.push(limit * 4);
+      if (kinds) {
+        const kindPlaceholders = kinds.map(() => "?").join(",");
+        extraSql += ` AND kind IN (${kindPlaceholders})`;
+        params.push(...kinds);
+      }
+      let limitSql = "";
+      if (sqlLimit !== null) {
+        limitSql = "\n           LIMIT ?";
+        params.push(sqlLimit);
+      }
       rows = this.db
         .prepare(
           `SELECT * FROM kb_entries
-           WHERE status IN (${placeholders})${scopeSql}
-           ORDER BY CASE kind WHEN 'invariant' THEN 0 WHEN 'gotcha' THEN 1 ELSE 2 END, hit_count DESC, updated_at DESC
-           LIMIT ?`,
+           WHERE status IN (${placeholders})${extraSql}
+           ORDER BY CASE kind WHEN 'invariant' THEN 0 WHEN 'gotcha' THEN 1 ELSE 2 END, hit_count DESC, updated_at DESC${limitSql}`,
         )
         .all(...params) as Record<string, unknown>[];
     }
@@ -327,8 +346,8 @@ export class KnowledgeBaseStore {
     if (!existing) throw new Error(`Unknown KB entry ${id}`);
     this.db
       .prepare("UPDATE kb_entries SET status = 'stale', stale_reason = ?, updated_at = ? WHERE id = ?")
-      .run(reason.slice(0, 500), Date.now(), id);
-    return this.getRaw(id)!;
+      .run(reason.slice(0, 500), Date.now(), existing.id);
+    return this.getRaw(existing.id)!;
   }
 
   promote(id: string, patch?: { title?: string; summary?: string; contextMd?: string; verifiedSha?: string }): KbEntry {
@@ -351,23 +370,28 @@ export class KnowledgeBaseStore {
         patch?.verifiedSha ?? null,
         patch?.verifiedSha ?? null,
         Date.now(),
-        id,
+        existing.id,
       );
-    return this.getRaw(id)!;
+    return this.getRaw(existing.id)!;
   }
 
   markCheckedClean(id: string, headSha: string): void {
-    this.db.prepare("UPDATE kb_entries SET last_checked_sha = ?, updated_at = ? WHERE id = ?").run(headSha, Date.now(), id);
+    const existing = this.getRaw(id);
+    if (!existing) return;
+    this.db
+      .prepare("UPDATE kb_entries SET last_checked_sha = ?, updated_at = ? WHERE id = ?")
+      .run(headSha, Date.now(), existing.id);
   }
 
   /** Bi-temporal archival: never hard-delete; preserve history via `superseded_by`. */
   archive(id: string, opts?: { reason?: string; supersededBy?: string }): KbEntry {
     const existing = this.getRaw(id);
     if (!existing) throw new Error(`Unknown KB entry ${id}`);
+    const supersededBy = opts?.supersededBy ? (this.getRaw(opts.supersededBy)?.id ?? opts.supersededBy) : null;
     this.db
       .prepare("UPDATE kb_entries SET status = 'archived', stale_reason = ?, superseded_by = ?, updated_at = ? WHERE id = ?")
-      .run(opts?.reason ?? existing.staleReason, opts?.supersededBy ?? null, Date.now(), id);
-    return this.getRaw(id)!;
+      .run(opts?.reason ?? existing.staleReason, supersededBy, Date.now(), existing.id);
+    return this.getRaw(existing.id)!;
   }
 
   listByStatus(repoScope: string, status: KbStatus): KbEntry[] {
