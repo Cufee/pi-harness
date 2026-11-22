@@ -350,7 +350,7 @@ export class ModelPickerOverlay implements Component, Focusable {
   private triggerSync(): void {
     if (this.syncing) return;
     this.syncing = true;
-    this.statusNote = "Syncing live benchmarks (Vals.ai, Harbor TB4, Epoch AI, models.dev, OpenRouter)…";
+    this.statusNote = "Syncing model catalog…";
     this.rerender();
     void this.client.request<CompiledModelCatalog>("models.sync", { cwd: this.repoRoot }).then(
       (fresh) => {
@@ -499,7 +499,8 @@ export class ModelPickerOverlay implements Component, Focusable {
         (!this.currentProfileId || route.profileId === this.currentProfileId);
 
       const marker = active ? this.theme.accentBold("▸ ") : isCurrent ? this.theme.success("★ ") : "  ";
-      const rankCell = fitWidth(active ? this.theme.accentBold(`#${m.codingRank}`) : this.theme.dim(`#${m.codingRank}`), rankW);
+      const rank = m.codingRank == null ? "-" : `#${m.codingRank}`;
+      const rankCell = fitWidth(active ? this.theme.accentBold(rank) : this.theme.dim(rank), rankW);
       const modelLabel = isCurrent && active ? `★ ${m.id}` : m.id;
       const modelCell = fitWidth(active ? this.theme.accentBold(modelLabel) : this.theme.text(modelLabel), modelW);
       const scoreText =

@@ -444,7 +444,7 @@ async function main(): Promise<void> {
           sources: string[];
           profileStatuses?: Array<{ profileId: string; status: "ok" | "error"; modelCount: number; error?: string }>;
           models: Array<{
-            codingRank: number;
+            codingRank: number | null;
             id: string;
             codingScore: number | null;
             scoreSource: string | null;
@@ -478,7 +478,7 @@ async function main(): Promise<void> {
                 : `${m.quota.availabilityName}${m.quota.effectiveRemainingRatio != null ? ` ${Math.round(m.quota.effectiveRemainingRatio * 100)}%` : ""}`
               : m.preferredRoute.billing;
             console.log(
-              `${String(m.codingRank).padEnd(5)} ${m.id.padEnd(29)} ${score.padEnd(17)} ${cost.padEnd(18)} ${time.padEnd(8)} ${q} (${m.preferredRoute.profileId})`,
+              `${String(m.codingRank ?? "-").padEnd(5)} ${m.id.padEnd(29)} ${score.padEnd(17)} ${cost.padEnd(18)} ${time.padEnd(8)} ${q} (${m.preferredRoute.profileId})`,
             );
           }
         }

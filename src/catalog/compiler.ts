@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { HarnessConfig, RunnerProfileConfig } from "../config.js";
@@ -9,18 +10,16 @@ import type { ProbedModelInfo } from "../runners/types.js";
 import {
   computeRefinedFamilyKey,
   selectLatestPerFamily,
-  stripSnapshotAndRouting,
   type CandidateModel,
   type ModelRoute,
 } from "./deduplicate.js";
+import { canonicalModelId } from "./lifecycle.js";
 import {
-  fetchArtificialAnalysisPro,
-  fetchEpochAiCodingBenchmarks,
-  fetchHarborTerminalBench,
+  RANKING_COHORT,
+  type BenchmarkEvidence,
   fetchLiteLlmDeprecations,
   fetchModelsDev,
   fetchOpenRouterMetadata,
-  fetchPinchBench,
   fetchValsAiBenchmarks,
   type BenchmarkMetricRow,
   type BenchmarkSourceName,
@@ -30,9 +29,10 @@ export interface CompiledModelEntry {
   id: string;
   family: string;
   name: string;
-  codingRank: number;
+  codingRank: number | null;
   codingScore: number | null;
   scoreSource: BenchmarkSourceName | null;
+  scoreObservation?: { model: string; effort: string };
   benchmarks: Partial<Record<BenchmarkSourceName, number>>;
   contextK: number | null;
   efforts: string[];
@@ -47,7 +47,7 @@ export interface CompiledModelEntry {
   recommendedFor: string[];
 }
 
-export const CATALOG_SCHEMA_VERSION = 4;
+export const CATALOG_SCHEMA_VERSION = 5;
 
 export interface ProfileProbeStatus {
   profileId: string;
@@ -61,31 +61,75 @@ export interface CompiledModelCatalog {
   profilesFingerprint?: string;
   syncedAt: string;
   sources: string[];
+  rankingEvidence?: BenchmarkEvidence;
+  nextLifecycleChangeAt?: string;
   profileStatuses?: ProfileProbeStatus[];
   models: CompiledModelEntry[];
 }
 
-const SOURCE_PRIORITY: Record<BenchmarkSourceName, number> = {
-  aa_pro: 100,
-  vals_tb4: 95,
-  harbor_tb4: 90,
-  epoch_frontierswe: 85,
-  vals_swebench: 80,
-  epoch_terminalbench: 78,
-  epoch_cursorbench: 75,
-  epoch_frontiercode: 72,
-  epoch_deepswe: 70,
-  epoch_swebench: 65,
-  pinchbench: 60,
-  openrouter_eng: 45,
-  openrouter_intel: 35,
-};
+// Defaults for the native Claude CLI, verified 2026-11-21.
+// https://code.claude.com/docs/en/model-config#model-aliases
+const CLAUDE_ROUTE_ALIASES = new Map([
+  ["anthropic/claude-opus-5-5", "opus"],
+  ["anthropic/claude-sonnet-5-5", "sonnet"],
+  ["anthropic/claude-haiku-5-5", "haiku"],
+  ["anthropic/claude-fable-5-2", "fable"],
+]);
 
-/**
- * Generates normalized match keys bridging vendor IDs (`anthropic/claude-opus-5-5`, `gpt-6.2-sol`),
- * Harbor short names (`Opus 5.5`, `Fable 5.2`), Epoch CSV names (`Claude Opus 5.5 (Max)`),
- * and Vals.ai `provider/model` keys.
- */
+const EVIDENCE_MAX_AGE_MS = 30 * 86_400_000;
+
+function currentEvidence(evidence: BenchmarkEvidence | undefined, now: number): evidence is BenchmarkEvidence {
+  if (!evidence || !/^\d{4}-\d{2}-\d{2}$/.test(evidence.asOf)) return false;
+  const date = Date.parse(evidence.asOf);
+  if (!Number.isFinite(date) || new Date(date).toISOString().slice(0, 10) !== evidence.asOf) return false;
+  const age = now - date;
+  const { source: _source, ...cohort } = RANKING_COHORT;
+  return age >= 0 && age < EVIDENCE_MAX_AGE_MS &&
+    /^https:\/\/www\.vals\.ai\/_astro\/benchmark_view_terminal_bench_4\.[a-zA-Z0-9_-]+\.json$/.test(evidence.revision) &&
+    Object.entries(cohort).every(([key, value]) => evidence[key as keyof BenchmarkEvidence] === value);
+}
+
+/** Vals publishes one aggregate per model. Ambiguous identities and conflicting reruns have no score. */
+function selectMeasurements(rows: BenchmarkMetricRow[], now: number) {
+  const cohortRows = rows.filter((row) => row.source === RANKING_COHORT.source && row.evidence);
+  const snapshotDates = new Map<string, string>();
+  for (const { evidence } of cohortRows) {
+    const { revision, asOf } = evidence!;
+    const previous = snapshotDates.get(revision);
+    snapshotDates.set(revision, previous === undefined || previous === asOf ? asOf : "");
+  }
+  const eligible = cohortRows.filter(({ evidence }) => currentEvidence(evidence, now) &&
+    snapshotDates.get(evidence.revision) === evidence.asOf);
+  const latestDate = eligible.reduce((date, row) => row.evidence!.asOf > date ? row.evidence!.asOf : date, "");
+  const latest = eligible.filter((row) => row.evidence!.asOf === latestDate);
+  const measurements = new Map<string, BenchmarkMetricRow>();
+  const evidence = latest[0]?.evidence;
+  if (!evidence || latest.some((row) => row.evidence!.revision !== evidence.revision)) return { measurements };
+
+  const identities = new Map<string, string>();
+  const conflicts = new Set<string>();
+  for (const row of latest) {
+    const id = row.canonicalKeyHint;
+    if (!id || !row.rawModelName) continue;
+    const priorId = identities.get(row.rawModelName);
+    const prior = measurements.get(id);
+    if (priorId && priorId !== id) {
+      conflicts.add(priorId);
+      conflicts.add(id);
+    }
+    identities.set(row.rawModelName, id);
+    if (!row.effort?.trim() || typeof row.codingScore !== "number" || !Number.isFinite(row.codingScore) ||
+        row.codingScore < 0 || row.codingScore > 100 ||
+        (prior && (prior.rawModelName !== row.rawModelName || prior.codingScore !== row.codingScore || prior.effort !== row.effort))) {
+      conflicts.add(id);
+    }
+    measurements.set(id, row);
+  }
+  for (const conflict of conflicts) measurements.delete(conflict);
+  return { evidence, measurements };
+}
+
+/** Fuzzy keys for translating explicit route requests. Ranking uses exact canonical IDs. */
 export function buildMatchKeys(raw: string): string[] {
   const cleaned = raw
     .toLowerCase()
@@ -115,23 +159,6 @@ export function buildMatchKeys(raw: string): string[] {
   }
 
   return [...keys];
-}
-
-function inferCreatorFromModelId(id: string, fallbackProvider: string): string {
-  const lower = id.toLowerCase();
-  if (lower.includes("claude") || lower.includes("opus") || lower.includes("sonnet") || lower.includes("haiku") || lower.includes("fable")) {
-    return "anthropic";
-  }
-  if (lower.includes("gpt") || lower.includes("codex") || lower.includes("astra") || lower.includes("sol") || /^o[134](-|$)/.test(lower)) {
-    return "openai";
-  }
-  if (lower.includes("gemini") || lower.includes("gemma")) return "google";
-  if (lower.includes("deepseek")) return "deepseek";
-  if (lower.includes("kimi")) return "moonshotai";
-  if (lower.includes("glm")) return "zai";
-  if (lower.includes("qwen")) return "qwen";
-  if (lower.includes("grok")) return "xai";
-  return fallbackProvider.replace(/^acp:/, "");
 }
 
 function inferRoles(entry: { family: string; codingScore: number | null; apiEquivCostUsd: number | null }): string[] {
@@ -167,15 +194,14 @@ export class ModelCatalogCompiler {
   }
 
   computeProfilesFingerprint(): string {
-    return this.config.profiles
+    const profiles = this.config.profiles
       .filter((p) => p.enabled !== false)
-      .map((p) =>
-        p.kind === "acp"
-          ? `${p.id}|acp|${p.command}|${(p.args ?? []).join(" ")}|${(p.models ?? []).join(",")}`
-          : `${p.id}|pi|${p.provider}|${(p.models ?? []).join(",")}`,
-      )
-      .sort()
-      .join(";;");
+      .map((p) => p.kind === "acp"
+        ? [p.id, p.kind, p.adapter, p.command, p.args, p.models, p.billing, Object.entries(p.env ?? {}).sort()]
+        : [p.id, p.kind, p.provider, p.models, p.billing, p.baseUrl, p.api]);
+    const content = JSON.stringify([profiles, this.config.catalog.allowPreview, this.config.catalog.preferSubscription,
+      this.config.defaultOrchestratorProfile]);
+    return createHash("sha256").update(content).digest("hex");
   }
 
   invalidateCache(): void {
@@ -200,10 +226,16 @@ export class ModelCatalogCompiler {
 
   isCacheFresh(catalog: CompiledModelCatalog | null): boolean {
     if (!catalog) return false;
-    if ((catalog.schemaVersion ?? 1) < CATALOG_SCHEMA_VERSION) return false;
+    if (catalog.schemaVersion !== CATALOG_SCHEMA_VERSION) return false;
     if (catalog.profilesFingerprint !== this.computeProfilesFingerprint()) return false;
-    const ageMs = Date.now() - Date.parse(catalog.syncedAt);
-    return Number.isFinite(ageMs) && ageMs < this.config.catalog.ttlHours * 3_600_000;
+    const now = Date.now();
+    if (catalog.nextLifecycleChangeAt !== undefined && !(Date.parse(catalog.nextLifecycleChangeAt) > now)) return false;
+    const syncedAt = Date.parse(catalog.syncedAt);
+    if (!Number.isFinite(syncedAt) || new Date(syncedAt).toISOString() !== catalog.syncedAt) return false;
+    if (catalog.models.some((model) => model.codingScore !== null || model.codingRank !== null) &&
+        !currentEvidence(catalog.rankingEvidence, now)) return false;
+    const ageMs = now - syncedAt;
+    return ageMs >= 0 && ageMs < this.config.catalog.ttlHours * 3_600_000;
   }
 
   /**
@@ -229,9 +261,13 @@ export class ModelCatalogCompiler {
 
     const lower = model.toLowerCase();
     const requestKeys = new Set(buildMatchKeys(model));
+    const claudeAlias = CLAUDE_ROUTE_ALIASES.get(lower);
+    const aliasRoute = candidates.find(({ route }) => route.runner === "acp" && route.provider === "claude" &&
+      route.wireModelId === claudeAlias);
     const pick =
       candidates.find((c) => c.route.wireModelId.toLowerCase() === lower) ??
       candidates.find((c) => c.entry.id.toLowerCase() === lower) ??
+      aliasRoute ??
       candidates
         .map((c) => {
           const keys = new Set([...buildMatchKeys(c.entry.id), ...buildMatchKeys(c.route.wireModelId)]);
@@ -244,7 +280,7 @@ export class ModelCatalogCompiler {
     const efforts = pick.route.supportedEfforts;
     return {
       wireModelId: pick.route.wireModelId,
-      canonicalId: pick.entry.id,
+      canonicalId: pick === aliasRoute ? lower : pick.entry.id,
       ...(effort && (!efforts?.length || efforts.includes(effort)) ? { effort } : {}),
     };
   }
@@ -299,28 +335,15 @@ export class ModelCatalogCompiler {
         }
       : await this.discoverEnabledInventory(enabledProfiles, cwd);
 
-    const aaKeyEnv = this.config.catalog.artificialAnalysisKeyEnv ?? "ARTIFICIAL_ANALYSIS_API_KEY";
-    const aaKey = process.env[aaKeyEnv];
-
-    const [modelsDev, openRouter, litellmDep, valsAi, harbor, epoch, pinch, aaPro] = await Promise.all([
-      fetchModelsDev(),
-      fetchOpenRouterMetadata(),
-      fetchLiteLlmDeprecations(),
-      fetchValsAiBenchmarks(),
-      fetchHarborTerminalBench(),
-      fetchEpochAiCodingBenchmarks(),
-      fetchPinchBench(),
-      fetchArtificialAnalysisPro(aaKey),
+    const [modelsDev, openRouter, litellmDep, benchmarks] = await Promise.all([
+      fetchModelsDev(), fetchOpenRouterMetadata(), fetchLiteLlmDeprecations(), fetchValsAiBenchmarks(),
     ]);
 
     const sources: string[] = [];
     if (modelsDev.length) sources.push("models.dev");
     if (openRouter.length) sources.push("openrouter");
-    if (valsAi.length) sources.push("vals_ai");
-    if (harbor.length) sources.push("harbor_tb4");
-    if (epoch.length) sources.push("epoch_ai");
-    if (pinch.length) sources.push("pinchbench");
-    if (aaPro.length) sources.push("artificial_analysis_pro");
+    if (litellmDep.size) sources.push("litellm");
+    if (benchmarks.length) sources.push("vals_ai");
 
     const catalog = this.compileFromData({
       enabledProfiles,
@@ -329,7 +352,7 @@ export class ModelCatalogCompiler {
       modelsDev,
       openRouter,
       litellmDep,
-      benchmarks: [...aaPro, ...valsAi, ...harbor, ...epoch, ...pinch],
+      benchmarks,
       sources,
     });
 
@@ -348,127 +371,53 @@ export class ModelCatalogCompiler {
     benchmarks: BenchmarkMetricRow[];
     sources: string[];
   }): CompiledModelCatalog {
-    const mdByKey = new Map<string, (typeof input.modelsDev)[number]>();
-    for (const m of input.modelsDev) {
-      for (const k of [...buildMatchKeys(`${m.provider}/${m.id}`), ...buildMatchKeys(m.id), ...buildMatchKeys(m.name)]) {
-        if (!mdByKey.has(k)) mdByKey.set(k, m);
-      }
-    }
-
-    const orByKey = new Map<string, (typeof input.openRouter)[number]>();
-    for (const m of input.openRouter) {
-      for (const k of [...buildMatchKeys(m.id), ...(m.canonicalSlug ? buildMatchKeys(m.canonicalSlug) : [])]) {
-        if (!orByKey.has(k)) orByKey.set(k, m);
-      }
-    }
-
-    const benchByKey = new Map<string, BenchmarkMetricRow[]>();
-    const indexBench = (row: BenchmarkMetricRow) => {
-      const keys = new Set([
-        ...buildMatchKeys(row.rawModelName),
-        ...(row.canonicalKeyHint ? buildMatchKeys(row.canonicalKeyHint) : []),
-      ]);
-      for (const k of keys) {
-        const list = benchByKey.get(k) ?? [];
-        list.push(row);
-        benchByKey.set(k, list);
-      }
+    const now = Date.now();
+    const { evidence, measurements } = selectMeasurements(input.benchmarks, now);
+    let nextLifecycleChange = Infinity;
+    const reached = (date: string | undefined): boolean => {
+      if (!date) return false;
+      const at = Date.parse(date);
+      if (at > now) nextLifecycleChange = Math.min(nextLifecycleChange, at);
+      return at <= now;
     };
-    for (const b of input.benchmarks) indexBench(b);
-
-    // Also add OpenRouter's free AA engineering_index & intelligence_index as fallback benchmark rows
-    for (const m of input.openRouter) {
-      if (m.aaEngineeringIndex !== undefined) {
-        indexBench({
-          source: "openrouter_eng",
-          rawModelName: m.id,
-          canonicalKeyHint: m.canonicalSlug,
-          codingScore: m.aaEngineeringIndex,
-        });
+    const canonicalMetadata = new Map<string, (typeof input.modelsDev)[number]>();
+    const routeMetadata = new Map<string, (typeof input.modelsDev)[number]>();
+    for (const md of input.modelsDev) {
+      if (md.isCanonical !== false) {
+        canonicalMetadata.set(canonicalModelId(md.canonicalId ?? `${md.provider}/${md.id}`, md.provider), md);
       }
-      if (m.aaIntelligenceIndex !== undefined) {
-        indexBench({
-          source: "openrouter_intel",
-          rawModelName: m.id,
-          canonicalKeyHint: m.canonicalSlug,
-          codingScore: m.aaIntelligenceIndex,
-        });
-      }
+      if (!md.isCanonical) routeMetadata.set(`${md.provider}/${md.id}`, md);
     }
-
-    // Track per-canonicalId detailed benchmark breakdown & winning source
-    const detailByCanonical = new Map<
-      string,
-      { scoreSource: BenchmarkSourceName | null; benchmarks: Partial<Record<BenchmarkSourceName, number>> }
-    >();
+    const orById = new Map(input.openRouter.map((row) => [row.id, row]));
     const candidateMap = new Map<string, CandidateModel>();
-
     for (const profile of input.enabledProfiles) {
       const models = input.inventory.get(profile.id) ?? [];
       const providerName = profile.kind === "pi" ? profile.provider : profile.adapter;
       for (const m of models) {
-        // Resolve short ACP aliases like "opus" / "sonnet" / "haiku" against latest models.dev entry if present
-        let resolvedWireId = m.wireModelId;
-        if (/^(opus|sonnet|haiku|fable)$/i.test(resolvedWireId)) {
-          const matchingMd = input.modelsDev
-            .filter((d) => d.family === `claude-${resolvedWireId.toLowerCase()}` && d.status !== "deprecated")
-            .sort((a, b) => (b.releaseDate ?? "").localeCompare(a.releaseDate ?? ""))[0];
-          if (matchingMd) resolvedWireId = matchingMd.id;
-        }
+        const routeMd = routeMetadata.get(`${providerName}/${m.wireModelId}`);
+        const inventoryId = canonicalModelId(m.wireModelId, providerName);
+        const linkedId = routeMd?.canonicalId ? canonicalModelId(routeMd.canonicalId, providerName) : undefined;
+        // Some provider listings link dated or preview routes to an undated product page.
+        // An exact provider route may identify its publisher only if its model ID is unchanged.
+        const canonicalId = linkedId &&
+          inventoryId.slice(inventoryId.indexOf("/") + 1) === linkedId.slice(linkedId.indexOf("/") + 1)
+          ? linkedId : inventoryId;
+        const slash = canonicalId.indexOf("/");
+        const creator = canonicalId.slice(0, slash);
+        const bare = canonicalId.slice(slash + 1);
+        const md = canonicalMetadata.get(canonicalId);
+        const or = providerName === "openrouter" ? orById.get(m.wireModelId) : orById.get(canonicalId);
+        const dep = input.litellmDep.get(canonicalId.toLowerCase()) ??
+          (canonicalModelId(bare, "generic") === canonicalId ? input.litellmDep.get(bare.toLowerCase()) : undefined);
+        if (routeMd?.status === "deprecated" || routeMd?.status === "retired" || routeMd?.toolCall === false ||
+            (routeMd?.modalities?.output && !routeMd.modalities.output.includes("text"))) continue;
+        if (providerName === "openrouter" && reached(or?.expirationDate)) continue;
 
-        const creator = inferCreatorFromModelId(resolvedWireId, providerName);
-        const { base } = stripSnapshotAndRouting(resolvedWireId);
-        const bare = base.includes("/") ? base.slice(base.lastIndexOf("/") + 1) : base;
-        const canonicalId = `${creator}/${bare}`;
-
-        const lookupKeys = [
-          ...buildMatchKeys(canonicalId),
-          ...buildMatchKeys(bare),
-          ...(m.name ? buildMatchKeys(m.name) : []),
-        ];
-
-        const md = lookupKeys.map((k) => mdByKey.get(k)).find(Boolean);
-        const or = lookupKeys.map((k) => orByKey.get(k)).find(Boolean);
-        const dep = input.litellmDep.get(resolvedWireId.toLowerCase()) ?? input.litellmDep.get(canonicalId.toLowerCase());
-
-        const allSearchKeys = new Set([
-          ...lookupKeys,
-          ...(md?.name ? buildMatchKeys(md.name) : []),
-          ...(md?.id ? buildMatchKeys(md.id) : []),
-          ...(or?.id ? buildMatchKeys(or.id) : []),
-        ]);
-
-        const matchedRows: BenchmarkMetricRow[] = [];
-        for (const k of allSearchKeys) {
-          const list = benchByKey.get(k);
-          if (list) matchedRows.push(...list);
-        }
-
-        // Collapse to best score per benchmark source, then pick highest-priority coding benchmark
-        const bySource = new Map<BenchmarkSourceName, BenchmarkMetricRow>();
-        for (const row of matchedRows) {
-          const prev = bySource.get(row.source);
-          if (!prev || (row.codingScore ?? -1) > (prev.codingScore ?? -1)) {
-            bySource.set(row.source, row);
-          }
-        }
-
-        const rankedSources = [...bySource.values()].sort(
-          (a, b) => (SOURCE_PRIORITY[b.source] ?? 0) - (SOURCE_PRIORITY[a.source] ?? 0),
-        );
-        const primaryBench = rankedSources[0];
-        const costBench = rankedSources.find((r) => r.costPerTaskUsd !== undefined);
-        const timeBench = rankedSources.find((r) => r.timePerTaskSeconds !== undefined);
-
-        const benchmarksObj: Partial<Record<BenchmarkSourceName, number>> = {};
-        for (const [src, row] of bySource) {
-          if (row.codingScore !== undefined) benchmarksObj[src] = Number(row.codingScore.toFixed(1));
-        }
-
-        detailByCanonical.set(canonicalId, {
-          scoreSource: primaryBench?.source ?? null,
-          benchmarks: benchmarksObj,
-        });
+        const primaryBench = measurements.get(canonicalId);
+        // Undated task measurements can supply cost/time on exact native IDs, never quality.
+        const taskMetrics = primaryBench ?? input.benchmarks.find((row) => row.source === "harbor_tb4" &&
+          (row.canonicalKeyHint === canonicalId || (!row.canonicalKeyHint && row.rawModelName === bare &&
+            canonicalModelId(bare, "generic") === canonicalId)));
 
         const route: ModelRoute = {
           profileId: profile.id,
@@ -476,7 +425,7 @@ export class ModelCatalogCompiler {
           provider: providerName,
           wireModelId: m.wireModelId, // keep original wire ID so ACP/Pi accepts it verbatim
           billing: profile.billing,
-          supportedEfforts: m.supportedEfforts ?? md?.supportedEfforts ?? or?.supportedEfforts,
+          supportedEfforts: m.supportedEfforts ?? routeMd?.supportedEfforts ?? md?.supportedEfforts ?? or?.supportedEfforts,
         };
 
         const existing = candidateMap.get(canonicalId);
@@ -484,29 +433,29 @@ export class ModelCatalogCompiler {
           existing.routes.push(route);
         } else {
           const isDeprecated =
-            md?.status === "deprecated" ||
-            Boolean(dep?.deprecationDate && Date.parse(dep.deprecationDate) <= Date.now());
+            md?.status === "deprecated" || md?.status === "retired" ||
+            reached(dep?.deprecationDate);
           candidateMap.set(canonicalId, {
             canonicalId,
             creator,
             wireModelId: bare,
             name: md?.name ?? m.name ?? bare,
             rawFamily: md?.family,
-            releaseDate: md?.releaseDate ?? (or?.created ? new Date(or.created * 1000).toISOString().slice(0, 10) : undefined),
+            releaseDate: md?.releaseDate,
             deprecated: isDeprecated,
-            successorModel: dep?.successorModel,
+            successorModel: dep?.deprecationDate && !isDeprecated ? undefined : dep?.successorModel,
             toolCall: md?.toolCall ?? true,
             modalities: md?.modalities,
             contextWindow: md?.contextWindow ?? or?.contextLength,
             supportedEfforts: route.supportedEfforts,
             listCostPer1m:
-              md?.cost ??
+              routeMd?.cost ?? md?.cost ??
               (or?.costPer1mInput !== undefined
                 ? { input: or.costPer1mInput, output: or.costPer1mOutput ?? 0 }
                 : undefined),
             codingScore: primaryBench?.codingScore,
-            costPerTaskUsd: costBench?.costPerTaskUsd,
-            timePerTaskSeconds: timeBench?.timePerTaskSeconds,
+            costPerTaskUsd: taskMetrics?.costPerTaskUsd,
+            timePerTaskSeconds: taskMetrics?.timePerTaskSeconds,
             routes: [route],
           });
         }
@@ -515,6 +464,11 @@ export class ModelCatalogCompiler {
 
     const winners = selectLatestPerFamily([...candidateMap.values()], {
       allowPreview: this.config.catalog.allowPreview ?? true,
+      upstreamModelIds: [...canonicalMetadata.entries()]
+        .filter(([, md]) => md.isCanonical && md.status !== "deprecated" && md.status !== "retired" &&
+          md.toolCall !== false && (!md.modalities?.output || md.modalities.output.includes("text")) &&
+          (!md.releaseDate || reached(md.releaseDate)))
+        .map(([id]) => id),
     });
 
     const preferSub = this.config.catalog.preferSubscription ?? true;
@@ -528,7 +482,7 @@ export class ModelCatalogCompiler {
       return false;
     };
 
-    const compiled: CompiledModelEntry[] = winners.map((w, idx) => {
+    const compiled: CompiledModelEntry[] = winners.map((w) => {
       const sortedRoutes = [...w.routes].sort((a, b) => {
         if (preferSub && a.billing !== b.billing) {
           if (a.billing === "subscription") return -1;
@@ -549,16 +503,17 @@ export class ModelCatalogCompiler {
       const apiEquiv = rawApiEquiv === null ? null : Number(rawApiEquiv.toFixed(2));
       const marginalCost = preferredRoute.billing === "subscription" || preferredRoute.billing === "local" ? 0 : apiEquiv;
       const family = computeRefinedFamilyKey(w.creator, w.wireModelId, w.rawFamily);
-      const detail = detailByCanonical.get(w.canonicalId);
+      const observation = measurements.get(w.canonicalId);
 
       return {
         id: w.canonicalId,
         family,
         name: w.name,
-        codingRank: idx + 1,
-        codingScore: w.codingScore === undefined ? null : Number(w.codingScore.toFixed(1)),
-        scoreSource: detail?.scoreSource ?? null,
-        benchmarks: detail?.benchmarks ?? {},
+        codingRank: null,
+        codingScore: w.codingScore ?? null,
+        scoreSource: w.codingScore === undefined ? null : RANKING_COHORT.source,
+        ...(observation?.effort ? { scoreObservation: { model: observation.rawModelName, effort: observation.effort } } : {}),
+        benchmarks: w.codingScore === undefined ? {} : { [RANKING_COHORT.source]: w.codingScore },
         contextK: w.contextWindow ? Math.round(w.contextWindow / 1000) : null,
         efforts: preferredRoute.supportedEfforts ?? w.supportedEfforts ?? ["default"],
         preferredRoute,
@@ -570,11 +525,20 @@ export class ModelCatalogCompiler {
       };
     });
 
+    compiled.sort((a, b) => (b.codingScore ?? -1) - (a.codingScore ?? -1) || a.id.localeCompare(b.id));
+    for (const [index, entry] of compiled.entries()) {
+      if (entry.codingScore === null) break;
+      const previous = compiled[index - 1];
+      entry.codingRank = previous?.codingScore === entry.codingScore ? previous.codingRank : index + 1;
+    }
+
     return {
       schemaVersion: CATALOG_SCHEMA_VERSION,
       profilesFingerprint: this.computeProfilesFingerprint(),
       syncedAt: new Date().toISOString(),
       sources: input.sources,
+      nextLifecycleChangeAt: Number.isFinite(nextLifecycleChange) ? new Date(nextLifecycleChange).toISOString() : undefined,
+      rankingEvidence: compiled.some((entry) => entry.codingScore !== null) ? evidence : undefined,
       profileStatuses: input.profileStatuses,
       models: compiled,
     };
