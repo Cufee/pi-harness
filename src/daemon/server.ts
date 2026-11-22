@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, statSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
@@ -32,6 +33,22 @@ interface ClientAttachment {
   taskId: string | null;
 }
 
+/** Read-only event subscription; never binds or evicts the socket's chat/run session. */
+type ClientWatch = { id: string; lastSeq: number; buffer: DaemonEventFrame[] | null } & (
+  | { scope: "runs" }
+  | { scope: "task"; runId: string; taskId: string }
+);
+
+function isRunsWatchEvent(type: string): boolean {
+  return (
+    type.startsWith("run.") ||
+    type.startsWith("task.") ||
+    type.startsWith("quota.") ||
+    type.startsWith("escalation.") ||
+    type === "agent.rollover"
+  );
+}
+
 /**
  * `harnessd`: persistent headless daemon owning SQLite state, running agents,
  * worktree GC, model catalog + quota sync, and optional raw PTY shells.
@@ -55,6 +72,7 @@ export class HarnessDaemon {
   private tuiSockets = new Set<Socket>();
   private takenOverSockets = new WeakSet<Socket>();
   private ptyDetachFns = new Map<Socket, Map<string, () => void>>();
+  private watches = new Map<Socket, Map<string, ClientWatch>>();
   private unsubEvents: (() => void) | null = null;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
   private idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
@@ -167,6 +185,7 @@ export class HarnessDaemon {
     this.socketToChatId.clear();
     this.chatSubscribers.clear();
     this.tuiSockets.clear();
+    this.watches.clear();
     if (this.server) {
       await new Promise<void>((resolve) => this.server!.close(() => resolve()));
       this.server = null;
@@ -216,6 +235,58 @@ export class HarnessDaemon {
         }
       }
     }
+    for (const [sock, map] of this.watches) {
+      for (const w of map.values()) {
+        if (ev.seq <= w.lastSeq) continue;
+        if (w.scope === "runs" ? !isRunsWatchEvent(ev.type) : ev.runId !== w.runId || ev.taskId !== w.taskId) continue;
+        w.lastSeq = ev.seq;
+        const watchFrame: DaemonEventFrame = { ...frame, watchId: w.id };
+        if (w.buffer) w.buffer.push(watchFrame);
+        else writeNdjson(sock, watchFrame);
+      }
+    }
+  }
+
+  private startWatch(socket: Socket, p: Record<string, unknown>): unknown {
+    const id = `watch-${randomBytes(4).toString("hex")}`;
+    let watch: ClientWatch;
+    let result: Record<string, unknown>;
+    if (p.scope === "runs") {
+      const lastSeq = this.db.getLatestEventSeq();
+      watch = { id, scope: "runs", lastSeq, buffer: [] };
+      result = { watchId: id, replay: [], lastSeq };
+    } else if (p.scope === "task") {
+      const runId = String(p.runId);
+      const taskId = String(p.taskId);
+      const sinceSeq = typeof p.sinceSeq === "number" ? p.sinceSeq : 0;
+      const replay = this.db.getAllEventsSince(runId, sinceSeq, taskId);
+      const lastSeq = replay.length ? replay[replay.length - 1]!.seq : sinceSeq;
+      watch = { id, scope: "task", runId, taskId, lastSeq, buffer: [] };
+      result = {
+        watchId: id,
+        replay,
+        lastSeq,
+        run: this.db.getRun(runId) ?? undefined,
+        task: this.db.getTask(taskId) ?? undefined,
+      };
+    } else {
+      throw new Error(`Unknown watch scope: ${String(p.scope)}`);
+    }
+    let map = this.watches.get(socket);
+    if (!map) {
+      map = new Map();
+      this.watches.set(socket, map);
+    }
+    map.set(id, watch);
+    // Live events emitted before the RPC response is written are buffered, then flushed after it,
+    // so the client always sees the replay first and every live frame exactly once.
+    setImmediate(() => {
+      const buffered = watch.buffer ?? [];
+      watch.buffer = null;
+      if (this.watches.get(socket)?.get(id) !== watch) return;
+      for (const f of buffered) writeNdjson(socket, f);
+    });
+    return result;
   }
 
   private cancelIdleShutdown(): void {
@@ -384,6 +455,7 @@ export class HarnessDaemon {
     const wasTakenOver = this.takenOverSockets.has(socket);
     this.unbindSocketSession(socket);
     this.chatSubscribers.delete(socket);
+    this.watches.delete(socket);
     const ptyMap = this.ptyDetachFns.get(socket);
     if (ptyMap) {
       for (const fn of ptyMap.values()) fn();
@@ -793,7 +865,7 @@ export class HarnessDaemon {
         const taskId = typeof p.taskId === "string" ? p.taskId : null;
         const sinceSeq = typeof p.sinceSeq === "number" ? p.sinceSeq : 0;
         const { tookOver } = this.bindRunSocket(socket, runId, taskId);
-        const replay = this.db.getEventsSince(runId, sinceSeq, taskId, 500);
+        const replay = this.db.getAllEventsSince(runId, sinceSeq, taskId);
         return {
           attached: true,
           tookOver,
@@ -818,6 +890,31 @@ export class HarnessDaemon {
           worktrees: this.db.listWorktrees(runId),
           quotaPause: this.orchestrator.getRunQuotaStatus(runId),
         };
+      }
+
+      case "runs.trees": {
+        const runs = Array.isArray(p.runIds)
+          ? (p.runIds as unknown[]).map((id) => this.db.getRun(String(id))).filter((r) => r !== null)
+          : this.db.listRuns(typeof p.limit === "number" ? p.limit : 50);
+        return {
+          generatedAt: Date.now(),
+          runs: runs.map((run) => ({
+            run,
+            tasks: this.db.listTasks(run.id),
+            escalations: this.db.listEscalations(run.id, "open"),
+            quotaPause: this.orchestrator.getRunQuotaStatus(run.id),
+          })),
+        };
+      }
+
+      case "watch.start":
+        return this.startWatch(socket, p);
+
+      case "watch.stop": {
+        const map = this.watches.get(socket);
+        const stopped = map?.delete(String(p.watchId)) ?? false;
+        if (map && map.size === 0) this.watches.delete(socket);
+        return { stopped };
       }
 
       case "task.steer":

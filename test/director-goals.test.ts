@@ -46,7 +46,7 @@ describe("Tier 0 Director, Run-Until-Done Goal Engine, Independent Done-Review &
             }
 
             // Independent Done-Reviewer
-            if (req.taskId.startsWith("reviewer-")) {
+            if (req.kind === "verify") {
               reviewCalls++;
               if (reviewCalls === 1) {
                 // Attempt premature approval WITHOUT satisfying required c2 -> mechanical guard MUST reject!
