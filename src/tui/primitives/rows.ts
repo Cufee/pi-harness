@@ -31,15 +31,14 @@ export function secondary(theme: HarnessTheme, text: string): string {
   return theme.muted(text);
 }
 
-/** `<glyph> <bold title>  <secondary detail>` fitted to one physical row. */
-export function titleRow(
-  theme: HarnessTheme,
-  opts: { glyph: string; title: string; detail?: string; indent?: number },
-  width: number,
-): string {
-  const lead = " ".repeat(opts.indent ?? 2);
-  const detail = opts.detail ? `  ${secondary(theme, opts.detail)}` : "";
-  return fitWidth(`${lead}${opts.glyph} ${theme.bold(opts.title)}${detail}`, width);
+type RowTitle = { glyph: string; title: string; detail?: string };
+
+export function titleText(theme: HarnessTheme, { glyph, title, detail }: RowTitle): string {
+  return `${glyph} ${theme.bold(title)}${detail ? `  ${secondary(theme, detail)}` : ""}`;
+}
+
+export function titleRow(theme: HarnessTheme, opts: RowTitle & { indent?: number }, width: number): string {
+  return fitWidth(`${" ".repeat(opts.indent ?? 2)}${titleText(theme, opts)}`, width);
 }
 
 /** Collapses untrusted multi-line text (control sequences and newlines) into one trimmed line. */

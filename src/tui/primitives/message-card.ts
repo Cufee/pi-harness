@@ -2,7 +2,7 @@ import { Markdown, wrapTextWithAnsi, type Component } from "@earendil-works/pi-t
 import type { ChatControlEvent } from "../../protocol/chat-events.js";
 import type { FormattedAgentError } from "./error-format.js";
 import type { HarnessTheme } from "./theme.js";
-import { flattenText, secondary, SPACER, statusGlyph, titleRow, type RowStatus } from "./rows.js";
+import { flattenText, secondary, SPACER, statusGlyph, titleRow, titleText, type RowStatus } from "./rows.js";
 import { clampLine, fillLineBg, fitWidth } from "./width.js";
 
 /** Immutable compact session header rendered once at the top of scrollback. */
@@ -238,10 +238,6 @@ export class ErrorCard implements Component {
   }
 }
 
-/**
- * Distinct typed control-plane Event card rendered differently from conversational chat turns.
- * Switches strictly on `event.kind` — never parses string prefixes like `[Event]`.
- */
 export class GoalNotice implements Component {
   constructor(private readonly theme: HarnessTheme, private readonly text: string) {}
 
@@ -252,6 +248,7 @@ export class GoalNotice implements Component {
   }
 }
 
+/** Typed control-plane event in the chat transcript. */
 export class EventCard implements Component {
   private cachedWidth = -1;
   private cachedLines: readonly string[] = [];
@@ -277,7 +274,7 @@ export class EventCard implements Component {
     if (event.kind === "goal.reviewed" && event.status === "achieved" && !event.circuitBreakerTripped) {
       return new GoalNotice(this.theme, `${event.goalId} achieved`).render(width);
     }
-    const { icon, badge, headline, detail, tone } = this.describe();
+    const { icon, status, badge, headline, detail, tone } = this.describe(event);
     const paint =
       tone === "success"
         ? this.theme.success
@@ -287,7 +284,7 @@ export class EventCard implements Component {
             ? this.theme.warning
             : this.theme.info;
     const gutter = paint("┃");
-    const tag = `${paint(icon)} ${paint(this.theme.bold(badge))}`;
+    const tag = paint(titleText(this.theme, { glyph: status ? statusGlyph(this.theme, status) : paint(icon), title: badge }));
     const inner = Math.max(1, width - 4);
     const out: string[] = [SPACER];
 
@@ -307,35 +304,28 @@ export class EventCard implements Component {
     return out;
   }
 
-  private describe(): {
+  private describe(ev: Exclude<ChatControlEvent, { kind: "goal.committed" }>): {
     icon: string;
+    status?: RowStatus;
     badge: string;
     headline: string;
     detail?: string;
     tone: "info" | "success" | "warning" | "error";
   } {
-    const ev = this.event;
     switch (ev.kind) {
       case "goal.settled": {
         const tone = ev.runStatus === "completed" ? "success" : ev.runStatus === "failed" ? "error" : "warning";
-        const icon = ev.runStatus === "completed" ? "✓" : ev.runStatus === "failed" ? "✗" : "■";
+        const status = ev.runStatus === "completed" ? "ok" : ev.runStatus === "failed" ? "error" : undefined;
         const badge = ev.runStatus === "completed" ? "EVENT · GOAL RUN COMPLETED" : `EVENT · GOAL RUN ${ev.runStatus.toUpperCase()}`;
         const escNote = ev.openEscalations > 0 ? ` · ${ev.openEscalations} open escalation(s)` : "";
         return {
-          icon,
+          icon: "■",
+          status,
           badge,
           headline: `${this.theme.bold(`${ev.goalId} v${ev.goalVersion}`)} "${ev.goalTitle}" ${this.theme.dim(`(${ev.runId}${escNote})`)}`,
           tone,
         };
       }
-      case "goal.committed":
-        return {
-          icon: "▶",
-          badge: "EVENT · GOAL STARTED",
-          headline: `${this.theme.bold(`${ev.goalId} v${ev.goalVersion}`)} "${ev.goalTitle}"`,
-          detail: `Autonomous run ${ev.runId} · ${ev.criteriaCount} criteria`,
-          tone: "info",
-        };
       case "goal.amended":
         return {
           icon: "↻",

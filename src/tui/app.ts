@@ -1438,11 +1438,16 @@ export async function runDirectorChatTui(opts: {
     } else if (ev.type === "goal.progress") {
       void refreshGoals();
     } else if (ev.type === "goal.reviewed") {
-      const p = ev.payload as { goalId: string; version: number; cycle: number; verdict: string; status: string; summary: string };
-      appendSystem(
-        [`[${p.goalId} v${p.version}] Review #${p.cycle}: ${p.verdict.toUpperCase()} (${p.status}) — ${p.summary}`],
-        p.verdict === "approved" ? "success" : "warning",
-      );
+      const p = ev.payload as { goalId: string; version: number; cycle: number; verdict: string; status: string; summary: string; circuitBreakerTripped?: string };
+      if (p.status === "achieved" && !p.circuitBreakerTripped) {
+        chatContainer.addChild(new GoalNotice(theme, `${p.goalId} achieved`));
+        tui.requestRender();
+      } else {
+        appendSystem(
+          [`[${p.goalId} v${p.version}] Review #${p.cycle}: ${p.verdict.toUpperCase()} (${p.status}) — ${p.summary}`],
+          "warning",
+        );
+      }
       void refreshGoals();
     } else if (ev.type === "goal.amended") {
       const p = ev.payload as { goalId: string; delta: { fromVersion: number; toVersion: number; rationale: string } };

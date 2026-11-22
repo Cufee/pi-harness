@@ -1,3 +1,4 @@
+import { titleText } from "../primitives/rows.js";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { HarnessTheme } from "../primitives/theme.js";
 import { clampLine, fillLineBg, fitWidth } from "../primitives/width.js";
@@ -34,7 +35,7 @@ export function renderRunActivity(display: ToolDisplayPayload, width: number, th
   const innerW = Math.max(1, width - 2);
   const row = (content: string) => out.push(clampLine(`${rail}${truncateToWidth(content, innerW, "…")}`, width));
 
-  const headerTag = `${theme.accent("◆")} ${theme.bold(runId)}  ${statusPaint(phase, theme)(`● ${phase}`)}`;
+  const headerTag = `${titleText(theme, { glyph: theme.accent("◆"), title: runId })}  ${statusPaint(phase, theme)(`● ${phase}`)}`;
   const topLabel = ` ${headerTag} `;
   const topFill = Math.max(0, width - 2 - visibleWidth(topLabel));
   out.push(clampLine(`${theme.border("╭─")}${topLabel}${theme.border("─".repeat(topFill))}`, width));
