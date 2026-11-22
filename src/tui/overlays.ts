@@ -229,7 +229,8 @@ export class CommandPaletteOverlay implements Component, Focusable {
 }
 
 /**
- * Interactive Searchable Tabular Model & ACP Route Picker (`/model` or `/models`):
+ * Interactive Searchable Tabular Model & ACP Route Picker (`/model`):
+ * - Per-CLI default rows at the top pick an ACP CLI without pinning a model (the CLI uses its own default)
  * - Live fuzzy filter (type model name OR CLI like `codex`, `claude`, `amp` — auto-selects matching route!)
  * - `Tab` (or `←`/`→`) cycles the ACP CLI route when a model is offered by multiple CLIs
  * - Crisp aligned columns: RANK, MODEL, SCORE, COST/TASK, TIME, CLI / QUOTA
@@ -240,6 +241,7 @@ export class ModelPickerOverlay implements Component, Focusable {
   private input: Input;
   private selected = 0;
   private filtered: CompiledModelEntry[] = [];
+  private filteredClis: RunnerProfileConfig[] = [];
   private routeIdxByModel = new Map<string, number>();
   private statusNote = "";
   private syncing = false;
@@ -255,15 +257,23 @@ export class ModelPickerOverlay implements Component, Focusable {
     private readonly onSelectModel: (entry: CompiledModelEntry, route: ModelRoute) => void,
     private readonly onClose: () => void,
     private readonly rerender: () => void,
+    private readonly cliDefaults?: {
+      profiles: RunnerProfileConfig[];
+      probeStatuses?: ProfileProbeStatus[];
+      onSelect: (profileId: string) => void;
+    },
   ) {
     this.input = new Input();
     this.input.focused = true;
     this.applyFilter();
+    const curCli = this.currentModel ? -1 : this.filteredClis.findIndex((p) => p.id === this.currentProfileId);
     const curIdx = this.filtered.findIndex(
       (m) => this.currentModel && (m.id === this.currentModel || this.allRoutes(m).some((r) => r.wireModelId === this.currentModel)),
     );
-    if (curIdx >= 0) {
-      this.selected = curIdx;
+    if (curCli >= 0) {
+      this.selected = curCli;
+    } else if (curIdx >= 0) {
+      this.selected = this.filteredClis.length + curIdx;
       const m = this.filtered[curIdx]!;
       const routes = this.allRoutes(m);
       const rIdx = routes.findIndex((r) => r.profileId === this.currentProfileId);
@@ -290,8 +300,20 @@ export class ModelPickerOverlay implements Component, Focusable {
     return { route: all[idx]!, idx, all };
   }
 
+  private get rowCount(): number {
+    return this.filteredClis.length + this.filtered.length;
+  }
+
+  private selectedCli(): RunnerProfileConfig | undefined {
+    return this.filteredClis[this.selected];
+  }
+
+  private selectedModel(): CompiledModelEntry | undefined {
+    return this.filtered[this.selected - this.filteredClis.length];
+  }
+
   private cycleRoute(delta: number): void {
-    const cur = this.filtered[this.selected];
+    const cur = this.selectedModel();
     if (!cur) return;
     const all = this.allRoutes(cur);
     if (all.length <= 1) return;
@@ -303,6 +325,8 @@ export class ModelPickerOverlay implements Component, Focusable {
 
   private applyFilter(): void {
     const q = this.input.getValue().trim().toLowerCase();
+    const clis = (this.cliDefaults?.profiles ?? []).filter((p) => p.enabled !== false);
+    this.filteredClis = !q ? clis : clis.filter((p) => `${p.id} cli default`.toLowerCase().includes(q));
     this.filtered = !q
       ? [...this.catalog.models]
       : this.catalog.models.filter(
@@ -321,7 +345,7 @@ export class ModelPickerOverlay implements Component, Focusable {
         }
       }
     }
-    this.selected = Math.min(this.selected, Math.max(0, this.filtered.length - 1));
+    this.selected = Math.min(this.selected, Math.max(0, this.rowCount - 1));
   }
 
   private triggerSync(): void {
@@ -382,13 +406,16 @@ export class ModelPickerOverlay implements Component, Focusable {
       return;
     }
     if (matchesKey(data, "down") || matchesKey(data, "ctrl+n")) {
-      this.selected = Math.min(Math.max(0, this.filtered.length - 1), this.selected + 1);
+      this.selected = Math.min(Math.max(0, this.rowCount - 1), this.selected + 1);
       this.rerender();
       return;
     }
     if (matchesKey(data, "enter")) {
-      const chosen = this.filtered[this.selected];
-      if (chosen) {
+      const cli = this.selectedCli();
+      const chosen = this.selectedModel();
+      if (cli) {
+        this.cliDefaults?.onSelect(cli.id);
+      } else if (chosen) {
         const { route } = this.activeRoute(chosen);
         this.onSelectModel(chosen, route);
       }
@@ -418,14 +445,14 @@ export class ModelPickerOverlay implements Component, Focusable {
     }
     out.push(this.theme.border("─".repeat(width)));
 
-    if (this.filtered.length === 0) {
+    if (this.rowCount === 0) {
       out.push(fitWidth(this.theme.muted("  No models match. Press Ctrl+R to sync benchmarks or check /settings."), width));
       return out;
     }
 
     const maxRows = 10;
-    const start = Math.max(0, Math.min(this.selected - Math.floor(maxRows / 2), this.filtered.length - maxRows));
-    const slice = this.filtered.slice(start, start + maxRows);
+    const start = Math.max(0, Math.min(this.selected - Math.floor(maxRows / 2), this.rowCount - maxRows));
+    const end = Math.min(this.rowCount, start + maxRows);
 
     // Responsive column widths
     const showRoute = width >= 86;
@@ -451,10 +478,21 @@ export class ModelPickerOverlay implements Component, Focusable {
     out.push(clampLine(hdrParts.join("  ").replace(/^  \s{2}/, "  "), width));
     out.push(this.theme.border("─".repeat(width)));
 
-    for (let i = 0; i < slice.length; i++) {
-      const idx = start + i;
-      const m = slice[i]!;
+    const statusById = new Map((this.cliDefaults?.probeStatuses ?? []).map((st) => [st.profileId, st]));
+    for (let idx = start; idx < end; idx++) {
       const active = idx === this.selected;
+      const cli = this.filteredClis[idx];
+      if (cli) {
+        const isCurrent = !this.currentModel && cli.id === this.currentProfileId;
+        const marker = active ? this.theme.accentBold("▸ ") : isCurrent ? this.theme.success("★ ") : "  ";
+        const st = statusById.get(cli.id);
+        const stText = !st ? "" : st.status === "ok" ? `  ${this.theme.dim(`${st.modelCount} models`)}` : `  ${this.theme.warning(st.error ?? "probe error")}`;
+        const label = `${active ? this.theme.accentBold(cli.id) : this.theme.text(cli.id)} ${this.theme.muted("· CLI default model")}${stText}`;
+        const row = `${marker}${fitWidth(this.theme.dim("CLI"), rankW)}  ${fitWidth(label, Math.max(1, width - 2 - rankW - 2))}`;
+        out.push(active ? fillLineBg(row, width, this.theme.badgeBg) : clampLine(row, width));
+        continue;
+      }
+      const m = this.filtered[idx - this.filteredClis.length]!;
       const { route, all } = this.activeRoute(m);
       const isCurrent =
         Boolean(this.currentModel) &&
@@ -498,8 +536,19 @@ export class ModelPickerOverlay implements Component, Focusable {
     }
 
     // Inspector strip for currently highlighted model (with live route selector!)
-    const cur = this.filtered[this.selected];
-    if (cur) {
+    const curCli = this.selectedCli();
+    const cur = this.selectedModel();
+    if (curCli) {
+      out.push(this.theme.border("─".repeat(width)));
+      out.push(
+        renderFlexRow(
+          this.theme.muted("Use the CLI's own default model (no model pinned)"),
+          `${this.theme.dim("CLI:")} ${this.theme.accentBold(curCli.id)}`,
+          width,
+          { minGap: 2, priority: "right" },
+        ),
+      );
+    } else if (cur) {
       out.push(this.theme.border("─".repeat(width)));
       const { route, all } = this.activeRoute(cur);
       const efforts = route.supportedEfforts ?? cur.efforts;
@@ -519,96 +568,6 @@ export class ModelPickerOverlay implements Component, Focusable {
     }
 
     return out;
-  }
-}
-
-/**
- * Interactive ACP CLI Quick-Switcher (`/cli`, `/acp`, or `/profile`):
- * Switch your active Director Chat between enabled ACP CLIs (e.g. `acp:codex`, `acp:claude`, `acp:amp`)
- * in a single keypress without digging into `/settings`.
- */
-export class CliPickerOverlay implements Component {
-  private selected = 0;
-  private readonly profiles: RunnerProfileConfig[];
-
-  constructor(
-    private readonly theme: HarnessTheme,
-    profiles: RunnerProfileConfig[],
-    private readonly currentProfileId: string | null,
-    private readonly probeStatuses: ProfileProbeStatus[] | undefined,
-    private readonly onSelectProfile: (profile: RunnerProfileConfig) => void,
-    private readonly onClose: () => void,
-    private readonly rerender: () => void,
-  ) {
-    this.profiles = profiles.filter((p) => p.enabled !== false);
-    const curIdx = this.profiles.findIndex((p) => p.id === currentProfileId);
-    if (curIdx >= 0) this.selected = curIdx;
-  }
-
-  handleInput(data: string): void {
-    if (matchesKey(data, "escape") || data === "q") {
-      this.onClose();
-      return;
-    }
-    if (matchesKey(data, "up") || data === "k") {
-      this.selected = Math.max(0, this.selected - 1);
-      this.rerender();
-    } else if (matchesKey(data, "down") || data === "j") {
-      this.selected = Math.min(Math.max(0, this.profiles.length - 1), this.selected + 1);
-      this.rerender();
-    } else if (matchesKey(data, "enter")) {
-      const chosen = this.profiles[this.selected];
-      this.onClose();
-      if (chosen) this.onSelectProfile(chosen);
-    }
-  }
-
-  invalidate(): void {}
-
-  render(width: number): readonly string[] {
-    if (this.profiles.length === 0) {
-      return [fitWidth(this.theme.muted("No enabled CLIs. Open /settings (Ctrl+,) to add or enable an ACP CLI."), width)];
-    }
-
-    const statusById = new Map((this.probeStatuses ?? []).map((s) => [s.profileId, s]));
-    return renderTable(
-      this.profiles.map((p, idx) => ({ p, idx })),
-      [
-        {
-          header: "ACP CLI",
-          width: 20,
-          priority: 0,
-          render: ({ p, idx }) => {
-            const active = idx === this.selected;
-            const isCur = p.id === this.currentProfileId;
-            const marker = active ? this.theme.accentBold("▸ ") : isCur ? this.theme.success("★ ") : "  ";
-            return `${marker}${active ? this.theme.accentBold(p.id) : this.theme.bold(p.id)}`;
-          },
-        },
-        {
-          header: "STATUS",
-          width: 18,
-          priority: 0,
-          render: ({ p }) => {
-            const st = statusById.get(p.id);
-            if (!st) return this.theme.muted(p.billing);
-            return st.status === "ok"
-              ? badge(`${st.modelCount} models`, "success", this.theme)
-              : badge(st.error ?? "probe error", "warning", this.theme);
-          },
-        },
-        {
-          header: "COMMAND",
-          width: "flex",
-          minWidth: 16,
-          priority: 1,
-          render: ({ p }) =>
-            this.theme.dim(p.kind === "acp" ? `${p.command} ${(p.args ?? []).join(" ")}` : `pi:${p.provider}`),
-        },
-      ],
-      width,
-      this.theme,
-    );
   }
 }
 
@@ -870,7 +829,7 @@ export interface AttachableSession {
 }
 
 /**
- * Interactive Sessions & Attach Switcher (`/attach` or `/sessions`):
+ * Interactive Sessions & Attach Switcher (`/sessions`):
  * Lists all Director Chat sessions and Autonomous Runs across `harnessd`.
  * Pressing Enter moves you over to the selected session, taking it over and detaching any other terminal attached there.
  */
@@ -993,7 +952,10 @@ export class RunsOverlay implements Component {
     private readonly onAction: (action: "inspect" | "stop" | "resume" | "wait", run: RunRecord) => void,
     private readonly onClose: () => void,
     private readonly rerender: () => void,
-  ) {}
+    initialRunId?: string,
+  ) {
+    this.selected = Math.max(0, runs.findIndex((r) => r.id === initialRunId));
+  }
 
   handleInput(data: string): void {
     if (matchesKey(data, "escape") || data === "q") {
@@ -1031,8 +993,11 @@ export class RunsOverlay implements Component {
       return [fitWidth(this.theme.muted("No autonomous runs yet. Launch a Goal in Director Chat or via `pi-harness run`."), width)];
     }
 
+    // Slide a 12-row window so the selected run is always visible.
+    const maxRows = 12;
+    const start = Math.max(0, Math.min(this.selected - Math.floor(maxRows / 2), this.runs.length - maxRows));
     return renderTable(
-      this.runs.slice(0, 12).map((r, i) => ({ r, i })),
+      this.runs.slice(start, start + maxRows).map((r, i) => ({ r, i: start + i })),
       [
         {
           header: "RUN",
@@ -1077,7 +1042,7 @@ export class RunsOverlay implements Component {
 }
 
 /**
- * Interactive Quota Resume / Wait-Duration Picker (`/resume` or `w` in `/runs`):
+ * Interactive Quota Resume / Wait-Duration Picker (`w` in `/runs`):
  * Lets the user either resume immediately (resetting the quota state machine) or
  * choose how long to wait before automatic restart when no Quota Endpoint is configured.
  */
@@ -1457,7 +1422,7 @@ export class GoalsOverlay implements Component {
   }
 }
 
-/** Interactive Agent Tree Switcher (`Ctrl+T` / `/tree`) for attached runs. */
+/** Agent Tree Switcher for the attached run, opened from `/runs` (Enter on the attached run). */
 export class TreeOverlay implements Component {
   private selected = 0;
 

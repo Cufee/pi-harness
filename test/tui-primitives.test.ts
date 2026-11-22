@@ -3,7 +3,9 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { visibleWidth, type Component } from "@earendil-works/pi-tui";
-import { CliPickerOverlay, CommandPaletteOverlay, EffortPickerOverlay, ModelPickerOverlay, RunsOverlay, SessionsOverlay, TreeOverlay } from "../src/tui/overlays.js";
+import type { CompiledModelCatalog } from "../src/catalog/compiler.js";
+import type { RunnerProfileConfig } from "../src/config.js";
+import { CommandPaletteOverlay, EffortPickerOverlay, ModelPickerOverlay, RunsOverlay, SessionsOverlay, TreeOverlay } from "../src/tui/overlays.js";
 import {
   AssistantCard,
   BannerCard,
@@ -195,53 +197,54 @@ describe("TUI Primitives Library", () => {
 
     let selectedId = "";
     let selectedRouteId = "";
+    const catalog: CompiledModelCatalog = {
+      schemaVersion: 4,
+      syncedAt: "2026-11-21T23:55:00Z",
+      sources: ["vals_ai", "models.dev"],
+      models: [
+        {
+          id: "openai/gpt-6.2-astra",
+          family: "openai/gpt-astra",
+          name: "GPT 6.2 Astra",
+          codingRank: 1,
+          codingScore: 63.1,
+          scoreSource: "vals_tb4",
+          benchmarks: { vals_tb4: 63.1 },
+          contextK: 200,
+          costPerTaskUsd: 0,
+          apiEquivCostUsd: 4.69,
+          timePerTaskSeconds: 2040,
+          efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+          preferredRoute: { profileId: "acp:codex", runner: "acp", provider: "openai", wireModelId: "gpt-6.2-astra", billing: "subscription" },
+          alternateRoutes: [{ profileId: "acp:amp", runner: "acp", provider: "openai", wireModelId: "openai/gpt-6.2-astra", billing: "subscription" }],
+          recommendedFor: ["orchestrator", "worker"],
+          quota: null,
+        },
+        {
+          id: "openai/gpt-6.2-sol",
+          family: "openai/gpt-sol",
+          name: "GPT 6.2 Sol",
+          codingRank: 2,
+          codingScore: 60.6,
+          scoreSource: "vals_tb4",
+          benchmarks: { vals_tb4: 60.6 },
+          contextK: 200,
+          costPerTaskUsd: 0,
+          apiEquivCostUsd: 1.13,
+          timePerTaskSeconds: 1380,
+          efforts: ["low", "medium", "high"],
+          preferredRoute: { profileId: "acp:codex", runner: "acp", provider: "openai", wireModelId: "gpt-6.2-sol", billing: "subscription" },
+          alternateRoutes: [{ profileId: "acp:amp", runner: "acp", provider: "openai", wireModelId: "openai/gpt-6.2-sol", billing: "subscription" }],
+          recommendedFor: ["task"],
+          quota: null,
+        },
+      ],
+    };
     const picker = new ModelPickerOverlay(
       theme,
       {} as never,
       "/tmp",
-      {
-        schemaVersion: 4,
-        syncedAt: "2026-11-21T23:55:00Z",
-        sources: ["vals_ai", "models.dev"],
-        models: [
-          {
-            id: "openai/gpt-6.2-astra",
-            family: "openai/gpt-astra",
-            name: "GPT 6.2 Astra",
-            codingRank: 1,
-            codingScore: 63.1,
-            scoreSource: "vals_tb4",
-            benchmarks: { vals_tb4: 63.1 },
-            contextK: 200,
-            costPerTaskUsd: 0,
-            apiEquivCostUsd: 4.69,
-            timePerTaskSeconds: 2040,
-            efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
-            preferredRoute: { profileId: "acp:codex", runner: "acp", provider: "openai", wireModelId: "gpt-6.2-astra", billing: "subscription" },
-            alternateRoutes: [{ profileId: "acp:amp", runner: "acp", provider: "openai", wireModelId: "openai/gpt-6.2-astra", billing: "subscription" }],
-            recommendedFor: ["orchestrator", "worker"],
-            quota: null,
-          },
-          {
-            id: "openai/gpt-6.2-sol",
-            family: "openai/gpt-sol",
-            name: "GPT 6.2 Sol",
-            codingRank: 2,
-            codingScore: 60.6,
-            scoreSource: "vals_tb4",
-            benchmarks: { vals_tb4: 60.6 },
-            contextK: 200,
-            costPerTaskUsd: 0,
-            apiEquivCostUsd: 1.13,
-            timePerTaskSeconds: 1380,
-            efforts: ["low", "medium", "high"],
-            preferredRoute: { profileId: "acp:codex", runner: "acp", provider: "openai", wireModelId: "gpt-6.2-sol", billing: "subscription" },
-            alternateRoutes: [{ profileId: "acp:amp", runner: "acp", provider: "openai", wireModelId: "openai/gpt-6.2-sol", billing: "subscription" }],
-            recommendedFor: ["task"],
-            quota: null,
-          },
-        ],
-      },
+      catalog,
       "openai/gpt-6.2-astra",
       "acp:codex",
       (m, route) => {
@@ -263,24 +266,43 @@ describe("TUI Primitives Library", () => {
     expect(selectedId).toBe("openai/gpt-6.2-sol");
     expect(selectedRouteId).toBe("acp:amp");
 
-    const cliPicker = new CliPickerOverlay(
+    // `/model` per-CLI default rows: choose an ACP CLI without pinning a model.
+    const cliChosen: string[] = [];
+    const cliProfiles = [
+      { id: "acp:codex", kind: "acp", adapter: "codex", command: "npx", args: ["-y", "@agentclientprotocol/codex-acp"], billing: "subscription", enabled: true },
+      { id: "acp:amp", kind: "acp", adapter: "generic", command: "npx", args: ["-y", "amp-acp"], billing: "subscription", enabled: true },
+      { id: "acp:off", kind: "acp", adapter: "generic", command: "npx", args: [], billing: "subscription", enabled: false },
+    ] satisfies RunnerProfileConfig[];
+    const cliPicker = new ModelPickerOverlay(
       theme,
-      [
-        { id: "acp:codex", kind: "acp", adapter: "codex", command: "npx", args: ["-y", "@agentclientprotocol/codex-acp"], billing: "subscription", enabled: true },
-        { id: "acp:amp", kind: "acp", adapter: "generic", command: "npx", args: ["-y", "amp-acp"], billing: "subscription", enabled: true },
-      ],
-      "acp:codex",
-      [
-        { profileId: "acp:codex", status: "ok", modelCount: 10 },
-        { profileId: "acp:amp", status: "ok", modelCount: 47 },
-      ],
+      {} as never,
+      "/tmp",
+      catalog,
+      null,
+      "acp:amp",
+      () => {
+        throw new Error("CLI-default row must not pin a model");
+      },
       () => {},
       () => {},
-      () => {},
+      {
+        profiles: cliProfiles,
+        probeStatuses: [
+          { profileId: "acp:codex", status: "ok", modelCount: 10 },
+          { profileId: "acp:amp", status: "ok", modelCount: 47 },
+        ],
+        onSelect: (id) => cliChosen.push(id),
+      },
     );
     for (const width of [24, 48, 80, 110]) {
-      assertWidthSafe(cliPicker.render(width), width, "CliPickerOverlay");
+      assertWidthSafe(cliPicker.render(width), width, "ModelPickerOverlay CLI defaults");
     }
+    const cliRendered = cliPicker.render(110).join("\n");
+    expect(cliRendered).toContain("CLI default model");
+    expect(cliRendered).not.toContain("acp:off");
+    // With no pinned model, the active CLI's default row starts selected.
+    cliPicker.handleInput("\r");
+    expect(cliChosen).toEqual(["acp:amp"]);
 
     const runs = new RunsOverlay(
       theme,
@@ -305,6 +327,25 @@ describe("TUI Primitives Library", () => {
     for (const width of [24, 48, 80, 110]) {
       assertWidthSafe(runs.render(width), width, "RunsOverlay");
     }
+
+    // A preselected run beyond the first page must be visible, since x stops the selected run.
+    const manyRuns = Array.from({ length: 20 }, (_, i) => ({
+      id: `run-${i + 1}`,
+      goal: `Goal ${i + 1}`,
+      repoRoot: "/tmp/demo",
+      baseBranch: "main",
+      baseSha: "abc1234",
+      coordinationGroup: "default",
+      isolationMode: "standalone" as const,
+      status: "active" as const,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }));
+    const stopped: string[] = [];
+    const paged = new RunsOverlay(theme, manyRuns, (action, r) => action === "stop" && stopped.push(r.id), () => {}, () => {}, "run-15");
+    expect(paged.render(110).find((l) => l.includes("▸"))).toContain("run-15");
+    paged.handleInput("x");
+    expect(stopped).toEqual(["run-15"]);
 
     const effort = new EffortPickerOverlay(theme, ["low", "medium", "high", "ultra"], "medium", () => {}, () => {}, () => {});
     for (const width of [24, 48, 80, 110]) {
