@@ -3,6 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Database } from "bun:sqlite";
+import type { GoalsConfig } from "../config.js";
 import { runGit } from "../worktree/manager.js";
 
 function canonicalRepoPath(p: string): string {
@@ -13,7 +14,12 @@ function canonicalRepoPath(p: string): string {
   }
 }
 
-async function runGate(command: string, cwd: string, signal?: AbortSignal): Promise<{ stdout: string; stderr: string }> {
+async function runGate(
+  command: string,
+  cwd: string,
+  signal?: AbortSignal,
+  timeoutMs = 180_000,
+): Promise<{ stdout: string; stderr: string }> {
   signal?.throwIfAborted();
   const child = spawn("/bin/sh", ["-lc", command], { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
   const stdout: Buffer[] = [];
@@ -29,7 +35,7 @@ async function runGate(command: string, cwd: string, signal?: AbortSignal): Prom
     }
   };
   const abort = () => stop(new Error("Verification gate cancelled"));
-  const timeout = setTimeout(() => stop(new Error("Verification gate timed out")), 180_000);
+  const timeout = setTimeout(() => stop(new Error("Verification gate timed out")), timeoutMs);
   signal?.addEventListener("abort", abort, { once: true });
   const collect = (stream: NodeJS.ReadableStream, chunks: Buffer[]) => {
     let bytes = 0;
@@ -68,6 +74,16 @@ export type GoalStatus =
 
 export type CriterionKind = "deterministic" | "behavioral" | "architectural";
 
+/**
+ * Agent-selected verification depth for a Goal:
+ * - `"auto"` (default): runs deterministic checks; spawns an independent LLM reviewer only if required
+ *   `behavioral` or `architectural` criteria exist.
+ * - `"none"`: skips automated gates and independent LLM review (agent decides no separate review pass is needed).
+ * - `"deterministic"`: runs deterministic shell checks only ($0 LLM cost) and approves immediately on pass.
+ * - `"independent_review"`: always runs deterministic gates followed by an independent read-only LLM Done-Reviewer.
+ */
+export type VerificationMode = "auto" | "none" | "deterministic" | "independent_review";
+
 export interface GoalCriterion {
   id: string;
   description: string;
@@ -94,6 +110,7 @@ export interface GoalRecord {
   criteria: GoalCriterion[];
   nonGoals: string[];
   budgets: GoalBudgets;
+  verificationMode?: VerificationMode;
   status: GoalStatus;
   linkedRunId: string | null;
   reviewCycle: number;
@@ -152,6 +169,7 @@ CREATE TABLE IF NOT EXISTS goals (
   criteria_json TEXT NOT NULL,
   non_goals_json TEXT NOT NULL DEFAULT '[]',
   budgets_json TEXT NOT NULL,
+  verification_mode TEXT NOT NULL DEFAULT 'auto',
   status TEXT NOT NULL DEFAULT 'draft',
   linked_run_id TEXT,
   review_cycle INTEGER NOT NULL DEFAULT 0,
@@ -206,12 +224,44 @@ function reviewId(): string {
  * - Strict mechanical validation of Independent Skeptical Done-Review verdicts (blocks premature approval!)
  * - Anti-spin circuit breakers (`maxReviewCycles` + `noProgressStreak` diff-hash/failure fingerprint)
  */
+export function shouldRunIndependentReview(goal: GoalRecord, overrideMode?: VerificationMode): boolean {
+  const mode: VerificationMode = overrideMode ?? goal.verificationMode ?? "auto";
+  if (mode === "none" || mode === "deterministic") return false;
+  if (mode === "independent_review") return true;
+  // Auto: only burn an independent LLM review when required behavioral/architectural criteria exist.
+  return goal.criteria.some((c) => c.required && c.kind !== "deterministic");
+}
+
 export class GoalEngine {
-  constructor(private readonly db: Database, private readonly onReviewInvalidated?: (goalId: string) => void) {
+  private readonly cfg: GoalsConfig;
+
+  constructor(
+    private readonly db: Database,
+    private readonly onReviewInvalidated?: (goalId: string) => void,
+    config?: Partial<GoalsConfig>,
+  ) {
+    this.cfg = {
+      defaultMaxReviewCycles: config?.defaultMaxReviewCycles ?? 4,
+      defaultMaxNoProgressCycles: config?.defaultMaxNoProgressCycles ?? 2,
+      gateTimeoutMs: config?.gateTimeoutMs ?? 180_000,
+    };
     this.db.exec(GOALS_SCHEMA);
+    this.migrateGoals();
+  }
+
+  private migrateGoals(): void {
+    const cols = new Set(
+      (this.db.prepare("PRAGMA table_info(goals)").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    if (!cols.has("verification_mode")) {
+      this.db.exec("ALTER TABLE goals ADD COLUMN verification_mode TEXT NOT NULL DEFAULT 'auto'");
+    }
   }
 
   private mapGoal(r: Record<string, unknown>): GoalRecord {
+    const rawMode = typeof r.verification_mode === "string" ? r.verification_mode : "auto";
+    const verificationMode: VerificationMode =
+      rawMode === "none" || rawMode === "deterministic" || rawMode === "independent_review" ? rawMode : "auto";
     return {
       id: String(r.id),
       chatSessionId: r.chat_session_id ? String(r.chat_session_id) : null,
@@ -222,6 +272,7 @@ export class GoalEngine {
       criteria: JSON.parse(String(r.criteria_json)) as GoalCriterion[],
       nonGoals: JSON.parse(String(r.non_goals_json)) as string[],
       budgets: JSON.parse(String(r.budgets_json)) as GoalBudgets,
+      verificationMode,
       status: String(r.status) as GoalStatus,
       linkedRunId: r.linked_run_id ? String(r.linked_run_id) : null,
       reviewCycle: Number(r.review_cycle),
@@ -241,9 +292,13 @@ export class GoalEngine {
     criteria: Array<Omit<GoalCriterion, "id" | "required"> & { id?: string; required?: boolean }>;
     nonGoals?: string[];
     budgets?: Partial<GoalBudgets>;
+    verificationMode?: VerificationMode;
   }): GoalRecord {
     if (!input.title.trim()) throw new Error("Goal title is required");
-    if (input.criteria.length === 0) throw new Error("Goal requires at least one acceptance criterion");
+    const verificationMode: VerificationMode = input.verificationMode ?? "auto";
+    if (input.criteria.length === 0 && verificationMode !== "none") {
+      throw new Error("Goal requires at least one acceptance criterion unless verificationMode is 'none'");
+    }
 
     const id = goalId();
     const now = Date.now();
@@ -256,8 +311,8 @@ export class GoalEngine {
     }));
     const nonGoals = input.nonGoals ?? [];
     const budgets: GoalBudgets = {
-      maxReviewCycles: input.budgets?.maxReviewCycles ?? 4,
-      maxNoProgressCycles: input.budgets?.maxNoProgressCycles ?? 2,
+      maxReviewCycles: input.budgets?.maxReviewCycles ?? this.cfg.defaultMaxReviewCycles,
+      maxNoProgressCycles: input.budgets?.maxNoProgressCycles ?? this.cfg.defaultMaxNoProgressCycles,
       maxWallClockMin: input.budgets?.maxWallClockMin,
       maxApiEquivUsd: input.budgets?.maxApiEquivUsd,
     };
@@ -266,8 +321,8 @@ export class GoalEngine {
       .prepare(
         `INSERT INTO goals(
           id, chat_session_id, repo_root, version, title, description,
-          criteria_json, non_goals_json, budgets_json, status, created_at, updated_at
-        ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 'draft', ?, ?)`,
+          criteria_json, non_goals_json, budgets_json, verification_mode, status, created_at, updated_at
+        ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)`,
       )
       .run(
         id,
@@ -278,6 +333,7 @@ export class GoalEngine {
         JSON.stringify(criteria),
         JSON.stringify(nonGoals),
         JSON.stringify(budgets),
+        verificationMode,
         now,
         now,
       );
@@ -453,7 +509,7 @@ export class GoalEngine {
     for (const c of goal.criteria) {
       if (c.kind !== "deterministic" || !c.command) continue;
       try {
-        const { stdout, stderr } = await runGate(c.command, goal.repoRoot, signal);
+        const { stdout, stderr } = await runGate(c.command, goal.repoRoot, signal, this.cfg.gateTimeoutMs);
         results.push({
           criterionId: c.id,
           passed: true,

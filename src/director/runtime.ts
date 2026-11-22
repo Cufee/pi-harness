@@ -12,10 +12,12 @@ import type { ControlPlaneDb } from "../control-plane/db.js";
 import type { CustomRunnerFactory, HarnessOrchestrator } from "../control-plane/orchestrator.js";
 import {
   GoalEngine,
+  shouldRunIndependentReview,
   type CriterionEvaluation,
   type GoalCriterion,
   type GoalRecord,
   type GoalReviewVerdict,
+  type VerificationMode,
 } from "../goals/engine.js";
 import { buildGoalDetailDisplay, buildGoalsTableDisplay, codeExecEventSink, summarizeToolDisplay, type ToolDisplayPayload } from "../protocol/tool-display.js";
 import type { QuotaClient } from "../quota/client.js";
@@ -52,6 +54,12 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
         },
         non_goals: { type: "array", items: { type: "string" } },
         max_review_cycles: { type: "number" },
+        verification_mode: {
+          type: "string",
+          enum: ["auto", "none", "deterministic", "independent_review"],
+          description:
+            "Verification depth chosen by the agent based on risk (default 'auto': runs deterministic checks and only spawns an independent LLM reviewer if required behavioral/architectural criteria exist).",
+        },
         commit_immediately: { type: "boolean", description: "Start autonomous Tier 1 execution with the selected model" },
         model: { type: "string", minLength: 1, description: "Required for immediate commit. Select from list_models." },
         profile_id: { type: "string" },
@@ -109,11 +117,16 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   },
   {
     name: "goal_trigger_review",
-    description: "Run deterministic verification gates followed by an Independent Skeptical Done-Review on a Goal.",
+    description:
+      "Verify and settle a Goal at the chosen verification depth (defaults to the Goal's verification_mode: 'auto' runs deterministic checks and only spawns an independent LLM reviewer when required behavioral/architectural criteria exist; 'deterministic' runs checks only; 'none' approves directly).",
     inputSchema: {
       type: "object",
       required: ["goal_id"],
-      properties: { goal_id: { type: "string" } },
+      properties: {
+        goal_id: { type: "string" },
+        verification_mode: { type: "string", enum: ["auto", "none", "deterministic", "independent_review"] },
+        summary: { type: "string", description: "Optional concise completion summary when verification_mode is 'none'." },
+      },
     },
   },
   {
@@ -221,7 +234,11 @@ export class DirectorRuntime {
     private readonly customRunnerFactory?: CustomRunnerFactory,
   ) {
     this.chats = new DirectorSessionStore(db.db);
-    this.goals = new GoalEngine(db.db, (id) => this.activeReviews.get(id)?.abort(new Error("Goal changed during review")));
+    this.goals = new GoalEngine(
+      db.db,
+      (id) => this.activeReviews.get(id)?.abort(new Error("Goal changed during review")),
+      config.goals,
+    );
   }
 
   updateConfig(next: HarnessConfig, catalog = this.orchestrator.catalog, quota = this.orchestrator.quota): void {
@@ -339,7 +356,11 @@ export class DirectorRuntime {
    * Executes the full deterministic Verification Gates -> Independent Skeptical Done-Review pipeline.
    * Never lets the generator self-approve: invokes a fresh read-only Reviewer session (or fails fast at $0 LLM cost on deterministic gates).
    */
-  async verifyAndReviewGoal(goalId: string, signal?: AbortSignal): Promise<{
+  async verifyAndReviewGoal(
+    goalId: string,
+    signal?: AbortSignal,
+    opts?: { verificationMode?: VerificationMode; summary?: string },
+  ): Promise<{
     goal: GoalRecord;
     review: GoalReviewVerdict;
     circuitBreakerTripped?: string;
@@ -356,7 +377,7 @@ export class DirectorRuntime {
       if ((ev.payload as { status: string }).status === "stopped") abort.abort(new Error("Run stopped during review"));
     });
     try {
-      return await this.verifyAndReviewGoalInner(goal, reviewSignal);
+      return await this.verifyAndReviewGoalInner(goal, reviewSignal, opts);
     } catch (error) {
       const current = this.goals.getGoal(goalId);
       if (current?.version === goal.version && (current.status === "verifying" || current.status === "reviewing")) {
@@ -369,7 +390,11 @@ export class DirectorRuntime {
     }
   }
 
-  private async verifyAndReviewGoalInner(goal: GoalRecord, signal: AbortSignal): Promise<{
+  private async verifyAndReviewGoalInner(
+    goal: GoalRecord,
+    signal: AbortSignal,
+    opts?: { verificationMode?: VerificationMode; summary?: string },
+  ): Promise<{
     goal: GoalRecord;
     review: GoalReviewVerdict;
     circuitBreakerTripped?: string;
@@ -384,6 +409,25 @@ export class DirectorRuntime {
       }
     };
     assertCurrent();
+
+    const effectiveMode: VerificationMode = opts?.verificationMode ?? goal.verificationMode ?? "auto";
+    if (effectiveMode === "none") {
+      const directResults: CriterionEvaluation[] = goal.criteria.map((c) => ({
+        criterionId: c.id,
+        passed: true,
+        evidence: opts?.summary?.trim() || "Marked complete without separate verification pass (verification_mode=none).",
+      }));
+      const outcome = this.goals.recordReviewVerdict(goal.id, {
+        verdict: "approved",
+        criteriaResults: directResults,
+        blockingIssues: [],
+        summary: opts?.summary?.trim() || "Goal completed directly (verification_mode=none).",
+        diffHash: `direct-${Date.now()}`,
+      });
+      await this.handlePostReviewTransition(outcome);
+      return outcome;
+    }
+
     const gateResult = await this.goals.runDeterministicGates(goal.id, run?.baseSha, signal);
     assertCurrent();
 
@@ -394,6 +438,35 @@ export class DirectorRuntime {
         criteriaResults: gateResult.results,
         blockingIssues: gateResult.results.filter((r) => !r.passed).map((r) => r.evidence),
         summary: "Deterministic verification gates failed; bouncing back to Tier 1 before LLM review.",
+        diffHash: gateResult.diffHash,
+      });
+      await this.handlePostReviewTransition(outcome);
+      return outcome;
+    }
+
+    // Agent-chosen verification depth: when deterministic checks already cover the goal (or mode='deterministic'),
+    // approve cleanly at $0 LLM cost without spawning a redundant independent reviewer session!
+    if (!shouldRunIndependentReview(goal, effectiveMode)) {
+      const coveredIds = new Set(gateResult.results.map((r) => r.criterionId));
+      const allResults: CriterionEvaluation[] = [
+        ...gateResult.results,
+        ...goal.criteria
+          .filter((c) => !coveredIds.has(c.id))
+          .map((c) => ({
+            criterionId: c.id,
+            passed: true,
+            evidence: opts?.summary?.trim() || `Verified without separate LLM review (${effectiveMode}).`,
+          })),
+      ];
+      const outcome = this.goals.recordReviewVerdict(goal.id, {
+        verdict: "approved",
+        criteriaResults: allResults,
+        blockingIssues: [],
+        summary:
+          opts?.summary?.trim() ||
+          (gateResult.results.length > 0
+            ? `All ${gateResult.results.length} deterministic check(s) passed; approved without redundant LLM review.`
+            : "Approved cleanly without redundant LLM review."),
         diffHash: gateResult.diffHash,
       });
       await this.handlePostReviewTransition(outcome);
@@ -457,7 +530,7 @@ export class DirectorRuntime {
       readOnly: true,
       profileId: profile.id,
       model,
-      maxTurns: 12,
+      maxTurns: this.config.rollover.reviewerMaxTurns,
     });
     const abort = new AbortController();
     const reviewerSignal = AbortSignal.any([signal, abort.signal]);
@@ -499,7 +572,7 @@ export class DirectorRuntime {
         systemPrompt:
           "You are an independent read-only Done-Reviewer. Inspect the implementation and verification evidence for each required criterion. Never edit files, run mutating commands, or delegate. Call submit_review_verdict if available, or return the requested JSON verdict with concrete sources for every required criterion.",
         initialPrompt: reviewerPrompt,
-        maxTurns: 12,
+        maxTurns: this.config.rollover.reviewerMaxTurns,
         tools: [submitTool],
         executeTool: async (name, args) => {
           if (name === "submit_review_verdict") {
@@ -679,7 +752,7 @@ export class DirectorRuntime {
       mode: effectiveCodeMode(this.config.codeMode),
       allowedTools: () => DIRECTOR_TOOLS,
       execute: (name, args) => this.executeDirectorTool(session.id, session.repoRoot, name, args, signal),
-      artifactsDir: join(session.repoRoot, ".harness", "artifacts"),
+      artifactsDir: resolve(session.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts"),
       saveOutput: async (name, json) => {
         signal.throwIfAborted();
         const run = await this.orchestrator.ensureDirectorTaskRun(session.id, session.repoRoot);
@@ -717,7 +790,7 @@ export class DirectorRuntime {
     if (this.activeChats.has(chatSessionId)) throw new Error(`Chat ${chatSessionId} already has an active turn`);
     const userTurn = this.chats.appendTurn(chatSessionId, "user", userMessage);
     const history = this.chats.getRecentHistory(chatSessionId, 40);
-    const activeGoals = this.goals.listGoals({ repoRoot: session.repoRoot });
+    const activeGoals = this.goals.listGoals({ repoRoot: session.repoRoot, chatSessionId });
 
     const contextTranscript = history
       .slice(0, -1)
@@ -769,7 +842,7 @@ export class DirectorRuntime {
         initialPrompt: prompt,
         model: wireModel,
         effort: session.effort,
-        maxTurns: 12,
+        maxTurns: this.config.rollover.directorMaxTurns,
         quotaRetryTimeoutMs: this.config.quotaRetry.nativeRetryTimeoutMs,
         tools: executor.tools(),
         executeTool: executor.execute,
@@ -884,6 +957,11 @@ export class DirectorRuntime {
           description: String(args.description),
           criteria,
           nonGoals: Array.isArray(args.non_goals) ? (args.non_goals as string[]) : [],
+          verificationMode:
+            typeof args.verification_mode === "string" &&
+            ["auto", "none", "deterministic", "independent_review"].includes(args.verification_mode)
+              ? (args.verification_mode as VerificationMode)
+              : undefined,
           budgets:
             typeof args.max_review_cycles === "number" ? { maxReviewCycles: args.max_review_cycles } : undefined,
         });
@@ -946,7 +1024,14 @@ export class DirectorRuntime {
       }
 
       case "goal_trigger_review": {
-        const reviewed = await this.verifyAndReviewGoal(String(args.goal_id), signal);
+        const reviewed = await this.verifyAndReviewGoal(String(args.goal_id), signal, {
+          verificationMode:
+            typeof args.verification_mode === "string" &&
+            ["auto", "none", "deterministic", "independent_review"].includes(args.verification_mode)
+              ? (args.verification_mode as VerificationMode)
+              : undefined,
+          summary: typeof args.summary === "string" ? args.summary : undefined,
+        });
         this.emitGoalDetailDisplay(chatSessionId, name, reviewed.goal);
         return { ...reviewed, rendered_in_ui: "Goal detail card shown to the user; do not repeat it." };
       }

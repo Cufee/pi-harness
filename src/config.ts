@@ -50,23 +50,48 @@ export interface QuotaEndpointConfig {
 export interface WorktreeConfig {
   /** Base dir relative to repo root (default `.harness/worktrees`) */
   dir?: string;
+  /** Durable artifact dossier dir relative to repo root (default `.harness/artifacts`) */
+  artifactsDir?: string;
   /** Optional fast bootstrap command run inside newly created worktree */
   setupCommand?: string;
   /** Deterministic CI gate commands run by the bisecting merge queue */
   ciCommands?: string[];
+  /** Per-command CI timeout in ms for the merge queue (default 300_000) */
+  ciTimeoutMs?: number;
+  /** Git author name used for automated merge commits (default `pi-harness`) */
+  gitAuthorName?: string;
+  /** Git author email used for automated merge commits (default `harness@local`) */
+  gitAuthorEmail?: string;
   /** Days to retain safety archive git refs before GC (default 7) */
   archiveRetentionDays?: number;
   /** Max concurrent active Tier 2 worker worktrees (default 4) */
   maxConcurrentWorkers?: number;
 }
 
+export interface GoalsConfig {
+  /** Default max review cycles before escalating to human (default 4) */
+  defaultMaxReviewCycles: number;
+  /** Default max consecutive no-progress review cycles before escalating (default 2) */
+  defaultMaxNoProgressCycles: number;
+  /** Timeout in ms for each deterministic goal verification shell gate (default 180_000) */
+  gateTimeoutMs: number;
+}
+
 export interface RolloverConfig {
-  /** Context ratio triggering Tier 1 Orchestrator clean relay (default 0.60) */
+  /** Context ratio triggering Tier 1 Orchestrator clean relay (default 0.72) */
   orchestratorThreshold: number;
-  /** Context ratio triggering Tier 2 Worker clean worktree rollover (default 0.65) */
+  /** Context ratio triggering Tier 2 Worker clean worktree rollover (default 0.78) */
   workerThreshold: number;
-  /** Hard turn cap for Tier 3 Task Agents (default 20) */
+  /** Hard turn cap for Tier 1 Orchestrators (default 200) */
+  orchestratorMaxTurns: number;
+  /** Hard turn cap for Tier 2 Workers (default 120) */
+  workerMaxTurns: number;
+  /** Hard turn cap for Tier 3 Task Agents (default 40) */
   taskMaxTurns: number;
+  /** Hard turn cap for Tier 0 Director chat turns (default 20) */
+  directorMaxTurns: number;
+  /** Hard turn cap for Goal Done-Review agents (default 12) */
+  reviewerMaxTurns: number;
   /** Tool output byte threshold above which output is externalized to artifact file (default 2048) */
   externalizeBytes: number;
 }
@@ -122,6 +147,7 @@ export interface HarnessConfig {
   defaultTaskProfile?: string;
   rollover: RolloverConfig;
   worktree: WorktreeConfig;
+  goals: GoalsConfig;
   catalog: CatalogConfig;
   quotaRetry: QuotaRetryConfig;
   quotaEndpoint?: QuotaEndpointConfig;
@@ -194,7 +220,11 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
   const rollover: RolloverConfig = {
     orchestratorThreshold: 0.72,
     workerThreshold: 0.78,
+    orchestratorMaxTurns: 200,
+    workerMaxTurns: 120,
     taskMaxTurns: 40,
+    directorMaxTurns: 20,
+    reviewerMaxTurns: 12,
     externalizeBytes: 2048,
     ...(globalCfg.rollover as Partial<RolloverConfig> | undefined),
     ...(repoCfg.rollover as Partial<RolloverConfig> | undefined),
@@ -202,10 +232,22 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
 
   const worktree: WorktreeConfig = {
     dir: ".harness/worktrees",
+    artifactsDir: ".harness/artifacts",
+    ciTimeoutMs: 300_000,
+    gitAuthorName: "pi-harness",
+    gitAuthorEmail: "harness@local",
     archiveRetentionDays: 7,
     maxConcurrentWorkers: 4,
     ...(globalCfg.worktree as Partial<WorktreeConfig> | undefined),
     ...(repoCfg.worktree as Partial<WorktreeConfig> | undefined),
+  };
+
+  const goals: GoalsConfig = {
+    defaultMaxReviewCycles: 4,
+    defaultMaxNoProgressCycles: 2,
+    gateTimeoutMs: 180_000,
+    ...(globalCfg.goals as Partial<GoalsConfig> | undefined),
+    ...(repoCfg.goals as Partial<GoalsConfig> | undefined),
   };
 
   const catalog: CatalogConfig = {
@@ -249,6 +291,7 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
     defaultTaskProfile: merged.defaultTaskProfile ?? profiles.find((p) => p.enabled !== false)?.id,
     rollover,
     worktree,
+    goals,
     catalog,
     quotaRetry,
     quotaEndpoint: merged.quotaEndpoint,

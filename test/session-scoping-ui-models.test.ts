@@ -18,7 +18,7 @@ import { deriveRunStatus } from "../src/control-plane/orchestrator.js";
 import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import { DirectorSessionStore } from "../src/director/session.js";
-import type { GoalRecord } from "../src/goals/engine.js";
+import { GoalEngine, shouldRunIndependentReview, type GoalRecord } from "../src/goals/engine.js";
 import { isSubagentWaitTool } from "../src/tui/app.js";
 import { ModelConfigOverlay, ModelPickerOverlay } from "../src/tui/overlays.js";
 import { effectiveRunStatus } from "../src/tui/runs-tree.js";
@@ -729,6 +729,119 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
       assert.equal(tableRes.display.kind, "goals_table");
     } finally {
       client.close();
+      await daemon.stop();
+      rmSync(repoDir, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("lets agents choose proportional verification depth (none / deterministic / auto / independent_review) without hardcoded review overhead", async () => {
+    // 1. Safe migration of legacy goals table lacking verification_mode
+    const legacyDb = new Database(":memory:");
+    legacyDb.exec(`
+      CREATE TABLE goals (
+        id TEXT PRIMARY KEY,
+        chat_session_id TEXT,
+        repo_root TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        criteria_json TEXT NOT NULL,
+        non_goals_json TEXT NOT NULL DEFAULT '[]',
+        budgets_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'draft',
+        linked_run_id TEXT,
+        review_cycle INTEGER NOT NULL DEFAULT 0,
+        no_progress_streak INTEGER NOT NULL DEFAULT 0,
+        last_progress_fingerprint TEXT,
+        last_review_summary TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      INSERT INTO goals(id, repo_root, title, description, criteria_json, budgets_json, created_at, updated_at)
+      VALUES ('goal-legacy', '/tmp/repo', 'Legacy', 'Desc', '[]', '{"maxReviewCycles":4,"maxNoProgressCycles":2}', 1, 1);
+    `);
+    const migratedGoals = new GoalEngine(legacyDb);
+    assert.equal(migratedGoals.getGoal("goal-legacy")?.verificationMode, "auto");
+    legacyDb.close();
+
+    // 2. End-to-end verification depth selection
+    const repoDir = initTempGitRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-verify-mode-"));
+    const sockPath = join(stateDir, "d.sock");
+    const cfg = loadConfig(repoDir);
+    cfg.stateDir = stateDir;
+    cfg.socketPath = sockPath;
+
+    let reviewerRuns = 0;
+    const daemon = new HarnessDaemon(cfg, {
+      dbPath: join(stateDir, "cp.sqlite"),
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          reviewerRuns += 1;
+          await req.executeTool("submit_review_verdict", {
+            verdict: "approved",
+            criteriaResults: [{ criterionId: "c1", passed: true, evidence: "Checked" }],
+            summary: "Independent review passed",
+          });
+          return { text: "", stopReason: "completed" };
+        },
+      }),
+    });
+    await daemon.start();
+    try {
+      // A. Deterministic-only goal under `auto`: approves at $0 LLM cost without spawning reviewer!
+      const detGoal = daemon.director.goals.createGoal({
+        repoRoot: repoDir,
+        title: "Simple operational update",
+        description: "Run deterministic check only",
+        criteria: [{ id: "c1", kind: "deterministic", description: "Exit 0", command: "true" }],
+      });
+      assert.equal(shouldRunIndependentReview(detGoal), false);
+      const detRes = await daemon.director.verifyAndReviewGoal(detGoal.id);
+      assert.equal(detRes.goal.status, "achieved");
+      assert.equal(detRes.review.verdict, "approved");
+      assert.equal(reviewerRuns, 0, "Deterministic-only goal must NOT spawn redundant LLM reviewer");
+
+      // B. `verificationMode: "none"` allows zero criteria and approves immediately without gates or LLM reviewer!
+      const noneGoal = daemon.director.goals.createGoal({
+        repoRoot: repoDir,
+        title: "Quick trivial chore",
+        description: "No separate verification needed",
+        criteria: [],
+        verificationMode: "none",
+      });
+      const noneRes = await daemon.director.verifyAndReviewGoal(noneGoal.id, undefined, { summary: "Done directly" });
+      assert.equal(noneRes.goal.status, "achieved");
+      assert.equal(reviewerRuns, 0);
+
+      // C. `verificationMode: "deterministic"` skips LLM reviewer even when behavioral criteria exist
+      const detOverrideGoal = daemon.director.goals.createGoal({
+        repoRoot: repoDir,
+        title: "Behavioral note but deterministic mode",
+        description: "Check command suffices",
+        criteria: [
+          { id: "c1", kind: "deterministic", description: "Check passes", command: "true" },
+          { id: "c2", kind: "behavioral", description: "Looks clean" },
+        ],
+        verificationMode: "deterministic",
+      });
+      const detOverrideRes = await daemon.director.verifyAndReviewGoal(detOverrideGoal.id);
+      assert.equal(detOverrideRes.goal.status, "achieved");
+      assert.equal(reviewerRuns, 0);
+
+      // D. Required behavioral criterion under `auto` STILL spawns Independent Done-Reviewer!
+      const behGoal = daemon.director.goals.createGoal({
+        repoRoot: repoDir,
+        title: "Complex architecture change",
+        description: "Needs independent review",
+        criteria: [{ id: "c1", kind: "behavioral", description: "Meets architectural contract" }],
+      });
+      assert.equal(shouldRunIndependentReview(behGoal), true);
+      const behRes = await daemon.director.verifyAndReviewGoal(behGoal.id);
+      assert.equal(behRes.goal.status, "achieved");
+      assert.equal(reviewerRuns, 1);
+    } finally {
       await daemon.stop();
       rmSync(repoDir, { recursive: true, force: true });
       rmSync(stateDir, { recursive: true, force: true });

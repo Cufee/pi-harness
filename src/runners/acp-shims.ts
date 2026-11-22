@@ -210,8 +210,9 @@ export function buildNewSessionParams(
 
   if (adapter === "codex" && opts.mcpServers.length > 0) {
     // Ensure codex-acp awaits harness MCP bridge startup before Turn 1 instead of racing.
+    const envAwait = Number(process.env.PI_HARNESS_MCP_AWAIT_MS);
     params._meta = {
-      mcpStartupAwaitTimeoutMs: 15_000,
+      mcpStartupAwaitTimeoutMs: Number.isFinite(envAwait) && envAwait > 0 ? envAwait : 15_000,
     };
   }
 

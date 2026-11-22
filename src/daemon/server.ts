@@ -611,6 +611,7 @@ export class HarnessDaemon {
           ...(typeof patch.defaultTaskProfile === "string" ? { defaultTaskProfile: patch.defaultTaskProfile } : {}),
           ...(patch.rollover ? { rollover: { ...this.config.rollover, ...(patch.rollover as HarnessConfig["rollover"]) } } : {}),
           ...(patch.worktree ? { worktree: { ...this.config.worktree, ...(patch.worktree as HarnessConfig["worktree"]) } } : {}),
+          ...(patch.goals ? { goals: { ...this.config.goals, ...(patch.goals as HarnessConfig["goals"]) } } : {}),
           ...(patch.catalog ? { catalog: { ...this.config.catalog, ...(patch.catalog as HarnessConfig["catalog"]) } } : {}),
           ...(patch.quotaRetry
             ? { quotaRetry: { ...this.config.quotaRetry, ...(patch.quotaRetry as HarnessConfig["quotaRetry"]) } }
@@ -872,6 +873,11 @@ export class HarnessDaemon {
           description: String(p.description ?? p.title),
           criteria: (p.criteria as Array<Omit<GoalCriterion, "id" | "required">>) ?? [],
           nonGoals: Array.isArray(p.nonGoals) ? (p.nonGoals as string[]) : [],
+          verificationMode:
+            typeof p.verificationMode === "string" &&
+            ["auto", "none", "deterministic", "independent_review"].includes(p.verificationMode)
+              ? (p.verificationMode as "auto" | "none" | "deterministic" | "independent_review")
+              : undefined,
         });
 
       case "goal.commit":
@@ -939,7 +945,14 @@ export class HarnessDaemon {
       }
 
       case "goal.review":
-        return await this.director.verifyAndReviewGoal(String(p.goalId));
+        return await this.director.verifyAndReviewGoal(String(p.goalId), undefined, {
+          verificationMode:
+            typeof p.verificationMode === "string" &&
+            ["auto", "none", "deterministic", "independent_review"].includes(p.verificationMode)
+              ? (p.verificationMode as "auto" | "none" | "deterministic" | "independent_review")
+              : undefined,
+          summary: typeof p.summary === "string" ? p.summary : undefined,
+        });
 
       case "goal.pause": {
         const g = this.director.goals.setStatus(String(p.goalId), "paused", "Paused by user");

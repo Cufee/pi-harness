@@ -357,7 +357,7 @@ export class HarnessOrchestrator {
       profileId: profile.id,
       model,
       effort: input.effort ?? null,
-      maxTurns: 200,
+      maxTurns: this.config.rollover.orchestratorMaxTurns,
     });
 
     this.launchTaskLoop(orchestratorTask.id);
@@ -402,7 +402,7 @@ export class HarnessOrchestrator {
       profileId: profile.id,
       model,
       effort: input.effort ?? null,
-      maxTurns: input.maxTurns ?? (input.tier === 3 ? this.config.rollover.taskMaxTurns : 120),
+      maxTurns: input.maxTurns ?? (input.tier === 3 ? this.config.rollover.taskMaxTurns : this.config.rollover.workerMaxTurns),
       dependsOn: input.dependsOn,
       writeScopes: input.writeScopes,
     });

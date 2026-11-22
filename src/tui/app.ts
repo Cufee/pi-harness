@@ -805,7 +805,7 @@ export async function runDirectorChatTui(opts: {
     handle = overlays.push(
       {
         title: "Settings & External Harness CLIs",
-        subtitle: "~/.pi-harness/config.json",
+        subtitle: `${config.stateDir}/config.json`,
         footer: "↑/↓ move · Enter edit/toggle · Esc back/close",
       },
       comp,
@@ -1444,7 +1444,7 @@ export async function runDirectorChatTui(opts: {
 
   unsubClose = opts.client.onClose(() => {
     if (evictedByTakeover) return;
-    void term.shutdown("[Connection to harnessd closed — check ~/.pi-harness/daemon.log if unexpected.]", {
+    void term.shutdown(`[Connection to harnessd closed — check ${config.stateDir}/daemon.log if unexpected.]`, {
       overlays,
       spinner,
       cleanup: cleanupFullExit,

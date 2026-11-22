@@ -88,9 +88,9 @@ export class BisectingMergeQueue {
       try {
         await runGit(intPath, [
           "-c",
-          "user.name=pi-harness",
+          `user.name=${this.config.gitAuthorName ?? "pi-harness"}`,
           "-c",
-          "user.email=harness@local",
+          `user.email=${this.config.gitAuthorEmail ?? "harness@local"}`,
           "merge",
           "--no-ff",
           "--no-edit",
@@ -113,7 +113,7 @@ export class BisectingMergeQueue {
         try {
           const { stdout, stderr } = await execFileAsync("/bin/sh", ["-lc", cmd], {
             cwd: intPath,
-            timeout: 300_000,
+            timeout: this.config.ciTimeoutMs ?? 300_000,
             maxBuffer: 16 * 1024 * 1024,
           });
           ciLogs.push(`$ ${cmd} -> OK\n${stdout.slice(-1000)}${stderr ? "\n" + stderr.slice(-500) : ""}`);
