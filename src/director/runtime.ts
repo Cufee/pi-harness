@@ -360,63 +360,110 @@ export class DirectorRuntime {
       },
     };
 
-    const res = await runner.run({
-      runId: goal.linkedRunId ?? goal.id,
-      taskId: `reviewer-${goal.id}-c${goal.reviewCycle + 1}`,
-      tier: 3,
-      kind: "verify",
-      cwd: goal.repoRoot,
-      readOnly: true,
-      systemPrompt:
-        "You are an independent, skeptical code reviewer. Inspect actual code and test outputs; call submit_review_verdict if available or return the requested strict JSON verdict with concrete evidence for every required criterion.",
-      initialPrompt: reviewerPrompt,
-      maxTurns: 12,
-      tools: [submitTool],
-      executeTool: async (name, args) => {
-        if (name === "submit_review_verdict") {
-          verdictBox.value = {
-            verdict: String(args.verdict) as SubmittedVerdict["verdict"],
-            criteriaResults: Array.isArray(args.criteriaResults) ? (args.criteriaResults as CriterionEvaluation[]) : [],
-            blockingIssues: Array.isArray(args.blockingIssues) ? (args.blockingIssues as string[]) : [],
-            summary: String(args.summary ?? ""),
-          };
-          return { recorded: true };
-        }
-        throw new Error(`Unknown reviewer tool ${name}`);
-      },
-      signal: new AbortController().signal,
-      callbacks: {},
-    });
+    // Persist the reviewer as a Tier 3 verify task under the goal's linked run so it shows up in
+    // runs.trees and its transcript is replayable / watchable like any orchestrator agent.
+    const cycle = goal.reviewCycle + 1;
+    const reviewerTask = run
+      ? this.db.createTask({
+          runId: run.id,
+          parentId: this.db.listTasks(run.id).find((t) => t.tier === 1)?.id ?? null,
+          tier: 3,
+          kind: "verify",
+          title: `Done-Review: ${goal.title} (cycle ${cycle})`,
+          objective: reviewerPrompt,
+          readOnly: true,
+          profileId: profile.id,
+          maxTurns: 12,
+        })
+      : null;
+    if (reviewerTask) this.db.updateTask(reviewerTask.id, { status: "running" });
+    const emit = (type: string, payload: unknown) => {
+      if (run && reviewerTask) this.db.emitEvent(run.id, reviewerTask.id, type, payload);
+    };
 
-    // Fallback JSON parse if reviewer returned JSON text instead of calling submit_review_verdict
-    if (!verdictBox.value) {
-      try {
-        const jsonMatch = res.text.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          verdictBox.value = JSON.parse(jsonMatch[0]) as SubmittedVerdict;
-        }
-      } catch {
-        // handled below
+    const failReviewer = (msg: string) => {
+      if (!reviewerTask || this.db.getTask(reviewerTask.id)?.status !== "running") return;
+      emit("agent.error", { error: msg });
+      this.db.updateTask(reviewerTask.id, { status: "failed", summary: msg });
+    };
+
+    let outcome: ReturnType<GoalEngine["recordReviewVerdict"]>;
+    try {
+      const res = await runner.run({
+        runId: goal.linkedRunId ?? goal.id,
+        taskId: reviewerTask?.id ?? `reviewer-${goal.id}-c${cycle}`,
+        tier: 3,
+        kind: "verify",
+        cwd: goal.repoRoot,
+        readOnly: true,
+        systemPrompt:
+          "You are an independent, skeptical code reviewer. Inspect actual code and test outputs; call submit_review_verdict if available or return the requested strict JSON verdict with concrete evidence for every required criterion.",
+        initialPrompt: reviewerPrompt,
+        maxTurns: 12,
+        tools: [submitTool],
+        executeTool: async (name, args) => {
+          if (name === "submit_review_verdict") {
+            verdictBox.value = {
+              verdict: String(args.verdict) as SubmittedVerdict["verdict"],
+              criteriaResults: Array.isArray(args.criteriaResults) ? (args.criteriaResults as CriterionEvaluation[]) : [],
+              blockingIssues: Array.isArray(args.blockingIssues) ? (args.blockingIssues as string[]) : [],
+              summary: String(args.summary ?? ""),
+            };
+            return { recorded: true };
+          }
+          throw new Error(`Unknown reviewer tool ${name}`);
+        },
+        signal: new AbortController().signal,
+        callbacks: {
+          onTextDelta: (text) => emit("agent.text_delta", { text }),
+          onThoughtDelta: (text) => emit("agent.thought_delta", { text }),
+          onToolEvent: (ev) => emit("agent.tool", ev),
+        },
+      });
+      if (res.stopReason === "error" || res.stopReason === "cancelled") {
+        failReviewer(res.text || `Reviewer stopped: ${res.stopReason}`);
       }
-    }
 
-    const submittedVerdict = verdictBox.value;
-
-    // Merge deterministic gate pass results with reviewer evaluations so deterministic criteria stay evidenced
-    const mergedResults: CriterionEvaluation[] = [...gateResult.results];
-    for (const r of submittedVerdict?.criteriaResults ?? []) {
-      if (!mergedResults.some((m) => m.criterionId === r.criterionId)) {
-        mergedResults.push(r);
+      // Fallback JSON parse if reviewer returned JSON text instead of calling submit_review_verdict
+      if (!verdictBox.value) {
+        try {
+          const jsonMatch = res.text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            verdictBox.value = JSON.parse(jsonMatch[0]) as SubmittedVerdict;
+          }
+        } catch {
+          // handled below
+        }
       }
-    }
 
-    const outcome = this.goals.recordReviewVerdict(goal.id, {
-      verdict: submittedVerdict?.verdict ?? "changes_requested",
-      criteriaResults: mergedResults,
-      blockingIssues: submittedVerdict?.blockingIssues ?? (submittedVerdict ? [] : ["Reviewer did not return a structured verdict"]),
-      summary: submittedVerdict?.summary ?? (res.text.slice(0, 300) || "Incomplete review output"),
-      diffHash: gateResult.diffHash,
-    });
+      const submittedVerdict = verdictBox.value;
+
+      // Merge deterministic gate pass results with reviewer evaluations so deterministic criteria stay evidenced
+      const mergedResults: CriterionEvaluation[] = [...gateResult.results];
+      for (const r of submittedVerdict?.criteriaResults ?? []) {
+        if (!mergedResults.some((m) => m.criterionId === r.criterionId)) {
+          mergedResults.push(r);
+        }
+      }
+
+      outcome = this.goals.recordReviewVerdict(goal.id, {
+        verdict: submittedVerdict?.verdict ?? "changes_requested",
+        criteriaResults: mergedResults,
+        blockingIssues:
+          submittedVerdict?.blockingIssues ?? (submittedVerdict ? [] : ["Reviewer did not return a structured verdict"]),
+        summary: submittedVerdict?.summary ?? (res.text.slice(0, 300) || "Incomplete review output"),
+        diffHash: gateResult.diffHash,
+      });
+      if (reviewerTask && this.db.getTask(reviewerTask.id)?.status === "running") {
+        this.db.updateTask(reviewerTask.id, {
+          status: "completed",
+          summary: `${outcome.review.verdict}: ${outcome.review.summary}`.slice(0, 500),
+        });
+      }
+    } catch (err) {
+      failReviewer(err instanceof Error ? err.message : String(err));
+      throw err;
+    }
 
     await this.handlePostReviewTransition(outcome);
     return outcome;

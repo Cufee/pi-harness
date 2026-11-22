@@ -21,6 +21,8 @@ export interface DaemonEventFrame {
   type: string;
   payload: unknown;
   createdAt: number;
+  /** Set only on frames delivered for a read-only `watch.start` subscription. */
+  watchId?: string;
 }
 
 export type WireFrame = RpcRequest | RpcResponse | DaemonEventFrame;
@@ -62,6 +64,9 @@ export type DaemonOp =
   | "attach"
   | "detach"
   | "tree.get"
+  | "runs.trees"
+  | "watch.start"
+  | "watch.stop"
   | "task.steer"
   | "task.cancel"
   | "escalation.ack"

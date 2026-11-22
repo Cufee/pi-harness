@@ -470,6 +470,24 @@ export class ControlPlaneDb {
     }));
   }
 
+  /** Like getEventsSince, but pages internally until exhausted so replays are never truncated. */
+  getAllEventsSince(runId: string, sinceSeq: number, taskId?: string | null, pageSize = 500): EventRecord[] {
+    const all: EventRecord[] = [];
+    let cursor = sinceSeq;
+    for (;;) {
+      const page = this.getEventsSince(runId, cursor, taskId, pageSize);
+      all.push(...page);
+      if (page.length < pageSize) return all;
+      cursor = page[page.length - 1]!.seq;
+    }
+  }
+
+  /** Highest event seq persisted so far (0 when there are no events). */
+  getLatestEventSeq(): number {
+    const r = this.db.prepare("SELECT MAX(seq) AS seq FROM events").get() as { seq: number | null } | undefined;
+    return Number(r?.seq ?? 0);
+  }
+
   // ---- Runs ----
   createRun(input: {
     goal: string;
