@@ -1,4 +1,5 @@
-import { isKeyRelease, matchesKey, ProcessTerminal, TuiMainScreen } from "@earendil-works/pi-tui";
+import { isKeyRelease, matchesKey, ProcessTerminal } from "@earendil-works/pi-tui";
+import { ModalScreen } from "./modal-screen.js";
 import type { OverlayManager } from "./overlay-stack.js";
 import type { TimedSpinner } from "./spinner.js";
 import type { FooterHint } from "./status-bar.js";
@@ -34,7 +35,7 @@ export interface TerminalSessionCallbacks {
  */
 export class TerminalSession {
   readonly terminal: ProcessTerminal;
-  readonly tui: TuiMainScreen;
+  readonly tui: ModalScreen;
 
   private shuttingDown = false;
   private ctrlCArmedUntil = 0;
@@ -50,7 +51,7 @@ export class TerminalSession {
     // Avoid unnecessary OSC 7501 capability query traffic when unused
     process.env.PI_PROGRAM_STATUS ??= "0";
     this.terminal = new ProcessTerminal();
-    this.tui = new TuiMainScreen(this.terminal);
+    this.tui = new ModalScreen(this.terminal);
     this.exitPromise = new Promise<void>((resolve) => {
       this.exitResolve = resolve;
     });
