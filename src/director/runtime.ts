@@ -11,6 +11,7 @@ import { writeCodeOutput, writeTaskDossier } from "../control-plane/dossiers.js"
 import type { ControlPlaneDb } from "../control-plane/db.js";
 import type { CustomRunnerFactory, HarnessOrchestrator } from "../control-plane/orchestrator.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
+import type { TimerRecord } from "../control-plane/timers.js";
 import {
   GoalEngine,
   shouldRunIndependentReview,
@@ -20,6 +21,11 @@ import {
   type GoalReviewVerdict,
   type VerificationMode,
 } from "../goals/engine.js";
+import {
+  formatChatEventForModel,
+  formatChatEventSummary,
+  type ChatControlEvent,
+} from "../protocol/chat-events.js";
 import {
   buildGoalDetailDisplay,
   buildGoalsTableDisplay,
@@ -259,6 +265,51 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
       properties: { goal_id: { type: "string" }, message: { type: "string" } },
     },
   },
+  {
+    name: "schedule_timer",
+    description:
+      "Schedule a durable non-blocking timer (survives daemon restarts) to wake the Director after a delay or at an ISO timestamp (e.g. a model quota reset time), optionally pausing a Goal now and auto-resuming it when the timer fires. Work productively by default — use timers for self-pacing around usage/reset limits when instructed by the user or sessionModelContext, or for explicit reminders. End your turn after scheduling so the user stays unblocked.",
+    inputSchema: {
+      type: "object",
+      required: ["reason"],
+      properties: {
+        delay_seconds: { type: "number", description: "Seconds from now until the timer fires." },
+        wake_at: { type: "string", description: "ISO-8601 UTC timestamp to wake at (e.g. quota resetsAt)." },
+        reason: { type: "string", description: "Concise description of what to resume or check when the timer fires." },
+        goal_id: { type: "string", description: "Optional Goal ID (e.g. goal-1) associated with this timer." },
+        pause_goal: {
+          type: "boolean",
+          description: "If true (with goal_id), cleanly pause the Goal now while waiting for the timer.",
+        },
+        resume_goal: {
+          type: "boolean",
+          description: "If true (with goal_id), automatically resume the Goal's run when the timer fires.",
+        },
+        wake_on_event: {
+          type: "string",
+          enum: ["none", "user_message", "goal_settled", "any"],
+          description: "Optional early-wake/cancel trigger (default: 'none').",
+        },
+      },
+    },
+  },
+  {
+    name: "list_timers",
+    description: "List pending or recent durable timers for this Director session.",
+    inputSchema: {
+      type: "object",
+      properties: { status: { type: "string", enum: ["pending", "fired", "cancelled"] } },
+    },
+  },
+  {
+    name: "cancel_timer",
+    description: "Cancel a pending durable timer by ID (e.g. timer-1).",
+    inputSchema: {
+      type: "object",
+      required: ["timer_id"],
+      properties: { timer_id: { type: "string" }, reason: { type: "string" } },
+    },
+  },
 ];
 
 interface ChatSelection {
@@ -290,7 +341,7 @@ export class DirectorRuntime {
   private activeChats = new Map<string, ActiveChat>();
   private activeReviews = new Map<string, AbortController>();
   private unsubRunEvents: (() => void) | null = null;
-  private wakeHandler: ((chatSessionId: string, eventSummary: string, prompt: string) => void) | null = null;
+  private wakeHandler: ((chatSessionId: string, event: ChatControlEvent) => void) | null = null;
   private notifiedSettledGoals = new Set<string>();
 
   constructor(
@@ -308,9 +359,12 @@ export class DirectorRuntime {
       config.goals,
     );
     this.unsubRunEvents = this.db.onEvent((ev) => this.handleControlPlaneEvent(ev));
+    this.db.timers.setOnFire((timer, wakeReason) => {
+      void this.handleTimerFired(timer, wakeReason);
+    });
   }
 
-  setWakeHandler(handler: (chatSessionId: string, eventSummary: string, prompt: string) => void): void {
+  setWakeHandler(handler: (chatSessionId: string, event: ChatControlEvent) => void): void {
     this.wakeHandler = handler;
   }
 
@@ -319,11 +373,61 @@ export class DirectorRuntime {
     this.unsubRunEvents = null;
   }
 
-  private handleControlPlaneEvent(ev: { runId: string; type: string; payload: unknown }): void {
+  private async handleTimerFired(timer: TimerRecord, wakeReason: string): Promise<void> {
+    if (timer.ownerKind !== "chat") return;
+    let resumedGoal = false;
+    if (timer.resumeGoal && timer.goalId) {
+      try {
+        const g = this.goals.getGoal(timer.goalId);
+        if (g && g.status === "paused") {
+          const linkedRun = g.linkedRunId ? this.db.getRun(g.linkedRunId) : null;
+          if (linkedRun?.status === "paused_quota") {
+            await this.orchestrator.resumeRunFromQuota(linkedRun.id, { trigger: "user_timer" });
+            this.goals.setStatus(g.id, "executing");
+            resumedGoal = true;
+          } else {
+            await this.commitGoal(g.id);
+            resumedGoal = true;
+          }
+        }
+      } catch {
+        resumedGoal = false;
+      }
+    }
+    const event: ChatControlEvent = {
+      kind: "timer.fired",
+      timerId: timer.id,
+      reason: timer.reason,
+      wakeReason,
+      ...(timer.goalId ? { goalId: timer.goalId } : {}),
+      ...(resumedGoal ? { resumedGoal: true } : {}),
+    };
+    this.wakeHandler?.(timer.ownerId, event);
+  }
+
+  private handleControlPlaneEvent(ev: { runId: string; taskId?: string | null; type: string; payload: unknown }): void {
+    // Wake any subagent task timers waiting early on a child settlement
+    if (ev.type === "task.status" && ev.taskId) {
+      const payload = ev.payload as { to?: string; status?: string } | null;
+      const st = String(payload?.to ?? payload?.status ?? "");
+      if (["completed", "failed", "cancelled", "blocked", "returned_for_rescope"].includes(st)) {
+        const child = this.db.getTask(ev.taskId);
+        if (child?.parentId) {
+          this.db.timers.triggerEarly(
+            (t) =>
+              t.ownerKind === "task" &&
+              t.ownerId === child.parentId &&
+              (t.wakeOnEvent === "child_settled" || t.wakeOnEvent === "any"),
+            `child_settled:${child.id}`,
+          );
+        }
+      }
+    }
+
     if (!this.config.events?.wakeDirectorOnGoalSettle) return;
     if (ev.type !== "run.status") return;
     const status = String((ev.payload as { status?: string } | null)?.status ?? "");
-    if (!["completed", "failed", "stopped"].includes(status)) return;
+    if (status !== "completed" && status !== "failed" && status !== "stopped") return;
 
     // Find any active Goal linked to this run and wake its owning Director session automatically!
     const row = this.db.db
@@ -334,20 +438,28 @@ export class DirectorRuntime {
     if (!goal?.chatSessionId) return;
     if (["achieved", "cancelled", "paused"].includes(goal.status)) return;
 
+    // Cancel any chat timers subscribed to `goal_settled` / `any` for this goal (we're waking directly now)
+    for (const t of this.db.timers.list({ ownerKind: "chat", ownerId: goal.chatSessionId, status: "pending" })) {
+      if ((t.wakeOnEvent === "goal_settled" || t.wakeOnEvent === "any") && (!t.goalId || t.goalId === goal.id)) {
+        this.db.timers.cancel(t.id, `goal_settled:${goal.id}`);
+      }
+    }
+
     const dedupeKey = `${goal.id}:v${goal.version}:${ev.runId}:${status}`;
     if (this.notifiedSettledGoals.has(dedupeKey)) return;
     this.notifiedSettledGoals.add(dedupeKey);
 
     const openEsc = this.db.listEscalations(ev.runId, "open");
-    const summary = `[Event] Goal ${goal.id} v${goal.version} ("${goal.title}") run ${ev.runId} ${status}${openEsc.length ? ` (${openEsc.length} open escalation(s))` : ""}.`;
-    const wakePrompt = [
-      summary,
-      status === "completed"
-        ? `The autonomous run for Goal ${goal.id} finished. Inspect/settle the goal with \`goal_trigger_review\` (using the appropriate \`verification_mode\` for this task) or report the outcome concisely to the user.`
-        : `The autonomous run for Goal ${goal.id} ended with status '${status}'. Inspect the goal via \`goal_get\` and report the status, any blockers, and recommended next steps to the user.`,
-    ].join("\n");
-
-    this.wakeHandler?.(goal.chatSessionId, summary, wakePrompt);
+    const event: ChatControlEvent = {
+      kind: "goal.settled",
+      goalId: goal.id,
+      goalVersion: goal.version,
+      goalTitle: goal.title,
+      runId: ev.runId,
+      runStatus: status,
+      openEscalations: openEsc.length,
+    };
+    this.wakeHandler?.(goal.chatSessionId, event);
   }
 
   updateConfig(next: HarnessConfig, catalog = this.orchestrator.catalog, quota = this.orchestrator.quota): void {
@@ -411,10 +523,20 @@ export class DirectorRuntime {
 
     const started = this.goals.linkRunAndStart(goal.id, run.id);
     if (started.chatSessionId) {
+      const committedEvent: ChatControlEvent = {
+        kind: "goal.committed",
+        goalId: started.id,
+        goalVersion: started.version,
+        goalTitle: started.title,
+        runId: run.id,
+        criteriaCount: started.criteria.length,
+      };
       this.chats.appendTurn(
         started.chatSessionId,
         "system_notice",
-        `[${started.id} v${started.version}] Started autonomous run ${run.id} (${started.criteria.length} criteria).`,
+        formatChatEventSummary(committedEvent),
+        undefined,
+        committedEvent,
       );
     }
     this.db.emitEvent(run.id, null, "goal.committed", { goalId: started.id, version: started.version, title: started.title });
@@ -451,10 +573,19 @@ export class DirectorRuntime {
     }
 
     if (goal.chatSessionId) {
+      const amendedEvent: ChatControlEvent = {
+        kind: "goal.amended",
+        goalId: goal.id,
+        fromVersion: delta.fromVersion,
+        toVersion: delta.toVersion,
+        rationale: delta.rationale,
+      };
       this.chats.appendTurn(
         goal.chatSessionId,
         "system_notice",
-        `[${goal.id} v${delta.fromVersion}->v${delta.toVersion}] Amended (${delta.rationale}); stale reviews invalidated.`,
+        formatChatEventSummary(amendedEvent),
+        undefined,
+        amendedEvent,
       );
     }
 
@@ -812,13 +943,23 @@ export class DirectorRuntime {
     }
 
     if (goal.chatSessionId) {
-      const badge =
-        goal.status === "achieved"
-          ? "ACHIEVED"
-          : goal.status === "awaiting_human"
-            ? `P0 HUMAN NEEDED (${circuitBreakerTripped ?? "escalated"})`
-            : `REVIEW #${review.cycle} -> CHANGES REQUESTED`;
-      this.chats.appendTurn(goal.chatSessionId, "system_notice", `[${goal.id} v${goal.version}] ${badge}: ${review.summary}`);
+      const reviewedEvent: ChatControlEvent = {
+        kind: "goal.reviewed",
+        goalId: goal.id,
+        goalVersion: goal.version,
+        cycle: review.cycle,
+        verdict: review.verdict,
+        status: goal.status,
+        summary: review.summary,
+        ...(circuitBreakerTripped ? { circuitBreakerTripped } : {}),
+      };
+      this.chats.appendTurn(
+        goal.chatSessionId,
+        "system_notice",
+        formatChatEventSummary(reviewedEvent),
+        undefined,
+        reviewedEvent,
+      );
     }
   }
 
@@ -834,29 +975,31 @@ export class DirectorRuntime {
   async steerChat(
     chatSessionId: string,
     message: string,
-    opts?: { role?: "user" | "system_notice" },
+    opts?: { role?: "user" | "system_notice"; event?: ChatControlEvent },
   ): Promise<boolean> {
     const active = this.activeChats.get(chatSessionId);
     if (!active || active.abort.signal.aborted) return false;
-    const role = opts?.role ?? "user";
+    const role = opts?.event ? "system_notice" : (opts?.role ?? "user");
+    const modelText = opts?.event ? formatChatEventForModel(opts.event) : message;
+    const storedText = opts?.event ? formatChatEventSummary(opts.event) : message;
 
     // If the Director is currently blocked waiting on subagents (`goal_wait` / `wait_tasks`),
     // unblock the wait immediately so the Director receives the user's message in milliseconds
     // while background subagents continue running uninterrupted!
     if (active.waitInterrupts.size > 0) {
       this.flushChatPartial(chatSessionId, active);
-      this.chats.appendTurn(chatSessionId, role, message);
+      this.chats.appendTurn(chatSessionId, role, storedText, undefined, opts?.event);
       for (const interrupt of [...active.waitInterrupts]) {
-        interrupt(message, role);
+        interrupt(modelText, role);
       }
       return true;
     }
 
     if (!active.handle) return false;
-    const accepted = await active.handle.steer(message);
+    const accepted = await active.handle.steer(modelText);
     if (accepted && this.activeChats.get(chatSessionId) === active && !active.abort.signal.aborted) {
       this.flushChatPartial(chatSessionId, active);
-      this.chats.appendTurn(chatSessionId, role, message);
+      this.chats.appendTurn(chatSessionId, role, storedText, undefined, opts?.event);
       return true;
     }
     return false;
@@ -911,20 +1054,39 @@ export class DirectorRuntime {
     userMessage: string,
     onDelta?: (delta: string) => void,
     onToolEvent?: RunnerCallbacks["onToolEvent"],
-    opts?: { turnRole?: "user" | "system_notice" },
+    opts?: { turnRole?: "user" | "system_notice"; event?: ChatControlEvent },
   ): Promise<{ userTurn: ChatTurnRecord; assistantTurn: ChatTurnRecord | null }> {
     const session = this.chats.getSession(chatSessionId);
     if (!session) throw new Error(`Unknown chat session ${chatSessionId}`);
 
     if (this.activeChats.has(chatSessionId)) throw new Error(`Chat ${chatSessionId} already has an active turn`);
-    const userTurn = this.chats.appendTurn(chatSessionId, opts?.turnRole ?? "user", userMessage);
+    const typedEvent = opts?.event ?? null;
+    if (!typedEvent) {
+      // A fresh user message naturally supersedes any pending timer subscribed to `user_message` / `any`.
+      for (const t of this.db.timers.list({ ownerKind: "chat", ownerId: chatSessionId, status: "pending" })) {
+        if (t.wakeOnEvent === "user_message" || t.wakeOnEvent === "any") {
+          this.db.timers.cancel(t.id, "superseded_by_user_message");
+        }
+      }
+    }
+    const turnRole = typedEvent ? "system_notice" : (opts?.turnRole ?? "user");
+    const storedContent = typedEvent ? formatChatEventSummary(typedEvent) : userMessage;
+    const userTurn = this.chats.appendTurn(chatSessionId, turnRole, storedContent, undefined, typedEvent);
     const history = this.chats.getRecentHistory(chatSessionId, 40);
     const activeGoals = this.goals.listGoals({ repoRoot: session.repoRoot, chatSessionId });
 
     const contextTranscript = history
       .slice(0, -1)
       .map((t) => {
-        const speaker = t.role === "user" ? "User" : t.role === "assistant" ? "Director" : t.role === "tool_output" ? "Tool output" : "System";
+        const speaker = t.event
+          ? `Event (${t.event.kind})`
+          : t.role === "user"
+            ? "User"
+            : t.role === "assistant"
+              ? "Director"
+              : t.role === "tool_output"
+                ? "Tool output"
+                : "System";
         // tool_output turns contribute only their short summary; the display JSON stays out of the model context.
         return `${speaker}: ${t.content}`;
       })
@@ -934,11 +1096,17 @@ export class DirectorRuntime {
       activeGoals.length > 0
         ? `\n\nActive/Recent Goals:\n${activeGoals
             .slice(0, 8)
-            .map((g) => `- ${g.id} v${g.version} [${g.status}] "${g.title}" (review ${g.reviewCycle}/${g.budgets.maxReviewCycles})`)
+            .map((g) => {
+              const ver = g.reviewCycle > 0 ? `${g.reviewCycle} rev` : g.liveProgress?.verificationStatus ?? g.status;
+              return `- ${g.id} v${g.version} [${g.status}] "${g.title}" (${ver})`;
+            })
             .join("\n")}`
         : "";
 
-    const prompt = `${contextTranscript ? `Prior conversation:\n${contextTranscript}\n\n` : ""}Workspace: ${session.repoRoot}${goalBanner}\n\nUser: ${userMessage}`;
+    const currentTurnBlock = typedEvent
+      ? `Control-plane event (${typedEvent.kind}):\n${formatChatEventForModel(typedEvent)}`
+      : `User: ${userMessage}`;
+    const prompt = `${contextTranscript ? `Prior conversation:\n${contextTranscript}\n\n` : ""}Workspace: ${session.repoRoot}${goalBanner}\n\n${currentTurnBlock}`;
 
     const abort = new AbortController();
     const mode = effectiveCodeMode(this.config.codeMode);
@@ -1277,7 +1445,8 @@ export class DirectorRuntime {
           const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, count), { stream: stat.size > count });
           const limit = typeof args.max_chars === "number" ? Math.min(4096, Math.max(0, args.max_chars)) : 4096;
           const content = text.slice(0, limit);
-          this.chats.appendTurn(chatSessionId, "system_notice", `Director read_file: ${path} (${count} bytes). Reason: ${reason}`);
+          const readEvent: ChatControlEvent = { kind: "director.read_file", path, bytes: count, reason };
+          this.chats.appendTurn(chatSessionId, "system_notice", formatChatEventSummary(readEvent), undefined, readEvent);
           return { path, truncated: stat.size > count || content.length < text.length, content };
         } finally {
           closeSync(fd);
@@ -1339,6 +1508,68 @@ export class DirectorRuntime {
         const orch = this.db.listTasks(g.linkedRunId).find((t) => t.tier === 1);
         if (!orch) throw new Error("Orchestrator task not found");
         return { steered: await this.orchestrator.steerTask(orch.id, String(args.message)) };
+      }
+
+      case "schedule_timer": {
+        let goalId: string | null = null;
+        let runId: string | null = null;
+        let pausedGoal = false;
+        if (typeof args.goal_id === "string" && args.goal_id.trim()) {
+          const g = this.goals.getGoal(args.goal_id.trim());
+          if (!g) throw new Error(`Unknown goal ${args.goal_id}`);
+          goalId = g.id;
+          runId = g.linkedRunId;
+          if (args.pause_goal === true && g.status !== "paused" && g.status !== "achieved" && g.status !== "cancelled") {
+            this.goals.setStatus(g.id, "paused", "Paused for scheduled timer");
+            if (g.linkedRunId) await this.orchestrator.stopRun(g.linkedRunId, "Goal paused for timer");
+            pausedGoal = true;
+          }
+        }
+        const wakeOnEvent =
+          args.wake_on_event === "user_message" || args.wake_on_event === "goal_settled" || args.wake_on_event === "any"
+            ? args.wake_on_event
+            : "none";
+        const timer = this.db.timers.schedule({
+          ownerKind: "chat",
+          ownerId: chatSessionId,
+          runId,
+          goalId,
+          delaySeconds: typeof args.delay_seconds === "number" ? args.delay_seconds : undefined,
+          wakeAtIso: typeof args.wake_at === "string" ? args.wake_at : undefined,
+          reason: String(args.reason ?? "Scheduled wakeup"),
+          wakeOnEvent,
+          resumeGoal: Boolean(args.resume_goal),
+        });
+        const schedEvent: ChatControlEvent = {
+          kind: "timer.scheduled",
+          timerId: timer.id,
+          wakeAt: timer.wakeAt,
+          reason: timer.reason,
+          ...(goalId ? { goalId } : {}),
+          ...(wakeOnEvent !== "none" ? { wakeOnEvent } : {}),
+          ...(pausedGoal ? { pausedGoal: true } : {}),
+        };
+        this.chats.appendTurn(chatSessionId, "system_notice", formatChatEventSummary(schedEvent), undefined, schedEvent);
+        return {
+          timer,
+          pausedGoal,
+          wakeAtIso: new Date(timer.wakeAt).toISOString(),
+        };
+      }
+
+      case "list_timers": {
+        const status =
+          args.status === "pending" || args.status === "fired" || args.status === "cancelled" ? args.status : undefined;
+        return { timers: this.db.timers.list({ ownerKind: "chat", ownerId: chatSessionId, status }) };
+      }
+
+      case "cancel_timer": {
+        const cancelled = this.db.timers.cancel(
+          String(args.timer_id),
+          typeof args.reason === "string" ? args.reason : "cancelled_by_director",
+        );
+        if (!cancelled) throw new Error(`Unknown timer ${args.timer_id}`);
+        return { timer: cancelled };
       }
 
       default:

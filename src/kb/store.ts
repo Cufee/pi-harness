@@ -1,6 +1,6 @@
-import { randomBytes } from "node:crypto";
 import type { Database } from "bun:sqlite";
 import { globsOverlap } from "../control-plane/db.js";
+import { friendlyIdCandidates, nextFriendlyId } from "../control-plane/ids.js";
 
 export type KbKind = "invariant" | "gotcha" | "architecture" | "decision" | "convention";
 export type KbStatus = "candidate" | "active" | "stale" | "archived";
@@ -88,8 +88,8 @@ CREATE TRIGGER IF NOT EXISTS kb_entries_au AFTER UPDATE ON kb_entries BEGIN
 END;
 `;
 
-function kbId(): string {
-  return `kb-${randomBytes(4).toString("hex")}`;
+function kbId(db: Database): string {
+  return nextFriendlyId(db, "kb", "kb_entries");
 }
 
 function sanitizeFtsQuery(raw: string): string {
@@ -179,7 +179,7 @@ export class KnowledgeBaseStore {
       throw new Error(`KB kind '${input.kind}' requires at least one evidence_paths reference`);
     }
 
-    const id = kbId();
+    const id = kbId(this.db);
     const now = Date.now();
     const tags = (input.tags ?? []).map((t) => t.trim().toLowerCase()).filter(Boolean);
     const globs = (input.pathGlobs ?? []).map((g) => g.trim()).filter(Boolean);
@@ -217,8 +217,11 @@ export class KnowledgeBaseStore {
   }
 
   getRaw(id: string): KbEntry | null {
-    const r = this.db.prepare("SELECT * FROM kb_entries WHERE id = ?").get(id) as Record<string, unknown> | undefined;
-    return r ? this.mapEntry(r) : null;
+    for (const candidate of friendlyIdCandidates(id, "kb")) {
+      const r = this.db.prepare("SELECT * FROM kb_entries WHERE id = ?").get(candidate) as Record<string, unknown> | undefined;
+      if (r) return this.mapEntry(r);
+    }
+    return null;
   }
 
   /** Stage 2 on-demand fetch: returns full context_md + evidence and increments hit telemetry. */

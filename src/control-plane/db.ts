@@ -2,6 +2,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { Database } from "bun:sqlite";
+import { friendlyIdCandidates, nextFriendlyId } from "./ids.js";
+import { TimerManager } from "./timers.js";
 import { KnowledgeBaseStore } from "../kb/store.js";
 
 export type AgentTier = 1 | 2 | 3;
@@ -411,6 +413,7 @@ CREATE INDEX IF NOT EXISTS idx_events_task_seq ON events(task_id, seq);
 export class ControlPlaneDb {
   readonly db: Database;
   readonly kb: KnowledgeBaseStore;
+  readonly timers: TimerManager;
   private listeners = new Set<(event: EventRecord) => void>();
 
   constructor(dbPath: string) {
@@ -420,9 +423,11 @@ export class ControlPlaneDb {
     this.db = new Database(dbPath);
     this.db.exec(SCHEMA);
     this.kb = new KnowledgeBaseStore(this.db);
+    this.timers = new TimerManager(this.db);
   }
 
   close(): void {
+    this.timers.dispose();
     this.db.close();
   }
 
@@ -536,7 +541,7 @@ export class ControlPlaneDb {
     coordinationGroup?: string | null;
     isolationMode?: "standalone" | "coordinated";
   }): RunRecord {
-    const id = input.id ?? shortHashId("run");
+    const id = input.id ?? nextFriendlyId(this.db, "run", "runs");
     const now = Date.now();
     const isolation = input.isolationMode ?? (input.coordinationGroup ? "coordinated" : "standalone");
     this.db
@@ -556,7 +561,11 @@ export class ControlPlaneDb {
   }
 
   getRun(id: string): RunRecord | null {
-    const r = this.db.prepare("SELECT * FROM runs WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    let r: Record<string, unknown> | undefined;
+    for (const candidate of friendlyIdCandidates(id, "run")) {
+      r = this.db.prepare("SELECT * FROM runs WHERE id = ?").get(candidate) as Record<string, unknown> | undefined;
+      if (r) break;
+    }
     if (!r) return null;
     return {
       id: String(r.id),
@@ -614,7 +623,7 @@ export class ControlPlaneDb {
     writeScopes?: string[];
   }): TaskRecord {
     return this.transaction(() => {
-      const id = shortHashId("t");
+      const id = nextFriendlyId(this.db, "t", "tasks");
       const now = Date.now();
       const deps = input.dependsOn ?? [];
       const scopes = input.writeScopes ?? [];
@@ -684,7 +693,7 @@ export class ControlPlaneDb {
             .prepare(
               "INSERT INTO write_leases(id, run_id, repo_root, target_branch, task_id, glob_pattern, active, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
             )
-            .run(shortHashId("lease"), input.runId, run.repoRoot, run.baseBranch, id, glob, now);
+            .run(nextFriendlyId(this.db, "lease", "write_leases"), input.runId, run.repoRoot, run.baseBranch, id, glob, now);
         }
       }
 
@@ -748,8 +757,11 @@ export class ControlPlaneDb {
   }
 
   getTask(id: string): TaskRecord | null {
-    const r = this.db.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as Record<string, unknown> | undefined;
-    return r ? this.mapTask(r) : null;
+    for (const candidate of friendlyIdCandidates(id, "t")) {
+      const r = this.db.prepare("SELECT * FROM tasks WHERE id = ?").get(candidate) as Record<string, unknown> | undefined;
+      if (r) return this.mapTask(r);
+    }
+    return null;
   }
 
   listTasks(runId: string, filters?: { parentId?: string | null; status?: TaskStatus }): TaskRecord[] {
@@ -866,7 +878,7 @@ export class ControlPlaneDb {
     gitSha?: string | null;
     exitCode?: number | null;
   }): ArtifactRecord {
-    const id = shortHashId("art");
+    const id = nextFriendlyId(this.db, "art", "artifacts");
     const now = Date.now();
     this.db
       .prepare(
@@ -936,7 +948,7 @@ export class ControlPlaneDb {
     if (input.category === "scope_too_large" && (input.suggestedSplits?.length ?? 0) < 2) {
       throw new Error("scope_too_large requires at least 2 concrete suggested_splits so parent can re-scope cleanly");
     }
-    const id = shortHashId("esc");
+    const id = nextFriendlyId(this.db, "esc", "escalations");
     const now = Date.now();
     this.db
       .prepare(
@@ -965,7 +977,11 @@ export class ControlPlaneDb {
   }
 
   getEscalation(id: string): EscalationRecord | null {
-    const r = this.db.prepare("SELECT * FROM escalations WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    let r: Record<string, unknown> | undefined;
+    for (const candidate of friendlyIdCandidates(id, "esc")) {
+      r = this.db.prepare("SELECT * FROM escalations WHERE id = ?").get(candidate) as Record<string, unknown> | undefined;
+      if (r) break;
+    }
     if (!r) return null;
     return {
       id: String(r.id),
@@ -1004,9 +1020,9 @@ export class ControlPlaneDb {
     const status = resolve ? "resolved" : "acked";
     this.db
       .prepare("UPDATE escalations SET status = ?, resolution = ?, acked_at = ? WHERE id = ?")
-      .run(status, resolution, now, id);
-    const updated = this.getEscalation(id)!;
-    this.emitEvent(esc.runId, esc.fromTaskId, "escalation.updated", { id, status, resolution });
+      .run(status, resolution, now, esc.id);
+    const updated = this.getEscalation(esc.id)!;
+    this.emitEvent(esc.runId, esc.fromTaskId, "escalation.updated", { id: esc.id, status, resolution });
     return updated;
   }
 
@@ -1039,7 +1055,7 @@ export class ControlPlaneDb {
   }
 
   createMessage(runId: string, fromTaskId: string, toTaskId: string, question: string): MessageRecord {
-    const id = shortHashId("msg");
+    const id = nextFriendlyId(this.db, "msg", "messages");
     const now = Date.now();
     this.db
       .prepare("INSERT INTO messages(id, run_id, from_task_id, to_task_id, question, status, created_at) VALUES (?, ?, ?, ?, ?, 'open', ?)")
@@ -1098,7 +1114,7 @@ export class ControlPlaneDb {
 
   // ---- Worktrees & Merge Queue ----
   recordWorktree(input: { runId: string; taskId: string; path: string; branch: string; baseSha: string }): WorktreeRecord {
-    const id = shortHashId("wt");
+    const id = nextFriendlyId(this.db, "wt", "worktrees");
     const now = Date.now();
     this.db
       .prepare(
@@ -1156,7 +1172,7 @@ export class ControlPlaneDb {
   }
 
   enqueueMerge(input: { runId: string; taskId: string; worktreeId: string; branch: string }): MergeQueueRecord {
-    const id = shortHashId("mq");
+    const id = nextFriendlyId(this.db, "mq", "merge_queue");
     const now = Date.now();
     this.db
       .prepare(
@@ -1307,7 +1323,7 @@ export class ControlPlaneDb {
   sendPeerAdvisory(fromRunId: string, toRunId: string, topicKey: string, message: string): PeerExchangeRecord {
     const target = this.getRun(toRunId);
     if (!target) throw new Error(`Unknown target run ${toRunId}`);
-    const id = shortHashId("padv");
+    const id = nextFriendlyId(this.db, "padv", "peer_exchanges");
     const now = Date.now();
     this.db
       .prepare(
@@ -1412,7 +1428,7 @@ export class ControlPlaneDb {
         throw new Error(`ERR_CROSS_RUN_DEADLOCK: wait cycle detected (${path.join(" -> ")})`);
       }
 
-      const id = shortHashId("preq");
+      const id = nextFriendlyId(this.db, "preq", "peer_exchanges");
       const ttlMs = Math.min(input.timeoutSec ?? 120, 300) * 1000;
       this.db
         .prepare(

@@ -1,9 +1,10 @@
 import { spawn } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { GoalsConfig } from "../config.js";
+import { friendlyIdCandidates, nextFriendlyId } from "../control-plane/ids.js";
 import { runGit } from "../worktree/manager.js";
 
 function canonicalRepoPath(p: string): string {
@@ -220,12 +221,12 @@ CREATE TABLE IF NOT EXISTS goal_reviews (
 CREATE INDEX IF NOT EXISTS idx_goal_reviews_goal ON goal_reviews(goal_id, cycle);
 `;
 
-function goalId(): string {
-  return `goal-${randomBytes(4).toString("hex")}`;
+function goalId(db: Database): string {
+  return nextFriendlyId(db, "goal", "goals");
 }
 
-function reviewId(): string {
-  return `rev-${randomBytes(4).toString("hex")}`;
+function reviewId(db: Database): string {
+  return nextFriendlyId(db, "rev", "goal_reviews");
 }
 
 /**
@@ -323,7 +324,7 @@ export class GoalEngine {
       throw new Error("Goal requires at least one acceptance criterion unless verificationMode is 'none'");
     }
 
-    const id = goalId();
+    const id = goalId(this.db);
     const now = Date.now();
     const criteria: GoalCriterion[] = input.criteria.map((c, idx) => ({
       id: c.id ?? `c${idx + 1}`,
@@ -372,8 +373,11 @@ export class GoalEngine {
   }
 
   getGoal(id: string): GoalRecord | null {
-    const r = this.db.prepare("SELECT * FROM goals WHERE id = ?").get(id) as Record<string, unknown> | undefined;
-    return r ? this.mapGoal(r) : null;
+    for (const candidate of friendlyIdCandidates(id, "goal")) {
+      const r = this.db.prepare("SELECT * FROM goals WHERE id = ?").get(candidate) as Record<string, unknown> | undefined;
+      if (r) return this.mapGoal(r);
+    }
+    return null;
   }
 
   listGoals(opts?: { repoRoot?: string; chatSessionId?: string; status?: GoalStatus }): GoalRecord[] {
@@ -400,8 +404,8 @@ export class GoalEngine {
     if (!g) throw new Error(`Unknown goal ${goalIdStr}`);
     this.db
       .prepare("UPDATE goals SET linked_run_id = ?, status = 'executing', updated_at = ? WHERE id = ?")
-      .run(runId, Date.now(), goalIdStr);
-    return this.getGoal(goalIdStr)!;
+      .run(runId, Date.now(), g.id);
+    return this.getGoal(g.id)!;
   }
 
   /** Persists live model-reported progress, verification status, and criterion checks onto the Goal. */
@@ -424,8 +428,8 @@ export class GoalEngine {
     };
     this.db
       .prepare("UPDATE goals SET live_progress_json = ?, updated_at = ? WHERE id = ?")
-      .run(JSON.stringify(next), now, goalIdStr);
-    return this.getGoal(goalIdStr)!;
+      .run(JSON.stringify(next), now, g.id);
+    return this.getGoal(g.id)!;
   }
 
   setStatus(goalIdStr: string, status: GoalStatus, summary?: string): GoalRecord {
@@ -433,9 +437,9 @@ export class GoalEngine {
     if (!g) throw new Error(`Unknown goal ${goalIdStr}`);
     this.db
       .prepare("UPDATE goals SET status = ?, last_review_summary = COALESCE(?, last_review_summary), updated_at = ? WHERE id = ?")
-      .run(status, summary ?? null, Date.now(), goalIdStr);
-    if (status === "paused" || status === "cancelled") this.onReviewInvalidated?.(goalIdStr);
-    return this.getGoal(goalIdStr)!;
+      .run(status, summary ?? null, Date.now(), g.id);
+    if (status === "paused" || status === "cancelled") this.onReviewInvalidated?.(g.id);
+    return this.getGoal(g.id)!;
   }
 
   /**
@@ -663,7 +667,7 @@ export class GoalEngine {
       nextStatus = "executing";
     }
 
-    const revId = reviewId();
+    const revId = reviewId(this.db);
     const now = Date.now();
     this.db
       .prepare(

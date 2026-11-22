@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { recommendModelsByTaskKind, type ModelCatalogCompiler } from "../catalog/compiler.js";
@@ -9,6 +8,7 @@ import type { ToolDefinition } from "../runners/types.js";
 import type { KbKind } from "../kb/store.js";
 import type { BisectingMergeQueue } from "../worktree/merge-queue.js";
 import type { WorktreeManager } from "../worktree/manager.js";
+import { nextUniqueFileName } from "./ids.js";
 import type {
   AgentTier,
   ControlPlaneDb,
@@ -565,6 +565,61 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
       properties: { request_id: { type: "string" }, reply: { type: "string" } },
     },
   },
+  {
+    name: "wait_timer",
+    tiers: [1, 2],
+    description:
+      "Explicitly sleep with zero token burn for a duration (delay_seconds) or until an ISO timestamp (wake_at, e.g. a quota reset time), optionally waking early when a subscribed event occurs (child_settled, any). Work productively by default — use this when pacing around quota limits/resets per user/session instructions or waiting for a timed condition.",
+    inputSchema: {
+      type: "object",
+      required: ["reason"],
+      properties: {
+        delay_seconds: { type: "number", description: "Seconds to sleep before waking." },
+        wake_at: { type: "string", description: "ISO-8601 UTC timestamp to wake at (e.g. a quota resetsAt value)." },
+        reason: { type: "string", description: "Concise reason for sleeping (shown in live run telemetry)." },
+        wake_on_event: {
+          type: "string",
+          enum: ["none", "child_settled", "any"],
+          description: "Optional early-wake event trigger (default: 'none').",
+        },
+      },
+    },
+  },
+  {
+    name: "schedule_timer",
+    tiers: [1, 2],
+    description:
+      "Schedule a durable non-blocking timer (survives daemon restart) for a reminder or delayed continuation without blocking the current turn.",
+    inputSchema: {
+      type: "object",
+      required: ["reason"],
+      properties: {
+        delay_seconds: { type: "number", description: "Seconds from now until the timer fires." },
+        wake_at: { type: "string", description: "ISO-8601 UTC timestamp when the timer should fire." },
+        reason: { type: "string", description: "Concise description of what to do when the timer fires." },
+        wake_on_event: { type: "string", enum: ["none", "child_settled", "goal_settled", "any"] },
+      },
+    },
+  },
+  {
+    name: "list_timers",
+    tiers: [1, 2],
+    description: "List pending or recent durable timers owned by this task.",
+    inputSchema: {
+      type: "object",
+      properties: { status: { type: "string", enum: ["pending", "fired", "cancelled"] } },
+    },
+  },
+  {
+    name: "cancel_timer",
+    tiers: [1, 2],
+    description: "Cancel a pending durable timer by ID (e.g. timer-1).",
+    inputSchema: {
+      type: "object",
+      required: ["timer_id"],
+      properties: { timer_id: { type: "string" }, reason: { type: "string" } },
+    },
+  },
 ];
 
 export function toolsForTier(tier: AgentTier): ToolDefinition[] {
@@ -846,9 +901,10 @@ export class ControlPlaneToolExecutor {
         const paths = [...artifactPaths];
         let overflowPath: string | undefined;
         if (summary.length > SUMMARY_LIMIT) {
-          const artifactPath = `.harness/artifacts/${taskId}-summary-${randomUUID()}.md`;
+          const artifactsDir = dossierDirectory(run.repoRoot);
+          const fileName = nextUniqueFileName(artifactsDir, `${taskId}-summary`, ".md");
+          const artifactPath = `.harness/artifacts/${fileName}`;
           overflowPath = resolve(run.repoRoot, artifactPath);
-          dossierDirectory(run.repoRoot);
           writeFileSync(overflowPath, summary, { encoding: "utf8", flag: "wx" });
           paths.push(overflowPath);
           const pointer = `\n\n[Full summary: ${artifactPath}]`;
@@ -1126,6 +1182,66 @@ export class ControlPlaneToolExecutor {
 
       case "peer_reply":
         return this.db.replyPeerRequest(String(args.request_id), runId, String(args.reply));
+
+      case "wait_timer": {
+        const timer = this.db.timers.schedule({
+          ownerKind: "task",
+          ownerId: taskId,
+          runId,
+          delaySeconds: typeof args.delay_seconds === "number" ? args.delay_seconds : undefined,
+          wakeAtIso: typeof args.wake_at === "string" ? args.wake_at : undefined,
+          reason: String(args.reason ?? "Timed wait"),
+          wakeOnEvent:
+            args.wake_on_event === "child_settled" || args.wake_on_event === "any" ? args.wake_on_event : "none",
+        });
+        this.db.emitEvent(runId, taskId, "agent.timer_sleep", {
+          timerId: timer.id,
+          wakeAt: timer.wakeAt,
+          reason: timer.reason,
+          wakeOnEvent: timer.wakeOnEvent,
+        });
+        const sig = scriptSignal ?? this.hooks.getTaskSignal(taskId);
+        const res = await this.db.timers.waitForTimer(timer.id, sig);
+        return {
+          timerId: res.timer.id,
+          status: res.timer.status,
+          wakeReason: res.wakeReason,
+          reason: res.timer.reason,
+          sleptMs: Math.max(0, Date.now() - timer.createdAt),
+        };
+      }
+
+      case "schedule_timer": {
+        const timer = this.db.timers.schedule({
+          ownerKind: "task",
+          ownerId: taskId,
+          runId,
+          delaySeconds: typeof args.delay_seconds === "number" ? args.delay_seconds : undefined,
+          wakeAtIso: typeof args.wake_at === "string" ? args.wake_at : undefined,
+          reason: String(args.reason ?? "Scheduled reminder"),
+          wakeOnEvent:
+            args.wake_on_event === "child_settled" || args.wake_on_event === "goal_settled" || args.wake_on_event === "any"
+              ? args.wake_on_event
+              : "none",
+        });
+        this.db.emitEvent(runId, taskId, "timer.scheduled", timer);
+        return { timer };
+      }
+
+      case "list_timers": {
+        const status =
+          args.status === "pending" || args.status === "fired" || args.status === "cancelled" ? args.status : undefined;
+        return { timers: this.db.timers.list({ ownerKind: "task", ownerId: taskId, status }) };
+      }
+
+      case "cancel_timer": {
+        const cancelled = this.db.timers.cancel(
+          String(args.timer_id),
+          typeof args.reason === "string" ? args.reason : "cancelled_by_agent",
+        );
+        if (!cancelled) throw new Error(`Unknown timer ${args.timer_id}`);
+        return { timer: cancelled };
+      }
 
       default:
         throw new Error(`Unhandled tool: ${name}`);

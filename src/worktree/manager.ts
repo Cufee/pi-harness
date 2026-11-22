@@ -75,8 +75,19 @@ export class WorktreeManager {
     }
 
     const sha = baseSha ?? (await runGit(this.repoRoot, ["rev-parse", "HEAD"])).stdout;
-    const wtPath = join(this.baseDir, runId, taskId);
-    const branch = `harness/${runId}/${taskId}`;
+    const baseBranchName = `harness/${runId}/${taskId}`;
+    let branch = baseBranchName;
+    let suffix = 1;
+    while (
+      await runGit(this.repoRoot, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]).then(
+        () => true,
+        () => false,
+      )
+    ) {
+      suffix++;
+      branch = `${baseBranchName}-${suffix}`;
+    }
+    const wtPath = join(this.baseDir, runId, suffix === 1 ? taskId : `${taskId}-${suffix}`);
 
     mkdirSync(join(this.baseDir, runId), { recursive: true });
     await runGit(this.repoRoot, ["worktree", "add", "-b", branch, wtPath, sha]);

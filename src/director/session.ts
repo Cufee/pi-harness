@@ -1,8 +1,9 @@
-import { randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import { codeModePromptSection, type CodeMode } from "../code-mode/index.js";
+import { friendlyIdCandidates, nextFriendlyId } from "../control-plane/ids.js";
+import { parseChatControlEvent, type ChatControlEvent } from "../protocol/chat-events.js";
 import type { ToolDisplayPayload } from "../protocol/tool-display.js";
 
 function canonicalRepoPath(p: string): string {
@@ -30,13 +31,15 @@ export interface ChatTurnRecord {
   seq: number;
   chatSessionId: string;
   role: "user" | "assistant" | "system_notice" | "tool_output";
-  /** Short plain-text summary for tool_output turns, e.g. "goal_list → Goals table (3 goals)". */
+  /** Short plain-text summary for tool_output / event turns, or message text for user/assistant turns. */
   content: string;
   createdAt: number;
   /** Only set on tool_output turns. */
   toolName?: string | null;
   /** Only set on tool_output turns. */
   display?: ToolDisplayPayload | null;
+  /** Typed control-plane event payload (rendered distinctly in the TUI without string-prefix parsing). */
+  event?: ChatControlEvent | null;
 }
 
 export const DIRECTOR_SCHEMA = `
@@ -60,7 +63,8 @@ CREATE TABLE IF NOT EXISTS chat_turns (
   content TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   tool_name TEXT,
-  display_json TEXT
+  display_json TEXT,
+  event_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_chat_turns_session ON chat_turns(chat_session_id, seq);
 `;
@@ -79,7 +83,7 @@ export function buildDirectorSystemPrompt(mode: CodeMode = "off"): string {
     "3. When the user changes requirements mid-flight, call `goal_amend` so a clean `vN -> vN+1` amendment delta propagates to the running Tier 1 Orchestrator without losing unaffected work.",
     "4. Surface `P0` escalations, circuit-breaker trips, and Independent Done-Review verdicts clearly to the user with actionable options.",
     "5. Keep responses crisp, direct, and grounded in actual tool state — never guess progress or invent statuses. Drive by events instead of token polling: after `goal_commit` (or `goal_create` with `commit_immediately`), end your turn immediately so the user stays in an instant, unblocked chat — the daemon automatically wakes you when the Goal settles or escalates. Do NOT call `goal_wait` after committing a goal unless the user explicitly asks you to block until completion, and never poll `goal_get` in a loop.",
-    "6. Whenever the user states per-session model or routing preferences (for example, using a specific model for a kind of task, or utilizing a particular model family more), call `set_model_selection_context` to store concise session-scoped guidance (empty by default; pass an empty string to clear). This context is returned to both users and spawned agents whenever models are listed.",
+    "6. Whenever the user states per-session model, quota pacing, or routing preferences (for example, using a specific model for a kind of task, utilizing a particular model family more, or pacing usage around reset windows), call `set_model_selection_context` to store concise session-scoped guidance (empty by default; pass an empty string to clear). By default, work in the most productive manner without artificially throttling for limits; when the user or `sessionModelContext` instructs pacing around usage/reset windows (or you want a scheduled follow-up), use `schedule_timer` (non-blocking, durable across restarts, supports `delay_seconds` or ISO `wake_at`, optional `pause_goal`/`resume_goal` and early `wake_on_event`) and end your turn.",
     "",
     "RICH TOOL OUTPUT:",
     "- `goal_list` renders the live Goals table directly in the user's UI, and `goal_get`, `goal_create`, `goal_commit`, `goal_amend`, `goal_pause`, `goal_cancel`, and `goal_trigger_review` render the native Goal detail card there. When the user asks about goals or progress, call the tool instead of printing a Goals table or goal details in prose.",
@@ -139,6 +143,7 @@ export class DirectorSessionStore {
     const cols = new Set((this.db.prepare("PRAGMA table_info(chat_turns)").all() as Array<{ name: string }>).map((c) => c.name));
     if (!cols.has("tool_name")) this.db.exec("ALTER TABLE chat_turns ADD COLUMN tool_name TEXT");
     if (!cols.has("display_json")) this.db.exec("ALTER TABLE chat_turns ADD COLUMN display_json TEXT");
+    if (!cols.has("event_json")) this.db.exec("ALTER TABLE chat_turns ADD COLUMN event_json TEXT");
   }
 
   private lastTs = 0;
@@ -165,7 +170,7 @@ export class DirectorSessionStore {
     effort?: string | null;
   }): ChatSessionRecord {
     const canon = canonicalRepoPath(input.repoRoot);
-    const id = `chat-${randomBytes(4).toString("hex")}`;
+    const id = nextFriendlyId(this.db, "chat", "chat_sessions");
     const now = this.nextTimestamp();
     this.db
       .prepare(
@@ -194,8 +199,11 @@ export class DirectorSessionStore {
   }
 
   getSession(id: string): ChatSessionRecord | null {
-    const r = this.db.prepare("SELECT * FROM chat_sessions WHERE id = ?").get(id) as Record<string, unknown> | undefined;
-    return r ? this.mapSession(r) : null;
+    for (const candidate of friendlyIdCandidates(id, "chat")) {
+      const r = this.db.prepare("SELECT * FROM chat_sessions WHERE id = ?").get(candidate) as Record<string, unknown> | undefined;
+      if (r) return this.mapSession(r);
+    }
+    return null;
   }
 
   listSessions(limit = 20): ChatSessionRecord[] {
@@ -210,11 +218,22 @@ export class DirectorSessionStore {
     role: ChatTurnRecord["role"],
     content: string,
     tool?: { toolName: string; display: ToolDisplayPayload | null },
+    event?: ChatControlEvent | null,
   ): ChatTurnRecord {
     const now = Date.now();
     const res = this.db
-      .prepare("INSERT INTO chat_turns(chat_session_id, role, content, created_at, tool_name, display_json) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(chatSessionId, role, content, now, tool?.toolName ?? null, tool?.display ? JSON.stringify(tool.display) : null);
+      .prepare(
+        "INSERT INTO chat_turns(chat_session_id, role, content, created_at, tool_name, display_json, event_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        chatSessionId,
+        role,
+        content,
+        now,
+        tool?.toolName ?? null,
+        tool?.display ? JSON.stringify(tool.display) : null,
+        event ? JSON.stringify(event) : null,
+      );
     this.db.prepare("UPDATE chat_sessions SET updated_at = ? WHERE id = ?").run(now, chatSessionId);
     return {
       seq: Number(res.lastInsertRowid),
@@ -223,6 +242,7 @@ export class DirectorSessionStore {
       content,
       createdAt: now,
       ...(tool ? { toolName: tool.toolName, display: tool.display } : {}),
+      ...(event ? { event } : {}),
     };
   }
 
@@ -280,19 +300,30 @@ export class DirectorSessionStore {
   }
 
   private mapTurns(rows: Record<string, unknown>[]): ChatTurnRecord[] {
-    return rows.map((r) => ({
-      seq: Number(r.seq),
-      chatSessionId: String(r.chat_session_id),
-      role: String(r.role) as ChatTurnRecord["role"],
-      content: String(r.content),
-      createdAt: Number(r.created_at),
-      ...(r.role === "tool_output"
-        ? {
-            toolName: r.tool_name ? String(r.tool_name) : null,
-            display: r.display_json ? (JSON.parse(String(r.display_json)) as ToolDisplayPayload) : null,
-          }
-        : {}),
-    }));
+    return rows.map((r) => {
+      let parsedEvent: ChatControlEvent | null = null;
+      if (typeof r.event_json === "string" && r.event_json) {
+        try {
+          parsedEvent = parseChatControlEvent(JSON.parse(r.event_json));
+        } catch {
+          parsedEvent = null;
+        }
+      }
+      return {
+        seq: Number(r.seq),
+        chatSessionId: String(r.chat_session_id),
+        role: String(r.role) as ChatTurnRecord["role"],
+        content: String(r.content),
+        createdAt: Number(r.created_at),
+        ...(r.role === "tool_output"
+          ? {
+              toolName: r.tool_name ? String(r.tool_name) : null,
+              display: r.display_json ? (JSON.parse(String(r.display_json)) as ToolDisplayPayload) : null,
+            }
+          : {}),
+        ...(parsedEvent ? { event: parsedEvent } : {}),
+      };
+    });
   }
 
   private mapSession(r: Record<string, unknown>): ChatSessionRecord {

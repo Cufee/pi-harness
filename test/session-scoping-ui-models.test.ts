@@ -27,7 +27,7 @@ import {
 } from "../src/protocol/tool-display.js";
 import { QuotaClient } from "../src/quota/client.js";
 import { parseCodexRateLimitsFromJsonl } from "../src/quota/local-harvest.js";
-import { isSubagentWaitTool } from "../src/tui/app.js";
+import { isSubagentWaitTool, historyTurnComponent } from "../src/tui/app.js";
 import { ModelConfigOverlay, ModelPickerOverlay, QuotaOverlay } from "../src/tui/overlays.js";
 import { effectiveRunStatus } from "../src/tui/runs-tree.js";
 import { renderToolOutput, type ToolDisplayPayload } from "../src/tui/tool-output/index.js";
@@ -35,6 +35,7 @@ import {
   createTheme,
   DISABLE_MOUSE_WHEEL_SEQ,
   ENABLE_MOUSE_WHEEL_SEQ,
+  EventCard,
   GoalHeader,
   OverlayManager,
   parseMouseWheel,
@@ -1282,6 +1283,196 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
       });
       const activityTurn = turns.find((t) => t.role === "tool_output" && t.toolName === "run_status");
       assert.equal(activityTurn?.display?.kind, "run_activity");
+    } finally {
+      client.close();
+      await daemon.stop();
+      rmSync(repoDir, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses model-friendly sequential IDs, typed control-plane EventCards, and durable timer self-pacing primitives", async () => {
+    const repoDir = initTempGitRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-ids-events-timers-"));
+    const sockPath = join(stateDir, "d.sock");
+    const cfg = loadConfig(repoDir);
+    cfg.stateDir = stateDir;
+    cfg.socketPath = sockPath;
+
+    const wakePrompts: string[] = [];
+    const receivedChatEvents: Array<{ type: string; payload: Record<string, unknown> }> = [];
+
+    const daemon = new HarnessDaemon(cfg, {
+      dbPath: join(stateDir, "cp.sqlite"),
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          if (req.taskId.startsWith("chat-")) {
+            wakePrompts.push(req.initialPrompt);
+            return { text: "Resumed after timer fired.", stopReason: "completed" };
+          }
+          return { text: "ok", stopReason: "completed" };
+        },
+      }),
+    });
+    await daemon.start();
+    const client = new DaemonClient(sockPath);
+    await client.connect();
+    client.onEvent((ev) => {
+      if (ev.type.startsWith("chat.")) {
+        receivedChatEvents.push({ type: ev.type, payload: (ev.payload ?? {}) as Record<string, unknown> });
+      }
+    });
+
+    try {
+      // 1. Model-friendly sequential IDs (no random hex/UUIDs!) + tolerant lookup normalization
+      const chat = await client.request<{ session: { id: string } }>("chat.create", {
+        repoRoot: repoDir,
+        title: "Friendly IDs Session",
+      });
+      assert.equal(chat.session.id, "chat-1");
+      assert.equal(daemon.director.chats.getSession("CHAT_1")?.id, "chat-1");
+
+      const goal = daemon.director.goals.createGoal({
+        repoRoot: repoDir,
+        chatSessionId: chat.session.id,
+        title: "Paced migration",
+        description: "Verify friendly IDs, typed events, and timers",
+        criteria: [{ kind: "deterministic", description: "Pass", command: "true" }],
+      });
+      assert.equal(goal.id, "goal-1");
+      assert.equal(goal.criteria[0]!.id, "c1");
+      assert.equal(daemon.director.goals.getGoal("GOAL-1")?.id, "goal-1");
+      assert.equal(daemon.director.goals.getGoal("#1")?.id, "goal-1");
+
+      const run = daemon.db.createRun({ goal: goal.title, repoRoot: repoDir, baseBranch: "main", baseSha: "abc" });
+      assert.equal(run.id, "run-1");
+      assert.equal(daemon.db.getRun("run_1")?.id, "run-1");
+      daemon.director.goals.linkRunAndStart(goal.id, run.id);
+
+      const parent = daemon.db.createTask({
+        runId: run.id,
+        tier: 1,
+        kind: "orchestrator",
+        title: "Orchestrator",
+        objective: "Coordinate",
+        profileId: "acp:codex",
+        model: "openai/gpt-6.2-astra",
+      });
+      assert.equal(parent.id, "t-1");
+      assert.equal(daemon.db.getTask("T-1")?.id, "t-1");
+
+      const child = daemon.db.createTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 2,
+        kind: "worker",
+        title: "Worker",
+        objective: "Do work",
+        profileId: "acp:codex",
+        model: "openai/gpt-6.2-sol",
+      });
+      assert.equal(child.id, "t-2");
+
+      const kb = daemon.db.kb.propose({
+        repoScope: repoDir,
+        kind: "decision",
+        title: "Friendly IDs",
+        summary: "Use sequential IDs",
+        contextMd: "Sequential IDs prevent model hallucinations.",
+        evidencePaths: ["README.md"],
+      });
+      assert.equal(kb.id, "kb-1");
+      assert.equal(daemon.db.kb.getRaw("KB_1")?.id, "kb-1");
+
+      // 2. Director durable timer: pause goal now, schedule timer-1 to auto-resume & wake Director with typed event
+      await client.request("chat.open", { repoRoot: repoDir, chatSessionId: chat.session.id });
+      const sched = (await daemon.director.executeDirectorMcpTool(chat.session.id, "schedule_timer", {
+        delay_seconds: 0.08,
+        reason: "Resume after quota reset window",
+        goal_id: "GOAL-1",
+        pause_goal: true,
+        resume_goal: true,
+      })) as { timer: { id: string; status: string }; pausedGoal: boolean };
+      assert.equal(sched.timer.id, "timer-1");
+      assert.equal(sched.pausedGoal, true);
+      assert.equal(daemon.director.goals.getGoal("goal-1")?.status, "paused");
+
+      // List timers returns timer-1
+      const listed = (await daemon.director.executeDirectorMcpTool(chat.session.id, "list_timers", {
+        status: "pending",
+      })) as { timers: Array<{ id: string }> };
+      assert.equal(listed.timers.some((t) => t.id === "timer-1"), true);
+
+      // Wait for timer-1 to fire and wake Director with a typed `timer.fired` ChatControlEvent
+      for (let i = 0; i < 60 && !wakePrompts.some((p) => p.includes("Control-plane event (timer.fired):")); i++) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      const timerWakePrompt = wakePrompts.find((p) => p.includes("Control-plane event (timer.fired):"));
+      assert.ok(timerWakePrompt, "Timer firing must wake Director automatically");
+      assert.ok(timerWakePrompt.includes("timer-1"));
+      const resumedGoal = daemon.director.goals.getGoal("goal-1");
+      assert.ok(resumedGoal && resumedGoal.status !== "paused", "resume_goal must auto-resume paused goal");
+
+      // Wire frame chat.turn.start carried typed `event` (NOT a raw `[Event]` string!)
+      const startFrame = receivedChatEvents.find(
+        (e) => e.type === "chat.turn.start" && (e.payload.event as { kind?: string } | undefined)?.kind === "timer.fired",
+      );
+      assert.ok(startFrame, "chat.turn.start must carry typed timer.fired event");
+
+      // Persisted history turns carry typed `event` objects and render via EventCard (distinct from chat)
+      const history = daemon.director.chats.getHistory(chat.session.id);
+      const schedTurn = history.find((t) => t.event?.kind === "timer.scheduled");
+      const firedTurn = history.find((t) => t.event?.kind === "timer.fired");
+      assert.ok(schedTurn?.event, "timer.scheduled must be persisted as typed event");
+      assert.ok(firedTurn?.event, "timer.fired must be persisted as typed event");
+
+      const theme = createTheme();
+      const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+      const comp = historyTurnComponent(firedTurn, theme, "model");
+      assert.equal(comp instanceof EventCard, true, "Typed event turns must render as EventCard, not plain chat");
+      for (const w of [50, 80, 120]) {
+        const lines = comp.render(w);
+        assert.ok(lines.length > 0);
+        for (const l of lines) assert.ok(visibleWidth(l) <= w, `EventCard overflowed width ${w}`);
+      }
+      const rendered = comp.render(100).map(strip).join("\n");
+      assert.ok(rendered.includes("EVENT · TIMER FIRED"));
+      assert.ok(rendered.includes("timer-1"));
+      assert.equal(rendered.includes("[Event]"), false, "EventCard must not render raw [Event] string prefixes");
+
+      // 3. Subagent `wait_timer` sleeps cleanly with telemetry and wakes early on `child_settled`
+      daemon.db.updateTask(parent.id, { status: "running" });
+      daemon.db.updateTask(child.id, { status: "running" });
+      const waitTimerPromise = daemon.orchestrator.toolExecutor.execute(run.id, parent.id, "wait_timer", {
+        delay_seconds: 3600,
+        reason: "Wait for quota reset or worker completion",
+        wake_on_event: "child_settled",
+      }) as Promise<{ timerId: string; wakeReason: string }>;
+
+      await new Promise((r) => setTimeout(r, 25));
+      const sleepTelemetry = buildRunActivitySummary(daemon.db, run.id);
+      const parentSnap = sleepTelemetry.tasks.find((t) => t.id === parent.id);
+      assert.ok(parentSnap?.currentAction?.includes("sleeping"), `Expected sleeping telemetry, got: ${parentSnap?.currentAction}`);
+
+      // Completing child wakes parent's wait_timer immediately!
+      const t0 = Date.now();
+      daemon.db.updateTask(child.id, { status: "completed", summary: "Finished early" });
+      const waitTimerRes = await waitTimerPromise;
+      assert.equal(waitTimerRes.timerId, "timer-2");
+      assert.equal(waitTimerRes.wakeReason, "child_settled:t-2");
+      assert.ok(Date.now() - t0 < 1500, "wait_timer must wake immediately on subscribed child_settled event");
+
+      // 4. cancel_timer cancels a pending future timer cleanly
+      const future = (await daemon.director.executeDirectorMcpTool(chat.session.id, "schedule_timer", {
+        wake_at: new Date(Date.now() + 86_400_000).toISOString(),
+        reason: "Tomorrow quota reset",
+      })) as { timer: { id: string } };
+      assert.equal(future.timer.id, "timer-3");
+      const cancelled = (await daemon.director.executeDirectorMcpTool(chat.session.id, "cancel_timer", {
+        timer_id: "TIMER_3",
+      })) as { timer: { id: string; status: string } };
+      assert.equal(cancelled.timer.id, "timer-3");
+      assert.equal(cancelled.timer.status, "cancelled");
     } finally {
       client.close();
       await daemon.stop();

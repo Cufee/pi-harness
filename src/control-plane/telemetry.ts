@@ -99,7 +99,7 @@ export function buildRunActivitySummary(db: ControlPlaneDb, runId: string, now =
   const evRows = db.db
     .prepare(
       `SELECT task_id, type, payload_json FROM events
-       WHERE run_id = ? AND task_id IS NOT NULL AND type IN ('agent.tool', 'quota.agent_retrying', 'quota.agent_paused', 'agent.rollover')
+       WHERE run_id = ? AND task_id IS NOT NULL AND type IN ('agent.tool', 'agent.timer_sleep', 'quota.agent_retrying', 'quota.agent_paused', 'agent.rollover')
        ORDER BY seq DESC LIMIT 400`,
     )
     .all(runId) as Array<{ task_id: string; type: string; payload_json: string }>;
@@ -160,7 +160,11 @@ export function buildRunActivitySummary(db: ControlPlaneDb, runId: string, now =
         latestActionByTask.set(tid, `${prefix} ${label}`.slice(0, 72));
       }
     } else if (!latestActionByTask.has(tid)) {
-      if (row.type === "quota.agent_retrying") {
+      if (row.type === "agent.timer_sleep") {
+        const wakeAt = typeof payload.wakeAt === "number" ? new Date(payload.wakeAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+        const reason = typeof payload.reason === "string" && payload.reason ? ` — ${payload.reason}` : "";
+        latestActionByTask.set(tid, `⏰ sleeping${wakeAt ? ` until ${wakeAt}` : ""}${reason}`.slice(0, 72));
+      } else if (row.type === "quota.agent_retrying") {
         latestActionByTask.set(tid, "⏳ retrying rate limit…");
       } else if (row.type === "quota.agent_paused") {
         latestActionByTask.set(tid, "⏸ paused (quota)");

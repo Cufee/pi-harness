@@ -21,6 +21,7 @@ import { HarnessOrchestrator, type CustomRunnerFactory } from "../control-plane/
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { DirectorRuntime } from "../director/runtime.js";
 import type { GoalCriterion } from "../goals/engine.js";
+import { formatChatEventSummary, type ChatControlEvent } from "../protocol/chat-events.js";
 import type { DaemonEventFrame, RpcRequest, RpcResponse } from "../protocol/daemon-rpc.js";
 import { attachNdjsonReader, writeDaemonMessage } from "../protocol/frames.js";
 import { buildGoalDetailDisplay, buildGoalsTableDisplay, summarizeToolDisplay } from "../protocol/tool-display.js";
@@ -87,7 +88,7 @@ export class HarnessDaemon {
   private runBindings = new Map<string, Socket>();
   private chatBindings = new Map<string, Socket>();
   private chatTurns = new Map<string, { id: string; text: string; cancelling: boolean }>();
-  private pendingWakeups = new Map<string, Array<{ summary: string; prompt: string }>>();
+  private pendingWakeups = new Map<string, ChatControlEvent[]>();
   private socketToChatId = new Map<Socket, string>();
   private chatSubscribers = new Set<Socket>();
   private tuiSockets = new Set<Socket>();
@@ -111,34 +112,38 @@ export class HarnessDaemon {
     this.catalog = new ModelCatalogCompiler(config, this.quota);
     this.orchestrator = new HarnessOrchestrator(this.db, config, this.catalog, this.quota, opts?.customRunnerFactory);
     this.director = new DirectorRuntime(this.db, config, this.catalog, this.quota, this.orchestrator, opts?.customRunnerFactory);
-    this.director.setWakeHandler((chatSessionId, summary, prompt) => {
-      this.scheduleDirectorWakeup(chatSessionId, summary, prompt);
+    this.director.setWakeHandler((chatSessionId, event) => {
+      this.scheduleDirectorWakeup(chatSessionId, event);
     });
   }
 
   /**
-   * Event-driven wakeup for Tier 0 Director when an autonomous Goal run settles (zero polling!).
-   * - If the Director is idle: starts a live wakeup turn immediately so the Director settles/reports the Goal.
-   * - If the Director is currently busy (e.g. already inside `goal_wait` or mid-turn): avoids spawning a
-   *   duplicate follow-up turn and delivers a best-effort steer notification instead.
+   * Event-driven wakeup for Tier 0 Director when a typed control-plane event fires
+   * (e.g. `goal.settled`, `timer.fired`) — zero polling, zero string-prefix parsing.
    */
-  private scheduleDirectorWakeup(chatSessionId: string, summary: string, prompt: string): void {
+  private scheduleDirectorWakeup(chatSessionId: string, event: ChatControlEvent): void {
     const activeTurn = this.chatTurns.get(chatSessionId);
     if (activeTurn) {
+      const summary = formatChatEventSummary(event);
       void this.director
-        .steerChat(chatSessionId, summary, { role: "system_notice" })
+        .steerChat(chatSessionId, summary, { role: "system_notice", event })
         .then((accepted) => {
           if (accepted) {
             this.sendChatEvent(chatSessionId, activeTurn.id, "chat.steered", {
               message: summary,
               role: "system_notice",
+              event,
             });
+          } else {
+            const q = this.pendingWakeups.get(chatSessionId) ?? [];
+            q.push(event);
+            this.pendingWakeups.set(chatSessionId, q);
           }
         })
         .catch(() => {});
       return;
     }
-    void this.runDirectorWakeupTurn(chatSessionId, summary, prompt);
+    void this.runDirectorWakeupTurn(chatSessionId, event);
   }
 
   private drainPendingWakeup(chatSessionId: string): void {
@@ -147,20 +152,24 @@ export class HarnessDaemon {
     const next = q?.shift();
     if (!next) return;
     if (q && q.length === 0) this.pendingWakeups.delete(chatSessionId);
-    void this.runDirectorWakeupTurn(chatSessionId, next.summary, next.prompt);
+    void this.runDirectorWakeupTurn(chatSessionId, next);
   }
 
-  private async runDirectorWakeupTurn(chatSessionId: string, summary: string, prompt: string): Promise<void> {
+  private async runDirectorWakeupTurn(chatSessionId: string, event: ChatControlEvent): Promise<void> {
     if (this.chatTurns.has(chatSessionId)) return;
     if (!this.director.chats.getSession(chatSessionId)) return;
     const id = `wake-${randomBytes(4).toString("hex")}`;
     const turn = { id, text: "", cancelling: false };
     this.chatTurns.set(chatSessionId, turn);
-    this.sendChatEvent(chatSessionId, id, "chat.turn.start", { reason: "goal_settled", summary });
+    this.sendChatEvent(chatSessionId, id, "chat.turn.start", {
+      reason: event.kind,
+      event,
+      summary: formatChatEventSummary(event),
+    });
     try {
       const result = await this.director.sendChatMessage(
         chatSessionId,
-        prompt,
+        "",
         (delta) => {
           turn.text += delta;
           this.sendChatEvent(chatSessionId, id, "chat.delta", { delta });
@@ -168,7 +177,7 @@ export class HarnessDaemon {
         (tool) => {
           this.sendChatEvent(chatSessionId, id, "chat.tool", tool);
         },
-        { turnRole: "system_notice" },
+        { event },
       );
       this.sendChatEvent(chatSessionId, id, "chat.turn.end", {
         assistantTurn: result.assistantTurn,
@@ -220,6 +229,7 @@ export class HarnessDaemon {
 
   async start(): Promise<string> {
     this.orchestrator.reconcileStaleRunsOnStartup();
+    this.db.timers.restorePending();
     await this.ptyHost.init();
     const sockPath = this.config.socketPath;
     mkdirSync(dirname(sockPath), { recursive: true });

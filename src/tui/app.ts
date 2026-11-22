@@ -9,6 +9,7 @@ import type { DaemonClient } from "../daemon/remote.js";
 import type { ChatSessionRecord, ChatTurnRecord } from "../director/session.js";
 import type { GoalRecord, GoalReviewVerdict } from "../goals/engine.js";
 import type { KbCard } from "../kb/store.js";
+import { parseChatControlEvent } from "../protocol/chat-events.js";
 import type { DaemonEventFrame } from "../protocol/daemon-rpc.js";
 import type { LiveWorktreeInfo } from "../worktree/manager.js";
 import {
@@ -42,6 +43,7 @@ import {
   createTheme,
   type HarnessTheme,
   ErrorCard,
+  EventCard,
   FooterHint,
   GoalHeader,
   formatAgentError,
@@ -276,6 +278,7 @@ async function resolveLeaveNote(client: DaemonClient): Promise<string> {
 export function historyTurnComponent(t: ChatTurnRecord, theme: HarnessTheme, modelLabel: string): Component {
   if (t.role === "user") return new UserCard(theme, t.content);
   if (t.role === "assistant") return new AssistantCard(theme, t.content, modelLabel);
+  if (t.event) return new EventCard(theme, t.event);
   return componentForHistoryTurn(t, theme) ?? new SystemCard(theme, [t.content], "muted");
 }
 
@@ -1353,14 +1356,19 @@ export async function runDirectorChatTui(opts: {
       return;
     }
     if (ev.type.startsWith("chat.")) {
-      const p = ev.payload as TurnEnd & { chatSessionId: string; turnId: string; summary?: string };
+      const p = ev.payload as TurnEnd & { chatSessionId: string; turnId: string; summary?: string; event?: unknown };
       if (p.chatSessionId !== session.id) return;
       if (ev.type === "chat.turn.start") {
         if (activeTurnId || busy) return;
         activeTurnId = p.turnId;
         busy = true;
         clearPending();
-        if (p.summary) appendSystem([p.summary], "info");
+        const typedEv = parseChatControlEvent(p.event);
+        if (typedEv) {
+          chatContainer.addChild(new EventCard(theme, typedEv));
+        } else if (p.summary) {
+          appendSystem([p.summary], "info");
+        }
         refreshStatus();
         spinner.start(`Thinking (${session.model ?? session.profileId})…`);
         tui.requestRender();
@@ -1368,11 +1376,15 @@ export async function runDirectorChatTui(opts: {
       }
       if (!activeTurnId || p.turnId !== activeTurnId) return;
       if (ev.type === "chat.steered") {
-        const steered = ev.payload as { message: string; role?: "user" | "system_notice" };
-        if (steered.role === "system_notice") {
-          appendSystem([steered.message], "info");
+        const steered = ev.payload as { message?: string; role?: "user" | "system_notice"; event?: unknown };
+        const typedEv = parseChatControlEvent(steered.event);
+        if (typedEv) {
+          chatContainer.addChild(new EventCard(theme, typedEv));
+          tui.requestRender();
+        } else if (steered.role === "system_notice") {
+          if (steered.message) appendSystem([steered.message], "info");
         } else {
-          chatContainer.addChild(new UserCard(theme, String(steered.message)));
+          chatContainer.addChild(new UserCard(theme, String(steered.message ?? "")));
           tui.requestRender();
         }
         return;

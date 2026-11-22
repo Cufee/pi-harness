@@ -1,9 +1,9 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { nextUniqueFileName } from "../control-plane/ids.js";
 import type { ToolDefinition } from "../runners/types.js";
 import { guard, sandboxCommand, sandboxEnv } from "./sandbox.js";
 import { generateSdkDeclarations } from "./sdk.js";
@@ -161,7 +161,7 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     const limit = Math.max(0, opts.maxOutputChars ?? 20_000);
     result.preview = json.slice(0, limit);
     if (json.length > limit) {
-      const name = `code-exec-${randomUUID()}.json`;
+      const name = nextUniqueFileName(opts.saveOutput ? null : opts.artifactsDir, "code-exec", ".json");
       if (opts.saveOutput) {
         result.artifactPath = await opts.saveOutput(name, json);
       } else {

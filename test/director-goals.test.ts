@@ -34,7 +34,7 @@ describe("Tier 0 Director, Run-Until-Done Goal Engine, Independent Done-Review &
           run: async (req) => {
             // Tier 0 Director Chat creates and commits a Goal Contract on user request (and acknowledges event wakeups)
             if (req.taskId.startsWith("chat-")) {
-              if (req.initialPrompt.includes("[Event]")) {
+              if (req.initialPrompt.includes("Control-plane event")) {
                 return { text: "Noted goal run settlement.", stopReason: "completed" };
               }
               const created = (await req.executeTool("goal_create", {

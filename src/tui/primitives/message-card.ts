@@ -1,4 +1,5 @@
 import { Markdown, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
+import type { ChatControlEvent } from "../../protocol/chat-events.js";
 import type { FormattedAgentError } from "./error-format.js";
 import type { HarnessTheme } from "./theme.js";
 import { clampLine, fillLineBg, fitWidth } from "./width.js";
@@ -227,5 +228,149 @@ export class ErrorCard implements Component {
     this.cachedWidth = width;
     this.cachedLines = out;
     return out;
+  }
+}
+
+/**
+ * Distinct typed control-plane Event card rendered differently from conversational chat turns.
+ * Switches strictly on `event.kind` — never parses string prefixes like `[Event]`.
+ */
+export class EventCard implements Component {
+  private cachedWidth = -1;
+  private cachedLines: readonly string[] = [];
+
+  constructor(
+    private readonly theme: HarnessTheme,
+    private readonly event: ChatControlEvent,
+  ) {}
+
+  invalidate(): void {
+    this.cachedWidth = -1;
+  }
+
+  render(width: number): readonly string[] {
+    if (width <= 0) return [];
+    if (this.cachedWidth === width) return this.cachedLines;
+
+    const { icon, badge, headline, detail, tone } = this.describe();
+    const paint =
+      tone === "success"
+        ? this.theme.success
+        : tone === "error"
+          ? this.theme.error
+          : tone === "warning"
+            ? this.theme.warning
+            : this.theme.info;
+    const gutter = paint("┃");
+    const tag = `${paint(icon)} ${paint(this.theme.bold(badge))}`;
+    const inner = Math.max(1, width - 4);
+    const out: string[] = [""];
+
+    const headLines = wrapTextWithAnsi(`${tag}  ${headline}`, inner);
+    for (let i = 0; i < headLines.length; i++) {
+      const line = i === 0 ? ` ${gutter} ${headLines[i]!}` : ` ${gutter}   ${headLines[i]!}`;
+      out.push(fillLineBg(fitWidth(line, width), width, this.theme.surfaceBg));
+    }
+    if (detail) {
+      for (const l of wrapTextWithAnsi(this.theme.muted(detail), inner)) {
+        out.push(fillLineBg(fitWidth(` ${gutter}   ${l}`, width), width, this.theme.surfaceBg));
+      }
+    }
+
+    this.cachedWidth = width;
+    this.cachedLines = out;
+    return out;
+  }
+
+  private describe(): {
+    icon: string;
+    badge: string;
+    headline: string;
+    detail?: string;
+    tone: "info" | "success" | "warning" | "error";
+  } {
+    const ev = this.event;
+    switch (ev.kind) {
+      case "goal.settled": {
+        const tone = ev.runStatus === "completed" ? "success" : ev.runStatus === "failed" ? "error" : "warning";
+        const icon = ev.runStatus === "completed" ? "✓" : ev.runStatus === "failed" ? "✗" : "■";
+        const badge = ev.runStatus === "completed" ? "EVENT · GOAL RUN COMPLETED" : `EVENT · GOAL RUN ${ev.runStatus.toUpperCase()}`;
+        const escNote = ev.openEscalations > 0 ? ` · ${ev.openEscalations} open escalation(s)` : "";
+        return {
+          icon,
+          badge,
+          headline: `${this.theme.bold(`${ev.goalId} v${ev.goalVersion}`)} "${ev.goalTitle}" ${this.theme.dim(`(${ev.runId}${escNote})`)}`,
+          tone,
+        };
+      }
+      case "goal.committed":
+        return {
+          icon: "▶",
+          badge: "EVENT · GOAL STARTED",
+          headline: `${this.theme.bold(`${ev.goalId} v${ev.goalVersion}`)} "${ev.goalTitle}"`,
+          detail: `Autonomous run ${ev.runId} · ${ev.criteriaCount} criteria`,
+          tone: "info",
+        };
+      case "goal.amended":
+        return {
+          icon: "↻",
+          badge: "EVENT · GOAL AMENDED",
+          headline: `${this.theme.bold(ev.goalId)} v${ev.fromVersion} → v${ev.toVersion}`,
+          detail: ev.rationale,
+          tone: "warning",
+        };
+      case "goal.reviewed": {
+        const tone =
+          ev.status === "achieved" ? "success" : ev.status === "awaiting_human" ? "error" : "warning";
+        const icon = ev.status === "achieved" ? "✓" : ev.status === "awaiting_human" ? "!" : "◆";
+        const badge =
+          ev.status === "achieved"
+            ? "EVENT · GOAL ACHIEVED"
+            : ev.status === "awaiting_human"
+              ? `EVENT · HUMAN REVIEW NEEDED${ev.circuitBreakerTripped ? ` (${ev.circuitBreakerTripped})` : ""}`
+              : `EVENT · REVIEW #${ev.cycle} CHANGES REQUESTED`;
+        return {
+          icon,
+          badge,
+          headline: `${this.theme.bold(`${ev.goalId} v${ev.goalVersion}`)}`,
+          detail: ev.summary,
+          tone,
+        };
+      }
+      case "director.read_file":
+        return {
+          icon: "◇",
+          badge: "EVENT · FILE EXCEPTION",
+          headline: `${this.theme.bold(ev.path)} ${this.theme.dim(`(${ev.bytes} bytes)`)}`,
+          detail: ev.reason,
+          tone: "info",
+        };
+      case "timer.scheduled": {
+        const at = new Date(ev.wakeAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+        const extras: string[] = [`wakes ${at}`];
+        if (ev.goalId) extras.push(ev.goalId);
+        if (ev.pausedGoal) extras.push("paused goal");
+        if (ev.wakeOnEvent && ev.wakeOnEvent !== "none") extras.push(`early wake: ${ev.wakeOnEvent}`);
+        return {
+          icon: "⏰",
+          badge: "EVENT · TIMER SCHEDULED",
+          headline: `${this.theme.bold(ev.timerId)} ${this.theme.dim(`(${extras.join(" · ")})`)}`,
+          detail: ev.reason,
+          tone: "info",
+        };
+      }
+      case "timer.fired": {
+        const extras: string[] = [ev.wakeReason];
+        if (ev.goalId) extras.push(ev.goalId);
+        if (ev.resumedGoal) extras.push("resumed goal");
+        return {
+          icon: "⏰",
+          badge: "EVENT · TIMER FIRED",
+          headline: `${this.theme.bold(ev.timerId)} ${this.theme.dim(`(${extras.join(" · ")})`)}`,
+          detail: ev.reason,
+          tone: "success",
+        };
+      }
+    }
   }
 }
