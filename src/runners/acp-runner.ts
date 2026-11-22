@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { lstat, open, realpath, stat } from "node:fs/promises";
@@ -9,6 +10,7 @@ import {
   buildNewSessionParams,
   buildPostSessionActions,
   extractArtifactsFromToolUpdate,
+  isAmpAcpProfile,
   prepareAcpSpawn,
   reportedModels,
   selectValues,
@@ -150,8 +152,10 @@ export class AcpRunner {
     let needsParagraphBreak = false;
     let lastUsage: RunnerUsage | undefined;
     let rolloverTriggered = false;
+    let rolloverWarningSent = false;
     let sessionId: string | undefined;
     let steeringSupported = false;
+    const isAmpProfile = isAmpAcpProfile(this.profile);
     let activeConnection: ClientConnection | null = null;
     const toolTitlesById = new Map<string, string>();
 
@@ -303,11 +307,44 @@ export class AcpRunner {
             }
           }
 
+          const ratio = size > 0 ? used / size : 0;
+          const softWarnThreshold = req.rolloverThreshold ? Math.max(0.5, req.rolloverThreshold - 0.12) : undefined;
+          if (
+            !rolloverWarningSent &&
+            !rolloverTriggered &&
+            softWarnThreshold &&
+            req.rolloverThreshold &&
+            ratio >= softWarnThreshold &&
+            ratio < req.rolloverThreshold &&
+            sessionId &&
+            activeConnection &&
+            (steeringSupported || isAmpProfile)
+          ) {
+            rolloverWarningSent = true;
+            const pct = Math.round(ratio * 100);
+            const limitPct = Math.round(req.rolloverThreshold * 100);
+            const warnMsg =
+              `Context usage is at ${pct}% (hard rollover at ${limitPct}%). Finish your current atomic step and call \`request_rollover\` with a thorough anchored handoff (goal_invariants, architectural_decisions, active_risks, next_actions) so no context is lost.`;
+            if (steeringSupported) {
+              void activeConnection.agent
+                .request("_session/steering", { sessionId, prompt: [{ type: "text", text: warnMsg }] })
+                .catch(() => {});
+            } else if (isAmpProfile) {
+              void activeConnection.agent
+                .request("_amp/session/steer", {
+                  sessionId,
+                  steerId: randomUUID(),
+                  prompt: [{ type: "text", text: warnMsg }],
+                })
+                .catch(() => {});
+            }
+          }
+
           if (
             !rolloverTriggered &&
             req.rolloverThreshold &&
             size > 0 &&
-            used / size >= req.rolloverThreshold &&
+            ratio >= req.rolloverThreshold &&
             sessionId &&
             activeConnection
           ) {
@@ -376,7 +413,10 @@ export class AcpRunner {
           toolCall?: {
             toolCallId?: string; title?: string; name?: string; kind?: string;
             locations?: Array<{ path: string }>;
-            _meta?: { claudeCode?: { toolName?: string; mcpServer?: { name?: string; source?: string } } };
+            _meta?: {
+              claudeCode?: { toolName?: string; mcpServer?: { name?: string; source?: string } };
+              "gemini-cli"?: { mcp?: { server_name?: string; tool_name?: string } };
+            };
           };
           options?: Array<{ optionId: string; kind: string }>;
         };
@@ -393,6 +433,9 @@ export class AcpRunner {
           claude.toolName !== undefined && claudeToolNames.has(claude.toolName);
         const codexCall = this.profile.adapter === "codex" && toolKind === "execute" &&
           p._meta?.is_mcp_tool_approval === true && callId !== undefined && codexHarnessCalls.has(callId);
+        const geminiMcp = p.toolCall?._meta?.["gemini-cli"]?.mcp;
+        const geminiCall = this.profile.adapter === "gemini" && geminiMcp?.server_name === "harness" &&
+          geminiMcp.tool_name !== undefined && harnessToolNames.has(geminiMcp.tool_name);
         const genericCall = this.profile.adapter === "generic" && toolKind === "other" &&
           p.toolCall?.name !== undefined && harnessToolNames.has(p.toolCall.name);
         const isRead = toolKind === "read" || toolKind === "search";
@@ -400,7 +443,7 @@ export class AcpRunner {
         let workspaceCall = false;
         // Native commands may run inside the CLI sandbox. An opaque command approval
         // can request elevation and supplies no checkable set of filesystem targets.
-        if (!controlOnly && !claude?.mcpServer && !p._meta?.is_mcp_tool_approval &&
+        if (!controlOnly && !claude?.mcpServer && !p._meta?.is_mcp_tool_approval && !geminiMcp &&
             (isRead || (canWrite && isWrite))) {
           try {
             const locations = p.toolCall?.locations ?? [];
@@ -412,7 +455,7 @@ export class AcpRunner {
             workspaceCall = false;
           }
         }
-        if (!sessionId || params.sessionId !== sessionId || !(workspaceCall || (hasHarnessBridge && (claudeCall || codexCall || genericCall)))) {
+        if (!sessionId || params.sessionId !== sessionId || !(workspaceCall || (hasHarnessBridge && (claudeCall || codexCall || geminiCall || genericCall)))) {
           const deniedLabel = title || toolKind || "native tool";
           turnDeniedTools.push(deniedLabel);
           allToolFailures.push(`${deniedLabel} (blocked by ${req.toolPolicy})`);
@@ -507,15 +550,6 @@ export class AcpRunner {
         },
       } as never)) as unknown as Record<string, unknown>;
 
-      // ACP does not negotiate support for Claude's native tool inventory option.
-      // Accept the implementation audited to honor tools: [] and strictMcpConfig.
-      if (controlOnly) {
-        const agent = initRes.agentInfo as { name?: string; version?: string } | undefined;
-        if (agent?.name !== "@agentclientprotocol/claude-agent-acp" || agent.version !== "0.109.1") {
-          throw new Error(`Profile ${this.profile.id} requires claude-agent-acp 0.109.1 for control_plane_only`);
-        }
-      }
-
       const initMeta = (initRes._meta ?? {}) as Record<string, unknown>;
       const steeringMeta = initMeta.steering as { supported?: boolean } | undefined;
       steeringSupported = Boolean(steeringMeta?.supported);
@@ -548,7 +582,7 @@ export class AcpRunner {
       const newSessionRes = (await conn.agent.request(
         "session/new",
         newSessionParams as never,
-      )) as unknown as Record<string, unknown>;
+      )) as AcpModelState & { sessionId: string };
       sessionId = String(newSessionRes.sessionId);
       req.callbacks.onSessionId?.(sessionId);
 
@@ -567,7 +601,10 @@ export class AcpRunner {
           continue; // Effort is optional.
         }
         const currentModels = reportedModels(reply, modelConfigIds);
-        if (action.requiredModel && !currentModels.length) {
+        // session/set_model acknowledges the selected ID with an empty success response.
+        const acknowledgedLegacyModel = action.method === "session/set_model" &&
+          newSessionRes.models?.availableModels?.some(({ modelId }) => modelId === req.model);
+        if (action.requiredModel && !currentModels.length && !acknowledgedLegacyModel) {
           throw new Error(`Could not select model ${req.model}: ${action.method} returned no current model`);
         }
         for (const current of currentModels) {
@@ -584,6 +621,18 @@ export class AcpRunner {
             try {
               await conn.agent.request("_session/steering", {
                 sessionId,
+                prompt: [{ type: "text", text: message }],
+              });
+              return true;
+            } catch {
+              return false;
+            }
+          }
+          if (isAmpProfile) {
+            try {
+              await conn.agent.request("_amp/session/steer", {
+                sessionId,
+                steerId: randomUUID(),
                 prompt: [{ type: "text", text: message }],
               });
               return true;

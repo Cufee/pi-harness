@@ -1,7 +1,7 @@
 import { matchesKey, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 import type { EventRecord } from "../control-plane/db.js";
 import { formatResetCountdown } from "./overlays.js";
-import { fitWidth, formatAgentError, type HarnessTheme } from "./primitives/index.js";
+import { fitWidth, formatAgentError, parseMouseWheel, type HarnessTheme } from "./primitives/index.js";
 
 /** Replay rows and live frames share these fields. */
 export type TranscriptEvent = Pick<EventRecord, "seq" | "type" | "payload"> & Partial<EventRecord>;
@@ -216,6 +216,11 @@ export class AgentTranscriptOverlay implements Component {
     if (this.closed) return;
     const page = Math.max(1, this.viewportRows() - 1);
     if (this.follow) this.scrollTop = this.maxTop(); // catch up to the live bottom first
+    const mouse = parseMouseWheel(data, 3);
+    if (mouse.isMouse) {
+      if (mouse.deltaLines !== 0) this.scrollTo(this.scrollTop + mouse.deltaLines);
+      return;
+    }
     if (matchesKey(data, "escape")) {
       this.closed = true;
       const stop = this.stopFn;
@@ -257,18 +262,37 @@ export class AgentTranscriptOverlay implements Component {
       return out;
     }
     const lines = this.allLines(width);
-    if (lines.length === 0) out.push(fitWidth(t.muted("No output from this agent yet."), width));
-    const max = Math.max(0, lines.length - vp);
+    const hasScrollbar = lines.length > vp && width >= 20;
+    const contentWidth = hasScrollbar ? width - 2 : width;
+    const renderedLines = hasScrollbar ? this.allLines(contentWidth) : lines;
+    if (renderedLines.length === 0) out.push(fitWidth(t.muted("No output from this agent yet."), width));
+    const max = Math.max(0, renderedLines.length - vp);
     if (this.follow) this.scrollTop = max;
     this.scrollTop = Math.min(this.scrollTop, max);
-    for (const l of lines.slice(this.scrollTop, this.scrollTop + vp)) out.push(fitWidth(l, width));
-    const pos = lines.length > vp ? `${this.scrollTop + 1}-${Math.min(lines.length, this.scrollTop + vp)}/${lines.length}` : `${lines.length}/${lines.length}`;
-    out.push(
-      fitWidth(
-        t.dim(`${pos} lines · ${this.follow ? "following" : "paused"} · ↑↓/jk scroll · PgUp/PgDn · g/G top/bottom · Esc close`),
-        width,
-      ),
-    );
+
+    const visibleSlice = renderedLines.slice(this.scrollTop, this.scrollTop + vp);
+    if (hasScrollbar && renderedLines.length > vp) {
+      const thumbSize = Math.max(1, Math.round((vp * vp) / renderedLines.length));
+      const thumbTop = max > 0 ? Math.round((this.scrollTop / max) * (vp - thumbSize)) : 0;
+      for (let i = 0; i < visibleSlice.length; i++) {
+        const isThumb = i >= thumbTop && i < thumbTop + thumbSize;
+        const bar = isThumb ? t.accent("┃") : t.dim("│");
+        out.push(`${bar} ${fitWidth(visibleSlice[i]!, contentWidth)}`);
+      }
+    } else {
+      for (const l of visibleSlice) out.push(fitWidth(l, width));
+    }
+
+    const pct = max > 0 ? Math.round((this.scrollTop / max) * 100) : 100;
+    const pos =
+      renderedLines.length > vp
+        ? `${this.scrollTop + 1}-${Math.min(renderedLines.length, this.scrollTop + vp)}/${renderedLines.length} (${pct}%)`
+        : `${renderedLines.length}/${renderedLines.length}`;
+    const hint =
+      width >= 96
+        ? `${pos} · ${this.follow ? "following" : "paused"} · mouse wheel/↑↓/jk scroll · PgUp/PgDn · g/G top/bottom · Esc close`
+        : `${pos} · ${this.follow ? "following" : "paused"} · wheel/↑↓ scroll · g/G · Esc close`;
+    out.push(fitWidth(t.dim(hint), width));
     return out;
   }
 }

@@ -439,9 +439,11 @@ async function main(): Promise<void> {
           cwd: repoRoot,
           role: typeof flags.role === "string" ? flags.role : undefined,
           excludeExhausted: Boolean(flags["exclude-exhausted"]),
+          chatSessionId: typeof flags.chat === "string" ? flags.chat : undefined,
         })) as {
           syncedAt: string;
           sources: string[];
+          sessionModelContext?: string | null;
           profileStatuses?: Array<{ profileId: string; status: "ok" | "error"; modelCount: number; error?: string }>;
           models: Array<{
             codingRank: number | null;
@@ -459,6 +461,9 @@ async function main(): Promise<void> {
           console.log(JSON.stringify(out, null, 2));
         } else {
           console.log(`Models (${out.models.length}) · synced ${out.syncedAt} · sources: ${out.sources.join(", ") || "none"}`);
+          if (out.sessionModelContext) {
+            console.log(`  Session model context: ${out.sessionModelContext}`);
+          }
           for (const st of out.profileStatuses ?? []) {
             if (st.status === "error") {
               console.log(`  ⚠ ${st.profileId}: ${st.error ?? "probe failed"}`);

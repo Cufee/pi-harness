@@ -10,6 +10,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { ACP_PROFILE_PRESETS, type AcpProfileConfig, type HarnessConfig, type RunnerProfileConfig } from "../config.js";
 import type { DaemonClient } from "../daemon/remote.js";
+import { ModelConfigOverlay } from "./overlays.js";
 import { clampLine, fitWidth, type HarnessTheme } from "./primitives/index.js";
 
 class InlinePromptSubmenu implements Component, Focusable {
@@ -288,8 +289,19 @@ export class SettingsOverlay implements Component {
     private readonly onConfigChanged: (cfg: HarnessConfig) => void,
     private readonly onClose: () => void,
     private readonly rerender: () => void,
+    private readonly repoRoot: string = process.cwd(),
   ) {
     this.list = this.buildList();
+  }
+
+  private enabledModelsSummary(): string {
+    const mode = this.config.catalog.modelFilterMode ?? "all";
+    if (mode === "allowlist") {
+      const n = (this.config.catalog.enabledModels ?? []).length;
+      return n === 0 ? "0 selected (all off)" : `${n} selected`;
+    }
+    const disabled = (this.config.catalog.disabledModels ?? []).length;
+    return disabled > 0 ? `all minus ${disabled}` : "all (ranked)";
   }
 
   private buildList(): SettingsList {
@@ -314,6 +326,29 @@ export class SettingsOverlay implements Component {
             (summary) => {
               done(summary);
               // Rebuild SettingsList immediately so Default Director/Worker/Task CLI pickers include new/removed profiles!
+              this.list = this.buildList();
+              this.rerender();
+            },
+            this.rerender,
+          ),
+      },
+      {
+        id: "enabledModels",
+        label: "Configure Enabled Models",
+        description: "Toggle ranked models ON/OFF individually, or toggle all OFF to pick just a few",
+        currentValue: this.enabledModelsSummary(),
+        submenu: (_cur, done) =>
+          new ModelConfigOverlay(
+            this.theme,
+            this.client,
+            this.repoRoot,
+            this.config,
+            (nextCfg) => {
+              this.config = nextCfg;
+              this.onConfigChanged(nextCfg);
+            },
+            (summary) => {
+              done(summary);
               this.list = this.buildList();
               this.rerender();
             },
@@ -391,14 +426,14 @@ export class SettingsOverlay implements Component {
         label: "Orchestrator Rollover Threshold",
         description: "Context utilization triggering Clean Relay Rollover before compaction",
         currentValue: `${Math.round(this.config.rollover.orchestratorThreshold * 100)}%`,
-        values: ["50%", "55%", "60%", "65%", "70%"],
+        values: ["60%", "65%", "72%", "75%", "80%"],
       },
       {
         id: "workerThreshold",
         label: "Worker Rollover Threshold",
         description: "Context utilization triggering clean git-worktree Worker rollover",
         currentValue: `${Math.round(this.config.rollover.workerThreshold * 100)}%`,
-        values: ["55%", "60%", "65%", "70%", "75%"],
+        values: ["65%", "70%", "75%", "78%", "82%", "85%"],
       },
       {
         id: "maxConcurrentWorkers",

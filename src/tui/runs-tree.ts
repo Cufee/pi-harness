@@ -3,7 +3,7 @@ import type { RunQuotaPauseStatus } from "../control-plane/orchestrator.js";
 import type { EscalationRecord, RunRecord, TaskRecord } from "../control-plane/db.js";
 import type { DaemonEventFrame } from "../protocol/daemon-rpc.js";
 import { formatResetCountdown } from "./overlays.js";
-import { badge, fillLineBg, fitWidth, type HarnessTheme, type SemanticTone } from "./primitives/index.js";
+import { badge, fillLineBg, fitWidth, parseMouseWheel, type HarnessTheme, type SemanticTone } from "./primitives/index.js";
 
 /** One entry of the `runs.trees` RPC result (contract.runs-watch-commands.v1). */
 export interface RunsTreeEntry {
@@ -62,12 +62,46 @@ const ACTIVE_TASK_STATUSES = new Set<TaskRecord["status"]>([
   "paused_quota",
 ]);
 
-function isActiveRun(run: RunRecord): boolean {
-  return run.status === "active" || run.status === "paused_quota";
+const LIVE_TASK_STATUSES = new Set<TaskRecord["status"]>(["running", "draining", "waiting_children", "merging"]);
+const IN_FLIGHT_TASK_STATUSES = new Set<TaskRecord["status"]>([
+  "pending",
+  "ready",
+  "running",
+  "draining",
+  "waiting_children",
+  "merging",
+]);
+
+/** Dynamically derives a run's displayed status from live task states so it never contradicts active tasks. */
+export function effectiveRunStatus(entry: RunsTreeEntry): RunRecord["status"] {
+  const { run, tasks } = entry;
+  if (tasks.some((t) => LIVE_TASK_STATUSES.has(t.status))) return "active";
+  if (tasks.length === 0) return run.status;
+  if (tasks.some((t) => t.status === "paused_quota")) return run.status === "stopped" ? "stopped" : "paused_quota";
+  if (run.status === "stopped") return "stopped";
+  if (tasks.some((t) => IN_FLIGHT_TASK_STATUSES.has(t.status))) return run.status;
+
+  // All tasks are terminal — never keep displaying ACTIVE!
+  const realOrch = tasks.find((t) => t.tier === 1 && t.profileId !== "director");
+  if (realOrch) {
+    if (realOrch.status === "failed") return "failed";
+    if (realOrch.status === "cancelled") return "stopped";
+    if (realOrch.status === "completed") return "completed";
+  }
+  const realTasks = tasks.filter((t) => t.profileId !== "director");
+  if (realTasks.length === 0) return run.status === "active" ? "completed" : run.status;
+  if (realTasks.some((t) => t.status === "failed")) return "failed";
+  if (realTasks.every((t) => t.status === "cancelled")) return "stopped";
+  return "completed";
 }
 
-function isFailedRun(run: RunRecord): boolean {
-  return run.status === "failed";
+function isActiveRun(entry: RunsTreeEntry): boolean {
+  const st = effectiveRunStatus(entry);
+  return st === "active" || st === "paused_quota";
+}
+
+function isFailedRun(entry: RunsTreeEntry): boolean {
+  return effectiveRunStatus(entry) === "failed";
 }
 
 function taskKey(runId: string, taskId: string): string {
@@ -119,11 +153,11 @@ export function buildRunsTreeRows(
         case "all":
           return true;
         case "running":
-          return isActiveRun(run);
+          return isActiveRun(entry);
         case "running_recent":
-          return isActiveRun(run) || run.updatedAt >= recentCutoff;
+          return isActiveRun(entry) || run.updatedAt >= recentCutoff;
         case "failed":
-          return isFailedRun(run) || entry.escalations.some((e) => e.status === "open");
+          return isFailedRun(entry) || entry.escalations.some((e) => e.status === "open");
       }
     };
 
@@ -133,7 +167,7 @@ export function buildRunsTreeRows(
     // Search: a run-level match keeps all filter-passing tasks; otherwise only matching tasks.
     let shownTasks = filterTasks;
     if (q) {
-      const runMatch = [run.goal, run.id, run.status].some((s) => s.toLowerCase().includes(q));
+      const runMatch = [run.goal, run.id, effectiveRunStatus(entry)].some((s) => s.toLowerCase().includes(q));
       if (!runMatch) {
         shownTasks = filterTasks.filter((t) =>
           [t.id, t.title, t.status, t.model ?? "", t.profileId].some((s) => s.toLowerCase().includes(q)),
@@ -375,6 +409,18 @@ export class RunsTreeOverlay implements Component {
   }
 
   handleInput(data: string): void {
+    const mouse = parseMouseWheel(data, 1);
+    if (mouse.isMouse) {
+      if (mouse.deltaLines !== 0) {
+        const { rows } = this.build();
+        if (rows.length > 0) {
+          const idx = this.selectedIndex(rows);
+          this.select(rows, idx + mouse.deltaLines);
+          this.opts.requestRender();
+        }
+      }
+      return;
+    }
     if (this.searching) {
       this.handleSearchInput(data);
       return;
@@ -523,12 +569,13 @@ export class RunsTreeOverlay implements Component {
 
     if (row.kind === "run") {
       const run = row.entry.run;
+      const effStatus = effectiveRunStatus(row.entry);
       const fold = row.collapsed ? "▸" : "▾";
       const n = row.entry.tasks.length;
       const quota = qp
         ? ` ${badge(`⏸ ${qp.resumeAt ? `resume ${formatResetCountdown(qp.resumeAt)}` : "quota paused"}`, "warning", t)}`
         : "";
-      return `${marker}${t.muted(fold)} ${badge("RUN", "info", t)} ${badge(statusLabel(run.status), runTone(run.status), t)} ${id(run.id)} ${firstLine(run.goal)} ${t.dim(`(${n} agent${n === 1 ? "" : "s"})`)}${esc}${quota}`;
+      return `${marker}${t.muted(fold)} ${badge("RUN", "info", t)} ${badge(statusLabel(effStatus), runTone(effStatus), t)} ${id(run.id)} ${firstLine(run.goal)} ${t.dim(`(${n} agent${n === 1 ? "" : "s"})`)}${esc}${quota}`;
     }
 
     const task = row.task!;

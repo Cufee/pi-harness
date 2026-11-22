@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { WorktreeConfig } from "../config.js";
@@ -88,9 +88,44 @@ export class WorktreeManager {
         env: { ...process.env, HARNESS_REPO_ROOT: this.repoRoot, HARNESS_WORKTREE_PATH: wtPath },
         timeout: 120_000,
       });
+    } else {
+      await this.linkIgnoredNodeModules(wtPath);
     }
 
     return this.db.recordWorktree({ runId, taskId, path: wtPath, branch, baseSha: sha });
+  }
+
+  /**
+   * Automatically symlinks `<repoRoot>/node_modules` into a fresh worktree when gitignored,
+   * so workers and CI gates (`tsc`, `bun test`) work on turn 1 without redundant installs.
+   */
+  async linkIgnoredNodeModules(wtPath: string): Promise<void> {
+    const srcNm = join(this.repoRoot, "node_modules");
+    const dstNm = join(wtPath, "node_modules");
+    if (!existsSync(srcNm) || existsSync(dstNm)) return;
+    try {
+      await runGit(this.repoRoot, ["check-ignore", "-q", "node_modules"]);
+      symlinkSync(srcNm, dstNm, "dir");
+      // If `.gitignore` uses `node_modules/` (directory-only), git treats a symlink named `node_modules`
+      // as untracked (`?? node_modules`)! Add `/node_modules` to local `.git/info/exclude` (untracked)
+      // so the worktree stays 100% clean for `git status` and `submit_for_merge`.
+      const isIgnoredInWt = await runGit(wtPath, ["check-ignore", "-q", "node_modules"]).then(
+        () => true,
+        () => false,
+      );
+      if (!isIgnoredInWt) {
+        const { stdout: commonDir } = await runGit(this.repoRoot, ["rev-parse", "--git-common-dir"]);
+        const excludePath = resolve(this.repoRoot, commonDir, "info", "exclude");
+        mkdirSync(resolve(excludePath, ".."), { recursive: true });
+        const existing = existsSync(excludePath) ? readFileSync(excludePath, "utf8") : "";
+        if (!existing.split("\n").some((line) => line.trim() === "/node_modules" || line.trim() === "node_modules")) {
+          const prefix = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+          appendFileSync(excludePath, `${prefix}/node_modules\n`, "utf8");
+        }
+      }
+    } catch {
+      // Not gitignored or symlink unsupported — leave untouched
+    }
   }
 
   async isDirty(wtPath: string, opts?: { ignoreHarnessDir?: boolean }): Promise<boolean> {

@@ -1,8 +1,6 @@
 import { ModelCatalogCompiler } from "../catalog/compiler.js";
 import type { HarnessConfig, RunnerProfileConfig } from "../config.js";
 import type { QuotaClient } from "../quota/client.js";
-import { supportsToolPolicy } from "../runners/acp-shims.js";
-import type { ToolPolicy } from "../runners/types.js";
 import type { AgentTier } from "./db.js";
 
 const modelPlaceholder = /(?:^|\/)(?:auto|default)$/i;
@@ -15,7 +13,6 @@ interface LaunchSelection {
   cwd?: string;
   profileId?: string | null;
   model?: string | null;
-  toolPolicy?: ToolPolicy;
 }
 
 export async function resolveLaunchRoute(config: HarnessConfig, selection: LaunchSelection): Promise<{
@@ -24,14 +21,13 @@ export async function resolveLaunchRoute(config: HarnessConfig, selection: Launc
   wireModel: string;
 }> {
   const { tier, profileId, model, cwd } = selection;
-  const policy = tier <= 1 ? "control_plane_only" : selection.toolPolicy ?? "read_write_workspace";
-  const profiles = config.profiles.filter((profile) => profile.enabled !== false);
-  if (profileId != null && !profiles.some((profile) => profile.id === profileId)) {
-    throw new Error(`Unknown or disabled runner profile "${profileId}". Select an enabled profile.`);
+  const profiles = config.profiles.filter((profile) =>
+    profile.enabled !== false && (profileId == null || profile.id === profileId));
+  if (profiles.length === 0) {
+    if (profileId != null) throw new Error(`Unknown or disabled runner profile "${profileId}". Select an enabled profile.`);
+    throw new Error("No runner profiles are enabled.");
   }
   if (model != null && !model.trim()) throw new Error("Select a nonblank catalog model.");
-  const eligible = profiles.filter((profile) => (profileId == null || profile.id === profileId) && supportsToolPolicy(profile, policy));
-  if (!eligible.length) throw new Error(`No enabled ${profileId ?? "runner"} profile supports ${policy} for tier ${tier}.`);
 
   const compiler = selection.catalog ?? new ModelCatalogCompiler(config);
   const snapshot = await compiler.getCatalog({ cwd, excludeExhausted: model == null && !selection.quota });
@@ -41,7 +37,7 @@ export async function resolveLaunchRoute(config: HarnessConfig, selection: Launc
     if (!entry.id.trim() || modelPlaceholder.test(entry.id)) continue;
     const bareId = entry.id.slice(entry.id.lastIndexOf("/") + 1);
     for (const route of [entry.preferredRoute, ...entry.alternateRoutes]) {
-      const profile = eligible.find((p) => p.id === route.profileId);
+      const profile = profiles.find((p) => p.id === route.profileId);
       if (!profile || !route.wireModelId.trim() || modelPlaceholder.test(route.wireModelId)) continue;
       let canonicalId = entry.id;
       if (model != null && model !== entry.id && model !== route.wireModelId && model !== bareId) {

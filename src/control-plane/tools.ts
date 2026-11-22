@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import type { ModelCatalogCompiler } from "../catalog/compiler.js";
+import { recommendModelsByTaskKind, type ModelCatalogCompiler } from "../catalog/compiler.js";
 import { CODE_EXEC_TOOL_NAME, TOOL_SEARCH_TOOL_NAME, createCodeModeExecutor, effectiveCodeMode, exposedTools } from "../code-mode/index.js";
 import type { HarnessConfig } from "../config.js";
 import { codeExecEventSink } from "../protocol/tool-display.js";
@@ -113,7 +113,7 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
     name: "list_models",
     tiers: [1, 2],
     description:
-      "List currently enabled latest-per-family models ranked by coding quality with cost/task, time/task, and live subscription quota availability.",
+      "List currently enabled latest-per-family models ranked by coding quality with cost/task, time/task, live subscription quota availability, recommendedByKind, and any per-session model selection context.",
     inputSchema: {
       type: "object",
       properties: {
@@ -636,6 +636,8 @@ export class ControlPlaneToolExecutor {
         return {
           syncedAt: compiled.syncedAt,
           sources: compiled.sources,
+          sessionModelContext: this.resolveSessionModelContext(runId),
+          recommendedByKind: recommendModelsByTaskKind(compiled.models, { avoidModelId: task.model }),
           models: compiled.models.map((m) => ({
             id: m.id,
             family: m.family,
@@ -1043,6 +1045,30 @@ export class ControlPlaneToolExecutor {
 
       default:
         throw new Error(`Unhandled tool: ${name}`);
+    }
+  }
+
+  private resolveSessionModelContext(runId: string): string | null {
+    try {
+      let chatSessionId: string | null = null;
+      if (runId.startsWith("director-tasks-")) {
+        chatSessionId = runId.slice("director-tasks-".length) || null;
+      } else {
+        const row = this.db.db
+          .prepare(
+            "SELECT chat_session_id FROM goals WHERE linked_run_id = ? AND chat_session_id IS NOT NULL ORDER BY updated_at DESC LIMIT 1",
+          )
+          .get(runId) as { chat_session_id: string } | undefined;
+        chatSessionId = row?.chat_session_id ?? null;
+      }
+      if (!chatSessionId) return null;
+      const sess = this.db.db
+        .prepare("SELECT model_selection_context FROM chat_sessions WHERE id = ?")
+        .get(chatSessionId) as { model_selection_context: string | null } | undefined;
+      const ctx = typeof sess?.model_selection_context === "string" ? sess.model_selection_context.trim() : "";
+      return ctx || null;
+    } catch {
+      return null;
     }
   }
 }

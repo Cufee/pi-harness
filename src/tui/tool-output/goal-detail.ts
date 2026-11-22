@@ -1,21 +1,26 @@
-import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { HarnessTheme } from "../primitives/theme.js";
-import { clampLine } from "../primitives/width.js";
+import { renderProgressBar } from "../primitives/layout.js";
+import { clampLine, fillLineBg, fitWidth } from "../primitives/width.js";
 import { asInt, asRecord, sanitizeText, statusPaint, type ToolDisplayPayload } from "./types.js";
 
-const INDENT = "  ";
-const SUB = "    ";
 const MAX_CRITERIA = 12;
 const MAX_ESCALATIONS = 5;
+const MAX_NON_GOALS = 5;
 const MAX_SUMMARY_LINES = 3;
 
 function records(v: unknown): Record<string, unknown>[] {
   return Array.isArray(v) ? v.map(asRecord).filter((r): r is Record<string, unknown> => r !== null) : [];
 }
 
+function strings(v: unknown): string[] {
+  return Array.isArray(v) ? v.map((x) => sanitizeText(x)).filter(Boolean) : [];
+}
+
 /**
- * `goal_detail` renderer: header (id, version, status, title), a meta line (run, review cycle, criteria
- * tally, tasks), criteria with ✓/✗/○ markers, open escalations, and the last review summary.
+ * Native `goal_detail` UI card: framed header (id, version, status, title), metadata & progress bar,
+ * criteria with ✓/✗/○ markers (+ deterministic commands), non-goals, task breakdown, open escalations,
+ * and latest review verdict. Used both when models return goals and when users print a goal from `/goals`.
  */
 export function renderGoalDetail(display: ToolDisplayPayload, width: number, theme: HarnessTheme): string[] | null {
   const data = asRecord(display.data);
@@ -27,27 +32,42 @@ export function renderGoalDetail(display: ToolDisplayPayload, width: number, the
   const status = sanitizeText(goal.status) || "unknown";
   const title = sanitizeText(goal.title) || "(untitled)";
   const runId = sanitizeText(goal.linkedRunId);
+  const nonGoals = strings(goal.nonGoals);
   const criteria = records(data.criteria);
   const tasks = records(data.tasks);
   const escalations = records(data.openEscalations);
   const lastReview = asRecord(data.lastReview);
 
   const out: string[] = [];
-  const line = (s: string) => out.push(clampLine(truncateToWidth(s, width, "…"), width));
-  const wrapped = (prefix: string, text: string, paint: (s: string) => string, maxLines = Infinity) => {
-    const inner = Math.max(1, width - prefix.length);
-    const parts = wrapTextWithAnsi(text, inner);
+  const rail = `${theme.border("│")} `;
+  const innerW = Math.max(1, width - 2);
+  const row = (content: string) => out.push(clampLine(`${rail}${truncateToWidth(content, innerW, "…")}`, width));
+  const subRow = (content: string) => {
+    const subW = Math.max(1, innerW - 2);
+    out.push(clampLine(`${rail}  ${truncateToWidth(content, subW, "…")}`, width));
+  };
+  const wrappedSub = (text: string, paint: (s: string) => string, maxLines = Infinity) => {
+    const subW = Math.max(1, innerW - 2);
+    const parts = wrapTextWithAnsi(text, subW);
     const shown = parts.slice(0, maxLines);
     if (parts.length > shown.length && shown.length > 0) shown[shown.length - 1] += "…";
-    for (const p of shown) line(prefix + paint(p));
+    for (const p of shown) out.push(clampLine(`${rail}  ${paint(p)}`, width));
   };
 
-  line(
-    `${INDENT}${theme.accent("◆")} ${theme.bold(`${id} v${version}`)}  ${statusPaint(status, theme)(`● ${status}`)}  ${title}`,
-  );
+  // Framed top rule + shaded header strip so printed Goals stand out cleanly from chat prose
+  const headerTag = `${theme.accent("◆")} ${theme.bold(`${id} v${version}`)}  ${statusPaint(status, theme)(`● ${status}`)}`;
+  const topLabel = ` ${headerTag} `;
+  const topFill = Math.max(0, width - 2 - visibleWidth(topLabel));
+  out.push(clampLine(`${theme.border("╭─")}${topLabel}${theme.border("─".repeat(topFill))}`, width));
+
+  const titleLines = wrapTextWithAnsi(title, Math.max(1, innerW));
+  for (const tl of titleLines.slice(0, 2)) {
+    const lineText = `${rail}${theme.bold(tl)}`;
+    out.push(fillLineBg(fitWidth(lineText, width), width, theme.surfaceBg));
+  }
 
   const description = sanitizeText(goal.description);
-  if (description) wrapped(SUB, description, theme.muted, 2);
+  if (description) wrappedSub(description, theme.muted, 2);
 
   const passed = criteria.filter((c) => c.lastResult === "pass").length;
   const meta = [
@@ -56,40 +76,66 @@ export function renderGoalDetail(display: ToolDisplayPayload, width: number, the
     `Criteria ${passed}/${criteria.length} passed`,
   ];
   if (tasks.length > 0) meta.push(`Tasks ${tasks.length}`);
-  line(`${SUB}${theme.dim(meta.join(" · "))}`);
+  const metaText = theme.dim(meta.join(" · "));
+  if (criteria.length > 0 && width >= 88) {
+    const bar = renderProgressBar(passed / criteria.length, theme, { barWidth: 8 });
+    subRow(`${metaText}  ${bar}`);
+  } else {
+    subRow(metaText);
+  }
+
+  if (tasks.length > 0) {
+    const counts = new Map<string, number>();
+    for (const t of tasks) {
+      const st = sanitizeText(t.status) || "unknown";
+      counts.set(st, (counts.get(st) ?? 0) + 1);
+    }
+    const breakdown = [...counts.entries()].map(([st, n]) => `${n} ${st}`).join(" · ");
+    if (breakdown) subRow(`${theme.dim("Task states:")} ${theme.muted(breakdown)}`);
+  }
 
   if (criteria.length > 0) {
-    line(`${INDENT}${theme.muted(theme.bold("Criteria"))}`);
+    row(theme.muted(theme.bold("Criteria")));
     for (const c of criteria.slice(0, MAX_CRITERIA)) {
       const marker =
         c.lastResult === "pass" ? theme.success("✓") : c.lastResult === "fail" ? theme.error("✗") : theme.dim("○");
       const desc = sanitizeText(c.description) || sanitizeText(c.id) || "(criterion)";
+      const cmd = sanitizeText(c.command);
+      const cmdHint = cmd && width >= 72 ? ` ${theme.code(`$ ${cmd}`)}` : "";
       const optional = c.required === false ? theme.dim(" (optional)") : "";
-      line(`${SUB}${marker} ${desc}${optional}`);
+      subRow(`${marker} ${desc}${optional}${cmdHint}`);
     }
-    if (criteria.length > MAX_CRITERIA) line(`${SUB}${theme.dim(`… ${criteria.length - MAX_CRITERIA} more`)}`);
+    if (criteria.length > MAX_CRITERIA) subRow(theme.dim(`… ${criteria.length - MAX_CRITERIA} more`));
+  }
+
+  if (nonGoals.length > 0) {
+    row(theme.muted(theme.bold("Non-goals")));
+    for (const ng of nonGoals.slice(0, MAX_NON_GOALS)) {
+      subRow(`${theme.dim("·")} ${theme.muted(ng)}`);
+    }
+    if (nonGoals.length > MAX_NON_GOALS) subRow(theme.dim(`… ${nonGoals.length - MAX_NON_GOALS} more`));
   }
 
   if (escalations.length > 0) {
-    line(`${INDENT}${theme.warning(theme.bold(`Open escalations (${escalations.length})`))}`);
+    row(theme.warning(theme.bold(`Open escalations (${escalations.length})`)));
     for (const e of escalations.slice(0, MAX_ESCALATIONS)) {
       const task = sanitizeText(e.taskId);
       const summary = sanitizeText(e.summary) || sanitizeText(e.id) || "(escalation)";
-      line(`${SUB}${theme.warning("!")} ${task ? theme.dim(`[${task}] `) : ""}${summary}`);
+      subRow(`${theme.warning("!")} ${task ? theme.dim(`[${task}] `) : ""}${summary}`);
     }
     if (escalations.length > MAX_ESCALATIONS) {
-      line(`${SUB}${theme.dim(`… ${escalations.length - MAX_ESCALATIONS} more`)}`);
+      subRow(theme.dim(`… ${escalations.length - MAX_ESCALATIONS} more`));
     }
   }
 
   if (lastReview) {
     const verdict = sanitizeText(lastReview.verdict) || "unknown";
     const verdictPaint = verdict === "approved" ? theme.success : theme.warning;
-    line(
-      `${INDENT}${theme.muted(theme.bold(`Last review #${asInt(lastReview.cycle)}`))} ${verdictPaint(verdict.toUpperCase())}`,
-    );
+    row(`${theme.muted(theme.bold(`Last review #${asInt(lastReview.cycle)}`))} ${verdictPaint(verdict.toUpperCase())}`);
     const summary = sanitizeText(lastReview.summary);
-    if (summary) wrapped(SUB, summary, theme.muted, MAX_SUMMARY_LINES);
+    if (summary) wrappedSub(summary, theme.muted, MAX_SUMMARY_LINES);
   }
+
+  out.push(clampLine(theme.border(`╰${"─".repeat(Math.max(0, width - 1))}`), width));
   return out;
 }

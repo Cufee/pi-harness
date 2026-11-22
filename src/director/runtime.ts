@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ModelCatalogCompiler } from "../catalog/compiler.js";
+import { recommendModelsByTaskKind, type ModelCatalogCompiler } from "../catalog/compiler.js";
 import { createCodeModeExecutor, effectiveCodeMode } from "../code-mode/index.js";
 import type { HarnessConfig } from "../config.js";
 import { resolveLaunchRoute } from "../control-plane/launch-route.js";
@@ -154,8 +154,24 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   },
   {
     name: "list_models",
-    description: "Inspect enabled latest-per-family models with coding rankings, cost/time/task, and live subscription quota capacity.",
+    description:
+      "Inspect enabled latest-per-family models with coding rankings, cost/time/task, live subscription quota capacity, recommendedByKind, and any per-session model selection context.",
     inputSchema: { type: "object", properties: { exclude_exhausted: { type: "boolean" } } },
+  },
+  {
+    name: "set_model_selection_context",
+    description:
+      "Set or clear concise per-session model selection context based on the user's preferences (e.g. using a specific model for a kind of task or utilizing a model family more). Empty by default; returned to users and spawned agents when listing models.",
+    inputSchema: {
+      type: "object",
+      required: ["context"],
+      properties: {
+        context: {
+          type: "string",
+          description: "Concise per-session model routing guidance, or an empty string to clear.",
+        },
+      },
+    },
   },
   {
     name: "steer_run",
@@ -394,7 +410,7 @@ export class DirectorRuntime {
 
     const reviewerPrompt = this.goals.buildReviewerPrompt(goal, gateResult, diffStat);
     const { profile, model, wireModel } = await resolveLaunchRoute(this.config, {
-      tier: 3, cwd: goal.repoRoot, catalog: this.catalog, quota: this.quota, toolPolicy: "read_only_workspace",
+      tier: 3, cwd: goal.repoRoot, catalog: this.catalog, quota: this.quota,
     });
     const runner = this.customRunnerFactory
       ? this.customRunnerFactory(profile)
@@ -817,6 +833,23 @@ export class DirectorRuntime {
     this.activeChats.get(chatSessionId)?.onToolEvent?.({ id: `display-${randomUUID()}`, name: toolName, status: "completed", display });
   }
 
+  /** Builds and emits a native Goal Detail UI card into the chat transcript. */
+  private emitGoalDetailDisplay(chatSessionId: string, toolName: string, goal: GoalRecord): {
+    goal: GoalRecord;
+    reviews: GoalReviewVerdict[];
+    tasks: ReturnType<ControlPlaneDb["listTasks"]>;
+    openEscalations: ReturnType<ControlPlaneDb["listEscalations"]>;
+  } {
+    const detail = {
+      goal,
+      reviews: this.goals.listReviews(goal.id),
+      tasks: goal.linkedRunId ? this.db.listTasks(goal.linkedRunId) : [],
+      openEscalations: goal.linkedRunId ? this.db.listEscalations(goal.linkedRunId, "open") : [],
+    };
+    this.emitToolDisplay(chatSessionId, toolName, buildGoalDetailDisplay(detail));
+    return detail;
+  }
+
   private async executeDirectorTool(
     chatSessionId: string,
     repoRoot: string,
@@ -855,23 +888,29 @@ export class DirectorRuntime {
             typeof args.max_review_cycles === "number" ? { maxReviewCycles: args.max_review_cycles } : undefined,
         });
         if (args.commit_immediately) {
-          return await this.commitGoal(created.id, {
+          const committed = await this.commitGoal(created.id, {
             model: String(args.model), profileId: args.profile_id as string | undefined,
             effort: typeof args.effort === "string" ? args.effort : undefined,
           });
+          this.emitGoalDetailDisplay(chatSessionId, name, committed);
+          return { ...committed, rendered_in_ui: "Goal detail card shown to the user; do not repeat it." };
         }
-        return created;
+        this.emitGoalDetailDisplay(chatSessionId, name, created);
+        return { ...created, rendered_in_ui: "Goal detail card shown to the user; do not repeat it." };
       }
 
-      case "goal_commit":
-        return await this.commitGoal(String(args.goal_id), {
+      case "goal_commit": {
+        const committed = await this.commitGoal(String(args.goal_id), {
           profileId: typeof args.profile_id === "string" ? args.profile_id : undefined,
           model: typeof args.model === "string" ? args.model : undefined,
           effort: typeof args.effort === "string" ? args.effort : undefined,
         });
+        this.emitGoalDetailDisplay(chatSessionId, name, committed);
+        return { ...committed, rendered_in_ui: "Goal detail card shown to the user; do not repeat it." };
+      }
 
-      case "goal_amend":
-        return await this.amendGoal(String(args.goal_id), {
+      case "goal_amend": {
+        const amended = await this.amendGoal(String(args.goal_id), {
           rationale: String(args.rationale),
           title: typeof args.title === "string" ? args.title : undefined,
           description: typeof args.description === "string" ? args.description : undefined,
@@ -879,9 +918,12 @@ export class DirectorRuntime {
           removeCriteriaIds: Array.isArray(args.remove_criteria_ids) ? (args.remove_criteria_ids as string[]) : undefined,
           nonGoals: Array.isArray(args.non_goals) ? (args.non_goals as string[]) : undefined,
         });
+        this.emitGoalDetailDisplay(chatSessionId, name, amended.goal);
+        return { ...amended, rendered_in_ui: "Goal detail card shown to the user; do not repeat it." };
+      }
 
       case "goal_list": {
-        const goals = this.goals.listGoals({ repoRoot });
+        const goals = this.goals.listGoals({ repoRoot, chatSessionId });
         this.emitToolDisplay(
           chatSessionId,
           name,
@@ -899,29 +941,28 @@ export class DirectorRuntime {
       case "goal_get": {
         const g = this.goals.getGoal(String(args.goal_id));
         if (!g) throw new Error(`Unknown goal ${args.goal_id}`);
-        const detail = {
-          goal: g,
-          reviews: this.goals.listReviews(g.id),
-          tasks: g.linkedRunId ? this.db.listTasks(g.linkedRunId) : [],
-          openEscalations: g.linkedRunId ? this.db.listEscalations(g.linkedRunId, "open") : [],
-        };
-        this.emitToolDisplay(chatSessionId, name, buildGoalDetailDisplay(detail));
+        const detail = this.emitGoalDetailDisplay(chatSessionId, name, g);
         return { ...detail, tasks: detail.tasks.map((t) => compactTaskHandoff(t, detail.openEscalations)), rendered_in_ui: "Goal detail shown to the user; do not repeat it." };
       }
 
-      case "goal_trigger_review":
-        return await this.verifyAndReviewGoal(String(args.goal_id), signal);
+      case "goal_trigger_review": {
+        const reviewed = await this.verifyAndReviewGoal(String(args.goal_id), signal);
+        this.emitGoalDetailDisplay(chatSessionId, name, reviewed.goal);
+        return { ...reviewed, rendered_in_ui: "Goal detail card shown to the user; do not repeat it." };
+      }
 
       case "goal_pause": {
         const g = this.goals.setStatus(String(args.goal_id), "paused", "Paused by Director");
         if (g.linkedRunId) await this.orchestrator.stopRun(g.linkedRunId, "Goal paused");
-        return g;
+        this.emitGoalDetailDisplay(chatSessionId, name, g);
+        return { ...g, rendered_in_ui: "Goal detail card shown to the user; do not repeat it." };
       }
 
       case "goal_cancel": {
         const g = this.goals.setStatus(String(args.goal_id), "cancelled", "Cancelled by Director");
         if (g.linkedRunId) await this.orchestrator.stopRun(g.linkedRunId, "Goal cancelled");
-        return g;
+        this.emitGoalDetailDisplay(chatSessionId, name, g);
+        return { ...g, rendered_in_ui: "Goal detail card shown to the user; do not repeat it." };
       }
 
       case "read_file": {
@@ -959,11 +1000,29 @@ export class DirectorRuntime {
           }),
         };
 
-      case "list_models":
-        return await this.catalog.getCatalog({
+      case "list_models": {
+        const session = this.chats.getSession(chatSessionId);
+        const catalog = await this.catalog.getCatalog({
           cwd: repoRoot,
           excludeExhausted: Boolean(args.exclude_exhausted),
         });
+        return {
+          ...catalog,
+          sessionModelContext: session?.modelSelectionContext ?? null,
+          recommendedByKind: recommendModelsByTaskKind(catalog.models, { avoidModelId: session?.model }),
+        };
+      }
+
+      case "set_model_selection_context": {
+        const raw = typeof args.context === "string" ? args.context.trim() : "";
+        const updated = this.chats.updateSession(chatSessionId, {
+          modelSelectionContext: raw || null,
+        });
+        return {
+          chatSessionId,
+          sessionModelContext: updated.modelSelectionContext,
+        };
+      }
 
       case "steer_run": {
         const g = this.goals.getGoal(String(args.goal_id));

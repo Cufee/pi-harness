@@ -12,12 +12,12 @@ import { AcpRunner } from "../src/runners/acp-runner.js";
 import { buildNewSessionParams, buildPostSessionActions, prepareAcpSpawn } from "../src/runners/acp-shims.js";
 import type { PassiveQuotaSignal, RunAgentRequest, RunnerUsage } from "../src/runners/types.js";
 
-const trustedAgent = { name: "@agentclientprotocol/claude-agent-acp", version: "0.109.1" };
+const claudeAgent = { name: "@agentclientprotocol/claude-agent-acp", version: "0.109.0" };
 const profile = (adapter: AcpProfileConfig["adapter"]): AcpProfileConfig => ({
   id: `acp:${adapter}`, kind: "acp", adapter, command: "unused", billing: "subscription",
 });
 
-describe("ACP control-plane policy", () => {
+describe("ACP role policies", () => {
   const request: RunAgentRequest = {
     // Director and T1 both call the runner as tier 1, with different tool inventories.
     runId: "fixture", taskId: "fixture", tier: 1, kind: "orchestrator", toolPolicy: "control_plane_only",
@@ -25,24 +25,34 @@ describe("ACP control-plane policy", () => {
     tools: [], executeTool: async () => ({}), signal: new AbortController().signal, callbacks: {},
   };
 
-  it("rejects unsupported adapter policies before initialize", async () => {
-    let inits = 0;
-    const fixture = agent().onRequest("initialize", async () => { inits++; return { protocolVersion: 1, agentCapabilities: {} }; });
+  it("runs every adapter with the file capabilities for the selected role", async () => {
     for (const adapter of ["claude", "codex", "gemini", "generic"] as const) {
       const runner = new AcpRunner(profile(adapter));
-      await assert.rejects(runner.run({ ...request, tier: 3, kind: "research", toolPolicy: "read_only_workspace" }, fixture), /does not support read_only_workspace/);
-      if (adapter !== "claude") await assert.rejects(runner.run(request, fixture), /does not support control_plane_only/);
+      for (const [role, readTextFile, writeTextFile] of [
+        [request, false, false],
+        [{ ...request, tier: 3, kind: "research", toolPolicy: "read_only_workspace" }, true, false],
+        [{ ...request, tier: 2, kind: "worker", toolPolicy: "read_write_workspace" }, true, true],
+      ] as const) {
+        const fixture = agent().onRequest("initialize", async ({ params }) => {
+          assert.deepEqual(params.clientCapabilities?.fs, { readTextFile, writeTextFile });
+          return { protocolVersion: 1, agentCapabilities: {} };
+        }).onRequest("session/new", async () => ({
+          sessionId: "fixture", models: {
+            currentModelId: adapter === "gemini" ? "previous" : role.model,
+            availableModels: [{ modelId: role.model, name: role.model }],
+          },
+        })).onRequest("*", async ({ method, params }) => {
+          assert.equal(method, "session/set_model");
+          assert.deepEqual(params, { sessionId: "fixture", modelId: role.model });
+          return {};
+        }).onRequest("session/prompt", async ({ client, params: { sessionId } }) => {
+          await client.notify("session/update", { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } } });
+          return { stopReason: "end_turn" };
+        });
+        const result = await runner.run(role, fixture);
+        assert.equal(result.text, "ok", `${adapter} ${role.toolPolicy}`);
+      }
     }
-    assert.equal(inits, 0);
-  });
-
-  it("rejects an unaudited Claude version before session creation", async () => {
-    let sessions = 0;
-    const fixture = agent().onRequest("initialize", async () => ({
-      protocolVersion: 1, agentCapabilities: {}, agentInfo: { ...trustedAgent, version: "0.109.0" },
-    })).onRequest("session/new", async () => { sessions++; return { sessionId: "fixture" }; });
-    await assert.rejects(new AcpRunner(profile("claude")).run(request, fixture), /requires claude-agent-acp 0\.109\.1/);
-    assert.equal(sessions, 0);
   });
 
   for (const [role, roleTool, bridge] of [["Director", "goal_list", true], ["T1", "tree_view", true], ["T1 without bridge", "tree_view", false]] as const) {
@@ -53,7 +63,7 @@ describe("ACP control-plane policy", () => {
         writeFileSync(path, "original");
         const fixture = agent().onRequest("initialize", async ({ params }) => {
           assert.deepEqual(params.clientCapabilities?.fs, { readTextFile: false, writeTextFile: false });
-          return { protocolVersion: 1, agentCapabilities: {}, agentInfo: trustedAgent };
+          return { protocolVersion: 1, agentCapabilities: {}, agentInfo: claudeAgent };
         }).onRequest("session/new", async ({ params }) => {
           const options = (params._meta?.claudeCode as { options: { tools: string[]; disallowedTools: string[]; strictMcpConfig: boolean } }).options;
           assert.deepEqual(options.tools, []);
@@ -128,10 +138,48 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
     };
     const codexSpawn = prepareAcpSpawn(codexProfile, { systemPrompt: "Role", toolPolicy: "read_write_workspace" });
     assert.ok(codexSpawn.args.includes("features.multi_agent=false"));
+    assert.equal(codexSpawn.env.DISABLE_MCP_CONFIG_FILTERING, "true");
+    assert.equal(JSON.parse(codexSpawn.env.CODEX_CONFIG ?? "{}").features?.multi_agent, false);
     codexSpawn.cleanup();
+
+    const codexNew = buildNewSessionParams("codex", {
+      cwd: "/tmp",
+      systemPrompt: "Role",
+      toolPolicy: "control_plane_only",
+      model: "gpt-6.2-sol",
+      mcpServers: [{ name: "harness", command: "bun", args: ["bridge.ts"], env: [] }],
+    });
+    assert.equal((codexNew.params._meta as { mcpStartupAwaitTimeoutMs?: number })?.mcpStartupAwaitTimeoutMs, 15_000);
 
     const codexPost = buildPostSessionActions("codex", "s1", {}, { toolPolicy: "read_write_workspace", model: "gpt-6.2-sol", effort: "high" });
     assert.deepEqual(codexPost.map(action => action.params.configId), ["model", "reasoning_effort"]);
+
+    // Codex legacy bracketed currentModelId (`gpt-6.2-sol[high]`) does not conflict with bare configOption `gpt-6.2-sol`
+    const codexNoop = buildPostSessionActions(
+      "codex",
+      "s1",
+      {
+        configOptions: [{ id: "model", category: "model", currentValue: "gpt-6.2-sol", options: [{ value: "gpt-6.2-sol" }] }],
+        models: { currentModelId: "gpt-6.2-sol[high]" },
+      },
+      { toolPolicy: "read_write_workspace", model: "gpt-6.2-sol" },
+    );
+    assert.deepEqual(codexNoop, []);
+
+    // 2b. Amp ACP shim: temp AMP_SETTINGS_FILE enforces control_plane_only / read_only_workspace policies
+    const ampProfile: AcpProfileConfig = {
+      id: "acp:amp",
+      kind: "acp",
+      adapter: "generic",
+      command: "amp-acp",
+      billing: "subscription",
+    };
+    const ampCtrlSpawn = prepareAcpSpawn(ampProfile, { systemPrompt: "Role", toolPolicy: "control_plane_only" });
+    assert.ok(ampCtrlSpawn.env.AMP_SETTINGS_FILE);
+    const ampCfg = JSON.parse(readFileSync(ampCtrlSpawn.env.AMP_SETTINGS_FILE!, "utf8")) as Record<string, string[]>;
+    assert.deepEqual(ampCfg["amp.tools.enable"], ["mcp__harness__*"]);
+    assert.ok(ampCfg["amp.tools.disable"]?.includes("Bash"));
+    ampCtrlSpawn.cleanup();
 
     // 3. Gemini shim: GEMINI_SYSTEM_MD env file + legacy session/set_model
     const geminiProfile: AcpProfileConfig = {
@@ -158,7 +206,7 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
     const mockAgent = agent()
       .onRequest("initialize", async () => ({
         protocolVersion: 1,
-        agentInfo: trustedAgent,
+        agentInfo: claudeAgent,
         agentCapabilities: { sessionCapabilities: { systemPrompt: {}, options: {} } },
         _meta: { steering: { supported: true } },
       } as never))

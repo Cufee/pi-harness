@@ -7,9 +7,14 @@ import {
   type Focusable,
   type SelectItem,
 } from "@earendil-works/pi-tui";
-import type { CompiledModelCatalog, CompiledModelEntry, ProfileProbeStatus } from "../catalog/compiler.js";
+import {
+  isModelEnabledInCatalog,
+  type CompiledModelCatalog,
+  type CompiledModelEntry,
+  type ProfileProbeStatus,
+} from "../catalog/compiler.js";
 import type { ModelRoute } from "../catalog/deduplicate.js";
-import type { RunnerProfileConfig } from "../config.js";
+import type { HarnessConfig, RunnerProfileConfig } from "../config.js";
 import type { DaemonClient } from "../daemon/remote.js";
 import type { GoalRecord, GoalReviewVerdict } from "../goals/engine.js";
 import type { KbCard, KbEntry } from "../kb/store.js";
@@ -19,6 +24,7 @@ import {
   clampLine,
   fillLineBg,
   fitWidth,
+  parseMouseWheel,
   renderFlexRow,
   renderProgressBar,
   renderTable,
@@ -261,6 +267,7 @@ export class ModelPickerOverlay implements Component, Focusable {
       probeStatuses?: ProfileProbeStatus[];
       onSelect: (profileId: string) => void;
     },
+    private readonly onManageModels?: () => void,
   ) {
     this.input = new Input();
     this.input.focused = true;
@@ -355,7 +362,10 @@ export class ModelPickerOverlay implements Component, Focusable {
     void this.client.request<CompiledModelCatalog>("models.sync", { cwd: this.repoRoot }).then(
       (fresh) => {
         this.syncing = false;
-        this.catalog = fresh;
+        this.catalog = {
+          ...fresh,
+          sessionModelContext: fresh.sessionModelContext ?? this.catalog.sessionModelContext ?? null,
+        };
         this.statusNote = `Synced ${fresh.models.length} latest-per-family models (${fresh.sources.join(", ")})`;
         this.applyFilter();
         this.rerender();
@@ -381,6 +391,11 @@ export class ModelPickerOverlay implements Component, Focusable {
     }
     if (matchesKey(data, "ctrl+r")) {
       this.triggerSync();
+      return;
+    }
+    if (matchesKey(data, "ctrl+e") && this.onManageModels) {
+      this.onClose();
+      this.onManageModels();
       return;
     }
     if (matchesKey(data, "tab")) {
@@ -433,6 +448,14 @@ export class ModelPickerOverlay implements Component, Focusable {
   render(width: number): readonly string[] {
     const out: string[] = [];
     out.push(renderCleanSearchLine(this.input, "⌕", "Filter by model or CLI (codex/claude/amp)…  Tab switches CLI", width, this.theme));
+    const sessionCtx = this.catalog.sessionModelContext?.trim();
+    if (sessionCtx) {
+      const prefix = `${this.theme.accentBold("◆ Session model context:")} `;
+      const wrapped = wrapTextWithAnsi(`${prefix}${this.theme.text(sessionCtx)}`, Math.max(10, width - 2));
+      for (const line of wrapped.slice(0, 3)) {
+        out.push(fillLineBg(fitWidth(` ${line}`, width), width, this.theme.surfaceBg));
+      }
+    }
     if (this.statusNote) {
       out.push(fitWidth(this.theme.warning(this.statusNote), width));
     }
@@ -445,7 +468,16 @@ export class ModelPickerOverlay implements Component, Focusable {
     out.push(this.theme.border("─".repeat(width)));
 
     if (this.rowCount === 0) {
-      out.push(fitWidth(this.theme.muted("  No models match. Press Ctrl+R to sync benchmarks or check /settings."), width));
+      out.push(
+        fitWidth(
+          this.theme.muted(
+            this.onManageModels
+              ? "  No enabled models match. Press Ctrl+E to toggle models, Ctrl+R to sync, or check /settings."
+              : "  No models match. Press Ctrl+R to sync benchmarks or check /settings.",
+          ),
+          width,
+        ),
+      );
       return out;
     }
 
@@ -567,6 +599,284 @@ export class ModelPickerOverlay implements Component, Focusable {
       );
     }
 
+    return out;
+  }
+}
+
+/**
+ * Interactive Model Enable/Disable Configurator (`/settings -> Configure Enabled Models` or `Ctrl+E` in `/model`):
+ * - Starts from our ranked model list (all enabled by default)
+ * - Space / Enter toggles the highlighted model ON or OFF (persisted to `~/.pi-harness/config.json`)
+ * - `Ctrl+X` (or `x` with empty search): Toggle ALL Off (so it's easy to enable just a few)
+ * - `Ctrl+A` (or `a` with empty search): Enable ALL (restores full ranked list)
+ */
+export class ModelConfigOverlay implements Component, Focusable {
+  private input: Input;
+  private selected = 0;
+  private allModels: CompiledModelEntry[] = [];
+  private filtered: CompiledModelEntry[] = [];
+  private loading = true;
+  private statusMsg = "";
+  private _focused = true;
+
+  constructor(
+    private readonly theme: HarnessTheme,
+    private readonly client: DaemonClient,
+    private readonly repoRoot: string,
+    private config: HarnessConfig,
+    private readonly onConfigChanged: (cfg: HarnessConfig) => void,
+    private readonly onClose: (summary?: string) => void,
+    private readonly rerender: () => void,
+    initialModels?: CompiledModelEntry[],
+  ) {
+    this.input = new Input();
+    this.input.focused = true;
+    if (initialModels) {
+      this.allModels = initialModels;
+      this.loading = false;
+      this.applyFilter();
+    } else {
+      void this.loadModels();
+    }
+  }
+
+  get focused(): boolean {
+    return this._focused;
+  }
+
+  set focused(val: boolean) {
+    this._focused = val;
+    this.input.focused = val;
+  }
+
+  private async loadModels(): Promise<void> {
+    this.loading = true;
+    this.rerender();
+    try {
+      const cat = await this.client.request<CompiledModelCatalog>("models.list", {
+        cwd: this.repoRoot,
+        includeDisabled: true,
+      });
+      this.allModels = cat.models;
+      this.loading = false;
+      this.applyFilter();
+    } catch (err) {
+      this.loading = false;
+      this.statusMsg = `Failed to load models: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    this.rerender();
+  }
+
+  private isEnabled(modelId: string): boolean {
+    return isModelEnabledInCatalog(modelId, this.config.catalog);
+  }
+
+  private enabledCount(): number {
+    return this.allModels.filter((m) => this.isEnabled(m.id)).length;
+  }
+
+  private summaryText(): string {
+    const mode = this.config.catalog.modelFilterMode ?? "all";
+    if (this.allModels.length > 0) {
+      const n = this.enabledCount();
+      return n === this.allModels.length ? `all (${n})` : `${n}/${this.allModels.length} enabled`;
+    }
+    return mode === "allowlist"
+      ? `${(this.config.catalog.enabledModels ?? []).length} selected`
+      : (this.config.catalog.disabledModels ?? []).length > 0
+        ? `all minus ${this.config.catalog.disabledModels!.length}`
+        : "all (ranked)";
+  }
+
+  private applyFilter(): void {
+    const q = this.input.getValue().trim().toLowerCase();
+    this.filtered = !q
+      ? [...this.allModels]
+      : this.allModels.filter(
+          (m) =>
+            m.id.toLowerCase().includes(q) ||
+            m.preferredRoute.profileId.toLowerCase().includes(q) ||
+            (m.alternateRoutes ?? []).some((r) => r.profileId.toLowerCase().includes(q)),
+        );
+    this.selected = Math.min(this.selected, Math.max(0, this.filtered.length - 1));
+  }
+
+  private saveCatalogFilter(patch: {
+    modelFilterMode: "all" | "allowlist";
+    disabledModels: string[];
+    enabledModels: string[];
+  }, note: string): void {
+    // Optimistically update local config immediately so rapid Space toggles feel instant
+    this.config = {
+      ...this.config,
+      catalog: { ...this.config.catalog, ...patch },
+    };
+    this.statusMsg = note;
+    this.rerender();
+    void this.client
+      .request<HarnessConfig>("config.update", {
+        patch: { catalog: this.config.catalog },
+      })
+      .then((nextCfg) => {
+        this.config = nextCfg;
+        this.onConfigChanged(nextCfg);
+        this.rerender();
+      })
+      .catch((err) => {
+        this.statusMsg = `Save failed: ${err instanceof Error ? err.message : String(err)}`;
+        this.rerender();
+      });
+  }
+
+  private toggleModel(modelId: string): void {
+    const mode = this.config.catalog.modelFilterMode ?? "all";
+    const norm = modelId.toLowerCase();
+    if (mode === "allowlist") {
+      const prev = this.config.catalog.enabledModels ?? [];
+      const exists = prev.some((id) => id.toLowerCase() === norm);
+      const enabledModels = exists ? prev.filter((id) => id.toLowerCase() !== norm) : [...prev, modelId];
+      this.saveCatalogFilter(
+        { modelFilterMode: "allowlist", enabledModels, disabledModels: [] },
+        `${exists ? "Disabled" : "Enabled"} ${modelId} (${this.enabledCount() + (exists ? -1 : 1)} enabled)`,
+      );
+    } else {
+      const prev = this.config.catalog.disabledModels ?? [];
+      const isDisabled = prev.some((id) => id.toLowerCase() === norm);
+      const disabledModels = isDisabled ? prev.filter((id) => id.toLowerCase() !== norm) : [...prev, modelId];
+      this.saveCatalogFilter(
+        { modelFilterMode: "all", disabledModels, enabledModels: [] },
+        `${isDisabled ? "Enabled" : "Disabled"} ${modelId}`,
+      );
+    }
+  }
+
+  private toggleAllOff(): void {
+    this.saveCatalogFilter(
+      { modelFilterMode: "allowlist", enabledModels: [], disabledModels: [] },
+      "All models turned OFF — press Space/Enter on any models you want to enable.",
+    );
+  }
+
+  private enableAll(): void {
+    this.saveCatalogFilter(
+      { modelFilterMode: "all", enabledModels: [], disabledModels: [] },
+      "All ranked models turned ON.",
+    );
+  }
+
+  handleInput(data: string): void {
+    const mouse = parseMouseWheel(data, 1);
+    if (mouse.isMouse) {
+      if (mouse.deltaLines !== 0 && this.filtered.length > 0) {
+        this.selected = Math.max(0, Math.min(this.filtered.length - 1, this.selected + mouse.deltaLines));
+        this.rerender();
+      }
+      return;
+    }
+    if (matchesKey(data, "escape")) {
+      if (this.input.getValue().length > 0) {
+        this.input.setValue("");
+        this.applyFilter();
+        this.rerender();
+      } else {
+        this.onClose(this.summaryText());
+      }
+      return;
+    }
+    if (matchesKey(data, "ctrl+x") || (this.input.getValue().length === 0 && (data === "x" || data === "X"))) {
+      this.toggleAllOff();
+      return;
+    }
+    if (matchesKey(data, "ctrl+a") || (this.input.getValue().length === 0 && (data === "a" || data === "A"))) {
+      this.enableAll();
+      return;
+    }
+    if (matchesKey(data, "up") || matchesKey(data, "ctrl+p")) {
+      this.selected = Math.max(0, this.selected - 1);
+      this.rerender();
+      return;
+    }
+    if (matchesKey(data, "down") || matchesKey(data, "ctrl+n")) {
+      this.selected = Math.min(Math.max(0, this.filtered.length - 1), this.selected + 1);
+      this.rerender();
+      return;
+    }
+    if (matchesKey(data, "enter") || (this.input.getValue().length === 0 && matchesKey(data, "space"))) {
+      const cur = this.filtered[this.selected];
+      if (cur) this.toggleModel(cur.id);
+      return;
+    }
+    this.input.handleInput(data);
+    this.applyFilter();
+    this.rerender();
+  }
+
+  invalidate(): void {
+    this.input.invalidate();
+  }
+
+  render(width: number): readonly string[] {
+    const t = this.theme;
+    const out: string[] = [];
+    out.push(renderCleanSearchLine(this.input, "⌕", "Filter models…  Space/Enter toggle · x All Off · a All On", width, t));
+    const countBadge =
+      this.loading
+        ? t.muted("Loading ranked models…")
+        : `${t.accentBold(`${this.enabledCount()}/${this.allModels.length}`)} ${t.muted("models enabled")}  ${t.dim("│")}  ${t.dim("x / Ctrl+X: toggle all OFF  ·  a / Ctrl+A: enable ALL")}`;
+    out.push(fitWidth(countBadge, width));
+    if (this.statusMsg) {
+      out.push(fitWidth(t.info(this.statusMsg), width));
+    }
+    out.push(t.border("─".repeat(Math.max(0, width))));
+
+    if (this.loading) {
+      out.push(fitWidth(t.muted("  Loading model catalog…"), width));
+      return out;
+    }
+    if (this.filtered.length === 0) {
+      out.push(fitWidth(t.muted("  No models match your filter."), width));
+      return out;
+    }
+
+    const maxRows = 12;
+    const start = Math.max(0, Math.min(this.selected - Math.floor(maxRows / 2), this.filtered.length - maxRows));
+    const slice = this.filtered.slice(start, start + maxRows);
+
+    const checkW = 4;
+    const rankW = 4;
+    const scoreW = width >= 72 ? 8 : 0;
+    const routeW = width >= 86 ? 18 : 0;
+    const gaps = 2 * (2 + (scoreW ? 1 : 0) + (routeW ? 1 : 0));
+    const modelW = Math.max(16, width - 2 - checkW - rankW - scoreW - routeW - gaps);
+
+    for (let i = 0; i < slice.length; i++) {
+      const idx = start + i;
+      const m = slice[i]!;
+      const active = idx === this.selected;
+      const on = this.isEnabled(m.id);
+      const marker = active ? t.accentBold("▸ ") : "  ";
+      const checkCell = fitWidth(on ? t.success("[✓]") : t.dim("[ ]"), checkW);
+      const rankStr = m.codingRank == null ? "-" : `#${m.codingRank}`;
+      const rankCell = fitWidth(active ? t.accentBold(rankStr) : t.dim(rankStr), rankW);
+      const modelCell = fitWidth(
+        active ? t.accentBold(m.id) : on ? t.text(m.id) : t.dim(m.id),
+        modelW,
+      );
+      const cells = [checkCell, rankCell, modelCell];
+      if (scoreW > 0) {
+        cells.push(fitWidth(m.codingScore != null ? t.success(m.codingScore.toFixed(1)) : t.dim("-"), scoreW, { align: "right" }));
+      }
+      if (routeW > 0) {
+        const routes = [m.preferredRoute, ...(m.alternateRoutes ?? [])].map((r) => r.profileId.replace(/^acp:/, "")).join(",");
+        cells.push(fitWidth(t.dim(routes), routeW));
+      }
+      const row = `${marker}${cells.join("  ")}`;
+      out.push(active ? fillLineBg(row, width, t.badgeBg) : clampLine(row, width));
+    }
+
+    if (this.filtered.length > maxRows) {
+      out.push(fitWidth(t.dim(`  ${this.selected + 1}/${this.filtered.length} models`), width));
+    }
     return out;
   }
 }
@@ -1229,7 +1539,7 @@ export class GoalsOverlay implements Component {
   constructor(
     private readonly theme: HarnessTheme,
     private readonly getGoals: () => GoalRecord[],
-    private readonly onAction: (action: "review" | "pause" | "cancel" | "inspect", goal: GoalRecord) => void,
+    private readonly onAction: (action: "review" | "pause" | "cancel" | "inspect" | "print_table", goal: GoalRecord) => void,
     private readonly onClose: () => void,
     private readonly rerender: () => void,
   ) {}
@@ -1256,6 +1566,9 @@ export class GoalsOverlay implements Component {
         this.onClose();
       } else if (data === "x") {
         this.onAction("cancel", g);
+        this.onClose();
+      } else if (data === "l" || data === "t") {
+        this.onAction("print_table", g);
         this.onClose();
       } else if (matchesKey(data, "enter")) {
         this.onAction("inspect", g);

@@ -50,7 +50,14 @@ export interface GoalDetailData {
     maxReviewCycles: number;
     nonGoals: string[];
   };
-  criteria: Array<{ id: string; kind: string; description: string; required: boolean; lastResult: "pass" | "fail" | null }>;
+  criteria: Array<{
+    id: string;
+    kind: string;
+    description: string;
+    command?: string;
+    required: boolean;
+    lastResult: "pass" | "fail" | null;
+  }>;
   tasks: Array<{ id: string; title: string; status: string; tier: number }>;
   openEscalations: Array<{ id: string; taskId: string; summary: string }>;
   lastReview: { cycle: number; verdict: string; summary: string } | null;
@@ -120,6 +127,7 @@ export function buildGoalDetailDisplay(input: {
       id: c.id,
       kind: c.kind,
       description: c.description,
+      ...(c.command ? { command: c.command } : {}),
       required: c.required,
       lastResult: results.get(c.id) ?? null,
     })),

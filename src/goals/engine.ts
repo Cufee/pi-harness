@@ -297,12 +297,16 @@ export class GoalEngine {
     return r ? this.mapGoal(r) : null;
   }
 
-  listGoals(opts?: { repoRoot?: string; status?: GoalStatus }): GoalRecord[] {
+  listGoals(opts?: { repoRoot?: string; chatSessionId?: string; status?: GoalStatus }): GoalRecord[] {
     let sql = "SELECT * FROM goals WHERE 1=1";
     const params: string[] = [];
     if (opts?.repoRoot) {
       sql += " AND repo_root = ?";
       params.push(canonicalRepoPath(opts.repoRoot));
+    }
+    if (opts?.chatSessionId) {
+      sql += " AND chat_session_id = ?";
+      params.push(opts.chatSessionId);
     }
     if (opts?.status) {
       sql += " AND status = ?";

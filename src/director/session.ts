@@ -21,6 +21,7 @@ export interface ChatSessionRecord {
   model: string | null;
   effort: string | null;
   acpSessionId: string | null;
+  modelSelectionContext: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -47,6 +48,7 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
   model TEXT,
   effort TEXT,
   acp_session_id TEXT,
+  model_selection_context TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -73,14 +75,15 @@ export function buildDirectorSystemPrompt(mode: CodeMode = "off"): string {
     "1. Brainstorm designs, discuss tradeoffs, explore requirements, and answer progress questions immediately using `goal_list`, `goal_get`, `list_models`, and `kb_search`.",
     "Never edit code, run shell commands, or inspect repository files directly in normal operation. Delegate lookups to a narrow read-only research, plan, or verify worker via spawn_task. Select a concrete model from list_models. Read its summary and sources via wait_tasks; open authorized artifacts on demand. Use read_file only as a rare logged exception with an exception_reason.",
     "2. When the user is ready to execute work, draft a structured **Goal Contract** via `goal_create` (with concrete `deterministic` shell check commands + `behavioral`/`architectural` criteria + `non_goals`), commit it immediately via `goal_commit` for a clear action request so an autonomous Tier 1 Orchestrator runs until objectively verified and independently reviewed.",
-    "Use sensible defaults. Ask only when a genuinely ambiguous or irreversible decision blocks action. Create separate goals for distinct requests or amend the relevant active goal.",
+    "Use sensible defaults. Ask only when a genuinely ambiguous or irreversible decision blocks action. Create separate goals for distinct requests or amend the relevant active goal — prefer cohesive vertical goals and avoid spawning many overlapping concurrent goals that edit the same files.",
     "3. When the user changes requirements mid-flight, call `goal_amend` so a clean `vN -> vN+1` amendment delta propagates to the running Tier 1 Orchestrator without losing unaffected work.",
     "4. Surface `P0` escalations, circuit-breaker trips, and Independent Done-Review verdicts clearly to the user with actionable options.",
     "5. Keep responses crisp, direct, and grounded in actual tool state — never guess progress or invent statuses.",
+    "6. Whenever the user states per-session model or routing preferences (for example, using a specific model for a kind of task, or utilizing a particular model family more), call `set_model_selection_context` to store concise session-scoped guidance (empty by default; pass an empty string to clear). This context is returned to both users and spawned agents whenever models are listed.",
     "",
     "RICH TOOL OUTPUT:",
-    "- `goal_list` renders the live Goals table directly in the user's UI, and `goal_get` renders the Goal detail card there. When the user asks about goals or progress, call the tool instead of printing a Goals table or goal details in prose.",
-    "- Never duplicate a rendered table: after `goal_list` / `goal_get`, add only brief commentary (highlights, blockers, next steps), not a re-typed table or per-goal listing.",
+    "- `goal_list` renders the live Goals table directly in the user's UI, and `goal_get`, `goal_create`, `goal_commit`, `goal_amend`, `goal_pause`, `goal_cancel`, and `goal_trigger_review` render the native Goal detail card there. When the user asks about goals or progress, call the tool instead of printing a Goals table or goal details in prose.",
+    "- Never duplicate a rendered table or card: after `goal_list` / `goal_get` / goal mutations, add only brief commentary (highlights, blockers, next steps), not a re-typed table or per-goal listing.",
     ...(codeMode ? ["", codeMode] : []),
   ].join("\n");
 }
@@ -91,7 +94,18 @@ export function buildDirectorSystemPrompt(mode: CodeMode = "off"): string {
 export class DirectorSessionStore {
   constructor(private readonly db: Database) {
     this.db.exec(DIRECTOR_SCHEMA);
+    this.migrateChatSessions();
     this.migrateChatTurns();
+  }
+
+  /** Safely upgrades existing chat_sessions tables created before model_selection_context existed. */
+  private migrateChatSessions(): void {
+    const cols = new Set(
+      (this.db.prepare("PRAGMA table_info(chat_sessions)").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    if (!cols.has("model_selection_context")) {
+      this.db.exec("ALTER TABLE chat_sessions ADD COLUMN model_selection_context TEXT");
+    }
   }
 
   /** Upgrades chat_turns created before tool_output turns existed: rebuilds it when its role CHECK lacks 'tool_output' (keeping rows and seq), then adds missing columns. */
@@ -214,22 +228,41 @@ export class DirectorSessionStore {
 
   updateSession(
     chatSessionId: string,
-    patch: Partial<{ profileId: string; model: string | null; effort: string | null; title: string }>,
+    patch: Partial<{
+      profileId: string;
+      model: string | null;
+      effort: string | null;
+      title: string;
+      modelSelectionContext: string | null;
+    }>,
   ): ChatSessionRecord {
     const existing = this.getSession(chatSessionId);
     if (!existing) throw new Error(`Unknown chat session ${chatSessionId}`);
     const now = Date.now();
+    const nextModelContext =
+      patch.modelSelectionContext !== undefined
+        ? typeof patch.modelSelectionContext === "string" && patch.modelSelectionContext.trim()
+          ? patch.modelSelectionContext.trim()
+          : null
+        : existing.modelSelectionContext;
     this.db
-      .prepare("UPDATE chat_sessions SET profile_id = ?, model = ?, effort = ?, title = ?, updated_at = ? WHERE id = ?")
+      .prepare(
+        "UPDATE chat_sessions SET profile_id = ?, model = ?, effort = ?, title = ?, model_selection_context = ?, updated_at = ? WHERE id = ?",
+      )
       .run(
         patch.profileId ?? existing.profileId,
         patch.model !== undefined ? patch.model : existing.model,
         patch.effort !== undefined ? patch.effort : existing.effort,
         patch.title ?? existing.title,
+        nextModelContext,
         now,
         chatSessionId,
       );
     return this.getSession(chatSessionId)!;
+  }
+
+  getModelSelectionContext(chatSessionId: string): string | null {
+    return this.getSession(chatSessionId)?.modelSelectionContext ?? null;
   }
 
   getHistory(chatSessionId: string, sinceSeq = 0, limit = 100): ChatTurnRecord[] {
@@ -263,6 +296,7 @@ export class DirectorSessionStore {
   }
 
   private mapSession(r: Record<string, unknown>): ChatSessionRecord {
+    const rawCtx = typeof r.model_selection_context === "string" ? r.model_selection_context.trim() : "";
     return {
       id: String(r.id),
       repoRoot: String(r.repo_root),
@@ -271,6 +305,7 @@ export class DirectorSessionStore {
       model: r.model ? String(r.model) : null,
       effort: r.effort ? String(r.effort) : null,
       acpSessionId: r.acp_session_id ? String(r.acp_session_id) : null,
+      modelSelectionContext: rawCtx || null,
       createdAt: Number(r.created_at),
       updatedAt: Number(r.updated_at),
     };

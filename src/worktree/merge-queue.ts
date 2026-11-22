@@ -82,6 +82,7 @@ export class BisectingMergeQueue {
 
       // Create detached ephemeral integration worktree on latest targetSha
       await runGit(this.repoRoot, ["worktree", "add", "--detach", intPath, targetSha]);
+      await this.worktrees.linkIgnoredNodeModules(intPath);
 
       // Attempt clean no-ff merge of the worker branch
       try {
@@ -123,17 +124,31 @@ export class BisectingMergeQueue {
         }
       }
 
-      // Check main working tree cleanliness BEFORE advancing target branch ref
-      const mainDirtyBefore = await this.worktrees.isDirty(this.repoRoot, { ignoreHarnessDir: true });
+      // Advance target branch safely without ever leaving the checked-out working tree out of sync with HEAD!
       const { stdout: headBranch } = await runGit(this.repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"]);
-
-      // Atomically advance target branch ref (optimistic CAS against targetSha)
       const { stdout: mergedSha } = await runGit(intPath, ["rev-parse", "HEAD"]);
-      await runGit(this.repoRoot, ["update-ref", `refs/heads/${targetBranch}`, mergedSha, targetSha]);
 
-      // Sync main working tree if it was clean & checked out on targetBranch
-      if (!mainDirtyBefore && headBranch === targetBranch) {
-        await runGit(this.repoRoot, ["reset", "--hard", mergedSha]).catch(() => {});
+      if (headBranch === targetBranch) {
+        // `git merge --ff-only` atomically updates HEAD, index, and working tree while preserving
+        // untracked files (like `bun.lock`) and unrelated dirty tracked edits. If a dirty tracked file
+        // genuinely collides with a merged path, it refuses cleanly instead of corrupting HEAD with staged deletions.
+        const { stdout: curHead } = await runGit(this.repoRoot, ["rev-parse", "HEAD"]);
+        if (curHead !== targetSha) {
+          return this.bounce(next, "conflict", `Target branch ${targetBranch} moved concurrently (${targetSha} -> ${curHead}); re-submit.`);
+        }
+        try {
+          await runGit(this.repoRoot, ["merge", "--ff-only", mergedSha]);
+        } catch (ffErr) {
+          const detail = ffErr instanceof Error ? ffErr.message : String(ffErr);
+          return this.bounce(
+            next,
+            "conflict",
+            `Cannot fast-forward checked-out ${targetBranch} safely due to conflicting local changes in repoRoot: ${detail}`,
+          );
+        }
+      } else {
+        // Target branch is not currently checked out — atomic CAS update-ref is safe
+        await runGit(this.repoRoot, ["update-ref", `refs/heads/${targetBranch}`, mergedSha, targetSha]);
       }
 
       const finished = this.db.finishMergeItem(next.id, "merged", ciLogs.join("\n"));

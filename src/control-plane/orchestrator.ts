@@ -9,7 +9,7 @@ import { toolPolicyForTask } from "../runners/types.js";
 import { resolveLaunchRoute } from "./launch-route.js";
 import type { RunAgentRequest, RunAgentResult, RunnerExecutionHandle } from "../runners/types.js";
 import { BisectingMergeQueue } from "../worktree/merge-queue.js";
-import { WorktreeManager } from "../worktree/manager.js";
+import { runGit, WorktreeManager } from "../worktree/manager.js";
 import type { AgentTier, ControlPlaneDb, RunRecord, TaskKind, TaskRecord } from "./db.js";
 import { buildHydrationTurn, buildImmutableSystemPrompt, type AnchoredHandoff } from "./prompts.js";
 import { ControlPlaneToolExecutor, compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./tools.js";
@@ -49,6 +49,58 @@ interface InternalRunQuotaState extends RunQuotaPauseStatus {
 export type CustomRunnerFactory = (profile: RunnerProfileConfig) => {
   run: (req: RunAgentRequest) => Promise<RunAgentResult>;
 };
+
+const LIVE_TASK_STATUSES = new Set<TaskRecord["status"]>(["running", "draining", "waiting_children", "merging"]);
+const IN_FLIGHT_TASK_STATUSES = new Set<TaskRecord["status"]>([
+  "pending",
+  "ready",
+  "running",
+  "draining",
+  "waiting_children",
+  "merging",
+]);
+
+/**
+ * Computes the authoritative dynamic status of a Run from its live in-memory execution state
+ * and current SQLite tasks so a run NEVER displays `completed` while work is still running,
+ * and NEVER stays stuck in `active` once all of its tasks have settled.
+ */
+export function deriveRunStatus(
+  run: RunRecord,
+  tasks: TaskRecord[],
+  liveInMemory?: boolean,
+): RunRecord["status"] {
+  if (liveInMemory === true) return "active";
+  if (tasks.some((t) => LIVE_TASK_STATUSES.has(t.status))) return "active";
+  if (tasks.length === 0) return run.status;
+
+  if (tasks.some((t) => t.status === "paused_quota")) {
+    return run.status === "stopped" ? "stopped" : "paused_quota";
+  }
+
+  if (run.status === "stopped") return "stopped";
+
+  const hasQueued = tasks.some((t) => IN_FLIGHT_TASK_STATUSES.has(t.status));
+  if (hasQueued) {
+    if (liveInMemory === false && !tasks.some((t) => t.status === "ready")) {
+      return tasks.some((t) => t.status === "failed") ? "failed" : "stopped";
+    }
+    return run.status === "active" ? "active" : run.status;
+  }
+
+  const realOrch = tasks.find((t) => t.tier === 1 && t.profileId !== "director");
+  if (realOrch) {
+    if (realOrch.status === "failed") return "failed";
+    if (realOrch.status === "cancelled") return "stopped";
+    if (realOrch.status === "completed") return "completed";
+  }
+
+  const realTasks = tasks.filter((t) => t.profileId !== "director");
+  if (realTasks.length === 0) return run.status === "active" ? "completed" : run.status;
+  if (realTasks.some((t) => t.status === "failed")) return "failed";
+  if (realTasks.every((t) => t.status === "cancelled")) return "stopped";
+  return "completed";
+}
 
 export class HarnessOrchestrator {
   private active = new Map<string, ActiveTaskExecution>();
@@ -159,7 +211,61 @@ export class HarnessOrchestrator {
       const t = this.db.getTask(taskId);
       if (t?.runId === runId) return true;
     }
+    for (const taskId of this.allocatingWorktrees) {
+      const t = this.db.getTask(taskId);
+      if (t?.runId === runId) return true;
+    }
     return false;
+  }
+
+  /** Recomputes and persists the dynamic status for a single run based on live tasks + SQLite state. */
+  reconcileRunStatus(runId: string): RunRecord | null {
+    const run = this.db.getRun(runId);
+    if (!run) return null;
+    const tasks = this.db.listTasks(runId);
+    const live = this.isRunActiveInMemory(runId);
+    const derived = deriveRunStatus(run, tasks, live);
+    if (derived !== run.status) {
+      this.db.updateRunStatus(runId, derived);
+      return this.db.getRun(runId);
+    }
+    return run;
+  }
+
+  /** Returns a run with its dynamically reconciled status (safe for read paths like runs.trees/run.list/sessions.list). */
+  getEffectiveRun(runId: string): RunRecord | null {
+    const run = this.db.getRun(runId);
+    if (!run) return null;
+    const tasks = this.db.listTasks(runId);
+    const live = this.isRunActiveInMemory(runId);
+    const derived = deriveRunStatus(run, tasks, live);
+    if (derived !== run.status && tasks.length > 0) {
+      this.db.updateRunStatus(runId, derived);
+      return this.db.getRun(runId);
+    }
+    return derived === run.status ? run : { ...run, status: derived };
+  }
+
+  /**
+   * Called on daemon startup when 0 agent tasks are alive in memory: marks any orphaned
+   * in-flight tasks from a previous crashed/restarted daemon as failed and reconciles run statuses.
+   */
+  reconcileStaleRunsOnStartup(): void {
+    if (this.active.size > 0 || this.allocatingWorktrees.size > 0) return;
+    const runs = this.db.listRuns(200);
+    for (const run of runs) {
+      const tasks = this.db.listTasks(run.id);
+      let mutated = false;
+      for (const t of tasks) {
+        if (LIVE_TASK_STATUSES.has(t.status)) {
+          this.db.updateTask(t.id, { status: "failed", summary: "Interrupted by daemon restart" });
+          mutated = true;
+        }
+      }
+      if (mutated || run.status === "active") {
+        this.reconcileRunStatus(run.id);
+      }
+    }
   }
 
   getWorktreeManager(repoRoot: string): WorktreeManager {
@@ -184,7 +290,6 @@ export class HarnessOrchestrator {
     return resolveLaunchRoute(this.config, {
       profileId: target?.profileId ?? task.profileId,
       model: target?.model ?? task.model ?? undefined,
-      toolPolicy: toolPolicyForTask(task.tier, task.kind, task.readOnly),
       tier: task.tier,
       catalog: this.catalog, quota: this.quota,
       cwd,
@@ -279,7 +384,7 @@ export class HarnessOrchestrator {
     if (!run) throw new Error(`Unknown run ${input.runId}`);
     const toolPolicy = toolPolicyForTask(input.tier, input.kind, input.readOnly);
     const { profile, model } = await resolveLaunchRoute(this.config, {
-      ...input, toolPolicy, catalog: this.catalog, quota: this.quota, cwd: run.repoRoot,
+      ...input, catalog: this.catalog, quota: this.quota, cwd: run.repoRoot,
     });
 
     const parent = this.db.getTask(input.parentId);
@@ -330,6 +435,13 @@ export class HarnessOrchestrator {
 
   launchTaskLoop(taskId: string): void {
     if (this.active.has(taskId) || this.allocatingWorktrees.has(taskId)) return;
+    const initialTask = this.db.getTask(taskId);
+    if (initialTask) {
+      const owningRun = this.db.getRun(initialTask.runId);
+      if (owningRun && owningRun.status !== "active") {
+        this.db.updateRunStatus(owningRun.id, "active");
+      }
+    }
     const abort = new AbortController();
     const entry: ActiveTaskExecution = {
       taskId,
@@ -342,7 +454,6 @@ export class HarnessOrchestrator {
       if (!task || entry.abort.signal.aborted) return;
       this.db.updateTask(taskId, { status: "failed", summary: "Task launch failed." });
       this.db.emitEvent(task.runId, taskId, "agent.error", { error: String(err) });
-      if (task.tier === 1) this.db.updateRunStatus(task.runId, "failed");
     }).finally(() => {
       this.pendingRollovers.delete(taskId);
       this.active.delete(taskId);
@@ -357,10 +468,15 @@ export class HarnessOrchestrator {
             launchedAny = true;
           }
         }
-        // Quiescence barrier: once ALL active tasks in this run have exited and at least one
-        // task was stopped early due to quota, pause the run & arm timer (if quota data exists).
+        // Quiescence barrier: once ALL active tasks in this run have exited, either arm quota pause
+        // OR dynamically reconcile the run's true terminal status!
         if (!launchedAny && !this.isRunActiveInMemory(t.runId)) {
-          void this.checkRunQuotaQuiescence(t.runId).catch(() => {});
+          const paused = this.db.listTasks(t.runId).some((x) => x.status === "paused_quota");
+          if (paused) {
+            void this.checkRunQuotaQuiescence(t.runId).catch(() => {});
+          } else {
+            this.reconcileRunStatus(t.runId);
+          }
         }
       }
     });
@@ -721,17 +837,19 @@ export class HarnessOrchestrator {
         const latest = this.db.getTask(task.id)!;
         if (exec.abort.signal.aborted || latest.status === "cancelled") return;
 
-        // Clean rollover requested either via explicit `request_rollover` tool OR automatic 60/65% threshold
+        // Clean rollover requested either via explicit `request_rollover` tool OR automatic threshold
         const explicitRollover = this.pendingRollovers.get(task.id);
         if (explicitRollover || res.stopReason === "rollover_requested") {
           this.pendingRollovers.delete(task.id);
           const nextGen = latest.generation + 1;
-          const nextHandoff: AnchoredHandoff = explicitRollover?.handoff ?? {
-            goalInvariants: [latest.objective],
-            architecturalDecisions: [],
-            activeRisks: ["Auto-rollover triggered by context threshold"],
-            nextActions: ["Resume from authoritative SQLite Task Tree and Artifact Index"],
-          };
+          const nextHandoff = await this.buildCleanRolloverHandoff({
+            runId: run.id,
+            task: latest,
+            priorHandoff: handoff,
+            explicitHandoff: explicitRollover?.handoff ?? null,
+            worktreePath: wt?.path ?? null,
+            result: res,
+          });
           this.db.updateTask(task.id, {
             status: "ready",
             generation: nextGen,
@@ -797,8 +915,6 @@ export class HarnessOrchestrator {
                 status: "paused_quota",
                 summary: "Waiting for quota-paused child task(s) to resume",
               });
-            } else {
-              this.db.updateRunStatus(run.id, "completed");
             }
           }
           return;
@@ -824,7 +940,6 @@ export class HarnessOrchestrator {
         if (isReadOnlyKind(latest.kind) || res.stopReason === "error") {
           this.db.updateTask(task.id, { status: "failed", summary: isReadOnlyKind(latest.kind)
             ? "Task ended without a valid sourced handoff." : "Task runner reported an error." });
-          if (latest.tier === 1) this.db.updateRunStatus(run.id, "failed");
           return;
         }
         // Agent finished its turn naturally without calling `return_task`
@@ -833,18 +948,12 @@ export class HarnessOrchestrator {
           summary: res.text.slice(0, 1000) || "Completed",
           resultJson: JSON.stringify({ status: "completed", text: res.text }),
         });
-        if (latest.tier === 1) {
-          this.db.updateRunStatus(run.id, "completed");
-        }
         return;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (exec.abort.signal.aborted) return;
         this.db.updateTask(task.id, { status: "failed", summary: "Task runner failed before settlement." });
         this.db.emitEvent(run.id, task.id, "agent.error", { error: msg });
-        if (task.tier === 1) {
-          this.db.updateRunStatus(run.id, "failed");
-        }
         return;
       } finally {
         generation.abort(); // Outstanding MCP scripts must not survive their runner (including a rollover).
@@ -852,6 +961,129 @@ export class HarnessOrchestrator {
         exec.handle = undefined;
       }
     }
+  }
+
+  /**
+   * Builds a lossless anchored handoff across rollovers: preserves prior invariants/decisions
+   * across generations and enriches automatic context-threshold rollovers with deterministic
+   * git worktree state, recent indexed artifacts, recent failures, and the predecessor's last output.
+   */
+  private async buildCleanRolloverHandoff(input: {
+    runId: string;
+    task: TaskRecord;
+    priorHandoff: AnchoredHandoff | null;
+    explicitHandoff: AnchoredHandoff | null;
+    worktreePath: string | null;
+    result: RunAgentResult;
+  }): Promise<AnchoredHandoff> {
+    const mergeUnique = (a: string[], b: string[]): string[] => {
+      const seen = new Set<string>();
+      const out: string[] = [];
+      for (const item of [...a, ...b]) {
+        const trimmed = item.trim();
+        if (!trimmed || seen.has(trimmed)) continue;
+        seen.add(trimmed);
+        out.push(trimmed);
+      }
+      return out;
+    };
+
+    const mergeDecisions = (
+      a: Array<{ decision: string; rationale: string }>,
+      b: Array<{ decision: string; rationale: string }>,
+    ): Array<{ decision: string; rationale: string }> => {
+      const seen = new Set<string>();
+      const out: Array<{ decision: string; rationale: string }> = [];
+      for (const d of [...a, ...b]) {
+        const key = d.decision.trim().toLowerCase();
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        out.push(d);
+      }
+      return out;
+    };
+
+    const priorInvariants = input.priorHandoff?.goalInvariants ?? [];
+    const priorDecisions = input.priorHandoff?.architecturalDecisions ?? [];
+
+    if (input.explicitHandoff) {
+      return {
+        goalInvariants: mergeUnique(priorInvariants, input.explicitHandoff.goalInvariants),
+        architecturalDecisions: mergeDecisions(priorDecisions, input.explicitHandoff.architecturalDecisions),
+        activeRisks: input.explicitHandoff.activeRisks,
+        nextActions: input.explicitHandoff.nextActions,
+      };
+    }
+
+    const activeRisks: string[] = [
+      `Auto-rollover triggered at context threshold during generation ${input.task.generation} (no explicit request_rollover submitted).`,
+    ];
+    const nextActions: string[] = [];
+
+    if (input.worktreePath) {
+      const [statusOut, logOut] = await Promise.all([
+        runGit(input.worktreePath, ["status", "--short"]).then((r) => r.stdout).catch(() => ""),
+        runGit(input.worktreePath, ["log", "-n", "5", "--oneline"]).then((r) => r.stdout).catch(() => ""),
+      ]);
+      const modified = statusOut
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .slice(0, 15);
+      if (modified.length > 0) {
+        activeRisks.push(`Uncommitted worktree changes: ${modified.join(", ")}`);
+        nextActions.push("Inspect existing uncommitted changes in the worktree before making new edits; run verification tests.");
+      }
+      const commits = logOut
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .slice(0, 3);
+      if (commits.length > 0) {
+        nextActions.push(`Recent worktree commits: ${commits.join(" | ")}`);
+      }
+    }
+
+    if (input.task.tier === 1) {
+      const children = this.db.listTasks(input.runId).filter((t) => t.id !== input.task.id);
+      const running = children.filter((t) => LIVE_TASK_STATUSES.has(t.status));
+      const failed = children.filter((t) => t.status === "failed");
+      const openEsc = this.db.listEscalations(input.runId, "open");
+      if (running.length > 0) {
+        nextActions.push(`Wait for ${running.length} active child task(s): ${running.map((t) => t.id).join(", ")}`);
+      }
+      if (failed.length > 0) {
+        activeRisks.push(`Failed child task(s): ${failed.map((t) => `${t.id} (${t.title})`).join(", ")}`);
+      }
+      if (openEsc.length > 0) {
+        activeRisks.push(`Open escalations requiring resolution: ${openEsc.map((e) => `${e.id}: ${e.title}`).join(" | ")}`);
+      }
+    }
+
+    const recentArtifacts = this.db.listArtifacts(input.runId, input.task.id, 8);
+    if (recentArtifacts.length > 0) {
+      nextActions.push(
+        `Recently touched artifacts: ${recentArtifacts.map((a) => `${a.kind}:${a.path}`).slice(0, 8).join(", ")}`,
+      );
+    }
+    if (input.result.toolFailures?.length) {
+      activeRisks.push(`Recent tool failures: ${input.result.toolFailures.slice(-3).join(" | ")}`);
+    }
+    const lastText = input.result.text.trim();
+    if (lastText) {
+      const excerpt = lastText.length > 600 ? `…${lastText.slice(-600)}` : lastText;
+      nextActions.push(`Predecessor gen ${input.task.generation} final progress note: ${excerpt}`);
+    }
+    if (nextActions.length === 0) {
+      nextActions.push("Resume from authoritative SQLite Task Tree, Blackboard, and Artifact Index.");
+    }
+
+    return {
+      goalInvariants: mergeUnique(priorInvariants.length > 0 ? priorInvariants : [input.task.objective], []),
+      architecturalDecisions: priorDecisions,
+      activeRisks,
+      nextActions,
+    };
   }
 
   async steerTask(taskId: string, message: string): Promise<boolean> {

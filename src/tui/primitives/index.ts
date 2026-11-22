@@ -13,6 +13,7 @@ export {
 } from "./layout.js";
 export { TerminalSession, type TerminalSessionCallbacks } from "./lifecycle.js";
 export { AssistantCard, BannerCard, ErrorCard, SystemCard, ToolPill, UserCard } from "./message-card.js";
+export { DISABLE_MOUSE_WHEEL_SEQ, ENABLE_MOUSE_WHEEL_SEQ, parseMouseWheel, type ParsedMouseInput } from "./mouse.js";
 export { OverlayManager } from "./overlay-stack.js";
 export { Panel, type PanelOptions } from "./panel.js";
 export { TimedSpinner } from "./spinner.js";

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { HarnessConfig, RunnerProfileConfig } from "../config.js";
+import type { CatalogConfig, HarnessConfig, RunnerProfileConfig } from "../config.js";
 import type { QuotaClient } from "../quota/client.js";
 import type { ResolvedModelQuota } from "../quota/schema.js";
 import { AcpRunner } from "../runners/acp-runner.js";
@@ -45,6 +45,116 @@ export interface CompiledModelEntry {
   timePerTaskSeconds: number | null;
   quota?: ResolvedModelQuota | null;
   recommendedFor: string[];
+  /** Whether this model is enabled in the user's configured model list (default true). */
+  enabled?: boolean;
+}
+
+/** Evaluates whether a canonical model ID is enabled under the user's `config.catalog` filter. */
+export function isModelEnabledInCatalog(modelId: string, catalogCfg?: Partial<CatalogConfig>): boolean {
+  const mode = catalogCfg?.modelFilterMode ?? "all";
+  const norm = modelId.toLowerCase();
+  if (mode === "allowlist") {
+    return (catalogCfg?.enabledModels ?? []).some((id) => id.toLowerCase() === norm);
+  }
+  return !(catalogCfg?.disabledModels ?? []).some((id) => id.toLowerCase() === norm);
+}
+
+export interface TaskModelRecommendation {
+  model: string;
+  profile: string;
+  effort: string;
+  rationale: string;
+}
+
+function pickEffort(supported: string[], preferred: string[]): string {
+  const lowerMap = new Map(supported.map((e) => [e.toLowerCase(), e]));
+  for (const want of preferred) {
+    const hit = lowerMap.get(want);
+    if (hit) return hit;
+  }
+  return supported[0] ?? "medium";
+}
+
+/**
+ * Computes concrete task-kind-aware model + effort recommendations from the user's currently enabled
+ * catalog so Orchestrators & Workers stop spawning every task on the exact same model as Director.
+ */
+export function recommendModelsByTaskKind(
+  models: CompiledModelEntry[],
+  opts?: { avoidModelId?: string | null },
+): Record<"orchestrator" | "worker" | "research" | "plan" | "execute" | "verify", TaskModelRecommendation | null> {
+  const available = models.filter((m) => m.enabled !== false && !m.quota?.exhausted);
+  const pool = available.length > 0 ? available : models.filter((m) => m.enabled !== false);
+  const byRank = [...pool].sort((a, b) => (b.codingScore ?? -1) - (a.codingScore ?? -1) || a.id.localeCompare(b.id));
+
+  const pickByRoles = (
+    roles: string[],
+    preferredEfforts: string[],
+    rationale: string,
+    preferDifferentFrom?: string | null,
+    preferFastest = false,
+  ): TaskModelRecommendation | null => {
+    if (byRank.length === 0) return null;
+    let candidates = byRank.filter((m) => roles.some((r) => m.recommendedFor.includes(r)));
+    if (candidates.length === 0) candidates = byRank;
+    if (preferDifferentFrom) {
+      const normAvoid = preferDifferentFrom.toLowerCase();
+      const diff = candidates.filter(
+        (m) => m.id.toLowerCase() !== normAvoid && m.preferredRoute.wireModelId.toLowerCase() !== normAvoid,
+      );
+      if (diff.length > 0) candidates = diff;
+    }
+    const chosen = preferFastest
+      ? [...candidates].sort(
+          (a, b) =>
+            (a.timePerTaskSeconds ?? Number.POSITIVE_INFINITY) - (b.timePerTaskSeconds ?? Number.POSITIVE_INFINITY) ||
+            (a.apiEquivCostUsd ?? Number.POSITIVE_INFINITY) - (b.apiEquivCostUsd ?? Number.POSITIVE_INFINITY) ||
+            (b.codingScore ?? -1) - (a.codingScore ?? -1),
+        )[0]!
+      : candidates[0]!;
+    return {
+      model: chosen.id,
+      profile: chosen.preferredRoute.profileId,
+      effort: pickEffort(chosen.preferredRoute.supportedEfforts ?? chosen.efforts, preferredEfforts),
+      rationale,
+    };
+  };
+
+  return {
+    orchestrator: pickByRoles(
+      ["orchestrator", "complex_architecture"],
+      ["high", "medium", "xhigh"],
+      "Top frontier reasoning model for planning & architecture",
+    ),
+    worker: pickByRoles(
+      ["worker_execution", "refactoring", "general_coding"],
+      ["high", "medium"],
+      "Balanced coding workhorse for vertical implementation slices",
+    ),
+    research: pickByRoles(
+      ["codebase_research", "fast_scout", "log_triage"],
+      ["low", "minimal", "medium"],
+      "Fast, low-cost scout for read-only codebase exploration",
+      null,
+      true,
+    ),
+    plan: pickByRoles(
+      ["complex_architecture", "plan_synthesis", "orchestrator"],
+      ["high", "medium"],
+      "Strong architectural model for design synthesis",
+    ),
+    execute: pickByRoles(
+      ["worker_execution", "refactoring", "general_coding"],
+      ["medium", "high"],
+      "Fast coding workhorse for bounded implementation sub-steps",
+    ),
+    verify: pickByRoles(
+      ["independent_verifier", "hard_debugging", "verification"],
+      ["high", "xhigh", "medium"],
+      "Independent skeptical verifier (prefers a different model than generator)",
+      opts?.avoidModelId ?? null,
+    ),
+  };
 }
 
 export const CATALOG_SCHEMA_VERSION = 5;
@@ -64,6 +174,8 @@ export interface CompiledModelCatalog {
   rankingEvidence?: BenchmarkEvidence;
   nextLifecycleChangeAt?: string;
   profileStatuses?: ProfileProbeStatus[];
+  /** Optional per-session model selection context set by the discovery/director agent (empty/null by default). */
+  sessionModelContext?: string | null;
   models: CompiledModelEntry[];
 }
 
@@ -291,6 +403,7 @@ export class ModelCatalogCompiler {
     role?: string;
     maxApiEquivUsd?: number;
     excludeExhausted?: boolean;
+    includeDisabled?: boolean;
   }): Promise<CompiledModelCatalog> {
     const cached = this.loadCached();
     const catalog: CompiledModelCatalog =
@@ -308,9 +421,11 @@ export class ModelCatalogCompiler {
           wireModelId: route.wireModelId,
           canonicalModelId: m.id,
         });
-        return { ...m, quota: quota ?? m.quota ?? null };
+        const enabled = isModelEnabledInCatalog(m.id, this.config.catalog);
+        return { ...m, quota: quota ?? m.quota ?? null, enabled };
       })
       .filter((m) => {
+        if (!opts?.includeDisabled && m.enabled === false) return false;
         if (opts?.excludeExhausted && m.quota?.exhausted) return false;
         if (opts?.role && !m.recommendedFor.includes(opts.role)) return false;
         if (opts?.maxApiEquivUsd !== undefined && m.apiEquivCostUsd !== null && m.apiEquivCostUsd > opts.maxApiEquivUsd) {

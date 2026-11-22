@@ -22,6 +22,7 @@ import { DirectorRuntime } from "../director/runtime.js";
 import type { GoalCriterion } from "../goals/engine.js";
 import type { DaemonEventFrame, RpcRequest, RpcResponse } from "../protocol/daemon-rpc.js";
 import { attachNdjsonReader, writeDaemonMessage } from "../protocol/frames.js";
+import { buildGoalDetailDisplay, buildGoalsTableDisplay, summarizeToolDisplay } from "../protocol/tool-display.js";
 import { QuotaClient } from "../quota/client.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
@@ -40,7 +41,7 @@ interface ClientAttachment {
 
 /** Read-only event subscription; never binds or evicts the socket's chat/run session. */
 type ClientWatch = { throughSeq: number; pendingSeq?: number; next?: ReplayCursor; id: string; lastSeq: number; buffer: DaemonEventFrame[] | null } & (
-  | { scope: "runs" }
+  | { scope: "runs"; chatSessionId?: string; runIds?: Set<string> }
   | { scope: "task"; runId: string; taskId: string }
 );
 
@@ -144,6 +145,7 @@ export class HarnessDaemon {
   }
 
   async start(): Promise<string> {
+    this.orchestrator.reconcileStaleRunsOnStartup();
     await this.ptyHost.init();
     const sockPath = this.config.socketPath;
     mkdirSync(dirname(sockPath), { recursive: true });
@@ -226,6 +228,26 @@ export class HarnessDaemon {
     }
   }
 
+  private getRunIdsForChatSession(chatSessionId: string): string[] {
+    const ids = new Set<string>();
+    for (const g of this.director.goals.listGoals({ chatSessionId })) {
+      if (g.linkedRunId) ids.add(g.linkedRunId);
+    }
+    const dirRunId = `director-tasks-${chatSessionId}`;
+    if (this.db.getRun(dirRunId)) ids.add(dirRunId);
+    return [...ids];
+  }
+
+  private getChatSessionIdForRun(runId: string): string | null {
+    if (runId.startsWith("director-tasks-")) {
+      return runId.slice("director-tasks-".length) || null;
+    }
+    const row = this.db.db
+      .prepare("SELECT chat_session_id FROM goals WHERE linked_run_id = ? AND chat_session_id IS NOT NULL ORDER BY updated_at DESC LIMIT 1")
+      .get(runId) as { chat_session_id?: string | null } | undefined;
+    return row?.chat_session_id ? String(row.chat_session_id) : null;
+  }
+
   private fanoutEvent(ev: EventRecord): void {
     const frame: DaemonEventFrame = {
       kind: "event",
@@ -242,6 +264,7 @@ export class HarnessDaemon {
       if (att.next) att.pendingSeq = ev.seq;
       else writeDaemonMessage(att.socket, frame);
     }
+    const owningChatId = this.getChatSessionIdForRun(ev.runId);
     if (
       ev.type.startsWith("goal.") ||
       ev.type === "quota.agent_paused" ||
@@ -250,15 +273,22 @@ export class HarnessDaemon {
       ev.type === "quota.run_resumed"
     ) {
       for (const sock of this.chatSubscribers) {
-        if (!this.attachments.has(sock)) {
-          writeDaemonMessage(sock, frame);
-        }
+        if (this.attachments.has(sock)) continue;
+        const boundChatId = this.socketToChatId.get(sock);
+        if (owningChatId && boundChatId && owningChatId !== boundChatId) continue;
+        writeDaemonMessage(sock, frame);
       }
     }
     for (const [sock, map] of this.watches) {
       for (const w of map.values()) {
         if (ev.seq <= w.lastSeq) continue;
-        if (w.scope === "runs" ? !isRunsWatchEvent(ev.type) : ev.runId !== w.runId || ev.taskId !== w.taskId) continue;
+        if (w.scope === "runs") {
+          if (!isRunsWatchEvent(ev.type)) continue;
+          if (w.runIds && !w.runIds.has(ev.runId)) continue;
+          if (w.chatSessionId && owningChatId !== w.chatSessionId) continue;
+        } else if (ev.runId !== w.runId || ev.taskId !== w.taskId) {
+          continue;
+        }
         if (w.next) {
           w.pendingSeq = ev.seq;
           continue;
@@ -277,7 +307,9 @@ export class HarnessDaemon {
     let result: Record<string, unknown>;
     if (p.scope === "runs") {
       const lastSeq = this.db.getLatestEventSeq();
-      watch = { id, scope: "runs", throughSeq: lastSeq, lastSeq, buffer: [] };
+      const chatSessionId = typeof p.chatSessionId === "string" && p.chatSessionId ? p.chatSessionId : undefined;
+      const runIds = Array.isArray(p.runIds) ? new Set((p.runIds as unknown[]).map((x) => String(x))) : undefined;
+      watch = { id, scope: "runs", chatSessionId, runIds, throughSeq: lastSeq, lastSeq, buffer: [] };
       result = { watchId: id, replay: [], lastSeq };
     } else if (p.scope === "task") {
       const runId = String(p.runId);
@@ -646,7 +678,7 @@ export class HarnessDaemon {
           activeTurnId: turn?.id ?? null,
           activeText: turn?.text ?? "",
           activePartial: turn ? this.director.getChatPartial(session.id) : "",
-          goals: this.director.goals.listGoals({ repoRoot: session.repoRoot }),
+          goals: this.director.goals.listGoals({ chatSessionId: session.id }),
           config: this.config,
           tookOver,
           busy: Boolean(turn),
@@ -667,7 +699,7 @@ export class HarnessDaemon {
           activeTurnId: null,
           activeText: "",
           activePartial: "",
-          goals: this.director.goals.listGoals({ repoRoot: session.repoRoot }),
+          goals: this.director.goals.listGoals({ chatSessionId: session.id }),
           config: this.config,
           tookOver: false,
           busy: false,
@@ -679,7 +711,7 @@ export class HarnessDaemon {
           const bound = this.chatBindings.get(c.id);
           const busy = this.director.isChatBusy(c.id);
           const activeGoals = this.director.goals
-            .listGoals({ repoRoot: c.repoRoot })
+            .listGoals({ chatSessionId: c.id })
             .filter((g) => ["executing", "verifying", "reviewing"].includes(g.status)).length;
           return {
             id: c.id,
@@ -695,7 +727,8 @@ export class HarnessDaemon {
             updatedAt: c.updatedAt,
           };
         });
-        const runs = this.db.listRuns(20).map((r) => {
+        const runs = this.db.listRuns(20).map((raw) => {
+          const r = this.orchestrator.getEffectiveRun(raw.id) ?? raw;
           const bound = this.runBindings.get(r.id);
           const live = this.orchestrator.isRunActiveInMemory(r.id);
           const quotaSt = this.orchestrator.getRunQuotaStatus(r.id);
@@ -808,6 +841,12 @@ export class HarnessDaemon {
           model: p.model === null ? null : typeof p.model === "string" ? p.model : undefined,
           effort: p.effort === null ? null : typeof p.effort === "string" ? p.effort : undefined,
           title: typeof p.title === "string" ? p.title : undefined,
+          modelSelectionContext:
+            p.modelSelectionContext === null
+              ? null
+              : typeof p.modelSelectionContext === "string"
+                ? p.modelSelectionContext
+                : undefined,
         });
 
       case "chat.list":
@@ -855,17 +894,48 @@ export class HarnessDaemon {
       case "goal.list":
         return this.director.goals.listGoals({
           repoRoot: typeof p.repoRoot === "string" ? p.repoRoot : undefined,
+          chatSessionId: typeof p.chatSessionId === "string" && p.chatSessionId ? p.chatSessionId : undefined,
         });
 
       case "goal.get": {
         const g = this.director.goals.getGoal(String(p.goalId));
         if (!g) throw new Error(`Unknown goal ${p.goalId}`);
-        return {
-          goal: g,
-          reviews: this.director.goals.listReviews(g.id),
-          tasks: g.linkedRunId ? this.db.listTasks(g.linkedRunId) : [],
-          escalations: g.linkedRunId ? this.db.listEscalations(g.linkedRunId, "open") : [],
-        };
+        const reviews = this.director.goals.listReviews(g.id);
+        const tasks = g.linkedRunId ? this.db.listTasks(g.linkedRunId) : [];
+        const escalations = g.linkedRunId ? this.db.listEscalations(g.linkedRunId, "open") : [];
+        const display = buildGoalDetailDisplay({ goal: g, reviews, tasks, openEscalations: escalations });
+        if (typeof p.persistChatSessionId === "string" && p.persistChatSessionId) {
+          this.director.chats.appendTurn(
+            p.persistChatSessionId,
+            "tool_output",
+            summarizeToolDisplay("goal_get", display),
+            { toolName: "goal_get", display },
+          );
+        }
+        return { goal: g, reviews, tasks, escalations, display };
+      }
+
+      case "goal.table_display": {
+        const goals = this.director.goals.listGoals({
+          repoRoot: typeof p.repoRoot === "string" ? p.repoRoot : undefined,
+          chatSessionId: typeof p.chatSessionId === "string" && p.chatSessionId ? p.chatSessionId : undefined,
+        });
+        const display = buildGoalsTableDisplay(
+          goals.map((goal) => ({
+            goal,
+            reviews: this.director.goals.listReviews(goal.id),
+            openEscalations: goal.linkedRunId ? this.db.listEscalations(goal.linkedRunId, "open") : [],
+          })),
+        );
+        if (typeof p.persistChatSessionId === "string" && p.persistChatSessionId) {
+          this.director.chats.appendTurn(
+            p.persistChatSessionId,
+            "tool_output",
+            summarizeToolDisplay("goal_list", display),
+            { toolName: "goal_list", display },
+          );
+        }
+        return { goals, display };
       }
 
       case "goal.review":
@@ -892,13 +962,22 @@ export class HarnessDaemon {
           effort: typeof p.effort === "string" ? p.effort : undefined,
         });
 
-      case "run.list":
-        return this.db.listRuns(typeof p.limit === "number" ? p.limit : 20);
+      case "run.list": {
+        const limit = typeof p.limit === "number" ? p.limit : 20;
+        if (typeof p.chatSessionId === "string" && p.chatSessionId) {
+          return this.getRunIdsForChatSession(p.chatSessionId)
+            .map((id) => this.orchestrator.getEffectiveRun(id))
+            .filter((r): r is NonNullable<typeof r> => r !== null)
+            .sort((a, b) => b.createdAt - a.createdAt)
+            .slice(0, limit);
+        }
+        return this.db.listRuns(limit).map((r) => this.orchestrator.getEffectiveRun(r.id) ?? r);
+      }
 
       case "run.get": {
         const runId = String(p.runId);
         return {
-          run: this.db.getRun(runId),
+          run: this.orchestrator.getEffectiveRun(runId),
           tasks: this.db.listTasks(runId),
           escalations: this.db.listEscalations(runId),
           worktrees: this.db.listWorktrees(runId),
@@ -983,21 +1062,30 @@ export class HarnessDaemon {
       case "runs.trees": {
         const limit = typeof p.limit === "number" ? Math.min(50, Math.max(1, Math.floor(p.limit))) : 50;
         const before = p.before as { id: string; createdAt: number } | undefined;
+        const scopedChatId = typeof p.chatSessionId === "string" && p.chatSessionId ? p.chatSessionId : null;
         const runs = Array.isArray(p.runIds)
           ? (p.runIds as unknown[]).map((id) => this.db.getRun(String(id))).filter((r) => r !== null)
-          : this.db.listRuns(limit + 1, before);
-        const hasMore = !Array.isArray(p.runIds) && runs.length > limit;
+          : scopedChatId
+            ? this.getRunIdsForChatSession(scopedChatId)
+                .map((id) => this.db.getRun(id))
+                .filter((r) => r !== null)
+                .sort((a, b) => b.createdAt - a.createdAt)
+            : this.db.listRuns(limit + 1, before);
+        const hasMore = !Array.isArray(p.runIds) && !scopedChatId && runs.length > limit;
         if (hasMore) runs.pop();
         const last = runs.at(-1);
         return {
           next: hasMore && last ? { id: last.id, createdAt: last.createdAt } : undefined,
           generatedAt: Date.now(),
-          runs: runs.map((run) => ({
-            run,
-            tasks: this.db.listTasks(run.id),
-            escalations: this.db.listEscalations(run.id, "open"),
-            quotaPause: this.orchestrator.getRunQuotaStatus(run.id),
-          })),
+          runs: runs.map((raw) => {
+            const run = this.orchestrator.getEffectiveRun(raw.id) ?? raw;
+            return {
+              run,
+              tasks: this.db.listTasks(run.id),
+              escalations: this.db.listEscalations(run.id, "open"),
+              quotaPause: this.orchestrator.getRunQuotaStatus(run.id),
+            };
+          }),
         };
       }
 
@@ -1021,15 +1109,30 @@ export class HarnessDaemon {
       case "escalation.ack":
         return this.db.ackEscalation(String(p.escalationId), String(p.resolution ?? "Resolved"), true);
 
-      case "models.list":
-        return await this.catalog.getCatalog({
+      case "models.list": {
+        const chatSessionId =
+          typeof p.chatSessionId === "string" && p.chatSessionId
+            ? p.chatSessionId
+            : (this.socketToChatId.get(socket) ?? null);
+        const catalog = await this.catalog.getCatalog({
           cwd: typeof p.cwd === "string" ? p.cwd : process.cwd(),
           role: typeof p.role === "string" ? p.role : undefined,
           excludeExhausted: Boolean(p.excludeExhausted),
+          includeDisabled: Boolean(p.includeDisabled),
         });
+        const sessionModelContext = chatSessionId ? this.director.chats.getModelSelectionContext(chatSessionId) : null;
+        return { ...catalog, sessionModelContext };
+      }
 
-      case "models.sync":
-        return await this.catalog.sync(typeof p.cwd === "string" ? p.cwd : process.cwd());
+      case "models.sync": {
+        const chatSessionId =
+          typeof p.chatSessionId === "string" && p.chatSessionId
+            ? p.chatSessionId
+            : (this.socketToChatId.get(socket) ?? null);
+        const catalog = await this.catalog.sync(typeof p.cwd === "string" ? p.cwd : process.cwd());
+        const sessionModelContext = chatSessionId ? this.director.chats.getModelSelectionContext(chatSessionId) : null;
+        return { ...catalog, sessionModelContext };
+      }
 
       case "quota.get":
         await this.quota.sync(false).catch(() => {});

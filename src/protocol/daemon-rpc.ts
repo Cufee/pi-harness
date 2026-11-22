@@ -53,6 +53,7 @@ export type DaemonOp =
   | "goal.commit"
   | "goal.list"
   | "goal.get"
+  | "goal.table_display"
   | "goal.review"
   | "goal.pause"
   | "goal.cancel"

@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AcpAdapterKind, AcpProfileConfig, RunnerProfileConfig } from "../config.js";
+import type { AcpAdapterKind, AcpProfileConfig } from "../config.js";
 import type { ArtifactRecord } from "../control-plane/db.js";
 import type { ToolPolicy } from "./types.js";
 
@@ -21,16 +21,10 @@ export interface AcpMcpServerEntry {
   env: Array<{ name: string; value: string }>;
 }
 
-/**
- * ACP filesystem callbacks cover only operations delegated by the adapter.
- * The supported ACP adapters lack verified checkout-only native reads. Claude's
- * version-checked control-plane session disables native tools altogether.
- */
-export function supportsToolPolicy(profile: RunnerProfileConfig, policy: ToolPolicy): boolean {
-  if (profile.enabled === false) return false;
-  if (profile.kind === "pi") return true;
-  if (policy === "control_plane_only") return profile.adapter === "claude";
-  return policy === "read_write_workspace";
+export function isAmpAcpProfile(profile: Pick<AcpProfileConfig, "id" | "adapter" | "command" | "args">): boolean {
+  if (profile.adapter !== "generic") return false;
+  const hay = [profile.id, profile.command, ...(profile.args ?? [])].join(" ").toLowerCase();
+  return hay.includes("amp-acp") || /\bamp\b/.test(profile.id.toLowerCase());
 }
 
 export function prepareAcpSpawn(
@@ -40,9 +34,7 @@ export function prepareAcpSpawn(
     toolPolicy: ToolPolicy;
   },
 ): PreparedAcpSpawn {
-  if (!supportsToolPolicy(profile, opts.toolPolicy)) {
-    throw new Error(`Profile ${profile.id} does not support ${opts.toolPolicy}. Select a compatible enabled profile.`);
-  }
+  if (profile.enabled === false) throw new Error(`Runner profile "${profile.id}" is disabled.`);
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v !== undefined) env[k] = v;
@@ -59,8 +51,30 @@ export function prepareAcpSpawn(
     // Prevent silent auto-compaction so harness controls clean rollover via usage_update
     env.DISABLE_COMPACT = "1";
   } else if (profile.adapter === "codex") {
-    // Block Codex's internal multi_agent subagents so all subagents stay in our harness tree
+    // Block Codex's internal multi_agent subagents via BOTH CLI flag and CODEX_CONFIG JSON
+    // (codex-acp v2.9+ reads features from CODEX_CONFIG and can otherwise shadow harness MCP from ~/.codex/config.toml).
     args.push("-c", "features.multi_agent=false");
+    let existingCodexCfg: Record<string, unknown> = {};
+    if (env.CODEX_CONFIG) {
+      try {
+        const parsed = JSON.parse(env.CODEX_CONFIG);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          existingCodexCfg = parsed as Record<string, unknown>;
+        }
+      } catch {
+        // ignore invalid user CODEX_CONFIG JSON
+      }
+    }
+    const existingFeatures =
+      existingCodexCfg.features && typeof existingCodexCfg.features === "object" && !Array.isArray(existingCodexCfg.features)
+        ? (existingCodexCfg.features as Record<string, unknown>)
+        : {};
+    env.CODEX_CONFIG = JSON.stringify({
+      ...existingCodexCfg,
+      features: { ...existingFeatures, multi_agent: false },
+    });
+    env.DISABLE_MCP_CONFIG_FILTERING = "true";
+    if (opts.toolPolicy !== "read_write_workspace") env.INITIAL_AGENT_MODE = "read-only";
   } else if (profile.adapter === "gemini") {
     // Shim 1: gemini --acp ignores NewSessionRequest.systemPrompt; use GEMINI_SYSTEM_MD
     const dir = mkdtempSync(join(tmpdir(), "pi-harness-gemini-"));
@@ -70,6 +84,36 @@ export function prepareAcpSpawn(
     env.GEMINI_SYSTEM_MD = mdPath;
   } else {
     prependSystemPromptToTurn1 = true;
+    // Amp ACP (`amp-acp`) never sends `session/request_permission` callbacks; enforce control-plane / read-only
+    // tool boundaries cleanly via a temporary AMP_SETTINGS_FILE!
+    if (isAmpAcpProfile(profile) && opts.toolPolicy !== "read_write_workspace") {
+      const dir = mkdtempSync(join(tmpdir(), "pi-harness-amp-"));
+      tempDirs.push(dir);
+      const settingsPath = join(dir, "settings.json");
+      const ampSettings: Record<string, unknown> =
+        opts.toolPolicy === "control_plane_only"
+          ? {
+              "amp.tools.enable": ["mcp__harness__*"],
+              "amp.tools.disable": [
+                "Bash",
+                "Read",
+                "Grep",
+                "glob",
+                "edit_file",
+                "create_file",
+                "delete_file",
+                "Task",
+                "finder",
+                "oracle",
+                "librarian",
+              ],
+            }
+          : {
+              "amp.tools.disable": ["Bash", "edit_file", "create_file", "delete_file", "Task"],
+            };
+      writeFileSync(settingsPath, JSON.stringify(ampSettings, null, 2), "utf8");
+      env.AMP_SETTINGS_FILE = settingsPath;
+    }
   }
 
   if (opts.toolPolicy !== "read_write_workspace" && profile.readOnlyArgs?.length) {
@@ -164,6 +208,13 @@ export function buildNewSessionParams(
     }
   }
 
+  if (adapter === "codex" && opts.mcpServers.length > 0) {
+    // Ensure codex-acp awaits harness MCP bridge startup before Turn 1 instead of racing.
+    params._meta = {
+      mcpStartupAwaitTimeoutMs: 15_000,
+    };
+  }
+
   return { params, needsTurn1SystemPrompt };
 }
 
@@ -199,7 +250,14 @@ export function reportedModels(state: AcpModelState, modelConfigIds = new Set(["
   const values = state.configOptions
     ?.filter((option) => modelConfigIds.has(option.id))
     .map((option) => option.currentValue) ?? [];
-  return [...values, state.models?.currentModelId].filter((value) => value !== undefined);
+  const legacyId = state.models?.currentModelId;
+  // Codex legacy `models.currentModelId` appends `[effort]` (e.g. `gpt-6.2-astra[medium]`) while
+  // `configOptions` reports the bare model ID (`gpt-6.2-astra`). Do not treat that as a mismatch.
+  const normalizedLegacy =
+    typeof legacyId === "string" && values.some((v) => typeof v === "string" && legacyId.startsWith(`${v}[`))
+      ? undefined
+      : legacyId;
+  return [...values, normalizedLegacy].filter((value) => value !== undefined);
 }
 
 /**
@@ -226,7 +284,7 @@ export function buildPostSessionActions(
   if (!model?.trim()) throw new Error(`${adapter}: a nonblank wire model ID is required`);
   // Never translate the catalog's selected wire ID. Check the list belonging to
   // the setter we will use, not the union of two potentially different lists.
-  const useConfig = adapter !== "gemini" && (modelOpt !== undefined || adapter === "codex" || (adapter === "claude" && !legacyModels));
+  const useConfig = modelOpt !== undefined || adapter === "codex" || (adapter === "claude" && !legacyModels);
   const configIds = selectValues(modelOpt)?.map((o) => o.value);
   const legacyIds = legacyModels?.availableModels?.map((m) => m.modelId);
   const advertised = useConfig ? configIds ?? legacyIds : legacyIds ?? configIds;

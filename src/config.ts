@@ -80,6 +80,16 @@ export interface CatalogConfig {
   allowPreview?: boolean;
   /** Prefer subscription routes over API routes for same canonical model (default true) */
   preferSubscription?: boolean;
+  /**
+   * User model filter mode:
+   * - `"all"` (default): all ranked catalog models enabled except those in `disabledModels`.
+   * - `"allowlist"`: only models listed in `enabledModels` are active (used after "Toggle All Off").
+   */
+  modelFilterMode?: "all" | "allowlist";
+  /** Canonical model IDs disabled when `modelFilterMode === "all"`. */
+  disabledModels?: string[];
+  /** Canonical model IDs enabled when `modelFilterMode === "allowlist"`. */
+  enabledModels?: string[];
 }
 
 export interface QuotaRetryConfig {
@@ -182,9 +192,9 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
 
   const merged = { ...globalCfg, ...repoCfg } as Partial<HarnessConfig>;
   const rollover: RolloverConfig = {
-    orchestratorThreshold: 0.6,
-    workerThreshold: 0.65,
-    taskMaxTurns: 20,
+    orchestratorThreshold: 0.72,
+    workerThreshold: 0.78,
+    taskMaxTurns: 40,
     externalizeBytes: 2048,
     ...(globalCfg.rollover as Partial<RolloverConfig> | undefined),
     ...(repoCfg.rollover as Partial<RolloverConfig> | undefined),
@@ -203,6 +213,9 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
     artificialAnalysisKeyEnv: "ARTIFICIAL_ANALYSIS_API_KEY",
     allowPreview: true,
     preferSubscription: true,
+    modelFilterMode: "all",
+    disabledModels: [],
+    enabledModels: [],
     ...(globalCfg.catalog as Partial<CatalogConfig> | undefined),
     ...(repoCfg.catalog as Partial<CatalogConfig> | undefined),
   };

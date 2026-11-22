@@ -27,6 +27,7 @@ import {
   formatResetCountdown,
   GoalsOverlay,
   KbOverlay,
+  ModelConfigOverlay,
   ModelPickerOverlay,
   QuotaOverlay,
   QuotaWaitPickerOverlay,
@@ -53,7 +54,7 @@ import {
   UserCard,
 } from "./primitives/index.js";
 import { RunsTreeOverlay, type RunsTreesResult } from "./runs-tree.js";
-import { componentForHistoryTurn, extractDisplay, ToolOutputCard } from "./tool-output/index.js";
+import { componentForHistoryTurn, extractDisplay, ToolOutputCard, type ToolDisplayPayload } from "./tool-output/index.js";
 import { SettingsOverlay } from "./settings-overlay.js";
 import { AgentTranscriptOverlay } from "./transcript-overlay.js";
 
@@ -75,6 +76,15 @@ function parseSlashInput(mode: CommandMode, text: string): { cmd: SlashCommand; 
 }
 
 export type RunsAction = "resume" | "wait" | "stop";
+
+/** Returns true when a Director tool call is waiting on delegated subagent(s) rather than Director reasoning. */
+export function isSubagentWaitTool(name?: string, title?: string): boolean {
+  const hay = `${name ?? ""} ${title ?? ""}`.toLowerCase();
+  return /\b(wait_tasks|wait_children|goal_trigger_review)\b/.test(hay) ||
+    hay.includes("mcp__harness__wait_tasks") ||
+    hay.includes("mcp__harness__wait_children") ||
+    hay.includes("mcp__harness__goal_trigger_review");
+}
 
 /** True for frames delivered to a `watch.start` subscription; only the overlay that owns the watch consumes them. */
 export function isWatchFrame(ev: DaemonEventFrame): boolean {
@@ -112,7 +122,9 @@ async function consumeReplay(
  */
 async function startWatch(
   client: WatchClient,
-  params: { scope: "runs" } | { scope: "task"; runId: string; taskId: string },
+  params:
+    | { scope: "runs"; chatSessionId?: string; runIds?: string[] }
+    | { scope: "task"; runId: string; taskId: string },
   onEvent: (ev: DaemonEventFrame) => void,
   closed?: () => boolean,
   onReplay?: (ev: EventRecord) => void,
@@ -159,6 +171,8 @@ export function openRunsOverlay(ctx: {
   overlays: OverlayManager;
   requestRender: () => void;
   onAction: (action: RunsAction, runId: string) => void;
+  chatSessionId?: string;
+  runIds?: string[];
 }): RunsTreeOverlay {
   const openTranscript = (row: { runId: string; taskId: string; title: string }) => {
     let watch: Awaited<ReturnType<typeof startWatch>> | null = null;
@@ -176,10 +190,11 @@ export function openRunsOverlay(ctx: {
       requestRender: ctx.requestRender,
     });
     handle = ctx.overlays.push(
-      { title: "Agent Transcript", subtitle: `${row.runId} · ${row.taskId}`, footer: "read-only · Esc back to /runs" },
+      { title: "Agent Transcript", subtitle: `${row.runId} · ${row.taskId}`, footer: "mouse wheel / ↑↓ scroll · read-only · Esc back to /runs" },
       comp,
       {
         width: "94%",
+        captureMouseWheel: true,
         onClose: () => {
           closed = true;
           void watch?.stop();
@@ -189,20 +204,24 @@ export function openRunsOverlay(ctx: {
   };
 
   let handle: ReturnType<OverlayManager["push"]> | null = null;
+  const scopeParams = {
+    ...(ctx.chatSessionId ? { chatSessionId: ctx.chatSessionId } : {}),
+    ...(ctx.runIds ? { runIds: ctx.runIds } : {}),
+  };
   const comp = new RunsTreeOverlay({
     theme: ctx.theme,
     fetchTrees: async () => {
       type Page = RunsTreesResult & { next?: { id: string; createdAt: number } };
-      let page = await ctx.client.request<Page>("runs.trees");
+      let page = await ctx.client.request<Page>("runs.trees", scopeParams);
       const runs = [...page.runs];
       while (page.next) {
-        page = await ctx.client.request<Page>("runs.trees", { before: page.next });
+        page = await ctx.client.request<Page>("runs.trees", { ...scopeParams, before: page.next });
         runs.push(...page.runs);
       }
       return { generatedAt: page.generatedAt, runs };
     },
     subscribe: async (onEvent) => {
-      const watch = await startWatch(ctx.client, { scope: "runs" }, onEvent);
+      const watch = await startWatch(ctx.client, { scope: "runs", ...scopeParams }, onEvent);
       return () => void watch.stop();
     },
     onOpenTranscript: openTranscript,
@@ -210,8 +229,17 @@ export function openRunsOverlay(ctx: {
     onClose: () => handle?.close(),
     requestRender: ctx.requestRender,
   });
+  const subtitle = ctx.chatSessionId
+    ? `session ${ctx.chatSessionId}`
+    : ctx.runIds?.length === 1
+      ? `run ${ctx.runIds[0]}`
+      : undefined;
   // Ctrl+T / Ctrl+C pop the overlay without Esc, so stop the watch on every close path.
-  handle = ctx.overlays.push({ title: "Autonomous Runs" }, comp, { width: "94%", onClose: () => comp.dispose() });
+  handle = ctx.overlays.push(
+    { title: "Autonomous Runs", ...(subtitle ? { subtitle } : {}) },
+    comp,
+    { width: "94%", captureMouseWheel: true, onClose: () => comp.dispose() },
+  );
   return comp;
 }
 
@@ -442,12 +470,25 @@ export async function runDirectorChatTui(opts: {
     return `${shortCli}:${bareModel}`;
   };
 
+  const waitingSubagentCalls = new Map<string, string>();
+  const isWaitingOnSubagent = () => waitingSubagentCalls.size > 0;
+  const syncActivityIndicator = () => {
+    if (!busy) return;
+    if (isWaitingOnSubagent()) {
+      const hasReview = [...waitingSubagentCalls.values()].some((n) => n.toLowerCase().includes("review"));
+      spinner.setLabel(hasReview ? "Waiting on review subagent…" : "Waiting on subagent(s)…");
+    } else {
+      spinner.setLabel(`Thinking (${session.model ?? session.profileId})…`);
+    }
+  };
+
   const refreshStatus = () => {
     const humanNeeded = goals.filter((g) => g.status === "awaiting_human").length;
+    const waitingSubagent = busy && isWaitingOnSubagent();
     goalHeader.update(goals);
     statusBar.update({
-      tone: humanNeeded > 0 ? "error" : busy ? "accent" : "success",
-      modeLabel: busy ? "thinking" : "director",
+      tone: humanNeeded > 0 ? "error" : waitingSubagent ? "info" : busy ? "accent" : "success",
+      modeLabel: waitingSubagent ? "waiting on subagent" : busy ? "thinking" : "director",
       modelLabel: activeModelDisplay(),
       effortLabel: session.effort,
       goalsSummary: "",
@@ -470,6 +511,7 @@ export async function runDirectorChatTui(opts: {
     streamedText = "";
     lastSegment = undefined;
     activeToolPills.clear();
+    waitingSubagentCalls.clear();
   };
 
   const appendDelta = (delta: string) => {
@@ -509,10 +551,11 @@ export async function runDirectorChatTui(opts: {
   let pollingGoals = false;
   const refreshGoals = async () => {
     const repo = activeRepoRoot;
+    const chatId = session.id;
     const request = ++goalsRequest;
     try {
-      const next = await opts.client.request<GoalRecord[]>("goal.list", { repoRoot: repo });
-      if (repo !== activeRepoRoot || request !== goalsRequest) return;
+      const next = await opts.client.request<GoalRecord[]>("goal.list", { repoRoot: repo, chatSessionId: chatId });
+      if (repo !== activeRepoRoot || chatId !== session.id || request !== goalsRequest) return;
       goals = next;
       refreshStatus();
       tui.requestRender();
@@ -649,10 +692,39 @@ export async function runDirectorChatTui(opts: {
       .catch((err) => appendError(err, "cli.switch"));
   };
 
+  const openModelConfig = (reopenPicker = false) => {
+    let handle: ReturnType<OverlayManager["push"]> | null = null;
+    const comp = new ModelConfigOverlay(
+      theme,
+      opts.client,
+      activeRepoRoot,
+      config,
+      (nextCfg) => {
+        config = nextCfg;
+        refreshStatus();
+        tui.requestRender();
+      },
+      () => {
+        handle?.close();
+        if (reopenPicker) openModelPicker();
+      },
+      () => handle?.rerender(),
+    );
+    handle = overlays.push(
+      {
+        title: "Configure Enabled Models",
+        subtitle: "ranked catalog",
+        footer: "Space/Enter toggle · x All Off · a All On · Esc done",
+      },
+      comp,
+      { width: "90%", captureMouseWheel: true },
+    );
+  };
+
   const openModelPicker = () => {
     spinner.start("Loading model catalog…", "Esc to cancel");
     void opts.client
-      .request<CompiledModelCatalog>("models.list", { cwd: activeRepoRoot })
+      .request<CompiledModelCatalog>("models.list", { cwd: activeRepoRoot, chatSessionId: session.id })
       // Keep the per-CLI default rows usable even when the catalog cannot load.
       .catch((err): CompiledModelCatalog => {
         appendError(err, "models.list");
@@ -697,12 +769,13 @@ export async function runDirectorChatTui(opts: {
           () => handle?.close(),
           () => handle?.rerender(),
           { profiles: config.profiles, probeStatuses: cat.profileStatuses, onSelect: switchCliDefault },
+          () => openModelConfig(true),
         );
         handle = overlays.push(
           {
             title: "Model Catalog & ACP Route Picker",
-            subtitle: `${cat.models.length} models · synced ${cat.syncedAt.slice(0, 16).replace("T", " ")}`,
-            footer: "Type to filter · CLI rows use the CLI's default model · Tab switch CLI route · Enter select · Ctrl+R sync · Esc close",
+            subtitle: `${cat.models.length} enabled · synced ${cat.syncedAt.slice(0, 16).replace("T", " ")}`,
+            footer: "Type to filter · Tab switch CLI · Ctrl+E toggle models · Ctrl+R sync · Enter select · Esc close",
           },
           comp,
           { width: "92%" },
@@ -727,6 +800,7 @@ export async function runDirectorChatTui(opts: {
       },
       () => handle?.close(),
       () => handle?.rerender(),
+      activeRepoRoot,
     );
     handle = overlays.push(
       {
@@ -833,17 +907,25 @@ export async function runDirectorChatTui(opts: {
     }
   };
 
-  const openRuns = () => openRunsOverlay({ client: opts.client, theme, overlays, requestRender: () => tui.requestRender(), onAction: onRunsAction });
+  const openRuns = () =>
+    openRunsOverlay({
+      client: opts.client,
+      theme,
+      overlays,
+      requestRender: () => tui.requestRender(),
+      onAction: onRunsAction,
+      chatSessionId: session.id,
+    });
 
   const openWorktrees = () => {
     void opts.client
-      .request<LiveWorktreeInfo[]>("worktrees.list", { repoRoot: opts.repoRoot })
+      .request<LiveWorktreeInfo[]>("worktrees.list", { repoRoot: activeRepoRoot })
       .then((list) => {
         let handle: ReturnType<OverlayManager["push"]> | null = null;
         const comp = new WorktreesOverlay(
           theme,
           opts.client,
-          opts.repoRoot,
+          activeRepoRoot,
           list,
           () => handle?.close(),
           () => handle?.rerender(),
@@ -863,7 +945,7 @@ export async function runDirectorChatTui(opts: {
 
   const openKb = (query: string) => {
     void opts.client
-      .request<KbCard[]>("kb.search", { repoRoot: opts.repoRoot, query: query || undefined, includeCandidates: true })
+      .request<KbCard[]>("kb.search", { repoRoot: activeRepoRoot, query: query || undefined, includeCandidates: true })
       .then((cards) => {
         let handle: ReturnType<OverlayManager["push"]> | null = null;
         const comp = new KbOverlay(
@@ -925,10 +1007,32 @@ export async function runDirectorChatTui(opts: {
               void refreshGoals();
             })
             .catch((err) => appendError(err, `goal.${action}`));
+        } else if (action === "print_table") {
+          void opts.client
+            .request<{ display: ToolDisplayPayload }>("goal.table_display", {
+              repoRoot: activeRepoRoot,
+              chatSessionId: session.id,
+              persistChatSessionId: session.id,
+            })
+            .then((res) => {
+              chatContainer.addChild(new ToolOutputCard(theme, res.display));
+              tui.requestRender();
+            })
+            .catch((err) => appendError(err, "goal.table_display"));
         } else {
           void opts.client
-            .request<{ goal: GoalRecord; reviews: GoalReviewVerdict[] }>("goal.get", { goalId: g.id })
-            .then((detail) => appendSystem(formatGoalDetailCard(detail.goal, detail.reviews, theme), "info"))
+            .request<{ goal: GoalRecord; reviews: GoalReviewVerdict[]; display?: ToolDisplayPayload }>("goal.get", {
+              goalId: g.id,
+              persistChatSessionId: session.id,
+            })
+            .then((detail) => {
+              if (detail.display) {
+                chatContainer.addChild(new ToolOutputCard(theme, detail.display));
+                tui.requestRender();
+              } else {
+                appendSystem(formatGoalDetailCard(detail.goal, detail.reviews, theme), "info");
+              }
+            })
             .catch((err) => appendError(err, "goal.get"));
         }
       },
@@ -939,7 +1043,7 @@ export async function runDirectorChatTui(opts: {
       {
         title: "Goals Dashboard",
         subtitle: `${goals.length} total`,
-        footer: "Enter inspect · r review · p pause · x cancel · Esc close",
+        footer: "Enter print card · l print table · r review · p pause · x cancel · Esc close",
       },
       comp,
       { width: "90%" },
@@ -1227,12 +1331,27 @@ export async function runDirectorChatTui(opts: {
     if (ev.type === "chat.delta" && busy) {
       const delta = String((ev.payload as { delta?: string })?.delta ?? "");
       if (!delta) return;
+      if (waitingSubagentCalls.size > 0) {
+        waitingSubagentCalls.clear();
+        syncActivityIndicator();
+        refreshStatus();
+      }
       appendDelta(delta);
     } else if (ev.type === "chat.tool" && busy) {
       const p = ev.payload as { id?: string; name?: string; title?: string; status?: string };
       const display = extractDisplay(p);
       const name = p.title ?? p.name ?? "tool";
       const key = p.id || name;
+      if (isSubagentWaitTool(p.name, p.title)) {
+        if (p.status === "completed" || p.status === "failed") {
+          waitingSubagentCalls.delete(key);
+          waitingSubagentCalls.delete(name);
+        } else {
+          waitingSubagentCalls.set(key, name);
+        }
+        syncActivityIndicator();
+        refreshStatus();
+      }
       const previous = activeToolPills.get(key);
       if (display) {
         // Pi emits an unkeyed progress event before the independently keyed display.
@@ -1732,7 +1851,15 @@ export async function runNativeScrollbackTui(opts: {
     }
   };
 
-  const openRuns = () => openRunsOverlay({ client: opts.client, theme, overlays, requestRender: () => tui.requestRender(), onAction: onRunsAction });
+  const openRuns = () =>
+    openRunsOverlay({
+      client: opts.client,
+      theme,
+      overlays,
+      requestRender: () => tui.requestRender(),
+      onAction: onRunsAction,
+      runIds: [opts.runId],
+    });
 
   const runRunCommand = (cmd: SlashCommand, arg: string) => {
     switch (cmd.name) {

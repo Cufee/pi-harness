@@ -101,4 +101,54 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
       rmSync(repo, { recursive: true, force: true });
     }
   });
+
+  it("materializes merged files safely when untracked files exist (like bun.lock) and auto-links gitignored node_modules", async () => {
+    const repo = await initTempRepo();
+    try {
+      const { mkdirSync, lstatSync } = await import("node:fs");
+      writeFileSync(join(repo, ".gitignore"), "node_modules/\n", "utf8");
+      await runGit(repo, ["add", ".gitignore"]);
+      await runGit(repo, ["-c", "user.name=test", "-c", "user.email=test@local", "commit", "-m", "ignore node_modules"]);
+      mkdirSync(join(repo, "node_modules/fake-pkg"), { recursive: true });
+      writeFileSync(join(repo, "node_modules/fake-pkg/index.js"), "export const ok = true;\n", "utf8");
+      // Untracked file in repo root (just like bun.lock created by `bun install`)
+      writeFileSync(join(repo, "bun.lock"), "# untracked lockfile\n", "utf8");
+
+      const db = new ControlPlaneDb(":memory:");
+      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
+      const run = db.createRun({ goal: "Merge with untracked lockfile", repoRoot: repo, baseBranch, baseSha });
+      const worker = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Add feature.ts",
+        objective: "Create feature.ts",
+        profileId: "acp:codex",
+      });
+
+      const wt = await mgr.createForWorker(run.id, worker.id, baseSha);
+      // Verify gitignored node_modules was automatically symlinked into the worker worktree!
+      assert.ok(lstatSync(join(wt.path, "node_modules")).isSymbolicLink());
+      assert.ok(existsSync(join(wt.path, "node_modules/fake-pkg/index.js")));
+
+      writeFileSync(join(wt.path, "feature.ts"), "export const answer = 42;\n", "utf8");
+      await runGit(wt.path, ["add", "feature.ts"]);
+      await runGit(wt.path, ["-c", "user.name=w", "-c", "user.email=w@local", "commit", "-m", "add feature"]);
+
+      const mq = new BisectingMergeQueue(db, mgr, repo, { ciCommands: ["test -f node_modules/fake-pkg/index.js"] });
+      db.enqueueMerge({ runId: run.id, taskId: worker.id, worktreeId: wt.id, branch: wt.branch });
+      const outcome = await mq.processNext(run.id);
+
+      assert.equal(outcome?.item.status, "merged");
+      // Merged file MUST exist on disk AND NOT be staged as a deletion!
+      assert.equal(readFileSync(join(repo, "feature.ts"), "utf8").trim(), "export const answer = 42;");
+      assert.equal(readFileSync(join(repo, "bun.lock"), "utf8").trim(), "# untracked lockfile");
+      const status = (await runGit(repo, ["status", "--porcelain"])).stdout;
+      assert.ok(!status.includes("D  feature.ts"), `Unexpected staged deletion in git status:\n${status}`);
+      db.close();
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
 });
