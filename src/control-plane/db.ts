@@ -849,6 +849,10 @@ export class ControlPlaneDb {
     return art;
   }
 
+  hasDossier(runId: string, path: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM artifacts WHERE run_id = ? AND path = ? AND kind = 'dossier' LIMIT 1").get(runId, path);
+  }
+
   listArtifacts(runId: string, taskId?: string, limit = 100): ArtifactRecord[] {
     const rows = taskId
       ? (this.db
