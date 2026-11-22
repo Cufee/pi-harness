@@ -10,7 +10,9 @@ import {
   buildPostSessionActions,
   extractArtifactsFromToolUpdate,
   prepareAcpSpawn,
+  reportedModels,
   selectValues,
+  type AcpModelState,
   type AcpConfigOption,
   type AcpMcpServerEntry,
 } from "./acp-shims.js";
@@ -550,34 +552,26 @@ export class AcpRunner {
       sessionId = String(newSessionRes.sessionId);
       req.callbacks.onSessionId?.(sessionId);
 
-      // Apply adapter-specific post-session actions (Codex model/effort/read-only, Gemini set_model/plan)
+      const modelConfigIds = new Set(["model"]);
       const postActions = buildPostSessionActions(this.profile.adapter, sessionId, newSessionRes, {
         toolPolicy: req.toolPolicy,
         model: req.model,
         effort: req.effort,
-      });
-      const sessionOptions = (newSessionRes.configOptions ?? []) as AcpConfigOption[];
-      const modelConfigId = sessionOptions.find((o) => o.category === "model" || o.id === "model")?.id ?? "model";
-      let modelPending = postActions.some((action) => action.requiredModel);
+      }, modelConfigIds);
       for (const action of postActions) {
-        let reply: {
-          configOptions?: Array<{ id: string; category?: string; currentValue?: unknown }>;
-          models?: { currentModelId?: string };
-        };
+        let reply: AcpModelState;
         try {
           reply = await conn.agent.request(action.method as never, action.params as never);
         } catch (err) {
           if (action.requiredModel) throw new Error(`Could not select model ${action.requiredModel}: ${err}`);
-          if (action.method === "session/set_mode") throw err;
           continue; // Effort is optional.
         }
-        if (action.requiredModel) modelPending = false;
-        if (modelPending) continue;
-        const modelValues = reply.configOptions
-          ?.filter((option) => option.category === "model" || option.id === modelConfigId)
-          .map((option) => option.currentValue) ?? [];
-        for (const current of [...modelValues, reply.models?.currentModelId]) {
-          if (current !== undefined && current !== req.model) {
+        const currentModels = reportedModels(reply, modelConfigIds);
+        if (action.requiredModel && !currentModels.length) {
+          throw new Error(`Could not select model ${req.model}: ${action.method} returned no current model`);
+        }
+        for (const current of currentModels) {
+          if (current !== req.model) {
             throw new Error(`Could not select model ${req.model}: ${action.method} reported ${current}`);
           }
         }

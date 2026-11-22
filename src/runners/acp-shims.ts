@@ -22,15 +22,15 @@ export interface AcpMcpServerEntry {
 }
 
 /**
- * Workspace policies constrain ACP filesystem callbacks and approvals. A CLI
- * can perform native operations internally under its own sandbox rules.
- * Control-plane sessions additionally require native tools to be disabled.
+ * ACP filesystem callbacks cover only operations delegated by the adapter.
+ * The supported ACP adapters lack verified checkout-only native reads. Claude's
+ * version-checked control-plane session disables native tools altogether.
  */
 export function supportsToolPolicy(profile: RunnerProfileConfig, policy: ToolPolicy): boolean {
   if (profile.enabled === false) return false;
   if (profile.kind === "pi") return true;
   if (policy === "control_plane_only") return profile.adapter === "claude";
-  return policy === "read_write_workspace" || profile.adapter !== "generic";
+  return policy === "read_write_workspace";
 }
 
 export function prepareAcpSpawn(
@@ -61,9 +61,6 @@ export function prepareAcpSpawn(
   } else if (profile.adapter === "codex") {
     // Block Codex's internal multi_agent subagents so all subagents stay in our harness tree
     args.push("-c", "features.multi_agent=false");
-    if (opts.toolPolicy !== "read_write_workspace") {
-      env.INITIAL_AGENT_MODE = "read-only";
-    }
   } else if (profile.adapter === "gemini") {
     // Shim 1: gemini --acp ignores NewSessionRequest.systemPrompt; use GEMINI_SYSTEM_MD
     const dir = mkdtempSync(join(tmpdir(), "pi-harness-gemini-"));
@@ -171,7 +168,7 @@ export function buildNewSessionParams(
 }
 
 export interface PostSessionAction {
-  method: "session/set_mode" | "session/set_config_option" | "session/set_model";
+  method: "session/set_config_option" | "session/set_model";
   params: Record<string, unknown>;
   /** Prompting is unsafe unless this setter succeeds for the exact wire ID. */
   requiredModel?: string;
@@ -190,29 +187,35 @@ export function selectValues(option?: AcpConfigOption): SelectValue[] | undefine
   return option?.options?.flatMap((item) => "options" in item ? item.options : [item]);
 }
 
+export interface AcpModelState {
+  configOptions?: AcpConfigOption[];
+  models?: { currentModelId?: string; availableModels?: Array<{ modelId: string }> };
+}
+
+export function reportedModels(state: AcpModelState, modelConfigIds = new Set(["model"])): unknown[] {
+  for (const option of state.configOptions ?? []) {
+    if (option.category === "model") modelConfigIds.add(option.id);
+  }
+  const values = state.configOptions
+    ?.filter((option) => modelConfigIds.has(option.id))
+    .map((option) => option.currentValue) ?? [];
+  return [...values, state.models?.currentModelId].filter((value) => value !== undefined);
+}
+
 /**
- * Computes post-`session/new` configuration calls (model, effort, read-only mode)
+ * Computes post-`session/new` configuration calls (model and effort)
  * tailored to each adapter's verified ACP behavior.
  */
 export function buildPostSessionActions(
   adapter: AcpAdapterKind,
   sessionId: string,
-  newSessionResponse: Record<string, unknown>,
+  newSessionResponse: AcpModelState,
   opts: { toolPolicy: ToolPolicy; model: string; effort?: string | null },
+  modelConfigIds = new Set(["model"]),
 ): PostSessionAction[] {
   const actions: PostSessionAction[] = [];
-  const configOptions = (newSessionResponse.configOptions ?? []) as AcpConfigOption[];
-  const legacyModels = newSessionResponse.models as
-    | { currentModelId?: string; availableModels?: Array<{ modelId: string; name?: string }> }
-    | undefined;
-
-  if (opts.toolPolicy === "read_only_workspace") {
-    if (adapter === "codex") {
-      actions.push({ method: "session/set_mode", params: { sessionId, modeId: "read-only" } });
-    } else if (adapter === "claude" || adapter === "gemini") {
-      actions.push({ method: "session/set_mode", params: { sessionId, modeId: "plan" } });
-    }
-  }
+  const configOptions = newSessionResponse.configOptions ?? [];
+  const legacyModels = newSessionResponse.models;
 
   const modelOpt = configOptions.find((c) => c.category === "model" || c.id === "model");
   const effortOpt = configOptions.find(
@@ -230,8 +233,8 @@ export function buildPostSessionActions(
   if (advertised && !advertised.includes(model)) {
     throw new Error(`${adapter}: requested model '${model}' is not advertised by this session`);
   }
-  const current = useConfig ? modelOpt?.currentValue ?? legacyModels?.currentModelId : legacyModels?.currentModelId ?? modelOpt?.currentValue;
-  if (model !== current) {
+  const current = reportedModels(newSessionResponse, modelConfigIds);
+  if (!current.length || current.some((value) => value !== model)) {
     actions.push(useConfig
       ? { method: "session/set_config_option", params: { sessionId, configId: modelOpt?.id ?? "model", value: model }, requiredModel: model }
       : { method: "session/set_model", params: { sessionId, modelId: model }, requiredModel: model });
