@@ -1,6 +1,14 @@
 import type { AgentTier, ArtifactRecord, TaskKind } from "../control-plane/db.js";
 import type { ToolDisplayPayload } from "../protocol/tool-display.js";
 
+export type ToolPolicy = "control_plane_only" | "read_only_workspace" | "read_write_workspace";
+
+export function toolPolicyForTask(tier: AgentTier, kind: TaskKind, readOnly = false): ToolPolicy {
+  if (tier === 1) return "control_plane_only";
+  if (!readOnly && (tier === 2 || (tier === 3 && kind === "execute"))) return "read_write_workspace";
+  return "read_only_workspace";
+}
+
 export interface RunnerUsage {
   used: number;
   size: number;
@@ -71,10 +79,10 @@ export interface RunAgentRequest {
   tier: AgentTier;
   kind: TaskKind;
   cwd: string;
-  readOnly: boolean;
+  toolPolicy: ToolPolicy;
   systemPrompt: string;
   initialPrompt: string;
-  model?: string | null;
+  model: string;
   effort?: string | null;
   maxTurns: number;
   rolloverThreshold?: number;
@@ -89,6 +97,18 @@ export interface RunAgentRequest {
   signal: AbortSignal;
   callbacks: RunnerCallbacks;
   onHandle?: (handle: RunnerExecutionHandle) => void;
+}
+
+/** Reject a stale or overprivileged launch request before contacting the provider. */
+export function validateRunPolicy(req: RunAgentRequest): void {
+  if (typeof req.model !== "string" || !req.model.trim()) {
+    throw new Error("A nonblank profile-native model ID is required");
+  }
+  const maximum = toolPolicyForTask(req.tier, req.kind);
+  if (req.toolPolicy !== maximum && req.toolPolicy !== "control_plane_only" &&
+      !(req.toolPolicy === "read_only_workspace" && maximum === "read_write_workspace")) {
+    throw new Error(`Invalid tool policy ${req.toolPolicy} for tier ${req.tier} ${req.kind}`);
+  }
 }
 
 export interface RunAgentResult {

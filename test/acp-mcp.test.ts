@@ -21,14 +21,14 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
       command: "claude-agent-acp",
       billing: "subscription",
     };
-    const claudeSpawn = prepareAcpSpawn(claudeProfile, { systemPrompt: "Role", readOnly: true });
+    const claudeSpawn = prepareAcpSpawn(claudeProfile, { systemPrompt: "Role", toolPolicy: "read_only_workspace" });
     assert.equal(claudeSpawn.env.DISABLE_COMPACT, "1");
     claudeSpawn.cleanup();
 
     const claudeNew = buildNewSessionParams("claude", {
       cwd: "/tmp",
       systemPrompt: "Role",
-      readOnly: true,
+      toolPolicy: "read_only_workspace",
       model: "claude-opus-5-5",
       effort: "high",
       mcpServers: [],
@@ -46,12 +46,12 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
       command: "codex-acp",
       billing: "subscription",
     };
-    const codexSpawn = prepareAcpSpawn(codexProfile, { systemPrompt: "Role", readOnly: true });
+    const codexSpawn = prepareAcpSpawn(codexProfile, { systemPrompt: "Role", toolPolicy: "read_only_workspace" });
     assert.ok(codexSpawn.args.includes("features.multi_agent=false"));
     assert.equal(codexSpawn.env.INITIAL_AGENT_MODE, "read-only");
     codexSpawn.cleanup();
 
-    const codexPost = buildPostSessionActions("codex", "s1", {}, { readOnly: true, model: "gpt-6.2-sol", effort: "high" });
+    const codexPost = buildPostSessionActions("codex", "s1", {}, { toolPolicy: "read_only_workspace", model: "gpt-6.2-sol", effort: "high" });
     assert.equal(codexPost[0]?.method, "session/set_mode");
     assert.equal(codexPost[1]?.method, "session/set_config_option");
     assert.equal(codexPost[2]?.params.configId, "reasoning_effort");
@@ -65,11 +65,11 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
       args: ["--acp"],
       billing: "subscription",
     };
-    const geminiSpawn = prepareAcpSpawn(geminiProfile, { systemPrompt: "Gemini role", readOnly: true });
+    const geminiSpawn = prepareAcpSpawn(geminiProfile, { systemPrompt: "Gemini role", toolPolicy: "read_only_workspace" });
     assert.ok(geminiSpawn.env.GEMINI_SYSTEM_MD?.endsWith("system.md"));
     geminiSpawn.cleanup();
 
-    const geminiPost = buildPostSessionActions("gemini", "s1", {}, { readOnly: true, model: "gemini-4-neon" });
+    const geminiPost = buildPostSessionActions("gemini", "s1", {}, { toolPolicy: "read_only_workspace", model: "gemini-4-neon" });
     assert.equal(geminiPost.find((a) => a.method === "session/set_model")?.params.modelId, "gemini-4-neon");
   });
 
@@ -84,7 +84,8 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
         agentCapabilities: { sessionCapabilities: { systemPrompt: {}, options: {} } },
         _meta: { steering: { supported: true } },
       } as never))
-      .onRequest("session/new", async () => ({ sessionId: "sess-1" } as never))
+      .onRequest("session/new", async () => ({ sessionId: "sess-1", models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] } } as never))
+      .onRequest("session/set_mode", async () => ({}))
       .onNotification("session/cancel", async () => {
         cancelReceived = true;
       })
@@ -102,7 +103,7 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
 
         const mcpPerm = (await acpClient.request("session/request_permission", {
           sessionId: "sess-1",
-          toolCall: { toolCallId: "tc-m", title: "mcp__harness__tree_view", kind: "other" },
+          toolCall: { toolCallId: "tc-m", title: "harness: tree_view", kind: "other", _meta: { claudeCode: { toolName: "mcp__harness__tree_view", mcpServer: { name: "harness", source: "dynamic" } } } },
           options: [
             { optionId: "allow", kind: "allow_once", name: "Allow" },
             { optionId: "deny", kind: "reject_once", name: "Deny" },
@@ -159,12 +160,15 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
         tier: 2,
         kind: "worker",
         cwd: process.cwd(),
-        readOnly: true,
+        toolPolicy: "read_only_workspace",
         systemPrompt: "sys",
         initialPrompt: "hello",
         maxTurns: 5,
         rolloverThreshold: 0.65,
-        tools: [],
+        model: "opus",
+        daemonSocketPath: "/unused/socket",
+        mcpBridgeEntrypoint: "/unused/bridge.ts",
+        tools: [{ name: "tree_view", description: "View task tree", inputSchema: {} }],
         executeTool: async () => ({}),
         signal: new AbortController().signal,
         callbacks: {

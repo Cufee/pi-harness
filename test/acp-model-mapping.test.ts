@@ -1,31 +1,22 @@
 import assert from "node:assert/strict";
 import { describe, it } from "bun:test";
-import { buildNewSessionParams, buildPostSessionActions, resolveNativeModelOption } from "../src/runners/acp-shims.js";
+import { buildNewSessionParams, buildPostSessionActions } from "../src/runners/acp-shims.js";
 
-const modelConfig = (values: Array<string | { value: string; name?: string }>, currentValue?: string) => ({
+const toolPolicy = "read_write_workspace" as const;
+const modelConfig = (values: string[], currentValue: string) => ({
   id: "model",
   category: "model",
-  currentValue,
-  options: values.map((v) => (typeof v === "string" ? { value: v } : v)),
-});
-
-const effortConfig = (values: string[], currentValue?: string) => ({
-  id: "effort",
-  category: "thought_level",
   currentValue,
   options: values.map((value) => ({ value })),
 });
 
-const sentValues = (actions: ReturnType<typeof buildPostSessionActions>) =>
-  actions.map((a) => String(a.params.value ?? a.params.modelId ?? ""));
-
 describe("ACP adapter-native model matching", () => {
-  it("never hands Claude a company prefix on session/new", () => {
+  it("hands Claude its selected native model on session/new", () => {
     const { params } = buildNewSessionParams("claude", {
       cwd: "/tmp",
       systemPrompt: "Role",
-      readOnly: false,
-      model: "anthropic/claude-opus-5-5",
+      toolPolicy,
+      model: "claude-opus-5-5",
       mcpServers: [],
       agentCapabilities: { sessionCapabilities: { options: {} } },
     });
@@ -34,132 +25,61 @@ describe("ACP adapter-native model matching", () => {
     assert.deepEqual(params.configOptions, [{ configId: "model", value: "claude-opus-5-5" }]);
   });
 
-  it("maps Claude canonical IDs to the advertised alias and corrects a mismatched currentValue", () => {
-    const res = {
-      configOptions: [
-        modelConfig(
-          [
-            { value: "default", name: "Default (recommended)" },
-            { value: "sonnet", name: "Sonnet" },
-            { value: "opus", name: "Opus" },
-            { value: "haiku", name: "Haiku" },
-          ],
-          "default",
-        ),
-      ],
-    };
-    const actions = buildPostSessionActions("claude", "s1", res, { readOnly: false, model: "anthropic/claude-opus-5-5" });
-    assert.deepEqual(actions, [
-      { method: "session/set_config_option", params: { sessionId: "s1", configId: "model", value: "opus" } },
-    ]);
-
-    // Already on the resolved option: nothing to send
-    const same = buildPostSessionActions(
-      "claude",
-      "s1",
-      { configOptions: [modelConfig(["sonnet", "opus"], "opus")] },
-      { readOnly: false, model: "anthropic/claude-opus-5-5" },
-    );
-    assert.equal(same.length, 0);
+  it("sets Claude's explicitly selected alias unless it is already current", () => {
+    const opts = { toolPolicy, model: "opus" };
+    const config = modelConfig(["sonnet", "opus"], "sonnet");
+    assert.deepEqual(buildPostSessionActions("claude", "s1", { configOptions: [config] }, opts), [{
+      method: "session/set_config_option", params: { sessionId: "s1", configId: "model", value: "opus" }, requiredModel: "opus",
+    }]);
+    assert.deepEqual(buildPostSessionActions("claude", "s1", { configOptions: [{ ...config, currentValue: "opus" }] }, opts), []);
   });
 
-  it("prefers the exact bare Claude ID over a family alias and never sends anthropic/", () => {
-    const opts = ["opus", "claude-opus-5-5", "claude-opus-5"];
-    assert.equal(resolveNativeModelOption("claude", "anthropic/claude-opus-5-5", opts.map((value) => ({ value }))), "claude-opus-5-5");
-    assert.equal(resolveNativeModelOption("claude", "anthropic/claude-sonnet-5-5", [{ value: "sonnet" }, { value: "opus" }]), "sonnet");
-    assert.equal(resolveNativeModelOption("claude", "anthropic/claude-haiku-5-5", [{ value: "Haiku-tier", name: "Claude Haiku 5.5" }]), "Haiku-tier");
-    assert.equal(resolveNativeModelOption("claude", "anthropic/claude-fable-5-2", [{ value: "opus" }, { value: "fable" }]), "fable");
-    // Reverse alias: requested `opus` against full IDs
-    assert.equal(resolveNativeModelOption("claude", "opus", [{ value: "claude-sonnet-5-5" }, { value: "claude-opus-5-5" }]), "claude-opus-5-5");
-    // Nothing advertised: single-vendor prefix strip
-    assert.equal(resolveNativeModelOption("claude", "anthropic/claude-opus-5-5", []), "claude-opus-5-5");
-
-    const actions = buildPostSessionActions(
-      "claude",
-      "s1",
-      { configOptions: [modelConfig(["claude-opus-5", "claude-opus-5-5"], "claude-opus-5")] },
-      { readOnly: false, model: "anthropic/claude-opus-5-5" },
-    );
-    assert.deepEqual(sentValues(actions), ["claude-opus-5-5"]);
-    assert.ok(sentValues(actions).every((v) => !v.startsWith("anthropic/")));
+  it("does not substitute a Claude family alias, display name or sibling revision", () => {
+    const model = "claude-opus-5-5";
+    const res = { configOptions: [{ id: "model", currentValue: "opus", options: [
+      { value: "opus", name: "Claude Opus 5.5" }, { value: "claude-opus-5" },
+    ] }] };
+    assert.throws(() => buildPostSessionActions("claude", "s1", res, { toolPolicy, model }), /claude-opus-5-5.*not advertised/);
   });
 
-  it("strips openai/ for Codex with or without advertised options", () => {
-    const blind = buildPostSessionActions("codex", "s1", {}, { readOnly: false, model: "openai/gpt-6.2-astra" });
-    assert.deepEqual(blind[0], {
-      method: "session/set_config_option",
-      params: { sessionId: "s1", configId: "model", value: "gpt-6.2-astra" },
-    });
-
-    const advertised = buildPostSessionActions(
-      "codex",
-      "s1",
-      { configOptions: [modelConfig(["gpt-6.2-sol", "gpt-6.2-astra"], "gpt-6.2-sol")] },
-      { readOnly: false, model: "openai/gpt-6.2-astra" },
-    );
-    assert.deepEqual(sentValues(advertised), ["gpt-6.2-astra"]);
+  it("sets the exact Codex model with or without advertised options", () => {
+    const model = "gpt-6.2-astra";
+    for (const res of [{}, { configOptions: [modelConfig(["gpt-6.2-sol", model], "gpt-6.2-sol")] }]) {
+      assert.deepEqual(buildPostSessionActions("codex", "s1", res, { toolPolicy, model }), [{
+        method: "session/set_config_option", params: { sessionId: "s1", configId: "model", value: model }, requiredModel: model,
+      }]);
+    }
   });
 
-  it("strips google/ for Gemini set_model, using legacy availableModels when advertised", () => {
-    const blind = buildPostSessionActions("gemini", "s1", {}, { readOnly: false, model: "google/gemini-4-neon" });
-    assert.deepEqual(blind, [{ method: "session/set_model", params: { sessionId: "s1", modelId: "gemini-4-neon" } }]);
-
-    const legacy = buildPostSessionActions(
-      "gemini",
-      "s1",
-      {
-        models: {
-          currentModelId: "gemini-3.8-flash",
-          availableModels: [{ modelId: "gemini-3.8-flash" }, { modelId: "gemini-4-carbon" }],
-        },
-      },
-      { readOnly: false, model: "google/gemini-4-carbon" },
-    );
-    assert.deepEqual(sentValues(legacy), ["gemini-4-carbon"]);
+  it("uses Gemini's legacy model setter and its advertised model list", () => {
+    const model = "gemini-4-carbon";
+    const opts = { toolPolicy, model };
+    const res = { models: { currentModelId: "gemini-3.8-flash", availableModels: [{ modelId: model }] } };
+    for (const response of [{}, res]) {
+      assert.deepEqual(buildPostSessionActions("gemini", "s1", response, opts), [{
+        method: "session/set_model", params: { sessionId: "s1", modelId: model }, requiredModel: model,
+      }]);
+    }
+    assert.throws(() => buildPostSessionActions("gemini", "s1", res, { toolPolicy, model: "gemini-4-neon" }), /not advertised/);
   });
 
-  it("maps Amp/generic canonical IDs onto the advertised provider namespace", () => {
-    const res = {
-      configOptions: [
-        modelConfig(
-          ["anthropic/claude-opus-5-5", "google-vertex/gemini-4-carbon", "zhipuai/glm-5.3", "openai/gpt-6.2-astra"],
-          "anthropic/claude-opus-5-5",
-        ),
-      ],
-    };
-    const gemini = buildPostSessionActions("generic", "s1", res, { readOnly: true, model: "google/gemini-4-carbon" });
-    assert.deepEqual(sentValues(gemini), ["google-vertex/gemini-4-carbon"]);
-    const glm = buildPostSessionActions("generic", "s1", res, { readOnly: true, model: "zai/glm-5.3" });
-    assert.deepEqual(sentValues(glm), ["zhipuai/glm-5.3"]);
-    const exact = buildPostSessionActions("generic", "s1", res, { readOnly: true, model: "openai/gpt-6.2-astra" });
-    assert.deepEqual(sentValues(exact), ["openai/gpt-6.2-astra"]);
-    // Generic never prefix-strips blindly: no match means null from the resolver
-    assert.equal(resolveNativeModelOption("generic", "google/gemini-9", res.configOptions[0]!.options), null);
-    // ...and an unadvertised model is skipped instead of sent
-    assert.equal(buildPostSessionActions("generic", "s1", res, { readOnly: true, model: "google/gemini-9" }).length, 0);
-    const codexUnknown = buildPostSessionActions(
-      "codex",
-      "s1",
-      { configOptions: [modelConfig(["gpt-6.2-sol"], "gpt-6.2-sol")] },
-      { readOnly: false, model: "openai/gpt-9" },
-    );
-    assert.equal(codexUnknown.length, 0);
+  it("keeps Amp's provider namespace and fails if the selected route disappeared", () => {
+    const model = "google-vertex/gemini-4-carbon";
+    const res = { configOptions: [modelConfig([model, "openai/gpt-6.2-astra"], "openai/gpt-6.2-astra")] };
+    assert.equal(buildPostSessionActions("generic", "s1", res, { toolPolicy, model })[0]?.params.value, model);
+    assert.throws(() => buildPostSessionActions("generic", "s1", res, { toolPolicy, model: "google/gemini-4-carbon" }), /not advertised/);
   });
 
   it("only sets effort when an advertised effort option matches (case-insensitive)", () => {
-    const res = { configOptions: [effortConfig(["low", "medium", "high"], "medium")] };
-
-    const ok = buildPostSessionActions("codex", "s1", res, { readOnly: false, effort: "HIGH" });
-    assert.deepEqual(ok, [
+    const opts = { toolPolicy, model: "selected" };
+    const res = { configOptions: [modelConfig([opts.model], opts.model), {
+      id: "effort", category: "thought_level", currentValue: "medium", options: ["low", "medium", "high"].map((value) => ({ value })),
+    }] };
+    assert.deepEqual(buildPostSessionActions("codex", "s1", res, { ...opts, effort: "HIGH" }), [
       { method: "session/set_config_option", params: { sessionId: "s1", configId: "effort", value: "high" } },
     ]);
-
     for (const adapter of ["claude", "codex", "gemini", "generic"] as const) {
-      const bad = buildPostSessionActions(adapter, "s1", res, { readOnly: false, effort: "xhigh" });
-      assert.equal(bad.length, 0, `${adapter} must not send an unadvertised effort`);
+      assert.deepEqual(buildPostSessionActions(adapter, "s1", res, { ...opts, effort: "xhigh" }), []);
     }
-
-    const claude = buildPostSessionActions("claude", "s1", res, { readOnly: false, effort: "Low" });
-    assert.deepEqual(sentValues(claude), ["low"]);
   });
 });

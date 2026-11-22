@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open, realpath, stat } from "node:fs/promises";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { client, ndJsonStream, PROTOCOL_VERSION, type AgentApp, type ClientConnection } from "@agentclientprotocol/sdk/unstable";
 import type { AcpProfileConfig } from "../config.js";
@@ -8,33 +10,59 @@ import {
   buildPostSessionActions,
   extractArtifactsFromToolUpdate,
   prepareAcpSpawn,
+  selectValues,
+  type AcpConfigOption,
   type AcpMcpServerEntry,
 } from "./acp-shims.js";
 import { detectQuotaErrorText } from "./quota-detect.js";
+import { validateRunPolicy } from "./types.js";
 import type { ProbedModelInfo, QuotaPauseInfo, RunAgentRequest, RunAgentResult, RunnerUsage } from "./types.js";
 
-function isHarnessMcpTool(titleOrName: string, harnessToolNames?: Set<string>): boolean {
-  const lower = titleOrName.toLowerCase().trim();
-  if (
-    lower.includes("mcp__harness__") ||
-    lower.includes("mcp.harness.") ||
-    lower.includes("mcp/harness/") ||
-    lower.includes("harness__") ||
-    lower.startsWith("harness:") ||
-    lower.startsWith("harness/") ||
-    lower.startsWith("harness.")
-  ) {
-    return true;
+function requireWorkspacePath(root: string, path: string): void {
+  const rel = relative(root, path);
+  if (isAbsolute(rel) || rel === ".." || rel.startsWith(`..${sep}`)) {
+    throw new Error("ACP filesystem path is outside the task workspace");
   }
-  if (!harnessToolNames || harnessToolNames.size === 0) return false;
-  if (harnessToolNames.has(lower)) return true;
-  // Also match adapter-formatted titles like "harness - goal_create" or "tool: goal_create(...)"
-  const token = lower.split(/[:/.\s(]+/).filter(Boolean).pop();
-  return Boolean(token && harnessToolNames.has(token));
 }
 
-function isMutatingToolKind(kind: string | undefined): boolean {
-  return kind === "edit" || kind === "delete" || kind === "move" || kind === "execute";
+async function workspaceTarget(root: string, requested: string, allowNew: boolean) {
+  const absolute = resolve(root, requested);
+  try {
+    const path = await realpath(absolute);
+    requireWorkspacePath(root, path);
+    return { path, exists: true };
+  } catch (error) {
+    if (!allowNew || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const parent = await realpath(dirname(absolute));
+  requireWorkspacePath(root, parent);
+  const path = resolve(parent, basename(absolute));
+  // A dangling symlink is an existing directory entry, not a new workspace file.
+  if (await lstat(path).catch((error) => {
+    if (error.code !== "ENOENT") throw error;
+    return undefined;
+  })) throw new Error("ACP filesystem target is not a new workspace file");
+  return { path, exists: false };
+}
+
+async function openWorkspaceFile(root: string, requested: string, write: boolean) {
+  const { path: target, exists } = await workspaceTarget(root, requested, write);
+  const flags = (write ? constants.O_WRONLY : constants.O_RDONLY) | constants.O_NOFOLLOW |
+    constants.O_NONBLOCK | (exists ? 0 : constants.O_CREAT | constants.O_EXCL);
+  const file = await open(target, flags);
+  try {
+    const actual = await realpath(target);
+    requireWorkspacePath(root, actual);
+    const opened = await file.stat();
+    const current = await stat(actual);
+    if (!opened.isFile() || (write && opened.nlink !== 1) || opened.dev !== current.dev || opened.ino !== current.ino) {
+      throw new Error("ACP filesystem request requires a regular workspace file");
+    }
+    return file;
+  } catch (error) {
+    await file.close();
+    throw error;
+  }
 }
 
 function extractToolErrorSnippet(update: Record<string, unknown>): string | undefined {
@@ -78,10 +106,17 @@ export class AcpRunner {
    * Accepts an optional in-process `testAgent` for deterministic unit testing.
    */
   async run(req: RunAgentRequest, testAgent?: AgentApp): Promise<RunAgentResult> {
+    validateRunPolicy(req);
+    if (this.profile.models?.length && !this.profile.models.includes(req.model)) {
+      throw new Error(`Model ${req.model} is unavailable on ACP profile ${this.profile.id}`);
+    }
+    const workspace = await realpath(req.cwd);
     const prepared = prepareAcpSpawn(this.profile, {
       systemPrompt: req.systemPrompt,
-      readOnly: req.readOnly,
+      toolPolicy: req.toolPolicy,
     });
+    const controlOnly = req.toolPolicy === "control_plane_only";
+    const canWrite = req.toolPolicy === "read_write_workspace";
 
     const child = testAgent
       ? null
@@ -102,7 +137,10 @@ export class AcpRunner {
       child.stderr?.on("error", () => {});
     }
 
-    const harnessToolNames = new Set(req.tools.map((t) => t.name.toLowerCase()));
+    const hasHarnessBridge = Boolean(req.daemonSocketPath && req.mcpBridgeEntrypoint);
+    const harnessToolNames = new Set(req.tools.map(({ name }) => name));
+    const claudeToolNames = new Set(req.tools.map(({ name }) => `mcp__harness__${name}`));
+    const codexHarnessCalls = new Set<string>();
     const quotaTimeoutMs = Math.max(0, req.quotaRetryTimeoutMs ?? DEFAULT_QUOTA_RETRY_TIMEOUT_MS);
 
     let accumulatedText = "";
@@ -207,7 +245,7 @@ export class AcpRunner {
     const app = client()
       .onNotification("session/update", ({ params }) => {
         const update = (params as unknown as { update?: Record<string, unknown> }).update;
-        if (!update || typeof update !== "object") return;
+        if (params.sessionId !== sessionId || !update || typeof update !== "object") return;
         const kind = String(update.sessionUpdate ?? "");
 
         if (kind === "agent_message_chunk") {
@@ -278,6 +316,18 @@ export class AcpRunner {
           if (accumulatedText.length > 0) needsParagraphBreak = true;
           textSinceLastTool = "";
           const callId = update.toolCallId ? String(update.toolCallId) : update.id ? String(update.id) : undefined;
+          if (this.profile.adapter === "codex" && callId) {
+            const meta = update._meta as { is_mcp_tool_call?: boolean } | undefined;
+            const input = update.rawInput as { server?: string; tool?: string } | undefined;
+            if (kind === "tool_call") {
+              codexHarnessCalls.delete(callId);
+              if (update.kind === "execute" && meta?.is_mcp_tool_call === true &&
+                  input?.server === "harness" && input.tool && harnessToolNames.has(input.tool)) {
+                codexHarnessCalls.add(callId);
+              }
+            }
+            if (update.status === "completed" || update.status === "failed") codexHarnessCalls.delete(callId);
+          }
           const rawTitle = update.title ? String(update.title) : update.name ? String(update.name) : undefined;
           if (callId && rawTitle) {
             toolTitlesById.set(callId, rawTitle);
@@ -318,9 +368,14 @@ export class AcpRunner {
           }
         }
       })
-      .onRequest("session/request_permission", ({ params }) => {
+      .onRequest("session/request_permission", async ({ params }) => {
         const p = params as unknown as {
-          toolCall?: { toolCallId?: string; title?: string; name?: string; kind?: string; rawInput?: unknown };
+          _meta?: { is_mcp_tool_approval?: boolean };
+          toolCall?: {
+            toolCallId?: string; title?: string; name?: string; kind?: string;
+            locations?: Array<{ path: string }>;
+            _meta?: { claudeCode?: { toolName?: string; mcpServer?: { name?: string; source?: string } } };
+          };
           options?: Array<{ optionId: string; kind: string }>;
         };
         const callId = p.toolCall?.toolCallId ? String(p.toolCall.toolCallId) : undefined;
@@ -328,19 +383,37 @@ export class AcpRunner {
         const toolKind = p.toolCall?.kind;
         const options = p.options ?? [];
 
-        const allowOpt = options.find((o) => o.kind === "allow_once" || o.kind === "allow_always");
-        const denyOpt = options.find((o) => o.kind === "reject_once" || o.kind === "reject_always");
-
-        // Always allow our own harness MCP tools (even in read-only Director / Orchestrator / Verifier sessions)
-        if (isHarnessMcpTool(title, harnessToolNames) && allowOpt) {
-          return { outcome: { outcome: "selected", optionId: allowOpt.optionId } } as never;
+        const allowOpt = options.find((o) => o.kind === "allow_once");
+        const denyOpt = options.find((o) => o.kind === "reject_once") ?? options.find((o) => o.kind === "reject_always");
+        const claude = p.toolCall?._meta?.claudeCode;
+        const claudeCall = this.profile.adapter === "claude" && toolKind === "other" &&
+          claude?.mcpServer?.name === "harness" && claude.mcpServer.source === "dynamic" &&
+          claude.toolName !== undefined && claudeToolNames.has(claude.toolName);
+        const codexCall = this.profile.adapter === "codex" && toolKind === "execute" &&
+          p._meta?.is_mcp_tool_approval === true && callId !== undefined && codexHarnessCalls.has(callId);
+        const genericCall = this.profile.adapter === "generic" && toolKind === "other" &&
+          p.toolCall?.name !== undefined && harnessToolNames.has(p.toolCall.name);
+        const isRead = toolKind === "read" || toolKind === "search";
+        const isWrite = toolKind === "edit" || toolKind === "delete" || toolKind === "move";
+        let workspaceCall = false;
+        // Native commands may run inside the CLI sandbox. An opaque command approval
+        // can request elevation and supplies no checkable set of filesystem targets.
+        if (!controlOnly && !claude?.mcpServer && !p._meta?.is_mcp_tool_approval &&
+            (isRead || (canWrite && isWrite))) {
+          try {
+            const locations = p.toolCall?.locations ?? [];
+            for (const location of locations) {
+              await workspaceTarget(workspace, location.path, toolKind === "edit" || toolKind === "move");
+            }
+            workspaceCall = locations.length > 0;
+          } catch {
+            workspaceCall = false;
+          }
         }
-
-        // Hard-deny mutating or shell actions in read-only mode (prefer reject_once so turn does not abort!)
-        if (req.readOnly && isMutatingToolKind(toolKind)) {
-          const deniedLabel = title || toolKind || "mutating tool";
+        if (!sessionId || params.sessionId !== sessionId || !(workspaceCall || (hasHarnessBridge && (claudeCall || codexCall || genericCall)))) {
+          const deniedLabel = title || toolKind || "native tool";
           turnDeniedTools.push(deniedLabel);
-          allToolFailures.push(`${deniedLabel} (blocked: read-only mode)`);
+          allToolFailures.push(`${deniedLabel} (blocked by ${req.toolPolicy})`);
           return (
             denyOpt
               ? { outcome: { outcome: "selected", optionId: denyOpt.optionId } }
@@ -354,8 +427,17 @@ export class AcpRunner {
         return { outcome: { outcome: "cancelled" } } as never;
       })
       .onRequest("fs/read_text_file", async ({ params }) => {
+        if (!sessionId || params.sessionId !== sessionId || controlOnly) {
+          throw new Error("Read denied: agent is running in control-plane-only mode");
+        }
         const p = params as unknown as { path: string; line?: number; limit?: number };
-        const raw = await readFile(p.path, "utf8");
+        const file = await openWorkspaceFile(workspace, p.path, false);
+        let raw: string;
+        try {
+          raw = await file.readFile("utf8");
+        } finally {
+          await file.close();
+        }
         req.callbacks.onArtifact?.({
           kind: "read",
           path: p.path,
@@ -372,12 +454,17 @@ export class AcpRunner {
         return { content: raw };
       })
       .onRequest("fs/write_text_file", async ({ params }) => {
-        if (req.readOnly) {
-          throw new Error("Write denied: agent is running in strictly read-only mode");
+        if (!sessionId || params.sessionId !== sessionId || !canWrite) {
+          throw new Error(`Write denied: agent is running in ${controlOnly ? "control-plane-only" : "strictly read-only"} mode`);
         }
         const p = params as unknown as { path: string; content: string };
-        const { writeFile } = await import("node:fs/promises");
-        await writeFile(p.path, p.content, "utf8");
+        const file = await openWorkspaceFile(workspace, p.path, true);
+        try {
+          await file.truncate(0);
+          await file.writeFile(p.content, "utf8");
+        } finally {
+          await file.close();
+        }
         req.callbacks.onArtifact?.({
           kind: "write",
           path: p.path,
@@ -411,12 +498,21 @@ export class AcpRunner {
         protocolVersion: PROTOCOL_VERSION,
         clientInfo: { name: "pi-harness", version: "0.1.0" },
         clientCapabilities: {
-          fs: { readTextFile: true, writeTextFile: !req.readOnly },
-          _meta: {
-            jetbrains: { air: { capabilities: ["sessionFailure"] } },
-          },
+          fs: { readTextFile: !controlOnly, writeTextFile: canWrite },
+          ...(this.profile.adapter === "claude" ? {} : {
+            _meta: { jetbrains: { air: { capabilities: ["sessionFailure"] } } },
+          }),
         },
       } as never)) as unknown as Record<string, unknown>;
+
+      // ACP does not negotiate support for Claude's native tool inventory option.
+      // Accept the implementation audited to honor tools: [] and strictMcpConfig.
+      if (controlOnly) {
+        const agent = initRes.agentInfo as { name?: string; version?: string } | undefined;
+        if (agent?.name !== "@agentclientprotocol/claude-agent-acp" || agent.version !== "0.109.1") {
+          throw new Error(`Profile ${this.profile.id} requires claude-agent-acp 0.109.1 for control_plane_only`);
+        }
+      }
 
       const initMeta = (initRes._meta ?? {}) as Record<string, unknown>;
       const steeringMeta = initMeta.steering as { supported?: boolean } | undefined;
@@ -440,7 +536,7 @@ export class AcpRunner {
       const { params: newSessionParams, needsTurn1SystemPrompt } = buildNewSessionParams(this.profile.adapter, {
         cwd: req.cwd,
         systemPrompt: req.systemPrompt,
-        readOnly: req.readOnly,
+        toolPolicy: req.toolPolicy,
         model: req.model,
         effort: req.effort,
         mcpServers,
@@ -456,15 +552,34 @@ export class AcpRunner {
 
       // Apply adapter-specific post-session actions (Codex model/effort/read-only, Gemini set_model/plan)
       const postActions = buildPostSessionActions(this.profile.adapter, sessionId, newSessionRes, {
-        readOnly: req.readOnly,
+        toolPolicy: req.toolPolicy,
         model: req.model,
         effort: req.effort,
       });
+      const sessionOptions = (newSessionRes.configOptions ?? []) as AcpConfigOption[];
+      const modelConfigId = sessionOptions.find((o) => o.category === "model" || o.id === "model")?.id ?? "model";
+      let modelPending = postActions.some((action) => action.requiredModel);
       for (const action of postActions) {
+        let reply: {
+          configOptions?: Array<{ id: string; category?: string; currentValue?: unknown }>;
+          models?: { currentModelId?: string };
+        };
         try {
-          await conn.agent.request(action.method as never, action.params as never);
-        } catch {
-          // Non-fatal if an adapter rejects an optional mode/effort value
+          reply = await conn.agent.request(action.method as never, action.params as never);
+        } catch (err) {
+          if (action.requiredModel) throw new Error(`Could not select model ${action.requiredModel}: ${err}`);
+          if (action.method === "session/set_mode") throw err;
+          continue; // Effort is optional.
+        }
+        if (action.requiredModel) modelPending = false;
+        if (modelPending) continue;
+        const modelValues = reply.configOptions
+          ?.filter((option) => option.category === "model" || option.id === modelConfigId)
+          .map((option) => option.currentValue) ?? [];
+        for (const current of [...modelValues, reply.models?.currentModelId]) {
+          if (current !== undefined && current !== req.model) {
+            throw new Error(`Could not select model ${req.model}: ${action.method} reported ${current}`);
+          }
         }
       }
 
@@ -763,22 +878,15 @@ export class AcpRunner {
       } as never)) as unknown as Record<string, unknown>;
 
       const results: ProbedModelInfo[] = [];
-      const configOptions = (res.configOptions ?? []) as Array<{
-        id: string;
-        category?: string;
-        options?: Array<{ value: string; name?: string }>;
-      }>;
-
+      const configOptions = (res.configOptions ?? []) as AcpConfigOption[];
       const effortOpt = configOptions.find(
         (c) => c.category === "thought_level" || c.id === "effort" || c.id === "reasoning_effort",
       );
-      const supportedEfforts = effortOpt?.options?.map((o) => o.value);
+      const supportedEfforts = selectValues(effortOpt)?.map((o) => o.value);
 
       const modelOpt = configOptions.find((c) => c.category === "model" || c.id === "model");
-      if (modelOpt?.options) {
-        for (const opt of modelOpt.options) {
-          results.push({ wireModelId: opt.value, name: opt.name, supportedEfforts });
-        }
+      for (const opt of selectValues(modelOpt) ?? []) {
+        results.push({ wireModelId: opt.value, name: opt.name, supportedEfforts });
       }
 
       // Legacy fallback (gemini --acp `models.availableModels`)

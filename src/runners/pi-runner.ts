@@ -16,6 +16,7 @@ import { googleProvider } from "@earendil-works/pi-ai/providers/google";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import type { PiProfileConfig } from "../config.js";
 import { detectQuotaErrorText } from "./quota-detect.js";
+import { validateRunPolicy } from "./types.js";
 import type { ProbedModelInfo, RunAgentRequest, RunAgentResult, RunnerUsage } from "./types.js";
 
 const BUILTIN_PROVIDERS = new Map<string, [() => Provider<Api>, string]>([
@@ -54,14 +55,15 @@ export class PiRunner {
   }
 
   async run(req: RunAgentRequest): Promise<RunAgentResult> {
+    validateRunPolicy(req);
+    if (this.profile.enabled === false) throw new Error(`Pi profile ${this.profile.id} is disabled`);
+    const modelId = req.model;
     const builtin = BUILTIN_PROVIDERS.get(this.profile.provider);
     const catalog = builtin?.[0]();
-    const modelId = req.model ?? this.profile.models?.[0] ?? catalog?.getModels()[0]?.id;
-    if (!modelId) {
-      throw new Error(`No model specified or discoverable for pi profile ${this.profile.id}`);
-    }
-
     const builtinModel = catalog?.getModels().find((m) => m.id === modelId);
+    if (!(this.profile.models?.length ? this.profile.models.includes(modelId) : builtinModel)) {
+      throw new Error(`Model ${modelId} is unavailable on Pi profile ${this.profile.id}. Select a current catalog route.`);
+    }
     const baseUrl = this.profile.baseUrl ?? catalog?.baseUrl;
     if (!baseUrl) {
       throw new Error(`Custom pi profile ${this.profile.id} requires baseUrl`);
@@ -176,6 +178,12 @@ export class PiRunner {
           }
 
           finalMsg = await s.result();
+          if (finalMsg.stopReason === "error") {
+            throw new Error(finalMsg.errorMessage || `Pi provider rejected the request for ${modelId}`);
+          }
+          if (finalMsg.stopReason === "aborted") {
+            return { text: lastText, stopReason: "cancelled", usage: lastUsage };
+          }
           if (retryCount > 0) {
             req.callbacks.onQuotaRetryState?.({
               state: "recovered",
@@ -274,6 +282,9 @@ export class PiRunner {
       for (const call of toolCalls) {
         req.callbacks.onToolEvent?.({ name: call.name, status: "in_progress" });
         try {
+          if (!piTools.some((tool) => tool.name === call.name)) {
+            throw new Error(`Tool ${call.name} is unavailable to this agent.`);
+          }
           const out = await req.executeTool(call.name, call.arguments ?? {});
           req.callbacks.onToolEvent?.({ name: call.name, status: "completed" });
           messages.push({
