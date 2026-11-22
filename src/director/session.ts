@@ -16,6 +16,7 @@ function canonicalRepoPath(p: string): string {
 
 export interface ChatSessionRecord {
   id: string;
+  projectId: string | null;
   repoRoot: string;
   title: string;
   profileId: string;
@@ -45,6 +46,7 @@ export interface ChatTurnRecord {
 export const DIRECTOR_SCHEMA = `
 CREATE TABLE IF NOT EXISTS chat_sessions (
   id TEXT PRIMARY KEY,
+  project_id TEXT,
   repo_root TEXT NOT NULL,
   title TEXT NOT NULL,
   profile_id TEXT NOT NULL,
@@ -113,6 +115,9 @@ export class DirectorSessionStore {
     if (!cols.has("model_selection_context")) {
       this.db.exec("ALTER TABLE chat_sessions ADD COLUMN model_selection_context TEXT");
     }
+    if (!cols.has("project_id")) {
+      this.db.exec("ALTER TABLE chat_sessions ADD COLUMN project_id TEXT");
+    }
   }
 
   /** Upgrades chat_turns created before tool_output turns existed: rebuilds it when its role CHECK lacks 'tool_output' (keeping rows and seq), then adds missing columns. */
@@ -157,16 +162,30 @@ export class DirectorSessionStore {
     return this.lastTs;
   }
 
-  getOrCreateDefault(input: { repoRoot: string; profileId: string; model?: string | null; effort?: string | null }): ChatSessionRecord {
+  getOrCreateDefault(input: {
+    repoRoot: string;
+    projectId?: string | null;
+    profileId: string;
+    model?: string | null;
+    effort?: string | null;
+  }): ChatSessionRecord {
     const canon = canonicalRepoPath(input.repoRoot);
-    const existing = this.getWorkspaceSession(canon);
-    if (existing) return existing;
+    const existing =
+      (input.projectId ? this.getProjectSession(input.projectId) : null) ??
+      this.getWorkspaceSession(canon);
+    if (existing) {
+      if (input.projectId && existing.projectId !== input.projectId) {
+        return this.updateSession(existing.id, { projectId: input.projectId, repoRoot: canon });
+      }
+      return existing;
+    }
 
     return this.createSession({ ...input, repoRoot: canon });
   }
 
   createSession(input: {
     repoRoot: string;
+    projectId?: string | null;
     profileId: string;
     title?: string;
     model?: string | null;
@@ -177,14 +196,31 @@ export class DirectorSessionStore {
     const now = this.nextTimestamp();
     this.db
       .prepare(
-        "INSERT INTO chat_sessions(id, repo_root, title, profile_id, model, effort, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO chat_sessions(id, project_id, repo_root, title, profile_id, model, effort, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
-      .run(id, canon, input.title?.trim() || "Director Chat", input.profileId, input.model ?? null, input.effort ?? null, now, now);
+      .run(
+        id,
+        input.projectId ?? null,
+        canon,
+        input.title?.trim() || "Director Chat",
+        input.profileId,
+        input.model ?? null,
+        input.effort ?? null,
+        now,
+        now,
+      );
     return this.getSession(id)!;
   }
 
   touchSession(id: string): void {
     this.db.prepare("UPDATE chat_sessions SET updated_at = ? WHERE id = ?").run(this.nextTimestamp(), id);
+  }
+
+  getProjectSession(projectId: string): ChatSessionRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM chat_sessions WHERE project_id = ? ORDER BY updated_at DESC, rowid DESC LIMIT 1")
+      .get(projectId) as Record<string, unknown> | undefined;
+    return row ? this.mapSession(row) : null;
   }
 
   getWorkspaceSession(repoRoot: string): ChatSessionRecord | null {
@@ -252,36 +288,45 @@ export class DirectorSessionStore {
   updateSession(
     chatSessionId: string,
     patch: Partial<{
+      projectId: string | null;
+      repoRoot: string;
       profileId: string;
       model: string | null;
       effort: string | null;
       title: string;
       modelSelectionContext: string | null;
+      resetAcpSession: boolean;
     }>,
   ): ChatSessionRecord {
     const existing = this.getSession(chatSessionId);
     if (!existing) throw new Error(`Unknown chat session ${chatSessionId}`);
-    const now = Date.now();
+    const now = this.nextTimestamp();
     const nextModelContext =
       patch.modelSelectionContext !== undefined
         ? typeof patch.modelSelectionContext === "string" && patch.modelSelectionContext.trim()
           ? patch.modelSelectionContext.trim()
           : null
         : existing.modelSelectionContext;
+    const nextRepoRoot = patch.repoRoot ? canonicalRepoPath(patch.repoRoot) : existing.repoRoot;
+    const nextProjectId = patch.projectId !== undefined ? patch.projectId : existing.projectId;
+    const nextAcpSessionId = patch.resetAcpSession ? null : existing.acpSessionId;
     this.db
       .prepare(
-        "UPDATE chat_sessions SET profile_id = ?, model = ?, effort = ?, title = ?, model_selection_context = ?, updated_at = ? WHERE id = ?",
+        "UPDATE chat_sessions SET project_id = ?, repo_root = ?, profile_id = ?, model = ?, effort = ?, title = ?, acp_session_id = ?, model_selection_context = ?, updated_at = ? WHERE id = ?",
       )
       .run(
+        nextProjectId,
+        nextRepoRoot,
         patch.profileId ?? existing.profileId,
         patch.model !== undefined ? patch.model : existing.model,
         patch.effort !== undefined ? patch.effort : existing.effort,
         patch.title ?? existing.title,
+        nextAcpSessionId,
         nextModelContext,
         now,
-        chatSessionId,
+        existing.id,
       );
-    return this.getSession(chatSessionId)!;
+    return this.getSession(existing.id)!;
   }
 
   getModelSelectionContext(chatSessionId: string): string | null {
@@ -377,6 +422,7 @@ export class DirectorSessionStore {
     const rawCtx = typeof r.model_selection_context === "string" ? r.model_selection_context.trim() : "";
     return {
       id: String(r.id),
+      projectId: r.project_id ? String(r.project_id) : null,
       repoRoot: String(r.repo_root),
       title: String(r.title),
       profileId: String(r.profile_id),

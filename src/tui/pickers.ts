@@ -1645,9 +1645,9 @@ export class SessionSwitcherScreen implements Screen {
       this.list.setTableItems(
         list.map((s) => {
           const isMe = Boolean(s.attachedByMe) || s.id === this.currentId;
-          const repoName = s.repoRoot ? s.repoRoot.split("/").filter(Boolean).pop() ?? s.repoRoot : "";
+          const projLabel = s.projectName || (s.repoRoot ? s.repoRoot.split("/").filter(Boolean).pop() ?? s.repoRoot : "");
           const modelStr = s.model ? `${s.model}${s.effort ? ` (${s.effort})` : ""}` : s.profileId ?? "";
-          const detailParts = [firstLine(s.title, 26), modelStr, repoName].filter(Boolean);
+          const detailParts = [projLabel ? `[${projLabel}]` : "", firstLine(s.title, 22), modelStr].filter(Boolean);
           return {
             id: `${s.kind}:${s.id}`,
             value: s,

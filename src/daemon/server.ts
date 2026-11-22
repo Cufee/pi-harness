@@ -4,7 +4,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const DAEMON_PROTOCOL_REV = 6;
+export const DAEMON_PROTOCOL_REV = 7;
 
 export function currentDaemonBuildId(): string {
   try {
@@ -859,20 +859,104 @@ export class HarnessDaemon {
         return { id, models };
       }
 
+      case "project.list":
+        return await this.db.projects.listProjects();
+
+      case "project.get": {
+        const ref = String(p.projectId ?? p.id ?? p.name ?? p.path ?? "");
+        const proj = this.db.projects.resolveProject(ref);
+        if (!proj) throw new Error(`Unknown project: ${ref}`);
+        const all = await this.db.projects.listProjects();
+        return all.find((x) => x.id === proj.id) ?? proj;
+      }
+
+      case "project.create": {
+        const created = await this.db.projects.createProject({
+          path: String(p.path ?? ""),
+          name: typeof p.name === "string" ? p.name : undefined,
+          description: typeof p.description === "string" ? p.description : undefined,
+          createDir: p.createDir === undefined ? true : Boolean(p.createDir),
+          gitInit: Boolean(p.gitInit),
+          cloneUrl: typeof p.cloneUrl === "string" && p.cloneUrl.trim() ? p.cloneUrl.trim() : undefined,
+          defaultProfileId: typeof p.defaultProfileId === "string" ? p.defaultProfileId : undefined,
+          defaultModel: typeof p.defaultModel === "string" ? p.defaultModel : undefined,
+          defaultEffort: typeof p.defaultEffort === "string" ? p.defaultEffort : undefined,
+        });
+        const all = await this.db.projects.listProjects();
+        return all.find((x) => x.id === created.id) ?? created;
+      }
+
+      case "project.update": {
+        const ref = String(p.projectId ?? p.id ?? "");
+        const updated = this.db.projects.updateProject(ref, {
+          name: typeof p.name === "string" ? p.name : undefined,
+          description: p.description === null ? null : typeof p.description === "string" ? p.description : undefined,
+          defaultProfileId: p.defaultProfileId === null ? null : typeof p.defaultProfileId === "string" ? p.defaultProfileId : undefined,
+          defaultModel: p.defaultModel === null ? null : typeof p.defaultModel === "string" ? p.defaultModel : undefined,
+          defaultEffort: p.defaultEffort === null ? null : typeof p.defaultEffort === "string" ? p.defaultEffort : undefined,
+        });
+        const all = await this.db.projects.listProjects();
+        return all.find((x) => x.id === updated.id) ?? updated;
+      }
+
+      case "project.remove": {
+        const ref = String(p.projectId ?? p.id ?? "");
+        return this.db.projects.removeProject(ref);
+      }
+
+      case "project.browse":
+        return this.db.projects.browseDirectory(typeof p.path === "string" ? p.path : undefined);
+
+      case "chat.set_project": {
+        const chatSessionId = String(p.chatSessionId);
+        const projectRef = String(p.projectId ?? p.project ?? "");
+        const { session, project } = this.director.switchChatProject(chatSessionId, projectRef);
+        return { session, project };
+      }
+
       case "chat.open": {
+        const requestedProjectRef = typeof p.projectId === "string" && p.projectId.trim() ? p.projectId.trim() : undefined;
+        const explicitProject = requestedProjectRef ? this.db.projects.resolveProject(requestedProjectRef) : null;
+        if (requestedProjectRef && !explicitProject) {
+          throw new Error(`Unknown project "${requestedProjectRef}". Add it first with \`pi-harness project add <path>\` or /projects.`);
+        }
+
         let session =
           typeof p.chatSessionId === "string" && p.chatSessionId
             ? this.director.chats.getSession(p.chatSessionId)
-            : p.preferLastGlobal
-              ? this.director.chats.getMostRecentSession()
-              : null;
+            : explicitProject
+              ? this.director.chats.getProjectSession(explicitProject.id) ??
+                this.director.chats.getWorkspaceSession(explicitProject.rootPath)
+              : p.preferLastGlobal
+                ? this.director.chats.getMostRecentSession()
+                : null;
 
         if (typeof p.chatSessionId === "string" && p.chatSessionId && !session) {
           throw new Error(`Unknown chat session: ${p.chatSessionId}`);
         }
+
+        let targetProject = explicitProject;
         if (!session) {
-          session = await this.director.openDefaultChat(chatSelection(p));
+          if (!targetProject && p.preferLastProject) {
+            targetProject = this.db.projects.getMostRecent();
+          }
+          const sel = chatSelection({
+            ...p,
+            repoRoot: targetProject?.rootPath ?? (typeof p.repoRoot === "string" && p.repoRoot ? p.repoRoot : process.cwd()),
+          });
+          session = await this.director.openDefaultChat({
+            ...sel,
+            projectId: targetProject?.id ?? undefined,
+          });
         }
+        const boundProject =
+          (session.projectId ? this.db.projects.getById(session.projectId) : null) ??
+          this.db.projects.ensureProjectForPath(session.repoRoot);
+        if (boundProject && session.projectId !== boundProject.id) {
+          session = this.director.chats.updateSession(session.id, { projectId: boundProject.id });
+        }
+        if (boundProject) this.db.projects.touchProject(boundProject.id);
+
         const { tookOver } = this.bindChatSocket(socket, session.id);
         const turn = this.chatTurns.get(session.id);
         const { historyThrough } = this.db.db.prepare(
@@ -880,6 +964,7 @@ export class HarnessDaemon {
         ).get(session.id) as { historyThrough: number };
         return {
           session,
+          project: boundProject,
           ...this.chatHistoryPage(session.id, 0, historyThrough),
           activeTurnId: turn?.id ?? null,
           activeText: turn?.text ?? "",
@@ -892,13 +977,26 @@ export class HarnessDaemon {
       }
 
       case "chat.create": {
+        const requestedProjectRef = typeof p.projectId === "string" && p.projectId.trim() ? p.projectId.trim() : undefined;
+        const explicitProject = requestedProjectRef ? this.db.projects.resolveProject(requestedProjectRef) : null;
+        if (requestedProjectRef && !explicitProject) {
+          throw new Error(`Unknown project "${requestedProjectRef}"`);
+        }
         const session = await this.director.createChat({
-          ...chatSelection(p),
+          ...chatSelection({
+            ...p,
+            repoRoot: explicitProject?.rootPath ?? (typeof p.repoRoot === "string" && p.repoRoot ? p.repoRoot : process.cwd()),
+          }),
+          projectId: explicitProject?.id ?? undefined,
           title: typeof p.title === "string" ? p.title : undefined,
         });
+        const boundProject =
+          (session.projectId ? this.db.projects.getById(session.projectId) : null) ??
+          this.db.projects.ensureProjectForPath(session.repoRoot);
         this.bindChatSocket(socket, session.id);
         return {
           session,
+          project: boundProject,
           history: [],
           historyThrough: 0,
           historyNext: null,
@@ -913,16 +1011,22 @@ export class HarnessDaemon {
       }
 
       case "sessions.list": {
+        const allProjects = await this.db.projects.listProjects();
+        const projById = new Map(allProjects.map((pr) => [pr.id, pr]));
+        const projByPath = new Map(allProjects.map((pr) => [pr.rootPath, pr]));
         const chats = this.director.chats.listSessions(25).map((c) => {
           const bound = this.chatBindings.get(c.id);
           const busy = this.director.isChatBusy(c.id);
           const activeGoals = this.director.goals
             .listGoals({ chatSessionId: c.id })
             .filter((g) => ["executing", "verifying", "reviewing"].includes(g.status)).length;
+          const proj = (c.projectId ? projById.get(c.projectId) : undefined) ?? projByPath.get(c.repoRoot);
           return {
             id: c.id,
             kind: "chat" as const,
             title: c.title,
+            projectId: proj?.id ?? c.projectId ?? null,
+            projectName: proj?.name ?? null,
             repoRoot: c.repoRoot,
             status: busy ? "busy" : activeGoals > 0 ? `${activeGoals} active goal${activeGoals === 1 ? "" : "s"}` : "idle",
             running: busy || activeGoals > 0,
@@ -938,10 +1042,13 @@ export class HarnessDaemon {
           const bound = this.runBindings.get(r.id);
           const live = this.orchestrator.isRunActiveInMemory(r.id);
           const quotaSt = this.orchestrator.getRunQuotaStatus(r.id);
+          const proj = projByPath.get(r.repoRoot);
           return {
             id: r.id,
             kind: "run" as const,
             title: (r.goal.split("\n")[0] ?? r.goal).slice(0, 80),
+            projectId: proj?.id ?? null,
+            projectName: proj?.name ?? null,
             repoRoot: r.repoRoot,
             status: live ? "running" : quotaSt ? (quotaSt.resumeAt ? "quota (timer)" : "paused_quota") : r.status,
             running: live || Boolean(quotaSt),

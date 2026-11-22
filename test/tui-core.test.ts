@@ -362,7 +362,7 @@ describe("TUI v2 Core Primitives", () => {
     }
   });
 
-  it("keeps ImmutableTranscript blocks frozen (including Tool-Output cards), FixedDock height strictly constant, and UndoableEditor undo working", () => {
+  it("keeps ImmutableTranscript blocks frozen (including Tool-Output cards), FixedDock height strictly constant, and UndoableEditor undo working", async () => {
     const theme = createTheme({ color: true, ascii: false });
     const { terminal } = makeFakeTerminal();
     const tui = new ModalScreen(terminal);
@@ -488,6 +488,63 @@ describe("TUI v2 Core Primitives", () => {
     const midText = trMid.render(80).map(stripTerminalSequences).join("\n");
     assert.ok(midText.indexOf("INTRO-SEGMENT") < midText.indexOf("Goals"), "INTRO-SEGMENT must stay above mid-turn card");
     assert.ok(midText.indexOf("Goals") < midText.indexOf("FINAL-SEGMENT"), "FINAL-SEGMENT must render below mid-turn card");
+
+    // 3c. Floating slash-command autocomplete keeps total line count constant (never shifts input up!) and emits 0 scrollback wipes
+    const { terminal: acTerm, writes: acWrites } = makeFakeTerminal(80, 24);
+    const acTui = new ModalScreen(acTerm);
+    const acTranscript = new ImmutableTranscript(theme);
+    for (let i = 0; i < 24; i++) acTranscript.appendLines([`History line ${i + 1}`]);
+    const acDock = new FixedDock(acTui, theme, {
+      autocomplete: {
+        getSuggestions: async () => ({
+          prefix: "/",
+          items: [
+            { value: "projects", label: "projects", description: "Manage projects" },
+            { value: "work", label: "work", description: "Work Navigator" },
+            { value: "settings", label: "settings", description: "Settings" },
+          ],
+        }),
+        applyCompletion: (_lines, line, _col, item) => ({ lines: [`/${item.value} `], cursorLine: line, cursorCol: item.value.length + 2 }),
+      },
+      onSubmit: () => {},
+      initialState: {
+        slots: [],
+        idleBanner: "Ready",
+        busy: false,
+        phaseText: "Ready",
+        rightStatus: "codex",
+        queuedCount: 0,
+        hints: [{ key: "Ctrl+P", label: "Projects" }],
+      },
+    });
+    acDock.editor.floatAutocomplete = true;
+    acTui.addChild(acTranscript);
+    acTui.addChild(acDock);
+    acTui.setFocus(acDock.editor);
+    acTui.setFloatingPopupProvider((w) => {
+      const ac = acDock.editor.getFloatingAutocompleteLines();
+      return ac.length ? { lines: ac.map((l) => fit(l, w)), bottomOffset: acDock.renderedHeight } : null;
+    });
+    acTui.start();
+    const linesBefore = acTui.render(80);
+    (acTui as unknown as { doRender: () => void }).doRender();
+    acWrites.length = 0;
+
+    // Type `/` to open slash autocomplete
+    acDock.editor.handleInput("/");
+    await new Promise((r) => setTimeout(r, 20));
+    const linesDuring = acTui.render(80);
+    (acTui as unknown as { doRender: () => void }).doRender();
+    assert.equal(linesDuring.length, linesBefore.length, "Slash autocomplete must NEVER grow line count or shift input up");
+    assert.ok(linesDuring.map(stripTerminalSequences).join("\n").includes("projects"), "Floating popup must show suggestions");
+
+    // Press Esc to dismiss slash autocomplete
+    acDock.editor.handleInput("\x1b");
+    const linesAfter = acTui.render(80);
+    (acTui as unknown as { doRender: () => void }).doRender();
+    assert.equal(linesAfter.length, linesBefore.length, "Dismissing slash autocomplete must keep exact line count");
+    assert.equal(acWrites.filter((w) => w.includes("\x1b[3J")).length, 0, "Slash autocomplete open/close must emit 0 scrollback wipes");
+    acTui.stop();
 
     // 4. RecentRefsRing & slash commands
     const ring = new RecentRefsRing(3);

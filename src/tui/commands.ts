@@ -12,6 +12,7 @@ export interface CommandSpec {
 }
 
 export const COMMAND_SPECS: CommandSpec[] = [
+  { name: "projects", aliases: ["project", "proj"], usage: "/projects [name|add <path>|switch <name>]", description: "Manage, create, browse, or switch projects (Ctrl+P)", modes: ["chat", "run"] },
   { name: "work", usage: "/work [tab]", description: "Open Work Navigator (Ctrl+G) — Inbox, Goals, Runs, Escalations, Timers, Worktrees", modes: ["chat", "run"] },
   { name: "inbox", usage: "/inbox", description: "Jump straight to Inbox (open escalations, awaiting_human goals, blockers)", modes: ["chat", "run"] },
   { name: "escalations", aliases: ["esc"], usage: "/escalations", description: "Open Escalations tab to inspect, acknowledge, or resolve escalations", modes: ["chat", "run"] },
@@ -62,6 +63,7 @@ export function createCommandAutocomplete(mode: TuiMode): CombinedAutocompletePr
 }
 
 export const KEYBOARD_SHORTCUTS: ReadonlyArray<{ key: string; description: string }> = [
+  { key: "Ctrl+P", description: "Open Projects manager/picker (select, create, clone, browse, switch session)" },
   { key: "Ctrl+G", description: "Open Work Navigator (Inbox / Goals / Runs / Escalations / Timers / Worktrees)" },
   { key: "Ctrl+T", description: "Open Runs tab directly in Work Navigator" },
   { key: "Ctrl+O", description: "Go-To-Anything fuzzy palette (pinned commands, inbox blockers, entities)" },

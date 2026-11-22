@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { matchesKey, type Terminal } from "@earendil-works/pi-tui";
+import type { ProjectRecord } from "../control-plane/projects.js";
 import type { EventRecord, ReplayPage, RunRecord } from "../control-plane/db.js";
 import type { DaemonClient } from "../daemon/remote.js";
 import type { ChatSessionRecord, ChatTurnRecord } from "../director/session.js";
@@ -9,7 +10,9 @@ import { createCommandAutocomplete, parseSlashCommand, renderHelp, type TuiMode 
 import {
   createTheme,
   type TuiEntityRef as EntityRef,
+  fillLineBg,
   firstLine,
+  fit,
   FixedDock,
   formatCountdown,
   formatDuration,
@@ -33,6 +36,7 @@ import {
   SessionSwitcherScreen,
   SettingsScreen,
 } from "./pickers.js";
+import { ProjectsScreen } from "./projects.js";
 import { consumeReplay } from "./replay.js";
 import { type AttachableSession, WorkStore } from "./store.js";
 import { extractDisplay, parseToolDisplay } from "./tool-output/index.js";
@@ -40,13 +44,23 @@ import { WorkNavigatorScreen, type WorkTabId } from "./work-navigator.js";
 
 export type TuiExitAction =
   | { kind: "exit" }
-  | { kind: "switch"; targetKind: "chat" | "run"; targetId: string; taskId?: string | null; title?: string };
+  | {
+      kind: "switch";
+      targetKind: "chat" | "run";
+      targetId: string;
+      taskId?: string | null;
+      title?: string;
+      projectId?: string;
+      repoRoot?: string;
+    };
 
 export interface DirectorChatTuiOptions {
   client: DaemonClient;
-  repoRoot: string;
+  repoRoot?: string;
+  projectId?: string;
   chatSessionId?: string;
   preferLastGlobal?: boolean;
+  preferLastProject?: boolean;
   terminal?: Terminal;
 }
 
@@ -59,6 +73,7 @@ export interface NativeScrollbackTuiOptions {
 
 interface ChatOpenResult {
   session: ChatSessionRecord;
+  project?: ProjectRecord | null;
   history: ChatTurnRecord[];
   historyNext?: number | null;
   historyThrough?: number;
@@ -86,6 +101,9 @@ interface SharedShellContext {
   mode: TuiMode;
   client: DaemonClient;
   repoRoot: string;
+  projectId?: string | null;
+  getProject?: () => { id: string | null; name: string | null; repoRoot: string };
+  onSwitchCurrentSessionProject?: (project: ProjectRecord) => Promise<void>;
   sessionId: string;
   chatSessionId?: string;
   runId?: string;
@@ -177,7 +195,7 @@ function createSharedShell(spec: SharedShellContext) {
   const switchTo = (
     targetKind: "chat" | "run",
     targetId: string,
-    extra?: { taskId?: string | null; title?: string },
+    extra?: { taskId?: string | null; title?: string; projectId?: string; repoRoot?: string },
   ) => {
     exitAction = {
       kind: "switch",
@@ -185,9 +203,13 @@ function createSharedShell(spec: SharedShellContext) {
       targetId,
       ...(extra?.taskId !== undefined ? { taskId: extra.taskId } : {}),
       ...(extra?.title ? { title: extra.title } : {}),
+      ...(extra?.projectId ? { projectId: extra.projectId } : {}),
+      ...(extra?.repoRoot ? { repoRoot: extra.repoRoot } : {}),
     };
     void session.stop();
   };
+
+  const currentRepoRoot = () => spec.getProject?.().repoRoot ?? spec.repoRoot;
 
   const inspectorDeps: InspectorDeps = {
     client: spec.client,
@@ -196,7 +218,31 @@ function createSharedShell(spec: SharedShellContext) {
     onAttachRun: (runId, taskId) => switchTo("run", runId, { taskId }),
   };
 
+  const openProjects = () => {
+    const cur = spec.getProject?.() ?? { id: spec.projectId ?? null, name: null, repoRoot: spec.repoRoot };
+    navigator.push(
+      new ProjectsScreen(spec.client, {
+        currentProjectId: cur.id,
+        currentRepoRoot: cur.repoRoot,
+        canSwitchCurrentSession: Boolean(spec.onSwitchCurrentSessionProject),
+        onOpenProject: (project) => {
+          switchTo("chat", "__project__", { projectId: project.id, repoRoot: project.rootPath });
+        },
+        onSwitchCurrentSession: spec.onSwitchCurrentSessionProject
+          ? async (project) => {
+              await spec.onSwitchCurrentSessionProject!(project);
+              inspectorDeps.repoRoot = project.rootPath;
+              store.setScope({ chatSessionId: spec.chatSessionId, repoRoot: project.rootPath, runId: spec.runId });
+              void store.refresh();
+              syncDock();
+            }
+          : undefined,
+      }),
+    );
+  };
+
   const openWork = (tab?: WorkTabId) => {
+    inspectorDeps.repoRoot = currentRepoRoot();
     navigator.push(new WorkNavigatorScreen(inspectorDeps, tab));
   };
 
@@ -330,6 +376,7 @@ function createSharedShell(spec: SharedShellContext) {
 
   const openPalette = () => {
     const actions: QuickActionItem[] = [
+      { id: "projects", label: "/projects", detail: "Select, Create, Clone or Switch Project (Ctrl+P)", pinned: true, run: () => openProjects() },
       { id: "settings", label: "/settings", detail: "ACP CLIs, Enabled Models & Defaults (Ctrl+,)", pinned: true, run: () => openSettings() },
       ...(spec.onModelUpdated ? [{ id: "model", label: "/model", detail: "Select Model & Enable/Disable Models", pinned: true, run: () => openModels() }] : []),
       ...(spec.onEffortUpdated ? [{ id: "effort", label: "/effort", detail: "Set Reasoning Effort", pinned: true, run: () => openEffort() }] : []),
@@ -350,6 +397,7 @@ function createSharedShell(spec: SharedShellContext) {
   };
 
   const dockHints: Hint[] = [
+    { key: "Ctrl+P", label: "Projects" },
     { key: "Ctrl+G", label: "Work" },
     { key: "Ctrl+T", label: "Runs" },
     { key: "Ctrl+O", label: "Go" },
@@ -363,6 +411,42 @@ function createSharedShell(spec: SharedShellContext) {
     const parsed = parseSlashCommand(raw);
     if (!parsed) return false;
     switch (parsed.name) {
+      case "projects": {
+        const arg = parsed.args.trim();
+        if (!arg) {
+          openProjects();
+          return true;
+        }
+        const addMatch = arg.match(/^add\s+(\S+)(?:\s+(.+))?$/i);
+        if (addMatch) {
+          const created = await spec.client.request<ProjectRecord>("project.create", {
+            path: addMatch[1]!,
+            name: addMatch[2]?.trim() || undefined,
+            createDir: true,
+          });
+          transcript.appendReceipt({
+            glyph: theme.glyphs.check,
+            tone: "ok",
+            tag: "project",
+            text: `Registered project ${created.name} (${created.rootPath}). Use /project ${created.name} to open it.`,
+          });
+          session.tui.requestRender();
+          return true;
+        }
+        const swMatch = arg.match(/^switch\s+(.+)$/i);
+        if (swMatch && spec.onSwitchCurrentSessionProject) {
+          const target = await spec.client.request<ProjectRecord>("project.get", { projectId: swMatch[1]!.trim() });
+          await spec.onSwitchCurrentSessionProject(target);
+          inspectorDeps.repoRoot = target.rootPath;
+          store.setScope({ chatSessionId: spec.chatSessionId, repoRoot: target.rootPath, runId: spec.runId });
+          void store.refresh();
+          syncDock();
+          return true;
+        }
+        const target = await spec.client.request<ProjectRecord>("project.get", { projectId: arg });
+        switchTo("chat", "__project__", { projectId: target.id, repoRoot: target.rootPath });
+        return true;
+      }
       case "work": {
         const tab = (["inbox", "goals", "runs", "escalations", "timers", "worktrees"] as const).find(
           (t) => t === parsed.args.toLowerCase(),
@@ -613,6 +697,23 @@ function createSharedShell(spec: SharedShellContext) {
   session.tui.addChild(dock);
   session.tui.setFocus(dock.editor);
 
+  // Float slash-command autocomplete above the dock so typing `/` never shifts the input up or leaves blank rows below!
+  dock.editor.floatAutocomplete = true;
+  session.tui.setFloatingPopupProvider((width) => {
+    const acLines = dock.editor.getFloatingAutocompleteLines();
+    if (acLines.length === 0) return null;
+    const w = Math.max(12, Math.floor(width));
+    const g = theme.glyphs;
+    const innerW = Math.max(4, w - 4);
+    const bdr = theme.borderFocused;
+    const framed: string[] = [
+      fillLineBg(bdr(`${g.boxTL}${g.barH.repeat(Math.max(1, w - 2))}${g.boxTR}`), w, theme.surfaceBg),
+      ...acLines.map((l) => fillLineBg(`${bdr(g.barV)} ${fit(l.trimEnd(), innerW)} ${bdr(g.barV)}`, w, theme.surfaceBg)),
+      fillLineBg(bdr(`${g.boxBL}${g.barH.repeat(Math.max(1, w - 2))}${g.boxBR}`), w, theme.surfaceBg),
+    ];
+    return { lines: framed, bottomOffset: dock.renderedHeight };
+  });
+
   const unsubStore = store.subscribe(syncDock);
 
   const spinTimer = setInterval(() => {
@@ -624,6 +725,10 @@ function createSharedShell(spec: SharedShellContext) {
   session.start((data) => {
     if (navigator.isOpen) return undefined;
 
+    if (matchesKey(data, "ctrl+p")) {
+      openProjects();
+      return { consume: true };
+    }
     if (matchesKey(data, "ctrl+g")) {
       openWork();
       return { consume: true };
@@ -755,9 +860,11 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   let fullHistory: ChatTurnRecord[];
   try {
     opened = await opts.client.request<ChatOpenResult>("chat.open", {
-      repoRoot: opts.repoRoot,
+      ...(opts.repoRoot ? { repoRoot: opts.repoRoot } : {}),
+      ...(opts.projectId ? { projectId: opts.projectId } : {}),
       ...(opts.chatSessionId ? { chatSessionId: opts.chatSessionId } : {}),
       ...(opts.preferLastGlobal ? { preferLastGlobal: true } : {}),
+      ...(opts.preferLastProject ? { preferLastProject: true } : {}),
     });
     fullHistory = await loadAllChatHistory(opts.client, opened);
   } catch (err) {
@@ -766,6 +873,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   }
 
   let chatSession = opened.session;
+  let activeProject: ProjectRecord | null = opened.project ?? null;
   let activeTurnId: string | null = opened.activeTurnId;
   let sending = opened.busy;
   let turnFrozeSegments = false;
@@ -929,12 +1037,36 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   shell = createSharedShell({
     mode: "chat",
     client: opts.client,
-    repoRoot: chatSession.repoRoot || opts.repoRoot,
+    repoRoot: chatSession.repoRoot || opts.repoRoot || process.cwd(),
+    projectId: activeProject?.id ?? chatSession.projectId,
+    getProject: () => ({
+      id: activeProject?.id ?? chatSession.projectId,
+      name: activeProject?.name ?? null,
+      repoRoot: chatSession.repoRoot,
+    }),
+    onSwitchCurrentSessionProject: async (project) => {
+      const res = await opts.client.request<{ session: ChatSessionRecord; project: ProjectRecord }>("chat.set_project", {
+        chatSessionId: chatSession.id,
+        projectId: project.id,
+      });
+      chatSession = res.session;
+      activeProject = res.project;
+      shell.transcript.appendReceipt({
+        glyph: shell.theme.glyphs.check,
+        tone: "ok",
+        tag: "project",
+        text: `Switched ${chatSession.id} → ${project.name} (${project.rootPath})`,
+      });
+      shell.syncDock();
+    },
     sessionId: chatSession.id,
     chatSessionId: chatSession.id,
     terminal: opts.terminal,
     getRightStatus: modelBadge,
-    getIdleBanner: () => `${chatSession.id} · ${sanitizeLine(chatSession.title || "Director Chat")} (Ctrl+G Work · Ctrl+O Go · Ctrl+, Settings)`,
+    getIdleBanner: () => {
+      const pTag = activeProject ? `[${activeProject.name}] · ` : "";
+      return `${pTag}${chatSession.id} · ${sanitizeLine(chatSession.title || "Director Chat")} (Ctrl+P Projects · Ctrl+G Work · Ctrl+O Go)`;
+    },
     onUserSubmit: dispatchPrompt,
     onCancelActiveTurn: async () => {
       if (!activeTurnId) return false;
@@ -981,10 +1113,11 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   });
 
   // Top session banner
+  const projectLabel = activeProject ? `${activeProject.name} (${chatSession.repoRoot})` : chatSession.repoRoot || opts.repoRoot || "";
   shell.transcript.appendBanner(
-    `pi-harness · ${chatSession.id}`,
+    `pi-harness · ${chatSession.id}${activeProject ? ` · [${activeProject.name}]` : ""}`,
     modelBadge(),
-    `repo: ${chatSession.repoRoot || opts.repoRoot}  ·  Ctrl+G Work · Ctrl+O Go · Ctrl+, Settings · /help`,
+    `project: ${projectLabel}  ·  Ctrl+P Projects · Ctrl+G Work · Ctrl+O Go · /help`,
   );
 
   // Hydrate ALL paginated chat history cleanly as immutable blocks

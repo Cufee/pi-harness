@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { Database } from "bun:sqlite";
 import { friendlyIdCandidates, nextFriendlyId } from "./ids.js";
+import { ProjectStore } from "./projects.js";
 import { TimerManager } from "./timers.js";
 import { KnowledgeBaseStore } from "../kb/store.js";
 
@@ -504,6 +505,7 @@ export class ControlPlaneDb {
   readonly db: Database;
   readonly kb: KnowledgeBaseStore;
   readonly timers: TimerManager;
+  readonly projects: ProjectStore;
   private listeners = new Set<(event: EventRecord) => void>();
 
   constructor(dbPath: string) {
@@ -514,6 +516,7 @@ export class ControlPlaneDb {
     this.db.exec(SCHEMA);
     this.kb = new KnowledgeBaseStore(this.db);
     this.timers = new TimerManager(this.db);
+    this.projects = new ProjectStore(this.db);
   }
 
   close(): void {

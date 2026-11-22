@@ -24,4 +24,5 @@ export * from "./catalog/compiler.js";
 export * from "./daemon/server.js";
 export * from "./daemon/remote.js";
 export * from "./daemon/pty-host.js";
+export * from "./control-plane/projects.js";
 export * from "./tui/core/index.js";

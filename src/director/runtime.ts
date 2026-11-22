@@ -41,7 +41,12 @@ import { PiRunner } from "../runners/pi-runner.js";
 import type { RunnerCallbacks, RunnerExecutionHandle, ToolDefinition } from "../runners/types.js";
 import { nativeToolsPathDirs, resolveExternalMcpServers } from "../tools/native-tools.js";
 import { runGit } from "../worktree/manager.js";
-import { buildDirectorSystemPrompt, DirectorSessionStore, type ChatTurnRecord } from "./session.js";
+import {
+  buildDirectorSystemPrompt,
+  DirectorSessionStore,
+  type ChatSessionRecord,
+  type ChatTurnRecord,
+} from "./session.js";
 
 const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
@@ -119,8 +124,29 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
     name: "goal_list",
     description:
-      "List Goals in this workspace with their version, status, review cycles, and linked run IDs. Pass the returned presentation_id to present_result to show the Goals table.",
+      "List Goals in this workspace (or across all projects when all_projects is true) with their version, status, review cycles, and linked run IDs. Pass the returned presentation_id to present_result to show the Goals table.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        all_projects: { type: "boolean", description: "When true, list goals across all registered projects." },
+      },
+    },
+  },
+  {
+    name: "project_list",
+    description: "List all registered projects on this daemon host with their paths, git status/branch, and active session/goal counts.",
     inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "project_switch",
+    description: "Rebind this chat session to another registered project (by project ID, name, or path), preserving conversation history while switching workspace cwd.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project: { type: "string", description: "Project ID (e.g. proj-1), name, or path on the daemon host." },
+      },
+      required: ["project"],
+    },
   },
   {
     name: "goal_get",
@@ -356,6 +382,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
 
 interface ChatSelection {
   repoRoot: string;
+  projectId?: string | null;
   profileId?: string;
   model?: string | null;
   effort?: string | null;
@@ -634,13 +661,67 @@ export class DirectorRuntime {
   }
 
   async createChat(input: ChatSelection) {
-    return this.chats.createSession(await this.resolveChatSelection(input));
+    const project = input.projectId
+      ? this.db.projects.resolveProject(input.projectId)
+      : this.db.projects.ensureProjectForPath(input.repoRoot);
+    const repoRoot = project?.rootPath ?? input.repoRoot;
+    const projectId = project?.id ?? input.projectId ?? null;
+    if (project) this.db.projects.touchProject(project.id);
+    return this.chats.createSession(
+      await this.resolveChatSelection({
+        ...input,
+        repoRoot,
+        projectId,
+        profileId: input.profileId ?? project?.defaultProfileId ?? undefined,
+        model: input.model !== undefined ? input.model : project?.defaultModel ?? undefined,
+        effort: input.effort !== undefined ? input.effort : project?.defaultEffort ?? undefined,
+      }),
+    );
   }
 
   async openDefaultChat(input: ChatSelection) {
-    const existing = this.chats.getWorkspaceSession(input.repoRoot);
-    if (existing) return existing;
-    return this.chats.getOrCreateDefault(await this.resolveChatSelection(input));
+    const project = input.projectId
+      ? this.db.projects.resolveProject(input.projectId)
+      : this.db.projects.ensureProjectForPath(input.repoRoot);
+    const repoRoot = project?.rootPath ?? input.repoRoot;
+    const projectId = project?.id ?? input.projectId ?? null;
+    if (project) this.db.projects.touchProject(project.id);
+    const existing = (projectId ? this.chats.getProjectSession(projectId) : null) ?? this.chats.getWorkspaceSession(repoRoot);
+    if (existing) {
+      if (projectId && existing.projectId !== projectId) {
+        return this.chats.updateSession(existing.id, { projectId, repoRoot });
+      }
+      return existing;
+    }
+    return this.chats.getOrCreateDefault(
+      await this.resolveChatSelection({
+        ...input,
+        repoRoot,
+        projectId,
+        profileId: input.profileId ?? project?.defaultProfileId ?? undefined,
+        model: input.model !== undefined ? input.model : project?.defaultModel ?? undefined,
+        effort: input.effort !== undefined ? input.effort : project?.defaultEffort ?? undefined,
+      }),
+    );
+  }
+
+  switchChatProject(chatSessionId: string, projectRef: string): { session: ChatSessionRecord; project: ReturnType<ControlPlaneDb["projects"]["resolveProject"]> } {
+    const session = this.chats.getSession(chatSessionId);
+    if (!session) throw new Error(`Unknown chat session ${chatSessionId}`);
+    const project = this.db.projects.resolveProject(projectRef);
+    if (!project) throw new Error(`Unknown project "${projectRef}". Use /projects or \`pi-harness project add <path>\` first.`);
+    this.db.projects.touchProject(project.id);
+    const updated = this.chats.updateSession(session.id, {
+      projectId: project.id,
+      repoRoot: project.rootPath,
+      resetAcpSession: true,
+    });
+    this.chats.appendTurn(
+      updated.id,
+      "system_notice",
+      `Switched session project → ${project.name} (${project.rootPath})`,
+    );
+    return { session: updated, project };
   }
 
   activeChatCount(): number {
@@ -1731,9 +1812,28 @@ export class DirectorRuntime {
       }
 
       case "goal_list": {
-        const goals = this.goals.listGoals({ repoRoot, chatSessionId });
+        const allProjects = Boolean(args.all_projects);
+        const goals = allProjects ? this.goals.listGoals({}) : this.goals.listGoals({ repoRoot, chatSessionId });
         const presentation_id = offerPresentation(() => buildGoalsTableDisplay(goals.map((goal) => this.goalDisplayData(goal))));
         return { goals, presentation_id };
+      }
+
+      case "project_list": {
+        const projects = await this.db.projects.listProjects();
+        const curSess = this.chats.getSession(chatSessionId);
+        return { currentProjectId: curSess?.projectId ?? null, currentPath: repoRoot, projects };
+      }
+
+      case "project_switch": {
+        const ref = String(args.project ?? "").trim();
+        if (!ref) throw new Error("project is required");
+        const switched = this.switchChatProject(chatSessionId, ref);
+        return {
+          switched: true,
+          project: switched.project,
+          sessionId: switched.session.id,
+          repoRoot: switched.session.repoRoot,
+        };
       }
 
       case "report_goal_progress": {

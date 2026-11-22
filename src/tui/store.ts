@@ -18,6 +18,8 @@ export interface AttachableSession {
   id: string;
   kind: "chat" | "run";
   title: string;
+  projectId?: string | null;
+  projectName?: string | null;
   repoRoot: string;
   status: string;
   running: boolean;

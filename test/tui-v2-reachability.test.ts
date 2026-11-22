@@ -122,7 +122,7 @@ function makeMockClient(
 
 describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
   it("exposes all surfaced entities via work.snapshot, streams live escalation events, supports Left/Right tabs, aligned tables, and resolves escalations via Navigator", async () => {
-    assert.equal(DAEMON_PROTOCOL_REV, 6);
+    assert.equal(DAEMON_PROTOCOL_REV, 7);
     const repoDir = initTempGitRepo();
     const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-tuiv2-state-"));
     const sockPath = join(stateDir, "d.sock");
@@ -842,6 +842,7 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
       const { terminal, writes, sendInput } = makeFakeTerminal(100, 30);
       const chatSession: ChatSessionRecord = {
         id: "chat-42",
+        projectId: null,
         repoRoot: "/repo",
         title: "Wiring Test",
         profileId: "acp:codex",

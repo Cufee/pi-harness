@@ -37,13 +37,54 @@ export function dimLine(line: string): string {
  * - Overrides `compositeOverlays` to dim the visible viewport beneath open modals while leaving
  *   scrollback above the viewport untouched.
  */
+export type FloatingPopupProvider = (
+  width: number,
+  baseLineCount: number,
+  termHeight: number,
+) => { lines: string[]; bottomOffset: number } | null;
+
 export class ModalScreen extends TuiMainScreen {
+  private floatingPopupProvider: FloatingPopupProvider | null = null;
+  private readonly hostTerminal: Terminal;
+
   constructor(terminal: Terminal) {
     super(terminal);
+    this.hostTerminal = terminal;
+  }
+
+  /** Registers an optional non-focus-stealing popup (e.g. slash-command autocomplete floated above the dock). */
+  setFloatingPopupProvider(provider: FloatingPopupProvider | null): void {
+    this.floatingPopupProvider = provider;
   }
 
   override render(width: number): string[] {
-    return [...super.render(width)];
+    const lines = [...super.render(width)];
+    if (!this.hasOverlay() && this.floatingPopupProvider) {
+      const termHeight = Math.max(8, this.hostTerminal.rows || 30);
+      const popup = this.floatingPopupProvider(width, lines.length, termHeight);
+      if (popup && popup.lines.length > 0) {
+        const prevTop = this.captureRenderState().previousViewportTop;
+        const viewportStart = Math.max(0, lines.length - termHeight, prevTop);
+        const maxAboveDock = Math.max(0, lines.length - popup.bottomOffset - viewportStart);
+        if (maxAboveDock >= 2) {
+          // Composite popup strictly inside visible rows above the dock so total line count never grows or shrinks!
+          const clipped = popup.lines.slice(0, maxAboveDock);
+          const startRow = lines.length - popup.bottomOffset - clipped.length;
+          for (let i = 0; i < clipped.length; i++) {
+            const idx = startRow + i;
+            if (idx >= viewportStart && idx < lines.length) {
+              lines[idx] = clipped[i]!;
+            }
+          }
+        } else {
+          // Brand-new short screen with room below: append inline without exceeding termHeight
+          const roomBelow = Math.max(0, termHeight - lines.length);
+          const clipped = popup.lines.slice(0, roomBelow);
+          lines.push(...clipped);
+        }
+      }
+    }
+    return lines;
   }
 
   protected override getExitRestorePrefix(): string {

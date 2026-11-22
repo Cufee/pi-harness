@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { ProjectBrowseResult, ProjectSummary } from "./control-plane/projects.js";
 import { loadConfig, type AcpProfileConfig } from "./config.js";
 import { DaemonClient, runStdioSocketBridge } from "./daemon/remote.js";
 import { currentDaemonBuildId, DAEMON_PROTOCOL_REV, HarnessDaemon } from "./daemon/server.js";
@@ -140,14 +141,21 @@ function printHelp(): void {
   console.log(`pi-harness — CLI-first, daemonized interactive Director + 3-tier multi-agent coding harness
 
 Usage:
-  pi-harness [--remote ssh://host]                  Resume last session for this repo (takes over if attached elsewhere)
+  pi-harness [-p <project>] [--remote ssh://host]   Resume last session for project/workspace (remote uses last remote project)
+  pi-harness projects [--json]                      List registered projects on local or remote daemon
+  pi-harness project list [--json]                  List registered projects
+  pi-harness project add <path> [--name n] [--init] [--clone <url>]
+                                                    Register or create a project folder/repo on the daemon host (~ expands remotely)
+  pi-harness project use <name|id|path>             Open Director Chat bound to a project
+  pi-harness project rm <name|id>                   Unregister a project (never deletes files on disk)
+  pi-harness project browse [path]                  Browse directories on the daemon host (useful over SSH)
   pi-harness attach [session-or-run-id]             Attach to & take over last active session (or specific chat-/run- ID)
   pi-harness sessions [--json]                      List all Director Chat & autonomous run sessions
-  pi-harness chat [--remote ssh://host]             Explicitly open Tier 0 Interactive Director Chat
+  pi-harness chat [-p <project>] [--remote ssh://host]
   pi-harness goals [list | review <id> | pause <id> | cancel <id>]
   pi-harness profiles [list | add <id> <cmd> [args...] | remove <id> | probe <id>]
   pi-harness daemon serve | status | stop | restart
-  pi-harness run "<goal>" [--profile id] [--model id] [--effort level] [--detach] [--remote ssh://host]
+  pi-harness run "<goal>" [-p <project>] [--profile id] [--model id] [--effort level] [--detach] [--remote ssh://host]
   pi-harness runs [--remote ssh://host]
   pi-harness tree <run-id> [--remote ssh://host]
   pi-harness steer <task-id> "<message>" [--remote ssh://host]
@@ -163,8 +171,8 @@ Usage:
 async function runInteractiveSessionLoop(
   client: DaemonClient,
   initial:
-    | { kind: "chat"; repoRoot: string; chatSessionId?: string; preferLastGlobal?: boolean }
-    | { kind: "run"; repoRoot: string; runId: string; initialTaskId?: string | null },
+    | { kind: "chat"; repoRoot?: string; projectId?: string; chatSessionId?: string; preferLastGlobal?: boolean; preferLastProject?: boolean }
+    | { kind: "run"; repoRoot?: string; runId: string; initialTaskId?: string | null },
 ): Promise<void> {
   let current = initial;
   while (true) {
@@ -173,8 +181,10 @@ async function runInteractiveSessionLoop(
       action = await runDirectorChatTui({
         client,
         repoRoot: current.repoRoot,
+        projectId: current.projectId,
         chatSessionId: current.chatSessionId,
         preferLastGlobal: current.preferLastGlobal,
+        preferLastProject: current.preferLastProject,
       });
     } else {
       action = await runNativeScrollbackTui({
@@ -186,12 +196,20 @@ async function runInteractiveSessionLoop(
     if (action.kind === "exit") return;
     if (action.targetKind === "run") {
       current = { kind: "run", repoRoot: current.repoRoot, runId: action.targetId, initialTaskId: action.taskId };
+    } else if (action.targetId === "__project__" && action.projectId) {
+      current = { kind: "chat", projectId: action.projectId, repoRoot: action.repoRoot };
     } else if (action.targetId === "__new__") {
-      const created = await client.request<{ session: { id: string; repoRoot: string } }>("chat.create", {
-        repoRoot: current.repoRoot,
+      const created = await client.request<{ session: { id: string; repoRoot: string; projectId?: string | null } }>("chat.create", {
+        ...(current.kind === "chat" && current.projectId ? { projectId: current.projectId } : {}),
+        ...(current.repoRoot ? { repoRoot: current.repoRoot } : {}),
         ...(action.title ? { title: action.title } : {}),
       });
-      current = { kind: "chat", repoRoot: created.session.repoRoot, chatSessionId: created.session.id };
+      current = {
+        kind: "chat",
+        repoRoot: created.session.repoRoot,
+        projectId: created.session.projectId ?? undefined,
+        chatSessionId: created.session.id,
+      };
     } else {
       current = { kind: "chat", repoRoot: current.repoRoot, chatSessionId: action.targetId };
     }
@@ -206,7 +224,15 @@ async function main(): Promise<void> {
     return;
   }
 
-  const rawRepoRoot = typeof flags.repo === "string" ? flags.repo : process.cwd();
+  const remote = typeof flags.remote === "string" ? flags.remote : undefined;
+  const projectFlag =
+    typeof flags.project === "string"
+      ? flags.project
+      : typeof flags.p === "string"
+        ? flags.p
+        : undefined;
+  const explicitRepoFlag = typeof flags.repo === "string" ? flags.repo : undefined;
+  const rawRepoRoot = explicitRepoFlag ?? process.cwd();
   let repoRoot: string;
   try {
     repoRoot = realpathSync(rawRepoRoot);
@@ -214,16 +240,22 @@ async function main(): Promise<void> {
     repoRoot = resolve(rawRepoRoot);
   }
   const config = loadConfig(repoRoot);
-  const remote = typeof flags.remote === "string" ? flags.remote : undefined;
 
-  // Zero-arg default on a TTY: resume last session for this workspace (taking over if attached elsewhere)!
+  // Zero-arg default on a TTY:
+  //  - Local: resume last session for the current directory (or --project)
+  //  - Remote SSH without --repo/--project: open last used remote project (never send local Mac cwd to remote host!)
   if (!cmd || cmd === "chat") {
     if (!process.stdout.isTTY) {
       printHelp();
       return;
     }
     const client = await connectClient(config.socketPath, remote);
-    await runInteractiveSessionLoop(client, { kind: "chat", repoRoot });
+    const preferRemoteLast = Boolean(remote && !explicitRepoFlag && !projectFlag);
+    await runInteractiveSessionLoop(client, {
+      kind: "chat",
+      ...(preferRemoteLast ? { preferLastProject: true } : { repoRoot: explicitRepoFlag ? repoRoot : projectFlag ? undefined : repoRoot }),
+      ...(projectFlag ? { projectId: projectFlag } : {}),
+    });
     return;
   }
 
@@ -278,12 +310,82 @@ async function main(): Promise<void> {
   const client = await connectClient(config.socketPath, remote);
   try {
     switch (cmd) {
+      case "projects":
+      case "project": {
+        const sub = cmd === "projects" ? (positional[1] ?? "list") : (positional[1] ?? "list");
+        if (sub === "list") {
+          const projects = await client.request<ProjectSummary[]>("project.list");
+          if (flags.json) {
+            console.log(JSON.stringify(projects, null, 2));
+          } else if (projects.length === 0) {
+            console.log("No projects registered. Add one with: pi-harness project add <path> [--name <name>] [--init] [--clone <url>]");
+          } else {
+            console.log("ID\tNAME\tWORKSPACE\tSESSIONS\tGOALS\tPATH");
+            for (const p of projects) {
+              const ws = !p.exists ? "missing" : p.isGit ? `git:${p.gitBranch ?? "HEAD"}` : "folder";
+              console.log(`${p.id}\t${p.name}\t${ws}\t${p.sessionCount}\t${p.activeGoalCount}\t${p.rootPath}`);
+            }
+          }
+          break;
+        }
+        if (sub === "add" || sub === "create") {
+          const targetPath = positional[2];
+          if (!targetPath) throw new Error("Usage: pi-harness project add <path> [--name <name>] [--init] [--clone <url>]");
+          const created = await client.request<ProjectSummary>("project.create", {
+            path: targetPath,
+            name: typeof flags.name === "string" ? flags.name : undefined,
+            description: typeof flags.description === "string" ? flags.description : undefined,
+            createDir: !flags["no-create"],
+            gitInit: Boolean(flags.init),
+            cloneUrl: typeof flags.clone === "string" ? flags.clone : undefined,
+          });
+          console.log(JSON.stringify(created, null, 2));
+          break;
+        }
+        if (sub === "use" || sub === "open") {
+          const ref = positional[2];
+          if (!ref) throw new Error("Usage: pi-harness project use <name|id|path>");
+          const proj = await client.request<ProjectSummary>("project.get", { projectId: ref });
+          if (!process.stdout.isTTY) {
+            console.log(JSON.stringify(proj, null, 2));
+            break;
+          }
+          await runInteractiveSessionLoop(client, { kind: "chat", projectId: proj.id, repoRoot: proj.rootPath });
+          return;
+        }
+        if (sub === "rm" || sub === "remove") {
+          const ref = positional[2];
+          if (!ref) throw new Error("Usage: pi-harness project rm <name|id>");
+          console.log(JSON.stringify(await client.request("project.remove", { projectId: ref }), null, 2));
+          break;
+        }
+        if (sub === "browse") {
+          const dir = positional[2];
+          const res = await client.request<ProjectBrowseResult>("project.browse", { ...(dir ? { path: dir } : {}) });
+          if (flags.json) {
+            console.log(JSON.stringify(res, null, 2));
+          } else {
+            console.log(`Directory: ${res.path}`);
+            for (const e of res.entries) {
+              console.log(`  ${e.isGit ? "[git]" : "[dir]"} ${e.name}\t${e.path}`);
+            }
+          }
+          break;
+        }
+        throw new Error(`Unknown project subcommand "${sub}". Expected: list | add | use | rm | browse`);
+      }
+
       case "run": {
         const goal = positional.slice(1).join(" ").trim();
         if (!goal) throw new Error('Usage: pi-harness run "<goal>"');
+        let targetRepoRoot = repoRoot;
+        if (projectFlag) {
+          const proj = await client.request<ProjectSummary>("project.get", { projectId: projectFlag });
+          targetRepoRoot = proj.rootPath;
+        }
         const created = (await client.request("run.create", {
           goal,
-          repoRoot,
+          repoRoot: targetRepoRoot,
           profileId: typeof flags.profile === "string" ? flags.profile : undefined,
           model: typeof flags.model === "string" ? flags.model : undefined,
           effort: typeof flags.effort === "string" ? flags.effort : undefined,
@@ -293,7 +395,7 @@ async function main(): Promise<void> {
           client.close();
           return;
         }
-        await runInteractiveSessionLoop(client, { kind: "run", repoRoot, runId: created.run.id });
+        await runInteractiveSessionLoop(client, { kind: "run", repoRoot: targetRepoRoot, runId: created.run.id });
         return;
       }
 

@@ -332,6 +332,9 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
  * 2-column horizontal padding without shifting cursor geometry.
  */
 export class UndoableEditor extends Editor {
+  private lastAutocompleteLines: string[] = [];
+  floatAutocomplete = false;
+
   constructor(
     tui: TUI,
     private readonly harnessTheme: Theme,
@@ -341,6 +344,10 @@ export class UndoableEditor extends Editor {
 
   clearUndoHistory(): void {
     // Base Editor manages and clears its own undoStack on submit/setText.
+  }
+
+  getFloatingAutocompleteLines(): string[] {
+    return this.lastAutocompleteLines;
   }
 
   override handleInput(data: string): void {
@@ -354,6 +361,15 @@ export class UndoableEditor extends Editor {
 
   override render(width: number): string[] {
     const lines = super.render(width);
+    const acCount = this.isShowingAutocomplete()
+      ? Number((this as unknown as { renderedAutocompleteHeight?: number }).renderedAutocompleteHeight ?? 0)
+      : 0;
+    if (acCount > 0 && this.floatAutocomplete && lines.length > acCount) {
+      this.lastAutocompleteLines = lines.slice(lines.length - acCount);
+      lines.length = lines.length - acCount;
+    } else {
+      this.lastAutocompleteLines = [];
+    }
     // With paddingX: 2, line[0] is the top border and line[1] starts with 2 spaces;
     // swap those 2 spaces for the 2-col prompt cue `› ` so cursor alignment stays exact.
     if (lines.length >= 2 && lines[1]!.startsWith("  ")) {
@@ -459,6 +475,13 @@ export class FixedDock implements Component {
     return fillLineBg(splitRow(left, right, width), width, t.statusBg);
   }
 
+  private lastRenderedHeight = 7;
+
+  /** Last rendered row count of the FixedDock (used to anchor floating slash-autocomplete above the dock). */
+  get renderedHeight(): number {
+    return this.lastRenderedHeight;
+  }
+
   render(width: number): string[] {
     const w = Math.max(12, Math.floor(width));
     const lines: string[] = [
@@ -468,6 +491,7 @@ export class FixedDock implements Component {
       ...this.editor.render(w).map((l) => clamp(l, w)),
       fit(` ${renderHintBar(this.state.hints, Math.max(1, w - 2), this.theme)}`, w),
     ];
+    this.lastRenderedHeight = lines.length;
     return lines;
   }
 

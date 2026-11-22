@@ -1,0 +1,468 @@
+import { matchesKey } from "@earendil-works/pi-tui";
+import type { ProjectBrowseEntry, ProjectBrowseResult, ProjectRecord, ProjectSummary } from "../control-plane/projects.js";
+import type { DaemonClient } from "../daemon/remote.js";
+import {
+  type ColumnSpec,
+  Frame,
+  type Hint,
+  isPopKey,
+  middleEllipsis,
+  type Navigator,
+  sanitizeLine,
+  type Screen,
+  type ScreenContext,
+  TableListView,
+  type Theme,
+} from "./core/index.js";
+
+const PROJECT_COLUMNS: ColumnSpec[] = [
+  { key: "cur", header: " ", width: 2, priority: 0 },
+  { key: "name", header: "PROJECT", width: 20, priority: 0 },
+  { key: "git", header: "WORKSPACE", width: 16, priority: 1 },
+  { key: "path", header: "PATH", minWidth: 16, priority: 0 },
+  { key: "counts", header: "ACTIVITY", width: 18, align: "right", priority: 2 },
+];
+
+const BROWSE_COLUMNS: ColumnSpec[] = [
+  { key: "kind", header: "TYPE", width: 6, priority: 1 },
+  { key: "name", header: "DIRECTORY", minWidth: 18, priority: 0 },
+  { key: "path", header: "PATH", minWidth: 16, priority: 2 },
+];
+
+/**
+ * Interactive daemon-host folder browser (`b` inside ProjectsScreen).
+ * Designed specifically for SSH usage: browse directories on the remote host without leaving the TUI,
+ * drill in with `Enter`, go up with `Backspace`/`..`, and press `a` to register any folder as a Project.
+ */
+class RemoteBrowseDialog implements Screen {
+  readonly variant = "sheet" as const;
+  readonly title = "Browse Folders";
+  private readonly frame = new Frame();
+  private nav: Navigator | null = null;
+  private readonly list = new TableListView<{ kind: "up"; path: string } | { kind: "dir"; entry: ProjectBrowseEntry }>({
+    columns: BROWSE_COLUMNS,
+    emptyText: "No subdirectories here. Press 'a' to register this directory as a project.",
+  });
+  private currentPath: string | undefined;
+  private browseData: ProjectBrowseResult | null = null;
+  private loading = true;
+
+  constructor(
+    private readonly client: DaemonClient,
+    private readonly onPickDir: (dirPath: string) => Promise<void>,
+    initialPath?: string,
+  ) {
+    this.currentPath = initialPath;
+  }
+
+  onShow(ctx: ScreenContext): void {
+    this.nav = ctx.navigator;
+    void this.load(this.currentPath, ctx);
+  }
+
+  private async load(targetPath: string | undefined, ctx: ScreenContext): Promise<void> {
+    this.loading = true;
+    ctx.requestRender();
+    try {
+      this.browseData = await this.client.request<ProjectBrowseResult>("project.browse", {
+        ...(targetPath ? { path: targetPath } : {}),
+      });
+      this.currentPath = this.browseData.path;
+      const rows: Array<{ kind: "up"; path: string } | { kind: "dir"; entry: ProjectBrowseEntry }> = [];
+      if (this.browseData.parentPath) {
+        rows.push({ kind: "up", path: this.browseData.parentPath });
+      }
+      for (const entry of this.browseData.entries) {
+        rows.push({ kind: "dir", entry });
+      }
+      this.list.setTableItems(
+        rows.map((r) =>
+          r.kind === "up"
+            ? {
+                id: `up:${r.path}`,
+                value: r,
+                searchText: ".. parent up",
+                cells: (sel, theme) => ({
+                  kind: theme.muted("up"),
+                  name: sel ? theme.accentBold("..") : theme.muted(".."),
+                  path: theme.dim(middleEllipsis(r.path, 38)),
+                }),
+              }
+            : {
+                id: r.entry.path,
+                value: r,
+                searchText: `${r.entry.name} ${r.entry.path} ${r.entry.isGit ? "git" : "dir"}`,
+                cells: (sel, theme) => ({
+                  kind: r.entry.isGit ? theme.ok("git") : theme.muted("dir"),
+                  name: sel ? theme.accentBold(sanitizeLine(r.entry.name)) : theme.bold(sanitizeLine(r.entry.name)),
+                  path: theme.dim(middleEllipsis(r.entry.path, 38)),
+                }),
+              },
+        ),
+      );
+    } catch (err) {
+      this.frame.setNotice(err instanceof Error ? err.message : String(err), "danger");
+    } finally {
+      this.loading = false;
+      ctx.requestRender();
+    }
+  }
+
+  render(width: number, maxHeight: number, theme: Theme): string[] {
+    return this.frame.render({
+      width,
+      maxHeight,
+      theme,
+      breadcrumbs: this.nav?.breadcrumbs ?? ["Projects", "Browse Folders"],
+      subtitle: this.currentPath ? `Host dir: ${this.currentPath}` : "Loading host directory…",
+      hints: [
+        { key: "Enter", label: "open dir" },
+        { key: "a", label: "add selected/current as project" },
+        { key: "p", label: "jump to path" },
+        { key: "/", label: "filter" },
+        { key: "Esc", label: "back" },
+      ],
+      renderBody: (innerW, bodyH) =>
+        this.loading && !this.browseData ? [theme.muted("Loading remote directories…")] : this.list.render(innerW, bodyH, theme),
+    });
+  }
+
+  handleInput(data: string, ctx: ScreenContext): void {
+    if (this.frame.handleInlineInput(data, ctx.requestRender)) return;
+
+    if (this.list.isFiltering) {
+      const res = this.list.handleInput(data);
+      if (res === "select") this.enterSelected(ctx);
+      else ctx.requestRender();
+      return;
+    }
+
+    if (matchesKey(data, "escape") || data === "q") {
+      if (this.list.query) {
+        this.list.clearFilter();
+        ctx.requestRender();
+        return;
+      }
+      ctx.navigator.pop();
+      return;
+    }
+
+    if (matchesKey(data, "backspace") && this.browseData?.parentPath) {
+      void this.load(this.browseData.parentPath, ctx);
+      return;
+    }
+
+    if (data === "p") {
+      this.frame.askPrompt({
+        label: "Jump to directory",
+        placeholder: "~/projects",
+        initialValue: this.currentPath,
+        onSubmit: async (raw) => {
+          await this.load(raw, ctx);
+        },
+      });
+      ctx.requestRender();
+      return;
+    }
+
+    if (data === "a") {
+      const sel = this.list.selectedItem()?.value;
+      const target = sel?.kind === "dir" ? sel.entry.path : this.currentPath;
+      if (!target) return;
+      void this.onPickDir(target)
+        .then(() => {
+          if (ctx.navigator.current === this) ctx.navigator.pop();
+        })
+        .catch((err) => {
+          this.frame.setNotice(err instanceof Error ? err.message : String(err), "danger");
+          ctx.requestRender();
+        });
+      return;
+    }
+
+    const res = this.list.handleInput(data);
+    if (res === "select") {
+      this.enterSelected(ctx);
+      return;
+    }
+    if (res === "handled") ctx.requestRender();
+  }
+
+  private enterSelected(ctx: ScreenContext): void {
+    const sel = this.list.selectedItem()?.value;
+    if (!sel) return;
+    if (sel.kind === "up") void this.load(sel.path, ctx);
+    else void this.load(sel.entry.path, ctx);
+  }
+}
+
+/**
+ * Unified Projects Manager & Picker (`/projects`, `/project`, `Ctrl+P`).
+ *
+ * Works identically locally and over SSH (paths expand & directories are created/cloned on the daemon host):
+ *  - `Enter`: Open project (switches to that project's chat session, or creates one bound to it)
+ *  - `s`: Switch THIS session into the selected project in-place (keeps conversation history)
+ *  - `n`: Add / create a project at a path (auto-creates directory if missing)
+ *  - `g`: Create a new git-initialized project at a path
+ *  - `c`: Clone a git repository into a new project path
+ *  - `b`: Browse remote daemon directories to pick a folder
+ *  - `x`: Unregister project (files on disk are never deleted)
+ */
+export class ProjectsScreen implements Screen {
+  readonly variant = "sheet" as const;
+  readonly title = "Projects";
+  private readonly frame = new Frame();
+  private nav: Navigator | null = null;
+  private readonly list = new TableListView<ProjectSummary>({
+    columns: PROJECT_COLUMNS,
+    emptyText: "No projects registered yet. Press 'n' to add/create a project or 'b' to browse folders.",
+  });
+  private projects: ProjectSummary[] = [];
+  private loading = true;
+
+  constructor(
+    private readonly client: DaemonClient,
+    private readonly opts: {
+      currentProjectId?: string | null;
+      currentRepoRoot?: string | null;
+      canSwitchCurrentSession?: boolean;
+      onOpenProject: (project: ProjectRecord) => void | Promise<void>;
+      onSwitchCurrentSession?: (project: ProjectRecord) => void | Promise<void>;
+    },
+  ) {}
+
+  onShow(ctx: ScreenContext): void {
+    this.nav = ctx.navigator;
+    void this.load(ctx);
+  }
+
+  private async load(ctx: ScreenContext, selectId?: string): Promise<void> {
+    this.loading = true;
+    ctx.requestRender();
+    try {
+      this.projects = await this.client.request<ProjectSummary[]>("project.list");
+      this.rebuild(selectId);
+    } catch (err) {
+      this.frame.setNotice(err instanceof Error ? err.message : String(err), "danger");
+    } finally {
+      this.loading = false;
+      ctx.requestRender();
+    }
+  }
+
+  private isCurrent(p: ProjectSummary): boolean {
+    if (this.opts.currentProjectId && p.id === this.opts.currentProjectId) return true;
+    if (this.opts.currentRepoRoot && p.rootPath === this.opts.currentRepoRoot) return true;
+    return false;
+  }
+
+  private rebuild(selectId?: string): void {
+    this.list.setTableItems(
+      this.projects.map((p) => {
+        const cur = this.isCurrent(p);
+        const wsLabel = !p.exists
+          ? "missing"
+          : p.isGit
+            ? `git:${p.gitBranch ?? "HEAD"}`
+            : "folder";
+        const activity = `${p.sessionCount}ch · ${p.activeGoalCount}g`;
+        return {
+          id: p.id,
+          value: p,
+          searchText: `${p.id} ${p.name} ${p.rootPath} ${p.gitBranch ?? ""} ${p.description ?? ""}`,
+          cells: (sel, theme) => ({
+            cur: cur ? theme.ok(theme.glyphs.ascii ? "*" : "★") : "",
+            name: sel ? theme.accentBold(sanitizeLine(p.name)) : cur ? theme.ok(sanitizeLine(p.name)) : theme.bold(sanitizeLine(p.name)),
+            git: !p.exists ? theme.danger(wsLabel) : p.isGit ? theme.info(wsLabel) : theme.muted(wsLabel),
+            path: sel ? theme.text(middleEllipsis(p.rootPath, 42)) : theme.muted(middleEllipsis(p.rootPath, 42)),
+            counts: p.activeGoalCount > 0 ? theme.accent(activity) : theme.muted(activity),
+          }),
+        };
+      }),
+      selectId,
+    );
+  }
+
+  render(width: number, maxHeight: number, theme: Theme): string[] {
+    const hints: Hint[] = [
+      { key: "Enter", label: "open" },
+      ...(this.opts.canSwitchCurrentSession ? [{ key: "s", label: "switch session here" }] : []),
+      { key: "n", label: "new/add" },
+      { key: "g", label: "git init" },
+      { key: "c", label: "clone" },
+      { key: "b", label: "browse" },
+      { key: "x", label: "remove" },
+      { key: "/", label: "filter" },
+      { key: "Esc", label: "close" },
+    ];
+    const sel = this.list.selectedItem()?.value;
+    const sub = sel
+      ? `${sel.id} · ${sel.rootPath}${sel.description ? ` · ${sanitizeLine(sel.description)}` : ""}`
+      : "Paths resolve on the daemon host (~ expands remotely over SSH)";
+
+    return this.frame.render({
+      width,
+      maxHeight,
+      theme,
+      breadcrumbs: this.nav?.breadcrumbs ?? ["Projects"],
+      rightHeader: this.loading ? theme.accent("loading…") : theme.muted(`${this.projects.length} project${this.projects.length === 1 ? "" : "s"}`),
+      subtitle: sub,
+      hints,
+      renderBody: (innerW, bodyH) =>
+        this.loading && this.projects.length === 0 ? [theme.muted("Loading projects…")] : this.list.render(innerW, bodyH, theme),
+    });
+  }
+
+  handleInput(data: string, ctx: ScreenContext): void {
+    if (this.frame.handleInlineInput(data, ctx.requestRender)) return;
+
+    if (this.list.isFiltering) {
+      const res = this.list.handleInput(data);
+      if (res === "select") this.openSelected(ctx);
+      else ctx.requestRender();
+      return;
+    }
+
+    if (isPopKey(data, ctx)) {
+      if (this.list.query) {
+        this.list.clearFilter();
+        ctx.requestRender();
+        return;
+      }
+      ctx.navigator.pop();
+      return;
+    }
+
+    if (data === "n") {
+      this.frame.askPrompt({
+        label: "Project path [optional name]",
+        placeholder: "~/projects/my-app my-app",
+        onSubmit: async (raw) => {
+          const parts = raw.trim().split(/\s+/);
+          const path = parts[0]!;
+          const name = parts.slice(1).join("-") || undefined;
+          const created = await this.client.request<ProjectSummary>("project.create", {
+            path,
+            name,
+            createDir: true,
+          });
+          this.frame.setNotice(`Added project ${created.name} (${created.rootPath})`, "ok");
+          await this.load(ctx, created.id);
+        },
+      });
+      ctx.requestRender();
+      return;
+    }
+
+    if (data === "g") {
+      this.frame.askPrompt({
+        label: "New git project path [optional name]",
+        placeholder: "~/projects/new-repo",
+        onSubmit: async (raw) => {
+          const parts = raw.trim().split(/\s+/);
+          const path = parts[0]!;
+          const name = parts.slice(1).join("-") || undefined;
+          const created = await this.client.request<ProjectSummary>("project.create", {
+            path,
+            name,
+            createDir: true,
+            gitInit: true,
+          });
+          this.frame.setNotice(`Initialized git project ${created.name}`, "ok");
+          await this.load(ctx, created.id);
+        },
+      });
+      ctx.requestRender();
+      return;
+    }
+
+    if (data === "c") {
+      this.frame.askPrompt({
+        label: "Clone (<git-url> <dest-path> [name])",
+        placeholder: "git@github.com:org/repo.git ~/projects/repo",
+        onSubmit: async (raw) => {
+          const parts = raw.trim().split(/\s+/);
+          if (parts.length < 2) {
+            this.frame.setNotice("Provide both <git-url> and <dest-path>", "warn");
+            ctx.requestRender();
+            return;
+          }
+          const [cloneUrl, path, ...rest] = parts;
+          const name = rest.join("-") || undefined;
+          this.frame.setNotice(`Cloning ${cloneUrl}…`, "info");
+          ctx.requestRender();
+          const created = await this.client.request<ProjectSummary>("project.create", {
+            path: path!,
+            cloneUrl: cloneUrl!,
+            name,
+            createDir: true,
+          });
+          this.frame.setNotice(`Cloned project ${created.name}`, "ok");
+          await this.load(ctx, created.id);
+        },
+      });
+      ctx.requestRender();
+      return;
+    }
+
+    if (data === "b") {
+      ctx.navigator.push(
+        new RemoteBrowseDialog(
+          this.client,
+          async (dirPath) => {
+            const created = await this.client.request<ProjectSummary>("project.create", {
+              path: dirPath,
+              createDir: false,
+            });
+            this.frame.setNotice(`Registered project ${created.name}`, "ok");
+            await this.load(ctx, created.id);
+          },
+          this.opts.currentRepoRoot ?? undefined,
+        ),
+      );
+      return;
+    }
+
+    if (data === "s" && this.opts.canSwitchCurrentSession && this.opts.onSwitchCurrentSession) {
+      const sel = this.list.selectedItem()?.value;
+      if (!sel) return;
+      ctx.navigator.closeAll();
+      void Promise.resolve(this.opts.onSwitchCurrentSession(sel)).catch(() => {});
+      return;
+    }
+
+    if (data === "x") {
+      const sel = this.list.selectedItem()?.value;
+      if (!sel) return;
+      this.frame.askConfirm({
+        message: `Unregister project "${sel.name}"? (Files at ${sel.rootPath} will NOT be deleted)`,
+        onConfirm: async () => {
+          await this.client.request("project.remove", { projectId: sel.id });
+          this.frame.setNotice(`Removed project ${sel.name}`, "warn");
+          await this.load(ctx);
+        },
+      });
+      ctx.requestRender();
+      return;
+    }
+
+    if (data === "r") {
+      void this.load(ctx);
+      return;
+    }
+
+    const res = this.list.handleInput(data);
+    if (res === "select") {
+      this.openSelected(ctx);
+      return;
+    }
+    if (res === "handled") ctx.requestRender();
+  }
+
+  private openSelected(ctx: ScreenContext): void {
+    const sel = this.list.selectedItem()?.value;
+    if (!sel) return;
+    ctx.navigator.closeAll();
+    void Promise.resolve(this.opts.onOpenProject(sel)).catch(() => {});
+  }
+}

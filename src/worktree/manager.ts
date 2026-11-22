@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { WorktreeConfig } from "../config.js";
 import type { ControlPlaneDb, WorktreeRecord } from "../control-plane/db.js";
@@ -59,7 +59,22 @@ export class WorktreeManager {
     return resolve(canonicalPath(this.repoRoot), this.config.dir ?? ".harness/worktrees");
   }
 
+  isGitRepo(): boolean {
+    if (!existsSync(this.repoRoot)) return false;
+    let cur = canonicalPath(this.repoRoot);
+    for (let i = 0; i < 32; i++) {
+      if (existsSync(join(cur, ".git"))) return true;
+      const parent = dirname(cur);
+      if (parent === cur) break;
+      cur = parent;
+    }
+    return false;
+  }
+
   async resolveRepoInfo(): Promise<{ baseBranch: string; baseSha: string }> {
+    if (!this.isGitRepo()) {
+      return { baseBranch: "workspace", baseSha: "none" };
+    }
     const [branchRes, shaRes] = await Promise.all([
       runGit(this.repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"]),
       runGit(this.repoRoot, ["rev-parse", "HEAD"]),

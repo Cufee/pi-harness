@@ -471,16 +471,19 @@ export class HarnessOrchestrator {
 
     // Tier 2 Workers get their own isolated git worktree automatically when ready (deferred for `pending`
     // tasks waiting on `depends_on` so they branch off fresh HEAD after their dependency merges!).
+    // Plain non-git project folders run workers directly in `run.repoRoot` without failing on git worktree setup.
     if (task.tier === 2 && task.status === "ready") {
       const wtMgr = this.getWorktreeManager(run.repoRoot);
-      this.allocatingWorktrees.add(task.id);
-      try {
-        await wtMgr.createForWorker(run.id, task.id);
-      } catch (error) {
-        this.db.updateTask(task.id, { status: "failed", summary: "Could not allocate the worker worktree." });
-        throw error;
-      } finally {
-        this.allocatingWorktrees.delete(task.id);
+      if (wtMgr.isGitRepo()) {
+        this.allocatingWorktrees.add(task.id);
+        try {
+          await wtMgr.createForWorker(run.id, task.id);
+        } catch (error) {
+          this.db.updateTask(task.id, { status: "failed", summary: "Could not allocate the worker worktree." });
+          throw error;
+        } finally {
+          this.allocatingWorktrees.delete(task.id);
+        }
       }
     } else if (task.tier === 3 && input.parentId) {
       // Tier 3 Task Agents inherit their parent Worker's worktree
@@ -823,10 +826,12 @@ export class HarnessOrchestrator {
           reacquiredLeases = true;
         }
         const wtMgr = this.getWorktreeManager(run.repoRoot);
-        if (!wt || wt.runId !== run.id || !existsSync(wt.path)) {
-          wt = await wtMgr.createForWorker(run.id, task.id);
-        } else if (wt.status !== "active") {
-          this.db.updateWorktree(wt.id, { status: "active", cleanedAt: null });
+        if (wtMgr.isGitRepo()) {
+          if (!wt || wt.runId !== run.id || !existsSync(wt.path)) {
+            wt = await wtMgr.createForWorker(run.id, task.id);
+          } else if (wt.status !== "active") {
+            this.db.updateWorktree(wt.id, { status: "active", cleanedAt: null });
+          }
         }
       }
 
@@ -967,7 +972,7 @@ export class HarnessOrchestrator {
         if (!wt || wt.runId !== task.runId) {
           const wtMgr = this.getWorktreeManager(run.repoRoot);
           // If worktree concurrency cap is currently full across runs, wait cleanly for a slot instead of failing!
-          while (!wt && !exec.abort.signal.aborted) {
+          while (!wt && wtMgr.isGitRepo() && !exec.abort.signal.aborted) {
             this.allocatingWorktrees.add(task.id);
             try {
               wt = await wtMgr.createForWorker(run.id, task.id);
