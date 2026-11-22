@@ -61,7 +61,7 @@ describe("Latest-Per-Family Model Deduplication & Generated-Proto Multi-Bucket Q
     assert.ok(winners.includes("gemini-4-neon"));
     assert.ok(winners.includes("gemini-4-argon"));
     assert.ok(winners.includes("gemini-4-carbon"));
-    assert.ok(winners.includes("gemini-3.8-flash"));
+    assert.ok(!winners.includes("gemini-3.8-flash"));
     assert.ok(!winners.includes("gemini-3.5-flash"));
   });
 
