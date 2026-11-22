@@ -185,10 +185,11 @@ async function runInteractiveSessionLoop(
     }
     if (action.kind === "exit") return;
     if (action.targetKind === "run") {
-      current = { kind: "run", repoRoot: current.repoRoot, runId: action.targetId };
+      current = { kind: "run", repoRoot: current.repoRoot, runId: action.targetId, initialTaskId: action.taskId };
     } else if (action.targetId === "__new__") {
       const created = await client.request<{ session: { id: string; repoRoot: string } }>("chat.create", {
         repoRoot: current.repoRoot,
+        ...(action.title ? { title: action.title } : {}),
       });
       current = { kind: "chat", repoRoot: created.session.repoRoot, chatSessionId: created.session.id };
     } else {

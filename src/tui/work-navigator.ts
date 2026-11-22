@@ -196,17 +196,20 @@ export class WorkNavigatorScreen implements Screen {
     // worktrees + merges tab
     this.list.emptyText = "No active worktrees or merge queue items.";
     const combined = [
-      ...snap.worktrees.map((wt) => ({
-        id: `wt:${wt.id}`,
-        value: { ref: { kind: "worktree" as const, id: wt.id, runId: wt.runId, label: `${wt.id} ${wt.branch}` } },
-        searchText: `worktree ${wt.id} ${wt.branch} ${wt.status} ${wt.runId} ${wt.taskId}`,
-        render: (w: number, _sel: boolean, theme: Theme) =>
-          splitRow(
-            `${statusBadge(wt.status, theme)} ${tag("wt", "info", theme)} ${theme.bold(wt.id)} ${middleEllipsis(wt.branch, 36)}`,
-            theme.muted(wt.taskId),
-            w,
-          ),
-      })),
+      ...snap.worktrees.map((wt) => {
+        const wtKey = wt.id ?? wt.path;
+        return {
+          id: `wt:${wtKey}`,
+          value: { ref: { kind: "worktree" as const, id: wtKey, runId: wt.runId ?? undefined, label: `${wt.id ?? wt.branch} ${wt.branch}` } },
+          searchText: `worktree ${wt.id ?? ""} ${wt.branch} ${wt.status} ${wt.runId ?? ""} ${wt.taskId ?? ""}`,
+          render: (w: number, _sel: boolean, theme: Theme) =>
+            splitRow(
+              `${statusBadge(wt.status, theme)} ${tag("wt", "info", theme)} ${theme.bold(wt.id ?? "(untracked)")} ${middleEllipsis(wt.branch, 36)}`,
+              theme.muted(wt.taskId ?? (wt.orphaned ? "orphaned" : "")),
+              w,
+            ),
+        };
+      }),
       ...snap.merges.map((m) => ({
         id: `merge:${m.id}`,
         value: { ref: { kind: "merge" as const, id: m.id, runId: m.runId, label: `${m.id} ${m.branch}` } },

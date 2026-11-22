@@ -11,7 +11,7 @@ import type { RunActivitySummary } from "../control-plane/telemetry.js";
 import type { TimerRecord } from "../control-plane/timers.js";
 import type { DaemonClient } from "../daemon/remote.js";
 import type { GoalRecord, GoalReviewVerdict, GoalRevisionRecord } from "../goals/engine.js";
-import type { DaemonEventFrame, InboxItem } from "../protocol/daemon-rpc.js";
+import type { DaemonEventFrame, InboxItem, SnapshotWorktreeEntry } from "../protocol/daemon-rpc.js";
 import type { AttentionSlot, TuiEntityRef as EntityRef } from "./core/index.js";
 
 export interface AttachableSession {
@@ -42,7 +42,7 @@ export interface SnapshotRunEntry {
   quotaPause: {
     mode: string;
     reason: string;
-    resumeAtMs: number | null;
+    resumeAt: number | null;
   } | null;
   activity: RunActivitySummary | null;
 }
@@ -55,7 +55,7 @@ export interface WorkSnapshot {
   escalations: EscalationRecord[];
   timers: TimerRecord[];
   merges: MergeQueueRecord[];
-  worktrees: WorktreeRecord[];
+  worktrees: SnapshotWorktreeEntry[];
   messages: MessageRecord[];
   inbox: InboxItem[];
 }
@@ -147,6 +147,7 @@ export class WorkStore {
       .request<WorkSnapshot>("work.snapshot", {
         ...(this.scope.chatSessionId ? { chatSessionId: this.scope.chatSessionId } : {}),
         ...(this.scope.repoRoot ? { repoRoot: this.scope.repoRoot } : {}),
+        ...(this.scope.runId ? { runId: this.scope.runId } : {}),
       })
       .then((snap) => {
         this.snapshot = snap ?? EMPTY_SNAPSHOT;
@@ -190,8 +191,8 @@ export class WorkStore {
     return this.snapshot.timers.find((t) => t.id === id);
   }
 
-  getWorktree(id: string): WorktreeRecord | undefined {
-    return this.snapshot.worktrees.find((w) => w.id === id);
+  getWorktree(id: string): SnapshotWorktreeEntry | undefined {
+    return this.snapshot.worktrees.find((w) => w.id === id || w.path === id);
   }
 
   getMerge(id: string): MergeQueueRecord | undefined {

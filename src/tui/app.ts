@@ -35,7 +35,7 @@ import { WorkNavigatorScreen, type WorkTabId } from "./work-navigator.js";
 
 export type TuiExitAction =
   | { kind: "exit" }
-  | { kind: "switch"; targetKind: "chat" | "run"; targetId: string };
+  | { kind: "switch"; targetKind: "chat" | "run"; targetId: string; taskId?: string | null; title?: string };
 
 export interface DirectorChatTuiOptions {
   client: DaemonClient;
@@ -535,7 +535,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     try {
       await opts.client.request("chat.send", {
         chatSessionId: chatSession.id,
-        message: text,
+        text,
         turnId,
       });
     } catch (err) {

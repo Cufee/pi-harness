@@ -125,6 +125,19 @@ export interface EntityRef {
   label?: string;
 }
 
+export interface SnapshotWorktreeEntry {
+  id: string | null;
+  runId: string | null;
+  taskId: string | null;
+  status: string;
+  branch: string;
+  path: string;
+  existsOnDisk: boolean;
+  dirty: boolean;
+  orphaned: boolean;
+  archiveRef: string | null;
+}
+
 export interface InboxItem {
   id: string;
   severity: "P0" | "P1" | "P2" | "info";

@@ -215,13 +215,27 @@ export class WorktreeManager {
     }
   }
 
-  async teardown(worktreeId: string, opts?: { archiveBeforeRemove?: boolean; finalStatus?: WorktreeRecord["status"] }): Promise<string | null> {
+  async teardown(
+    worktreeId: string,
+    opts?: { archiveBeforeRemove?: boolean; requireArchive?: boolean; finalStatus?: WorktreeRecord["status"] },
+  ): Promise<string | null> {
     const wt = this.db.getWorktree(worktreeId);
     if (!wt) return null;
 
     let archiveRef: string | null = wt.archiveRef;
     if (opts?.archiveBeforeRemove) {
       archiveRef = await this.snapshotToArchiveRef(wt);
+      if (opts.requireArchive && !archiveRef && existsSync(wt.path)) {
+        const statusRes = await runGit(wt.path, ["status", "--porcelain"]).catch(() => ({ stdout: "", exitCode: 1 }));
+        const aheadRes = await runGit(this.repoRoot, ["rev-list", "--count", `${wt.baseSha}..${wt.branch}`]).catch(() => ({
+          stdout: "0",
+          exitCode: 1,
+        }));
+        const hasChanges = Boolean(statusRes.stdout.trim()) || Number(aheadRes.stdout.trim()) > 0;
+        if (hasChanges) {
+          throw new Error(`Refusing to remove worktree ${worktreeId}: archiving unmerged/dirty work failed.`);
+        }
+      }
     }
 
     if (existsSync(wt.path)) {

@@ -52,26 +52,33 @@ export function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
-/** Parses human duration strings like `30s`, `15m`, `2h`, `1h30m`, `1.5h` into ms. */
+/** Parses human duration strings like `30s`, `15m`, `2 hours`, `1h30m`, `in 45m` into ms. Rejects negatives & trailing garbage. */
 export function parseDurationMs(input: string): number | null {
   const trimmed = input.trim().toLowerCase().replace(/^in\s+/, "");
-  if (!trimmed) return null;
+  if (!trimmed || trimmed.startsWith("-")) return null;
   if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
     const mins = Number(trimmed);
     return mins > 0 ? Math.round(mins * 60_000) : null;
   }
-  const matches = [...trimmed.matchAll(/(\d+(?:\.\d+)?)\s*(ms|secs?|s|mins?|m|hrs?|h|days?|d)(?![a-z])/g)];
-  if (matches.length === 0) return null;
+  const tokenRx = /(\d+(?:\.\d+)?)\s*(ms|milliseconds?|secs?|seconds?|s|mins?|minutes?|m|hrs?|hours?|h|days?|d)(?![a-z])/g;
   let total = 0;
-  for (const m of matches) {
+  let matchedChars = 0;
+  let count = 0;
+  for (const m of trimmed.matchAll(tokenRx)) {
     const val = Number(m[1]);
     const unit = m[2]!;
-    if (unit === "ms") total += val;
+    if (!Number.isFinite(val) || val <= 0) return null;
+    count += 1;
+    matchedChars += m[0].length;
+    if (unit === "ms" || unit.startsWith("millisecond")) total += val;
     else if (unit.startsWith("s")) total += val * 1_000;
     else if (unit.startsWith("m")) total += val * 60_000;
     else if (unit.startsWith("h")) total += val * 3_600_000;
     else if (unit.startsWith("d")) total += val * 86_400_000;
   }
+  // Reject any leftover non-whitespace / non-separator characters (e.g. "1h garbage" or "-5m")
+  const stripped = trimmed.replace(tokenRx, "").replace(/[\s,]+/g, "");
+  if (count === 0 || matchedChars === 0 || stripped.length > 0) return null;
   return total > 0 ? Math.round(total) : null;
 }
 

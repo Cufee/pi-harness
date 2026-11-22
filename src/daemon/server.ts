@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, statSync, unlinkSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, realpathSync, statSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,7 +17,7 @@ export function currentDaemonBuildId(): string {
 import { ModelCatalogCompiler } from "../catalog/compiler.js";
 import { saveGlobalConfig, type HarnessConfig, type RunnerProfileConfig } from "../config.js";
 import { ControlPlaneDb, type ReplayCursor, type EventRecord } from "../control-plane/db.js";
-import { readRunDossier } from "../control-plane/dossiers.js";
+import { readRunDossier, readWorkspaceArtifact } from "../control-plane/dossiers.js";
 import { compactTaskHandoff } from "../control-plane/handoffs.js";
 import { HarnessOrchestrator, type CustomRunnerFactory } from "../control-plane/orchestrator.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
@@ -25,7 +25,13 @@ import { summarizeCost } from "../cost/ledger.js";
 import { DirectorRuntime } from "../director/runtime.js";
 import type { GoalCriterion } from "../goals/engine.js";
 import { formatChatEventSummary, type ChatControlEvent } from "../protocol/chat-events.js";
-import type { DaemonEventFrame, InboxItem, RpcRequest, RpcResponse } from "../protocol/daemon-rpc.js";
+import type {
+  DaemonEventFrame,
+  InboxItem,
+  RpcRequest,
+  RpcResponse,
+  SnapshotWorktreeEntry,
+} from "../protocol/daemon-rpc.js";
 import { attachNdjsonReader, writeDaemonMessage } from "../protocol/frames.js";
 import { buildGoalDetailDisplay, buildGoalsTableDisplay, summarizeToolDisplay } from "../protocol/tool-display.js";
 import { QuotaClient } from "../quota/client.js";
@@ -49,6 +55,7 @@ interface ClientAttachment {
 /** Read-only event subscription; never binds or evicts the socket's chat/run session. */
 type ClientWatch = { throughSeq: number; pendingSeq?: number; next?: ReplayCursor; id: string; lastSeq: number; buffer: DaemonEventFrame[] | null } & (
   | { scope: "runs"; chatSessionId?: string; runIds?: Set<string> }
+  | { scope: "run"; runId: string; taskId: null }
   | { scope: "task"; runId: string; taskId: string }
 );
 
@@ -417,10 +424,24 @@ export class HarnessDaemon {
       ev.type === "quota.run_scheduled" ||
       ev.type === "quota.run_resumed"
     ) {
+      const evRepoRoot = this.db.getRun(ev.runId)?.repoRoot ?? null;
       for (const sock of this.chatSubscribers) {
         if (this.attachments.has(sock)) continue;
         const boundChatId = this.socketToChatId.get(sock);
         if (owningChatId && boundChatId && owningChatId !== boundChatId) continue;
+        if (!owningChatId && boundChatId && evRepoRoot) {
+          const boundRepo = this.director.chats.getSession(boundChatId)?.repoRoot;
+          if (boundRepo && boundRepo !== evRepoRoot) {
+            const norm = (p: string) => {
+              try {
+                return realpathSync(p);
+              } catch {
+                return p;
+              }
+            };
+            if (norm(boundRepo) !== norm(evRepoRoot)) continue;
+          }
+        }
         writeDaemonMessage(sock, frame);
       }
     }
@@ -431,6 +452,8 @@ export class HarnessDaemon {
           if (!isRunsWatchEvent(ev.type)) continue;
           if (w.runIds && !w.runIds.has(ev.runId)) continue;
           if (w.chatSessionId && owningChatId !== w.chatSessionId) continue;
+        } else if (w.scope === "run") {
+          if (ev.runId !== w.runId) continue;
         } else if (ev.runId !== w.runId || ev.taskId !== w.taskId) {
           continue;
         }
@@ -456,6 +479,18 @@ export class HarnessDaemon {
       const runIds = Array.isArray(p.runIds) ? new Set((p.runIds as unknown[]).map((x) => String(x))) : undefined;
       watch = { id, scope: "runs", chatSessionId, runIds, throughSeq: lastSeq, lastSeq, buffer: [] };
       result = { watchId: id, replay: [], lastSeq };
+    } else if (p.scope === "run") {
+      const runId = String(p.runId);
+      const sinceSeq = typeof p.sinceSeq === "number" ? p.sinceSeq : 0;
+      const lastSeq = Math.max(sinceSeq, this.db.getLatestEventSeq());
+      const page = this.db.getReplayPage(runId, null, { sinceSeq, payloadOffset: 0 }, lastSeq);
+      watch = { id, scope: "run", runId, taskId: null, throughSeq: lastSeq, lastSeq, next: page.next, buffer: [] };
+      result = {
+        watchId: id,
+        ...page,
+        lastSeq,
+        run: this.db.getRun(runId) ?? undefined,
+      };
     } else if (p.scope === "task") {
       const runId = String(p.runId);
       const taskId = String(p.taskId);
@@ -775,6 +810,9 @@ export class HarnessDaemon {
             : {}),
           ...(typeof patch.defaultWorkerProfile === "string" ? { defaultWorkerProfile: patch.defaultWorkerProfile } : {}),
           ...(typeof patch.defaultTaskProfile === "string" ? { defaultTaskProfile: patch.defaultTaskProfile } : {}),
+          ...(patch.codeMode === "collapsed" || patch.codeMode === "hybrid" || patch.codeMode === "off"
+            ? { codeMode: patch.codeMode }
+            : {}),
           ...(patch.rollover ? { rollover: { ...this.config.rollover, ...(patch.rollover as HarnessConfig["rollover"]) } } : {}),
           ...(patch.worktree ? { worktree: { ...this.config.worktree, ...(patch.worktree as HarnessConfig["worktree"]) } } : {}),
           ...(patch.goals ? { goals: { ...this.config.goals, ...(patch.goals as HarnessConfig["goals"]) } } : {}),
@@ -1121,6 +1159,9 @@ export class HarnessDaemon {
       case "goal.resume": {
         const g = this.director.goals.getGoal(String(p.goalId));
         if (!g) throw new Error(`Unknown goal ${p.goalId}`);
+        if (g.status === "achieved" || g.status === "cancelled") {
+          throw new Error(`Cannot resume ${g.id}: goal is already ${g.status}`);
+        }
         if (g.linkedRunId) {
           const res = await this.orchestrator.resumeRun(g.linkedRunId, {
             trigger: "manual",
@@ -1130,6 +1171,15 @@ export class HarnessDaemon {
             this.director.goals.setStatus(g.id, "executing", "Resumed by user");
             return { resumed: true, goal: this.director.goals.getGoal(g.id)!, resumedTaskIds: res.resumedTaskIds };
           }
+          return {
+            resumed: false,
+            goal: g,
+            resumedTaskIds: [],
+            reason: `Linked run ${g.linkedRunId} has no paused or resumable tasks`,
+          };
+        }
+        if (g.status !== "draft" && g.status !== "paused" && g.status !== "awaiting_human") {
+          throw new Error(`Cannot resume ${g.id} in status ${g.status}`);
         }
         const committed = await this.director.commitGoal(g.id);
         return { resumed: true, goal: committed, resumedTaskIds: [] };
@@ -1268,7 +1318,12 @@ export class HarnessDaemon {
       case "replay.page": {
         const attachment = this.attachments.get(socket);
         const watch = this.watches.get(socket)?.get(String(p.watchId));
-        const target = watch?.scope === "task" ? watch : attachment && attachment.id === p.attachmentId ? attachment : undefined;
+        const target =
+          watch && (watch.scope === "task" || watch.scope === "run")
+            ? watch
+            : attachment && attachment.id === p.attachmentId
+              ? attachment
+              : undefined;
         if (!target?.next) throw new Error("Replay expired or complete");
         const page = this.db.getReplayPage(target.runId, target.taskId, target.next, target.throughSeq,
           "boundAtSeq" in target ? target.boundAtSeq : undefined);
@@ -1279,7 +1334,7 @@ export class HarnessDaemon {
           target.pendingSeq = undefined;
         }
         target.next = page.next;
-        if (watch?.scope === "task") watch.lastSeq = target.throughSeq;
+        if (watch && (watch.scope === "task" || watch.scope === "run")) watch.lastSeq = target.throughSeq;
         return page;
       }
 
@@ -1332,14 +1387,19 @@ export class HarnessDaemon {
       case "work.snapshot": {
         const chatSessionId = typeof p.chatSessionId === "string" && p.chatSessionId ? p.chatSessionId : undefined;
         const repoRoot = typeof p.repoRoot === "string" && p.repoRoot ? p.repoRoot : undefined;
+        const filterRunId = typeof p.runId === "string" && p.runId ? p.runId : undefined;
         const goals = this.director.goals.listGoals({ repoRoot, chatSessionId });
         const goalByRunId = new Map(goals.filter((g) => g.linkedRunId).map((g) => [g.linkedRunId!, g]));
-        const runIds = chatSessionId
-          ? this.getRunIdsForChatSession(chatSessionId)
-          : this.db
-              .listRuns(50)
-              .filter((r) => !repoRoot || r.repoRoot === repoRoot)
-              .map((r) => r.id);
+        const runIds = filterRunId
+          ? [filterRunId]
+          : chatSessionId
+            ? this.getRunIdsForChatSession(chatSessionId)
+            : this.db
+                .listRuns(500)
+                .filter((r) => !repoRoot || r.repoRoot === repoRoot)
+                .slice(0, 50)
+                .map((r) => r.id);
+        const runIdSet = new Set(runIds);
         const runEntries = runIds
           .map((id) => this.db.getRun(id))
           .filter((r): r is NonNullable<typeof r> => r !== null)
@@ -1357,20 +1417,56 @@ export class HarnessDaemon {
               activity: buildRunActivitySummary(this.db, run.id),
             };
           });
-        const escalations = this.db.listAllEscalations({ runIds, limit: 150 });
+        // Always include all open/acked escalations without recency truncation, then append recent resolved ones
+        const openEscs = this.db.listAllEscalations({ runIds, status: "open", limit: 500 });
+        const ackedEscs = this.db.listAllEscalations({ runIds, status: "acked", limit: 500 });
+        const recentEscs = this.db.listAllEscalations({ runIds, limit: 150 });
+        const escMap = new Map(openEscs.map((e) => [e.id, e]));
+        for (const e of ackedEscs) escMap.set(e.id, e);
+        for (const e of recentEscs) if (!escMap.has(e.id)) escMap.set(e.id, e);
+        const escalations = [...escMap.values()].sort((a, b) => b.createdAt - a.createdAt);
+
+        const repoChatIds = repoRoot
+          ? new Set(this.director.chats.listSessions(200).filter((c) => c.repoRoot === repoRoot).map((c) => c.id))
+          : null;
         const timers = this.db.timers
           .list({})
           .filter((t) => {
-            if (!chatSessionId) return true;
-            if (t.ownerKind === "chat") return t.ownerId === chatSessionId;
-            return t.runId != null && runIds.includes(t.runId);
+            if (filterRunId) return t.runId === filterRunId;
+            if (chatSessionId) {
+              if (t.ownerKind === "chat") return t.ownerId === chatSessionId;
+              return t.runId != null && runIdSet.has(t.runId);
+            }
+            if (repoChatIds) {
+              if (t.ownerKind === "chat") return repoChatIds.has(t.ownerId);
+              return t.runId != null && runIdSet.has(t.runId);
+            }
+            return true;
           })
           .slice(0, 100);
         const merges = this.db.listMergeQueue({ runIds, limit: 100 });
-        const worktrees = repoRoot
-          ? await this.orchestrator.getWorktreeManager(repoRoot).listLive().catch(() => [])
+        const rawLiveWorktrees = repoRoot
+          ? await this.orchestrator.getWorktreeManager(repoRoot).listLive(filterRunId).catch(() => [])
           : [];
-        const messages = runIds.flatMap((id) => this.db.listMessagesForRun(id, 20));
+        const worktrees: SnapshotWorktreeEntry[] = rawLiveWorktrees
+          .filter((wt) => {
+            if (wt.orphaned) return true;
+            if (!chatSessionId && !filterRunId) return true;
+            return wt.record ? runIdSet.has(wt.record.runId) : true;
+          })
+          .map((wt) => ({
+            id: wt.record?.id ?? null,
+            runId: wt.record?.runId ?? null,
+            taskId: wt.record?.taskId ?? null,
+            status: wt.record?.status ?? (wt.orphaned ? "orphaned" : "active"),
+            branch: wt.branch ?? "(detached)",
+            path: wt.path,
+            existsOnDisk: wt.existsOnDisk,
+            dirty: wt.dirty,
+            orphaned: wt.orphaned,
+            archiveRef: wt.record?.archiveRef ?? null,
+          }));
+        const messages = runIds.flatMap((id) => this.db.listMessagesForRun(id, 50));
 
         // Build severity-sorted Inbox of items needing human attention
         const inbox: InboxItem[] = [];
@@ -1580,12 +1676,27 @@ export class HarnessDaemon {
       case "artifact.read": {
         const run = this.db.getRun(String(p.runId));
         if (!run) throw new Error(`Unknown run ${p.runId}`);
-        return readRunDossier(this.db, run, {
-          path: typeof p.path === "string" ? p.path : undefined,
-          task_id: typeof p.taskId === "string" ? p.taskId : undefined,
-          max_chars: typeof p.maxChars === "number" ? p.maxChars : 16_000,
-          offset: typeof p.offset === "number" ? p.offset : 0,
-        });
+        const reqPath = typeof p.path === "string" && p.path ? p.path : undefined;
+        const maxChars = typeof p.maxChars === "number" ? p.maxChars : 16_000;
+        const offset = typeof p.offset === "number" ? p.offset : 0;
+        try {
+          return readRunDossier(this.db, run, {
+            path: reqPath,
+            task_id: typeof p.taskId === "string" ? p.taskId : undefined,
+            max_chars: maxChars,
+            offset,
+          });
+        } catch (err) {
+          if (!reqPath) throw err;
+          // Allow reading any indexed non-dossier artifact belonging to this run safely within its workspace
+          const indexed = this.db.listArtifacts(run.id, typeof p.taskId === "string" ? p.taskId : undefined, 200);
+          const match = indexed.find((a) => a.path === reqPath);
+          if (!match) throw err;
+          const task = this.db.getTask(match.taskId);
+          const wt = task?.worktreeId ? this.db.getWorktree(task.worktreeId) : null;
+          const root = wt && existsSync(wt.path) ? wt.path : run.repoRoot;
+          return readWorkspaceArtifact(root, reqPath, maxChars, offset);
+        }
       }
 
       case "timer.list": {
@@ -1718,8 +1829,29 @@ export class HarnessDaemon {
         const repoRoot = String(p.repoRoot ?? process.cwd());
         const mgr = this.orchestrator.getWorktreeManager(repoRoot);
         if (typeof p.worktreeId === "string" && p.worktreeId) {
-          const ref = await mgr.teardown(p.worktreeId, { archiveBeforeRemove: true, finalStatus: "archived" });
-          return { removed: [p.worktreeId], archivedRefs: ref ? [ref] : [], prunedAdminEntries: true, expiredArchiveRefs: [], errors: [] };
+          const wt = this.db.getWorktree(p.worktreeId);
+          if (!wt) throw new Error(`Unknown worktree ${p.worktreeId}`);
+          const run = this.db.getRun(wt.runId);
+          if (run && run.repoRoot !== repoRoot) {
+            throw new Error(`Worktree ${p.worktreeId} belongs to ${run.repoRoot}, not ${repoRoot}`);
+          }
+          const task = this.db.getTask(wt.taskId);
+          const activeStatuses = new Set(["running", "waiting_children", "pending", "ready"]);
+          if (task && activeStatuses.has(task.status) && !Boolean(p.force)) {
+            throw new Error(`Cannot remove worktree ${p.worktreeId}: task ${task.id} is still ${task.status}`);
+          }
+          const ref = await mgr.teardown(p.worktreeId, {
+            archiveBeforeRemove: true,
+            requireArchive: true,
+            finalStatus: "archived",
+          });
+          return {
+            removed: [p.worktreeId],
+            archivedRefs: ref ? [ref] : [],
+            prunedAdminEntries: true,
+            expiredArchiveRefs: [],
+            errors: [],
+          };
         }
         return await mgr.sweep({
           runId: typeof p.runId === "string" ? p.runId : undefined,

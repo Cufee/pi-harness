@@ -708,7 +708,7 @@ class RunInspectorScreen implements Screen {
     ];
 
     const sub = run
-      ? `branch ${run.baseBranch}${entry?.goalId ? ` · ${entry.goalId}` : ""}${entry?.quotaPause ? ` · quota paused (${formatCountdown(entry.quotaPause.resumeAtMs)})` : ""}`
+      ? `branch ${run.baseBranch}${entry?.goalId ? ` · ${entry.goalId}` : ""}${entry?.quotaPause ? ` · quota paused (${formatCountdown(entry.quotaPause.resumeAt)})` : ""}`
       : undefined;
 
     return this.frame.render({
@@ -1215,28 +1215,29 @@ class WorktreeInspectorScreen implements Screen {
 
   render(width: number, maxHeight: number, theme: Theme): string[] {
     const wt = this.data?.worktree ?? this.deps.store.getWorktree(this.worktreeId);
+    const wtId = wt?.id ?? this.worktreeId;
     const hints: Hint[] = [
       ...(wt?.taskId ? [{ key: "t", label: "task" }] : []),
-      { key: "x", label: "archive & remove" },
+      ...(wt?.id ? [{ key: "x", label: "archive & remove" }] : []),
       { key: "Esc", label: "back" },
     ];
     return this.frame.render({
       width,
       maxHeight,
       theme,
-      breadcrumbs: ["Work", "Worktrees", this.worktreeId],
+      breadcrumbs: ["Work", "Worktrees", wtId],
       rightHeader: wt ? statusBadge(wt.status, theme) : undefined,
       hints,
       renderBody: (innerW, bodyH) => {
         if (this.loading && !wt) return [theme.muted("Loading worktree...")];
         if (!wt) return [theme.muted("Worktree not found.")];
         const lines: string[] = [
-          kvRow("Worktree ID", wt.id, innerW, theme),
+          kvRow("Worktree ID", wt.id ?? "(untracked)", innerW, theme),
           kvRow("Status", statusBadge(wt.status, theme), innerW, theme),
           kvRow("Branch", wt.branch, innerW, theme),
           kvRow("Path", middleEllipsis(wt.path, Math.max(16, innerW - 16)), innerW, theme),
-          kvRow("On Disk", this.data?.existsOnDisk ? theme.ok("yes") : theme.muted("no"), innerW, theme),
-          kvRow("Run / Task", `${wt.runId} / ${wt.taskId}`, innerW, theme),
+          kvRow("On Disk", (this.data?.existsOnDisk ?? ("existsOnDisk" in wt ? wt.existsOnDisk : false)) ? theme.ok("yes") : theme.muted("no"), innerW, theme),
+          kvRow("Run / Task", `${wt.runId ?? "—"} / ${wt.taskId ?? "—"}`, innerW, theme),
           ...(this.data?.gitStatus ? ["", divider(innerW, theme, "git status --short"), ...wrap(sanitizeText(this.data.gitStatus), innerW)] : []),
           ...(this.data?.diffStat ? ["", divider(innerW, theme, "git diff --stat"), ...wrap(sanitizeText(this.data.diffStat), innerW)] : []),
         ];
@@ -1261,12 +1262,13 @@ class WorktreeInspectorScreen implements Screen {
       ctx.navigator.push(new TaskInspectorScreen(wt.taskId, this.deps));
       return;
     }
-    if (data === "x") {
+    if (data === "x" && wt.id) {
+      const targetId = wt.id;
       this.frame.askConfirm({
-        message: `Archive branch ${wt.branch} and remove worktree ${wt.id}?`,
+        message: `Archive branch ${wt.branch} and remove worktree ${targetId}?`,
         onConfirm: async () => {
-          await this.deps.client.request("worktrees.clean", { repoRoot: this.deps.repoRoot, worktreeId: wt.id });
-          this.frame.setNotice(`Archived & removed ${wt.id}`, "ok");
+          await this.deps.client.request("worktrees.clean", { repoRoot: this.deps.repoRoot, worktreeId: targetId });
+          this.frame.setNotice(`Archived & removed ${targetId}`, "ok");
           await this.deps.store.refresh();
           ctx.navigator.pop();
         },
