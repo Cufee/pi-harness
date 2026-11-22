@@ -206,6 +206,49 @@ export class ModelCatalogCompiler {
     return Number.isFinite(ageMs) && ageMs < this.config.catalog.ttlHours * 3_600_000;
   }
 
+  /**
+   * Translates a canonical (`google/gemini-4-carbon`), bare (`gemini-4-carbon`), or wire
+   * (`google-vertex/gemini-4-carbon`) model ID into the exact wire ID that `profileId` probed,
+   * using the cached catalog. Returns null when there is no catalog or no route on that profile
+   * matches; callers then pass the original string through unchanged.
+   */
+  resolveForProfile(
+    profileId: string,
+    model: string,
+    effort?: string,
+  ): { wireModelId: string; canonicalId: string; effort?: string } | null {
+    const catalog = this.loadCached();
+    if (!catalog || !model) return null;
+
+    const candidates = catalog.models.flatMap((entry) =>
+      [entry.preferredRoute, ...entry.alternateRoutes]
+        .filter((route) => route?.profileId === profileId)
+        .map((route) => ({ entry, route })),
+    );
+    if (candidates.length === 0) return null;
+
+    const lower = model.toLowerCase();
+    const requestKeys = new Set(buildMatchKeys(model));
+    const pick =
+      candidates.find((c) => c.route.wireModelId.toLowerCase() === lower) ??
+      candidates.find((c) => c.entry.id.toLowerCase() === lower) ??
+      candidates
+        .map((c) => {
+          const keys = new Set([...buildMatchKeys(c.entry.id), ...buildMatchKeys(c.route.wireModelId)]);
+          return { c, score: [...requestKeys].filter((k) => keys.has(k)).length };
+        })
+        .filter((s) => s.score > 0)
+        .sort((a, b) => b.score - a.score)[0]?.c;
+    if (!pick) return null;
+
+    const efforts = pick.route.supportedEfforts;
+    return {
+      wireModelId: pick.route.wireModelId,
+      canonicalId: pick.entry.id,
+      ...(effort && (!efforts?.length || efforts.includes(effort)) ? { effort } : {}),
+    };
+  }
+
   async getCatalog(opts?: {
     forceSync?: boolean;
     cwd?: string;

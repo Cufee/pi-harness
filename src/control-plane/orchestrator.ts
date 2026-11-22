@@ -581,7 +581,8 @@ export class HarnessOrchestrator {
         readOnly: task.readOnly,
         systemPrompt,
         initialPrompt,
-        model: task.model,
+        // Only the runner sees the profile's wire ID; task rows, events and quota keep the canonical ID.
+        model: (task.model && this.catalog?.resolveForProfile(profile.id, task.model)?.wireModelId) || task.model,
         effort: task.effort,
         maxTurns: task.maxTurns,
         rolloverThreshold,
