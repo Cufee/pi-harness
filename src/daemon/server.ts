@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, realpathSync, statSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
@@ -34,7 +34,7 @@ import type {
   RpcResponse,
   SnapshotWorktreeEntry,
 } from "../protocol/daemon-rpc.js";
-import { attachNdjsonReader, writeDaemonMessage } from "../protocol/frames.js";
+import { attachDaemonReader, writeDaemonMessage } from "../protocol/frames.js";
 import { buildGoalDetailDisplay, buildGoalsTableDisplay, summarizeToolDisplay } from "../protocol/tool-display.js";
 import { QuotaClient } from "../quota/client.js";
 import { ensureOctofs } from "../tools/native-tools.js";
@@ -86,6 +86,23 @@ function isRunsWatchEvent(type: string): boolean {
 
 export const MAX_PEER_MESSAGE_HOPS = 10;
 
+/** Single positive allowlist enforced identically on inbound peer links, reverse peer calls, and `peer.proxy`. */
+const PEER_ALLOWED_OPS: ReadonlySet<DaemonOp> = new Set<DaemonOp>([
+  "ping",
+  "project.list",
+  "project.get",
+  "project.create",
+  "project.update",
+  "project.remove",
+  "project.browse",
+  "sessions.list",
+  "chat.create",
+  "session.deliver_message",
+  "session.list_messages",
+  "session.read",
+  "peer.sync_outbox",
+]);
+
 /**
  * `harnessd`: persistent headless daemon owning SQLite state, running agents,
  * worktree GC, model catalog + quota sync, and optional raw PTY shells.
@@ -114,6 +131,9 @@ export class HarnessDaemon {
   private takenOverSockets = new WeakSet<Socket>();
   private ptyDetachFns = new Map<Socket, Map<string, () => void>>();
   private watches = new Map<Socket, Map<string, ClientWatch>>();
+  private flushingPeers = new Set<string>();
+  private pendingFlushPeers = new Set<string>();
+  private flushRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private unsubEvents: (() => void) | null = null;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
   private idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
@@ -148,7 +168,8 @@ export class HarnessDaemon {
     });
     this.director.setPeerBridge({
       listRemotes: () => this.listRemoteStatuses(),
-      listSessions: (host) => this.listFederatedSessions(null, { includeRemotes: true, host }),
+      listSessions: async (host) =>
+        (await this.listFederatedSessions(null, { includeRemotes: true, host })).filter((s) => s.kind === "chat"),
       createSession: (input) => this.createSessionOnHost(input),
       sendMessage: (input) => this.sendSessionMessage(input),
       readSession: (input) => this.readSessionOnHost(input),
@@ -167,6 +188,9 @@ export class HarnessDaemon {
         .steerChat(chatSessionId, summary, { role: "system_notice", event })
         .then((accepted) => {
           if (accepted) {
+            if (event.kind === "session.message_received") {
+              this.db.sessionMessages.markWakeStatus(event.messageId, "done");
+            }
             this.sendChatEvent(chatSessionId, activeTurn.id, "chat.steered", {
               message: summary,
               role: "system_notice",
@@ -244,6 +268,9 @@ export class HarnessDaemon {
         assistantTurn: result.assistantTurn,
         cancelled: turn.cancelling,
       });
+      if (event.kind === "session.message_received") {
+        this.db.sessionMessages.markWakeStatus(event.messageId, "done");
+      }
     } catch (err) {
       this.sendChatEvent(chatSessionId, id, "chat.turn.end", {
         error: err instanceof Error ? err.message : String(err),
@@ -348,6 +375,24 @@ export class HarnessDaemon {
     // Start auto-connect peer links for any configured remote hosts
     this.peers.syncRemotes(this.config.remotes ?? []);
 
+    // Recover any durable inbound peer wakeups that were persisted before a crash/restart
+    for (const pending of this.db.sessionMessages.listPendingInboundWakes()) {
+      if (!this.director.chats.getSession(pending.toSessionId)) {
+        this.db.sessionMessages.markWakeStatus(pending.id, "done");
+        continue;
+      }
+      this.scheduleDirectorWakeup(pending.toSessionId, {
+        kind: "session.message_received",
+        messageId: pending.id,
+        fromHost: pending.fromHost,
+        fromSessionId: pending.fromSessionId,
+        fromProjectName: pending.fromProjectName,
+        body: pending.body,
+        expectReply: pending.expectReply,
+        hopCount: pending.hopCount,
+      });
+    }
+
     return sockPath;
   }
 
@@ -360,6 +405,10 @@ export class HarnessDaemon {
       clearInterval(this.sweepTimer);
       this.sweepTimer = null;
     }
+    for (const t of this.flushRetryTimers.values()) clearTimeout(t);
+    this.flushRetryTimers.clear();
+    this.flushingPeers.clear();
+    this.pendingFlushPeers.clear();
     this.peers.dispose();
     this.director.dispose();
     this.orchestrator.dispose();
@@ -742,12 +791,31 @@ export class HarnessDaemon {
   private handleConnection(socket: Socket): void {
     this.allSockets.add(socket);
     this.cancelIdleShutdown();
-    const detach = attachNdjsonReader(socket, {
+    const detach = attachDaemonReader(socket, {
       onMessage: (raw) => {
-        // If this socket was upgraded via `peer.hello`, forward RPC responses back to the PeerLink
+        // Once upgraded via `peer.hello`, a socket is strictly a peer link:
+        //  - `res` frames complete our outbound reverse requests on that link
+        //  - `req` frames ONLY execute through the strict positive-allowlist `dispatchPeerRequest`
         const inboundPeer = this.peers.getInboundLinkForSocket(socket);
-        if (inboundPeer && (raw as { kind?: string })?.kind === "res") {
-          inboundPeer.handleWireFrame(raw);
+        if (inboundPeer) {
+          const kind = (raw as { kind?: string })?.kind;
+          if (kind === "res") {
+            inboundPeer.handleWireFrame(raw);
+            return;
+          }
+          if (kind === "req") {
+            const req = raw as RpcRequest;
+            void this.dispatchPeerRequest(req.op, req.params ?? {}, inboundPeer).then(
+              (result) => writeDaemonMessage(socket, { kind: "res", id: req.id, ok: true, result } satisfies RpcResponse),
+              (err) =>
+                writeDaemonMessage(socket, {
+                  kind: "res",
+                  id: req.id,
+                  ok: false,
+                  error: err instanceof Error ? err.message : String(err),
+                } satisfies RpcResponse),
+            );
+          }
           return;
         }
         const req = raw as RpcRequest;
@@ -997,8 +1065,8 @@ export class HarnessDaemon {
     const session = this.director.chats.getSession(sessionId);
     if (!session) throw new Error(`Unknown chat session: ${sessionId}`);
     const project = session.projectId ? this.db.projects.getById(session.projectId) : null;
-    const allHistory = this.director.chats.getHistory(sessionId, 0, 500);
-    const turns = allHistory.slice(-limit).map((t) => ({
+    const recentHistory = this.director.chats.getRecentHistory(sessionId, limit);
+    const turns = recentHistory.map((t) => ({
       seq: t.seq,
       role: t.role,
       content: t.content,
@@ -1095,6 +1163,7 @@ export class HarnessDaemon {
     }
 
     if (circuitBreakerTripped) {
+      this.db.sessionMessages.markWakeStatus(record.id, "tripped");
       this.director.chats.appendTurn(
         input.toSessionId,
         "system_notice",
@@ -1134,7 +1203,7 @@ export class HarnessDaemon {
 
     // Unified local delivery (same host, same or different project)
     if (this.isLocalHostTarget(host)) {
-      const id = `smsg-${randomBytes(6).toString("hex")}`;
+      const id = `smsg-${randomUUID()}`;
       const delivered = this.deliverLocalSessionMessage({
         id,
         fromNode: this.nodeId,
@@ -1156,12 +1225,17 @@ export class HarnessDaemon {
       };
     }
 
-    // Remote delivery: persist durably in outbox first so SSH drops or offline hosts never lose messages
+    // Remote delivery: validate target host is a configured or previously observed peer so typos never pin auto-quit
     const targetHost = host!;
     const link = this.peers.findLink(targetHost);
     const resolvedToNode =
       link?.remoteIdentity?.nodeId ??
-      (prevMsg && prevMsg.fromHost.toLowerCase() === targetHost.toLowerCase() ? prevMsg.fromNode : null);
+      this.peers.getKnownNodeId(targetHost) ??
+      (prevMsg && prevMsg.fromHost.toLowerCase() === targetHost.toLowerCase() ? prevMsg.fromNode : null) ??
+      this.db.sessionMessages.findKnownNodeForHost(targetHost);
+    if (!link && !this.peers.isKnownPeer(targetHost) && !resolvedToNode) {
+      throw new Error(`Unknown remote host "${targetHost}". Add it first with \`pi-harness remote add ${targetHost} <ssh-target>\` or /remotes.`);
+    }
 
     const record = this.db.sessionMessages.enqueueOutbound({
       fromNode: this.nodeId,
@@ -1214,62 +1288,100 @@ export class HarnessDaemon {
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      // Permanent remote error (e.g. unknown session) -> fail; transient transport/timeout -> stay queued
-      if (/Unknown target chat session/i.test(msg)) {
+      if (/Unknown target chat session|Conflicting session message envelope/i.test(msg)) {
         this.db.sessionMessages.markFailed(record.id, msg);
         throw new Error(msg);
       }
+      // Schedule a bounded retry on the still-live peer link so transient timeouts never stall the outbox
+      this.scheduleOutboxRetry(link);
       return {
         messageId: record.id,
         target: `${targetHost}:${toSessionId}`,
         status: "queued",
         woke: false,
-        note: `Delivery deferred (${msg}); message remains queued and will auto-flush on reconnect.`,
+        note: `Delivery deferred (${msg}); message remains queued and will retry automatically.`,
       };
     }
   }
 
+  private scheduleOutboxRetry(peer: PeerLink, delayMs = 3_000): void {
+    const key = peer.remoteIdentity?.nodeId ?? peer.alias.toLowerCase();
+    if (this.flushRetryTimers.has(key)) return;
+    const timer = setTimeout(() => {
+      this.flushRetryTimers.delete(key);
+      if (peer.isOpen) void this.flushOutboxForPeer(peer);
+    }, delayMs);
+    timer.unref?.();
+    this.flushRetryTimers.set(key, timer);
+  }
+
   private async flushOutboxForPeer(peer: PeerLink): Promise<number> {
-    const targets = [peer.alias];
-    if (peer.remoteIdentity?.hostName) targets.push(peer.remoteIdentity.hostName);
-    if (peer.remoteIdentity?.nodeId) targets.push(peer.remoteIdentity.nodeId);
-    const queued = this.db.sessionMessages.listQueuedOutbound(targets);
+    const key = peer.remoteIdentity?.nodeId ?? peer.alias.toLowerCase();
+    if (this.flushingPeers.has(key)) {
+      this.pendingFlushPeers.add(key);
+      return 0;
+    }
+    this.flushingPeers.add(key);
     let flushed = 0;
-    for (const msg of queued) {
-      if (!peer.isOpen) break;
-      try {
-        await peer.request(
-          "session.deliver_message",
-          {
-            id: msg.id,
-            fromNode: msg.fromNode,
-            fromHost: msg.fromHost,
-            fromSessionId: msg.fromSessionId,
-            fromProjectName: msg.fromProjectName,
-            toSessionId: msg.toSessionId,
-            body: msg.body,
-            replyToId: msg.replyToId,
-            expectReply: msg.expectReply,
-            hopCount: msg.hopCount,
-          },
-          15_000,
-        );
-        this.db.sessionMessages.markDelivered(msg.id);
-        flushed++;
-      } catch (err) {
-        const text = err instanceof Error ? err.message : String(err);
-        if (/Unknown target chat session/i.test(text)) {
-          this.db.sessionMessages.markFailed(msg.id, text);
-        } else {
-          break; // Link dropped mid-flush; remaining items stay queued
+    try {
+      do {
+        this.pendingFlushPeers.delete(key);
+        const queued = this.db.sessionMessages.listQueuedOutboundForPeer({
+          alias: peer.alias,
+          hostName: peer.remoteIdentity?.hostName ?? null,
+          nodeId: peer.remoteIdentity?.nodeId ?? null,
+        });
+        let hadTransientFailure = false;
+        for (const msg of queued) {
+          if (!peer.isOpen) break;
+          try {
+            await peer.request(
+              "session.deliver_message",
+              {
+                id: msg.id,
+                fromNode: msg.fromNode,
+                fromHost: msg.fromHost,
+                fromSessionId: msg.fromSessionId,
+                fromProjectName: msg.fromProjectName,
+                toSessionId: msg.toSessionId,
+                body: msg.body,
+                replyToId: msg.replyToId,
+                expectReply: msg.expectReply,
+                hopCount: msg.hopCount,
+              },
+              15_000,
+            );
+            this.db.sessionMessages.markDelivered(msg.id);
+            flushed++;
+          } catch (err) {
+            const text = err instanceof Error ? err.message : String(err);
+            if (/Unknown target chat session|Conflicting session message envelope/i.test(text)) {
+              this.db.sessionMessages.markFailed(msg.id, text);
+            } else {
+              hadTransientFailure = true;
+              continue; // Don't let one transient timeout permanently block unrelated messages; retry shortly
+            }
+          }
         }
-      }
+        if (hadTransientFailure && peer.isOpen) {
+          this.scheduleOutboxRetry(peer);
+        }
+      } while (this.pendingFlushPeers.has(key) && peer.isOpen);
+    } finally {
+      this.flushingPeers.delete(key);
     }
     return flushed;
   }
 
-  /** Handles inbound RPCs arriving over an outbound `PeerLink` (reverse direction: remote server calling laptop). */
+  /**
+   * Strict positive-allowlist local-only handler for ALL peer-originated RPCs (both inbound sockets
+   * after `peer.hello` and reverse RPCs over outbound links). Never forwards to a third host and
+   * always derives sender identity from the authenticated `PeerLink`.
+   */
   private async dispatchPeerRequest(op: DaemonOp, p: Record<string, unknown>, peer: PeerLink): Promise<unknown> {
+    if (!PEER_ALLOWED_OPS.has(op)) {
+      throw new Error(`RPC "${op}" is not permitted over a peer link`);
+    }
     switch (op) {
       case "ping": {
         const live = this.getLiveWorkSummary();
@@ -1288,17 +1400,44 @@ export class HarnessDaemon {
         const ref = String(p.projectId ?? p.id ?? p.name ?? p.path ?? "");
         const proj = this.db.projects.resolveProject(ref);
         if (!proj) throw new Error(`Unknown project: ${ref}`);
-        return proj;
+        const all = await this.db.projects.listProjects();
+        return all.find((x) => x.id === proj.id) ?? proj;
       }
-      case "project.create":
-        return await this.db.projects.createProject({
+      case "project.create": {
+        const cloneUrl = typeof p.cloneUrl === "string" && p.cloneUrl.trim() ? p.cloneUrl.trim() : undefined;
+        if (cloneUrl && (cloneUrl.startsWith("-") || !/^(?:https?:\/\/|ssh:\/\/|git@)/i.test(cloneUrl))) {
+          throw new Error(`Invalid clone URL "${cloneUrl}" (must use https://, ssh://, or git@)`);
+        }
+        const created = await this.db.projects.createProject({
           path: String(p.path ?? ""),
           name: typeof p.name === "string" ? p.name : undefined,
           description: typeof p.description === "string" ? p.description : undefined,
           createDir: p.createDir === undefined ? true : Boolean(p.createDir),
           gitInit: Boolean(p.gitInit),
-          cloneUrl: typeof p.cloneUrl === "string" && p.cloneUrl.trim() ? p.cloneUrl.trim() : undefined,
+          cloneUrl,
+          defaultProfileId: typeof p.defaultProfileId === "string" ? p.defaultProfileId : undefined,
+          defaultModel: typeof p.defaultModel === "string" ? p.defaultModel : undefined,
+          defaultEffort: typeof p.defaultEffort === "string" ? p.defaultEffort : undefined,
         });
+        const all = await this.db.projects.listProjects();
+        return all.find((x) => x.id === created.id) ?? created;
+      }
+      case "project.update": {
+        const ref = String(p.projectId ?? p.id ?? "");
+        const updated = this.db.projects.updateProject(ref, {
+          name: typeof p.name === "string" ? p.name : undefined,
+          description: p.description === null ? null : typeof p.description === "string" ? p.description : undefined,
+          defaultProfileId: p.defaultProfileId === null ? null : typeof p.defaultProfileId === "string" ? p.defaultProfileId : undefined,
+          defaultModel: p.defaultModel === null ? null : typeof p.defaultModel === "string" ? p.defaultModel : undefined,
+          defaultEffort: p.defaultEffort === null ? null : typeof p.defaultEffort === "string" ? p.defaultEffort : undefined,
+        });
+        const all = await this.db.projects.listProjects();
+        return all.find((x) => x.id === updated.id) ?? updated;
+      }
+      case "project.remove": {
+        const ref = String(p.projectId ?? p.id ?? "");
+        return this.db.projects.removeProject(ref);
+      }
       case "project.browse":
         return this.db.projects.browseDirectory(typeof p.path === "string" ? p.path : undefined);
       case "sessions.list":
@@ -1308,11 +1447,15 @@ export class HarnessDaemon {
           project: typeof p.projectId === "string" ? p.projectId : undefined,
           title: typeof p.title === "string" ? p.title : undefined,
         });
-      case "session.deliver_message":
+      case "session.deliver_message": {
+        // Always derive sender node & host from the authenticated PeerLink, never trusting spoofed payload fields
+        const authNode = peer.remoteIdentity?.nodeId;
+        if (!authNode) throw new Error("Unauthenticated peer link");
+        const authHost = peer.remoteIdentity?.hostName || peer.alias;
         return this.deliverLocalSessionMessage({
           id: String(p.id),
-          fromNode: String(p.fromNode ?? peer.remoteIdentity?.nodeId ?? "unknown"),
-          fromHost: String(p.fromHost ?? peer.alias),
+          fromNode: authNode,
+          fromHost: authHost,
           fromSessionId: String(p.fromSessionId),
           fromProjectName: typeof p.fromProjectName === "string" ? p.fromProjectName : null,
           toSessionId: String(p.toSessionId),
@@ -1321,19 +1464,26 @@ export class HarnessDaemon {
           expectReply: p.expectReply === undefined ? true : Boolean(p.expectReply),
           hopCount: typeof p.hopCount === "number" ? p.hopCount : 1,
         });
-      case "session.list_messages":
-        return this.db.sessionMessages.listForSession(String(p.sessionId), typeof p.limit === "number" ? p.limit : 50);
-      case "session.read":
+      }
+      case "session.list_messages": {
+        const { host, sessionId } = parseSessionAddress(String(p.sessionId ?? p.target ?? ""));
+        if (host && !this.isLocalHostTarget(host)) throw new Error("Cross-host forwarding is not permitted over a peer link");
+        return this.db.sessionMessages.listForSession(sessionId, typeof p.limit === "number" ? p.limit : 50);
+      }
+      case "session.read": {
+        const { host, sessionId } = parseSessionAddress(String(p.target ?? p.sessionId ?? ""));
+        if (host && !this.isLocalHostTarget(host)) throw new Error("Cross-host forwarding is not permitted over a peer link");
         return await this.readSessionOnHost({
-          target: String(p.target ?? p.sessionId ?? ""),
+          target: sessionId,
           limit: typeof p.limit === "number" ? p.limit : undefined,
         });
+      }
       case "peer.sync_outbox": {
         const flushed = await this.flushOutboxForPeer(peer);
         return { flushed };
       }
       default:
-        throw new Error(`RPC "${op}" is not permitted over reverse peer link`);
+        throw new Error(`RPC "${op}" is not permitted over a peer link`);
     }
   }
 
@@ -1461,7 +1611,7 @@ export class HarnessDaemon {
         const params = (p.params ?? {}) as Record<string, unknown>;
         if (!host) throw new Error("host is required");
         if (!op) throw new Error("op is required");
-        if (op === "daemon.shutdown" || op === "peer.hello") {
+        if (!PEER_ALLOWED_OPS.has(op)) {
           throw new Error(`Op "${op}" cannot be proxied`);
         }
         return await this.peers.callRemote(host, op, params, typeof p.timeoutMs === "number" ? p.timeoutMs : 30_000);

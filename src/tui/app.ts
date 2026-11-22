@@ -37,6 +37,7 @@ import {
   SettingsScreen,
 } from "./pickers.js";
 import { ProjectsScreen } from "./projects.js";
+import { RemotesScreen } from "./remotes.js";
 import { consumeReplay } from "./replay.js";
 import { type AttachableSession, WorkStore } from "./store.js";
 import { extractDisplay, parseToolDisplay } from "./tool-output/index.js";
@@ -48,6 +49,7 @@ export type TuiExitAction =
       kind: "switch";
       targetKind: "chat" | "run";
       targetId: string;
+      targetHost?: string;
       taskId?: string | null;
       title?: string;
       projectId?: string;
@@ -56,6 +58,7 @@ export type TuiExitAction =
 
 export interface DirectorChatTuiOptions {
   client: DaemonClient;
+  remoteHost?: string | null;
   repoRoot?: string;
   projectId?: string;
   chatSessionId?: string;
@@ -66,6 +69,7 @@ export interface DirectorChatTuiOptions {
 
 export interface NativeScrollbackTuiOptions {
   client: DaemonClient;
+  remoteHost?: string | null;
   runId: string;
   initialTaskId?: string | null;
   terminal?: Terminal;
@@ -100,6 +104,7 @@ interface DaemonStatusResult {
 interface SharedShellContext {
   mode: TuiMode;
   client: DaemonClient;
+  remoteHost?: string | null;
   repoRoot: string;
   projectId?: string | null;
   getProject?: () => { id: string | null; name: string | null; repoRoot: string };
@@ -195,12 +200,13 @@ function createSharedShell(spec: SharedShellContext) {
   const switchTo = (
     targetKind: "chat" | "run",
     targetId: string,
-    extra?: { taskId?: string | null; title?: string; projectId?: string; repoRoot?: string },
+    extra?: { targetHost?: string; taskId?: string | null; title?: string; projectId?: string; repoRoot?: string },
   ) => {
     exitAction = {
       kind: "switch",
       targetKind,
       targetId,
+      ...(extra?.targetHost ? { targetHost: extra.targetHost } : {}),
       ...(extra?.taskId !== undefined ? { taskId: extra.taskId } : {}),
       ...(extra?.title ? { title: extra.title } : {}),
       ...(extra?.projectId ? { projectId: extra.projectId } : {}),
@@ -218,15 +224,32 @@ function createSharedShell(spec: SharedShellContext) {
     onAttachRun: (runId, taskId) => switchTo("run", runId, { taskId }),
   };
 
+  const openRemotes = () => {
+    navigator.push(
+      new RemotesScreen(spec.client, {
+        currentHost: spec.remoteHost ?? null,
+        onSwitchHost: (host) => {
+          switchTo("chat", "__host__", { targetHost: host });
+        },
+      }),
+    );
+  };
+
   const openProjects = () => {
     const cur = spec.getProject?.() ?? { id: spec.projectId ?? null, name: null, repoRoot: spec.repoRoot };
     navigator.push(
       new ProjectsScreen(spec.client, {
+        currentHost: spec.remoteHost ?? null,
         currentProjectId: cur.id,
         currentRepoRoot: cur.repoRoot,
         canSwitchCurrentSession: Boolean(spec.onSwitchCurrentSessionProject),
         onOpenProject: (project) => {
-          switchTo("chat", "__project__", { projectId: project.id, repoRoot: project.rootPath });
+          const targetHost = project.host && project.host !== "local" ? project.host : undefined;
+          switchTo("chat", "__project__", {
+            projectId: project.id,
+            repoRoot: project.rootPath,
+            ...(targetHost ? { targetHost } : {}),
+          });
         },
         onSwitchCurrentSession: spec.onSwitchCurrentSessionProject
           ? async (project) => {
@@ -237,6 +260,7 @@ function createSharedShell(spec: SharedShellContext) {
               syncDock();
             }
           : undefined,
+        onOpenRemotes: () => openRemotes(),
       }),
     );
   };
@@ -326,7 +350,12 @@ function createSharedShell(spec: SharedShellContext) {
       new SessionSwitcherScreen(
         spec.client,
         spec.sessionId,
-        (picked) => switchTo(picked.kind, picked.id),
+        (picked) =>
+          switchTo(picked.kind, picked.id, {
+            ...(picked.host && picked.host !== "local" ? { targetHost: picked.host } : {}),
+            ...(picked.projectId ? { projectId: picked.projectId } : {}),
+            ...(picked.repoRoot ? { repoRoot: picked.repoRoot } : {}),
+          }),
         () => switchTo("chat", "__new__"),
       ),
     );
@@ -376,7 +405,8 @@ function createSharedShell(spec: SharedShellContext) {
 
   const openPalette = () => {
     const actions: QuickActionItem[] = [
-      { id: "projects", label: "/projects", detail: "Select, Create, Clone or Switch Project (Ctrl+P)", pinned: true, run: () => openProjects() },
+      { id: "projects", label: "/projects", detail: "Select, Create, Clone or Switch Local & Remote Projects (Ctrl+P)", pinned: true, run: () => openProjects() },
+      { id: "remotes", label: "/remotes", detail: "Manage Remote SSH Peer Hosts & Switch Host", pinned: true, run: () => openRemotes() },
       { id: "settings", label: "/settings", detail: "ACP CLIs, Enabled Models & Defaults (Ctrl+,)", pinned: true, run: () => openSettings() },
       ...(spec.onModelUpdated ? [{ id: "model", label: "/model", detail: "Select Model & Enable/Disable Models", pinned: true, run: () => openModels() }] : []),
       ...(spec.onEffortUpdated ? [{ id: "effort", label: "/effort", detail: "Set Reasoning Effort", pinned: true, run: () => openEffort() }] : []),
@@ -445,6 +475,81 @@ function createSharedShell(spec: SharedShellContext) {
         }
         const target = await spec.client.request<ProjectRecord>("project.get", { projectId: arg });
         switchTo("chat", "__project__", { projectId: target.id, repoRoot: target.rootPath });
+        return true;
+      }
+      case "remotes": {
+        const sub = parsed.args.trim();
+        if (!sub) {
+          openRemotes();
+          return true;
+        }
+        const parts = sub.split(/\s+/);
+        const verb = parts[0]!.toLowerCase();
+        if (verb === "add" && parts.length >= 3) {
+          const [, name, sshTarget, ...bridgeRest] = parts;
+          const added = await spec.client.request<{ name: string; status: string; lastError?: string | null }>("remote.add", {
+            name,
+            sshTarget,
+            ...(bridgeRest.length > 0 ? { bridgeCommand: bridgeRest.join(" ") } : {}),
+            autoConnect: true,
+          });
+          transcript.appendReceipt({
+            tone: added.status === "connected" ? "ok" : "warn",
+            tag: "remote",
+            text:
+              added.status === "connected"
+                ? `Connected remote "${added.name}"`
+                : `Saved remote "${added.name}" (${added.lastError ?? added.status})`,
+          });
+          session.tui.requestRender();
+          return true;
+        }
+        if ((verb === "connect" || verb === "disconnect") && parts[1]) {
+          const st = await spec.client.request<{ name: string; status: string }>(`remote.${verb}`, { name: parts[1] });
+          transcript.appendReceipt({ tone: st.status === "connected" ? "ok" : "info", tag: "remote", text: `${st.name}: ${st.status}` });
+          session.tui.requestRender();
+          return true;
+        }
+        if ((verb === "rm" || verb === "remove") && parts[1]) {
+          await spec.client.request("remote.remove", { name: parts[1] });
+          transcript.appendReceipt({ tone: "warn", tag: "remote", text: `Removed remote "${parts[1]}"` });
+          session.tui.requestRender();
+          return true;
+        }
+        if (verb === "use" || verb === "switch") {
+          const host = parts[1];
+          if (host) {
+            switchTo("chat", "__host__", { targetHost: host });
+            return true;
+          }
+        }
+        openRemotes();
+        return true;
+      }
+      case "send": {
+        const m = parsed.args.match(/^(\S+)\s+([\s\S]+)$/);
+        if (!m) {
+          transcript.appendReceipt({ tone: "warn", tag: "send", text: "Usage: /send <host:chat-id|chat-id> <message>" });
+        } else {
+          const res = await spec.client.request<{ target: string; status: string; woke?: boolean; note?: string }>(
+            "session.send_message",
+            {
+              fromSessionId: spec.chatSessionId ?? spec.sessionId,
+              target: m[1],
+              body: m[2],
+              expectReply: true,
+            },
+          );
+          transcript.appendReceipt({
+            tone: res.status === "delivered" ? "ok" : "warn",
+            tag: "peer",
+            text:
+              res.status === "delivered"
+                ? `Sent to ${res.target}${res.woke ? " (woke recipient)" : ""}`
+                : res.note ?? `Queued for ${res.target}`,
+          });
+        }
+        session.tui.requestRender();
         return true;
       }
       case "work": {
@@ -650,6 +755,7 @@ function createSharedShell(spec: SharedShellContext) {
       idleBanner: spec.getIdleBanner(),
       busy: false,
       phaseText: "Ready",
+      remoteHost: spec.remoteHost ?? null,
       transientHint: null,
       rightStatus: spec.getRightStatus(),
       queuedCount: 0,
@@ -686,6 +792,7 @@ function createSharedShell(spec: SharedShellContext) {
       idleBanner: spec.getIdleBanner(),
       busy,
       phaseText,
+      remoteHost: spec.remoteHost ?? null,
       transientHint,
       rightStatus: spec.getRightStatus(),
       queuedCount: queuedMessages.length,
@@ -1037,6 +1144,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   shell = createSharedShell({
     mode: "chat",
     client: opts.client,
+    remoteHost: opts.remoteHost ?? null,
     repoRoot: chatSession.repoRoot || opts.repoRoot || process.cwd(),
     projectId: activeProject?.id ?? chatSession.projectId,
     getProject: () => ({
@@ -1112,12 +1220,13 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     },
   });
 
-  // Top session banner
+  // Top session banner (prominently flags `[REMOTE: <host>]` whenever attached to a remote host)
+  const remotePrefix = opts.remoteHost ? `[REMOTE: ${opts.remoteHost}] ` : "";
   const projectLabel = activeProject ? `${activeProject.name} (${chatSession.repoRoot})` : chatSession.repoRoot || opts.repoRoot || "";
   shell.transcript.appendBanner(
-    `pi-harness · ${chatSession.id}${activeProject ? ` · [${activeProject.name}]` : ""}`,
+    `${remotePrefix}pi-harness · ${chatSession.id}${activeProject ? ` · [${activeProject.name}]` : ""}`,
     modelBadge(),
-    `project: ${projectLabel}  ·  Ctrl+P Projects · Ctrl+G Work · Ctrl+O Go · /help`,
+    `project: ${projectLabel}  ·  Ctrl+P Projects · /remotes · Ctrl+G Work · /help`,
   );
 
   // Hydrate ALL paginated chat history cleanly as immutable blocks
@@ -1192,6 +1301,21 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       }
 
       if (activeTurnId && evTurnId && evTurnId !== activeTurnId) return;
+
+      if (ev.type === "session.message_received") {
+        const fromHost = String(p.fromHost ?? "peer");
+        const fromSid = String(p.fromSessionId ?? "?");
+        const fromProj = typeof p.fromProjectName === "string" && p.fromProjectName ? ` [${p.fromProjectName}]` : "";
+        const bodyText = firstLine(String(p.body ?? ""), 100);
+        const tripped = Boolean(p.circuitBreakerTripped);
+        shell.transcript.appendReceipt({
+          tone: tripped ? "warn" : "info",
+          tag: tripped ? "peer-paused" : "peer",
+          text: `${fromHost}:${fromSid}${fromProj}: ${bodyText}${tripped ? " (auto-wakeup paused by hop breaker)" : ""}`,
+        });
+        shell.session.tui.requestRender();
+        return;
+      }
 
       if (ev.type === "chat.delta") {
         const delta = String(p.delta ?? "");
@@ -1369,6 +1493,7 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
   shell = createSharedShell({
     mode: "run",
     client: opts.client,
+    remoteHost: opts.remoteHost ?? null,
     repoRoot,
     sessionId: opts.runId,
     runId: opts.runId,
@@ -1399,10 +1524,11 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
     },
   });
 
+  const runRemotePrefix = opts.remoteHost ? `[REMOTE: ${opts.remoteHost}] ` : "";
   shell.transcript.appendBanner(
-    `Attached Run · ${opts.runId}${opts.initialTaskId ? ` / ${opts.initialTaskId}` : ""}`,
+    `${runRemotePrefix}Attached Run · ${opts.runId}${opts.initialTaskId ? ` / ${opts.initialTaskId}` : ""}`,
     attached.run?.status ?? "active",
-    `Ctrl+G Work · Ctrl+T Runs · Ctrl+O Go · /resume · /stop`,
+    `Ctrl+G Work · Ctrl+T Runs · /remotes · /resume · /stop`,
   );
 
   let liveTaskId: string | null = null;

@@ -1639,21 +1639,25 @@ export class SessionSwitcherScreen implements Screen {
     this.loading = true;
     ctx.requestRender();
     try {
-      const sessions = await this.client.request<AttachableSession[]>("sessions.list");
+      const sessions = await this.client.request<AttachableSession[]>("sessions.list", { includeRemotes: true });
       const list = sessions ?? [];
-      const firstOther = list.find((s) => !(s.attachedByMe || s.id === this.currentId));
+      const firstOther = list.find((s) => !(s.attachedByMe || (s.id === this.currentId && (!s.host || s.host === "local"))));
       this.list.setTableItems(
         list.map((s) => {
-          const isMe = Boolean(s.attachedByMe) || s.id === this.currentId;
+          const isRemote = Boolean(s.host && s.host !== "local");
+          const isMe = !isRemote && (Boolean(s.attachedByMe) || s.id === this.currentId);
           const projLabel = s.projectName || (s.repoRoot ? s.repoRoot.split("/").filter(Boolean).pop() ?? s.repoRoot : "");
           const modelStr = s.model ? `${s.model}${s.effort ? ` (${s.effort})` : ""}` : s.profileId ?? "";
-          const detailParts = [projLabel ? `[${projLabel}]` : "", firstLine(s.title, 22), modelStr].filter(Boolean);
+          const hostPrefix = isRemote ? `[${s.host}]` : "";
+          const detailParts = [hostPrefix, projLabel ? `[${projLabel}]` : "", firstLine(s.title, 20), modelStr].filter(Boolean);
+          const rowId = `${s.host ?? "local"}:${s.kind}:${s.id}`;
           return {
-            id: `${s.kind}:${s.id}`,
+            id: rowId,
             value: s,
-            searchText: `${s.kind} ${s.id} ${s.title} ${s.status} ${s.repoRoot} ${s.model ?? ""}`,
+            searchText: `${s.host ?? "local"} ${s.kind} ${s.id} ${s.title} ${s.status} ${s.repoRoot} ${s.model ?? ""}`,
             cells: (sel, theme) => {
               const star = isMe ? `${theme.ok("★")} ` : "";
+              const hostTag = isRemote ? `${tag(s.host!, "warn", theme)} ` : "";
               const att = isMe
                 ? tag("YOU", "ok", theme)
                 : s.attached
@@ -1661,7 +1665,7 @@ export class SessionSwitcherScreen implements Screen {
                   : "";
               const st = s.running ? statusBadge("running", theme, s.status) : theme.muted(s.status);
               return {
-                session: `${star}${sel ? theme.accentBold(s.id) : theme.bold(s.id)}`,
+                session: `${star}${hostTag}${sel ? theme.accentBold(s.id) : theme.bold(s.id)}`,
                 type: s.kind === "chat" ? theme.info("CHAT") : theme.accent("RUN"),
                 state: att ? `${att} ${st}` : st,
                 detail: theme.muted(detailParts.join(" · ")),
@@ -1669,7 +1673,7 @@ export class SessionSwitcherScreen implements Screen {
             },
           };
         }),
-        firstOther ? `${firstOther.kind}:${firstOther.id}` : undefined,
+        firstOther ? `${firstOther.host ?? "local"}:${firstOther.kind}:${firstOther.id}` : undefined,
       );
     } catch (err) {
       this.frame.setNotice(err instanceof Error ? err.message : String(err), "danger");

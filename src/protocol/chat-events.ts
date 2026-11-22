@@ -272,12 +272,12 @@ export function formatChatEventForModel(event: ChatControlEvent): string {
     case "session.message_received": {
       const replyTarget = `${event.fromHost}:${event.fromSessionId}`;
       return [
-        `Peer message (${event.messageId}) from ${replyTarget}${event.fromProjectName ? ` [${event.fromProjectName}]` : ""}:`,
+        `Peer message (messageId=${event.messageId} | hop=${event.hopCount}) from ${replyTarget}${event.fromProjectName ? ` [${event.fromProjectName}]` : ""}:`,
         event.body,
         "",
         event.expectReply === false
           ? "The sender marked this as informational (no reply needed). Update the user or act on the information; do NOT send an acknowledgment reply."
-          : `Act on the message and reply via \`session_send({ target: "${replyTarget}", message: "..." })\` ONLY when a substantive answer, result, or follow-up is needed — never send pure acknowledgment loops.`,
+          : `Act on the message and reply via \`session_send({ target: "${replyTarget}", reply_to_id: "${event.messageId}", message: "...", expect_reply: false })\` ONLY when a substantive answer, result, or follow-up is needed — never send pure acknowledgment loops.`,
       ].join("\n");
     }
     default:

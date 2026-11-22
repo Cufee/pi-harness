@@ -1,14 +1,42 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "bun:test";
+import type { Terminal } from "@earendil-works/pi-tui";
+import { Database } from "bun:sqlite";
+import { parseArgs } from "../src/cli.js";
 import { loadConfig } from "../src/config.js";
 import type { CustomRunnerFactory } from "../src/control-plane/orchestrator.js";
-import type { RemoteHostStatus } from "../src/daemon/peer.js";
+import { SessionMessageStore } from "../src/control-plane/session-messages.js";
+import { parseValidatedSshTarget, type RemoteHostStatus } from "../src/daemon/peer.js";
 import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon, MAX_PEER_MESSAGE_HOPS } from "../src/daemon/server.js";
 import type { RunAgentRequest } from "../src/runners/types.js";
+import { createTheme, FixedDock, ModalScreen, Navigator, stripTerminalSequences, visibleWidth } from "../src/tui/core/index.js";
+import { ProjectsScreen } from "../src/tui/projects.js";
+import { RemotesScreen } from "../src/tui/remotes.js";
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
+
+function makeFakeTerminal(): Terminal {
+  return {
+    columns: 100,
+    rows: 30,
+    kittyProtocolActive: false,
+    start() {},
+    stop() {},
+    async drainInput() {},
+    write() {},
+    moveBy() {},
+    hideCursor() {},
+    showCursor() {},
+    clearLine() {},
+    clearFromCursor() {},
+    clearScreen() {},
+    setTitle() {},
+    setProgress() {},
+    setProgramStatus() {},
+  };
+}
 
 async function waitFor(pred: () => boolean | Promise<boolean>, timeoutMs = 4_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -219,6 +247,68 @@ describe("Symmetric PeerLink, Federated Projects/Sessions & Two-Way Messaging", 
       });
       assert.equal(tripped.woke, false);
       assert.equal(tripped.circuitBreakerTripped, true);
+
+      // 8. Security: peer.proxy rejects non-allowlisted ops, unknown host fails fast
+      await assert.rejects(
+        () => laptopClient.request("peer.proxy", { host: "gpu-box", op: "config.update", params: {} }),
+        /cannot be proxied/i,
+      );
+      await assert.rejects(
+        () => laptopClient.request("session.send_message", { fromSessionId: lapChatA.session.id, target: "nonexistent-host:chat-1", body: "hi" }),
+        /Unknown remote host/i,
+      );
+
+      // 9. TUI RemotesScreen, federated ProjectsScreen (HOST column), and FixedDock `[REMOTE: gpu-box]` indicator
+      const theme = createTheme();
+      const term = makeFakeTerminal();
+      const tui = new ModalScreen(term);
+      const nav = new Navigator(tui, term, theme);
+
+      const remScreen = new RemotesScreen(laptopClient, { currentHost: "local" });
+      nav.push(remScreen);
+      await new Promise((r) => setTimeout(r, 80));
+      const remLines = remScreen.render(100, 20, theme);
+      const remPlain = remLines.map((l) => stripTerminalSequences(l)).join("\n");
+      assert.ok(remPlain.includes("local"), "RemotesScreen shows local row");
+      assert.ok(remPlain.includes("gpu-box"), "RemotesScreen shows gpu-box row");
+      assert.ok(remPlain.includes("ONLINE"), "RemotesScreen shows ONLINE badge");
+      for (const l of remLines) assert.ok(visibleWidth(l) <= 100, `RemotesScreen line overflow: ${visibleWidth(l)}`);
+      nav.pop();
+
+      const projScreen = new ProjectsScreen(laptopClient, {
+        currentHost: "local",
+        onOpenProject: () => {},
+      });
+      nav.push(projScreen);
+      await new Promise((r) => setTimeout(r, 80));
+      const projLines = projScreen.render(100, 20, theme);
+      const projPlain = projLines.map((l) => stripTerminalSequences(l)).join("\n");
+      assert.ok(projPlain.includes("HOST"), "ProjectsScreen shows HOST column");
+      assert.ok(projPlain.includes("web-ui") && projPlain.includes("ml-trainer"), "ProjectsScreen shows both local and remote projects");
+      assert.ok(projPlain.includes("gpu-box"), "ProjectsScreen displays remote host name");
+      for (const l of projLines) assert.ok(visibleWidth(l) <= 100, `ProjectsScreen line overflow: ${visibleWidth(l)}`);
+      nav.pop();
+
+      const dock = new FixedDock(tui, theme, {
+        onSubmit: () => {},
+        initialState: {
+          slots: [],
+          idleBanner: "Idle",
+          busy: false,
+          phaseText: "Ready",
+          remoteHost: null,
+          rightStatus: "claude-opus-5-5",
+          queuedCount: 0,
+          hints: [{ key: "Ctrl+P", label: "projects" }],
+        },
+      });
+      const localDockLines = dock.render(100);
+      dock.update({ remoteHost: "gpu-box" });
+      const remoteDockLines = dock.render(100);
+      assert.equal(localDockLines.length, remoteDockLines.length, "Remote badge must preserve constant dock height");
+      const remoteDockPlain = remoteDockLines.map((l) => stripTerminalSequences(l)).join("\n");
+      assert.ok(remoteDockPlain.includes("[REMOTE: gpu-box]"), "Dock renders prominent [REMOTE: gpu-box] badge");
+      for (const l of remoteDockLines) assert.ok(visibleWidth(l) <= 100, `Dock line overflow: ${visibleWidth(l)}`);
     } finally {
       laptopClient.close();
       gpuClient.close();
@@ -226,5 +316,78 @@ describe("Symmetric PeerLink, Federated Projects/Sessions & Two-Way Messaging", 
       await gpu.stop();
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("enforces SSH target validation, repo-config remote isolation, node-pinned outbox, session history isolation, and CLI short flags (-p/-h)", () => {
+    // 1. CLI short flags (-p, -h)
+    const parsed1 = parseArgs(["-p", "vanolyze"]);
+    assert.deepEqual(parsed1.positional, []);
+    assert.equal(parsed1.flags.p, "vanolyze");
+
+    const parsed2 = parseArgs(["-h", "projects"]);
+    assert.equal(parsed2.flags.h, true);
+    assert.deepEqual(parsed2.positional, ["projects"]);
+
+    const parsed3 = parseArgs(["chat", "send", "gpu-box:chat-4", "run", "eval", "--no-reply"]);
+    assert.deepEqual(parsed3.positional, ["chat", "send", "gpu-box:chat-4", "run", "eval"]);
+    assert.equal(parsed3.flags["no-reply"], true);
+
+    // 2. SSH option injection rejected
+    assert.throws(() => parseValidatedSshTarget("ssh://-oProxyCommand=id@host"), /Invalid SSH/i);
+    assert.throws(() => parseValidatedSshTarget("ssh://user@-evilhost"), /Invalid SSH/i);
+    assert.deepEqual(parseValidatedSshTarget("ssh://vlad@gpu-box:2222"), {
+      host: "vlad@gpu-box",
+      port: "2222",
+      remoteCmd: "pi-harness bridge",
+    });
+
+    // 3. Repo `.pi-harness.json` MUST NOT inject `remotes`
+    const repoDir = realpathSync(mkdtempSync("/tmp/pi-repo-sec-"));
+    try {
+      writeFileSync(
+        join(repoDir, ".pi-harness.json"),
+        JSON.stringify({ remotes: [{ name: "evil", sshTarget: "ssh://attacker@evil" }] }),
+        "utf8",
+      );
+      const cfg = loadConfig(repoDir);
+      assert.ok(!cfg.remotes?.some((r) => r.name === "evil"), "Repo config must never inject remote hosts");
+    } finally {
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+
+    // 4. SessionMessageStore: pinned `toNode` isolation + local/remote same-ID history isolation
+    const db = new Database(":memory:");
+    const store = new SessionMessageStore(db);
+    store.enqueueOutbound({
+      fromNode: "node-local",
+      fromHost: "laptop",
+      fromSessionId: "chat-1",
+      toNode: "node-A",
+      toHost: "gpu-box",
+      toSessionId: "chat-1",
+      body: "secret-for-node-A",
+    });
+    // A different node (node-B) claiming the same hostname "gpu-box" MUST NOT receive rows pinned to node-A!
+    const forWrongNode = store.listQueuedOutboundForPeer({ alias: "gpu-box", hostName: "gpu-box", nodeId: "node-B" });
+    assert.equal(forWrongNode.length, 0);
+    const forRightNode = store.listQueuedOutboundForPeer({ alias: "gpu-box", hostName: "gpu-box", nodeId: "node-A" });
+    assert.equal(forRightNode.length, 1);
+
+    // Inbound message from remote `chat-1` addressed to local `chat-2` MUST NOT appear in local `chat-1`'s history!
+    store.recordInbound({
+      id: "smsg-remote-1",
+      fromNode: "node-A",
+      fromHost: "gpu-box",
+      fromSessionId: "chat-1",
+      toNode: "node-local",
+      toHost: "laptop",
+      toSessionId: "chat-2",
+      body: "addressed-to-local-chat-2",
+    });
+    const localChat1History = store.listForSession("chat-1");
+    assert.ok(!localChat1History.some((m) => m.body === "addressed-to-local-chat-2"));
+    const localChat2History = store.listForSession("chat-2");
+    assert.ok(localChat2History.some((m) => m.body === "addressed-to-local-chat-2"));
+    db.close();
   });
 });

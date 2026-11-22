@@ -12,7 +12,9 @@ export interface CommandSpec {
 }
 
 export const COMMAND_SPECS: CommandSpec[] = [
-  { name: "projects", aliases: ["project", "proj"], usage: "/projects [name|add <path>|switch <name>]", description: "Manage, create, browse, or switch projects (Ctrl+P)", modes: ["chat", "run"] },
+  { name: "projects", aliases: ["project", "proj"], usage: "/projects [name|add <path>|switch <name>]", description: "Manage, create, browse, or switch local & remote projects (Ctrl+P)", modes: ["chat", "run"] },
+  { name: "remotes", aliases: ["remote", "hosts"], usage: "/remotes [add <name> <ssh> | connect <name>]", description: "Manage remote SSH peer hosts and switch active host", modes: ["chat", "run"] },
+  { name: "send", usage: "/send <host:chat|chat-id> <message>", description: "Send a peer message to any local or remote session (wakes recipient)", modes: ["chat"] },
   { name: "work", usage: "/work [tab]", description: "Open Work Navigator (Ctrl+G) — Inbox, Goals, Runs, Escalations, Timers, Worktrees", modes: ["chat", "run"] },
   { name: "inbox", usage: "/inbox", description: "Jump straight to Inbox (open escalations, awaiting_human goals, blockers)", modes: ["chat", "run"] },
   { name: "escalations", aliases: ["esc"], usage: "/escalations", description: "Open Escalations tab to inspect, acknowledge, or resolve escalations", modes: ["chat", "run"] },

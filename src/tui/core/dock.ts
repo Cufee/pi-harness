@@ -316,6 +316,8 @@ export interface DockState {
   /** Row 2: left phase/action + spinner; right model/quota/queue summary. */
   busy: boolean;
   phaseText: string;
+  /** Non-null when attached to a remote host — renders a prominent `[REMOTE: <host>]` badge on the status bar. */
+  remoteHost?: string | null;
   /** Optional transient Ctrl+C or double-Esc confirmation hint shown in status row without changing height. */
   transientHint?: string | null;
   rightStatus: string;
@@ -461,8 +463,11 @@ export class FixedDock implements Component {
   private renderStatusRow(width: number): string {
     const t = this.theme;
     const g = t.glyphs;
+    const remoteBadge = this.state.remoteHost
+      ? `${t.warn(`[REMOTE: ${sanitizeLine(this.state.remoteHost)}]`)} `
+      : "";
     if (this.state.transientHint) {
-      const left = ` ${t.warn(g.warn)} ${t.warn(sanitizeLine(this.state.transientHint))}`;
+      const left = ` ${remoteBadge}${t.warn(g.warn)} ${t.warn(sanitizeLine(this.state.transientHint))}`;
       const right = this.state.rightStatus ? `${t.muted(this.state.rightStatus)} ` : "";
       return fillLineBg(splitRow(left, right, width), width, t.statusBg);
     }
@@ -470,7 +475,7 @@ export class FixedDock implements Component {
       ? t.accentBold(SPINNER_FRAMES[this.spinnerIdx]!)
       : t.ok(g.check);
     const q = this.state.queuedCount > 0 ? `  ${t.warn(`+${this.state.queuedCount} queued`)}` : "";
-    const left = ` ${spin} ${sanitizeLine(this.state.phaseText)}${q}`;
+    const left = ` ${remoteBadge}${spin} ${sanitizeLine(this.state.phaseText)}${q}`;
     const right = this.state.rightStatus ? `${t.muted(this.state.rightStatus)} ` : "";
     return fillLineBg(splitRow(left, right, width), width, t.statusBg);
   }

@@ -17,11 +17,14 @@ import {
 
 const PROJECT_COLUMNS: ColumnSpec[] = [
   { key: "cur", header: " ", width: 2, priority: 0 },
-  { key: "name", header: "PROJECT", width: 20, priority: 0 },
-  { key: "git", header: "WORKSPACE", width: 16, priority: 1 },
-  { key: "path", header: "PATH", minWidth: 16, priority: 0 },
-  { key: "counts", header: "ACTIVITY", width: 18, align: "right", priority: 2 },
+  { key: "host", header: "HOST", width: 12, priority: 0 },
+  { key: "name", header: "PROJECT", width: 18, priority: 0 },
+  { key: "git", header: "WORKSPACE", width: 15, priority: 1 },
+  { key: "path", header: "PATH", minWidth: 14, priority: 0 },
+  { key: "counts", header: "ACTIVITY", width: 14, align: "right", priority: 2 },
 ];
+
+export type FederatedProjectSummary = ProjectSummary & { host?: string };
 
 const BROWSE_COLUMNS: ColumnSpec[] = [
   { key: "kind", header: "TYPE", width: 6, priority: 1 },
@@ -213,21 +216,23 @@ export class ProjectsScreen implements Screen {
   readonly title = "Projects";
   private readonly frame = new Frame();
   private nav: Navigator | null = null;
-  private readonly list = new TableListView<ProjectSummary>({
+  private readonly list = new TableListView<FederatedProjectSummary>({
     columns: PROJECT_COLUMNS,
     emptyText: "No projects registered yet. Press 'n' to add/create a project or 'b' to browse folders.",
   });
-  private projects: ProjectSummary[] = [];
+  private projects: FederatedProjectSummary[] = [];
   private loading = true;
 
   constructor(
     private readonly client: DaemonClient,
     private readonly opts: {
+      currentHost?: string | null;
       currentProjectId?: string | null;
       currentRepoRoot?: string | null;
       canSwitchCurrentSession?: boolean;
-      onOpenProject: (project: ProjectRecord) => void | Promise<void>;
-      onSwitchCurrentSession?: (project: ProjectRecord) => void | Promise<void>;
+      onOpenProject: (project: FederatedProjectSummary) => void | Promise<void>;
+      onSwitchCurrentSession?: (project: FederatedProjectSummary) => void | Promise<void>;
+      onOpenRemotes?: () => void;
     },
   ) {}
 
@@ -240,7 +245,7 @@ export class ProjectsScreen implements Screen {
     this.loading = true;
     ctx.requestRender();
     try {
-      this.projects = await this.client.request<ProjectSummary[]>("project.list");
+      this.projects = await this.client.request<FederatedProjectSummary[]>("project.list", { includeRemotes: true });
       this.rebuild(selectId);
     } catch (err) {
       this.frame.setNotice(err instanceof Error ? err.message : String(err), "danger");
@@ -250,55 +255,65 @@ export class ProjectsScreen implements Screen {
     }
   }
 
-  private isCurrent(p: ProjectSummary): boolean {
+  private isCurrent(p: FederatedProjectSummary): boolean {
+    if (p.host && p.host !== "local") return false;
     if (this.opts.currentProjectId && p.id === this.opts.currentProjectId) return true;
     if (this.opts.currentRepoRoot && p.rootPath === this.opts.currentRepoRoot) return true;
     return false;
   }
 
   private rebuild(selectId?: string): void {
+    const currentHostLabel = this.opts.currentHost?.trim() || "local";
     this.list.setTableItems(
       this.projects.map((p) => {
         const cur = this.isCurrent(p);
+        const isRemoteRow = p.host != null && p.host !== "local";
+        const hostName = isRemoteRow ? p.host! : currentHostLabel;
         const wsLabel = !p.exists
           ? "missing"
           : p.isGit
             ? `git:${p.gitBranch ?? "HEAD"}`
             : "folder";
         const activity = `${p.sessionCount}ch · ${p.activeGoalCount}g`;
+        const rowId = `${p.host ?? "local"}:${p.id}`;
         return {
-          id: p.id,
+          id: rowId,
           value: p,
-          searchText: `${p.id} ${p.name} ${p.rootPath} ${p.gitBranch ?? ""} ${p.description ?? ""}`,
+          searchText: `${hostName} ${p.id} ${p.name} ${p.rootPath} ${p.gitBranch ?? ""} ${p.description ?? ""}`,
           cells: (sel, theme) => ({
             cur: cur ? theme.ok(theme.glyphs.ascii ? "*" : "★") : "",
+            host: isRemoteRow || currentHostLabel !== "local"
+              ? theme.warn(sanitizeLine(hostName))
+              : theme.muted("local"),
             name: sel ? theme.accentBold(sanitizeLine(p.name)) : cur ? theme.ok(sanitizeLine(p.name)) : theme.bold(sanitizeLine(p.name)),
             git: !p.exists ? theme.danger(wsLabel) : p.isGit ? theme.info(wsLabel) : theme.muted(wsLabel),
-            path: sel ? theme.text(middleEllipsis(p.rootPath, 42)) : theme.muted(middleEllipsis(p.rootPath, 42)),
+            path: sel ? theme.text(middleEllipsis(p.rootPath, 38)) : theme.muted(middleEllipsis(p.rootPath, 38)),
             counts: p.activeGoalCount > 0 ? theme.accent(activity) : theme.muted(activity),
           }),
         };
       }),
-      selectId,
+      selectId ? (selectId.includes(":") ? selectId : `local:${selectId}`) : undefined,
     );
   }
 
   render(width: number, maxHeight: number, theme: Theme): string[] {
     const hints: Hint[] = [
       { key: "Enter", label: "open" },
-      ...(this.opts.canSwitchCurrentSession ? [{ key: "s", label: "switch session here" }] : []),
-      { key: "n", label: "new/add" },
+      ...(this.opts.canSwitchCurrentSession ? [{ key: "s", label: "switch here" }] : []),
+      { key: "n", label: "new" },
       { key: "g", label: "git init" },
       { key: "c", label: "clone" },
       { key: "b", label: "browse" },
+      ...(this.opts.onOpenRemotes ? [{ key: "m", label: "remotes" }] : []),
       { key: "x", label: "remove" },
       { key: "/", label: "filter" },
       { key: "Esc", label: "close" },
     ];
     const sel = this.list.selectedItem()?.value;
+    const hostDisplay = sel?.host && sel.host !== "local" ? sel.host : this.opts.currentHost || "local";
     const sub = sel
-      ? `${sel.id} · ${sel.rootPath}${sel.description ? ` · ${sanitizeLine(sel.description)}` : ""}`
-      : "Paths resolve on the daemon host (~ expands remotely over SSH)";
+      ? `[${hostDisplay}] ${sel.id} · ${sel.rootPath}${sel.description ? ` · ${sanitizeLine(sel.description)}` : ""}`
+      : "Paths resolve on the target host (~ expands remotely over SSH)";
 
     return this.frame.render({
       width,
@@ -423,9 +438,19 @@ export class ProjectsScreen implements Screen {
       return;
     }
 
+    if (data === "m" && this.opts.onOpenRemotes) {
+      this.opts.onOpenRemotes();
+      return;
+    }
+
     if (data === "s" && this.opts.canSwitchCurrentSession && this.opts.onSwitchCurrentSession) {
       const sel = this.list.selectedItem()?.value;
       if (!sel) return;
+      if (sel.host && sel.host !== "local") {
+        this.frame.setNotice(`"${sel.name}" lives on remote host "${sel.host}" — press Enter to open it on ${sel.host}`, "warn");
+        ctx.requestRender();
+        return;
+      }
       ctx.navigator.closeAll();
       void Promise.resolve(this.opts.onSwitchCurrentSession(sel)).catch(() => {});
       return;
@@ -434,10 +459,14 @@ export class ProjectsScreen implements Screen {
     if (data === "x") {
       const sel = this.list.selectedItem()?.value;
       if (!sel) return;
+      const hostSuffix = sel.host && sel.host !== "local" ? ` on ${sel.host}` : "";
       this.frame.askConfirm({
-        message: `Unregister project "${sel.name}"? (Files at ${sel.rootPath} will NOT be deleted)`,
+        message: `Unregister project "${sel.name}"${hostSuffix}? (Files at ${sel.rootPath} will NOT be deleted)`,
         onConfirm: async () => {
-          await this.client.request("project.remove", { projectId: sel.id });
+          await this.client.request("project.remove", {
+            projectId: sel.id,
+            ...(sel.host && sel.host !== "local" ? { host: sel.host } : {}),
+          });
           this.frame.setNotice(`Removed project ${sel.name}`, "warn");
           await this.load(ctx);
         },

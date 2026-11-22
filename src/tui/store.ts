@@ -16,6 +16,8 @@ import type { AttentionSlot, TuiEntityRef as EntityRef } from "./core/index.js";
 
 export interface AttachableSession {
   id: string;
+  host?: string;
+  address?: string;
   kind: "chat" | "run";
   title: string;
   projectId?: string | null;

@@ -5,29 +5,45 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ProjectBrowseResult, ProjectSummary } from "./control-plane/projects.js";
 import { loadConfig, type AcpProfileConfig } from "./config.js";
+import type { RemoteHostStatus } from "./daemon/peer.js";
 import { DaemonClient, runStdioSocketBridge } from "./daemon/remote.js";
 import { currentDaemonBuildId, DAEMON_PROTOCOL_REV, HarnessDaemon } from "./daemon/server.js";
 import { runDirectorChatTui, runNativeScrollbackTui, type TuiExitAction } from "./tui/app.js";
 import { parseDurationMs } from "./tui/core/index.js";
 import type { AttachableSession } from "./tui/store.js";
 
-function parseArgs(argv: string[]): { positional: string[]; flags: Record<string, string | boolean> } {
+const BOOLEAN_SHORT_FLAGS = new Set(["h"]);
+
+export function parseArgs(argv: string[]): { positional: string[]; flags: Record<string, string | boolean> } {
   const positional: string[] = [];
   const flags: Record<string, string | boolean> = {};
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
-    if (arg.startsWith("--")) {
+    if (arg === "--") {
+      positional.push(...argv.slice(i + 1));
+      break;
+    }
+    if (arg.startsWith("--") && arg.length > 2) {
       const eq = arg.indexOf("=");
       if (eq !== -1) {
         flags[arg.slice(2, eq)] = arg.slice(eq + 1);
       } else {
         const next = argv[i + 1];
-        if (next && !next.startsWith("--")) {
+        if (next && !next.startsWith("-")) {
           flags[arg.slice(2)] = next;
           i++;
         } else {
           flags[arg.slice(2)] = true;
         }
+      }
+    } else if (/^-[A-Za-z]$/.test(arg)) {
+      const key = arg.slice(1);
+      const next = argv[i + 1];
+      if (!BOOLEAN_SHORT_FLAGS.has(key) && next && !next.startsWith("-")) {
+        flags[key] = next;
+        i++;
+      } else {
+        flags[key] = true;
       }
     } else {
       positional.push(arg);
@@ -75,6 +91,12 @@ async function ensureLocalDaemon(socketPath: string): Promise<DaemonClient> {
     if (info.protocolRev === DAEMON_PROTOCOL_REV && info.buildId === expectedBuildId) {
       // Reuse the live socket directly — avoids a redundant connect/close handshake on every TUI launch!
       return probe;
+    }
+    if (info.protocolRev !== DAEMON_PROTOCOL_REV && info.running) {
+      probe.close();
+      throw new Error(
+        `Live harnessd (pid ${info.pid ?? "?"}, protocol rev ${info.protocolRev ?? "?"}) has active work (${info.liveWork ?? "active"}) and will not be stopped automatically for protocol rev ${DAEMON_PROTOCOL_REV}. Wait for work to finish or run \`pi-harness daemon restart\` explicitly.`,
+      );
     }
     if (info.protocolRev === DAEMON_PROTOCOL_REV && info.running) {
       // Never kill an active daemon with running agents/timers just because source file mtime changed
@@ -128,11 +150,37 @@ async function ensureLocalDaemon(socketPath: string): Promise<DaemonClient> {
   throw new Error(`Timed out waiting for harnessd to listen on ${socketPath}`);
 }
 
-async function connectClient(configSocketPath: string, remote?: string): Promise<DaemonClient> {
-  if (!remote) {
+function resolveRemoteSpec(
+  rawRemote: string | undefined,
+  remotes: ReadonlyArray<{ name: string; sshTarget: string }> | undefined,
+): { target?: string; hostLabel: string | null } {
+  if (!rawRemote || rawRemote.trim().toLowerCase() === "local") {
+    return { target: undefined, hostLabel: null };
+  }
+  const trimmed = rawRemote.trim();
+  const saved = remotes?.find((r) => r.name.toLowerCase() === trimmed.toLowerCase());
+  if (saved) {
+    return { target: saved.sshTarget, hostLabel: saved.name };
+  }
+  if (trimmed.startsWith("ssh://")) {
+    try {
+      const u = new URL(trimmed);
+      return { target: trimmed, hostLabel: u.hostname || trimmed };
+    } catch {
+      return { target: trimmed, hostLabel: trimmed };
+    }
+  }
+  if (trimmed.startsWith("/") || trimmed.startsWith("./")) {
+    return { target: trimmed, hostLabel: trimmed };
+  }
+  return { target: `ssh://${trimmed}`, hostLabel: trimmed.includes("@") ? trimmed.split("@")[1]! : trimmed };
+}
+
+async function connectClient(configSocketPath: string, remoteTarget?: string): Promise<DaemonClient> {
+  if (!remoteTarget) {
     return await ensureLocalDaemon(configSocketPath);
   }
-  const client = new DaemonClient(remote);
+  const client = new DaemonClient(remoteTarget);
   await client.connect();
   return client;
 }
@@ -141,78 +189,116 @@ function printHelp(): void {
   console.log(`pi-harness — CLI-first, daemonized interactive Director + 3-tier multi-agent coding harness
 
 Usage:
-  pi-harness [-p <project>] [--remote ssh://host]   Resume last session for project/workspace (remote uses last remote project)
-  pi-harness projects [--json]                      List registered projects on local or remote daemon
-  pi-harness project list [--json]                  List registered projects
-  pi-harness project add <path> [--name n] [--init] [--clone <url>]
-                                                    Register or create a project folder/repo on the daemon host (~ expands remotely)
-  pi-harness project use <name|id|path>             Open Director Chat bound to a project
-  pi-harness project rm <name|id>                   Unregister a project (never deletes files on disk)
-  pi-harness project browse [path]                  Browse directories on the daemon host (useful over SSH)
+  pi-harness [-p <project>] [--remote <alias|ssh://host>]
+                                                    Resume last session for project/workspace (remote uses last remote project)
+  pi-harness remotes | remote [list | add <name> <ssh> | rm <name> | connect <name> | disconnect <name>]
+                                                    Manage remote SSH peer hosts
+  pi-harness projects [--host <name>] [--json]      List local & connected remote projects
+  pi-harness project list [--host <name>] [--json]  List registered projects
+  pi-harness project add <path> [--name n] [--host <name>] [--init] [--clone <url>]
+                                                    Register or create a project folder/repo (~ expands on target host)
+  pi-harness project use <name|id|path> [--host <name>]
+                                                    Open Director Chat bound to a project
+  pi-harness project rm <name|id> [--host <name>]   Unregister a project (never deletes files on disk)
+  pi-harness project browse [path] [--host <name>]  Browse directories on local or remote host
   pi-harness attach [session-or-run-id]             Attach to & take over last active session (or specific chat-/run- ID)
-  pi-harness sessions [--json]                      List all Director Chat & autonomous run sessions
-  pi-harness chat [-p <project>] [--remote ssh://host]
+  pi-harness sessions [--host <name>] [--json]      List local & connected remote Director Chat & run sessions
+  pi-harness chat [-p <project>] [--remote <alias|ssh://host>]
+  pi-harness chat send <target> "<message>" [--from <chat-id>] [--no-reply]
+                                                    Send a message to any local (chat-1) or remote (gpu-box:chat-4) chat
   pi-harness goals [list | review <id> | pause <id> | cancel <id>]
   pi-harness profiles [list | add <id> <cmd> [args...] | remove <id> | probe <id>]
-  pi-harness daemon serve | status | stop | restart
-  pi-harness run "<goal>" [-p <project>] [--profile id] [--model id] [--effort level] [--detach] [--remote ssh://host]
-  pi-harness runs [--remote ssh://host]
-  pi-harness tree <run-id> [--remote ssh://host]
-  pi-harness steer <task-id> "<message>" [--remote ssh://host]
-  pi-harness resume <run-id> [--in 15m] [--message "<msg>"] [--remote ssh://host]
-  pi-harness stop <run-id> [--remote ssh://host]
-  pi-harness models [list | sync] [--role name] [--remote ssh://host]
-  pi-harness quota [show | sync] [--remote ssh://host]
-  pi-harness worktrees [list | clean [--all]] [--remote ssh://host]
+  pi-harness daemon serve | status | stop | restart [--remote <alias|ssh://host>]
+  pi-harness run "<goal>" [-p <project>] [--profile id] [--model id] [--effort level] [--detach] [--remote <alias|ssh://host>]
+  pi-harness runs [--json] [--remote <alias|ssh://host>]
+  pi-harness tree <run-id> [--remote <alias|ssh://host>]
+  pi-harness steer <task-id> "<message>" [--remote <alias|ssh://host>]
+  pi-harness resume <run-id> [--in 15m] [--message "<msg>"] [--remote <alias|ssh://host>]
+  pi-harness stop <run-id> [--remote <alias|ssh://host>]
+  pi-harness models [list | sync] [--role name] [--remote <alias|ssh://host>]
+  pi-harness quota [show | sync] [--remote <alias|ssh://host>]
+  pi-harness worktrees [list | clean [--all]] [--remote <alias|ssh://host>]
   pi-harness bridge                                 (stdio <-> local Unix socket bridge for remote SSH attach)
 `);
 }
 
 async function runInteractiveSessionLoop(
-  client: DaemonClient,
+  initialClient: DaemonClient,
   initial:
     | { kind: "chat"; repoRoot?: string; projectId?: string; chatSessionId?: string; preferLastGlobal?: boolean; preferLastProject?: boolean }
     | { kind: "run"; repoRoot?: string; runId: string; initialTaskId?: string | null },
+  hostCtx: {
+    localSocketPath: string;
+    remoteHost: string | null;
+    getRemotes: () => ReadonlyArray<{ name: string; sshTarget: string }> | undefined;
+  },
 ): Promise<void> {
+  let client = initialClient;
   let current = initial;
-  while (true) {
-    let action: TuiExitAction;
-    if (current.kind === "chat") {
-      action = await runDirectorChatTui({
-        client,
-        repoRoot: current.repoRoot,
-        projectId: current.projectId,
-        chatSessionId: current.chatSessionId,
-        preferLastGlobal: current.preferLastGlobal,
-        preferLastProject: current.preferLastProject,
-      });
-    } else {
-      action = await runNativeScrollbackTui({
-        client,
-        runId: current.runId,
-        initialTaskId: current.initialTaskId,
-      });
+  let currentRemoteHost = hostCtx.remoteHost;
+
+  try {
+    while (true) {
+      let action: TuiExitAction;
+      if (current.kind === "chat") {
+        action = await runDirectorChatTui({
+          client,
+          remoteHost: currentRemoteHost,
+          repoRoot: current.repoRoot,
+          projectId: current.projectId,
+          chatSessionId: current.chatSessionId,
+          preferLastGlobal: current.preferLastGlobal,
+          preferLastProject: current.preferLastProject,
+        });
+      } else {
+        action = await runNativeScrollbackTui({
+          client,
+          remoteHost: currentRemoteHost,
+          runId: current.runId,
+          initialTaskId: current.initialTaskId,
+        });
+      }
+      if (action.kind === "exit") return;
+
+      // Handle cross-host switch (local <-> remote peer host) seamlessly!
+      if (action.targetHost) {
+        const nextSpec = resolveRemoteSpec(action.targetHost, hostCtx.getRemotes());
+        if (nextSpec.hostLabel !== currentRemoteHost) {
+          client.close();
+          client = await connectClient(hostCtx.localSocketPath, nextSpec.target);
+          currentRemoteHost = nextSpec.hostLabel;
+        }
+      }
+
+      if (action.targetKind === "run") {
+        current = { kind: "run", repoRoot: action.repoRoot ?? current.repoRoot, runId: action.targetId, initialTaskId: action.taskId };
+      } else if (action.targetId === "__host__") {
+        current = { kind: "chat", preferLastProject: Boolean(currentRemoteHost), preferLastGlobal: !currentRemoteHost };
+      } else if (action.targetId === "__project__" && action.projectId) {
+        current = { kind: "chat", projectId: action.projectId, repoRoot: action.repoRoot };
+      } else if (action.targetId === "__new__") {
+        const created = await client.request<{ session: { id: string; repoRoot: string; projectId?: string | null } }>("chat.create", {
+          ...(current.kind === "chat" && current.projectId ? { projectId: current.projectId } : {}),
+          ...(current.repoRoot ? { repoRoot: current.repoRoot } : {}),
+          ...(action.title ? { title: action.title } : {}),
+        });
+        current = {
+          kind: "chat",
+          repoRoot: created.session.repoRoot,
+          projectId: created.session.projectId ?? undefined,
+          chatSessionId: created.session.id,
+        };
+      } else {
+        current = {
+          kind: "chat",
+          repoRoot: action.repoRoot ?? current.repoRoot,
+          projectId: action.projectId,
+          chatSessionId: action.targetId,
+        };
+      }
     }
-    if (action.kind === "exit") return;
-    if (action.targetKind === "run") {
-      current = { kind: "run", repoRoot: current.repoRoot, runId: action.targetId, initialTaskId: action.taskId };
-    } else if (action.targetId === "__project__" && action.projectId) {
-      current = { kind: "chat", projectId: action.projectId, repoRoot: action.repoRoot };
-    } else if (action.targetId === "__new__") {
-      const created = await client.request<{ session: { id: string; repoRoot: string; projectId?: string | null } }>("chat.create", {
-        ...(current.kind === "chat" && current.projectId ? { projectId: current.projectId } : {}),
-        ...(current.repoRoot ? { repoRoot: current.repoRoot } : {}),
-        ...(action.title ? { title: action.title } : {}),
-      });
-      current = {
-        kind: "chat",
-        repoRoot: created.session.repoRoot,
-        projectId: created.session.projectId ?? undefined,
-        chatSessionId: created.session.id,
-      };
-    } else {
-      current = { kind: "chat", repoRoot: current.repoRoot, chatSessionId: action.targetId };
-    }
+  } finally {
+    client.close();
   }
 }
 
@@ -224,7 +310,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  const remote = typeof flags.remote === "string" ? flags.remote : undefined;
+  const rawRemote = typeof flags.remote === "string" ? flags.remote : undefined;
+  const hostFlag = typeof flags.host === "string" ? flags.host : undefined;
   const projectFlag =
     typeof flags.project === "string"
       ? flags.project
@@ -240,6 +327,35 @@ async function main(): Promise<void> {
     repoRoot = resolve(rawRepoRoot);
   }
   const config = loadConfig(repoRoot);
+  const remoteSpec = resolveRemoteSpec(rawRemote, config.remotes);
+  const hostCtx = {
+    localSocketPath: config.socketPath,
+    remoteHost: remoteSpec.hostLabel,
+    getRemotes: () => loadConfig(repoRoot).remotes,
+  };
+
+  // `pi-harness chat send <target> "<message>"` — non-interactive cross-session / remote message delivery
+  if (cmd === "chat" && positional[1] === "send") {
+    const target = positional[2];
+    const body = positional.slice(3).join(" ").trim();
+    if (!target || !body) {
+      throw new Error('Usage: pi-harness chat send <chat-id|host:chat-id> "<message>" [--from <chat-id>] [--no-reply]');
+    }
+    const client = await connectClient(config.socketPath, remoteSpec.target);
+    try {
+      const fromSessionId = typeof flags.from === "string" && flags.from.trim() ? flags.from.trim() : "cli";
+      const res = await client.request("session.send_message", {
+        fromSessionId,
+        target,
+        body,
+        expectReply: !flags["no-reply"],
+      });
+      console.log(JSON.stringify(res, null, 2));
+    } finally {
+      client.close();
+    }
+    return;
+  }
 
   // Zero-arg default on a TTY:
   //  - Local: resume last session for the current directory (or --project)
@@ -249,19 +365,26 @@ async function main(): Promise<void> {
       printHelp();
       return;
     }
-    const client = await connectClient(config.socketPath, remote);
-    const preferRemoteLast = Boolean(remote && !explicitRepoFlag && !projectFlag);
-    await runInteractiveSessionLoop(client, {
-      kind: "chat",
-      ...(preferRemoteLast ? { preferLastProject: true } : { repoRoot: explicitRepoFlag ? repoRoot : projectFlag ? undefined : repoRoot }),
-      ...(projectFlag ? { projectId: projectFlag } : {}),
-    });
+    const client = await connectClient(config.socketPath, remoteSpec.target);
+    const preferRemoteLast = Boolean(remoteSpec.target && !explicitRepoFlag && !projectFlag);
+    await runInteractiveSessionLoop(
+      client,
+      {
+        kind: "chat",
+        ...(preferRemoteLast ? { preferLastProject: true } : { repoRoot: explicitRepoFlag ? repoRoot : projectFlag ? undefined : repoRoot }),
+        ...(projectFlag ? { projectId: projectFlag } : {}),
+      },
+      hostCtx,
+    );
     return;
   }
 
   if (cmd === "daemon") {
     const sub = positional[1] ?? "status";
     if (sub === "serve") {
+      if (remoteSpec.target) {
+        throw new Error(`\`daemon serve\` only runs locally; omit --remote (got --remote ${rawRemote}).`);
+      }
       // Never allow stray subprocess pipe errors (`EPIPE`) to crash `harnessd` and drop client TUIs
       process.on("uncaughtException", (err) => {
         console.error(`[harnessd ${new Date().toISOString()}] uncaughtException:`, err);
@@ -282,21 +405,52 @@ async function main(): Promise<void> {
       return;
     }
     if (sub === "stop") {
+      if (remoteSpec.target) {
+        const client = await connectClient(config.socketPath, remoteSpec.target);
+        try {
+          const res = await client.request<{ pid?: number }>("daemon.shutdown");
+          console.log(`Stopped remote harnessd on ${remoteSpec.hostLabel ?? rawRemote} (pid ${res.pid ?? "?"}).`);
+        } finally {
+          client.close();
+        }
+        return;
+      }
       const stopped = await stopLocalDaemon(config.socketPath);
       console.log(stopped ? "Stopped harnessd." : "harnessd was not running.");
       return;
     }
     if (sub === "restart") {
+      if (remoteSpec.target) {
+        const stopClient = await connectClient(config.socketPath, remoteSpec.target);
+        try {
+          await stopClient.request("daemon.shutdown").catch(() => {});
+        } finally {
+          stopClient.close();
+        }
+        await new Promise((r) => setTimeout(r, 300));
+        // Reconnecting via `pi-harness bridge` triggers `ensureLocalDaemon` on the remote host
+        const restartClient = await connectClient(config.socketPath, remoteSpec.target);
+        try {
+          const info = await restartClient.request<{ pid?: number }>("ping");
+          console.log(`Restarted remote harnessd on ${remoteSpec.hostLabel ?? rawRemote} (pid ${info.pid ?? "?"}).`);
+        } finally {
+          restartClient.close();
+        }
+        return;
+      }
       await stopLocalDaemon(config.socketPath);
       const c = await ensureLocalDaemon(config.socketPath);
       c.close();
       console.log("Restarted harnessd.");
       return;
     }
-    const client = await connectClient(config.socketPath, remote);
-    const res = await client.request("status");
-    console.log(JSON.stringify(res, null, 2));
-    client.close();
+    const client = await connectClient(config.socketPath, remoteSpec.target);
+    try {
+      const res = await client.request("status");
+      console.log(JSON.stringify(res, null, 2));
+    } finally {
+      client.close();
+    }
     return;
   }
 
@@ -307,30 +461,91 @@ async function main(): Promise<void> {
     return;
   }
 
-  const client = await connectClient(config.socketPath, remote);
+  const client = await connectClient(config.socketPath, remoteSpec.target);
+  let handoffClientToTui = false;
   try {
     switch (cmd) {
+      case "remotes":
+      case "remote": {
+        const sub = positional[1] ?? "list";
+        if (sub === "list" || sub === "status") {
+          const remotes = await client.request<RemoteHostStatus[]>("remote.list");
+          if (flags.json) {
+            console.log(JSON.stringify(remotes, null, 2));
+          } else if (remotes.length === 0) {
+            console.log("No remote hosts configured. Add one with: pi-harness remote add <name> <user@host>");
+          } else {
+            console.log("HOST             STATUS        LINK      QUEUED  TARGET");
+            for (const r of remotes) {
+              const note = r.lastError ? `${r.sshTarget} (${r.lastError})` : r.sshTarget;
+              console.log(
+                `${r.name.padEnd(16)} ${r.status.padEnd(13)} ${r.direction.padEnd(9)} ${String(r.queuedMessages).padEnd(7)} ${note}`,
+              );
+            }
+          }
+          break;
+        }
+        if (sub === "add") {
+          const name = positional[2];
+          const sshTarget = positional[3];
+          if (!name || !sshTarget) {
+            throw new Error("Usage: pi-harness remote add <name> <user@host|ssh://host> [--bridge <cmd>] [--no-connect]");
+          }
+          const added = await client.request<RemoteHostStatus>("remote.add", {
+            name,
+            sshTarget,
+            bridgeCommand: typeof flags.bridge === "string" ? flags.bridge : undefined,
+            autoConnect: !flags["no-connect"],
+            connectNow: !flags["no-connect"],
+          });
+          console.log(JSON.stringify(added, null, 2));
+          break;
+        }
+        if (sub === "rm" || sub === "remove") {
+          const name = positional[2];
+          if (!name) throw new Error("Usage: pi-harness remote rm <name>");
+          console.log(JSON.stringify(await client.request("remote.remove", { name }), null, 2));
+          break;
+        }
+        if (sub === "connect") {
+          const name = positional[2];
+          if (!name) throw new Error("Usage: pi-harness remote connect <name>");
+          console.log(JSON.stringify(await client.request("remote.connect", { name }), null, 2));
+          break;
+        }
+        if (sub === "disconnect") {
+          const name = positional[2];
+          if (!name) throw new Error("Usage: pi-harness remote disconnect <name>");
+          console.log(JSON.stringify(await client.request("remote.disconnect", { name }), null, 2));
+          break;
+        }
+        throw new Error(`Unknown remote subcommand "${sub}". Expected: list | add | rm | connect | disconnect`);
+      }
+
       case "projects":
       case "project": {
-        const sub = cmd === "projects" ? (positional[1] ?? "list") : (positional[1] ?? "list");
+        const sub = positional[1] ?? "list";
         if (sub === "list") {
-          const projects = await client.request<ProjectSummary[]>("project.list");
+          const projects = await client.request<Array<ProjectSummary & { host?: string }>>("project.list", {
+            includeRemotes: !hostFlag,
+            ...(hostFlag ? { host: hostFlag } : {}),
+          });
           if (flags.json) {
             console.log(JSON.stringify(projects, null, 2));
           } else if (projects.length === 0) {
             console.log("No projects registered. Add one with: pi-harness project add <path> [--name <name>] [--init] [--clone <url>]");
           } else {
-            console.log("ID\tNAME\tWORKSPACE\tSESSIONS\tGOALS\tPATH");
+            console.log("HOST\tID\tNAME\tWORKSPACE\tSESSIONS\tGOALS\tPATH");
             for (const p of projects) {
               const ws = !p.exists ? "missing" : p.isGit ? `git:${p.gitBranch ?? "HEAD"}` : "folder";
-              console.log(`${p.id}\t${p.name}\t${ws}\t${p.sessionCount}\t${p.activeGoalCount}\t${p.rootPath}`);
+              console.log(`${p.host ?? "local"}\t${p.id}\t${p.name}\t${ws}\t${p.sessionCount}\t${p.activeGoalCount}\t${p.rootPath}`);
             }
           }
           break;
         }
         if (sub === "add" || sub === "create") {
           const targetPath = positional[2];
-          if (!targetPath) throw new Error("Usage: pi-harness project add <path> [--name <name>] [--init] [--clone <url>]");
+          if (!targetPath) throw new Error("Usage: pi-harness project add <path> [--name <name>] [--host <name>] [--init] [--clone <url>]");
           const created = await client.request<ProjectSummary>("project.create", {
             path: targetPath,
             name: typeof flags.name === "string" ? flags.name : undefined,
@@ -338,34 +553,60 @@ async function main(): Promise<void> {
             createDir: !flags["no-create"],
             gitInit: Boolean(flags.init),
             cloneUrl: typeof flags.clone === "string" ? flags.clone : undefined,
+            ...(hostFlag ? { host: hostFlag } : {}),
           });
           console.log(JSON.stringify(created, null, 2));
           break;
         }
         if (sub === "use" || sub === "open") {
           const ref = positional[2];
-          if (!ref) throw new Error("Usage: pi-harness project use <name|id|path>");
-          const proj = await client.request<ProjectSummary>("project.get", { projectId: ref });
+          if (!ref) throw new Error("Usage: pi-harness project use <name|id|path> [--host <name>]");
+          const proj = await client.request<ProjectSummary & { host?: string }>("project.get", {
+            projectId: ref,
+            ...(hostFlag ? { host: hostFlag } : {}),
+          });
           if (!process.stdout.isTTY) {
             console.log(JSON.stringify(proj, null, 2));
             break;
           }
-          await runInteractiveSessionLoop(client, { kind: "chat", projectId: proj.id, repoRoot: proj.rootPath });
+          let targetClient = client;
+          let targetHostLabel = remoteSpec.hostLabel;
+          if (hostFlag && hostFlag.toLowerCase() !== "local" && !remoteSpec.target) {
+            const spec = resolveRemoteSpec(hostFlag, config.remotes);
+            client.close();
+            targetClient = await connectClient(config.socketPath, spec.target);
+            targetHostLabel = spec.hostLabel;
+          }
+          handoffClientToTui = true;
+          await runInteractiveSessionLoop(
+            targetClient,
+            { kind: "chat", projectId: proj.id, repoRoot: proj.rootPath },
+            { ...hostCtx, remoteHost: targetHostLabel },
+          );
           return;
         }
         if (sub === "rm" || sub === "remove") {
           const ref = positional[2];
-          if (!ref) throw new Error("Usage: pi-harness project rm <name|id>");
-          console.log(JSON.stringify(await client.request("project.remove", { projectId: ref }), null, 2));
+          if (!ref) throw new Error("Usage: pi-harness project rm <name|id> [--host <name>]");
+          console.log(
+            JSON.stringify(
+              await client.request("project.remove", { projectId: ref, ...(hostFlag ? { host: hostFlag } : {}) }),
+              null,
+              2,
+            ),
+          );
           break;
         }
         if (sub === "browse") {
           const dir = positional[2];
-          const res = await client.request<ProjectBrowseResult>("project.browse", { ...(dir ? { path: dir } : {}) });
+          const res = await client.request<ProjectBrowseResult>("project.browse", {
+            ...(dir ? { path: dir } : {}),
+            ...(hostFlag ? { host: hostFlag } : {}),
+          });
           if (flags.json) {
             console.log(JSON.stringify(res, null, 2));
           } else {
-            console.log(`Directory: ${res.path}`);
+            console.log(`Directory (${hostFlag ?? remoteSpec.hostLabel ?? "local"}): ${res.path}`);
             for (const e of res.entries) {
               console.log(`  ${e.isGit ? "[git]" : "[dir]"} ${e.name}\t${e.path}`);
             }
@@ -395,7 +636,8 @@ async function main(): Promise<void> {
           client.close();
           return;
         }
-        await runInteractiveSessionLoop(client, { kind: "run", repoRoot: targetRepoRoot, runId: created.run.id });
+        handoffClientToTui = true;
+        await runInteractiveSessionLoop(client, { kind: "run", repoRoot: targetRepoRoot, runId: created.run.id }, hostCtx);
         return;
       }
 
@@ -405,52 +647,74 @@ async function main(): Promise<void> {
           // Default to last active/most-recent session globally (taking it over if attached elsewhere)
           const sessions = await client.request<AttachableSession[]>("sessions.list");
           const best = sessions[0];
+          handoffClientToTui = true;
           if (best?.kind === "run" && best.running) {
-            await runInteractiveSessionLoop(client, {
-              kind: "run",
-              repoRoot: best.repoRoot,
-              runId: best.id,
-              initialTaskId: typeof flags.task === "string" ? flags.task : null,
-            });
+            await runInteractiveSessionLoop(
+              client,
+              {
+                kind: "run",
+                repoRoot: best.repoRoot,
+                runId: best.id,
+                initialTaskId: typeof flags.task === "string" ? flags.task : null,
+              },
+              hostCtx,
+            );
           } else {
-            await runInteractiveSessionLoop(client, {
-              kind: "chat",
-              repoRoot: best?.repoRoot ?? repoRoot,
-              chatSessionId: best?.kind === "chat" ? best.id : undefined,
-              preferLastGlobal: true,
-            });
+            await runInteractiveSessionLoop(
+              client,
+              {
+                kind: "chat",
+                repoRoot: best?.repoRoot ?? repoRoot,
+                chatSessionId: best?.kind === "chat" ? best.id : undefined,
+                preferLastGlobal: true,
+              },
+              hostCtx,
+            );
           }
           return;
         }
+        handoffClientToTui = true;
         if (targetId.startsWith("run-")) {
-          await runInteractiveSessionLoop(client, {
-            kind: "run",
-            repoRoot,
-            runId: targetId,
-            initialTaskId: typeof flags.task === "string" ? flags.task : null,
-          });
+          await runInteractiveSessionLoop(
+            client,
+            {
+              kind: "run",
+              repoRoot,
+              runId: targetId,
+              initialTaskId: typeof flags.task === "string" ? flags.task : null,
+            },
+            hostCtx,
+          );
         } else {
-          await runInteractiveSessionLoop(client, {
-            kind: "chat",
-            repoRoot,
-            chatSessionId: targetId,
-          });
+          await runInteractiveSessionLoop(
+            client,
+            {
+              kind: "chat",
+              repoRoot,
+              chatSessionId: targetId,
+            },
+            hostCtx,
+          );
         }
         return;
       }
 
       case "sessions": {
-        const sessions = await client.request<AttachableSession[]>("sessions.list");
+        const sessions = await client.request<AttachableSession[]>("sessions.list", {
+          includeRemotes: !hostFlag,
+          ...(hostFlag ? { host: hostFlag } : {}),
+        });
         if (flags.json) {
           console.log(JSON.stringify(sessions, null, 2));
         } else if (sessions.length === 0) {
           console.log("No sessions found.");
         } else {
-          console.log("SESSION          TYPE  STATE          ATTACHED  WORKSPACE / TITLE");
+          console.log("HOST          SESSION          TYPE  STATE          ATTACHED  WORKSPACE / TITLE");
           for (const s of sessions) {
+            const hostCol = (s.host ?? remoteSpec.hostLabel ?? "local").padEnd(13);
             const att = s.attached ? "yes" : "no";
             const dir = s.repoRoot.split("/").filter(Boolean).pop() ?? s.repoRoot;
-            console.log(`${s.id.padEnd(16)} ${s.kind.padEnd(5)} ${s.status.padEnd(14)} ${att.padEnd(9)} ${s.title} (${dir})`);
+            console.log(`${hostCol} ${s.id.padEnd(16)} ${s.kind.padEnd(5)} ${s.status.padEnd(14)} ${att.padEnd(9)} ${s.title} (${dir})`);
           }
         }
         break;
@@ -499,8 +763,22 @@ async function main(): Promise<void> {
       }
 
       case "runs": {
-        const runs = await client.request("run.list");
-        console.log(JSON.stringify(runs, null, 2));
+        const runs = (await client.request<
+          Array<{ id: string; status: string; repoRoot: string; goal: string; updatedAt: number }>
+        >("run.list")) ?? [];
+        if (flags.json) {
+          console.log(JSON.stringify(runs, null, 2));
+        } else if (runs.length === 0) {
+          console.log("No runs found.");
+        } else {
+          console.log("RUN              STATUS        UPDATED              WORKSPACE         GOAL");
+          for (const r of runs) {
+            const ws = (r.repoRoot.split("/").filter(Boolean).pop() ?? r.repoRoot).slice(0, 16);
+            const firstLine = (r.goal.split("\n")[0] ?? "").trim().slice(0, 64);
+            const ts = new Date(r.updatedAt).toISOString().replace("T", " ").slice(0, 19);
+            console.log(`${r.id.padEnd(16)} ${r.status.padEnd(13)} ${ts.padEnd(20)} ${ws.padEnd(17)} ${firstLine}`);
+          }
+        }
         break;
       }
 
@@ -647,11 +925,13 @@ async function main(): Promise<void> {
         throw new Error(`Unknown command: ${cmd}`);
     }
   } finally {
-    client.close();
+    if (!handoffClientToTui) client.close();
   }
 }
 
-main().catch((err) => {
-  console.error(err instanceof Error ? err.message : String(err));
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  });
+}

@@ -324,13 +324,17 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
 
   const profiles = (merged.profiles && merged.profiles.length > 0 ? merged.profiles : defaultProfiles());
 
+  // Security: `remotes` (SSH peer trust & auto-connect targets) MUST only come from trusted user global config,
+  // never from untrusted repository `.pi-harness.json`.
+  const globalRemotes = Array.isArray(globalCfg.remotes) ? (globalCfg.remotes as RemoteHostConfig[]) : undefined;
+
   const codeMode = merged.codeMode ?? "collapsed";
   if (!["collapsed", "hybrid", "off"].includes(codeMode)) throw new Error(`Unknown codeMode: ${codeMode}`);
   return {
     stateDir,
     socketPath: merged.socketPath ? resolve(merged.socketPath) : defaultSocketPath(stateDir),
     profiles,
-    ...(merged.remotes?.length ? { remotes: merged.remotes } : {}),
+    ...(globalRemotes?.length ? { remotes: globalRemotes } : {}),
     ...(merged.externalMcpServers?.length ? { externalMcpServers: merged.externalMcpServers } : {}),
     codeMode,
     codeExec: {
