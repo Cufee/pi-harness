@@ -3,6 +3,7 @@ import type { CompiledModelCatalog, CompiledModelEntry } from "../catalog/compil
 import type { HarnessConfig } from "../config.js";
 import type { DaemonClient } from "../daemon/remote.js";
 import type { KbEntry } from "../kb/store.js";
+import type { CostSnapshot } from "../protocol/daemon-rpc.js";
 import {
   clamp,
   divider,
@@ -375,18 +376,6 @@ interface QuotaResponse {
   coverage?: Record<string, { covered?: boolean; confidence?: string }>;
 }
 
-interface CostSummaryResponse {
-  scope?: { kind: "chat" | "run"; id: string; label: string };
-  available?: boolean;
-  totals?: Array<{ currency: string; amount: number }>;
-  byModel?: Array<{ model: string | null; currency: string; amount: number }>;
-  coverage?: {
-    complete: boolean;
-    routes: Array<{ profileId: string; billing: string; invocations: number; running: number; status: string; note: string }>;
-    unattributed: Array<{ currency: string; amount: number }>;
-  };
-}
-
 function formatMoney(currency: string, amount: number): string {
   return currency.toUpperCase() === "USD" ? formatUsd(amount) : `${amount.toFixed(4)} ${currency}`;
 }
@@ -397,7 +386,7 @@ export class QuotaCostScreen implements Screen {
   private readonly frame = new Frame();
   private readonly viewport = new Viewport();
   private quota: QuotaResponse | null = null;
-  private cost: CostSummaryResponse | null = null;
+  private cost: CostSnapshot | null = null;
   private loading = true;
 
   constructor(
@@ -418,7 +407,7 @@ export class QuotaCostScreen implements Screen {
       this.frame.setNotice(err instanceof Error ? err.message : String(err), "danger");
     }
     try {
-      this.cost = await this.client.request<CostSummaryResponse>("cost.get" as never, {
+      this.cost = await this.client.request<CostSnapshot>("cost.get", {
         ...(this.scope?.chatSessionId ? { chatSessionId: this.scope.chatSessionId } : {}),
         ...(this.scope?.runId ? { runId: this.scope.runId } : {}),
       });

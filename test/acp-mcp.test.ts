@@ -177,10 +177,62 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
     };
     const ampCtrlSpawn = prepareAcpSpawn(ampProfile, { systemPrompt: "Role", toolPolicy: "control_plane_only" });
     assert.ok(ampCtrlSpawn.env.AMP_SETTINGS_FILE);
-    const ampCfg = JSON.parse(readFileSync(ampCtrlSpawn.env.AMP_SETTINGS_FILE!, "utf8")) as Record<string, string[]>;
+    const ampCfg = JSON.parse(readFileSync(ampCtrlSpawn.env.AMP_SETTINGS_FILE!, "utf8")) as Record<string, unknown>;
+    assert.equal(ampCfg["amp.dangerouslyAllowAll"], false);
     assert.deepEqual(ampCfg["amp.tools.enable"], ["mcp__harness__*"]);
-    assert.ok(ampCfg["amp.tools.disable"]?.includes("Bash"));
+    const ctrlDisabled = ampCfg["amp.tools.disable"] as string[];
+    for (const t of ["Bash", "shell_command", "shell_command_status", "shell_command_kill", "edit_file", "create_file", "apply_patch", "Task"]) {
+      assert.ok(ctrlDisabled.includes(t), `control_plane_only should disable ${t}`);
+    }
     ampCtrlSpawn.cleanup();
+
+    // Regression for esc-19 / esc-20: Amp read_only_workspace (allowShellInReadOnly=false) must NOT disable
+    // `shell_command` (Amp has no built-in Read/Grep/glob tools), and must instead disable write/subagent tools
+    // while enforcing a strict read-only `amp.permissions` allowlist with `amp.dangerouslyAllowAll: false`.
+    const ampRoSpawn = prepareAcpSpawn(ampProfile, {
+      systemPrompt: "Research",
+      toolPolicy: "read_only_workspace",
+      allowShellInReadOnly: false,
+    });
+    assert.ok(ampRoSpawn.env.AMP_SETTINGS_FILE);
+    const ampRoCfg = JSON.parse(readFileSync(ampRoSpawn.env.AMP_SETTINGS_FILE!, "utf8")) as Record<string, unknown>;
+    assert.equal(ampRoCfg["amp.dangerouslyAllowAll"], false);
+    const roDisabled = ampRoCfg["amp.tools.disable"] as string[];
+    assert.ok(!roDisabled.includes("shell_command"), "read_only_workspace must keep shell_command enabled for Amp");
+    assert.ok(!roDisabled.includes("Bash"), "read_only_workspace must keep Bash enabled for Amp");
+    for (const t of ["edit_file", "create_file", "delete_file", "apply_patch", "Task", "create_thread"]) {
+      assert.ok(roDisabled.includes(t), `read_only_workspace must disable ${t}`);
+    }
+    const roPerms = ampRoCfg["amp.permissions"] as Array<{ tool: string; action: string; matches?: Record<string, string[]> }>;
+    assert.ok(Array.isArray(roPerms) && roPerms.length >= 6);
+    const shellRules = roPerms.filter((r) => r.tool === "shell_command");
+    assert.equal(shellRules.length, 3);
+    assert.equal(shellRules[0]?.action, "reject");
+    assert.ok(shellRules[0]?.matches?.command?.includes("*>*"));
+    assert.ok(shellRules[0]?.matches?.command?.includes("*&&*"));
+    assert.equal(shellRules[1]?.action, "allow");
+    assert.ok(shellRules[1]?.matches?.command?.includes("rg *"));
+    assert.ok(shellRules[1]?.matches?.command?.includes("cat *"));
+    assert.ok(shellRules[1]?.matches?.command?.includes("git status *"));
+    assert.equal(shellRules[2]?.action, "reject");
+    assert.equal(shellRules[2]?.matches, undefined);
+    ampRoSpawn.cleanup();
+
+    // Amp read_only_workspace with allowShellInReadOnly=true (verify / Done-Review) disables/rejects write tools without restricting shell
+    const ampVerifySpawn = prepareAcpSpawn(ampProfile, {
+      systemPrompt: "Verify",
+      toolPolicy: "read_only_workspace",
+      allowShellInReadOnly: true,
+    });
+    assert.ok(ampVerifySpawn.env.AMP_SETTINGS_FILE);
+    const ampVerifyCfg = JSON.parse(readFileSync(ampVerifySpawn.env.AMP_SETTINGS_FILE!, "utf8")) as Record<string, unknown>;
+    assert.equal(ampVerifyCfg["amp.dangerouslyAllowAll"], false);
+    const verifyPerms = ampVerifyCfg["amp.permissions"] as Array<{ tool: string; action: string }>;
+    assert.ok(verifyPerms.some((r) => r.tool === "edit_file" && r.action === "reject"));
+    assert.ok(!verifyPerms.some((r) => r.tool === "shell_command"));
+    assert.ok((ampVerifyCfg["amp.tools.disable"] as string[]).includes("apply_patch"));
+    assert.ok(!(ampVerifyCfg["amp.tools.disable"] as string[]).includes("shell_command"));
+    ampVerifySpawn.cleanup();
 
     // 3. Gemini shim: GEMINI_SYSTEM_MD env file + legacy session/set_model
     const geminiProfile: AcpProfileConfig = {
