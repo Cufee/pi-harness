@@ -1,0 +1,881 @@
+import { chmodSync, existsSync, mkdirSync, statSync, unlinkSync } from "node:fs";
+import { createServer, type Server, type Socket } from "node:net";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+export const DAEMON_PROTOCOL_REV = 3;
+
+export function currentDaemonBuildId(): string {
+  try {
+    const serverFile = fileURLToPath(import.meta.url);
+    return `${DAEMON_PROTOCOL_REV}:${Math.floor(statSync(serverFile).mtimeMs)}`;
+  } catch {
+    return `${DAEMON_PROTOCOL_REV}:0`;
+  }
+}
+import { ModelCatalogCompiler } from "../catalog/compiler.js";
+import { saveGlobalConfig, type HarnessConfig, type RunnerProfileConfig } from "../config.js";
+import { ControlPlaneDb, type EventRecord } from "../control-plane/db.js";
+import { HarnessOrchestrator, type CustomRunnerFactory } from "../control-plane/orchestrator.js";
+import { DirectorRuntime } from "../director/runtime.js";
+import type { GoalCriterion } from "../goals/engine.js";
+import type { DaemonEventFrame, RpcRequest, RpcResponse } from "../protocol/daemon-rpc.js";
+import { attachNdjsonReader, writeNdjson } from "../protocol/frames.js";
+import { QuotaClient } from "../quota/client.js";
+import { AcpRunner } from "../runners/acp-runner.js";
+import { PiRunner } from "../runners/pi-runner.js";
+import { PtyHost } from "./pty-host.js";
+
+interface ClientAttachment {
+  socket: Socket;
+  runId: string;
+  taskId: string | null;
+}
+
+/**
+ * `harnessd`: persistent headless daemon owning SQLite state, running agents,
+ * worktree GC, model catalog + quota sync, and optional raw PTY shells.
+ * Closing any terminal simply disconnects its socket — agents continue running uninterrupted.
+ */
+export class HarnessDaemon {
+  readonly db: ControlPlaneDb;
+  quota: QuotaClient;
+  catalog: ModelCatalogCompiler;
+  readonly orchestrator: HarnessOrchestrator;
+  readonly director: DirectorRuntime;
+  readonly ptyHost = new PtyHost();
+
+  private server: Server | null = null;
+  private allSockets = new Set<Socket>();
+  private attachments = new Map<Socket, ClientAttachment>();
+  private runBindings = new Map<string, Socket>();
+  private chatBindings = new Map<string, Socket>();
+  private socketToChatId = new Map<Socket, string>();
+  private chatSubscribers = new Set<Socket>();
+  private tuiSockets = new Set<Socket>();
+  private takenOverSockets = new WeakSet<Socket>();
+  private ptyDetachFns = new Map<Socket, Map<string, () => void>>();
+  private unsubEvents: (() => void) | null = null;
+  private sweepTimer: ReturnType<typeof setInterval> | null = null;
+  private idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
+  private autoQuitWhenIdle = false;
+  private startedAt = Date.now();
+
+  constructor(
+    public config: HarnessConfig,
+    opts?: { dbPath?: string; customRunnerFactory?: CustomRunnerFactory; autoQuitWhenIdle?: boolean },
+  ) {
+    this.autoQuitWhenIdle = Boolean(opts?.autoQuitWhenIdle);
+    const dbPath = opts?.dbPath ?? join(config.stateDir, "control-plane.sqlite");
+    this.db = new ControlPlaneDb(dbPath);
+    this.quota = new QuotaClient(config.quotaEndpoint);
+    this.catalog = new ModelCatalogCompiler(config, this.quota);
+    this.orchestrator = new HarnessOrchestrator(this.db, config, this.catalog, this.quota, opts?.customRunnerFactory);
+    this.director = new DirectorRuntime(this.db, config, this.catalog, this.quota, this.orchestrator, opts?.customRunnerFactory);
+  }
+
+  private applyConfigMutation(next: HarnessConfig, opts?: { profilesChanged?: boolean }): HarnessConfig {
+    // Keep default profile pointers valid if a profile was removed or disabled
+    const enabledIds = next.profiles.filter((p) => p.enabled !== false).map((p) => p.id);
+    const fallback = enabledIds[0];
+    if (fallback) {
+      if (!next.defaultOrchestratorProfile || !enabledIds.includes(next.defaultOrchestratorProfile)) {
+        next = { ...next, defaultOrchestratorProfile: fallback };
+      }
+      if (!next.defaultWorkerProfile || !enabledIds.includes(next.defaultWorkerProfile)) {
+        next = { ...next, defaultWorkerProfile: fallback };
+      }
+      if (!next.defaultTaskProfile || !enabledIds.includes(next.defaultTaskProfile)) {
+        next = { ...next, defaultTaskProfile: fallback };
+      }
+    }
+
+    this.config = next;
+    Object.assign(this.orchestrator.config, next);
+    this.quota = new QuotaClient(next.quotaEndpoint);
+    this.catalog = new ModelCatalogCompiler(next, this.quota);
+    this.director.updateConfig(next);
+    saveGlobalConfig(next);
+
+    if (opts?.profilesChanged) {
+      this.catalog.invalidateCache();
+      // Warm up the newly enabled/changed CLI catalog in the background immediately
+      void this.catalog.sync(process.cwd()).catch(() => {});
+    }
+    return next;
+  }
+
+  async start(): Promise<string> {
+    await this.ptyHost.init();
+    const sockPath = this.config.socketPath;
+    mkdirSync(dirname(sockPath), { recursive: true });
+    if (existsSync(sockPath)) {
+      try {
+        unlinkSync(sockPath);
+      } catch {
+        // ignore stale socket removal error
+      }
+    }
+
+    this.unsubEvents = this.db.onEvent((ev) => this.fanoutEvent(ev));
+
+    this.server = createServer((socket) => this.handleConnection(socket));
+    await new Promise<void>((resolve, reject) => {
+      this.server!.once("error", reject);
+      this.server!.listen(sockPath, () => {
+        try {
+          chmodSync(sockPath, 0o600);
+        } catch {
+          // ignore on unsupported filesystems
+        }
+        resolve();
+      });
+    });
+
+    // Periodic hourly worktree orphan sweep across known repos
+    this.sweepTimer = setInterval(() => {
+      void this.sweepAllKnownRepos().catch(() => {});
+    }, 3_600_000);
+    this.sweepTimer.unref();
+
+    // Non-blocking initial quota sync if configured
+    void this.quota.sync(false).catch(() => {});
+
+    return sockPath;
+  }
+
+  async stop(): Promise<void> {
+    if (this.idleShutdownTimer) {
+      clearTimeout(this.idleShutdownTimer);
+      this.idleShutdownTimer = null;
+    }
+    if (this.sweepTimer) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = null;
+    }
+    this.unsubEvents?.();
+    this.ptyHost.closeAll();
+    for (const sock of this.allSockets) {
+      sock.destroy();
+    }
+    this.allSockets.clear();
+    this.attachments.clear();
+    this.chatBindings.clear();
+    this.runBindings.clear();
+    this.socketToChatId.clear();
+    this.chatSubscribers.clear();
+    this.tuiSockets.clear();
+    if (this.server) {
+      await new Promise<void>((resolve) => this.server!.close(() => resolve()));
+      this.server = null;
+    }
+    if (existsSync(this.config.socketPath)) {
+      try {
+        unlinkSync(this.config.socketPath);
+      } catch {
+        // ignore
+      }
+    }
+    this.db.close();
+  }
+
+  private async sweepAllKnownRepos(): Promise<void> {
+    const repos = new Set(this.db.listRuns(100).map((r) => r.repoRoot));
+    for (const repo of repos) {
+      await this.orchestrator.getWorktreeManager(repo).sweep();
+    }
+  }
+
+  private fanoutEvent(ev: EventRecord): void {
+    const frame: DaemonEventFrame = {
+      kind: "event",
+      seq: ev.seq,
+      runId: ev.runId,
+      taskId: ev.taskId,
+      type: ev.type,
+      payload: ev.payload,
+      createdAt: ev.createdAt,
+    };
+    for (const att of this.attachments.values()) {
+      if (att.runId !== ev.runId) continue;
+      if (att.taskId && ev.taskId && att.taskId !== ev.taskId) continue;
+      writeNdjson(att.socket, frame);
+    }
+    if (ev.type.startsWith("goal.")) {
+      for (const sock of this.chatSubscribers) {
+        if (!this.attachments.has(sock)) {
+          writeNdjson(sock, frame);
+        }
+      }
+    }
+  }
+
+  private cancelIdleShutdown(): void {
+    if (this.idleShutdownTimer) {
+      clearTimeout(this.idleShutdownTimer);
+      this.idleShutdownTimer = null;
+    }
+  }
+
+  private getLiveWorkSummary(): {
+    running: boolean;
+    activeChats: number;
+    activeTasks: number;
+    activeReviews: number;
+    activePtys: number;
+    otherTuiClients: number;
+    description: string;
+  } {
+    const activeChats = this.director.activeChatCount();
+    const activeTasks = this.orchestrator.activeTaskCount();
+    const activeReviews = this.director.activeReviewCount();
+    const activePtys = this.ptyHost.activePtyCount();
+    const otherTuiClients = this.tuiSockets.size;
+    const parts: string[] = [];
+    if (activeTasks > 0) parts.push(`${activeTasks} active agent task${activeTasks === 1 ? "" : "s"}`);
+    if (activeChats > 0) parts.push(`${activeChats} in-flight chat${activeChats === 1 ? "" : "s"}`);
+    if (activeReviews > 0) parts.push(`${activeReviews} goal review${activeReviews === 1 ? "" : "s"}`);
+    if (activePtys > 0) parts.push(`${activePtys} open shell${activePtys === 1 ? "" : "s"}`);
+    if (otherTuiClients > 0) parts.push(`${otherTuiClients} other attached terminal${otherTuiClients === 1 ? "" : "s"}`);
+    const running = activeChats + activeTasks + activeReviews + activePtys + otherTuiClients > 0;
+    return {
+      running,
+      activeChats,
+      activeTasks,
+      activeReviews,
+      activePtys,
+      otherTuiClients,
+      description: parts.join(", "),
+    };
+  }
+
+  private evictSocket(prevSock: Socket, sessionId: string): void {
+    this.takenOverSockets.add(prevSock);
+    this.tuiSockets.delete(prevSock);
+    this.chatSubscribers.delete(prevSock);
+    this.attachments.delete(prevSock);
+    const prevChat = this.socketToChatId.get(prevSock);
+    if (prevChat) {
+      if (this.chatBindings.get(prevChat) === prevSock) this.chatBindings.delete(prevChat);
+      this.socketToChatId.delete(prevSock);
+    }
+    for (const [rid, s] of this.runBindings.entries()) {
+      if (s === prevSock) this.runBindings.delete(rid);
+    }
+    writeNdjson(prevSock, {
+      kind: "event",
+      seq: 0,
+      runId: sessionId,
+      taskId: sessionId,
+      type: "session.taken_over",
+      payload: { sessionId, reason: "Attached from another terminal" },
+      createdAt: Date.now(),
+    } satisfies DaemonEventFrame);
+    setTimeout(() => {
+      try {
+        prevSock.end();
+      } catch {
+        // ignore
+      }
+    }, 60).unref();
+    setTimeout(() => {
+      try {
+        if (!prevSock.destroyed) prevSock.destroy();
+      } catch {
+        // ignore
+      }
+    }, 200).unref();
+  }
+
+  private unbindSocketSession(socket: Socket): void {
+    const oldChat = this.socketToChatId.get(socket);
+    if (oldChat) {
+      if (this.chatBindings.get(oldChat) === socket) this.chatBindings.delete(oldChat);
+      this.socketToChatId.delete(socket);
+    }
+    const oldAtt = this.attachments.get(socket);
+    if (oldAtt) {
+      if (this.runBindings.get(oldAtt.runId) === socket) this.runBindings.delete(oldAtt.runId);
+      this.attachments.delete(socket);
+    }
+  }
+
+  private bindChatSocket(socket: Socket, chatSessionId: string): { tookOver: boolean } {
+    this.cancelIdleShutdown();
+    const curChat = this.socketToChatId.get(socket);
+    if (curChat !== chatSessionId) {
+      this.unbindSocketSession(socket);
+    }
+    let tookOver = false;
+    const prev = this.chatBindings.get(chatSessionId);
+    if (prev && prev !== socket) {
+      this.evictSocket(prev, chatSessionId);
+      tookOver = true;
+    }
+    this.chatBindings.set(chatSessionId, socket);
+    this.socketToChatId.set(socket, chatSessionId);
+    this.chatSubscribers.add(socket);
+    this.tuiSockets.add(socket);
+    this.director.chats.touchSession(chatSessionId);
+    return { tookOver };
+  }
+
+  private bindRunSocket(socket: Socket, runId: string, taskId: string | null): { tookOver: boolean } {
+    this.cancelIdleShutdown();
+    const curAtt = this.attachments.get(socket);
+    if (!curAtt || curAtt.runId !== runId) {
+      this.unbindSocketSession(socket);
+    }
+    let tookOver = false;
+    const prev = this.runBindings.get(runId);
+    if (prev && prev !== socket) {
+      this.evictSocket(prev, runId);
+      tookOver = true;
+    }
+    this.runBindings.set(runId, socket);
+    this.attachments.set(socket, { socket, runId, taskId });
+    this.tuiSockets.add(socket);
+    return { tookOver };
+  }
+
+  private handleConnection(socket: Socket): void {
+    this.allSockets.add(socket);
+    this.cancelIdleShutdown();
+    const detach = attachNdjsonReader(socket, {
+      onMessage: (raw) => {
+        const req = raw as RpcRequest;
+        if (req?.kind !== "req") return;
+        void this.dispatch(socket, req).then(
+          (result) => writeNdjson(socket, { kind: "res", id: req.id, ok: true, result } satisfies RpcResponse),
+          (err) =>
+            writeNdjson(socket, {
+              kind: "res",
+              id: req.id,
+              ok: false,
+              error: err instanceof Error ? err.message : String(err),
+            } satisfies RpcResponse),
+        );
+      },
+      onEnd: () => this.cleanupSocket(socket),
+      onError: () => this.cleanupSocket(socket),
+    });
+
+    socket.once("close", () => {
+      detach();
+      this.cleanupSocket(socket);
+    });
+  }
+
+  private cleanupSocket(socket: Socket): void {
+    this.allSockets.delete(socket);
+    const wasTui = this.tuiSockets.delete(socket);
+    const wasTakenOver = this.takenOverSockets.has(socket);
+    this.unbindSocketSession(socket);
+    this.chatSubscribers.delete(socket);
+    const ptyMap = this.ptyDetachFns.get(socket);
+    if (ptyMap) {
+      for (const fn of ptyMap.values()) fn();
+      this.ptyDetachFns.delete(socket);
+    }
+
+    // If the last interactive TUI disconnected abruptly (e.g. terminal window closed) and nothing is running, quit cleanly
+    if (this.autoQuitWhenIdle && wasTui && !wasTakenOver) {
+      const work = this.getLiveWorkSummary();
+      if (!work.running) {
+        this.cancelIdleShutdown();
+        this.idleShutdownTimer = setTimeout(() => {
+          this.idleShutdownTimer = null;
+          if (!this.getLiveWorkSummary().running) {
+            void this.stop().finally(() => process.exit(0));
+          }
+        }, 1200);
+        this.idleShutdownTimer.unref();
+      }
+    }
+  }
+
+  private async dispatch(socket: Socket, req: RpcRequest): Promise<unknown> {
+    const p = req.params ?? {};
+
+    switch (req.op) {
+      case "ping":
+        return {
+          pong: true,
+          pid: process.pid,
+          uptimeMs: Date.now() - this.startedAt,
+          protocolRev: DAEMON_PROTOCOL_REV,
+          buildId: currentDaemonBuildId(),
+        };
+
+      case "daemon.shutdown":
+        setTimeout(() => {
+          void this.stop().finally(() => process.exit(0));
+        }, 25).unref();
+        return { shuttingDown: true, pid: process.pid };
+
+      case "status":
+        return {
+          pid: process.pid,
+          uptimeMs: Date.now() - this.startedAt,
+          socketPath: this.config.socketPath,
+          hasLibghosttyVt: this.ptyHost.hasLibghosttyVt,
+          runs: this.db.listRuns(20),
+          goals: this.director.goals.listGoals(),
+          profiles: this.config.profiles.map((pr) => ({ id: pr.id, kind: pr.kind, billing: pr.billing, enabled: pr.enabled !== false })),
+        };
+
+      case "config.get":
+        return this.config;
+
+      case "config.update": {
+        const patch = (p.patch ?? {}) as Record<string, unknown>;
+        const next: HarnessConfig = {
+          ...this.config,
+          ...(typeof patch.defaultOrchestratorProfile === "string"
+            ? { defaultOrchestratorProfile: patch.defaultOrchestratorProfile }
+            : {}),
+          ...(typeof patch.defaultWorkerProfile === "string" ? { defaultWorkerProfile: patch.defaultWorkerProfile } : {}),
+          ...(typeof patch.defaultTaskProfile === "string" ? { defaultTaskProfile: patch.defaultTaskProfile } : {}),
+          ...(patch.rollover ? { rollover: { ...this.config.rollover, ...(patch.rollover as HarnessConfig["rollover"]) } } : {}),
+          ...(patch.worktree ? { worktree: { ...this.config.worktree, ...(patch.worktree as HarnessConfig["worktree"]) } } : {}),
+          ...(patch.catalog ? { catalog: { ...this.config.catalog, ...(patch.catalog as HarnessConfig["catalog"]) } } : {}),
+          ...("quotaEndpoint" in patch
+            ? { quotaEndpoint: (patch.quotaEndpoint as HarnessConfig["quotaEndpoint"] | null) ?? undefined }
+            : {}),
+        };
+        return this.applyConfigMutation(next);
+      }
+
+      case "profiles.upsert": {
+        const profile = p.profile as RunnerProfileConfig;
+        if (!profile?.id) throw new Error("profile.id is required");
+        const idx = this.config.profiles.findIndex((x) => x.id === profile.id);
+        const nextProfiles = [...this.config.profiles];
+        if (idx >= 0) nextProfiles[idx] = profile;
+        else nextProfiles.push(profile);
+        return this.applyConfigMutation({ ...this.config, profiles: nextProfiles }, { profilesChanged: true });
+      }
+
+      case "profiles.remove": {
+        const id = String(p.id);
+        return this.applyConfigMutation(
+          {
+            ...this.config,
+            profiles: this.config.profiles.filter((x) => x.id !== id),
+          },
+          { profilesChanged: true },
+        );
+      }
+
+      case "profiles.probe": {
+        const id = String(p.id);
+        const profile = this.config.profiles.find((x) => x.id === id);
+        if (!profile) throw new Error(`Unknown profile ${id}`);
+        const cwd = String(p.cwd ?? process.cwd());
+        const models =
+          profile.kind === "pi" ? new PiRunner(profile).probeModels() : await new AcpRunner(profile).probeModels(cwd);
+        return { id, models };
+      }
+
+      case "chat.open": {
+        const repoRoot = String(p.repoRoot ?? process.cwd());
+        const profileId =
+          (typeof p.profileId === "string" ? p.profileId : undefined) ??
+          this.config.defaultOrchestratorProfile ??
+          this.config.profiles[0]?.id ??
+          "acp:claude";
+
+        let session =
+          typeof p.chatSessionId === "string" && p.chatSessionId
+            ? this.director.chats.getSession(p.chatSessionId)
+            : p.preferLastGlobal
+              ? this.director.chats.getMostRecentSession()
+              : null;
+
+        if (typeof p.chatSessionId === "string" && p.chatSessionId && !session) {
+          throw new Error(`Unknown chat session: ${p.chatSessionId}`);
+        }
+        if (!session) {
+          session = this.director.chats.getOrCreateDefault({
+            repoRoot,
+            profileId,
+            model: typeof p.model === "string" ? p.model : null,
+            effort: typeof p.effort === "string" ? p.effort : null,
+          });
+        }
+        const { tookOver } = this.bindChatSocket(socket, session.id);
+        return {
+          session,
+          history: this.director.chats.getHistory(session.id, 0, 100),
+          goals: this.director.goals.listGoals({ repoRoot: session.repoRoot }),
+          config: this.config,
+          tookOver,
+          busy: this.director.isChatBusy(session.id),
+        };
+      }
+
+      case "chat.create": {
+        const repoRoot = String(p.repoRoot ?? process.cwd());
+        const profileId =
+          (typeof p.profileId === "string" ? p.profileId : undefined) ??
+          this.config.defaultOrchestratorProfile ??
+          this.config.profiles[0]?.id ??
+          "acp:claude";
+        const session = this.director.chats.createSession({
+          repoRoot,
+          profileId,
+          title: typeof p.title === "string" ? p.title : undefined,
+          model: typeof p.model === "string" ? p.model : null,
+          effort: typeof p.effort === "string" ? p.effort : null,
+        });
+        this.bindChatSocket(socket, session.id);
+        return {
+          session,
+          history: [],
+          goals: this.director.goals.listGoals({ repoRoot: session.repoRoot }),
+          config: this.config,
+          tookOver: false,
+          busy: false,
+        };
+      }
+
+      case "sessions.list": {
+        const chats = this.director.chats.listSessions(25).map((c) => {
+          const bound = this.chatBindings.get(c.id);
+          const busy = this.director.isChatBusy(c.id);
+          const activeGoals = this.director.goals
+            .listGoals({ repoRoot: c.repoRoot })
+            .filter((g) => ["executing", "verifying", "reviewing"].includes(g.status)).length;
+          return {
+            id: c.id,
+            kind: "chat" as const,
+            title: c.title,
+            repoRoot: c.repoRoot,
+            status: busy ? "busy" : activeGoals > 0 ? `${activeGoals} active goal${activeGoals === 1 ? "" : "s"}` : "idle",
+            running: busy || activeGoals > 0,
+            attached: Boolean(bound),
+            attachedByMe: bound === socket,
+            model: c.model ?? c.profileId,
+            effort: c.effort,
+            updatedAt: c.updatedAt,
+          };
+        });
+        const runs = this.db.listRuns(20).map((r) => {
+          const bound = this.runBindings.get(r.id);
+          const live = this.orchestrator.isRunActiveInMemory(r.id);
+          return {
+            id: r.id,
+            kind: "run" as const,
+            title: (r.goal.split("\n")[0] ?? r.goal).slice(0, 80),
+            repoRoot: r.repoRoot,
+            status: live ? "running" : r.status,
+            running: live,
+            attached: Boolean(bound),
+            attachedByMe: bound === socket,
+            model: null,
+            effort: null,
+            updatedAt: r.updatedAt,
+          };
+        });
+        return [...chats, ...runs].sort(
+          (a, b) => Number(b.running) - Number(a.running) || b.updatedAt - a.updatedAt,
+        );
+      }
+
+      case "session.leave": {
+        this.tuiSockets.delete(socket);
+        this.unbindSocketSession(socket);
+        this.chatSubscribers.delete(socket);
+        const work = this.getLiveWorkSummary();
+        const daemonWillQuit = this.autoQuitWhenIdle && !work.running;
+        if (daemonWillQuit) {
+          this.cancelIdleShutdown();
+          setTimeout(() => {
+            if (!this.getLiveWorkSummary().running) {
+              void this.stop().finally(() => process.exit(0));
+            }
+          }, 35).unref();
+        }
+        return {
+          daemonWillQuit,
+          running: work.running,
+          activeWorkSummary: work.description,
+        };
+      }
+
+      case "chat.send": {
+        const chatSessionId = String(p.chatSessionId);
+        const text = String(p.text);
+        return await this.director.sendChatMessage(
+          chatSessionId,
+          text,
+          (delta) => {
+            // Stream to whichever terminal is CURRENTLY bound to this chat session (supports live takeover mid-turn!)
+            const target = this.chatBindings.get(chatSessionId) ?? socket;
+            writeNdjson(target, {
+              kind: "event",
+              seq: 0,
+              runId: chatSessionId,
+              taskId: chatSessionId,
+              type: "chat.delta",
+              payload: { delta },
+              createdAt: Date.now(),
+            } satisfies DaemonEventFrame);
+          },
+          (toolEv) => {
+            const target = this.chatBindings.get(chatSessionId) ?? socket;
+            writeNdjson(target, {
+              kind: "event",
+              seq: 0,
+              runId: chatSessionId,
+              taskId: chatSessionId,
+              type: "chat.tool",
+              payload: toolEv,
+              createdAt: Date.now(),
+            } satisfies DaemonEventFrame);
+          },
+        );
+      }
+
+      case "chat.cancel":
+        return { cancelled: this.director.cancelChat(String(p.chatSessionId)) };
+
+      case "chat.history":
+        return this.director.chats.getHistory(
+          String(p.chatSessionId),
+          typeof p.sinceSeq === "number" ? p.sinceSeq : 0,
+          typeof p.limit === "number" ? p.limit : 100,
+        );
+
+      case "chat.update":
+        return this.director.chats.updateSession(String(p.chatSessionId), {
+          profileId: typeof p.profileId === "string" ? p.profileId : undefined,
+          model: p.model === null ? null : typeof p.model === "string" ? p.model : undefined,
+          effort: p.effort === null ? null : typeof p.effort === "string" ? p.effort : undefined,
+          title: typeof p.title === "string" ? p.title : undefined,
+        });
+
+      case "chat.list":
+        return this.director.chats.listSessions();
+
+      case "kb.search":
+        return this.db.kb.search({
+          query: typeof p.query === "string" ? p.query : undefined,
+          repoScope: typeof p.repoRoot === "string" ? p.repoRoot : undefined,
+          includeCandidates: Boolean(p.includeCandidates),
+          includeStale: Boolean(p.includeStale),
+          limit: typeof p.limit === "number" ? p.limit : 20,
+        });
+
+      case "kb.get":
+        return this.db.kb.getMany(Array.isArray(p.ids) ? (p.ids as string[]) : []);
+
+      case "goal.create":
+        return this.director.goals.createGoal({
+          repoRoot: String(p.repoRoot ?? process.cwd()),
+          chatSessionId: typeof p.chatSessionId === "string" ? p.chatSessionId : null,
+          title: String(p.title),
+          description: String(p.description ?? p.title),
+          criteria: (p.criteria as Array<Omit<GoalCriterion, "id" | "required">>) ?? [],
+          nonGoals: Array.isArray(p.nonGoals) ? (p.nonGoals as string[]) : [],
+        });
+
+      case "goal.commit":
+        return await this.director.commitGoal(String(p.goalId), {
+          profileId: typeof p.profileId === "string" ? p.profileId : undefined,
+          model: typeof p.model === "string" ? p.model : undefined,
+          effort: typeof p.effort === "string" ? p.effort : undefined,
+        });
+
+      case "goal.amend":
+        return await this.director.amendGoal(String(p.goalId), {
+          rationale: String(p.rationale ?? "Amended by user"),
+          title: typeof p.title === "string" ? p.title : undefined,
+          description: typeof p.description === "string" ? p.description : undefined,
+          addCriteria: Array.isArray(p.addCriteria) ? (p.addCriteria as GoalCriterion[]) : undefined,
+          removeCriteriaIds: Array.isArray(p.removeCriteriaIds) ? (p.removeCriteriaIds as string[]) : undefined,
+          nonGoals: Array.isArray(p.nonGoals) ? (p.nonGoals as string[]) : undefined,
+        });
+
+      case "goal.list":
+        return this.director.goals.listGoals({
+          repoRoot: typeof p.repoRoot === "string" ? p.repoRoot : undefined,
+        });
+
+      case "goal.get": {
+        const g = this.director.goals.getGoal(String(p.goalId));
+        if (!g) throw new Error(`Unknown goal ${p.goalId}`);
+        return {
+          goal: g,
+          reviews: this.director.goals.listReviews(g.id),
+          tasks: g.linkedRunId ? this.db.listTasks(g.linkedRunId) : [],
+          escalations: g.linkedRunId ? this.db.listEscalations(g.linkedRunId, "open") : [],
+        };
+      }
+
+      case "goal.review":
+        return await this.director.verifyAndReviewGoal(String(p.goalId));
+
+      case "goal.pause": {
+        const g = this.director.goals.setStatus(String(p.goalId), "paused", "Paused by user");
+        if (g.linkedRunId) await this.orchestrator.stopRun(g.linkedRunId, "Goal paused");
+        return g;
+      }
+
+      case "goal.cancel": {
+        const g = this.director.goals.setStatus(String(p.goalId), "cancelled", "Cancelled by user");
+        if (g.linkedRunId) await this.orchestrator.stopRun(g.linkedRunId, "Goal cancelled");
+        return g;
+      }
+
+      case "run.create":
+        return await this.orchestrator.startRun({
+          goal: String(p.goal),
+          repoRoot: String(p.repoRoot ?? process.cwd()),
+          profileId: typeof p.profileId === "string" ? p.profileId : undefined,
+          model: typeof p.model === "string" ? p.model : undefined,
+          effort: typeof p.effort === "string" ? p.effort : undefined,
+        });
+
+      case "run.list":
+        return this.db.listRuns(typeof p.limit === "number" ? p.limit : 20);
+
+      case "run.get": {
+        const runId = String(p.runId);
+        return {
+          run: this.db.getRun(runId),
+          tasks: this.db.listTasks(runId),
+          escalations: this.db.listEscalations(runId),
+          worktrees: this.db.listWorktrees(runId),
+        };
+      }
+
+      case "run.stop":
+        await this.orchestrator.stopRun(String(p.runId), typeof p.reason === "string" ? p.reason : "Stopped by user");
+        return { stopped: true };
+
+      case "attach": {
+        const runId = String(p.runId);
+        const taskId = typeof p.taskId === "string" ? p.taskId : null;
+        const sinceSeq = typeof p.sinceSeq === "number" ? p.sinceSeq : 0;
+        const { tookOver } = this.bindRunSocket(socket, runId, taskId);
+        const replay = this.db.getEventsSince(runId, sinceSeq, taskId, 500);
+        return {
+          attached: true,
+          tookOver,
+          run: this.db.getRun(runId),
+          tasks: this.db.listTasks(runId),
+          escalations: this.db.listEscalations(runId, "open"),
+          replay,
+        };
+      }
+
+      case "detach":
+        this.unbindSocketSession(socket);
+        return { detached: true };
+
+      case "tree.get": {
+        const runId = String(p.runId);
+        return {
+          run: this.db.getRun(runId),
+          tasks: this.db.listTasks(runId),
+          escalations: this.db.listEscalations(runId, "open"),
+          worktrees: this.db.listWorktrees(runId),
+        };
+      }
+
+      case "task.steer":
+        return { steered: await this.orchestrator.steerTask(String(p.taskId), String(p.message)) };
+
+      case "task.cancel":
+        await this.orchestrator.cancelTask(String(p.taskId), String(p.reason ?? "Cancelled by user"));
+        return { cancelled: true };
+
+      case "escalation.ack":
+        return this.db.ackEscalation(String(p.escalationId), String(p.resolution ?? "Resolved"), true);
+
+      case "models.list":
+        return await this.catalog.getCatalog({
+          cwd: typeof p.cwd === "string" ? p.cwd : process.cwd(),
+          role: typeof p.role === "string" ? p.role : undefined,
+          excludeExhausted: Boolean(p.excludeExhausted),
+        });
+
+      case "models.sync":
+        return await this.catalog.sync(typeof p.cwd === "string" ? p.cwd : process.cwd());
+
+      case "quota.get":
+        await this.quota.sync(false).catch(() => {});
+        return { snapshot: this.quota.getCurrentSnapshotJson(), configured: Boolean(this.config.quotaEndpoint?.url) };
+
+      case "quota.sync":
+        await this.quota.sync(true);
+        return { snapshot: this.quota.getCurrentSnapshotJson(), configured: Boolean(this.config.quotaEndpoint?.url) };
+
+      case "worktrees.list": {
+        const repoRoot = String(p.repoRoot ?? process.cwd());
+        return await this.orchestrator.getWorktreeManager(repoRoot).listLive(typeof p.runId === "string" ? p.runId : undefined);
+      }
+
+      case "worktrees.clean": {
+        const repoRoot = String(p.repoRoot ?? process.cwd());
+        return await this.orchestrator.getWorktreeManager(repoRoot).sweep({
+          runId: typeof p.runId === "string" ? p.runId : undefined,
+          forceAll: Boolean(p.forceAll),
+        });
+      }
+
+      case "pty.open": {
+        const cwd = String(p.cwd ?? process.cwd());
+        const info = this.ptyHost.open({
+          cwd,
+          cols: typeof p.cols === "number" ? p.cols : undefined,
+          rows: typeof p.rows === "number" ? p.rows : undefined,
+        });
+        const { snapshot, detach } = this.ptyHost.attach(info.id, (chunk) => {
+          writeNdjson(socket, {
+            kind: "event",
+            seq: 0,
+            runId: "pty",
+            taskId: info.id,
+            type: "pty.output",
+            payload: { chunk },
+            createdAt: Date.now(),
+          } satisfies DaemonEventFrame);
+        });
+        let map = this.ptyDetachFns.get(socket);
+        if (!map) {
+          map = new Map();
+          this.ptyDetachFns.set(socket, map);
+        }
+        map.set(info.id, detach);
+        return { info, snapshot };
+      }
+
+      case "pty.input":
+        this.ptyHost.write(String(p.ptyId), String(p.data));
+        return { ok: true };
+
+      case "pty.resize":
+        this.ptyHost.resize(String(p.ptyId), Number(p.cols), Number(p.rows));
+        return { ok: true };
+
+      case "pty.close":
+        this.ptyHost.close(String(p.ptyId));
+        return { ok: true };
+
+      case "tool.call": {
+        const taskId = String(p.taskId);
+        const name = String(p.name);
+        const args = (p.args ?? {}) as Record<string, unknown>;
+        if (taskId.startsWith("chat-")) {
+          return await this.director.executeDirectorMcpTool(taskId, name, args);
+        }
+        return await this.orchestrator.toolExecutor.execute(String(p.runId), taskId, name, args);
+      }
+
+      default:
+        throw new Error(`Unknown daemon op: ${req.op}`);
+    }
+  }
+}

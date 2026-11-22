@@ -1,0 +1,269 @@
+syntax = "proto3";
+
+package harness.quota.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Optional gRPC / Connect / ProtoJSON-over-HTTP or Unix-socket contract.
+// Over plain HTTP/ProtoJSON (easiest for user-managed scripts/daemons):
+//   GET  /v1/quota          -> QuotaSnapshot (ProtoJSON)
+//   POST /v1/quota:query    -> GetQuotaSnapshotRequest -> QuotaSnapshot
+//   POST /v1/quota:observe  -> UsageObservation -> ReportUsageObservationResponse
+service QuotaService {
+  rpc GetQuotaSnapshot(GetQuotaSnapshotRequest) returns (QuotaSnapshot);
+  rpc WatchQuota(GetQuotaSnapshotRequest) returns (stream QuotaSnapshot);
+  rpc ReportUsageObservation(UsageObservation) returns (ReportUsageObservationResponse);
+}
+
+message GetQuotaSnapshotRequest {
+  repeated string profiles = 1;       // Harness profile IDs (e.g. "acp:claude", "acp:codex", "acp:gemini")
+  repeated string providers = 2;      // Canonical providers (e.g. "claude", "codex", "antigravity", "copilot")
+  repeated string model_ids = 3;      // Filter to specific model IDs
+  bool include_stale = 4;             // Return cached data even past stale_after
+  bool force_refresh = 5;             // Ask endpoint to bypass its own cache if possible
+}
+
+message QuotaSnapshot {
+  string schema_version = 1;                         // "1"
+  google.protobuf.Timestamp generated_at = 2;
+  optional int32 ttl_seconds = 3;                    // Advisory poll interval for the harness
+  repeated AccountInfo accounts = 4;                 // Optional account/plan metadata
+  repeated QuotaBucket buckets = 5;                  // Reusable shared or model-specific quota pools
+  repeated ModelCapacity models = 6;                 // Model-level bindings & resolved capacity
+  repeated ProviderError errors = 7;                 // Non-fatal per-provider/account fetch failures
+  map<string, string> metadata = 8;                  // Producer metadata (e.g. "producer": "my-quota-daemon")
+}
+
+message AccountInfo {
+  string account_id = 1;                             // Stable opaque ID (never raw secrets/tokens)
+  string provider = 2;                               // "claude", "codex", "antigravity", "copilot", "kimi", "zai", "openai", "anthropic", "google"
+  string label = 3;                                  // Human display label (e.g. "personal-max", "team-pool")
+  string plan_tier = 4;                              // Plan tier (e.g. "max_20x", "pro", "ai_ultra", "copilot_pro")
+  LimitScope scope = 5;
+  google.protobuf.Timestamp renews_at = 6;
+  google.protobuf.Timestamp expires_at = 7;
+}
+
+// Reusable capacity container (shared across models or dedicated to one model family,
+// e.g. Google Antigravity's separate Gemini vs Claude Opus 5.5 buckets).
+message QuotaBucket {
+  string bucket_id = 1;                              // Stable unique ID, e.g. "claude:acct1:all", "agy:acct1:claude-gpt"
+  string provider = 2;
+  string account_id = 3;
+  string display_name = 4;                           // e.g. "Claude All Models", "Antigravity Opus/3P"
+  BucketKind kind = 5;
+  LimitScope scope = 6;
+  QuotaStatus status = 7;
+
+  // Optional summary of the currently binding window (harness also recomputes deterministically).
+  optional double used_percent = 8;                  // 0..100 (may exceed 100 when overage is active)
+  optional double remaining_ratio = 9;               // 0.0..1.0 clamped
+  google.protobuf.Timestamp reset_at = 10;           // Effective unblock time: max(reset_at) across exhausted binding windows
+  optional string binding_window_id = 11;
+
+  repeated QuotaWindow windows = 12;                 // All active time/rate/spend windows on this bucket
+  optional OveragePolicy overage = 13;               // Overflow credits / extra usage / pay-as-you-go fallback
+  ObservationMeta observation = 14;                  // Provenance & freshness for merging with passive ACP signals
+  map<string, string> labels = 15;
+}
+
+message QuotaWindow {
+  string window_id = 1;                              // e.g. "five_hour", "seven_day", "monthly", "daily_usd", "rpm", "tpm"
+  string label = 2;                                  // Human label (e.g. "5-hour rolling", "Weekly Opus")
+  WindowCadence cadence = 3;
+  optional int64 window_seconds = 4;                 // 60 (RPM), 18000 (5h), 86400 (24h), 604800 (7d)
+  QuotaUnit unit = 5;
+
+  optional double used_percent = 6;                  // 0..100 (or >100 if overage active)
+  optional double remaining_ratio = 7;               // 0.0..1.0
+  optional double limit = 8;                         // Absolute cap in `unit` (e.g. 300 reqs, 50.00 USD, 400000 TPM)
+  optional double used = 9;
+  optional double remaining = 10;
+  optional double personal_used = 11;                // Member's own share when `scope` is WORKSPACE/GROUP_POOL
+  string currency_code = 12;                         // ISO-4217 (e.g. "USD") when unit == CURRENCY
+
+  google.protobuf.Timestamp reset_at = 13;
+  optional string reset_description = 14;
+  optional double next_regen_percent = 15;
+
+  optional bool binding = 16;                        // Default true when unset; explicit false for informational sub-slices
+  bool unlimited = 17;                               // Explicitly unlimited pool
+  bool is_placeholder = 18;                          // True when provider returned null/uninitialized lane (not real 0% used)
+  QuotaStatus status = 19;
+  ObservationMeta observation = 20;
+}
+
+message OveragePolicy {
+  bool enabled = 1;                                  // Account allows overflow past included window caps
+  bool in_use = 2;                                   // Currently drawing from overage/extra usage
+  QuotaStatus status = 3;
+  QuotaUnit unit = 4;                                // CURRENCY or CREDITS
+  string currency_code = 5;                          // e.g. "USD"
+  optional double used = 6;
+  optional double limit = 7;                         // Monthly/period spend ceiling
+  optional double remaining_balance = 8;             // Prepaid credit pool balance
+  google.protobuf.Timestamp reset_at = 9;
+  optional string disabled_reason = 10;
+}
+
+// Binds a runnable (profile / runner / provider / model_id) to 1..N QuotaBuckets.
+message ModelCapacity {
+  string profile = 1;                                // Harness profile match (e.g. "acp:claude", "acp:gemini")
+  string runner = 2;                                 // Runner kind ("acp", "pi")
+  string provider = 3;                               // Canonical provider ("anthropic", "openai", "antigravity", "copilot", "google")
+  string model_id = 4;                               // Exact model ID, alias, or "*" wildcard default for (profile/provider)
+  string account_id = 5;
+  BillingMode billing_mode = 6;
+
+  repeated BucketBinding bucket_bindings = 7;        // Buckets this model draws from (AND-gate for required=true)
+  optional double cost_multiplier = 8;               // Summary consumption weight (e.g. 0.0, 0.33, 1.0, 3.0, 5.0)
+
+  // Resolved effective state (optional from endpoint; harness recomputes cleanly after passive merges).
+  AvailabilityStatus availability = 9;
+  bool exhausted = 10;
+  optional double effective_remaining_ratio = 11;    // min across required buckets
+  google.protobuf.Timestamp next_available_at = 12;  // Earliest timestamp all exhausted required buckets reset
+  optional int32 estimated_tasks_remaining = 13;
+  optional double estimated_requests_remaining = 14;
+  optional int32 priority_hint = 15;
+  optional string reason = 16;
+  repeated string fallback_model_ids = 17;
+  map<string, string> labels = 18;
+}
+
+message BucketBinding {
+  string bucket_id = 1;                              // References QuotaBucket.bucket_id
+  optional double multiplier = 2;                    // Default 1.0 if unset; explicit 0.0 for free/0x models
+  optional bool required = 3;                        // Default true when unset; explicit false for advisory/bonus pool
+}
+
+message ObservationMeta {
+  google.protobuf.Timestamp observed_at = 1;
+  google.protobuf.Timestamp stale_after = 2;
+  SignalSource source = 3;
+  DataConfidence confidence = 4;
+  optional string raw_status = 5;
+}
+
+message ProviderError {
+  string provider = 1;
+  string account_id = 2;
+  string code = 3;
+  string message = 4;
+  google.protobuf.Timestamp retry_after = 5;
+}
+
+message UsageObservation {
+  string profile = 1;
+  string runner = 2;
+  string provider = 3;
+  string model_id = 4;
+  string account_id = 5;
+  google.protobuf.Timestamp observed_at = 6;
+  SignalSource source = 7;
+  optional QuotaBucket bucket_patch = 8;
+  optional TurnTokenSpend token_spend = 9;
+}
+
+message TurnTokenSpend {
+  int64 input_tokens = 1;
+  int64 output_tokens = 2;
+  int64 cached_input_tokens = 3;
+  int64 cached_write_tokens = 4;
+  int64 reasoning_output_tokens = 5;
+  optional double estimated_cost_usd = 6;
+}
+
+message ReportUsageObservationResponse {
+  bool accepted = 1;
+}
+
+enum BucketKind {
+  BUCKET_KIND_UNSPECIFIED = 0;
+  BUCKET_KIND_SUBSCRIPTION_WINDOW = 1;
+  BUCKET_KIND_CREDIT_POOL = 2;
+  BUCKET_KIND_SPEND_CAP = 3;
+  BUCKET_KIND_RATE_LIMIT = 4;
+  BUCKET_KIND_BONUS_CREDITS = 5;
+}
+
+enum LimitScope {
+  LIMIT_SCOPE_UNSPECIFIED = 0;
+  LIMIT_SCOPE_PERSONAL = 1;
+  LIMIT_SCOPE_WORKSPACE = 2;
+  LIMIT_SCOPE_GROUP_POOL = 3;
+  LIMIT_SCOPE_ORGANIZATION = 4;
+  LIMIT_SCOPE_API_KEY = 5;
+  LIMIT_SCOPE_POOLED_ACCOUNTS = 6;
+}
+
+enum WindowCadence {
+  WINDOW_CADENCE_UNSPECIFIED = 0;
+  WINDOW_CADENCE_ROLLING = 1;
+  WINDOW_CADENCE_FIXED_CALENDAR = 2;
+  WINDOW_CADENCE_PER_MINUTE = 3;
+  WINDOW_CADENCE_PER_HOUR = 4;
+  WINDOW_CADENCE_PER_DAY = 5;
+  WINDOW_CADENCE_ONE_TIME_GRANT = 6;
+  WINDOW_CADENCE_UNBOUNDED = 7;
+}
+
+enum QuotaUnit {
+  QUOTA_UNIT_UNSPECIFIED = 0;
+  QUOTA_UNIT_PERCENT_ONLY = 1;
+  QUOTA_UNIT_REQUESTS = 2;
+  QUOTA_UNIT_TOKENS = 3;
+  QUOTA_UNIT_INPUT_TOKENS = 4;
+  QUOTA_UNIT_OUTPUT_TOKENS = 5;
+  QUOTA_UNIT_CREDITS = 6;
+  QUOTA_UNIT_CURRENCY = 7;
+  QUOTA_UNIT_TOOL_CALLS = 8;
+}
+
+enum QuotaStatus {
+  QUOTA_STATUS_UNSPECIFIED = 0;
+  QUOTA_STATUS_AVAILABLE = 1;
+  QUOTA_STATUS_WARNING = 2;
+  QUOTA_STATUS_EXHAUSTED = 3;
+  QUOTA_STATUS_OVERAGE_ACTIVE = 4;
+  QUOTA_STATUS_RATE_LIMITED = 5;
+  QUOTA_STATUS_DISABLED = 6;
+  QUOTA_STATUS_UNAVAILABLE = 7;
+}
+
+enum BillingMode {
+  BILLING_MODE_UNSPECIFIED = 0;
+  BILLING_MODE_SUBSCRIPTION = 1;
+  BILLING_MODE_API = 2;
+  BILLING_MODE_CREDITS = 3;
+  BILLING_MODE_LOCAL = 4;
+  BILLING_MODE_USER_MANAGED = 5;
+  BILLING_MODE_HYBRID_OVERAGE = 6;
+}
+
+enum AvailabilityStatus {
+  AVAILABILITY_STATUS_UNSPECIFIED = 0;
+  AVAILABILITY_STATUS_READY = 1;
+  AVAILABILITY_STATUS_DEGRADED = 2;
+  AVAILABILITY_STATUS_THROTTLED = 3;
+  AVAILABILITY_STATUS_EXHAUSTED = 4;
+  AVAILABILITY_STATUS_DISABLED = 5;
+  AVAILABILITY_STATUS_UNKNOWN = 6;
+}
+
+enum SignalSource {
+  SIGNAL_SOURCE_UNSPECIFIED = 0;
+  SIGNAL_SOURCE_ENDPOINT = 1;
+  SIGNAL_SOURCE_ACP_PASSIVE = 2;
+  SIGNAL_SOURCE_RUNNER_NATIVE = 3;
+  SIGNAL_SOURCE_ERROR_SIGNAL = 4;
+  SIGNAL_SOURCE_LOCAL_LEDGER = 5;
+}
+
+enum DataConfidence {
+  DATA_CONFIDENCE_UNSPECIFIED = 0;
+  DATA_CONFIDENCE_AUTHORITATIVE = 1;
+  DATA_CONFIDENCE_ESTIMATED = 2;
+  DATA_CONFIDENCE_STALE = 3;
+  DATA_CONFIDENCE_SYNTHETIC = 4;
+}
