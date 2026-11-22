@@ -61,10 +61,13 @@ export type TuiExitAction =
  * Resolves composer input against the slash command registry. Input that looks like a slash command
  * (`/word`, not a path such as `/Users/me`) but names no command in `mode` reports `unknown`.
  */
-function parseSlashInput(mode: CommandMode, text: string): { cmd: SlashCommand; arg: string } | "unknown" | null {
+function parseSlashInput(mode: CommandMode, text: string): { cmd: SlashCommand; arg: string } | { error: string } | null {
   const resolved = resolveCommand(mode, text);
+  if (resolved && resolved.arg && !resolved.cmd.args) {
+    return { error: `/${resolved.cmd.name} takes no arguments. Type /help for commands.` };
+  }
   if (resolved) return resolved;
-  return /^\/[A-Za-z][\w-]*(\s|$)/.test(text) ? "unknown" : null;
+  return /^\/[A-Za-z][\w-]*(\s|$)/.test(text) ? { error: `Unknown command ${text.split(/\s/)[0]}. Type /help for commands.` } : null;
 }
 
 type RunsAction = "inspect" | "stop" | "resume" | "wait";
@@ -421,9 +424,14 @@ export async function runDirectorChatTui(opts: {
     spinner.start("Loading model catalog…", "Esc to cancel");
     void opts.client
       .request<CompiledModelCatalog>("models.list", { cwd: activeRepoRoot })
+      // Keep the per-CLI default rows usable even when the catalog cannot load.
+      .catch((err): CompiledModelCatalog => {
+        appendError(err, "models.list");
+        return { syncedAt: new Date().toISOString(), sources: [], models: [] };
+      })
       .then((cat) => {
         spinner.stop();
-        cachedCatalog = cat;
+        if (cat.models.length > 0) cachedCatalog = cat;
         let handle: ReturnType<OverlayManager["push"]> | null = null;
         const comp = new ModelPickerOverlay(
           theme,
@@ -933,7 +941,7 @@ export async function runDirectorChatTui(opts: {
     composer.addToHistory(text);
 
     const slash = parseSlashInput("chat", text);
-    if (slash === "unknown") return appendSystem([`Unknown command ${text.split(/\s/)[0]}. Type /help for commands.`], "warning");
+    if (slash && "error" in slash) return appendSystem([slash.error], "warning");
     if (slash) return runChatCommand(slash.cmd, slash.arg);
 
     if (busy) {
@@ -1147,7 +1155,7 @@ export async function runNativeScrollbackTui(opts: {
     const quotaAlert = isQuotaPaused
       ? quotaPause?.resumeAt
         ? `⏸ quota (${formatResetCountdown(quotaPause.resumeAt)})`
-        : "⏸ quota (/runs w)"
+        : "⏸ quota (Ctrl+T, then w)"
       : null;
 
     statusBar.update({
@@ -1413,11 +1421,16 @@ export async function runNativeScrollbackTui(opts: {
       cleanup: cleanupFullExit,
     });
 
+  const runError = (err: unknown, context: string) => {
+    streamContainer.addChild(new ErrorCard(theme, formatAgentError(err, { context })));
+    tui.requestRender();
+  };
+
   const stopRun = (runId: string) =>
     void opts.client
       .request("run.stop", { runId })
       .then(() => (runId === opts.runId ? quitRun() : notice([`Stopped run ${runId}.`], "warning")))
-      .catch((err) => streamContainer.addChild(new ErrorCard(theme, formatAgentError(err, { context: "run.stop" }))));
+      .catch((err) => runError(err, "run.stop"));
 
   const openQuotaWaitPicker = (runId: string, reason: string, resumeAt: string | null) => {
     let handle: ReturnType<OverlayManager["push"]> | null = null;
@@ -1428,9 +1441,11 @@ export async function runNativeScrollbackTui(opts: {
       resumeAt,
       (choice) => {
         if (choice.kind === "now") {
-          void opts.client.request("run.resume", { runId }).catch(() => {});
+          void opts.client.request("run.resume", { runId }).catch((err) => runError(err, "run.resume"));
         } else {
-          void opts.client.request("run.schedule_resume", { runId, delayMs: choice.delayMs }).catch(() => {});
+          void opts.client
+            .request("run.schedule_resume", { runId, delayMs: choice.delayMs })
+            .catch((err) => runError(err, "run.schedule_resume"));
         }
       },
       () => handle?.close(),
@@ -1460,7 +1475,7 @@ export async function runNativeScrollbackTui(opts: {
             res.resumed ? "success" : "muted",
           ),
         )
-        .catch(() => {});
+        .catch((err) => runError(err, "run.resume"));
     } else if (action === "wait") {
       if (target.id === opts.runId) {
         openQuotaWaitPicker(target.id, quotaPause?.reason ?? "Paused due to quota limit", quotaPause?.resumeAt ?? null);
@@ -1536,7 +1551,7 @@ export async function runNativeScrollbackTui(opts: {
     composer.addToHistory(text);
 
     const slash = parseSlashInput("run", text);
-    if (slash === "unknown") return notice([`Unknown command ${text.split(/\s/)[0]}. Type /help for commands.`], "warning");
+    if (slash && "error" in slash) return notice([slash.error], "warning");
     if (slash) return runRunCommand(slash.cmd, slash.arg);
 
     // Sending ANY message while the run is paused on quota manually resumes & resets the quota state machine!

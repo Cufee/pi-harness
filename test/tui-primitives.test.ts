@@ -328,6 +328,25 @@ describe("TUI Primitives Library", () => {
       assertWidthSafe(runs.render(width), width, "RunsOverlay");
     }
 
+    // A preselected run beyond the first page must be visible, since x stops the selected run.
+    const manyRuns = Array.from({ length: 20 }, (_, i) => ({
+      id: `run-${i + 1}`,
+      goal: `Goal ${i + 1}`,
+      repoRoot: "/tmp/demo",
+      baseBranch: "main",
+      baseSha: "abc1234",
+      coordinationGroup: "default",
+      isolationMode: "standalone" as const,
+      status: "active" as const,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }));
+    const stopped: string[] = [];
+    const paged = new RunsOverlay(theme, manyRuns, (action, r) => action === "stop" && stopped.push(r.id), () => {}, () => {}, "run-15");
+    expect(paged.render(110).find((l) => l.includes("▸"))).toContain("run-15");
+    paged.handleInput("x");
+    expect(stopped).toEqual(["run-15"]);
+
     const effort = new EffortPickerOverlay(theme, ["low", "medium", "high", "ultra"], "medium", () => {}, () => {}, () => {});
     for (const width of [24, 48, 80, 110]) {
       assertWidthSafe(effort.render(width), width, "EffortPickerOverlay");

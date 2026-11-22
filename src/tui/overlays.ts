@@ -993,8 +993,11 @@ export class RunsOverlay implements Component {
       return [fitWidth(this.theme.muted("No autonomous runs yet. Launch a Goal in Director Chat or via `pi-harness run`."), width)];
     }
 
+    // Slide a 12-row window so the selected run is always visible.
+    const maxRows = 12;
+    const start = Math.max(0, Math.min(this.selected - Math.floor(maxRows / 2), this.runs.length - maxRows));
     return renderTable(
-      this.runs.slice(0, 12).map((r, i) => ({ r, i })),
+      this.runs.slice(start, start + maxRows).map((r, i) => ({ r, i: start + i })),
       [
         {
           header: "RUN",
