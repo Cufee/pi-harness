@@ -1356,6 +1356,75 @@ export class ControlPlaneDb {
     return rows.map((r) => this.getEscalation(String(r.id))!);
   }
 
+  listAllEscalations(opts?: {
+    runIds?: string[];
+    status?: EscalationRecord["status"];
+    limit?: number;
+  }): EscalationRecord[] {
+    const where: string[] = [];
+    const params: (string | number)[] = [];
+    if (opts?.runIds) {
+      if (opts.runIds.length === 0) return [];
+      where.push(`run_id IN (${opts.runIds.map(() => "?").join(",")})`);
+      params.push(...opts.runIds);
+    }
+    if (opts?.status) {
+      where.push("status = ?");
+      params.push(opts.status);
+    }
+    const sql = `SELECT id FROM escalations${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY created_at DESC LIMIT ?`;
+    params.push(opts?.limit ?? 100);
+    const rows = this.db.prepare(sql).all(...params) as Array<{ id: string }>;
+    return rows.map((r) => this.getEscalation(r.id)!).filter(Boolean);
+  }
+
+  listMergeQueue(opts?: { runId?: string; runIds?: string[]; limit?: number }): MergeQueueRecord[] {
+    const where: string[] = [];
+    const params: (string | number)[] = [];
+    if (opts?.runId) {
+      where.push("run_id = ?");
+      params.push(opts.runId);
+    } else if (opts?.runIds) {
+      if (opts.runIds.length === 0) return [];
+      where.push(`run_id IN (${opts.runIds.map(() => "?").join(",")})`);
+      params.push(...opts.runIds);
+    }
+    const sql = `SELECT id FROM merge_queue${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY created_at DESC LIMIT ?`;
+    params.push(opts?.limit ?? 100);
+    const rows = this.db.prepare(sql).all(...params) as Array<{ id: string }>;
+    return rows.map((r) => this.getMergeQueueItem(r.id)!).filter(Boolean);
+  }
+
+  listMessagesForRun(runId: string, limit = 50): MessageRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM messages WHERE run_id = ? ORDER BY created_at DESC LIMIT ?")
+      .all(runId, limit) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      id: String(r.id),
+      runId: String(r.run_id),
+      fromTaskId: String(r.from_task_id),
+      toTaskId: String(r.to_task_id),
+      question: String(r.question),
+      answer: r.answer ? String(r.answer) : null,
+      status: String(r.status) as MessageRecord["status"],
+      createdAt: Number(r.created_at),
+      answeredAt: r.answered_at == null ? null : Number(r.answered_at),
+    }));
+  }
+
+  getEventBySeq(seq: number): EventRecord | null {
+    const r = this.db.prepare("SELECT * FROM events WHERE seq = ?").get(seq) as Record<string, unknown> | undefined;
+    if (!r) return null;
+    return {
+      seq: Number(r.seq),
+      runId: String(r.run_id),
+      taskId: r.task_id ? String(r.task_id) : null,
+      type: String(r.type),
+      payload: JSON.parse(String(r.payload_json)),
+      createdAt: Number(r.created_at),
+    };
+  }
+
   ackEscalation(id: string, resolution: string, resolve = true): EscalationRecord {
     const esc = this.getEscalation(id);
     if (!esc) throw new Error(`Unknown escalation ${id}`);

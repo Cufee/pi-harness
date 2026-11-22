@@ -4,7 +4,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const DAEMON_PROTOCOL_REV = 5;
+export const DAEMON_PROTOCOL_REV = 6;
 
 export function currentDaemonBuildId(): string {
   try {
@@ -17,18 +17,21 @@ export function currentDaemonBuildId(): string {
 import { ModelCatalogCompiler } from "../catalog/compiler.js";
 import { saveGlobalConfig, type HarnessConfig, type RunnerProfileConfig } from "../config.js";
 import { ControlPlaneDb, type ReplayCursor, type EventRecord } from "../control-plane/db.js";
+import { readRunDossier } from "../control-plane/dossiers.js";
+import { compactTaskHandoff } from "../control-plane/handoffs.js";
 import { HarnessOrchestrator, type CustomRunnerFactory } from "../control-plane/orchestrator.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { DirectorRuntime } from "../director/runtime.js";
 import type { GoalCriterion } from "../goals/engine.js";
 import { formatChatEventSummary, type ChatControlEvent } from "../protocol/chat-events.js";
-import type { DaemonEventFrame, RpcRequest, RpcResponse } from "../protocol/daemon-rpc.js";
+import type { DaemonEventFrame, InboxItem, RpcRequest, RpcResponse } from "../protocol/daemon-rpc.js";
 import { attachNdjsonReader, writeDaemonMessage } from "../protocol/frames.js";
 import { buildGoalDetailDisplay, buildGoalsTableDisplay, summarizeToolDisplay } from "../protocol/tool-display.js";
 import { QuotaClient } from "../quota/client.js";
 import { ensureOctofs } from "../tools/native-tools.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
+import { runGit } from "../worktree/manager.js";
 import { PtyHost } from "./pty-host.js";
 
 interface ClientAttachment {
@@ -398,6 +401,16 @@ export class HarnessDaemon {
     const owningChatId = this.getChatSessionIdForRun(ev.runId);
     if (
       ev.type.startsWith("goal.") ||
+      ev.type.startsWith("escalation.") ||
+      ev.type.startsWith("merge.") ||
+      ev.type.startsWith("timer.") ||
+      ev.type === "run.status" ||
+      ev.type === "run.created" ||
+      ev.type === "task.created" ||
+      ev.type === "task.status" ||
+      ev.type === "task.resumed" ||
+      ev.type === "worktree.created" ||
+      ev.type === "worktree.removed" ||
       ev.type === "quota.agent_paused" ||
       ev.type === "quota.run_paused" ||
       ev.type === "quota.run_scheduled" ||
@@ -1101,6 +1114,26 @@ export class HarnessDaemon {
         return { goals, display };
       }
 
+      case "goal.revisions":
+        return this.director.goals.listRevisions(String(p.goalId));
+
+      case "goal.resume": {
+        const g = this.director.goals.getGoal(String(p.goalId));
+        if (!g) throw new Error(`Unknown goal ${p.goalId}`);
+        if (g.linkedRunId) {
+          const res = await this.orchestrator.resumeRun(g.linkedRunId, {
+            trigger: "manual",
+            note: typeof p.note === "string" ? p.note : undefined,
+          });
+          if (res.resumed) {
+            this.director.goals.setStatus(g.id, "executing", "Resumed by user");
+            return { resumed: true, goal: this.director.goals.getGoal(g.id)!, resumedTaskIds: res.resumedTaskIds };
+          }
+        }
+        const committed = await this.director.commitGoal(g.id);
+        return { resumed: true, goal: committed, resumedTaskIds: [] };
+      }
+
       case "goal.review":
         return await this.director.verifyAndReviewGoal(String(p.goalId), undefined, {
           verificationMode:
@@ -1295,6 +1328,178 @@ export class HarnessDaemon {
         };
       }
 
+      case "work.snapshot": {
+        const chatSessionId = typeof p.chatSessionId === "string" && p.chatSessionId ? p.chatSessionId : undefined;
+        const repoRoot = typeof p.repoRoot === "string" && p.repoRoot ? p.repoRoot : undefined;
+        const goals = this.director.goals.listGoals({ repoRoot, chatSessionId });
+        const goalByRunId = new Map(goals.filter((g) => g.linkedRunId).map((g) => [g.linkedRunId!, g]));
+        const runIds = chatSessionId
+          ? this.getRunIdsForChatSession(chatSessionId)
+          : this.db
+              .listRuns(50)
+              .filter((r) => !repoRoot || r.repoRoot === repoRoot)
+              .map((r) => r.id);
+        const runEntries = runIds
+          .map((id) => this.db.getRun(id))
+          .filter((r): r is NonNullable<typeof r> => r !== null)
+          .sort((a, b) => b.createdAt - a.createdAt)
+          .map((raw) => {
+            const run = this.orchestrator.getEffectiveRun(raw.id) ?? raw;
+            const tasks = this.db.listTasks(run.id);
+            const escalations = this.db.listEscalations(run.id);
+            return {
+              run,
+              goalId: goalByRunId.get(run.id)?.id ?? null,
+              tasks,
+              escalations,
+              quotaPause: this.orchestrator.getRunQuotaStatus(run.id),
+              activity: buildRunActivitySummary(this.db, run.id),
+            };
+          });
+        const escalations = this.db.listAllEscalations({ runIds, limit: 150 });
+        const timers = this.db.timers
+          .list({})
+          .filter((t) => {
+            if (!chatSessionId) return true;
+            if (t.ownerKind === "chat") return t.ownerId === chatSessionId;
+            return t.runId != null && runIds.includes(t.runId);
+          })
+          .slice(0, 100);
+        const merges = this.db.listMergeQueue({ runIds, limit: 100 });
+        const worktrees = repoRoot
+          ? await this.orchestrator.getWorktreeManager(repoRoot).listLive().catch(() => [])
+          : [];
+        const messages = runIds.flatMap((id) => this.db.listMessagesForRun(id, 20));
+
+        // Build severity-sorted Inbox of items needing human attention
+        const inbox: InboxItem[] = [];
+        for (const g of goals) {
+          if (g.status === "awaiting_human") {
+            inbox.push({
+              id: `inbox:goal:${g.id}`,
+              severity: "P0",
+              kind: "goal_awaiting_human",
+              title: `${g.id} (v${g.version}) awaits input: ${g.title}`,
+              detail: g.lastReviewSummary ?? "Goal paused awaiting human review or decision",
+              ref: { kind: "goal", id: g.id, runId: g.linkedRunId ?? undefined, label: `${g.id} ${g.title}` },
+              goalId: g.id,
+              runId: g.linkedRunId,
+              createdAt: g.updatedAt,
+            });
+          }
+        }
+        for (const e of escalations) {
+          if (e.status !== "open") continue;
+          const owningGoal = goalByRunId.get(e.runId);
+          inbox.push({
+            id: `inbox:esc:${e.id}`,
+            severity: e.severity,
+            kind: "escalation",
+            title: `[${e.severity}/${e.category}] ${e.title}`,
+            detail: `from ${e.fromTaskId} in ${e.runId}${e.blocking ? " · blocking" : ""}`,
+            ref: { kind: "escalation", id: e.id, runId: e.runId, goalId: owningGoal?.id, label: `${e.id} ${e.title}` },
+            goalId: owningGoal?.id ?? null,
+            runId: e.runId,
+            taskId: e.fromTaskId,
+            createdAt: e.createdAt,
+          });
+        }
+        for (const re of runEntries) {
+          if (re.run.status === "paused_quota") {
+            inbox.push({
+              id: `inbox:quota:${re.run.id}`,
+              severity: re.quotaPause?.mode === "manual" ? "P0" : "P1",
+              kind: "quota_paused",
+              title: `${re.run.id} paused for quota`,
+              detail: re.quotaPause?.reason ?? "Quota limit reached",
+              ref: { kind: "run", id: re.run.id, goalId: re.goalId ?? undefined, label: re.run.id },
+              goalId: re.goalId,
+              runId: re.run.id,
+              createdAt: re.run.updatedAt,
+            });
+          } else if (re.run.status === "failed" && !re.run.id.startsWith("director-tasks-")) {
+            inbox.push({
+              id: `inbox:run:${re.run.id}`,
+              severity: "P1",
+              kind: "run_failed",
+              title: `${re.run.id} failed`,
+              detail: re.run.goal.split("\n")[0] ?? re.run.id,
+              ref: { kind: "run", id: re.run.id, goalId: re.goalId ?? undefined, label: re.run.id },
+              goalId: re.goalId,
+              runId: re.run.id,
+              createdAt: re.run.updatedAt,
+            });
+          }
+          for (const t of re.tasks) {
+            if (t.status === "blocked" || (t.status === "failed" && re.run.status === "active")) {
+              inbox.push({
+                id: `inbox:task:${t.id}`,
+                severity: t.status === "blocked" ? "P1" : "P2",
+                kind: t.status === "blocked" ? "task_blocked" : "task_failed",
+                title: `${t.id} (${t.status}): ${t.title}`,
+                detail: t.summary ?? `${re.run.id} · T${t.tier}/${t.kind}`,
+                ref: { kind: "task", id: t.id, runId: re.run.id, goalId: re.goalId ?? undefined, label: `${t.id} ${t.title}` },
+                goalId: re.goalId,
+                runId: re.run.id,
+                taskId: t.id,
+                createdAt: t.updatedAt,
+              });
+            }
+          }
+        }
+        for (const m of merges) {
+          if (m.status === "conflict" || m.status === "ci_failed") {
+            const owningGoal = goalByRunId.get(m.runId);
+            inbox.push({
+              id: `inbox:merge:${m.id}`,
+              severity: "P1",
+              kind: "merge_bounced",
+              title: `Merge ${m.id} (${m.status}): ${m.branch}`,
+              detail: (m.log ?? "").split("\n")[0] ?? m.status,
+              ref: { kind: "merge", id: m.id, runId: m.runId, goalId: owningGoal?.id, label: m.id },
+              goalId: owningGoal?.id ?? null,
+              runId: m.runId,
+              taskId: m.taskId,
+              createdAt: m.finishedAt ?? m.createdAt,
+            });
+          }
+        }
+        for (const msg of messages) {
+          if (msg.status === "open") {
+            inbox.push({
+              id: `inbox:msg:${msg.id}`,
+              severity: "P2",
+              kind: "open_message",
+              title: `Open message ${msg.id} (${msg.fromTaskId} -> ${msg.toTaskId})`,
+              detail: msg.question.slice(0, 140),
+              ref: { kind: "message", id: msg.id, runId: msg.runId, label: msg.id },
+              runId: msg.runId,
+              taskId: msg.toTaskId,
+              createdAt: msg.createdAt,
+            });
+          }
+        }
+        const sevRank = { P0: 0, P1: 1, P2: 2, info: 3 };
+        inbox.sort((a, b) => sevRank[a.severity] - sevRank[b.severity] || b.createdAt - a.createdAt);
+
+        return {
+          generatedAt: Date.now(),
+          latestSeq: this.db.getLatestEventSeq(),
+          goals: goals.map((goal) => ({
+            goal,
+            reviews: this.director.goals.listReviews(goal.id),
+            revisions: this.director.goals.listRevisions(goal.id),
+          })),
+          runs: runEntries,
+          escalations,
+          timers,
+          merges,
+          worktrees,
+          messages,
+          inbox,
+        };
+      }
+
       case "watch.start":
         return this.startWatch(socket, p);
 
@@ -1305,6 +1510,31 @@ export class HarnessDaemon {
         return { stopped };
       }
 
+      case "task.get": {
+        const task = this.db.getTask(String(p.taskId));
+        if (!task) throw new Error(`Unknown task ${p.taskId}`);
+        const run = this.db.getRun(task.runId);
+        const escalations = this.db.listEscalations(task.runId).filter((e) => e.fromTaskId === task.id || e.toTaskId === task.id);
+        const artifacts = this.db.listArtifacts(task.runId, task.id, 100);
+        const worktree = task.worktreeId ? this.db.getWorktree(task.worktreeId) : null;
+        const merges = this.db.listMergeQueue({ runId: task.runId, limit: 50 }).filter((m) => m.taskId === task.id);
+        const messages = this.db.listMessagesForRun(task.runId, 50).filter((m) => m.fromTaskId === task.id || m.toTaskId === task.id);
+        const children = this.db.listTasks(task.runId, { parentId: task.id });
+        const writeScopes = this.db.listAssignedWriteScopes(task.runId, task.id);
+        return {
+          task,
+          handoff: compactTaskHandoff(task, escalations),
+          run: run ? (this.orchestrator.getEffectiveRun(run.id) ?? run) : null,
+          escalations,
+          artifacts,
+          worktree,
+          merges,
+          messages,
+          children,
+          writeScopes,
+        };
+      }
+
       case "task.steer":
         return { steered: await this.orchestrator.steerTask(String(p.taskId), String(p.message)) };
 
@@ -1312,8 +1542,88 @@ export class HarnessDaemon {
         await this.orchestrator.cancelTask(String(p.taskId), String(p.reason ?? "Cancelled by user"));
         return { cancelled: true };
 
-      case "escalation.ack":
-        return this.db.ackEscalation(String(p.escalationId), String(p.resolution ?? "Resolved"), true);
+      case "escalation.list": {
+        const chatSessionId = typeof p.chatSessionId === "string" && p.chatSessionId ? p.chatSessionId : undefined;
+        const runId = typeof p.runId === "string" && p.runId ? p.runId : undefined;
+        const status =
+          p.status === "open" || p.status === "acked" || p.status === "resolved" ? p.status : undefined;
+        const runIds = runId ? [runId] : chatSessionId ? this.getRunIdsForChatSession(chatSessionId) : undefined;
+        return this.db.listAllEscalations({
+          runIds,
+          status,
+          limit: typeof p.limit === "number" ? p.limit : 100,
+        });
+      }
+
+      case "escalation.get": {
+        const esc = this.db.getEscalation(String(p.escalationId));
+        if (!esc) throw new Error(`Unknown escalation ${p.escalationId}`);
+        const run = this.db.getRun(esc.runId);
+        const fromTask = this.db.getTask(esc.fromTaskId);
+        const goal = this.director.goals.listGoals().find((g) => g.linkedRunId === esc.runId) ?? null;
+        return { escalation: esc, run, fromTask, goal };
+      }
+
+      case "escalation.ack": {
+        const resolveFlag = p.resolve === undefined ? true : Boolean(p.resolve);
+        const resolution = String(p.resolution ?? (resolveFlag ? "Resolved" : "Acknowledged"));
+        return this.db.ackEscalation(String(p.escalationId), resolution, resolveFlag);
+      }
+
+      case "artifact.list": {
+        const runId = String(p.runId);
+        const taskId = typeof p.taskId === "string" && p.taskId ? p.taskId : undefined;
+        return this.db.listArtifacts(runId, taskId, typeof p.limit === "number" ? p.limit : 100);
+      }
+
+      case "artifact.read": {
+        const run = this.db.getRun(String(p.runId));
+        if (!run) throw new Error(`Unknown run ${p.runId}`);
+        return readRunDossier(this.db, run, {
+          path: typeof p.path === "string" ? p.path : undefined,
+          task_id: typeof p.taskId === "string" ? p.taskId : undefined,
+          max_chars: typeof p.maxChars === "number" ? p.maxChars : 16_000,
+          offset: typeof p.offset === "number" ? p.offset : 0,
+        });
+      }
+
+      case "timer.list": {
+        const status =
+          p.status === "pending" || p.status === "fired" || p.status === "cancelled" ? p.status : undefined;
+        const ownerKind = p.ownerKind === "chat" || p.ownerKind === "task" ? p.ownerKind : undefined;
+        const ownerId = typeof p.ownerId === "string" && p.ownerId ? p.ownerId : undefined;
+        const limit = typeof p.limit === "number" ? p.limit : 100;
+        return this.db.timers.list({ ownerKind, ownerId, status }).slice(0, limit);
+      }
+
+      case "timer.cancel": {
+        const cancelled = this.db.timers.cancel(
+          String(p.timerId),
+          typeof p.reason === "string" ? p.reason : "cancelled_by_user",
+        );
+        if (!cancelled) throw new Error(`Unknown timer ${p.timerId}`);
+        return { timer: cancelled };
+      }
+
+      case "merge.list": {
+        const runId = typeof p.runId === "string" && p.runId ? p.runId : undefined;
+        const chatSessionId = typeof p.chatSessionId === "string" && p.chatSessionId ? p.chatSessionId : undefined;
+        const runIds = !runId && chatSessionId ? this.getRunIdsForChatSession(chatSessionId) : undefined;
+        return this.db.listMergeQueue({ runId, runIds, limit: typeof p.limit === "number" ? p.limit : 100 });
+      }
+
+      case "messages.list": {
+        const runId = String(p.runId);
+        return this.db.listMessagesForRun(runId, typeof p.limit === "number" ? p.limit : 50);
+      }
+
+      case "event.get": {
+        const seq = Number(p.seq);
+        if (!Number.isFinite(seq) || seq <= 0) throw new Error("event.get requires a positive seq number");
+        const ev = this.db.getEventBySeq(seq);
+        if (!ev) throw new Error(`Unknown event seq ${seq}`);
+        return ev;
+      }
 
       case "models.list": {
         this.quota.harvestLocal(this.config.profiles);
@@ -1367,9 +1677,28 @@ export class HarnessDaemon {
         return await this.orchestrator.getWorktreeManager(repoRoot).listLive(typeof p.runId === "string" ? p.runId : undefined);
       }
 
+      case "worktrees.get": {
+        const wt = this.db.getWorktree(String(p.worktreeId));
+        if (!wt) throw new Error(`Unknown worktree ${p.worktreeId}`);
+        const run = this.db.getRun(wt.runId);
+        const task = this.db.getTask(wt.taskId);
+        let statusOut = "";
+        let diffStat = "";
+        if (existsSync(wt.path)) {
+          statusOut = await runGit(wt.path, ["status", "--short"]).then((r) => r.stdout).catch(() => "");
+          diffStat = await runGit(wt.path, ["diff", "--stat", wt.baseSha]).then((r) => r.stdout).catch(() => "");
+        }
+        return { worktree: wt, run, task, existsOnDisk: existsSync(wt.path), gitStatus: statusOut, diffStat };
+      }
+
       case "worktrees.clean": {
         const repoRoot = String(p.repoRoot ?? process.cwd());
-        return await this.orchestrator.getWorktreeManager(repoRoot).sweep({
+        const mgr = this.orchestrator.getWorktreeManager(repoRoot);
+        if (typeof p.worktreeId === "string" && p.worktreeId) {
+          const ref = await mgr.teardown(p.worktreeId, { archiveBeforeRemove: true, finalStatus: "archived" });
+          return { removed: [p.worktreeId], archivedRefs: ref ? [ref] : [], prunedAdminEntries: true, expiredArchiveRefs: [], errors: [] };
+        }
+        return await mgr.sweep({
           runId: typeof p.runId === "string" ? p.runId : undefined,
           forceAll: Boolean(p.forceAll),
         });

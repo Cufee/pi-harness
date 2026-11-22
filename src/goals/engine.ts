@@ -143,6 +143,18 @@ export interface GoalAmendmentDelta {
   nonGoalsChanged: boolean;
 }
 
+export interface GoalRevisionRecord {
+  goalId: string;
+  version: number;
+  title: string;
+  description: string;
+  criteria: GoalCriterion[];
+  nonGoals: string[];
+  rationale: string;
+  delta: GoalAmendmentDelta | null;
+  createdAt: number;
+}
+
 export interface CriterionEvaluation {
   criterionId: string;
   passed: boolean;
@@ -792,6 +804,24 @@ export class GoalEngine {
     };
 
     return { goal: this.getGoal(goal.id)!, review, circuitBreakerTripped };
+  }
+
+  listRevisions(goalIdStr: string): GoalRevisionRecord[] {
+    const resolvedId = this.getGoal(goalIdStr)?.id ?? goalIdStr;
+    const rows = this.db
+      .prepare("SELECT * FROM goal_revisions WHERE goal_id = ? ORDER BY version DESC")
+      .all(resolvedId) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      goalId: String(r.goal_id),
+      version: Number(r.version),
+      title: String(r.title),
+      description: String(r.description),
+      criteria: JSON.parse(String(r.criteria_json)) as GoalCriterion[],
+      nonGoals: JSON.parse(String(r.non_goals_json)) as string[],
+      rationale: String(r.rationale),
+      delta: r.delta_json ? (JSON.parse(String(r.delta_json)) as GoalAmendmentDelta) : null,
+      createdAt: Number(r.created_at),
+    }));
   }
 
   listReviews(goalIdStr: string): GoalReviewVerdict[] {

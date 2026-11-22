@@ -53,6 +53,8 @@ export type DaemonOp =
   | "goal.commit"
   | "goal.list"
   | "goal.get"
+  | "goal.revisions"
+  | "goal.resume"
   | "goal.table_display"
   | "goal.review"
   | "goal.pause"
@@ -69,20 +71,76 @@ export type DaemonOp =
   | "detach"
   | "tree.get"
   | "runs.trees"
+  | "work.snapshot"
   | "watch.start"
   | "watch.stop"
+  | "task.get"
   | "task.steer"
   | "task.cancel"
   | "task.resume"
+  | "escalation.list"
+  | "escalation.get"
   | "escalation.ack"
+  | "artifact.list"
+  | "artifact.read"
+  | "timer.list"
+  | "timer.cancel"
+  | "merge.list"
+  | "messages.list"
+  | "event.get"
   | "models.list"
   | "models.sync"
   | "quota.get"
   | "quota.sync"
   | "worktrees.list"
+  | "worktrees.get"
   | "worktrees.clean"
   | "pty.open"
   | "pty.input"
   | "pty.resize"
   | "pty.close"
   | "tool.call";
+
+export type EntityKind =
+  | "goal"
+  | "run"
+  | "task"
+  | "escalation"
+  | "review"
+  | "revision"
+  | "artifact"
+  | "timer"
+  | "worktree"
+  | "merge"
+  | "message"
+  | "tool_call"
+  | "transcript";
+
+export interface EntityRef {
+  kind: EntityKind;
+  id: string;
+  runId?: string;
+  goalId?: string;
+  label?: string;
+}
+
+export interface InboxItem {
+  id: string;
+  severity: "P0" | "P1" | "P2" | "info";
+  kind:
+    | "goal_awaiting_human"
+    | "escalation"
+    | "task_failed"
+    | "task_blocked"
+    | "run_failed"
+    | "quota_paused"
+    | "merge_bounced"
+    | "open_message";
+  title: string;
+  detail: string;
+  ref: EntityRef;
+  goalId?: string | null;
+  runId?: string | null;
+  taskId?: string | null;
+  createdAt: number;
+}
