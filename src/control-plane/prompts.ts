@@ -165,7 +165,7 @@ export function buildHydrationTurn(input: {
     lines.push("", "## Open Cross-Run Peer Requests (reply via `peer_reply`)");
     for (const req of input.openPeerRequests.slice(0, 10)) {
       lines.push(
-        `- [${req.id}] from ${req.fromRunId} (topic=${req.topicKey}, round=${req.round}): ${req.message.slice(0, 240)}`,
+        `- [${req.id}] from ${req.fromRunId} (topic=${req.topicKey}, round=${req.round}): <untrusted_peer_input>${req.message.slice(0, 240)}</untrusted_peer_input>`,
       );
     }
   }
@@ -174,7 +174,7 @@ export function buildHydrationTurn(input: {
     lines.push("", "## Answered Peer Messages");
     for (const msg of input.answeredMessages.slice(0, 10)) {
       lines.push(
-        `- [${msg.id}] to ${msg.toTaskId}: Q="${msg.question.slice(0, 120)}" -> A="${(msg.answer ?? "").slice(0, 240)}"`,
+        `- [${msg.id}] to ${msg.toTaskId}: Q="${msg.question.slice(0, 120)}" -> A=<untrusted_peer_input>${(msg.answer ?? "").slice(0, 240)}</untrusted_peer_input>`,
       );
     }
   }

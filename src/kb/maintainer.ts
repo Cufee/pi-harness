@@ -119,8 +119,9 @@ export class KnowledgeMaintainer {
       };
 
       for (const entry of active) {
-        const useEvidence = entry.evidencePaths.length > 0;
-        const watchedPatterns = useEvidence ? entry.evidencePaths : entry.pathGlobs;
+        // Only auto-stale on explicit `evidencePaths` (never broad `pathGlobs` like `src/**`, which stale on routine merges).
+        const useEvidence = true;
+        const watchedPatterns = entry.evidencePaths;
         if (!entry.verifiedSha || watchedPatterns.length === 0) continue;
         if (entry.lastCheckedSha === headSha) continue;
 

@@ -104,6 +104,8 @@ export interface RunAgentRequest {
   mcpBridgeEntrypoint?: string;
   /** Optional external stdio MCP servers forwarded alongside the harness bridge (e.g. ast-grep, octofs, serena). */
   externalMcpServers?: ExternalMcpServerConfig[];
+  /** Permit shell execution (`Bash`/`shell_command`/`execute`) in `read_only_workspace` (used for verify/Done-Review in isolated checkouts). */
+  allowShellInReadOnly?: boolean;
   signal: AbortSignal;
   callbacks: RunnerCallbacks;
   onHandle?: (handle: RunnerExecutionHandle) => void;

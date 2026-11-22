@@ -877,7 +877,12 @@ export class ControlPlaneDb {
 
       if (!input.readOnly && scopes.length > 0) {
         const activeLeases = this.db
-          .prepare("SELECT run_id, target_branch, task_id, glob_pattern FROM write_leases WHERE repo_root = ? AND active = 1")
+          .prepare(
+            `SELECT wl.run_id, wl.target_branch, wl.task_id, wl.glob_pattern
+             FROM write_leases wl
+             JOIN tasks t ON t.id = wl.task_id
+             WHERE wl.repo_root = ? AND (wl.active = 1 OR t.status = 'pending')`,
+          )
           .all(run.repoRoot) as Array<{ run_id: string; target_branch: string; task_id: string; glob_pattern: string }>;
         for (const requested of scopes) {
           for (const existing of activeLeases) {

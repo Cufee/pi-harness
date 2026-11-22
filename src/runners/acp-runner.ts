@@ -210,12 +210,14 @@ export class AcpRunner {
       throw new Error(`Model ${req.model} is unavailable on ACP profile ${this.profile.id}`);
     }
     const workspace = await realpath(req.cwd);
+    const controlOnly = req.toolPolicy === "control_plane_only";
+    const canWrite = req.toolPolicy === "read_write_workspace";
+    const allowShell = canWrite || (req.toolPolicy === "read_only_workspace" && Boolean(req.allowShellInReadOnly));
     const prepared = prepareAcpSpawn(this.profile, {
       systemPrompt: req.systemPrompt,
       toolPolicy: req.toolPolicy,
+      allowShellInReadOnly: Boolean(req.allowShellInReadOnly),
     });
-    const controlOnly = req.toolPolicy === "control_plane_only";
-    const canWrite = req.toolPolicy === "read_write_workspace";
 
     const child = testAgent
       ? null
@@ -673,7 +675,7 @@ export class AcpRunner {
         const allowOpt = options.find((o) => o.kind === "allow_once");
         const denyOpt = options.find((o) => o.kind === "reject_once") ?? options.find((o) => o.kind === "reject_always");
         const externalMcpNames = new Set(
-          !controlOnly
+          allowShell
             ? (req.externalMcpServers ?? []).filter((s) => s.enabled !== false && s.name.trim()).map((s) => s.name.trim())
             : [],
         );
@@ -717,7 +719,7 @@ export class AcpRunner {
             } catch {
               workspaceCall = false;
             }
-          } else if (isExecute) {
+          } else if (isExecute && allowShell) {
             workspaceCall = true;
           }
         }
@@ -844,7 +846,7 @@ export class AcpRunner {
           ],
         });
       }
-      if (!controlOnly && req.externalMcpServers?.length) {
+      if (allowShell && req.externalMcpServers?.length) {
         for (const ext of req.externalMcpServers) {
           if (ext.enabled === false || !ext.name?.trim() || !ext.command?.trim() || ext.name.trim() === "harness") continue;
           mcpServers.push({
@@ -860,6 +862,7 @@ export class AcpRunner {
         cwd: req.cwd,
         systemPrompt: req.systemPrompt,
         toolPolicy: req.toolPolicy,
+        allowShellInReadOnly: Boolean(req.allowShellInReadOnly),
         model: req.model,
         effort: req.effort,
         mcpServers,
@@ -1045,11 +1048,17 @@ export class AcpRunner {
         rawStop = String(promptRes.stopReason ?? "end_turn");
 
         const turnQuotaDetected = detectQuotaErrorText(quotaRejected ? textSinceQuotaRejection || accumulatedText : accumulatedText);
-        // Require a real provider/adapter rejection or observed rate-limit signal before classifying assistant text as quota_paused,
-        // so ordinary prose mentioning "rate limiting" never falsely pauses healthy turns.
+        // Require either a real rejection/rate-limit signal OR a short hard-exhaustion message with 0 successful tools,
+        // so ordinary prose mentioning "rate limiting" never falsely pauses healthy turns while text-only caps still pause.
+        const shortHardQuotaText =
+          turnSucceededTools === 0 &&
+          accumulatedText.trim().length > 0 &&
+          accumulatedText.trim().length <= 600 &&
+          turnQuotaDetected.isHardExhaustion;
         const turnQuotaFalseCompletion =
           (quotaRejected && (textSinceQuotaRejection.trim().length === 0 || turnQuotaDetected.isQuota)) ||
-          (quotaRetryHits > 0 && turnSucceededTools === 0 && turnQuotaDetected.isQuota);
+          (quotaRetryHits > 0 && turnSucceededTools === 0 && turnQuotaDetected.isQuota) ||
+          shortHardQuotaText;
 
         // Never continue if rollover, maxTurns, quota watchdog, quota rejection, user abort, or quota failure occurred
         if (
@@ -1118,9 +1127,15 @@ export class AcpRunner {
       }
 
       const finalQuotaDetected = detectQuotaErrorText(quotaRejected ? textSinceQuotaRejection || accumulatedText : accumulatedText);
+      const finalShortHardQuota =
+        turnSucceededTools === 0 &&
+        accumulatedText.trim().length > 0 &&
+        accumulatedText.trim().length <= 600 &&
+        finalQuotaDetected.isHardExhaustion;
       const quotaFalseCompletion =
         (quotaRejected && (textSinceQuotaRejection.trim().length === 0 || finalQuotaDetected.isQuota)) ||
-        (quotaRetryHits > 0 && turnSucceededTools === 0 && finalQuotaDetected.isQuota);
+        (quotaRetryHits > 0 && turnSucceededTools === 0 && finalQuotaDetected.isQuota) ||
+        finalShortHardQuota;
 
       if (
         quotaWatchdogTriggered ||

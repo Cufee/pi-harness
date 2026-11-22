@@ -100,21 +100,14 @@ export function buildRunActivitySummary(db: ControlPlaneDb, runId: string, now =
   const evRows = db.db
     .prepare(
       `SELECT task_id, type, payload_json FROM events
-       WHERE run_id = ? AND task_id IS NOT NULL AND type NOT IN ('agent.text_delta', 'agent.thought_delta')
-       ORDER BY seq DESC`,
+       WHERE run_id = ? AND task_id IS NOT NULL
+         AND type IN ('agent.tool', 'agent.timer_sleep', 'quota.agent_retrying', 'quota.agent_paused', 'agent.rollover')
+       ORDER BY seq DESC
+       LIMIT 2000`,
     )
     .all(runId) as Array<{ task_id: string; type: string; payload_json: string }>;
 
   for (const row of evRows) {
-    if (
-      row.type !== "agent.tool" &&
-      row.type !== "agent.timer_sleep" &&
-      row.type !== "quota.agent_retrying" &&
-      row.type !== "quota.agent_paused" &&
-      row.type !== "agent.rollover"
-    ) {
-      continue;
-    }
     let payload: Record<string, unknown> = {};
     try {
       payload = JSON.parse(row.payload_json) as Record<string, unknown>;

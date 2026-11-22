@@ -168,6 +168,7 @@ export class HarnessOrchestrator {
       getWorktreeManager: (repoRoot) => this.getWorktreeManager(repoRoot),
       getMergeQueue: (repoRoot) => this.getMergeQueue(repoRoot),
       getTaskSignal: (taskId) => this.active.get(taskId)?.generationSignal,
+      getTaskCancelSignal: (taskId) => this.active.get(taskId)?.abort.signal,
       resumeTask: (taskId, opts) => this.resumeTask(taskId, opts),
     }, config);
   }
@@ -805,27 +806,40 @@ export class HarnessOrchestrator {
 
     const toolPolicy = toolPolicyForTask(task.tier, task.kind, task.readOnly);
     let wt = task.worktreeId ? this.db.getWorktree(task.worktreeId) : null;
-    if (toolPolicy === "read_write_workspace") {
-      if (wt && wt.status === "merged") {
-        throw new Error(`Cannot resume worker ${task.id}: its worktree ${wt.id} was already merged.`);
+    let reacquiredLeases = false;
+    let profile: RunnerProfileConfig;
+    let model: string;
+    try {
+      if (toolPolicy === "read_write_workspace") {
+        if (wt && wt.status === "merged") {
+          throw new Error(`Cannot resume worker ${task.id}: its worktree ${wt.id} was already merged.`);
+        }
+        // Atomically validate and re-acquire assigned write leases before resuming a Tier 2 worker!
+        if (task.tier === 2) {
+          this.db.reacquireWriteLeasesForTask(run.id, task.id);
+          reacquiredLeases = true;
+        }
+        const wtMgr = this.getWorktreeManager(run.repoRoot);
+        if (!wt || wt.runId !== run.id || !existsSync(wt.path)) {
+          wt = await wtMgr.createForWorker(run.id, task.id);
+        } else if (wt.status !== "active") {
+          this.db.updateWorktree(wt.id, { status: "active", cleanedAt: null });
+        }
       }
-      // Atomically validate and re-acquire assigned write leases before resuming a Tier 2 worker!
-      if (task.tier === 2) {
-        this.db.reacquireWriteLeasesForTask(run.id, task.id);
-      }
-      const wtMgr = this.getWorktreeManager(run.repoRoot);
-      if (!wt || wt.runId !== run.id || !existsSync(wt.path)) {
-        wt = await wtMgr.createForWorker(run.id, task.id);
-      } else if (wt.status !== "active") {
-        this.db.updateWorktree(wt.id, { status: "active", cleanedAt: null });
-      }
-    }
 
-    const cwd = wt?.path ?? run.repoRoot;
-    const { profile, model } = await this.taskRoute(task, cwd, {
-      profileId: opts?.profileId,
-      model: opts?.model,
-    });
+      const cwd = wt?.path ?? run.repoRoot;
+      const route = await this.taskRoute(task, cwd, {
+        profileId: opts?.profileId,
+        model: opts?.model,
+      });
+      profile = route.profile;
+      model = route.model;
+    } catch (err) {
+      if (reacquiredLeases) {
+        this.db.db.prepare("UPDATE write_leases SET active = 0 WHERE task_id = ?").run(task.id);
+      }
+      throw err;
+    }
     this.quota.clearPassiveExhaustion(profile.id);
 
     const priorReason = task.summary?.trim() || `previous status was '${task.status}'`;
@@ -1028,6 +1042,7 @@ export class HarnessOrchestrator {
         daemonSocketPath: this.config.socketPath,
         mcpBridgeEntrypoint,
         externalMcpServers: this.config.externalMcpServers,
+        allowShellInReadOnly: task.kind === "verify",
         signal: exec.generationSignal,
         onHandle: (h) => {
           exec.handle = h;
@@ -1394,12 +1409,36 @@ export class HarnessOrchestrator {
     const priorInvariants = input.priorHandoff?.goalInvariants ?? [];
     const priorDecisions = input.priorHandoff?.architecturalDecisions ?? [];
 
+    // Collect only accepted steers since the last rollover so stale/rejected steers never replay across generations
+    const lastRolloverSeq =
+      (
+        this.db.db
+          .prepare("SELECT MAX(seq) AS s FROM events WHERE run_id = ? AND task_id = ? AND type = 'agent.rollover'")
+          .get(input.runId, input.task.id) as { s: number | null } | undefined
+      )?.s ?? 0;
+    const steeredRows = this.db.db
+      .prepare(
+        "SELECT payload_json FROM events WHERE run_id = ? AND task_id = ? AND type = 'agent.steered' AND seq > ? ORDER BY seq ASC LIMIT 6",
+      )
+      .all(input.runId, input.task.id, lastRolloverSeq) as Array<{ payload_json: string }>;
+    const acceptedSteers: string[] = [];
+    for (const row of steeredRows) {
+      try {
+        const p = JSON.parse(row.payload_json) as { message?: string; accepted?: boolean };
+        if (p.accepted !== false && p.message?.trim()) {
+          acceptedSteers.push(`Steered update: ${p.message.trim().slice(0, 400)}`);
+        }
+      } catch {
+        // ignore malformed payload
+      }
+    }
+
     if (input.explicitHandoff) {
       return {
         goalInvariants: mergeUnique(priorInvariants, input.explicitHandoff.goalInvariants),
         architecturalDecisions: mergeDecisions(priorDecisions, input.explicitHandoff.architecturalDecisions),
         activeRisks: input.explicitHandoff.activeRisks,
-        nextActions: input.explicitHandoff.nextActions,
+        nextActions: mergeUnique(input.explicitHandoff.nextActions, acceptedSteers),
       };
     }
 
@@ -1460,23 +1499,12 @@ export class HarnessOrchestrator {
         `Recently touched artifacts: ${recentArtifacts.map((a) => `${a.kind}:${a.path}`).slice(0, 8).join(", ")}`,
       );
     }
-    // Preserve steered instructions and unanswered peer questions so rollovers NEVER forget mid-flight updates!
-    const steeredRows = this.db.db
-      .prepare("SELECT payload_json FROM events WHERE run_id = ? AND task_id = ? AND type = 'agent.steered' ORDER BY seq DESC LIMIT 6")
-      .all(input.runId, input.task.id) as Array<{ payload_json: string }>;
-    for (const row of steeredRows.reverse()) {
-      try {
-        const p = JSON.parse(row.payload_json) as { message?: string };
-        if (p.message?.trim()) {
-          nextActions.push(`Steered update: ${p.message.trim().slice(0, 400)}`);
-        }
-      } catch {
-        // ignore malformed payload
-      }
+    for (const s of acceptedSteers) {
+      nextActions.push(s);
     }
     const openPeerMsgs = this.db.listOpenMessages(input.task.id);
     for (const m of openPeerMsgs.slice(0, 5)) {
-      nextActions.push(`Unanswered peer question ${m.id} from ${m.fromTaskId}: ${m.question.slice(0, 260)}`);
+      nextActions.push(`Unanswered peer question ${m.id} from ${m.fromTaskId}: <untrusted_peer_input>${m.question.slice(0, 260)}</untrusted_peer_input>`);
     }
     if (input.result.toolFailures?.length) {
       activeRisks.push(`Recent tool failures: ${input.result.toolFailures.slice(-3).join(" | ")}`);
@@ -1508,8 +1536,11 @@ export class HarnessOrchestrator {
       gitState = `${head}|${status}`;
     }
     const artCount = this.db.listArtifacts(runId, taskId, 200).length;
-    const childCount = this.db.listTasks(runId, { parentId: taskId }).length;
-    return `${gitState}::art=${artCount}::kids=${childCount}`;
+    const kids = this.db.listTasks(runId, { parentId: taskId });
+    const kidSig = kids.map((k) => `${k.id}:${k.status}:${k.generation}:${k.updatedAt}`).join(",");
+    const bbKeys = Object.keys(this.db.blackboardGet(runId)).sort().join(",");
+    const openEsc = this.db.listEscalations(runId, "open").map((e) => e.id).join(",");
+    return `${gitState}::art=${artCount}::kids=${kidSig}::bb=${bbKeys}::esc=${openEsc}`;
   }
 
   async steerTask(taskId: string, message: string): Promise<boolean> {

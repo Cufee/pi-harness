@@ -1094,9 +1094,12 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
 
       try {
         const sendPromise = daemon2.director.sendChatMessage(chat2.id, "Wait on the goal");
-        await new Promise((r) => setTimeout(r, 30));
+        let steered = false;
         const tStart = Date.now();
-        const steered = await daemon2.director.steerChat(chat2.id, "Prefer Neon for subagents", { role: "user" });
+        for (let i = 0; i < 40 && !steered; i++) {
+          await new Promise((r) => setTimeout(r, 25));
+          steered = await daemon2.director.steerChat(chat2.id, "Prefer Neon for subagents", { role: "user" });
+        }
         assert.equal(steered, true);
         await sendPromise;
         assert.ok(Date.now() - tStart < 1500, "User message must unblock goal_wait immediately");

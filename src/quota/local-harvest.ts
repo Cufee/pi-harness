@@ -103,8 +103,13 @@ function findRecentCodexSessionFiles(
   const sessionsDir = join(codexHome, "sessions");
   if (!existsSync(sessionsDir)) return [];
 
+  const cutoffDate = new Date(now - maxAgeMs);
+  const cutoffYear = cutoffDate.getUTCFullYear();
+  const cutoffYm = cutoffYear * 100 + (cutoffDate.getUTCMonth() + 1);
+  const cutoffYmd = cutoffYm * 100 + cutoffDate.getUTCDate();
+
   const found: Array<{ path: string; mtimeMs: number }> = [];
-  const walk = (dir: string, depth: number) => {
+  const walk = (dir: string, depth: number, y?: number, m?: number) => {
     if (depth > 4) return;
     let entries: string[];
     try {
@@ -114,11 +119,17 @@ function findRecentCodexSessionFiles(
     }
     for (const name of entries) {
       if (name.startsWith(".")) continue;
+      const num = /^\d+$/.test(name) ? Number(name) : NaN;
+      if (depth === 0 && !Number.isNaN(num) && num < cutoffYear) continue;
+      if (depth === 1 && y !== undefined && !Number.isNaN(num) && y * 100 + num < cutoffYm) continue;
+      if (depth === 2 && y !== undefined && m !== undefined && !Number.isNaN(num) && (y * 100 + m) * 100 + num < cutoffYmd) {
+        continue;
+      }
       const full = join(dir, name);
       try {
         const st = statSync(full);
         if (st.isDirectory()) {
-          walk(full, depth + 1);
+          walk(full, depth + 1, depth === 0 && !Number.isNaN(num) ? num : y, depth === 1 && !Number.isNaN(num) ? num : m);
         } else if (st.isFile() && name.endsWith(".jsonl") && now - st.mtimeMs <= maxAgeMs) {
           found.push({ path: full, mtimeMs: st.mtimeMs });
         }

@@ -232,7 +232,9 @@ export class BisectingMergeQueue {
       const pending = this.listPendingMergesForTarget(runId, targetBranch);
       for (const item of pending) {
         const itemRun = item.runId === runId ? run : this.db.getRun(item.runId);
-        const outcome = await this.processMergeItem(item, itemRun?.baseBranch ?? targetBranch, opts);
+        // Only apply caller's AbortSignal to caller's own merge item so cancelling one worker never aborts another run's merge!
+        const itemOpts = item.id === mergeId ? opts : { ...opts, signal: undefined };
+        const outcome = await this.processMergeItem(item, itemRun?.baseBranch ?? targetBranch, itemOpts);
         this.rememberOutcome(item.id, outcome);
         if (item.id === mergeId) {
           return outcome;
@@ -271,9 +273,23 @@ export class BisectingMergeQueue {
         return Boolean(curTask && ["cancelled", "failed", "completed"].includes(curTask.status));
       };
 
+      const abortMerge = async (reason: string): Promise<MergeOutcome> => {
+        const curTask = this.db.getTask(next.taskId);
+        const isTerminal = Boolean(curTask && ["cancelled", "failed", "completed"].includes(curTask.status));
+        if (!isTerminal) {
+          return this.bounce(next, "ci_failed", reason, targetBranch, opts);
+        }
+        const finished = this.db.finishMergeItem(next.id, "ci_failed", reason);
+        await this.worktrees
+          .teardown(next.worktreeId, { archiveBeforeRemove: true, finalStatus: "archived" })
+          .catch(() => {
+            this.db.updateWorktree(next.worktreeId, { status: "bounced" });
+          });
+        return { item: finished, bouncedReason: reason };
+      };
+
       if (isTaskCancelledOrTerminal()) {
-        const finished = this.db.finishMergeItem(next.id, "ci_failed", "Merge aborted: task was cancelled or already settled.");
-        return { item: finished, bouncedReason: "Merge aborted: task was cancelled or already settled." };
+        return await abortMerge("Merge aborted: task was cancelled or already settled.");
       }
 
       // Verify test integrity before touching integration branch
@@ -328,8 +344,7 @@ export class BisectingMergeQueue {
       const ciLogs: string[] = [];
       for (const cmd of this.config.ciCommands ?? []) {
         if (isTaskCancelledOrTerminal()) {
-          const finished = this.db.finishMergeItem(next.id, "ci_failed", "Merge aborted before CI: task cancelled.");
-          return { item: finished, bouncedReason: "Merge aborted before CI: task cancelled." };
+          return await abortMerge("Merge aborted before CI: task cancelled.");
         }
         try {
           const { stdout, stderr } = await execFileAsync("/bin/sh", ["-lc", cmd], {
@@ -341,8 +356,7 @@ export class BisectingMergeQueue {
           ciLogs.push(`$ ${cmd} -> OK\n${stdout.slice(-1000)}${stderr ? "\n" + stderr.slice(-500) : ""}`);
         } catch (err: unknown) {
           if (isTaskCancelledOrTerminal()) {
-            const finished = this.db.finishMergeItem(next.id, "ci_failed", "Merge aborted during CI: task cancelled.");
-            return { item: finished, bouncedReason: "Merge aborted during CI: task cancelled." };
+            return await abortMerge("Merge aborted during CI: task cancelled.");
           }
           const e = err as { stdout?: string; stderr?: string; message?: string };
           const log = `CI gate failed: ${cmd}\n${(e.stdout ?? "").slice(-2000)}\n${(e.stderr ?? e.message ?? "").slice(-2000)}`;
@@ -350,10 +364,9 @@ export class BisectingMergeQueue {
         }
       }
 
-      // Re-check cancellation right before advancing targetBranch so cancelled work NEVER lands on targetBranch!
+      // Re-check cancellation right before advancing targetBranch
       if (isTaskCancelledOrTerminal()) {
-        const finished = this.db.finishMergeItem(next.id, "ci_failed", "Merge aborted before ref promotion: task cancelled.");
-        return { item: finished, bouncedReason: "Merge aborted before ref promotion: task cancelled." };
+        return await abortMerge("Merge aborted before ref promotion: task cancelled.");
       }
 
       // Advance target branch safely without ever leaving the checked-out working tree out of sync with HEAD!

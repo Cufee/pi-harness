@@ -1080,6 +1080,7 @@ export class DirectorRuntime {
           kind: "verify",
           cwd: verifyCwd,
           toolPolicy: "read_only_workspace",
+          allowShellInReadOnly: Boolean(verifyWorktreePath),
           model: wireModel,
           effort: reviewerEffort,
           systemPrompt:

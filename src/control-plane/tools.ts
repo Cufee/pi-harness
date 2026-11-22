@@ -61,6 +61,8 @@ export interface ToolRuntimeHooks {
   getWorktreeManager: (repoRoot: string) => WorktreeManager;
   getMergeQueue: (repoRoot: string) => BisectingMergeQueue;
   getTaskSignal: (taskId: string) => AbortSignal | undefined;
+  /** True task cancellation signal (does NOT fire on clean rollover, so in-flight merges aren't aborted). */
+  getTaskCancelSignal?: (taskId: string) => AbortSignal | undefined;
   resumeTask?: (
     taskId: string,
     opts?: { note?: string; profileId?: string; model?: string; effort?: string; allowCompleted?: boolean },
@@ -1233,7 +1235,8 @@ export class ControlPlaneToolExecutor {
           throw new Error("Cannot submit_for_merge while worktree has uncommitted changes. Commit first.");
         }
         const item = this.db.enqueueMerge({ runId, taskId, worktreeId: wt.id, branch: wt.branch });
-        const mergeSig = scriptSignal ?? this.hooks.getTaskSignal(taskId);
+        // Use the true task cancellation signal (not generation/rollover signal) so an auto-rollover never aborts an in-flight merge.
+        const mergeSig = this.hooks.getTaskCancelSignal?.(taskId);
         const outcome = await this.hooks
           .getMergeQueue(run.repoRoot)
           .submitAndDrain(runId, item.id, { preserveLiveTask: true, signal: mergeSig });

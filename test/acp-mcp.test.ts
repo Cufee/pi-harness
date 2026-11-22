@@ -679,17 +679,31 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
       );
       assert.equal(proseRes.stopReason, "completed");
 
-      // read_only_workspace allows Bash (Claude) and shell_command (Amp) for verification tools like tmux/rg/sg while disabling file edits
-      const roClaude = buildNewSessionParams("claude", {
+      // read_only_workspace allows Bash when allowShellInReadOnly=true (verify/Done-Review in isolated checkouts)
+      // while keeping Bash disabled for Tier 1 read_only_workspace on the host repo!
+      const roVerify = buildNewSessionParams("claude", {
         cwd,
         systemPrompt: "Verify",
         toolPolicy: "read_only_workspace",
+        allowShellInReadOnly: true,
         model: "claude-fable-5-2",
         mcpServers: [],
       });
-      const roDisallowed = (roClaude.params._meta as { claudeCode: { options: { disallowedTools: string[] } } }).claudeCode.options.disallowedTools;
-      assert.ok(!roDisallowed.includes("Bash"), "read_only_workspace must allow Bash for verification tools like tmux/tests");
-      assert.ok(roDisallowed.includes("Edit") && roDisallowed.includes("Write"), "read_only_workspace must still disable direct file edits");
+      const roVerifyDisallowed = (roVerify.params._meta as { claudeCode: { options: { disallowedTools: string[] } } }).claudeCode.options.disallowedTools;
+      assert.ok(!roVerifyDisallowed.includes("Bash"), "verify read_only_workspace must allow Bash for tmux/tests");
+      assert.ok(roVerifyDisallowed.includes("Edit") && roVerifyDisallowed.includes("Write"), "verify read_only_workspace must still disable direct file edits");
+
+      const roTier1 = buildNewSessionParams("claude", {
+        cwd,
+        systemPrompt: "Plan",
+        toolPolicy: "read_only_workspace",
+        allowShellInReadOnly: false,
+        model: "claude-opus-5-5",
+        mcpServers: [],
+      });
+      const roTier1Disallowed = (roTier1.params._meta as { claudeCode: { options: { disallowedTools: string[] } } }).claudeCode.options.disallowedTools;
+      assert.ok(roTier1Disallowed.includes("Bash"), "Tier 1 read_only_workspace on host checkout must keep Bash disabled");
+      assert.ok(!roTier1Disallowed.includes("Read"), "Tier 1 read_only_workspace must still allow Read/Grep/Glob");
     } finally {
       rmSync(cwd, { recursive: true, force: true });
       rmSync(outside, { recursive: true, force: true });

@@ -100,7 +100,14 @@ export class WorktreeManager {
       throw new Error(`Worktree concurrency cap reached (${active.length}/${limit}). Finish or clean a worker first.`);
     }
 
-    const sha = baseSha ?? (await runGit(this.repoRoot, ["rev-parse", "HEAD"])).stdout;
+    const run = this.db.getRun(runId);
+    const sha =
+      baseSha ??
+      (run?.baseBranch
+        ? await runGit(this.repoRoot, ["rev-parse", "--verify", `${run.baseBranch}^{commit}`])
+            .then((r) => r.stdout)
+            .catch(async () => (await runGit(this.repoRoot, ["rev-parse", "HEAD"])).stdout)
+        : (await runGit(this.repoRoot, ["rev-parse", "HEAD"])).stdout);
     const baseBranchName = `harness/${runId}/${taskId}`;
     let branch = baseBranchName;
     let suffix = 1;
@@ -251,9 +258,13 @@ export class WorktreeManager {
     const entries = parsePorcelainWorktrees(stdout);
     const results: LiveWorktreeInfo[] = [];
 
+    const verifyPrefix = canonicalPath(join(this.baseDir, "_verify"));
+    const intPrefix = canonicalPath(join(this.baseDir, "_integration"));
     for (const entry of entries) {
       const abs = canonicalPath(entry.path);
       if (!abs.startsWith(base)) continue;
+      // Never treat active ephemeral verification or merge integration worktrees as orphans during sweep
+      if (abs.startsWith(verifyPrefix) || abs.startsWith(intPrefix)) continue;
       const rec = byPath.get(abs) ?? null;
       const existsOnDisk = existsSync(abs);
       const dirty = existsOnDisk ? await this.isDirty(abs) : false;
@@ -317,18 +328,15 @@ export class WorktreeManager {
       }
     }
 
-    // Also reconcile DB worktree rows in active/queued/bounced whose directory disappeared or whose task settled
+    // Reconcile DB worktree rows whose directory no longer exists on disk (existing orphaned dirs were torn down above)
     const repoCanon = canonicalPath(this.repoRoot);
     for (const rec of this.db.listWorktrees(opts?.runId)) {
       if (rec.status !== "active" && rec.status !== "queued" && rec.status !== "bounced") continue;
       const run = this.db.getRun(rec.runId);
       if (run && canonicalPath(run.repoRoot) !== repoCanon) continue;
-      const task = this.db.getTask(rec.taskId);
-      const missingDir = !existsSync(rec.path);
-      const taskTerminal = task != null && ["completed", "failed", "cancelled", "returned_for_rescope"].includes(task.status);
-      if (missingDir || taskTerminal) {
+      if (!existsSync(rec.path)) {
         this.db.updateWorktree(rec.id, {
-          status: missingDir ? "removed" : "archived",
+          status: "removed",
           cleanedAt: Date.now(),
         });
       }
