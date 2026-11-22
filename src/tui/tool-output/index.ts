@@ -24,6 +24,7 @@
 export { ToolOutputCard, ToolOutputNote } from "./card.js";
 export { renderGoalDetail } from "./goal-detail.js";
 export { renderGoalsTable } from "./goals-table.js";
+export { renderRunActivity } from "./run-activity.js";
 export { hasToolOutputRenderer, registerToolOutputRenderer, renderFallbackLine, renderToolOutput } from "./registry.js";
 export { componentForHistoryTurn, extractDisplay, parseToolDisplay, type ToolOutputTurnLike } from "./transcript.js";
 export type { ToolDisplayPayload, ToolOutputRenderer } from "./types.js";

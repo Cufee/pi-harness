@@ -175,7 +175,14 @@ export function openRunsOverlay(ctx: {
   chatSessionId?: string;
   runIds?: string[];
 }): RunsTreeOverlay {
-  const openTranscript = (row: { runId: string; taskId: string; title: string }) => {
+  const openTranscript = (row: {
+    runId: string;
+    taskId: string;
+    title: string;
+    model?: string | null;
+    profileId?: string | null;
+    effort?: string | null;
+  }) => {
     let watch: Awaited<ReturnType<typeof startWatch>> | null = null;
     let closed = false;
     let handle: ReturnType<OverlayManager["push"]> | null = null;
@@ -190,8 +197,14 @@ export function openRunsOverlay(ctx: {
       onClose: () => handle?.close(),
       requestRender: ctx.requestRender,
     });
+    const modelBase = row.model || row.profileId || "";
+    const modelTag = modelBase ? (row.effort ? `${modelBase} (${row.effort})` : modelBase) : "";
     handle = ctx.overlays.push(
-      { title: "Agent Transcript", subtitle: `${row.runId} · ${row.taskId}`, footer: "mouse wheel / ↑↓ scroll · read-only · Esc back to /runs" },
+      {
+        title: "Agent Transcript",
+        subtitle: `${row.runId} · ${row.taskId}${modelTag ? ` · ${modelTag}` : ""}`,
+        footer: "mouse wheel / ↑↓ scroll · read-only · Esc back to /runs",
+      },
       comp,
       {
         width: "94%",
@@ -452,9 +465,11 @@ export async function runDirectorChatTui(opts: {
       const lines: string[] = [];
       if (queuedMessages.length) {
         lines.push(fitWidth(` Queued (${queuedMessages.length}): ${queuedMessages[0]}`, width));
-        lines.push(fitWidth(" Esc stop & send · Ctrl+S steer · Ctrl+R recall", width));
+        lines.push(fitWidth(" Esc stop & send · Ctrl+S send to Director now · Ctrl+R recall", width));
+      } else if (isWaitingOnSubagent()) {
+        lines.push(fitWidth(" Waiting on subagents — type & press Enter anytime to message Director · Esc stop", width));
       } else {
-        lines.push(fitWidth(" Enter queue · Ctrl+S steer now · Esc stop", width));
+        lines.push(fitWidth(" Enter queue · Ctrl+S send to Director now · Esc stop", width));
       }
       return lines;
     },
@@ -1213,16 +1228,18 @@ export async function runDirectorChatTui(opts: {
 
   // A terminal event can arrive before the control RPC acknowledges cancellation or steering.
   // Hold that event until the acknowledgement identifies what to do with the queue.
-  const controlTurn = async (action: "escape" | "ctrl+c" | "steer") => {
+  const controlTurn = async (action: "escape" | "ctrl+c" | "steer", directMessage?: string) => {
     const turnId = activeTurnId;
     if (!turnId || controlling || buffering) return;
-    const draft = composer.getExpandedText();
-    const steerFromDraft = action === "steer" && Boolean(draft.trim());
-    const message = steerFromDraft ? draft : queuedMessages[0] ?? "";
+    const draft = directMessage === undefined ? composer.getExpandedText() : "";
+    const hasDirect = directMessage !== undefined && Boolean(directMessage.trim());
+    const steerFromDraft = action === "steer" && !hasDirect && Boolean(draft.trim());
+    const message = hasDirect ? directMessage! : steerFromDraft ? draft : queuedMessages[0] ?? "";
     if (action === "steer" && !message) return;
     if (steerFromDraft) composer.clear();
     const restoreSteerDraft = () => {
-      if (steerFromDraft) composer.setText([draft, composer.getExpandedText()].filter(Boolean).join("\n\n"));
+      if (hasDirect) composer.setText([directMessage!, composer.getExpandedText()].filter(Boolean).join("\n\n"));
+      else if (steerFromDraft) composer.setText([draft, composer.getExpandedText()].filter(Boolean).join("\n\n"));
     };
     controlling = true;
     let end: TurnEnd | undefined;
@@ -1234,14 +1251,19 @@ export async function runDirectorChatTui(opts: {
         if (evictedByTakeover) return;
         if (res.steered || res.cancelled) {
           if (res.steered) {
-            if (!steerFromDraft) queuedMessages.shift();
+            if (!hasDirect && !steerFromDraft) queuedMessages.shift();
           } else {
-            if (steerFromDraft) queuedMessages.unshift(message);
+            if (hasDirect || steerFromDraft) queuedMessages.unshift(message);
             end = { cancelled: true };
           }
         } else {
-          restoreSteerDraft();
-          appendSystem(["Turn already ended. Steering message kept."], "warning");
+          if (hasDirect) {
+            // Turn just finished right as the user hit Enter while waiting on subagents -> send normally!
+            queuedMessages.unshift(message);
+          } else {
+            restoreSteerDraft();
+            appendSystem(["Turn already ended. Message kept in input."], "warning");
+          }
         }
       } else {
         const res = await opts.client.request<{ cancelled: boolean }>("chat.cancel", {
@@ -1303,6 +1325,12 @@ export async function runDirectorChatTui(opts: {
     if (slash) return runChatCommand(slash.cmd, slash.arg);
 
     if (busy) {
+      // If the Director is only blocked waiting on background subagents, deliver the message straight
+      // to the Director immediately instead of blocking it in a queue!
+      if (isWaitingOnSubagent() && !controlling) {
+        void controlTurn("steer", text);
+        return;
+      }
       queuedMessages.push(text);
       tui.requestRender();
       return;
@@ -1340,8 +1368,13 @@ export async function runDirectorChatTui(opts: {
       }
       if (!activeTurnId || p.turnId !== activeTurnId) return;
       if (ev.type === "chat.steered") {
-        chatContainer.addChild(new UserCard(theme, String((ev.payload as { message: string }).message)));
-        appendSystem(["Steered current response."], "info");
+        const steered = ev.payload as { message: string; role?: "user" | "system_notice" };
+        if (steered.role === "system_notice") {
+          appendSystem([steered.message], "info");
+        } else {
+          chatContainer.addChild(new UserCard(theme, String(steered.message)));
+          tui.requestRender();
+        }
         return;
       }
       if (ev.type === "chat.turn.end") {
@@ -1394,6 +1427,8 @@ export async function runDirectorChatTui(opts: {
         if (card) activeToolPills.set(name, card);
       }
       tui.requestRender();
+    } else if (ev.type === "goal.progress") {
+      void refreshGoals();
     } else if (ev.type === "goal.reviewed") {
       const p = ev.payload as { goalId: string; version: number; cycle: number; verdict: string; status: string; summary: string };
       appendSystem(

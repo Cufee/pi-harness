@@ -18,6 +18,7 @@ import { ModelCatalogCompiler } from "../catalog/compiler.js";
 import { saveGlobalConfig, type HarnessConfig, type RunnerProfileConfig } from "../config.js";
 import { ControlPlaneDb, type ReplayCursor, type EventRecord } from "../control-plane/db.js";
 import { HarnessOrchestrator, type CustomRunnerFactory } from "../control-plane/orchestrator.js";
+import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { DirectorRuntime } from "../director/runtime.js";
 import type { GoalCriterion } from "../goals/engine.js";
 import type { DaemonEventFrame, RpcRequest, RpcResponse } from "../protocol/daemon-rpc.js";
@@ -122,8 +123,19 @@ export class HarnessDaemon {
    *   duplicate follow-up turn and delivers a best-effort steer notification instead.
    */
   private scheduleDirectorWakeup(chatSessionId: string, summary: string, prompt: string): void {
-    if (this.chatTurns.has(chatSessionId)) {
-      void this.director.steerChat(chatSessionId, summary).catch(() => {});
+    const activeTurn = this.chatTurns.get(chatSessionId);
+    if (activeTurn) {
+      void this.director
+        .steerChat(chatSessionId, summary, { role: "system_notice" })
+        .then((accepted) => {
+          if (accepted) {
+            this.sendChatEvent(chatSessionId, activeTurn.id, "chat.steered", {
+              message: summary,
+              role: "system_notice",
+            });
+          }
+        })
+        .catch(() => {});
       return;
     }
     void this.runDirectorWakeupTurn(chatSessionId, summary, prompt);
@@ -882,8 +894,8 @@ export class HarnessDaemon {
         if (!turn || turn.id !== p.turnId || turn.cancelling) return { steered: false, cancelled: false };
         if (req.op === "chat.steer") {
           const message = String(p.message);
-          if (await this.director.steerChat(chatSessionId, message)) {
-            this.sendChatEvent(chatSessionId, turn.id, "chat.steered", { message });
+          if (await this.director.steerChat(chatSessionId, message, { role: "user" })) {
+            this.sendChatEvent(chatSessionId, turn.id, "chat.steered", { message, role: "user" });
             return { steered: true };
           }
           this.requireChatOwner(socket, chatSessionId);
@@ -980,7 +992,8 @@ export class HarnessDaemon {
         const reviews = this.director.goals.listReviews(g.id);
         const tasks = g.linkedRunId ? this.db.listTasks(g.linkedRunId) : [];
         const escalations = g.linkedRunId ? this.db.listEscalations(g.linkedRunId, "open") : [];
-        const display = buildGoalDetailDisplay({ goal: g, reviews, tasks, openEscalations: escalations });
+        const activity = g.linkedRunId ? buildRunActivitySummary(this.db, g.linkedRunId) : null;
+        const display = buildGoalDetailDisplay({ goal: g, reviews, tasks, openEscalations: escalations, activity });
         if (typeof p.persistChatSessionId === "string" && p.persistChatSessionId) {
           this.director.chats.appendTurn(
             p.persistChatSessionId,
@@ -989,7 +1002,7 @@ export class HarnessDaemon {
             { toolName: "goal_get", display },
           );
         }
-        return { goal: g, reviews, tasks, escalations, display };
+        return { goal: g, reviews, tasks, escalations, activity, display };
       }
 
       case "goal.table_display": {
@@ -1001,6 +1014,8 @@ export class HarnessDaemon {
           goals.map((goal) => ({
             goal,
             reviews: this.director.goals.listReviews(goal.id),
+            tasks: goal.linkedRunId ? this.db.listTasks(goal.linkedRunId) : [],
+            activity: goal.linkedRunId ? buildRunActivitySummary(this.db, goal.linkedRunId) : null,
             openEscalations: goal.linkedRunId ? this.db.listEscalations(goal.linkedRunId, "open") : [],
           })),
         );
@@ -1168,6 +1183,7 @@ export class HarnessDaemon {
               tasks: this.db.listTasks(run.id),
               escalations: this.db.listEscalations(run.id, "open"),
               quotaPause: this.orchestrator.getRunQuotaStatus(run.id),
+              activity: buildRunActivitySummary(this.db, run.id),
             };
           }),
         };

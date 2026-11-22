@@ -116,6 +116,9 @@ export interface AgentTranscriptOverlayOptions {
   runId: string;
   taskId: string;
   title: string;
+  model?: string | null;
+  profileId?: string | null;
+  effort?: string | null;
   startWatch: (
     onEvent: (ev: TranscriptEvent) => void,
     onReplay: (ev: EventRecord) => void,
@@ -247,8 +250,15 @@ export class AgentTranscriptOverlay implements Component {
   render(width: number): readonly string[] {
     const t = this.opts.theme;
     this.lastWidth = width;
+    const modelBase = this.opts.model || this.opts.profileId || "";
+    const modelStr = modelBase
+      ? this.opts.effort
+        ? `${modelBase} (${this.opts.effort})`
+        : modelBase
+      : "";
+    const modelPart = modelStr ? ` ${t.accent(`[${modelStr}]`)}` : "";
     const header = fitWidth(
-      `${t.accentBold(this.opts.taskId)} ${this.opts.title} ${t.dim(`· ${this.opts.runId} · read-only`)}`,
+      `${t.accentBold(this.opts.taskId)} ${this.opts.title}${modelPart} ${t.dim(`· ${this.opts.runId} · read-only`)}`,
       width,
     );
     const out = [header, t.border("─".repeat(Math.max(0, width)))];

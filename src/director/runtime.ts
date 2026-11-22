@@ -10,6 +10,7 @@ import { compactTaskHandoff, toolsForTier } from "../control-plane/tools.js";
 import { writeCodeOutput, writeTaskDossier } from "../control-plane/dossiers.js";
 import type { ControlPlaneDb } from "../control-plane/db.js";
 import type { CustomRunnerFactory, HarnessOrchestrator } from "../control-plane/orchestrator.js";
+import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import {
   GoalEngine,
   shouldRunIndependentReview,
@@ -19,7 +20,14 @@ import {
   type GoalReviewVerdict,
   type VerificationMode,
 } from "../goals/engine.js";
-import { buildGoalDetailDisplay, buildGoalsTableDisplay, codeExecEventSink, summarizeToolDisplay, type ToolDisplayPayload } from "../protocol/tool-display.js";
+import {
+  buildGoalDetailDisplay,
+  buildGoalsTableDisplay,
+  buildRunActivityDisplay,
+  codeExecEventSink,
+  summarizeToolDisplay,
+  type ToolDisplayPayload,
+} from "../protocol/tool-display.js";
 import type { QuotaClient } from "../quota/client.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
@@ -116,9 +124,37 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
     },
   },
   {
+    name: "report_goal_progress",
+    description:
+      "Record live progress, verification status, or checked criterion results on a Goal so the Goals table and detail cards dynamically reflect actual work.",
+    inputSchema: {
+      type: "object",
+      required: ["goal_id", "summary"],
+      properties: {
+        goal_id: { type: "string" },
+        summary: { type: "string" },
+        phase: { type: "string" },
+        verification_status: { type: "string", enum: ["not_needed", "in_progress", "passed", "failed"] },
+        criteria_results: {
+          type: "array",
+          items: {
+            type: "object",
+            required: ["criterion_id", "passed", "evidence"],
+            properties: {
+              criterion_id: { type: "string" },
+              passed: { type: "boolean" },
+              evidence: { type: "string" },
+              remediation: { type: "string" },
+            },
+          },
+        },
+      },
+    },
+  },
+  {
     name: "goal_wait",
     description:
-      "Event-driven wait for a Goal's linked autonomous run to settle (or raise a P0 escalation) without token polling. Optional fallback_interval_s configures a long dead-agent watchdog wakeup (default 600s).",
+      "Event-driven wait for a Goal's linked autonomous run to settle (or raise a P0 escalation) without token polling. Only call when the user explicitly asks to block until completion — normally end your turn after goal_commit so the user stays unblocked and the daemon wakes you automatically. Any new user message immediately unblocks this wait without stopping background subagents.",
     inputSchema: {
       type: "object",
       required: ["goal_id"],
@@ -203,6 +239,18 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
     },
   },
   {
+    name: "run_status",
+    description:
+      "Inspect and render a structured live telemetry card for a run (or Goal's linked run) and all its subagents (current actions, models, tool calls, files edited, phase, escalations) automatically harvested by the control plane.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        run_id: { type: "string", description: "Run ID to inspect." },
+        goal_id: { type: "string", description: "Goal ID whose linked run should be inspected." },
+      },
+    },
+  },
+  {
     name: "steer_run",
     description: "Forward human steering guidance to an active Goal's Tier 1 Orchestrator.",
     inputSchema: {
@@ -229,6 +277,7 @@ interface ActiveChat {
   handle?: RunnerExecutionHandle;
   executor: ReturnType<typeof createCodeModeExecutor>;
   onToolEvent: RunnerCallbacks["onToolEvent"];
+  waitInterrupts: Set<(message: string, role: "user" | "system_notice") => void>;
 }
 
 /**
@@ -782,13 +831,32 @@ export class DirectorRuntime {
     return true;
   }
 
-  async steerChat(chatSessionId: string, message: string): Promise<boolean> {
+  async steerChat(
+    chatSessionId: string,
+    message: string,
+    opts?: { role?: "user" | "system_notice" },
+  ): Promise<boolean> {
     const active = this.activeChats.get(chatSessionId);
-    if (!active?.handle || active.abort.signal.aborted) return false;
+    if (!active || active.abort.signal.aborted) return false;
+    const role = opts?.role ?? "user";
+
+    // If the Director is currently blocked waiting on subagents (`goal_wait` / `wait_tasks`),
+    // unblock the wait immediately so the Director receives the user's message in milliseconds
+    // while background subagents continue running uninterrupted!
+    if (active.waitInterrupts.size > 0) {
+      this.flushChatPartial(chatSessionId, active);
+      this.chats.appendTurn(chatSessionId, role, message);
+      for (const interrupt of [...active.waitInterrupts]) {
+        interrupt(message, role);
+      }
+      return true;
+    }
+
+    if (!active.handle) return false;
     const accepted = await active.handle.steer(message);
     if (accepted && this.activeChats.get(chatSessionId) === active && !active.abort.signal.aborted) {
       this.flushChatPartial(chatSessionId, active);
-      this.chats.appendTurn(chatSessionId, "user", message);
+      this.chats.appendTurn(chatSessionId, role, message);
       return true;
     }
     return false;
@@ -876,7 +944,15 @@ export class DirectorRuntime {
     const mode = effectiveCodeMode(this.config.codeMode);
     const executor = this.directorExecutor(session, abort.signal, onToolEvent);
     const { promise: settled, resolve: markSettled } = Promise.withResolvers<void>();
-    const active: ActiveChat = { abort, executor, onToolEvent, settled, partial: "", flushedText: "" };
+    const active: ActiveChat = {
+      abort,
+      executor,
+      onToolEvent,
+      settled,
+      partial: "",
+      flushedText: "",
+      waitInterrupts: new Set(),
+    };
     this.activeChats.set(chatSessionId, active);
     const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", "mcp-bridge.ts");
 
@@ -974,11 +1050,13 @@ export class DirectorRuntime {
     tasks: ReturnType<ControlPlaneDb["listTasks"]>;
     openEscalations: ReturnType<ControlPlaneDb["listEscalations"]>;
   } {
+    const activity = goal.linkedRunId ? buildRunActivitySummary(this.db, goal.linkedRunId) : null;
     const detail = {
       goal,
       reviews: this.goals.listReviews(goal.id),
       tasks: goal.linkedRunId ? this.db.listTasks(goal.linkedRunId) : [],
       openEscalations: goal.linkedRunId ? this.db.listEscalations(goal.linkedRunId, "open") : [],
+      activity,
     };
     this.emitToolDisplay(chatSessionId, toolName, buildGoalDetailDisplay(detail));
     return detail;
@@ -1001,9 +1079,37 @@ export class DirectorRuntime {
     }
     switch (name) {
       case "wait_children":
-        return this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, "wait_tasks", args, signal);
+      case "wait_tasks": {
+        const active = this.activeChats.get(chatSessionId);
+        if (!active) {
+          return this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, "wait_tasks", args, signal);
+        }
+        const waitAbort = new AbortController();
+        const combinedSignal = signal ? AbortSignal.any([signal, waitAbort.signal]) : waitAbort.signal;
+        let userInterruption: { message: string; role: "user" | "system_notice" } | null = null;
+        const onInterrupt = (message: string, role: "user" | "system_notice") => {
+          userInterruption = { message, role };
+          waitAbort.abort(new Error("user_message"));
+        };
+        active.waitInterrupts.add(onInterrupt);
+        try {
+          return await this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, "wait_tasks", args, combinedSignal);
+        } catch (err) {
+          if (userInterruption) {
+            const inter = userInterruption as { message: string; role: "user" | "system_notice" };
+            return {
+              wakeReason: inter.role === "user" ? "user_message" : "system_event",
+              userMessage: inter.message,
+              backgroundStillRunning: true,
+              hint: "A new message arrived while waiting on background subagent(s). Those subagents are STILL running uninterrupted. Handle the user's message directly (or ask for details / adjust work) and end your turn cleanly.",
+            };
+          }
+          throw err;
+        } finally {
+          active.waitInterrupts.delete(onInterrupt);
+        }
+      }
       case "spawn_task":
-      case "wait_tasks":
       case "cancel_task":
       case "artifact_read":
         return this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, name, args, signal);
@@ -1070,11 +1176,40 @@ export class DirectorRuntime {
             goals.map((goal) => ({
               goal,
               reviews: this.goals.listReviews(goal.id),
+              tasks: goal.linkedRunId ? this.db.listTasks(goal.linkedRunId) : [],
+              activity: goal.linkedRunId ? buildRunActivitySummary(this.db, goal.linkedRunId) : null,
               openEscalations: goal.linkedRunId ? this.db.listEscalations(goal.linkedRunId, "open") : [],
             })),
           ),
         );
         return { goals, rendered_in_ui: "Goals table shown to the user; do not repeat it." };
+      }
+
+      case "report_goal_progress": {
+        const g = this.goals.reportProgress(String(args.goal_id), {
+          summary: String(args.summary ?? "").trim() || undefined,
+          phase: typeof args.phase === "string" ? args.phase.trim() || undefined : undefined,
+          verificationStatus:
+            typeof args.verification_status === "string" &&
+            ["not_needed", "in_progress", "passed", "failed"].includes(args.verification_status)
+              ? (args.verification_status as "not_needed" | "in_progress" | "passed" | "failed")
+              : undefined,
+          criteriaResults: Array.isArray(args.criteria_results)
+            ? (args.criteria_results as Array<Record<string, unknown>>)
+                .filter((r) => typeof r?.criterion_id === "string")
+                .map((r) => ({
+                  criterionId: String(r.criterion_id),
+                  passed: Boolean(r.passed),
+                  evidence: String(r.evidence ?? ""),
+                  ...(typeof r.remediation === "string" ? { remediation: r.remediation } : {}),
+                }))
+            : undefined,
+          reportedByTaskId: chatSessionId,
+        });
+        if (g.linkedRunId) {
+          this.db.emitEvent(g.linkedRunId, null, "goal.progress", { goalId: g.id, ...g.liveProgress });
+        }
+        return { goal: g };
       }
 
       case "goal_get": {
@@ -1093,7 +1228,7 @@ export class DirectorRuntime {
           1,
           typeof args.fallback_interval_s === "number" ? args.fallback_interval_s : defaultSec,
         ) * 1000;
-        return await this.waitForGoalEvent(goalId, fallbackMs, signal);
+        return await this.waitForGoalEvent(goalId, fallbackMs, signal, chatSessionId);
       }
 
       case "goal_trigger_review": {
@@ -1182,6 +1317,22 @@ export class DirectorRuntime {
         };
       }
 
+      case "run_status": {
+        let runId = typeof args.run_id === "string" && args.run_id.trim() ? args.run_id.trim() : "";
+        if (!runId && typeof args.goal_id === "string" && args.goal_id.trim()) {
+          const g = this.goals.getGoal(args.goal_id.trim());
+          if (!g) throw new Error(`Unknown goal ${args.goal_id}`);
+          if (!g.linkedRunId) throw new Error(`Goal ${g.id} has no linked run yet`);
+          runId = g.linkedRunId;
+        }
+        if (!runId) throw new Error("run_status requires run_id or goal_id");
+        const run = this.orchestrator.getEffectiveRun(runId);
+        if (!run) throw new Error(`Unknown run ${runId}`);
+        const activity = buildRunActivitySummary(this.db, runId);
+        this.emitToolDisplay(chatSessionId, name, buildRunActivityDisplay(activity));
+        return { run, activity, rendered_in_ui: "Run activity card shown to the user; do not repeat it." };
+      }
+
       case "steer_run": {
         const g = this.goals.getGoal(String(args.goal_id));
         if (!g?.linkedRunId) throw new Error(`Goal ${args.goal_id} has no active run`);
@@ -1203,10 +1354,14 @@ export class DirectorRuntime {
     goalId: string,
     fallbackIntervalMs = (this.config.events?.fallbackWakeupIntervalSec ?? 600) * 1000,
     signal?: AbortSignal,
+    chatSessionId?: string,
   ): Promise<{
     goal: GoalRecord;
     runStatus: string | null;
-    wakeReason: "already_settled" | "event" | "fallback_interval" | "run_inactive";
+    wakeReason: "already_settled" | "event" | "fallback_interval" | "run_inactive" | "user_message" | "system_event";
+    userMessage?: string;
+    backgroundStillRunning?: boolean;
+    hint?: string;
     openEscalations: ReturnType<ControlPlaneDb["listEscalations"]>;
   }> {
     signal?.throwIfAborted();
@@ -1233,13 +1388,18 @@ export class DirectorRuntime {
       };
     }
 
+    const activeChat = chatSessionId ? this.activeChats.get(chatSessionId) : undefined;
     return new Promise((resolve, reject) => {
       let done = false;
-      const finish = (wakeReason: "event" | "fallback_interval" | "run_inactive") => {
+      const finish = (
+        wakeReason: "event" | "fallback_interval" | "run_inactive" | "user_message" | "system_event",
+        extra?: { userMessage?: string; backgroundStillRunning?: boolean; hint?: string },
+      ) => {
         if (done) return;
         done = true;
         unsub();
         clearTimeout(timer);
+        if (activeChat) activeChat.waitInterrupts.delete(onInterrupt);
         signal?.removeEventListener("abort", onAbort);
         if (signal?.aborted) {
           reject(signal.reason);
@@ -1250,10 +1410,19 @@ export class DirectorRuntime {
           goal: cur.g,
           runStatus: cur.run?.status ?? null,
           wakeReason,
+          ...(extra ?? {}),
           openEscalations: cur.openEscalations,
         });
       };
+      const onInterrupt = (message: string, role: "user" | "system_notice") => {
+        finish(role === "user" ? "user_message" : "system_event", {
+          userMessage: message,
+          backgroundStillRunning: true,
+          hint: "The user sent a message while you were waiting on this Goal. Its background run is STILL executing uninterrupted — respond to the user directly (or ask for details / adjust work) and end your turn cleanly; the daemon will wake you automatically when the Goal finishes.",
+        });
+      };
       const onAbort = () => finish("event");
+      if (activeChat) activeChat.waitInterrupts.add(onInterrupt);
       const unsub = this.db.onEvent((ev) => {
         const cur = snapshot();
         if (ev.runId && cur.g.linkedRunId && ev.runId !== cur.g.linkedRunId) return;

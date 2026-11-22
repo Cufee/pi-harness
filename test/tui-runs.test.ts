@@ -219,7 +219,14 @@ describe("buildRunsTreeRows hierarchy", () => {
 
 function makeOverlay(trees: () => RunsTreesResult = fixture) {
   const calls = {
-    open: [] as Array<{ runId: string; taskId: string; title: string }>,
+    open: [] as Array<{
+      runId: string;
+      taskId: string;
+      title: string;
+      model?: string | null;
+      profileId?: string | null;
+      effort?: string | null;
+    }>,
     actions: [] as Array<[string, string]>,
     closed: 0,
     stopped: 0,
@@ -275,7 +282,9 @@ describe("RunsTreeOverlay", () => {
     overlay.handleInput(KEY.down);
     expect(overlay.state.selectedKey).toBe("run-a/t-w1");
     overlay.handleInput(KEY.enter);
-    expect(calls.open).toEqual([{ runId: "run-a", taskId: "t-w1", title: "title t-w1" }]);
+    expect(calls.open).toEqual([
+      { runId: "run-a", taskId: "t-w1", title: "title t-w1", model: null, profileId: "acp:amp", effort: null },
+    ]);
     overlay.handleInput("r");
     overlay.handleInput("w");
     overlay.handleInput("x");

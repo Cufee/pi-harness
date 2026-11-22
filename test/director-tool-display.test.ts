@@ -140,7 +140,8 @@ describe("Director structured tool display", () => {
           title: "Ship greeting",
           linkedRunId: run.id,
           reviewCycle: reviewed.reviewCycle,
-          maxReviewCycles: reviewed.budgets.maxReviewCycles,
+          maxReviewCycles: null,
+          verificationLabel: `${reviewed.reviewCycle} rev`,
           criteriaTotal: 3,
           criteriaPassed: 1,
           openEscalations: 1,
@@ -232,7 +233,9 @@ describe("Director structured tool display", () => {
           description: "Write greet.txt",
           linkedRunId: run.id,
           reviewCycle: reviewed.reviewCycle,
-          maxReviewCycles: reviewed.budgets.maxReviewCycles,
+          maxReviewCycles: null,
+          verificationLabel: `${reviewed.reviewCycle} rev`,
+          liveSummary: null,
           nonGoals: ["No i18n"],
         });
         assert.deepEqual(
@@ -243,7 +246,10 @@ describe("Director structured tool display", () => {
             ["c3", "behavioral", false, null],
           ],
         );
-        assert.deepEqual(data.tasks, [{ id: orch.id, title: "Orchestrate", status: orch.status, tier: 1 }]);
+        assert.deepEqual(
+          data.tasks.map((t) => ({ id: t.id, title: t.title, status: t.status, tier: t.tier })),
+          [{ id: orch.id, title: "Orchestrate", status: orch.status, tier: 1 }],
+        );
         assert.deepEqual(data.openEscalations, [{ id: esc.id, taskId: orch.id, summary: "Broken build" }]);
         assert.equal(data.lastReview?.summary, "Missing world");
         assert.equal(data.lastReview?.verdict, "changes_requested");

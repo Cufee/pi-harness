@@ -1,6 +1,7 @@
 import { decodeKittyPrintable, matchesKey, type Component } from "@earendil-works/pi-tui";
 import type { RunQuotaPauseStatus } from "../control-plane/orchestrator.js";
 import type { EscalationRecord, RunRecord, TaskRecord } from "../control-plane/db.js";
+import type { RunActivitySummary } from "../control-plane/telemetry.js";
 import type { DaemonEventFrame } from "../protocol/daemon-rpc.js";
 import { formatResetCountdown } from "./overlays.js";
 import { badge, fillLineBg, fitWidth, parseMouseWheel, type HarnessTheme, type SemanticTone } from "./primitives/index.js";
@@ -13,6 +14,8 @@ export interface RunsTreeEntry {
   /** Open escalations. */
   escalations: EscalationRecord[];
   quotaPause: RunQuotaPauseStatus | null;
+  /** Automatically harvested live phase, file edits, and per-task actions (zero model calls). */
+  activity?: RunActivitySummary | null;
 }
 
 export interface RunsTreesResult {
@@ -271,7 +274,14 @@ export interface RunsTreeOverlayOptions {
   fetchTrees: () => Promise<RunsTreesResult>;
   /** Starts a `scope: 'runs'` watch and returns its stop function. */
   subscribe: (onEvent: (ev: WatchEventFrame) => void) => Promise<() => void>;
-  onOpenTranscript: (row: { runId: string; taskId: string; title: string }) => void;
+  onOpenTranscript: (row: {
+    runId: string;
+    taskId: string;
+    title: string;
+    model?: string | null;
+    profileId?: string | null;
+    effort?: string | null;
+  }) => void;
   onAction: (action: "resume" | "wait" | "stop", runId: string) => void;
   onClose: () => void;
   requestRender: () => void;
@@ -462,7 +472,14 @@ export class RunsTreeOverlay implements Component {
     } else if (matchesKey(data, "enter")) {
       if (!row) return;
       if (row.kind === "task" && row.task) {
-        this.opts.onOpenTranscript({ runId: row.runId, taskId: row.task.id, title: row.task.title });
+        this.opts.onOpenTranscript({
+          runId: row.runId,
+          taskId: row.task.id,
+          title: row.task.title,
+          model: row.task.model,
+          profileId: row.task.profileId,
+          effort: row.task.effort,
+        });
         return;
       }
       if (this.collapsed.has(row.runId)) this.collapsed.delete(row.runId);
@@ -572,10 +589,16 @@ export class RunsTreeOverlay implements Component {
       const effStatus = effectiveRunStatus(row.entry);
       const fold = row.collapsed ? "▸" : "▾";
       const n = row.entry.tasks.length;
+      const act = row.entry.activity;
+      const phaseTag =
+        effStatus === "active" && act?.phase && !["active", "idle", "completed", "failed", "stopped"].includes(act.phase)
+          ? ` ${t.accent(act.phase)}`
+          : "";
+      const editsTag = act && act.filesEdited > 0 ? ` · ${act.filesEdited}f` : "";
       const quota = qp
         ? ` ${badge(`⏸ ${qp.resumeAt ? `resume ${formatResetCountdown(qp.resumeAt)}` : "quota paused"}`, "warning", t)}`
         : "";
-      return `${marker}${t.muted(fold)} ${badge("RUN", "info", t)} ${badge(statusLabel(effStatus), runTone(effStatus), t)} ${id(run.id)} ${firstLine(run.goal)} ${t.dim(`(${n} agent${n === 1 ? "" : "s"})`)}${esc}${quota}`;
+      return `${marker}${t.muted(fold)} ${badge("RUN", "info", t)} ${badge(statusLabel(effStatus), runTone(effStatus), t)} ${id(run.id)} ${firstLine(run.goal)} ${t.dim(`(${n} agent${n === 1 ? "" : "s"}${editsTag})`)}${phaseTag}${esc}${quota}`;
     }
 
     const task = row.task!;
@@ -583,8 +606,11 @@ export class RunsTreeOverlay implements Component {
     const tierBadge = badge(tier, task.kind === "verify" ? "info" : "accent", t);
     const ctx = task.contextSize > 0 ? ` ${Math.round((task.contextUsed / task.contextSize) * 100)}%` : "";
     const model = task.model ? `${task.model} · ${task.profileId}` : task.profileId;
+    const taskAct = row.entry.activity?.tasks.find((x) => x.id === task.id);
+    const liveAction =
+      taskAct?.currentAction && LIVE_TASK_STATUSES.has(task.status) ? ` ${t.muted(taskAct.currentAction)}` : "";
     const quota =
       task.status === "paused_quota" && qp?.resumeAt ? ` ${t.warning(`⏱ ${formatResetCountdown(qp.resumeAt)}`)}` : "";
-    return `${marker}${t.dim(row.connector)}${tierBadge} ${badge(statusLabel(task.status), taskTone(task.status), t)} ${id(task.id)} ${task.title} ${t.dim(`(${model}${ctx})`)}${esc}${quota}`;
+    return `${marker}${t.dim(row.connector)}${tierBadge} ${badge(statusLabel(task.status), taskTone(task.status), t)} ${id(task.id)} ${task.title} ${t.dim(`(${model}${ctx})`)}${liveAction}${esc}${quota}`;
   }
 }

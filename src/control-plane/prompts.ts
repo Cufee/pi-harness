@@ -25,7 +25,7 @@ function tierInstructions(tier: 1 | 2 | 3, kind: TaskRecord["kind"]): string {
       "4. Use `spawn_task` for substantial read-only research, planning, and verification instead of reading workspace files yourself (do not spam tiny single-file micro-tasks). Decide when verification is needed and to what extent based on task risk: do NOT spawn redundant Tier 3 `verify` passes for straightforward tasks already proved by the Worker's checks, and avoid double-verifying work that will go through Goal Done-Review. Rely on event-driven `wait_children` (long default fallback interval) instead of token-polling `tree_view` or short timeouts. Read child handoffs first with `wait_children`: compact summaries, sources (required for research, plan, and verify), and `artifact_paths`. Use `artifact_read` only when you need more detail.",
       "5. When a Worker returns `scope_too_large` or reports a P1 issue, re-scope cleanly using its evidence and suggested splits without discarding prior artifacts.",
       "6. Protect your context window: when context approaches 72% or when requested by the control plane, write a detailed anchored handoff via `request_rollover` (Goal Invariants, Architectural Decisions, Active Risks, Next Actions) so no context is lost in the middle.",
-      "7. If you inherited from a previous Orchestrator generation and need historical rationale not in the handoff, call `query_predecessor`.",
+      "7. If you inherited from a previous Orchestrator generation and need historical rationale not in the handoff, call `query_predecessor`. Use `report_goal_progress` at key milestones or verification steps so the live Goals table reflects real progress and checked criteria.",
     ].join("\n");
   }
 
@@ -43,7 +43,7 @@ function tierInstructions(tier: 1 | 2 | 3, kind: TaskRecord["kind"]): string {
       "4. ISSUE REPORTING: Whenever you uncover pre-existing code defects, broken tests, or interface mismatches outside your slice, call `report_issue` immediately.",
       "5. CONTEXT HYGIENE: Never rely on lossy compaction. If your context nears 78% or you need a different model, commit clean WIP to your worktree branch and call `request_rollover` with a thorough anchored handoff.",
       "6. Rely on event-driven `wait_children` (long default fallback interval) rather than token-polling child status. Read child handoffs first with `wait_children`: compact summaries, sources (required for research, plan, and verify), and `artifact_paths`. Use `artifact_read` only when you need more detail.",
-      "7. COMPLETION: Commit any repository changes you made, run the verification checks appropriate to your task's scope and risk, call `submit_for_merge` if you modified the repo, then `return_task` with a summary of at most 2,000 characters, structured sources, and any `artifact_paths`.",
+      "7. COMPLETION: Commit any repository changes you made, run the verification checks appropriate to your task's scope and risk, call `report_goal_progress` if you verified goal criteria, call `submit_for_merge` if you modified the repo, then `return_task` with a summary of at most 2,000 characters, structured sources, and any `artifact_paths`.",
     ].join("\n");
   }
 

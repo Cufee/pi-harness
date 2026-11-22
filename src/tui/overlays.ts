@@ -1638,18 +1638,39 @@ export class GoalsOverlay implements Component {
           },
         },
         {
-          header: "REVIEWS",
-          width: 9,
+          header: "VERIFY",
+          width: 11,
           align: "right",
           priority: 2,
-          render: ({ g }) => this.theme.muted(`${g.reviewCycle}/${g.budgets.maxReviewCycles}`),
+          render: ({ g }) => {
+            const label =
+              g.status === "verifying" || g.status === "reviewing" || g.liveProgress?.verificationStatus === "in_progress"
+                ? "verifying"
+                : g.reviewCycle > 0
+                  ? `${g.reviewCycle} rev`
+                  : g.liveProgress?.verificationStatus === "passed"
+                    ? "verified"
+                    : g.liveProgress?.verificationStatus === "failed"
+                      ? "failed"
+                      : g.liveProgress?.verificationStatus === "not_needed" || g.verificationMode === "none"
+                        ? "skipped"
+                        : g.liveProgress?.phase ?? "—";
+            return this.theme.muted(label);
+          },
         },
         {
           header: "CRITERIA",
-          width: 8,
+          width: 9,
           align: "right",
           priority: 3,
-          render: ({ g }) => this.theme.dim(String(g.criteria.length)),
+          render: ({ g }) => {
+            const liveRes = g.liveProgress?.criteriaResults;
+            if (liveRes?.length && g.criteria.length > 0) {
+              const passed = liveRes.filter((r) => r.passed).length;
+              return this.theme.dim(`${passed}/${g.criteria.length}`);
+            }
+            return this.theme.dim(String(g.criteria.length));
+          },
         },
       ],
       width,

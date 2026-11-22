@@ -208,6 +208,38 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
   { ...cancelChildTool, tiers: [1, 2] },
   { ...cancelChildTool, name: "cancel_task", tiers: [1] },
   {
+    name: "report_goal_progress",
+    tiers: [1, 2],
+    description:
+      "Report live goal progress, verification status, and checked criteria results back to the owning Goal so the Goals table and cards reflect what agents are actually doing.",
+    inputSchema: {
+      type: "object",
+      required: ["summary"],
+      properties: {
+        summary: { type: "string", description: "Concise live progress or verification update." },
+        phase: { type: "string", description: "Short current phase label (e.g. 'planning', 'implementing', 'verifying')." },
+        verification_status: {
+          type: "string",
+          enum: ["not_needed", "in_progress", "passed", "failed"],
+          description: "Current verification state as decided/observed by the agent.",
+        },
+        criteria_results: {
+          type: "array",
+          items: {
+            type: "object",
+            required: ["criterion_id", "passed", "evidence"],
+            properties: {
+              criterion_id: { type: "string" },
+              passed: { type: "boolean" },
+              evidence: { type: "string" },
+              remediation: { type: "string" },
+            },
+          },
+        },
+      },
+    },
+  },
+  {
     name: "return_task",
     tiers: [2, 3],
     description:
@@ -763,6 +795,29 @@ export class ControlPlaneToolExecutor {
         return { cancelled: childId };
       }
 
+      case "report_goal_progress": {
+        const updated = this.updateLinkedGoalProgress(runId, taskId, {
+          summary: String(args.summary ?? "").trim() || undefined,
+          phase: typeof args.phase === "string" ? args.phase.trim() || undefined : undefined,
+          verificationStatus:
+            typeof args.verification_status === "string" &&
+            ["not_needed", "in_progress", "passed", "failed"].includes(args.verification_status)
+              ? (args.verification_status as "not_needed" | "in_progress" | "passed" | "failed")
+              : undefined,
+          criteriaResults: Array.isArray(args.criteria_results)
+            ? (args.criteria_results as Array<Record<string, unknown>>)
+                .filter((r) => typeof r?.criterion_id === "string")
+                .map((r) => ({
+                  criterionId: String(r.criterion_id),
+                  passed: Boolean(r.passed),
+                  evidence: String(r.evidence ?? ""),
+                  ...(typeof r.remediation === "string" ? { remediation: r.remediation } : {}),
+                }))
+            : undefined,
+        });
+        return updated;
+      }
+
       case "return_task": {
         const status = String(args.status);
         if (status !== "completed" && status !== "blocked" && status !== "scope_too_large") {
@@ -826,6 +881,13 @@ export class ControlPlaneToolExecutor {
               summary,
               resultJson: JSON.stringify({ status, summary, sources, artifact_paths: paths, escalationId, suggestedSplits }),
             });
+            // Automatically reflect verify task outcomes onto any linked Goal without requiring extra model calls.
+            if (task.kind === "verify") {
+              this.updateLinkedGoalProgress(runId, taskId, {
+                verificationStatus: taskStatus === "completed" ? "passed" : "failed",
+                summary: summary.slice(0, 300),
+              });
+            }
             return { returned: true, status: taskStatus, ...(escalationId ? { escalationId } : {}) };
           });
         } catch (error) {
@@ -1067,6 +1129,59 @@ export class ControlPlaneToolExecutor {
 
       default:
         throw new Error(`Unhandled tool: ${name}`);
+    }
+  }
+
+  private updateLinkedGoalProgress(
+    runId: string,
+    taskId: string,
+    patch: {
+      summary?: string;
+      phase?: string;
+      verificationStatus?: "not_needed" | "in_progress" | "passed" | "failed";
+      criteriaResults?: Array<{ criterionId: string; passed: boolean; evidence: string; remediation?: string }>;
+    },
+  ): { recorded: boolean; goalId: string | null } {
+    try {
+      const row = this.db.db
+        .prepare("SELECT id, live_progress_json FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1")
+        .get(runId) as { id: string; live_progress_json?: string | null } | undefined;
+      if (!row) return { recorded: false, goalId: null };
+
+      let prev: {
+        phase?: string;
+        summary?: string;
+        verificationStatus?: string;
+        criteriaResults?: Array<{ criterionId: string; passed: boolean; evidence: string; remediation?: string }>;
+        reportedByTaskId?: string | null;
+      } = {};
+      if (typeof row.live_progress_json === "string" && row.live_progress_json.trim()) {
+        try {
+          prev = JSON.parse(row.live_progress_json) as typeof prev;
+        } catch {
+          prev = {};
+        }
+      }
+      const byId = new Map<string, { criterionId: string; passed: boolean; evidence: string; remediation?: string }>();
+      for (const c of prev.criteriaResults ?? []) byId.set(c.criterionId, c);
+      for (const c of patch.criteriaResults ?? []) byId.set(c.criterionId, c);
+
+      const now = Date.now();
+      const next = {
+        phase: patch.phase ?? prev.phase,
+        summary: patch.summary ?? prev.summary,
+        verificationStatus: patch.verificationStatus ?? prev.verificationStatus,
+        criteriaResults: byId.size > 0 ? [...byId.values()] : undefined,
+        reportedByTaskId: taskId,
+        updatedAt: now,
+      };
+      this.db.db
+        .prepare("UPDATE goals SET live_progress_json = ?, updated_at = ? WHERE id = ?")
+        .run(JSON.stringify(next), now, row.id);
+      this.db.emitEvent(runId, taskId, "goal.progress", { goalId: row.id, ...next });
+      return { recorded: true, goalId: row.id };
+    } catch {
+      return { recorded: false, goalId: null };
     }
   }
 

@@ -15,10 +15,16 @@ import {
 } from "../src/catalog/compiler.js";
 import { loadConfig } from "../src/config.js";
 import { deriveRunStatus } from "../src/control-plane/orchestrator.js";
+import { buildRunActivitySummary } from "../src/control-plane/telemetry.js";
 import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import { DirectorSessionStore } from "../src/director/session.js";
 import { GoalEngine, shouldRunIndependentReview, type GoalRecord } from "../src/goals/engine.js";
+import {
+  buildGoalDetailDisplay,
+  buildGoalsTableDisplay,
+  buildRunActivityDisplay,
+} from "../src/protocol/tool-display.js";
 import { QuotaClient } from "../src/quota/client.js";
 import { parseCodexRateLimitsFromJsonl } from "../src/quota/local-harvest.js";
 import { isSubagentWaitTool } from "../src/tui/app.js";
@@ -1024,6 +1030,258 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
       }
       assert.equal(directorWakePrompts.length, 1, "Director must be woken automatically by Goal run settlement event");
       assert.ok(directorWakePrompts[0]!.includes(goal.id));
+
+      // 4. Transcript header includes model name (+ effort) when opening an agent transcript
+      const theme = createTheme();
+      const tr = new AgentTranscriptOverlay({
+        theme,
+        runId: "run-999",
+        taskId: "t-999",
+        title: "Worker slice",
+        model: "google/gemini-4-neon",
+        effort: "high",
+        viewportRows: 8,
+        startWatch: async () => ({ replay: [], stop: () => {} }),
+        onClose: () => {},
+        requestRender: () => {},
+      });
+      const headerLine = tr.render(100)[0]!.replace(/\x1b\[[0-9;]*m/g, "");
+      assert.ok(headerLine.includes("google/gemini-4-neon (high)"));
+
+      // 5. User message while Director is blocked in goal_wait immediately unblocks the wait without killing background work
+      const waitChat = await client.request<{ session: { id: string } }>("chat.create", {
+        repoRoot: repoDir,
+        title: "Unblock Wait Session",
+      });
+      const longGoal = daemon.director.goals.createGoal({
+        repoRoot: repoDir,
+        chatSessionId: waitChat.session.id,
+        title: "Long background goal",
+        description: "Still running while user messages Director",
+        criteria: [{ id: "c1", kind: "deterministic", description: "Pass", command: "true" }],
+      });
+      const longRun = daemon.db.createRun({ goal: "Long run", repoRoot: repoDir, baseBranch: "main", baseSha: "abc" });
+      daemon.director.goals.linkRunAndStart(longGoal.id, longRun.id);
+
+      let waitToolResult: Record<string, unknown> | null = null;
+      const daemon2 = new HarnessDaemon(
+        { ...cfg, socketPath: join(stateDir, "d2.sock") },
+        {
+          dbPath: join(stateDir, "cp2.sqlite"),
+          customRunnerFactory: () => ({
+            run: async (req) => {
+              waitToolResult = (await req.executeTool("goal_wait", {
+                goal_id: longGoal2.id,
+                fallback_interval_s: 600,
+              })) as Record<string, unknown>;
+              return { text: "Received user message immediately while background goal kept running.", stopReason: "completed" };
+            },
+          }),
+        },
+      );
+      await daemon2.start();
+      const chat2 = await daemon2.director.createChat({ repoRoot: repoDir, title: "Interrupt test" });
+      const longGoal2 = daemon2.director.goals.createGoal({
+        repoRoot: repoDir,
+        chatSessionId: chat2.id,
+        title: "Long background goal",
+        description: "Still running",
+        criteria: [{ id: "c1", kind: "deterministic", description: "Pass", command: "true" }],
+      });
+      const longRun2 = daemon2.db.createRun({ goal: "Long run", repoRoot: repoDir, baseBranch: "main", baseSha: "abc" });
+      daemon2.director.goals.linkRunAndStart(longGoal2.id, longRun2.id);
+
+      try {
+        const sendPromise = daemon2.director.sendChatMessage(chat2.id, "Wait on the goal");
+        await new Promise((r) => setTimeout(r, 30));
+        const tStart = Date.now();
+        const steered = await daemon2.director.steerChat(chat2.id, "Prefer Neon for subagents", { role: "user" });
+        assert.equal(steered, true);
+        await sendPromise;
+        assert.ok(Date.now() - tStart < 1500, "User message must unblock goal_wait immediately");
+        assert.equal((waitToolResult as Record<string, unknown> | null)?.wakeReason, "user_message");
+        assert.equal((waitToolResult as Record<string, unknown> | null)?.userMessage, "Prefer Neon for subagents");
+        assert.equal(daemon2.db.getRun(longRun2.id)?.status, "active", "Background run must keep running uninterrupted");
+      } finally {
+        await daemon2.stop();
+      }
+    } finally {
+      client.close();
+      await daemon.stop();
+      rmSync(repoDir, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("projects structured subagent telemetry automatically and renders dynamic Goal verification without hardcoded counts", async () => {
+    const repoDir = initTempGitRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-telemetry-test-"));
+    const sockPath = join(stateDir, "d.sock");
+    const cfg = loadConfig(repoDir);
+    cfg.stateDir = stateDir;
+    cfg.socketPath = sockPath;
+
+    const daemon = new HarnessDaemon(cfg, {
+      dbPath: join(stateDir, "cp.sqlite"),
+      customRunnerFactory: () => ({
+        run: async () => ({ text: "ok", stopReason: "completed" }),
+      }),
+    });
+    await daemon.start();
+    const client = new DaemonClient(sockPath);
+    await client.connect();
+
+    try {
+      const chat = await client.request<{ session: { id: string } }>("chat.create", {
+        repoRoot: repoDir,
+        title: "Telemetry Session",
+      });
+      const goal = daemon.director.goals.createGoal({
+        repoRoot: repoDir,
+        chatSessionId: chat.session.id,
+        title: "Dynamic telemetry goal",
+        description: "Verify zero-tool-call telemetry projection and dynamic review columns",
+        criteria: [
+          { id: "c1", kind: "deterministic", description: "Typecheck passes", command: "bun run typecheck" },
+          { id: "c2", kind: "behavioral", description: "UI renders cleanly" },
+        ],
+      });
+      const run = daemon.db.createRun({ goal: goal.title, repoRoot: repoDir, baseBranch: "main", baseSha: "abc" });
+      daemon.director.goals.linkRunAndStart(goal.id, run.id);
+
+      const orch = daemon.db.createTask({
+        runId: run.id,
+        tier: 1,
+        kind: "orchestrator",
+        title: "Orchestrator",
+        objective: "Coordinate workers",
+        profileId: "acp:codex",
+        model: "openai/gpt-6.2-astra",
+        effort: "medium",
+      });
+      daemon.db.updateTask(orch.id, { status: "running" });
+
+      const worker = daemon.db.createTask({
+        runId: run.id,
+        parentId: orch.id,
+        tier: 2,
+        kind: "worker",
+        title: "Implement auth middleware",
+        objective: "Add auth middleware",
+        profileId: "acp:claude",
+        model: "anthropic/claude-opus-5-5",
+        effort: "high",
+      });
+      daemon.db.updateTask(worker.id, { status: "running" });
+
+      // Simulate normal ACP tool execution events (no extra telemetry tool calls from the model!)
+      daemon.db.emitEvent(run.id, worker.id, "agent.tool", {
+        name: "read_file",
+        title: "read_file src/auth.ts",
+        input: { path: "src/auth.ts" },
+        status: "completed",
+      });
+      daemon.db.emitEvent(run.id, worker.id, "agent.tool", {
+        name: "edit_file",
+        title: "edit_file src/auth.ts",
+        input: { path: "src/auth.ts" },
+        status: "running",
+      });
+
+      const activity1 = buildRunActivitySummary(daemon.db, run.id);
+      assert.ok(activity1);
+      assert.equal(activity1.phase, "implementing");
+      assert.equal(activity1.counts.running, 2);
+      assert.equal(activity1.filesEdited, 1);
+      const workerSnap = activity1.tasks.find((t) => t.id === worker.id);
+      assert.ok(workerSnap);
+      assert.equal(workerSnap.toolCalls, 2);
+      assert.equal(workerSnap.filesEdited, 1);
+      assert.equal(workerSnap.currentAction, "⚙ edit_file src/auth.ts");
+
+      // Goals table & detail must NEVER show hardcoded 0/4; they reflect dynamic implementing phase
+      const activeGoal = daemon.director.goals.getGoal(goal.id)!;
+      const tasksNow = daemon.db.listTasks(run.id);
+      const tablePayload = buildGoalsTableDisplay([
+        { goal: activeGoal, reviews: [], openEscalations: [], tasks: tasksNow, activity: activity1 },
+      ]);
+      const detailPayload = buildGoalDetailDisplay({
+        goal: activeGoal,
+        reviews: [],
+        tasks: tasksNow,
+        openEscalations: [],
+        activity: activity1,
+      });
+      const activityPayload = buildRunActivityDisplay(activity1);
+
+      const theme = createTheme();
+      const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+
+      for (const payload of [tablePayload, detailPayload, activityPayload]) {
+        for (const w of [60, 100, 120]) {
+          const lines = renderToolOutput(payload, w, theme);
+          assert.ok(lines && lines.length > 0);
+          for (const line of lines) {
+            assert.ok(visibleWidth(line) <= w, `${payload.kind} overflowed width ${w}: ${visibleWidth(line)}`);
+          }
+        }
+      }
+
+      const tableText = renderToolOutput(tablePayload, 120, theme).map(strip).join("\n");
+      assert.equal(tableText.includes("0/4"), false, "Goals table must not show hardcoded 0/4");
+      assert.ok(tableText.includes("implementing"), `Expected dynamic phase in table:\n${tableText}`);
+
+      const detailText = renderToolOutput(detailPayload, 120, theme).map(strip).join("\n");
+      assert.equal(detailText.includes("Review 0/4"), false, "Goal detail must not show hardcoded Review 0/4");
+      assert.ok(detailText.includes("Subagents"), `Expected live subagent breakdown in goal detail:\n${detailText}`);
+      assert.ok(detailText.includes("edit_file src/auth.ts"));
+
+      const activityText = renderToolOutput(activityPayload, 120, theme).map(strip).join("\n");
+      assert.ok(activityText.includes("● implementing"));
+      assert.ok(activityText.includes("1 file edited"));
+      assert.ok(activityText.includes("edit_file src/auth.ts"));
+
+      // Optional report_goal_progress updates live criterion status without running a full Goal review cycle
+      const progRes = (await daemon.orchestrator.toolExecutor.execute(run.id, worker.id, "report_goal_progress", {
+        summary: "Middleware implemented and typecheck green",
+        criteria_results: [{ criterion_id: "c1", passed: true, evidence: "bun run typecheck exited 0" }],
+      })) as { recorded: boolean; goalId: string };
+      assert.equal(progRes.recorded, true);
+      assert.equal(progRes.goalId, goal.id);
+
+      // Spawning and completing a verify task automatically marks verification passed on the Goal
+      const verifier = daemon.db.createTask({
+        runId: run.id,
+        parentId: orch.id,
+        tier: 2,
+        kind: "verify",
+        title: "Independent verification",
+        objective: "Verify auth middleware",
+        profileId: "acp:codex",
+        model: "openai/gpt-6.2-astra",
+      });
+      daemon.db.updateTask(verifier.id, { status: "running" });
+      assert.equal(buildRunActivitySummary(daemon.db, run.id)?.phase, "verifying");
+
+      await daemon.orchestrator.toolExecutor.execute(run.id, verifier.id, "return_task", {
+        status: "completed",
+        summary: "All auth checks verified",
+        sources: [{ path: "src/auth.ts", note: "verified middleware implementation" }],
+      });
+      const updatedGoal = daemon.director.goals.getGoal(goal.id)!;
+      assert.equal(updatedGoal.liveProgress?.verificationStatus, "passed");
+      assert.equal(updatedGoal.liveProgress?.criteriaResults?.[0]?.passed, true);
+
+      // Verify run_status Director tool resolves goal_id and emits native run_activity display card into history
+      const statusRes = (await daemon.director.executeDirectorMcpTool(chat.session.id, "run_status", {
+        goal_id: goal.id,
+      })) as { activity?: { phase: string; counts: { verifyCompleted: number } }; rendered_in_ui?: string };
+      assert.equal(statusRes.activity?.counts.verifyCompleted, 1);
+      const turns = await client.request<Array<{ role: string; toolName?: string; display?: ToolDisplayPayload }>>("chat.history", {
+        chatSessionId: chat.session.id,
+      });
+      const activityTurn = turns.find((t) => t.role === "tool_output" && t.toolName === "run_status");
+      assert.equal(activityTurn?.display?.kind, "run_activity");
     } finally {
       client.close();
       await daemon.stop();

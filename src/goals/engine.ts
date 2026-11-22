@@ -100,6 +100,15 @@ export interface GoalBudgets {
   maxApiEquivUsd?: number;
 }
 
+export interface GoalLiveProgress {
+  phase?: string;
+  summary?: string;
+  verificationStatus?: "not_needed" | "in_progress" | "passed" | "failed";
+  criteriaResults?: CriterionEvaluation[];
+  reportedByTaskId?: string | null;
+  updatedAt: number;
+}
+
 export interface GoalRecord {
   id: string;
   chatSessionId: string | null;
@@ -111,6 +120,7 @@ export interface GoalRecord {
   nonGoals: string[];
   budgets: GoalBudgets;
   verificationMode?: VerificationMode;
+  liveProgress?: GoalLiveProgress | null;
   status: GoalStatus;
   linkedRunId: string | null;
   reviewCycle: number;
@@ -170,6 +180,7 @@ CREATE TABLE IF NOT EXISTS goals (
   non_goals_json TEXT NOT NULL DEFAULT '[]',
   budgets_json TEXT NOT NULL,
   verification_mode TEXT NOT NULL DEFAULT 'auto',
+  live_progress_json TEXT,
   status TEXT NOT NULL DEFAULT 'draft',
   linked_run_id TEXT,
   review_cycle INTEGER NOT NULL DEFAULT 0,
@@ -256,12 +267,23 @@ export class GoalEngine {
     if (!cols.has("verification_mode")) {
       this.db.exec("ALTER TABLE goals ADD COLUMN verification_mode TEXT NOT NULL DEFAULT 'auto'");
     }
+    if (!cols.has("live_progress_json")) {
+      this.db.exec("ALTER TABLE goals ADD COLUMN live_progress_json TEXT");
+    }
   }
 
   private mapGoal(r: Record<string, unknown>): GoalRecord {
     const rawMode = typeof r.verification_mode === "string" ? r.verification_mode : "auto";
     const verificationMode: VerificationMode =
       rawMode === "none" || rawMode === "deterministic" || rawMode === "independent_review" ? rawMode : "auto";
+    let liveProgress: GoalLiveProgress | null = null;
+    if (typeof r.live_progress_json === "string" && r.live_progress_json.trim()) {
+      try {
+        liveProgress = JSON.parse(r.live_progress_json) as GoalLiveProgress;
+      } catch {
+        liveProgress = null;
+      }
+    }
     return {
       id: String(r.id),
       chatSessionId: r.chat_session_id ? String(r.chat_session_id) : null,
@@ -273,6 +295,7 @@ export class GoalEngine {
       nonGoals: JSON.parse(String(r.non_goals_json)) as string[],
       budgets: JSON.parse(String(r.budgets_json)) as GoalBudgets,
       verificationMode,
+      liveProgress,
       status: String(r.status) as GoalStatus,
       linkedRunId: r.linked_run_id ? String(r.linked_run_id) : null,
       reviewCycle: Number(r.review_cycle),
@@ -378,6 +401,30 @@ export class GoalEngine {
     this.db
       .prepare("UPDATE goals SET linked_run_id = ?, status = 'executing', updated_at = ? WHERE id = ?")
       .run(runId, Date.now(), goalIdStr);
+    return this.getGoal(goalIdStr)!;
+  }
+
+  /** Persists live model-reported progress, verification status, and criterion checks onto the Goal. */
+  reportProgress(goalIdStr: string, input: Omit<GoalLiveProgress, "updatedAt">): GoalRecord {
+    const g = this.getGoal(goalIdStr);
+    if (!g) throw new Error(`Unknown goal ${goalIdStr}`);
+    const now = Date.now();
+    const prev = g.liveProgress;
+    const mergedById = new Map<string, CriterionEvaluation>();
+    for (const c of prev?.criteriaResults ?? []) mergedById.set(c.criterionId, c);
+    for (const c of input.criteriaResults ?? []) mergedById.set(c.criterionId, c);
+
+    const next: GoalLiveProgress = {
+      phase: input.phase ?? prev?.phase,
+      summary: input.summary ?? prev?.summary,
+      verificationStatus: input.verificationStatus ?? prev?.verificationStatus,
+      criteriaResults: mergedById.size > 0 ? [...mergedById.values()] : undefined,
+      reportedByTaskId: input.reportedByTaskId ?? prev?.reportedByTaskId ?? null,
+      updatedAt: now,
+    };
+    this.db
+      .prepare("UPDATE goals SET live_progress_json = ?, updated_at = ? WHERE id = ?")
+      .run(JSON.stringify(next), now, goalIdStr);
     return this.getGoal(goalIdStr)!;
   }
 

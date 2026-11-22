@@ -2,7 +2,7 @@ import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works
 import type { HarnessTheme } from "../primitives/theme.js";
 import { renderProgressBar } from "../primitives/layout.js";
 import { clampLine, fillLineBg, fitWidth } from "../primitives/width.js";
-import { asInt, asRecord, sanitizeText, statusPaint, type ToolDisplayPayload } from "./types.js";
+import { asInt, asIntOrNull, asRecord, sanitizeText, statusPaint, type ToolDisplayPayload } from "./types.js";
 
 const MAX_CRITERIA = 12;
 const MAX_ESCALATIONS = 5;
@@ -70,9 +70,18 @@ export function renderGoalDetail(display: ToolDisplayPayload, width: number, the
   if (description) wrappedSub(description, theme.muted, 2);
 
   const passed = criteria.filter((c) => c.lastResult === "pass").length;
+  const maxCycles = asIntOrNull(goal.maxReviewCycles);
+  const verifyLabel = sanitizeText(goal.verificationLabel);
+  const reviewMeta = verifyLabel
+    ? `Verify ${verifyLabel}`
+    : maxCycles !== null && maxCycles > 0
+      ? `Review ${asInt(goal.reviewCycle)}/${maxCycles}`
+      : asInt(goal.reviewCycle) > 0
+        ? `Reviews ${asInt(goal.reviewCycle)}`
+        : "Verify —";
   const meta = [
     `Run ${runId || "—"}`,
-    `Review ${asInt(goal.reviewCycle)}/${asInt(goal.maxReviewCycles)}`,
+    reviewMeta,
     `Criteria ${passed}/${criteria.length} passed`,
   ];
   if (tasks.length > 0) meta.push(`Tasks ${tasks.length}`);
@@ -84,6 +93,11 @@ export function renderGoalDetail(display: ToolDisplayPayload, width: number, the
     subRow(metaText);
   }
 
+  const liveSummary = sanitizeText(goal.liveSummary);
+  if (liveSummary && !lastReview) {
+    wrappedSub(`Progress: ${liveSummary}`, theme.info, 2);
+  }
+
   if (tasks.length > 0) {
     const counts = new Map<string, number>();
     for (const t of tasks) {
@@ -92,6 +106,32 @@ export function renderGoalDetail(display: ToolDisplayPayload, width: number, the
     }
     const breakdown = [...counts.entries()].map(([st, n]) => `${n} ${st}`).join(" · ");
     if (breakdown) subRow(`${theme.dim("Task states:")} ${theme.muted(breakdown)}`);
+    const richTasks = tasks.filter((t) => sanitizeText(t.model) || sanitizeText(t.currentAction));
+    if (richTasks.length > 0) {
+      row(theme.muted(theme.bold("Subagents")));
+      for (const t of richTasks.slice(0, 6)) {
+        const st = sanitizeText(t.status) || "unknown";
+        const icon =
+          st === "completed"
+            ? theme.success("✓")
+            : st === "failed" || st === "cancelled"
+              ? theme.error("✗")
+              : st === "paused_quota"
+                ? theme.warning("⏸")
+                : theme.accent("⚙");
+        const kind = sanitizeText(t.kind) || `T${asInt(t.tier, 2)}`;
+        const model = sanitizeText(t.model);
+        const effort = sanitizeText(t.effort);
+        const modelStr = model ? ` ${theme.accent(`[${model}${effort ? ` (${effort})` : ""}]`)}` : "";
+        const action = sanitizeText(t.currentAction);
+        const tools = asInt(t.toolCalls);
+        const durS = Math.round(asInt(t.elapsedMs) / 1000);
+        const stat = tools > 0 || durS > 0 ? ` ${theme.dim(`(${[tools > 0 ? `${tools}t` : "", durS > 0 ? `${durS}s` : ""].filter(Boolean).join(" · ")})`)}` : "";
+        const desc = action || sanitizeText(t.title) || sanitizeText(t.id);
+        subRow(`${icon} ${theme.bold(`T${asInt(t.tier, 2)}/${kind}`)}${modelStr} ${desc}${stat}`);
+      }
+      if (richTasks.length > 6) subRow(theme.dim(`… ${richTasks.length - 6} more subagent(s)`));
+    }
   }
 
   if (criteria.length > 0) {

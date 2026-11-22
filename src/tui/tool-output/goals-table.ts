@@ -17,7 +17,8 @@ interface GoalRow {
   title: string;
   linkedRunId: string | null;
   reviewCycle: number;
-  maxReviewCycles: number;
+  maxReviewCycles: number | null;
+  verificationLabel: string | null;
   criteriaTotal: number;
   criteriaPassed: number | null;
   openEscalations: number;
@@ -51,7 +52,8 @@ function parseGoals(data: unknown): { rows: GoalRow[]; skipped: number } | null 
       title: sanitizeText(g.title) || "(untitled)",
       linkedRunId: sanitizeText(g.linkedRunId) || null,
       reviewCycle: asInt(g.reviewCycle),
-      maxReviewCycles: asInt(g.maxReviewCycles),
+      maxReviewCycles: asIntOrNull(g.maxReviewCycles),
+      verificationLabel: sanitizeText(g.verificationLabel) || null,
       criteriaTotal: asInt(g.criteriaTotal),
       criteriaPassed: asIntOrNull(g.criteriaPassed),
       openEscalations: asInt(g.openEscalations),
@@ -61,8 +63,15 @@ function parseGoals(data: unknown): { rows: GoalRow[]; skipped: number } | null 
 }
 
 function reviewText(r: GoalRow): string {
-  const cycle = `${r.reviewCycle}/${r.maxReviewCycles}`;
-  return r.criteriaPassed === null ? cycle : `${cycle} · ${r.criteriaPassed}/${r.criteriaTotal}✓`;
+  const base =
+    r.verificationLabel ??
+    (r.maxReviewCycles !== null && r.maxReviewCycles > 0
+      ? `${r.reviewCycle}/${r.maxReviewCycles}`
+      : r.reviewCycle > 0
+        ? `${r.reviewCycle} rev`
+        : "—");
+  if (r.criteriaPassed === null) return base;
+  return base === "—" ? `${r.criteriaPassed}/${r.criteriaTotal}✓` : `${base} · ${r.criteriaPassed}/${r.criteriaTotal}✓`;
 }
 
 function statusText(r: GoalRow, mode: StatusMode): string {

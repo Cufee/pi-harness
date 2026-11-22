@@ -3,11 +3,13 @@ import type { HarnessTheme } from "../primitives/theme.js";
 import { clampLine } from "../primitives/width.js";
 import { renderGoalDetail } from "./goal-detail.js";
 import { renderGoalsTable } from "./goals-table.js";
+import { renderRunActivity } from "./run-activity.js";
 import { sanitizeText, type ToolDisplayPayload, type ToolOutputRenderer } from "./types.js";
 
 const renderers = new Map<string, ToolOutputRenderer>([
   ["goals_table", renderGoalsTable],
   ["goal_detail", renderGoalDetail],
+  ["run_activity", renderRunActivity],
 ]);
 
 /**

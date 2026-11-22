@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { CodeExecToolEvent } from "../code-mode/index.js";
 import type { EscalationRecord, TaskRecord } from "../control-plane/db.js";
+import type { RunActivitySummary } from "../control-plane/telemetry.js";
 import type { GoalRecord, GoalReviewVerdict } from "../goals/engine.js";
 
 /** Pair each inner call's start and end for live pills and replay, even for parallel calls of the same tool. */
@@ -27,9 +28,12 @@ export interface GoalsTableRow {
   title: string;
   linkedRunId: string | null;
   reviewCycle: number;
-  maxReviewCycles: number;
+  /** Optional explicit max review cap (null when not capped / dynamic). */
+  maxReviewCycles?: number | null;
+  /** Dynamic verification/review label derived from actual model activity (e.g. `verifying`, `1 verified`, `1 rev`, `skipped`, `—`). */
+  verificationLabel?: string | null;
   criteriaTotal: number;
-  /** Passed criteria in the latest review; null if never reviewed. */
+  /** Passed criteria from latest review or live model progress; null if none reported yet. */
   criteriaPassed: number | null;
   openEscalations: number;
 }
@@ -47,7 +51,9 @@ export interface GoalDetailData {
     description: string;
     linkedRunId: string | null;
     reviewCycle: number;
-    maxReviewCycles: number;
+    maxReviewCycles?: number | null;
+    verificationLabel?: string | null;
+    liveSummary?: string | null;
     nonGoals: string[];
   };
   criteria: Array<{
@@ -58,7 +64,25 @@ export interface GoalDetailData {
     required: boolean;
     lastResult: "pass" | "fail" | null;
   }>;
-  tasks: Array<{ id: string; title: string; status: string; tier: number }>;
+  tasks: Array<{
+    id: string;
+    title: string;
+    status: string;
+    tier: number;
+    kind?: string;
+    model?: string | null;
+    effort?: string | null;
+    currentAction?: string | null;
+    toolCalls?: number;
+    filesEdited?: number;
+    elapsedMs?: number;
+  }>;
+  activity?: {
+    phase: string;
+    filesEdited: number;
+    elapsedMs: number;
+    modelsUsed: string[];
+  } | null;
   openEscalations: Array<{ id: string; taskId: string; summary: string }>;
   lastReview: { cycle: number; verdict: string; summary: string } | null;
 }
@@ -72,20 +96,69 @@ function latestReview(reviews: GoalReviewVerdict[]): GoalReviewVerdict | null {
 
 function criterionResults(goal: GoalRecord, review: GoalReviewVerdict | null): Map<string, "pass" | "fail"> {
   const results = new Map<string, "pass" | "fail">();
-  if (!review) return results;
   const ids = new Set(goal.criteria.map((c) => c.id));
-  for (const r of review.criteriaResults) {
+  // Seed from live model-reported progress first, then overlay authoritative review verdict if newer/present
+  for (const r of goal.liveProgress?.criteriaResults ?? []) {
     if (ids.has(r.criterionId)) results.set(r.criterionId, r.passed ? "pass" : "fail");
+  }
+  if (review) {
+    for (const r of review.criteriaResults) {
+      if (ids.has(r.criterionId)) results.set(r.criterionId, r.passed ? "pass" : "fail");
+    }
   }
   return results;
 }
 
+/** Derives a dynamic verification/review label from actual review records, live `verify` tasks, and model-reported progress. */
+export function deriveGoalVerificationLabel(
+  goal: GoalRecord,
+  tasks: TaskRecord[] = [],
+  activity?: RunActivitySummary | null,
+): string {
+  const verifyTasks = tasks.filter((t) => t.kind === "verify");
+  const runningVerify = activity?.counts.verifyRunning ?? verifyTasks.filter((t) => ["running", "ready", "pending", "draining"].includes(t.status)).length;
+  const completedVerify = activity?.counts.verifyCompleted ?? verifyTasks.filter((t) => t.status === "completed").length;
+
+  if (runningVerify > 0 || goal.status === "verifying" || goal.status === "reviewing" || goal.liveProgress?.verificationStatus === "in_progress") {
+    return runningVerify > 1 ? `verifying (${runningVerify})` : "verifying";
+  }
+  if (goal.reviewCycle > 0) {
+    return `${goal.reviewCycle} rev`;
+  }
+  if (completedVerify > 0) {
+    return completedVerify === 1 ? "1 verified" : `${completedVerify} verified`;
+  }
+  if (goal.liveProgress?.verificationStatus === "passed") return "verified";
+  if (goal.liveProgress?.verificationStatus === "failed") return "verify failed";
+  if (goal.liveProgress?.verificationStatus === "not_needed" || goal.verificationMode === "none") return "skipped";
+  if (activity && ["researching", "planning", "implementing", "merging", "paused_quota"].includes(activity.phase)) {
+    return activity.counts.running > 0 ? `${activity.phase} (${activity.counts.running})` : activity.phase;
+  }
+  if (goal.liveProgress?.phase) return goal.liveProgress.phase;
+  return "—";
+}
+
+export function buildRunActivityDisplay(activity: RunActivitySummary): ToolDisplayPayload {
+  return {
+    kind: "run_activity",
+    title: `Run ${activity.runId} (${activity.phase})`,
+    data: activity,
+  };
+}
+
 export function buildGoalsTableDisplay(
-  entries: Array<{ goal: GoalRecord; reviews: GoalReviewVerdict[]; openEscalations: EscalationRecord[] }>,
+  entries: Array<{
+    goal: GoalRecord;
+    reviews: GoalReviewVerdict[];
+    openEscalations: EscalationRecord[];
+    tasks?: TaskRecord[];
+    activity?: RunActivitySummary | null;
+  }>,
 ): ToolDisplayPayload {
-  const goals: GoalsTableRow[] = entries.map(({ goal, reviews, openEscalations }) => {
+  const goals: GoalsTableRow[] = entries.map(({ goal, reviews, openEscalations, tasks, activity }) => {
     const review = latestReview(reviews);
     const results = criterionResults(goal, review);
+    const hasResults = review !== null || (goal.liveProgress?.criteriaResults?.length ?? 0) > 0;
     return {
       id: goal.id,
       version: goal.version,
@@ -93,9 +166,10 @@ export function buildGoalsTableDisplay(
       title: goal.title,
       linkedRunId: goal.linkedRunId,
       reviewCycle: goal.reviewCycle,
-      maxReviewCycles: goal.budgets.maxReviewCycles,
+      maxReviewCycles: null,
+      verificationLabel: deriveGoalVerificationLabel(goal, tasks ?? [], activity),
       criteriaTotal: goal.criteria.length,
-      criteriaPassed: review ? [...results.values()].filter((v) => v === "pass").length : null,
+      criteriaPassed: hasResults ? [...results.values()].filter((v) => v === "pass").length : null,
       openEscalations: openEscalations.length,
     };
   });
@@ -107,10 +181,12 @@ export function buildGoalDetailDisplay(input: {
   reviews: GoalReviewVerdict[];
   tasks: TaskRecord[];
   openEscalations: EscalationRecord[];
+  activity?: RunActivitySummary | null;
 }): ToolDisplayPayload {
-  const { goal } = input;
+  const { goal, activity } = input;
   const review = latestReview(input.reviews);
   const results = criterionResults(goal, review);
+  const taskActivityById = new Map((activity?.tasks ?? []).map((t) => [t.id, t]));
   const data: GoalDetailData = {
     goal: {
       id: goal.id,
@@ -120,7 +196,9 @@ export function buildGoalDetailDisplay(input: {
       description: goal.description,
       linkedRunId: goal.linkedRunId,
       reviewCycle: goal.reviewCycle,
-      maxReviewCycles: goal.budgets.maxReviewCycles,
+      maxReviewCycles: null,
+      verificationLabel: deriveGoalVerificationLabel(goal, input.tasks, activity),
+      liveSummary: goal.liveProgress?.summary ?? null,
       nonGoals: goal.nonGoals,
     },
     criteria: goal.criteria.map((c) => ({
@@ -131,7 +209,30 @@ export function buildGoalDetailDisplay(input: {
       required: c.required,
       lastResult: results.get(c.id) ?? null,
     })),
-    tasks: input.tasks.map((t) => ({ id: t.id, title: t.title, status: t.status, tier: t.tier })),
+    tasks: input.tasks.map((t) => {
+      const snap = taskActivityById.get(t.id);
+      return {
+        id: t.id,
+        title: t.title,
+        status: t.status,
+        tier: t.tier,
+        kind: t.kind,
+        model: t.model,
+        effort: t.effort,
+        currentAction: snap?.currentAction ?? null,
+        toolCalls: snap?.toolCalls ?? 0,
+        filesEdited: snap?.filesEdited ?? 0,
+        elapsedMs: snap?.elapsedMs ?? 0,
+      };
+    }),
+    activity: activity
+      ? {
+          phase: activity.phase,
+          filesEdited: activity.filesEdited,
+          elapsedMs: activity.elapsedMs,
+          modelsUsed: activity.modelsUsed,
+        }
+      : null,
     openEscalations: input.openEscalations.map((e) => ({ id: e.id, taskId: e.fromTaskId, summary: e.title })),
     lastReview: review ? { cycle: review.cycle, verdict: review.verdict, summary: review.summary } : null,
   };
