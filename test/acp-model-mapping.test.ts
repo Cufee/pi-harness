@@ -135,6 +135,15 @@ describe("ACP adapter-native model matching", () => {
     assert.deepEqual(sentValues(exact), ["openai/gpt-6.2-astra"]);
     // Generic never prefix-strips blindly: no match means null from the resolver
     assert.equal(resolveNativeModelOption("generic", "google/gemini-9", res.configOptions[0]!.options), null);
+    // ...and an unadvertised model is skipped instead of sent
+    assert.equal(buildPostSessionActions("generic", "s1", res, { readOnly: true, model: "google/gemini-9" }).length, 0);
+    const codexUnknown = buildPostSessionActions(
+      "codex",
+      "s1",
+      { configOptions: [modelConfig(["gpt-6.2-sol"], "gpt-6.2-sol")] },
+      { readOnly: false, model: "openai/gpt-9" },
+    );
+    assert.equal(codexUnknown.length, 0);
   });
 
   it("only sets effort when an advertised effort option matches (case-insensitive)", () => {

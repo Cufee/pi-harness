@@ -195,7 +195,6 @@ export function stripSingleVendorPrefix(adapter: AcpAdapterKind, model: string):
 function normalizeModelName(raw: string): string {
   return stripVendorPrefix(raw)
     .toLowerCase()
-    .replace(/(\d)\.(\d)/g, "$1-$2")
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .replace(/^claude-/, "");
@@ -309,9 +308,10 @@ export function buildPostSessionActions(
         });
       }
     } else if (adapter === "codex" || modelOpt) {
-      // Codex does not apply initial session.options on session/new — set model first, then reasoning_effort
-      const value = resolved ?? opts.model;
-      if (value !== current) {
+      // Codex does not apply initial session.options on session/new — set model first, then reasoning_effort.
+      // When options are advertised, only send one of them; otherwise trust the resolved/requested ID.
+      const value = candidates.length > 0 ? (resolved && advertised.has(resolved) ? resolved : null) : (resolved ?? opts.model);
+      if (value && value !== current) {
         actions.push({
           method: "session/set_config_option",
           params: { sessionId, configId: modelOpt?.id ?? "model", value },
@@ -335,15 +335,11 @@ export function buildPostSessionActions(
           params: { sessionId, configId: effortOpt.id, value: match.value },
         });
       }
-    } else if (adapter === "codex" || (adapter === "generic" && effortOpt)) {
-      // Nothing advertised to validate against: keep the verified Codex default config id
+    } else if (adapter === "codex") {
+      // Codex advertises nothing to validate against before set_config_option: keep its verified config id
       actions.push({
         method: "session/set_config_option",
-        params: {
-          sessionId,
-          configId: effortOpt?.id ?? (adapter === "codex" ? "reasoning_effort" : "effort"),
-          value: opts.effort,
-        },
+        params: { sessionId, configId: effortOpt?.id ?? "reasoning_effort", value: opts.effort },
       });
     }
   }
