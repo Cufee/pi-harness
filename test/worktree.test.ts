@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "bun:test";
 import { ControlPlaneDb } from "../src/control-plane/db.js";
 import { runGit, WorktreeManager } from "../src/worktree/manager.js";
-import { BisectingMergeQueue } from "../src/worktree/merge-queue.js";
+import { BisectingMergeQueue, checkTestIntegrity } from "../src/worktree/merge-queue.js";
 
 async function initTempRepo(): Promise<string> {
   const dir = mkdtempSync(join(tmpdir(), "pi-harness-wt-"));
@@ -146,6 +146,301 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
       assert.equal(readFileSync(join(repo, "bun.lock"), "utf8").trim(), "# untracked lockfile");
       const status = (await runGit(repo, ["status", "--porcelain"])).stdout;
       assert.ok(!status.includes("D  feature.ts"), `Unexpected staged deletion in git status:\n${status}`);
+      db.close();
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes concurrent submitAndDrain from 2 workers and preserves live task/worktree when preserveLiveTask is true", async () => {
+    const repo = await initTempRepo();
+    try {
+      const db = new ControlPlaneDb(":memory:");
+      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
+      const run = db.createRun({ goal: "Concurrent merges", repoRoot: repo, baseBranch, baseSha });
+
+      const w1 = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Worker 1",
+        objective: "Add one.txt",
+        profileId: "acp:claude",
+      });
+      const w2 = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Worker 2",
+        objective: "Add two.txt",
+        profileId: "acp:claude",
+      });
+      db.updateTask(w1.id, { status: "running" });
+      db.updateTask(w2.id, { status: "running" });
+
+      const wt1 = await mgr.createForWorker(run.id, w1.id, baseSha);
+      const wt2 = await mgr.createForWorker(run.id, w2.id, baseSha);
+
+      writeFileSync(join(wt1.path, "one.txt"), "from worker 1\n", "utf8");
+      await runGit(wt1.path, ["add", "one.txt"]);
+      await runGit(wt1.path, ["-c", "user.name=w1", "-c", "user.email=w1@local", "commit", "-m", "add one"]);
+
+      writeFileSync(join(wt2.path, "two.txt"), "from worker 2\n", "utf8");
+      await runGit(wt2.path, ["add", "two.txt"]);
+      await runGit(wt2.path, ["-c", "user.name=w2", "-c", "user.email=w2@local", "commit", "-m", "add two"]);
+
+      const mq = new BisectingMergeQueue(db, mgr, repo, { ciCommands: ["sleep 0.05"] });
+      const item1 = db.enqueueMerge({ runId: run.id, taskId: w1.id, worktreeId: wt1.id, branch: wt1.branch });
+      const item2 = db.enqueueMerge({ runId: run.id, taskId: w2.id, worktreeId: wt2.id, branch: wt2.branch });
+
+      const [outcome1, outcome2] = await Promise.all([
+        mq.submitAndDrain(run.id, item1.id, { preserveLiveTask: true }),
+        mq.submitAndDrain(run.id, item2.id, { preserveLiveTask: true }),
+      ]);
+
+      assert.equal(outcome1.item.id, item1.id);
+      assert.equal(outcome1.item.status, "merged");
+      assert.ok(outcome1.mergedSha);
+
+      assert.equal(outcome2.item.id, item2.id);
+      assert.equal(outcome2.item.status, "merged");
+      assert.ok(outcome2.mergedSha);
+      assert.notEqual(outcome1.mergedSha, outcome2.mergedSha);
+
+      // Both files landed on main in serialized order
+      assert.equal(readFileSync(join(repo, "one.txt"), "utf8").trim(), "from worker 1");
+      assert.equal(readFileSync(join(repo, "two.txt"), "utf8").trim(), "from worker 2");
+
+      // Live tasks stay running and worktrees stay on disk with status "merged" until explicit teardown
+      assert.equal(db.getTask(w1.id)?.status, "running");
+      assert.equal(db.getTask(w2.id)?.status, "running");
+      assert.equal(db.getWorktree(wt1.id)?.status, "merged");
+      assert.equal(db.getWorktree(wt2.id)?.status, "merged");
+      assert.equal(existsSync(wt1.path), true);
+      assert.equal(existsSync(wt2.path), true);
+
+      await mgr.teardown(wt1.id, { archiveBeforeRemove: false, finalStatus: "merged" });
+      await mgr.teardown(wt2.id, { archiveBeforeRemove: false, finalStatus: "merged" });
+      assert.equal(existsSync(wt1.path), false);
+      assert.equal(existsSync(wt2.path), false);
+      db.close();
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("runs setupCommand in both worker and integration worktrees and cleans up leaked worktree + branch on setupCommand failure", async () => {
+    const repo = await initTempRepo();
+    try {
+      const db = new ControlPlaneDb(":memory:");
+      const logFile = join(repo, ".setup-invocations.log");
+      // Make sure untracked log file won't interfere with git status in worktrees (it lives in repo root)
+      const setupCmd = `printf '%s\\n' "$HARNESS_WORKTREE_PATH" >> "${logFile}" && printf 'bootstrapped' > .bootstrapped`;
+
+      const mgr = new WorktreeManager(db, repo, {
+        dir: ".harness/worktrees",
+        maxConcurrentWorkers: 4,
+        setupCommand: setupCmd,
+      });
+      const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
+      const run = db.createRun({ goal: "Bootstrap hook", repoRoot: repo, baseBranch, baseSha });
+      const worker = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Add feature",
+        objective: "Add ok.txt",
+        profileId: "acp:claude",
+      });
+
+      const wt = await mgr.createForWorker(run.id, worker.id, baseSha);
+      assert.equal(readFileSync(join(wt.path, ".bootstrapped"), "utf8"), "bootstrapped");
+      // Remove untracked marker from worker worktree so commit stays clean
+      rmSync(join(wt.path, ".bootstrapped"));
+
+      writeFileSync(join(wt.path, "ok.txt"), "ok\n", "utf8");
+      await runGit(wt.path, ["add", "ok.txt"]);
+      await runGit(wt.path, ["-c", "user.name=w", "-c", "user.email=w@local", "commit", "-m", "add ok"]);
+
+      const mq = new BisectingMergeQueue(db, mgr, repo, {
+        ciCommands: ["test -f .bootstrapped && test -f ok.txt"],
+      });
+      const item = db.enqueueMerge({ runId: run.id, taskId: worker.id, worktreeId: wt.id, branch: wt.branch });
+      const outcome = await mq.submitAndDrain(run.id, item.id);
+      assert.equal(outcome.item.status, "merged");
+
+      const invocations = readFileSync(logFile, "utf8").trim().split("\n");
+      assert.equal(invocations.length, 2, `Expected setupCommand to run in worker and integration worktrees, got: ${invocations.join(", ")}`);
+      assert.ok(invocations[0]!.includes(worker.id));
+      assert.ok(invocations[1]!.includes("_integration"));
+
+      // Failing setupCommand must clean up both the newly created worktree and branch
+      const badMgr = new WorktreeManager(db, repo, {
+        dir: ".harness/worktrees",
+        maxConcurrentWorkers: 4,
+        setupCommand: "echo boom >&2 && exit 1",
+      });
+      const failingWorker = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Failing bootstrap",
+        objective: "Should fail setup",
+        profileId: "acp:claude",
+      });
+
+      await assert.rejects(() => badMgr.createForWorker(run.id, failingWorker.id, baseSha));
+
+      const expectedBranch = `harness/${run.id}/${failingWorker.id}`;
+      const expectedPath = join(badMgr.baseDir, run.id, failingWorker.id);
+      assert.equal(existsSync(expectedPath), false, "Leaked worktree directory must be removed on setupCommand failure");
+      const branchExists = await runGit(repo, ["show-ref", "--verify", "--quiet", `refs/heads/${expectedBranch}`]).then(
+        () => true,
+        () => false,
+      );
+      assert.equal(branchExists, false, "Leaked worker branch must be deleted on setupCommand failure");
+      assert.equal(db.listWorktrees(run.id).some((w) => w.taskId === failingWorker.id), false);
+
+      db.close();
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("hardens checkTestIntegrity to ignore comments while catching test.only and Rust #[ignore]", async () => {
+    const repo = await initTempRepo();
+    try {
+      const db = new ControlPlaneDb(":memory:");
+      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
+      const run = db.createRun({ goal: "Test integrity", repoRoot: repo, baseBranch, baseSha });
+
+      // 1. Comment-only lines mentioning skip/only must be ignored
+      const wComments = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Add comments",
+        objective: "Document tests",
+        profileId: "acp:claude",
+      });
+      const wtComments = await mgr.createForWorker(run.id, wComments.id, baseSha);
+      writeFileSync(
+        join(wtComments.path, "app.test.js"),
+        [
+          "// it.skip('documented example', () => {});",
+          "/* test.only('block comment', () => {}); */",
+          " * describe.skip('jsdoc comment', () => {});",
+          "# pytest.skip('python comment')",
+          "test('ok', () => {});",
+        ].join("\n") + "\n",
+        "utf8",
+      );
+      await runGit(wtComments.path, ["add", "app.test.js"]);
+      await runGit(wtComments.path, ["-c", "user.name=w", "-c", "user.email=w@local", "commit", "-m", "comment only"]);
+
+      const commentWarnings = await checkTestIntegrity(repo, baseBranch, wtComments.branch);
+      assert.deepEqual(commentWarnings, []);
+
+      // 2. Real test.only( and Rust #[ignore] must be caught
+      const wViolations = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Add test.only and #[ignore]",
+        objective: "Weaken tests",
+        profileId: "acp:claude",
+      });
+      const wtViolations = await mgr.createForWorker(run.id, wViolations.id, baseSha);
+      writeFileSync(join(wtViolations.path, "app.test.js"), "test.only('focused', () => {});\n", "utf8");
+      writeFileSync(join(wtViolations.path, "lib_test.rs"), "#[test]\n#[ignore]\nfn skipped_rust_test() {}\n", "utf8");
+      await runGit(wtViolations.path, ["add", "app.test.js", "lib_test.rs"]);
+      await runGit(wtViolations.path, ["-c", "user.name=w", "-c", "user.email=w@local", "commit", "-m", "weaken tests"]);
+
+      const warnings = await checkTestIntegrity(repo, baseBranch, wtViolations.branch);
+      assert.equal(warnings.length, 2, `Expected 2 warnings, got: ${warnings.join(" | ")}`);
+      assert.ok(warnings.some((w) => w.includes("app.test.js") && w.includes("test.only")));
+      assert.ok(warnings.some((w) => w.includes("lib_test.rs") && w.includes("#[ignore]")));
+
+      db.close();
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces write_scopes mechanically at merge time, bouncing out-of-scope edits while allowing in-scope edits", async () => {
+    const repo = await initTempRepo();
+    try {
+      const db = new ControlPlaneDb(":memory:");
+      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
+      const run = db.createRun({ goal: "Enforce write scopes", repoRoot: repo, baseBranch, baseSha });
+
+      // 1. Out-of-scope edit bounces with ci_failed naming the offending file
+      const wBad = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Out-of-scope edit",
+        objective: "Edit src/a",
+        profileId: "acp:claude",
+        writeScopes: ["src/a/**"],
+      });
+      const wtBad = await mgr.createForWorker(run.id, wBad.id, baseSha);
+      mkdirSync(join(wtBad.path, "src/b"), { recursive: true });
+      writeFileSync(join(wtBad.path, "src/b/secret.ts"), "export const oops = true;\n", "utf8");
+      await runGit(wtBad.path, ["add", "src/b/secret.ts"]);
+      await runGit(wtBad.path, ["-c", "user.name=w", "-c", "user.email=w@local", "commit", "-m", "edit outside scope"]);
+
+      const mq = new BisectingMergeQueue(db, mgr, repo, {});
+      const badItem = db.enqueueMerge({ runId: run.id, taskId: wBad.id, worktreeId: wtBad.id, branch: wtBad.branch });
+      const badOutcome = await mq.submitAndDrain(run.id, badItem.id, { preserveLiveTask: true });
+
+      assert.equal(badOutcome.item.status, "ci_failed");
+      assert.match(badOutcome.bouncedReason ?? "", /src\/b\/secret\.ts/);
+      assert.equal(db.getTask(wBad.id)?.status, "running");
+      assert.equal(db.getWorktree(wtBad.id)?.status, "bounced");
+
+      // 2. In-scope edit (plus shared metadata file package.json) merges cleanly
+      const wGood = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "In-scope edit",
+        objective: "Edit src/c",
+        profileId: "acp:claude",
+        writeScopes: ["src/c/**"],
+      });
+      const wtGood = await mgr.createForWorker(run.id, wGood.id, baseSha);
+      mkdirSync(join(wtGood.path, "src/c"), { recursive: true });
+      writeFileSync(join(wtGood.path, "src/c/ok.ts"), "export const ok = 1;\n", "utf8");
+      writeFileSync(join(wtGood.path, "package.json"), '{"name":"demo"}\n', "utf8");
+      await runGit(wtGood.path, ["add", "src/c/ok.ts", "package.json"]);
+      await runGit(wtGood.path, ["-c", "user.name=w", "-c", "user.email=w@local", "commit", "-m", "edit inside scope"]);
+
+      const goodItem = db.enqueueMerge({ runId: run.id, taskId: wGood.id, worktreeId: wtGood.id, branch: wtGood.branch });
+      const goodOutcome = await mq.submitAndDrain(run.id, goodItem.id);
+
+      assert.equal(goodOutcome.item.status, "merged");
+      assert.equal(readFileSync(join(repo, "src/c/ok.ts"), "utf8").trim(), "export const ok = 1;");
+
+      // Also verify bounced worktrees count toward maxConcurrentWorkers and detached HEAD is rejected
+      const cappedMgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 1 });
+      const wExtra = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Capped worker",
+        objective: "Should hit cap because wtBad is bounced",
+        profileId: "acp:claude",
+      });
+      await assert.rejects(() => cappedMgr.createForWorker(run.id, wExtra.id, baseSha), /concurrency cap reached/);
+
+      // Detached HEAD check in resolveRepoInfo
+      await runGit(repo, ["checkout", "--detach", "HEAD"]);
+      await assert.rejects(() => mgr.resolveRepoInfo(), /detached HEAD/);
+
       db.close();
     } finally {
       rmSync(repo, { recursive: true, force: true });

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { constants } from "node:fs";
-import { lstat, open, realpath, stat } from "node:fs/promises";
+import { lstat, mkdir, open, realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { client, ndJsonStream, PROTOCOL_VERSION, type AgentApp, type ClientConnection } from "@agentclientprotocol/sdk/unstable";
@@ -22,6 +22,65 @@ import { detectQuotaErrorText } from "./quota-detect.js";
 import { validateRunPolicy } from "./types.js";
 import type { ProbedModelInfo, QuotaPauseInfo, RunAgentRequest, RunAgentResult, RunnerUsage } from "./types.js";
 
+const terminatingChildren = new WeakSet<ChildProcess>();
+
+function terminateChild(child: ChildProcess | null | undefined): void {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  if (terminatingChildren.has(child)) return;
+  terminatingChildren.add(child);
+
+  const sendSignal = (sig: NodeJS.Signals) => {
+    if (process.platform !== "win32" && child.pid) {
+      try {
+        process.kill(-child.pid, sig);
+        return;
+      } catch {
+        // Fallback to direct child signal if process group already exited
+      }
+    }
+    try {
+      child.kill(sig);
+    } catch {
+      // ignore
+    }
+  };
+
+  sendSignal("SIGTERM");
+  const killTimer = setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) {
+      sendSignal("SIGKILL");
+    }
+  }, 2000);
+  killTimer.unref?.();
+  child.once("exit", () => clearTimeout(killTimer));
+}
+
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  message: string,
+  onTimeout?: () => void,
+): Promise<T> {
+  if (ms <= 0) return promise;
+  return new Promise<T>((resolvePromise, rejectPromise) => {
+    const timer = setTimeout(() => {
+      onTimeout?.();
+      rejectPromise(new Error(message));
+    }, ms);
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolvePromise(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        rejectPromise(err);
+      },
+    );
+  });
+}
+
 function requireWorkspacePath(root: string, path: string): void {
   const rel = relative(root, path);
   if (isAbsolute(rel) || rel === ".." || rel.startsWith(`..${sep}`)) {
@@ -30,19 +89,46 @@ function requireWorkspacePath(root: string, path: string): void {
 }
 
 async function workspaceTarget(root: string, requested: string, allowNew: boolean) {
-  const absolute = resolve(root, requested);
+  const realRoot = await realpath(root);
+  const absolute = resolve(realRoot, requested);
   try {
     const path = await realpath(absolute);
-    requireWorkspacePath(root, path);
+    requireWorkspacePath(realRoot, path);
     return { path, exists: true };
   } catch (error) {
     if (!allowNew || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  const parent = await realpath(dirname(absolute));
-  requireWorkspacePath(root, parent);
-  const path = resolve(parent, basename(absolute));
-  // A dangling symlink is an existing directory entry, not a new workspace file.
-  if (await lstat(path).catch((error) => {
+
+  // Walk up parent directories until an existing ancestor is found, ensuring no intermediate
+  // symlink escapes `realRoot` and no dangling symlink occupies the target path.
+  const missingSegments: string[] = [];
+  let cursor = absolute;
+  let existingAncestor: string | null = null;
+  while (true) {
+    const entry = await lstat(cursor).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (entry) {
+      if (missingSegments.length === 0) {
+        // A dangling symlink is an existing directory entry, not a new workspace file.
+        throw new Error("ACP filesystem target is not a new workspace file");
+      }
+      existingAncestor = await realpath(cursor);
+      requireWorkspacePath(realRoot, existingAncestor);
+      break;
+    }
+    const parent = dirname(cursor);
+    if (parent === cursor) {
+      throw new Error("ACP filesystem path is outside the task workspace");
+    }
+    missingSegments.unshift(basename(cursor));
+    cursor = parent;
+  }
+
+  const path = resolve(existingAncestor, ...missingSegments);
+  requireWorkspacePath(realRoot, path);
+  if (await lstat(path).catch((error: NodeJS.ErrnoException) => {
     if (error.code !== "ENOENT") throw error;
     return undefined;
   })) throw new Error("ACP filesystem target is not a new workspace file");
@@ -51,6 +137,11 @@ async function workspaceTarget(root: string, requested: string, allowNew: boolea
 
 async function openWorkspaceFile(root: string, requested: string, write: boolean) {
   const { path: target, exists } = await workspaceTarget(root, requested, write);
+  if (write && !exists) {
+    await mkdir(dirname(target), { recursive: true });
+    const actualParent = await realpath(dirname(target));
+    requireWorkspacePath(root, actualParent);
+  }
   const flags = (write ? constants.O_WRONLY : constants.O_RDONLY) | constants.O_NOFOLLOW |
     constants.O_NONBLOCK | (exists ? 0 : constants.O_CREAT | constants.O_EXCL);
   const file = await open(target, flags);
@@ -96,6 +187,8 @@ const MAX_CONSECUTIVE_SILENT_RECOVERIES = 4;
 const MAX_TOTAL_RECOVERY_CONTINUATIONS = 10;
 const IDENTICAL_FAILURE_BREAKER = 6;
 const DEFAULT_QUOTA_RETRY_TIMEOUT_MS = 45_000;
+const DEFAULT_STARTUP_TIMEOUT_MS = 45_000;
+const DEFAULT_IDLE_TIMEOUT_MS = 600_000;
 
 export class AcpRunner {
   constructor(private readonly profile: AcpProfileConfig) {}
@@ -127,6 +220,7 @@ export class AcpRunner {
       : spawn(prepared.command, prepared.args, {
           cwd: req.cwd,
           env: prepared.env,
+          detached: process.platform !== "win32",
           stdio: ["pipe", "pipe", "pipe"],
         });
 
@@ -146,6 +240,8 @@ export class AcpRunner {
     const claudeToolNames = new Set(req.tools.map(({ name }) => `mcp__harness__${name}`));
     const codexHarnessCalls = new Set<string>();
     const quotaTimeoutMs = Math.max(0, req.quotaRetryTimeoutMs ?? DEFAULT_QUOTA_RETRY_TIMEOUT_MS);
+    const startupTimeoutMs = Math.max(0, req.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS);
+    const idleTimeoutMs = Math.max(0, req.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS);
 
     let accumulatedText = "";
     let textSinceLastTool = "";
@@ -153,11 +249,57 @@ export class AcpRunner {
     let lastUsage: RunnerUsage | undefined;
     let rolloverTriggered = false;
     let rolloverWarningSent = false;
+    let maxTurnsTriggered = false;
+    let turnsUsed = 0;
+    let completedToolInWave = false;
+    const inFlightToolCalls = new Set<string>();
     let sessionId: string | undefined;
     let steeringSupported = false;
     const isAmpProfile = isAmpAcpProfile(this.profile);
     let activeConnection: ClientConnection | null = null;
     const toolTitlesById = new Map<string, string>();
+
+    // Inactivity watchdog for active `session/prompt` calls
+    let idleTimedOut = false;
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    let rejectActivePromptOnIdle: ((err: Error) => void) | null = null;
+    const clearIdleWatchdog = () => {
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+      rejectActivePromptOnIdle = null;
+    };
+    const resetIdleWatchdog = () => {
+      if (!rejectActivePromptOnIdle || idleTimeoutMs <= 0 || idleTimedOut) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        idleTimer = null;
+        if (quotaWatchdogTriggered || rolloverTriggered || maxTurnsTriggered || req.signal.aborted) return;
+        idleTimedOut = true;
+        const cb = rejectActivePromptOnIdle;
+        rejectActivePromptOnIdle = null;
+        if (sessionId && activeConnection) {
+          void activeConnection.agent.notify("session/cancel", { sessionId }).catch(() => {});
+        }
+        terminateChild(child);
+        cb?.(new Error(`ACP session timed out after ${idleTimeoutMs}ms of inactivity`));
+      }, idleTimeoutMs);
+      idleTimer.unref?.();
+    };
+
+    const advanceTurnWaveIfNeeded = () => {
+      if (!completedToolInWave || inFlightToolCalls.size > 0 || maxTurnsTriggered) return;
+      completedToolInWave = false;
+      if (req.maxTurns > 0 && turnsUsed >= req.maxTurns) {
+        maxTurnsTriggered = true;
+        if (sessionId && activeConnection) {
+          void activeConnection.agent.notify("session/cancel", { sessionId }).catch(() => {});
+        }
+        return;
+      }
+      turnsUsed += 1;
+    };
 
     // Per-turn & cumulative tool-failure / read-only-denial tracking (for continuation recovery + robust circuit breaker)
     let turnFailedTools: Array<{ title: string; detail?: string }> = [];
@@ -173,6 +315,8 @@ export class AcpRunner {
     let quotaWatchdogTriggered = false;
     let quotaRetrying = false;
     let quotaRetryHits = 0;
+    let quotaRejected = false;
+    let textSinceQuotaRejection = "";
     let lastQuotaReason = "";
     let lastQuotaResetAt: string | null = null;
     let lastQuotaHard = false;
@@ -221,14 +365,10 @@ export class AcpRunner {
           if (sessionId && activeConnection) {
             void activeConnection.agent.notify("session/cancel", { sessionId }).catch(() => {});
           }
-          if (child && !child.killed) {
+          if (child) {
             setTimeout(() => {
-              try {
-                if (!child.killed) child.kill("SIGTERM");
-              } catch {
-                // ignore
-              }
-            }, 350).unref();
+              terminateChild(child);
+            }, 350).unref?.();
           }
         }, quotaTimeoutMs);
         quotaWatchdogTimer.unref?.();
@@ -236,30 +376,73 @@ export class AcpRunner {
     };
 
     let stderrBuf = "";
-    child?.stderr?.setEncoding("utf8").on("data", (chunk: string) => {
-      stderrBuf = (stderrBuf + chunk).slice(-4096);
-      const detected = detectQuotaErrorText(chunk);
+    let stderrLineBuf = "";
+    let stderrPartialMatched = false;
+    const inspectStderrText = (text: string): boolean => {
+      const detected = detectQuotaErrorText(text);
       if (detected.isQuota) {
         noteQuotaSignal({
           reason: detected.summary,
           resetAt: detected.resetAtIso ?? null,
           isHardExhaustion: detected.isHardExhaustion,
         });
+        return true;
       }
+      return false;
+    };
+    child?.stderr?.setEncoding("utf8").on("data", (chunk: string) => {
+      stderrBuf = (stderrBuf + chunk).slice(-4096);
+      stderrLineBuf += chunk;
+      const lines = stderrLineBuf.split(/\r?\n/);
+      stderrLineBuf = lines.pop() ?? "";
+      if (lines.length > 0) {
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i]!;
+          if (i === 0 && stderrPartialMatched) {
+            stderrPartialMatched = false;
+            continue;
+          }
+          if (line.trim()) inspectStderrText(line);
+        }
+        stderrPartialMatched = false;
+      }
+      if (!stderrPartialMatched && stderrLineBuf.trim()) {
+        stderrPartialMatched = inspectStderrText(stderrLineBuf);
+      }
+      if (stderrLineBuf.length > 4096) {
+        stderrLineBuf = stderrLineBuf.slice(-512);
+        stderrPartialMatched = false;
+      }
+    });
+    child?.stderr?.on("end", () => {
+      if (!stderrPartialMatched && stderrLineBuf.trim()) {
+        inspectStderrText(stderrLineBuf);
+      }
+      stderrLineBuf = "";
+      stderrPartialMatched = false;
     });
 
     const app = client()
       .onNotification("session/update", ({ params }) => {
         const update = (params as unknown as { update?: Record<string, unknown> }).update;
         if (params.sessionId !== sessionId || !update || typeof update !== "object") return;
+        resetIdleWatchdog();
         const kind = String(update.sessionUpdate ?? "");
 
         if (kind === "agent_message_chunk") {
+          advanceTurnWaveIfNeeded();
           const content = update.content as { type?: string; text?: string } | undefined;
           if (content?.type === "text" && typeof content.text === "string") {
+            if (quotaRejected) {
+              textSinceQuotaRejection += content.text;
+            }
             if (content.text.trim().length > 0) {
-              // Forward progress! Subscription-pool rotation succeeded — disarm any pending 429 watchdog.
-              disarmQuotaWatchdog(true);
+              // Forward progress! Subscription-pool rotation succeeded — disarm any pending 429 watchdog
+              // unless the assistant text itself is a rate-limit / quota exhaustion explanation.
+              const quotaCheckText = quotaRejected ? textSinceQuotaRejection : content.text;
+              if (!detectQuotaErrorText(quotaCheckText).isQuota) {
+                disarmQuotaWatchdog(true);
+              }
             }
             let chunk = content.text;
             if (needsParagraphBreak && accumulatedText.length > 0 && !accumulatedText.endsWith("\n") && !chunk.startsWith("\n")) {
@@ -271,13 +454,15 @@ export class AcpRunner {
             req.callbacks.onTextDelta?.(chunk);
           }
         } else if (kind === "agent_thought_chunk") {
+          advanceTurnWaveIfNeeded();
           const content = update.content as { type?: string; text?: string } | undefined;
           if (content?.type === "text" && typeof content.text === "string") {
             req.callbacks.onThoughtDelta?.(content.text);
           }
         } else if (kind === "usage_update") {
           const used = Number(update.used ?? 0);
-          const size = Number(update.size ?? 0);
+          const rawSize = Number(update.size ?? 0);
+          const size = rawSize > 0 ? rawSize : (req.contextWindow ?? 0);
           const costObj = update.cost as { amount?: number } | null | undefined;
           lastUsage = {
             used,
@@ -297,6 +482,8 @@ export class AcpRunner {
               observedAt: Date.now(),
             });
             if (rlPayload.status === "rejected" || rlPayload.overageStatus === "rejected") {
+              quotaRejected = true;
+              textSinceQuotaRejection = "";
               const resetIso =
                 typeof rlPayload.resetsAt === "number" ? new Date(rlPayload.resetsAt * 1000).toISOString() : null;
               noteQuotaSignal({
@@ -304,6 +491,9 @@ export class AcpRunner {
                 resetAt: resetIso,
                 isHardExhaustion: true,
               });
+            } else if (rlPayload.status !== undefined || rlPayload.overageStatus !== undefined) {
+              quotaRejected = false;
+              textSinceQuotaRejection = "";
             }
           }
           const codexRl = (updateMeta["_codex/rateLimits"] ?? updateMeta.rateLimits) as Record<string, unknown> | undefined;
@@ -364,6 +554,15 @@ export class AcpRunner {
           if (accumulatedText.length > 0) needsParagraphBreak = true;
           textSinceLastTool = "";
           const callId = update.toolCallId ? String(update.toolCallId) : update.id ? String(update.id) : undefined;
+          const status = String(update.status ?? "in_progress");
+          if (kind === "tool_call") {
+            advanceTurnWaveIfNeeded();
+            if (callId && status !== "completed" && status !== "failed") {
+              inFlightToolCalls.add(callId);
+            }
+          } else if (callId && (status === "in_progress" || status === "pending")) {
+            inFlightToolCalls.add(callId);
+          }
           if (this.profile.adapter === "codex" && callId) {
             const meta = update._meta as { is_mcp_tool_call?: boolean } | undefined;
             const input = update.rawInput as { server?: string; tool?: string } | undefined;
@@ -381,14 +580,19 @@ export class AcpRunner {
             toolTitlesById.set(callId, rawTitle);
           }
           const resolvedTitle = rawTitle ?? (callId ? toolTitlesById.get(callId) : undefined) ?? "tool";
-          const status = String(update.status ?? "in_progress");
           if (status === "completed") {
+            if (callId) inFlightToolCalls.delete(callId);
+            completedToolInWave = true;
+            quotaRejected = false;
+            textSinceQuotaRejection = "";
             disarmQuotaWatchdog(true);
             turnSucceededTools += 1;
             // Any successful tool call resets the identical-failure streak so exploratory debugging never trips the breaker
             identicalFailureStreak = 0;
             lastIdenticalFailureKey = "";
           } else if (status === "failed") {
+            if (callId) inFlightToolCalls.delete(callId);
+            completedToolInWave = true;
             const detail = extractToolErrorSnippet(update);
             turnFailedTools.push({ title: resolvedTitle, detail });
             allToolFailures.push(detail ? `${resolvedTitle}: ${detail}` : resolvedTitle);
@@ -417,6 +621,7 @@ export class AcpRunner {
         }
       })
       .onRequest("session/request_permission", async ({ params }) => {
+        if (sessionId && params.sessionId === sessionId) resetIdleWatchdog();
         const p = params as unknown as {
           _meta?: { is_mcp_tool_approval?: boolean };
           toolCall?: {
@@ -481,6 +686,7 @@ export class AcpRunner {
         return { outcome: { outcome: "cancelled" } } as never;
       })
       .onRequest("fs/read_text_file", async ({ params }) => {
+        if (sessionId && params.sessionId === sessionId) resetIdleWatchdog();
         if (!sessionId || params.sessionId !== sessionId || controlOnly) {
           throw new Error("Read denied: agent is running in control-plane-only mode");
         }
@@ -508,6 +714,7 @@ export class AcpRunner {
         return { content: raw };
       })
       .onRequest("fs/write_text_file", async ({ params }) => {
+        if (sessionId && params.sessionId === sessionId) resetIdleWatchdog();
         if (!sessionId || params.sessionId !== sessionId || !canWrite) {
           throw new Error(`Write denied: agent is running in ${controlOnly ? "control-plane-only" : "strictly read-only"} mode`);
         }
@@ -543,25 +750,32 @@ export class AcpRunner {
       if (sessionId) {
         void conn.agent.notify("session/cancel", { sessionId }).catch(() => {});
       }
-      child?.kill("SIGTERM");
+      terminateChild(child);
     };
     req.signal.addEventListener("abort", onAbort, { once: true });
 
     try {
-      const initRes = (await conn.agent.request("initialize", {
-        protocolVersion: PROTOCOL_VERSION,
-        clientInfo: { name: "pi-harness", version: "0.1.0" },
-        clientCapabilities: {
-          fs: { readTextFile: !controlOnly, writeTextFile: canWrite },
-          ...(this.profile.adapter === "claude" ? {} : {
-            _meta: { jetbrains: { air: { capabilities: ["sessionFailure"] } } },
-          }),
-        },
-      } as never)) as unknown as Record<string, unknown>;
+      const initRes = (await withTimeout(
+        conn.agent.request("initialize", {
+          protocolVersion: PROTOCOL_VERSION,
+          clientInfo: { name: "pi-harness", version: "0.1.0" },
+          clientCapabilities: {
+            fs: { readTextFile: !controlOnly, writeTextFile: canWrite },
+            ...(this.profile.adapter === "claude" ? {} : {
+              _meta: { jetbrains: { air: { capabilities: ["sessionFailure"] } } },
+            }),
+          },
+        } as never),
+        startupTimeoutMs,
+        `ACP initialize timed out after ${startupTimeoutMs}ms`,
+        () => terminateChild(child),
+      )) as unknown as Record<string, unknown>;
 
       const initMeta = (initRes._meta ?? {}) as Record<string, unknown>;
       const steeringMeta = initMeta.steering as { supported?: boolean } | undefined;
       steeringSupported = Boolean(steeringMeta?.supported);
+      const agentCapabilities = (initRes.agentCapabilities ?? {}) as Record<string, unknown>;
+      const sessionCaps = (agentCapabilities.sessionCapabilities ?? {}) as Record<string, unknown>;
 
       // Wire Harness MCP server via stdio when daemonSocketPath + bridge are configured
       const mcpServers: AcpMcpServerEntry[] = [];
@@ -585,12 +799,14 @@ export class AcpRunner {
         model: req.model,
         effort: req.effort,
         mcpServers,
-        agentCapabilities: (initRes.agentCapabilities ?? {}) as Record<string, unknown>,
+        agentCapabilities,
       });
 
-      const newSessionRes = (await conn.agent.request(
-        "session/new",
-        newSessionParams as never,
+      const newSessionRes = (await withTimeout(
+        conn.agent.request("session/new", newSessionParams as never),
+        startupTimeoutMs,
+        `ACP session/new timed out after ${startupTimeoutMs}ms`,
+        () => terminateChild(child),
       )) as AcpModelState & { sessionId: string };
       sessionId = String(newSessionRes.sessionId);
       req.callbacks.onSessionId?.(sessionId);
@@ -651,17 +867,21 @@ export class AcpRunner {
           }
           return false;
         },
-        cancel: async () => {
+        cancel: async (reason?: string) => {
+          if (reason === "clean_rollover") {
+            rolloverTriggered = true;
+          }
           if (sessionId) {
             await conn.agent.notify("session/cancel", { sessionId }).catch(() => {});
           }
         },
       });
 
-      const initialPromptText =
-        prepared.prependSystemPromptToTurn1 || needsTurn1SystemPrompt
-          ? `${req.systemPrompt}\n\n---\n\n${req.initialPrompt}`
-          : req.initialPrompt;
+      const shouldPrependSystemPrompt =
+        needsTurn1SystemPrompt || (prepared.prependSystemPromptToTurn1 && !sessionCaps.systemPrompt);
+      const initialPromptText = shouldPrependSystemPrompt
+        ? `${req.systemPrompt}\n\n---\n\n${req.initialPrompt}`
+        : req.initialPrompt;
 
       let nextPromptText = initialPromptText;
       let promptRes: Record<string, unknown> = {};
@@ -671,15 +891,41 @@ export class AcpRunner {
       let breakerExplainedOnce = false;
 
       for (let recoveryAttempt = 0; recoveryAttempt <= MAX_TOTAL_RECOVERY_CONTINUATIONS; recoveryAttempt++) {
+        if (recoveryAttempt > 0 && req.maxTurns > 0 && turnsUsed >= req.maxTurns) {
+          maxTurnsTriggered = true;
+          break;
+        }
+        turnsUsed += 1;
+        completedToolInWave = false;
+        inFlightToolCalls.clear();
         turnFailedTools = [];
         turnDeniedTools = [];
         turnSucceededTools = 0;
         textSinceLastTool = "";
 
-        promptRes = (await conn.agent.request("session/prompt", {
+        const promptPromise = conn.agent.request("session/prompt", {
           sessionId,
           prompt: [{ type: "text", text: nextPromptText }],
-        } as never)) as unknown as Record<string, unknown>;
+        } as never) as unknown as Promise<Record<string, unknown>>;
+
+        if (idleTimeoutMs > 0) {
+          promptRes = await new Promise<Record<string, unknown>>((resolvePrompt, rejectPrompt) => {
+            rejectActivePromptOnIdle = rejectPrompt;
+            resetIdleWatchdog();
+            promptPromise.then(
+              (val) => {
+                clearIdleWatchdog();
+                resolvePrompt(val);
+              },
+              (err) => {
+                clearIdleWatchdog();
+                rejectPrompt(err);
+              },
+            );
+          });
+        } else {
+          promptRes = await promptPromise;
+        }
 
         // Harvest passive quota & terminal sessionFailure signals
         const promptMeta = (promptRes._meta ?? {}) as Record<string, unknown>;
@@ -698,12 +944,22 @@ export class AcpRunner {
           }
         }
 
-        // Merge PromptResponse.usage if available
+        // Merge PromptResponse.usage if available, and run fallback rollover evaluation when usage_update was omitted
         const promptUsage = promptRes.usage as Record<string, unknown> | undefined;
         if (promptUsage) {
+          const hadUsageUpdate = lastUsage !== undefined;
+          const totalFromParts =
+            Number(promptUsage.inputTokens ?? 0) +
+            Number(promptUsage.outputTokens ?? 0) +
+            Number(promptUsage.cachedReadTokens ?? 0) +
+            Number(promptUsage.cachedWriteTokens ?? 0);
+          const fallbackUsed =
+            promptUsage.totalTokens != null ? Number(promptUsage.totalTokens) : totalFromParts;
+          const used = lastUsage?.used ?? fallbackUsed;
+          const size = (lastUsage?.size && lastUsage.size > 0 ? lastUsage.size : undefined) ?? req.contextWindow ?? 0;
           lastUsage = {
-            used: lastUsage?.used ?? Number(promptUsage.totalTokens ?? 0),
-            size: lastUsage?.size ?? 0,
+            used,
+            size,
             inputTokens: Number(promptUsage.inputTokens ?? 0),
             outputTokens: Number(promptUsage.outputTokens ?? 0),
             cachedReadTokens: promptUsage.cachedReadTokens == null ? undefined : Number(promptUsage.cachedReadTokens),
@@ -711,14 +967,28 @@ export class AcpRunner {
             thoughtTokens: promptUsage.thoughtTokens == null ? undefined : Number(promptUsage.thoughtTokens),
             costUsd: lastUsage?.costUsd,
           };
+          if (!hadUsageUpdate) {
+            req.callbacks.onUsage?.(lastUsage);
+            if (!rolloverTriggered && req.rolloverThreshold && size > 0 && used / size >= req.rolloverThreshold) {
+              rolloverTriggered = true;
+            }
+          }
         }
 
         rawStop = String(promptRes.stopReason ?? "end_turn");
 
-        // Never continue if rollover, quota watchdog, user abort, or quota failure occurred
+        const turnQuotaDetected = detectQuotaErrorText(quotaRejected ? textSinceQuotaRejection || accumulatedText : accumulatedText);
+        const turnQuotaFalseCompletion =
+          (quotaRejected && (textSinceQuotaRejection.trim().length === 0 || turnQuotaDetected.isQuota)) ||
+          (turnSucceededTools === 0 && turnQuotaDetected.isQuota);
+
+        // Never continue if rollover, maxTurns, quota watchdog, quota rejection, user abort, or quota failure occurred
         if (
           rolloverTriggered ||
+          maxTurnsTriggered ||
+          rawStop === "max_turn_requests" ||
           quotaWatchdogTriggered ||
+          turnQuotaFalseCompletion ||
           req.signal.aborted ||
           ["quota_exhausted", "rate_limited", "budget_exhausted"].includes(airFailureCode)
         ) {
@@ -760,7 +1030,11 @@ export class AcpRunner {
           consecutiveSilentRecoveries += 1;
           const failureSummary = [
             ...turnFailedTools.map((f) => `- Tool "${f.title}" failed${f.detail ? `: ${f.detail}` : ""}`),
-            ...turnDeniedTools.map((d) => `- Tool "${d}" was blocked because this session is strictly read-only`),
+            ...turnDeniedTools.map((d) =>
+              canWrite
+                ? `- Tool "${d}" was blocked: execution permission denied by harness policy`
+                : `- Tool "${d}" was blocked because this session is ${controlOnly ? "control-plane-only" : "strictly read-only"}`,
+            ),
           ].join("\n");
           nextPromptText = [
             "Your previous tool call did not succeed and your turn ended before you finished responding:",
@@ -774,23 +1048,38 @@ export class AcpRunner {
         break;
       }
 
-      if (quotaWatchdogTriggered || ["quota_exhausted", "rate_limited", "budget_exhausted"].includes(airFailureCode)) {
-        const isHard = lastQuotaHard || airFailureCode === "quota_exhausted" || airFailureCode === "budget_exhausted";
+      const finalQuotaDetected = detectQuotaErrorText(quotaRejected ? textSinceQuotaRejection || accumulatedText : accumulatedText);
+      const quotaFalseCompletion =
+        (quotaRejected && (textSinceQuotaRejection.trim().length === 0 || finalQuotaDetected.isQuota)) ||
+        (turnSucceededTools === 0 && finalQuotaDetected.isQuota);
+
+      if (
+        quotaWatchdogTriggered ||
+        quotaFalseCompletion ||
+        ["quota_exhausted", "rate_limited", "budget_exhausted"].includes(airFailureCode)
+      ) {
+        const isHard =
+          lastQuotaHard ||
+          finalQuotaDetected.isHardExhaustion ||
+          airFailureCode === "quota_exhausted" ||
+          airFailureCode === "budget_exhausted";
         const reason =
           lastQuotaReason ||
+          (finalQuotaDetected.isQuota ? finalQuotaDetected.summary : "") ||
           (airFailureCode ? `ACP sessionFailure: ${airFailureCode}` : `Rate-limit retry timed out after ${Math.round(quotaTimeoutMs / 1000)}s`);
+        const resetAt = lastQuotaResetAt ?? finalQuotaDetected.resetAtIso ?? null;
         req.callbacks.onPassiveQuota?.({
           profileId: this.profile.id,
           model: req.model,
           raw: {
             sessionFailure: isHard ? "quota_exhausted" : "rate_limited",
-            ...(lastQuotaResetAt ? { resetAt: lastQuotaResetAt } : {}),
+            ...(resetAt ? { resetAt } : {}),
           },
           observedAt: Date.now(),
         });
         const quotaPause: QuotaPauseInfo = {
           reason,
-          resetAt: lastQuotaResetAt,
+          resetAt,
           retryCount: Math.max(1, quotaRetryHits),
           watchdogTimedOut: quotaWatchdogTriggered,
           isHardExhaustion: isHard,
@@ -807,9 +1096,11 @@ export class AcpRunner {
 
       const stopReason: RunAgentResult["stopReason"] = rolloverTriggered
         ? "rollover_requested"
-        : rawStop === "cancelled" || req.signal.aborted
-          ? "cancelled"
-          : "completed";
+        : maxTurnsTriggered || rawStop === "max_turn_requests"
+          ? "max_turns"
+          : rawStop === "cancelled" || req.signal.aborted
+            ? "cancelled"
+            : "completed";
 
       return {
         text: accumulatedText,
@@ -820,7 +1111,25 @@ export class AcpRunner {
       };
     } catch (err) {
       if (rolloverTriggered) {
-        return { text: accumulatedText, stopReason: "rollover_requested", usage: lastUsage, sessionId };
+        return {
+          text: accumulatedText,
+          stopReason: "rollover_requested",
+          usage: lastUsage,
+          sessionId,
+          toolFailures: allToolFailures.length > 0 ? allToolFailures : undefined,
+        };
+      }
+      if (maxTurnsTriggered) {
+        return {
+          text: accumulatedText,
+          stopReason: "max_turns",
+          usage: lastUsage,
+          sessionId,
+          toolFailures: allToolFailures.length > 0 ? allToolFailures : undefined,
+        };
+      }
+      if (idleTimedOut && !quotaWatchdogTriggered) {
+        throw new Error(`ACP runner (${this.profile.id}) timed out after ${idleTimeoutMs}ms of inactivity`);
       }
       const primary = spawnErr ?? err;
       const errMsg = primary instanceof Error ? primary.message : String(primary);
@@ -876,6 +1185,7 @@ export class AcpRunner {
       const detail = stderrBuf.trim() ? ` (stderr: ${stderrBuf.trim().slice(-500)})` : "";
       throw new Error(`ACP runner (${this.profile.id}) failed: ${errMsg}${detail}`);
     } finally {
+      clearIdleWatchdog();
       disarmQuotaWatchdog(false);
       req.signal.removeEventListener("abort", onAbort);
       try {
@@ -883,13 +1193,7 @@ export class AcpRunner {
       } catch {
         // ignore close error on already-exited pipe
       }
-      if (child && !child.killed) {
-        try {
-          child.kill("SIGTERM");
-        } catch {
-          // ignore
-        }
-      }
+      terminateChild(child);
       prepared.cleanup();
     }
   }
@@ -906,6 +1210,7 @@ export class AcpRunner {
     const child = spawn(this.profile.command, this.profile.args ?? [], {
       cwd,
       env: { ...process.env, ...(this.profile.env ?? {}) },
+      detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
     });
     child.on("error", () => {});
@@ -927,12 +1232,9 @@ export class AcpRunner {
       } catch {
         // ignore
       }
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // ignore
-      }
+      terminateChild(child);
     }, timeoutMs);
+    timer.unref?.();
 
     try {
       await conn.agent.request("initialize", {
@@ -975,13 +1277,7 @@ export class AcpRunner {
       } catch {
         // ignore
       }
-      if (!child.killed) {
-        try {
-          child.kill("SIGTERM");
-        } catch {
-          // ignore
-        }
-      }
+      terminateChild(child);
     }
   }
 }

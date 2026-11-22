@@ -63,14 +63,27 @@ async function ensureLocalDaemon(socketPath: string): Promise<DaemonClient> {
   let needsRestart = false;
   try {
     await probe.connect();
-    const info = (await probe.request("ping")) as { pid?: number; protocolRev?: number; buildId?: string };
+    const info = (await probe.request("ping")) as {
+      pid?: number;
+      protocolRev?: number;
+      buildId?: string;
+      running?: boolean;
+      liveWork?: string;
+    };
     if (info.protocolRev === DAEMON_PROTOCOL_REV && info.buildId === expectedBuildId) {
       // Reuse the live socket directly — avoids a redundant connect/close handshake on every TUI launch!
       return probe;
     }
+    if (info.protocolRev === DAEMON_PROTOCOL_REV && info.running) {
+      // Never kill an active daemon with running agents/timers just because source file mtime changed
+      console.error(
+        `[pi-harness] Reusing live harnessd (pid ${info.pid ?? "?"}) despite build change because work is active (${info.liveWork ?? "active"}).`,
+      );
+      return probe;
+    }
     probe.close();
     needsRestart = true;
-    // Gracefully stop outdated daemon so newly built code takes over immediately
+    // Gracefully stop idle outdated daemon so newly built code takes over immediately
     await stopLocalDaemon(socketPath);
   } catch {
     probe.close();

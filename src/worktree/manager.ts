@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import type { WorktreeConfig } from "../config.js";
 import type { ControlPlaneDb, WorktreeRecord } from "../control-plane/db.js";
 
-function canonicalPath(p: string): string {
+export function canonicalPath(p: string): string {
   const abs = resolve(p);
   try {
     return realpathSync(abs);
@@ -64,11 +64,32 @@ export class WorktreeManager {
       runGit(this.repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"]),
       runGit(this.repoRoot, ["rev-parse", "HEAD"]),
     ]);
+    if (branchRes.stdout === "HEAD") {
+      throw new Error("Cannot start harness run from detached HEAD; checkout a branch first.");
+    }
     return { baseBranch: branchRes.stdout, baseSha: shaRes.stdout };
   }
 
+  async bootstrapWorktree(wtPath: string): Promise<void> {
+    // Optional fast workspace setup hook (e.g., APFS clone-on-write node_modules)
+    if (this.config.setupCommand) {
+      await execFileAsync("/bin/sh", ["-lc", this.config.setupCommand], {
+        cwd: wtPath,
+        env: { ...process.env, HARNESS_REPO_ROOT: this.repoRoot, HARNESS_WORKTREE_PATH: wtPath },
+        timeout: 120_000,
+      });
+    } else {
+      await this.linkIgnoredNodeModules(wtPath);
+    }
+  }
+
   async createForWorker(runId: string, taskId: string, baseSha?: string): Promise<WorktreeRecord> {
-    const active = this.db.listWorktrees(runId).filter((w) => w.status === "active" || w.status === "queued");
+    const active = this.db.listWorktrees(runId).filter((w) => {
+      if (w.status !== "active" && w.status !== "queued" && w.status !== "bounced") return false;
+      const ownerTask = this.db.getTask(w.taskId);
+      if (ownerTask && (ownerTask.status === "failed" || ownerTask.status === "cancelled")) return false;
+      return true;
+    });
     const limit = this.config.maxConcurrentWorkers ?? 4;
     if (active.length >= limit) {
       throw new Error(`Worktree concurrency cap reached (${active.length}/${limit}). Finish or clean a worker first.`);
@@ -92,15 +113,17 @@ export class WorktreeManager {
     mkdirSync(join(this.baseDir, runId), { recursive: true });
     await runGit(this.repoRoot, ["worktree", "add", "-b", branch, wtPath, sha]);
 
-    // Optional fast workspace setup hook (e.g., APFS clone-on-write node_modules)
-    if (this.config.setupCommand) {
-      await execFileAsync("/bin/sh", ["-lc", this.config.setupCommand], {
-        cwd: wtPath,
-        env: { ...process.env, HARNESS_REPO_ROOT: this.repoRoot, HARNESS_WORKTREE_PATH: wtPath },
-        timeout: 120_000,
-      });
-    } else {
-      await this.linkIgnoredNodeModules(wtPath);
+    try {
+      await this.bootstrapWorktree(wtPath);
+    } catch (err) {
+      try {
+        await runGit(this.repoRoot, ["worktree", "remove", "--force", wtPath]);
+      } catch {
+        rmSync(wtPath, { recursive: true, force: true });
+      }
+      await runGit(this.repoRoot, ["branch", "-D", branch]).catch(() => {});
+      await runGit(this.repoRoot, ["worktree", "prune"]).catch(() => {});
+      throw err;
     }
 
     return this.db.recordWorktree({ runId, taskId, path: wtPath, branch, baseSha: sha });
@@ -294,6 +317,40 @@ export class WorktreeManager {
       report.prunedAdminEntries = true;
     } catch (err) {
       report.errors.push({ target: "git worktree prune", error: err instanceof Error ? err.message : String(err) });
+    }
+
+    // Delete stale local `harness/*` branches with no active/queued/bounced DB record and not checked out
+    try {
+      const [{ stdout: branchesOut }, { stdout: wtListOut }] = await Promise.all([
+        runGit(this.repoRoot, ["for-each-ref", "--format=%(refname:short)", "refs/heads/harness"]),
+        runGit(this.repoRoot, ["worktree", "list", "--porcelain"]),
+      ]);
+      const checkedOutBranches = new Set(
+        parsePorcelainWorktrees(wtListOut)
+          .map((e) => e.branch)
+          .filter((b): b is string => Boolean(b)),
+      );
+      const activeDbBranches = new Set(
+        this.db
+          .listWorktrees()
+          .filter((w) => w.status === "active" || w.status === "queued" || w.status === "bounced")
+          .map((w) => w.branch),
+      );
+      const runPrefix = opts?.runId ? `harness/${opts.runId}/` : null;
+
+      for (const raw of branchesOut.split("\n")) {
+        const branch = raw.trim();
+        if (!branch) continue;
+        if (runPrefix && !branch.startsWith(runPrefix)) continue;
+        if (activeDbBranches.has(branch) || checkedOutBranches.has(branch)) continue;
+        try {
+          await runGit(this.repoRoot, ["branch", "-D", branch]);
+        } catch (err) {
+          report.errors.push({ target: branch, error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+    } catch (err) {
+      report.errors.push({ target: "refs/heads/harness", error: err instanceof Error ? err.message : String(err) });
     }
 
     // Expire old safety archive refs past retentionDays

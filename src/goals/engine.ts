@@ -513,7 +513,7 @@ export class GoalEngine {
       .prepare(
         `UPDATE goals
          SET version = ?, title = ?, description = ?, criteria_json = ?, non_goals_json = ?,
-             status = ?, no_progress_streak = 0, last_progress_fingerprint = NULL, updated_at = ?
+             status = ?, review_cycle = 0, no_progress_streak = 0, last_progress_fingerprint = NULL, updated_at = ?
          WHERE id = ?`,
       )
       .run(
@@ -524,7 +524,7 @@ export class GoalEngine {
         JSON.stringify(nextNonGoals),
         nextStatus,
         now,
-        goalIdStr,
+        cur.id,
       );
 
     this.db
@@ -533,7 +533,7 @@ export class GoalEngine {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
-        goalIdStr,
+        cur.id,
         nextVersion,
         nextTitle,
         nextDesc,
@@ -544,23 +544,55 @@ export class GoalEngine {
         now,
       );
 
-    this.onReviewInvalidated?.(goalIdStr);
-    return { goal: this.getGoal(goalIdStr)!, delta };
+    this.onReviewInvalidated?.(cur.id);
+    return { goal: this.getGoal(cur.id)!, delta };
+  }
+
+  /** Reconciles any goals stranded in `verifying` or `reviewing` after a daemon crash/restart. */
+  reconcileStaleGoalsOnStartup(): number {
+    const now = Date.now();
+    const res = this.db
+      .prepare(
+        `UPDATE goals
+         SET status = 'awaiting_human',
+             last_review_summary = COALESCE(last_review_summary, 'Interrupted during verification by daemon restart'),
+             updated_at = ?
+         WHERE status IN ('verifying', 'reviewing')`,
+      )
+      .run(now);
+    return res.changes;
   }
 
   /** Executes all `deterministic` criteria commands at $0 LLM cost and hashes repo diff for progress tracking. */
-  async runDeterministicGates(goalIdStr: string, baseSha?: string, signal?: AbortSignal): Promise<DeterministicGateResult> {
+  async runDeterministicGates(
+    goalIdStr: string,
+    baseSha?: string,
+    signal?: AbortSignal,
+    opts?: { cwd?: string; targetRef?: string },
+  ): Promise<DeterministicGateResult> {
     const goal = this.getGoal(goalIdStr);
     if (!goal) throw new Error(`Unknown goal ${goalIdStr}`);
-    this.setStatus(goalIdStr, "verifying");
+    this.setStatus(goal.id, "verifying");
 
+    const gateCwd = opts?.cwd ?? goal.repoRoot;
+    const targetRef = opts?.targetRef ?? "HEAD";
     const results: CriterionEvaluation[] = [];
     let allPassed = true;
 
     for (const c of goal.criteria) {
-      if (c.kind !== "deterministic" || !c.command) continue;
+      if (c.kind !== "deterministic") continue;
+      if (!c.command?.trim()) {
+        if (c.required) allPassed = false;
+        results.push({
+          criterionId: c.id,
+          passed: false,
+          evidence: `Deterministic criterion '${c.id}' has no shell command configured.`,
+          remediation: "Amend the goal to provide a runnable deterministic command or change criterion kind.",
+        });
+        continue;
+      }
       try {
-        const { stdout, stderr } = await runGate(c.command, goal.repoRoot, signal, this.cfg.gateTimeoutMs);
+        const { stdout, stderr } = await runGate(c.command, gateCwd, signal, this.cfg.gateTimeoutMs);
         results.push({
           criterionId: c.id,
           passed: true,
@@ -581,10 +613,12 @@ export class GoalEngine {
 
     let diffText = "";
     try {
-      const args = baseSha ? ["diff", `${baseSha}..HEAD`] : ["rev-parse", "HEAD"];
-      diffText = (await runGit(goal.repoRoot, args)).stdout;
+      const args = baseSha ? ["diff", `${baseSha}..${targetRef}`] : ["rev-parse", `${targetRef}^{tree}`];
+      const committed = (await runGit(gateCwd, args)).stdout;
+      const dirty = (await runGit(gateCwd, ["status", "--porcelain"])).stdout;
+      diffText = `${committed}\n---WORKTREE---\n${dirty}`;
     } catch {
-      diffText = String(Date.now());
+      diffText = `git-unavailable:${goal.id}:v${goal.version}`;
     }
     const diffHash = createHash("sha256").update(diffText).digest("hex").slice(0, 16);
 
@@ -663,6 +697,13 @@ export class GoalEngine {
     } else if (nextCycle >= goal.budgets.maxReviewCycles) {
       nextStatus = "awaiting_human";
       circuitBreakerTripped = `Max review cycles reached (${nextCycle}/${goal.budgets.maxReviewCycles})`;
+    } else if (
+      typeof goal.budgets.maxWallClockMin === "number" &&
+      goal.budgets.maxWallClockMin > 0 &&
+      Date.now() - goal.createdAt >= goal.budgets.maxWallClockMin * 60_000
+    ) {
+      nextStatus = "awaiting_human";
+      circuitBreakerTripped = `Wall-clock budget exceeded (${goal.budgets.maxWallClockMin} min)`;
     } else {
       nextStatus = "executing";
     }
@@ -723,9 +764,10 @@ export class GoalEngine {
   }
 
   listReviews(goalIdStr: string): GoalReviewVerdict[] {
+    const resolvedId = this.getGoal(goalIdStr)?.id ?? goalIdStr;
     const rows = this.db
       .prepare("SELECT * FROM goal_reviews WHERE goal_id = ? ORDER BY cycle ASC")
-      .all(goalIdStr) as Record<string, unknown>[];
+      .all(resolvedId) as Record<string, unknown>[];
     return rows.map((r) => ({
       id: String(r.id),
       goalId: String(r.goal_id),
@@ -740,7 +782,7 @@ export class GoalEngine {
     }));
   }
 
-  buildReviewerPrompt(goal: GoalRecord, gateResult: DeterministicGateResult, diffStat: string): string {
+  buildReviewerPrompt(goal: GoalRecord, gateResult: DeterministicGateResult, diffStat: string, diffPatch?: string): string {
     const lines = [
       `# Independent Skeptical Done-Review (Goal ${goal.id} v${goal.version}, Cycle ${goal.reviewCycle + 1}/${goal.budgets.maxReviewCycles})`,
       `Title: ${goal.title}`,
@@ -762,9 +804,12 @@ export class GoalEngine {
       lines.push(`- [${r.criterionId}] ${r.passed ? "PASS" : "FAIL"}: ${r.evidence}`);
     }
     lines.push("", "## Git Diff Summary", diffStat || "(no diff)");
+    if (diffPatch?.trim()) {
+      lines.push("", "## Git Diff Patch (truncated if large)", "```diff", diffPatch.trim(), "```");
+    }
     lines.push(
       "",
-      "Return a strict JSON verdict matching:",
+      "Return a strict JSON verdict (or call submit_review_verdict) matching:",
       `{ "verdict": "approved" | "changes_requested" | "escalate_human", "criteriaResults": [{ "criterionId": "...", "passed": true|false, "evidence": "...", "remediation": "..." }], "blockingIssues": [], "summary": "..." }`,
     );
     return lines.join("\n");

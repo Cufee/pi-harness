@@ -301,6 +301,35 @@ describe("Code Mode execution", () => {
     assert.deepEqual(readdirSync(scratchRoot), []);
   });
 
+  itWithSandbox("aborts the inner callTool AbortSignal when code_exec times out", async () => {
+    let toolSignal: AbortSignal | undefined;
+    let abortedSeen = false;
+    const result = await run('import { lookup_gizmo } from "harness"; await lookup_gizmo({ id: "slow" });', {
+      timeoutMs: 150,
+      tools: [lookup],
+      async callTool(_name, _args, signal) {
+        toolSignal = signal;
+        return await new Promise((_resolve, reject) => {
+          if (signal?.aborted) {
+            abortedSeen = true;
+            reject(new Error("aborted"));
+            return;
+          }
+          signal?.addEventListener("abort", () => {
+            abortedSeen = true;
+            reject(new Error("aborted"));
+          }, { once: true });
+        });
+      },
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.timedOut, true, result.error);
+    assert.ok(toolSignal, "expected callTool to receive an AbortSignal");
+    assert.equal(toolSignal?.aborted, true);
+    assert.equal(abortedSeen, true);
+    assert.deepEqual(readdirSync(scratchRoot), []);
+  });
+
   itWithSandbox("bounds the serialized IPC frame in bytes, not string length", async () => {
     const result = await run('output("界".repeat(6 * 1024 * 1024))');
     assert.equal(result.ok, false);

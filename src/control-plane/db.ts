@@ -199,17 +199,48 @@ export function shortHashId(prefix: string): string {
   return `${prefix}-${randomBytes(4).toString("hex")}`;
 }
 
-/** Simple glob-overlap detector for write-scope leasing (conservative: prevents conflicting concurrent edits). */
+/** Path-segment-aware glob-overlap detector for write-scope leasing. */
 export function globsOverlap(a: string, b: string): boolean {
-  const normA = a.replace(/^\.\//, "").replace(/\/+$/, "");
-  const normB = b.replace(/^\.\//, "").replace(/\/+$/, "");
+  const norm = (raw: string): string => {
+    const cleaned = raw.trim().replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/+$/, "");
+    const parts: string[] = [];
+    for (const seg of cleaned.split("/")) {
+      if (!seg || seg === ".") continue;
+      if (seg === ".." && parts.length > 0 && parts[parts.length - 1] !== "..") {
+        parts.pop();
+      } else {
+        parts.push(seg);
+      }
+    }
+    return parts.join("/");
+  };
+  const normA = norm(a);
+  const normB = norm(b);
+  if (!normA || !normB) return true;
   if (normA === normB) return true;
-  if (normA === "*" || normA === "**" || normB === "*" || normB === "**") return true;
+  if (normA === "*" || normA === "**" || normA === "**/*" || normB === "*" || normB === "**" || normB === "**/*") return true;
 
-  const prefixA = normA.split(/[*?[{]/)[0] ?? "";
-  const prefixB = normB.split(/[*?[{]/)[0] ?? "";
-  if (!prefixA || !prefixB) return true;
-  return prefixA.startsWith(prefixB) || prefixB.startsWith(prefixA);
+  const staticSegments = (pattern: string): { segs: string[]; isExactFile: boolean } => {
+    const rawSegs = pattern.split("/");
+    const segs: string[] = [];
+    for (const s of rawSegs) {
+      if (/[*?[{]/.test(s)) return { segs, isExactFile: false };
+      segs.push(s);
+    }
+    return { segs, isExactFile: true };
+  };
+
+  const pA = staticSegments(normA);
+  const pB = staticSegments(normB);
+  if (pA.segs.length === 0 || pB.segs.length === 0) return true;
+
+  const minLen = Math.min(pA.segs.length, pB.segs.length);
+  for (let i = 0; i < minLen; i++) {
+    if (pA.segs[i] !== pB.segs[i]) return false;
+  }
+  // If both are exact paths of different lengths, only overlap if the shorter is a directory prefix of the longer;
+  // an exact file like `src/app.ts` cannot overlap `src/app.ts/foo` (impossible), and `src/app` vs `src/app/x.ts` DOES overlap.
+  return true;
 }
 
 const SCHEMA = `
@@ -635,12 +666,35 @@ export class ControlPlaneDb {
       if (!run) throw new Error(`Unknown run ${input.runId}`);
       const crossBranchOverlaps: Array<{ otherRunId: string; otherTaskId: string; glob: string }> = [];
 
+      // Resolve dependencies (supporting transitive dependency exemption for sequential write leases)
+      const resolvedDeps: TaskRecord[] = [];
+      for (const depId of deps) {
+        const depTask = this.getTask(depId);
+        if (!depTask) throw new Error(`Unknown dependency task ${depId}`);
+        if (["failed", "cancelled", "returned_for_rescope"].includes(depTask.status)) {
+          throw new Error(`Cannot depend on task ${depTask.id} because its status is '${depTask.status}'`);
+        }
+        resolvedDeps.push(depTask);
+      }
+      const depAncestors = new Set<string>();
+      const depQueue = resolvedDeps.map((d) => d.id);
+      while (depQueue.length > 0) {
+        const curId = depQueue.shift()!;
+        if (depAncestors.has(curId)) continue;
+        depAncestors.add(curId);
+        const parents = this.db
+          .prepare("SELECT depends_on FROM task_dependencies WHERE task_id = ?")
+          .all(curId) as Array<{ depends_on: string }>;
+        for (const p of parents) depQueue.push(p.depends_on);
+      }
+
       if (!input.readOnly && scopes.length > 0) {
         const activeLeases = this.db
           .prepare("SELECT run_id, target_branch, task_id, glob_pattern FROM write_leases WHERE repo_root = ? AND active = 1")
           .all(run.repoRoot) as Array<{ run_id: string; target_branch: string; task_id: string; glob_pattern: string }>;
         for (const requested of scopes) {
           for (const existing of activeLeases) {
+            if (depAncestors.has(existing.task_id)) continue; // Sequential dependent task will wait until predecessor completes
             if (!globsOverlap(requested, existing.glob_pattern)) continue;
             if (existing.target_branch === run.baseBranch) {
               throw new Error(
@@ -656,7 +710,8 @@ export class ControlPlaneDb {
         }
       }
 
-      const initialStatus: TaskStatus = deps.length > 0 ? "pending" : "ready";
+      const unresolvedDeps = resolvedDeps.filter((d) => d.status !== "completed");
+      const initialStatus: TaskStatus = unresolvedDeps.length > 0 ? "pending" : "ready";
       this.db
         .prepare(
           `INSERT INTO tasks(
@@ -831,14 +886,16 @@ export class ControlPlaneDb {
     values.push(id);
     this.db.prepare(`UPDATE tasks SET ${sets.join(", ")} WHERE id = ?`).run(...values);
 
-    // Release write leases when task reaches a terminal or returned state
-    if (patch.status && ["completed", "failed", "cancelled", "returned_for_rescope"].includes(patch.status)) {
+    // Release write leases when task reaches a terminal, returned, or blocked state
+    if (patch.status && ["completed", "failed", "cancelled", "returned_for_rescope", "blocked"].includes(patch.status)) {
       this.db.prepare("UPDATE write_leases SET active = 0 WHERE task_id = ?").run(id);
     }
 
-    // Automatically unblock dependent pending tasks when a task completes
+    // Automatically unblock dependent pending tasks when a task completes, or cascade failure/cancellation
     if (patch.status === "completed") {
       this.unblockDependents(existing.runId, id);
+    } else if (patch.status && ["failed", "cancelled", "returned_for_rescope"].includes(patch.status)) {
+      this.cascadeDependencyFailure(existing.runId, id, patch.status);
     }
 
     const updated = this.getTask(id)!;
@@ -866,6 +923,95 @@ export class ControlPlaneDb {
         this.emitEvent(runId, task_id, "task.unblocked", { by: completedTaskId });
       }
     }
+  }
+
+  private cascadeDependencyFailure(runId: string, failedTaskId: string, reasonStatus: TaskStatus): void {
+    const queue = [failedTaskId];
+    const visited = new Set<string>([failedTaskId]);
+    const now = Date.now();
+    while (queue.length > 0) {
+      const depId = queue.shift()!;
+      const dependents = this.db
+        .prepare("SELECT task_id FROM task_dependencies WHERE depends_on = ?")
+        .all(depId) as { task_id: string }[];
+      for (const { task_id } of dependents) {
+        if (visited.has(task_id)) continue;
+        visited.add(task_id);
+        const target = this.getTask(task_id);
+        if (!target || target.status !== "pending") continue;
+        const summary = `Cancelled because dependency ${failedTaskId} ended with status '${reasonStatus}'`;
+        this.db
+          .prepare("UPDATE tasks SET status = 'cancelled', summary = ?, updated_at = ? WHERE id = ? AND status = 'pending'")
+          .run(summary, now, task_id);
+        this.db.prepare("UPDATE write_leases SET active = 0 WHERE task_id = ?").run(task_id);
+        this.emitEvent(runId, task_id, "task.status", { from: "pending", to: "cancelled", summary });
+        queue.push(task_id);
+      }
+    }
+  }
+
+  updateRunGoal(runId: string, goal: string): void {
+    this.db.prepare("UPDATE runs SET goal = ?, updated_at = ? WHERE id = ?").run(goal, Date.now(), runId);
+  }
+
+  releaseWriteLeasesForRun(runId: string): void {
+    this.db.prepare("UPDATE write_leases SET active = 0 WHERE run_id = ? AND active = 1").run(runId);
+  }
+
+  failStaleMergesForRun(runId: string, reason: string): number {
+    const now = Date.now();
+    const res = this.db
+      .prepare("UPDATE merge_queue SET status = 'ci_failed', log = ?, finished_at = ? WHERE run_id = ? AND status IN ('queued', 'running')")
+      .run(reason, now, runId);
+    return res.changes;
+  }
+
+  listPendingMergesForTarget(repoRoot: string, targetBranch: string): MergeQueueRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT mq.* FROM merge_queue mq
+         JOIN runs r ON r.id = mq.run_id
+         WHERE r.repo_root = ? AND r.base_branch = ? AND mq.status = 'queued'
+         ORDER BY mq.created_at ASC`,
+      )
+      .all(repoRoot, targetBranch) as Record<string, unknown>[];
+    return rows.map((r) => this.getMergeQueueItem(String(r.id))!);
+  }
+
+  listAnsweredMessagesFrom(taskId: string): MessageRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM messages WHERE from_task_id = ? AND status = 'answered' ORDER BY answered_at DESC LIMIT 20")
+      .all(taskId) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      id: String(r.id),
+      runId: String(r.run_id),
+      fromTaskId: String(r.from_task_id),
+      toTaskId: String(r.to_task_id),
+      question: String(r.question),
+      answer: r.answer ? String(r.answer) : null,
+      status: String(r.status) as MessageRecord["status"],
+      createdAt: Number(r.created_at),
+      answeredAt: r.answered_at == null ? null : Number(r.answered_at),
+    }));
+  }
+
+  listOpenPeerExchangesForRun(runId: string): PeerExchangeRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM peer_exchanges WHERE to_run_id = ? AND status = 'open' ORDER BY created_at ASC LIMIT 20")
+      .all(runId) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      id: String(r.id),
+      fromRunId: String(r.from_run_id),
+      toRunId: String(r.to_run_id),
+      kind: String(r.kind) as PeerExchangeRecord["kind"],
+      topicKey: String(r.topic_key),
+      round: Number(r.round),
+      message: String(r.message),
+      reply: r.reply ? String(r.reply) : null,
+      status: String(r.status) as PeerExchangeRecord["status"],
+      createdAt: Number(r.created_at),
+      answeredAt: r.answered_at == null ? null : Number(r.answered_at),
+    }));
   }
 
   // ---- Deterministic Artifact Index ----

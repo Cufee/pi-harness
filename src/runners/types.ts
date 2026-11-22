@@ -88,6 +88,12 @@ export interface RunAgentRequest {
   rolloverThreshold?: number;
   /** Soft timeout (ms) allowing native 429/rate-limit retries across subscription pools before pausing early. */
   quotaRetryTimeoutMs?: number;
+  /** Stream/turn inactivity watchdog timeout in ms (defaults to 600_000 ms for unattended safety). */
+  idleTimeoutMs?: number;
+  /** ACP `initialize`/`session/new` startup timeout in ms (defaults to 45_000 ms). */
+  startupTimeoutMs?: number;
+  /** Fallback context window size (tokens) when an adapter omits `usage_update.size`. */
+  contextWindow?: number;
   /** Role-scoped harness tools exposed via in-process callback (Pi) or MCP bridge (ACP) */
   tools: ToolDefinition[];
   executeTool: (name: string, args: Record<string, unknown>) => Promise<unknown>;

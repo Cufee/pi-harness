@@ -24,6 +24,12 @@ import type { AnchoredHandoff } from "./prompts.js";
 export { readRunDossier } from "./dossiers.js";
 export { compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./handoffs.js";
 
+export interface WaitForChildrenResult {
+  children: TaskRecord[];
+  wakeReason: "already_settled" | "event" | "escalation" | "steered" | "fallback_interval" | "child_inactive";
+  inactiveTaskIds: string[];
+}
+
 export interface ToolRuntimeHooks {
   spawnAndStartTask: (input: {
     runId: string;
@@ -41,14 +47,24 @@ export interface ToolRuntimeHooks {
     dependsOn?: string[];
     writeScopes?: string[];
   }) => Promise<TaskRecord>;
-  waitForChildren: (parentId: string, ids: string[] | undefined, mode: "any" | "all", timeoutMs: number) => Promise<TaskRecord[]>;
+  waitForChildren: (
+    parentId: string,
+    ids: string[] | undefined,
+    mode: "any" | "all",
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ) => Promise<WaitForChildrenResult>;
   steerTask: (taskId: string, message: string) => Promise<boolean>;
   cancelTask: (taskId: string, reason: string) => Promise<void>;
+  stopTaskForBlockingIssue?: (taskId: string, reason: string) => void;
   scheduleRollover: (taskId: string, handoff: AnchoredHandoff, target?: { profileId?: string; model?: string; effort?: string }) => Promise<void>;
   getWorktreeManager: (repoRoot: string) => WorktreeManager;
   getMergeQueue: (repoRoot: string) => BisectingMergeQueue;
   getTaskSignal: (taskId: string) => AbortSignal | undefined;
-  resumeTask?: (taskId: string, opts?: { note?: string; profileId?: string; model?: string; effort?: string }) => Promise<TaskRecord>;
+  resumeTask?: (
+    taskId: string,
+    opts?: { note?: string; profileId?: string; model?: string; effort?: string; allowCompleted?: boolean },
+  ) => Promise<TaskRecord>;
 }
 
 function requiredModel(args: Record<string, unknown>) {
@@ -684,7 +700,7 @@ export class ControlPlaneToolExecutor {
         ...this.config.codeExec,
         mode,
         allowedTools: () => toolsForTier(task.tier),
-        execute: (inner, input) => this.execute(runId, taskId, inner, input, signal),
+        execute: (inner, input, execSignal) => this.execute(runId, taskId, inner, input, execSignal ?? signal),
         artifactsDir: resolve(run.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts"),
         saveOutput: (name, json) => writeCodeOutput(this.db, run, taskId, name, json),
         signal,
@@ -820,13 +836,13 @@ export class ControlPlaneToolExecutor {
           kind,
           title: String(args.title),
           objective: String(args.objective),
-          criteria: !fromOrchestrator && typeof args.criteria === "string" ? args.criteria : "",
+          criteria: typeof args.criteria === "string" ? args.criteria : "",
           readOnly: readOnlyKind || args.read_only === true,
           profileId: optionalProfile(args.profile_id),
           model: requiredModel(args),
           effort: typeof args.effort === "string" ? args.effort : undefined,
-          maxTurns: !fromOrchestrator && typeof args.max_turns === "number" ? args.max_turns : undefined,
-          dependsOn: !fromOrchestrator && Array.isArray(args.depends_on) ? (args.depends_on as string[]) : [],
+          maxTurns: typeof args.max_turns === "number" ? args.max_turns : undefined,
+          dependsOn: Array.isArray(args.depends_on) ? (args.depends_on as string[]) : [],
         });
         return { spawned: created.id, kind: created.kind, readOnly: created.readOnly, status: created.status };
       }
@@ -843,17 +859,33 @@ export class ControlPlaneToolExecutor {
               ? args.timeout_s
               : defaultSec;
         const timeoutMs = Math.max(1, requestedSec) * 1000;
-        const settled = await this.hooks.waitForChildren(taskId, ids, mode, timeoutMs);
+        const waitSig = scriptSignal ?? this.hooks.getTaskSignal(taskId);
+        const waitRes = await this.hooks.waitForChildren(taskId, ids, mode, timeoutMs, waitSig);
+        const settled = waitRes.children;
         const escalations = this.db.listEscalations(runId);
         const stillRunning = settled.filter((c) => ["running", "ready", "pending", "draining", "waiting_children", "merging"].includes(c.status));
         return {
           children: settled.map((child) => compactTaskHandoff(child, escalations)),
-          ...(stillRunning.length > 0
+          ...(waitRes.wakeReason !== "event" && waitRes.wakeReason !== "already_settled"
             ? {
-                wakeReason: "fallback_interval",
-                hint: "Fallback wakeup fired while child task(s) are still in progress; wait again with wait_children rather than short-polling.",
+                wakeReason: waitRes.wakeReason,
+                ...(waitRes.inactiveTaskIds.length > 0 ? { inactiveTaskIds: waitRes.inactiveTaskIds } : {}),
+                ...(waitRes.wakeReason === "child_inactive"
+                  ? { hint: `Inactive child task(s) detected: ${waitRes.inactiveTaskIds.join(", ")}. Inspect or resume_task/cancel_child.` }
+                  : waitRes.wakeReason === "escalation"
+                    ? { hint: "Woke immediately on child escalation; inspect escalations and respond before waiting again." }
+                    : waitRes.wakeReason === "steered"
+                      ? { hint: "Woke on incoming steering or goal amendment; check Blackboard/goal state." }
+                      : stillRunning.length > 0
+                        ? { hint: "Fallback wakeup fired while child task(s) are still in progress; wait again with wait_children rather than short-polling." }
+                        : {}),
               }
-            : {}),
+            : stillRunning.length > 0
+              ? {
+                  wakeReason: "fallback_interval",
+                  hint: "Fallback wakeup fired while child task(s) are still in progress; wait again with wait_children rather than short-polling.",
+                }
+              : {}),
         };
       }
 
@@ -910,8 +942,15 @@ export class ControlPlaneToolExecutor {
           }
           if (task.tier === 2 && task.worktreeId) {
             const wt = this.db.getWorktree(task.worktreeId);
-            if (wt && wt.status === "active" && await this.hooks.getWorktreeManager(run.repoRoot).isDirty(wt.path)) {
-              throw new Error(`Settlement gate rejected completion: worktree ${wt.path} has uncommitted changes. Commit and call submit_for_merge first.`);
+            if (wt && wt.status !== "merged") {
+              if (wt.status === "queued" || wt.status === "bounced") {
+                throw new Error(
+                  `Settlement gate rejected completion: worktree merge status is '${wt.status}'. Resolve issues and complete submit_for_merge before returning completed.`,
+                );
+              }
+              if (await this.hooks.getWorktreeManager(run.repoRoot).isDirty(wt.path)) {
+                throw new Error(`Settlement gate rejected completion: worktree ${wt.path} has uncommitted changes. Commit and call submit_for_merge first.`);
+              }
             }
           }
         }
@@ -967,6 +1006,17 @@ export class ControlPlaneToolExecutor {
         } catch (error) {
           if (overflowPath) rmSync(overflowPath, { force: true });
           throw error;
+        } finally {
+          // Tear down a merged Tier 2 worktree once the worker settles via return_task
+          if (status === "completed" && task.tier === 2 && task.worktreeId) {
+            const wt = this.db.getWorktree(task.worktreeId);
+            if (wt && wt.status === "merged" && !wt.cleanedAt) {
+              void this.hooks
+                .getWorktreeManager(run.repoRoot)
+                .teardown(wt.id, { archiveBeforeRemove: false, finalStatus: "merged" })
+                .catch(() => {});
+            }
+          }
         }
       }
 
@@ -989,8 +1039,9 @@ export class ControlPlaneToolExecutor {
           attempted,
           blocking,
         });
-        if (blocking && severity !== "P0") {
+        if (blocking) {
           this.db.updateTask(taskId, { status: "blocked", summary: `Blocked on ${esc.id}: ${esc.title}` });
+          this.hooks.stopTaskForBlockingIssue?.(taskId, `Blocked on ${esc.id}: ${esc.title}`);
         }
         return { escalationId: esc.id, severity: esc.severity, routedTo: toTaskId ?? "human" };
       }
@@ -1077,6 +1128,12 @@ export class ControlPlaneToolExecutor {
         const id = String(args.message_id);
         if (!this.db.listOpenMessages(taskId).some((message) => message.id === id)) throw new Error(`Unknown incoming message ${id}`);
         const msg = this.db.replyMessage(id, String(args.answer));
+        void this.hooks
+          .steerTask(
+            msg.fromTaskId,
+            `Peer answer to your message ${msg.id} from ${taskId}:\n${msg.answer ?? ""}`,
+          )
+          .catch(() => {});
         return { messageId: msg.id, status: msg.status };
       }
 
@@ -1098,12 +1155,12 @@ export class ControlPlaneToolExecutor {
           throw new Error("Cannot submit_for_merge while worktree has uncommitted changes. Commit first.");
         }
         const item = this.db.enqueueMerge({ runId, taskId, worktreeId: wt.id, branch: wt.branch });
-        const outcome = await this.hooks.getMergeQueue(run.repoRoot).processNext(runId);
+        const outcome = await this.hooks.getMergeQueue(run.repoRoot).submitAndDrain(runId, item.id, { preserveLiveTask: true });
         return {
           mergeId: item.id,
-          status: outcome?.item.status ?? item.status,
-          mergedSha: outcome?.mergedSha,
-          bouncedReason: outcome?.bouncedReason,
+          status: outcome.item.status,
+          mergedSha: outcome.mergedSha,
+          bouncedReason: outcome.bouncedReason,
         };
       }
 
@@ -1253,11 +1310,16 @@ export class ControlPlaneToolExecutor {
       }
 
       case "cancel_timer": {
+        const id = String(args.timer_id);
+        const existing = this.db.timers.get(id);
+        if (!existing || existing.ownerKind !== "task" || existing.ownerId !== taskId) {
+          throw new Error(`Unknown timer ${id} for task ${taskId}`);
+        }
         const cancelled = this.db.timers.cancel(
-          String(args.timer_id),
+          existing.id,
           typeof args.reason === "string" ? args.reason : "cancelled_by_agent",
         );
-        if (!cancelled) throw new Error(`Unknown timer ${args.timer_id}`);
+        if (!cancelled) throw new Error(`Unknown timer ${id}`);
         return { timer: cancelled };
       }
 

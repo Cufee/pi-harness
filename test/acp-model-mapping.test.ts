@@ -82,4 +82,29 @@ describe("ACP adapter-native model matching", () => {
       assert.deepEqual(buildPostSessionActions(adapter, "s1", res, { ...opts, effort: "xhigh" }), []);
     }
   });
+
+  it("omits synthetic 'default' effort and applies strictMcpConfig/settingSources on Claude read_only_workspace", () => {
+    const { params } = buildNewSessionParams("claude", {
+      cwd: "/tmp",
+      systemPrompt: "Role",
+      toolPolicy: "read_only_workspace",
+      model: "claude-opus-5-5",
+      effort: "default",
+      mcpServers: [],
+      agentCapabilities: { sessionCapabilities: { options: {} } },
+    });
+    const meta = (params._meta as { claudeCode: { options: Record<string, unknown> } }).claudeCode.options;
+    assert.equal(meta.effort, undefined);
+    assert.equal(meta.strictMcpConfig, true);
+    assert.deepEqual(meta.settingSources, []);
+    assert.equal(meta.tools, undefined);
+    assert.deepEqual(params.configOptions, [{ configId: "model", value: "claude-opus-5-5" }]);
+
+    assert.deepEqual(
+      buildPostSessionActions("codex", "s1", {
+        configOptions: [modelConfig(["gpt-5"], "gpt-5")],
+      }, { toolPolicy, model: "gpt-5", effort: "default" }),
+      [],
+    );
+  });
 });

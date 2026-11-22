@@ -56,27 +56,63 @@ await new Promise((resolve, reject) => {
 console.log("sandbox probe complete");
 `;
 
+export function sandboxUnavailableReason(): string | null {
+  return unavailableReason;
+}
+
 let available: boolean | undefined;
+let unavailableReason: string | null = null;
 export function sandboxAvailable(): boolean {
   if (available !== undefined) return available;
   // Bubblewrap namespaces alone permit spawning children and using loopback.
   // Linux (including NixOS) needs an additional verified kernel policy.
-  if (process.platform !== "darwin") return false;
+  if (process.platform !== "darwin") {
+    available = false;
+    unavailableReason = `Code Mode sandbox is only supported on macOS (platform: ${process.platform})`;
+    return false;
+  }
   let dir: string | undefined;
   let listener: Bun.UnixSocketListener<undefined> | undefined;
   let tcp: Bun.TCPSocketListener<undefined> | undefined;
   try {
-    dir = realpathSync(mkdtempSync(join(tmpdir(), "cm-")));
-    const socket = join(dir, "ipc");
+    const sysTmp = tmpdir();
+    const probeBase = Buffer.byteLength(join(sysTmp, "cm-XXXXXX", "ipc")) > 100 ? "/tmp" : sysTmp;
+    dir = realpathSync(mkdtempSync(join(probeBase, "cm-")));
+    let socket = join(dir, "ipc");
+    if (Buffer.byteLength(socket) >= 104 && probeBase !== "/tmp") {
+      rmSync(dir, { recursive: true, force: true });
+      dir = realpathSync(mkdtempSync(join("/tmp", "cm-")));
+      socket = join(dir, "ipc");
+    }
     if (Buffer.byteLength(socket) >= 104) throw new Error("Code Mode IPC path too long");
     listener = Bun.listen({ unix: socket, socket: { data() {} } });
     tcp = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
     const args = sandboxArgs(realpathSync(process.execPath), dir, socket);
     const result = spawnSync(launcher, [...args, "-e", probe(tcp.port, socket)], {
-      cwd: dir, env: sandboxEnv(dir), timeout: 3000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+      cwd: dir, env: sandboxEnv(dir), timeout: 3000, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
     });
+    const errCode = (result.error as NodeJS.ErrnoException | undefined)?.code;
+    const timedOut = (result.status === null && result.signal === "SIGTERM") || errCode === "ETIMEDOUT";
+    if (timedOut) {
+      unavailableReason = "Code Mode sandbox probe timed out";
+      return false;
+    }
     available = result.status === 0 && result.stdout.trim() === "sandbox probe complete";
-  } catch {
+    if (!available) {
+      const detail = typeof result.stderr === "string" && result.stderr.trim()
+        ? `: ${result.stderr.trim().slice(0, 200)}`
+        : result.error
+          ? `: ${result.error.message}`
+          : "";
+      unavailableReason = `Code Mode sandbox probe failed (status=${result.status}, signal=${result.signal})${detail}`;
+    } else {
+      unavailableReason = null;
+    }
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    const msg = err instanceof Error ? err.message : String(err);
+    unavailableReason = `Code Mode sandbox probe error: ${msg}`;
+    if (code === "ETIMEDOUT") return false;
     available = false;
   } finally {
     tcp?.stop(true);
@@ -87,7 +123,7 @@ export function sandboxAvailable(): boolean {
 }
 
 export function sandboxCommand(bun: string, dir: string, socket: string): string[] {
-  if (!sandboxAvailable()) throw new Error("Code Mode sandbox unavailable on this host");
+  if (!sandboxAvailable()) throw new Error(unavailableReason ?? "Code Mode sandbox unavailable on this host");
   return [launcher, ...sandboxArgs(bun, dir, socket), "--preload", "./guard.mjs", "./script.ts"];
 }
 

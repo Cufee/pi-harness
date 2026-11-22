@@ -138,9 +138,15 @@ export class HarnessDaemon {
             const q = this.pendingWakeups.get(chatSessionId) ?? [];
             q.push(event);
             this.pendingWakeups.set(chatSessionId, q);
+            this.drainPendingWakeup(chatSessionId);
           }
         })
-        .catch(() => {});
+        .catch(() => {
+          const q = this.pendingWakeups.get(chatSessionId) ?? [];
+          q.push(event);
+          this.pendingWakeups.set(chatSessionId, q);
+          this.drainPendingWakeup(chatSessionId);
+        });
       return;
     }
     void this.runDirectorWakeupTurn(chatSessionId, event);
@@ -156,7 +162,12 @@ export class HarnessDaemon {
   }
 
   private async runDirectorWakeupTurn(chatSessionId: string, event: ChatControlEvent): Promise<void> {
-    if (this.chatTurns.has(chatSessionId)) return;
+    if (this.chatTurns.has(chatSessionId)) {
+      const q = this.pendingWakeups.get(chatSessionId) ?? [];
+      q.push(event);
+      this.pendingWakeups.set(chatSessionId, q);
+      return;
+    }
     if (!this.director.chats.getSession(chatSessionId)) return;
     const id = `wake-${randomBytes(4).toString("hex")}`;
     const turn = { id, text: "", cancelling: false };
@@ -210,10 +221,14 @@ export class HarnessDaemon {
       }
     }
 
+    const prevEndpoint = JSON.stringify(this.config.quotaEndpoint ?? null);
+    const nextEndpoint = JSON.stringify(next.quotaEndpoint ?? null);
     this.config = next;
     Object.assign(this.orchestrator.config, next);
-    this.quota = new QuotaClient(next.quotaEndpoint);
-    this.orchestrator.quota = this.quota;
+    if (prevEndpoint !== nextEndpoint) {
+      this.quota = new QuotaClient(next.quotaEndpoint);
+      this.orchestrator.quota = this.quota;
+    }
     this.catalog = new ModelCatalogCompiler(next, this.quota);
     this.orchestrator.catalog = this.catalog;
     this.director.updateConfig(next, this.catalog, this.quota);
@@ -228,11 +243,9 @@ export class HarnessDaemon {
   }
 
   async start(): Promise<string> {
-    this.orchestrator.reconcileStaleRunsOnStartup();
-    this.db.timers.restorePending();
     await this.ptyHost.init();
     const sockPath = this.config.socketPath;
-    mkdirSync(dirname(sockPath), { recursive: true });
+    mkdirSync(dirname(sockPath), { recursive: true, mode: 0o700 });
     if (existsSync(sockPath)) {
       try {
         unlinkSync(sockPath);
@@ -256,7 +269,14 @@ export class HarnessDaemon {
       });
     });
 
-    // Periodic hourly worktree orphan sweep across known repos
+    // Reconcile stale runs/goals and restore durable timers AFTER the daemon socket is bound,
+    // so immediate wakeups / MCP bridges can connect without racing socket creation!
+    this.orchestrator.reconcileStaleRunsOnStartup();
+    this.director.goals.reconcileStaleGoalsOnStartup();
+    this.db.timers.restorePending();
+
+    // Non-blocking startup orphan worktree sweep + periodic hourly sweep across known repos
+    void this.sweepAllKnownRepos().catch(() => {});
     this.sweepTimer = setInterval(() => {
       void this.sweepAllKnownRepos().catch(() => {});
     }, 3_600_000);
@@ -448,6 +468,8 @@ export class HarnessDaemon {
     activeChats: number;
     activeTasks: number;
     scheduledQuotaResumes: number;
+    pendingTimers: number;
+    pendingWakeups: number;
     activeReviews: number;
     activePtys: number;
     otherTuiClients: number;
@@ -456,22 +478,37 @@ export class HarnessDaemon {
     const activeChats = this.director.activeChatCount();
     const activeTasks = this.orchestrator.activeTaskCount();
     const scheduledQuotaResumes = this.orchestrator.scheduledQuotaResumeCount();
+    const pendingTimers = this.db.timers.list({ status: "pending" }).length;
+    const pendingWakeups = [...this.pendingWakeups.values()].reduce((sum, q) => sum + q.length, 0);
     const activeReviews = this.director.activeReviewCount();
     const activePtys = this.ptyHost.activePtyCount();
     const otherTuiClients = this.tuiSockets.size;
     const parts: string[] = [];
     if (activeTasks > 0) parts.push(`${activeTasks} active agent task${activeTasks === 1 ? "" : "s"}`);
     if (scheduledQuotaResumes > 0) parts.push(`${scheduledQuotaResumes} scheduled quota resume${scheduledQuotaResumes === 1 ? "" : "s"}`);
+    if (pendingTimers > 0) parts.push(`${pendingTimers} pending timer${pendingTimers === 1 ? "" : "s"}`);
+    if (pendingWakeups > 0) parts.push(`${pendingWakeups} pending wakeup${pendingWakeups === 1 ? "" : "s"}`);
     if (activeChats > 0) parts.push(`${activeChats} in-flight chat${activeChats === 1 ? "" : "s"}`);
     if (activeReviews > 0) parts.push(`${activeReviews} goal review${activeReviews === 1 ? "" : "s"}`);
     if (activePtys > 0) parts.push(`${activePtys} open shell${activePtys === 1 ? "" : "s"}`);
     if (otherTuiClients > 0) parts.push(`${otherTuiClients} other attached terminal${otherTuiClients === 1 ? "" : "s"}`);
-    const running = activeChats + activeTasks + scheduledQuotaResumes + activeReviews + activePtys + otherTuiClients > 0;
+    const running =
+      activeChats +
+        activeTasks +
+        scheduledQuotaResumes +
+        pendingTimers +
+        pendingWakeups +
+        activeReviews +
+        activePtys +
+        otherTuiClients >
+      0;
     return {
       running,
       activeChats,
       activeTasks,
       scheduledQuotaResumes,
+      pendingTimers,
+      pendingWakeups,
       activeReviews,
       activePtys,
       otherTuiClients,
@@ -662,14 +699,18 @@ export class HarnessDaemon {
     const p = req.params ?? {};
 
     switch (req.op) {
-      case "ping":
+      case "ping": {
+        const live = this.getLiveWorkSummary();
         return {
           pong: true,
           pid: process.pid,
           uptimeMs: Date.now() - this.startedAt,
           protocolRev: DAEMON_PROTOCOL_REV,
           buildId: currentDaemonBuildId(),
+          running: live.running,
+          liveWork: live.description,
         };
+      }
 
       case "daemon.shutdown":
         setTimeout(() => {
@@ -1335,6 +1376,9 @@ export class HarnessDaemon {
         const args = (p.args ?? {}) as Record<string, unknown>;
         if (taskId.startsWith("chat-")) {
           return await this.director.executeDirectorMcpTool(taskId, name, args);
+        }
+        if (this.director.hasActiveReviewer(taskId)) {
+          return await this.director.executeReviewerMcpTool(taskId, name, args);
         }
         return await this.orchestrator.toolExecutor.execute(String(p.runId), taskId, name, args);
       }

@@ -13,7 +13,7 @@ export interface CodeExecToolEvent {
 }
 export interface CodeExecOptions {
   code: string; tools: ToolDefinition[];
-  callTool: (name: string, args: Record<string, unknown>) => Promise<unknown>;
+  callTool: (name: string, args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>;
   signal?: AbortSignal; timeoutMs?: number; maxOutputChars?: number;
   artifactsDir: string; scratchRoot?: string;
   saveOutput?: (name: string, json: string) => string | Promise<string>;
@@ -60,6 +60,7 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
   const result: CodeExecResult = { ok: false, preview: "", logs: "", toolCalls: 0 };
   const names = new Set(opts.tools.map(t => t.name));
   const sockets = new Set<Socket>();
+  const execAbort = new AbortController();
   let pending = 0, pendingBytes = 0;
   let child: ChildProcess | undefined, dir: string | undefined, output: unknown, stopped = false;
   function kill() {
@@ -67,7 +68,9 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
   }
   function stop(reason: string) {
     if (stopped) return;
-    stopped = true; result.error = reason; kill();
+    stopped = true; result.error = reason;
+    if (!execAbort.signal.aborted) execAbort.abort(new Error(reason));
+    kill();
     for (const s of sockets) s.destroy();
   }
   const abort = () => { if (!stopped) { result.cancelled = true; stop("Code Mode cancelled"); } };
@@ -116,7 +119,7 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
       try {
         if (name === "code_exec" || name === "tool_search") throw new Error(`Recursive ${name} calls are not allowed inside code_exec`);
         if (!names.has(name)) throw new Error(`Tool not allowed: ${name}`);
-        const value = await opts.callTool(name, args);
+        const value = await opts.callTool(name, args, execAbort.signal);
         reply({ ok: true, value });
         opts.onToolEvent?.({ ...event, phase: "end", ok: true });
       } catch (e) {
@@ -129,7 +132,8 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
 
   try {
     if (stopped) return result;
-    dir = await realpath(await mkdtemp(join(opts.scratchRoot ?? tmpdir(), "cm-")));
+    const defaultScratch = Buffer.byteLength(join(tmpdir(), "cm-XXXXXX", "ipc")) > 100 ? "/tmp" : tmpdir();
+    dir = await realpath(await mkdtemp(join(opts.scratchRoot ?? defaultScratch, "cm-")));
     const socket = join(dir, "ipc");
     if (Buffer.byteLength(socket) >= 104) throw new Error("Code Mode scratch path too long for Unix socket; use a shorter scratchRoot");
     const [cmd, ...args] = sandboxCommand(await realpath(process.execPath), dir, socket);
@@ -174,7 +178,9 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     result.ok = true;
   } catch (e) { result.error ??= message(e); }
   finally {
-    stopped = true; clearTimeout(timer); opts.signal?.removeEventListener("abort", abort); kill();
+    stopped = true; clearTimeout(timer); opts.signal?.removeEventListener("abort", abort);
+    if (!execAbort.signal.aborted) execAbort.abort();
+    kill();
     for (const socket of sockets) socket.destroy();
     if (server.listening) await new Promise<void>(resolve => server.close(() => resolve()));
     if (dir) await rm(dir, { recursive: true, force: true });

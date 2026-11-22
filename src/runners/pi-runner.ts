@@ -41,7 +41,14 @@ export class PiRunner {
   constructor(private readonly profile: PiProfileConfig) {}
 
   probeModels(): ProbedModelInfo[] {
+    if (this.profile.enabled === false) return [];
     const builtin = BUILTIN_PROVIDERS.get(this.profile.provider);
+    if (this.profile.billing !== "local") {
+      const keyEnv = this.profile.apiKeyEnv ?? (!this.profile.baseUrl ? builtin?.[1] : undefined);
+      if (keyEnv && !process.env[keyEnv]?.trim()) {
+        return [];
+      }
+    }
     if (this.profile.models && this.profile.models.length > 0) {
       return this.profile.models.map((wireModelId) => ({ wireModelId }));
     }
@@ -82,7 +89,7 @@ export class PiRunner {
       throw new Error(`Unsupported pi wire API: ${apiName}`);
     }
 
-    const contextWindow = builtinModel?.contextWindow ?? 128_000;
+    const contextWindow = builtinModel?.contextWindow ?? req.contextWindow ?? 128_000;
     const model = {
       name: modelId,
       input: ["text"] as ("text" | "image")[],
@@ -120,17 +127,36 @@ export class PiRunner {
 
     const messages: Message[] = [{ role: "user", content: req.initialPrompt, timestamp: Date.now() }];
     const steeringQueue: string[] = [];
+    const runAbort = new AbortController();
+    const onReqAbort = () => runAbort.abort(req.signal.reason);
+    if (req.signal.aborted) {
+      runAbort.abort(req.signal.reason);
+    } else {
+      req.signal.addEventListener("abort", onReqAbort, { once: true });
+    }
     let cancelled = false;
+    let cancelReason: string | undefined;
+    let rolloverWarningSent = false;
     let lastText = "";
     let lastUsage: RunnerUsage | undefined;
+    const idleTimeoutMs = Math.max(0, req.idleTimeoutMs ?? 600_000);
+    const effectiveEffort =
+      req.effort && req.effort.toLowerCase() !== "default" ? req.effort : undefined;
+
+    const cancelledStopReason = (): RunAgentResult["stopReason"] =>
+      cancelReason === "clean_rollover" ? "rollover_requested" : "cancelled";
 
     req.onHandle?.({
       steer: async (msg: string) => {
         steeringQueue.push(msg);
         return true;
       },
-      cancel: async () => {
+      cancel: async (reason?: string) => {
         cancelled = true;
+        cancelReason = reason;
+        if (!runAbort.signal.aborted) {
+          runAbort.abort(reason ? new Error(reason) : undefined);
+        }
       },
     });
 
@@ -140,175 +166,262 @@ export class PiRunner {
       parameters: t.inputSchema as never,
     }));
 
-    for (let turn = 0; turn < req.maxTurns; turn++) {
-      if (cancelled || req.signal.aborted) {
-        return { text: lastText, stopReason: "cancelled", usage: lastUsage };
-      }
+    try {
+      for (let turn = 0; turn < req.maxTurns; turn++) {
+        if (cancelled || runAbort.signal.aborted) {
+          return { text: lastText, stopReason: cancelledStopReason(), usage: lastUsage };
+        }
 
-      if (steeringQueue.length > 0) {
-        const injected = steeringQueue.splice(0, steeringQueue.length).join("\n\n");
-        messages.push({ role: "user", content: `[Steering Update]\n${injected}`, timestamp: Date.now() });
-      }
+        if (steeringQueue.length > 0) {
+          const injected = steeringQueue.splice(0, steeringQueue.length).join("\n\n");
+          messages.push({ role: "user", content: `[Steering Update]\n${injected}`, timestamp: Date.now() });
+        }
 
-      const context: Context = {
-        systemPrompt: req.systemPrompt,
-        messages,
-        tools: piTools,
-      };
+        const context: Context = {
+          systemPrompt: req.systemPrompt,
+          messages,
+          tools: piTools,
+        };
 
-      const quotaTimeoutMs = Math.max(0, req.quotaRetryTimeoutMs ?? 45_000);
-      const retryStartMs = Date.now();
-      let retryCount = 0;
-      let finalMsg: Awaited<ReturnType<ReturnType<typeof models.streamSimple>["result"]>> | null = null;
+        const quotaTimeoutMs = Math.max(0, req.quotaRetryTimeoutMs ?? 45_000);
+        const retryStartMs = Date.now();
+        let retryCount = 0;
+        let finalMsg: Awaited<ReturnType<ReturnType<typeof models.streamSimple>["result"]>> | null = null;
 
-      while (true) {
-        try {
-          const s = models.streamSimple(resolvedModel, context, {
-            apiKey: apiKey ?? "local",
-            signal: req.signal,
-            reasoning: (req.effort as never) ?? undefined,
-          });
-
-          for await (const ev of s) {
-            if (ev.type === "text_delta") {
-              req.callbacks.onTextDelta?.(ev.delta);
-            } else if (ev.type === "thinking_delta") {
-              req.callbacks.onThoughtDelta?.(ev.delta);
+        while (true) {
+          const attemptAbort = new AbortController();
+          const onRunAbort = () => attemptAbort.abort(runAbort.signal.reason);
+          if (runAbort.signal.aborted) {
+            attemptAbort.abort(runAbort.signal.reason);
+          } else {
+            runAbort.signal.addEventListener("abort", onRunAbort, { once: true });
+          }
+          let idleTimedOut = false;
+          let idleTimer: ReturnType<typeof setTimeout> | null = null;
+          const resetIdleTimer = () => {
+            if (idleTimer) {
+              clearTimeout(idleTimer);
+              idleTimer = null;
             }
-          }
+            if (idleTimeoutMs > 0) {
+              idleTimer = setTimeout(() => {
+                idleTimedOut = true;
+                attemptAbort.abort(new Error(`Pi stream timed out after ${idleTimeoutMs}ms of inactivity`));
+              }, idleTimeoutMs);
+              idleTimer.unref?.();
+            }
+          };
 
-          finalMsg = await s.result();
-          if (finalMsg.stopReason === "error") {
-            throw new Error(finalMsg.errorMessage || `Pi provider rejected the request for ${modelId}`);
-          }
-          if (finalMsg.stopReason === "aborted") {
-            return { text: lastText, stopReason: "cancelled", usage: lastUsage };
-          }
-          if (retryCount > 0) {
-            req.callbacks.onQuotaRetryState?.({
-              state: "recovered",
-              retryCount,
-              timeoutMs: quotaTimeoutMs,
+          try {
+            resetIdleTimer();
+            const s = models.streamSimple(resolvedModel, context, {
+              apiKey: apiKey ?? "local",
+              signal: attemptAbort.signal,
+              reasoning: (effectiveEffort as never) ?? undefined,
             });
-          }
-          break;
-        } catch (err) {
-          if (cancelled || req.signal.aborted) {
-            return { text: lastText, stopReason: "cancelled", usage: lastUsage };
-          }
-          const msg = err instanceof Error ? err.message : String(err);
-          const detected = detectQuotaErrorText(msg);
-          if (!detected.isQuota) throw err;
 
-          retryCount += 1;
-          const elapsed = Date.now() - retryStartMs;
-          const remaining = quotaTimeoutMs - elapsed;
-          // For transient 429s (e.g. subscription pool rotation), retry within quotaTimeoutMs
-          if (!detected.isHardExhaustion && remaining > 500) {
-            if (retryCount === 1) {
+            for await (const ev of s) {
+              resetIdleTimer();
+              if (ev.type === "text_delta") {
+                req.callbacks.onTextDelta?.(ev.delta);
+              } else if (ev.type === "thinking_delta") {
+                req.callbacks.onThoughtDelta?.(ev.delta);
+              }
+            }
+
+            finalMsg = await s.result();
+            if (idleTimedOut) {
+              throw new Error(`Pi runner (${this.profile.id}) timed out after ${idleTimeoutMs}ms of inactivity`);
+            }
+            if (finalMsg.stopReason === "error") {
+              throw new Error(finalMsg.errorMessage || `Pi provider rejected the request for ${modelId}`);
+            }
+            if (finalMsg.stopReason === "aborted") {
+              return { text: lastText, stopReason: cancelledStopReason(), usage: lastUsage };
+            }
+            if (retryCount > 0) {
               req.callbacks.onQuotaRetryState?.({
-                state: "retrying",
+                state: "recovered",
                 retryCount,
                 timeoutMs: quotaTimeoutMs,
-                reason: detected.summary,
-                resetAt: detected.resetAtIso ?? null,
               });
             }
-            const delayMs = Math.min(remaining, Math.min(8_000, 1_000 * 2 ** (retryCount - 1)));
-            await new Promise((r) => setTimeout(r, delayMs));
-            continue;
-          }
+            break;
+          } catch (err) {
+            if (idleTimedOut) {
+              throw new Error(`Pi runner (${this.profile.id}) timed out after ${idleTimeoutMs}ms of inactivity`);
+            }
+            if (cancelled || runAbort.signal.aborted) {
+              return { text: lastText, stopReason: cancelledStopReason(), usage: lastUsage };
+            }
+            const msg = err instanceof Error ? err.message : String(err);
+            const detected = detectQuotaErrorText(msg);
+            if (!detected.isQuota) throw err;
 
-          req.callbacks.onPassiveQuota?.({
-            profileId: this.profile.id,
-            model: modelId,
-            raw: {
-              sessionFailure: detected.isHardExhaustion ? "quota_exhausted" : "rate_limited",
-              ...(detected.resetAtIso ? { resetAt: detected.resetAtIso } : {}),
-            },
-            observedAt: Date.now(),
-          });
-          return {
-            text: lastText,
-            stopReason: "quota_paused",
-            usage: lastUsage,
-            quotaPause: {
-              reason: detected.summary,
-              resetAt: detected.resetAtIso ?? null,
-              retryCount,
-              watchdogTimedOut: !detected.isHardExhaustion && remaining <= 500,
-              isHardExhaustion: detected.isHardExhaustion,
-            },
-          };
+            retryCount += 1;
+            const elapsed = Date.now() - retryStartMs;
+            const remaining = quotaTimeoutMs - elapsed;
+            // For transient 429s (e.g. subscription pool rotation), retry within quotaTimeoutMs
+            if (!detected.isHardExhaustion && remaining > 500) {
+              if (retryCount === 1) {
+                req.callbacks.onQuotaRetryState?.({
+                  state: "retrying",
+                  retryCount,
+                  timeoutMs: quotaTimeoutMs,
+                  reason: detected.summary,
+                  resetAt: detected.resetAtIso ?? null,
+                });
+              }
+              const delayMs = Math.min(remaining, Math.min(8_000, 1_000 * 2 ** (retryCount - 1)));
+              await new Promise<void>((resolve) => {
+                if (runAbort.signal.aborted) {
+                  resolve();
+                  return;
+                }
+                const onSleepAbort = () => {
+                  clearTimeout(t);
+                  resolve();
+                };
+                const t = setTimeout(() => {
+                  runAbort.signal.removeEventListener("abort", onSleepAbort);
+                  resolve();
+                }, delayMs);
+                t.unref?.();
+                runAbort.signal.addEventListener("abort", onSleepAbort, { once: true });
+              });
+              if (cancelled || runAbort.signal.aborted) {
+                return { text: lastText, stopReason: cancelledStopReason(), usage: lastUsage };
+              }
+              continue;
+            }
+
+            req.callbacks.onPassiveQuota?.({
+              profileId: this.profile.id,
+              model: modelId,
+              raw: {
+                sessionFailure: detected.isHardExhaustion ? "quota_exhausted" : "rate_limited",
+                ...(detected.resetAtIso ? { resetAt: detected.resetAtIso } : {}),
+              },
+              observedAt: Date.now(),
+            });
+            return {
+              text: lastText,
+              stopReason: "quota_paused",
+              usage: lastUsage,
+              quotaPause: {
+                reason: detected.summary,
+                resetAt: detected.resetAtIso ?? null,
+                retryCount,
+                watchdogTimedOut: !detected.isHardExhaustion && remaining <= 500,
+                isHardExhaustion: detected.isHardExhaustion,
+              },
+            };
+          } finally {
+            if (idleTimer) {
+              clearTimeout(idleTimer);
+              idleTimer = null;
+            }
+            runAbort.signal.removeEventListener("abort", onRunAbort);
+          }
+        }
+
+        if (!finalMsg) {
+          return { text: lastText, stopReason: cancelledStopReason(), usage: lastUsage };
+        }
+        messages.push(finalMsg);
+
+        const used =
+          (finalMsg.usage?.input ?? 0) +
+          (finalMsg.usage?.output ?? 0) +
+          (finalMsg.usage?.cacheRead ?? 0) +
+          (finalMsg.usage?.cacheWrite ?? 0);
+        lastUsage = {
+          used,
+          size: contextWindow,
+          inputTokens: finalMsg.usage?.input,
+          outputTokens: finalMsg.usage?.output,
+          cachedReadTokens: finalMsg.usage?.cacheRead,
+          cachedWriteTokens: finalMsg.usage?.cacheWrite,
+          costUsd: finalMsg.usage?.cost?.total,
+        };
+        req.callbacks.onUsage?.(lastUsage);
+
+        const textParts = finalMsg.content
+          .filter((c: { type: string }): c is { type: "text"; text: string } => c.type === "text")
+          .map((c: { text: string }) => c.text);
+        if (textParts.length > 0) {
+          lastText = textParts.join("\n");
+        }
+
+        const toolCalls = finalMsg.content.filter((c) => c.type === "toolCall");
+
+        // Execute harness tool calls directly in-process BEFORE checking rolloverThreshold so
+        // terminal tools (return_task, request_rollover, submit_for_merge) on the threshold turn run cleanly.
+        for (const call of toolCalls) {
+          req.callbacks.onToolEvent?.({ name: call.name, status: "in_progress" });
+          try {
+            if (!piTools.some((tool) => tool.name === call.name)) {
+              throw new Error(`Tool ${call.name} is unavailable to this agent.`);
+            }
+            const out = await req.executeTool(call.name, call.arguments ?? {});
+            req.callbacks.onToolEvent?.({ name: call.name, status: "completed" });
+            messages.push({
+              role: "toolResult",
+              toolCallId: call.id,
+              toolName: call.name,
+              content: [{ type: "text", text: typeof out === "string" ? out : JSON.stringify(out) }],
+              isError: false,
+              timestamp: Date.now(),
+            });
+          } catch (err) {
+            req.callbacks.onToolEvent?.({ name: call.name, status: "failed" });
+            messages.push({
+              role: "toolResult",
+              toolCallId: call.id,
+              toolName: call.name,
+              content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }],
+              isError: true,
+              timestamp: Date.now(),
+            });
+          }
+        }
+
+        if (cancelled || runAbort.signal.aborted) {
+          return { text: lastText, stopReason: cancelledStopReason(), usage: lastUsage };
+        }
+
+        const ratio = contextWindow > 0 ? used / contextWindow : 0;
+
+        // Check clean rollover threshold before starting another turn
+        if (req.rolloverThreshold && contextWindow > 0 && ratio >= req.rolloverThreshold) {
+          return { text: lastText, stopReason: "rollover_requested", usage: lastUsage };
+        }
+
+        if (toolCalls.length === 0) {
+          return { text: lastText, stopReason: "completed", usage: lastUsage };
+        }
+
+        // Inject soft rollover warning once when approaching rolloverThreshold
+        const softWarnThreshold = req.rolloverThreshold ? Math.max(0.5, req.rolloverThreshold - 0.12) : undefined;
+        if (
+          !rolloverWarningSent &&
+          softWarnThreshold &&
+          req.rolloverThreshold &&
+          ratio >= softWarnThreshold &&
+          ratio < req.rolloverThreshold
+        ) {
+          rolloverWarningSent = true;
+          const pct = Math.round(ratio * 100);
+          const limitPct = Math.round(req.rolloverThreshold * 100);
+          steeringQueue.push(
+            `Context usage is at ${pct}% (hard rollover at ${limitPct}%). Finish your current atomic step and call \`request_rollover\` with a thorough anchored handoff (goal_invariants, architectural_decisions, active_risks, next_actions) so no context is lost.`,
+          );
         }
       }
 
-      if (!finalMsg) {
-        return { text: lastText, stopReason: "cancelled", usage: lastUsage };
-      }
-      messages.push(finalMsg);
-
-      const used = (finalMsg.usage?.input ?? 0) + (finalMsg.usage?.cacheRead ?? 0) + (finalMsg.usage?.output ?? 0);
-      lastUsage = {
-        used,
-        size: contextWindow,
-        inputTokens: finalMsg.usage?.input,
-        outputTokens: finalMsg.usage?.output,
-        cachedReadTokens: finalMsg.usage?.cacheRead,
-        cachedWriteTokens: finalMsg.usage?.cacheWrite,
-        costUsd: finalMsg.usage?.cost?.total,
-      };
-      req.callbacks.onUsage?.(lastUsage);
-
-      const textParts = finalMsg.content
-        .filter((c: { type: string }): c is { type: "text"; text: string } => c.type === "text")
-        .map((c: { text: string }) => c.text);
-      if (textParts.length > 0) {
-        lastText = textParts.join("\n");
-      }
-
-      // Check clean rollover threshold before starting another turn
-      if (req.rolloverThreshold && contextWindow > 0 && used / contextWindow >= req.rolloverThreshold) {
-        return { text: lastText, stopReason: "rollover_requested", usage: lastUsage };
-      }
-
-      const toolCalls = finalMsg.content.filter((c) => c.type === "toolCall");
-
-      if (toolCalls.length === 0) {
-        return { text: lastText, stopReason: "completed", usage: lastUsage };
-      }
-
-      // Execute harness tool calls directly in-process
-      for (const call of toolCalls) {
-        req.callbacks.onToolEvent?.({ name: call.name, status: "in_progress" });
-        try {
-          if (!piTools.some((tool) => tool.name === call.name)) {
-            throw new Error(`Tool ${call.name} is unavailable to this agent.`);
-          }
-          const out = await req.executeTool(call.name, call.arguments ?? {});
-          req.callbacks.onToolEvent?.({ name: call.name, status: "completed" });
-          messages.push({
-            role: "toolResult",
-            toolCallId: call.id,
-            toolName: call.name,
-            content: [{ type: "text", text: typeof out === "string" ? out : JSON.stringify(out) }],
-            isError: false,
-            timestamp: Date.now(),
-          });
-        } catch (err) {
-          req.callbacks.onToolEvent?.({ name: call.name, status: "failed" });
-          messages.push({
-            role: "toolResult",
-            toolCallId: call.id,
-            toolName: call.name,
-            content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }],
-            isError: true,
-            timestamp: Date.now(),
-          });
-        }
-      }
+      return { text: lastText, stopReason: "max_turns", usage: lastUsage };
+    } finally {
+      req.signal.removeEventListener("abort", onReqAbort);
     }
-
-    return { text: lastText, stopReason: "max_turns", usage: lastUsage };
   }
 }

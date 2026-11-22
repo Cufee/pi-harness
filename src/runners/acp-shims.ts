@@ -96,6 +96,7 @@ export function prepareAcpSpawn(
               "amp.tools.enable": ["mcp__harness__*"],
               "amp.tools.disable": [
                 "Bash",
+                "shell_command",
                 "Read",
                 "Grep",
                 "glob",
@@ -109,7 +110,7 @@ export function prepareAcpSpawn(
               ],
             }
           : {
-              "amp.tools.disable": ["Bash", "edit_file", "create_file", "delete_file", "Task"],
+              "amp.tools.disable": ["Bash", "shell_command", "edit_file", "create_file", "delete_file", "Task"],
             };
       writeFileSync(settingsPath, JSON.stringify(ampSettings, null, 2), "utf8");
       env.AMP_SETTINGS_FILE = settingsPath;
@@ -181,18 +182,22 @@ export function buildNewSessionParams(
       disallowed.push("Write", "Edit", "MultiEdit", "NotebookEdit", "Bash");
     }
     if (opts.toolPolicy === "control_plane_only") disallowed.push("Read", "Grep", "Glob");
+    const effectiveEffort =
+      opts.effort && opts.effort.toLowerCase() !== "default" ? opts.effort : undefined;
     const claudeOptions: Record<string, unknown> = {
       disallowedTools: disallowed,
-      ...(opts.toolPolicy === "control_plane_only" ? {
-        tools: [],
+      ...(opts.toolPolicy !== "read_write_workspace" ? {
         settingSources: [],
         strictMcpConfig: true,
         allowDangerouslySkipPermissions: false,
       } : {}),
+      ...(opts.toolPolicy === "control_plane_only" ? {
+        tools: [],
+      } : {}),
       settings: { autoCompactEnabled: false },
     };
     claudeOptions.model = opts.model;
-    if (opts.effort) claudeOptions.effort = opts.effort;
+    if (effectiveEffort) claudeOptions.effort = effectiveEffort;
 
     params._meta = {
       claudeCode: {
@@ -203,7 +208,7 @@ export function buildNewSessionParams(
     if (sessionCaps.options) {
       const cfg: Array<{ configId: string; value: string }> = [];
       cfg.push({ configId: "model", value: opts.model });
-      if (opts.effort) cfg.push({ configId: "effort", value: opts.effort });
+      if (effectiveEffort) cfg.push({ configId: "effort", value: effectiveEffort });
       if (cfg.length > 0) params.configOptions = cfg;
     }
   }
@@ -300,7 +305,7 @@ export function buildPostSessionActions(
   }
 
   // Effort selection: only send a value the adapter advertises; skip cleanly otherwise
-  if (opts.effort) {
+  if (opts.effort && opts.effort.toLowerCase() !== "default") {
     const wanted = opts.effort.toLowerCase();
     const efforts = selectValues(effortOpt);
     if (effortOpt && efforts?.length) {

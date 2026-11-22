@@ -15,6 +15,7 @@ export type ChatControlEvent =
       runId: string;
       runStatus: "completed" | "failed" | "stopped";
       openEscalations: number;
+      detail?: string;
     }
   | {
       kind: "goal.committed";

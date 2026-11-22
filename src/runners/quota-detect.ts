@@ -16,14 +16,14 @@ const HARD_QUOTA_PATTERNS: RegExp[] = [
   /quota exceeded/i,
   /budget[_\s-]exhausted/i,
   /hit your (?:usage |daily |weekly |five[- ]hour )?limit/i,
-  /usage limit reached/i,
-  /out of (?:usage|quota|credits)/i,
+  /(?:usage|session|daily|weekly|five[- ]hour) limit reached/i,
+  /out of (?:extra )?(?:usage|quota|credits)/i,
   /billing hard limit/i,
   /plan limit reached/i,
 ];
 
 const TRANSIENT_RATE_LIMIT_PATTERNS: RegExp[] = [
-  /\b429\b/,
+  /(?:http|status|code|error|returned|response|got)[^\n]{0,16}\b429\b|\b429\s+too\s+many/i,
   /too many requests/i,
   /rate[_\s-]?limit(?:ed|ing)?/i,
   /\boverloaded(?:_error)?\b/i,

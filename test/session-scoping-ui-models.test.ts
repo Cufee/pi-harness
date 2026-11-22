@@ -1403,8 +1403,16 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
       })) as { timers: Array<{ id: string }> };
       assert.equal(listed.timers.some((t) => t.id === "timer-1"), true);
 
-      // Wait for timer-1 to fire and wake Director with a typed `timer.fired` ChatControlEvent
-      for (let i = 0; i < 60 && !wakePrompts.some((p) => p.includes("Control-plane event (timer.fired):")); i++) {
+      // Wait for timer-1 to fire and wake Director with a typed `timer.fired` ChatControlEvent (and client wire frame)
+      for (
+        let i = 0;
+        i < 80 &&
+        (!wakePrompts.some((p) => p.includes("Control-plane event (timer.fired):")) ||
+          !receivedChatEvents.some(
+            (e) => e.type === "chat.turn.start" && (e.payload.event as { kind?: string } | undefined)?.kind === "timer.fired",
+          ));
+        i++
+      ) {
         await new Promise((r) => setTimeout(r, 25));
       }
       const timerWakePrompt = wakePrompts.find((p) => p.includes("Control-plane event (timer.fired):"));

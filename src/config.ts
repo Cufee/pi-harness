@@ -75,6 +75,8 @@ export interface GoalsConfig {
   defaultMaxNoProgressCycles: number;
   /** Timeout in ms for each deterministic goal verification shell gate (default 180_000) */
   gateTimeoutMs: number;
+  /** Automatically run deterministic gates + independent Done-Review when a Goal's linked run settles completed (default true). */
+  autoVerifyOnSettle?: boolean;
 }
 
 export interface EventsConfig {
@@ -105,6 +107,8 @@ export interface RolloverConfig {
   reviewerMaxTurns: number;
   /** Tool output byte threshold above which output is externalized to artifact file (default 2048) */
   externalizeBytes: number;
+  /** Hard generation cap per task to prevent unbounded rollover loops (default 12) */
+  maxGenerations?: number;
 }
 
 export interface CatalogConfig {
@@ -174,10 +178,12 @@ export function defaultSocketPath(stateDir: string): string {
   if (runtime && existsSync(runtime)) {
     return join(runtime, "pi-harness", "daemon.sock");
   }
-  // Keep Unix socket paths short (<104 bytes on macOS)
+  // Keep Unix socket paths short (<104 bytes on macOS) while avoiding world-writable /tmp root races
   const candidate = join(stateDir, "daemon.sock");
   if (candidate.length < 96) return candidate;
-  return join(tmpdir(), `pi-harness-${process.getuid?.() ?? "u"}.sock`);
+  const uidDir = join(tmpdir(), `pi-harness-${process.getuid?.() ?? "u"}`);
+  mkdirSync(uidDir, { recursive: true, mode: 0o700 });
+  return join(uidDir, "daemon.sock");
 }
 
 export function defaultProfiles(): RunnerProfileConfig[] {
@@ -238,6 +244,7 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
     directorMaxTurns: 20,
     reviewerMaxTurns: 12,
     externalizeBytes: 2048,
+    maxGenerations: 12,
     ...(globalCfg.rollover as Partial<RolloverConfig> | undefined),
     ...(repoCfg.rollover as Partial<RolloverConfig> | undefined),
   };
@@ -258,6 +265,7 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
     defaultMaxReviewCycles: 4,
     defaultMaxNoProgressCycles: 2,
     gateTimeoutMs: 180_000,
+    autoVerifyOnSettle: true,
     ...(globalCfg.goals as Partial<GoalsConfig> | undefined),
     ...(repoCfg.goals as Partial<GoalsConfig> | undefined),
   };
@@ -301,7 +309,7 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
     profiles,
     codeMode,
     codeExec: {
-      defaultTimeoutMs: 60_000, maxTimeoutMs: 600_000,
+      defaultTimeoutMs: 300_000, maxTimeoutMs: 1_800_000,
       ...(globalCfg.codeExec as HarnessConfig["codeExec"]),
       ...(repoCfg.codeExec as HarnessConfig["codeExec"]),
     },
@@ -334,8 +342,11 @@ export function saveGlobalConfig(config: HarnessConfig): string {
     defaultTaskProfile: config.defaultTaskProfile,
     rollover: config.rollover,
     worktree: config.worktree,
+    goals: config.goals,
+    events: config.events,
     catalog: config.catalog,
     quotaRetry: config.quotaRetry,
+    ...(config.socketPath !== defaultSocketPath(config.stateDir) ? { socketPath: config.socketPath } : {}),
     ...(config.quotaEndpoint ? { quotaEndpoint: config.quotaEndpoint } : {}),
   };
   writeFileSync(filePath, JSON.stringify(serialized, null, 2) + "\n", "utf8");

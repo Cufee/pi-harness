@@ -47,11 +47,42 @@ export class DaemonClient {
       const remoteCmd = url.pathname && url.pathname !== "/" ? url.pathname.slice(1) : "pi-harness bridge";
       args.push(host, remoteCmd);
 
-      const proc = spawn("ssh", args, { stdio: ["pipe", "pipe", "inherit"] });
+      const proc = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] });
       this.sshProc = proc;
       this.readable = proc.stdout!;
       this.writable = proc.stdin!;
-      proc.once("exit", () => this.handleDisconnect(proc.stdin!));
+      let stderrBuf = "";
+      proc.stderr?.on("data", (chunk: Buffer) => {
+        stderrBuf = (stderrBuf + chunk.toString("utf8")).slice(-2000);
+      });
+      const spawnErr = new Promise<never>((_, reject) => {
+        proc.once("error", (err) => {
+          this.handleDisconnect(proc.stdin!);
+          reject(new Error(`SSH spawn failed: ${err.message}`));
+        });
+      });
+      proc.once("exit", (code) => {
+        if (code && code !== 0 && stderrBuf.trim()) {
+          for (const p of this.pending.values()) {
+            p.reject(new Error(`SSH bridge exited (${code}): ${stderrBuf.trim()}`));
+          }
+          this.pending.clear();
+        }
+        this.handleDisconnect(proc.stdin!);
+      });
+      this.attachTransportReader(proc.stdin!);
+      await Promise.race([
+        this.request("ping"),
+        spawnErr,
+        new Promise<never>((_, reject) => {
+          const t = setTimeout(() => reject(new Error(`Timed out connecting over SSH to ${host}`)), 15_000);
+          t.unref?.();
+        }),
+      ]).catch((err) => {
+        this.close();
+        throw err;
+      });
+      return;
     } else {
       const sock = createConnection(this.target);
       await new Promise<void>((resolve, reject) => {
@@ -64,7 +95,11 @@ export class DaemonClient {
       sock.once("close", () => this.handleDisconnect(sock));
     }
 
-    const transport = this.writable;
+    this.attachTransportReader(this.writable);
+  }
+
+  private attachTransportReader(transport: Writable | null): void {
+    if (!this.readable) return;
     this.detachReader = attachDaemonReader(this.readable, {
       onMessage: (raw) => {
         const frame = raw as RpcResponse | DaemonEventFrame;
@@ -127,6 +162,12 @@ export async function runStdioSocketBridge(socketPath: string): Promise<void> {
     sock.once("connect", resolve);
     sock.once("error", reject);
   });
+  const onErr = () => {
+    sock.destroy();
+  };
+  sock.on("error", onErr);
+  process.stdin.on("error", onErr);
+  process.stdout.on("error", onErr);
   process.stdin.pipe(sock);
   sock.pipe(process.stdout);
   await new Promise<void>((resolve) => {

@@ -1,16 +1,17 @@
 import type { ToolDefinition } from "../runners/types.js";
 import { runCodeExec, timeoutMs, type CodeExecOptions, type CodeExecToolEvent } from "./runner.js";
-import { sandboxAvailable } from "./sandbox.js";
+import { sandboxAvailable, sandboxUnavailableReason } from "./sandbox.js";
 import { CODE_EXEC_TOOL_NAME, TOOL_SEARCH_TOOL_NAME, exposedTools, toolSearch, type CodeMode } from "./sdk.js";
 
 export * from "./sdk.js";
 export { runCodeExec, type CodeExecOptions, type CodeExecResult, type CodeExecToolEvent } from "./runner.js";
+export { sandboxUnavailableReason } from "./sandbox.js";
 
 type Context = Omit<CodeExecOptions, "code" | "timeoutMs">;
 
 function dispatch(name: string, args: Record<string, unknown>, ctx: Context, defaultMs?: number, maxMs?: number): Promise<unknown> | undefined {
   if (name !== TOOL_SEARCH_TOOL_NAME && name !== CODE_EXEC_TOOL_NAME) return undefined;
-  if (!sandboxAvailable()) return Promise.reject(new Error("Code Mode sandbox unavailable on this host"));
+  if (!sandboxAvailable()) return Promise.reject(new Error(sandboxUnavailableReason() ?? "Code Mode sandbox unavailable on this host"));
   if (name === TOOL_SEARCH_TOOL_NAME) {
     if ((args.query !== undefined && typeof args.query !== "string") ||
         (args.names !== undefined && !(Array.isArray(args.names) && args.names.every(n => typeof n === "string")))) {
@@ -22,7 +23,8 @@ function dispatch(name: string, args: Record<string, unknown>, ctx: Context, def
   if (args.timeout_s !== undefined && (typeof args.timeout_s !== "number" || !Number.isFinite(args.timeout_s) || args.timeout_s <= 0)) {
     return Promise.reject(new Error("timeout_s must be a positive number"));
   }
-  const ms = args.timeout_s === undefined ? defaultMs : Math.min(600, args.timeout_s as number) * 1000;
+  const maxSec = (maxMs ?? 1_800_000) / 1000;
+  const ms = args.timeout_s === undefined ? defaultMs : Math.min(maxSec, args.timeout_s as number) * 1000;
   return runCodeExec({ ...ctx, code: args.code, timeoutMs: timeoutMs(ms, maxMs) });
 }
 

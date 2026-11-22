@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "bun:test";
@@ -10,7 +10,8 @@ import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import { AcpRunner } from "../src/runners/acp-runner.js";
 import { buildNewSessionParams, buildPostSessionActions, prepareAcpSpawn } from "../src/runners/acp-shims.js";
-import type { PassiveQuotaSignal, RunAgentRequest, RunnerUsage } from "../src/runners/types.js";
+import { detectQuotaErrorText } from "../src/runners/quota-detect.js";
+import type { PassiveQuotaSignal, RunAgentRequest, RunnerExecutionHandle, RunnerUsage } from "../src/runners/types.js";
 
 const claudeAgent = { name: "@agentclientprotocol/claude-agent-acp", version: "0.109.0" };
 const profile = (adapter: AcpProfileConfig["adapter"]): AcpProfileConfig => ({
@@ -405,6 +406,246 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
     } finally {
       await daemon.stop();
       rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns rollover_requested when handle.cancel('clean_rollover') causes session/prompt to reject", async () => {
+    let handle: RunnerExecutionHandle | undefined;
+    let rejectPrompt: ((err: Error) => void) | undefined;
+
+    const mockAgent = agent()
+      .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {} } as never))
+      .onRequest("session/new", async () => ({
+        sessionId: "sess-rollover",
+        models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+      } as never))
+      .onNotification("session/cancel", async () => {
+        rejectPrompt?.(new Error("Request cancelled (-32800)"));
+      })
+      .onRequest("session/prompt", async ({ client: acpClient }) => {
+        await acpClient.notify("session/update", {
+          sessionId: "sess-rollover",
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Handoff saved." } },
+        } as never);
+        const promptWait = new Promise<never>((_resolve, reject) => {
+          rejectPrompt = reject;
+        });
+        void handle?.cancel("clean_rollover");
+        return await promptWait;
+      });
+
+    const result = await new AcpRunner(profile("claude")).run(
+      {
+        runId: "r-roll",
+        taskId: "t-roll",
+        tier: 2,
+        kind: "worker",
+        cwd: process.cwd(),
+        toolPolicy: "read_write_workspace",
+        systemPrompt: "Worker",
+        initialPrompt: "Work",
+        model: "opus",
+        maxTurns: 5,
+        tools: [],
+        executeTool: async () => ({}),
+        signal: new AbortController().signal,
+        callbacks: {},
+        onHandle: (h) => {
+          handle = h;
+        },
+      },
+      mockAgent,
+    );
+
+    assert.equal(result.stopReason, "rollover_requested");
+    assert.equal(result.text, "Handoff saved.");
+  });
+
+  it("returns quota_paused (not completed) when Claude emits _claude/rateLimit rejected + explanation text + end_turn", async () => {
+    const futureSec = Math.floor((Date.now() + 600_000) / 1000);
+    const mockAgent = agent()
+      .onRequest("initialize", async () => ({ protocolVersion: 1, agentInfo: claudeAgent } as never))
+      .onRequest("session/new", async () => ({
+        sessionId: "sess-rl",
+        models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+      } as never))
+      .onRequest("session/prompt", async ({ client: acpClient }) => {
+        await acpClient.notify("session/update", {
+          sessionId: "sess-rl",
+          update: {
+            sessionUpdate: "usage_update",
+            used: 500,
+            size: 200_000,
+            _meta: { "_claude/rateLimit": { status: "rejected", rateLimitType: "five_hour", resetsAt: futureSec } },
+          },
+        } as never);
+        await acpClient.notify("session/update", {
+          sessionId: "sess-rl",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "You've hit your five-hour limit · resets later today." },
+          },
+        } as never);
+        return { stopReason: "end_turn" } as never;
+      });
+
+    const result = await new AcpRunner(profile("claude")).run(
+      {
+        runId: "r-rl",
+        taskId: "t-rl",
+        tier: 2,
+        kind: "worker",
+        cwd: process.cwd(),
+        toolPolicy: "read_write_workspace",
+        systemPrompt: "Worker",
+        initialPrompt: "Work",
+        model: "opus",
+        maxTurns: 5,
+        tools: [],
+        executeTool: async () => ({}),
+        signal: new AbortController().signal,
+        callbacks: {},
+      },
+      mockAgent,
+    );
+
+    assert.equal(result.stopReason, "quota_paused");
+    assert.ok(result.quotaPause);
+    assert.equal(result.quotaPause?.isHardExhaustion, true);
+    assert.equal(result.quotaPause?.resetAt, new Date(futureSec * 1000).toISOString());
+  });
+
+  it("tightens 429 detection so port/line numbers do not false-trigger while HTTP 429 still matches", () => {
+    assert.equal(detectQuotaErrorText("Listening on port 429").isQuota, false);
+    assert.equal(detectQuotaErrorText("SyntaxError at src/index.ts line 429").isQuota, false);
+    assert.equal(detectQuotaErrorText("Process pid 429 exited cleanly").isQuota, false);
+
+    const http429 = detectQuotaErrorText("HTTP 429 Too Many Requests");
+    assert.equal(http429.isQuota, true);
+    assert.equal(http429.isHardExhaustion, false);
+
+    assert.equal(detectQuotaErrorText("API returned status 429").isQuota, true);
+    assert.equal(detectQuotaErrorText("error code: 429").isQuota, true);
+  });
+
+  it("enforces maxTurns, avoids duplicating generic systemPrompt, evaluates PromptResponse.usage rollover, and allows nested new workspace directories while blocking symlink escapes", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "acp-hardening-"));
+    const outside = mkdtempSync(join(tmpdir(), "acp-outside-"));
+    try {
+      symlinkSync(outside, join(cwd, "escape-link"));
+      let receivedPrompt = "";
+      let nestedAllowed = false;
+      let escapeDenied = false;
+
+      const genericAgent = agent()
+        .onRequest("initialize", async () => ({
+          protocolVersion: 1,
+          agentCapabilities: { sessionCapabilities: { systemPrompt: {} } },
+        } as never))
+        .onRequest("session/new", async () => ({
+          sessionId: "sess-gen",
+          models: { currentModelId: "amp-model", availableModels: [{ modelId: "amp-model", name: "Amp" }] },
+        } as never))
+        .onRequest("session/prompt", async ({ client: acpClient, params }) => {
+          const p = params as unknown as { prompt?: Array<{ text?: string }> };
+          receivedPrompt = p.prompt?.[0]?.text ?? "";
+          const nested = await acpClient.request("session/request_permission", {
+            sessionId: "sess-gen",
+            toolCall: { toolCallId: "c1", title: "edit", kind: "edit", locations: [{ path: join(cwd, "newdir/sub/file.ts") }] },
+            options: [{ kind: "allow_once", optionId: "allow", name: "Allow" }, { kind: "reject_once", optionId: "deny", name: "Deny" }],
+          });
+          nestedAllowed = nested.outcome.outcome === "selected" && nested.outcome.optionId === "allow";
+          const esc = await acpClient.request("session/request_permission", {
+            sessionId: "sess-gen",
+            toolCall: { toolCallId: "c2", title: "edit", kind: "edit", locations: [{ path: join(cwd, "escape-link/newdir/file.ts") }] },
+            options: [{ kind: "allow_once", optionId: "allow", name: "Allow" }, { kind: "reject_once", optionId: "deny", name: "Deny" }],
+          });
+          escapeDenied = esc.outcome.outcome === "selected" && esc.outcome.optionId === "deny";
+          return { stopReason: "end_turn", usage: { totalTokens: 80_000, inputTokens: 70_000, outputTokens: 10_000 } } as never;
+        });
+
+      const genRes = await new AcpRunner(profile("generic")).run(
+        {
+          runId: "r-gen",
+          taskId: "t-gen",
+          tier: 2,
+          kind: "worker",
+          cwd,
+          toolPolicy: "read_write_workspace",
+          systemPrompt: "UNIQUE_SYSTEM_PROMPT",
+          initialPrompt: "USER_TURN_1",
+          model: "amp-model",
+          maxTurns: 3,
+          contextWindow: 100_000,
+          rolloverThreshold: 0.75,
+          tools: [],
+          executeTool: async () => ({}),
+          signal: new AbortController().signal,
+          callbacks: {},
+        },
+        genericAgent,
+      );
+
+      assert.equal(receivedPrompt, "USER_TURN_1");
+      assert.equal(nestedAllowed, true);
+      assert.equal(escapeDenied, true);
+      assert.equal(genRes.stopReason, "rollover_requested");
+      assert.equal(genRes.usage?.used, 80_000);
+      assert.equal(genRes.usage?.size, 100_000);
+
+      // maxTurns enforcement across tool-call waves
+      let cancelOnMaxTurns = false;
+      const loopAgent = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
+        .onRequest("session/new", async () => ({
+          sessionId: "sess-mt",
+          models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+        } as never))
+        .onNotification("session/cancel", async () => {
+          cancelOnMaxTurns = true;
+        })
+        .onRequest("session/prompt", async ({ client: acpClient }) => {
+          for (let i = 1; i <= 3; i++) {
+            await acpClient.notify("session/update", {
+              sessionId: "sess-mt",
+              update: { sessionUpdate: "tool_call", toolCallId: `tc-${i}`, title: "read", status: "in_progress" },
+            } as never);
+            await acpClient.notify("session/update", {
+              sessionId: "sess-mt",
+              update: { sessionUpdate: "tool_call_update", toolCallId: `tc-${i}`, title: "read", status: "completed" },
+            } as never);
+            await acpClient.notify("session/update", {
+              sessionId: "sess-mt",
+              update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `wave ${i}` } },
+            } as never);
+          }
+          return { stopReason: cancelOnMaxTurns ? "cancelled" : "end_turn" } as never;
+        });
+
+      const mtRes = await new AcpRunner(profile("claude")).run(
+        {
+          runId: "r-mt",
+          taskId: "t-mt",
+          tier: 2,
+          kind: "worker",
+          cwd,
+          toolPolicy: "read_write_workspace",
+          systemPrompt: "Worker",
+          initialPrompt: "Loop",
+          model: "opus",
+          maxTurns: 2,
+          tools: [],
+          executeTool: async () => ({}),
+          signal: new AbortController().signal,
+          callbacks: {},
+        },
+        loopAgent,
+      );
+      assert.equal(cancelOnMaxTurns, true);
+      assert.equal(mtRes.stopReason, "max_turns");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
     }
   });
 });

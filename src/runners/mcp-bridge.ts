@@ -16,26 +16,43 @@ async function daemonCall(socketPath: string, op: RpcRequest["op"], params: Reco
   return new Promise((resolve, reject) => {
     const id = randomUUID();
     const sock = createConnection(socketPath);
+    let settled = false;
+    const finish = (err: Error | null, value?: unknown) => {
+      if (settled) return;
+      settled = true;
+      detach();
+      sock.off("close", onClose);
+      sock.off("error", onSockError);
+      if (err) {
+        sock.destroy();
+        reject(err);
+      } else {
+        sock.end();
+        resolve(value);
+      }
+    };
+    const onClose = () => finish(new Error("Daemon connection closed before RPC response"));
+    const onSockError = (err: Error) => finish(err);
     const detach = attachDaemonReader(sock, {
       onMessage(msg) {
         const frame = msg as RpcResponse;
         if (frame.kind === "res" && frame.id === id) {
-          detach();
-          sock.end();
-          if (frame.ok) resolve(frame.result);
-          else reject(new Error(frame.error ?? "Daemon RPC error"));
+          if (frame.ok) finish(null, frame.result);
+          else finish(new Error(frame.error ?? "Daemon RPC error"));
         }
       },
       onError(err) {
-        detach();
-        sock.destroy();
-        reject(err);
+        finish(err);
+      },
+      onEnd() {
+        finish(new Error("Daemon connection ended before RPC response"));
       },
     });
     sock.once("connect", () => {
       writeNdjson(sock, { kind: "req", id, op, params } satisfies RpcRequest);
     });
-    sock.once("error", reject);
+    sock.once("close", onClose);
+    sock.once("error", onSockError);
   });
 }
 

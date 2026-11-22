@@ -108,6 +108,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
         title: { type: "string" },
         description: { type: "string" },
         add_criteria: { type: "array", items: { type: "object" } },
+        update_criteria: { type: "array", items: { type: "object" } },
         remove_criteria_ids: { type: "array", items: { type: "string" } },
         non_goals: { type: "array", items: { type: "string" } },
       },
@@ -369,7 +370,12 @@ export class DirectorRuntime {
   readonly goals: GoalEngine;
   private activeChats = new Map<string, ActiveChat>();
   private activeReviews = new Map<string, AbortController>();
+  private activeReviewerTools = new Map<
+    string,
+    { tools: ToolDefinition[]; execute: (name: string, args: Record<string, unknown>) => Promise<unknown> }
+  >();
   private unsubRunEvents: (() => void) | null = null;
+  private disposed = false;
   private wakeHandler: ((chatSessionId: string, event: ChatControlEvent) => void) | null = null;
   private notifiedSettledGoals = new Set<string>();
 
@@ -397,12 +403,40 @@ export class DirectorRuntime {
     this.wakeHandler = handler;
   }
 
+  hasActiveReviewer(taskId: string): boolean {
+    return this.activeReviewerTools.has(taskId);
+  }
+
+  async executeReviewerMcpTool(taskId: string, name: string, args: Record<string, unknown>): Promise<unknown> {
+    const entry = this.activeReviewerTools.get(taskId);
+    if (!entry) throw new Error(`No active Done-Reviewer tool executor for ${taskId}`);
+    if (name === "__list_tools") return entry.tools;
+    return await entry.execute(name, args);
+  }
+
   dispose(): void {
+    this.disposed = true;
     this.unsubRunEvents?.();
     this.unsubRunEvents = null;
+    for (const [chatId, active] of [...this.activeChats.entries()]) {
+      active.abort.abort(new Error("Daemon shutting down"));
+      void active.handle?.cancel("daemon_shutdown").catch(() => {});
+      this.activeChats.delete(chatId);
+    }
+    for (const [goalId, abort] of [...this.activeReviews.entries()]) {
+      abort.abort(new Error("Daemon shutting down"));
+      this.activeReviews.delete(goalId);
+    }
+    this.activeReviewerTools.clear();
   }
 
   private async handleTimerFired(timer: TimerRecord, wakeReason: string): Promise<void> {
+    if (timer.ownerKind === "task") {
+      // Deliver scheduled timer wakeup to the owning Tier 1/2 agent
+      const msg = `[SCHEDULED TIMER ${timer.id} FIRED (${wakeReason})]: ${timer.reason}`;
+      await this.orchestrator.steerTask(timer.ownerId, msg).catch(() => {});
+      return;
+    }
     if (timer.ownerKind !== "chat") return;
     let resumedGoal = false;
     if (timer.resumeGoal && timer.goalId) {
@@ -439,7 +473,7 @@ export class DirectorRuntime {
     if (ev.type === "task.status" && ev.taskId) {
       const payload = ev.payload as { to?: string; status?: string } | null;
       const st = String(payload?.to ?? payload?.status ?? "");
-      if (["completed", "failed", "cancelled", "blocked", "returned_for_rescope"].includes(st)) {
+      if (["completed", "failed", "cancelled", "blocked", "returned_for_rescope", "paused_quota"].includes(st)) {
         const child = this.db.getTask(ev.taskId);
         if (child?.parentId) {
           this.db.timers.triggerEarly(
@@ -454,29 +488,112 @@ export class DirectorRuntime {
     }
 
     if (!this.config.events?.wakeDirectorOnGoalSettle) return;
+
+    // Wake Director immediately on P0 escalations or manual quota pauses for any linked Goal
+    if (ev.type === "escalation.created") {
+      const p = ev.payload as { severity?: string; title?: string } | null;
+      if (p?.severity !== "P0") return;
+      const row = this.db.db
+        .prepare("SELECT id FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1")
+        .get(ev.runId) as { id: string } | undefined;
+      if (!row) return;
+      const goal = this.goals.getGoal(row.id);
+      if (!goal?.chatSessionId || ["achieved", "cancelled"].includes(goal.status)) return;
+      const openEsc = this.db.listEscalations(ev.runId, "open");
+      this.wakeHandler?.(goal.chatSessionId, {
+        kind: "goal.settled",
+        goalId: goal.id,
+        goalVersion: goal.version,
+        goalTitle: goal.title,
+        runId: ev.runId,
+        runStatus: "failed",
+        openEscalations: openEsc.length,
+        detail: `P0 escalation: ${p.title ?? "human input required"}`,
+      });
+      return;
+    }
+
+    if (ev.type === "quota.run_paused") {
+      const p = ev.payload as { mode?: string; reason?: string } | null;
+      if (p?.mode !== "manual") return;
+      const row = this.db.db
+        .prepare("SELECT id FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1")
+        .get(ev.runId) as { id: string } | undefined;
+      if (!row) return;
+      const goal = this.goals.getGoal(row.id);
+      if (!goal?.chatSessionId || ["achieved", "cancelled", "paused"].includes(goal.status)) return;
+      this.wakeHandler?.(goal.chatSessionId, {
+        kind: "goal.settled",
+        goalId: goal.id,
+        goalVersion: goal.version,
+        goalTitle: goal.title,
+        runId: ev.runId,
+        runStatus: "stopped",
+        openEscalations: this.db.listEscalations(ev.runId, "open").length,
+        detail: `paused_quota (manual): ${p.reason ?? "quota limit reached"}`,
+      });
+      return;
+    }
+
     if (ev.type !== "run.status") return;
     const status = String((ev.payload as { status?: string } | null)?.status ?? "");
     if (status !== "completed" && status !== "failed" && status !== "stopped") return;
 
-    // Find any active Goal linked to this run and wake its owning Director session automatically!
+    // Find any active Goal linked to this run and either run deterministic verification automatically
+    // or wake its owning Director session!
     const row = this.db.db
       .prepare("SELECT id FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1")
       .get(ev.runId) as { id: string } | undefined;
     if (!row) return;
     const goal = this.goals.getGoal(row.id);
-    if (!goal?.chatSessionId) return;
-    if (["achieved", "cancelled", "paused"].includes(goal.status)) return;
+    if (!goal) return;
+    if (["achieved", "cancelled", "paused", "verifying", "reviewing"].includes(goal.status)) return;
 
-    // Cancel any chat timers subscribed to `goal_settled` / `any` for this goal (we're waking directly now)
-    for (const t of this.db.timers.list({ ownerKind: "chat", ownerId: goal.chatSessionId, status: "pending" })) {
-      if ((t.wakeOnEvent === "goal_settled" || t.wakeOnEvent === "any") && (!t.goalId || t.goalId === goal.id)) {
-        this.db.timers.cancel(t.id, `goal_settled:${goal.id}`);
+    // Cancel any chat timers subscribed to `goal_settled` / `any` for this goal (we're handling settlement now)
+    if (goal.chatSessionId) {
+      for (const t of this.db.timers.list({ ownerKind: "chat", ownerId: goal.chatSessionId, status: "pending" })) {
+        if ((t.wakeOnEvent === "goal_settled" || t.wakeOnEvent === "any") && (!t.goalId || t.goalId === goal.id)) {
+          this.db.timers.cancel(t.id, `goal_settled:${goal.id}`);
+        }
       }
     }
 
-    const dedupeKey = `${goal.id}:v${goal.version}:${ev.runId}:${status}`;
+    const dedupeKey = `${goal.id}:v${goal.version}:c${goal.reviewCycle}:${ev.runId}:${status}`;
     if (this.notifiedSettledGoals.has(dedupeKey)) return;
     this.notifiedSettledGoals.add(dedupeKey);
+
+    // Control-plane-driven automatic verification on run completion (removes LLM single point of failure)
+    if (
+      status === "completed" &&
+      this.config.goals?.autoVerifyOnSettle !== false &&
+      goal.verificationMode !== "none" &&
+      !this.activeReviews.has(goal.id)
+    ) {
+      if (!this.unsubRunEvents) return; // daemon disposed
+      void this.verifyAndReviewGoal(goal.id, undefined, { autoTriggered: true }).catch((err) => {
+        if (!this.unsubRunEvents || !goal.chatSessionId) return;
+        const msg = err instanceof Error ? err.message : String(err);
+        let openEscCount = 0;
+        try {
+          openEscCount = this.db.listEscalations(ev.runId, "open").length;
+        } catch {
+          return;
+        }
+        this.wakeHandler?.(goal.chatSessionId, {
+          kind: "goal.settled",
+          goalId: goal.id,
+          goalVersion: goal.version,
+          goalTitle: goal.title,
+          runId: ev.runId,
+          runStatus: "failed",
+          openEscalations: openEscCount,
+          detail: `verification_error: ${msg.slice(0, 160)}`,
+        });
+      });
+      return;
+    }
+
+    if (!goal.chatSessionId) return;
 
     const openEsc = this.db.listEscalations(ev.runId, "open");
     const event: ChatControlEvent = {
@@ -579,10 +696,30 @@ export class DirectorRuntime {
     const { goal, delta } = this.goals.amendGoal(goalId, patch);
 
     if (goal.linkedRunId) {
+      // Persist updated Goal Contract text onto runs.goal and Blackboard so rollovers/resumes never see stale v1 requirements
+      const criteriaSummary = goal.criteria
+        .map((c) => `- [${c.id}] (${c.kind}${c.required ? ", required" : ""}): ${c.description}${c.command ? ` [cmd: ${c.command}]` : ""}`)
+        .join("\n");
+      const updatedObjective = [
+        `GOAL ${goal.id} (v${goal.version}): ${goal.title}`,
+        goal.description,
+        "",
+        "Acceptance Criteria:",
+        criteriaSummary,
+        ...(goal.nonGoals.length ? ["", "Non-Goals:", ...goal.nonGoals.map((n) => `- ${n}`)] : []),
+      ].join("\n");
+      this.db.updateRunGoal(goal.linkedRunId, updatedObjective);
+
       this.db.emitEvent(goal.linkedRunId, null, "goal.amended", { goalId: goal.id, delta });
-      // Steer active Tier 1 Orchestrator with the structured vN -> vN+1 amendment delta!
+      // Steer active Tier 1 Orchestrator (or relaunch in-place if settled!) with the structured vN -> vN+1 delta
       const orch = this.db.listTasks(goal.linkedRunId).find((t) => t.tier === 1);
       if (orch) {
+        this.db.blackboardSet(
+          goal.linkedRunId,
+          `goal_contract_v${goal.version}`,
+          { version: goal.version, title: goal.title, description: goal.description, criteria: goal.criteria, nonGoals: goal.nonGoals, delta },
+          orch.id,
+        );
         const steerMsg = [
           `[GOAL AMENDED: ${goal.id} v${delta.fromVersion} -> v${delta.toVersion}]`,
           `Rationale: ${delta.rationale}`,
@@ -597,7 +734,10 @@ export class DirectorRuntime {
         ]
           .filter(Boolean)
           .join("\n");
-        await this.orchestrator.steerTask(orch.id, steerMsg).catch(() => {});
+        const steered = await this.orchestrator.steerTask(orch.id, steerMsg).catch(() => false);
+        if (!steered && goal.status === "executing") {
+          await this.orchestrator.resumeTask(orch.id, { allowCompleted: true, note: steerMsg }).catch(() => {});
+        }
       }
     }
 
@@ -628,18 +768,18 @@ export class DirectorRuntime {
   async verifyAndReviewGoal(
     goalId: string,
     signal?: AbortSignal,
-    opts?: { verificationMode?: VerificationMode; summary?: string },
+    opts?: { verificationMode?: VerificationMode; summary?: string; autoTriggered?: boolean },
   ): Promise<{
     goal: GoalRecord;
     review: GoalReviewVerdict;
     circuitBreakerTripped?: string;
   }> {
-    if (this.activeReviews.has(goalId)) throw new Error(`Review already in progress for ${goalId}`);
     const goal = this.goals.getGoal(goalId);
     if (!goal) throw new Error(`Unknown goal ${goalId}`);
+    if (this.activeReviews.has(goal.id)) throw new Error(`Review already in progress for ${goal.id}`);
     if (goal.status === "paused" || goal.status === "cancelled") throw new Error(`Goal is ${goal.status}`);
     const abort = new AbortController();
-    this.activeReviews.set(goalId, abort);
+    this.activeReviews.set(goal.id, abort);
     const reviewSignal = signal ? AbortSignal.any([abort.signal, signal]) : abort.signal;
     const unsubscribe = this.db.onEvent(ev => {
       if (ev.runId !== goal.linkedRunId || ev.type !== "run.status") return;
@@ -648,21 +788,27 @@ export class DirectorRuntime {
     try {
       return await this.verifyAndReviewGoalInner(goal, reviewSignal, opts);
     } catch (error) {
-      const current = this.goals.getGoal(goalId);
-      if (current?.version === goal.version && (current.status === "verifying" || current.status === "reviewing")) {
-        this.goals.setStatus(goalId, goal.status);
+      if (!this.disposed) {
+        try {
+          const current = this.goals.getGoal(goal.id);
+          if (current?.version === goal.version && (current.status === "verifying" || current.status === "reviewing")) {
+            this.goals.setStatus(goal.id, goal.status);
+          }
+        } catch {
+          // DB may already be closing during shutdown
+        }
       }
       throw error;
     } finally {
       unsubscribe();
-      this.activeReviews.delete(goalId);
+      this.activeReviews.delete(goal.id);
     }
   }
 
   private async verifyAndReviewGoalInner(
     goal: GoalRecord,
     signal: AbortSignal,
-    opts?: { verificationMode?: VerificationMode; summary?: string },
+    opts?: { verificationMode?: VerificationMode; summary?: string; autoTriggered?: boolean },
   ): Promise<{
     goal: GoalRecord;
     review: GoalReviewVerdict;
@@ -679,7 +825,13 @@ export class DirectorRuntime {
     };
     assertCurrent();
 
-    const effectiveMode: VerificationMode = opts?.verificationMode ?? goal.verificationMode ?? "auto";
+    const committedMode: VerificationMode = goal.verificationMode ?? "auto";
+    if (opts?.verificationMode === "none" && committedMode !== "none") {
+      throw new Error(
+        `Cannot downgrade verification_mode to 'none' on goal ${goal.id} (committed mode is '${committedMode}'). Amend the goal if criteria are no longer required.`,
+      );
+    }
+    const effectiveMode: VerificationMode = opts?.verificationMode ?? committedMode;
     if (effectiveMode === "none") {
       const directResults: CriterionEvaluation[] = goal.criteria.map((c) => ({
         criterionId: c.id,
@@ -693,11 +845,12 @@ export class DirectorRuntime {
         summary: opts?.summary?.trim() || "Goal completed directly (verification_mode=none).",
         diffHash: `direct-${Date.now()}`,
       });
-      await this.handlePostReviewTransition(outcome);
+      await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
       return outcome;
     }
 
-    const gateResult = await this.goals.runDeterministicGates(goal.id, run?.baseSha, signal);
+    const targetRef = run?.baseBranch || "HEAD";
+    const gateResult = await this.goals.runDeterministicGates(goal.id, run?.baseSha, signal, { targetRef });
     assertCurrent();
 
     // If deterministic gates failed, record immediately without burning LLM review tokens!
@@ -709,7 +862,7 @@ export class DirectorRuntime {
         summary: "Deterministic verification gates failed; bouncing back to Tier 1 before LLM review.",
         diffHash: gateResult.diffHash,
       });
-      await this.handlePostReviewTransition(outcome);
+      await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
       return outcome;
     }
 
@@ -738,22 +891,46 @@ export class DirectorRuntime {
             : "Approved cleanly without redundant LLM review."),
         diffHash: gateResult.diffHash,
       });
-      await this.handlePostReviewTransition(outcome);
+      await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
       return outcome;
     }
 
     // All deterministic checks passed -> spawn fresh read-only Independent Skeptical Reviewer
     let diffStat = "";
+    let diffPatch = "";
     try {
-      diffStat = (await runGit(goal.repoRoot, run?.baseSha ? ["diff", "--stat", `${run.baseSha}..HEAD`] : ["status", "--short"])).stdout;
+      diffStat = (
+        await runGit(goal.repoRoot, run?.baseSha ? ["diff", "--stat", `${run.baseSha}..${targetRef}`] : ["status", "--short"])
+      ).stdout;
+      if (run?.baseSha) {
+        const rawPatch = (await runGit(goal.repoRoot, ["diff", `${run.baseSha}..${targetRef}`])).stdout;
+        diffPatch = rawPatch.length > 24_000 ? `${rawPatch.slice(0, 24_000)}\n... [diff truncated at 24KB]` : rawPatch;
+      }
     } catch {
       diffStat = "";
+      diffPatch = "";
     }
 
-    const reviewerPrompt = this.goals.buildReviewerPrompt(goal, gateResult, diffStat);
+    const reviewerPrompt = this.goals.buildReviewerPrompt(goal, gateResult, diffStat, diffPatch);
+    // Prefer an independent model family different from the authoring run's Tier 1/Tier 2 model
+    const runTasks = run ? this.db.listTasks(run.id) : [];
+    const authorModel =
+      runTasks.find((t) => t.tier === 2 && t.model)?.model ??
+      runTasks.find((t) => t.tier === 1 && t.model)?.model ??
+      undefined;
+    const cachedCat = this.catalog.loadCached();
+    const recVerify = cachedCat
+      ? recommendModelsByTaskKind(cachedCat.models, { avoidModelId: authorModel }).verify
+      : null;
     const { profile, model, wireModel } = await resolveLaunchRoute(this.config, {
-      tier: 3, cwd: goal.repoRoot, catalog: this.catalog, quota: this.quota,
+      tier: 3,
+      cwd: goal.repoRoot,
+      profileId: recVerify?.profile,
+      model: recVerify?.model,
+      catalog: this.catalog,
+      quota: this.quota,
     });
+    const reviewerEffort = recVerify?.effort && recVerify.effort !== "default" ? recVerify.effort : undefined;
     const runner = this.customRunnerFactory
       ? this.customRunnerFactory(profile)
       : profile.kind === "acp"
@@ -826,6 +1003,25 @@ export class DirectorRuntime {
     };
 
     let outcome: ReturnType<GoalEngine["recordReviewVerdict"]>;
+    const bridgeExt = import.meta.url.endsWith(".js") ? "mcp-bridge.js" : "mcp-bridge.ts";
+    const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", bridgeExt);
+    const reviewerExecuteTool = async (name: string, args: Record<string, unknown>) => {
+      if (name === "submit_review_verdict") {
+        verdictBox.value = {
+          verdict: String(args.verdict) as SubmittedVerdict["verdict"],
+          criteriaResults: Array.isArray(args.criteriaResults) ? (args.criteriaResults as CriterionEvaluation[]) : [],
+          blockingIssues: Array.isArray(args.blockingIssues) ? (args.blockingIssues as string[]) : [],
+          summary: String(args.summary ?? ""),
+        };
+        return { recorded: true };
+      }
+      throw new Error(`Unknown reviewer tool ${name}`);
+    };
+    this.activeReviewerTools.set(reviewerTask.id, { tools: [submitTool], execute: reviewerExecuteTool });
+    const reviewerTimeout = setTimeout(() => {
+      abort.abort(new Error("Independent Done-Reviewer timed out after 10 minutes"));
+    }, 600_000);
+    reviewerTimeout.unref?.();
     try {
       if (this.db.getTask(reviewerTask.id)?.status === "cancelled") abort.abort(new Error("Reviewer cancelled"));
       this.db.updateTask(reviewerTask.id, { status: reviewerSignal.aborted ? "cancelled" : "running" });
@@ -838,28 +1034,21 @@ export class DirectorRuntime {
         cwd: goal.repoRoot,
         toolPolicy: "read_only_workspace",
         model: wireModel,
+        effort: reviewerEffort,
         systemPrompt:
           "You are an independent read-only Done-Reviewer. Inspect the implementation and verification evidence for each required criterion. Never edit files, run mutating commands, or delegate. Call submit_review_verdict if available, or return the requested JSON verdict with concrete sources for every required criterion.",
         initialPrompt: reviewerPrompt,
         maxTurns: this.config.rollover.reviewerMaxTurns,
         tools: [submitTool],
-        executeTool: async (name, args) => {
-          if (name === "submit_review_verdict") {
-            verdictBox.value = {
-              verdict: String(args.verdict) as SubmittedVerdict["verdict"],
-              criteriaResults: Array.isArray(args.criteriaResults) ? (args.criteriaResults as CriterionEvaluation[]) : [],
-              blockingIssues: Array.isArray(args.blockingIssues) ? (args.blockingIssues as string[]) : [],
-              summary: String(args.summary ?? ""),
-            };
-            return { recorded: true };
-          }
-          throw new Error(`Unknown reviewer tool ${name}`);
-        },
+        executeTool: reviewerExecuteTool,
+        daemonSocketPath: this.config.socketPath,
+        mcpBridgeEntrypoint,
         signal: reviewerSignal,
         callbacks: {
           onTextDelta: (text) => emit("agent.text_delta", { text }),
           onThoughtDelta: (text) => emit("agent.thought_delta", { text }),
           onToolEvent: (ev) => emit("agent.tool", ev),
+          onPassiveQuota: (sig) => this.quota.ingestPassiveSignal(sig),
         },
       });
       reviewerSignal.throwIfAborted();
@@ -870,14 +1059,7 @@ export class DirectorRuntime {
 
       // Fallback JSON parse if reviewer returned JSON text instead of calling submit_review_verdict
       if (!verdictBox.value) {
-        try {
-          const jsonMatch = res.text.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            verdictBox.value = JSON.parse(jsonMatch[0]) as SubmittedVerdict;
-          }
-        } catch {
-          // handled below
-        }
+        verdictBox.value = parseReviewerVerdictJson<SubmittedVerdict>(res.text);
       }
 
       const submittedVerdict = verdictBox.value;
@@ -911,22 +1093,28 @@ export class DirectorRuntime {
         return recorded;
       });
     } catch (err) {
-      failReviewer(err instanceof Error ? err.message : String(err));
+      const detail = err instanceof Error ? err.message : String(err);
+      failReviewer(detail);
       reviewerSignal.throwIfAborted();
-      throw new Error(failedSummary);
+      throw new Error(`${failedSummary} (${detail})`);
     } finally {
+      clearTimeout(reviewerTimeout);
+      this.activeReviewerTools.delete(reviewerTask.id);
       unsubscribe();
     }
 
-    await this.handlePostReviewTransition(outcome);
+    await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
     return outcome;
   }
 
-  private async handlePostReviewTransition(outcome: {
-    goal: GoalRecord;
-    review: GoalReviewVerdict;
-    circuitBreakerTripped?: string;
-  }): Promise<void> {
+  private async handlePostReviewTransition(
+    outcome: {
+      goal: GoalRecord;
+      review: GoalReviewVerdict;
+      circuitBreakerTripped?: string;
+    },
+    opts?: { autoTriggered?: boolean },
+  ): Promise<void> {
     const { goal, review, circuitBreakerTripped } = outcome;
     if (goal.linkedRunId) {
       this.db.emitEvent(goal.linkedRunId, null, "goal.reviewed", {
@@ -956,7 +1144,7 @@ export class DirectorRuntime {
           });
         }
       } else if (goal.status === "executing") {
-        // Wake / steer Tier 1 Orchestrator with concrete failed criteria remediations
+        // Wake / steer Tier 1 Orchestrator — or relaunch in-place if Tier 1 already settled!
         const orch = this.db.listTasks(goal.linkedRunId).find((t) => t.tier === 1);
         if (orch) {
           const unmet = review.criteriaResults.filter((c) => !c.passed);
@@ -966,7 +1154,10 @@ export class DirectorRuntime {
             ...unmet.map((u) => `- ${u.criterionId}: ${u.evidence}${u.remediation ? ` | Fix: ${u.remediation}` : ""}`),
             ...review.blockingIssues.map((b) => `- Blocker: ${b}`),
           ].join("\n");
-          await this.orchestrator.steerTask(orch.id, msg).catch(() => {});
+          const steered = await this.orchestrator.steerTask(orch.id, msg).catch(() => false);
+          if (!steered) {
+            await this.orchestrator.resumeTask(orch.id, { allowCompleted: true, note: msg }).catch(() => {});
+          }
         }
       }
     }
@@ -989,6 +1180,9 @@ export class DirectorRuntime {
         undefined,
         reviewedEvent,
       );
+      if (opts?.autoTriggered && (goal.status === "achieved" || goal.status === "awaiting_human")) {
+        this.wakeHandler?.(goal.chatSessionId, reviewedEvent);
+      }
     }
   }
 
@@ -1151,7 +1345,8 @@ export class DirectorRuntime {
       waitInterrupts: new Set(),
     };
     this.activeChats.set(chatSessionId, active);
-    const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", "mcp-bridge.ts");
+    const bridgeExt = import.meta.url.endsWith(".js") ? "mcp-bridge.js" : "mcp-bridge.ts";
+    const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", bridgeExt);
 
     const finishCancelled = () => ({
       userTurn, assistantTurn: this.flushChatPartial(chatSessionId, active),
@@ -1211,6 +1406,9 @@ export class DirectorRuntime {
       if (res.stopReason === "quota_paused") {
         const pauseLine = "Paused for quota. Retry later or switch models with /model.";
         content = content ? `${content}\n\n${pauseLine}` : pauseLine;
+      } else if (res.stopReason === "max_turns") {
+        const turnLine = `Reached Director turn limit (${this.config.rollover.directorMaxTurns}); send a follow-up to continue.`;
+        content = content ? `${content}\n\n${turnLine}` : turnLine;
       } else if (!content && res.toolFailures?.length) {
         content = `Stopped after tool failure without a final response:\n${res.toolFailures.map((f) => `- ${f}`).join("\n")}`;
       } else if (!content && !active.flushedText) {
@@ -1357,6 +1555,7 @@ export class DirectorRuntime {
           title: typeof args.title === "string" ? args.title : undefined,
           description: typeof args.description === "string" ? args.description : undefined,
           addCriteria: Array.isArray(args.add_criteria) ? (args.add_criteria as GoalCriterion[]) : undefined,
+          updateCriteria: Array.isArray(args.update_criteria) ? (args.update_criteria as GoalCriterion[]) : undefined,
           removeCriteriaIds: Array.isArray(args.remove_criteria_ids) ? (args.remove_criteria_ids as string[]) : undefined,
           nonGoals: Array.isArray(args.non_goals) ? (args.non_goals as string[]) : undefined,
         });
@@ -1735,4 +1934,69 @@ export class DirectorRuntime {
       if (signal?.aborted) onAbort();
     });
   }
+}
+
+/**
+ * Extracts a structured verdict JSON object from reviewer prose without greedy regex bugs
+ * when the reviewer quotes code braces outside the JSON block.
+ */
+export function parseReviewerVerdictJson<T extends { verdict?: unknown }>(text: string): T | null {
+  const isValid = (parsed: unknown): parsed is T =>
+    Boolean(
+      parsed &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed) &&
+        typeof (parsed as { verdict?: unknown }).verdict === "string" &&
+        ["approved", "changes_requested", "escalate_human"].includes(String((parsed as { verdict: string }).verdict)),
+    );
+
+  // 1. Prefer the last fenced ```json ... ``` (or ``` ... ```) block containing a valid verdict object
+  const fenceMatches = [...text.matchAll(/```(?:json)?\s*\n([\s\S]*?)```/gi)];
+  for (let i = fenceMatches.length - 1; i >= 0; i--) {
+    try {
+      const parsed = JSON.parse(fenceMatches[i]![1]!.trim());
+      if (isValid(parsed)) return parsed;
+    } catch {
+      // keep scanning earlier fences
+    }
+  }
+
+  // 2. Fall back to scanning balanced top-level `{ ... }` objects from the end of the text
+  const candidates: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === "}" && depth > 0) {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        candidates.push(text.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    try {
+      const parsed = JSON.parse(candidates[i]!);
+      if (isValid(parsed)) return parsed;
+    } catch {
+      // ignore non-JSON brace blocks (e.g. code snippets)
+    }
+  }
+  return null;
 }

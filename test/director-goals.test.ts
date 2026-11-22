@@ -4,7 +4,9 @@ import { describe, it } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadConfig, type AcpProfileConfig, type HarnessConfig } from "../src/config.js";
+import { loadConfig, saveGlobalConfig, type AcpProfileConfig, type HarnessConfig } from "../src/config.js";
+import { globsOverlap } from "../src/control-plane/db.js";
+import { parseReviewerVerdictJson } from "../src/director/runtime.js";
 import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import type { GoalRecord } from "../src/goals/engine.js";
@@ -27,7 +29,13 @@ describe("Tier 0 Director, Run-Until-Done Goal Engine, Independent Done-Review &
     let reviewCalls = 0;
 
     try {
-      const config = withFixtureCatalog({ ...loadConfig(repoRoot), stateDir, socketPath: sockPath });
+      const baseCfg = loadConfig(repoRoot);
+      const config = withFixtureCatalog({
+        ...baseCfg,
+        goals: { ...baseCfg.goals, autoVerifyOnSettle: false },
+        stateDir,
+        socketPath: sockPath,
+      });
       const daemon = new HarnessDaemon(config, {
         dbPath: ":memory:",
         customRunnerFactory: () => ({
@@ -248,6 +256,116 @@ it("limits Director reads to a logged workspace snippet and delegates sourced re
       assert.equal(notices.length, 1);
       assert.match(notices[0]!.content, /large\.txt \(4096 bytes\).*Check encoding/);
     } finally {
+      await daemon.stop();
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+it("drives unattended auto-verification -> remediation relaunch -> achieved, protects pending timers, and preserves config", async () => {
+  const repoRoot = await makeTempRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-auto-goal-"));
+  const sockPath = join(stateDir, "d.sock");
+  let orchGenerations = 0;
+  let reviewerSawDiffPatch = false;
+
+  try {
+    // 1. Verify globsOverlap path-segment boundary and reviewer JSON parser with code braces
+    assert.equal(globsOverlap("src/auth", "src/auth-utils/**"), false);
+    assert.equal(globsOverlap("src/auth/**", "src/auth/login.ts"), true);
+    const parsed = parseReviewerVerdictJson(
+      'Checked `function f() { return { a: 1 }; }`.\n```json\n{"verdict":"approved","criteriaResults":[{"criterionId":"c1","passed":true,"evidence":"ok"}],"summary":"Clean"}\n```',
+    );
+    assert.equal(parsed?.verdict, "approved");
+
+    // 2. Verify saveGlobalConfig preserves goals and events
+    const cfg = withFixtureCatalog({
+      ...loadConfig(repoRoot),
+      stateDir,
+      socketPath: sockPath,
+      codeMode: "off",
+      goals: { defaultMaxReviewCycles: 6, defaultMaxNoProgressCycles: 3, gateTimeoutMs: 90_000, autoVerifyOnSettle: true },
+      events: { fallbackWakeupIntervalSec: 900, wakeDirectorOnGoalSettle: true },
+    });
+    saveGlobalConfig(cfg);
+    const saved = JSON.parse(readFileSync(join(stateDir, "config.json"), "utf8")) as HarnessConfig;
+    assert.equal(saved.goals.defaultMaxReviewCycles, 6);
+    assert.equal(saved.events.fallbackWakeupIntervalSec, 900);
+
+    // 3. Full unattended run-until-done loop: gen 1 misses file -> gate fails -> auto-relaunch gen 2 -> fixes file -> reviewer approves
+    const daemon = new HarnessDaemon(cfg, {
+      dbPath: ":memory:",
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          if (req.taskId.startsWith("chat-")) {
+            return { text: "Acknowledged.", stopReason: "completed" };
+          }
+          if (req.tier === 1) {
+            orchGenerations++;
+            if (orchGenerations === 1) {
+              // Gen 1 exits without creating out.txt -> deterministic gate should fail and auto-relaunch Gen 2!
+              return { text: "First attempt finished prematurely", stopReason: "completed" };
+            }
+            assert.match(req.initialPrompt, /CHANGES REQUESTED/);
+            writeFileSync(join(repoRoot, "out.txt"), "fixed in gen 2\n", "utf8");
+            await runGit(repoRoot, ["add", "out.txt"]);
+            await runGit(repoRoot, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "fix out.txt"]);
+            return { text: "Created out.txt in remediation gen 2", stopReason: "completed" };
+          }
+          if (req.kind === "verify") {
+            reviewerSawDiffPatch = req.initialPrompt.includes("fixed in gen 2");
+            // Return prose with code braces + fenced JSON (exercising fallback parser)
+            return {
+              stopReason: "completed",
+              text: 'Reviewed diff `const x = { ok: true };`.\n```json\n{"verdict":"approved","criteriaResults":[{"criterionId":"c2","passed":true,"evidence":"out.txt says fixed in gen 2"}],"summary":"Verified"}\n```',
+            };
+          }
+          return { text: "done", stopReason: "completed" };
+        },
+      }),
+    });
+
+    await daemon.start();
+    const client = new DaemonClient(sockPath);
+    await client.connect();
+    try {
+      const chat = await daemon.director.createChat({ repoRoot });
+      const goal = daemon.director.goals.createGoal({
+        repoRoot,
+        chatSessionId: chat.id,
+        title: "Auto-remediate out.txt",
+        description: "Produce out.txt and verify",
+        criteria: [
+          { id: "c1", kind: "deterministic", description: "out.txt exists", command: "test -f out.txt", required: true },
+          { id: "c2", kind: "behavioral", description: "out.txt mentions gen 2", required: true },
+        ],
+      });
+      await daemon.director.commitGoal(goal.id);
+
+      // Wait for the hands-free loop to run Gen 1 -> Fail gate -> Auto-resume Gen 2 -> Pass gate -> Reviewer -> Achieved!
+      const deadline = Date.now() + 8_000;
+      while (Date.now() < deadline && daemon.director.goals.getGoal(goal.id)?.status !== "achieved") {
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      assert.equal(daemon.director.goals.getGoal(goal.id)?.status, "achieved");
+      assert.equal(orchGenerations, 2, "Failed gate must auto-relaunch Tier 1 generation 2");
+      assert.equal(reviewerSawDiffPatch, true, "Done-Reviewer prompt must include actual git diff patch");
+
+      // Verify pending durable timers keep daemon `running: true` so autoQuitWhenIdle never kills it
+      const timer = daemon.db.timers.schedule({
+        ownerKind: "chat",
+        ownerId: chat.id,
+        delaySeconds: 3600,
+        reason: "Multi-hour unattended check",
+      });
+      const ping = (await client.request("ping")) as { running?: boolean; liveWork?: string };
+      assert.equal(ping.running, true);
+      assert.match(ping.liveWork ?? "", /pending timer/);
+      daemon.db.timers.cancel(timer.id, "cleanup");
+    } finally {
+      client.close();
       await daemon.stop();
     }
   } finally {
