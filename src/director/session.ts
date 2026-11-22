@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Database } from "bun:sqlite";
+import type { ToolDisplayPayload } from "../protocol/tool-display.js";
 
 function canonicalRepoPath(p: string): string {
   try {
@@ -26,9 +27,14 @@ export interface ChatSessionRecord {
 export interface ChatTurnRecord {
   seq: number;
   chatSessionId: string;
-  role: "user" | "assistant" | "system_notice";
+  role: "user" | "assistant" | "system_notice" | "tool_output";
+  /** Short plain-text summary for tool_output turns, e.g. "goal_list → Goals table (3 goals)". */
   content: string;
   createdAt: number;
+  /** Only set on tool_output turns. */
+  toolName?: string | null;
+  /** Only set on tool_output turns. */
+  display?: ToolDisplayPayload | null;
 }
 
 export const DIRECTOR_SCHEMA = `
@@ -47,9 +53,11 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
 CREATE TABLE IF NOT EXISTS chat_turns (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   chat_session_id TEXT NOT NULL REFERENCES chat_sessions(id),
-  role TEXT NOT NULL CHECK (role IN ('user','assistant','system_notice')),
+  role TEXT NOT NULL CHECK (role IN ('user','assistant','system_notice','tool_output')),
   content TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  tool_name TEXT,
+  display_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_chat_turns_session ON chat_turns(chat_session_id, seq);
 `;
@@ -65,6 +73,10 @@ export function buildDirectorSystemPrompt(): string {
     "3. When the user changes requirements mid-flight, call `goal_amend` so a clean `vN -> vN+1` amendment delta propagates to the running Tier 1 Orchestrator without losing unaffected work.",
     "4. Surface `P0` escalations, circuit-breaker trips, and Independent Done-Review verdicts clearly to the user with actionable options.",
     "5. Keep responses crisp, direct, and grounded in actual tool state — never guess progress or invent statuses.",
+    "",
+    "RICH TOOL OUTPUT:",
+    "- `goal_list` renders the live Goals table directly in the user's UI, and `goal_get` renders the Goal detail card there. When the user asks about goals or progress, call the tool instead of printing a Goals table or goal details in prose.",
+    "- Never duplicate a rendered table: after `goal_list` / `goal_get`, add only brief commentary (highlights, blockers, next steps), not a re-typed table or per-goal listing.",
   ].join("\n");
 }
 
@@ -74,6 +86,40 @@ export function buildDirectorSystemPrompt(): string {
 export class DirectorSessionStore {
   constructor(private readonly db: Database) {
     this.db.exec(DIRECTOR_SCHEMA);
+    this.migrateChatTurns();
+  }
+
+  /** Upgrades chat_turns created before tool_output turns existed: rebuilds it when its role CHECK lacks 'tool_output' (keeping rows and seq), then adds missing columns. */
+  private migrateChatTurns(): void {
+    const table = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chat_turns'")
+      .get() as { sql: string } | undefined;
+    if (table && !table.sql.includes("'tool_output'")) {
+      const cols = new Set((this.db.prepare("PRAGMA table_info(chat_turns)").all() as Array<{ name: string }>).map((c) => c.name));
+      const copied = ["seq", "chat_session_id", "role", "content", "created_at", "tool_name", "display_json"].filter((c) => cols.has(c));
+      this.db.transaction(() => {
+        this.db.exec(`
+          CREATE TABLE chat_turns_migrated (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_session_id TEXT NOT NULL REFERENCES chat_sessions(id),
+            role TEXT NOT NULL CHECK (role IN ('user','assistant','system_notice','tool_output')),
+            content TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            tool_name TEXT,
+            display_json TEXT
+          );
+          INSERT INTO chat_turns_migrated(${copied.join(", ")}) SELECT ${copied.join(", ")} FROM chat_turns;
+          DELETE FROM sqlite_sequence WHERE name = 'chat_turns_migrated';
+          INSERT INTO sqlite_sequence(name, seq) SELECT 'chat_turns_migrated', seq FROM sqlite_sequence WHERE name = 'chat_turns';
+          DROP TABLE chat_turns;
+          ALTER TABLE chat_turns_migrated RENAME TO chat_turns;
+          CREATE INDEX IF NOT EXISTS idx_chat_turns_session ON chat_turns(chat_session_id, seq);
+        `);
+      })();
+    }
+    const cols = new Set((this.db.prepare("PRAGMA table_info(chat_turns)").all() as Array<{ name: string }>).map((c) => c.name));
+    if (!cols.has("tool_name")) this.db.exec("ALTER TABLE chat_turns ADD COLUMN tool_name TEXT");
+    if (!cols.has("display_json")) this.db.exec("ALTER TABLE chat_turns ADD COLUMN display_json TEXT");
   }
 
   private lastTs = 0;
@@ -135,11 +181,16 @@ export class DirectorSessionStore {
     return rows.map((r) => this.mapSession(r));
   }
 
-  appendTurn(chatSessionId: string, role: ChatTurnRecord["role"], content: string): ChatTurnRecord {
+  appendTurn(
+    chatSessionId: string,
+    role: ChatTurnRecord["role"],
+    content: string,
+    tool?: { toolName: string; display: ToolDisplayPayload | null },
+  ): ChatTurnRecord {
     const now = Date.now();
     const res = this.db
-      .prepare("INSERT INTO chat_turns(chat_session_id, role, content, created_at) VALUES (?, ?, ?, ?)")
-      .run(chatSessionId, role, content, now);
+      .prepare("INSERT INTO chat_turns(chat_session_id, role, content, created_at, tool_name, display_json) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(chatSessionId, role, content, now, tool?.toolName ?? null, tool?.display ? JSON.stringify(tool.display) : null);
     this.db.prepare("UPDATE chat_sessions SET updated_at = ? WHERE id = ?").run(now, chatSessionId);
     return {
       seq: Number(res.lastInsertRowid),
@@ -147,6 +198,7 @@ export class DirectorSessionStore {
       role,
       content,
       createdAt: now,
+      ...(tool ? { toolName: tool.toolName, display: tool.display } : {}),
     };
   }
 
@@ -180,6 +232,12 @@ export class DirectorSessionStore {
       role: String(r.role) as ChatTurnRecord["role"],
       content: String(r.content),
       createdAt: Number(r.created_at),
+      ...(r.role === "tool_output"
+        ? {
+            toolName: r.tool_name ? String(r.tool_name) : null,
+            display: r.display_json ? (JSON.parse(String(r.display_json)) as ToolDisplayPayload) : null,
+          }
+        : {}),
     }));
   }
 
