@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { visibleWidth, type Component } from "@earendil-works/pi-tui";
 import type { CompiledModelCatalog } from "../src/catalog/compiler.js";
 import type { RunnerProfileConfig } from "../src/config.js";
-import { CommandPaletteOverlay, EffortPickerOverlay, ModelPickerOverlay, RunsOverlay, SessionsOverlay, TreeOverlay } from "../src/tui/overlays.js";
+import { CommandPaletteOverlay, EffortPickerOverlay, ModelPickerOverlay, SessionsOverlay } from "../src/tui/overlays.js";
 import {
   AssistantCard,
   BannerCard,
@@ -176,7 +176,7 @@ describe("TUI Primitives Library", () => {
     }
   });
 
-  test("CommandPaletteOverlay, ModelPickerOverlay, and RunsOverlay render fast & width-safe", () => {
+  test("CommandPaletteOverlay, ModelPickerOverlay, and pickers render fast & width-safe", () => {
     let ran = "";
     const palette = new CommandPaletteOverlay(
       theme,
@@ -304,49 +304,6 @@ describe("TUI Primitives Library", () => {
     cliPicker.handleInput("\r");
     expect(cliChosen).toEqual(["acp:amp"]);
 
-    const runs = new RunsOverlay(
-      theme,
-      [
-        {
-          id: "run-1",
-          goal: "Build fast cron parser CLI",
-          repoRoot: "/tmp/demo",
-          baseBranch: "main",
-          baseSha: "abc1234",
-          coordinationGroup: "default",
-          isolationMode: "standalone",
-          status: "active",
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-        },
-      ],
-      () => {},
-      () => {},
-      () => {},
-    );
-    for (const width of [24, 48, 80, 110]) {
-      assertWidthSafe(runs.render(width), width, "RunsOverlay");
-    }
-
-    // A preselected run beyond the first page must be visible, since x stops the selected run.
-    const manyRuns = Array.from({ length: 20 }, (_, i) => ({
-      id: `run-${i + 1}`,
-      goal: `Goal ${i + 1}`,
-      repoRoot: "/tmp/demo",
-      baseBranch: "main",
-      baseSha: "abc1234",
-      coordinationGroup: "default",
-      isolationMode: "standalone" as const,
-      status: "active" as const,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    }));
-    const stopped: string[] = [];
-    const paged = new RunsOverlay(theme, manyRuns, (action, r) => action === "stop" && stopped.push(r.id), () => {}, () => {}, "run-15");
-    expect(paged.render(110).find((l) => l.includes("▸"))).toContain("run-15");
-    paged.handleInput("x");
-    expect(stopped).toEqual(["run-15"]);
-
     const effort = new EffortPickerOverlay(theme, ["low", "medium", "high", "ultra"], "medium", () => {}, () => {}, () => {});
     for (const width of [24, 48, 80, 110]) {
       assertWidthSafe(effort.render(width), width, "EffortPickerOverlay");
@@ -366,27 +323,6 @@ describe("TUI Primitives Library", () => {
     for (const width of [24, 48, 80, 110]) {
       assertWidthSafe(sessionsOverlay.render(width), width, "SessionsOverlay");
     }
-
-    const tree = new TreeOverlay(
-      theme,
-      () => [
-        { id: "t-1", runId: "r-1", parentId: null, tier: 1, kind: "orchestrator", title: "Orch\nSecondLine", objective: "x", criteria: "", readOnly: true, profileId: "acp:codex", model: "gpt-6.2-sol", effort: "medium", status: "running", generation: 1, maxTurns: 20, turnsUsed: 0, contextUsed: 100, contextSize: 1000, worktreeId: null, sessionId: null, summary: null, handoffJson: null, resultJson: null, createdAt: 1, updatedAt: 1 },
-        { id: "t-2", runId: "r-1", parentId: "t-1", tier: 2, kind: "worker", title: "Worker A", objective: "x", criteria: "", readOnly: false, profileId: "acp:codex", model: "gpt-6.2-sol", effort: "medium", status: "completed", generation: 1, maxTurns: 20, turnsUsed: 0, contextUsed: 100, contextSize: 1000, worktreeId: null, sessionId: null, summary: null, handoffJson: null, resultJson: null, createdAt: 2, updatedAt: 2 },
-        { id: "t-3", runId: "r-1", parentId: "t-1", tier: 2, kind: "worker", title: "Worker B", objective: "x", criteria: "", readOnly: false, profileId: "acp:codex", model: "gpt-6.2-sol", effort: "medium", status: "running", generation: 1, maxTurns: 20, turnsUsed: 0, contextUsed: 100, contextSize: 1000, worktreeId: null, sessionId: null, summary: null, handoffJson: null, resultJson: null, createdAt: 3, updatedAt: 3 },
-        { id: "t-4", runId: "r-1", parentId: "t-2", tier: 3, kind: "verify", title: "Verify A", objective: "x", criteria: "", readOnly: true, profileId: "acp:codex", model: "gpt-6.2-astra", effort: "high", status: "completed", generation: 1, maxTurns: 20, turnsUsed: 0, contextUsed: 100, contextSize: 1000, worktreeId: null, sessionId: null, summary: null, handoffJson: null, resultJson: null, createdAt: 4, updatedAt: 4 },
-      ],
-      () => [],
-      () => {},
-      () => {},
-      () => {},
-    );
-    const treeRendered = tree.render(100);
-    assertWidthSafe(treeRendered, 100, "TreeOverlay");
-    // Verify DFS nesting: Verify A (t-4, child of t-2) renders BEFORE Worker B (t-3)!
-    const idxT4 = treeRendered.findIndex((l) => l.includes("t-4"));
-    const idxT3 = treeRendered.findIndex((l) => l.includes("t-3"));
-    expect(idxT4).toBeGreaterThan(0);
-    expect(idxT4).toBeLessThan(idxT3);
 
     // Performance budget: 200 full frames at 120 cols of StatusBar + BannerCard + UserCard + AssistantCard < 40ms total
     const bar = new StatusBar(theme, { tone: "success", modeLabel: "director", modelLabel: "gpt-6.2-astra", effortLabel: "high", goalsSummary: "2 goals" });

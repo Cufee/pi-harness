@@ -1,7 +1,7 @@
 import { Container, Markdown, Spacer } from "@earendil-works/pi-tui";
 import type { CompiledModelCatalog } from "../catalog/compiler.js";
 import type { HarnessConfig } from "../config.js";
-import type { EscalationRecord, RunRecord, TaskRecord } from "../control-plane/db.js";
+import type { EscalationRecord, EventRecord, RunRecord, TaskRecord } from "../control-plane/db.js";
 import type { RunQuotaPauseStatus } from "../control-plane/orchestrator.js";
 import type { DaemonClient } from "../daemon/remote.js";
 import type { ChatSessionRecord, ChatTurnRecord } from "../director/session.js";
@@ -28,9 +28,7 @@ import {
   ModelPickerOverlay,
   QuotaOverlay,
   QuotaWaitPickerOverlay,
-  RunsOverlay,
   SessionsOverlay,
-  TreeOverlay,
   WorktreesOverlay,
   type AttachableSession,
 } from "./overlays.js";
@@ -51,7 +49,9 @@ import {
   ToolPill,
   UserCard,
 } from "./primitives/index.js";
+import { RunsTreeOverlay, type RunsTreesResult } from "./runs-tree.js";
 import { SettingsOverlay } from "./settings-overlay.js";
+import { AgentTranscriptOverlay } from "./transcript-overlay.js";
 
 export type TuiExitAction =
   | { kind: "exit" }
@@ -70,38 +70,108 @@ function parseSlashInput(mode: CommandMode, text: string): { cmd: SlashCommand; 
   return /^\/[A-Za-z][\w-]*(\s|$)/.test(text) ? { error: `Unknown command ${text.split(/\s/)[0]}. Type /help for commands.` } : null;
 }
 
-type RunsAction = "inspect" | "stop" | "resume" | "wait";
+export type RunsAction = "resume" | "wait" | "stop";
+
+/** True for frames delivered to a `watch.start` subscription; only the overlay that owns the watch consumes them. */
+export function isWatchFrame(ev: DaemonEventFrame): boolean {
+  return Boolean(ev.watchId);
+}
+
+type WatchClient = Pick<DaemonClient, "request" | "onEvent">;
+
+/**
+ * Starts a read-only daemon watch (never attach/detach) and routes frames tagged with its watchId to
+ * `onEvent`. Frames that arrive before `watch.start` answers are buffered. `stop` is idempotent.
+ */
+async function startWatch(
+  client: WatchClient,
+  params: { scope: "runs" } | { scope: "task"; runId: string; taskId: string },
+  onEvent: (ev: DaemonEventFrame) => void,
+): Promise<{ replay: EventRecord[]; stop: () => Promise<void> }> {
+  let watchId: string | null = null;
+  const early: DaemonEventFrame[] = [];
+  const unsub = client.onEvent((ev) => {
+    if (!ev.watchId) return;
+    if (watchId === null) early.push(ev);
+    else if (ev.watchId === watchId) onEvent(ev);
+  });
+  let res: { watchId: string; replay: EventRecord[] };
+  try {
+    res = await client.request<{ watchId: string; replay: EventRecord[] }>("watch.start", params);
+  } catch (err) {
+    unsub();
+    throw err;
+  }
+  watchId = res.watchId;
+  for (const ev of early) if (ev.watchId === watchId) onEvent(ev);
+  let stopped = false;
+  return {
+    replay: res.replay,
+    stop: async () => {
+      if (stopped) return;
+      stopped = true;
+      unsub();
+      await client.request("watch.stop", { watchId: res.watchId }).catch(() => {});
+    },
+  };
+}
 
 /**
  * The single `/runs` overlay for both modes; every entry point (slash, palette, Ctrl+T) lands here.
- * In attached-run mode `attachedRun` is preselected and always listed.
+ * Read-only: it uses `runs.trees` + `watch.*` and never attaches, so the current session stays attached.
+ * Enter on an agent stacks its live transcript on top; closing it returns to the same tree state.
  */
-function openRunsOverlay(ctx: {
-  client: DaemonClient;
+export function openRunsOverlay(ctx: {
+  client: WatchClient;
   theme: HarnessTheme;
   overlays: OverlayManager;
-  attachedRun?: RunRecord;
-  onAction: (action: RunsAction, run: RunRecord) => void;
-  onError: (err: unknown) => void;
-}): void {
-  const attached = ctx.attachedRun;
-  void ctx.client
-    .request<RunRecord[]>("run.list", { limit: 20 })
-    .then((listed) => {
-      const runs = attached && !listed.some((r) => r.id === attached.id) ? [attached, ...listed] : listed;
-      let handle: ReturnType<OverlayManager["push"]> | null = null;
-      const comp = new RunsOverlay(ctx.theme, runs, ctx.onAction, () => handle?.close(), () => handle?.rerender(), attached?.id);
-      handle = ctx.overlays.push(
-        {
-          title: "Autonomous Runs",
-          subtitle: attached ? `${runs.length} recent · attached ${attached.id}` : `${runs.length} recent`,
-          footer: `${attached ? "Enter agent tree (this run) / attach (other run)" : "Enter inspect"} · r resume now · w schedule wait · x stop · Esc close`,
+  requestRender: () => void;
+  onAction: (action: RunsAction, runId: string) => void;
+}): RunsTreeOverlay {
+  const openTranscript = (row: { runId: string; taskId: string; title: string }) => {
+    let watch: Awaited<ReturnType<typeof startWatch>> | null = null;
+    let closed = false;
+    let handle: ReturnType<OverlayManager["push"]> | null = null;
+    const comp = new AgentTranscriptOverlay({
+      theme: ctx.theme,
+      ...row,
+      startWatch: async (onEvent) => {
+        watch = await startWatch(ctx.client, { scope: "task", runId: row.runId, taskId: row.taskId }, onEvent);
+        if (closed) void watch.stop();
+        return watch;
+      },
+      onClose: () => handle?.close(),
+      requestRender: ctx.requestRender,
+    });
+    handle = ctx.overlays.push(
+      { title: "Agent Transcript", subtitle: `${row.runId} · ${row.taskId}`, footer: "read-only · Esc back to /runs" },
+      comp,
+      {
+        width: "94%",
+        onClose: () => {
+          closed = true;
+          void watch?.stop();
         },
-        comp,
-        { width: "90%" },
-      );
-    })
-    .catch(ctx.onError);
+      },
+    );
+  };
+
+  let handle: ReturnType<OverlayManager["push"]> | null = null;
+  const comp = new RunsTreeOverlay({
+    theme: ctx.theme,
+    fetchTrees: () => ctx.client.request<RunsTreesResult>("runs.trees"),
+    subscribe: async (onEvent) => {
+      const watch = await startWatch(ctx.client, { scope: "runs" }, onEvent);
+      return () => void watch.stop();
+    },
+    onOpenTranscript: openTranscript,
+    onAction: ctx.onAction,
+    onClose: () => handle?.close(),
+    requestRender: ctx.requestRender,
+  });
+  // Ctrl+T / Ctrl+C pop the overlay without Esc, so stop the watch on every close path.
+  handle = ctx.overlays.push({ title: "Autonomous Runs" }, comp, { width: "94%", onClose: () => comp.dispose() });
+  return comp;
 }
 
 async function resolveLeaveNote(client: DaemonClient): Promise<string> {
@@ -588,54 +658,23 @@ export async function runDirectorChatTui(opts: {
     );
   };
 
-  const onRunsAction = (action: RunsAction, run: RunRecord) => {
+  const onRunsAction = (action: RunsAction, runId: string) => {
     if (action === "stop") {
       void opts.client
-        .request("run.stop", { runId: run.id })
-        .then(() => appendSystem([`Stopped run ${theme.bold(run.id)}.`], "warning"))
+        .request("run.stop", { runId })
+        .then(() => appendSystem([`Stopped run ${theme.bold(runId)}.`], "warning"))
         .catch((err) => appendError(err, "run.stop"));
     } else if (action === "resume") {
-      resumeRunNow(run.id);
-    } else if (action === "wait") {
-      void opts.client
-        .request<{ quotaPause?: RunQuotaPauseStatus | null }>("run.get", { runId: run.id })
-        .then((d) => openQuotaWaitPicker(run.id, d.quotaPause?.reason ?? "Paused due to quota", d.quotaPause?.resumeAt ?? null))
-        .catch(() => openQuotaWaitPicker(run.id));
+      resumeRunNow(runId);
     } else {
       void opts.client
-        .request<{ run: RunRecord; tasks: TaskRecord[]; escalations: EscalationRecord[]; quotaPause?: RunQuotaPauseStatus | null }>(
-          "tree.get",
-          { runId: run.id },
-        )
-        .then((detail) => {
-          const lines = [
-            `${theme.bold(`Run ${detail.run.id}`)} [${detail.run.status.toUpperCase()}] — ${detail.run.goal.split("\n")[0]}`,
-            theme.dim(`Repo: ${detail.run.repoRoot} │ Attach: pi-harness attach ${detail.run.id}`),
-            ...(detail.quotaPause
-              ? [
-                  theme.warning(
-                    `Quota pause (${detail.quotaPause.mode}): ${detail.quotaPause.reason}${
-                      detail.quotaPause.resumeAt ? ` · resumes ${formatResetCountdown(detail.quotaPause.resumeAt)}` : " · press r in /runs to resume or w to set a wait"
-                    }`,
-                  ),
-                ]
-              : []),
-            ...detail.tasks.map(
-              (t) =>
-                `${"  ".repeat(t.tier - 1)}• [T${t.tier}:${t.status}] ${theme.accent(t.id)} ${t.title} (${t.model ?? t.profileId})`,
-            ),
-          ];
-          if (detail.escalations.length > 0) {
-            lines.push(theme.warning(`Open escalations: ${detail.escalations.length}`));
-          }
-          appendSystem(lines, "info");
-        })
-        .catch((err) => appendError(err, "tree.get"));
+        .request<{ quotaPause?: RunQuotaPauseStatus | null }>("run.get", { runId })
+        .then((d) => openQuotaWaitPicker(runId, d.quotaPause?.reason ?? "Paused due to quota", d.quotaPause?.resumeAt ?? null))
+        .catch(() => openQuotaWaitPicker(runId));
     }
   };
 
-  const openRuns = () =>
-    openRunsOverlay({ client: opts.client, theme, overlays, onAction: onRunsAction, onError: (err) => appendError(err, "run.list") });
+  const openRuns = () => openRunsOverlay({ client: opts.client, theme, overlays, requestRender: () => tui.requestRender(), onAction: onRunsAction });
 
   const openWorktrees = () => {
     void opts.client
@@ -956,7 +995,7 @@ export async function runDirectorChatTui(opts: {
 
   unsubEvent = opts.client.onEvent((ev) => {
     // Frames tagged with a watchId belong to the overlay that started that watch.
-    if ("watchId" in ev && ev.watchId) return;
+    if (isWatchFrame(ev)) return;
     if (ev.type === "session.taken_over") {
       evictedByTakeover = true;
       const p = ev.payload as { sessionId?: string; reason?: string };
@@ -1078,7 +1117,7 @@ export async function runDirectorChatTui(opts: {
 }
 
 /**
- * Focused Run Stream TUI (`pi-harness attach <run-id>`); `Ctrl+T` opens `/runs`, where Enter on this run switches agent focus.
+ * Focused Run Stream TUI (`pi-harness attach <run-id>`); `Ctrl+T` opens the read-only `/runs` tree without detaching.
  */
 export async function runNativeScrollbackTui(opts: {
   client: DaemonClient;
@@ -1093,7 +1132,7 @@ export async function runNativeScrollbackTui(opts: {
     quotaPause?: RunQuotaPauseStatus | null;
   }>("tree.get", { runId: opts.runId });
 
-  let focusedTaskId: string | null = opts.initialTaskId ?? null;
+  const focusedTaskId: string | null = opts.initialTaskId ?? null;
   let lastSeq = 0;
   let run: RunRecord = snap.run;
   let tasks: TaskRecord[] = snap.tasks;
@@ -1175,35 +1214,9 @@ export async function runNativeScrollbackTui(opts: {
     }
   };
 
-  const openTree = () => {
-    let handle: ReturnType<OverlayManager["push"]> | null = null;
-    const comp = new TreeOverlay(
-      theme,
-      () => tasks,
-      () => escalations,
-      (selectedTaskId) => {
-        focusedTaskId = selectedTaskId;
-        streamContainer.addChild(new SystemCard(theme, [`Switched stream focus to ${focusedTaskId ?? "ALL"}`], "info"));
-        refreshStatus();
-        tui.requestRender();
-      },
-      () => handle?.close(),
-      () => handle?.rerender(),
-    );
-    handle = overlays.push(
-      {
-        title: "Agent Tree Switcher",
-        subtitle: `${tasks.length} tasks`,
-        footer: "↑/↓ move · Enter focus · Esc close",
-      },
-      comp,
-      { width: "86%" },
-    );
-  };
-
   const appendEvent = (ev: DaemonEventFrame) => {
     // Frames tagged with a watchId belong to the overlay that started that watch.
-    if ("watchId" in ev && ev.watchId) return;
+    if (isWatchFrame(ev)) return;
     if (ev.type === "session.taken_over") {
       evictedByTakeover = true;
       const p = ev.payload as { sessionId?: string };
@@ -1408,11 +1421,6 @@ export async function runNativeScrollbackTui(opts: {
     tui.requestRender();
   };
 
-  const switchToRun = (runId: string) => {
-    exitAction = { kind: "switch", targetId: runId, targetKind: "run" };
-    void term.shutdown(undefined, { overlays, spinner, cleanup: detachListenersOnly });
-  };
-
   const quitRun = () =>
     void term.shutdown(undefined, {
       overlays,
@@ -1462,36 +1470,32 @@ export async function runNativeScrollbackTui(opts: {
     );
   };
 
-  const onRunsAction = (action: RunsAction, target: RunRecord) => {
-    if (action === "inspect") {
-      if (target.id === opts.runId) openTree();
-      else switchToRun(target.id);
-    } else if (action === "resume") {
+  const onRunsAction = (action: RunsAction, runId: string) => {
+    if (action === "resume") {
       void opts.client
-        .request<{ resumed: boolean; resumedTaskIds: string[] }>("run.resume", { runId: target.id })
+        .request<{ resumed: boolean; resumedTaskIds: string[] }>("run.resume", { runId })
         .then((res) =>
           notice(
-            [res.resumed ? `Resumed ${target.id} (${res.resumedTaskIds.length} task(s)).` : `Run ${target.id} had no quota-paused tasks.`],
+            [res.resumed ? `Resumed ${runId} (${res.resumedTaskIds.length} task(s)).` : `Run ${runId} had no quota-paused tasks.`],
             res.resumed ? "success" : "muted",
           ),
         )
         .catch((err) => runError(err, "run.resume"));
     } else if (action === "wait") {
-      if (target.id === opts.runId) {
-        openQuotaWaitPicker(target.id, quotaPause?.reason ?? "Paused due to quota limit", quotaPause?.resumeAt ?? null);
+      if (runId === opts.runId) {
+        openQuotaWaitPicker(runId, quotaPause?.reason ?? "Paused due to quota limit", quotaPause?.resumeAt ?? null);
       } else {
         void opts.client
-          .request<{ quotaPause?: RunQuotaPauseStatus | null }>("run.get", { runId: target.id })
-          .then((d) => openQuotaWaitPicker(target.id, d.quotaPause?.reason ?? "Paused due to quota", d.quotaPause?.resumeAt ?? null))
-          .catch(() => openQuotaWaitPicker(target.id, "Paused due to quota", null));
+          .request<{ quotaPause?: RunQuotaPauseStatus | null }>("run.get", { runId })
+          .then((d) => openQuotaWaitPicker(runId, d.quotaPause?.reason ?? "Paused due to quota", d.quotaPause?.resumeAt ?? null))
+          .catch(() => openQuotaWaitPicker(runId, "Paused due to quota", null));
       }
     } else {
-      stopRun(target.id);
+      stopRun(runId);
     }
   };
 
-  const openRuns = () =>
-    openRunsOverlay({ client: opts.client, theme, overlays, attachedRun: run, onAction: onRunsAction, onError: () => openTree() });
+  const openRuns = () => openRunsOverlay({ client: opts.client, theme, overlays, requestRender: () => tui.requestRender(), onAction: onRunsAction });
 
   const runRunCommand = (cmd: SlashCommand, arg: string) => {
     switch (cmd.name) {
