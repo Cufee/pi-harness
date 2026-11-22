@@ -226,7 +226,14 @@ function createSharedShell(spec: SharedShellContext) {
         currentModel: cur.model,
         currentEffort: cur.effort,
         onSelected: (sel) => {
-          void spec.onModelUpdated?.(sel);
+          void spec.onModelUpdated?.(sel).catch((err) => {
+            transcript.appendReceipt({
+              tone: "danger",
+              tag: "model",
+              text: err instanceof Error ? err.message : String(err),
+            });
+            session.tui.requestRender();
+          });
         },
       }),
     );
@@ -241,7 +248,14 @@ function createSharedShell(spec: SharedShellContext) {
         currentEffort: cur.effort,
         modelLabel: label,
         onSelected: (effort) => {
-          void spec.onEffortUpdated?.(effort);
+          void spec.onEffortUpdated?.(effort).catch((err) => {
+            transcript.appendReceipt({
+              tone: "danger",
+              tag: "effort",
+              text: err instanceof Error ? err.message : String(err),
+            });
+            session.tui.requestRender();
+          });
         },
       }),
     );
@@ -382,7 +396,16 @@ function createSharedShell(spec: SharedShellContext) {
         return true;
       case "effort":
         if (parsed.args && spec.onEffortUpdated) {
-          await spec.onEffortUpdated(parsed.args);
+          try {
+            await spec.onEffortUpdated(parsed.args);
+          } catch (err) {
+            transcript.appendReceipt({
+              tone: "danger",
+              tag: "effort",
+              text: err instanceof Error ? err.message : String(err),
+            });
+            session.tui.requestRender();
+          }
           return true;
         }
         openEffort();
@@ -492,18 +515,26 @@ function createSharedShell(spec: SharedShellContext) {
           openWork("runs");
           return true;
         }
-        const inMatch = parsed.args.match(/^in\s+(.+)$/i);
-        if (inMatch) {
-          const delayMs = parseDurationMs(inMatch[1]!);
-          if (!delayMs) {
-            transcript.appendReceipt({ tone: "warn", tag: "resume", text: `Invalid duration: ${inMatch[1]}` });
+        try {
+          const inMatch = parsed.args.match(/^in\s+(.+)$/i);
+          if (inMatch) {
+            const delayMs = parseDurationMs(inMatch[1]!);
+            if (!delayMs) {
+              transcript.appendReceipt({ tone: "warn", tag: "resume", text: `Invalid duration: ${inMatch[1]}` });
+            } else {
+              await spec.client.request("run.schedule_resume", { runId: spec.runId, delayMs });
+              transcript.appendReceipt({ tone: "ok", tag: "resume", text: `Scheduled resume in ${formatDuration(delayMs)}` });
+            }
           } else {
-            await spec.client.request("run.schedule_resume", { runId: spec.runId, delayMs });
-            transcript.appendReceipt({ tone: "ok", tag: "resume", text: `Scheduled resume in ${formatDuration(delayMs)}` });
+            await spec.client.request("run.resume", { runId: spec.runId, message: parsed.args || undefined });
+            transcript.appendReceipt({ tone: "ok", tag: "resume", text: `Resumed ${spec.runId}` });
           }
-        } else {
-          await spec.client.request("run.resume", { runId: spec.runId, message: parsed.args || undefined });
-          transcript.appendReceipt({ tone: "ok", tag: "resume", text: `Resumed ${spec.runId}` });
+        } catch (err) {
+          transcript.appendReceipt({
+            tone: "danger",
+            tag: "resume",
+            text: err instanceof Error ? err.message : String(err),
+          });
         }
         session.tui.requestRender();
         return true;
@@ -544,10 +575,24 @@ function createSharedShell(spec: SharedShellContext) {
       const text = raw.trim();
       if (!text) return;
       if (text.startsWith("/")) {
-        void handleSlash(text);
+        void handleSlash(text).catch((err) => {
+          transcript.appendReceipt({
+            tone: "danger",
+            tag: "cmd",
+            text: err instanceof Error ? err.message : String(err),
+          });
+          session.tui.requestRender();
+        });
         return;
       }
-      void spec.onUserSubmit(text);
+      void spec.onUserSubmit(text).catch((err) => {
+        transcript.appendReceipt({
+          tone: "danger",
+          tag: "error",
+          text: err instanceof Error ? err.message : String(err),
+        });
+        session.tui.requestRender();
+      });
     },
   });
 
@@ -630,13 +675,15 @@ function createSharedShell(spec: SharedShellContext) {
       return { consume: true };
     }
 
-    // Alt+1..Alt+5 jump straight into numbered dock attention slot
-    if (data.length === 2 && data[0] === "\x1b" && data[1]! >= "1" && data[1]! <= "5") {
-      const slotIdx = Number(data[1]) - 1;
-      const slot = dock.slots[slotIdx];
-      if (slot) {
-        openEntity(slot.ref);
-        return { consume: true };
+    // Alt+1..Alt+5 jump straight into numbered dock attention slot (supports legacy ESC+digit, Kitty CSI u, and modifyOtherKeys)
+    const altKeys = ["alt+1", "alt+2", "alt+3", "alt+4", "alt+5"] as const;
+    for (let i = 0; i < altKeys.length; i++) {
+      if (matchesKey(data, altKeys[i]!)) {
+        const slot = dock.slots[i];
+        if (slot) {
+          openEntity(slot.ref);
+          return { consume: true };
+        }
       }
     }
 
@@ -721,6 +768,8 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   let chatSession = opened.session;
   let activeTurnId: string | null = opened.activeTurnId;
   let sending = opened.busy;
+  let turnFrozeSegments = false;
+  const frozenTextSet = new Set<string>();
   const settledTurns = new Set<string>();
 
   const modelBadge = () => {
@@ -743,10 +792,26 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       if (activeTurnId && activeTurnId !== turnId) return;
     }
 
+    let frozenSegments = 0;
     const snap = shell.transcript.liveTail.snapshot();
-    const finalText = optsSettle.finalText ?? snap.text;
+    // If mid-turn cards/steers already froze earlier streamed text, only append the post-card tail segment!
+    const finalText = turnFrozeSegments
+      ? snap.text.trim()
+        ? snap.text
+        : optsSettle.finalText && optsSettle.finalText.trim() && !frozenTextSet.has(optsSettle.finalText.trim())
+          ? optsSettle.finalText
+          : ""
+      : (optsSettle.finalText ?? snap.text);
     shell.transcript.liveTail.clear();
+    turnFrozeSegments = false;
+    frozenTextSet.clear();
+    frozenSegments = 0;
+    void frozenSegments;
 
+    // Append assistant turn BEFORE tool/error receipts so live tail freezes in place with zero scrollback wipe
+    if (finalText.trim()) {
+      shell.transcript.appendAssistantTurn(finalText, snap.modelLabel ?? modelBadge());
+    }
     if (snap.tools.length > 0) {
       const ref: EntityRef = {
         kind: "tool_call",
@@ -762,9 +827,6 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         text: `${snap.tools.length} call(s): ${snap.tools.map((t) => t.label).join(", ")}`,
         ref,
       });
-    }
-    if (finalText.trim()) {
-      shell.transcript.appendAssistantTurn(finalText, snap.modelLabel ?? modelBadge());
     }
     if (optsSettle.error) {
       shell.transcript.appendReceipt({
@@ -800,6 +862,9 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
             message: text,
           });
           if (res?.steered) {
+            if (shell.transcript.freezeLiveText()) {
+              turnFrozeSegments = true;
+            }
             shell.transcript.appendUserTurn(text);
             shell.transcript.appendReceipt({ tone: "info", tag: "steered", text: "Delivered live steering to Director" });
             shell.session.tui.requestRender();
@@ -816,10 +881,14 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         text: `Queued (${shell.queuedMessages.length}): ${firstLine(text, 80)}`,
       });
       shell.syncDock();
+      // If the active turn ended or cancelled while `chat.steer` was in flight, drain immediately!
+      if (!sending) drainQueue();
       return;
     }
 
     sending = true;
+    turnFrozeSegments = false;
+    frozenTextSet.clear();
     const turnId = `turn-${randomUUID().slice(0, 8)}`;
     activeTurnId = turnId;
     shell.transcript.appendUserTurn(text);
@@ -833,8 +902,20 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         turnId,
       });
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("Director is already responding") && activeTurnId !== turnId) {
+        // A wake turn started right before our send; queue our prompt so it runs right after!
+        shell.queuedMessages.unshift(text);
+        shell.transcript.appendReceipt({
+          tone: "info",
+          tag: "queued",
+          text: `Director busy with background wake — queued: ${firstLine(text, 80)}`,
+        });
+        shell.syncDock();
+        return;
+      }
       // Idempotent settlement: if `chat.turn.end` already settled this turn, this is a safe no-op
-      settleTurn(turnId, { error: err instanceof Error ? err.message : String(err) });
+      settleTurn(turnId, { error: msg });
     }
   };
 
@@ -936,9 +1017,12 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     }
   }
 
-  if (opened.busy && (opened.activeText || opened.activePartial)) {
+  if (opened.busy) {
+    sending = true;
     shell.transcript.liveTail.begin(modelBadge());
-    shell.transcript.liveTail.appendText(opened.activeText || opened.activePartial);
+    // Seed from `activePartial` (only the unpersisted tail since last mid-turn flush) to avoid duplicating persisted turns!
+    const seed = opened.activePartial || (opened.history.length === 0 ? opened.activeText : "");
+    if (seed) shell.transcript.liveTail.appendText(seed);
     shell.setStatus(true, "Director responding...");
   }
 
@@ -966,6 +1050,8 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
 
       if (ev.type === "chat.turn.start") {
         sending = true;
+        turnFrozeSegments = false;
+        frozenTextSet.clear();
         activeTurnId = evTurnId ?? activeTurnId;
         shell.transcript.liveTail.begin(modelBadge());
         shell.setStatus(true, "Director responding...");
@@ -986,6 +1072,11 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       if (ev.type === "chat.steered") {
         const msg = typeof p.message === "string" ? firstLine(p.message, 80) : "";
         if (p.role !== "user" && msg) {
+          const prevSnap = shell.transcript.liveTail.snapshot().text.trim();
+          if (shell.transcript.freezeLiveText()) {
+            turnFrozeSegments = true;
+            if (prevSnap) frozenTextSet.add(prevSnap);
+          }
           shell.transcript.appendReceipt({ tone: "info", tag: "steer", text: msg });
           shell.session.tui.requestRender();
         }
@@ -996,6 +1087,11 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         // Structured tool-output cards (`present_result`, `goals_table`, `goal_detail`, `run_activity`)
         const display = extractDisplay(p);
         if (display) {
+          const prevSnap = shell.transcript.liveTail.snapshot().text.trim();
+          if (prevSnap) {
+            turnFrozeSegments = true;
+            frozenTextSet.add(prevSnap);
+          }
           shell.transcript.appendToolOutput(display);
           shell.session.tui.requestRender();
           return;
@@ -1176,12 +1272,14 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
     `Ctrl+G Work · Ctrl+T Runs · Ctrl+O Go · /resume · /stop`,
   );
 
+  let liveTaskId: string | null = null;
   const flushRunTail = () => {
     const snap = shell.transcript.liveTail.snapshot();
     if (snap.text.trim()) {
       shell.transcript.liveTail.clear();
-      shell.transcript.appendAssistantTurn(snap.text);
+      shell.transcript.appendAssistantTurn(snap.text, snap.modelLabel || undefined);
     }
+    liveTaskId = null;
   };
 
   const renderEventToTranscript = (ev: EventRecord | DaemonEventFrame) => {
@@ -1195,6 +1293,13 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
     if (ev.type === "agent.text_delta") {
       const txt = String(p.text ?? p.delta ?? "");
       if (txt) {
+        if (liveTaskId && liveTaskId !== who) {
+          flushRunTail();
+        }
+        if (!shell.transcript.liveTail.isActive) {
+          shell.transcript.liveTail.begin(who);
+        }
+        liveTaskId = who;
         shell.transcript.liveTail.appendText(txt);
         shell.session.tui.requestRender();
       }
@@ -1319,39 +1424,50 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
     }
   };
 
-  // Drain ALL paginated replay events (`attached.replay` + `replay.page` + fragments)
+  // Drain ALL paginated replay events (`attached.replay` + `replay.page` + fragments), aborting immediately on detach/close
   let closed = false;
-  await consumeReplay(
-    opts.client,
-    attached,
-    { attachmentId: attached.attachmentId },
-    (ev) => renderEventToTranscript(ev),
-    () => closed,
-  );
-
-  liveHandler = (ev) => {
-    if (ev.type === "session.taken_over") {
-      const sid = typeof (ev.payload as Record<string, unknown> | undefined)?.sessionId === "string"
-        ? String((ev.payload as Record<string, unknown>).sessionId)
-        : ev.runId;
-      if (sid && sid !== opts.runId) return;
-      void shell.session.stop();
-      return;
-    }
-    renderEventToTranscript(ev);
-  };
-  buffering = false;
-  for (const ev of earlyBuffer.splice(0)) liveHandler(ev);
-
   const detachClose = opts.client.onClose(() => {
     closed = true;
     void shell.session.stop();
   });
+  void shell.session.done.then(() => {
+    closed = true;
+  });
 
-  await shell.store.refresh();
-  const action = await shell.waitAndCleanup();
-  closed = true;
-  detachEvents();
-  detachClose();
-  return action;
+  try {
+    await consumeReplay(
+      opts.client,
+      attached,
+      { attachmentId: attached.attachmentId },
+      (ev) => renderEventToTranscript(ev),
+      () => closed,
+    );
+
+    if (!closed) {
+      liveHandler = (ev) => {
+        if (ev.type === "session.taken_over") {
+          const sid = typeof (ev.payload as Record<string, unknown> | undefined)?.sessionId === "string"
+            ? String((ev.payload as Record<string, unknown>).sessionId)
+            : ev.runId;
+          if (sid && sid !== opts.runId) return;
+          void shell.session.stop();
+          return;
+        }
+        renderEventToTranscript(ev);
+      };
+      buffering = false;
+      for (const ev of earlyBuffer.splice(0)) liveHandler(ev);
+      await shell.store.refresh();
+    }
+    return await shell.waitAndCleanup();
+  } catch (err) {
+    closed = true;
+    await shell.session.stop();
+    await shell.waitAndCleanup().catch(() => {});
+    throw err;
+  } finally {
+    closed = true;
+    detachEvents();
+    detachClose();
+  }
 }

@@ -103,6 +103,21 @@ export class LiveTurnTail implements Component {
     const out: string[] = [];
     const g = this.theme.glyphs;
 
+    if (this.text.trim()) {
+      out.push("");
+      if (this.modelLabel) {
+        out.push(clamp(` ${this.theme.accent(g.diamond)} ${this.theme.muted(sanitizeLine(this.modelLabel))}`, w));
+      }
+      const md = new Markdown(sanitizeText(this.text).trim(), 1, 0, this.theme.toMarkdownTheme());
+      out.push(...md.render(w).map((l) => clamp(l, w)));
+    } else if (this.thought.trim()) {
+      const last = sanitizeLine(this.thought.trim().split("\n").slice(-1)[0] ?? "");
+      if (last) {
+        out.push(clamp(this.theme.dim(`  … ${last}`), w));
+      }
+    }
+
+    // Volatile live tool pills render strictly BELOW live text so status transitions never shift prior lines.
     if (this.tools.length > 0) {
       const recent = this.tools.slice(-4);
       const hidden = this.tools.length - recent.length;
@@ -116,22 +131,17 @@ export class LiveTurnTail implements Component {
       out.push(clamp(`  ${prefix}${parts.join(this.theme.muted(` ${g.sep} `))}`, w));
     }
 
-    if (this.thought.trim() && !this.text.trim()) {
-      const last = sanitizeLine(this.thought.trim().split("\n").slice(-1)[0] ?? "");
-      if (last) {
-        out.push(clamp(this.theme.dim(`  … ${last}`), w));
-      }
-    }
-
-    if (this.text.trim()) {
-      if (this.modelLabel) {
-        out.push(clamp(` ${this.theme.accent(g.diamond)} ${this.theme.muted(sanitizeLine(this.modelLabel))}`, w));
-      }
-      const md = new Markdown(sanitizeText(this.text), 1, 0, this.theme.toMarkdownTheme());
-      out.push(...md.render(w).map((l) => clamp(l, w)));
-    }
-
     return out;
+  }
+
+  /** Consumes and returns accumulated live text (preserving active state/tools/model for continued streaming). */
+  takeText(): { text: string; modelLabel: string } {
+    const text = this.text;
+    const modelLabel = this.modelLabel ?? "";
+    this.text = "";
+    this.thought = "";
+    this.modelLabel = undefined;
+    return { text, modelLabel };
   }
 
   invalidate(): void {}
@@ -227,10 +237,23 @@ export class ImmutableTranscript extends Container {
   }
 
   /**
+   * Freezes any streamed live text into an immutable AssistantCard before appending a mid-turn card or receipt,
+   * preserving exact chronological order and avoiding scrollback wipes.
+   */
+  freezeLiveText(): boolean {
+    if (!this.liveTail.isActive) return false;
+    const { text, modelLabel } = this.liveTail.takeText();
+    if (!text.trim()) return false;
+    this.appendAssistantTurn(text, modelLabel || undefined);
+    return true;
+  }
+
+  /**
    * Immutable structured Tool-Output Card (`goals_table`, `goal_detail`, `run_activity`).
    * Identical layout both live (from `chat.tool`) and replayed (from `turn.role === "tool_output"`).
    */
   appendToolOutput(display: ToolDisplayPayload): void {
+    this.freezeLiveText();
     const t = this.theme;
     this.frozenContainer.addChild(
       new FrozenBlock((w) => ["", ...renderToolOutput(display, w, t)]),
@@ -257,6 +280,7 @@ export class ImmutableTranscript extends Container {
     text: string;
     ref?: EntityRef;
   }): void {
+    this.freezeLiveText();
     const t = this.theme;
     const glyph = opts.glyph ?? t.glyphs.bullet;
     const tone = opts.tone ?? "muted";
@@ -303,14 +327,11 @@ export interface DockState {
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /**
- * Editor subclass that captures undo snapshots on normal typing directly inside `handleInput`
- * (so `Ctrl+Z` / `Ctrl+-` works seamlessly when the editor holds focus) and renders a `› ` prompt cue
- * inside its 2-column horizontal padding without shifting cursor geometry.
+ * Editor subclass that maps `Ctrl+Z` to base `Editor`'s native undo (preserving multi-paste payloads,
+ * clearing on submit, and undoing cleanly back to `""`) and renders a `› ` prompt cue inside its
+ * 2-column horizontal padding without shifting cursor geometry.
  */
 export class UndoableEditor extends Editor {
-  private readonly undoHistory: string[] = [];
-  private lastUndoValue = "";
-
   constructor(
     tui: TUI,
     private readonly harnessTheme: Theme,
@@ -319,27 +340,16 @@ export class UndoableEditor extends Editor {
   }
 
   clearUndoHistory(): void {
-    this.undoHistory.length = 0;
-    this.lastUndoValue = "";
+    // Base Editor manages and clears its own undoStack on submit/setText.
   }
 
   override handleInput(data: string): void {
-    if (matchesKey(data, "ctrl+z") || matchesKey(data, "ctrl+-")) {
-      const prev = this.undoHistory.pop();
-      if (prev !== undefined) {
-        this.setText(prev);
-        this.lastUndoValue = prev;
-      }
+    if (matchesKey(data, "ctrl+z")) {
+      // Delegate to pi-tui Editor's native undo (Ctrl+- / \x1f) which restores `{ state, pastes, pasteCounter }`.
+      super.handleInput("\x1f");
       return;
     }
-    const before = this.getText();
     super.handleInput(data);
-    const after = this.getText();
-    if (after !== before && before !== this.lastUndoValue) {
-      this.undoHistory.push(before);
-      if (this.undoHistory.length > 50) this.undoHistory.shift();
-      this.lastUndoValue = before;
-    }
   }
 
   override render(width: number): string[] {

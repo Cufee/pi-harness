@@ -71,32 +71,42 @@ export class QuotaWaitPickerScreen implements Screen {
     );
   }
 
+  private submitting = false;
+
   onShow(ctx: ScreenContext): void {
     this.nav = ctx.navigator;
   }
 
   private async applyChoice(choice: WaitChoice, ctx: ScreenContext): Promise<void> {
+    if (this.submitting) return;
     if (choice.id === "custom") {
       this.frame.askPrompt({
         label: "Wait duration (e.g. 90s, 15m, 1h30m)",
         placeholder: "15m",
         onSubmit: async (raw) => {
+          if (this.submitting) return;
           const delayMs = parseDurationMs(raw);
           if (!delayMs) {
             this.frame.setNotice(`Invalid duration "${raw}" — try 90s, 15m, or 1h30m`, "warn");
             ctx.requestRender();
             return;
           }
-          await this.client.request("run.schedule_resume", { runId: this.opts.runId, delayMs });
-          const msg = `Scheduled ${this.opts.runId} to resume in ${formatDuration(delayMs)}`;
-          await this.opts.onDone?.(msg);
-          ctx.navigator.pop();
+          this.submitting = true;
+          try {
+            await this.client.request("run.schedule_resume", { runId: this.opts.runId, delayMs });
+            const msg = `Scheduled ${this.opts.runId} to resume in ${formatDuration(delayMs)}`;
+            await this.opts.onDone?.(msg);
+            if (ctx.navigator.current === this) ctx.navigator.pop();
+          } finally {
+            this.submitting = false;
+          }
         },
       });
       ctx.requestRender();
       return;
     }
 
+    this.submitting = true;
     try {
       if (choice.id === "now") {
         await this.client.request("run.resume", { runId: this.opts.runId });
@@ -105,10 +115,12 @@ export class QuotaWaitPickerScreen implements Screen {
         await this.client.request("run.schedule_resume", { runId: this.opts.runId, delayMs: choice.delayMs });
         await this.opts.onDone?.(`Scheduled ${this.opts.runId} to resume in ${formatDuration(choice.delayMs)}`);
       }
-      ctx.navigator.pop();
+      if (ctx.navigator.current === this) ctx.navigator.pop();
     } catch (err) {
       this.frame.setNotice(err instanceof Error ? err.message : String(err), "danger");
       ctx.requestRender();
+    } finally {
+      this.submitting = false;
     }
   }
 
@@ -134,7 +146,23 @@ export class QuotaWaitPickerScreen implements Screen {
   handleInput(data: string, ctx: ScreenContext): void {
     if (this.frame.handleInlineInput(data, ctx.requestRender)) return;
 
+    if (this.list.isFiltering) {
+      const res = this.list.handleInput(data);
+      if (res === "select") {
+        const sel = this.list.selectedItem()?.value;
+        if (sel) void this.applyChoice(sel, ctx);
+        return;
+      }
+      ctx.requestRender();
+      return;
+    }
+
     if (isPopKey(data, ctx)) {
+      if (this.list.query) {
+        this.list.clearFilter();
+        ctx.requestRender();
+        return;
+      }
       ctx.navigator.pop();
       return;
     }

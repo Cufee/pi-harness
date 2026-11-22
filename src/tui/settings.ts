@@ -73,6 +73,7 @@ class AddCliDialogScreen implements Screen {
   readonly title = "Add ACP CLI";
   private readonly frame = new Frame();
   private nav: Navigator | null = null;
+  private submitting = false;
   private readonly list = new TableListView<{ kind: "preset"; key: string } | { kind: "custom" }>({
     columns: [
       { key: "id", header: "PROFILE", width: 18, priority: 0 },
@@ -132,55 +133,84 @@ class AddCliDialogScreen implements Screen {
   handleInput(data: string, ctx: ScreenContext): void {
     if (this.frame.handleInlineInput(data, ctx.requestRender)) return;
 
+    if (this.list.isFiltering) {
+      const res = this.list.handleInput(data);
+      if (res === "select") this.selectCurrent(ctx);
+      else ctx.requestRender();
+      return;
+    }
+
     if (isPopKey(data, ctx)) {
+      if (this.list.query) {
+        this.list.clearFilter();
+        ctx.requestRender();
+        return;
+      }
       ctx.navigator.pop();
       return;
     }
 
     const res = this.list.handleInput(data);
     if (res === "select") {
-      const sel = this.list.selectedItem()?.value;
-      if (!sel) return;
-      if (sel.kind === "preset") {
-        const preset = ACP_PROFILE_PRESETS[sel.key];
-        if (!preset) return;
-        const profile: AcpProfileConfig = { id: `acp:${sel.key}`, ...preset };
-        void this.onAdd(profile)
-          .then(() => ctx.navigator.pop())
-          .catch((err) => {
-            this.frame.setNotice(err instanceof Error ? err.message : String(err), "danger");
-            ctx.requestRender();
-          });
-        return;
-      }
-      this.frame.askPrompt({
-        label: "Custom CLI (<id> <cmd> [args...])",
-        placeholder: "acp:mycli mycli --acp",
-        onSubmit: async (raw) => {
-          const parts = raw.split(/\s+/).filter(Boolean);
-          if (parts.length < 2) {
-            this.frame.setNotice("Need at least <id> and <command>", "warn");
-            ctx.requestRender();
-            return;
-          }
-          const [id, command, ...args] = parts;
-          const profile: AcpProfileConfig = {
-            id: id!,
-            kind: "acp",
-            adapter: "generic",
-            command: command!,
-            args,
-            billing: "subscription",
-            enabled: true,
-          };
-          await this.onAdd(profile);
-          ctx.navigator.pop();
-        },
-      });
-      ctx.requestRender();
+      this.selectCurrent(ctx);
       return;
     }
     if (res === "handled") ctx.requestRender();
+  }
+
+  private selectCurrent(ctx: ScreenContext): void {
+    if (this.submitting) return;
+    const sel = this.list.selectedItem()?.value;
+    if (!sel) return;
+    if (sel.kind === "preset") {
+      const preset = ACP_PROFILE_PRESETS[sel.key];
+      if (!preset) return;
+      const profile: AcpProfileConfig = { id: `acp:${sel.key}`, ...preset };
+      this.submitting = true;
+      void this.onAdd(profile)
+        .then(() => {
+          if (ctx.navigator.current === this) ctx.navigator.pop();
+        })
+        .catch((err) => {
+          this.frame.setNotice(err instanceof Error ? err.message : String(err), "danger");
+          ctx.requestRender();
+        })
+        .finally(() => {
+          this.submitting = false;
+        });
+      return;
+    }
+    this.frame.askPrompt({
+      label: "Custom CLI (<id> <cmd> [args...])",
+      placeholder: "acp:mycli mycli --acp",
+      onSubmit: async (raw) => {
+        if (this.submitting) return;
+        const parts = raw.split(/\s+/).filter(Boolean);
+        if (parts.length < 2) {
+          this.frame.setNotice("Need at least <id> and <command>", "warn");
+          ctx.requestRender();
+          return;
+        }
+        const [id, command, ...args] = parts;
+        const profile: AcpProfileConfig = {
+          id: id!,
+          kind: "acp",
+          adapter: "generic",
+          command: command!,
+          args,
+          billing: "subscription",
+          enabled: true,
+        };
+        this.submitting = true;
+        try {
+          await this.onAdd(profile);
+          if (ctx.navigator.current === this) ctx.navigator.pop();
+        } finally {
+          this.submitting = false;
+        }
+      },
+    });
+    ctx.requestRender();
   }
 }
 
@@ -469,9 +499,13 @@ export class SettingsScreen implements Screen {
     }
   }
 
+  private configMutationSeq = 0;
+
   private async patchConfig(patch: Record<string, unknown>, notice: string, ctx: ScreenContext): Promise<void> {
+    const seq = ++this.configMutationSeq;
     try {
       const next = await this.client.request<HarnessConfig>("config.update", { patch });
+      if (seq !== this.configMutationSeq) return;
       this.config = next;
       this.opts?.onConfigChanged?.(next);
       this.rebuildCliList();
@@ -479,6 +513,7 @@ export class SettingsScreen implements Screen {
       if (this.modelsLoaded) this.rebuildModelList();
       this.frame.setNotice(notice, "ok");
     } catch (err) {
+      if (seq !== this.configMutationSeq) return;
       this.frame.setNotice(err instanceof Error ? err.message : String(err), "danger");
     }
     ctx.requestRender();
@@ -510,9 +545,11 @@ export class SettingsScreen implements Screen {
   }
 
   private async toggleCliProfile(profile: RunnerProfileConfig, ctx: ScreenContext): Promise<void> {
+    const seq = ++this.configMutationSeq;
     const updated: RunnerProfileConfig = { ...profile, enabled: profile.enabled === false };
     try {
       const next = await this.client.request<HarnessConfig>("profiles.upsert", { profile: updated });
+      if (seq !== this.configMutationSeq) return;
       this.config = next;
       this.opts?.onConfigChanged?.(next);
       this.rebuildCliList();

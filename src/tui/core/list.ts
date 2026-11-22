@@ -1,6 +1,6 @@
 import { fuzzyFilter, Input, matchesKey } from "@earendil-works/pi-tui";
 import { type ColumnSpec, computeColumnLayout, formatColumnRow } from "./layout.js";
-import { clamp, fillLineBg, fit, sanitizeLine } from "./text.js";
+import { clamp, fillLineBg, fit, sanitizeLine, visibleWidth } from "./text.js";
 import type { Theme } from "./tokens.js";
 import { parseMouseWheel, Viewport } from "./viewport.js";
 
@@ -167,6 +167,12 @@ export class ListView<T> {
       if (wheel.delta !== 0) {
         this.wheelScrolled = true;
         this.viewport.scrollBy(wheel.delta);
+        if (this.filtered.length > 0 && this.viewport.lastHeight > 0) {
+          const minVis = this.viewport.offset;
+          const maxVis = Math.min(this.filtered.length - 1, this.viewport.offset + this.viewport.lastHeight - 1);
+          if (this.selectedIdx < minVis) this.selectedIdx = minVis;
+          else if (this.selectedIdx > maxVis) this.selectedIdx = maxVis;
+        }
       }
       return "handled";
     }
@@ -249,8 +255,9 @@ export class ListView<T> {
     if (this.filterActive || this.filterQuery) {
       bodyHeight = Math.max(1, h - 1);
       if (this.filterActive) {
-        const rendered = (this.filterInput.render(Math.max(4, w - 3))[0] ?? "").replace(/^>\s?/, "");
         const countTag = this.filterQuery ? ` ${theme.dim(`(${this.filtered.length}/${this.allItems.length})`)}` : "";
+        const inpW = Math.max(4, w - 3 - visibleWidth(countTag));
+        const rendered = (this.filterInput.render(inpW)[0] ?? "").replace(/^>\s?/, "").trimEnd();
         out.push(clamp(`${theme.accentBold("/ ")}${rendered}${countTag}`, w));
       } else {
         out.push(

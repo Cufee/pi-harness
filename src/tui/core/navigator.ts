@@ -57,8 +57,11 @@ export class ModalScreen extends TuiMainScreen {
 
   protected override compositeOverlays(lines: string[], termWidth: number, termHeight: number): string[] {
     if (!this.hasOverlay()) return super.compositeOverlays(lines, termWidth, termHeight);
-    const viewportStart = Math.max(0, lines.length - termHeight);
-    const dimmed = lines.map((line, i) => (i >= viewportStart ? dimLine(line) : line));
+    const prevTop = this.captureRenderState().previousViewportTop;
+    const minLen = prevTop + termHeight;
+    const padded = lines.length < minLen ? [...lines, ...Array.from({ length: minLen - lines.length }, () => "")] : lines;
+    const viewportStart = Math.max(0, padded.length - termHeight, prevTop);
+    const dimmed = padded.map((line, i) => (i >= viewportStart ? dimLine(line) : line));
     return super.compositeOverlays(dimmed, termWidth, termHeight);
   }
 }
@@ -92,9 +95,12 @@ export function isPopKey(data: string, ctx: ScreenContext, opts?: { allowQ?: boo
   return false;
 }
 
-/**
- * Single modal/sheet stack manager with breadcrumbs and overlay-only mouse-wheel capture.
- */
+function computeOverlayHeight(termRows: number, isDialog: boolean): number {
+  const rows = Math.max(8, Math.floor(termRows || 30));
+  const maxByMargin = Math.max(6, rows - 2);
+  const desired = isDialog ? Math.min(26, Math.floor(rows * 0.78)) : Math.floor(rows * 0.88);
+  return Math.max(6, Math.min(maxByMargin, desired));
+}
 export class Navigator {
   private stack: Screen[] = [];
   private handle: OverlayHandle | null = null;
@@ -113,8 +119,7 @@ export class Navigator {
       render: (width: number) => {
         const top = this.current;
         if (!top) return [];
-        const rows = Math.max(10, this.terminal.rows || 30);
-        const maxH = top.variant === "dialog" ? Math.min(24, Math.max(12, rows - 6)) : Math.max(14, rows - 4);
+        const maxH = computeOverlayHeight(this.terminal.rows || 30, top.variant === "dialog");
         return top.render(width, maxH, this.theme);
       },
       invalidate: () => {},
@@ -192,6 +197,7 @@ export class Navigator {
     }
 
     const isDialog = top.variant === "dialog";
+    const maxH = computeOverlayHeight(this.terminal.rows || 30, isDialog);
     if (this.handle) {
       this.handle.hide();
       this.handle = null;
@@ -200,7 +206,7 @@ export class Navigator {
       anchor: isDialog ? "center" : "bottom-center",
       width: isDialog ? "80%" : "96%",
       minWidth: isDialog ? 46 : 54,
-      maxHeight: isDialog ? "78%" : "88%",
+      maxHeight: maxH,
       margin: { top: 1, bottom: 1, left: 1, right: 1 },
     });
     this.onChange?.();
@@ -348,17 +354,22 @@ export class TerminalSession {
         return { consume: true };
       }
 
-      // Ctrl+C: second press within 1.5s ALWAYS exits; first press clears overlay -> draft -> busy -> arms exit
+      // Ctrl+C: if an overlay is open, pop it cleanly without arming exit; otherwise clear draft -> stop turn -> 2x exit
       if (data === "\x03" || matchesKey(data, "ctrl+c")) {
         this.disarmEsc();
+        if (this.opts.isOverlayOpen?.()) {
+          this.disarmCtrlC();
+          this.opts.onInterrupt?.();
+          return { consume: true };
+        }
         const now = Date.now();
         if (now < this.ctrlCArmedUntil) {
           this.disarmCtrlC();
           void this.stop();
           return { consume: true };
         }
-        // Clear unsent draft first (when no overlay is open)
-        const hasDraft = !this.opts.isOverlayOpen?.() && (this.opts.getComposerText?.().length ?? 0) > 0;
+        // Clear unsent draft first
+        const hasDraft = (this.opts.getComposerText?.().length ?? 0) > 0;
         if (hasDraft) {
           this.opts.clearComposerText?.();
           this.armCtrlC("Draft cleared · press Ctrl+C again to exit");
@@ -366,7 +377,6 @@ export class TerminalSession {
         }
         const res = this.opts.onInterrupt?.() ?? "exit";
         if (res === "exit") {
-          // If draft/busy/overlay hooks are configured, require twice to exit; otherwise honor direct exit
           if (this.opts.onTransientHint) {
             this.armCtrlC("Press Ctrl+C again (or Ctrl+D) to detach & exit");
             return { consume: true };

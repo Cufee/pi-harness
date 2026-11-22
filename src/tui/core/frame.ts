@@ -250,12 +250,13 @@ export class Frame {
       out.push(boxRow(theme.warn(`${g.warn} ${sanitizeLine(this.confirmState.message)}  [${label}]`)));
     } else if (this.promptState) {
       const lbl = theme.accentBold(`${this.promptState.spec.label}: `);
-      const inpW = Math.max(4, innerW - visibleWidth(lbl) - 1);
-      const rendered = (this.promptState.input.render(inpW)[0] ?? "").replace(/^>\s?/, "");
       const placeholder =
         !this.promptState.input.getValue() && this.promptState.spec.placeholder
           ? ` ${theme.dim(this.promptState.spec.placeholder)}`
           : "";
+      const reserve = visibleWidth(lbl) + visibleWidth(placeholder);
+      const inpW = Math.max(4, innerW - reserve);
+      const rendered = (this.promptState.input.render(inpW)[0] ?? "").replace(/^>\s?/, "").trimEnd();
       out.push(boxRow(clamp(`${lbl}${rendered}${placeholder}`, innerW)));
     } else if (this.notice) {
       out.push(boxRow(theme.paint(this.notice.tone, this.notice.text)));

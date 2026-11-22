@@ -332,7 +332,13 @@ export class GoToPaletteScreen implements Screen {
   }
 
   handleInput(data: string, ctx: ScreenContext): void {
-    if (matchesKey(data, "escape") && !this.list.query) {
+    if (matchesKey(data, "escape")) {
+      if (this.list.query) {
+        this.list.clearFilter();
+        this.list.startFilter();
+        ctx.requestRender();
+        return;
+      }
       ctx.navigator.pop();
       return;
     }
@@ -617,12 +623,15 @@ export class ModelPickerScreen implements Screen {
     return true;
   }
 
+  private filterSaveSeq = 0;
+
   private saveModelFilter(
     patch: { modelFilterMode: "all" | "allowlist"; enabledModels: string[]; disabledModels: string[] },
     note: string,
     ctx: ScreenContext,
   ): void {
     if (!this.config) return;
+    const seq = ++this.filterSaveSeq;
     const nextCatalog = { ...this.config.catalog, ...patch };
     this.config = { ...this.config, catalog: nextCatalog };
     this.manageDirty = true;
@@ -632,11 +641,13 @@ export class ModelPickerScreen implements Screen {
     void this.client
       .request<HarnessConfig>("config.update", { patch: { catalog: nextCatalog } })
       .then((nextCfg) => {
+        if (seq !== this.filterSaveSeq) return;
         this.config = nextCfg;
         this.rebuildManage();
         ctx.requestRender();
       })
       .catch((err) => {
+        if (seq !== this.filterSaveSeq) return;
         this.frame.setNotice(err instanceof Error ? err.message : String(err), "danger");
         ctx.requestRender();
       });
@@ -1008,7 +1019,25 @@ export class EffortPickerScreen implements Screen {
   }
 
   handleInput(data: string, ctx: ScreenContext): void {
+    if (this.list.isFiltering) {
+      const res = this.list.handleInput(data);
+      if (res === "select") {
+        const sel = this.list.selectedItem()?.value;
+        if (sel) {
+          this.opts.onSelected(sel.value);
+          ctx.navigator.pop();
+        }
+        return;
+      }
+      ctx.requestRender();
+      return;
+    }
     if (isPopKey(data, ctx)) {
+      if (this.list.query) {
+        this.list.clearFilter();
+        ctx.requestRender();
+        return;
+      }
       ctx.navigator.pop();
       return;
     }

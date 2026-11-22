@@ -111,7 +111,13 @@ export class DaemonClient {
             else p.reject(new Error(frame.error ?? "Daemon RPC failed"));
           }
         } else if (frame.kind === "event") {
-          for (const fn of this.eventListeners) fn(frame);
+          for (const fn of this.eventListeners) {
+            try {
+              fn(frame);
+            } catch {
+              // Isolate listener errors so one faulty UI subscriber never disconnects the daemon socket.
+            }
+          }
         }
       },
       onError: () => this.handleDisconnect(transport),

@@ -87,6 +87,7 @@ export class WorkStore {
   private listeners = new Set<() => void>();
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private inflight: Promise<WorkSnapshot> | null = null;
+  private pendingRefresh = false;
   private disposed = false;
   private detachEvent: (() => void) | null = null;
   lastError: string | null = null;
@@ -144,7 +145,10 @@ export class WorkStore {
 
   async refresh(): Promise<WorkSnapshot> {
     if (this.disposed) return this.snapshot;
-    if (this.inflight) return this.inflight;
+    if (this.inflight) {
+      this.pendingRefresh = true;
+      return this.inflight;
+    }
     this.inflight = this.client
       .request<WorkSnapshot>("work.snapshot", {
         ...(this.scope.chatSessionId ? { chatSessionId: this.scope.chatSessionId } : {}),
@@ -164,6 +168,10 @@ export class WorkStore {
       })
       .finally(() => {
         this.inflight = null;
+        if (this.pendingRefresh && !this.disposed) {
+          this.pendingRefresh = false;
+          void this.refresh();
+        }
       });
     return this.inflight;
   }

@@ -181,18 +181,18 @@ describe("TUI v2 Core Primitives", () => {
     assert.ok(initial[2]!.includes("\x1b[48;"), "Selected row must paint full-width badgeBg surface");
     assert.equal(initial.some((l) => l.includes("\x1b[7m")), false, "Must not use harsh reverse video");
 
-    // Scroll down with SGR mouse wheel (selection stays at index 0, viewport scrolls freely!)
+    // Scroll down with SGR mouse wheel (viewport scrolls freely AND selection clamps into view so Enter acts on a visible row!)
     table.handleInput("\x1b[<65;10;5M\x1b[<65;10;5M");
     const afterWheel = table.render(50, 7, theme);
-    assert.equal(table.selectedIndex, 0);
+    assert.equal(table.selectedIndex, 6);
     assert.equal(afterWheel.some((l) => stripTerminalSequences(l).includes("Item number 1 ")), false);
     assert.ok(afterWheel.some((l) => stripTerminalSequences(l).includes("Item number 7")));
 
-    // Keyboard down snaps back cleanly
+    // Keyboard down advances from visible clamped selection cleanly
     table.handleInput("j");
-    assert.equal(table.selectedIndex, 1);
+    assert.equal(table.selectedIndex, 7);
     const afterKey = table.render(50, 7, theme);
-    assert.ok(afterKey.some((l) => stripTerminalSequences(l).includes("Item number 2")));
+    assert.ok(afterKey.some((l) => stripTerminalSequences(l).includes("Item number 8")));
 
     // Fuzzy filter + layered Escape
     const list = new ListView<string>();
@@ -468,12 +468,26 @@ describe("TUI v2 Core Primitives", () => {
     dock.update({ transientHint: "Press Esc again to stop active turn" });
     assert.equal(dock.render(80).length, idleH, "Transient hint must not change dock height");
 
-    // 3. UndoableEditor directly captures normal typing sent to dock.editor
+    // 3. UndoableEditor delegates Ctrl+Z to base Editor native undo (coalesced words undo all the way to "" and preserve paste payloads)
     dock.editor.handleInput("h");
     dock.editor.handleInput("i");
+    dock.editor.handleInput(" ");
+    dock.editor.handleInput("y");
+    assert.equal(dock.editor.getText(), "hi y");
+    dock.editor.handleInput("\x1a"); // Ctrl+Z undoes " y"
     assert.equal(dock.editor.getText(), "hi");
-    dock.editor.handleInput("\x1a"); // Ctrl+Z
-    assert.equal(dock.editor.getText(), "h");
+    dock.editor.handleInput("\x1a"); // Ctrl+Z undoes "hi" back to ""
+    assert.equal(dock.editor.getText(), "");
+
+    // 3b. ImmutableTranscript mid-turn appendToolOutput freezes earlier live text in exact chronological order
+    const trMid = new ImmutableTranscript(theme);
+    trMid.liveTail.begin("gpt-6.2");
+    trMid.liveTail.appendText("INTRO-SEGMENT");
+    trMid.appendToolOutput({ kind: "goals_table", title: "Session Goals", data: { goals: [] } });
+    trMid.liveTail.appendText("FINAL-SEGMENT");
+    const midText = trMid.render(80).map(stripTerminalSequences).join("\n");
+    assert.ok(midText.indexOf("INTRO-SEGMENT") < midText.indexOf("Goals"), "INTRO-SEGMENT must stay above mid-turn card");
+    assert.ok(midText.indexOf("Goals") < midText.indexOf("FINAL-SEGMENT"), "FINAL-SEGMENT must render below mid-turn card");
 
     // 4. RecentRefsRing & slash commands
     const ring = new RecentRefsRing(3);

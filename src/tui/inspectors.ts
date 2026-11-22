@@ -1377,12 +1377,12 @@ class ArtifactInspectorScreen implements Screen {
       ctx.requestRender();
       return;
     }
-    if (data === "n" && (this.result?.hasMore || this.result?.truncated)) {
+    if (data === "n" && !this.loading && (this.result?.hasMore || this.result?.truncated)) {
       this.offset += this.pageSize;
       void this.load(ctx);
       return;
     }
-    if (data === "p" && this.offset > 0) {
+    if (data === "p" && !this.loading && this.offset > 0) {
       this.offset = Math.max(0, this.offset - this.pageSize);
       void this.load(ctx);
       return;
@@ -1567,7 +1567,7 @@ class WorktreeInspectorScreen implements Screen {
           await this.deps.client.request("worktrees.clean", { repoRoot: this.deps.repoRoot, worktreeId: targetId });
           this.frame.setNotice(`Archived & removed ${targetId}`, "ok");
           await this.deps.store.refresh();
-          ctx.navigator.pop();
+          if (ctx.navigator.current === this) ctx.navigator.pop();
         },
       });
       ctx.requestRender();
@@ -1669,8 +1669,8 @@ export class LiveTranscriptScreen implements Screen {
   private detach: (() => void) | null = null;
   private earlyBuffer: DaemonEventFrame[] = [];
   private rawLines: string[] = [];
-  private textBuf = "";
-  private thoughtBuf = "";
+  private textBufByTask = new Map<string, string>();
+  private thoughtBufByTask = new Map<string, string>();
 
   constructor(
     private readonly runId: string,
@@ -1743,41 +1743,53 @@ export class LiveTranscriptScreen implements Screen {
     }
   }
 
-  private flushPendingBuffers(): void {
-    if (this.thoughtBuf.trim()) {
-      this.rawLines.push(`… ${sanitizeLine(this.thoughtBuf)}`);
-      this.thoughtBuf = "";
-    }
-    if (this.textBuf) {
-      this.rawLines.push(sanitizeLine(this.textBuf));
-      this.textBuf = "";
+  private flushPendingBuffers(taskKey?: string): void {
+    const keys = taskKey !== undefined ? [taskKey] : [...new Set([...this.thoughtBufByTask.keys(), ...this.textBufByTask.keys()])];
+    for (const k of keys) {
+      const prefix = !this.taskId && k !== "__run__" ? `[${k}] ` : "";
+      const th = this.thoughtBufByTask.get(k);
+      if (th && th.trim()) {
+        this.rawLines.push(`${prefix}… ${sanitizeLine(th)}`);
+      }
+      this.thoughtBufByTask.delete(k);
+      const tx = this.textBufByTask.get(k);
+      if (tx) {
+        this.rawLines.push(`${prefix}${sanitizeLine(tx)}`);
+      }
+      this.textBufByTask.delete(k);
     }
   }
 
   private ingestEvent(ev: EventRecord | DaemonEventFrame): void {
     const p = (ev.payload ?? {}) as Record<string, unknown>;
+    const taskKey = ev.taskId ?? "__run__";
     const who = !this.taskId && ev.taskId ? `[${ev.taskId}] ` : "";
 
     if (ev.type === "agent.text_delta") {
-      if (this.thoughtBuf.trim()) {
-        this.rawLines.push(`… ${sanitizeLine(this.thoughtBuf)}`);
-        this.thoughtBuf = "";
+      const th = this.thoughtBufByTask.get(taskKey);
+      if (th && th.trim()) {
+        this.rawLines.push(`${who}… ${sanitizeLine(th)}`);
+        this.thoughtBufByTask.delete(taskKey);
       }
       const delta = String(p.text ?? p.delta ?? "");
-      this.textBuf += delta;
-      const parts = this.textBuf.split(/\r?\n/);
-      this.textBuf = parts.pop() ?? "";
+      const combined = (this.textBufByTask.get(taskKey) ?? "") + delta;
+      const parts = combined.split(/\r?\n/);
+      const tail = parts.pop() ?? "";
+      if (tail) this.textBufByTask.set(taskKey, tail);
+      else this.textBufByTask.delete(taskKey);
       for (const line of parts) this.rawLines.push(`${who}${sanitizeLine(line)}`);
     } else if (ev.type === "agent.thought_delta") {
       const delta = String(p.text ?? p.delta ?? "");
-      this.thoughtBuf += delta;
-      const parts = this.thoughtBuf.split(/\r?\n/);
-      this.thoughtBuf = parts.pop() ?? "";
+      const combined = (this.thoughtBufByTask.get(taskKey) ?? "") + delta;
+      const parts = combined.split(/\r?\n/);
+      const tail = parts.pop() ?? "";
+      if (tail) this.thoughtBufByTask.set(taskKey, tail);
+      else this.thoughtBufByTask.delete(taskKey);
       for (const line of parts) {
         if (line.trim()) this.rawLines.push(`${who}… ${sanitizeLine(line)}`);
       }
     } else if (ev.type === "agent.tool") {
-      this.flushPendingBuffers();
+      this.flushPendingBuffers(taskKey);
       const name = formatToolLabel(String(p.title ?? p.name ?? p.toolName ?? "tool"));
       const st = String(p.status ?? "running");
       const icon = st === "completed" || st === "ok" ? "✓" : st === "failed" || st === "error" ? "✗" : "▶";
@@ -1826,11 +1838,20 @@ export class LiveTranscriptScreen implements Screen {
       rightHeader: this.viewport.follow ? theme.ok(`${theme.glyphs.running} live`) : theme.muted(this.viewport.statusText()),
       hints,
       renderBody: (innerW, bodyH) => {
-        const all = [
-          ...this.rawLines,
-          ...(this.thoughtBuf.trim() ? [theme.dim(`… ${sanitizeLine(this.thoughtBuf)}`)] : []),
-          ...(this.textBuf ? [sanitizeLine(this.textBuf)] : []),
-        ];
+        const trailing: string[] = [];
+        for (const [k, th] of this.thoughtBufByTask) {
+          if (th.trim()) {
+            const pfx = !this.taskId && k !== "__run__" ? `[${k}] ` : "";
+            trailing.push(theme.dim(`${pfx}… ${sanitizeLine(th)}`));
+          }
+        }
+        for (const [k, tx] of this.textBufByTask) {
+          if (tx) {
+            const pfx = !this.taskId && k !== "__run__" ? `[${k}] ` : "";
+            trailing.push(`${pfx}${sanitizeLine(tx)}`);
+          }
+        }
+        const all = [...this.rawLines, ...trailing];
         if (all.length === 0) return [theme.muted("Waiting for live events...")];
         const wrapped = all.flatMap((l) => wrap(l, innerW));
         return this.viewport.render(wrapped, innerW, bodyH, theme);
@@ -1850,7 +1871,11 @@ export class LiveTranscriptScreen implements Screen {
       return;
     }
     if (data === "y") {
-      yankText(this.rawLines.join("\n"), ctx.writeTerminal);
+      const copyLines = [
+        ...this.rawLines,
+        ...[...this.textBufByTask.entries()].filter(([, tx]) => tx).map(([k, tx]) => `${!this.taskId && k !== "__run__" ? `[${k}] ` : ""}${sanitizeLine(tx)}`),
+      ];
+      yankText(copyLines.join("\n"), ctx.writeTerminal);
       this.frame.setNotice("Copied transcript lines", "ok");
       ctx.requestRender();
       return;
