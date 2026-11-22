@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ModelCatalogCompiler } from "../catalog/compiler.js";
-import { createCodeModeExecutor } from "../code-mode/index.js";
-import type { HarnessConfig, RunnerProfileConfig } from "../config.js";
+import { createCodeModeExecutor, effectiveCodeMode } from "../code-mode/index.js";
+import type { HarnessConfig } from "../config.js";
+import { resolveLaunchRoute } from "../control-plane/launch-route.js";
+import { compactTaskHandoff, toolsForTier } from "../control-plane/tools.js";
+import { writeCodeOutput, writeTaskDossier } from "../control-plane/dossiers.js";
 import type { ControlPlaneDb } from "../control-plane/db.js";
 import type { CustomRunnerFactory, HarnessOrchestrator } from "../control-plane/orchestrator.js";
 import {
@@ -18,7 +21,7 @@ import { buildGoalDetailDisplay, buildGoalsTableDisplay, codeExecEventSink, summ
 import type { QuotaClient } from "../quota/client.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
-import type { RunnerCallbacks, ToolDefinition } from "../runners/types.js";
+import type { RunnerCallbacks, RunnerExecutionHandle, ToolDefinition } from "../runners/types.js";
 import { runGit } from "../worktree/manager.js";
 import { buildDirectorSystemPrompt, DirectorSessionStore, type ChatTurnRecord } from "./session.js";
 
@@ -49,7 +52,10 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
         },
         non_goals: { type: "array", items: { type: "string" } },
         max_review_cycles: { type: "number" },
-        commit_immediately: { type: "boolean", description: "Start autonomous Tier 1 execution right away" },
+        commit_immediately: { type: "boolean", description: "Start autonomous Tier 1 execution with the selected model" },
+        model: { type: "string", minLength: 1, description: "Required for immediate commit. Select from list_models." },
+        profile_id: { type: "string" },
+        effort: { type: "string" },
       },
     },
   },
@@ -58,7 +64,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
     description: "Commit a draft Goal Contract and launch its autonomous Tier 1 Run-Until-Done Orchestrator.",
     inputSchema: {
       type: "object",
-      required: ["goal_id"],
+      required: ["goal_id", "model"],
       properties: {
         goal_id: { type: "string" },
         profile_id: { type: "string" },
@@ -128,13 +134,14 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
       properties: { goal_id: { type: "string" } },
     },
   },
+  ...toolsForTier(1).filter(tool => ["spawn_task", "wait_tasks", "wait_children", "cancel_task", "artifact_read"].includes(tool.name)),
   {
     name: "read_file",
-    description: "Read-only inspection of a file in the repository to answer design or codebase questions directly.",
+    description: "Read up to 4096 bytes of workspace text as a logged exception. Delegate normal inspection to spawn_task.",
     inputSchema: {
       type: "object",
-      required: ["path"],
-      properties: { path: { type: "string" }, max_chars: { type: "number" } },
+      required: ["path", "exception_reason"],
+      properties: { path: { type: "string" }, exception_reason: { type: "string", minLength: 1 }, max_chars: { type: "number" } },
     },
   },
   {
@@ -161,6 +168,24 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   },
 ];
 
+interface ChatSelection {
+  repoRoot: string;
+  profileId?: string;
+  model?: string | null;
+  effort?: string | null;
+  title?: string;
+}
+
+interface ActiveChat {
+  abort: AbortController;
+  settled: Promise<void>;
+  partial: string;
+  flushedText: string;
+  handle?: RunnerExecutionHandle;
+  executor: ReturnType<typeof createCodeModeExecutor>;
+  onToolEvent: RunnerCallbacks["onToolEvent"];
+}
+
 /**
  * Tier 0 Interactive Director Runtime + Independent Goal Verification & Done-Review Coordinator.
  * Keeps conversational human UX completely decoupled from Tier 1 autonomous DAG rollovers.
@@ -168,27 +193,42 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
 export class DirectorRuntime {
   readonly chats: DirectorSessionStore;
   readonly goals: GoalEngine;
-  private activeChats = new Map<string, {
-    abort: AbortController;
-    executor: ReturnType<typeof createCodeModeExecutor>;
-    onToolEvent: RunnerCallbacks["onToolEvent"];
-  }>();
-  private activeReviewGoalIds = new Set<string>();
+  private activeChats = new Map<string, ActiveChat>();
+  private activeReviews = new Map<string, AbortController>();
 
   constructor(
     private readonly db: ControlPlaneDb,
     private config: HarnessConfig,
-    private readonly catalog: ModelCatalogCompiler,
-    private readonly quota: QuotaClient,
+    private catalog: ModelCatalogCompiler,
+    private quota: QuotaClient,
     private readonly orchestrator: HarnessOrchestrator,
     private readonly customRunnerFactory?: CustomRunnerFactory,
   ) {
     this.chats = new DirectorSessionStore(db.db);
-    this.goals = new GoalEngine(db.db);
+    this.goals = new GoalEngine(db.db, (id) => this.activeReviews.get(id)?.abort(new Error("Goal changed during review")));
   }
 
-  updateConfig(next: HarnessConfig): void {
+  updateConfig(next: HarnessConfig, catalog = this.orchestrator.catalog, quota = this.orchestrator.quota): void {
     this.config = next;
+    this.catalog = catalog;
+    this.quota = quota;
+  }
+
+  private async resolveChatSelection(input: ChatSelection) {
+    const { profile, model } = await resolveLaunchRoute(this.config, {
+      tier: 0, cwd: input.repoRoot, profileId: input.profileId, model: input.model, catalog: this.catalog, quota: this.quota,
+    });
+    return { ...input, profileId: profile.id, model };
+  }
+
+  async createChat(input: ChatSelection) {
+    return this.chats.createSession(await this.resolveChatSelection(input));
+  }
+
+  async openDefaultChat(input: ChatSelection) {
+    const existing = this.chats.getWorkspaceSession(input.repoRoot);
+    if (existing) return existing;
+    return this.chats.getOrCreateDefault(await this.resolveChatSelection(input));
   }
 
   activeChatCount(): number {
@@ -196,20 +236,11 @@ export class DirectorRuntime {
   }
 
   activeReviewCount(): number {
-    return this.activeReviewGoalIds.size;
+    return this.activeReviews.size;
   }
 
   isChatBusy(chatSessionId: string): boolean {
     return this.activeChats.has(chatSessionId);
-  }
-
-  private resolveProfile(profileId?: string): RunnerProfileConfig {
-    const wanted = profileId ?? this.config.defaultOrchestratorProfile;
-    const found =
-      (wanted ? this.config.profiles.find((p) => p.id === wanted) : undefined) ??
-      this.config.profiles.find((p) => p.enabled !== false);
-    if (!found) throw new Error("No enabled runner profile configured. Open /settings to add an ACP CLI or pi profile.");
-    return found;
   }
 
   async commitGoal(goalId: string, opts?: { profileId?: string; model?: string; effort?: string }): Promise<GoalRecord> {
@@ -292,29 +323,53 @@ export class DirectorRuntime {
    * Executes the full deterministic Verification Gates -> Independent Skeptical Done-Review pipeline.
    * Never lets the generator self-approve: invokes a fresh read-only Reviewer session (or fails fast at $0 LLM cost on deterministic gates).
    */
-  async verifyAndReviewGoal(goalId: string): Promise<{
+  async verifyAndReviewGoal(goalId: string, signal?: AbortSignal): Promise<{
     goal: GoalRecord;
     review: GoalReviewVerdict;
     circuitBreakerTripped?: string;
   }> {
-    this.activeReviewGoalIds.add(goalId);
+    if (this.activeReviews.has(goalId)) throw new Error(`Review already in progress for ${goalId}`);
+    const goal = this.goals.getGoal(goalId);
+    if (!goal) throw new Error(`Unknown goal ${goalId}`);
+    if (goal.status === "paused" || goal.status === "cancelled") throw new Error(`Goal is ${goal.status}`);
+    const abort = new AbortController();
+    this.activeReviews.set(goalId, abort);
+    const reviewSignal = signal ? AbortSignal.any([abort.signal, signal]) : abort.signal;
+    const unsubscribe = this.db.onEvent(ev => {
+      if (ev.runId !== goal.linkedRunId || ev.type !== "run.status") return;
+      if ((ev.payload as { status: string }).status === "stopped") abort.abort(new Error("Run stopped during review"));
+    });
     try {
-      return await this.verifyAndReviewGoalInner(goalId);
+      return await this.verifyAndReviewGoalInner(goal, reviewSignal);
+    } catch (error) {
+      const current = this.goals.getGoal(goalId);
+      if (current?.version === goal.version && (current.status === "verifying" || current.status === "reviewing")) {
+        this.goals.setStatus(goalId, goal.status);
+      }
+      throw error;
     } finally {
-      this.activeReviewGoalIds.delete(goalId);
+      unsubscribe();
+      this.activeReviews.delete(goalId);
     }
   }
 
-  private async verifyAndReviewGoalInner(goalId: string): Promise<{
+  private async verifyAndReviewGoalInner(goal: GoalRecord, signal: AbortSignal): Promise<{
     goal: GoalRecord;
     review: GoalReviewVerdict;
     circuitBreakerTripped?: string;
   }> {
-    const goal = this.goals.getGoal(goalId);
-    if (!goal) throw new Error(`Unknown goal ${goalId}`);
-
     const run = goal.linkedRunId ? this.db.getRun(goal.linkedRunId) : null;
-    const gateResult = await this.goals.runDeterministicGates(goal.id, run?.baseSha);
+    const assertCurrent = () => {
+      signal.throwIfAborted();
+      const current = this.goals.getGoal(goal.id);
+      if (current?.version !== goal.version || current.status === "paused" || current.status === "cancelled" ||
+          (run && this.db.getRun(run.id)?.status === "stopped")) {
+        throw new Error(`Goal ${goal.id} changed or stopped during review`);
+      }
+    };
+    assertCurrent();
+    const gateResult = await this.goals.runDeterministicGates(goal.id, run?.baseSha, signal);
+    assertCurrent();
 
     // If deterministic gates failed, record immediately without burning LLM review tokens!
     if (!gateResult.allPassed) {
@@ -330,7 +385,6 @@ export class DirectorRuntime {
     }
 
     // All deterministic checks passed -> spawn fresh read-only Independent Skeptical Reviewer
-    this.goals.setStatus(goal.id, "reviewing");
     let diffStat = "";
     try {
       diffStat = (await runGit(goal.repoRoot, run?.baseSha ? ["diff", "--stat", `${run.baseSha}..HEAD`] : ["status", "--short"])).stdout;
@@ -339,7 +393,9 @@ export class DirectorRuntime {
     }
 
     const reviewerPrompt = this.goals.buildReviewerPrompt(goal, gateResult, diffStat);
-    const profile = this.resolveProfile(this.config.defaultOrchestratorProfile);
+    const { profile, model, wireModel } = await resolveLaunchRoute(this.config, {
+      tier: 3, cwd: goal.repoRoot, catalog: this.catalog, quota: this.quota, toolPolicy: "read_only_workspace",
+    });
     const runner = this.customRunnerFactory
       ? this.customRunnerFactory(profile)
       : profile.kind === "acp"
@@ -372,41 +428,60 @@ export class DirectorRuntime {
     // Persist the reviewer as a Tier 3 verify task under the goal's linked run so it shows up in
     // runs.trees and its transcript is replayable / watchable like any orchestrator agent.
     const cycle = goal.reviewCycle + 1;
-    const reviewerTask = run
-      ? this.db.createTask({
-          runId: run.id,
-          parentId: this.db.listTasks(run.id).find((t) => t.tier === 1)?.id ?? null,
-          tier: 3,
-          kind: "verify",
-          title: `Done-Review: ${goal.title} (cycle ${cycle})`,
-          objective: reviewerPrompt,
-          readOnly: true,
-          profileId: profile.id,
-          maxTurns: 12,
-        })
-      : null;
-    if (reviewerTask) this.db.updateTask(reviewerTask.id, { status: "running" });
+    const reviewRun = run ?? await this.orchestrator.ensureDirectorTaskRun(goal.chatSessionId ?? goal.id, goal.repoRoot);
+    assertCurrent();
+    this.goals.setStatus(goal.id, "reviewing");
+    const reviewerTask = this.db.createTask({
+      runId: reviewRun.id,
+      parentId: this.db.listTasks(reviewRun.id).find((t) => t.tier === 1)?.id ?? null,
+      tier: 3,
+      kind: "verify",
+      title: `Done-Review: ${goal.title} (cycle ${cycle})`,
+      objective: reviewerPrompt,
+      readOnly: true,
+      profileId: profile.id,
+      model,
+      maxTurns: 12,
+    });
+    const abort = new AbortController();
+    const reviewerSignal = AbortSignal.any([signal, abort.signal]);
+    const unsubscribe = this.db.onEvent(ev => {
+      if (ev.runId !== reviewRun.id) return;
+      if ((ev.taskId === reviewerTask.id && ev.type === "task.status" && (ev.payload as { to: string }).to === "cancelled") ||
+          (ev.type === "run.status" && (ev.payload as { status: string }).status === "stopped")) {
+        abort.abort(new Error("Reviewer cancelled"));
+      }
+    });
     const emit = (type: string, payload: unknown) => {
-      if (run && reviewerTask) this.db.emitEvent(run.id, reviewerTask.id, type, payload);
+      if (!reviewerSignal.aborted) this.db.emitEvent(reviewRun.id, reviewerTask.id, type, payload);
     };
 
+    const failedSummary = "Independent reviewer failed before completing verification.";
     const failReviewer = (msg: string) => {
-      if (!reviewerTask || this.db.getTask(reviewerTask.id)?.status !== "running") return;
+      if (this.db.getTask(reviewerTask.id)?.status !== "running") return;
+      if (reviewerSignal.aborted) {
+        this.db.updateTask(reviewerTask.id, { status: "cancelled", summary: "Reviewer cancelled" });
+        return;
+      }
       emit("agent.error", { error: msg });
-      this.db.updateTask(reviewerTask.id, { status: "failed", summary: msg });
+      this.db.updateTask(reviewerTask.id, { status: "failed", summary: failedSummary });
     };
 
     let outcome: ReturnType<GoalEngine["recordReviewVerdict"]>;
     try {
+      if (this.db.getTask(reviewerTask.id)?.status === "cancelled") abort.abort(new Error("Reviewer cancelled"));
+      this.db.updateTask(reviewerTask.id, { status: reviewerSignal.aborted ? "cancelled" : "running" });
+      reviewerSignal.throwIfAborted();
       const res = await runner.run({
-        runId: goal.linkedRunId ?? goal.id,
-        taskId: reviewerTask?.id ?? `reviewer-${goal.id}-c${cycle}`,
+        runId: reviewRun.id,
+        taskId: reviewerTask.id,
         tier: 3,
         kind: "verify",
         cwd: goal.repoRoot,
-        readOnly: true,
+        toolPolicy: "read_only_workspace",
+        model: wireModel,
         systemPrompt:
-          "You are an independent, skeptical code reviewer. Inspect actual code and test outputs; call submit_review_verdict if available or return the requested strict JSON verdict with concrete evidence for every required criterion.",
+          "You are an independent read-only Done-Reviewer. Inspect the implementation and verification evidence for each required criterion. Never edit files, run mutating commands, or delegate. Call submit_review_verdict if available, or return the requested JSON verdict with concrete sources for every required criterion.",
         initialPrompt: reviewerPrompt,
         maxTurns: 12,
         tools: [submitTool],
@@ -422,15 +497,17 @@ export class DirectorRuntime {
           }
           throw new Error(`Unknown reviewer tool ${name}`);
         },
-        signal: new AbortController().signal,
+        signal: reviewerSignal,
         callbacks: {
           onTextDelta: (text) => emit("agent.text_delta", { text }),
           onThoughtDelta: (text) => emit("agent.thought_delta", { text }),
           onToolEvent: (ev) => emit("agent.tool", ev),
         },
       });
-      if (res.stopReason === "error" || res.stopReason === "cancelled") {
-        failReviewer(res.text || `Reviewer stopped: ${res.stopReason}`);
+      reviewerSignal.throwIfAborted();
+      assertCurrent();
+      if (res.stopReason !== "completed" && res.stopReason !== "max_turns") {
+        throw new Error(`Reviewer stopped: ${res.stopReason}. ${res.text}`);
       }
 
       // Fallback JSON parse if reviewer returned JSON text instead of calling submit_review_verdict
@@ -455,23 +532,32 @@ export class DirectorRuntime {
         }
       }
 
-      outcome = this.goals.recordReviewVerdict(goal.id, {
-        verdict: submittedVerdict?.verdict ?? "changes_requested",
-        criteriaResults: mergedResults,
-        blockingIssues:
-          submittedVerdict?.blockingIssues ?? (submittedVerdict ? [] : ["Reviewer did not return a structured verdict"]),
-        summary: submittedVerdict?.summary ?? (res.text.slice(0, 300) || "Incomplete review output"),
-        diffHash: gateResult.diffHash,
-      });
-      if (reviewerTask && this.db.getTask(reviewerTask.id)?.status === "running") {
-        this.db.updateTask(reviewerTask.id, {
-          status: "completed",
-          summary: `${outcome.review.verdict}: ${outcome.review.summary}`.slice(0, 500),
+      outcome = this.db.transaction(() => {
+        const recorded = this.goals.recordReviewVerdict(goal.id, {
+          verdict: submittedVerdict?.verdict ?? "changes_requested",
+          criteriaResults: mergedResults,
+          blockingIssues:
+            submittedVerdict?.blockingIssues ?? (submittedVerdict ? [] : ["Reviewer did not return a structured verdict"]),
+          summary: submittedVerdict?.summary ?? "Incomplete review output",
+          diffHash: gateResult.diffHash,
         });
-      }
+        const summary = `${recorded.review.verdict}: ${recorded.review.summary}`.slice(0, 2000);
+        const dossier = writeTaskDossier(this.db, reviewRun, reviewerTask.id, "review.json",
+          JSON.stringify(recorded.review, null, 2), `Independent review of ${goal.id} v${goal.version}`);
+        this.db.updateTask(reviewerTask.id, {
+          status: "completed", summary,
+          resultJson: JSON.stringify({
+            summary, sources: [{ path: dossier.path, symbol: "criteriaResults" }], artifact_paths: [dossier.path],
+          }),
+        });
+        return recorded;
+      });
     } catch (err) {
       failReviewer(err instanceof Error ? err.message : String(err));
-      throw err;
+      reviewerSignal.throwIfAborted();
+      throw new Error(failedSummary);
+    } finally {
+      unsubscribe();
     }
 
     await this.handlePostReviewTransition(outcome);
@@ -539,21 +625,52 @@ export class DirectorRuntime {
   }
 
   /** Cancels an in-flight Tier 0 Director turn immediately (e.g. when user presses Esc). */
-  cancelChat(chatSessionId: string): boolean {
+  async cancelChat(chatSessionId: string): Promise<boolean> {
     const active = this.activeChats.get(chatSessionId);
     if (!active) return false;
     active.abort.abort();
-    this.activeChats.delete(chatSessionId);
+    await active.settled;
     return true;
+  }
+
+  async steerChat(chatSessionId: string, message: string): Promise<boolean> {
+    const active = this.activeChats.get(chatSessionId);
+    if (!active?.handle || active.abort.signal.aborted) return false;
+    const accepted = await active.handle.steer(message);
+    if (accepted && this.activeChats.get(chatSessionId) === active && !active.abort.signal.aborted) {
+      this.flushChatPartial(chatSessionId, active);
+      this.chats.appendTurn(chatSessionId, "user", message);
+      return true;
+    }
+    return false;
+  }
+
+  getChatPartial(chatSessionId: string): string {
+    return this.activeChats.get(chatSessionId)?.partial ?? "";
+  }
+
+  private flushChatPartial(chatSessionId: string, active: ActiveChat | undefined): ChatTurnRecord | null {
+    if (!active?.partial) return null;
+    const turn = this.chats.appendTurn(chatSessionId, "assistant", active.partial);
+    active.flushedText += active.partial;
+    active.partial = "";
+    return turn;
   }
 
   private directorExecutor(session: { id: string; repoRoot: string }, signal: AbortSignal, onToolEvent?: RunnerCallbacks["onToolEvent"]) {
     return createCodeModeExecutor({
       ...this.config.codeExec,
-      mode: this.config.codeMode,
+      mode: effectiveCodeMode(this.config.codeMode),
       allowedTools: () => DIRECTOR_TOOLS,
-      execute: (name, args) => this.executeDirectorTool(session.id, session.repoRoot, name, args),
+      execute: (name, args) => this.executeDirectorTool(session.id, session.repoRoot, name, args, signal),
       artifactsDir: join(session.repoRoot, ".harness", "artifacts"),
+      saveOutput: async (name, json) => {
+        signal.throwIfAborted();
+        const run = await this.orchestrator.ensureDirectorTaskRun(session.id, session.repoRoot);
+        signal.throwIfAborted();
+        const [coordinator] = this.db.listTasks(run.id, { parentId: null });
+        return writeCodeOutput(this.db, run, coordinator!.id, name, json);
+      },
       signal,
       onToolEvent: onToolEvent && codeExecEventSink(onToolEvent),
     });
@@ -577,12 +694,13 @@ export class DirectorRuntime {
     userMessage: string,
     onDelta?: (delta: string) => void,
     onToolEvent?: RunnerCallbacks["onToolEvent"],
-  ): Promise<{ userTurn: ChatTurnRecord; assistantTurn: ChatTurnRecord }> {
+  ): Promise<{ userTurn: ChatTurnRecord; assistantTurn: ChatTurnRecord | null }> {
     const session = this.chats.getSession(chatSessionId);
     if (!session) throw new Error(`Unknown chat session ${chatSessionId}`);
 
+    if (this.activeChats.has(chatSessionId)) throw new Error(`Chat ${chatSessionId} already has an active turn`);
     const userTurn = this.chats.appendTurn(chatSessionId, "user", userMessage);
-    const history = this.chats.getHistory(chatSessionId, 0, 40);
+    const history = this.chats.getRecentHistory(chatSessionId, 40);
     const activeGoals = this.goals.listGoals({ repoRoot: session.repoRoot });
 
     const contextTranscript = history
@@ -604,31 +722,36 @@ export class DirectorRuntime {
 
     const prompt = `${contextTranscript ? `Prior conversation:\n${contextTranscript}\n\n` : ""}Workspace: ${session.repoRoot}${goalBanner}\n\nUser: ${userMessage}`;
 
-    const profile = this.resolveProfile(session.profileId);
-    const runner = this.customRunnerFactory
-      ? this.customRunnerFactory(profile)
-      : profile.kind === "acp"
-        ? new AcpRunner(profile)
-        : new PiRunner(profile);
-
     const abort = new AbortController();
-    const mode = this.config.codeMode;
+    const mode = effectiveCodeMode(this.config.codeMode);
     const executor = this.directorExecutor(session, abort.signal, onToolEvent);
-    const active = { abort, executor, onToolEvent };
+    const { promise: settled, resolve: markSettled } = Promise.withResolvers<void>();
+    const active: ActiveChat = { abort, executor, onToolEvent, settled, partial: "", flushedText: "" };
     this.activeChats.set(chatSessionId, active);
     const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", "mcp-bridge.ts");
 
+    const finishCancelled = () => ({
+      userTurn, assistantTurn: this.flushChatPartial(chatSessionId, active),
+    });
     try {
+      const { profile, model, wireModel } = await resolveLaunchRoute(this.config, {
+        tier: 0, cwd: session.repoRoot, profileId: session.profileId, model: session.model, catalog: this.catalog, quota: this.quota,
+      });
+      if (abort.signal.aborted) return finishCancelled();
+      this.chats.updateSession(chatSessionId, { profileId: profile.id, model });
+      const runner = this.customRunnerFactory
+        ? this.customRunnerFactory(profile)
+        : profile.kind === "acp" ? new AcpRunner(profile) : new PiRunner(profile);
       const res = await runner.run({
         runId: chatSessionId,
         taskId: chatSessionId,
         tier: 1,
         kind: "orchestrator",
         cwd: session.repoRoot,
-        readOnly: true,
+        toolPolicy: "control_plane_only",
         systemPrompt: buildDirectorSystemPrompt(mode),
         initialPrompt: prompt,
-        model: (session.model && this.catalog?.resolveForProfile(profile.id, session.model)?.wireModelId) || session.model,
+        model: wireModel,
         effort: session.effort,
         maxTurns: 12,
         quotaRetryTimeoutMs: this.config.quotaRetry.nativeRetryTimeoutMs,
@@ -637,37 +760,59 @@ export class DirectorRuntime {
         daemonSocketPath: this.config.socketPath,
         mcpBridgeEntrypoint,
         signal: abort.signal,
+        onHandle: (handle) => { if (!(runner instanceof PiRunner)) active.handle = handle; },
         callbacks: {
-          onTextDelta: onDelta,
+          onTextDelta: (delta) => {
+            if (abort.signal.aborted) return;
+            active.partial += delta;
+            onDelta?.(delta);
+          },
           onToolEvent,
           onPassiveQuota: (sig) => this.quota.ingestPassiveSignal(sig),
         },
       });
 
-      let content = res.text.trim();
+      // ACP returns the whole turn. Pi can return only its last provider response.
+      const finalSegment = res.text.startsWith(active.flushedText) ? res.text.slice(active.flushedText.length) : res.text;
+      if (abort.signal.aborted || res.stopReason === "cancelled") {
+        // On abort Pi can return the previous completed provider response while the
+        // current response exists only in deltas. Only recover new text consistent with those deltas.
+        const alreadyFlushed = active.flushedText.endsWith(res.text);
+        if (res.stopReason !== "error" && !alreadyFlushed && finalSegment.startsWith(active.partial)) {
+          active.partial = finalSegment;
+        }
+        return finishCancelled();
+      }
+      if (res.stopReason === "error") throw new Error(res.text.trim() || "Director runner failed");
+      let content = (res.text ? finalSegment : active.partial).trim();
       if (res.stopReason === "quota_paused") {
-        const qp = res.quotaPause;
-        const resetNote = qp?.resetAt ? ` · estimated reset: ${qp.resetAt}` : "";
-        const pauseLine = `Paused early due to quota / rate limit (${qp?.reason ?? "quota exhausted"}${resetNote}). Send another message anytime to retry or switch models with /model.`;
+        const pauseLine = "Paused for quota. Retry later or switch models with /model.";
         content = content ? `${content}\n\n${pauseLine}` : pauseLine;
       } else if (!content && res.toolFailures?.length) {
         content = `Stopped after tool failure without a final response:\n${res.toolFailures.map((f) => `- ${f}`).join("\n")}`;
-      } else if (!content) {
+      } else if (!content && !active.flushedText) {
         content = "(done)";
       }
 
-      const assistantTurn = this.chats.appendTurn(chatSessionId, "assistant", content);
+      active.partial = content;
+      const assistantTurn = this.flushChatPartial(chatSessionId, active);
       return { userTurn, assistantTurn };
+    } catch (error) {
+      if (abort.signal.aborted) return finishCancelled();
+      this.flushChatPartial(chatSessionId, active);
+      throw error;
     } finally {
       abort.abort();
       if (this.activeChats.get(chatSessionId) === active) {
         this.activeChats.delete(chatSessionId);
       }
+      markSettled();
     }
   }
 
   /** Persists a tool_output turn and forwards the display to the chat's active UI sink, if any. */
   private emitToolDisplay(chatSessionId: string, toolName: string, display: ToolDisplayPayload): void {
+    this.flushChatPartial(chatSessionId, this.activeChats.get(chatSessionId));
     this.chats.appendTurn(chatSessionId, "tool_output", summarizeToolDisplay(toolName, display), { toolName, display });
     this.activeChats.get(chatSessionId)?.onToolEvent?.({ id: `display-${randomUUID()}`, name: toolName, status: "completed", display });
   }
@@ -677,8 +822,24 @@ export class DirectorRuntime {
     repoRoot: string,
     name: string,
     args: Record<string, unknown>,
+    signal: AbortSignal,
   ): Promise<unknown> {
+    if (args.goal_id !== undefined) {
+      const goal = this.goals.getGoal(String(args.goal_id));
+      if (!goal || realpathSync(goal.repoRoot) !== realpathSync(repoRoot)) throw new Error("Unknown goal in this workspace");
+    }
+    if (name === "goal_commit" || (name === "goal_create" && args.commit_immediately)) {
+      if (typeof args.model !== "string" || !args.model.trim()) throw new Error("Select a model from list_models to commit this goal");
+      if (args.profile_id !== undefined && typeof args.profile_id !== "string") throw new Error("profile_id must be a string");
+    }
     switch (name) {
+      case "wait_children":
+        return this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, "wait_tasks", args, signal);
+      case "spawn_task":
+      case "wait_tasks":
+      case "cancel_task":
+      case "artifact_read":
+        return this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, name, args, signal);
       case "goal_create": {
         const criteria = (Array.isArray(args.criteria) ? args.criteria : []) as Array<
           Omit<GoalCriterion, "id" | "required"> & { id?: string; required?: boolean }
@@ -694,7 +855,10 @@ export class DirectorRuntime {
             typeof args.max_review_cycles === "number" ? { maxReviewCycles: args.max_review_cycles } : undefined,
         });
         if (args.commit_immediately) {
-          return await this.commitGoal(created.id);
+          return await this.commitGoal(created.id, {
+            model: String(args.model), profileId: args.profile_id as string | undefined,
+            effort: typeof args.effort === "string" ? args.effort : undefined,
+          });
         }
         return created;
       }
@@ -742,11 +906,11 @@ export class DirectorRuntime {
           openEscalations: g.linkedRunId ? this.db.listEscalations(g.linkedRunId, "open") : [],
         };
         this.emitToolDisplay(chatSessionId, name, buildGoalDetailDisplay(detail));
-        return { ...detail, rendered_in_ui: "Goal detail shown to the user; do not repeat it." };
+        return { ...detail, tasks: detail.tasks.map((t) => compactTaskHandoff(t, detail.openEscalations)), rendered_in_ui: "Goal detail shown to the user; do not repeat it." };
       }
 
       case "goal_trigger_review":
-        return await this.verifyAndReviewGoal(String(args.goal_id));
+        return await this.verifyAndReviewGoal(String(args.goal_id), signal);
 
       case "goal_pause": {
         const g = this.goals.setStatus(String(args.goal_id), "paused", "Paused by Director");
@@ -761,11 +925,29 @@ export class DirectorRuntime {
       }
 
       case "read_file": {
-        const target = resolve(repoRoot, String(args.path));
-        if (!existsSync(target)) throw new Error(`File not found: ${target}`);
-        const raw = readFileSync(target, "utf8");
-        const max = typeof args.max_chars === "number" ? args.max_chars : 8000;
-        return { path: target, truncated: raw.length > max, content: raw.slice(0, max) };
+        const reason = typeof args.exception_reason === "string" ? args.exception_reason.trim() : "";
+        if (!reason) throw new Error("read_file requires exception_reason");
+        const root = realpathSync(repoRoot);
+        const target = realpathSync(resolve(root, String(args.path)));
+        const path = relative(root, target);
+        if (path === ".." || path.startsWith(`..${sep}`) || isAbsolute(path) ||
+            path.split(sep).some(part => [".git", ".harness"].includes(part.toLowerCase()))) {
+          throw new Error("File outside the permitted workspace");
+        }
+        const fd = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        try {
+          const stat = fstatSync(fd);
+          if (!stat.isFile()) throw new Error("Expected a regular file");
+          const bytes = Buffer.alloc(4096);
+          const count = readSync(fd, bytes, 0, bytes.length, 0);
+          const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, count), { stream: stat.size > count });
+          const limit = typeof args.max_chars === "number" ? Math.min(4096, Math.max(0, args.max_chars)) : 4096;
+          const content = text.slice(0, limit);
+          this.chats.appendTurn(chatSessionId, "system_notice", `Director read_file: ${path} (${count} bytes). Reason: ${reason}`);
+          return { path, truncated: stat.size > count || content.length < text.length, content };
+        } finally {
+          closeSync(fd);
+        }
       }
 
       case "kb_search":

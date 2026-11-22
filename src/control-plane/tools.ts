@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { basename, join, relative, resolve, sep } from "node:path";
+import { rmSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import type { ModelCatalogCompiler } from "../catalog/compiler.js";
-import { CODE_EXEC_TOOL_NAME, TOOL_SEARCH_TOOL_NAME, createCodeModeExecutor, exposedTools } from "../code-mode/index.js";
+import { CODE_EXEC_TOOL_NAME, TOOL_SEARCH_TOOL_NAME, createCodeModeExecutor, effectiveCodeMode, exposedTools } from "../code-mode/index.js";
 import type { HarnessConfig } from "../config.js";
 import { codeExecEventSink } from "../protocol/tool-display.js";
 import type { ToolDefinition } from "../runners/types.js";
@@ -17,7 +17,12 @@ import type {
   TaskKind,
   TaskRecord,
 } from "./db.js";
+import { dossierDirectory, readRunDossier, readWorkspaceArtifact, writeCodeOutput, writeTaskDossier } from "./dossiers.js";
+import { compactTaskHandoff, isReadOnlyKind, SUMMARY_LIMIT, validateTaskHandoff } from "./handoffs.js";
 import type { AnchoredHandoff } from "./prompts.js";
+
+export { readRunDossier } from "./dossiers.js";
+export { compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./handoffs.js";
 
 export interface ToolRuntimeHooks {
   spawnAndStartTask: (input: {
@@ -39,24 +44,22 @@ export interface ToolRuntimeHooks {
   waitForChildren: (parentId: string, ids: string[] | undefined, mode: "any" | "all", timeoutMs: number) => Promise<TaskRecord[]>;
   steerTask: (taskId: string, message: string) => Promise<boolean>;
   cancelTask: (taskId: string, reason: string) => Promise<void>;
-  scheduleRollover: (taskId: string, handoff: AnchoredHandoff, target?: { profileId?: string; model?: string; effort?: string }) => void;
+  scheduleRollover: (taskId: string, handoff: AnchoredHandoff, target?: { profileId?: string; model?: string; effort?: string }) => Promise<void>;
   getWorktreeManager: (repoRoot: string) => WorktreeManager;
   getMergeQueue: (repoRoot: string) => BisectingMergeQueue;
   getTaskSignal: (taskId: string) => AbortSignal | undefined;
 }
 
-const READ_ONLY_TASK_ROLES = {
-  research: "codebase_research",
-  plan: "plan_synthesis",
-  verify: "independent_verifier",
-} as const;
-
-function isReadOnlyKind(kind: string): kind is keyof typeof READ_ONLY_TASK_ROLES {
-  return Object.hasOwn(READ_ONLY_TASK_ROLES, kind);
+function requiredModel(args: Record<string, unknown>) {
+  if (typeof args.model !== "string" || !args.model.trim()) throw new Error("Choose a nonblank model from list_models.");
+  return args.model.trim();
 }
 
-const SUMMARY_LIMIT = 2000;
-type TaskSource = { path: string; lines?: string; symbol?: string; note?: string };
+function optionalProfile(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !value.trim()) throw new Error("Select an enabled runner profile.");
+  return value;
+}
 
 const waitChildrenTool: ToolDefinition = {
   name: "wait_children",
@@ -99,7 +102,7 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
   {
     name: "task_get",
     tiers: [1, 2, 3],
-    description: "Get full metadata, summary, artifacts, and open escalations for a specific task ID.",
+    description: "Get the compact handoff, indexed dossiers, and escalations for a task in this run.",
     inputSchema: {
       type: "object",
       required: ["task_id"],
@@ -127,7 +130,7 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
       "Spawn a Tier 2 Worker in its own isolated git worktree with disjoint write_scopes. Workers dynamically manage sub-tasks and submit via the merge queue.",
     inputSchema: {
       type: "object",
-      required: ["title", "objective", "write_scopes"],
+      required: ["title", "objective", "write_scopes", "model"],
       properties: {
         title: { type: "string" },
         objective: { type: "string" },
@@ -146,9 +149,10 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
     description: "Spawn a read-only Tier 3 research, plan, or verify task. Read its handoff with wait_children.",
     inputSchema: {
       type: "object",
-      required: ["kind", "title", "objective"],
+      required: ["kind", "title", "objective", "model"],
       properties: {
-        kind: { type: "string", enum: Object.keys(READ_ONLY_TASK_ROLES) },
+        kind: { type: "string", enum: ["research", "plan", "verify"] },
+        profile_id: { type: "string" },
         title: { type: "string" },
         objective: { type: "string" },
         model: { type: "string" },
@@ -163,7 +167,7 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
       "Spawn a small, zero-compaction Tier 3 Task Agent (research, plan, execute, or verify) inside this Worker's worktree.",
     inputSchema: {
       type: "object",
-      required: ["kind", "title", "objective"],
+      required: ["kind", "title", "objective", "model"],
       properties: {
         kind: { type: "string", enum: ["research", "plan", "execute", "verify"] },
         title: { type: "string" },
@@ -534,7 +538,7 @@ export function toolsForTier(tier: AgentTier): ToolDefinition[] {
 export class ControlPlaneToolExecutor {
   constructor(
     private readonly db: ControlPlaneDb,
-    private readonly catalog: ModelCatalogCompiler,
+    private readonly getCatalogCompiler: () => ModelCatalogCompiler,
     private readonly hooks: ToolRuntimeHooks,
     private readonly config: HarnessConfig,
   ) {}
@@ -548,7 +552,8 @@ export class ControlPlaneToolExecutor {
     if (!task || task.runId !== runId) {
       throw new Error(`Task ${taskId} not found in run ${runId}`);
     }
-    if (scriptSignal || (name === CODE_EXEC_TOOL_NAME && this.config.codeMode !== "off")) {
+    const mode = effectiveCodeMode(this.config.codeMode);
+    if (scriptSignal || (name === CODE_EXEC_TOOL_NAME && mode !== "off")) {
       const signal = scriptSignal ?? this.hooks.getTaskSignal(taskId);
       if (!signal || signal.aborted || ["completed", "cancelled", "failed", "returned_for_rescope", "paused_quota"].includes(task.status)) {
         throw new Error(`code_exec requires an active task generation for ${taskId}`);
@@ -560,14 +565,15 @@ export class ControlPlaneToolExecutor {
     if (name === "__list_tools") {
       return this.tools(task.tier);
     }
-    if (this.config.codeMode !== "off" && (name === CODE_EXEC_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME)) {
+    if (mode !== "off" && (name === CODE_EXEC_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME)) {
       const signal = this.hooks.getTaskSignal(taskId);
       return createCodeModeExecutor({
         ...this.config.codeExec,
-        mode: this.config.codeMode,
+        mode,
         allowedTools: () => toolsForTier(task.tier),
         execute: (inner, input) => this.execute(runId, taskId, inner, input, signal),
         artifactsDir: join(run.repoRoot, ".harness", "artifacts"),
+        saveOutput: (name, json) => writeCodeOutput(this.db, run, taskId, name, json),
         signal,
         onToolEvent: codeExecEventSink((ev) => this.db.emitEvent(runId, taskId, "agent.tool", ev)),
       }).execute(name, args);
@@ -599,7 +605,7 @@ export class ControlPlaneToolExecutor {
             effort: t.effort,
             gen: t.generation,
             ctxPct: t.contextSize > 0 ? Math.round((t.contextUsed / t.contextSize) * 100) : null,
-            summary: t.summary,
+            summary: compactTaskHandoff(t).summary,
           })),
           openEscalations: escalations,
           inboxMessages: pendingMsgs.map((m) => ({
@@ -614,14 +620,14 @@ export class ControlPlaneToolExecutor {
         const target = this.db.getTask(String(args.task_id));
         if (!target || target.runId !== runId) throw new Error(`Unknown task ${args.task_id}`);
         return {
-          task: target,
-          artifacts: this.db.listArtifacts(runId, target.id, 30),
+          task: compactTaskHandoff(target),
+          artifacts: this.db.listArtifacts(runId, target.id, 30, "dossier"),
           escalations: this.db.listEscalations(runId).filter((e) => e.fromTaskId === target.id || e.toTaskId === target.id),
         };
       }
 
       case "list_models": {
-        const compiled = await this.catalog.getCatalog({
+        const compiled = await this.getCatalogCompiler().getCatalog({
           cwd: run.repoRoot,
           role: typeof args.role === "string" ? args.role : undefined,
           maxApiEquivUsd: typeof args.max_api_equiv_usd === "number" ? args.max_api_equiv_usd : undefined,
@@ -673,8 +679,8 @@ export class ControlPlaneToolExecutor {
           objective: String(args.objective),
           criteria: typeof args.criteria === "string" ? args.criteria : "",
           readOnly: false,
-          profileId: typeof args.profile_id === "string" ? args.profile_id : undefined,
-          model: typeof args.model === "string" ? args.model : undefined,
+          profileId: optionalProfile(args.profile_id),
+          model: requiredModel(args),
           effort: typeof args.effort === "string" ? args.effort : undefined,
           dependsOn: Array.isArray(args.depends_on) ? (args.depends_on as string[]) : [],
           writeScopes,
@@ -692,24 +698,6 @@ export class ControlPlaneToolExecutor {
         if (!readOnlyKind && kind !== "execute") throw new Error(`Unknown spawn_task kind: ${kind}`);
         if (task.status === "draining") throw new Error("Cannot spawn tasks while draining for rollover.");
 
-        let model = typeof args.model === "string" ? args.model : undefined;
-        let effort = typeof args.effort === "string" ? args.effort : undefined;
-        let profileId = !fromOrchestrator && typeof args.profile_id === "string" ? args.profile_id : undefined;
-        if (fromOrchestrator && readOnlyKind) {
-          const { models } = await this.catalog.getCatalog({ cwd: run.repoRoot, excludeExhausted: !model });
-          const requestedEffort = effort;
-          const candidates = requestedEffort ? models.filter((entry) => entry.efforts.includes(requestedEffort)) : models;
-          const selected = model
-            ? models.find((entry) => entry.id === model || entry.preferredRoute.wireModelId === model)
-            : candidates.find((entry) => entry.recommendedFor.includes(READ_ONLY_TASK_ROLES[kind])) ?? candidates[0];
-          if (selected) {
-            model = selected.preferredRoute.wireModelId;
-            profileId = selected.preferredRoute.profileId;
-            effort ??= ["default", "medium"].find((level) => selected.efforts.includes(level)) ?? selected.efforts[0];
-          } else if (!model) {
-            throw new Error("No available catalog model for this task. Specify a model or try again when quota is available.");
-          }
-        }
         const created = await this.hooks.spawnAndStartTask({
           runId,
           parentId: taskId,
@@ -719,9 +707,9 @@ export class ControlPlaneToolExecutor {
           objective: String(args.objective),
           criteria: !fromOrchestrator && typeof args.criteria === "string" ? args.criteria : "",
           readOnly: readOnlyKind || args.read_only === true,
-          profileId,
-          model,
-          effort,
+          profileId: optionalProfile(args.profile_id),
+          model: requiredModel(args),
+          effort: typeof args.effort === "string" ? args.effort : undefined,
           maxTurns: !fromOrchestrator && typeof args.max_turns === "number" ? args.max_turns : undefined,
           dependsOn: !fromOrchestrator && Array.isArray(args.depends_on) ? (args.depends_on as string[]) : [],
         });
@@ -736,34 +724,17 @@ export class ControlPlaneToolExecutor {
         const settled = await this.hooks.waitForChildren(taskId, ids, mode, timeoutMs);
         const escalations = this.db.listEscalations(runId);
         return {
-          children: settled.map((c) => {
-            const result = c.resultJson ? JSON.parse(c.resultJson) : null;
-            // The runner stores its final text as a fallback summary when return_task was skipped.
-            const missingHandoff = typeof result?.text === "string" && typeof result?.summary !== "string";
-            return {
-              id: c.id,
-              title: c.title,
-              kind: c.kind,
-              status: c.status,
-              summary: missingHandoff ? "Task ended without a structured handoff." : c.summary?.slice(0, SUMMARY_LIMIT) ?? null,
-              sources: result?.sources ?? [],
-              artifact_paths: result?.artifact_paths ?? result?.artifactPaths ?? [],
-              escalations: escalations.filter((e) => e.fromTaskId === c.id),
-            };
-          }),
+          children: settled.map((child) => compactTaskHandoff(child, escalations)),
         };
       }
 
-      case "steer_child": {
-        const ok = await this.hooks.steerTask(String(args.task_id), String(args.message));
-        return { steered: ok };
-      }
-
+      case "steer_child":
       case "cancel_task":
       case "cancel_child": {
         const childId = String(args.task_id);
         const child = this.db.getTask(childId);
         if (!child || child.runId !== runId || child.parentId !== taskId) throw new Error(`Unknown child task ${childId}`);
+        if (name === "steer_child") return { steered: await this.hooks.steerTask(childId, String(args.message)) };
         await this.hooks.cancelTask(childId, String(args.reason));
         return { cancelled: childId };
       }
@@ -773,24 +744,8 @@ export class ControlPlaneToolExecutor {
         if (status !== "completed" && status !== "blocked" && status !== "scope_too_large") {
           throw new Error("return_task requires status completed, blocked, or scope_too_large");
         }
-        const fullSummary = args.summary;
-        if (typeof fullSummary !== "string") throw new Error("return_task requires a summary string");
+        const { summary: fullSummary, sources, artifactPaths } = validateTaskHandoff(task.kind, args);
         let summary = fullSummary;
-        const artifactPaths = args.artifact_paths === undefined ? [] : args.artifact_paths;
-        if (!Array.isArray(artifactPaths) || !artifactPaths.every((path) => typeof path === "string")) {
-          throw new Error("return_task artifact_paths must be an array of strings");
-        }
-        const rawSources = args.sources === undefined ? [] : args.sources;
-        if (!Array.isArray(rawSources) || (isReadOnlyKind(task.kind) && rawSources.length === 0)) {
-          throw new Error(`return_task requires a non-empty sources array for ${task.kind} tasks (each source needs a path)`);
-        }
-        const sources: TaskSource[] = rawSources.map((source) => {
-          const { path, lines, symbol, note } = source ?? {};
-          if (typeof path !== "string" || !path.trim() || [lines, symbol, note].some((v) => v !== undefined && typeof v !== "string")) {
-            throw new Error("return_task sources require a non-empty path and optional string lines, symbol, and note");
-          }
-          return { path, lines, symbol, note };
-        });
 
         if (status === "completed") {
           const activeKids = this.db
@@ -814,7 +769,7 @@ export class ControlPlaneToolExecutor {
         if (summary.length > SUMMARY_LIMIT) {
           const artifactPath = `.harness/artifacts/${taskId}-summary-${randomUUID()}.md`;
           overflowPath = resolve(run.repoRoot, artifactPath);
-          mkdirSync(join(run.repoRoot, ".harness", "artifacts"), { recursive: true });
+          dossierDirectory(run.repoRoot);
           writeFileSync(overflowPath, summary, { encoding: "utf8", flag: "wx" });
           paths.push(overflowPath);
           const pointer = `\n\n[Full summary: ${artifactPath}]`;
@@ -881,7 +836,11 @@ export class ControlPlaneToolExecutor {
       }
 
       case "ack_escalation": {
-        const updated = this.db.ackEscalation(String(args.escalation_id), String(args.resolution), true);
+        const id = String(args.escalation_id);
+        if (!this.db.listEscalations(runId, "open").some((e) => e.id === id && e.toTaskId === taskId)) {
+          throw new Error(`Unknown incoming escalation ${id}`);
+        }
+        const updated = this.db.ackEscalation(id, String(args.resolution), true);
         return { escalation: updated };
       }
 
@@ -894,9 +853,8 @@ export class ControlPlaneToolExecutor {
           activeRisks: Array.isArray(args.active_risks) ? (args.active_risks as string[]) : [],
           nextActions: Array.isArray(args.next_actions) ? (args.next_actions as string[]) : [],
         };
-        this.db.updateTask(taskId, { status: "draining", handoffJson: JSON.stringify(handoff) });
-        this.hooks.scheduleRollover(taskId, handoff, {
-          profileId: typeof args.target_profile_id === "string" ? args.target_profile_id : undefined,
+        await this.hooks.scheduleRollover(taskId, handoff, {
+          profileId: optionalProfile(args.target_profile_id),
           model: typeof args.target_model === "string" ? args.target_model : undefined,
           effort: typeof args.target_effort === "string" ? args.target_effort : undefined,
         });
@@ -918,39 +876,17 @@ export class ControlPlaneToolExecutor {
       }
 
       case "artifact_write": {
-        const safeName = basename(String(args.name)).replace(/[^a-zA-Z0-9._-]/g, "_");
-        const dir = join(run.repoRoot, ".harness", "artifacts", runId, taskId);
-        mkdirSync(dir, { recursive: true });
-        const fullPath = join(dir, safeName);
-        writeFileSync(fullPath, String(args.content), "utf8");
-        const art = this.db.recordArtifact({
-          runId,
-          taskId,
-          kind: "dossier",
-          path: fullPath,
-          summary: String(args.summary),
-        });
-        return { artifactId: art.id, path: fullPath };
+        const art = writeTaskDossier(this.db, run, taskId, String(args.name), String(args.content), String(args.summary));
+        return { artifactId: art.id, path: art.path };
       }
 
       case "artifact_read": {
-        if (typeof args.path === "string" && args.path) {
-          const target = resolve(run.repoRoot, args.path);
-          if (task.tier === 1 && !this.db.hasDossier(runId, target)) throw new Error(`No indexed dossier in this run: ${target}`);
-          if (!existsSync(target)) throw new Error(`Artifact not found: ${target}`);
-          if (task.tier === 1) {
-            const repoRelative = relative(run.repoRoot, target);
-            if (!repoRelative.startsWith(`.harness${sep}artifacts${sep}`) ||
-                realpathSync(target) !== resolve(realpathSync(run.repoRoot), repoRelative)) {
-              throw new Error(`Dossier must be a non-symlink path under .harness/artifacts: ${target}`);
-            }
-          }
-          const raw = readFileSync(target, "utf8");
-          const max = typeof args.max_chars === "number" ? args.max_chars : 8000;
-          return { path: target, truncated: raw.length > max, content: raw.slice(0, max) };
+        if (task.tier === 1 || typeof args.path !== "string" || !args.path || this.db.hasDossier(runId, resolve(run.repoRoot, args.path))) {
+          return readRunDossier(this.db, run, args);
         }
-        const filterTask = typeof args.task_id === "string" ? args.task_id : undefined;
-        return { artifacts: this.db.listArtifacts(runId, filterTask, 50) };
+        const root = task.worktreeId ? this.db.getWorktree(task.worktreeId)?.path : run.repoRoot;
+        if (!root) throw new Error("Task worktree unavailable");
+        return readWorkspaceArtifact(root, args.path, args.max_chars);
       }
 
       case "blackboard_set": {
@@ -978,7 +914,9 @@ export class ControlPlaneToolExecutor {
       }
 
       case "reply_agent": {
-        const msg = this.db.replyMessage(String(args.message_id), String(args.answer));
+        const id = String(args.message_id);
+        if (!this.db.listOpenMessages(taskId).some((message) => message.id === id)) throw new Error(`Unknown incoming message ${id}`);
+        const msg = this.db.replyMessage(id, String(args.answer));
         return { messageId: msg.id, status: msg.status };
       }
 
@@ -1025,7 +963,11 @@ export class ControlPlaneToolExecutor {
 
       case "kb_get": {
         const ids = Array.isArray(args.ids) ? (args.ids as string[]) : [];
-        return { entries: this.db.kb.getMany(ids) };
+        const visible = ids.filter((id) => {
+          const scope = this.db.kb.getRaw(id)?.repoScope;
+          return scope === run.repoRoot || scope === "global";
+        });
+        return { entries: this.db.kb.getMany(visible) };
       }
 
       case "kb_propose": {

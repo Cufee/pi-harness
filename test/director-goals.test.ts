@@ -1,6 +1,7 @@
+import { withFixtureCatalog } from "./fixtures/launch-config.js";
 import assert from "node:assert/strict";
 import { describe, it } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, type AcpProfileConfig, type HarnessConfig } from "../src/config.js";
@@ -26,7 +27,7 @@ describe("Tier 0 Director, Run-Until-Done Goal Engine, Independent Done-Review &
     let reviewCalls = 0;
 
     try {
-      const config = { ...loadConfig(repoRoot), stateDir, socketPath: sockPath };
+      const config = withFixtureCatalog({ ...loadConfig(repoRoot), stateDir, socketPath: sockPath });
       const daemon = new HarnessDaemon(config, {
         dbPath: ":memory:",
         customRunnerFactory: () => ({
@@ -41,6 +42,7 @@ describe("Tier 0 Director, Run-Until-Done Goal Engine, Independent Done-Review &
                   { id: "c2", description: "Greeting includes world", kind: "behavioral", required: true },
                 ],
                 commit_immediately: true,
+                model: req.model,
               })) as GoalRecord;
               return { text: `Drafted & started goal ${created.id}`, stopReason: "completed" };
             }
@@ -185,4 +187,68 @@ describe("Tier 0 Director, Run-Until-Done Goal Engine, Independent Done-Review &
       rmSync(stateDir, { recursive: true, force: true });
     }
   });
+});
+
+it("limits Director reads to a logged workspace snippet and delegates sourced research", async () => {
+  const repoRoot = await makeTempRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "director-isolation-"));
+  let childId = "";
+  try {
+    writeFileSync(join(repoRoot, "large.txt"), "é".repeat(2500));
+    writeFileSync(join(stateDir, "outside.txt"), "private");
+    symlinkSync(join(stateDir, "outside.txt"), join(repoRoot, "link.txt"));
+    const config = withFixtureCatalog({ ...loadConfig(repoRoot), stateDir, socketPath: join(stateDir, "d.sock"), codeMode: "off" });
+    const daemon = new HarnessDaemon(config, {
+      dbPath: ":memory:",
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          if (req.kind === "research") {
+            assert.equal(req.toolPolicy, "read_only_workspace");
+            req.callbacks.onTextDelta?.("Inspecting status.txt");
+            await req.executeTool("return_task", {
+              status: "completed", summary: "Status found", sources: [{ path: "status.txt", lines: "1" }],
+            });
+            return { stopReason: "completed", text: "raw child transcript" };
+          }
+          assert.equal(req.toolPolicy, "control_plane_only");
+          await assert.rejects(req.executeTool("read_file", { path: "large.txt" }), /exception_reason/);
+          await assert.rejects(req.executeTool("read_file", { path: "link.txt", exception_reason: "Inspect link" }), /outside/);
+          const snippet = await req.executeTool("read_file", {
+            path: "large.txt", max_chars: 10000, exception_reason: "Check encoding",
+          }) as { content: string; truncated: boolean };
+          assert.equal(Buffer.byteLength(snippet.content), 4096);
+          assert.equal(snippet.truncated, true);
+          const assignment = { title: "Locate status", objective: "Read status.txt", model: req.model };
+          await assert.rejects(req.executeTool("spawn_task", { ...assignment, kind: "execute" }), /only permits/);
+          const child = await req.executeTool("spawn_task", { ...assignment, kind: "research" }) as { spawned: string };
+          childId = child.spawned;
+          const result = await req.executeTool("wait_tasks", { ids: [childId], timeout_s: 2 });
+          assert.deepEqual(result, { children: [{
+            id: childId, title: assignment.title, kind: "research", status: "completed", summary: "Status found",
+            sources: [{ path: "status.txt", lines: "1" }], artifact_paths: [], escalations: [],
+          }] });
+          return { stopReason: "completed", text: "Status found" };
+        },
+      }),
+    });
+    try {
+      const chat = await daemon.director.createChat({ repoRoot });
+      await daemon.director.sendChatMessage(chat.id, "Locate status");
+      const child = daemon.db.getTask(childId);
+      assert.equal(child?.tier, 3);
+      assert.equal(child?.runId, `director-tasks-${chat.id}`);
+      const events = daemon.db.getEventsSince(child!.runId, 0, childId);
+      assert.equal(events[0]?.type, "task.created");
+      assert.ok(events.some(event => event.type === "agent.text_delta" && (event.payload as { text: string }).text === "Inspecting status.txt"));
+      assert.ok(events.some(event => event.type === "task.status" && (event.payload as { to: string }).to === "completed"));
+      const notices = daemon.director.chats.getHistory(chat.id).filter(turn => turn.role === "system_notice");
+      assert.equal(notices.length, 1);
+      assert.match(notices[0]!.content, /large\.txt \(4096 bytes\).*Check encoding/);
+    } finally {
+      await daemon.stop();
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true });
+  }
 });

@@ -70,8 +70,10 @@ export function buildDirectorSystemPrompt(mode: CodeMode = "off"): string {
     "You sit ABOVE the autonomous Tier 1 Run Orchestrators so the user always has an instant, responsive chat.",
     "",
     "YOUR RESPONSIBILITIES:",
-    "1. Brainstorm designs, discuss tradeoffs, explore requirements, and answer progress questions immediately using deterministic tools (`goal_list`, `goal_get`, `tree_view`, `list_models`, `kb_search`).",
-    "2. Never edit repository code directly. When the user is ready to execute work, draft a structured **Goal Contract** via `goal_create` (with concrete `deterministic` shell check commands + `behavioral`/`architectural` criteria + `non_goals`), confirm or commit it via `goal_commit` so an autonomous Tier 1 Orchestrator runs until objectively verified and independently reviewed.",
+    "1. Brainstorm designs, discuss tradeoffs, explore requirements, and answer progress questions immediately using `goal_list`, `goal_get`, `list_models`, and `kb_search`.",
+    "Never edit code, run shell commands, or inspect repository files directly in normal operation. Delegate lookups to a narrow read-only research, plan, or verify worker via spawn_task. Select a concrete model from list_models. Read its summary and sources via wait_tasks; open authorized artifacts on demand. Use read_file only as a rare logged exception with an exception_reason.",
+    "2. When the user is ready to execute work, draft a structured **Goal Contract** via `goal_create` (with concrete `deterministic` shell check commands + `behavioral`/`architectural` criteria + `non_goals`), commit it immediately via `goal_commit` for a clear action request so an autonomous Tier 1 Orchestrator runs until objectively verified and independently reviewed.",
+    "Use sensible defaults. Ask only when a genuinely ambiguous or irreversible decision blocks action. Create separate goals for distinct requests or amend the relevant active goal.",
     "3. When the user changes requirements mid-flight, call `goal_amend` so a clean `vN -> vN+1` amendment delta propagates to the running Tier 1 Orchestrator without losing unaffected work.",
     "4. Surface `P0` escalations, circuit-breaker trips, and Independent Done-Review verdicts clearly to the user with actionable options.",
     "5. Keep responses crisp, direct, and grounded in actual tool state — never guess progress or invent statuses.",
@@ -135,10 +137,8 @@ export class DirectorSessionStore {
 
   getOrCreateDefault(input: { repoRoot: string; profileId: string; model?: string | null; effort?: string | null }): ChatSessionRecord {
     const canon = canonicalRepoPath(input.repoRoot);
-    const existing = this.db
-      .prepare("SELECT * FROM chat_sessions WHERE repo_root = ? ORDER BY updated_at DESC, rowid DESC LIMIT 1")
-      .get(canon) as Record<string, unknown> | undefined;
-    if (existing) return this.mapSession(existing);
+    const existing = this.getWorkspaceSession(canon);
+    if (existing) return existing;
 
     return this.createSession({ ...input, repoRoot: canon });
   }
@@ -163,6 +163,13 @@ export class DirectorSessionStore {
 
   touchSession(id: string): void {
     this.db.prepare("UPDATE chat_sessions SET updated_at = ? WHERE id = ?").run(this.nextTimestamp(), id);
+  }
+
+  getWorkspaceSession(repoRoot: string): ChatSessionRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM chat_sessions WHERE repo_root = ? ORDER BY updated_at DESC, rowid DESC LIMIT 1")
+      .get(canonicalRepoPath(repoRoot)) as Record<string, unknown> | undefined;
+    return row ? this.mapSession(row) : null;
   }
 
   getMostRecentSession(): ChatSessionRecord | null {
@@ -229,6 +236,17 @@ export class DirectorSessionStore {
     const rows = this.db
       .prepare("SELECT * FROM chat_turns WHERE chat_session_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?")
       .all(chatSessionId, sinceSeq, limit) as Record<string, unknown>[];
+    return this.mapTurns(rows);
+  }
+
+  getRecentHistory(chatSessionId: string, limit = 100): ChatTurnRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM chat_turns WHERE chat_session_id = ? ORDER BY seq DESC LIMIT ?")
+      .all(chatSessionId, limit) as Record<string, unknown>[];
+    return this.mapTurns(rows.reverse());
+  }
+
+  private mapTurns(rows: Record<string, unknown>[]): ChatTurnRecord[] {
     return rows.map((r) => ({
       seq: Number(r.seq),
       chatSessionId: String(r.chat_session_id),

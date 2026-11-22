@@ -1,3 +1,4 @@
+import { withFixtureCatalog } from "./fixtures/launch-config.js";
 import assert from "node:assert/strict";
 import { Database } from "bun:sqlite";
 import { describe, it } from "bun:test";
@@ -31,7 +32,7 @@ async function withDaemon(
   const factory: CustomRunnerFactory = () => ({
     run: async (req) => ({ text: await script(req), stopReason: "completed" }),
   });
-  const daemon = new HarnessDaemon({ ...loadConfig(repoRoot), codeMode: "off", stateDir, socketPath: sockPath }, { dbPath: ":memory:", customRunnerFactory: factory });
+  const daemon = new HarnessDaemon(withFixtureCatalog({ ...loadConfig(repoRoot), codeMode: "off", stateDir, socketPath: sockPath }), { dbPath: ":memory:", customRunnerFactory: factory });
   await daemon.start();
   const client = new DaemonClient(sockPath);
   await client.connect();
@@ -198,7 +199,7 @@ describe("Director structured tool display", () => {
           bridgeResults = {
             list: await call("goal_list", {}),
             get: await call("goal_get", { goal_id: seeded!.reviewed.id }),
-            read: await call("read_file", { path: "a.txt" }),
+            read: await call("read_file", { path: "a.txt", exception_reason: "Check fixture bytes" }),
             kb: await call("kb_search", { query: "x" }),
           };
         } finally {

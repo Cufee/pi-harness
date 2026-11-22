@@ -432,15 +432,7 @@ export class ControlPlaneDb {
   }
 
   transaction<T>(fn: () => T): T {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const out = fn();
-      this.db.exec("COMMIT");
-      return out;
-    } catch (err) {
-      this.db.exec("ROLLBACK");
-      throw err;
-    }
+    return this.db.transaction(fn).immediate();
   }
 
   emitEvent(runId: string, taskId: string | null, type: string, payload: unknown): EventRecord {
@@ -536,6 +528,7 @@ export class ControlPlaneDb {
 
   // ---- Runs ----
   createRun(input: {
+    id?: string;
     goal: string;
     repoRoot: string;
     baseBranch: string;
@@ -543,7 +536,7 @@ export class ControlPlaneDb {
     coordinationGroup?: string | null;
     isolationMode?: "standalone" | "coordinated";
   }): RunRecord {
-    const id = shortHashId("run");
+    const id = input.id ?? shortHashId("run");
     const now = Date.now();
     const isolation = input.isolationMode ?? (input.coordinationGroup ? "coordinated" : "standalone");
     this.db
@@ -899,14 +892,18 @@ export class ControlPlaneDb {
     return !!this.db.prepare("SELECT 1 FROM artifacts WHERE run_id = ? AND path = ? AND kind = 'dossier' LIMIT 1").get(runId, path);
   }
 
-  listArtifacts(runId: string, taskId?: string, limit = 100): ArtifactRecord[] {
-    const rows = taskId
-      ? (this.db
-          .prepare("SELECT * FROM artifacts WHERE run_id = ? AND task_id = ? ORDER BY created_at DESC LIMIT ?")
-          .all(runId, taskId, limit) as Record<string, unknown>[])
-      : (this.db
-          .prepare("SELECT * FROM artifacts WHERE run_id = ? ORDER BY created_at DESC LIMIT ?")
-          .all(runId, limit) as Record<string, unknown>[]);
+  listArtifacts(runId: string, taskId?: string, limit = 100, kind?: ArtifactRecord["kind"]): ArtifactRecord[] {
+    let sql = "SELECT * FROM artifacts WHERE run_id = ?";
+    const params: string[] = [runId];
+    if (taskId) {
+      sql += " AND task_id = ?";
+      params.push(taskId);
+    }
+    if (kind) {
+      sql += " AND kind = ?";
+      params.push(kind);
+    }
+    const rows = this.db.prepare(sql + " ORDER BY created_at DESC LIMIT ?").all(...params, limit) as Record<string, unknown>[];
     return rows.map((r) => ({
       id: String(r.id),
       runId: String(r.run_id),
@@ -1207,10 +1204,11 @@ export class ControlPlaneDb {
   }
 
   // ---- Cross-Run Coordination: Versioned Contracts, Advisories & Deadlock-Safe Requests ----
-  listActiveWriteScopes(runId: string): string[] {
-    const rows = this.db
-      .prepare("SELECT glob_pattern FROM write_leases WHERE run_id = ? AND active = 1")
-      .all(runId) as Array<{ glob_pattern: string }>;
+  listActiveWriteScopes(runId: string, taskId?: string): string[] {
+    const query = "SELECT glob_pattern FROM write_leases WHERE run_id = ? AND active = 1";
+    const rows = (taskId
+      ? this.db.prepare(query + " AND task_id = ?").all(runId, taskId)
+      : this.db.prepare(query).all(runId)) as Array<{ glob_pattern: string }>;
     return rows.map((r) => r.glob_pattern);
   }
 

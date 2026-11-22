@@ -5,12 +5,14 @@ import type { ModelCatalogCompiler } from "../catalog/compiler.js";
 import type { QuotaClient } from "../quota/client.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
+import { toolPolicyForTask } from "../runners/types.js";
+import { resolveLaunchRoute } from "./launch-route.js";
 import type { RunAgentRequest, RunAgentResult, RunnerExecutionHandle } from "../runners/types.js";
 import { BisectingMergeQueue } from "../worktree/merge-queue.js";
 import { WorktreeManager } from "../worktree/manager.js";
 import type { AgentTier, ControlPlaneDb, RunRecord, TaskKind, TaskRecord } from "./db.js";
 import { buildHydrationTurn, buildImmutableSystemPrompt, type AnchoredHandoff } from "./prompts.js";
-import { ControlPlaneToolExecutor } from "./tools.js";
+import { ControlPlaneToolExecutor, compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./tools.js";
 
 interface ActiveTaskExecution {
   taskId: string;
@@ -21,6 +23,7 @@ interface ActiveTaskExecution {
 }
 
 interface TaskQuotaPauseMeta {
+  wireModel: string;
   profileId: string;
   model: string | null;
   reason: string;
@@ -49,6 +52,7 @@ export type CustomRunnerFactory = (profile: RunnerProfileConfig) => {
 
 export class HarnessOrchestrator {
   private active = new Map<string, ActiveTaskExecution>();
+  private allocatingWorktrees = new Set<string>();
   private worktreeManagers = new Map<string, WorktreeManager>();
   private mergeQueues = new Map<string, BisectingMergeQueue>();
   private pendingRollovers = new Map<
@@ -64,17 +68,22 @@ export class HarnessOrchestrator {
   constructor(
     readonly db: ControlPlaneDb,
     readonly config: HarnessConfig,
-    readonly catalog: ModelCatalogCompiler,
+    public catalog: ModelCatalogCompiler,
     public quota: QuotaClient,
     private readonly customRunnerFactory?: CustomRunnerFactory,
   ) {
-    this.toolExecutor = new ControlPlaneToolExecutor(db, catalog, {
+    this.toolExecutor = new ControlPlaneToolExecutor(db, () => this.catalog, {
       spawnAndStartTask: (input) => this.spawnAndStartTask(input),
       waitForChildren: (parentId, ids, mode, timeoutMs) => this.waitForChildren(parentId, ids, mode, timeoutMs),
       steerTask: (taskId, message) => this.steerTask(taskId, message),
       cancelTask: (taskId, reason) => this.cancelTask(taskId, reason),
-      scheduleRollover: (taskId, handoff, target) => {
-        this.pendingRollovers.set(taskId, { handoff, target });
+      scheduleRollover: async (taskId, handoff, target) => {
+        const task = this.db.getTask(taskId)!;
+        const run = this.db.getRun(task.runId)!;
+        const route = await this.taskRoute(task, run.repoRoot, target);
+        if (this.db.getTask(taskId)?.status !== "running") throw new Error("Task is no longer running.");
+        this.db.updateTask(taskId, { status: "draining", handoffJson: JSON.stringify(handoff) });
+        this.pendingRollovers.set(taskId, { handoff, target: { ...target, profileId: route.profile.id, model: route.model } });
         const exec = this.active.get(taskId);
         if (exec?.handle) {
           void exec.handle.cancel("clean_rollover").catch(() => {});
@@ -171,21 +180,50 @@ export class HarnessOrchestrator {
     return mq;
   }
 
-  private resolveProfile(profileId?: string, tier?: AgentTier): RunnerProfileConfig {
-    const wanted =
-      profileId ??
-      (tier === 1
-        ? this.config.defaultOrchestratorProfile
-        : tier === 2
-          ? this.config.defaultWorkerProfile
-          : this.config.defaultTaskProfile);
-    const found =
-      (wanted ? this.config.profiles.find((p) => p.id === wanted) : undefined) ??
-      this.config.profiles.find((p) => p.enabled !== false);
-    if (!found) {
-      throw new Error(`No enabled runner profile found (requested: ${wanted ?? "default"})`);
+  private taskRoute(task: TaskRecord, cwd: string, target?: { profileId?: string; model?: string }) {
+    return resolveLaunchRoute(this.config, {
+      profileId: target?.profileId ?? task.profileId,
+      model: target?.model ?? task.model ?? undefined,
+      toolPolicy: toolPolicyForTask(task.tier, task.kind, task.readOnly),
+      tier: task.tier,
+      catalog: this.catalog, quota: this.quota,
+      cwd,
+    });
+  }
+
+  async ensureDirectorTaskRun(ownerId: string, repoRoot: string): Promise<RunRecord> {
+    const id = `director-tasks-${ownerId}`;
+    const found = this.db.getRun(id);
+    if (found) return found;
+    // Director chat also works in directories without a git checkout.
+    const base = await this.getWorktreeManager(repoRoot).resolveRepoInfo().catch(() => ({ baseBranch: "", baseSha: "" }));
+    return this.db.transaction(() => {
+      const existing = this.db.getRun(id);
+      if (existing) return existing;
+      const run = this.db.createRun({ id, goal: `Director tasks for ${ownerId}`, repoRoot, ...base });
+      const owner = this.db.createTask({
+        runId: id, tier: 1, kind: "orchestrator", title: "Director delegation", objective: "Track this Director's delegated tasks and artifacts.",
+        profileId: "director", readOnly: true,
+      });
+      // This durable owner never runs an agent or enters the ready queue.
+      this.db.updateTask(owner.id, { status: "completed" });
+      return run;
+    });
+  }
+
+  async executeDirectorTaskTool(ownerId: string, repoRoot: string, name: string, args: Record<string, unknown>, signal?: AbortSignal) {
+    if (!["spawn_task", "wait_tasks", "wait_children", "cancel_task", "artifact_read"].includes(name)) throw new Error(`Unknown Director task tool ${name}`);
+    const run = await this.ensureDirectorTaskRun(ownerId, repoRoot);
+    signal?.throwIfAborted();
+    const owner = this.db.listTasks(run.id, { parentId: null })[0]!;
+    if (name === "wait_tasks" || name === "wait_children") {
+      const ids = Array.isArray(args.ids) ? args.ids.map(String) : undefined;
+      const timeout = (typeof args.timeout_s === "number" ? args.timeout_s : 300) * 1000;
+      const tasks = await this.waitForChildren(owner.id, ids, args.mode === "any" ? "any" : "all", timeout, signal);
+      const escalations = this.db.listEscalations(run.id);
+      return { children: tasks.map((task) => compactTaskHandoff(task, escalations)) };
     }
-    return found;
+    return this.toolExecutor.execute(run.id, owner.id, name, args);
   }
 
   async startRun(input: {
@@ -195,11 +233,13 @@ export class HarnessOrchestrator {
     model?: string;
     effort?: string;
   }): Promise<{ run: RunRecord; orchestratorTask: TaskRecord }> {
+    const { profile, model } = await resolveLaunchRoute(this.config, {
+      ...input, tier: 1, catalog: this.catalog, quota: this.quota, cwd: input.repoRoot,
+    });
     const wtMgr = this.getWorktreeManager(input.repoRoot);
     const { baseBranch, baseSha } = await wtMgr.resolveRepoInfo();
     const run = this.db.createRun({ goal: input.goal, repoRoot: input.repoRoot, baseBranch, baseSha });
 
-    const profile = this.resolveProfile(input.profileId, 1);
     const orchestratorTask = this.db.createTask({
       runId: run.id,
       parentId: null,
@@ -210,7 +250,7 @@ export class HarnessOrchestrator {
       criteria: "Decompose into disjoint Tier 2 Workers, resolve escalations, verify integration on base branch.",
       readOnly: true,
       profileId: profile.id,
-      model: input.model ?? null,
+      model,
       effort: input.effort ?? null,
       maxTurns: 200,
     });
@@ -237,8 +277,14 @@ export class HarnessOrchestrator {
   }): Promise<TaskRecord> {
     const run = this.db.getRun(input.runId);
     if (!run) throw new Error(`Unknown run ${input.runId}`);
-    const profile = this.resolveProfile(input.profileId, input.tier);
+    const toolPolicy = toolPolicyForTask(input.tier, input.kind, input.readOnly);
+    const { profile, model } = await resolveLaunchRoute(this.config, {
+      ...input, toolPolicy, catalog: this.catalog, quota: this.quota, cwd: run.repoRoot,
+    });
 
+    const parent = this.db.getTask(input.parentId);
+    if (!parent || parent.runId !== run.id) throw new Error(`Unknown parent task ${input.parentId} in ${run.id}`);
+    if (this.db.getRun(run.id)?.status === "stopped" || parent.status === "cancelled") throw new Error("Task delegation was stopped.");
     const task = this.db.createTask({
       runId: input.runId,
       parentId: input.parentId,
@@ -247,9 +293,9 @@ export class HarnessOrchestrator {
       title: input.title,
       objective: input.objective,
       criteria: input.criteria,
-      readOnly: input.readOnly,
+      readOnly: toolPolicy !== "read_write_workspace",
       profileId: profile.id,
-      model: input.model ?? null,
+      model,
       effort: input.effort ?? null,
       maxTurns: input.maxTurns ?? (input.tier === 3 ? this.config.rollover.taskMaxTurns : 120),
       dependsOn: input.dependsOn,
@@ -259,11 +305,18 @@ export class HarnessOrchestrator {
     // Tier 2 Workers get their own isolated git worktree automatically
     if (task.tier === 2) {
       const wtMgr = this.getWorktreeManager(run.repoRoot);
-      await wtMgr.createForWorker(run.id, task.id);
+      this.allocatingWorktrees.add(task.id);
+      try {
+        await wtMgr.createForWorker(run.id, task.id);
+      } catch (error) {
+        this.db.updateTask(task.id, { status: "failed", summary: "Could not allocate the worker worktree." });
+        throw error;
+      } finally {
+        this.allocatingWorktrees.delete(task.id);
+      }
     } else if (task.tier === 3 && input.parentId) {
       // Tier 3 Task Agents inherit their parent Worker's worktree
-      const parent = this.db.getTask(input.parentId);
-      if (parent?.worktreeId) {
+      if (parent.worktreeId) {
         this.db.updateTask(task.id, { worktreeId: parent.worktreeId });
       }
     }
@@ -276,7 +329,7 @@ export class HarnessOrchestrator {
   }
 
   launchTaskLoop(taskId: string): void {
-    if (this.active.has(taskId)) return;
+    if (this.active.has(taskId) || this.allocatingWorktrees.has(taskId)) return;
     const abort = new AbortController();
     const entry: ActiveTaskExecution = {
       taskId,
@@ -284,7 +337,14 @@ export class HarnessOrchestrator {
       promise: Promise.resolve(),
     };
     this.active.set(taskId, entry);
-    entry.promise = this.runTaskWithRollovers(taskId, entry).finally(() => {
+    entry.promise = this.runTaskWithRollovers(taskId, entry).catch((err) => {
+      const task = this.db.getTask(taskId);
+      if (!task || entry.abort.signal.aborted) return;
+      this.db.updateTask(taskId, { status: "failed", summary: "Task launch failed." });
+      this.db.emitEvent(task.runId, taskId, "agent.error", { error: String(err) });
+      if (task.tier === 1) this.db.updateRunStatus(task.runId, "failed");
+    }).finally(() => {
+      this.pendingRollovers.delete(taskId);
       this.active.delete(taskId);
       // Kick any newly unblocked dependent tasks in the same run
       const t = this.db.getTask(taskId);
@@ -342,7 +402,7 @@ export class HarnessOrchestrator {
         return {
           profileId: t.profileId,
           provider,
-          wireModelId: t.model ?? "*",
+          wireModelId: hint?.wireModel ?? t.model ?? "*",
           canonicalModelId: t.model ?? undefined,
           hintResetAt: hint?.resetAt ?? null,
         };
@@ -377,11 +437,18 @@ export class HarnessOrchestrator {
       };
 
       if (canAutoSchedule && schedule.resumeAtMs) {
-        const delayMs = Math.max(250, schedule.resumeAtMs - Date.now());
-        state.timer = setTimeout(() => {
-          void this.resumeRunFromQuota(runId, { trigger: "auto_timer" }).catch(() => {});
-        }, delayMs);
-        state.timer.unref?.();
+        const deadline = schedule.resumeAtMs;
+        const delayMs = Math.max(250, deadline - Date.now());
+        const armTimer = () => {
+          const remaining = deadline - Date.now();
+          state.timer = setTimeout(() => {
+            if (this.runQuotaStates.get(runId) !== state) return;
+            if (Date.now() < deadline) armTimer();
+            else void this.resumeRunFromQuota(runId, { trigger: "auto_timer" }).catch(() => {});
+          }, Math.max(250, Math.min(remaining, 2_147_483_647)));
+          state.timer.unref?.();
+        };
+        armTimer();
 
         // If a Quota Endpoint is wired and the wait is long, also poll periodically to wake up early if quota returns!
         const pollMs = Math.max(5_000, this.config.quotaRetry.earlyWakePollMs ?? 30_000);
@@ -390,7 +457,7 @@ export class HarnessOrchestrator {
             void this.quota
               .resolveResumeSchedule(queries, { forceSync: true })
               .then((check) => {
-                if (check.availableNow && this.runQuotaStates.has(runId)) {
+                if (check.availableNow && this.runQuotaStates.get(runId) === state) {
                   void this.resumeRunFromQuota(runId, { trigger: "quota_recovered" }).catch(() => {});
                 }
               })
@@ -510,6 +577,7 @@ export class HarnessOrchestrator {
       });
       this.db.updateTask(t.id, {
         status: "ready",
+        summary: null,
         sessionId: null,
       });
       resumedTaskIds.push(t.id);
@@ -539,27 +607,35 @@ export class HarnessOrchestrator {
       if (!run) return;
 
       const wt = task.worktreeId ? this.db.getWorktree(task.worktreeId) : null;
+      const toolPolicy = toolPolicyForTask(task.tier, task.kind, task.readOnly);
+      if (toolPolicy === "read_write_workspace" && (!wt || wt.runId !== task.runId)) {
+        throw new Error("A writable agent requires its assigned worktree.");
+      }
       const cwd = wt?.path ?? run.repoRoot;
-      const profile = this.resolveProfile(task.profileId, task.tier);
+      const { profile, model, wireModel } = await this.taskRoute(task, cwd);
+      if (exec.abort.signal.aborted) return;
+      task.model = model;
 
-      this.db.updateTask(task.id, { status: "running" });
+      this.db.updateTask(task.id, { status: "running", model, profileId: profile.id });
 
       const handoff = task.handoffJson ? (JSON.parse(task.handoffJson) as AnchoredHandoff) : null;
       const quotaResumeNote = this.taskResumeNotes.get(task.id) ?? null;
       if (quotaResumeNote) this.taskResumeNotes.delete(task.id);
 
       const systemPrompt = buildImmutableSystemPrompt(task.tier, task.kind, this.config.codeMode);
-      const scopedKbHints =
-        task.tier === 2 ? this.db.kb.getScopedAmbientIndex(run.repoRoot, this.db.listActiveWriteScopes(run.id), 5) : [];
+      const writeScopes = task.tier === 2 ? this.db.listActiveWriteScopes(run.id, task.id)
+        : task.tier === 3 && task.parentId ? this.db.listActiveWriteScopes(run.id, task.parentId) : [];
+      const scopedKbHints = task.tier === 2 ? this.db.kb.getScopedAmbientIndex(run.repoRoot, writeScopes, 5) : [];
 
       const initialPrompt = buildHydrationTurn({
         task,
         handoff,
         tasksSnapshot: this.db.listTasks(run.id),
-        artifacts: this.db.listArtifacts(run.id, task.tier === 1 ? undefined : task.id, 30),
+        artifacts: task.tier === 1 ? this.db.listArtifacts(run.id, undefined, 30, "dossier") : this.db.listArtifacts(run.id, task.id, 30),
         openEscalations: this.db.listEscalations(run.id, "open"),
         blackboard: this.db.blackboardGet(run.id),
         scopedKbHints,
+        writeScopes,
         worktreePath: wt?.path ?? null,
         worktreeBranch: wt?.branch ?? null,
         quotaResumeNote,
@@ -582,11 +658,11 @@ export class HarnessOrchestrator {
         tier: task.tier,
         kind: task.kind,
         cwd,
-        readOnly: task.readOnly,
+        toolPolicy,
         systemPrompt,
         initialPrompt,
         // Only the runner sees the profile's wire ID; task rows, events and quota keep the canonical ID.
-        model: (task.model && this.catalog?.resolveForProfile(profile.id, task.model)?.wireModelId) || task.model,
+        model: wireModel,
         effort: task.effort,
         maxTurns: task.maxTurns,
         rolloverThreshold,
@@ -643,6 +719,7 @@ export class HarnessOrchestrator {
 
         const res = await runner.run(runnerReq);
         const latest = this.db.getTask(task.id)!;
+        if (exec.abort.signal.aborted || latest.status === "cancelled") return;
 
         // Clean rollover requested either via explicit `request_rollover` tool OR automatic 60/65% threshold
         const explicitRollover = this.pendingRollovers.get(task.id);
@@ -678,6 +755,7 @@ export class HarnessOrchestrator {
           const qp = res.quotaPause;
           const reason = qp?.reason ?? "Quota / rate limit reached";
           this.taskQuotaHints.set(task.id, {
+            wireModel,
             profileId: latest.profileId,
             model: latest.model,
             reason,
@@ -686,7 +764,7 @@ export class HarnessOrchestrator {
           });
           this.db.updateTask(task.id, {
             status: "paused_quota",
-            summary: `Paused (quota): ${reason}`.slice(0, 1000),
+            summary: "Task paused for quota.",
           });
           this.db.emitEvent(run.id, task.id, "quota.agent_paused", {
             runId: run.id,
@@ -705,6 +783,13 @@ export class HarnessOrchestrator {
 
         // If task already transitioned via `return_task`, keep that status
         if (["completed", "returned_for_rescope", "blocked", "cancelled"].includes(latest.status)) {
+          if (isReadOnlyKind(latest.kind) && latest.status === "completed") {
+            try {
+              validateTaskHandoff(latest.kind, JSON.parse(latest.resultJson ?? "{}"));
+            } catch {
+              this.db.updateTask(task.id, { status: "failed", resultJson: null, summary: "Task ended without a valid sourced handoff." });
+            }
+          }
           if (latest.tier === 1 && latest.status === "completed") {
             const hasPausedChildren = this.db.listTasks(run.id).some((t) => t.id !== latest.id && t.status === "paused_quota");
             if (hasPausedChildren) {
@@ -736,6 +821,12 @@ export class HarnessOrchestrator {
           }
         }
 
+        if (isReadOnlyKind(latest.kind) || res.stopReason === "error") {
+          this.db.updateTask(task.id, { status: "failed", summary: isReadOnlyKind(latest.kind)
+            ? "Task ended without a valid sourced handoff." : "Task runner reported an error." });
+          if (latest.tier === 1) this.db.updateRunStatus(run.id, "failed");
+          return;
+        }
         // Agent finished its turn naturally without calling `return_task`
         this.db.updateTask(task.id, {
           status: "completed",
@@ -748,7 +839,8 @@ export class HarnessOrchestrator {
         return;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        this.db.updateTask(task.id, { status: "failed", summary: msg.slice(0, 1000) });
+        if (exec.abort.signal.aborted) return;
+        this.db.updateTask(task.id, { status: "failed", summary: "Task runner failed before settlement." });
         this.db.emitEvent(run.id, task.id, "agent.error", { error: msg });
         if (task.tier === 1) {
           this.db.updateRunStatus(run.id, "failed");
@@ -757,6 +849,7 @@ export class HarnessOrchestrator {
       } finally {
         generation.abort(); // Outstanding MCP scripts must not survive their runner (including a rollover).
         exec.generationSignal = undefined;
+        exec.handle = undefined;
       }
     }
   }
@@ -775,8 +868,8 @@ export class HarnessOrchestrator {
   async cancelTask(taskId: string, reason: string): Promise<void> {
     const exec = this.active.get(taskId);
     if (exec) {
-      await exec.handle?.cancel(reason).catch(() => {});
       exec.abort.abort(new Error(reason));
+      await exec.handle?.cancel(reason).catch(() => {});
     }
     const task = this.db.getTask(taskId);
     if (task && !["completed", "cancelled", "failed"].includes(task.status)) {
@@ -797,7 +890,9 @@ export class HarnessOrchestrator {
     ids: string[] | undefined,
     mode: "any" | "all",
     timeoutMs: number,
+    signal = this.active.get(parentId)?.generationSignal,
   ): Promise<TaskRecord[]> {
+    signal?.throwIfAborted();
     const parent = this.db.getTask(parentId);
     if (!parent) throw new Error(`Unknown parent task ${parentId}`);
 
@@ -817,23 +912,29 @@ export class HarnessOrchestrator {
     let targets = getTargets();
     if (isDone(targets)) return targets;
 
-    this.db.updateTask(parentId, { status: "waiting_children" });
-    return new Promise((resolve) => {
+    if (parent.status === "running") this.db.updateTask(parentId, { status: "waiting_children" });
+    return new Promise((resolve, reject) => {
+      const finish = () => {
+        unsub();
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", finish);
+        if (parent.status === "running" && this.db.getTask(parentId)?.status === "waiting_children") {
+          this.db.updateTask(parentId, { status: "running" });
+        }
+        if (signal?.aborted) reject(signal.reason);
+        else resolve(targets);
+      };
       const check = () => {
         targets = getTargets();
-        if (isDone(targets) || Date.now() >= deadline) {
-          unsub();
-          clearTimeout(timer);
-          this.db.updateTask(parentId, { status: "running" });
-          resolve(targets);
-        }
+        if (isDone(targets) || Date.now() >= deadline) finish();
       };
       const unsub = this.db.onEvent((ev) => {
-        if (ev.runId === parent.runId && (ev.type === "task.status" || ev.type === "escalation.created")) {
-          check();
-        }
+        if (ev.runId === parent.runId && (ev.type === "task.status" || ev.type === "escalation.created")) check();
       });
       const timer = setTimeout(check, Math.max(50, deadline - Date.now()));
+      signal?.addEventListener("abort", finish, { once: true });
+      if (signal?.aborted) finish();
+      else check();
     });
   }
 }

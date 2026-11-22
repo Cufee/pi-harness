@@ -7,7 +7,11 @@ import { ModelCatalogCompiler } from "../src/catalog/compiler.js";
 import { loadConfig } from "../src/config.js";
 import { ControlPlaneDb } from "../src/control-plane/db.js";
 import { HarnessOrchestrator } from "../src/control-plane/orchestrator.js";
+import { buildImmutableSystemPrompt } from "../src/control-plane/prompts.js";
+import { DirectorRuntime } from "../src/director/runtime.js";
+import { buildDirectorSystemPrompt } from "../src/director/session.js";
 import { QuotaClient } from "../src/quota/client.js";
+import { withFixtureCatalog } from "./fixtures/launch-config.js";
 import { runGit } from "../src/worktree/manager.js";
 
 async function makeTempGitRepo(): Promise<string> {
@@ -16,6 +20,90 @@ async function makeTempGitRepo(): Promise<string> {
   await runGit(dir, ["-c", "user.name=test", "-c", "user.email=test@local", "commit", "--allow-empty", "-m", "init"]);
   return dir;
 }
+
+describe("Tier role instructions", () => {
+  it("directs T0 to delegate lookups and act on clear requests", () => {
+    const prompt = buildDirectorSystemPrompt("off");
+    assert.match(prompt, /never edit code, run shell commands, or inspect repository files directly/i);
+    assert.match(prompt, /delegate lookups.*read-only research, plan, or verify.*spawn_task/i);
+    assert.match(prompt, /concrete model from list_models/i);
+    assert.match(prompt, /summary and sources via wait_tasks.*artifacts on demand/i);
+    assert.match(prompt, /read_file only as a rare logged exception.*exception_reason/i);
+    assert.match(prompt, /goal_create.*commit it immediately.*clear action request/i);
+    assert.match(prompt, /sensible defaults.*ask only.*ambiguous or irreversible/i);
+    assert.match(prompt, /separate goals for distinct requests.*amend the relevant active goal/i);
+    assert.match(prompt, /goal_amend/);
+    assert.match(prompt, /never duplicate a rendered table/i);
+  });
+
+  it("assigns implementation and research to distinct tiers", () => {
+    const prompt = buildImmutableSystemPrompt(1, "orchestrator", "off");
+    assert.match(prompt, /never read repository files, edit code, or run shell commands/i);
+    assert.match(prompt, /implementation to Tier 2 Workers with disjoint write_scopes.*Blackboard/i);
+    assert.match(prompt, /always choose a concrete model ID from list_models/i);
+    assert.match(prompt, /spawn_task.*read-only research, planning, and verification/i);
+    assert.match(prompt, /wait_children.*summaries.*sources.*artifact_paths.*artifact_read.*more detail/i);
+  });
+
+  it("gives T2 ownership of a scoped worktree and independent verification", () => {
+    const prompt = buildImmutableSystemPrompt(2, "worker", "off");
+    assert.match(prompt, /isolated git worktree.*only within your assigned write scopes/i);
+    assert.match(prompt, /read-only Tier 3.*research.*explore/i);
+    assert.match(prompt, /independent read-only Tier 3.*verify.*before submitting/i);
+    assert.match(prompt, /list_models.*model.*effort/i);
+    assert.match(prompt, /wait_children.*summaries.*sources.*artifact_paths.*artifact_read.*more detail/i);
+    assert.match(prompt, /return_task.*2,000 characters.*structured sources.*artifact_paths/i);
+  });
+
+  it.each(["research", "plan", "verify", "execute"] as const)("bounds a T3 %s assignment and its output", (kind) => {
+    const prompt = buildImmutableSystemPrompt(3, kind, "off");
+    if (kind === "execute") {
+      assert.match(prompt, /execute only the assigned change.*respect any read-only restriction/i);
+    } else {
+      assert.ok(prompt.includes(`Your ${kind} assignment is read-only`));
+      assert.match(prompt, /never edit workspace files, run mutating commands, or implement changes/i);
+    }
+    assert.match(prompt, /never attempt to spawn subagents/i);
+    assert.match(prompt, /catalog model assigned by your parent/i);
+    assert.match(prompt, /return_task.*2,000 characters.*sources.*path.*lines.*symbol.*note/i);
+    assert.match(prompt, /research, plan, and verify tasks must include at least one source/i);
+    assert.match(prompt, /artifact_write.*artifact_paths.*transcripts or tool logs/i);
+  });
+
+  it("launches the independent reviewer with a read-only evidence and verdict contract", async () => {
+    const repoRoot = await makeTempGitRepo();
+    const db = new ControlPlaneDb(":memory:");
+    try {
+      const config = withFixtureCatalog({ ...loadConfig(repoRoot), stateDir: join(repoRoot, "state") });
+      const quota = new QuotaClient();
+      const catalog = new ModelCatalogCompiler(config, quota);
+      const orch = new HarnessOrchestrator(db, config, catalog, quota);
+      const director = new DirectorRuntime(db, config, catalog, quota, orch, () => ({
+        run: async (req) => {
+          assert.equal(req.kind, "verify");
+          assert.equal(req.toolPolicy, "read_only_workspace");
+          assert.match(req.systemPrompt, /independent read-only Done-Reviewer/i);
+          assert.match(req.systemPrompt, /never edit files, run mutating commands, or delegate/i);
+          assert.match(req.systemPrompt, /concrete sources for every required criterion/i);
+          assert.deepEqual(req.tools.map(tool => tool.name), ["submit_review_verdict"]);
+          await req.executeTool("submit_review_verdict", {
+            verdict: "approved", criteriaResults: [{ criterionId: "c1", passed: true, evidence: "Fixture reviewed" }],
+            summary: "Reviewed the fixture",
+          });
+          return { text: "", stopReason: "completed" };
+        },
+      }));
+      const goal = director.goals.createGoal({
+        repoRoot, title: "Review fixture", description: "Review the fixture",
+        criteria: [{ id: "c1", kind: "behavioral", description: "Fixture reviewed" }],
+      });
+      assert.equal((await director.verifyAndReviewGoal(goal.id)).review.verdict, "approved");
+    } finally {
+      db.close();
+      rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () => {
   it("enforces disjoint write-scope leases and auto-unblocks DAG dependents", () => {
@@ -94,7 +182,7 @@ describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () =>
     const repoRoot = await makeTempGitRepo();
     const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-state-"));
     try {
-      const config = { ...loadConfig(repoRoot), stateDir };
+      const config = withFixtureCatalog({ ...loadConfig(repoRoot), stateDir });
       const db = new ControlPlaneDb(":memory:");
       const quota = new QuotaClient();
       const catalog = new ModelCatalogCompiler(config, quota);

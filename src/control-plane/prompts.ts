@@ -1,5 +1,6 @@
 import { codeModePromptSection, type CodeMode } from "../code-mode/sdk.js";
 import type { KbCard } from "../kb/store.js";
+import { compactTaskHandoff, isReadOnlyKind } from "./handoffs.js";
 import type { ArtifactRecord, EscalationRecord, TaskRecord } from "./db.js";
 
 /**
@@ -18,8 +19,8 @@ function tierInstructions(tier: 1 | 2 | 3, kind: TaskRecord["kind"]): string {
       "Your job is to plan, coordinate, track progress, resolve escalations, and keep the overall goal on track.",
       "",
       "CORE RULES:",
-      "1. Never implement repo code directly. Decompose work into disjoint Tier 2 Worker feature slices with explicit non-overlapping `write_scopes`.",
-      "2. Before choosing models or efforts for Workers, call `list_models` to inspect live coding rankings, cost/time per task, and current subscription quota availability.",
+      "1. NEVER read repository files, edit code, or run shell commands. Assign implementation to Tier 2 Workers with disjoint write_scopes and publish shared interface contracts on the Blackboard.",
+      "2. ALWAYS choose a concrete model ID from list_models for every worker or task. Check effort and quota for its route. Never guess a model ID.",
       "3. Use `spawn_task` for read-only research, planning, and verification instead of reading workspace files yourself. Read child handoffs first with `wait_children`: compact summaries, sources (required for research, plan, and verify), and `artifact_paths`. Use `artifact_read` only when you need more detail.",
       "4. When a Worker returns `scope_too_large` or reports a P1 issue, re-scope the DAG cleanly using its evidence and suggested splits without discarding prior artifacts.",
       "5. Protect your context window: when context approaches 60% or when requested by the control plane, write a crisp anchored handoff via `request_rollover` (Goal Invariants, Architectural Decisions, Active Risks, Next Actions) and let the control plane boot your successor.",
@@ -29,7 +30,7 @@ function tierInstructions(tier: 1 | 2 | 3, kind: TaskRecord["kind"]): string {
 
   if (tier === 2) {
     return [
-      "You are a Tier 2 WORKER owning one feature slice inside an isolated git worktree.",
+      "You are a Tier 2 WORKER owning one feature slice inside an isolated git worktree. Edit only within your assigned write scopes.",
       "",
       "CORE RULES:",
       "1. Delegate DYNAMICALLY based on task structure:",
@@ -50,11 +51,13 @@ function tierInstructions(tier: 1 | 2 | 3, kind: TaskRecord["kind"]): string {
     `You are a Tier 3 TASK AGENT (kind: ${kind}) operating inside a small, zero-compaction context window.`,
     "",
     "CORE RULES:",
-    "1. Stay laser-focused on your exact objective and acceptance criteria. Do NOT expand scope.",
+    isReadOnlyKind(kind)
+      ? `1. Your ${kind} assignment is read-only. NEVER edit workspace files, run mutating commands, or implement changes. Inspect only the evidence needed for your assigned question.`
+      : "1. Execute only the assigned change inside the task workspace and respect any read-only restriction.",
     "2. Call `return_task` with a summary of at most 2,000 characters and structured `sources` (`path` and optional `lines`, `symbol`, `note`); research, plan, and verify tasks must include at least one source. Save details with `artifact_write` and pass their paths as `artifact_paths` rather than returning transcripts or tool logs.",
     "3. SCOPE SEND-BACK: If the task will not fit your turn or context budget, use status `scope_too_large` in your handoff and include evidence paths and at least two suggested splits.",
     "4. ISSUE REPORTING: If you find any bug, broken test, architectural violation, or ambiguity in the codebase, ALWAYS raise it up the chain via `report_issue`.",
-    "5. Never attempt to spawn subagents or bypass your tool/write boundaries.",
+    "5. Never attempt to spawn subagents or bypass your tool/write boundaries. Use the catalog model assigned by your parent.",
   ].join("\n");
 }
 
@@ -77,6 +80,7 @@ export function buildHydrationTurn(input: {
   openEscalations: EscalationRecord[];
   blackboard: Record<string, { value: unknown; authorTaskId: string }>;
   scopedKbHints?: KbCard[];
+  writeScopes?: string[];
   worktreePath?: string | null;
   worktreeBranch?: string | null;
   quotaResumeNote?: { reason?: string; userMessage?: string | null } | null;
@@ -88,12 +92,16 @@ export function buildHydrationTurn(input: {
   ];
   if (input.task.criteria) lines.push(`Acceptance Criteria: ${input.task.criteria}`);
   if (input.worktreePath) lines.push(`Worktree: ${input.worktreePath} (branch: ${input.worktreeBranch ?? "unknown"})`);
-  if (input.task.readOnly) lines.push(`Access Mode: STRICTLY READ-ONLY`);
+  if (input.writeScopes?.length && !input.task.readOnly) lines.push(`Assigned write scopes: ${JSON.stringify(input.writeScopes)}`);
+  if (input.task.tier === 1) lines.push("Access Mode: HARNESS TOOLS ONLY");
+  else if (input.task.readOnly || isReadOnlyKind(input.task.kind)) lines.push(`Access Mode: STRICTLY READ-ONLY`);
 
   if (input.quotaResumeNote) {
     lines.push("", "## Resumed After Quota Pause");
     lines.push(
-      `This task was paused early due to quota/rate limits (${input.quotaResumeNote.reason ?? "quota limit"}). Your git worktree, uncommitted WIP, and prior artifacts were preserved intact — inspect current files/git status and continue seamlessly without redoing completed work.`,
+      input.task.tier === 1
+        ? "This run resumed after a quota pause. Check child handoffs and the Blackboard before assigning more work."
+        : "This task resumed after a quota pause. Use the existing worktree and artifacts to continue the assignment.",
     );
     if (input.quotaResumeNote.userMessage) {
       lines.push(`Human Resume Instruction: ${input.quotaResumeNote.userMessage}`);
@@ -111,9 +119,10 @@ export function buildHydrationTurn(input: {
   if (input.tasksSnapshot.length > 0) {
     lines.push("", "## Authoritative Task Tree (from SQLite DB)");
     for (const t of input.tasksSnapshot) {
+      const summary = compactTaskHandoff(t).summary;
       lines.push(
         `- [${t.status}] ${t.id} (T${t.tier}/${t.kind}) "${t.title}" model=${t.model ?? t.profileId}${
-          t.summary ? ` — ${t.summary.slice(0, 140)}` : ""
+          summary ? ` — ${summary.slice(0, 140)}` : ""
         }`,
       );
     }
@@ -130,9 +139,10 @@ export function buildHydrationTurn(input: {
     }
   }
 
-  if (input.artifacts.length > 0) {
+  const artifacts = input.artifacts.filter((a) => a.kind === "dossier" || (input.task.tier !== 1 && a.taskId === input.task.id));
+  if (artifacts.length > 0) {
     lines.push("", "## Deterministic Artifact Index (recent)");
-    for (const a of input.artifacts.slice(0, 30)) {
+    for (const a of artifacts.slice(0, 30)) {
       lines.push(`- [${a.kind}] ${a.path} (by ${a.taskId}): ${a.summary.slice(0, 120)}`);
     }
   }
