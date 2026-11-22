@@ -854,8 +854,11 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
             return res.outcome.outcome === "selected" ? res.outcome.optionId : res.outcome.outcome;
           };
           assert.equal(await ask({ toolCallId: "1", name: "mcp__harness__code_exec", kind: "fetch" }), "allow");
+          assert.equal(await ask({ toolCallId: "1b", name: "mcp_harness_goal_list", kind: "other" }), "allow");
+          assert.equal(await ask({ toolCallId: "1c", title: "mcp_harness_code_exec", kind: "fetch" }), "allow");
           assert.equal(await ask({ toolCallId: "2", title: "harness:goal_list", kind: "execute" }), "allow");
           assert.equal(await ask({ toolCallId: "3", title: "code_exec", kind: "read", locations: [{ path: join(cwd, "a.txt") }] }), "deny");
+          assert.equal(await ask({ toolCallId: "4", name: "mcp_harness_goal_list", kind: "read", locations: [{ path: join(cwd, "a.txt") }] }), "deny");
           await client.notify("session/update", {
             sessionId,
             update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "checked" } },

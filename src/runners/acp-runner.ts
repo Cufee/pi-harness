@@ -730,12 +730,13 @@ export class AcpRunner {
           p._meta?.is_mcp_tool_approval === true && callId !== undefined && codexHarnessCalls.has(callId);
 
         // Normalize MCP tool names emitted by Gemini / Antigravity / generic ACP adapters:
-        // e.g. `mcp__harness__code_exec`, `harness__code_exec`, `harness:code_exec`, `harness/code_exec`, or bare `code_exec`
+        // e.g. `mcp__harness__code_exec`, `mcp_harness_goal_list` (agy), `harness__code_exec`, `harness:code_exec`, `harness/code_exec`, or bare `code_exec`
         const rawCandidateName = p.toolCall?.name ?? p.toolCall?.title ?? "";
         const normalizedHarnessTool = rawCandidateName
           .trim()
           .split(/\s+/)[0]
           ?.replace(/^mcp__harness__/, "")
+          .replace(/^mcp_harness_/, "")
           .replace(/^harness(?:__|:|\/)/, "") ?? "";
         const nonFileToolKind =
           toolKind !== "read" && toolKind !== "edit" && toolKind !== "delete" && toolKind !== "move";
@@ -749,6 +750,7 @@ export class AcpRunner {
           nonFileToolKind &&
           [...externalMcpNames].some((srv) =>
             rawCandidateName.startsWith(`mcp__${srv}__`) ||
+            rawCandidateName.startsWith(`mcp_${srv}_`) ||
             rawCandidateName.startsWith(`${srv}__`) ||
             rawCandidateName.startsWith(`${srv}:`) ||
             rawCandidateName.startsWith(`${srv}/`),
