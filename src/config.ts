@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import type { CodeMode } from "./code-mode/sdk.js";
 
 export type AcpAdapterKind = "claude" | "codex" | "gemini" | "generic";
 
@@ -104,6 +105,8 @@ export interface HarnessConfig {
   stateDir: string;
   socketPath: string;
   profiles: RunnerProfileConfig[];
+  codeMode: CodeMode;
+  codeExec?: { defaultTimeoutMs?: number; maxTimeoutMs?: number; maxOutputChars?: number };
   defaultOrchestratorProfile?: string;
   defaultWorkerProfile?: string;
   defaultTaskProfile?: string;
@@ -216,10 +219,18 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
 
   const profiles = (merged.profiles && merged.profiles.length > 0 ? merged.profiles : defaultProfiles());
 
+  const codeMode = merged.codeMode ?? "collapsed";
+  if (!["collapsed", "hybrid", "off"].includes(codeMode)) throw new Error(`Unknown codeMode: ${codeMode}`);
   return {
     stateDir,
     socketPath: merged.socketPath ? resolve(merged.socketPath) : defaultSocketPath(stateDir),
     profiles,
+    codeMode,
+    codeExec: {
+      defaultTimeoutMs: 60_000, maxTimeoutMs: 600_000,
+      ...(globalCfg.codeExec as HarnessConfig["codeExec"]),
+      ...(repoCfg.codeExec as HarnessConfig["codeExec"]),
+    },
     defaultOrchestratorProfile: merged.defaultOrchestratorProfile ?? profiles.find((p) => p.enabled !== false)?.id,
     defaultWorkerProfile: merged.defaultWorkerProfile ?? profiles.find((p) => p.enabled !== false)?.id,
     defaultTaskProfile: merged.defaultTaskProfile ?? profiles.find((p) => p.enabled !== false)?.id,
@@ -240,6 +251,8 @@ export function saveGlobalConfig(config: HarnessConfig): string {
   const filePath = join(config.stateDir, "config.json");
   const serialized = {
     profiles: config.profiles,
+    codeMode: config.codeMode,
+    codeExec: config.codeExec,
     defaultOrchestratorProfile: config.defaultOrchestratorProfile,
     defaultWorkerProfile: config.defaultWorkerProfile,
     defaultTaskProfile: config.defaultTaskProfile,

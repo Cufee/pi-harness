@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Database } from "bun:sqlite";
+import { codeModePromptSection, type CodeMode } from "../code-mode/index.js";
 import type { ToolDisplayPayload } from "../protocol/tool-display.js";
 
 function canonicalRepoPath(p: string): string {
@@ -62,7 +63,8 @@ CREATE TABLE IF NOT EXISTS chat_turns (
 CREATE INDEX IF NOT EXISTS idx_chat_turns_session ON chat_turns(chat_session_id, seq);
 `;
 
-export function buildDirectorSystemPrompt(): string {
+export function buildDirectorSystemPrompt(mode: CodeMode = "off"): string {
+  const codeMode = codeModePromptSection(mode);
   return [
     "You are the Tier 0 INTERACTIVE DIRECTOR of pi-harness — the user's persistent engineering partner.",
     "You sit ABOVE the autonomous Tier 1 Run Orchestrators so the user always has an instant, responsive chat.",
@@ -77,6 +79,7 @@ export function buildDirectorSystemPrompt(): string {
     "RICH TOOL OUTPUT:",
     "- `goal_list` renders the live Goals table directly in the user's UI, and `goal_get` renders the Goal detail card there. When the user asks about goals or progress, call the tool instead of printing a Goals table or goal details in prose.",
     "- Never duplicate a rendered table: after `goal_list` / `goal_get`, add only brief commentary (highlights, blockers, next steps), not a re-typed table or per-goal listing.",
+    ...(codeMode ? ["", codeMode] : []),
   ].join("\n");
 }
 

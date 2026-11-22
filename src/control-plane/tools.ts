@@ -2,6 +2,9 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
 import type { ModelCatalogCompiler } from "../catalog/compiler.js";
+import { CODE_EXEC_TOOL_NAME, TOOL_SEARCH_TOOL_NAME, createCodeModeExecutor, exposedTools } from "../code-mode/index.js";
+import type { HarnessConfig } from "../config.js";
+import { codeExecEventSink } from "../protocol/tool-display.js";
 import type { ToolDefinition } from "../runners/types.js";
 import type { KbKind } from "../kb/store.js";
 import type { BisectingMergeQueue } from "../worktree/merge-queue.js";
@@ -39,6 +42,7 @@ export interface ToolRuntimeHooks {
   scheduleRollover: (taskId: string, handoff: AnchoredHandoff, target?: { profileId?: string; model?: string; effort?: string }) => void;
   getWorktreeManager: (repoRoot: string) => WorktreeManager;
   getMergeQueue: (repoRoot: string) => BisectingMergeQueue;
+  getTaskSignal: (taskId: string) => AbortSignal | undefined;
 }
 
 const READ_ONLY_TASK_ROLES = {
@@ -532,18 +536,41 @@ export class ControlPlaneToolExecutor {
     private readonly db: ControlPlaneDb,
     private readonly catalog: ModelCatalogCompiler,
     private readonly hooks: ToolRuntimeHooks,
+    private readonly config: HarnessConfig,
   ) {}
 
-  async execute(runId: string, taskId: string, name: string, args: Record<string, unknown>): Promise<unknown> {
+  tools(tier: AgentTier): ToolDefinition[] {
+    return exposedTools(toolsForTier(tier), this.config.codeMode);
+  }
+
+  async execute(runId: string, taskId: string, name: string, args: Record<string, unknown>, scriptSignal?: AbortSignal): Promise<unknown> {
     const task = this.db.getTask(taskId);
     if (!task || task.runId !== runId) {
       throw new Error(`Task ${taskId} not found in run ${runId}`);
+    }
+    if (scriptSignal || (name === CODE_EXEC_TOOL_NAME && this.config.codeMode !== "off")) {
+      const signal = scriptSignal ?? this.hooks.getTaskSignal(taskId);
+      if (!signal || signal.aborted || ["completed", "cancelled", "failed", "returned_for_rescope", "paused_quota"].includes(task.status)) {
+        throw new Error(`code_exec requires an active task generation for ${taskId}`);
+      }
     }
     const run = this.db.getRun(runId);
     if (!run) throw new Error(`Run ${runId} not found`);
 
     if (name === "__list_tools") {
-      return toolsForTier(task.tier);
+      return this.tools(task.tier);
+    }
+    if (this.config.codeMode !== "off" && (name === CODE_EXEC_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME)) {
+      const signal = this.hooks.getTaskSignal(taskId);
+      return createCodeModeExecutor({
+        ...this.config.codeExec,
+        mode: this.config.codeMode,
+        allowedTools: () => toolsForTier(task.tier),
+        execute: (inner, input) => this.execute(runId, taskId, inner, input, signal),
+        artifactsDir: join(run.repoRoot, ".harness", "artifacts"),
+        signal,
+        onToolEvent: codeExecEventSink((ev) => this.db.emitEvent(runId, taskId, "agent.tool", ev)),
+      }).execute(name, args);
     }
 
     const allowed = new Set(toolsForTier(task.tier).map((t) => t.name));
