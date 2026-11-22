@@ -88,6 +88,8 @@ export function writeNdjson(stream: Writable, msg: unknown): boolean {
 
 // Only outbound daemon messages support fragmentation. Client requests keep their frame limit.
 const DAEMON_CHUNK_BYTES = 2 * 1024 * 1024;
+const MAX_CHUNKS_PER_FRAME = 64;
+const MAX_CHUNK_FRAME_BYTES = 32 * 1024 * 1024;
 
 export function writeDaemonMessage(stream: Writable, msg: unknown): void {
   if (stream.destroyed || !stream.writable) return;
@@ -105,15 +107,25 @@ export function writeDaemonMessage(stream: Writable, msg: unknown): void {
 
 export function attachDaemonReader(stream: Readable, opts: FrameReaderOptions): () => void {
   const parts: Buffer[] = [];
+  let bufferedBytes = 0;
   return attachNdjsonReader(stream, {
     ...opts,
     onMessage(raw) {
       const frame = raw as { kind?: string; data?: string; final?: boolean } | null;
       if (frame?.kind === "chunk" && typeof frame.data === "string") {
-        parts.push(Buffer.from(frame.data, "base64"));
+        const decoded = Buffer.from(frame.data, "base64");
+        bufferedBytes += decoded.length;
+        parts.push(decoded);
+        if (parts.length > MAX_CHUNKS_PER_FRAME || bufferedBytes > MAX_CHUNK_FRAME_BYTES) {
+          parts.length = 0;
+          bufferedBytes = 0;
+          opts.onError?.(new Error(`Daemon chunked frame exceeded limit (${MAX_CHUNKS_PER_FRAME} chunks / ${MAX_CHUNK_FRAME_BYTES} bytes)`));
+          return;
+        }
         if (frame.final) {
           const json = Buffer.concat(parts).toString("utf8");
           parts.length = 0;
+          bufferedBytes = 0;
           opts.onMessage(JSON.parse(json));
         }
       } else {

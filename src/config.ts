@@ -169,6 +169,12 @@ export interface RemoteHostConfig {
   bridgeCommand?: string;
   /** Whether the local daemon auto-connects a persistent PeerLink on startup (default: true). */
   autoConnect?: boolean;
+  /**
+   * Reverse peer capability policy for RPCs initiated by this remote host back to us:
+   * - `"messages"` (default): allow session messaging, read-only project/session discovery, and outbox sync only.
+   * - `"full"`: also allow remote-initiated `project.create/update/remove/browse` and `chat.create` on this machine.
+   */
+  reverseAccess?: "messages" | "full";
 }
 
 export interface HarnessConfig {

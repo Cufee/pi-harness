@@ -54,6 +54,8 @@ export class RemotesScreen implements Screen {
     private readonly client: DaemonClient,
     private readonly opts: {
       currentHost?: string | null;
+      /** Laptop's own configured remotes so switching hosts while attached to a remote uses local config cleanly. */
+      localRemotes?: ReadonlyArray<{ name: string; sshTarget: string }>;
       onSwitchHost?: (host: string) => void | Promise<void>;
     },
   ) {}
@@ -67,28 +69,65 @@ export class RemotesScreen implements Screen {
     this.loading = true;
     ctx.requestRender();
     try {
-      const remotes = (await this.client.request<RemoteHostStatus[]>("remote.list")) ?? [];
       const cur = this.opts.currentHost?.trim() || "local";
-      const items: HostRowItem[] = [
-        {
+      const attachedToRemote = cur !== "local";
+      const items: HostRowItem[] = [];
+      if (attachedToRemote && this.opts.localRemotes) {
+        items.push({
           name: "local",
           isLocal: true,
           status: "connected",
           direction: "local",
           queuedMessages: 0,
-          sshTarget: "this machine's daemon",
+          sshTarget: "return to local daemon",
           lastError: null,
-        },
-        ...remotes.map((r) => ({
-          name: r.name,
-          isLocal: false,
-          status: r.status,
-          direction: r.direction,
-          queuedMessages: r.queuedMessages,
-          sshTarget: r.sshTarget,
-          lastError: r.lastError,
-        })),
-      ];
+        });
+        for (const r of this.opts.localRemotes) {
+          items.push({
+            name: r.name,
+            isLocal: false,
+            status: r.name.toLowerCase() === cur.toLowerCase() ? "connected" : "disconnected",
+            direction: "outbound",
+            queuedMessages: 0,
+            sshTarget: r.sshTarget,
+            lastError: null,
+          });
+        }
+        // Include ad-hoc `--remote` host if not in saved config
+        if (!items.some((x) => x.name.toLowerCase() === cur.toLowerCase())) {
+          items.push({
+            name: cur,
+            isLocal: false,
+            status: "connected",
+            direction: "outbound",
+            queuedMessages: 0,
+            sshTarget: "(ad-hoc SSH target)",
+            lastError: null,
+          });
+        }
+      } else {
+        const remotes = (await this.client.request<RemoteHostStatus[]>("remote.list")) ?? [];
+        items.push(
+          {
+            name: "local",
+            isLocal: true,
+            status: "connected",
+            direction: "local",
+            queuedMessages: 0,
+            sshTarget: "this machine's daemon",
+            lastError: null,
+          },
+          ...remotes.map((r) => ({
+            name: r.name,
+            isLocal: false,
+            status: r.status,
+            direction: r.direction,
+            queuedMessages: r.queuedMessages,
+            sshTarget: r.sshTarget,
+            lastError: r.lastError,
+          })),
+        );
+      }
       this.rows = items;
       this.list.setTableItems(
         items.map((r) => {
@@ -199,7 +238,13 @@ export class RemotesScreen implements Screen {
       return;
     }
 
+    const attachedToRemote = Boolean(this.opts.currentHost && this.opts.currentHost !== "local" && this.opts.localRemotes);
     if (data === "a") {
+      if (attachedToRemote) {
+        this.frame.setNotice("Switch to local (Enter on 'local') to manage your configured remotes", "warn");
+        ctx.requestRender();
+        return;
+      }
       this.frame.askPrompt({
         label: "Add remote: <name> <user@host | ssh://...> [bridge cmd]",
         placeholder: "gpu-box vlad@gpu-box",
@@ -230,6 +275,11 @@ export class RemotesScreen implements Screen {
     }
 
     if (data === "c") {
+      if (attachedToRemote) {
+        this.frame.setNotice("Switch to local (Enter on 'local') to connect/disconnect remotes", "warn");
+        ctx.requestRender();
+        return;
+      }
       const sel = this.list.selectedItem()?.value;
       if (!sel || sel.isLocal || sel.direction === "inbound") {
         this.frame.setNotice("Select an outbound configured remote to connect/disconnect", "muted");
@@ -253,6 +303,11 @@ export class RemotesScreen implements Screen {
     }
 
     if (data === "x") {
+      if (attachedToRemote) {
+        this.frame.setNotice("Switch to local (Enter on 'local') to remove remotes", "warn");
+        ctx.requestRender();
+        return;
+      }
       const sel = this.list.selectedItem()?.value;
       if (!sel || sel.isLocal || sel.direction === "inbound") {
         this.frame.setNotice("Only outbound configured remotes can be removed", "muted");

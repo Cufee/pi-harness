@@ -4,6 +4,7 @@ import { createConnection, type Socket } from "node:net";
 import type { Readable, Writable } from "node:stream";
 import type { DaemonEventFrame, DaemonOp, RpcRequest, RpcResponse } from "../protocol/daemon-rpc.js";
 import { attachDaemonReader, writeNdjson } from "../protocol/frames.js";
+import { parseValidatedSshTarget } from "./peer.js";
 
 export interface DaemonClientTarget {
   /** Local Unix socket path OR `ssh://[user@]host[:port]` remote target */
@@ -26,7 +27,10 @@ export class DaemonClient {
   private eventListeners = new Set<(ev: DaemonEventFrame) => void>();
   private closeListeners = new Set<() => void>();
 
-  constructor(private readonly target: string) {}
+  constructor(
+    private readonly target: string,
+    private readonly bridgeCommand?: string,
+  ) {}
 
   onEvent(fn: (ev: DaemonEventFrame) => void): () => void {
     this.eventListeners.add(fn);
@@ -40,12 +44,10 @@ export class DaemonClient {
 
   async connect(): Promise<void> {
     if (this.target.startsWith("ssh://")) {
-      const url = new URL(this.target);
-      const host = url.username ? `${url.username}@${url.hostname}` : url.hostname;
+      const { host, port, remoteCmd } = parseValidatedSshTarget(this.target, this.bridgeCommand);
       const args = ["-T", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"];
-      if (url.port) args.push("-p", url.port);
-      const remoteCmd = url.pathname && url.pathname !== "/" ? url.pathname.slice(1) : "pi-harness bridge";
-      args.push(host, remoteCmd);
+      if (port) args.push("-p", port);
+      args.push("--", host, remoteCmd);
 
       const proc = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] });
       this.sshProc = proc;

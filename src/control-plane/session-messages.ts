@@ -265,14 +265,23 @@ export class SessionMessageStore {
 
   /**
    * Lists queued outbound messages for a connected peer.
-   * Security invariant: if a queued row has `toNode` pinned, ONLY deliver it to a peer whose authenticated `nodeId`
-   * matches `toNode` (never fall back to matching an unpinned hostname of a different node!).
+   * Security invariants:
+   *  - If a queued row has `toNode` pinned, ONLY deliver it to a peer whose authenticated `nodeId` matches `toNode`.
+   *  - If a queued row is unpinned (`toNode == null`) and targets a configured outbound alias, ONLY deliver it
+   *    over the configured outbound link with that exact alias (never an unrelated inbound peer claiming the name).
    */
-  listQueuedOutboundForPeer(peer: { alias?: string; hostName?: string | null; nodeId?: string | null }): SessionMessageRecord[] {
+  listQueuedOutboundForPeer(peer: {
+    alias?: string;
+    direction?: "outbound" | "inbound";
+    hostName?: string | null;
+    nodeId?: string | null;
+    configuredAliases?: ReadonlySet<string>;
+  }): SessionMessageRecord[] {
     const rows = this.db
       .prepare("SELECT * FROM session_messages WHERE direction = 'outbound' AND status = 'queued' ORDER BY created_at ASC")
       .all() as Record<string, unknown>[];
     const peerNode = peer.nodeId?.toLowerCase() ?? null;
+    const aliasLower = peer.alias?.trim().toLowerCase() ?? null;
     const hostNames = new Set(
       [peer.alias, peer.hostName].filter((s): s is string => Boolean(s && s.trim())).map((s) => s.trim().toLowerCase()),
     );
@@ -282,7 +291,11 @@ export class SessionMessageStore {
         if (m.toNode) {
           return peerNode !== null && m.toNode.toLowerCase() === peerNode;
         }
-        return hostNames.has(m.toHost.toLowerCase()) || (peerNode !== null && m.toHost.toLowerCase() === peerNode);
+        const targetLower = m.toHost.toLowerCase();
+        if (peer.configuredAliases?.has(targetLower)) {
+          return peer.direction === "outbound" && aliasLower === targetLower;
+        }
+        return hostNames.has(targetLower) || (peerNode !== null && targetLower === peerNode);
       });
   }
 
@@ -308,6 +321,54 @@ export class SessionMessageStore {
       .prepare("SELECT COUNT(*) AS cnt FROM session_messages WHERE direction = 'outbound' AND status = 'queued'")
       .get() as { cnt: number };
     return Number(row?.cnt ?? 0);
+  }
+
+  /** Marks queued outbound messages for a removed remote host as failed so they never pin daemon auto-quit. */
+  failQueuedForHost(host: string, nodeId: string | null, reason: string): number {
+    const lowerHost = host.trim().toLowerCase();
+    const res = nodeId
+      ? this.db
+          .prepare(
+            `UPDATE session_messages SET status = 'failed', error = ?
+             WHERE direction = 'outbound' AND status = 'queued'
+               AND (lower(to_host) = ? OR lower(COALESCE(to_node, '')) = ?)`,
+          )
+          .run(reason, lowerHost, nodeId.toLowerCase())
+      : this.db
+          .prepare(
+            `UPDATE session_messages SET status = 'failed', error = ?
+             WHERE direction = 'outbound' AND status = 'queued' AND lower(to_host) = ?`,
+          )
+          .run(reason, lowerHost);
+    return res.changes;
+  }
+
+  /** Expires undelivered outbound messages older than `maxAgeMs` so permanently unreachable peers cannot pin daemon busy forever. */
+  expireStaleOutbound(maxAgeMs: number): number {
+    const cutoff = Date.now() - maxAgeMs;
+    const res = this.db
+      .prepare(
+        `UPDATE session_messages SET status = 'failed', error = 'Expired in outbox after delivery TTL'
+         WHERE direction = 'outbound' AND status = 'queued' AND created_at < ?`,
+      )
+      .run(cutoff);
+    return res.changes;
+  }
+
+  /** Counts queued outbound messages targeting known active/configured peers (ignoring orphaned hosts). */
+  countQueuedOutboundForKnownPeers(knownHosts: ReadonlySet<string>, knownNodes: ReadonlySet<string>): number {
+    const rows = this.db
+      .prepare("SELECT to_host, to_node FROM session_messages WHERE direction = 'outbound' AND status = 'queued'")
+      .all() as Array<{ to_host: string; to_node: string | null }>;
+    let count = 0;
+    for (const r of rows) {
+      if (r.to_node && knownNodes.has(r.to_node.toLowerCase())) {
+        count++;
+      } else if (!r.to_node && knownHosts.has(r.to_host.toLowerCase())) {
+        count++;
+      }
+    }
+    return count;
   }
 
   queuedCountsByHost(): Map<string, number> {

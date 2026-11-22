@@ -1471,13 +1471,17 @@ export class AcpRunner {
         res.models as { availableModels?: Array<{ modelId: string; name?: string; description?: string }> } | undefined
       )?.availableModels;
       const legacyById = new Map((legacyModels ?? []).map((m) => [m.modelId, m]));
-      const explicitClaudeByFamily = new Map<string, string>();
+      const explicitClaudeByFamily = new Map<string, string | null>();
       for (const m of legacyModels ?? []) {
         const match = m.modelId.match(/^(?:anthropic\/)?(claude-(opus|sonnet|haiku|fable)-\d+(?:[.-]\d+)*(?:-\d{8})?)$/i);
         if (match) {
           const family = match[2]!.toLowerCase();
-          if (!explicitClaudeByFamily.has(family)) {
+          const prev = explicitClaudeByFamily.get(family);
+          if (prev === undefined) {
             explicitClaudeByFamily.set(family, match[1]!);
+          } else if (prev !== match[1]!) {
+            // Multiple distinct versions in the same family -> ambiguous; do not guess
+            explicitClaudeByFamily.set(family, null);
           }
         }
       }
@@ -1486,7 +1490,8 @@ export class AcpRunner {
       for (const opt of selectValues(modelOpt) ?? []) {
         const legacy = legacyById.get(opt.value);
         const bareClaude = opt.value.trim().match(/^(?:anthropic\/)?(?:claude-)?(opus|sonnet|haiku|fable)$/i);
-        const explicitModelId = bareClaude ? explicitClaudeByFamily.get(bareClaude[1]!.toLowerCase()) : undefined;
+        const candidateExplicit = bareClaude ? explicitClaudeByFamily.get(bareClaude[1]!.toLowerCase()) : undefined;
+        const explicitModelId = candidateExplicit ?? undefined;
         results.push({
           wireModelId: opt.value,
           name: opt.name ?? legacy?.name,

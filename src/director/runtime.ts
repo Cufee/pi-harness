@@ -1698,72 +1698,13 @@ export class DirectorRuntime {
     if (!session) throw new Error(`Unknown chat session ${chatSessionId}`);
 
     if (this.activeChats.has(chatSessionId)) throw new Error(`Chat ${chatSessionId} already has an active turn`);
-    session = await this.resolveOrMigrateSessionModel(session, { strict: true });
-    const typedEvent = opts?.event ?? null;
-    if (!typedEvent) {
-      // A fresh user message naturally supersedes any pending timer subscribed to `user_message` / `any`.
-      for (const t of this.db.timers.list({ ownerKind: "chat", ownerId: chatSessionId, status: "pending" })) {
-        if (t.wakeOnEvent === "user_message" || t.wakeOnEvent === "any") {
-          this.db.timers.cancel(t.id, "superseded_by_user_message");
-        }
-      }
-    }
-    const turnRole = typedEvent ? "system_notice" : (opts?.turnRole ?? "user");
-    const storedContent = typedEvent ? formatChatEventSummary(typedEvent) : userMessage;
-    const userTurn = this.chats.appendTurn(chatSessionId, turnRole, storedContent, undefined, typedEvent);
-    const priorHistory = this.chats.getPromptHistory(chatSessionId, {
-      conversationLimit: 24,
-      systemLimit: 16,
-      excludeSeq: userTurn.seq,
-    });
-    const allSessionGoals = this.goals.listGoals({ repoRoot: session.repoRoot, chatSessionId });
-    const nonArchivedGoals = allSessionGoals.filter((g) => g.status !== "achieved" && g.status !== "cancelled");
-    const archivedGoals = allSessionGoals.filter((g) => g.status === "achieved" || g.status === "cancelled");
-    const bannerGoals = [...nonArchivedGoals, ...archivedGoals.slice(0, 6)];
-    const omittedArchived = Math.max(0, archivedGoals.length - 6);
-
-    const contextTranscript = priorHistory
-      .map((t) => {
-        const speaker = t.event
-          ? `Event (${t.event.kind})`
-          : t.role === "user"
-            ? "User"
-            : t.role === "assistant"
-              ? "Director"
-              : t.role === "tool_output"
-                ? "Tool output"
-                : "System";
-        // tool_output turns contribute only their short summary; the display JSON stays out of the model context.
-        return `${speaker}: ${t.content}`;
-      })
-      .join("\n\n");
-
-    const goalBanner =
-      bannerGoals.length > 0
-        ? `\n\nActive/Recent Goals:\n${bannerGoals
-            .map((g) => {
-              const ver = g.reviewCycle > 0 ? `${g.reviewCycle} rev` : g.liveProgress?.verificationStatus ?? g.status;
-              return `- ${g.id} v${g.version} [${g.status}] "${g.title}" (${ver})`;
-            })
-            .join("\n")}${
-            omittedArchived > 0
-              ? `\n- ... and ${omittedArchived} older completed/cancelled goal${omittedArchived === 1 ? "" : "s"} (use goal_list for all)`
-              : ""
-          }`
-        : "";
-
-    const currentTurnBlock = typedEvent
-      ? `Control-plane event (${typedEvent.kind}):\n${formatChatEventForModel(typedEvent)}`
-      : `User: ${userMessage}`;
-    const prompt = `${contextTranscript ? `Prior conversation:\n${contextTranscript}\n\n` : ""}Workspace: ${session.repoRoot}${goalBanner}\n\n${currentTurnBlock}`;
-
+    // Reserve cancellable ActiveChat BEFORE awaiting cold catalog migration so Esc during migration cancels cleanly
     const abort = new AbortController();
-    const mode = effectiveCodeMode(this.config.codeMode);
-    const executor = this.directorExecutor(session, abort.signal, onToolEvent);
     const { promise: settled, resolve: markSettled } = Promise.withResolvers<void>();
+    const preExecutor = this.directorExecutor(session, abort.signal, onToolEvent);
     const active: ActiveChat = {
       abort,
-      executor,
+      executor: preExecutor,
       onToolEvent,
       settled,
       partial: "",
@@ -1771,13 +1712,81 @@ export class DirectorRuntime {
       waitInterrupts: new Set(),
     };
     this.activeChats.set(chatSessionId, active);
-    const bridgeExt = import.meta.url.endsWith(".js") ? "mcp-bridge.js" : "mcp-bridge.ts";
-    const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", bridgeExt);
 
+    let userTurn!: ChatTurnRecord;
     const finishCancelled = () => ({
-      userTurn, assistantTurn: this.flushChatPartial(chatSessionId, active),
+      userTurn,
+      assistantTurn: this.flushChatPartial(chatSessionId, active),
     });
     try {
+      session = await this.resolveOrMigrateSessionModel(session, { strict: true });
+      const typedEvent = opts?.event ?? null;
+      if (!typedEvent) {
+        // A fresh user message naturally supersedes any pending timer subscribed to `user_message` / `any`.
+        for (const t of this.db.timers.list({ ownerKind: "chat", ownerId: chatSessionId, status: "pending" })) {
+          if (t.wakeOnEvent === "user_message" || t.wakeOnEvent === "any") {
+            this.db.timers.cancel(t.id, "superseded_by_user_message");
+          }
+        }
+      }
+      const turnRole = typedEvent ? "system_notice" : (opts?.turnRole ?? "user");
+      const storedContent = typedEvent ? formatChatEventSummary(typedEvent) : userMessage;
+      userTurn = this.chats.appendTurn(chatSessionId, turnRole, storedContent, undefined, typedEvent);
+      if (abort.signal.aborted) {
+        return { userTurn, assistantTurn: null };
+      }
+      const priorHistory = this.chats.getPromptHistory(chatSessionId, {
+        conversationLimit: 24,
+        systemLimit: 16,
+        excludeSeq: userTurn.seq,
+      });
+      const allSessionGoals = this.goals.listGoals({ repoRoot: session.repoRoot, chatSessionId });
+      const nonArchivedGoals = allSessionGoals.filter((g) => g.status !== "achieved" && g.status !== "cancelled");
+      const archivedGoals = allSessionGoals.filter((g) => g.status === "achieved" || g.status === "cancelled");
+      const bannerGoals = [...nonArchivedGoals, ...archivedGoals.slice(0, 6)];
+      const omittedArchived = Math.max(0, archivedGoals.length - 6);
+
+      const contextTranscript = priorHistory
+        .map((t) => {
+          const speaker = t.event
+            ? `Event (${t.event.kind})`
+            : t.role === "user"
+              ? "User"
+              : t.role === "assistant"
+                ? "Director"
+                : t.role === "tool_output"
+                  ? "Tool output"
+                  : "System";
+          // tool_output turns contribute only their short summary; the display JSON stays out of the model context.
+          return `${speaker}: ${t.content}`;
+        })
+        .join("\n\n");
+
+      const goalBanner =
+        bannerGoals.length > 0
+          ? `\n\nActive/Recent Goals:\n${bannerGoals
+              .map((g) => {
+                const ver = g.reviewCycle > 0 ? `${g.reviewCycle} rev` : g.liveProgress?.verificationStatus ?? g.status;
+                return `- ${g.id} v${g.version} [${g.status}] "${g.title}" (${ver})`;
+              })
+              .join("\n")}${
+              omittedArchived > 0
+                ? `\n- ... and ${omittedArchived} older completed/cancelled goal${omittedArchived === 1 ? "" : "s"} (use goal_list for all)`
+                : ""
+            }`
+          : "";
+
+      const currentTurnBlock = typedEvent
+        ? `Control-plane event (${typedEvent.kind}):\n${formatChatEventForModel(typedEvent)}`
+        : `User: ${userMessage}`;
+      const prompt = `${contextTranscript ? `Prior conversation:\n${contextTranscript}\n\n` : ""}Workspace: ${session.repoRoot}${goalBanner}\n\n${currentTurnBlock}`;
+
+      const mode = effectiveCodeMode(this.config.codeMode);
+      const executor = this.directorExecutor(session, abort.signal, onToolEvent);
+      active.executor = executor;
+      const bridgeExt = import.meta.url.endsWith(".js") ? "mcp-bridge.js" : "mcp-bridge.ts";
+      const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", bridgeExt);
+
       const { profile, model, wireModel } = await resolveLaunchRoute(this.config, {
         tier: 0, cwd: session.repoRoot, profileId: session.profileId, model: session.model, catalog: this.catalog, quota: this.quota,
       });

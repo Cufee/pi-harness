@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, realpathSync, statSync, unlinkSync } from "node:fs";
-import { createServer, type Server, type Socket } from "node:net";
+import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -41,7 +41,7 @@ import { ensureOctofs } from "../tools/native-tools.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
 import { runGit } from "../worktree/manager.js";
-import { PeerManager, type PeerIdentity, type PeerLink, type RemoteHostStatus } from "./peer.js";
+import { parseValidatedSshTarget, PeerManager, type PeerIdentity, type PeerLink, type RemoteHostStatus } from "./peer.js";
 import { PtyHost } from "./pty-host.js";
 
 interface ClientAttachment {
@@ -102,6 +102,49 @@ const PEER_ALLOWED_OPS: ReadonlySet<DaemonOp> = new Set<DaemonOp>([
   "session.read",
   "peer.sync_outbox",
 ]);
+
+/** Default safe reverse-direction allowlist when a remote host calls back into an initiating daemon (`reverseAccess !== "full"`). */
+const REVERSE_MESSAGES_ONLY_OPS: ReadonlySet<DaemonOp> = new Set<DaemonOp>([
+  "ping",
+  "project.list",
+  "project.get",
+  "sessions.list",
+  "session.deliver_message",
+  "session.list_messages",
+  "session.read",
+  "peer.sync_outbox",
+]);
+
+const OUTBOX_TTL_MS = 24 * 60 * 60_000;
+const PEER_HOP_WINDOW_MS = 30 * 60_000;
+
+async function probeUnixSocketState(sockPath: string, timeoutMs = 250): Promise<"live" | "stale" | "unknown"> {
+  return await new Promise<"live" | "stale" | "unknown">((resolve) => {
+    let settled = false;
+    const done = (state: "live" | "stale" | "unknown") => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        probe.destroy();
+      } catch {
+        // ignore
+      }
+      resolve(state);
+    };
+    const probe = createConnection(sockPath);
+    const timer = setTimeout(() => done("unknown"), timeoutMs);
+    timer.unref?.();
+    probe.once("connect", () => done("live"));
+    probe.once("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "ECONNREFUSED" || err.code === "ENOENT") {
+        done("stale");
+      } else {
+        done("unknown");
+      }
+    });
+  });
+}
 
 /**
  * `harnessd`: persistent headless daemon owning SQLite state, running agents,
@@ -324,6 +367,13 @@ export class HarnessDaemon {
     const sockPath = this.config.socketPath;
     mkdirSync(dirname(sockPath), { recursive: true, mode: 0o700 });
     if (existsSync(sockPath)) {
+      const sockState = await probeUnixSocketState(sockPath);
+      if (sockState === "live") {
+        throw new Error(`Refusing to start harnessd: another live daemon is already listening on ${sockPath}`);
+      }
+      if (sockState === "unknown") {
+        throw new Error(`Refusing to unlink ${sockPath}: socket liveness could not be confirmed (timed out or inaccessible)`);
+      }
       try {
         unlinkSync(sockPath);
       } catch {
@@ -630,7 +680,9 @@ export class HarnessDaemon {
     const scheduledQuotaResumes = this.orchestrator.scheduledQuotaResumeCount();
     const pendingTimers = this.db.timers.list({ status: "pending" }).length;
     const pendingWakeups = [...this.pendingWakeups.values()].reduce((sum, q) => sum + q.length, 0);
-    const queuedPeerMessages = this.db.sessionMessages.countQueuedOutbound();
+    this.db.sessionMessages.expireStaleOutbound(OUTBOX_TTL_MS);
+    const knownPeers = this.peers.getKnownPeerSets();
+    const queuedPeerMessages = this.db.sessionMessages.countQueuedOutboundForKnownPeers(knownPeers.hosts, knownPeers.nodes);
     const activeReviews = this.director.activeReviewCount();
     const activePtys = this.ptyHost.activePtyCount();
     const otherTuiClients = this.tuiSockets.size;
@@ -881,8 +933,13 @@ export class HarnessDaemon {
     if (!host) return true;
     const h = host.trim();
     if (!h || h.toLowerCase() === "local" || h === this.nodeId) return true;
-    // Only match localHostName if no configured or connected remote peer has that exact alias
-    if (h.toLowerCase() === this.peers.localHostName.toLowerCase() && !this.peers.findLink(h) && !this.peers.getRemoteConfig(h)) {
+    // Only match localHostName if no configured, live, or previously observed remote peer uses that name
+    if (
+      h.toLowerCase() === this.peers.localHostName.toLowerCase() &&
+      !this.peers.findLink(h) &&
+      !this.peers.getRemoteConfig(h) &&
+      !this.peers.getKnownNodeId(h)
+    ) {
       return true;
     }
     return false;
@@ -897,10 +954,11 @@ export class HarnessDaemon {
         { includeRemotes: false },
         10_000,
       )) ?? [];
-      return remoteProjects.map((pr) => ({ ...pr, host: requestedHost }));
+      const remoteNodeId = this.peers.findLink(requestedHost)?.remoteIdentity?.nodeId ?? this.peers.getKnownNodeId(requestedHost);
+      return remoteProjects.map((pr) => ({ ...pr, host: requestedHost, nodeId: remoteNodeId ?? null }));
     }
 
-    const local = (await this.db.projects.listProjects()).map((pr) => ({ ...pr, host: "local" }));
+    const local = (await this.db.projects.listProjects()).map((pr) => ({ ...pr, host: "local", nodeId: this.nodeId }));
     if (!opts?.includeRemotes || (requestedHost && this.isLocalHostTarget(requestedHost))) {
       return local;
     }
@@ -911,7 +969,8 @@ export class HarnessDaemon {
       links.map(async (link) => {
         const items = (await link.request<Array<Record<string, unknown>>>("project.list", { includeRemotes: false }, 5_000)) ?? [];
         const hostName = link.alias;
-        return items.map((pr) => ({ ...pr, host: hostName }));
+        const nodeId = link.remoteIdentity?.nodeId ?? null;
+        return items.map((pr) => ({ ...pr, host: hostName, nodeId }));
       }),
     );
     const out: Array<Record<string, unknown>> = [...local];
@@ -989,10 +1048,17 @@ export class HarnessDaemon {
         { includeRemotes: false },
         10_000,
       )) ?? [];
-      return remote.map((s) => ({ ...s, host: requestedHost, address: `${requestedHost}:${String(s.id)}`, attachedByMe: false }));
+      const remoteNodeId = this.peers.findLink(requestedHost)?.remoteIdentity?.nodeId ?? this.peers.getKnownNodeId(requestedHost);
+      return remote.map((s) => ({
+        ...s,
+        host: requestedHost,
+        nodeId: remoteNodeId ?? null,
+        address: `${requestedHost}:${String(s.id)}`,
+        attachedByMe: false,
+      }));
     }
 
-    const local = await this.listLocalSessions(socket);
+    const local = (await this.listLocalSessions(socket)).map((s) => ({ ...s, nodeId: this.nodeId }));
     if (!opts?.includeRemotes || (requestedHost && this.isLocalHostTarget(requestedHost))) {
       return local;
     }
@@ -1003,7 +1069,14 @@ export class HarnessDaemon {
       links.map(async (link) => {
         const items = (await link.request<Array<Record<string, unknown>>>("sessions.list", { includeRemotes: false }, 5_000)) ?? [];
         const hostName = link.alias;
-        return items.map((s) => ({ ...s, host: hostName, address: `${hostName}:${String(s.id)}`, attachedByMe: false }));
+        const nodeId = link.remoteIdentity?.nodeId ?? null;
+        return items.map((s) => ({
+          ...s,
+          host: hostName,
+          nodeId,
+          address: `${hostName}:${String(s.id)}`,
+          attachedByMe: false,
+        }));
       }),
     );
     const out: Array<Record<string, unknown>> = [...local];
@@ -1052,23 +1125,12 @@ export class HarnessDaemon {
     };
   }
 
-  private async readSessionOnHost(input: { target: string; limit?: number }): Promise<Record<string, unknown>> {
-    const { host, sessionId } = parseSessionAddress(input.target);
-    const limit = Math.min(50, Math.max(1, input.limit ?? 12));
-    if (host && !this.isLocalHostTarget(host)) {
-      const res = await this.peers.callRemote<Record<string, unknown>>(
-        host,
-        "session.read",
-        { target: sessionId, limit },
-        15_000,
-      );
-      return { ...res, host, address: `${host}:${sessionId}` };
-    }
-
+  private readLocalSession(sessionId: string, limit = 12): Record<string, unknown> {
+    const bounded = Math.min(50, Math.max(1, limit));
     const session = this.director.chats.getSession(sessionId);
     if (!session) throw new Error(`Unknown chat session: ${sessionId}`);
     const project = session.projectId ? this.db.projects.getById(session.projectId) : null;
-    const recentHistory = this.director.chats.getRecentHistory(sessionId, limit);
+    const recentHistory = this.director.chats.getRecentHistory(sessionId, bounded);
     const turns = recentHistory.map((t) => ({
       seq: t.seq,
       role: t.role,
@@ -1091,6 +1153,21 @@ export class HarnessDaemon {
       turns,
       messages,
     };
+  }
+
+  private async readSessionOnHost(input: { target: string; limit?: number }): Promise<Record<string, unknown>> {
+    const { host, sessionId } = parseSessionAddress(input.target);
+    const limit = Math.min(50, Math.max(1, input.limit ?? 12));
+    if (host && !this.isLocalHostTarget(host)) {
+      const res = await this.peers.callRemote<Record<string, unknown>>(
+        host,
+        "session.read",
+        { target: sessionId, limit },
+        15_000,
+      );
+      return { ...res, host, address: `${host}:${sessionId}` };
+    }
+    return this.readLocalSession(sessionId, limit);
   }
 
   private lastUserTurnTimestamp(chatSessionId: string): number {
@@ -1137,8 +1214,10 @@ export class HarnessDaemon {
     }
 
     const sinceUser = this.lastUserTurnTimestamp(input.toSessionId);
-    const inboundSinceUser = this.db.sessionMessages.countInboundSince(input.toSessionId, sinceUser);
-    const hopCount = Math.max(record.hopCount, inboundSinceUser);
+    // Bound anti-loop window to 30m since last user turn so headless sessions without user turns aren't muted forever
+    const hopWindowStart = Math.max(sinceUser, Date.now() - PEER_HOP_WINDOW_MS);
+    const inboundInWindow = this.db.sessionMessages.countInboundSince(input.toSessionId, hopWindowStart);
+    const hopCount = Math.max(record.hopCount, inboundInWindow);
     const circuitBreakerTripped = hopCount > MAX_PEER_MESSAGE_HOPS;
 
     // Emit live event to attached TUI socket (if any) so the user immediately sees peer traffic
@@ -1329,14 +1408,22 @@ export class HarnessDaemon {
     try {
       do {
         this.pendingFlushPeers.delete(key);
+        this.db.sessionMessages.expireStaleOutbound(OUTBOX_TTL_MS);
+        const configuredAliases = new Set((this.config.remotes ?? []).map((r) => r.name.toLowerCase()));
         const queued = this.db.sessionMessages.listQueuedOutboundForPeer({
           alias: peer.alias,
+          direction: peer.direction,
           hostName: peer.remoteIdentity?.hostName ?? null,
           nodeId: peer.remoteIdentity?.nodeId ?? null,
+          configuredAliases,
         });
         let hadTransientFailure = false;
         for (const msg of queued) {
           if (!peer.isOpen) break;
+          if (Date.now() - msg.createdAt > OUTBOX_TTL_MS) {
+            this.db.sessionMessages.markFailed(msg.id, "Expired in outbox after delivery TTL");
+            continue;
+          }
           try {
             await peer.request(
               "session.deliver_message",
@@ -1372,18 +1459,31 @@ export class HarnessDaemon {
       } while (this.pendingFlushPeers.has(key) && peer.isOpen);
     } finally {
       this.flushingPeers.delete(key);
+      if (this.pendingFlushPeers.has(key)) {
+        const replacement = this.peers.findLink(key);
+        if (replacement && replacement.isOpen) {
+          setImmediate(() => void this.flushOutboxForPeer(replacement));
+        }
+      }
     }
     return flushed;
   }
 
   /**
    * Strict positive-allowlist local-only handler for ALL peer-originated RPCs (both inbound sockets
-   * after `peer.hello` and reverse RPCs over outbound links). Never forwards to a third host and
-   * always derives sender identity from the authenticated `PeerLink`.
+   * after `peer.hello` and reverse RPCs over outbound links). Never forwards to a third host, enforces
+   * reverse capability policy (`reverseAccess: "messages"` default vs `"full"`), and always derives
+   * sender identity from the authenticated `PeerLink`.
    */
   private async dispatchPeerRequest(op: DaemonOp, p: Record<string, unknown>, peer: PeerLink): Promise<unknown> {
     if (!PEER_ALLOWED_OPS.has(op)) {
       throw new Error(`RPC "${op}" is not permitted over a peer link`);
+    }
+    if (peer.direction === "outbound") {
+      const cfg = this.peers.getRemoteConfig(peer.alias);
+      if (cfg?.reverseAccess !== "full" && !REVERSE_MESSAGES_ONLY_OPS.has(op)) {
+        throw new Error(`Reverse RPC "${op}" requires reverseAccess: "full" on remote "${peer.alias}"`);
+      }
     }
     switch (op) {
       case "ping": {
@@ -1408,7 +1508,7 @@ export class HarnessDaemon {
       }
       case "project.create": {
         const cloneUrl = typeof p.cloneUrl === "string" && p.cloneUrl.trim() ? p.cloneUrl.trim() : undefined;
-        if (cloneUrl && (cloneUrl.startsWith("-") || !/^(?:https?:\/\/|ssh:\/\/|git@)/i.test(cloneUrl))) {
+        if (cloneUrl && (cloneUrl.startsWith("-") || !/^(?:https:\/\/|ssh:\/\/|git@)/i.test(cloneUrl))) {
           throw new Error(`Invalid clone URL "${cloneUrl}" (must use https://, ssh://, or git@)`);
         }
         const created = await this.db.projects.createProject({
@@ -1451,10 +1551,10 @@ export class HarnessDaemon {
           title: typeof p.title === "string" ? p.title : undefined,
         });
       case "session.deliver_message": {
-        // Always derive sender node & host from the authenticated PeerLink, never trusting spoofed payload fields
+        // Always derive sender node & host from the authenticated PeerLink (using our configured alias on outbound links)
         const authNode = peer.remoteIdentity?.nodeId;
         if (!authNode) throw new Error("Unauthenticated peer link");
-        const authHost = peer.remoteIdentity?.hostName || peer.alias;
+        const authHost = peer.direction === "outbound" ? peer.alias : (peer.remoteIdentity?.hostName || peer.alias);
         return this.deliverLocalSessionMessage({
           id: String(p.id),
           fromNode: authNode,
@@ -1474,12 +1574,12 @@ export class HarnessDaemon {
         return this.db.sessionMessages.listForSession(sessionId, typeof p.limit === "number" ? p.limit : 50);
       }
       case "session.read": {
-        const { host, sessionId } = parseSessionAddress(String(p.target ?? p.sessionId ?? ""));
-        if (host && !this.isLocalHostTarget(host)) throw new Error("Cross-host forwarding is not permitted over a peer link");
-        return await this.readSessionOnHost({
-          target: sessionId,
-          limit: typeof p.limit === "number" ? p.limit : undefined,
-        });
+        const rawTarget = String(p.target ?? p.sessionId ?? "").trim();
+        const { host, sessionId } = parseSessionAddress(rawTarget);
+        if ((host && !this.isLocalHostTarget(host)) || sessionId.includes(":")) {
+          throw new Error("Cross-host forwarding is not permitted over a peer link");
+        }
+        return this.readLocalSession(sessionId, typeof p.limit === "number" ? p.limit : 12);
       }
       case "peer.sync_outbox": {
         const flushed = await this.flushOutboxForPeer(peer);
@@ -1548,17 +1648,23 @@ export class HarnessDaemon {
           rawTarget.startsWith("ssh://") || rawTarget.startsWith("/") || rawTarget.startsWith("./")
             ? rawTarget
             : `ssh://${rawTarget}`;
+        const bridgeCommand = typeof p.bridgeCommand === "string" && p.bridgeCommand.trim() ? p.bridgeCommand.trim() : undefined;
+        if (sshTarget.startsWith("ssh://")) {
+          parseValidatedSshTarget(sshTarget, bridgeCommand);
+        }
+        const reverseAccess = p.reverseAccess === "full" ? "full" : p.reverseAccess === "messages" ? "messages" : undefined;
         const entry: RemoteHostConfig = {
           name,
           sshTarget,
-          ...(typeof p.bridgeCommand === "string" && p.bridgeCommand.trim() ? { bridgeCommand: p.bridgeCommand.trim() } : {}),
+          ...(bridgeCommand ? { bridgeCommand } : {}),
           autoConnect: p.autoConnect === undefined ? true : Boolean(p.autoConnect),
+          ...(reverseAccess ? { reverseAccess } : {}),
         };
         const existing = (this.config.remotes ?? []).filter((r) => r.name.toLowerCase() !== name.toLowerCase());
         const nextRemotes = [...existing, entry];
         this.config = { ...this.config, remotes: nextRemotes };
         saveGlobalConfig(this.config);
-        this.peers.syncRemotes(nextRemotes);
+        this.peers.syncRemotes(nextRemotes, p.connectNow === false ? { skipConnectNames: new Set([name.toLowerCase()]) } : undefined);
         if (p.connectNow !== false) {
           try {
             return await this.peers.connectRemote(name);
@@ -1575,10 +1681,12 @@ export class HarnessDaemon {
         const before = this.config.remotes ?? [];
         const nextRemotes = before.filter((r) => r.name.toLowerCase() !== name.toLowerCase());
         if (nextRemotes.length === before.length) throw new Error(`Unknown remote host: ${name}`);
+        const knownNodeId = this.peers.getKnownNodeId(name);
         this.config = { ...this.config, remotes: nextRemotes };
         saveGlobalConfig(this.config);
         this.peers.syncRemotes(nextRemotes);
-        return { removed: name };
+        const failedQueued = this.db.sessionMessages.failQueuedForHost(name, knownNodeId, `Remote host "${name}" was removed`);
+        return { removed: name, failedQueued };
       }
 
       case "remote.connect": {

@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ProjectBrowseResult, ProjectSummary } from "./control-plane/projects.js";
 import { loadConfig, type AcpProfileConfig } from "./config.js";
+import { loadOrCreateNodeId } from "./control-plane/session-messages.js";
 import type { RemoteHostStatus } from "./daemon/peer.js";
 import { DaemonClient, runStdioSocketBridge } from "./daemon/remote.js";
 import { currentDaemonBuildId, DAEMON_PROTOCOL_REV, HarnessDaemon } from "./daemon/server.js";
@@ -13,6 +14,19 @@ import { parseDurationMs } from "./tui/core/index.js";
 import type { AttachableSession } from "./tui/store.js";
 
 const BOOLEAN_SHORT_FLAGS = new Set(["h"]);
+const BOOLEAN_LONG_FLAGS = new Set([
+  "help",
+  "json",
+  "init",
+  "detach",
+  "all",
+  "no-reply",
+  "expect-reply",
+  "no-connect",
+  "no-auto-connect",
+  "no-create",
+  "exclude-exhausted",
+]);
 
 export function parseArgs(argv: string[]): { positional: string[]; flags: Record<string, string | boolean> } {
   const positional: string[] = [];
@@ -28,12 +42,13 @@ export function parseArgs(argv: string[]): { positional: string[]; flags: Record
       if (eq !== -1) {
         flags[arg.slice(2, eq)] = arg.slice(eq + 1);
       } else {
+        const key = arg.slice(2);
         const next = argv[i + 1];
-        if (next && !next.startsWith("-")) {
-          flags[arg.slice(2)] = next;
+        if (!BOOLEAN_LONG_FLAGS.has(key) && next && !next.startsWith("-")) {
+          flags[key] = next;
           i++;
         } else {
-          flags[arg.slice(2)] = true;
+          flags[key] = true;
         }
       }
     } else if (/^-[A-Za-z]$/.test(arg)) {
@@ -75,10 +90,11 @@ async function stopLocalDaemon(socketPath: string): Promise<boolean> {
   }
 }
 
-async function ensureLocalDaemon(socketPath: string): Promise<DaemonClient> {
+export async function ensureLocalDaemon(socketPath: string): Promise<DaemonClient> {
   const expectedBuildId = currentDaemonBuildId();
   const probe = new DaemonClient(socketPath);
   let needsRestart = false;
+  let busyMismatchError: Error | null = null;
   try {
     await probe.connect();
     const info = (await probe.request("ping")) as {
@@ -92,25 +108,29 @@ async function ensureLocalDaemon(socketPath: string): Promise<DaemonClient> {
       // Reuse the live socket directly — avoids a redundant connect/close handshake on every TUI launch!
       return probe;
     }
-    if (info.protocolRev !== DAEMON_PROTOCOL_REV && info.running) {
+    if (info.protocolRev !== DAEMON_PROTOCOL_REV && info.running !== false) {
       probe.close();
-      throw new Error(
-        `Live harnessd (pid ${info.pid ?? "?"}, protocol rev ${info.protocolRev ?? "?"}) has active work (${info.liveWork ?? "active"}) and will not be stopped automatically for protocol rev ${DAEMON_PROTOCOL_REV}. Wait for work to finish or run \`pi-harness daemon restart\` explicitly.`,
+      busyMismatchError = new Error(
+        `Live harnessd (pid ${info.pid ?? "?"}, protocol rev ${info.protocolRev ?? "?"}) has active or unknown work (${info.liveWork ?? "active"}) and will not be stopped automatically for protocol rev ${DAEMON_PROTOCOL_REV}. Wait for work to finish or run \`pi-harness daemon restart\` explicitly.`,
       );
-    }
-    if (info.protocolRev === DAEMON_PROTOCOL_REV && info.running) {
+    } else if (info.protocolRev === DAEMON_PROTOCOL_REV && info.running !== false) {
       // Never kill an active daemon with running agents/timers just because source file mtime changed
       console.error(
         `[pi-harness] Reusing live harnessd (pid ${info.pid ?? "?"}) despite build change because work is active (${info.liveWork ?? "active"}).`,
       );
       return probe;
+    } else {
+      probe.close();
+      needsRestart = true;
+      // Gracefully stop idle outdated daemon so newly built code takes over immediately
+      await stopLocalDaemon(socketPath);
     }
-    probe.close();
-    needsRestart = true;
-    // Gracefully stop idle outdated daemon so newly built code takes over immediately
-    await stopLocalDaemon(socketPath);
   } catch {
     probe.close();
+  }
+
+  if (busyMismatchError) {
+    throw busyMismatchError;
   }
 
   if (needsRestart) {
@@ -152,15 +172,15 @@ async function ensureLocalDaemon(socketPath: string): Promise<DaemonClient> {
 
 function resolveRemoteSpec(
   rawRemote: string | undefined,
-  remotes: ReadonlyArray<{ name: string; sshTarget: string }> | undefined,
-): { target?: string; hostLabel: string | null } {
+  remotes: ReadonlyArray<{ name: string; sshTarget: string; bridgeCommand?: string }> | undefined,
+): { target?: string; bridgeCommand?: string; hostLabel: string | null } {
   if (!rawRemote || rawRemote.trim().toLowerCase() === "local") {
     return { target: undefined, hostLabel: null };
   }
   const trimmed = rawRemote.trim();
   const saved = remotes?.find((r) => r.name.toLowerCase() === trimmed.toLowerCase());
   if (saved) {
-    return { target: saved.sshTarget, hostLabel: saved.name };
+    return { target: saved.sshTarget, bridgeCommand: saved.bridgeCommand, hostLabel: saved.name };
   }
   if (trimmed.startsWith("ssh://")) {
     try {
@@ -176,11 +196,11 @@ function resolveRemoteSpec(
   return { target: `ssh://${trimmed}`, hostLabel: trimmed.includes("@") ? trimmed.split("@")[1]! : trimmed };
 }
 
-async function connectClient(configSocketPath: string, remoteTarget?: string): Promise<DaemonClient> {
+async function connectClient(configSocketPath: string, remoteTarget?: string, bridgeCommand?: string): Promise<DaemonClient> {
   if (!remoteTarget) {
     return await ensureLocalDaemon(configSocketPath);
   }
-  const client = new DaemonClient(remoteTarget);
+  const client = new DaemonClient(remoteTarget, bridgeCommand);
   await client.connect();
   return client;
 }
@@ -229,21 +249,28 @@ async function runInteractiveSessionLoop(
     | { kind: "run"; repoRoot?: string; runId: string; initialTaskId?: string | null },
   hostCtx: {
     localSocketPath: string;
+    localNodeId: string;
     remoteHost: string | null;
-    getRemotes: () => ReadonlyArray<{ name: string; sshTarget: string }> | undefined;
+    getRemotes: () => ReadonlyArray<{ name: string; sshTarget: string; bridgeCommand?: string }> | undefined;
   },
 ): Promise<void> {
   let client = initialClient;
   let current = initial;
   let currentRemoteHost = hostCtx.remoteHost;
+  let pendingNotice: { tone: "info" | "warn" | "danger" | "ok"; text: string } | null = null;
 
   try {
     while (true) {
+      const localRemotes = hostCtx.getRemotes() ?? [];
+      const noticeForTurn = pendingNotice;
+      pendingNotice = null;
       let action: TuiExitAction;
       if (current.kind === "chat") {
         action = await runDirectorChatTui({
           client,
           remoteHost: currentRemoteHost,
+          localRemotes,
+          initialNotice: noticeForTurn,
           repoRoot: current.repoRoot,
           projectId: current.projectId,
           chatSessionId: current.chatSessionId,
@@ -254,19 +281,57 @@ async function runInteractiveSessionLoop(
         action = await runNativeScrollbackTui({
           client,
           remoteHost: currentRemoteHost,
+          localRemotes,
+          initialNotice: noticeForTurn,
           runId: current.runId,
           initialTaskId: current.initialTaskId,
         });
       }
       if (action.kind === "exit") return;
 
-      // Handle cross-host switch (local <-> remote peer host) seamlessly!
-      if (action.targetHost) {
-        const nextSpec = resolveRemoteSpec(action.targetHost, hostCtx.getRemotes());
-        if (nextSpec.hostLabel !== currentRemoteHost) {
-          client.close();
-          client = await connectClient(hostCtx.localSocketPath, nextSpec.target);
-          currentRemoteHost = nextSpec.hostLabel;
+      // Handle cross-host switch (local <-> saved remote peer host) safely:
+      //  - Map any row belonging to our own local nodeId back to "local"
+      //  - Only permit "local" or an explicitly configured local remote alias (never execute arbitrary daemon-supplied strings!)
+      //  - Connect BEFORE closing the current client so failures keep the user safely inside the TUI
+      const effectiveTargetHost =
+        action.targetNodeId && action.targetNodeId === hostCtx.localNodeId ? "local" : action.targetHost;
+      if (effectiveTargetHost) {
+        const remotesNow = hostCtx.getRemotes() ?? [];
+        const isLocal = effectiveTargetHost.trim().toLowerCase() === "local";
+        const matchedRemote = remotesNow.find((r) => r.name.toLowerCase() === effectiveTargetHost.trim().toLowerCase());
+        if (!isLocal && !matchedRemote) {
+          pendingNotice = {
+            tone: "danger",
+            text: `Cannot switch to unknown host "${effectiveTargetHost}" — add it to your local remotes first (/remotes).`,
+          };
+          continue;
+        }
+        const nextHostLabel = isLocal ? null : matchedRemote!.name;
+        const nextTarget = isLocal ? undefined : matchedRemote!.sshTarget;
+        const nextBridgeCommand = isLocal ? undefined : matchedRemote!.bridgeCommand;
+        if (nextHostLabel !== currentRemoteHost) {
+          let nextClient: DaemonClient | null = null;
+          try {
+            nextClient = await connectClient(hostCtx.localSocketPath, nextTarget, nextBridgeCommand);
+            if (action.targetNodeId) {
+              const info = await nextClient.request<{ nodeId?: string }>("ping");
+              if (info.nodeId && info.nodeId !== action.targetNodeId) {
+                throw new Error(
+                  `Remote "${effectiveTargetHost}" resolved to node ${info.nodeId}, expected ${action.targetNodeId} (alias mismatch)`,
+                );
+              }
+            }
+            client.close();
+            client = nextClient;
+            currentRemoteHost = nextHostLabel;
+          } catch (err) {
+            nextClient?.close();
+            pendingNotice = {
+              tone: "danger",
+              text: `Failed to connect to "${effectiveTargetHost}": ${err instanceof Error ? err.message : String(err)}`,
+            };
+            continue;
+          }
         }
       }
 
@@ -310,15 +375,19 @@ async function main(): Promise<void> {
     return;
   }
 
-  const rawRemote = typeof flags.remote === "string" ? flags.remote : undefined;
-  const hostFlag = typeof flags.host === "string" ? flags.host : undefined;
-  const projectFlag =
-    typeof flags.project === "string"
-      ? flags.project
-      : typeof flags.p === "string"
-        ? flags.p
-        : undefined;
-  const explicitRepoFlag = typeof flags.repo === "string" ? flags.repo : undefined;
+  const requireStringFlag = (name: string): string | undefined => {
+    const v = flags[name];
+    if (v === undefined) return undefined;
+    if (typeof v !== "string" || !v.trim()) {
+      throw new Error(`Flag --${name} requires a value`);
+    }
+    return v.trim();
+  };
+  const rawRemote = requireStringFlag("remote");
+  const hostFlag = requireStringFlag("host");
+  if (flags.p === true) throw new Error("Flag -p requires a project name/id/path");
+  const projectFlag = requireStringFlag("project") ?? (typeof flags.p === "string" ? flags.p.trim() : undefined);
+  const explicitRepoFlag = requireStringFlag("repo");
   const rawRepoRoot = explicitRepoFlag ?? process.cwd();
   let repoRoot: string;
   try {
@@ -330,6 +399,7 @@ async function main(): Promise<void> {
   const remoteSpec = resolveRemoteSpec(rawRemote, config.remotes);
   const hostCtx = {
     localSocketPath: config.socketPath,
+    localNodeId: loadOrCreateNodeId(config.stateDir),
     remoteHost: remoteSpec.hostLabel,
     getRemotes: () => loadConfig(repoRoot).remotes,
   };
@@ -341,14 +411,17 @@ async function main(): Promise<void> {
     if (!target || !body) {
       throw new Error('Usage: pi-harness chat send <chat-id|host:chat-id> "<message>" [--from <chat-id>] [--no-reply]');
     }
-    const client = await connectClient(config.socketPath, remoteSpec.target);
+    const client = await connectClient(config.socketPath, remoteSpec.target, remoteSpec.bridgeCommand);
     try {
-      const fromSessionId = typeof flags.from === "string" && flags.from.trim() ? flags.from.trim() : "cli";
+      const explicitFrom = typeof flags.from === "string" && flags.from.trim() ? flags.from.trim() : null;
+      const fromSessionId = explicitFrom ?? "cli";
+      // Default `expectReply: false` for one-shot CLI sends without `--from <chatId>` so the recipient isn't told to reply to `<host>:cli`
+      const expectReply = flags["no-reply"] ? false : Boolean(flags["expect-reply"] || explicitFrom);
       const res = await client.request("session.send_message", {
         fromSessionId,
         target,
         body,
-        expectReply: !flags["no-reply"],
+        expectReply,
       });
       console.log(JSON.stringify(res, null, 2));
     } finally {
@@ -365,7 +438,7 @@ async function main(): Promise<void> {
       printHelp();
       return;
     }
-    const client = await connectClient(config.socketPath, remoteSpec.target);
+    const client = await connectClient(config.socketPath, remoteSpec.target, remoteSpec.bridgeCommand);
     const preferRemoteLast = Boolean(remoteSpec.target && !explicitRepoFlag && !projectFlag);
     await runInteractiveSessionLoop(
       client,
@@ -406,7 +479,7 @@ async function main(): Promise<void> {
     }
     if (sub === "stop") {
       if (remoteSpec.target) {
-        const client = await connectClient(config.socketPath, remoteSpec.target);
+        const client = await connectClient(config.socketPath, remoteSpec.target, remoteSpec.bridgeCommand);
         try {
           const res = await client.request<{ pid?: number }>("daemon.shutdown");
           console.log(`Stopped remote harnessd on ${remoteSpec.hostLabel ?? rawRemote} (pid ${res.pid ?? "?"}).`);
@@ -421,7 +494,7 @@ async function main(): Promise<void> {
     }
     if (sub === "restart") {
       if (remoteSpec.target) {
-        const stopClient = await connectClient(config.socketPath, remoteSpec.target);
+        const stopClient = await connectClient(config.socketPath, remoteSpec.target, remoteSpec.bridgeCommand);
         try {
           await stopClient.request("daemon.shutdown").catch(() => {});
         } finally {
@@ -429,7 +502,7 @@ async function main(): Promise<void> {
         }
         await new Promise((r) => setTimeout(r, 300));
         // Reconnecting via `pi-harness bridge` triggers `ensureLocalDaemon` on the remote host
-        const restartClient = await connectClient(config.socketPath, remoteSpec.target);
+        const restartClient = await connectClient(config.socketPath, remoteSpec.target, remoteSpec.bridgeCommand);
         try {
           const info = await restartClient.request<{ pid?: number }>("ping");
           console.log(`Restarted remote harnessd on ${remoteSpec.hostLabel ?? rawRemote} (pid ${info.pid ?? "?"}).`);
@@ -444,7 +517,7 @@ async function main(): Promise<void> {
       console.log("Restarted harnessd.");
       return;
     }
-    const client = await connectClient(config.socketPath, remoteSpec.target);
+    const client = await connectClient(config.socketPath, remoteSpec.target, remoteSpec.bridgeCommand);
     try {
       const res = await client.request("status");
       console.log(JSON.stringify(res, null, 2));
@@ -461,7 +534,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  const client = await connectClient(config.socketPath, remoteSpec.target);
+  const client = await connectClient(config.socketPath, remoteSpec.target, remoteSpec.bridgeCommand);
   let handoffClientToTui = false;
   try {
     switch (cmd) {
@@ -495,7 +568,7 @@ async function main(): Promise<void> {
             name,
             sshTarget,
             bridgeCommand: typeof flags.bridge === "string" ? flags.bridge : undefined,
-            autoConnect: !flags["no-connect"],
+            autoConnect: !flags["no-auto-connect"],
             connectNow: !flags["no-connect"],
           });
           console.log(JSON.stringify(added, null, 2));
@@ -538,7 +611,8 @@ async function main(): Promise<void> {
             console.log("HOST\tID\tNAME\tWORKSPACE\tSESSIONS\tGOALS\tPATH");
             for (const p of projects) {
               const ws = !p.exists ? "missing" : p.isGit ? `git:${p.gitBranch ?? "HEAD"}` : "folder";
-              console.log(`${p.host ?? "local"}\t${p.id}\t${p.name}\t${ws}\t${p.sessionCount}\t${p.activeGoalCount}\t${p.rootPath}`);
+              const displayHost = p.host === "local" && remoteSpec.hostLabel ? remoteSpec.hostLabel : (p.host ?? "local");
+              console.log(`${displayHost}\t${p.id}\t${p.name}\t${ws}\t${p.sessionCount}\t${p.activeGoalCount}\t${p.rootPath}`);
             }
           }
           break;
@@ -561,6 +635,9 @@ async function main(): Promise<void> {
         if (sub === "use" || sub === "open") {
           const ref = positional[2];
           if (!ref) throw new Error("Usage: pi-harness project use <name|id|path> [--host <name>]");
+          if (hostFlag && remoteSpec.target && hostFlag.toLowerCase() !== (remoteSpec.hostLabel ?? "").toLowerCase()) {
+            throw new Error(`Cannot combine --remote ${rawRemote} with --host ${hostFlag} on \`project use\`; specify one target host.`);
+          }
           const proj = await client.request<ProjectSummary & { host?: string }>("project.get", {
             projectId: ref,
             ...(hostFlag ? { host: hostFlag } : {}),
@@ -574,7 +651,7 @@ async function main(): Promise<void> {
           if (hostFlag && hostFlag.toLowerCase() !== "local" && !remoteSpec.target) {
             const spec = resolveRemoteSpec(hostFlag, config.remotes);
             client.close();
-            targetClient = await connectClient(config.socketPath, spec.target);
+            targetClient = await connectClient(config.socketPath, spec.target, spec.bridgeCommand);
             targetHostLabel = spec.hostLabel;
           }
           handoffClientToTui = true;
@@ -711,7 +788,8 @@ async function main(): Promise<void> {
         } else {
           console.log("HOST          SESSION          TYPE  STATE          ATTACHED  WORKSPACE / TITLE");
           for (const s of sessions) {
-            const hostCol = (s.host ?? remoteSpec.hostLabel ?? "local").padEnd(13);
+            const rawHost = s.host === "local" && remoteSpec.hostLabel ? remoteSpec.hostLabel : (s.host ?? remoteSpec.hostLabel ?? "local");
+            const hostCol = rawHost.padEnd(13);
             const att = s.attached ? "yes" : "no";
             const dir = s.repoRoot.split("/").filter(Boolean).pop() ?? s.repoRoot;
             console.log(`${hostCol} ${s.id.padEnd(16)} ${s.kind.padEnd(5)} ${s.status.padEnd(14)} ${att.padEnd(9)} ${s.title} (${dir})`);
@@ -771,12 +849,14 @@ async function main(): Promise<void> {
         } else if (runs.length === 0) {
           console.log("No runs found.");
         } else {
-          console.log("RUN              STATUS        UPDATED              WORKSPACE         GOAL");
+          const maxW = Math.max(80, process.stdout.columns || 120);
+          const goalW = Math.max(16, maxW - 73);
+          console.log("RUN              STATUS        UPDATED (UTC)         WORKSPACE         GOAL");
           for (const r of runs) {
             const ws = (r.repoRoot.split("/").filter(Boolean).pop() ?? r.repoRoot).slice(0, 16);
-            const firstLine = (r.goal.split("\n")[0] ?? "").trim().slice(0, 64);
-            const ts = new Date(r.updatedAt).toISOString().replace("T", " ").slice(0, 19);
-            console.log(`${r.id.padEnd(16)} ${r.status.padEnd(13)} ${ts.padEnd(20)} ${ws.padEnd(17)} ${firstLine}`);
+            const firstLine = (r.goal.split("\n")[0] ?? "").trim().slice(0, goalW);
+            const ts = `${new Date(r.updatedAt).toISOString().replace("T", " ").slice(0, 19)}Z`;
+            console.log(`${r.id.padEnd(16)} ${r.status.padEnd(13)} ${ts.padEnd(21)} ${ws.padEnd(17)} ${firstLine}`);
           }
         }
         break;

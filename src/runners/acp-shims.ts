@@ -518,9 +518,10 @@ export function claudeOptionMatchesExactModel(opt: SelectValue, requestedModel: 
     if (!field) continue;
     const explicit = field.match(CLAUDE_EXPLICIT_METADATA_ID_RE);
     if (explicit) {
+      // Once explicit versioned metadata is present, it is authoritative — never fall through to stale display text
       const expFamily = explicit[2]!.toLowerCase();
       const expVer = explicit[3]!.replace(/\./g, "-");
-      if (expFamily === reqFamily && expVer === reqVer) return true;
+      return expFamily === reqFamily && expVer === reqVer;
     }
   }
   if (!opt.name) return false;

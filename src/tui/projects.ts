@@ -24,7 +24,7 @@ const PROJECT_COLUMNS: ColumnSpec[] = [
   { key: "counts", header: "ACTIVITY", width: 14, align: "right", priority: 2 },
 ];
 
-export type FederatedProjectSummary = ProjectSummary & { host?: string };
+export type FederatedProjectSummary = ProjectSummary & { host?: string; nodeId?: string | null };
 
 const BROWSE_COLUMNS: ColumnSpec[] = [
   { key: "kind", header: "TYPE", width: 6, priority: 1 },

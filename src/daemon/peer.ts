@@ -33,6 +33,15 @@ const MIN_PEER_PROTOCOL_REV = 8;
 const SAFE_SSH_PART_RE = /^[A-Za-z0-9._-]+$/;
 const SAFE_SSH_HOST_RE = /^(?:[A-Za-z0-9._-]+|\[[0-9a-fA-F:]+\])$/;
 
+/** Validates a peer-claimed or configured host alias/name (prevents SSH option injection & weird whitespace). */
+export function validatePeerHostName(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.startsWith("-") || !SAFE_SSH_PART_RE.test(trimmed)) {
+    throw new Error(`Invalid peer hostName "${raw}"`);
+  }
+  return trimmed;
+}
+
 /** Validates an `ssh://` URL to prevent SSH option injection (e.g. `-oProxyCommand=...`). */
 export function parseValidatedSshTarget(sshTarget: string, bridgeCommand?: string): {
   host: string;
@@ -59,7 +68,9 @@ export function parseValidatedSshTarget(sshTarget: string, bridgeCommand?: strin
   if (url.port && !/^\d{1,5}$/.test(url.port)) {
     throw new Error(`Invalid SSH port "${url.port}"`);
   }
-  const host = usernamePart ? `${usernamePart}@${hostnamePart}` : hostnamePart;
+  // OpenSSH CLI expects unbracketed IPv6 literal (`::1`, not `[::1]`)
+  const sshHost = hostnamePart.startsWith("[") && hostnamePart.endsWith("]") ? hostnamePart.slice(1, -1) : hostnamePart;
+  const host = usernamePart ? `${usernamePart}@${sshHost}` : sshHost;
   const remoteCmd =
     bridgeCommand?.trim() ||
     (url.pathname && url.pathname !== "/" ? decodeURIComponent(url.pathname.slice(1)).trim() : "pi-harness bridge");
@@ -96,7 +107,10 @@ export class PeerLink {
     if (attachReader) {
       this.detachReader = attachDaemonReader(this.readable, {
         onMessage: (raw) => this.handleWireFrame(raw),
-        onError: () => this.close(),
+        onError: () => {
+          // Tolerate stray non-JSON SSH MOTD/banner lines prior to `peer.hello` completion
+          if (this.remoteIdentity) this.close();
+        },
         onEnd: () => this.close(),
       });
     }
@@ -127,6 +141,18 @@ export class PeerLink {
       const reqId = frame.id;
       const op = frame.op as DaemonOp;
       const params = (frame.params ?? {}) as Record<string, unknown>;
+      // Gate ALL inbound RPCs on outbound links until `peer.hello` has been validated
+      if (this.direction === "outbound" && !this.remoteIdentity) {
+        if (this.isOpen) {
+          writeDaemonMessage(this.writable, {
+            kind: "res",
+            id: reqId,
+            ok: false,
+            error: "Peer handshake incomplete",
+          } satisfies RpcResponse);
+        }
+        return;
+      }
       void this.onInboundRequest(op, params, this).then(
         (result) => {
           if (this.isOpen) {
@@ -177,13 +203,14 @@ export class PeerLink {
     });
   }
 
-  close(): void {
+  close(reason?: string): void {
     if (this.closed) return;
     this.closed = true;
     this.detachReader?.();
     this.detachReader = null;
+    const msg = reason?.trim() ? `Peer "${this.alias}" disconnected: ${reason.trim()}` : `Peer "${this.alias}" disconnected`;
     for (const p of this.pending.values()) {
-      p.reject(new Error(`Peer "${this.alias}" disconnected`));
+      p.reject(new Error(msg));
     }
     this.pending.clear();
     try {
@@ -242,7 +269,7 @@ export class PeerManager {
   }
 
   /** Applies configured `remotes` list, starting auto-connect links and closing removed/retargeted ones. */
-  syncRemotes(configs: RemoteHostConfig[]): void {
+  syncRemotes(configs: RemoteHostConfig[], opts?: { skipConnectNames?: ReadonlySet<string> }): void {
     if (this.disposed) return;
     const nextNames = new Set(configs.map((c) => c.name.toLowerCase()));
     for (const [key, entry] of [...this.outbound.entries()]) {
@@ -258,6 +285,7 @@ export class PeerManager {
     }
     for (const cfg of configs) {
       const key = cfg.name.toLowerCase();
+      const skipConnect = Boolean(opts?.skipConnectNames?.has(key));
       const existing = this.outbound.get(key);
       if (!existing) {
         const entry: OutboundPeerEntry = {
@@ -276,7 +304,7 @@ export class PeerManager {
           connectPromise: null,
         };
         this.outbound.set(key, entry);
-        if (cfg.autoConnect !== false) {
+        if (cfg.autoConnect !== false && !skipConnect) {
           void this.connectRemote(cfg.name).catch(() => {});
         }
       } else {
@@ -293,7 +321,7 @@ export class PeerManager {
           existing.connectPromise = null;
           existing.remoteNodeId = null;
           existing.remoteHostName = null;
-          if (cfg.autoConnect !== false && !existing.manuallyDisconnected) {
+          if (cfg.autoConnect !== false && !existing.manuallyDisconnected && !skipConnect) {
             void this.connectRemote(cfg.name).catch(() => {});
           }
         }
@@ -362,20 +390,37 @@ export class PeerManager {
         if (Number(hello.protocolRev ?? 0) < MIN_PEER_PROTOCOL_REV) {
           throw new Error(`Remote "${entry.config.name}" protocol rev ${hello.protocolRev} is below minimum ${MIN_PEER_PROTOCOL_REV}`);
         }
+        const safeRemoteHost = validatePeerHostName(String(hello.hostName ?? entry.config.name));
+        // Prevent two configured aliases pointing at the same remote node from flapping each other's links
+        for (const [otherKey, other] of this.outbound.entries()) {
+          if (otherKey !== entry.config.name.toLowerCase() && other.link?.isOpen && other.remoteNodeId === hello.nodeId) {
+            throw new Error(`Remote node ${hello.nodeId} is already connected under alias "${other.config.name}"`);
+          }
+        }
+        const verifiedHello: PeerIdentity = {
+          nodeId: hello.nodeId,
+          hostName: safeRemoteHost,
+          protocolRev: Number(hello.protocolRev),
+        };
 
         const link = provisional;
         provisional = null;
         entry.pendingLink = null;
-        link.remoteIdentity = hello;
+        link.remoteIdentity = verifiedHello;
         entry.link = link;
         entry.status = "connected";
-        entry.remoteNodeId = hello.nodeId;
-        entry.remoteHostName = hello.hostName;
+        entry.remoteNodeId = verifiedHello.nodeId;
+        entry.remoteHostName = verifiedHello.hostName;
         entry.lastConnectedAt = Date.now();
         entry.lastError = null;
         entry.backoffMs = 2_000;
-        this.knownNodeByHost.set(entry.config.name.toLowerCase(), hello.nodeId);
-        if (hello.hostName) this.knownNodeByHost.set(hello.hostName.toLowerCase(), hello.nodeId);
+        this.knownNodeByHost.set(entry.config.name.toLowerCase(), verifiedHello.nodeId);
+        if (
+          verifiedHello.hostName.toLowerCase() !== this.localHostName.toLowerCase() &&
+          !this.outbound.has(verifiedHello.hostName.toLowerCase())
+        ) {
+          this.knownNodeByHost.set(verifiedHello.hostName.toLowerCase(), verifiedHello.nodeId);
+        }
 
         link.onClose(() => {
           if (entry.link === link) {
@@ -461,7 +506,10 @@ export class PeerManager {
           }
         },
       );
-      proc.once("exit", () => link.close());
+      proc.once("exit", (code) => {
+        const detail = stderrBuf.trim() || (code != null ? `ssh exited with code ${code}` : undefined);
+        link.close(detail);
+      });
       return link;
     }
 
@@ -490,19 +538,33 @@ export class PeerManager {
     if (Number(hello.protocolRev ?? 0) < MIN_PEER_PROTOCOL_REV) {
       throw new Error(`Incompatible peer protocolRev ${hello.protocolRev} (minimum ${MIN_PEER_PROTOCOL_REV})`);
     }
-    const existing = this.inbound.get(hello.nodeId);
+    const safeHostName = validatePeerHostName(String(hello.hostName ?? hello.nodeId));
+    const lowerHost = safeHostName.toLowerCase();
+    if (lowerHost === "local" || lowerHost === this.localHostName.toLowerCase()) {
+      throw new Error(`Peer hostName "${safeHostName}" collides with local daemon hostname "${this.localHostName}"`);
+    }
+    const conflictingOutbound = this.outbound.get(lowerHost);
+    if (conflictingOutbound?.remoteNodeId && conflictingOutbound.remoteNodeId !== hello.nodeId) {
+      throw new Error(`Peer hostName "${safeHostName}" collides with configured remote alias "${conflictingOutbound.config.name}"`);
+    }
+    const verifiedHello: PeerIdentity = {
+      nodeId: hello.nodeId,
+      hostName: safeHostName,
+      protocolRev: Number(hello.protocolRev),
+    };
+    const existing = this.inbound.get(verifiedHello.nodeId);
     if (existing && existing.isOpen) {
       existing.close();
     }
     const link = new PeerLink(
-      hello.hostName || hello.nodeId,
+      verifiedHello.hostName,
       "inbound",
       socket,
       socket,
       this.onInboundRequest,
       () => {
         this.socketToInbound.delete(socket);
-        if (this.inbound.get(hello.nodeId) === link) this.inbound.delete(hello.nodeId);
+        if (this.inbound.get(verifiedHello.nodeId) === link) this.inbound.delete(verifiedHello.nodeId);
         try {
           socket.destroy();
         } catch {
@@ -511,17 +573,36 @@ export class PeerManager {
       },
       false,
     );
-    link.remoteIdentity = hello;
-    this.inbound.set(hello.nodeId, link);
+    link.remoteIdentity = verifiedHello;
+    this.inbound.set(verifiedHello.nodeId, link);
     this.socketToInbound.set(socket, link);
-    if (hello.hostName) this.knownNodeByHost.set(hello.hostName.toLowerCase(), hello.nodeId);
+    if (!this.outbound.has(lowerHost)) {
+      this.knownNodeByHost.set(lowerHost, verifiedHello.nodeId);
+    }
 
     socket.once("close", () => {
       this.socketToInbound.delete(socket);
-      if (this.inbound.get(hello.nodeId) === link) this.inbound.delete(hello.nodeId);
+      if (this.inbound.get(verifiedHello.nodeId) === link) this.inbound.delete(verifiedHello.nodeId);
       link.close();
     });
     return link;
+  }
+
+  /** Returns sets of currently configured/known host aliases and node IDs for live-work accounting. */
+  getKnownPeerSets(): { hosts: Set<string>; nodes: Set<string> } {
+    const hosts = new Set<string>();
+    const nodes = new Set<string>();
+    for (const [k, entry] of this.outbound.entries()) {
+      hosts.add(k);
+      if (entry.remoteNodeId) nodes.add(entry.remoteNodeId.toLowerCase());
+      if (entry.remoteHostName) hosts.add(entry.remoteHostName.toLowerCase());
+    }
+    for (const [nodeId, link] of this.inbound.entries()) {
+      if (!link.isOpen) continue;
+      nodes.add(nodeId.toLowerCase());
+      hosts.add(link.alias.toLowerCase());
+    }
+    return { hosts, nodes };
   }
 
   getInboundLinkForSocket(socket: Socket): PeerLink | undefined {
@@ -542,13 +623,19 @@ export class PeerManager {
     return Boolean(this.outbound.has(key) || this.knownNodeByHost.has(key) || this.findLink(hostOrNodeId));
   }
 
-  /** Finds a live `PeerLink` by configured alias, remote hostname, or remote nodeId. */
+  /**
+   * Finds a live `PeerLink` by configured alias, remote hostname, or remote nodeId.
+   * Security invariant: a configured outbound alias is strictly reserved — if that alias is offline,
+   * NEVER fall through to an unrelated inbound peer claiming the same hostname.
+   */
   findLink(hostOrNodeId: string): PeerLink | null {
     const key = hostOrNodeId.trim().toLowerCase();
     if (!key || key === "local") return null;
 
-    const outDirect = this.outbound.get(key);
-    if (outDirect?.link?.isOpen) return outDirect.link;
+    if (this.outbound.has(key)) {
+      const outDirect = this.outbound.get(key)!;
+      return outDirect.link?.isOpen ? outDirect.link : null;
+    }
 
     for (const entry of this.outbound.values()) {
       if (!entry.link?.isOpen) continue;

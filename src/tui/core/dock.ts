@@ -9,7 +9,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { renderToolOutput, type ToolDisplayPayload } from "../tool-output/index.js";
 import { type EntityRef, type Hint, renderHintBar } from "./keymap.js";
-import { clamp, fillLineBg, fit, sanitizeLine, sanitizeText, splitRow, visibleWidth, wrap } from "./text.js";
+import { clamp, fillLineBg, fit, middleEllipsis, sanitizeLine, sanitizeText, splitRow, visibleWidth, wrap } from "./text.js";
 import { statusGlyph, statusTone, type Theme, type Tone } from "./tokens.js";
 
 /**
@@ -108,7 +108,7 @@ export class LiveTurnTail implements Component {
       if (this.modelLabel) {
         out.push(clamp(` ${this.theme.accent(g.diamond)} ${this.theme.muted(sanitizeLine(this.modelLabel))}`, w));
       }
-      const md = new Markdown(sanitizeText(this.text).trim(), 1, 0, this.theme.toMarkdownTheme());
+      const md = new Markdown(sanitizeText(this.text).replace(/^\n+|\n+$/g, ""), 1, 0, this.theme.toMarkdownTheme());
       out.push(...md.render(w).map((l) => clamp(l, w)));
     } else if (this.thought.trim()) {
       const last = sanitizeLine(this.thought.trim().split("\n").slice(-1)[0] ?? "");
@@ -217,8 +217,8 @@ export class ImmutableTranscript extends Container {
    * Immutable AssistantCard: optional `◆ <model>` attribution header + syntax-highlighted Markdown.
    */
   appendAssistantTurn(markdownText: string, meta?: string): void {
-    const clean = sanitizeText(markdownText).trim();
-    if (!clean) return;
+    const clean = sanitizeText(markdownText).replace(/^\n+|\n+$/g, "");
+    if (!clean.trim()) return;
     const t = this.theme;
     const g = t.glyphs;
     const mdTheme = t.toMarkdownTheme();
@@ -681,21 +681,26 @@ export class FixedDock implements Component {
   private renderStatusRow(width: number): string {
     const t = this.theme;
     const g = t.glyphs;
-    const remoteBadge = this.state.remoteHost
-      ? `${t.warn(`[REMOTE: ${sanitizeLine(this.state.remoteHost)}]`)} `
-      : "";
+    const shortHost = this.state.remoteHost ? middleEllipsis(sanitizeLine(this.state.remoteHost), 16) : "";
+    const remoteBadge = shortHost ? `${t.warn(`[REMOTE: ${shortHost}]`)} ` : "";
+    const right = this.state.rightStatus ? `${t.muted(this.state.rightStatus)} ` : "";
+    const compose = (left: string) => {
+      // Prioritize left status (remote badge + Ctrl+C / Esc confirmation hint + spinner) over right status on narrow widths
+      if (right && visibleWidth(left) + 2 + visibleWidth(right) <= width) {
+        return fillLineBg(splitRow(left, right, width), width, t.statusBg);
+      }
+      return fillLineBg(fit(left, width), width, t.statusBg);
+    };
     if (this.state.transientHint) {
       const left = ` ${remoteBadge}${t.warn(g.warn)} ${t.warn(sanitizeLine(this.state.transientHint))}`;
-      const right = this.state.rightStatus ? `${t.muted(this.state.rightStatus)} ` : "";
-      return fillLineBg(splitRow(left, right, width), width, t.statusBg);
+      return compose(left);
     }
     const spin = this.state.busy
       ? t.accentBold(SPINNER_FRAMES[this.spinnerIdx]!)
       : t.ok(g.check);
     const q = this.state.queuedCount > 0 ? `  ${t.warn(`+${this.state.queuedCount} queued`)}` : "";
     const left = ` ${remoteBadge}${spin} ${sanitizeLine(this.state.phaseText)}${q}`;
-    const right = this.state.rightStatus ? `${t.muted(this.state.rightStatus)} ` : "";
-    return fillLineBg(splitRow(left, right, width), width, t.statusBg);
+    return compose(left);
   }
 
   private lastRenderedHeight = 9;

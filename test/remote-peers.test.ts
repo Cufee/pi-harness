@@ -1,16 +1,18 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { createServer } from "node:net";
 import { describe, it } from "bun:test";
 import type { Terminal } from "@earendil-works/pi-tui";
 import { Database } from "bun:sqlite";
-import { parseArgs } from "../src/cli.js";
+import { ensureLocalDaemon, parseArgs } from "../src/cli.js";
 import { loadConfig } from "../src/config.js";
 import type { CustomRunnerFactory } from "../src/control-plane/orchestrator.js";
 import { SessionMessageStore } from "../src/control-plane/session-messages.js";
-import { parseValidatedSshTarget, type RemoteHostStatus } from "../src/daemon/peer.js";
+import { parseValidatedSshTarget, validatePeerHostName, type RemoteHostStatus } from "../src/daemon/peer.js";
 import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon, MAX_PEER_MESSAGE_HOPS } from "../src/daemon/server.js";
+import { attachDaemonReader, writeDaemonMessage } from "../src/protocol/frames.js";
 import type { RunAgentRequest } from "../src/runners/types.js";
 import { createTheme, FixedDock, ModalScreen, Navigator, stripTerminalSequences, visibleWidth } from "../src/tui/core/index.js";
 import { ProjectsScreen } from "../src/tui/projects.js";
@@ -248,15 +250,32 @@ describe("Symmetric PeerLink, Federated Projects/Sessions & Two-Way Messaging", 
       assert.equal(tripped.woke, false);
       assert.equal(tripped.circuitBreakerTripped, true);
 
-      // 8. Security: peer.proxy rejects non-allowlisted ops, unknown host fails fast
+      // 8. Security: peer.proxy rejects non-allowlisted ops, reverse project.create denied by default (`reverseAccess: "messages"`), unknown host fails fast
       await assert.rejects(
         () => laptopClient.request("peer.proxy", { host: "gpu-box", op: "config.update", params: {} }),
         /cannot be proxied/i,
       );
       await assert.rejects(
+        () => gpuClient.request("project.create", { host: "laptop", path: join(root, "evil-clone"), createDir: true }),
+        /requires reverseAccess: "full"/i,
+      );
+      await assert.rejects(
         () => laptopClient.request("session.send_message", { fromSessionId: lapChatA.session.id, target: "nonexistent-host:chat-1", body: "hi" }),
         /Unknown remote host/i,
       );
+
+      // 8b. P1-7: Removing a remote with queued outbound messages marks them failed so daemon isn't pinned busy
+      await laptopClient.request("remote.disconnect", { name: "gpu-box" });
+      await laptopClient.request("session.send_message", {
+        fromSessionId: lapChatA.session.id,
+        target: `gpu-box:${gpuChat.session.id}`,
+        body: "queued-before-remove",
+      });
+      const removed = await laptopClient.request<{ removed: string; failedQueued: number }>("remote.remove", { name: "gpu-box" });
+      assert.equal(removed.removed, "gpu-box");
+      assert.ok(removed.failedQueued >= 1, "remote.remove must fail queued outbound rows for the removed remote");
+      // Re-add gpu-box for TUI screen checks below
+      await laptopClient.request("remote.add", { name: "gpu-box", sshTarget: gpuSock, autoConnect: true });
 
       // 9. TUI RemotesScreen, federated ProjectsScreen (HOST column), and FixedDock `[REMOTE: gpu-box]` indicator
       const theme = createTheme();
@@ -318,7 +337,7 @@ describe("Symmetric PeerLink, Federated Projects/Sessions & Two-Way Messaging", 
     }
   });
 
-  it("enforces SSH target validation, repo-config remote isolation, node-pinned outbox, session history isolation, and CLI short flags (-p/-h)", () => {
+  it("enforces SSH target validation, repo-config remote isolation, node-pinned outbox, session history isolation, and CLI short flags (-p/-h)", async () => {
     // 1. CLI short flags (-p, -h)
     const parsed1 = parseArgs(["-p", "vanolyze"]);
     assert.deepEqual(parsed1.positional, []);
@@ -389,5 +408,114 @@ describe("Symmetric PeerLink, Federated Projects/Sessions & Two-Way Messaging", 
     const localChat2History = store.listForSession("chat-2");
     assert.ok(localChat2History.some((m) => m.body === "addressed-to-local-chat-2"));
     db.close();
+
+    // 5. Boolean long flags do not swallow positional args, hostName validation rejects option strings, and narrow dock prioritizes remote + transient hint
+    const parsedBool = parseArgs(["chat", "send", "gpu-box:chat-4", "--no-reply", "hello"]);
+    assert.deepEqual(parsedBool.positional, ["chat", "send", "gpu-box:chat-4", "hello"]);
+    assert.equal(parsedBool.flags["no-reply"], true);
+    assert.throws(() => validatePeerHostName("-oProxyCommand=id"), /Invalid peer hostName/i);
+    assert.equal(validatePeerHostName("gpu-box.local"), "gpu-box.local");
+
+    const theme = createTheme();
+    const term = makeFakeTerminal();
+    const tui = new ModalScreen(term);
+    const narrowDock = new FixedDock(tui, theme, {
+      onSubmit: () => {},
+      initialState: {
+        slots: [],
+        idleBanner: "Idle",
+        busy: false,
+        phaseText: "Ready",
+        remoteHost: "very-long-remote-gpu-cluster-name.internal",
+        transientHint: "Press Ctrl+C again to exit",
+        rightStatus: "anthropic/claude-opus-5-5 (high)",
+        queuedCount: 0,
+        hints: [{ key: "Ctrl+P", label: "projects" }],
+      },
+    });
+    const narrowLines = narrowDock.render(60);
+    const narrowPlain = narrowLines.map((l) => stripTerminalSequences(l)).join("\n");
+    assert.ok(narrowPlain.includes("[REMOTE:"), "Narrow 60-col dock preserves [REMOTE: ...] badge");
+    assert.ok(narrowPlain.includes("Ctrl+C"), "Narrow 60-col dock preserves Ctrl+C confirmation hint over rightStatus");
+    for (const l of narrowLines) assert.ok(visibleWidth(l) <= 60, `Narrow dock line overflow: ${visibleWidth(l)}`);
+
+    // 6. Astra final P1 regressions: claudeOptionMatchesExactModel must not match contradictory stale display text,
+    //    and unpinned outbox rows targeting a configured outbound alias must not deliver to an unrelated inbound peer.
+    const { claudeOptionMatchesExactModel } = await import("../src/runners/acp-shims.js");
+    const contradictoryOpt = { value: "opus", name: "Opus 4.7", description: "Resolved to claude-opus-5-5" };
+    assert.equal(claudeOptionMatchesExactModel(contradictoryOpt, "claude-opus-5-5"), true);
+    assert.equal(claudeOptionMatchesExactModel(contradictoryOpt, "claude-opus-4-7"), false);
+
+    const db2 = new Database(":memory:");
+    const store2 = new SessionMessageStore(db2);
+    store2.enqueueOutbound({
+      fromNode: "node-local",
+      fromHost: "laptop",
+      fromSessionId: "chat-1",
+      toNode: null,
+      toHost: "gpu-box",
+      toSessionId: "chat-1",
+      body: "unpinned-for-configured-alias",
+    });
+    const configured = new Set(["gpu-box"]);
+    // Unrelated inbound peer claiming hostName "gpu-box" MUST NOT receive unpinned rows for configured outbound alias "gpu-box"
+    assert.equal(
+      store2.listQueuedOutboundForPeer({ alias: "gpu-box", direction: "inbound", hostName: "gpu-box", nodeId: "node-evil", configuredAliases: configured }).length,
+      0,
+    );
+    assert.equal(
+      store2.listQueuedOutboundForPeer({ alias: "gpu-box", direction: "outbound", hostName: "gpu-box", nodeId: "node-real", configuredAliases: configured }).length,
+      1,
+    );
+    db2.close();
+  });
+
+  it("refuses to stop or overwrite a busy older-protocol daemon (P0-1) and rejects SSH option injection on DaemonClient (P1-3)", async () => {
+    // P1-3: DaemonClient validates SSH targets before spawning ssh
+    const badClient = new DaemonClient("ssh://-oProxyCommand=id");
+    await assert.rejects(() => badClient.connect(), /Invalid SSH hostname/i);
+
+    // P0-1: Fake busy protocolRev=7 daemon listening on a Unix socket
+    const dir = realpathSync(mkdtempSync("/tmp/pi-busy-rev7-"));
+    const sockPath = join(dir, "busy.sock");
+    let shutdownCount = 0;
+    const fakeServer = createServer((socket) => {
+      attachDaemonReader(socket, {
+        onMessage: (raw) => {
+          const req = raw as { kind?: string; id?: string; op?: string };
+          if (req?.kind !== "req" || !req.id) return;
+          if (req.op === "ping") {
+            writeDaemonMessage(socket, {
+              kind: "res",
+              id: req.id,
+              ok: true,
+              result: { pong: true, pid: 99999, protocolRev: 7, running: true, liveWork: "1 active agent task" },
+            });
+          } else if (req.op === "daemon.shutdown") {
+            shutdownCount++;
+            writeDaemonMessage(socket, { kind: "res", id: req.id, ok: true, result: { shuttingDown: true } });
+          }
+        },
+        onError: () => {},
+        onEnd: () => {},
+      });
+    });
+    await new Promise<void>((resolve) => fakeServer.listen(sockPath, resolve));
+    try {
+      await assert.rejects(() => ensureLocalDaemon(sockPath), /has active or unknown work.*protocol rev 8/i);
+      assert.equal(shutdownCount, 0, "Busy older-rev daemon must never receive daemon.shutdown");
+
+      // Defense in depth: HarnessDaemon.start() also refuses to unlink a live listening socket
+      const cfg = withFixtureCatalog({ ...loadConfig(dir), stateDir: dir, socketPath: sockPath });
+      const rival = new HarnessDaemon(cfg, { dbPath: ":memory:" });
+      try {
+        await assert.rejects(() => rival.start(), /already listening/i);
+      } finally {
+        await rival.stop().catch(() => {});
+      }
+    } finally {
+      await new Promise<void>((resolve) => fakeServer.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

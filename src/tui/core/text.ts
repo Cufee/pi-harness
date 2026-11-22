@@ -9,11 +9,16 @@ import {
 
 /**
  * Single boundary sanitizer for all untrusted text (LLM output, git logs, paths, escalation titles).
- * Strips terminal escape sequences (CSI/OSC/DCS) and normalizes raw control bytes once at entry.
+ * Strips terminal escape sequences (CSI/OSC/DCS) and normalizes raw control bytes per line while
+ * preserving `\n` line breaks (and expanding tabs to two spaces) so Markdown headings, lists,
+ * paragraphs, and fenced code blocks render intact.
  */
 export function sanitizeText(raw: string): string {
   if (!raw) return "";
-  return replaceControlCharacters(stripTerminalSequences(raw.replace(/\r\n?/g, "\n")));
+  return stripTerminalSequences(raw.replace(/\r\n?/g, "\n"))
+    .split("\n")
+    .map((line) => replaceControlCharacters(line.replace(/\t/g, "  ")))
+    .join("\n");
 }
 
 /** Single-line sanitized text (collapses newlines/tabs into single spaces). */

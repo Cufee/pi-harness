@@ -565,4 +565,27 @@ describe("TUI v2 Core Primitives", () => {
     assert.ok(help.includes("Ctrl+X"));
     assert.ok(help.includes("/stop"));
   });
+
+  it("preserves Markdown newlines, bullet lists, and code blocks in sanitizeText, LiveTurnTail, and ImmutableTranscript", () => {
+    const raw = "## Plan\n\nLine 1\nLine 2\n\n- item A\n- item B\n\n```ts\nconst x = 1;\nconsole.log(x);\n```\n\x1b[31mred\x1b[0m\x07";
+    const clean = sanitizeText(raw);
+    assert.ok(clean.includes("\n\n"), "sanitizeText must preserve blank paragraph lines");
+    assert.ok(clean.includes("- item A\n- item B"), "sanitizeText must preserve list item newlines");
+    assert.ok(!clean.includes("\x1b"), "sanitizeText must still strip ANSI escapes");
+    assert.ok(!clean.includes("\x07"), "sanitizeText must still strip bell/control chars");
+
+    const theme = createTheme();
+    const transcript = new ImmutableTranscript(theme);
+    transcript.appendAssistantTurn(raw, "claude-opus-5-5");
+    const frozenLines = transcript.render(80).map((l) => stripTerminalSequences(l).trimEnd());
+    const idx1 = frozenLines.findIndex((l) => l.includes("Line 1"));
+    const idx2 = frozenLines.findIndex((l) => l.includes("Line 2"));
+    const idxA = frozenLines.findIndex((l) => l.includes("item A"));
+    const idxB = frozenLines.findIndex((l) => l.includes("item B"));
+    const idxCode1 = frozenLines.findIndex((l) => l.includes("const x = 1;"));
+    const idxCode2 = frozenLines.findIndex((l) => l.includes("console.log(x);"));
+    assert.ok(idx1 >= 0 && idx2 > idx1, "Line 1 and Line 2 must render on separate lines");
+    assert.ok(idxA >= 0 && idxB > idxA, "Markdown list items must render on separate lines");
+    assert.ok(idxCode1 >= 0 && idxCode2 > idxCode1, "Fenced code block lines must render on separate lines");
+  });
 });

@@ -17,6 +17,7 @@ import type { AgentStateCounts, AttentionSlot, LiveHudItem, TuiEntityRef as Enti
 export interface AttachableSession {
   id: string;
   host?: string;
+  nodeId?: string | null;
   address?: string;
   kind: "chat" | "run";
   title: string;
@@ -328,11 +329,17 @@ export class WorkStore {
       }
     }
 
+    const liveRunIds = new Set(
+      this.snapshot.runs
+        .filter((r) => r.run.status === "active" || r.run.status === "paused_quota")
+        .map((r) => r.run.id),
+    );
     const openEscalations = this.snapshot.escalations.filter((e) => e.status === "open").length;
     let activeMerges = 0;
     let bouncedMerges = 0;
     for (const m of this.snapshot.merges) {
       if (m.status === "merged") continue;
+      if (!liveRunIds.has(m.runId)) continue;
       activeMerges++;
       if (m.status === "conflict" || m.status === "ci_failed") bouncedMerges++;
     }
