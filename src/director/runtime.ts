@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,10 +13,11 @@ import {
   type GoalRecord,
   type GoalReviewVerdict,
 } from "../goals/engine.js";
+import { buildGoalDetailDisplay, buildGoalsTableDisplay, summarizeToolDisplay, type ToolDisplayPayload } from "../protocol/tool-display.js";
 import type { QuotaClient } from "../quota/client.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
-import type { ToolDefinition } from "../runners/types.js";
+import type { RunnerCallbacks, ToolDefinition } from "../runners/types.js";
 import { runGit } from "../worktree/manager.js";
 import { buildDirectorSystemPrompt, DirectorSessionStore, type ChatTurnRecord } from "./session.js";
 
@@ -84,12 +86,14 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   },
   {
     name: "goal_list",
-    description: "List all Goals for this workspace with their version, status, review cycles, and linked run ID.",
+    description:
+      "List all Goals for this workspace with their version, status, review cycles, and linked run ID. The result is rendered as a live Goals table directly in the user's UI: call this instead of printing or duplicating a Goals table in prose, and afterwards add only brief commentary.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "goal_get",
-    description: "Inspect a Goal's full criteria, latest review scorecard, linked run tree, and open escalations.",
+    description:
+      "Inspect a Goal's full criteria, latest review scorecard, linked run tree, and open escalations. The result is rendered as a Goal detail card directly in the user's UI: do not re-print it in prose; add only brief commentary.",
     inputSchema: {
       type: "object",
       required: ["goal_id"],
@@ -165,6 +169,8 @@ export class DirectorRuntime {
   readonly goals: GoalEngine;
   private activeChatAborts = new Map<string, AbortController>();
   private activeReviewGoalIds = new Set<string>();
+  /** onToolEvent sinks of in-flight sendChatMessage turns, so tool displays reach the UI from both PiRunner and the ACP MCP bridge. */
+  private chatToolSinks = new Map<string, NonNullable<RunnerCallbacks["onToolEvent"]>>();
 
   constructor(
     private readonly db: ControlPlaneDb,
@@ -551,7 +557,7 @@ export class DirectorRuntime {
     chatSessionId: string,
     userMessage: string,
     onDelta?: (delta: string) => void,
-    onToolEvent?: (ev: { id?: string; name: string; status: string; kind?: string; title?: string }) => void,
+    onToolEvent?: RunnerCallbacks["onToolEvent"],
   ): Promise<{ userTurn: ChatTurnRecord; assistantTurn: ChatTurnRecord }> {
     const session = this.chats.getSession(chatSessionId);
     if (!session) throw new Error(`Unknown chat session ${chatSessionId}`);
@@ -562,7 +568,11 @@ export class DirectorRuntime {
 
     const contextTranscript = history
       .slice(0, -1)
-      .map((t) => `${t.role === "user" ? "User" : t.role === "assistant" ? "Director" : "System"}: ${t.content}`)
+      .map((t) => {
+        const speaker = t.role === "user" ? "User" : t.role === "assistant" ? "Director" : t.role === "tool_output" ? "Tool output" : "System";
+        // tool_output turns contribute only their short summary; the display JSON stays out of the model context.
+        return `${speaker}: ${t.content}`;
+      })
       .join("\n\n");
 
     const goalBanner =
@@ -584,6 +594,7 @@ export class DirectorRuntime {
 
     const abort = new AbortController();
     this.activeChatAborts.set(chatSessionId, abort);
+    if (onToolEvent) this.chatToolSinks.set(chatSessionId, onToolEvent);
     const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", "mcp-bridge.ts");
 
     try {
@@ -630,7 +641,16 @@ export class DirectorRuntime {
       if (this.activeChatAborts.get(chatSessionId) === abort) {
         this.activeChatAborts.delete(chatSessionId);
       }
+      if (onToolEvent && this.chatToolSinks.get(chatSessionId) === onToolEvent) {
+        this.chatToolSinks.delete(chatSessionId);
+      }
     }
+  }
+
+  /** Persists a tool_output turn and forwards the display to the chat's active UI sink, if any. */
+  private emitToolDisplay(chatSessionId: string, toolName: string, display: ToolDisplayPayload): void {
+    this.chats.appendTurn(chatSessionId, "tool_output", summarizeToolDisplay(toolName, display), { toolName, display });
+    this.chatToolSinks.get(chatSessionId)?.({ id: `display-${randomUUID()}`, name: toolName, status: "completed", display });
   }
 
   private async executeDirectorTool(
@@ -677,18 +697,33 @@ export class DirectorRuntime {
           nonGoals: Array.isArray(args.non_goals) ? (args.non_goals as string[]) : undefined,
         });
 
-      case "goal_list":
-        return { goals: this.goals.listGoals({ repoRoot }) };
+      case "goal_list": {
+        const goals = this.goals.listGoals({ repoRoot });
+        this.emitToolDisplay(
+          chatSessionId,
+          name,
+          buildGoalsTableDisplay(
+            goals.map((goal) => ({
+              goal,
+              reviews: this.goals.listReviews(goal.id),
+              openEscalations: goal.linkedRunId ? this.db.listEscalations(goal.linkedRunId, "open") : [],
+            })),
+          ),
+        );
+        return { goals, rendered_in_ui: "Goals table shown to the user; do not repeat it." };
+      }
 
       case "goal_get": {
         const g = this.goals.getGoal(String(args.goal_id));
         if (!g) throw new Error(`Unknown goal ${args.goal_id}`);
-        return {
+        const detail = {
           goal: g,
           reviews: this.goals.listReviews(g.id),
           tasks: g.linkedRunId ? this.db.listTasks(g.linkedRunId) : [],
           openEscalations: g.linkedRunId ? this.db.listEscalations(g.linkedRunId, "open") : [],
         };
+        this.emitToolDisplay(chatSessionId, name, buildGoalDetailDisplay(detail));
+        return { ...detail, rendered_in_ui: "Goal detail shown to the user; do not repeat it." };
       }
 
       case "goal_trigger_review":

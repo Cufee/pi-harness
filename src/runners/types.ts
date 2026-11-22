@@ -1,4 +1,5 @@
 import type { AgentTier, ArtifactRecord, TaskKind } from "../control-plane/db.js";
+import type { ToolDisplayPayload } from "../protocol/tool-display.js";
 
 export interface RunnerUsage {
   used: number;
@@ -42,7 +43,15 @@ export interface RunnerCallbacks {
   onArtifact?: (artifact: Omit<ArtifactRecord, "id" | "runId" | "taskId" | "createdAt">) => void;
   onPassiveQuota?: (signal: PassiveQuotaSignal) => void;
   onQuotaRetryState?: (ev: QuotaRetryStateEvent) => void;
-  onToolEvent?: (ev: { id?: string; name: string; status: string; kind?: string; title?: string }) => void;
+  onToolEvent?: (ev: {
+    id?: string;
+    name: string;
+    status: string;
+    kind?: string;
+    title?: string;
+    /** Structured rich output (contract/tool-display-v1); events without it render as a compact tool pill. */
+    display?: ToolDisplayPayload;
+  }) => void;
 }
 
 export interface RunnerExecutionHandle {
