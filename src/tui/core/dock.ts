@@ -309,11 +309,53 @@ export interface AttentionSlot {
   ref: EntityRef;
 }
 
+export interface AgentStateCounts {
+  /** Tasks in `running` | `draining` | `merging`. */
+  active: number;
+  /** Tasks in `waiting_children`. */
+  waiting: number;
+  /** Tasks in `blocked` | `returned_for_rescope`. */
+  blocked: number;
+  /** Tasks in `paused_quota` (plus any quota-paused runs without a `paused_quota` task). */
+  paused: number;
+  /** Tasks in `pending` | `ready`. */
+  queued: number;
+  /** Tasks in `failed` on live/non-terminal runs. */
+  failed: number;
+  /** Open escalations needing attention. */
+  openEscalations: number;
+  /** Pending/active/conflicted merges (`queued` | `running` | `conflict` | `ci_failed`). */
+  activeMerges: number;
+  /** Conflicted or CI-failed merges (used to highlight merges in danger tone). */
+  bouncedMerges?: number;
+}
+
+export interface LiveHudItem {
+  /** Quick-jump Alt+1..5 slot index when mapped in `slots`. */
+  slot?: number;
+  kind: "escalation" | "goal" | "run" | "task";
+  id: string;
+  status: string;
+  title: string;
+  badge?: string;
+  /** Live description of what is happening right now. */
+  activity?: string;
+  ref: EntityRef;
+}
+
 export interface DockState {
-  /** Numbered active goal / blocking escalation slots for row 1 (always rendered on 1 line). */
+  /** Numbered active goal / blocking escalation slots for Alt+1..5 quick-jump. */
   slots: AttentionSlot[];
   idleBanner: string;
-  /** Row 2: left phase/action + spinner; right model/quota/queue summary. */
+  /** Live counts of agents across states + escalations/merges (defaults to all zeros). */
+  agentCounts?: AgentStateCounts;
+  /** Live goals / escalations / runs shown in the always-visible compact HUD rows. */
+  hudItems?: LiveHudItem[];
+  /** Optional secondary detail line for HUD row 2 when a single item is active (e.g. live worker activity). */
+  hudSecondaryLine?: string | null;
+  /** Total active/in-flight goals count. */
+  activeGoalsCount?: number;
+  /** Status row: left phase/action + spinner; right model/quota/queue summary. */
   busy: boolean;
   phaseText: string;
   /** Optional transient Ctrl+C or double-Esc confirmation hint shown in status row without changing height. */
@@ -383,18 +425,20 @@ export class UndoableEditor extends Editor {
 /**
  * Constant-height bottom dock!
  *   Row 1: Top separator rule (always 1 row)
- *   Row 2: Attention / Active Goals strip with `Alt+1`..`Alt+5` badges (always 1 row)
- *   Row 3: Unified Status / Spinner / Model / Quota / Queue bar with `statusBg` fill (always 1 row)
- *   Row 4+: Composer (`UndoableEditor` with `paddingX: 2` & `› ` prompt cue)
+ *   Row 2-3: Compact Live Goals & Activity HUD with `Alt+1`..`Alt+5` badges (always 2 rows; 1 row on ultra-short <18-row terminals)
+ *   Row 4: Live Agent State Counts strip (active / waiting / blocked / paused / queued + esc / merges, always 1 row)
+ *   Row 5: Unified Status / Spinner / Model / Queue bar with `statusBg` fill (always 1 row)
+ *   Row 6+: Composer (`UndoableEditor` with `paddingX: 2` & `› ` prompt cue)
  *   Last Row: Keybinding HintBar (always 1 row)
  */
 export class FixedDock implements Component {
   readonly editor: UndoableEditor;
+  private readonly tuiRef: Component & { requestRender: () => void; terminal?: { rows?: number } };
   private state: DockState;
   private spinnerIdx = 0;
 
   constructor(
-    tui: Component & { requestRender: () => void },
+    tui: Component & { requestRender: () => void; terminal?: { rows?: number } },
     private readonly theme: Theme,
     opts: {
       autocomplete?: AutocompleteProvider;
@@ -402,6 +446,7 @@ export class FixedDock implements Component {
       initialState: DockState;
     },
   ) {
+    this.tuiRef = tui;
     this.state = opts.initialState;
     this.editor = new UndoableEditor(tui as unknown as TUI, theme);
     if (opts.autocomplete) this.editor.setAutocompleteProvider(opts.autocomplete);
@@ -409,6 +454,7 @@ export class FixedDock implements Component {
       this.editor.clearUndoHistory();
       opts.onSubmit(raw);
     };
+    this.lastRenderedHeight = this.hudRowCount() + 7;
   }
 
   update(patch: Partial<DockState>): void {
@@ -429,33 +475,205 @@ export class FixedDock implements Component {
     this.editor.handleInput(data);
   }
 
-  private renderAttentionRow(width: number): string {
+  /** Constant HUD row count for a given terminal height (never varies with goal/agent count). */
+  private hudRowCount(): number {
+    const rows = this.tuiRef.terminal?.rows ?? 30;
+    return rows < 18 ? 1 : 2;
+  }
+
+  private effectiveHudItems(): LiveHudItem[] {
+    if (this.state.hudItems !== undefined) return this.state.hudItems;
+    return this.state.slots.map((s) => ({
+      slot: s.slot,
+      kind: s.ref.kind === "escalation" ? "escalation" : s.ref.kind === "run" ? "run" : "goal",
+      id: s.label,
+      status: s.status,
+      title: "",
+      badge: s.badge,
+      activity: "",
+      ref: s.ref,
+    }));
+  }
+
+  private renderHudItemRow(item: LiveHudItem, width: number, rightTag = ""): string {
     const t = this.theme;
     const g = t.glyphs;
-    const slots = this.state.slots;
-    if (slots.length === 0) {
-      return fit(t.muted(` ${this.state.idleBanner}`), width);
+    const tone = statusTone(item.status);
+    const glyph = statusGlyph(item.status, g);
+    const slotTag =
+      item.slot != null ? `${t.dim(`[${item.slot === 1 ? `Alt+${item.slot}` : String(item.slot)}]`)} ` : "";
+    const idPart = t.paint(tone, `${glyph} ${sanitizeLine(item.id)}`);
+    const cleanTitle = sanitizeLine(item.title);
+    const cleanActivity = sanitizeLine(item.activity ?? "");
+    const titleMax = cleanActivity
+      ? width < 68
+        ? 12
+        : width < 96
+          ? 18
+          : 26
+      : width < 68
+        ? 24
+        : width < 96
+          ? 38
+          : 56;
+    const titlePart = cleanTitle ? ` ${t.bold(clamp(cleanTitle, titleMax))}` : "";
+    const badgePart = item.badge ? ` ${t.paint(tone, `[${sanitizeLine(item.badge)}]`)}` : "";
+    let actPart = "";
+    if (cleanActivity) {
+      const stLower = item.status.toLowerCase();
+      const actTone: Tone =
+        stLower === "p0" || stLower === "failed"
+          ? "danger"
+          : stLower === "blocked" || stLower === "awaiting_human" || stLower === "paused" || stLower === "paused_quota"
+            ? "warn"
+            : "muted";
+      actPart = ` ${t.dim(g.sep)} ${t.paint(actTone, cleanActivity)}`;
     }
-    const sep = t.muted(` ${g.sep} `);
-    const sepW = visibleWidth(sep);
-    const pieces: string[] = [];
-    let used = 1;
-    for (let i = 0; i < slots.length; i++) {
-      const s = slots[i]!;
-      const tone = statusTone(s.status);
-      const glyph = statusGlyph(s.status, g);
-      const extra = s.badge ? ` ${t.paint(tone, s.badge)}` : "";
-      const keyTag = i === 0 ? `Alt+${s.slot}` : `${s.slot}`;
-      const item = `${t.dim(`[${keyTag}]`)} ${t.paint(tone, `${glyph} ${sanitizeLine(s.label)}`)}${extra}`;
-      const pw = visibleWidth(item);
-      if (pieces.length > 0 && used + sepW + pw > width - 3) {
-        pieces.push(t.muted(`+${slots.length - pieces.length}`));
-        break;
+    const left = ` ${slotTag}${idPart}${titlePart}${badgePart}${actPart}`;
+    return rightTag ? splitRow(left, rightTag, width) : fit(left, width);
+  }
+
+  private renderHudRows(width: number, rowCount: number): string[] {
+    const t = this.theme;
+    const g = t.glyphs;
+    const items = this.effectiveHudItems();
+
+    if (items.length === 0) {
+      const row0 = fit(t.muted(` ${sanitizeLine(this.state.idleBanner)}`), width);
+      if (rowCount <= 1) return [row0];
+      const left1 = ` ${t.dim("Goals:")} ${t.dim(`no active goals ${g.sep} idle`)}`;
+      const right1 = width >= 60 ? `${t.dim(`/goals ${g.sep} Ctrl+G`)} ` : "";
+      const row1 = right1 ? splitRow(left1, right1, width) : fit(left1, width);
+      return [row0, row1];
+    }
+
+    if (items.length === 1) {
+      const row0 = this.renderHudItemRow(items[0]!, width);
+      if (rowCount <= 1) return [row0];
+      const secondary = sanitizeLine(this.state.hudSecondaryLine ?? "");
+      if (secondary) {
+        const right1 = width >= 88 ? `${t.dim("/goals")} ` : "";
+        const left1 = `  ${t.dim(g.branchEnd)} ${t.muted(secondary)}`;
+        const row1 = right1 && visibleWidth(left1) + 2 + visibleWidth(right1) <= width
+          ? splitRow(left1, right1, width)
+          : fit(left1, width);
+        return [row0, row1];
       }
-      pieces.push(item);
-      used += (pieces.length > 1 ? sepW : 0) + pw;
+      const left1 = `  ${t.dim(g.branchEnd)} ${t.dim(sanitizeLine(this.state.idleBanner))}`;
+      const right1 = width >= 72 ? `${t.dim(`/goals ${g.sep} Ctrl+G`)} ` : "";
+      const row1 = right1 ? splitRow(left1, right1, width) : fit(left1, width);
+      return [row0, row1];
     }
-    return fit(` ${pieces.join(sep)}`, width);
+
+    const out: string[] = [];
+    const shown = Math.min(rowCount, items.length);
+    const hidden = Math.max(0, items.length - shown);
+    for (let i = 0; i < shown; i++) {
+      const isLast = i === shown - 1;
+      const rightTag =
+        isLast && hidden > 0
+          ? width < 72
+            ? `${t.muted(`+${hidden} (/goals)`)} `
+            : `${t.muted(`+${hidden} more (/goals)`)} `
+          : "";
+      out.push(this.renderHudItemRow(items[i]!, width, rightTag));
+    }
+    return out;
+  }
+
+  private renderAgentCountsRow(width: number): string {
+    const t = this.theme;
+    const g = t.glyphs;
+    const c: AgentStateCounts = this.state.agentCounts ?? {
+      active: 0,
+      waiting: 0,
+      blocked: 0,
+      paused: 0,
+      queued: 0,
+      failed: 0,
+      openEscalations: 0,
+      activeMerges: 0,
+      bouncedMerges: 0,
+    };
+    const sep = t.dim(` ${g.sep} `);
+    const mergeGlyph = g.ascii ? "M" : "⇄";
+    const activeGoals = this.state.activeGoalsCount ?? 0;
+
+    const totalSignal =
+      c.active + c.waiting + c.blocked + c.paused + c.queued + c.failed + c.openEscalations + c.activeMerges;
+
+    if (totalSignal === 0) {
+      const left = ` ${t.muted("Agents:")} ${t.dim(`0 active ${g.sep} idle`)}`;
+      const right =
+        activeGoals > 0
+          ? `${t.accent(`${activeGoals} active ${activeGoals === 1 ? "goal" : "goals"}`)} `
+          : `${t.dim("Ctrl+T Runs")} `;
+      return visibleWidth(left) + 2 + visibleWidth(right) <= width
+        ? splitRow(left, right, width)
+        : fit(left, width);
+    }
+
+    const buildLine = (mode: "full" | "compact" | "micro"): string => {
+      const parts: string[] = [];
+      if (mode === "full") {
+        if (c.active > 0) parts.push(t.ok(`${g.running} ${c.active} active`));
+        if (c.waiting > 0) parts.push(t.warn(`${g.pending} ${c.waiting} waiting`));
+        if (c.blocked > 0) parts.push(t.danger(`${g.warn} ${c.blocked} blocked`));
+        if (c.paused > 0) parts.push(t.warn(`${g.pause} ${c.paused} paused`));
+        if (c.queued > 0) parts.push(t.warn(`${c.queued} queued`));
+        if (c.failed > 0) parts.push(t.danger(`${g.cross} ${c.failed} failed`));
+        if (c.openEscalations > 0) parts.push(t.danger(`${g.warn} ${c.openEscalations} esc`));
+        if (c.activeMerges > 0) {
+          const mTone: Tone = (c.bouncedMerges ?? 0) > 0 ? "danger" : "info";
+          parts.push(t.paint(mTone, `${mergeGlyph} ${c.activeMerges} ${c.activeMerges === 1 ? "merge" : "merges"}`));
+        }
+        return ` ${t.muted("Agents:")} ${parts.join(sep)}`;
+      }
+      if (mode === "compact") {
+        if (c.active > 0) parts.push(t.ok(`${g.running} ${c.active} act`));
+        if (c.waiting > 0) parts.push(t.warn(`${c.waiting} wait`));
+        if (c.blocked > 0) parts.push(t.danger(`${g.warn} ${c.blocked} blk`));
+        if (c.paused > 0) parts.push(t.warn(`${g.pause} ${c.paused} psd`));
+        if (c.queued > 0) parts.push(t.warn(`${c.queued} q`));
+        if (c.failed > 0) parts.push(t.danger(`${c.failed} fail`));
+        if (c.openEscalations > 0) parts.push(t.danger(`${g.warn} ${c.openEscalations} esc`));
+        if (c.activeMerges > 0) {
+          const mTone: Tone = (c.bouncedMerges ?? 0) > 0 ? "danger" : "info";
+          parts.push(t.paint(mTone, `${mergeGlyph} ${c.activeMerges}m`));
+        }
+        return ` ${t.muted("Agents:")} ${parts.join(sep)}`;
+      }
+      if (c.active > 0) parts.push(t.ok(`${c.active}a`));
+      if (c.waiting > 0) parts.push(t.warn(`${c.waiting}w`));
+      if (c.blocked > 0) parts.push(t.danger(`${c.blocked}b`));
+      if (c.paused > 0) parts.push(t.warn(`${c.paused}p`));
+      if (c.queued > 0) parts.push(t.warn(`${c.queued}q`));
+      if (c.failed > 0) parts.push(t.danger(`${c.failed}f`));
+      if (c.openEscalations > 0) parts.push(t.danger(`!${c.openEscalations}`));
+      if (c.activeMerges > 0) {
+        const mTone: Tone = (c.bouncedMerges ?? 0) > 0 ? "danger" : "info";
+        parts.push(t.paint(mTone, `${mergeGlyph}${c.activeMerges}`));
+      }
+      return ` ${t.muted("Agents:")} ${parts.join(t.dim(g.sep))}`;
+    };
+
+    const full = buildLine("full");
+    const chosen =
+      visibleWidth(full) <= width
+        ? full
+        : (() => {
+            const compact = buildLine("compact");
+            return visibleWidth(compact) <= width ? compact : buildLine("micro");
+          })();
+
+    const right =
+      activeGoals > 0
+        ? `${t.accent(`${activeGoals} ${activeGoals === 1 ? "goal" : "goals"}`)} `
+        : "";
+    if (right && visibleWidth(chosen) + 2 + visibleWidth(right) <= width) {
+      return splitRow(chosen, right, width);
+    }
+    return fit(chosen, width);
   }
 
   private renderStatusRow(width: number): string {
@@ -475,7 +693,7 @@ export class FixedDock implements Component {
     return fillLineBg(splitRow(left, right, width), width, t.statusBg);
   }
 
-  private lastRenderedHeight = 7;
+  private lastRenderedHeight = 9;
 
   /** Last rendered row count of the FixedDock (used to anchor floating slash-autocomplete above the dock). */
   get renderedHeight(): number {
@@ -484,9 +702,11 @@ export class FixedDock implements Component {
 
   render(width: number): string[] {
     const w = Math.max(12, Math.floor(width));
+    const hudRows = this.renderHudRows(w, this.hudRowCount());
     const lines: string[] = [
       this.theme.border(this.theme.glyphs.barH.repeat(w)),
-      this.renderAttentionRow(w),
+      ...hudRows,
+      this.renderAgentCountsRow(w),
       this.renderStatusRow(w),
       ...this.editor.render(w).map((l) => clamp(l, w)),
       fit(` ${renderHintBar(this.state.hints, Math.max(1, w - 2), this.theme)}`, w),
