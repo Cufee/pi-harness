@@ -4,7 +4,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const DAEMON_PROTOCOL_REV = 4;
+export const DAEMON_PROTOCOL_REV = 5;
 
 export function currentDaemonBuildId(): string {
   try {
@@ -16,25 +16,30 @@ export function currentDaemonBuildId(): string {
 }
 import { ModelCatalogCompiler } from "../catalog/compiler.js";
 import { saveGlobalConfig, type HarnessConfig, type RunnerProfileConfig } from "../config.js";
-import { ControlPlaneDb, type EventRecord } from "../control-plane/db.js";
+import { ControlPlaneDb, type ReplayCursor, type EventRecord } from "../control-plane/db.js";
 import { HarnessOrchestrator, type CustomRunnerFactory } from "../control-plane/orchestrator.js";
 import { DirectorRuntime } from "../director/runtime.js";
 import type { GoalCriterion } from "../goals/engine.js";
 import type { DaemonEventFrame, RpcRequest, RpcResponse } from "../protocol/daemon-rpc.js";
-import { attachNdjsonReader, writeNdjson } from "../protocol/frames.js";
+import { attachNdjsonReader, writeDaemonMessage } from "../protocol/frames.js";
 import { QuotaClient } from "../quota/client.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
 import { PtyHost } from "./pty-host.js";
 
 interface ClientAttachment {
+  id: string;
+  boundAtSeq: number;
+  throughSeq: number;
+  pendingSeq?: number;
+  next?: ReplayCursor;
   socket: Socket;
   runId: string;
   taskId: string | null;
 }
 
 /** Read-only event subscription; never binds or evicts the socket's chat/run session. */
-type ClientWatch = { id: string; lastSeq: number; buffer: DaemonEventFrame[] | null } & (
+type ClientWatch = { throughSeq: number; pendingSeq?: number; next?: ReplayCursor; id: string; lastSeq: number; buffer: DaemonEventFrame[] | null } & (
   | { scope: "runs" }
   | { scope: "task"; runId: string; taskId: string }
 );
@@ -67,6 +72,7 @@ export class HarnessDaemon {
   private attachments = new Map<Socket, ClientAttachment>();
   private runBindings = new Map<string, Socket>();
   private chatBindings = new Map<string, Socket>();
+  private chatTurns = new Map<string, { id: string; text: string; cancelling: boolean }>();
   private socketToChatId = new Map<Socket, string>();
   private chatSubscribers = new Set<Socket>();
   private tuiSockets = new Set<Socket>();
@@ -220,7 +226,8 @@ export class HarnessDaemon {
     for (const att of this.attachments.values()) {
       if (att.runId !== ev.runId) continue;
       if (att.taskId && ev.taskId && att.taskId !== ev.taskId) continue;
-      writeNdjson(att.socket, frame);
+      if (att.next) att.pendingSeq = ev.seq;
+      else writeDaemonMessage(att.socket, frame);
     }
     if (
       ev.type.startsWith("goal.") ||
@@ -231,7 +238,7 @@ export class HarnessDaemon {
     ) {
       for (const sock of this.chatSubscribers) {
         if (!this.attachments.has(sock)) {
-          writeNdjson(sock, frame);
+          writeDaemonMessage(sock, frame);
         }
       }
     }
@@ -239,10 +246,14 @@ export class HarnessDaemon {
       for (const w of map.values()) {
         if (ev.seq <= w.lastSeq) continue;
         if (w.scope === "runs" ? !isRunsWatchEvent(ev.type) : ev.runId !== w.runId || ev.taskId !== w.taskId) continue;
+        if (w.next) {
+          w.pendingSeq = ev.seq;
+          continue;
+        }
         w.lastSeq = ev.seq;
         const watchFrame: DaemonEventFrame = { ...frame, watchId: w.id };
         if (w.buffer) w.buffer.push(watchFrame);
-        else writeNdjson(sock, watchFrame);
+        else writeDaemonMessage(sock, watchFrame);
       }
     }
   }
@@ -253,18 +264,18 @@ export class HarnessDaemon {
     let result: Record<string, unknown>;
     if (p.scope === "runs") {
       const lastSeq = this.db.getLatestEventSeq();
-      watch = { id, scope: "runs", lastSeq, buffer: [] };
+      watch = { id, scope: "runs", throughSeq: lastSeq, lastSeq, buffer: [] };
       result = { watchId: id, replay: [], lastSeq };
     } else if (p.scope === "task") {
       const runId = String(p.runId);
       const taskId = String(p.taskId);
       const sinceSeq = typeof p.sinceSeq === "number" ? p.sinceSeq : 0;
-      const replay = this.db.getAllEventsSince(runId, sinceSeq, taskId);
-      const lastSeq = replay.length ? replay[replay.length - 1]!.seq : sinceSeq;
-      watch = { id, scope: "task", runId, taskId, lastSeq, buffer: [] };
+      const lastSeq = Math.max(sinceSeq, this.db.getLatestEventSeq());
+      const page = this.db.getReplayPage(runId, taskId, { sinceSeq, payloadOffset: 0 }, lastSeq);
+      watch = { id, scope: "task", runId, taskId, throughSeq: lastSeq, lastSeq, next: page.next, buffer: [] };
       result = {
         watchId: id,
-        replay,
+        ...page,
         lastSeq,
         run: this.db.getRun(runId) ?? undefined,
         task: this.db.getTask(taskId) ?? undefined,
@@ -284,7 +295,7 @@ export class HarnessDaemon {
       const buffered = watch.buffer ?? [];
       watch.buffer = null;
       if (this.watches.get(socket)?.get(id) !== watch) return;
-      for (const f of buffered) writeNdjson(socket, f);
+      for (const f of buffered) writeDaemonMessage(socket, f);
     });
     return result;
   }
@@ -345,7 +356,7 @@ export class HarnessDaemon {
     for (const [rid, s] of this.runBindings.entries()) {
       if (s === prevSock) this.runBindings.delete(rid);
     }
-    writeNdjson(prevSock, {
+    writeDaemonMessage(prevSock, {
       kind: "event",
       seq: 0,
       runId: sessionId,
@@ -383,6 +394,36 @@ export class HarnessDaemon {
     }
   }
 
+  private requireChatOwner(socket: Socket, chatSessionId: string): void {
+    if (this.chatBindings.get(chatSessionId) !== socket) throw new Error("Chat is attached to another terminal or detached");
+  }
+
+  private sendChatEvent(chatSessionId: string, turnId: string, type: string, payload: Record<string, unknown>): void {
+    const target = this.chatBindings.get(chatSessionId);
+    if (!target || this.chatTurns.get(chatSessionId)?.id !== turnId) return;
+    writeDaemonMessage(target, {
+      kind: "event", seq: 0, runId: chatSessionId, taskId: chatSessionId, type,
+      payload: { ...payload, chatSessionId, turnId }, createdAt: Date.now(),
+    } satisfies DaemonEventFrame);
+  }
+
+  private chatHistoryPage(chatSessionId: string, afterSeq: number, historyThrough: number) {
+    const sizes = this.db.db.prepare(`
+      SELECT seq, length(CAST(content AS BLOB)) + coalesce(length(CAST(display_json AS BLOB)), 0) AS bytes
+      FROM chat_turns WHERE chat_session_id = ? AND seq > ? AND seq <= ? ORDER BY seq LIMIT 100
+    `).all(chatSessionId, afterSeq, historyThrough) as { seq: number; bytes: number }[];
+    let bytes = 0;
+    let count = 0;
+    for (const row of sizes) {
+      if (count && bytes + row.bytes > 512 * 1024) break;
+      bytes += row.bytes;
+      count++;
+    }
+    const history = this.director.chats.getHistory(chatSessionId, afterSeq, count);
+    const last = history.at(-1)?.seq ?? historyThrough;
+    return { history, historyNext: last < historyThrough ? last : null, historyThrough };
+  }
+
   private bindChatSocket(socket: Socket, chatSessionId: string): { tookOver: boolean } {
     this.cancelIdleShutdown();
     const curChat = this.socketToChatId.get(socket);
@@ -416,7 +457,8 @@ export class HarnessDaemon {
       tookOver = true;
     }
     this.runBindings.set(runId, socket);
-    this.attachments.set(socket, { socket, runId, taskId });
+    const boundAtSeq = this.db.getLatestEventSeq();
+    this.attachments.set(socket, { id: randomBytes(8).toString("hex"), boundAtSeq, throughSeq: boundAtSeq, socket, runId, taskId });
     this.tuiSockets.add(socket);
     return { tookOver };
   }
@@ -429,9 +471,9 @@ export class HarnessDaemon {
         const req = raw as RpcRequest;
         if (req?.kind !== "req") return;
         void this.dispatch(socket, req).then(
-          (result) => writeNdjson(socket, { kind: "res", id: req.id, ok: true, result } satisfies RpcResponse),
+          (result) => writeDaemonMessage(socket, { kind: "res", id: req.id, ok: true, result } satisfies RpcResponse),
           (err) =>
-            writeNdjson(socket, {
+            writeDaemonMessage(socket, {
               kind: "res",
               id: req.id,
               ok: false,
@@ -479,6 +521,7 @@ export class HarnessDaemon {
   }
 
   private async dispatch(socket: Socket, req: RpcRequest): Promise<unknown> {
+    if (this.takenOverSockets.has(socket)) throw new Error("Session taken over by another terminal");
     const p = req.params ?? {};
 
     switch (req.op) {
@@ -591,13 +634,20 @@ export class HarnessDaemon {
           });
         }
         const { tookOver } = this.bindChatSocket(socket, session.id);
+        const turn = this.chatTurns.get(session.id);
+        const { historyThrough } = this.db.db.prepare(
+          "SELECT COALESCE(MAX(seq), 0) AS historyThrough FROM chat_turns WHERE chat_session_id = ?",
+        ).get(session.id) as { historyThrough: number };
         return {
           session,
-          history: this.director.chats.getHistory(session.id, 0, 100),
+          ...this.chatHistoryPage(session.id, 0, historyThrough),
+          activeTurnId: turn?.id ?? null,
+          activeText: turn?.text ?? "",
+          activePartial: turn ? this.director.getChatPartial(session.id) : "",
           goals: this.director.goals.listGoals({ repoRoot: session.repoRoot }),
           config: this.config,
           tookOver,
-          busy: this.director.isChatBusy(session.id),
+          busy: Boolean(turn),
         };
       }
 
@@ -619,6 +669,11 @@ export class HarnessDaemon {
         return {
           session,
           history: [],
+          historyThrough: 0,
+          historyNext: null,
+          activeTurnId: null,
+          activeText: "",
+          activePartial: "",
           goals: this.director.goals.listGoals({ repoRoot: session.repoRoot }),
           config: this.config,
           tookOver: false,
@@ -693,46 +748,65 @@ export class HarnessDaemon {
 
       case "chat.send": {
         const chatSessionId = String(p.chatSessionId);
-        const text = String(p.text);
-        return await this.director.sendChatMessage(
-          chatSessionId,
-          text,
-          (delta) => {
-            // Stream to whichever terminal is CURRENTLY bound to this chat session (supports live takeover mid-turn!)
-            const target = this.chatBindings.get(chatSessionId) ?? socket;
-            writeNdjson(target, {
-              kind: "event",
-              seq: 0,
-              runId: chatSessionId,
-              taskId: chatSessionId,
-              type: "chat.delta",
-              payload: { delta },
-              createdAt: Date.now(),
-            } satisfies DaemonEventFrame);
-          },
-          (toolEv) => {
-            const target = this.chatBindings.get(chatSessionId) ?? socket;
-            writeNdjson(target, {
-              kind: "event",
-              seq: 0,
-              runId: chatSessionId,
-              taskId: chatSessionId,
-              type: "chat.tool",
-              payload: toolEv,
-              createdAt: Date.now(),
-            } satisfies DaemonEventFrame);
-          },
-        );
+        this.requireChatOwner(socket, chatSessionId);
+        if (this.chatTurns.has(chatSessionId)) throw new Error("Director is already responding");
+        const id = typeof p.turnId === "string" && p.turnId ? p.turnId : req.id;
+        const turn = { id, text: "", cancelling: false };
+        this.chatTurns.set(chatSessionId, turn);
+        try {
+          const result = await this.director.sendChatMessage(
+            chatSessionId, String(p.text),
+            (delta) => {
+              turn.text += delta;
+              this.sendChatEvent(chatSessionId, id, "chat.delta", { delta });
+            },
+            (tool) => {
+              this.sendChatEvent(chatSessionId, id, "chat.tool", tool);
+            },
+          );
+          this.sendChatEvent(chatSessionId, id, "chat.turn.end", { assistantTurn: result.assistantTurn, cancelled: turn.cancelling });
+          return result;
+        } catch (err) {
+          this.sendChatEvent(chatSessionId, id, "chat.turn.end", {
+            error: err instanceof Error ? err.message : String(err), cancelled: turn.cancelling,
+          });
+          throw err;
+        } finally {
+          this.chatTurns.delete(chatSessionId);
+        }
       }
 
-      case "chat.cancel":
-        return { cancelled: this.director.cancelChat(String(p.chatSessionId)) };
+      case "chat.steer":
+      case "chat.cancel": {
+        const chatSessionId = String(p.chatSessionId);
+        this.requireChatOwner(socket, chatSessionId);
+        const turn = this.chatTurns.get(chatSessionId);
+        if (!turn || turn.id !== p.turnId || turn.cancelling) return { steered: false, cancelled: false };
+        if (req.op === "chat.steer") {
+          const message = String(p.message);
+          if (await this.director.steerChat(chatSessionId, message)) {
+            this.sendChatEvent(chatSessionId, turn.id, "chat.steered", { message });
+            return { steered: true };
+          }
+          this.requireChatOwner(socket, chatSessionId);
+          if (this.chatTurns.get(chatSessionId) !== turn || turn.cancelling) return { steered: false, cancelled: false };
+        }
+        turn.cancelling = true;
+        try {
+          return { steered: false, cancelled: await this.director.cancelChat(chatSessionId) };
+        } finally {
+          turn.cancelling = false;
+        }
+      }
 
       case "chat.history":
+        if (typeof p.afterSeq === "number" && typeof p.throughSeq === "number") {
+          return this.chatHistoryPage(String(p.chatSessionId), p.afterSeq, p.throughSeq);
+        }
         return this.director.chats.getHistory(
           String(p.chatSessionId),
           typeof p.sinceSeq === "number" ? p.sinceSeq : 0,
-          typeof p.limit === "number" ? p.limit : 100,
+          Math.min(100, Math.max(1, Number(p.limit) || 100)),
         );
 
       case "chat.update":
@@ -865,16 +939,37 @@ export class HarnessDaemon {
         const taskId = typeof p.taskId === "string" ? p.taskId : null;
         const sinceSeq = typeof p.sinceSeq === "number" ? p.sinceSeq : 0;
         const { tookOver } = this.bindRunSocket(socket, runId, taskId);
-        const replay = this.db.getAllEventsSince(runId, sinceSeq, taskId);
+        const attachment = this.attachments.get(socket)!;
+        const page = this.db.getReplayPage(runId, taskId, { sinceSeq, payloadOffset: 0 }, attachment.boundAtSeq);
+        attachment.next = page.next;
         return {
+          attachmentId: attachment.id,
           attached: true,
           tookOver,
           run: this.db.getRun(runId),
           tasks: this.db.listTasks(runId),
           escalations: this.db.listEscalations(runId, "open"),
           quotaPause: this.orchestrator.getRunQuotaStatus(runId),
-          replay,
+          ...page,
         };
+      }
+
+      case "replay.page": {
+        const attachment = this.attachments.get(socket);
+        const watch = this.watches.get(socket)?.get(String(p.watchId));
+        const target = watch?.scope === "task" ? watch : attachment && attachment.id === p.attachmentId ? attachment : undefined;
+        if (!target?.next) throw new Error("Replay expired or complete");
+        const page = this.db.getReplayPage(target.runId, target.taskId, target.next, target.throughSeq,
+          "boundAtSeq" in target ? target.boundAtSeq : undefined);
+        // Finish each snapshot before advancing the watermark to matching live events.
+        if (!page.next && target.pendingSeq !== undefined) {
+          page.next = { sinceSeq: target.throughSeq, payloadOffset: 0 };
+          target.throughSeq = target.pendingSeq;
+          target.pendingSeq = undefined;
+        }
+        target.next = page.next;
+        if (watch?.scope === "task") watch.lastSeq = target.throughSeq;
+        return page;
       }
 
       case "detach":
@@ -893,10 +988,16 @@ export class HarnessDaemon {
       }
 
       case "runs.trees": {
+        const limit = typeof p.limit === "number" ? Math.min(50, Math.max(1, Math.floor(p.limit))) : 50;
+        const before = p.before as { id: string; createdAt: number } | undefined;
         const runs = Array.isArray(p.runIds)
           ? (p.runIds as unknown[]).map((id) => this.db.getRun(String(id))).filter((r) => r !== null)
-          : this.db.listRuns(typeof p.limit === "number" ? p.limit : 50);
+          : this.db.listRuns(limit + 1, before);
+        const hasMore = !Array.isArray(p.runIds) && runs.length > limit;
+        if (hasMore) runs.pop();
+        const last = runs.at(-1);
         return {
+          next: hasMore && last ? { id: last.id, createdAt: last.createdAt } : undefined,
           generatedAt: Date.now(),
           runs: runs.map((run) => ({
             run,
@@ -966,7 +1067,7 @@ export class HarnessDaemon {
           rows: typeof p.rows === "number" ? p.rows : undefined,
         });
         const { snapshot, detach } = this.ptyHost.attach(info.id, (chunk) => {
-          writeNdjson(socket, {
+          writeDaemonMessage(socket, {
             kind: "event",
             seq: 0,
             runId: "pty",

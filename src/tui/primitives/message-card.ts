@@ -71,7 +71,7 @@ export class UserCard implements Component {
 }
 
 /**
- * Immutable finalized assistant Markdown card.
+ * Assistant Markdown segment, cached between text updates.
  * Code blocks have NO right border so native terminal mouse-drag copy is 100% clean.
  */
 export class AssistantCard implements Component {
@@ -85,6 +85,11 @@ export class AssistantCard implements Component {
     private readonly meta?: string,
   ) {
     this.md = new Markdown(markdownText, 1, 0, theme.toMarkdownTheme());
+  }
+
+  setText(text: string): void {
+    this.md.setText(text);
+    this.cachedWidth = -1;
   }
 
   invalidate(): void {
@@ -112,7 +117,7 @@ export class AssistantCard implements Component {
 export class ToolPill implements Component {
   constructor(
     private readonly theme: HarnessTheme,
-    private status: "running" | "ok" | "error",
+    private status: "running" | "ok" | "error" | "called",
     private readonly name: string,
     private detail = "",
   ) {}
@@ -120,6 +125,13 @@ export class ToolPill implements Component {
   update(status: "running" | "ok" | "error", detail?: string): void {
     this.status = status;
     if (detail !== undefined) this.detail = detail;
+  }
+
+  finishCall(): void {
+    if (this.status === "running") {
+      this.status = "called";
+      this.detail = "called";
+    }
   }
 
   invalidate(): void {}
@@ -131,7 +143,9 @@ export class ToolPill implements Component {
         ? this.theme.success("✓")
         : this.status === "error"
           ? this.theme.error("✗")
-          : this.theme.accent("●");
+          : this.status === "called"
+            ? this.theme.muted("·")
+            : this.theme.accent("●");
     const line = `  ${icon} ${this.theme.bold(this.name)}${this.detail ? `  ${this.theme.muted(this.detail)}` : ""}`;
     return [fitWidth(line, width)];
   }

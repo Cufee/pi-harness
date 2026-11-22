@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { createConnection, type Socket } from "node:net";
 import type { Readable, Writable } from "node:stream";
 import type { DaemonEventFrame, DaemonOp, RpcRequest, RpcResponse } from "../protocol/daemon-rpc.js";
-import { attachNdjsonReader, writeNdjson } from "../protocol/frames.js";
+import { attachDaemonReader, writeNdjson } from "../protocol/frames.js";
 
 export interface DaemonClientTarget {
   /** Local Unix socket path OR `ssh://[user@]host[:port]` remote target */
@@ -51,7 +51,7 @@ export class DaemonClient {
       this.sshProc = proc;
       this.readable = proc.stdout!;
       this.writable = proc.stdin!;
-      proc.once("exit", () => this.handleDisconnect());
+      proc.once("exit", () => this.handleDisconnect(proc.stdin!));
     } else {
       const sock = createConnection(this.target);
       await new Promise<void>((resolve, reject) => {
@@ -61,10 +61,11 @@ export class DaemonClient {
       this.socket = sock;
       this.readable = sock;
       this.writable = sock;
-      sock.once("close", () => this.handleDisconnect());
+      sock.once("close", () => this.handleDisconnect(sock));
     }
 
-    this.detachReader = attachNdjsonReader(this.readable, {
+    const transport = this.writable;
+    this.detachReader = attachDaemonReader(this.readable, {
       onMessage: (raw) => {
         const frame = raw as RpcResponse | DaemonEventFrame;
         if (frame.kind === "res") {
@@ -78,12 +79,17 @@ export class DaemonClient {
           for (const fn of this.eventListeners) fn(frame);
         }
       },
-      onError: () => this.handleDisconnect(),
-      onEnd: () => this.handleDisconnect(),
+      onError: () => this.handleDisconnect(transport),
+      onEnd: () => this.handleDisconnect(transport),
     });
   }
 
-  private handleDisconnect(): void {
+  private handleDisconnect(transport: Writable | null): void {
+    if (!transport || transport !== this.writable) return;
+    this.writable = null;
+    this.readable = null;
+    this.detachReader?.();
+    this.detachReader = null;
     for (const p of this.pending.values()) {
       p.reject(new Error("Disconnected from harnessd"));
     }
@@ -105,9 +111,9 @@ export class DaemonClient {
   }
 
   close(): void {
-    this.detachReader?.();
     this.socket?.end();
     this.sshProc?.kill("SIGTERM");
+    this.handleDisconnect(this.writable);
   }
 }
 

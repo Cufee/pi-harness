@@ -179,6 +179,20 @@ export interface EventRecord {
   createdAt: number;
 }
 
+export interface ReplayCursor {
+  sinceSeq: number;
+  payloadOffset: number;
+}
+
+export interface ReplayPage {
+  replay: EventRecord[];
+  throughSeq: number;
+  next?: ReplayCursor;
+  fragment?: { event: EventRecord; data: string; final: boolean };
+}
+
+const REPLAY_PAGE_BYTES = 1024 * 1024;
+
 export function shortHashId(prefix: string): string {
   return `${prefix}-${randomBytes(4).toString("hex")}`;
 }
@@ -470,16 +484,48 @@ export class ControlPlaneDb {
     }));
   }
 
-  /** Like getEventsSince, but pages internally until exhausted so replays are never truncated. */
-  getAllEventsSince(runId: string, sinceSeq: number, taskId?: string | null, pageSize = 500): EventRecord[] {
-    const all: EventRecord[] = [];
-    let cursor = sinceSeq;
-    for (;;) {
-      const page = this.getEventsSince(runId, cursor, taskId, pageSize);
-      all.push(...page);
-      if (page.length < pageSize) return all;
-      cursor = page[page.length - 1]!.seq;
+  /** Read one bounded page of the snapshot. A single oversized payload travels in byte slices. */
+  getReplayPage(runId: string, taskId: string | null, cursor: ReplayCursor, throughSeq: number, runNoticesAfter?: number): ReplayPage {
+    // Focused attachments also receive run-wide notices that arrive after attachment.
+    const taskFilter = !taskId ? "" : runNoticesAfter === undefined
+      ? "AND task_id = ?"
+      : "AND (task_id = ? OR (task_id IS NULL AND seq > ?))";
+    const args: Array<string | number> = [runId, cursor.sinceSeq, throughSeq];
+    if (taskId) args.push(taskId);
+    if (taskId && runNoticesAfter !== undefined) args.push(runNoticesAfter);
+    using statement = this.db.prepare(`
+      SELECT seq, task_id, type, created_at, length(CAST(payload_json AS BLOB)) AS bytes,
+             substr(CAST(payload_json AS BLOB), ?, ?) AS data
+      FROM events WHERE run_id = ? AND seq > ? AND seq <= ? ${taskFilter}
+      ORDER BY seq LIMIT 2049
+    `);
+    const rows = statement.iterate(cursor.payloadOffset + 1, REPLAY_PAGE_BYTES, ...args) as Iterable<{
+      seq: number; task_id: string | null; type: string; created_at: number; bytes: number; data: Uint8Array;
+    }>;
+    const page: ReplayPage = { replay: [], throughSeq };
+    let bytes = 0;
+    let sinceSeq = cursor.sinceSeq;
+    for (const row of rows) {
+      const event: EventRecord = { seq: row.seq, taskId: row.task_id, runId, type: row.type, createdAt: row.created_at, payload: null };
+      const size = Buffer.byteLength(JSON.stringify(event)) + row.bytes + 1;
+      if (page.replay.length && (bytes + size > REPLAY_PAGE_BYTES || page.replay.length === 2048)) {
+        page.next = { sinceSeq, payloadOffset: 0 };
+        break;
+      }
+      if (size > REPLAY_PAGE_BYTES) {
+        const offset = cursor.payloadOffset;
+        const final = offset + row.data.length >= row.bytes;
+        page.fragment = { event, data: Buffer.from(row.data).toString("base64"), final };
+        if (!final) page.next = { sinceSeq, payloadOffset: offset + row.data.length };
+        else if (row.seq < throughSeq) page.next = { sinceSeq: row.seq, payloadOffset: 0 };
+        break;
+      }
+      bytes += size;
+      event.payload = JSON.parse(Buffer.from(row.data).toString("utf8"));
+      page.replay.push(event);
+      sinceSeq = row.seq;
     }
+    return page;
   }
 
   /** Highest event seq persisted so far (0 when there are no events). */
@@ -533,10 +579,10 @@ export class ControlPlaneDb {
     };
   }
 
-  listRuns(limit = 50): RunRecord[] {
+  listRuns(limit = 50, before?: { createdAt: number; id: string }): RunRecord[] {
     const rows = this.db
-      .prepare("SELECT * FROM runs ORDER BY created_at DESC LIMIT ?")
-      .all(limit) as Record<string, unknown>[];
+      .prepare(`SELECT * FROM runs ${before ? "WHERE (created_at, id) < (?, ?)" : ""} ORDER BY created_at DESC, id DESC LIMIT ?`)
+      .all(...(before ? [before.createdAt, before.id, limit] : [limit])) as Record<string, unknown>[];
     return rows.map((r) => ({
       id: String(r.id),
       goal: String(r.goal),

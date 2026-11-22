@@ -1,7 +1,9 @@
+import { randomUUID } from "node:crypto";
+import { fitWidth } from "./primitives/width.js";
 import { type Component, Container, Markdown, Spacer } from "@earendil-works/pi-tui";
 import type { CompiledModelCatalog } from "../catalog/compiler.js";
 import type { HarnessConfig } from "../config.js";
-import type { EscalationRecord, EventRecord, RunRecord, TaskRecord } from "../control-plane/db.js";
+import type { EscalationRecord, EventRecord, ReplayPage, RunRecord, TaskRecord } from "../control-plane/db.js";
 import type { RunQuotaPauseStatus } from "../control-plane/orchestrator.js";
 import type { DaemonClient } from "../daemon/remote.js";
 import type { ChatSessionRecord, ChatTurnRecord } from "../director/session.js";
@@ -40,6 +42,7 @@ import {
   type HarnessTheme,
   ErrorCard,
   FooterHint,
+  GoalHeader,
   formatAgentError,
   OverlayManager,
   StatusBar,
@@ -80,6 +83,29 @@ export function isWatchFrame(ev: DaemonEventFrame): boolean {
 
 type WatchClient = Pick<DaemonClient, "request" | "onEvent">;
 
+async function consumeReplay(
+  client: WatchClient,
+  first: ReplayPage,
+  subscription: { watchId: string } | { attachmentId: string },
+  append: (event: EventRecord) => void,
+  closed: () => boolean = () => false,
+): Promise<void> {
+  let page = first;
+  const parts: Buffer[] = [];
+  while (!closed()) {
+    for (const event of page.replay) append(event);
+    if (page.fragment) {
+      parts.push(Buffer.from(page.fragment.data, "base64"));
+      if (page.fragment.final) {
+        append({ ...page.fragment.event, payload: JSON.parse(Buffer.concat(parts).toString("utf8")) });
+        parts.length = 0;
+      }
+    }
+    if (!page.next) break;
+    page = await client.request<ReplayPage>("replay.page", subscription);
+  }
+}
+
 /**
  * Starts a read-only daemon watch (never attach/detach) and routes frames tagged with its watchId to
  * `onEvent`. Frames that arrive before `watch.start` answers are buffered. `stop` is idempotent.
@@ -88,6 +114,8 @@ async function startWatch(
   client: WatchClient,
   params: { scope: "runs" } | { scope: "task"; runId: string; taskId: string },
   onEvent: (ev: DaemonEventFrame) => void,
+  closed?: () => boolean,
+  onReplay?: (ev: EventRecord) => void,
 ): Promise<{ replay: EventRecord[]; stop: () => Promise<void> }> {
   let watchId: string | null = null;
   const early: DaemonEventFrame[] = [];
@@ -96,18 +124,21 @@ async function startWatch(
     if (watchId === null) early.push(ev);
     else if (ev.watchId === watchId) onEvent(ev);
   });
-  let res: { watchId: string; replay: EventRecord[] };
+  const replay: EventRecord[] = [];
+  let res: ReplayPage & { watchId: string };
   try {
-    res = await client.request<{ watchId: string; replay: EventRecord[] }>("watch.start", params);
+    res = await client.request<ReplayPage & { watchId: string }>("watch.start", params);
+    watchId = res.watchId;
+    for (const ev of early) if (ev.watchId === watchId) onEvent(ev);
+    await consumeReplay(client, res, { watchId }, onReplay ?? ((ev) => replay.push(ev)), closed);
   } catch (err) {
     unsub();
+    if (watchId) void client.request("watch.stop", { watchId }).catch(() => {});
     throw err;
   }
-  watchId = res.watchId;
-  for (const ev of early) if (ev.watchId === watchId) onEvent(ev);
   let stopped = false;
   return {
-    replay: res.replay,
+    replay,
     stop: async () => {
       if (stopped) return;
       stopped = true;
@@ -136,8 +167,8 @@ export function openRunsOverlay(ctx: {
     const comp = new AgentTranscriptOverlay({
       theme: ctx.theme,
       ...row,
-      startWatch: async (onEvent) => {
-        watch = await startWatch(ctx.client, { scope: "task", runId: row.runId, taskId: row.taskId }, onEvent);
+      startWatch: async (onEvent, onReplay) => {
+        watch = await startWatch(ctx.client, { scope: "task", runId: row.runId, taskId: row.taskId }, onEvent, () => closed, onReplay);
         if (closed) void watch.stop();
         return watch;
       },
@@ -160,7 +191,16 @@ export function openRunsOverlay(ctx: {
   let handle: ReturnType<OverlayManager["push"]> | null = null;
   const comp = new RunsTreeOverlay({
     theme: ctx.theme,
-    fetchTrees: () => ctx.client.request<RunsTreesResult>("runs.trees"),
+    fetchTrees: async () => {
+      type Page = RunsTreesResult & { next?: { id: string; createdAt: number } };
+      let page = await ctx.client.request<Page>("runs.trees");
+      const runs = [...page.runs];
+      while (page.next) {
+        page = await ctx.client.request<Page>("runs.trees", { before: page.next });
+        runs.push(...page.runs);
+      }
+      return { generatedAt: page.generatedAt, runs };
+    },
     subscribe: async (onEvent) => {
       const watch = await startWatch(ctx.client, { scope: "runs" }, onEvent);
       return () => void watch.stop();
@@ -262,24 +302,67 @@ export async function runDirectorChatTui(opts: {
     goals: GoalRecord[];
     config: HarnessConfig;
     tookOver?: boolean;
-    busy?: boolean;
+    activeTurnId: string | null;
+    activePartial?: string;
+    activeText?: string;
+    historyNext?: number | null;
+    historyThrough?: number;
   };
 
   // Handshake BEFORE touching terminal raw mode so a failed RPC never leaves escape sequences in zsh!
-  const opened = await opts.client.request<ChatOpenPayload>("chat.open", {
-    repoRoot: opts.repoRoot,
-    ...(opts.chatSessionId ? { chatSessionId: opts.chatSessionId } : {}),
-    ...(opts.preferLastGlobal ? { preferLastGlobal: true } : {}),
+  const bufferedEvents: DaemonEventFrame[] = [];
+  let buffering = true;
+  let handleEvent: (ev: DaemonEventFrame) => void;
+  const unsubEvent = opts.client.onEvent((event) => {
+    if (buffering) bufferedEvents.push(event);
+    else handleEvent(event);
   });
+  const resumeEvents = () => {
+    buffering = false;
+    for (const event of bufferedEvents.splice(0)) handleEvent(event);
+  };
+  const loadHistory = async (payload: ChatOpenPayload) => {
+    let afterSeq = payload.historyNext;
+    while (afterSeq != null) {
+      const page = await opts.client.request<Pick<ChatOpenPayload, "history" | "historyNext">>("chat.history", {
+        chatSessionId: payload.session.id, afterSeq, throughSeq: payload.historyThrough,
+      });
+      if (page.historyNext != null && page.historyNext <= afterSeq) throw new Error("Chat history cursor did not advance");
+      for (const row of page.history) payload.history.push(row);
+      afterSeq = page.historyNext;
+    }
+  };
+  let disconnected = false;
+  const unsubOpeningClose = opts.client.onClose(() => { disconnected = true; });
+  let opened: ChatOpenPayload;
+  try {
+    opened = await opts.client.request<ChatOpenPayload>("chat.open", {
+      repoRoot: opts.repoRoot,
+      ...(opts.chatSessionId ? { chatSessionId: opts.chatSessionId } : {}),
+      ...(opts.preferLastGlobal ? { preferLastGlobal: true } : {}),
+    });
+    await loadHistory(opened);
+    if (disconnected) throw new Error("Disconnected while opening Director chat");
+  } catch (err) {
+    unsubEvent();
+    throw err;
+  } finally {
+    unsubOpeningClose();
+  }
 
   let session: ChatSessionRecord = opened.session;
   let activeRepoRoot: string = opened.session.repoRoot;
   let config: HarnessConfig = opened.config;
   let goals: GoalRecord[] = opened.goals;
   let cachedCatalog: CompiledModelCatalog | null = null;
-  let streamingText = "";
-  let busy = Boolean(opened.busy);
-  let activeRequestId = 0;
+  let streamedText = "";
+  let lastSegment: { card: AssistantCard; text: string } | undefined;
+  type TurnEnd = { assistantTurn?: ChatTurnRecord | null; error?: string; cancelled?: boolean };
+  let activeTurnId = opened.activeTurnId;
+  let busy = Boolean(activeTurnId);
+  let controlling = false;
+  let pendingEnd: TurnEnd | undefined;
+  const drafts = new Map<string, string>();
   let exitAction: TuiExitAction = { kind: "exit" };
   let evictedByTakeover = false;
   const queuedMessages: string[] = [];
@@ -290,9 +373,7 @@ export async function runDirectorChatTui(opts: {
   const tui = term.tui;
 
   const chatContainer = new Container();
-  const pendingToolsContainer = new Container();
-  const pendingMarkdownContainer = new Container();
-  const pendingMarkdown = new Markdown("", 1, 0, theme.toMarkdownTheme());
+  const goalHeader = new GoalHeader(theme);
   const spinner = new TimedSpinner(tui, theme);
   const statusBar = new StatusBar(theme, {
     tone: "success",
@@ -327,27 +408,29 @@ export async function runDirectorChatTui(opts: {
     }
   };
 
-  seedTranscript(opened);
 
   tui.addChild(chatContainer);
-  tui.addChild(pendingToolsContainer);
-  tui.addChild(pendingMarkdownContainer);
   tui.addChild(new Spacer(1));
   tui.addChild(spinner);
+  tui.addChild(goalHeader);
   tui.addChild(statusBar);
+  tui.addChild({
+    invalidate() {},
+    render(width) {
+      if (!busy) return [];
+      const lines: string[] = [];
+      if (queuedMessages.length) {
+        lines.push(fitWidth(` Queued (${queuedMessages.length}): ${queuedMessages[0]}`, width));
+        lines.push(fitWidth(" Esc to stop & send queued · Ctrl+S steer · Ctrl+R recall", width));
+      } else {
+        lines.push(fitWidth(" Enter queue · Ctrl+S steer now · Esc stop", width));
+      }
+      return lines;
+    },
+  });
   tui.addChild(composer);
   tui.addChild(footerHint);
   tui.setFocus(composer);
-
-  const refreshQueueHint = () => {
-    if (queuedMessages.length > 0) {
-      const next = queuedMessages[0]!;
-      const preview = next.length > 54 ? `${next.slice(0, 54)}…` : next;
-      footerHint.set(`↳ Queued (${queuedMessages.length}): ${preview}  (Esc to cancel)`, "info");
-    } else {
-      footerHint.clear();
-    }
-  };
 
   const activeModelDisplay = () => {
     const shortCli = session.profileId.replace(/^acp:/, "");
@@ -357,22 +440,14 @@ export async function runDirectorChatTui(opts: {
   };
 
   const refreshStatus = () => {
-    const activeGoals = goals.filter((g) => ["executing", "verifying", "reviewing"].includes(g.status));
     const humanNeeded = goals.filter((g) => g.status === "awaiting_human").length;
-    const goalSummary =
-      activeGoals.length > 0
-        ? activeGoals
-            .map((g) => `${g.id}[${g.status}]`)
-            .slice(0, 2)
-            .join(" ")
-        : `${goals.length} goal${goals.length === 1 ? "" : "s"}`;
-
+    goalHeader.update(goals);
     statusBar.update({
       tone: humanNeeded > 0 ? "error" : busy ? "accent" : "success",
       modeLabel: busy ? "thinking" : "director",
       modelLabel: activeModelDisplay(),
       effortLabel: session.effort,
-      goalsSummary: goalSummary,
+      goalsSummary: "",
       alertText: humanNeeded > 0 ? `${humanNeeded} P0!` : null,
     });
   };
@@ -389,64 +464,100 @@ export async function runDirectorChatTui(opts: {
   };
 
   const clearPending = () => {
-    streamingText = "";
+    streamedText = "";
+    lastSegment = undefined;
     activeToolPills.clear();
-    pendingToolsContainer.clear();
-    pendingMarkdownContainer.clear();
   };
 
+  const appendDelta = (delta: string) => {
+    if (!delta) return;
+    if (!lastSegment || chatContainer.children.at(-1) !== lastSegment.card) {
+      const card = new AssistantCard(theme, "", session.model ?? session.profileId);
+      lastSegment = { card, text: "" };
+      chatContainer.addChild(card);
+    }
+    lastSegment.text += delta;
+    lastSegment.card.setText(lastSegment.text);
+    streamedText += delta;
+    tui.requestRender();
+  };
+
+  const seedActiveTranscript = (partial: string, allText: string) => {
+    appendDelta(partial);
+    streamedText = allText || partial;
+  };
+
+  const finishTranscript = (finalText?: string) => {
+    const final = finalText?.trim();
+    const streamed = streamedText.trim();
+    // ACP returns the whole turn, while Pi may return only its final message.
+    if (final && (!streamed || !streamed.endsWith(final))) {
+      const last = lastSegment?.text.trim();
+      const prefix = streamed && final.startsWith(streamed) ? streamed : last && final.startsWith(last) ? last : "";
+      appendDelta(final.slice(prefix.length));
+    }
+    for (const component of activeToolPills.values()) {
+      if (component instanceof ToolPill) component.finishCall();
+    }
+    clearPending();
+  };
+
+  let goalsRequest = 0;
+  let pollingGoals = false;
   const refreshGoals = async () => {
+    const repo = activeRepoRoot;
+    const request = ++goalsRequest;
     try {
-      goals = await opts.client.request<GoalRecord[]>("goal.list", { repoRoot: activeRepoRoot });
+      const next = await opts.client.request<GoalRecord[]>("goal.list", { repoRoot: repo });
+      if (repo !== activeRepoRoot || request !== goalsRequest) return;
+      goals = next;
       refreshStatus();
       tui.requestRender();
     } catch {
-      // ignore transient refresh errors
+      // The next refresh retries after a transient disconnect.
     }
   };
 
-  const switchToChatSessionInPlace = (targetSessionId: string) => {
-    void opts.client
-      .request<ChatOpenPayload>("chat.open", { repoRoot: activeRepoRoot, chatSessionId: targetSessionId })
-      .then((next) => {
-        activeRequestId++;
-        session = next.session;
-        activeRepoRoot = next.session.repoRoot;
-        goals = next.goals;
-        config = next.config;
-        busy = Boolean(next.busy);
-        queuedMessages.length = 0;
-        clearPending();
-        if (busy) spinner.start(`Thinking (${session.model ?? session.profileId})…`);
-        else spinner.stop();
-        seedTranscript(next, next.tookOver ? undefined : `Attached to ${next.session.id}.`);
-        refreshStatus();
-        refreshQueueHint();
-        tui.requestRender(true);
-      })
-      .catch((err) => appendError(err, `attach:${targetSessionId}`));
-  };
+  seedTranscript(opened);
+  if (busy) seedActiveTranscript(opened.activePartial ?? "", opened.activeText ?? "");
 
-  const createNewChatSession = (title?: string) => {
-    void opts.client
-      .request<ChatOpenPayload>("chat.create", { repoRoot: activeRepoRoot, title })
-      .then((next) => {
-        activeRequestId++;
-        session = next.session;
-        activeRepoRoot = next.session.repoRoot;
-        goals = next.goals;
-        config = next.config;
-        busy = false;
-        queuedMessages.length = 0;
-        spinner.stop();
-        clearPending();
-        seedTranscript(next, `Started new session ${next.session.id}.`);
+  const changeSession = async (op: "chat.open" | "chat.create", params: Record<string, unknown>) => {
+    if (buffering || controlling) return;
+    buffering = true;
+    try {
+      const next = await opts.client.request<ChatOpenPayload>(op, { repoRoot: activeRepoRoot, ...params });
+      const draft = [...queuedMessages, composer.getExpandedText()].filter(Boolean).join("\n\n");
+      if (draft) drafts.set(session.id, draft);
+      queuedMessages.length = 0;
+      composer.setText(drafts.get(next.session.id) ?? "");
+      drafts.delete(next.session.id);
+      session = next.session;
+      activeRepoRoot = session.repoRoot;
+      goals = next.goals;
+      config = next.config;
+      activeTurnId = next.activeTurnId;
+      busy = Boolean(activeTurnId);
+      pendingEnd = undefined;
+      clearPending();
+      if (busy) spinner.start(`Thinking (${session.model ?? session.profileId})…`);
+      else spinner.stop();
+      try {
+        await loadHistory(next);
+      } finally {
+        seedTranscript(next, op === "chat.create" ? `Started new session ${session.id}.` : undefined);
+        if (busy) seedActiveTranscript(next.activePartial ?? "", next.activeText ?? "");
         refreshStatus();
-        refreshQueueHint();
-        tui.requestRender(true);
-      })
-      .catch((err) => appendError(err, "chat.create"));
+      }
+    } catch (err) {
+      appendError(err, op);
+    } finally {
+      resumeEvents();
+      if (!busy) sendNextQueued();
+      tui.requestRender(true);
+    }
   };
+  const switchToChatSessionInPlace = (chatSessionId: string) => void changeSession("chat.open", { chatSessionId });
+  const createNewChatSession = (title?: string) => void changeSession("chat.create", { title });
 
   const switchToTarget = (targetId: string) => {
     if (targetId === session.id) {
@@ -927,7 +1038,6 @@ export async function runDirectorChatTui(opts: {
     );
   };
 
-  let unsubEvent = () => {};
   let unsubClose = () => {};
 
   const detachListenersOnly = () => {
@@ -940,47 +1050,99 @@ export async function runDirectorChatTui(opts: {
     opts.client.close();
   };
 
+  const restoreQueued = () => {
+    if (queuedMessages.length) {
+      composer.setText([...queuedMessages.splice(0), composer.getExpandedText()].filter(Boolean).join("\n\n"));
+    }
+  };
+
+  const sendNextQueued = () => {
+    if (busy || buffering || evictedByTakeover) return;
+    const next = queuedMessages.shift();
+    if (next) dispatchChatTurn(next);
+  };
+
+  const settleTurn = (turnId: string, end: TurnEnd, recall = false) => {
+    if (activeTurnId !== turnId || evictedByTakeover) return;
+    if (controlling) {
+      pendingEnd ??= end;
+      return;
+    }
+    activeTurnId = null;
+    busy = false;
+    spinner.stop();
+    finishTranscript(end.assistantTurn?.content);
+    if (end.cancelled) appendSystem(["Cancelled current response."], "warning");
+    else if (end.error) appendError(new Error(end.error), `chat.send:${session.profileId}`);
+    refreshStatus();
+    if (end.error || recall) restoreQueued();
+    else sendNextQueued();
+    tui.requestRender();
+    void refreshGoals();
+  };
+
   const dispatchChatTurn = (text: string) => {
+    const turnId = randomUUID();
+    activeTurnId = turnId;
     busy = true;
-    const reqId = ++activeRequestId;
     chatContainer.addChild(new UserCard(theme, text));
     clearPending();
     refreshStatus();
-    refreshQueueHint();
     spinner.start(`Thinking (${session.model ?? session.profileId})…`);
+    void opts.client.request<TurnEnd>("chat.send", { chatSessionId: session.id, turnId, text }).then(
+      (res) => settleTurn(turnId, res),
+      (err) => settleTurn(turnId, { error: err instanceof Error ? err.message : String(err) }),
+    );
+  };
 
-    void opts.client
-      .request<{ assistantTurn: ChatTurnRecord }>("chat.send", { chatSessionId: session.id, text })
-      .then(
-        (res) => {
-          if (reqId !== activeRequestId) return;
-          busy = false;
-          spinner.stop();
-          // Preserve finalized tool pills and output cards into immutable scrollback before clearing pending
-          preservePendingTools(activeToolPills, chatContainer);
-          clearPending();
-          chatContainer.addChild(
-            new AssistantCard(theme, res.assistantTurn.content, session.model ?? session.profileId),
-          );
-          refreshStatus();
-          tui.requestRender();
-          void refreshGoals();
-          const nextQueued = queuedMessages.shift();
-          refreshQueueHint();
-          if (nextQueued) dispatchChatTurn(nextQueued);
-        },
-        (err) => {
-          if (reqId !== activeRequestId) return;
-          busy = false;
-          spinner.stop();
-          preservePendingTools(activeToolPills, chatContainer, { cardsOnly: true });
-          clearPending();
-          appendError(err, `chat.send:${session.profileId}`);
-          refreshStatus();
-          refreshQueueHint();
-          tui.requestRender();
-        },
-      );
+  // A terminal event can arrive before the control RPC acknowledges cancellation or steering.
+  // Hold that event until the acknowledgement identifies what to do with the queue.
+  const controlTurn = async (action: "escape" | "ctrl+c" | "steer") => {
+    const turnId = activeTurnId;
+    if (!turnId || controlling || buffering) return;
+    const draft = composer.getExpandedText();
+    const steerFromDraft = action === "steer" && Boolean(draft.trim());
+    const message = steerFromDraft ? draft : queuedMessages[0] ?? "";
+    if (action === "steer" && !message) return;
+    if (steerFromDraft) composer.clear();
+    const restoreSteerDraft = () => {
+      if (steerFromDraft) composer.setText([draft, composer.getExpandedText()].filter(Boolean).join("\n\n"));
+    };
+    controlling = true;
+    let end: TurnEnd | undefined;
+    try {
+      if (action === "steer") {
+        const res = await opts.client.request<{ steered: boolean; cancelled?: boolean }>("chat.steer", {
+          chatSessionId: session.id, turnId, message,
+        });
+        if (evictedByTakeover) return;
+        if (res.steered || res.cancelled) {
+          if (res.steered) {
+            if (!steerFromDraft) queuedMessages.shift();
+          } else {
+            if (steerFromDraft) queuedMessages.unshift(message);
+            end = { cancelled: true };
+          }
+        } else {
+          restoreSteerDraft();
+          appendSystem(["Turn already ended. Steering message kept."], "warning");
+        }
+      } else {
+        const res = await opts.client.request<{ cancelled: boolean }>("chat.cancel", {
+          chatSessionId: session.id, turnId,
+        });
+        if (res.cancelled) end = { cancelled: true };
+      }
+    } catch (err) {
+      restoreSteerDraft();
+      appendError(err, action === "steer" ? "chat.steer" : "chat.cancel");
+    } finally {
+      controlling = false;
+      end = end ? { ...pendingEnd, ...end, error: undefined } : pendingEnd;
+      pendingEnd = undefined;
+      if (end) settleTurn(turnId, end, action === "ctrl+c");
+      tui.requestRender();
+    }
   };
 
   term.bindControls({
@@ -993,22 +1155,14 @@ export async function runDirectorChatTui(opts: {
       clearComposerText: () => composer.clear(),
       isAutocompleteOpen: () => composer.isAutocompleteOpen(),
       isBusy: () => busy,
-      onAbortGeneration: () => {
-        if (!busy) return;
-        activeRequestId++;
-        busy = false;
-        queuedMessages.length = 0;
-        spinner.stop();
-        void opts.client.request("chat.cancel", { chatSessionId: session.id }).catch(() => {});
-        preservePendingTools(activeToolPills, chatContainer, { cardsOnly: true });
-        if (streamingText.trim()) {
-          chatContainer.addChild(new AssistantCard(theme, streamingText, `${session.model ?? session.profileId} · cancelled`));
-        }
-        clearPending();
-        refreshQueueHint();
-        appendSystem(["Cancelled current response."], "warning");
-        refreshStatus();
+      onAbortGeneration: (key) => void controlTurn(key),
+      onSteer: () => void controlTurn("steer"),
+      onRecallQueued: () => {
+        if (controlling || buffering || !queuedMessages.length) return false;
+        const recalled = queuedMessages.shift()!;
+        composer.setText([recalled, composer.getExpandedText()].filter(Boolean).join("\n\n"));
         tui.requestRender();
+        return true;
       },
       onOpenSettings: openSettings,
       onOpenPalette: openCommandPalette,
@@ -1019,6 +1173,10 @@ export async function runDirectorChatTui(opts: {
   });
 
   composer.onSubmit = (raw) => {
+    if (buffering) {
+      composer.setText(raw);
+      return;
+    }
     const text = raw.trim();
     composer.clear();
     if (!text) return;
@@ -1030,7 +1188,6 @@ export async function runDirectorChatTui(opts: {
 
     if (busy) {
       queuedMessages.push(text);
-      refreshQueueHint();
       tui.requestRender();
       return;
     }
@@ -1038,29 +1195,61 @@ export async function runDirectorChatTui(opts: {
     dispatchChatTurn(text);
   };
 
-  unsubEvent = opts.client.onEvent((ev) => {
+  handleEvent = (ev) => {
     // Frames tagged with a watchId belong to the overlay that started that watch.
     if (isWatchFrame(ev)) return;
     if (ev.type === "session.taken_over") {
-      evictedByTakeover = true;
       const p = ev.payload as { sessionId?: string; reason?: string };
+      if (p.sessionId !== session.id) return;
+      evictedByTakeover = true;
       void term.shutdown(
         `[Detached — session ${p.sessionId ?? session.id} was taken over by another terminal.]`,
         { overlays, spinner, cleanup: cleanupFullExit },
       );
       return;
     }
+    if (ev.type.startsWith("chat.")) {
+      const p = ev.payload as TurnEnd & { chatSessionId: string; turnId: string };
+      if (!activeTurnId || p.chatSessionId !== session.id || p.turnId !== activeTurnId) return;
+      if (ev.type === "chat.steered") {
+        chatContainer.addChild(new UserCard(theme, String((ev.payload as { message: string }).message)));
+        appendSystem(["Steered current response."], "info");
+        return;
+      }
+      if (ev.type === "chat.turn.end") {
+        settleTurn(p.turnId, p);
+        return;
+      }
+    }
     if (ev.type === "chat.delta" && busy) {
       const delta = String((ev.payload as { delta?: string })?.delta ?? "");
       if (!delta) return;
-      streamingText += delta;
-      if (pendingMarkdownContainer.children.length === 0) {
-        pendingMarkdownContainer.addChild(pendingMarkdown);
-      }
-      pendingMarkdown.setText(streamingText);
-      tui.requestRender();
+      appendDelta(delta);
     } else if (ev.type === "chat.tool" && busy) {
-      applyChatToolEvent(ev.payload, activeToolPills, pendingToolsContainer, theme);
+      const p = ev.payload as { id?: string; name?: string; title?: string; status?: string };
+      const display = extractDisplay(p);
+      const name = p.title ?? p.name ?? "tool";
+      const key = p.id || name;
+      const previous = activeToolPills.get(key);
+      if (display) {
+        // Pi emits an unkeyed progress event before the independently keyed display.
+        const progress = previous ?? activeToolPills.get(name);
+        if (progress instanceof ToolPill) {
+          if (chatContainer.children.at(-1) === progress) chatContainer.removeChild(progress);
+          else progress.finishCall();
+        }
+      } else if (p.status !== "completed" && p.status !== "failed") {
+        if (!p.id) activeToolPills.delete(key);
+      } else if (previous instanceof ToolPill && chatContainer.children.at(-1) !== previous) {
+        // A command, notice or another tool arrived since this call started.
+        previous.finishCall();
+        activeToolPills.delete(key);
+      }
+      applyChatToolEvent(p, activeToolPills, chatContainer, theme);
+      if (display && p.id && activeToolPills.has(name)) {
+        const card = activeToolPills.get(key);
+        if (card) activeToolPills.set(name, card);
+      }
       tui.requestRender();
     } else if (ev.type === "goal.reviewed") {
       const p = ev.payload as { goalId: string; version: number; cycle: number; verdict: string; status: string; summary: string };
@@ -1129,7 +1318,7 @@ export async function runDirectorChatTui(opts: {
         "success",
       );
     }
-  });
+  };
 
   unsubClose = opts.client.onClose(() => {
     if (evictedByTakeover) return;
@@ -1143,8 +1332,19 @@ export async function runDirectorChatTui(opts: {
   if (busy) spinner.start(`Thinking (${session.model ?? session.profileId})…`);
   refreshStatus();
   term.start();
+  resumeEvents();
   tui.requestRender();
-  await term.closed;
+  const goalTimer = setInterval(async () => {
+    if (pollingGoals) return;
+    pollingGoals = true;
+    await refreshGoals();
+    pollingGoals = false;
+  }, 3_000);
+  try {
+    await term.closed;
+  } finally {
+    clearInterval(goalTimer);
+  }
   return exitAction;
 }
 
@@ -1409,7 +1609,9 @@ export async function runNativeScrollbackTui(opts: {
   let unsubEvent = () => {};
   let unsubClose = () => {};
 
+  let leftRun = false;
   const detachListenersOnly = () => {
+    leftRun = true;
     unsubEvent();
     unsubClose();
   };
@@ -1617,41 +1819,45 @@ export async function runNativeScrollbackTui(opts: {
     });
   };
 
-  unsubEvent = opts.client.onEvent(appendEvent);
+  let earlyRunEvents: DaemonEventFrame[] | null = [];
+  unsubEvent = opts.client.onEvent((ev) => {
+    if (isWatchFrame(ev)) return;
+    if (ev.type === "session.taken_over") appendEvent(ev);
+    else if (ev.runId === opts.runId) {
+      if (earlyRunEvents) earlyRunEvents.push(ev);
+      else appendEvent(ev);
+    }
+  });
   unsubClose = opts.client.onClose(() => {
     if (evictedByTakeover) return;
     void term.shutdown("[Connection to harnessd closed.]", { overlays, spinner, cleanup: cleanupFullExit });
   });
 
-  const attached = await opts.client.request<{
-    tookOver?: boolean;
-    replay?: Array<{
-      seq: number;
-      runId: string;
-      taskId: string | null;
-      type: string;
-      payload: unknown;
-      createdAt: number;
-    }>;
-  }>("attach", {
-    runId: opts.runId,
-    taskId: focusedTaskId,
-    sinceSeq: lastSeq,
-  });
-
-  for (const ev of attached.replay ?? []) {
-    appendEvent({ kind: "event", ...ev });
-  }
-  flushStreaming();
-  if (attached.tookOver) {
-    streamContainer.addChild(
-      new SystemCard(theme, [`Took over ${opts.runId} (previous terminal was detached).`], "info"),
-    );
-  }
-
-  refreshStatus();
   term.start();
-  tui.requestRender();
+  try {
+    const attached = await opts.client.request<ReplayPage & { attachmentId: string; tookOver?: boolean }>("attach", {
+      runId: opts.runId,
+      taskId: focusedTaskId,
+      sinceSeq: lastSeq,
+    });
+    await consumeReplay(opts.client, attached, { attachmentId: attached.attachmentId }, (ev) => {
+      appendEvent({ kind: "event", ...ev });
+    }, () => leftRun || evictedByTakeover);
+    if (!leftRun && !evictedByTakeover) {
+      for (const ev of earlyRunEvents) if (ev.seq > lastSeq) appendEvent(ev);
+      earlyRunEvents = null;
+      flushStreaming();
+      if (attached.tookOver) {
+        streamContainer.addChild(new SystemCard(theme, [`Took over ${opts.runId} (previous terminal was detached).`], "info"));
+      }
+      refreshStatus();
+      tui.requestRender();
+    }
+  } catch (err) {
+    if (!leftRun && !evictedByTakeover) {
+      await term.shutdown(`[Failed to attach: ${err instanceof Error ? err.message : String(err)}]`, { overlays, spinner, cleanup: cleanupFullExit });
+    }
+  }
   await term.closed;
   return exitAction;
 }

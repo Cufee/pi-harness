@@ -118,6 +118,7 @@ export interface AgentTranscriptOverlayOptions {
   title: string;
   startWatch: (
     onEvent: (ev: TranscriptEvent) => void,
+    onReplay: (ev: EventRecord) => void,
   ) => Promise<{ replay: EventRecord[]; stop: () => Promise<void> | void }>;
   onClose: () => void;
   requestRender: () => void;
@@ -144,7 +145,11 @@ export class AgentTranscriptOverlay implements Component {
 
   constructor(private readonly opts: AgentTranscriptOverlayOptions) {
     void this.opts
-      .startWatch((ev) => this.onLive(ev))
+      .startWatch((ev) => this.onLive(ev), (ev) => {
+        if (this.closed) return;
+        this.push(ev);
+        this.opts.requestRender();
+      })
       .then(({ replay, stop }) => {
         if (this.closed) {
           void stop();
@@ -247,7 +252,7 @@ export class AgentTranscriptOverlay implements Component {
       out.push(fitWidth(t.error(`Failed to open transcript: ${this.loadError}`), width));
       return out;
     }
-    if (!this.replayed) {
+    if (!this.replayed && !this.events.length) {
       out.push(fitWidth(t.muted("Loading transcript…"), width));
       return out;
     }
