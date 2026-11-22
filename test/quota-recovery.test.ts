@@ -25,8 +25,7 @@ import { AcpRunner } from "../src/runners/acp-runner.js";
 import { buildPostSessionActions } from "../src/runners/acp-shims.js";
 import { detectQuotaErrorText } from "../src/runners/quota-detect.js";
 import type { QuotaRetryStateEvent, RunAgentRequest, RunAgentResult } from "../src/runners/types.js";
-import { parseDurationMs, QuotaWaitPickerOverlay } from "../src/tui/overlays.js";
-import { createTheme } from "../src/tui/primitives/index.js";
+import { parseDurationMs } from "../src/tui/core/index.js";
 
 function initTempGitRepo(): string {
   const dir = mkdtempSync(join(tmpdir(), "pi-harness-quota-test-"));
@@ -633,7 +632,7 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
     }
   });
 
-  it("parses wait durations, detects quota error strings, and renders QuotaWaitPickerOverlay width-safely", () => {
+  it("parses wait durations and detects quota error strings", () => {
     assert.equal(parseDurationMs("30s"), 30_000);
     assert.equal(parseDurationMs("15m"), 900_000);
     assert.equal(parseDurationMs("1h30m"), 5_400_000);
@@ -651,23 +650,5 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
     assert.equal(d2.isHardExhaustion, true);
 
     assert.equal(detectQuotaErrorText("ENOENT: file not found").isQuota, false);
-
-    const theme = createTheme();
-    const picker = new QuotaWaitPickerOverlay(
-      theme,
-      "run-abc123",
-      "429 Too Many Requests",
-      null,
-      () => {},
-      () => {},
-      () => {},
-    );
-    for (const width of [40, 80, 120]) {
-      const lines = picker.render(width);
-      assert.ok(lines.length >= 8);
-      for (const line of lines) {
-        assert.ok(visibleWidth(line) <= width, `line overflowed ${width}: ${visibleWidth(line)}`);
-      }
-    }
   });
 });

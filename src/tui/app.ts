@@ -1,2157 +1,852 @@
 import { randomUUID } from "node:crypto";
-import { fitWidth } from "./primitives/width.js";
-import { type Component, Container, isKeyRelease, Markdown, matchesKey, Spacer } from "@earendil-works/pi-tui";
-import type { CompiledModelCatalog } from "../catalog/compiler.js";
-import type { HarnessConfig } from "../config.js";
-import type { EscalationRecord, EventRecord, ReplayPage, RunRecord, TaskRecord } from "../control-plane/db.js";
-import type { RunQuotaPauseStatus } from "../control-plane/orchestrator.js";
+import { matchesKey, type Terminal } from "@earendil-works/pi-tui";
+import type { RunRecord } from "../control-plane/db.js";
 import type { DaemonClient } from "../daemon/remote.js";
 import type { ChatSessionRecord, ChatTurnRecord } from "../director/session.js";
-import type { GoalRecord, GoalReviewVerdict } from "../goals/engine.js";
-import type { KbCard } from "../kb/store.js";
-import { parseChatControlEvent } from "../protocol/chat-events.js";
+import { formatChatEventSummary, parseChatControlEvent } from "../protocol/chat-events.js";
 import type { DaemonEventFrame } from "../protocol/daemon-rpc.js";
-import type { LiveWorktreeInfo } from "../worktree/manager.js";
+import { createCommandAutocomplete, parseSlashCommand, renderHelp, type TuiMode } from "./commands.js";
 import {
-  autocompleteCommands,
-  paletteCommands,
-  renderHelp,
-  resolveCommand,
-  type CommandMode,
-  type SlashCommand,
-} from "./commands.js";
-import {
-  CommandPaletteOverlay,
-  EffortPickerOverlay,
-  formatGoalDetailCard,
-  formatGoalReviewCard,
-  formatResetCountdown,
-  GoalsOverlay,
-  KbOverlay,
-  ModelConfigOverlay,
-  ModelPickerOverlay,
-  QuotaOverlay,
-  QuotaWaitPickerOverlay,
-  SessionsOverlay,
-  WorktreesOverlay,
-  type AttachableSession,
-} from "./overlays.js";
-import {
-  AssistantCard,
-  BannerCard,
-  Composer,
   createTheme,
-  type HarnessTheme,
-  ErrorCard,
-  EventCard,
-  FooterHint,
-  GoalHeader,
-  formatAgentError,
-  OverlayManager,
-  StatusBar,
-  SystemCard,
+  type TuiEntityRef as EntityRef,
+  FixedDock,
+  formatDuration,
+  formatToolLabel,
+  type Hint,
+  ImmutableTranscript,
+  Navigator,
+  parseDurationMs,
+  RecentRefsRing,
+  sanitizeLine,
   TerminalSession,
-  TimedSpinner,
-  ToolPill,
-  GoalNotice,
-  UserCard,
-} from "./primitives/index.js";
-import { ToolTranscript } from "./primitives/tool-chain.js";
-import { RunsTreeOverlay, type RunsTreesResult } from "./runs-tree.js";
-import { componentForHistoryTurn, extractDisplay, ToolOutputCard, type ToolDisplayPayload } from "./tool-output/index.js";
-import { SettingsOverlay } from "./settings-overlay.js";
-import { AgentTranscriptOverlay } from "./transcript-overlay.js";
+} from "./core/index.js";
+import { type InspectorDeps, openEntityInspector } from "./inspectors.js";
+import {
+  GoToPaletteScreen,
+  KbBrowserScreen,
+  ModelPickerScreen,
+  type QuickActionItem,
+  QuotaCostScreen,
+  SessionSwitcherScreen,
+  SettingsScreen,
+} from "./pickers.js";
+import { WorkStore } from "./store.js";
+import { WorkNavigatorScreen, type WorkTabId } from "./work-navigator.js";
 
 export type TuiExitAction =
   | { kind: "exit" }
-  | { kind: "switch"; targetId: string; targetKind: "chat" | "run" };
+  | { kind: "switch"; targetKind: "chat" | "run"; targetId: string };
 
-/**
- * Resolves composer input against the slash command registry. Input that looks like a slash command
- * (`/word`, not a path such as `/Users/me`) but names no command in `mode` reports `unknown`.
- */
-function parseSlashInput(mode: CommandMode, text: string): { cmd: SlashCommand; arg: string } | { error: string } | null {
-  const resolved = resolveCommand(mode, text);
-  if (resolved && resolved.arg && !resolved.cmd.args) {
-    return { error: `/${resolved.cmd.name} takes no arguments. Type /help for commands.` };
-  }
-  if (resolved) return resolved;
-  return /^\/[A-Za-z][\w-]*(\s|$)/.test(text) ? { error: `Unknown command ${text.split(/\s/)[0]}. Type /help for commands.` } : null;
-}
-
-export type RunsAction = "resume" | "wait" | "stop";
-
-/** Returns true when a Director tool call is waiting on delegated subagent(s) rather than Director reasoning. */
-export function isSubagentWaitTool(name?: string, title?: string): boolean {
-  const hay = `${name ?? ""} ${title ?? ""}`.toLowerCase();
-  return /\b(wait_tasks|wait_children|goal_wait|goal_trigger_review)\b/.test(hay) ||
-    hay.includes("mcp__harness__wait_tasks") ||
-    hay.includes("mcp__harness__wait_children") ||
-    hay.includes("mcp__harness__goal_wait") ||
-    hay.includes("mcp__harness__goal_trigger_review");
-}
-
-/** True for frames delivered to a `watch.start` subscription; only the overlay that owns the watch consumes them. */
-export function isWatchFrame(ev: DaemonEventFrame): boolean {
-  return Boolean(ev.watchId);
-}
-
-type WatchClient = Pick<DaemonClient, "request" | "onEvent">;
-
-async function consumeReplay(
-  client: WatchClient,
-  first: ReplayPage,
-  subscription: { watchId: string } | { attachmentId: string },
-  append: (event: EventRecord) => void,
-  closed: () => boolean = () => false,
-): Promise<void> {
-  let page = first;
-  const parts: Buffer[] = [];
-  while (!closed()) {
-    for (const event of page.replay) append(event);
-    if (page.fragment) {
-      parts.push(Buffer.from(page.fragment.data, "base64"));
-      if (page.fragment.final) {
-        append({ ...page.fragment.event, payload: JSON.parse(Buffer.concat(parts).toString("utf8")) });
-        parts.length = 0;
-      }
-    }
-    if (!page.next) break;
-    page = await client.request<ReplayPage>("replay.page", subscription);
-  }
-}
-
-/**
- * Starts a read-only daemon watch (never attach/detach) and routes frames tagged with its watchId to
- * `onEvent`. Frames that arrive before `watch.start` answers are buffered. `stop` is idempotent.
- */
-async function startWatch(
-  client: WatchClient,
-  params:
-    | { scope: "runs"; chatSessionId?: string; runIds?: string[] }
-    | { scope: "task"; runId: string; taskId: string },
-  onEvent: (ev: DaemonEventFrame) => void,
-  closed?: () => boolean,
-  onReplay?: (ev: EventRecord) => void,
-): Promise<{ replay: EventRecord[]; stop: () => Promise<void> }> {
-  let watchId: string | null = null;
-  const early: DaemonEventFrame[] = [];
-  const unsub = client.onEvent((ev) => {
-    if (!ev.watchId) return;
-    if (watchId === null) early.push(ev);
-    else if (ev.watchId === watchId) onEvent(ev);
-  });
-  const replay: EventRecord[] = [];
-  let res: ReplayPage & { watchId: string };
-  try {
-    res = await client.request<ReplayPage & { watchId: string }>("watch.start", params);
-    watchId = res.watchId;
-    for (const ev of early) if (ev.watchId === watchId) onEvent(ev);
-    await consumeReplay(client, res, { watchId }, onReplay ?? ((ev) => replay.push(ev)), closed);
-  } catch (err) {
-    unsub();
-    if (watchId) void client.request("watch.stop", { watchId }).catch(() => {});
-    throw err;
-  }
-  let stopped = false;
-  return {
-    replay,
-    stop: async () => {
-      if (stopped) return;
-      stopped = true;
-      unsub();
-      await client.request("watch.stop", { watchId: res.watchId }).catch(() => {});
-    },
-  };
-}
-
-/**
- * The single `/runs` overlay for both modes; every entry point (slash, palette, Ctrl+T) lands here.
- * Read-only: it uses `runs.trees` + `watch.*` and never attaches, so the current session stays attached.
- * Enter on an agent stacks its live transcript on top; closing it returns to the same tree state.
- */
-export function openRunsOverlay(ctx: {
-  client: WatchClient;
-  theme: HarnessTheme;
-  overlays: OverlayManager;
-  requestRender: () => void;
-  onAction: (action: RunsAction, runId: string) => void;
-  chatSessionId?: string;
-  runIds?: string[];
-}): RunsTreeOverlay {
-  const openTranscript = (row: {
-    runId: string;
-    taskId: string;
-    title: string;
-    model?: string | null;
-    profileId?: string | null;
-    effort?: string | null;
-  }) => {
-    let watch: Awaited<ReturnType<typeof startWatch>> | null = null;
-    let closed = false;
-    let handle: ReturnType<OverlayManager["push"]> | null = null;
-    const comp = new AgentTranscriptOverlay({
-      theme: ctx.theme,
-      ...row,
-      startWatch: async (onEvent, onReplay) => {
-        watch = await startWatch(ctx.client, { scope: "task", runId: row.runId, taskId: row.taskId }, onEvent, () => closed, onReplay);
-        if (closed) void watch.stop();
-        return watch;
-      },
-      onClose: () => handle?.close(),
-      requestRender: ctx.requestRender,
-    });
-    const modelBase = row.model || row.profileId || "";
-    const subParts = [row.runId, row.taskId, ...(modelBase ? [modelBase] : []), ...(row.effort ? [row.effort] : [])];
-    handle = ctx.overlays.push(
-      {
-        title: "Agent Transcript",
-        subtitle: subParts.join(" · "),
-        footer: "mouse wheel / ↑↓ scroll · read-only · Esc back to /runs",
-      },
-      comp,
-      {
-        width: "94%",
-        captureMouseWheel: true,
-        onClose: () => {
-          closed = true;
-          void watch?.stop();
-        },
-      },
-    );
-  };
-
-  let handle: ReturnType<OverlayManager["push"]> | null = null;
-  const scopeParams = {
-    ...(ctx.chatSessionId ? { chatSessionId: ctx.chatSessionId } : {}),
-    ...(ctx.runIds ? { runIds: ctx.runIds } : {}),
-  };
-  const comp = new RunsTreeOverlay({
-    theme: ctx.theme,
-    fetchTrees: async () => {
-      type Page = RunsTreesResult & { next?: { id: string; createdAt: number } };
-      let page = await ctx.client.request<Page>("runs.trees", scopeParams);
-      const runs = [...page.runs];
-      while (page.next) {
-        page = await ctx.client.request<Page>("runs.trees", { ...scopeParams, before: page.next });
-        runs.push(...page.runs);
-      }
-      return { generatedAt: page.generatedAt, runs };
-    },
-    subscribe: async (onEvent) => {
-      const watch = await startWatch(ctx.client, { scope: "runs", ...scopeParams }, onEvent);
-      return () => void watch.stop();
-    },
-    onOpenTranscript: openTranscript,
-    onAction: ctx.onAction,
-    onClose: () => handle?.close(),
-    requestRender: ctx.requestRender,
-  });
-  const subtitle = ctx.chatSessionId
-    ? `session ${ctx.chatSessionId}`
-    : ctx.runIds?.length === 1
-      ? `run ${ctx.runIds[0]}`
-      : undefined;
-  // Ctrl+T / Ctrl+C pop the overlay without Esc, so stop the watch on every close path.
-  handle = ctx.overlays.push(
-    { title: "Autonomous Runs", ...(subtitle ? { subtitle } : {}) },
-    comp,
-    { width: "94%", captureMouseWheel: true, onClose: () => comp.dispose() },
-  );
-  return comp;
-}
-
-async function resolveLeaveNote(client: DaemonClient): Promise<string> {
-  try {
-    const res = await client.request<{ daemonWillQuit: boolean; running: boolean; activeWorkSummary?: string }>(
-      "session.leave",
-    );
-    if (res.daemonWillQuit) {
-      return "[Exited — no background agents running; harnessd stopped.]";
-    }
-    const detail = res.activeWorkSummary ? ` (${res.activeWorkSummary})` : "";
-    return `[Detached — background work${detail} continues in harnessd. Reattach with: pi-harness attach]`;
-  } catch {
-    return "[Exited.]";
-  }
-}
-
-/** Transcript component for one persisted chat turn (history replay on chat.open / session switch). */
-export function historyTurnComponent(t: ChatTurnRecord, theme: HarnessTheme, modelLabel: string): Component {
-  if (t.role === "user") return new UserCard(theme, t.content);
-  if (t.role === "assistant") return new AssistantCard(theme, t.content, modelLabel);
-  if (t.event) return new EventCard(theme, t.event);
-  return componentForHistoryTurn(t, theme) ?? new SystemCard(theme, [t.content], "muted");
-}
-
-/** Live tool components of the in-flight chat turn, keyed by tool event id, in arrival order. */
-export type PendingTools = Map<string, ToolPill | ToolOutputCard>;
-
-type ToolEvent = { id?: string; name?: string; status?: string; title?: string; args?: string; result?: string; error?: string };
-
-/**
- * Applies one `chat.tool` event to the pending tools area: a `ToolOutputCard` when the event carries a
- * structured display (contract/tool-display-v1), otherwise the compact `ToolPill` created or updated in place.
- */
-export function applyChatToolEvent(payload: unknown, pending: PendingTools, container: Container, theme: HarnessTheme): void {
-  const p = (payload ?? {}) as ToolEvent;
-  const display = extractDisplay(payload);
-  if (display) {
-    const key = p.id || `display-${pending.size}`;
-    if (pending.get(key) instanceof ToolOutputCard) return;
-    const card = new ToolOutputCard(theme, display);
-    pending.set(key, card);
-    container.addChild(card);
-    return;
-  }
-  const rawLabel = p.title ?? p.name ?? "tool";
-  const displayLabel = rawLabel.replace(/^mcp[._/]harness[._/]+/i, "harness:").replace(/^mcp__harness__/i, "harness:");
-  const key = p.id || displayLabel;
-  const st = p.status === "completed" ? "ok" : p.status === "failed" ? "error" : "running";
-  const existing = pending.get(key);
-  if (existing instanceof ToolPill && (p.id || st !== "running" || existing.status === "running")) {
-    existing.update(st, p.error ?? p.result, p.args);
-  } else if (!(existing instanceof ToolOutputCard)) {
-    const pill = new ToolPill(theme, st, displayLabel, p.args);
-    pill.update(st, p.error ?? p.result);
-    pending.set(key, pill);
-    container.addChild(pill);
-  }
-}
-
-/**
- * Moves pending tool components into scrollback in arrival order. With `cardsOnly` (cancel / error
- * paths) only structured cards are kept, since the daemon already persisted them as tool_output turns.
- */
-export function preservePendingTools(pending: PendingTools, scrollback: Container, opts: { cardsOnly?: boolean } = {}): void {
-  for (const c of pending.values()) {
-    if (opts.cardsOnly && !(c instanceof ToolOutputCard)) continue;
-    scrollback.addChild(c);
-  }
-}
-
-const TOOL_CHAIN_TOGGLE_CLICK = {
-  type: "click" as const,
-  button: "left" as const,
-  x: 0,
-  y: 0,
-  screenX: 0,
-  screenY: 0,
-  width: 1,
-  height: 1,
-  shift: false,
-  alt: false,
-  ctrl: false,
-};
-
-/** Expands or collapses the latest `ToolChain` disclosure card in a `ToolTranscript` via keyboard. */
-export function toggleLatestToolChain(transcript: ToolTranscript): boolean {
-  for (let i = transcript.children.length - 1; i >= 0; i--) {
-    if (transcript.children[i]?.handleMouse?.(TOOL_CHAIN_TOGGLE_CLICK)?.handled) return true;
-  }
-  return false;
-}
-
-/**
- * Primary zero-arg interactive TUI: Persistent Tier 0 Director Chat on native terminal scrollback
- * (`@earendil-works/pi-tui` `TuiMainScreen`) built on `src/tui/primitives/`:
- *   - Bulletproof `Ctrl+C` / `Ctrl+D` / `Esc` / `Ctrl+]` / `Ctrl+,` / `Ctrl+O` controls
- *   - Zero `7u1;2c` shell escape leaks on exit (`drainInput` before `tui.stop()`)
- *   - Immutable width-memoized scrollback cards + memoized 1-line `StatusBar`
- *   - Live `ToolPill` + streaming `Markdown` during turns + follow-up turn queueing
- *   - Clean `ErrorCard` with full raw stderr persisted to `~/.pi-harness/logs/errors/`
- */
-export async function runDirectorChatTui(opts: {
+export interface DirectorChatTuiOptions {
   client: DaemonClient;
   repoRoot: string;
   chatSessionId?: string;
   preferLastGlobal?: boolean;
-}): Promise<TuiExitAction> {
-  type ChatOpenPayload = {
-    session: ChatSessionRecord;
-    history: ChatTurnRecord[];
-    goals: GoalRecord[];
-    config: HarnessConfig;
-    tookOver?: boolean;
-    activeTurnId: string | null;
-    activePartial?: string;
-    activeText?: string;
-    historyNext?: number | null;
-    historyThrough?: number;
-  };
+  terminal?: Terminal;
+}
 
-  // Handshake BEFORE touching terminal raw mode so a failed RPC never leaves escape sequences in zsh!
-  const bufferedEvents: DaemonEventFrame[] = [];
-  let buffering = true;
-  let handleEvent: (ev: DaemonEventFrame) => void;
-  const unsubEvent = opts.client.onEvent((event) => {
-    if (buffering) bufferedEvents.push(event);
-    else handleEvent(event);
-  });
-  const resumeEvents = () => {
-    buffering = false;
-    for (const event of bufferedEvents.splice(0)) handleEvent(event);
-  };
-  const loadHistory = async (payload: ChatOpenPayload) => {
-    let afterSeq = payload.historyNext;
-    while (afterSeq != null) {
-      const page = await opts.client.request<Pick<ChatOpenPayload, "history" | "historyNext">>("chat.history", {
-        chatSessionId: payload.session.id, afterSeq, throughSeq: payload.historyThrough,
-      });
-      if (page.historyNext != null && page.historyNext <= afterSeq) throw new Error("Chat history cursor did not advance");
-      for (const row of page.history) payload.history.push(row);
-      afterSeq = page.historyNext;
-    }
-  };
-  let disconnected = false;
-  const unsubOpeningClose = opts.client.onClose(() => { disconnected = true; });
-  let opened: ChatOpenPayload;
-  try {
-    opened = await opts.client.request<ChatOpenPayload>("chat.open", {
-      repoRoot: opts.repoRoot,
-      ...(opts.chatSessionId ? { chatSessionId: opts.chatSessionId } : {}),
-      ...(opts.preferLastGlobal ? { preferLastGlobal: true } : {}),
-    });
-    await loadHistory(opened);
-    if (disconnected) throw new Error("Disconnected while opening Director chat");
-  } catch (err) {
-    unsubEvent();
-    throw err;
-  } finally {
-    unsubOpeningClose();
-  }
+export interface NativeScrollbackTuiOptions {
+  client: DaemonClient;
+  runId: string;
+  initialTaskId?: string | null;
+  terminal?: Terminal;
+}
 
-  let session: ChatSessionRecord = opened.session;
-  let activeRepoRoot: string = opened.session.repoRoot;
-  let config: HarnessConfig = opened.config;
-  let goals: GoalRecord[] = opened.goals;
-  let cachedCatalog: CompiledModelCatalog | null = null;
-  let streamedText = "";
-  let lastSegment: { card: AssistantCard; text: string } | undefined;
-  type TurnEnd = { assistantTurn?: ChatTurnRecord | null; error?: string; cancelled?: boolean };
-  let activeTurnId = opened.activeTurnId;
-  let busy = Boolean(activeTurnId);
-  let controlling = false;
-  let pendingEnd: TurnEnd | undefined;
-  const drafts = new Map<string, string>();
-  let exitAction: TuiExitAction = { kind: "exit" };
-  let evictedByTakeover = false;
-  const queuedMessages: string[] = [];
-  const activeToolPills: PendingTools = new Map();
+interface ChatOpenResult {
+  session: ChatSessionRecord;
+  history: ChatTurnRecord[];
+  activeTurnId: string | null;
+  activeText: string;
+  activePartial: string;
+  tookOver: boolean;
+  busy: boolean;
+}
 
+interface AttachRunResult {
+  attachmentId: string;
+  attached: boolean;
+  tookOver: boolean;
+  run: RunRecord | null;
+  events?: DaemonEventFrame[];
+}
+
+interface SharedShellContext {
+  mode: TuiMode;
+  client: DaemonClient;
+  repoRoot: string;
+  sessionId: string;
+  chatSessionId?: string;
+  runId?: string;
+  terminal?: Terminal;
+  getRightStatus: () => string;
+  getIdleBanner: () => string;
+  onUserSubmit: (text: string) => Promise<void>;
+  onCancelActiveTurn: () => Promise<boolean>;
+  onModelUpdated?: (sel: { profileId: string; model: string; effort: string | null }) => Promise<void>;
+  getCurrentModel?: () => { profileId?: string; model?: string | null; effort?: string | null };
+  onClear?: () => void;
+}
+
+/**
+ * Unified interactive TUI shell shared by both Director Chat mode and Attached Run mode.
+ *
+ * Guarantees:
+ *  - Strictly append-only immutable transcript above the live tail (never triggers pi-tui scrollback wipes).
+ *  - Constant-height dock (attention strip + status bar + composer + 1-line hint strip).
+ *  - Zero main-screen mouse tracking (native terminal scrollback & mouse-drag copy always work).
+ *  - Every surfaced entity (escalations, goals, runs, tasks, timers, worktrees, tool calls) is directly
+ *    reachable via `Ctrl+G`, `Ctrl+O`, `Ctrl+X`, or `Alt+1..5`.
+ */
+function createSharedShell(spec: SharedShellContext) {
   const theme = createTheme();
-  const term = new TerminalSession();
-  const tui = term.tui;
-
-  const chatContainer = new ToolTranscript(theme);
-  const goalHeader = new GoalHeader(theme);
-  const spinner = new TimedSpinner(tui, theme);
-  const statusBar = new StatusBar(theme, {
-    tone: "success",
-    modeLabel: "director",
-    modelLabel: session.model ?? session.profileId,
-    effortLabel: session.effort,
-    goalsSummary: `${goals.length} goals`,
+  const recentRefs = new RecentRefsRing(80);
+  const store = new WorkStore(spec.client, {
+    chatSessionId: spec.chatSessionId,
+    repoRoot: spec.repoRoot,
+    runId: spec.runId,
   });
-  const header = new Container();
-  const footerHint = new FooterHint(theme);
-  const composer = new Composer(tui, theme, {
-    placeholder: "Message Director…",
-    slashCommands: autocompleteCommands("chat"),
-    cwd: opts.repoRoot,
-    maxRows: (width) => tui.terminal.rows - header.render(width).length - footerHint.render(width).length,
-  });
-  const overlays = new OverlayManager(tui, theme, composer);
 
-  const seedTranscript = (payload: ChatOpenPayload, notice?: string) => {
-    chatContainer.clear();
-    const dirLabel = payload.session.repoRoot.split("/").filter(Boolean).pop() ?? payload.session.repoRoot;
-    chatContainer.addChild(
-      new BannerCard(theme, "pi-harness", `${payload.session.title} · ${payload.session.id} (${dirLabel})`),
-    );
-    const modelLabel = payload.session.model ?? payload.session.profileId;
-    for (const t of payload.history) chatContainer.addChild(historyTurnComponent(t, theme, modelLabel));
-    if (payload.tookOver) {
-      chatContainer.addChild(
-        new SystemCard(theme, [`Took over ${payload.session.id} (previous terminal was detached).`], "info"),
-      );
-    }
-    if (notice) {
-      chatContainer.addChild(new SystemCard(theme, [notice], "success"));
-    }
-  };
+  let exitAction: TuiExitAction = { kind: "exit" };
+  let busy = false;
+  let phaseText = "Ready";
+  const queuedMessages: string[] = [];
 
-
-  tui.addChild(chatContainer);
-  tui.addChild(new Spacer(1));
-  tui.addChild(spinner);
-  header.addChild(goalHeader);
-  header.addChild(statusBar);
-  header.addChild({
-    invalidate() {},
-    render(width) {
-      if (!busy || queuedMessages.length === 0) return [];
-      return [fitWidth(` Queued (${queuedMessages.length}): ${queuedMessages[0]}`, width)];
+  const session = new TerminalSession({
+    terminal: spec.terminal,
+    onInterrupt: () => {
+      if (navigator.isOpen) {
+        navigator.pop();
+        return "consumed";
+      }
+      if (busy) {
+        void spec.onCancelActiveTurn();
+        return "consumed";
+      }
+      return "exit";
     },
   });
-  tui.addChild(header);
-  tui.addChild(composer);
-  tui.addChild(footerHint);
-  tui.setFocus(composer);
 
-  const activeModelDisplay = () => {
-    const shortCli = session.profileId.replace(/^acp:/, "");
-    if (!session.model) return session.profileId;
-    const bareModel = session.model.includes("/") ? session.model.slice(session.model.indexOf("/") + 1) : session.model;
-    return `${shortCli}:${bareModel}`;
+  const transcript = new ImmutableTranscript(theme);
+  const navigator = new Navigator(session.tui, session.terminal, theme, {
+    onChange: () => {
+      if (!navigator.isOpen) {
+        session.tui.setFocus(dock.editor);
+      }
+    },
+  });
+
+  const switchTo = (targetKind: "chat" | "run", targetId: string) => {
+    exitAction = { kind: "switch", targetKind, targetId };
+    session.stop();
   };
 
-  const waitingSubagentCalls = new Map<string, string>();
-  const isWaitingOnSubagent = () => waitingSubagentCalls.size > 0;
-  const syncActivityIndicator = () => {
-    if (!busy) return;
-    if (isWaitingOnSubagent()) {
-      const hasReview = [...waitingSubagentCalls.values()].some((n) => n.toLowerCase().includes("review"));
-      spinner.setLabel(hasReview ? "Waiting on review subagent…" : "Waiting on subagent(s)…");
-    } else {
-      spinner.setLabel(`Thinking (${session.model ?? session.profileId})…`);
-    }
+  const inspectorDeps: InspectorDeps = {
+    client: spec.client,
+    store,
+    repoRoot: spec.repoRoot,
+    onAttachRun: (runId) => switchTo("run", runId),
   };
 
-  const refreshStatus = () => {
-    const humanNeeded = goals.filter((g) => g.status === "awaiting_human").length;
-    const waitingSubagent = busy && isWaitingOnSubagent();
-    goalHeader.update(goals);
-    statusBar.update({
-      tone: humanNeeded > 0 ? "error" : waitingSubagent ? "info" : busy ? "accent" : "success",
-      modeLabel: waitingSubagent ? "waiting on subagent" : busy ? "thinking" : "director",
-      modelLabel: activeModelDisplay(),
-      effortLabel: session.effort,
-      goalsSummary: "",
-      alertText: humanNeeded > 0 ? `${humanNeeded} P0!` : null,
+  const openWork = (tab?: WorkTabId) => {
+    navigator.push(new WorkNavigatorScreen(inspectorDeps, tab));
+  };
+
+  const openEntity = (ref: EntityRef) => {
+    openEntityInspector(ref, inspectorDeps, {
+      navigator,
+      theme,
+      requestRender: () => session.tui.requestRender(),
+      writeTerminal: (seq) => {
+        try {
+          session.terminal.write(seq);
+        } catch {
+          // ignore
+        }
+      },
     });
   };
 
-  const appendSystem = (lines: string[], tone: "muted" | "success" | "warning" | "info" = "muted") => {
-    chatContainer.addChild(new SystemCard(theme, lines, tone));
-    tui.requestRender();
-  };
-
-  const appendError = (err: unknown, context: string) => {
-    const formatted = formatAgentError(err, { stateDir: config.stateDir, context });
-    chatContainer.addChild(new ErrorCard(theme, formatted));
-    tui.requestRender();
-  };
-
-  const clearPending = () => {
-    streamedText = "";
-    lastSegment = undefined;
-    activeToolPills.clear();
-    waitingSubagentCalls.clear();
-  };
-
-  const appendDelta = (delta: string) => {
-    if (!delta) return;
-    if (!lastSegment || chatContainer.children.at(-1) !== lastSegment.card) {
-      const card = new AssistantCard(theme, "", session.model ?? session.profileId);
-      lastSegment = { card, text: "" };
-      chatContainer.addChild(card);
-    }
-    lastSegment.text += delta;
-    lastSegment.card.setText(lastSegment.text);
-    streamedText += delta;
-    tui.requestRender();
-  };
-
-  const seedActiveTranscript = (partial: string, allText: string) => {
-    appendDelta(partial);
-    streamedText = allText || partial;
-  };
-
-  const finishTranscript = (finalText?: string) => {
-    const final = finalText?.trim();
-    const streamed = streamedText.trim();
-    // ACP returns the whole turn, while Pi may return only its final message.
-    if (final && (!streamed || !streamed.endsWith(final))) {
-      const last = lastSegment?.text.trim();
-      const prefix = streamed && final.startsWith(streamed) ? streamed : last && final.startsWith(last) ? last : "";
-      appendDelta(final.slice(prefix.length));
-    }
-    for (const component of activeToolPills.values()) {
-      if (component instanceof ToolPill) component.finishCall();
-    }
-    clearPending();
-  };
-
-  let goalsRequest = 0;
-  let pollingGoals = false;
-  const refreshGoals = async () => {
-    const repo = activeRepoRoot;
-    const chatId = session.id;
-    const request = ++goalsRequest;
-    try {
-      const next = await opts.client.request<GoalRecord[]>("goal.list", { repoRoot: repo, chatSessionId: chatId });
-      if (repo !== activeRepoRoot || chatId !== session.id || request !== goalsRequest) return;
-      goals = next;
-      refreshStatus();
-      tui.requestRender();
-    } catch {
-      // The next refresh retries after a transient disconnect.
-    }
-  };
-
-  seedTranscript(opened);
-  if (busy) seedActiveTranscript(opened.activePartial ?? "", opened.activeText ?? "");
-
-  const changeSession = async (op: "chat.open" | "chat.create", params: Record<string, unknown>) => {
-    if (buffering || controlling) return;
-    buffering = true;
-    try {
-      const next = await opts.client.request<ChatOpenPayload>(op, { repoRoot: activeRepoRoot, ...params });
-      const draft = [...queuedMessages, composer.getExpandedText()].filter(Boolean).join("\n\n");
-      if (draft) drafts.set(session.id, draft);
-      queuedMessages.length = 0;
-      composer.setText(drafts.get(next.session.id) ?? "");
-      drafts.delete(next.session.id);
-      session = next.session;
-      activeRepoRoot = session.repoRoot;
-      goals = next.goals;
-      config = next.config;
-      activeTurnId = next.activeTurnId;
-      busy = Boolean(activeTurnId);
-      pendingEnd = undefined;
-      clearPending();
-      if (busy) spinner.start(`Thinking (${session.model ?? session.profileId})…`);
-      else spinner.stop();
-      try {
-        await loadHistory(next);
-      } finally {
-        seedTranscript(next, op === "chat.create" ? `Started new session ${session.id}.` : undefined);
-        if (busy) seedActiveTranscript(next.activePartial ?? "", next.activeText ?? "");
-        refreshStatus();
-      }
-    } catch (err) {
-      appendError(err, op);
-    } finally {
-      resumeEvents();
-      if (!busy) sendNextQueued();
-      tui.requestRender(true);
-    }
-  };
-  const switchToChatSessionInPlace = (chatSessionId: string) => void changeSession("chat.open", { chatSessionId });
-  const createNewChatSession = (title?: string) => void changeSession("chat.create", { title });
-
-  const switchToTarget = (targetId: string) => {
-    if (targetId === session.id) {
-      appendSystem([`Already attached to ${targetId}.`], "muted");
-      return;
-    }
-    if (targetId.startsWith("run-")) {
-      exitAction = { kind: "switch", targetId, targetKind: "run" };
-      void term.shutdown(undefined, { overlays, spinner, cleanup: detachListenersOnly });
-      return;
-    }
-    switchToChatSessionInPlace(targetId);
-  };
-
-  const openSessionsPicker = () => {
-    void opts.client
-      .request<AttachableSession[]>("sessions.list")
-      .then((sessions) => {
-        let handle: ReturnType<OverlayManager["push"]> | null = null;
-        const comp = new SessionsOverlay(
-          theme,
-          sessions,
-          (chosen) => switchToTarget(chosen.id),
-          () => createNewChatSession(),
-          () => handle?.close(),
-          () => handle?.rerender(),
-        );
-        handle = overlays.push(
-          {
-            title: "Sessions & Attach Switcher",
-            subtitle: `${sessions.length} session${sessions.length === 1 ? "" : "s"}`,
-            footer: "Enter attach & take over · n new chat · Esc close",
-          },
-          comp,
-          { width: "92%" },
-        );
-      })
-      .catch((err) => appendError(err, "sessions.list"));
-  };
-
-  const openEffortPicker = (efforts?: string[]) => {
-    const activeModel = cachedCatalog?.models.find(
-      (m) => m.id === session.model || m.preferredRoute.wireModelId === session.model,
-    );
-    const available = efforts ?? activeModel?.efforts ?? ["low", "medium", "high", "xhigh", "max"];
-    let handle: ReturnType<OverlayManager["push"]> | null = null;
-    const comp = new EffortPickerOverlay(
-      theme,
-      available,
-      session.effort,
-      (effort) => {
-        void opts.client
-          .request<ChatSessionRecord>("chat.update", { chatSessionId: session.id, effort })
-          .then((updated) => {
-            session = updated;
-            appendSystem([`Active reasoning effort set to ${theme.bold(effort)}`], "success");
-            refreshStatus();
-            tui.requestRender();
-          })
-          .catch((err) => appendError(err, "effort.update"));
-      },
-      () => handle?.close(),
-      () => handle?.rerender(),
-    );
-    handle = overlays.push(
-      {
-        title: "Reasoning Effort",
-        subtitle: session.model ?? session.profileId,
-        footer: "↑/↓ move · Enter apply · Esc cancel",
-      },
-      comp,
-      { width: "68%" },
-    );
-  };
-
-  /** `/model` CLI-default row: switch the ACP CLI without pinning a model. */
-  const switchCliDefault = (profileId: string) => {
-    void opts.client
-      .request<ChatSessionRecord>("chat.update", { chatSessionId: session.id, profileId, model: null })
-      .then((updated) => {
-        session = updated;
-        appendSystem([`Switched active ACP CLI to ${theme.bold(profileId)} (using its default model)`], "success");
-        refreshStatus();
-        tui.requestRender();
-      })
-      .catch((err) => appendError(err, "cli.switch"));
-  };
-
-  const openModelConfig = (reopenPicker = false) => {
-    let handle: ReturnType<OverlayManager["push"]> | null = null;
-    const comp = new ModelConfigOverlay(
-      theme,
-      opts.client,
-      activeRepoRoot,
-      config,
-      (nextCfg) => {
-        config = nextCfg;
-        refreshStatus();
-        tui.requestRender();
-      },
-      () => {
-        handle?.close();
-        if (reopenPicker) openModelPicker();
-      },
-      () => handle?.rerender(),
-    );
-    handle = overlays.push(
-      {
-        title: "Configure Enabled Models",
-        subtitle: "ranked catalog",
-        footer: "Space/Enter toggle · x All Off · a All On · Esc done",
-      },
-      comp,
-      { width: "90%", captureMouseWheel: true },
-    );
-  };
-
-  const openModelPicker = () => {
-    spinner.start("Loading model catalog…", "Esc to cancel");
-    void opts.client
-      .request<CompiledModelCatalog>("models.list", { cwd: activeRepoRoot, chatSessionId: session.id })
-      // Keep the per-CLI default rows usable even when the catalog cannot load.
-      .catch((err): CompiledModelCatalog => {
-        appendError(err, "models.list");
-        return { syncedAt: new Date().toISOString(), sources: [], models: [] };
-      })
-      .then((cat) => {
-        spinner.stop();
-        if (cat.models.length > 0) cachedCatalog = cat;
-        let handle: ReturnType<OverlayManager["push"]> | null = null;
-        const comp = new ModelPickerOverlay(
-          theme,
-          opts.client,
-          activeRepoRoot,
-          cat,
-          session.model ?? null,
-          session.profileId,
-          (entry, route) => {
-            void opts.client
-              .request<ChatSessionRecord>("chat.update", {
-                chatSessionId: session.id,
-                profileId: route.profileId,
-                model: route.wireModelId,
-              })
-              .then((updated) => {
-                session = updated;
-                appendSystem(
-                  [
-                    `Selected ${theme.bold(entry.id)} via ${theme.accent(route.profileId)} (score: ${entry.codingScore?.toFixed(1) ?? "-"})`,
-                  ],
-                  "success",
-                );
-                refreshStatus();
-                const routeEfforts = route.supportedEfforts ?? entry.efforts;
-                if (routeEfforts.length > 1) {
-                  openEffortPicker(routeEfforts);
-                } else {
-                  tui.requestRender();
-                }
-              })
-              .catch((err) => appendError(err, "model.select"));
-          },
-          () => handle?.close(),
-          () => handle?.rerender(),
-          { profiles: config.profiles, probeStatuses: cat.profileStatuses, onSelect: switchCliDefault },
-          () => openModelConfig(true),
-        );
-        handle = overlays.push(
-          {
-            title: "Model Catalog & ACP Route Picker",
-            subtitle: `${cat.models.length} enabled · synced ${cat.syncedAt.slice(0, 16).replace("T", " ")}`,
-            footer: "Type to filter · Tab switch CLI · Ctrl+E toggle models · Ctrl+R sync · Enter select · Esc close",
-          },
-          comp,
-          { width: "92%" },
-        );
-      })
-      .catch((err) => {
-        spinner.stop();
-        appendError(err, "models.list");
-      });
-  };
-
-  const openSettings = () => {
-    let handle: ReturnType<OverlayManager["push"]> | null = null;
-    const comp = new SettingsOverlay(
-      theme,
-      opts.client,
-      config,
-      (nextCfg) => {
-        config = nextCfg;
-        refreshStatus();
-        tui.requestRender();
-      },
-      () => handle?.close(),
-      () => handle?.rerender(),
-      activeRepoRoot,
-    );
-    handle = overlays.push(
-      {
-        title: "Settings & External Harness CLIs",
-        subtitle: `${config.stateDir}/config.json`,
-        footer: "↑/↓ move · Enter edit/toggle · Esc back/close",
-      },
-      comp,
-      { width: "90%" },
+  const openModels = () => {
+    if (!spec.onModelUpdated) return;
+    const cur = spec.getCurrentModel?.() ?? {};
+    navigator.push(
+      new ModelPickerScreen(spec.client, {
+        chatSessionId: spec.chatSessionId,
+        cwd: spec.repoRoot,
+        currentProfileId: cur.profileId,
+        currentModel: cur.model,
+        currentEffort: cur.effort,
+        onSelected: (sel) => {
+          void spec.onModelUpdated?.(sel);
+        },
+      }),
     );
   };
 
   const openQuota = () => {
-    void opts.client
-      .request<{
-        configured: boolean;
-        snapshot: Record<string, unknown> | null;
-        coverage?: Array<{ profileId: string; adapter: string; hasData: boolean; source: string; note: string }>;
-      }>("quota.get")
-      .then((data) => {
-        let handle: ReturnType<OverlayManager["push"]> | null = null;
-        const comp = new QuotaOverlay(
-          theme,
-          opts.client,
-          data,
-          () => handle?.close(),
-          () => handle?.rerender(),
-        );
-        handle = overlays.push(
-          {
-            title: "Live Subscription & API Quotas",
-            subtitle: data.configured
-              ? "endpoint + passive"
-              : data.snapshot
-                ? "passive / local harvest"
-                : "no endpoint configured",
-            footer: "r refresh now · Esc close",
-          },
-          comp,
-          { width: "88%" },
-        );
-      })
-      .catch((err) => appendError(err, "quota.get"));
-  };
-
-  const resumeRunNow = (runId: string) => {
-    void opts.client
-      .request<{ resumed: boolean; resumedTaskIds: string[] }>("run.resume", { runId })
-      .then((res) => {
-        if (res.resumed) {
-          appendSystem([`Resumed ${theme.bold(runId)} (${res.resumedTaskIds.length} task(s) restarted; quota state reset).`], "success");
-        } else {
-          appendSystem([`Run ${runId} had no quota-paused tasks.`], "muted");
-        }
-      })
-      .catch((err) => appendError(err, `run.resume:${runId}`));
-  };
-
-  const scheduleRunWait = (runId: string, delayMs: number) => {
-    void opts.client
-      .request<RunQuotaPauseStatus>("run.schedule_resume", { runId, delayMs })
-      .then((st) => {
-        appendSystem(
-          [
-            `Scheduled ${theme.bold(runId)} to auto-resume ${formatResetCountdown(st.resumeAt)} (${st.resumeAt ?? ""}).`,
-            theme.dim("Open /runs and press r anytime to override and resume immediately."),
-          ],
-          "info",
-        );
-      })
-      .catch((err) => appendError(err, `run.schedule_resume:${runId}`));
-  };
-
-  const openQuotaWaitPicker = (runId: string, reason = "Paused due to quota limit", currentResumeAt: string | null = null) => {
-    let handle: ReturnType<OverlayManager["push"]> | null = null;
-    const comp = new QuotaWaitPickerOverlay(
-      theme,
-      runId,
-      reason,
-      currentResumeAt,
-      (choice) => {
-        if (choice.kind === "now") resumeRunNow(runId);
-        else scheduleRunWait(runId, choice.delayMs);
-      },
-      () => handle?.close(),
-      () => handle?.rerender(),
-    );
-    handle = overlays.push(
-      {
-        title: "Quota Pause — Resume or Schedule Wait",
-        subtitle: runId,
-        footer: "↑/↓ move · Enter apply · Esc keep paused",
-      },
-      comp,
-      { width: "80%" },
+    navigator.push(
+      new QuotaCostScreen(spec.client, { chatSessionId: spec.chatSessionId, runId: spec.runId, repoRoot: spec.repoRoot }),
     );
   };
 
-  const onRunsAction = (action: RunsAction, runId: string) => {
-    if (action === "stop") {
-      void opts.client
-        .request("run.stop", { runId })
-        .then(() => appendSystem([`Stopped run ${theme.bold(runId)}.`], "warning"))
-        .catch((err) => appendError(err, "run.stop"));
-    } else if (action === "resume") {
-      resumeRunNow(runId);
-    } else {
-      void opts.client
-        .request<{ quotaPause?: RunQuotaPauseStatus | null }>("run.get", { runId })
-        .then((d) => openQuotaWaitPicker(runId, d.quotaPause?.reason ?? "Paused due to quota", d.quotaPause?.resumeAt ?? null))
-        .catch(() => openQuotaWaitPicker(runId));
-    }
+  const openKb = () => {
+    navigator.push(new KbBrowserScreen(spec.client, spec.repoRoot));
   };
 
-  const openRuns = () =>
-    openRunsOverlay({
-      client: opts.client,
-      theme,
-      overlays,
-      requestRender: () => tui.requestRender(),
-      onAction: onRunsAction,
-      chatSessionId: session.id,
-    });
-
-  const openWorktrees = () => {
-    void opts.client
-      .request<LiveWorktreeInfo[]>("worktrees.list", { repoRoot: activeRepoRoot })
-      .then((list) => {
-        let handle: ReturnType<OverlayManager["push"]> | null = null;
-        const comp = new WorktreesOverlay(
-          theme,
-          opts.client,
-          activeRepoRoot,
-          list,
-          () => handle?.close(),
-          () => handle?.rerender(),
-        );
-        handle = overlays.push(
-          {
-            title: "Git Worktrees Manager",
-            subtitle: `${list.length} active`,
-            footer: "c clean stale/orphaned · r refresh · Esc close",
-          },
-          comp,
-          { width: "88%" },
-        );
-      })
-      .catch((err) => appendError(err, "worktrees.list"));
-  };
-
-  const openKb = (query: string) => {
-    void opts.client
-      .request<KbCard[]>("kb.search", { repoRoot: activeRepoRoot, query: query || undefined, includeCandidates: true })
-      .then((cards) => {
-        let handle: ReturnType<OverlayManager["push"]> | null = null;
-        const comp = new KbOverlay(
-          theme,
-          opts.client,
-          cards,
-          () => handle?.close(),
-          () => handle?.rerender(),
-        );
-        handle = overlays.push(
-          {
-            title: "Knowledge Base",
-            subtitle: query ? `query: "${query}"` : `${cards.length} cards`,
-            footer: "Enter open full context (Stage 2) · Esc close",
-          },
-          comp,
-          { width: "90%" },
-        );
-      })
-      .catch((err) => appendError(err, "kb.search"));
-  };
-
-  const triggerGoalReview = (goalId: string) => {
-    spinner.start(`Reviewing ${goalId} (deterministic gates + Skeptical Done-Review)…`);
-    void opts.client
-      .request<{ goal: GoalRecord; review: GoalReviewVerdict; circuitBreakerTripped?: string }>("goal.review", { goalId })
-      .then(
-        (res) => {
-          spinner.stop();
-          const tone =
-            res.review.verdict === "approved"
-              ? "success"
-              : res.review.verdict === "escalate_human"
-                ? "warning"
-                : "info";
-          appendSystem(formatGoalReviewCard(res, theme), tone);
-          void refreshGoals();
-        },
-        (err) => {
-          spinner.stop();
-          appendError(err, `goal.review:${goalId}`);
-        },
-      );
-  };
-
-  const openGoals = () => {
-    let handle: ReturnType<OverlayManager["push"]> | null = null;
-    const comp = new GoalsOverlay(
-      theme,
-      () => goals,
-      (action, g) => {
-        if (action === "review") {
-          triggerGoalReview(g.id);
-        } else if (action === "pause" || action === "cancel") {
-          void opts.client
-            .request(action === "pause" ? "goal.pause" : "goal.cancel", { goalId: g.id })
-            .then(() => {
-              appendSystem([`Goal ${theme.bold(g.id)} ${action === "pause" ? "paused" : "cancelled"}.`], "info");
-              void refreshGoals();
-            })
-            .catch((err) => appendError(err, `goal.${action}`));
-        } else if (action === "print_table") {
-          void opts.client
-            .request<{ display: ToolDisplayPayload }>("goal.table_display", {
-              repoRoot: activeRepoRoot,
-              chatSessionId: session.id,
-              persistChatSessionId: session.id,
-            })
-            .then((res) => {
-              chatContainer.addChild(new ToolOutputCard(theme, res.display));
-              tui.requestRender();
-            })
-            .catch((err) => appendError(err, "goal.table_display"));
-        } else {
-          void opts.client
-            .request<{ goal: GoalRecord; reviews: GoalReviewVerdict[]; display?: ToolDisplayPayload }>("goal.get", {
-              goalId: g.id,
-              persistChatSessionId: session.id,
-            })
-            .then((detail) => {
-              if (detail.display) {
-                chatContainer.addChild(new ToolOutputCard(theme, detail.display));
-                tui.requestRender();
-              } else {
-                appendSystem(formatGoalDetailCard(detail.goal, detail.reviews, theme), "info");
-              }
-            })
-            .catch((err) => appendError(err, "goal.get"));
-        }
-      },
-      () => handle?.close(),
-      () => handle?.rerender(),
-    );
-    handle = overlays.push(
-      {
-        title: "Goals Dashboard",
-        subtitle: `${goals.length} total`,
-        footer: "Enter print card · l print table · r review · p pause · x cancel · Esc close",
-      },
-      comp,
-      { width: "90%" },
+  const openSessions = () => {
+    navigator.push(
+      new SessionSwitcherScreen(spec.client, spec.sessionId, (picked) => {
+        switchTo(picked.kind, picked.id);
+      }),
     );
   };
 
-  const showStatusCard = () => {
-    void opts.client
-      .request<{ pid: number; uptimeMs: number; profiles: Array<{ id: string; enabled: boolean }> }>("status")
-      .then((st) => {
-        const enabled = st.profiles
-          .filter((p) => p.enabled)
-          .map((p) => p.id)
-          .join(", ");
-        appendSystem(
-          [
-            `${theme.bold("Harness Status")} · daemon pid ${st.pid} (up ${Math.round(st.uptimeMs / 1000)}s)`,
-            `Chat: ${theme.accent(session.id)} │ Model: ${theme.bold(session.model ?? session.profileId)} │ Effort: ${session.effort ?? "default"}`,
-            `Enabled CLIs: ${enabled || "(none)"}`,
-            `Goals: ${goals.length} total (${goals.filter((g) => g.status === "executing").length} executing, ${goals.filter((g) => g.status === "achieved").length} achieved)`,
-          ],
-          "info",
-        );
-      })
-      .catch((err) => appendError(err, "status"));
+  const openSettings = () => {
+    navigator.push(new SettingsScreen(spec.client));
   };
 
-  const showHelpCard = () => appendSystem(renderHelp("chat", theme), "info");
-
-  const quitChat = () =>
-    void term.shutdown(undefined, {
-      overlays,
-      spinner,
-      resolveNote: () => resolveLeaveNote(opts.client),
-      cleanup: cleanupFullExit,
-    });
-
-  const runChatCommand = (cmd: SlashCommand, arg: string) => {
-    switch (cmd.name) {
-      case "runs":
-        return openRuns();
-      case "goals":
-        return void refreshGoals().then(openGoals);
-      case "sessions":
-        return arg ? switchToTarget(arg) : openSessionsPicker();
-      case "new":
-        return createNewChatSession(arg || undefined);
-      case "model":
-        return openModelPicker();
-      case "effort":
-        if (!arg) return openEffortPicker();
-        return void opts.client
-          .request<ChatSessionRecord>("chat.update", { chatSessionId: session.id, effort: arg })
-          .then((updated) => {
-            session = updated;
-            appendSystem([`Active reasoning effort set to ${theme.bold(arg)}`], "success");
-            refreshStatus();
-            tui.requestRender();
-          })
-          .catch((err) => appendError(err, "effort.update"));
-      case "quota":
-        return openQuota();
-      case "worktrees":
-        return openWorktrees();
-      case "kb":
-        return openKb(arg);
-      case "settings":
-        return openSettings();
-      case "status":
-        return showStatusCard();
-      case "clear":
-        chatContainer.clear();
-        chatContainer.addChild(new BannerCard(theme, "pi-harness", `Director Chat · ${session.id}`));
-        return tui.requestRender(true);
-      case "stop":
-        return void (async () => {
-          try {
-            const res = (await opts.client.request("runs.stop_all", {
-              reason: "Stopped by user (/stop)",
-            })) as { stoppedRunIds: string[]; cancelledChats: number; cancelledReviews: number };
-            const totalStopped = res.stoppedRunIds.length + res.cancelledChats + res.cancelledReviews;
-            const detail =
-              totalStopped === 0
-                ? "No active agents, runs, or reviews were running."
-                : [
-                    res.stoppedRunIds.length > 0 ? `runs: ${res.stoppedRunIds.join(", ")}` : null,
-                    res.cancelledReviews > 0 ? `${res.cancelledReviews} review${res.cancelledReviews === 1 ? "" : "s"}` : null,
-                    res.cancelledChats > 0 ? `${res.cancelledChats} chat turn${res.cancelledChats === 1 ? "" : "s"}` : null,
-                  ]
-                    .filter(Boolean)
-                    .join(" · ");
-            chatContainer.addChild(
-              new BannerCard(theme, totalStopped > 0 ? "Stopped all agents" : "Nothing running", detail),
-            );
-            await refreshGoals().catch(() => {});
-          } catch (err) {
-            chatContainer.addChild(
-              new BannerCard(theme, "Stop failed", err instanceof Error ? err.message : String(err)),
-            );
-          }
-          tui.requestRender();
-        })();
-      case "help":
-        return showHelpCard();
-      case "quit":
-        return quitChat();
-    }
-  };
-
-  const openCommandPalette = () => {
-    const commands = paletteCommands("chat", (cmd) => runChatCommand(cmd, ""));
-    let handle: ReturnType<OverlayManager["push"]> | null = null;
-    const comp = new CommandPaletteOverlay(
-      theme,
-      commands,
-      () => handle?.close(),
-      () => handle?.rerender(),
-    );
-    handle = overlays.push(
-      {
-        title: "Command Palette",
-        subtitle: `${commands.length} commands`,
-        footer: "↑/↓ move · Enter run · Esc close",
-      },
-      comp,
-      { width: "80%" },
-    );
-  };
-
-  let unsubClose = () => {};
-
-  const detachListenersOnly = () => {
-    unsubEvent();
-    unsubClose();
-  };
-
-  const cleanupFullExit = () => {
-    detachListenersOnly();
-    opts.client.close();
-  };
-
-  const restoreQueued = () => {
-    if (queuedMessages.length) {
-      composer.setText([...queuedMessages.splice(0), composer.getExpandedText()].filter(Boolean).join("\n\n"));
-    }
-  };
-
-  const sendNextQueued = () => {
-    if (busy || buffering || evictedByTakeover) return;
-    const next = queuedMessages.shift();
-    if (next) dispatchChatTurn(next);
-  };
-
-  const settleTurn = (turnId: string, end: TurnEnd, recall = false) => {
-    if (activeTurnId !== turnId || evictedByTakeover) return;
-    if (controlling) {
-      pendingEnd ??= end;
-      return;
-    }
-    activeTurnId = null;
-    busy = false;
-    composer.clearConfirmBanner();
-    spinner.stop();
-    finishTranscript(end.assistantTurn?.content);
-    if (end.cancelled) appendSystem(["Cancelled current response."], "warning");
-    else if (end.error) appendError(new Error(end.error), `chat.send:${session.profileId}`);
-    refreshStatus();
-    if (end.error || recall) restoreQueued();
-    else sendNextQueued();
-    tui.requestRender();
-    void refreshGoals();
-  };
-
-  const dispatchChatTurn = (text: string) => {
-    const turnId = randomUUID();
-    activeTurnId = turnId;
-    busy = true;
-    chatContainer.addChild(new UserCard(theme, text));
-    clearPending();
-    refreshStatus();
-    spinner.start(`Thinking (${session.model ?? session.profileId})…`);
-    void opts.client.request<TurnEnd>("chat.send", { chatSessionId: session.id, turnId, text }).then(
-      (res) => settleTurn(turnId, res),
-      (err) => settleTurn(turnId, { error: err instanceof Error ? err.message : String(err) }),
-    );
-  };
-
-  // A terminal event can arrive before the control RPC acknowledges cancellation or steering.
-  // Hold that event until the acknowledgement identifies what to do with the queue.
-  const controlTurn = async (action: "escape" | "ctrl+c" | "steer", directMessage?: string) => {
-    const turnId = activeTurnId;
-    if (!turnId || controlling || buffering) return;
-    const draft = directMessage === undefined ? composer.getExpandedText() : "";
-    const hasDirect = directMessage !== undefined && Boolean(directMessage.trim());
-    const steerFromDraft = action === "steer" && !hasDirect && Boolean(draft.trim());
-    const message = hasDirect ? directMessage! : steerFromDraft ? draft : queuedMessages[0] ?? "";
-    if (action === "steer" && !message) return;
-    if (steerFromDraft) composer.clear();
-    const restoreSteerDraft = () => {
-      if (hasDirect) composer.setText([directMessage!, composer.getExpandedText()].filter(Boolean).join("\n\n"));
-      else if (steerFromDraft) composer.setText([draft, composer.getExpandedText()].filter(Boolean).join("\n\n"));
-    };
-    controlling = true;
-    let end: TurnEnd | undefined;
+  const stopAllAgents = async (reason?: string) => {
     try {
-      if (action === "steer") {
-        const res = await opts.client.request<{ steered: boolean; cancelled?: boolean }>("chat.steer", {
-          chatSessionId: session.id, turnId, message,
-        });
-        if (evictedByTakeover) return;
-        if (res.steered || res.cancelled) {
-          if (res.steered) {
-            if (!hasDirect && !steerFromDraft) queuedMessages.shift();
-          } else {
-            if (hasDirect || steerFromDraft) queuedMessages.unshift(message);
-            end = { cancelled: true };
-          }
-        } else {
-          if (hasDirect) {
-            // Turn just finished right as the user hit Enter while waiting on subagents -> send normally!
-            queuedMessages.unshift(message);
-          } else {
-            restoreSteerDraft();
-            appendSystem(["Turn already ended. Message kept in input."], "warning");
+      await spec.onCancelActiveTurn();
+      const res = await spec.client.request<{ stoppedRuns?: string[]; stoppedCount?: number }>("runs.stop_all", {
+        reason: reason || "Stopped by user (/stop)",
+      });
+      const count = res.stoppedRuns?.length ?? res.stoppedCount ?? 0;
+      transcript.appendReceipt({
+        glyph: theme.glyphs.cross,
+        tone: "warn",
+        tag: "stop",
+        text: count > 0 ? `Stopped ${count} active run(s) and all running agents.` : "Stopped active turn; no active runs were running.",
+      });
+      await store.refresh();
+    } catch (err) {
+      transcript.appendReceipt({
+        glyph: theme.glyphs.cross,
+        tone: "danger",
+        tag: "stop",
+        text: `Failed to stop agents: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+    session.tui.requestRender();
+  };
+
+  const openPalette = () => {
+    const actions: QuickActionItem[] = [
+      { id: "work", label: "/work", detail: "Open Work Navigator", run: () => openWork() },
+      { id: "inbox", label: "/inbox", detail: "Open Inbox (escalations & blockers)", run: () => openWork("inbox") },
+      { id: "escalations", label: "/escalations", detail: "Open Escalations tab", run: () => openWork("escalations") },
+      { id: "goals", label: "/goals", detail: "Open Goals tab", run: () => openWork("goals") },
+      { id: "runs", label: "/runs", detail: "Open Runs tab", run: () => openWork("runs") },
+      { id: "timers", label: "/timers", detail: "Open Timers tab", run: () => openWork("timers") },
+      { id: "worktrees", label: "/worktrees", detail: "Open Worktrees & Merges tab", run: () => openWork("worktrees") },
+      ...(spec.onModelUpdated ? [{ id: "model", label: "/model", detail: "Select Model & Effort", run: () => openModels() }] : []),
+      { id: "quota", label: "/quota", detail: "View Quota & Spend", run: () => openQuota() },
+      { id: "kb", label: "/kb", detail: "Browse Knowledge Base", run: () => openKb() },
+      { id: "sessions", label: "/sessions", detail: "Switch Chat / Run Session", run: () => openSessions() },
+      { id: "settings", label: "/settings", detail: "Edit Harness Settings", run: () => openSettings() },
+      { id: "stop", label: "/stop", detail: "Stop ALL active runs & agents", run: () => void stopAllAgents() },
+    ];
+    navigator.push(new GoToPaletteScreen(inspectorDeps, recentRefs, actions));
+  };
+
+  const dockHints: Hint[] = [
+    { key: "Ctrl+G", label: "Work" },
+    { key: "Ctrl+O", label: "Go" },
+    { key: "Ctrl+X", label: "Inspect" },
+    { key: "Alt+1..5", label: "Slot" },
+    { key: "/stop", label: "Stop all" },
+    { key: "/help", label: "Help" },
+  ];
+
+  const handleSlash = async (raw: string): Promise<boolean> => {
+    const parsed = parseSlashCommand(raw);
+    if (!parsed) return false;
+    switch (parsed.name) {
+      case "work": {
+        const tab = (["inbox", "goals", "runs", "escalations", "timers", "worktrees"] as const).find(
+          (t) => t === parsed.args.toLowerCase(),
+        );
+        openWork(tab);
+        return true;
+      }
+      case "inbox":
+        openWork("inbox");
+        return true;
+      case "escalations":
+        openWork("escalations");
+        return true;
+      case "goals":
+        openWork("goals");
+        return true;
+      case "runs":
+        openWork("runs");
+        return true;
+      case "timers":
+        openWork("timers");
+        return true;
+      case "worktrees":
+        openWork("worktrees");
+        return true;
+      case "stop":
+        await stopAllAgents(parsed.args || undefined);
+        return true;
+      case "model":
+      case "effort":
+        if (parsed.name === "effort" && parsed.args && spec.onModelUpdated) {
+          const cur = spec.getCurrentModel?.() ?? {};
+          if (cur.profileId && cur.model) {
+            await spec.onModelUpdated({ profileId: cur.profileId, model: cur.model, effort: parsed.args });
+            return true;
           }
         }
-      } else {
-        const res = await opts.client.request<{ cancelled: boolean }>("chat.cancel", {
-          chatSessionId: session.id, turnId,
+        openModels();
+        return true;
+      case "quota":
+      case "cost":
+        openQuota();
+        return true;
+      case "kb":
+        openKb();
+        return true;
+      case "sessions":
+        openSessions();
+        return true;
+      case "new":
+        switchTo("chat", "__new__");
+        return true;
+      case "settings":
+        openSettings();
+        return true;
+      case "status": {
+        await store.refresh();
+        const s = store.state;
+        const activeGoals = s.goals.filter((g) => ["executing", "verifying", "reviewing", "awaiting_human"].includes(g.goal.status)).length;
+        const openEsc = store.openEscalationsCount;
+        const activeRuns = s.runs.filter((r) => r.run.status === "active" || r.run.status === "paused_quota").length;
+        transcript.appendReceipt({
+          glyph: theme.glyphs.bullet,
+          tone: openEsc > 0 ? "warn" : "info",
+          tag: "status",
+          text: `${activeGoals} active goal(s) · ${activeRuns} active run(s) · ${openEsc} open escalation(s) · ${s.inbox.length} inbox item(s) — press Ctrl+G to open Work Navigator`,
         });
-        if (res.cancelled) end = { cancelled: true };
+        session.tui.requestRender();
+        return true;
       }
-    } catch (err) {
-      restoreSteerDraft();
-      appendError(err, action === "steer" ? "chat.steer" : "chat.cancel");
-    } finally {
-      controlling = false;
-      end = end ? { ...pendingEnd, ...end, error: undefined } : pendingEnd;
-      pendingEnd = undefined;
-      if (end) settleTurn(turnId, end, action === "ctrl+c");
-      tui.requestRender();
+      case "steer": {
+        const m = parsed.args.match(/^(\S+)\s+([\s\S]+)$/);
+        if (!m) {
+          transcript.appendReceipt({ tone: "warn", tag: "steer", text: "Usage: /steer <task-id> <message>" });
+        } else {
+          await spec.client.request("task.steer", { taskId: m[1], message: m[2] });
+          transcript.appendReceipt({ tone: "ok", tag: "steer", text: `Steered ${m[1]}` });
+        }
+        session.tui.requestRender();
+        return true;
+      }
+      case "resume": {
+        if (!spec.runId) {
+          openWork("runs");
+          return true;
+        }
+        const inMatch = parsed.args.match(/^in\s+(.+)$/i);
+        if (inMatch) {
+          const delayMs = parseDurationMs(inMatch[1]!);
+          if (!delayMs) {
+            transcript.appendReceipt({ tone: "warn", tag: "resume", text: `Invalid duration: ${inMatch[1]}` });
+          } else {
+            await spec.client.request("run.schedule_resume", { runId: spec.runId, delayMs });
+            transcript.appendReceipt({ tone: "ok", tag: "resume", text: `Scheduled resume in ${formatDuration(delayMs)}` });
+          }
+        } else {
+          await spec.client.request("run.resume", { runId: spec.runId, message: parsed.args || undefined });
+          transcript.appendReceipt({ tone: "ok", tag: "resume", text: `Resumed ${spec.runId}` });
+        }
+        session.tui.requestRender();
+        return true;
+      }
+      case "clear":
+        transcript.clearAll();
+        spec.onClear?.();
+        session.tui.requestRender();
+        return true;
+      case "help":
+        transcript.appendLines(["", ...renderHelp(spec.mode), ""]);
+        session.tui.requestRender();
+        return true;
+      case "quit":
+        exitAction = { kind: "exit" };
+        session.stop();
+        return true;
+      default:
+        transcript.appendReceipt({ tone: "warn", tag: "cmd", text: `Unknown command /${parsed.name}. Try /help.` });
+        session.tui.requestRender();
+        return true;
     }
   };
 
-  term.bindControls({
-    overlays,
-    spinner,
-    footerHint,
-    detachBanner: "[Exited.]",
-    callbacks: {
-      getComposerText: () => composer.getText(),
-      clearComposerText: () => composer.clear(),
-      isAutocompleteOpen: () => composer.isAutocompleteOpen(),
-      isBusy: () => busy,
-      onAbortGeneration: (key) => void controlTurn(key),
-      onEscConfirmChange: (state) => composer.setConfirmBanner(state),
-      onSteer: () => void controlTurn("steer"),
-      onEnqueue: () => {
-        if (buffering) return false;
-        const text = composer.getExpandedText().trim();
-        if (!text) return false;
-        composer.clear();
-        composer.addToHistory(text);
-        const slash = parseSlashInput("chat", text);
-        if (slash && "error" in slash) {
-          appendSystem([slash.error], "warning");
-          return true;
-        }
-        if (slash) {
-          runChatCommand(slash.cmd, slash.arg);
-          return true;
-        }
-        queuedMessages.push(text);
-        tui.requestRender();
-        return true;
-      },
-      onRecallQueued: () => {
-        if (controlling || buffering || !queuedMessages.length) return false;
-        const recalled = queuedMessages.shift()!;
-        composer.setText([recalled, composer.getExpandedText()].filter(Boolean).join("\n\n"));
-        tui.requestRender();
-        return true;
-      },
-      onOpenSettings: openSettings,
-      onOpenPalette: openCommandPalette,
-      onOpenTree: openRuns,
-      onResolveExitNote: () => resolveLeaveNote(opts.client),
-      onShutdownCleanup: cleanupFullExit,
+  const dock = new FixedDock(session.tui, theme, {
+    autocomplete: createCommandAutocomplete(spec.mode),
+    initialState: {
+      slots: [],
+      idleBanner: spec.getIdleBanner(),
+      busy: false,
+      phaseText: "Ready",
+      rightStatus: spec.getRightStatus(),
+      queuedCount: 0,
+      hints: dockHints,
+    },
+    onSubmit: (raw) => {
+      const text = raw.trim();
+      if (!text) return;
+      if (text.startsWith("/")) {
+        void handleSlash(text);
+        return;
+      }
+      void spec.onUserSubmit(text);
     },
   });
 
-  tui.addInputListener((data) => {
-    if (isKeyRelease(data) || overlays.isOpen) return undefined;
-    if (data === "\x18" || matchesKey(data, "ctrl+x")) {
-      if (toggleLatestToolChain(chatContainer)) tui.requestRender();
+  const syncDock = () => {
+    dock.update({
+      slots: store.buildAttentionSlots(5),
+      idleBanner: spec.getIdleBanner(),
+      busy,
+      phaseText,
+      rightStatus: spec.getRightStatus(),
+      queuedCount: queuedMessages.length,
+    });
+    session.tui.requestRender();
+  };
+
+  session.tui.addChild(transcript);
+  session.tui.addChild(dock);
+  session.tui.setFocus(dock.editor);
+
+  const unsubStore = store.subscribe(syncDock);
+
+  // Spinner interval (only renders when busy)
+  const spinTimer = setInterval(() => {
+    if (dock.tickSpinner()) session.tui.requestRender();
+  }, 120);
+  spinTimer.unref?.();
+
+  // Global keyboard shortcuts when no overlay is open
+  session.start((data) => {
+    if (navigator.isOpen) return undefined;
+
+    if (matchesKey(data, "ctrl+g")) {
+      openWork();
+      return { consume: true };
+    }
+    if (matchesKey(data, "ctrl+o")) {
+      openPalette();
+      return { consume: true };
+    }
+    if (matchesKey(data, "ctrl+x")) {
+      const latest = recentRefs.latest();
+      if (latest) openEntity(latest);
+      else openWork();
+      return { consume: true };
+    }
+    // Alt+1..Alt+5 jump straight into numbered dock attention slot
+    if (data.length === 2 && data[0] === "\x1b" && data[1]! >= "1" && data[1]! <= "5") {
+      const slotIdx = Number(data[1]) - 1;
+      const slot = dock.slots[slotIdx];
+      if (slot) {
+        openEntity(slot.ref);
+        return { consume: true };
+      }
+    }
+    // Forward undo / composer keys
+    if (matchesKey(data, "ctrl+z") || matchesKey(data, "ctrl+-")) {
+      dock.handleInput(data);
+      session.tui.requestRender();
       return { consume: true };
     }
     return undefined;
   });
 
-  composer.onSubmit = (raw) => {
-    if (buffering) {
-      composer.setText(raw);
-      return;
-    }
-    const text = raw.trim();
-    composer.clear();
-    if (!text) return;
-    composer.addToHistory(text);
-
-    const slash = parseSlashInput("chat", text);
-    if (slash && "error" in slash) return appendSystem([slash.error], "warning");
-    if (slash) return runChatCommand(slash.cmd, slash.arg);
-
-    if (busy) {
-      // Default for Director chat: Enter sends immediately (steer/deliver now).
-      // Use Ctrl+Q / Alt+Enter to explicitly enqueue for after the current turn.
-      if (!controlling) {
-        void controlTurn("steer", text);
-        return;
-      }
-      queuedMessages.push(text);
-      tui.requestRender();
-      return;
-    }
-
-    dispatchChatTurn(text);
+  const recordRef = (ref: EntityRef) => {
+    recentRefs.push(ref);
   };
 
-  handleEvent = (ev) => {
-    // Frames tagged with a watchId belong to the overlay that started that watch.
-    if (isWatchFrame(ev)) return;
-    if (ev.type === "session.taken_over") {
-      const p = ev.payload as { sessionId?: string; reason?: string };
-      if (p.sessionId !== session.id) return;
-      evictedByTakeover = true;
-      void term.shutdown(
-        `[Detached — session ${p.sessionId ?? session.id} was taken over by another terminal.]`,
-        { overlays, spinner, cleanup: cleanupFullExit },
-      );
-      return;
-    }
-    if (ev.type.startsWith("chat.")) {
-      const p = ev.payload as TurnEnd & { chatSessionId: string; turnId: string; summary?: string; event?: unknown };
-      if (p.chatSessionId !== session.id) return;
-      if (ev.type === "chat.turn.start") {
-        if (activeTurnId || busy) return;
-        activeTurnId = p.turnId;
-        busy = true;
-        clearPending();
-        const typedEv = parseChatControlEvent(p.event);
-        if (typedEv) {
-          chatContainer.addChild(new EventCard(theme, typedEv));
-        } else if (p.summary) {
-          appendSystem([p.summary], "info");
-        }
-        refreshStatus();
-        spinner.start(`Thinking (${session.model ?? session.profileId})…`);
-        tui.requestRender();
-        return;
-      }
-      if (!activeTurnId || p.turnId !== activeTurnId) return;
-      if (ev.type === "chat.steered") {
-        const steered = ev.payload as { message?: string; role?: "user" | "system_notice"; event?: unknown };
-        const typedEv = parseChatControlEvent(steered.event);
-        if (typedEv) {
-          chatContainer.addChild(new EventCard(theme, typedEv));
-          tui.requestRender();
-        } else if (steered.role === "system_notice") {
-          if (steered.message) appendSystem([steered.message], "info");
-        } else {
-          chatContainer.addChild(new UserCard(theme, String(steered.message ?? "")));
-          tui.requestRender();
-        }
-        return;
-      }
-      if (ev.type === "chat.turn.end") {
-        settleTurn(p.turnId, p);
-        return;
-      }
-    }
-    if (ev.type === "chat.delta" && busy) {
-      const delta = String((ev.payload as { delta?: string })?.delta ?? "");
-      if (!delta) return;
-      if (waitingSubagentCalls.size > 0) {
-        waitingSubagentCalls.clear();
-        syncActivityIndicator();
-        refreshStatus();
-      }
-      appendDelta(delta);
-    } else if (ev.type === "chat.tool" && busy) {
-      const p = ev.payload as ToolEvent;
-      const name = p.title ?? p.name ?? "tool";
-      const key = p.id || name;
-      if (isSubagentWaitTool(p.name, p.title)) {
-        if (p.status === "completed" || p.status === "failed") {
-          waitingSubagentCalls.delete(key);
-          waitingSubagentCalls.delete(name);
-        } else {
-          waitingSubagentCalls.set(key, name);
-        }
-        syncActivityIndicator();
-        refreshStatus();
-      }
-      applyChatToolEvent(p, activeToolPills, chatContainer, theme);
-      tui.requestRender();
-    } else if (ev.type === "goal.progress") {
-      void refreshGoals();
-    } else if (ev.type === "goal.reviewed") {
-      const p = ev.payload as { goalId: string; version: number; cycle: number; verdict: string; status: string; summary: string; circuitBreakerTripped?: string };
-      if (p.status === "achieved" && !p.circuitBreakerTripped) {
-        chatContainer.addChild(new GoalNotice(theme, `${p.goalId} achieved`));
-        tui.requestRender();
-      } else {
-        appendSystem(
-          [`[${p.goalId} v${p.version}] Review #${p.cycle}: ${p.verdict.toUpperCase()} (${p.status}) — ${p.summary}`],
-          "warning",
-        );
-      }
-      void refreshGoals();
-    } else if (ev.type === "goal.amended") {
-      const p = ev.payload as { goalId: string; delta: { fromVersion: number; toVersion: number; rationale: string } };
-      appendSystem([`[${p.goalId}] Amended v${p.delta.fromVersion} → v${p.delta.toVersion}: ${p.delta.rationale}`], "info");
-      void refreshGoals();
-    } else if (ev.type === "goal.committed") {
-      const p = ev.payload as { goalId: string };
-      chatContainer.addChild(new GoalNotice(theme, `${p.goalId} started`));
-      tui.requestRender();
-      void refreshGoals();
-    } else if (ev.type === "quota.agent_paused") {
-      const p = ev.payload as {
-        runId: string;
-        taskId: string;
-        tier: number;
-        title: string;
-        profileId: string;
-        model?: string | null;
-        reason: string;
-        resetAt?: string | null;
-      };
-      const eta = p.resetAt ? ` (reset ${formatResetCountdown(p.resetAt)})` : "";
-      appendSystem(
-        [
-          `${theme.bold(`⏸ Agent paused early (quota)`)} · ${theme.accent(p.taskId)} [T${p.tier}] "${p.title}" (${p.model ?? p.profileId})`,
-          `${p.reason}${eta} — worktree & WIP preserved; healthy sibling tasks continue.`,
-        ],
-        "warning",
-      );
-    } else if (ev.type === "quota.run_paused") {
-      const p = ev.payload as {
-        runId: string;
-        pausedTaskIds: string[];
-        mode: "auto_timer" | "user_timer" | "manual";
-        source: string;
-        resumeAt?: string | null;
-        reason: string;
-      };
-      const actionLine =
-        p.mode === "auto_timer" && p.resumeAt
-          ? `Auto-resume scheduled ${formatResetCountdown(p.resumeAt)} (${p.source}). Open /runs and press r to resume now or w to pick a wait timer.`
-          : `No Quota Endpoint / reset time wired — paused cleanly. Open /runs and press r to resume now or w to pick how long to wait.`;
-      appendSystem(
-        [
-          `${theme.bold(`⏸ Run ${p.runId} paused (quota)`)} — all active workers exited (${p.pausedTaskIds.length} task(s) waiting)`,
-          actionLine,
-        ],
-        "warning",
-      );
-    } else if (ev.type === "quota.run_scheduled") {
-      const p = ev.payload as { runId: string; resumeAt: string };
-      appendSystem(
-        [`⏱ Run ${theme.bold(p.runId)} scheduled to auto-resume ${formatResetCountdown(p.resumeAt)} (${p.resumeAt}).`],
-        "info",
-      );
-    } else if (ev.type === "quota.run_resumed") {
-      const p = ev.payload as { runId: string; trigger: string; resumedTaskIds: string[] };
-      appendSystem(
-        [`▶ Run ${theme.bold(p.runId)} resumed (${p.trigger}) — restarted ${p.resumedTaskIds.length} task(s).`],
-        "success",
-      );
-    }
+  return {
+    theme,
+    session,
+    transcript,
+    dock,
+    navigator,
+    store,
+    recentRefs,
+    queuedMessages,
+    recordRef,
+    openEntity,
+    openWork,
+    setStatus(nextBusy: boolean, nextPhase: string) {
+      busy = nextBusy;
+      phaseText = nextPhase;
+      syncDock();
+    },
+    syncDock,
+    async waitAndCleanup(): Promise<TuiExitAction> {
+      await session.done;
+      clearInterval(spinTimer);
+      unsubStore();
+      store.dispose();
+      return exitAction;
+    },
   };
-
-  unsubClose = opts.client.onClose(() => {
-    if (evictedByTakeover) return;
-    void term.shutdown(`[Connection to harnessd closed — check ${config.stateDir}/daemon.log if unexpected.]`, {
-      overlays,
-      spinner,
-      cleanup: cleanupFullExit,
-    });
-  });
-
-  if (busy) spinner.start(`Thinking (${session.model ?? session.profileId})…`);
-  refreshStatus();
-  term.start();
-  resumeEvents();
-  tui.requestRender();
-  const goalTimer = setInterval(async () => {
-    if (pollingGoals) return;
-    pollingGoals = true;
-    await refreshGoals();
-    pollingGoals = false;
-  }, 3_000);
-  try {
-    await term.closed;
-  } finally {
-    clearInterval(goalTimer);
-  }
-  return exitAction;
 }
 
-/**
- * Focused Run Stream TUI (`pi-harness attach <run-id>`); `Ctrl+T` opens the read-only `/runs` tree without detaching.
- */
-export async function runNativeScrollbackTui(opts: {
-  client: DaemonClient;
-  runId: string;
-  initialTaskId?: string | null;
-}): Promise<TuiExitAction> {
-  // Handshake BEFORE touching terminal raw mode
-  const snap = await opts.client.request<{
-    run: RunRecord;
-    tasks: TaskRecord[];
-    escalations: EscalationRecord[];
-    quotaPause?: RunQuotaPauseStatus | null;
-  }>("tree.get", { runId: opts.runId });
+/* ───────────────────────────── Director Chat TUI ──────────────────────────── */
 
-  const focusedTaskId: string | null = opts.initialTaskId ?? null;
-  let lastSeq = 0;
-  let run: RunRecord = snap.run;
-  let tasks: TaskRecord[] = snap.tasks;
-  let escalations: EscalationRecord[] = snap.escalations;
-  let quotaPause: RunQuotaPauseStatus | null = snap.quotaPause ?? null;
-  let streamingBuffer = "";
-  let exitAction: TuiExitAction = { kind: "exit" };
-  let evictedByTakeover = false;
-  const activeRunToolPills = new Map<string, ToolPill>();
-
-  const theme = createTheme();
-  const term = new TerminalSession();
-  const tui = term.tui;
-
-  const streamContainer = new ToolTranscript(theme);
-  const pendingContainer = new Container();
-  const pendingMarkdown = new Markdown("", 1, 0, theme.toMarkdownTheme());
-  const spinner = new TimedSpinner(tui, theme);
-  const focusedOrRootTask = () =>
-    (focusedTaskId ? tasks.find((t) => t.id === focusedTaskId) : undefined) ??
-    tasks.find((t) => t.tier === 1) ??
-    tasks[0];
-  const initialTask = focusedOrRootTask();
-  const initialModel = initialTask?.model ?? initialTask?.profileId ?? null;
-  const initialEffort = initialTask?.effort ?? null;
-
-  const statusBar = new StatusBar(theme, {
-    tone: "accent",
-    modeLabel: opts.runId,
-    modelLabel: initialModel ? `${focusedTaskId ?? "ALL"} · ${initialModel}` : (focusedTaskId ?? "ALL"),
-    effortLabel: initialEffort,
-    goalsSummary: `${tasks.filter((t) => t.status === "running").length} running`,
+export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<TuiExitAction> {
+  const opened = await opts.client.request<ChatOpenResult>("chat.open", {
+    repoRoot: opts.repoRoot,
+    ...(opts.chatSessionId ? { chatSessionId: opts.chatSessionId } : {}),
+    ...(opts.preferLastGlobal ? { preferLastGlobal: true } : {}),
   });
-  const composer = new Composer(tui, theme, {
-    placeholder: "Steer focused agent…",
-    slashCommands: autocompleteCommands("run"),
-  });
-  const footerHint = new FooterHint(theme);
-  const overlays = new OverlayManager(tui, theme, composer);
 
-  const runTitle = [
-    `pi-harness run ${opts.runId}`,
-    ...(initialModel ? [initialModel] : []),
-    ...(initialEffort ? [initialEffort] : []),
-  ].join(" · ");
+  let chatSession = opened.session;
+  let activeTurnId: string | null = opened.activeTurnId;
+  let sending = opened.busy;
 
-  streamContainer.addChild(
-    new BannerCard(
-      theme,
-      runTitle,
-      `status: ${run.status} · focus: ${focusedTaskId ?? "ALL"}`,
-    ),
-  );
-
-  tui.addChild(streamContainer);
-  tui.addChild(pendingContainer);
-  tui.addChild(new Spacer(1));
-  tui.addChild(spinner);
-  tui.addChild(statusBar);
-  tui.addChild(composer);
-  tui.addChild(footerHint);
-  tui.setFocus(composer);
-
-  const refreshStatus = () => {
-    const running = tasks.filter((t) => t.status === "running").length;
-    const pausedQuota = tasks.filter((t) => t.status === "paused_quota").length;
-    const isQuotaPaused = run.status === "paused_quota" || (running === 0 && pausedQuota > 0);
-    const quotaAlert = isQuotaPaused
-      ? quotaPause?.resumeAt
-        ? `⏸ quota (${formatResetCountdown(quotaPause.resumeAt)})`
-        : "⏸ quota (Ctrl+T, then w)"
-      : null;
-
-    const activeTask = focusedOrRootTask();
-    const activeModel = activeTask?.model ?? activeTask?.profileId ?? null;
-    statusBar.update({
-      tone: escalations.length > 0 ? "error" : isQuotaPaused ? "warning" : running > 0 ? "accent" : "success",
-      modeLabel: `${opts.runId} (${run.status})`,
-      modelLabel: activeModel ? `focus:${focusedTaskId ?? "ALL"} · ${activeModel}` : `focus:${focusedTaskId ?? "ALL"}`,
-      effortLabel: activeTask?.effort ?? null,
-      goalsSummary: isQuotaPaused ? `${pausedQuota} paused` : `${running} running`,
-      alertText: escalations.length > 0 ? `${escalations.length} esc` : quotaAlert,
-    });
+  const modelBadge = () => {
+    const m = chatSession.model ?? "auto";
+    const e = chatSession.effort ? ` (${chatSession.effort})` : "";
+    return `${chatSession.profileId ?? "director"} · ${m}${e}`;
   };
 
-  const flushStreaming = () => {
-    if (streamingBuffer) {
-      streamContainer.addChild(new AssistantCard(theme, streamingBuffer));
-      streamingBuffer = "";
-      pendingContainer.clear();
-    }
-  };
+  let shell!: ReturnType<typeof createSharedShell>;
 
-  const appendEvent = (ev: DaemonEventFrame) => {
-    // Frames tagged with a watchId belong to the overlay that started that watch.
-    if (isWatchFrame(ev)) return;
-    if (ev.type === "session.taken_over") {
-      evictedByTakeover = true;
-      const p = ev.payload as { sessionId?: string };
-      void term.shutdown(
-        `[Detached — session ${p.sessionId ?? opts.runId} was taken over by another terminal.]`,
-        { overlays, spinner, cleanup: cleanupFullExit },
-      );
+  const dispatchPrompt = async (text: string): Promise<void> => {
+    if (sending) {
+      shell.queuedMessages.push(text);
+      shell.syncDock();
       return;
     }
-    if (ev.seq > lastSeq) lastSeq = ev.seq;
-    if (focusedTaskId && ev.taskId && ev.taskId !== focusedTaskId) return;
+    sending = true;
+    const turnId = `turn-${randomUUID().slice(0, 8)}`;
+    activeTurnId = turnId;
+    shell.transcript.appendUserTurn(text);
+    shell.transcript.liveTail.begin();
+    shell.setStatus(true, "Director thinking...");
 
-    if (ev.type === "agent.text_delta") {
-      const text = String((ev.payload as { text?: string })?.text ?? "");
-      if (!text) return;
-      streamingBuffer += text;
-      if (pendingContainer.children.length === 0) pendingContainer.addChild(pendingMarkdown);
-      pendingMarkdown.setText(streamingBuffer);
-      tui.requestRender();
-      return;
-    }
-
-    flushStreaming();
-    const prefix = ev.taskId ? `[${ev.taskId}]` : `[run]`;
-
-    if (ev.type === "agent.tool") {
-      const p = ev.payload as ToolEvent;
-      const rawLabel = p.title ?? p.name ?? "tool";
-      const displayLabel = rawLabel.replace(/^mcp[._/]harness[._/]+/i, "harness:").replace(/^mcp__harness__/i, "harness:");
-      const key = p.id ? `${ev.taskId ?? ""}:${p.id}` : `${ev.taskId ?? ""}:${displayLabel}`;
-      const st = p.status === "completed" ? "ok" : p.status === "failed" ? "error" : "running";
-      const existing = activeRunToolPills.get(key);
-      if (existing && (p.id || st !== "running" || existing.status === "running")) {
-        existing.update(st, p.error ?? p.result, p.args);
-      } else {
-        const pill = new ToolPill(theme, st, `${prefix} ${displayLabel}`, p.args);
-        pill.update(st, p.error ?? p.result);
-        activeRunToolPills.set(key, pill);
-        streamContainer.addChild(pill);
-      }
-    } else if (ev.type === "agent.error") {
-      const formatted = formatAgentError(String((ev.payload as { error?: string })?.error ?? "Agent error"));
-      streamContainer.addChild(new ErrorCard(theme, formatted));
-    } else if (
-      ev.type === "quota.agent_retrying" ||
-      ev.type === "quota.agent_recovered" ||
-      ev.type === "quota.agent_paused" ||
-      ev.type === "quota.run_paused" ||
-      ev.type === "quota.run_scheduled" ||
-      ev.type === "quota.run_resumed"
-    ) {
-      const p = (ev.payload ?? {}) as Record<string, unknown>;
-      if (ev.type === "quota.agent_retrying") {
-        streamContainer.addChild(
-          new SystemCard(
-            theme,
-            [
-              `${prefix} Rate-limited (${String(p.reason ?? "429")}) — letting CLI retry natively (watchdog ${Math.round(Number(p.timeoutMs ?? 45000) / 1000)}s)…`,
-            ],
-            "muted",
-          ),
-        );
-      } else if (ev.type === "quota.agent_recovered") {
-        streamContainer.addChild(
-          new SystemCard(theme, [`${prefix} Recovered after ${String(p.retryCount ?? 1)} transient 429 retry(ies).`], "success"),
-        );
-      } else if (ev.type === "quota.agent_paused") {
-        const eta = p.resetAt ? ` · reset ${formatResetCountdown(String(p.resetAt))}` : "";
-        streamContainer.addChild(
-          new SystemCard(
-            theme,
-            [`${prefix} ⏸ Stopped early due to quota (${String(p.reason ?? "quota")}${eta}) — worktree & WIP preserved.`],
-            "warning",
-          ),
-        );
-      } else if (ev.type === "quota.run_paused") {
-        const resumeAt = typeof p.resumeAt === "string" ? p.resumeAt : null;
-        const mode = String(p.mode ?? "manual");
-        const msg =
-          mode === "auto_timer" && resumeAt
-            ? `⏸ All workers exited — run paused on quota. Auto-resuming ${formatResetCountdown(resumeAt)}. Send any message to resume now, or press w in /runs (Ctrl+T) to change the wait.`
-            : `⏸ All workers exited — run paused on quota (no Quota Endpoint wired). Send any message to resume now, or press w in /runs (Ctrl+T) to pick a wait timer.`;
-        streamContainer.addChild(new SystemCard(theme, [msg], "warning"));
-      } else if (ev.type === "quota.run_scheduled") {
-        streamContainer.addChild(
-          new SystemCard(
-            theme,
-            [`⏱ Auto-resume scheduled ${formatResetCountdown(String(p.resumeAt ?? ""))} (${String(p.resumeAt ?? "")}). Send any message to resume sooner.`],
-            "info",
-          ),
-        );
-      } else if (ev.type === "quota.run_resumed") {
-        quotaPause = null;
-        streamContainer.addChild(
-          new SystemCard(
-            theme,
-            [`▶ Run resumed (${String(p.trigger ?? "manual")}) — restarted ${Array.isArray(p.resumedTaskIds) ? p.resumedTaskIds.length : 0} task(s).`],
-            "success",
-          ),
-        );
-      }
-      void opts.client
-        .request<{
-          run: RunRecord;
-          tasks: TaskRecord[];
-          escalations: EscalationRecord[];
-          quotaPause?: RunQuotaPauseStatus | null;
-        }>("tree.get", { runId: opts.runId })
-        .then((fresh) => {
-          run = fresh.run;
-          tasks = fresh.tasks;
-          escalations = fresh.escalations;
-          quotaPause = fresh.quotaPause ?? null;
-          refreshStatus();
-          tui.requestRender();
-        })
-        .catch(() => {});
-    } else if (
-      ev.type === "task.created" ||
-      ev.type === "task.status" ||
-      ev.type === "agent.rollover" ||
-      ev.type === "escalation.created" ||
-      ev.type === "merge.finished" ||
-      ev.type === "goal.reviewed" ||
-      ev.type === "goal.amended"
-    ) {
-      const p = (ev.payload ?? {}) as Record<string, unknown>;
-      const detail =
-        ev.type === "task.created"
-          ? `spawned T${p.tier} "${p.title}" (${p.model ?? p.profileId})`
-          : ev.type === "task.status"
-            ? `${p.from} → ${p.to}${p.summary ? ` — ${p.summary}` : ""}`
-            : ev.type === "agent.rollover"
-              ? `clean rollover gen ${p.fromGen} → ${p.toGen} (${p.reason})`
-              : ev.type === "escalation.created"
-                ? `[${p.severity}/${p.category}] ${p.title}`
-                : ev.type === "merge.finished"
-                  ? `branch ${p.branch} → ${p.status}`
-                  : String(p.summary ?? ev.type);
-      const tone = ev.type === "escalation.created" ? "warning" : ev.type === "merge.finished" ? "success" : "muted";
-      streamContainer.addChild(new SystemCard(theme, [`${prefix} ${detail}`], tone));
-      void opts.client
-        .request<{ run: RunRecord; tasks: TaskRecord[]; escalations: EscalationRecord[] }>("tree.get", { runId: opts.runId })
-        .then((fresh) => {
-          run = fresh.run;
-          tasks = fresh.tasks;
-          escalations = fresh.escalations;
-          refreshStatus();
-          tui.requestRender();
-        })
-        .catch(() => {});
-    }
-
-    refreshStatus();
-    tui.requestRender();
-  };
-
-  let unsubEvent = () => {};
-  let unsubClose = () => {};
-
-  let leftRun = false;
-  const detachListenersOnly = () => {
-    leftRun = true;
-    unsubEvent();
-    unsubClose();
-  };
-
-  const cleanupFullExit = () => {
-    detachListenersOnly();
-    opts.client.close();
-  };
-
-  const openRunSessionsPicker = () => {
-    void opts.client.request<AttachableSession[]>("sessions.list").then((sessions) => {
-      let handle: ReturnType<OverlayManager["push"]> | null = null;
-      const comp = new SessionsOverlay(
-        theme,
-        sessions,
-        (chosen) => {
-          exitAction = { kind: "switch", targetId: chosen.id, targetKind: chosen.kind };
-          void term.shutdown(undefined, { overlays, spinner, cleanup: detachListenersOnly });
-        },
-        () => {
-          exitAction = { kind: "switch", targetId: "__new__", targetKind: "chat" };
-          void term.shutdown(undefined, { overlays, spinner, cleanup: detachListenersOnly });
-        },
-        () => handle?.close(),
-        () => handle?.rerender(),
-      );
-      handle = overlays.push(
-        {
-          title: "Sessions & Attach Switcher",
-          subtitle: `${sessions.length} session${sessions.length === 1 ? "" : "s"}`,
-          footer: "Enter attach & take over · n new chat · Esc close",
-        },
-        comp,
-        { width: "92%" },
-      );
-    });
-  };
-
-  const notice = (lines: string[], tone: "muted" | "success" | "warning" | "info" = "info") => {
-    streamContainer.addChild(new SystemCard(theme, lines, tone));
-    tui.requestRender();
-  };
-
-  const quitRun = () =>
-    void term.shutdown(undefined, {
-      overlays,
-      spinner,
-      resolveNote: () => resolveLeaveNote(opts.client),
-      cleanup: cleanupFullExit,
-    });
-
-  const runError = (err: unknown, context: string) => {
-    streamContainer.addChild(new ErrorCard(theme, formatAgentError(err, { context })));
-    tui.requestRender();
-  };
-
-  const stopRun = (runId: string) =>
-    void opts.client
-      .request("run.stop", { runId })
-      .then(() => (runId === opts.runId ? quitRun() : notice([`Stopped run ${runId}.`], "warning")))
-      .catch((err) => runError(err, "run.stop"));
-
-  const openQuotaWaitPicker = (runId: string, reason: string, resumeAt: string | null) => {
-    let handle: ReturnType<OverlayManager["push"]> | null = null;
-    const comp = new QuotaWaitPickerOverlay(
-      theme,
-      runId,
-      reason,
-      resumeAt,
-      (choice) => {
-        if (choice.kind === "now") {
-          void opts.client.request("run.resume", { runId }).catch((err) => runError(err, "run.resume"));
-        } else {
-          void opts.client
-            .request("run.schedule_resume", { runId, delayMs: choice.delayMs })
-            .catch((err) => runError(err, "run.schedule_resume"));
-        }
-      },
-      () => handle?.close(),
-      () => handle?.rerender(),
-    );
-    handle = overlays.push(
-      {
-        title: "Quota Pause — Resume or Schedule Wait",
-        subtitle: runId,
-        footer: "↑/↓ move · Enter apply · Esc keep paused",
-      },
-      comp,
-      { width: "80%" },
-    );
-  };
-
-  const onRunsAction = (action: RunsAction, runId: string) => {
-    if (action === "resume") {
-      void opts.client
-        .request<{ resumed: boolean; resumedTaskIds: string[] }>("run.resume", { runId })
-        .then((res) =>
-          notice(
-            [res.resumed ? `Resumed ${runId} (${res.resumedTaskIds.length} task(s)).` : `Run ${runId} had no quota-paused tasks.`],
-            res.resumed ? "success" : "muted",
-          ),
-        )
-        .catch((err) => runError(err, "run.resume"));
-    } else if (action === "wait") {
-      if (runId === opts.runId) {
-        openQuotaWaitPicker(runId, quotaPause?.reason ?? "Paused due to quota limit", quotaPause?.resumeAt ?? null);
-      } else {
-        void opts.client
-          .request<{ quotaPause?: RunQuotaPauseStatus | null }>("run.get", { runId })
-          .then((d) => openQuotaWaitPicker(runId, d.quotaPause?.reason ?? "Paused due to quota", d.quotaPause?.resumeAt ?? null))
-          .catch(() => openQuotaWaitPicker(runId, "Paused due to quota", null));
-      }
-    } else {
-      stopRun(runId);
+    try {
+      await opts.client.request("chat.send", {
+        chatSessionId: chatSession.id,
+        message: text,
+        turnId,
+      });
+    } catch (err) {
+      shell.transcript.liveTail.clear();
+      shell.transcript.appendReceipt({
+        glyph: shell.theme.glyphs.cross,
+        tone: "danger",
+        tag: "error",
+        text: err instanceof Error ? err.message : String(err),
+      });
+      sending = false;
+      activeTurnId = null;
+      shell.setStatus(false, "Ready");
     }
   };
 
-  const openRuns = () =>
-    openRunsOverlay({
-      client: opts.client,
-      theme,
-      overlays,
-      requestRender: () => tui.requestRender(),
-      onAction: onRunsAction,
-      runIds: [opts.runId],
-    });
-
-  const runRunCommand = (cmd: SlashCommand, arg: string) => {
-    switch (cmd.name) {
-      case "runs":
-        return openRuns();
-      case "sessions":
-        if (!arg) return openRunSessionsPicker();
-        exitAction = { kind: "switch", targetId: arg, targetKind: arg.startsWith("run-") ? "run" : "chat" };
-        return void term.shutdown(undefined, { overlays, spinner, cleanup: detachListenersOnly });
-      case "stop":
-        return void (async () => {
-          try {
-            const res = (await opts.client.request("runs.stop_all", {
-              reason: "Stopped by user (/stop)",
-            })) as { stoppedRunIds: string[]; cancelledChats: number; cancelledReviews: number };
-            const count = res.stoppedRunIds.length;
-            notice([
-              count > 0
-                ? `Stopped all active agents (${res.stoppedRunIds.join(", ")}).`
-                : "No active agents were running.",
-            ]);
-          } catch (err) {
-            notice([`Stop failed: ${err instanceof Error ? err.message : String(err)}`]);
-          }
-        })();
-      case "help":
-        return notice(renderHelp("run", theme));
-      case "quit":
-        return quitRun();
-    }
+  const drainQueue = () => {
+    if (sending || shell.queuedMessages.length === 0) return;
+    const next = shell.queuedMessages.shift()!;
+    shell.syncDock();
+    void dispatchPrompt(next);
   };
 
-  const openRunPalette = () => {
-    const commands = paletteCommands("run", (cmd) => runRunCommand(cmd, ""));
-    let handle: ReturnType<OverlayManager["push"]> | null = null;
-    const comp = new CommandPaletteOverlay(
-      theme,
-      commands,
-      () => handle?.close(),
-      () => handle?.rerender(),
-    );
-    handle = overlays.push(
-      { title: "Command Palette", subtitle: `${commands.length} commands`, footer: "↑/↓ move · Enter run · Esc close" },
-      comp,
-      { width: "80%" },
-    );
-  };
-
-  term.bindControls({
-    overlays,
-    spinner,
-    footerHint,
-    detachBanner: "[Exited.]",
-    callbacks: {
-      getComposerText: () => composer.getText(),
-      clearComposerText: () => composer.clear(),
-      isAutocompleteOpen: () => composer.isAutocompleteOpen(),
-      isBusy: () => false,
-      onAbortGeneration: () => {},
-      onOpenTree: openRuns,
-      onOpenPalette: openRunPalette,
-      onResolveExitNote: () => resolveLeaveNote(opts.client),
-      onShutdownCleanup: cleanupFullExit,
+  shell = createSharedShell({
+    mode: "chat",
+    client: opts.client,
+    repoRoot: chatSession.repoRoot || opts.repoRoot,
+    sessionId: chatSession.id,
+    chatSessionId: chatSession.id,
+    terminal: opts.terminal,
+    getRightStatus: modelBadge,
+    getIdleBanner: () => `${chatSession.id} · ${sanitizeLine(chatSession.title || "Director Chat")} (Ctrl+G Work · Ctrl+O Go)`,
+    onUserSubmit: dispatchPrompt,
+    onCancelActiveTurn: async () => {
+      if (!activeTurnId) return false;
+      const id = activeTurnId;
+      await opts.client.request("chat.cancel", { chatSessionId: chatSession.id, turnId: id }).catch(() => {});
+      return true;
+    },
+    getCurrentModel: () => ({
+      profileId: chatSession.profileId,
+      model: chatSession.model,
+      effort: chatSession.effort,
+    }),
+    onModelUpdated: async (sel) => {
+      const updated = await opts.client.request<ChatSessionRecord>("chat.update", {
+        chatSessionId: chatSession.id,
+        profileId: sel.profileId,
+        model: sel.model,
+        effort: sel.effort,
+      });
+      chatSession = updated;
+      shell.transcript.appendReceipt({
+        glyph: shell.theme.glyphs.check,
+        tone: "ok",
+        tag: "model",
+        text: `Switched to ${sel.profileId} / ${sel.model}${sel.effort ? ` (${sel.effort})` : ""}`,
+      });
+      shell.syncDock();
     },
   });
 
-  tui.addInputListener((data) => {
-    if (isKeyRelease(data) || overlays.isOpen) return undefined;
-    if (data === "\x18" || matchesKey(data, "ctrl+x")) {
-      if (toggleLatestToolChain(streamContainer)) tui.requestRender();
-      return { consume: true };
-    }
-    return undefined;
-  });
-
-  composer.onSubmit = (raw) => {
-    const text = raw.trim();
-    composer.clear();
-    if (!text) return;
-    composer.addToHistory(text);
-
-    const slash = parseSlashInput("run", text);
-    if (slash && "error" in slash) return notice([slash.error], "warning");
-    if (slash) return runRunCommand(slash.cmd, slash.arg);
-
-    // Sending ANY message while the run is paused on quota manually resumes & resets the quota state machine!
-    const hasPausedTasks = tasks.some((t) => t.status === "paused_quota");
-    if (run.status === "paused_quota" || (hasPausedTasks && !tasks.some((t) => t.status === "running"))) {
-      void opts.client
-        .request<{ resumed: boolean; resumedTaskIds: string[] }>("run.resume", { runId: opts.runId, message: text })
-        .then((res) => {
-          streamContainer.addChild(new UserCard(theme, `[▶ resume] ${text}`));
-          if (!res.resumed) {
-            streamContainer.addChild(new SystemCard(theme, ["No quota-paused tasks remained to resume."], "muted"));
-          }
-          tui.requestRender();
-        });
-      return;
-    }
-
-    const targetId = focusedTaskId ?? tasks.find((t) => t.tier === 1)?.id;
-    if (!targetId) {
-      streamContainer.addChild(new SystemCard(theme, ["No active task to steer."], "warning"));
-      tui.requestRender();
-      return;
-    }
-    void opts.client.request("task.steer", { taskId: targetId, message: text }).then(() => {
-      streamContainer.addChild(new UserCard(theme, `[→ ${targetId}] ${text}`));
-      tui.requestRender();
-    });
-  };
-
-  let earlyRunEvents: DaemonEventFrame[] | null = [];
-  unsubEvent = opts.client.onEvent((ev) => {
-    if (isWatchFrame(ev)) return;
-    if (ev.type === "session.taken_over") appendEvent(ev);
-    else if (ev.runId === opts.runId) {
-      if (earlyRunEvents) earlyRunEvents.push(ev);
-      else appendEvent(ev);
-    }
-  });
-  unsubClose = opts.client.onClose(() => {
-    if (evictedByTakeover) return;
-    void term.shutdown("[Connection to harnessd closed.]", { overlays, spinner, cleanup: cleanupFullExit });
-  });
-
-  term.start();
-  try {
-    const attached = await opts.client.request<ReplayPage & { attachmentId: string; tookOver?: boolean }>("attach", {
-      runId: opts.runId,
-      taskId: focusedTaskId,
-      sinceSeq: lastSeq,
-    });
-    await consumeReplay(opts.client, attached, { attachmentId: attached.attachmentId }, (ev) => {
-      appendEvent({ kind: "event", ...ev });
-    }, () => leftRun || evictedByTakeover);
-    if (!leftRun && !evictedByTakeover) {
-      for (const ev of earlyRunEvents) if (ev.seq > lastSeq) appendEvent(ev);
-      earlyRunEvents = null;
-      flushStreaming();
-      if (attached.tookOver) {
-        streamContainer.addChild(new SystemCard(theme, [`Took over ${opts.runId} (previous terminal was detached).`], "info"));
-      }
-      refreshStatus();
-      tui.requestRender();
-    }
-  } catch (err) {
-    if (!leftRun && !evictedByTakeover) {
-      await term.shutdown(`[Failed to attach: ${err instanceof Error ? err.message : String(err)}]`, { overlays, spinner, cleanup: cleanupFullExit });
+  // Hydrate existing chat history cleanly as immutable blocks
+  for (const turn of opened.history ?? []) {
+    if (turn.role === "user") {
+      shell.transcript.appendUserTurn(turn.content);
+    } else if (turn.role === "assistant") {
+      shell.transcript.appendAssistantTurn(turn.content);
+    } else if (turn.role === "system_notice") {
+      const parsed = turn.event ? parseChatControlEvent(turn.event) : null;
+      const summary = parsed ? formatChatEventSummary(parsed) : turn.content;
+      const ref: EntityRef | undefined =
+        parsed && "goalId" in parsed && parsed.goalId
+          ? { kind: "goal", id: parsed.goalId, label: `${parsed.goalId}` }
+          : undefined;
+      if (ref) shell.recordRef(ref);
+      shell.transcript.appendReceipt({
+        tone: parsed?.kind === "goal.reviewed" ? "ok" : "info",
+        tag: parsed?.kind ?? "notice",
+        text: summary,
+        ref,
+      });
     }
   }
-  await term.closed;
-  return exitAction;
+
+  if (opened.busy && (opened.activeText || opened.activePartial)) {
+    shell.transcript.liveTail.begin();
+    shell.transcript.liveTail.appendText(opened.activeText || opened.activePartial);
+    shell.setStatus(true, "Director responding...");
+  }
+
+  // Subscribe to live daemon frames
+  const detachEvents = opts.client.onEvent((ev: DaemonEventFrame) => {
+    if (ev.watchId) return;
+    const p = (ev.payload ?? {}) as Record<string, unknown>;
+
+    if (ev.type === "session.taken_over") {
+      shell.transcript.appendReceipt({
+        tone: "warn",
+        tag: "session",
+        text: "Another client took over this session — detaching.",
+      });
+      shell.session.stop();
+      return;
+    }
+
+    if (ev.type === "chat.turn.start") {
+      sending = true;
+      activeTurnId = typeof p.turnId === "string" ? p.turnId : activeTurnId;
+      shell.transcript.liveTail.begin();
+      shell.setStatus(true, "Director responding...");
+      return;
+    }
+
+    if (ev.type === "chat.delta") {
+      const delta = String(p.delta ?? "");
+      if (delta) {
+        shell.transcript.liveTail.appendText(delta);
+        shell.session.tui.requestRender();
+      }
+      return;
+    }
+
+    if (ev.type === "chat.tool") {
+      const id = String(p.id ?? p.toolCallId ?? randomUUID().slice(0, 8));
+      const label = formatToolLabel(String(p.name ?? p.title ?? "tool"));
+      const rawStatus = String(p.status ?? "running");
+      const status = rawStatus === "completed" || rawStatus === "ok" ? "ok" : rawStatus === "error" || rawStatus === "failed" ? "error" : "running";
+      const detail = typeof p.summary === "string" ? p.summary : undefined;
+      shell.transcript.liveTail.upsertTool({ id, label, status, detail });
+      if (status !== "running") {
+        shell.recordRef({
+          kind: "tool_call",
+          id,
+          label: `${label}${detail ? `: ${detail}` : ""}`,
+          payload: p,
+        });
+      }
+      shell.setStatus(true, `Running ${label}...`);
+      return;
+    }
+
+    if (ev.type === "chat.turn.end") {
+      const snap = shell.transcript.liveTail.snapshot();
+      const assistantTurn = p.assistantTurn as ChatTurnRecord | undefined;
+      const finalText = assistantTurn?.content ?? snap.text;
+      shell.transcript.liveTail.clear();
+
+      if (snap.tools.length > 0) {
+        const ref: EntityRef = {
+          kind: "tool_call",
+          id: `tools-${Date.now()}`,
+          label: `${snap.tools.length} tool call(s): ${snap.tools.map((t) => t.label).join(", ")}`,
+          payload: snap.tools,
+        };
+        shell.recordRef(ref);
+        shell.transcript.appendReceipt({
+          glyph: shell.theme.glyphs.check,
+          tone: snap.tools.some((t) => t.status === "error") ? "warn" : "muted",
+          tag: "tools",
+          text: `${snap.tools.length} call(s): ${snap.tools.map((t) => t.label).join(", ")}`,
+          ref,
+        });
+      }
+      if (finalText.trim()) {
+        shell.transcript.appendAssistantTurn(finalText);
+      }
+      if (typeof p.error === "string" && p.error) {
+        shell.transcript.appendReceipt({ glyph: shell.theme.glyphs.cross, tone: "danger", tag: "error", text: p.error });
+      }
+      sending = false;
+      activeTurnId = null;
+      shell.setStatus(false, "Ready");
+      void shell.store.refresh();
+      drainQueue();
+      return;
+    }
+
+    // Surface high-signal live escalations right into the transcript with a direct Inspector ref!
+    if (ev.type === "escalation.created") {
+      const escId = String(p.id ?? p.escalationId ?? "");
+      const title = String(p.title ?? "Escalation raised");
+      const sev = String(p.severity ?? "P1");
+      const ref: EntityRef = {
+        kind: "escalation",
+        id: escId,
+        runId: ev.runId,
+        label: `${escId} ${title}`,
+      };
+      if (escId) shell.recordRef(ref);
+      shell.transcript.appendReceipt({
+        glyph: shell.theme.glyphs.warn,
+        tone: sev === "P0" ? "danger" : "warn",
+        tag: `${sev} ${escId || "escalation"}`,
+        text: title,
+        ref: escId ? ref : undefined,
+      });
+      shell.session.tui.requestRender();
+      return;
+    }
+  });
+
+  const detachClose = opts.client.onClose(() => {
+    shell.session.stop();
+  });
+
+  await shell.store.refresh();
+  const action = await shell.waitAndCleanup();
+  detachEvents();
+  detachClose();
+  return action;
+}
+
+/* ──────────────────────────── Attached Run TUI ────────────────────────────── */
+
+export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): Promise<TuiExitAction> {
+  const attached = await opts.client.request<AttachRunResult>("attach", {
+    runId: opts.runId,
+    ...(opts.initialTaskId ? { taskId: opts.initialTaskId } : {}),
+  });
+
+  const repoRoot = attached.run?.repoRoot ?? process.cwd();
+  let shell!: ReturnType<typeof createSharedShell>;
+
+  shell = createSharedShell({
+    mode: "run",
+    client: opts.client,
+    repoRoot,
+    sessionId: opts.runId,
+    runId: opts.runId,
+    terminal: opts.terminal,
+    getRightStatus: () => `run ${opts.runId}${opts.initialTaskId ? ` / ${opts.initialTaskId}` : ""}`,
+    getIdleBanner: () => `${opts.runId} (${attached.run?.status ?? "active"}) · Ctrl+G Work · /resume · /stop`,
+    onUserSubmit: async (text) => {
+      shell.transcript.appendUserTurn(text);
+      if (opts.initialTaskId) {
+        await opts.client.request("task.steer", { taskId: opts.initialTaskId, message: text });
+        shell.transcript.appendReceipt({ tone: "ok", tag: "steered", text: `Sent to ${opts.initialTaskId}` });
+      } else {
+        await opts.client.request("run.resume", { runId: opts.runId, message: text });
+        shell.transcript.appendReceipt({ tone: "ok", tag: "run", text: `Sent guidance to ${opts.runId}` });
+      }
+      shell.session.tui.requestRender();
+    },
+    onCancelActiveTurn: async () => {
+      await opts.client.request("run.stop", { runId: opts.runId, reason: "Stopped from TUI" }).catch(() => {});
+      return true;
+    },
+  });
+
+  const renderEventToTranscript = (ev: DaemonEventFrame) => {
+    if (ev.runId !== opts.runId) return;
+    const p = (ev.payload ?? {}) as Record<string, unknown>;
+    if (ev.type === "agent.text_delta") {
+      const txt = String(p.text ?? p.delta ?? "");
+      if (txt) {
+        shell.transcript.liveTail.appendText(txt);
+        shell.session.tui.requestRender();
+      }
+      return;
+    }
+    if (ev.type === "agent.turn_end" || ev.type === "task.status") {
+      const snap = shell.transcript.liveTail.snapshot();
+      if (snap.text.trim()) {
+        shell.transcript.liveTail.clear();
+        shell.transcript.appendAssistantTurn(snap.text);
+      }
+    }
+    if (ev.type === "escalation.created") {
+      const escId = String(p.id ?? p.escalationId ?? "");
+      const ref: EntityRef = { kind: "escalation", id: escId, runId: ev.runId, label: `${escId} ${String(p.title ?? "")}` };
+      if (escId) shell.recordRef(ref);
+      shell.transcript.appendReceipt({
+        glyph: shell.theme.glyphs.warn,
+        tone: "danger",
+        tag: escId || "escalation",
+        text: String(p.title ?? "Escalation"),
+        ref: escId ? ref : undefined,
+      });
+    } else if (ev.type === "task.status" || ev.type === "run.status") {
+      const id = ev.taskId ?? ev.runId;
+      const status = String(p.to ?? p.status ?? "");
+      const ref: EntityRef = ev.taskId
+        ? { kind: "task", id: ev.taskId, runId: ev.runId, label: ev.taskId }
+        : { kind: "run", id: ev.runId, label: ev.runId };
+      shell.recordRef(ref);
+      shell.transcript.appendReceipt({
+        tone: status === "failed" || status === "blocked" ? "danger" : status === "completed" ? "ok" : "info",
+        tag: id,
+        text: `${ev.type}: ${status}${p.summary ? ` — ${sanitizeLine(String(p.summary))}` : ""}`,
+        ref,
+      });
+    }
+    shell.session.tui.requestRender();
+  };
+
+  for (const ev of attached.events ?? []) renderEventToTranscript(ev);
+
+  const detachEvents = opts.client.onEvent((ev) => {
+    if (ev.type === "session.taken_over") {
+      shell.session.stop();
+      return;
+    }
+    renderEventToTranscript(ev);
+  });
+
+  const detachClose = opts.client.onClose(() => shell.session.stop());
+
+  await shell.store.refresh();
+  const action = await shell.waitAndCleanup();
+  detachEvents();
+  detachClose();
+  return action;
 }

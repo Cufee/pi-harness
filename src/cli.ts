@@ -7,7 +7,8 @@ import { loadConfig, type AcpProfileConfig } from "./config.js";
 import { DaemonClient, runStdioSocketBridge } from "./daemon/remote.js";
 import { currentDaemonBuildId, DAEMON_PROTOCOL_REV, HarnessDaemon } from "./daemon/server.js";
 import { runDirectorChatTui, runNativeScrollbackTui, type TuiExitAction } from "./tui/app.js";
-import { parseDurationMs, type AttachableSession } from "./tui/overlays.js";
+import { parseDurationMs } from "./tui/core/index.js";
+import type { AttachableSession } from "./tui/store.js";
 
 function parseArgs(argv: string[]): { positional: string[]; flags: Record<string, string | boolean> } {
   const positional: string[] = [];

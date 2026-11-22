@@ -24,4 +24,4 @@ export * from "./catalog/compiler.js";
 export * from "./daemon/server.js";
 export * from "./daemon/remote.js";
 export * from "./daemon/pty-host.js";
-export * from "./tui/primitives/index.js";
+export * from "./tui/core/index.js";

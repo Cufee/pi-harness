@@ -1,114 +1,91 @@
-import type { SlashCommand as TuiSlashCommand } from "@earendil-works/pi-tui";
-import type { PaletteCommand } from "./overlays.js";
-import { COMPOSER_SHORTCUT_HELP } from "./primitives/composer.js";
-import type { HarnessTheme } from "./primitives/index.js";
+import { CombinedAutocompleteProvider, type SlashCommand } from "@earendil-works/pi-tui";
+import { fit } from "./core/index.js";
 
-/**
- * Single slash-command registry. It is the only source for slash autocomplete, input dispatch,
- * `/help`, and the `Ctrl+O` Command Palette in both Director Chat (`chat`) and Attached-Run (`run`) modes.
- * Commands resolve by exact name only; there are no aliases.
- */
-export type CommandMode = "chat" | "run";
+export type TuiMode = "chat" | "run";
 
-export interface SlashCommand {
-  /** Command name without the leading slash. */
+export interface CommandSpec {
   name: string;
-  args?: string;
+  aliases?: string[];
+  usage: string;
   description: string;
-  modes: Array<CommandMode>;
-  /** Keyboard shortcut that runs the same command, e.g. `Ctrl+T`. */
-  key?: string;
+  modes: TuiMode[];
 }
 
-export const COMMANDS: readonly SlashCommand[] = [
-  { name: "runs", description: "Runs dashboard: inspect agent tree, resume (r), wait (w), stop (x)", modes: ["chat", "run"], key: "Ctrl+T" },
-  { name: "goals", description: "Goals dashboard: inspect, review (r), pause (p), cancel (x)", modes: ["chat"] },
-  { name: "sessions", args: "[id]", description: "List & switch sessions (takes over the other terminal)", modes: ["chat", "run"] },
-  { name: "new", args: "[title]", description: "Start a new concurrent Director Chat session", modes: ["chat"] },
-  { name: "model", description: "Pick a model & ACP CLI route, or a CLI's default model", modes: ["chat"] },
-  { name: "effort", args: "[level]", description: "Pick reasoning effort (low / medium / high / xhigh / max / ultra)", modes: ["chat"] },
-  { name: "quota", description: "Subscription & API quota buckets with reset timers", modes: ["chat"] },
-  { name: "worktrees", description: "List & clean stale/orphaned git worktrees", modes: ["chat"] },
-  { name: "kb", args: "[query]", description: "Browse the 2-stage Knowledge Base", modes: ["chat"] },
-  { name: "settings", description: "Configure defaults, Quota Endpoint & external ACP CLIs", modes: ["chat"], key: "Ctrl+," },
-  { name: "status", description: "Daemon health, active model/effort, CLIs & goals summary", modes: ["chat"] },
-  { name: "clear", description: "Clear the local transcript", modes: ["chat"] },
-  { name: "stop", description: "Stop all running agents, reviews, and active runs", modes: ["chat", "run"] },
-  { name: "help", description: "List commands & keyboard shortcuts", modes: ["chat", "run"] },
-  { name: "quit", description: "Leave (background agents keep running; harnessd stops if idle)", modes: ["chat", "run"], key: "Ctrl+]" },
+export const COMMAND_SPECS: CommandSpec[] = [
+  { name: "work", usage: "/work [tab]", description: "Open Work Navigator (Ctrl+G) — Inbox, Goals, Runs, Escalations, Timers, Worktrees", modes: ["chat", "run"] },
+  { name: "inbox", usage: "/inbox", description: "Jump straight to Inbox (open escalations, awaiting_human goals, blockers)", modes: ["chat", "run"] },
+  { name: "escalations", aliases: ["esc"], usage: "/escalations", description: "Open Escalations tab to inspect, acknowledge, or resolve escalations", modes: ["chat", "run"] },
+  { name: "goals", usage: "/goals", description: "Open Goals tab in Work Navigator", modes: ["chat", "run"] },
+  { name: "runs", usage: "/runs", description: "Open Runs tab in Work Navigator", modes: ["chat", "run"] },
+  { name: "timers", usage: "/timers", description: "Open scheduled Timers tab", modes: ["chat", "run"] },
+  { name: "worktrees", usage: "/worktrees", description: "Inspect or sweep Worktrees & Merge Queue", modes: ["chat", "run"] },
+  { name: "stop", usage: "/stop [reason]", description: "Stop ALL active runs and running agents across the harness", modes: ["chat", "run"] },
+  { name: "model", usage: "/model", description: "Open Model & Effort picker", modes: ["chat"] },
+  { name: "effort", usage: "/effort [level]", description: "Set reasoning effort or open Model & Effort picker", modes: ["chat"] },
+  { name: "quota", usage: "/quota", description: "Open Quota & Cost viewer", modes: ["chat", "run"] },
+  { name: "cost", usage: "/cost", description: "Open Cost & Quota viewer", modes: ["chat", "run"] },
+  { name: "kb", usage: "/kb", description: "Browse repository Knowledge Base", modes: ["chat", "run"] },
+  { name: "sessions", usage: "/sessions", description: "Switch between chat sessions and live runs", modes: ["chat", "run"] },
+  { name: "new", usage: "/new [title]", description: "Start a new Director chat session", modes: ["chat"] },
+  { name: "settings", usage: "/settings", description: "Edit default harness profiles and worker limits", modes: ["chat", "run"] },
+  { name: "status", usage: "/status", description: "Print concise summary of active goals, escalations, and runs", modes: ["chat", "run"] },
+  { name: "resume", usage: "/resume [in <dur> | msg]", description: "Resume paused run now or schedule delayed resume (e.g. /resume in 15m)", modes: ["run"] },
+  { name: "steer", usage: "/steer <task-id> <msg>", description: "Steer a specific running task", modes: ["chat", "run"] },
+  { name: "clear", usage: "/clear", description: "Clear the local transcript view", modes: ["chat", "run"] },
+  { name: "help", aliases: ["?"], usage: "/help", description: "Show commands and keyboard shortcuts", modes: ["chat", "run"] },
+  { name: "quit", aliases: ["exit", "detach"], usage: "/quit", description: "Detach from TUI (daemon and background runs keep running)", modes: ["chat", "run"] },
 ];
 
-export function commandsFor(mode: CommandMode): SlashCommand[] {
-  return COMMANDS.filter((c) => c.modes.includes(mode));
+export interface ParsedSlashCommand {
+  name: string;
+  args: string;
+  raw: string;
 }
 
-/** Resolves `/name [arg]` to a command available in `mode`; exact names only. */
-export function resolveCommand(mode: CommandMode, input: string): { cmd: SlashCommand; arg: string } | null {
-  const match = /^\/(\S+)(?:\s+([\s\S]*))?$/.exec(input.trim());
+export function parseSlashCommand(input: string): ParsedSlashCommand | null {
+  const trimmed = input.trim();
+  if (!trimmed.startsWith("/")) return null;
+  const match = trimmed.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
   if (!match) return null;
-  const cmd = commandsFor(mode).find((c) => c.name === match[1]);
-  return cmd ? { cmd, arg: (match[2] ?? "").trim() } : null;
+  const rawName = match[1]!.toLowerCase();
+  const args = (match[2] ?? "").trim();
+  const canonical = COMMAND_SPECS.find((c) => c.name === rawName || c.aliases?.includes(rawName))?.name ?? rawName;
+  return { name: canonical, args, raw: trimmed };
 }
 
-export function completions(mode: CommandMode, prefix: string): SlashCommand[] {
-  const p = prefix.trim().replace(/^\//, "");
-  return commandsFor(mode).filter((c) => c.name.startsWith(p));
-}
-
-/** Composer `/` autocomplete entries for `mode`. */
-export function autocompleteCommands(mode: CommandMode): TuiSlashCommand[] {
-  return completions(mode, "").map((c) => ({
+export function createCommandAutocomplete(mode: TuiMode): CombinedAutocompleteProvider {
+  const cmds: SlashCommand[] = COMMAND_SPECS.filter((c) => c.modes.includes(mode)).map((c) => ({
     name: c.name,
-    description: c.key ? `${c.description} (${c.key})` : c.description,
-    ...(c.args ? { argumentHint: c.args } : {}),
-  }));
-}
-
-/** `Ctrl+O` Command Palette entries for `mode`; `run` dispatches the chosen command with no argument. */
-export function paletteCommands(mode: CommandMode, run: (cmd: SlashCommand) => void): PaletteCommand[] {
-  return commandsFor(mode).map((c) => ({
-    id: c.name,
-    label: `/${c.name}`,
-    ...(c.key ? { shortcut: c.key } : {}),
     description: c.description,
-    run: () => run(c),
   }));
+  return new CombinedAutocompleteProvider(cmds, process.cwd());
 }
 
-const SHORTCUTS: Record<CommandMode, Array<[string, string]>> = {
-  chat: [
-    ["Enter", "Send message immediately (steers active turn if busy)"],
-    ["Ctrl+Q / Alt+Enter", "Enqueue message for after the active turn"],
-    ["Ctrl+S", "Send queued message immediately"],
-    ["Ctrl+R", "Recall queued message into input"],
-    ["Ctrl+X", "Expand / collapse latest tool calls"],
-    ["Esc", "Press twice to stop active turn / close overlay"],
-    ["Ctrl+O", "Command palette (keeps your draft)"],
-    ["Ctrl+C", "Clear input / cancel turn; twice to quit"],
-  ],
-  run: [
-    ["Ctrl+X", "Expand / collapse latest tool calls"],
-    ["Ctrl+O", "Command palette (keeps your draft)"],
-    ["Ctrl+C", "Clear input; twice to quit"],
-  ],
-};
+export const KEYBOARD_SHORTCUTS: ReadonlyArray<{ key: string; description: string }> = [
+  { key: "Ctrl+G", description: "Open Work Navigator (Inbox / Goals / Runs / Escalations / Timers / Worktrees)" },
+  { key: "Ctrl+O", description: "Go-To-Anything fuzzy palette (jump to any entity or command)" },
+  { key: "Ctrl+X", description: "Inspect latest surfaced receipt, escalation, goal, or tool call" },
+  { key: "Alt+1..5", description: "Jump straight into numbered attention slot in top dock row" },
+  { key: "Ctrl+U / Ctrl+K / Ctrl+W", description: "Clear line before cursor / to end / previous word" },
+  { key: "Ctrl+Z / Ctrl+-", description: "Undo composer edit" },
+  { key: "Shift+Enter", description: "Insert newline in composer" },
+  { key: "Ctrl+C / Ctrl+]", description: "Cancel active turn (press twice to detach) / immediate detach" },
+];
 
-export function renderHelp(mode: CommandMode, theme?: HarnessTheme): string[] {
-  const bold = theme?.bold ?? ((s: string) => s);
-  const accent = theme?.accent ?? ((s: string) => s);
-  const dim = theme?.dim ?? ((s: string) => s);
-  const cmds = commandsFor(mode);
-  const shortcuts: ReadonlyArray<readonly [string, string]> = [...SHORTCUTS[mode], ...COMPOSER_SHORTCUT_HELP];
-  const usage = (c: SlashCommand) => `/${c.name}${c.args ? ` ${c.args}` : ""}`;
-  const colW = Math.max(...cmds.map((c) => usage(c).length), ...shortcuts.map(([key]) => key.length)) + 2;
-  const lines = [bold(mode === "chat" ? "Commands & Shortcuts" : "Attached-Run Commands")];
-  for (const c of cmds) {
-    const u = usage(c);
-    lines.push(`${accent(`/${c.name}`)}${c.args ? ` ${c.args}` : ""}${" ".repeat(colW - u.length)}${c.description}${c.key ? ` ${dim(`(${c.key})`)}` : ""}`);
-  }
-  for (const [key, desc] of shortcuts) {
-    lines.push(`${accent(key)}${" ".repeat(colW - key.length)}${desc}`);
-  }
-  if (mode === "run") lines.push(dim("Type text to steer the focused agent (or resume if quota-paused)."));
+export function renderHelp(mode: TuiMode): string[] {
+  const cmds = COMMAND_SPECS.filter((c) => c.modes.includes(mode));
+  const colW =
+    Math.max(
+      ...cmds.map((c) => c.usage.length),
+      ...KEYBOARD_SHORTCUTS.map((s) => s.key.length),
+    ) + 2;
+
+  const lines: string[] = [
+    `Commands (${mode} mode):`,
+    ...cmds.map((c) => `  ${fit(c.usage, colW)}${c.description}`),
+    "",
+    "Shortcuts:",
+    ...KEYBOARD_SHORTCUTS.map((s) => `  ${fit(s.key, colW)}${s.description}`),
+  ];
   return lines;
 }

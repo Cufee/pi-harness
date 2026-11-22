@@ -27,20 +27,6 @@ import {
 } from "../src/protocol/tool-display.js";
 import { QuotaClient } from "../src/quota/client.js";
 import { parseCodexRateLimitsFromJsonl } from "../src/quota/local-harvest.js";
-import { isSubagentWaitTool, historyTurnComponent } from "../src/tui/app.js";
-import { ModelConfigOverlay, ModelPickerOverlay, QuotaOverlay } from "../src/tui/overlays.js";
-import { effectiveRunStatus } from "../src/tui/runs-tree.js";
-import { renderToolOutput, type ToolDisplayPayload } from "../src/tui/tool-output/index.js";
-import {
-  createTheme,
-  DISABLE_MOUSE_WHEEL_SEQ,
-  ENABLE_MOUSE_WHEEL_SEQ,
-  EventCard,
-  GoalHeader,
-  OverlayManager,
-  parseMouseWheel,
-} from "../src/tui/primitives/index.js";
-import { AgentTranscriptOverlay } from "../src/tui/transcript-overlay.js";
 
 function initTempGitRepo(): string {
   const dir = mkdtempSync(join(tmpdir(), "pi-harness-scope-test-"));
@@ -158,141 +144,7 @@ function sampleModels(): CompiledModelEntry[] {
   ];
 }
 
-describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolling & Configurable Model List", () => {
-  it("renders GoalHeader with boxed visual separation and strict width safety", () => {
-    const theme = createTheme();
-    const header = new GoalHeader(theme);
-    assert.deepEqual(header.render(80), []);
-
-    const goals: GoalRecord[] = [
-      {
-        id: "goal-11111111",
-        chatSessionId: "chat-a",
-        repoRoot: "/tmp/repo",
-        version: 1,
-        title: "Build resilient queue engine",
-        description: "desc",
-        criteria: [],
-        nonGoals: [],
-        budgets: { maxReviewCycles: 4, maxNoProgressCycles: 2 },
-        status: "executing",
-        linkedRunId: "run-1",
-        reviewCycle: 0,
-        noProgressStreak: 0,
-        lastProgressFingerprint: null,
-        lastReviewSummary: null,
-        createdAt: 1,
-        updatedAt: 20,
-      },
-      {
-        id: "goal-22222222",
-        chatSessionId: "chat-a",
-        repoRoot: "/tmp/repo",
-        version: 1,
-        title: "Add live telemetry dashboard",
-        description: "desc",
-        criteria: [],
-        nonGoals: [],
-        budgets: { maxReviewCycles: 4, maxNoProgressCycles: 2 },
-        status: "draft",
-        linkedRunId: null,
-        reviewCycle: 0,
-        noProgressStreak: 0,
-        lastProgressFingerprint: null,
-        lastReviewSummary: null,
-        createdAt: 1,
-        updatedAt: 10,
-      },
-      {
-        id: "goal-33333333",
-        chatSessionId: "chat-a",
-        repoRoot: "/tmp/repo",
-        version: 1,
-        title: "Older archived goal",
-        description: "desc",
-        criteria: [],
-        nonGoals: [],
-        budgets: { maxReviewCycles: 4, maxNoProgressCycles: 2 },
-        status: "achieved",
-        linkedRunId: null,
-        reviewCycle: 1,
-        noProgressStreak: 0,
-        lastProgressFingerprint: null,
-        lastReviewSummary: null,
-        createdAt: 1,
-        updatedAt: 5,
-      },
-    ];
-
-    header.update(goals);
-    for (const width of [40, 80, 120]) {
-      const lines = header.render(width);
-      assert.equal(lines.length, 4); // top border + 2 rows + bottom border
-      assert.ok(lines[0]!.includes("╭─"));
-      assert.ok(lines[0]!.includes("Goals"));
-      assert.ok(lines[3]!.includes("╰─"));
-      for (const l of lines) {
-        assert.ok(visibleWidth(l) <= width, `overflow at width=${width}: ${visibleWidth(l)}`);
-      }
-    }
-  });
-
-  it("parses SGR/X10 mouse wheel events, scrolls AgentTranscriptOverlay, and toggles terminal mouse tracking cleanly", async () => {
-    assert.deepEqual(parseMouseWheel("\x1b[<64;10;5M"), { isMouse: true, deltaLines: -3 });
-    assert.deepEqual(parseMouseWheel("\x1b[<65;10;5M\x1b[<65;10;5M"), { isMouse: true, deltaLines: 6 });
-    assert.deepEqual(parseMouseWheel("\x1b[<72;10;5M"), { isMouse: true, deltaLines: -9 }); // Alt+wheel up
-    assert.deepEqual(parseMouseWheel("\x1b[<0;10;5M\x1b[<0;10;5m"), { isMouse: true, deltaLines: 0 }); // click ignored
-    assert.deepEqual(parseMouseWheel("j"), { isMouse: false, deltaLines: 0 });
-
-    const theme = createTheme();
-    const lines = Array.from({ length: 40 }, (_, i) => `Line ${i + 1}\n`).join("");
-    const overlay = new AgentTranscriptOverlay({
-      theme,
-      runId: "run-1",
-      taskId: "t-1",
-      title: "Worker",
-      viewportRows: 10,
-      startWatch: async () => ({
-        replay: [{ seq: 1, runId: "run-1", taskId: "t-1", type: "agent.text_delta", payload: { text: lines }, createdAt: 1 }],
-        stop: () => {},
-      }),
-      onClose: () => {},
-      requestRender: () => {},
-    });
-
-    await new Promise((r) => setTimeout(r, 15));
-    const atBottom = overlay.render(80).join("\n");
-    assert.ok(atBottom.includes("following"));
-
-    // Scroll up 6 lines with two SGR wheel-up ticks -> should pause following and move viewport up!
-    overlay.handleInput("\x1b[<64;20;10M\x1b[<64;20;10M");
-    const scrolledUp = overlay.render(80).join("\n");
-    assert.ok(scrolledUp.includes("paused"));
-    assert.ok(!scrolledUp.includes("Line 40"));
-
-    // Scroll back down -> resumes following at bottom!
-    overlay.handleInput("\x1b[<65;20;10M\x1b[<65;20;10M");
-    const backBottom = overlay.render(80).join("\n");
-    assert.ok(backBottom.includes("following"));
-
-    // Verify OverlayManager ref-counted SGR mouse enable/disable sequences
-    const writes: string[] = [];
-    const fakeTui = {
-      terminal: { write: (s: string) => writes.push(s) },
-      showOverlay: () => ({ hide() {} }),
-      setFocus() {},
-      requestRender() {},
-    } as unknown as TUI;
-    const mgr = new OverlayManager(fakeTui, theme, { render: () => [], invalidate() {} });
-    const h1 = mgr.push({ title: "Runs" }, { render: () => [], invalidate() {} }, { captureMouseWheel: true });
-    const h2 = mgr.push({ title: "Transcript" }, { render: () => [], invalidate() {} }, { captureMouseWheel: true });
-    assert.deepEqual(writes, [ENABLE_MOUSE_WHEEL_SEQ]); // enabled once on 0 -> 1
-    h2.close();
-    assert.deepEqual(writes, [ENABLE_MOUSE_WHEEL_SEQ]); // still 1 open -> stays enabled
-    h1.close();
-    assert.deepEqual(writes, [ENABLE_MOUSE_WHEEL_SEQ, DISABLE_MOUSE_WHEEL_SEQ]); // disabled on 1 -> 0!
-  });
-
+describe("Session Scoping, Model Selection, Dynamic Telemetry & Timers", () => {
   it("scopes goals, runs.trees, and run.list strictly to the active chat session", async () => {
     const repoDir = initTempGitRepo();
     const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-scoping-"));
@@ -361,7 +213,6 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
 
   it("supports toggling models on/off, Toggle All Off, Enable All, and task-kind model recommendations", () => {
     const models = sampleModels();
-    const theme = createTheme();
     const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-models-cfg-"));
     try {
       const cfg = loadConfig();
@@ -379,55 +230,6 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
       assert.equal(recs.worker?.model, "openai/gpt-6.2-sol");
       assert.equal(recs.verify?.model, "anthropic/claude-opus-5-5"); // avoids generator openai/gpt-6.2-astra!
       assert.equal(recs.verify?.effort, "high");
-
-      // Interactive ModelConfigOverlay: Toggle All Off (`x`), then select 1 model (`enter`), then Enable All (`a`)
-      let latestCfg = cfg;
-      const fakeClient = {
-        request: async (_op: string, params?: Record<string, unknown>) => {
-          const patch = (params?.patch ?? {}) as { catalog?: typeof cfg.catalog };
-          latestCfg = { ...latestCfg, catalog: { ...latestCfg.catalog, ...(patch.catalog ?? {}) } };
-          return latestCfg;
-        },
-      } as unknown as DaemonClient;
-
-      const overlay = new ModelConfigOverlay(
-        theme,
-        fakeClient,
-        process.cwd(),
-        cfg,
-        (next) => {
-          latestCfg = next;
-        },
-        () => {},
-        () => {},
-        models,
-      );
-
-      // 1. Toggle ALL off with 'x'
-      overlay.handleInput("x");
-      assert.equal(latestCfg.catalog.modelFilterMode, "allowlist");
-      assert.deepEqual(latestCfg.catalog.enabledModels, []);
-      assert.equal(models.filter((m) => isModelEnabledInCatalog(m.id, latestCfg.catalog)).length, 0);
-
-      // 2. Toggle first model ON with Enter
-      overlay.handleInput("\r");
-      assert.equal(latestCfg.catalog.modelFilterMode, "allowlist");
-      assert.deepEqual(latestCfg.catalog.enabledModels, ["openai/gpt-6.2-astra"]);
-      assert.equal(isModelEnabledInCatalog("openai/gpt-6.2-astra", latestCfg.catalog), true);
-      assert.equal(isModelEnabledInCatalog("openai/gpt-6.2-sol", latestCfg.catalog), false);
-
-      // 3. Enable ALL with 'a'
-      overlay.handleInput("a");
-      assert.equal(latestCfg.catalog.modelFilterMode, "all");
-      assert.deepEqual(latestCfg.catalog.disabledModels, []);
-      assert.equal(models.every((m) => isModelEnabledInCatalog(m.id, latestCfg.catalog)), true);
-
-      // Width safety check
-      for (const w of [48, 80, 120]) {
-        for (const line of overlay.render(w)) {
-          assert.ok(visibleWidth(line) <= w, `ModelConfigOverlay overflowed ${w}: ${visibleWidth(line)}`);
-        }
-      }
 
       // Verify ModelCatalogCompiler filters disabled models out unless includeDisabled=true
       const compiler = new ModelCatalogCompiler({
@@ -578,46 +380,6 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
       };
       assert.equal(agentModelsB.sessionModelContext, null);
 
-      // ModelPickerOverlay renders the banner when set (width-safe across 48/80/120) and omits it when null
-      const theme = createTheme();
-      const catalogWithCtx: CompiledModelCatalog = {
-        syncedAt: new Date().toISOString(),
-        sources: ["fixture"],
-        sessionModelContext: guidance,
-        models: sampleModels(),
-      };
-      const pickerWithCtx = new ModelPickerOverlay(
-        theme,
-        client,
-        repoDir,
-        catalogWithCtx,
-        null,
-        null,
-        () => {},
-        () => {},
-        () => {},
-      );
-      for (const w of [48, 80, 120]) {
-        const lines = pickerWithCtx.render(w);
-        assert.ok(lines.some((l) => l.includes("Session model context:")));
-        for (const l of lines) {
-          assert.ok(visibleWidth(l) <= w, `ModelPickerOverlay overflowed ${w}: ${visibleWidth(l)}`);
-        }
-      }
-
-      const pickerNoCtx = new ModelPickerOverlay(
-        theme,
-        client,
-        repoDir,
-        { ...catalogWithCtx, sessionModelContext: null },
-        null,
-        null,
-        () => {},
-        () => {},
-        () => {},
-      );
-      assert.equal(pickerNoCtx.render(80).some((l) => l.includes("Session model context:")), false);
-
       // Clearing via empty string resets to null
       const cleared = (await daemon.director.executeDirectorMcpTool(chatA.session.id, "set_model_selection_context", {
         context: "",
@@ -636,15 +398,8 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
     }
   });
 
-  it("reconciles dynamic run status, native goal card printing, subagent-wait indicator, and clean rollover handoffs", async () => {
-    // 1. Subagent wait vs Director thinking classification
-    assert.equal(isSubagentWaitTool("wait_tasks"), true);
-    assert.equal(isSubagentWaitTool("mcp__harness__wait_children"), true);
-    assert.equal(isSubagentWaitTool("goal_trigger_review"), true);
-    assert.equal(isSubagentWaitTool("goal_list"), false);
-    assert.equal(isSubagentWaitTool("list_models"), false);
-
-    // 2. Dynamic run status never contradicts running or settled tasks
+  it("reconciles dynamic run status, native goal card printing, and clean rollover handoffs", async () => {
+    // 1. Dynamic run status never contradicts running or settled tasks
     const repoDir = initTempGitRepo();
     const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-dyn-status-"));
     const sockPath = join(stateDir, "d.sock");
@@ -677,10 +432,6 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
 
       const effWhileRunning = daemon.orchestrator.getEffectiveRun(runWithChild.id)!;
       assert.equal(effWhileRunning.status, "active", "Run with running task must NEVER report completed");
-      assert.equal(
-        effectiveRunStatus({ run: { ...runWithChild, status: "completed" }, tasks: [daemon.db.getTask(t1.id)!, daemon.db.getTask(t2.id)!], escalations: [], quotaPause: null }),
-        "active",
-      );
 
       // Run wrongly stuck in `active` after all tasks finished (e.g. director-tasks-* or crashed finish) -> must report `completed`!
       daemon.db.updateTask(t2.id, { status: "completed" });
@@ -715,22 +466,13 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
       })) as { id: string; presentation_id?: string };
       assert.ok(created.presentation_id);
 
-      const detailRes = await client.request<{ display: ToolDisplayPayload }>("goal.get", {
+      const detailRes = await client.request<{ display: { kind: string } }>("goal.get", {
         goalId: created.id,
         persistChatSessionId: chat.session.id,
       });
       assert.equal(detailRes.display.kind, "goal_detail");
-      const theme = createTheme();
-      const rendered = renderToolOutput(detailRes.display, 100, theme);
-      const plain = rendered.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
-      assert.ok(plain.includes("╭─"));
-      assert.ok(plain.includes("Native Goal Card"));
-      assert.ok(plain.includes("$ bun test"));
-      assert.ok(plain.includes("Unrelated refactor"));
-      assert.ok(plain.includes("╰─"));
-      for (const l of rendered) assert.ok(visibleWidth(l) <= 100);
 
-      const tableRes = await client.request<{ display: ToolDisplayPayload }>("goal.table_display", {
+      const tableRes = await client.request<{ display: { kind: string } }>("goal.table_display", {
         repoRoot: repoDir,
         chatSessionId: chat.session.id,
         persistChatSessionId: chat.session.id,
@@ -918,28 +660,6 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
       assert.equal(coverage.find((c) => c.profileId === "acp:codex")?.source, "local_session");
       assert.equal(coverage.find((c) => c.profileId === "acp:claude")?.source, "acp_passive");
       assert.equal(coverage.find((c) => c.profileId === "acp:amp")?.source, "none");
-
-      // QuotaOverlay renders BOTH the endpoint-in-settings note AND the live harvested quota table + profile coverage!
-      const theme = createTheme();
-      const overlay = new QuotaOverlay(
-        theme,
-        {} as unknown as DaemonClient,
-        { configured: false, snapshot: effJson as unknown as Record<string, unknown>, coverage },
-        () => {},
-        () => {},
-      );
-      for (const w of [60, 90, 120]) {
-        const lines = overlay.render(w);
-        const plain = lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
-        const flat = plain.replace(/\s+/g, " ");
-        assert.ok(flat.includes("Quota Endpoint URL"));
-        assert.ok(flat.includes("/settings"));
-        assert.ok(plain.includes("Codex"));
-        assert.ok(plain.includes("acp:amp"));
-        for (const l of lines) {
-          assert.ok(visibleWidth(l) <= w, `QuotaOverlay overflowed ${w}: ${visibleWidth(l)}`);
-        }
-      }
     } finally {
       rmSync(codexHome, { recursive: true, force: true });
     }
@@ -1032,24 +752,7 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
       assert.equal(directorWakePrompts.length, 1, "Director must be woken automatically by Goal run settlement event");
       assert.ok(directorWakePrompts[0]!.includes(goal.id));
 
-      // 4. Transcript header includes model name (+ effort) when opening an agent transcript
-      const theme = createTheme();
-      const tr = new AgentTranscriptOverlay({
-        theme,
-        runId: "run-999",
-        taskId: "t-999",
-        title: "Worker slice",
-        model: "google/gemini-4-neon",
-        effort: "high",
-        viewportRows: 8,
-        startWatch: async () => ({ replay: [], stop: () => {} }),
-        onClose: () => {},
-        requestRender: () => {},
-      });
-      const headerLine = tr.render(100)[0]!.replace(/\x1b\[[0-9;]*m/g, "");
-      assert.ok(headerLine.includes("google/gemini-4-neon · high"));
-
-      // 5. User message while Director is blocked in goal_wait immediately unblocks the wait without killing background work
+      // 4. User message while Director is blocked in goal_wait immediately unblocks the wait without killing background work
       const waitChat = await client.request<{ session: { id: string } }>("chat.create", {
         repoRoot: repoDir,
         title: "Unblock Wait Session",
@@ -1223,33 +926,9 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
         activity: activity1,
       });
       const activityPayload = buildRunActivityDisplay(activity1);
-
-      const theme = createTheme();
-      const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
-
-      for (const payload of [tablePayload, detailPayload, activityPayload]) {
-        for (const w of [60, 100, 120]) {
-          const lines = renderToolOutput(payload, w, theme);
-          assert.ok(lines && lines.length > 0);
-          for (const line of lines) {
-            assert.ok(visibleWidth(line) <= w, `${payload.kind} overflowed width ${w}: ${visibleWidth(line)}`);
-          }
-        }
-      }
-
-      const tableText = renderToolOutput(tablePayload, 120, theme).map(strip).join("\n");
-      assert.equal(tableText.includes("0/4"), false, "Goals table must not show hardcoded 0/4");
-      assert.ok(tableText.includes("implementing"), `Expected dynamic phase in table:\n${tableText}`);
-
-      const detailText = renderToolOutput(detailPayload, 120, theme).map(strip).join("\n");
-      assert.equal(detailText.includes("Review 0/4"), false, "Goal detail must not show hardcoded Review 0/4");
-      assert.ok(detailText.includes("Subagents"), `Expected live subagent breakdown in goal detail:\n${detailText}`);
-      assert.ok(detailText.includes("edit_file src/auth.ts"));
-
-      const activityText = renderToolOutput(activityPayload, 120, theme).map(strip).join("\n");
-      assert.ok(activityText.includes("● implementing"));
-      assert.ok(activityText.includes("1 file edited"));
-      assert.ok(activityText.includes("edit_file src/auth.ts"));
+      assert.equal(tablePayload.kind, "goals_table");
+      assert.equal(detailPayload.kind, "goal_detail");
+      assert.equal(activityPayload.kind, "run_activity");
 
       // Optional report_goal_progress updates live criterion status without running a full Goal review cycle
       const progRes = (await daemon.orchestrator.toolExecutor.execute(run.id, worker.id, "report_goal_progress", {
@@ -1285,7 +964,7 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
       inspectGoalId = goal.id;
       await client.request("chat.send", { chatSessionId: chat.session.id, text: "Show linked run activity" });
       assert.equal(statusRes!.activity?.counts.verifyCompleted, 1);
-      const turns = await client.request<Array<{ role: string; toolName?: string; display?: ToolDisplayPayload }>>("chat.history", {
+      const turns = await client.request<Array<{ role: string; toolName?: string; display?: { kind: string } }>>("chat.history", {
         chatSessionId: chat.session.id,
       });
       const activityTurn = turns.find((t) => t.role === "tool_output" && t.toolName === "run_status");
@@ -1440,20 +1119,6 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
       const firedTurn = history.find((t) => t.event?.kind === "timer.fired");
       assert.ok(schedTurn?.event, "timer.scheduled must be persisted as typed event");
       assert.ok(firedTurn?.event, "timer.fired must be persisted as typed event");
-
-      const theme = createTheme();
-      const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
-      const comp = historyTurnComponent(firedTurn, theme, "model");
-      assert.equal(comp instanceof EventCard, true, "Typed event turns must render as EventCard, not plain chat");
-      for (const w of [50, 80, 120]) {
-        const lines = comp.render(w);
-        assert.ok(lines.length > 0);
-        for (const l of lines) assert.ok(visibleWidth(l) <= w, `EventCard overflowed width ${w}`);
-      }
-      const rendered = comp.render(100).map(strip).join("\n");
-      assert.ok(rendered.includes("EVENT · TIMER FIRED"));
-      assert.ok(rendered.includes("timer-1"));
-      assert.equal(rendered.includes("[Event]"), false, "EventCard must not render raw [Event] string prefixes");
 
       // 3. Subagent `wait_timer` sleeps cleanly with telemetry and wakes early on `child_settled`
       daemon.db.updateTask(parent.id, { status: "running" });
