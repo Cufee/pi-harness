@@ -724,9 +724,26 @@ export class DirectorRuntime {
       // Steer active Tier 1 Orchestrator (or relaunch in-place if settled!) with the structured vN -> vN+1 delta
       const orch = this.db.listTasks(goal.linkedRunId).find((t) => t.tier === 1);
       if (orch) {
+        // Refresh Tier 1's title, objective, and stored handoff goalInvariants so rollovers never replay stale v1 constraints
+        let updatedHandoffJson = orch.handoffJson;
+        if (orch.handoffJson) {
+          try {
+            const parsed = JSON.parse(orch.handoffJson) as {
+              goalInvariants?: string[];
+              architecturalDecisions?: Array<{ decision: string; rationale: string }>;
+              activeRisks?: string[];
+              nextActions?: string[];
+            };
+            parsed.goalInvariants = [updatedObjective];
+            updatedHandoffJson = JSON.stringify(parsed);
+          } catch {
+            // keep existing handoffJson if unparseable
+          }
+        }
         this.db.updateTask(orch.id, {
           title: `Goal ${goal.id} v${goal.version}: ${goal.title}`,
           objective: updatedObjective,
+          ...(updatedHandoffJson !== orch.handoffJson ? { handoffJson: updatedHandoffJson } : {}),
         });
         this.db.blackboardSet(
           goal.linkedRunId,
@@ -877,17 +894,23 @@ export class DirectorRuntime {
       if (targetSha) {
         const wtMgr = this.orchestrator.getWorktreeManager(goal.repoRoot);
         const candidatePath = join(wtMgr.baseDir, "_verify", `${goal.id}-${randomUUID().slice(0, 8)}`);
-        try {
-          const { mkdirSync } = await import("node:fs");
-          mkdirSync(join(wtMgr.baseDir, "_verify"), { recursive: true });
-          await runGit(goal.repoRoot, ["worktree", "add", "--detach", candidatePath, targetSha]);
-          await wtMgr.bootstrapWorktree(candidatePath).catch(() => {});
-          verifyWorktreePath = candidatePath;
-          verifyCwd = candidatePath;
-          verifyRef = targetSha;
-        } catch {
-          verifyWorktreePath = null;
-          verifyCwd = goal.repoRoot;
+        const { mkdirSync } = await import("node:fs");
+        mkdirSync(join(wtMgr.baseDir, "_verify"), { recursive: true });
+        await runGit(goal.repoRoot, ["worktree", "add", "--detach", candidatePath, targetSha]);
+        verifyWorktreePath = candidatePath;
+        verifyCwd = candidatePath;
+        verifyRef = targetSha;
+        // Do NOT silently swallow bootstrap failures — fail verification cleanly if setupCommand fails
+        await wtMgr.bootstrapWorktree(candidatePath);
+      } else {
+        // Fail closed when targetBranch cannot be resolved and host checkout is on a different branch
+        const headBranch = await runGit(goal.repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])
+          .then((r) => r.stdout)
+          .catch(() => null);
+        if (headBranch && headBranch !== run.baseBranch) {
+          throw new Error(
+            `Cannot verify goal ${goal.id}: target branch '${run.baseBranch}' does not resolve (host checkout is '${headBranch}').`,
+          );
         }
       }
     }
@@ -918,6 +941,7 @@ export class DirectorRuntime {
           blockingIssues: gateResult.results.filter((r) => !r.passed).map((r) => r.evidence),
           summary: "Deterministic verification gates failed; bouncing back to Tier 1 before LLM review.",
           diffHash: gateResult.diffHash,
+          spentUsd: this.sumRunCostUsd(goal.linkedRunId),
         });
         await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
         return outcome;
@@ -1139,6 +1163,7 @@ export class DirectorRuntime {
               submittedVerdict?.blockingIssues ?? (submittedVerdict ? [] : ["Reviewer did not return a structured verdict"]),
             summary: submittedVerdict?.summary ?? "Incomplete review output",
             diffHash: gateResult.diffHash,
+            spentUsd: this.sumRunCostUsd(goal.linkedRunId),
           });
           const summary = `${recorded.review.verdict}: ${recorded.review.summary}`.slice(0, 2000);
           const dossier = writeTaskDossier(this.db, reviewRun, reviewerTask.id, "review.json",
@@ -1248,6 +1273,21 @@ export class DirectorRuntime {
     }
   }
 
+  /** Cancels all active Director turns and in-flight Done-Reviews (used by `/stop`). */
+  async cancelAllActive(reason = "Stopped by user"): Promise<{ cancelledChats: number; cancelledReviews: number }> {
+    let cancelledChats = 0;
+    for (const chatId of [...this.activeChats.keys()]) {
+      if (await this.cancelChat(chatId)) cancelledChats++;
+    }
+    let cancelledReviews = 0;
+    for (const [goalId, abort] of [...this.activeReviews.entries()]) {
+      abort.abort(new Error(reason));
+      this.activeReviews.delete(goalId);
+      cancelledReviews++;
+    }
+    return { cancelledChats, cancelledReviews };
+  }
+
   /** Cancels an in-flight Tier 0 Director turn immediately (e.g. when user presses Esc). */
   async cancelChat(chatSessionId: string): Promise<boolean> {
     const active = this.activeChats.get(chatSessionId);
@@ -1302,15 +1342,33 @@ export class DirectorRuntime {
     return turn;
   }
 
+  private sumRunCostUsd(runId: string | null): number {
+    if (!runId) return 0;
+    const rows = this.db.db
+      .prepare("SELECT payload_json FROM events WHERE run_id = ? AND type = 'agent.usage'")
+      .all(runId) as Array<{ payload_json: string }>;
+    let total = 0;
+    for (const r of rows) {
+      try {
+        const p = JSON.parse(r.payload_json) as { costUsd?: unknown };
+        if (typeof p.costUsd === "number" && Number.isFinite(p.costUsd) && p.costUsd > 0) total += p.costUsd;
+      } catch {
+        // ignore malformed usage payload
+      }
+    }
+    return total;
+  }
+
   private directorExecutor(session: { id: string; repoRoot: string }, signal: AbortSignal, onToolEvent?: RunnerCallbacks["onToolEvent"]) {
     const presentations = new Map<string, { toolName: string; build: () => ToolDisplayPayload }>();
     return createCodeModeExecutor({
       ...this.config.codeExec,
       mode: effectiveCodeMode(this.config.codeMode),
       allowedTools: () => DIRECTOR_TOOLS,
-      execute: async (name, args) => {
+      execute: async (name, args, execSignal) => {
+        const effectiveSignal = execSignal ?? signal;
         if (name === "present_result") {
-          signal.throwIfAborted();
+          effectiveSignal.throwIfAborted();
           const id = String(args.presentation_id);
           const selected = presentations.get(id);
           if (!selected) throw new Error("Unknown or already presented result in this turn");
@@ -1318,13 +1376,14 @@ export class DirectorRuntime {
           presentations.delete(id);
           return { presented: true };
         }
-        return this.executeDirectorTool(session.id, session.repoRoot, name, args, signal, (build) => {
+        return this.executeDirectorTool(session.id, session.repoRoot, name, args, effectiveSignal, (build) => {
           const id = randomUUID();
           presentations.set(id, { toolName: name, build });
           return id;
         });
       },
       artifactsDir: resolve(session.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts"),
+      pythonCacheDir: join(this.config.stateDir, "code-mode", "python"),
       saveOutput: async (name, json) => {
         signal.throwIfAborted();
         const run = await this.orchestrator.ensureDirectorTaskRun(session.id, session.repoRoot);
@@ -1455,11 +1514,11 @@ export class DirectorRuntime {
         kind: "orchestrator",
         cwd: session.repoRoot,
         toolPolicy: "control_plane_only",
-        systemPrompt: buildDirectorSystemPrompt(mode),
+        systemPrompt: buildDirectorSystemPrompt(mode, this.config.codeExec),
         initialPrompt: prompt,
         model: wireModel,
         effort: session.effort,
-        maxTurns: this.config.rollover.directorMaxTurns,
+        maxTurns: 0,
         quotaRetryTimeoutMs: this.config.quotaRetry.nativeRetryTimeoutMs,
         tools: executor.tools(),
         executeTool: executor.execute,
@@ -1494,9 +1553,6 @@ export class DirectorRuntime {
       if (res.stopReason === "quota_paused") {
         const pauseLine = "Paused for quota. Retry later or switch models with /model.";
         content = content ? `${content}\n\n${pauseLine}` : pauseLine;
-      } else if (res.stopReason === "max_turns") {
-        const turnLine = `Reached Director turn limit (${this.config.rollover.directorMaxTurns}); send a follow-up to continue.`;
-        content = content ? `${content}\n\n${turnLine}` : turnLine;
       } else if (!content && res.toolFailures?.length) {
         content = `Stopped after tool failure without a final response:\n${res.toolFailures.map((f) => `- ${f}`).join("\n")}`;
       } else if (!content && !active.flushedText) {

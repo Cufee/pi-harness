@@ -1,5 +1,6 @@
 import type { SlashCommand as TuiSlashCommand } from "@earendil-works/pi-tui";
 import type { PaletteCommand } from "./overlays.js";
+import { COMPOSER_SHORTCUT_HELP } from "./primitives/composer.js";
 import type { HarnessTheme } from "./primitives/index.js";
 
 /**
@@ -32,7 +33,7 @@ export const COMMANDS: readonly SlashCommand[] = [
   { name: "settings", description: "Configure defaults, Quota Endpoint & external ACP CLIs", modes: ["chat"], key: "Ctrl+," },
   { name: "status", description: "Daemon health, active model/effort, CLIs & goals summary", modes: ["chat"] },
   { name: "clear", description: "Clear the local transcript", modes: ["chat"] },
-  { name: "stop", description: "Stop this autonomous run", modes: ["run"] },
+  { name: "stop", description: "Stop all running agents, reviews, and active runs", modes: ["chat", "run"] },
   { name: "help", description: "List commands & keyboard shortcuts", modes: ["chat", "run"] },
   { name: "quit", description: "Leave (background agents keep running; harnessd stops if idle)", modes: ["chat", "run"], key: "Ctrl+]" },
 ];
@@ -80,11 +81,13 @@ const SHORTCUTS: Record<CommandMode, Array<[string, string]>> = {
     ["Ctrl+Q / Alt+Enter", "Enqueue message for after the active turn"],
     ["Ctrl+S", "Send queued message immediately"],
     ["Ctrl+R", "Recall queued message into input"],
+    ["Ctrl+X", "Expand / collapse latest tool calls"],
     ["Esc", "Press twice to stop active turn / close overlay"],
     ["Ctrl+O", "Command palette (keeps your draft)"],
     ["Ctrl+C", "Clear input / cancel turn; twice to quit"],
   ],
   run: [
+    ["Ctrl+X", "Expand / collapse latest tool calls"],
     ["Ctrl+O", "Command palette (keeps your draft)"],
     ["Ctrl+C", "Clear input; twice to quit"],
   ],
@@ -95,15 +98,16 @@ export function renderHelp(mode: CommandMode, theme?: HarnessTheme): string[] {
   const accent = theme?.accent ?? ((s: string) => s);
   const dim = theme?.dim ?? ((s: string) => s);
   const cmds = commandsFor(mode);
+  const shortcuts: ReadonlyArray<readonly [string, string]> = [...SHORTCUTS[mode], ...COMPOSER_SHORTCUT_HELP];
   const usage = (c: SlashCommand) => `/${c.name}${c.args ? ` ${c.args}` : ""}`;
-  const colW = Math.max(...cmds.map((c) => usage(c).length)) + 2;
+  const colW = Math.max(...cmds.map((c) => usage(c).length), ...shortcuts.map(([key]) => key.length)) + 2;
   const lines = [bold(mode === "chat" ? "Commands & Shortcuts" : "Attached-Run Commands")];
   for (const c of cmds) {
     const u = usage(c);
     lines.push(`${accent(`/${c.name}`)}${c.args ? ` ${c.args}` : ""}${" ".repeat(colW - u.length)}${c.description}${c.key ? ` ${dim(`(${c.key})`)}` : ""}`);
   }
-  for (const [key, desc] of SHORTCUTS[mode]) {
-    lines.push(`${accent(key)}${" ".repeat(Math.max(1, colW - key.length))}${desc}`);
+  for (const [key, desc] of shortcuts) {
+    lines.push(`${accent(key)}${" ".repeat(colW - key.length)}${desc}`);
   }
   if (mode === "run") lines.push(dim("Type text to steer the focused agent (or resume if quota-paused)."));
   return lines;

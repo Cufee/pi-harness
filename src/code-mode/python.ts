@@ -195,6 +195,7 @@ const jobs = new Map<string, Job>();
  * is cancelled only when every caller has aborted; completed work is reused from the on-disk cache.
  */
 export async function providePython(packages: string[], cacheDir?: string, signal?: AbortSignal): Promise<PythonRuntime> {
+  if (signal?.aborted) throw new Error("Code Mode cancelled");
   const specs = normalizePackages(packages);
   const base = pythonCacheRoot(cacheDir);
   await mkdir(base, { recursive: true, mode: 0o700 });

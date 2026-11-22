@@ -32,7 +32,7 @@ case "$INSTALL_DIR$BIN_DIR" in
   *[\"\$\`\\]*) die 'paths must not contain " $ ` or \' ;;
 esac
 
-for tool in curl unzip tar find sort cut awk uname; do
+for tool in curl unzip tar grep find sort cut awk uname; do
   command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
 done
 if command -v sha256sum >/dev/null 2>&1; then sha256() { sha256sum "$@"; }
@@ -119,7 +119,7 @@ ln -sfn "$BUN" "$REL/.bun" # each release runs with the Bun it was installed wit
 # --- activate: current symlink, then launcher (each swapped atomically) -----
 rm -f "$INSTALL_DIR/current.new"
 ln -s "releases/$ID" "$INSTALL_DIR/current.new"
-mv -fT "$INSTALL_DIR/current.new" "$INSTALL_DIR/current" 2>/dev/null || mv -fh "$INSTALL_DIR/current.new" "$INSTALL_DIR/current"
+"$BUN" -e 'require("node:fs").renameSync(process.argv[1], process.argv[2])' "$INSTALL_DIR/current.new" "$INSTALL_DIR/current"
 
 cat > "$BIN_DIR/.pi-harness.new" <<EOF
 #!/bin/sh

@@ -46,6 +46,7 @@ export interface CodeModeExecutorOptions {
   allowedTools: () => ToolDefinition[];
   execute: CodeExecOptions["callTool"];
   artifactsDir: string;
+  pythonCacheDir?: string;
   saveOutput?: CodeExecOptions["saveOutput"];
   signal?: AbortSignal;
   defaultTimeoutMs?: number; maxTimeoutMs?: number; maxOutputChars?: number;
@@ -59,7 +60,8 @@ export function createCodeModeExecutor(opts: CodeModeExecutorOptions) {
       if (opts.mode !== "off" && (name === CODE_EXEC_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME)) {
         return dispatch(name, args, {
           tools: opts.allowedTools(), callTool: opts.execute, artifactsDir: opts.artifactsDir,
-          saveOutput: opts.saveOutput, signal: opts.signal, maxOutputChars: opts.maxOutputChars, onToolEvent: opts.onToolEvent,
+          pythonCacheDir: opts.pythonCacheDir, saveOutput: opts.saveOutput, signal: opts.signal,
+          maxOutputChars: opts.maxOutputChars, onToolEvent: opts.onToolEvent,
         }, opts.defaultTimeoutMs, opts.maxTimeoutMs);
       }
       return opts.execute(name, args);

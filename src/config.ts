@@ -101,8 +101,6 @@ export interface RolloverConfig {
   workerMaxTurns: number;
   /** Hard turn cap for Tier 3 Task Agents (default 40) */
   taskMaxTurns: number;
-  /** Hard turn cap for Tier 0 Director chat turns (default 20) */
-  directorMaxTurns: number;
   /** Hard turn cap for Goal Done-Review agents (default 12) */
   reviewerMaxTurns: number;
   /** Tool output byte threshold above which output is externalized to artifact file (default 2048) */
@@ -166,7 +164,7 @@ export interface HarnessConfig {
   stateDir: string;
   socketPath: string;
   profiles: RunnerProfileConfig[];
-  /** Optional external stdio MCP servers forwarded automatically to all non-control-plane ACP agents (e.g. ast-grep-mcp, octofs, serena). */
+  /** Optional external stdio MCP servers forwarded automatically to shell-enabled ACP agents (Tier 2 workers, Tier 3 verify/execute, and isolated Done-Reviewers). */
   externalMcpServers?: ExternalMcpServerConfig[];
   codeMode: CodeMode;
   codeExec?: { defaultTimeoutMs?: number; maxTimeoutMs?: number; maxOutputChars?: number };
@@ -254,7 +252,6 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
     orchestratorMaxTurns: 200,
     workerMaxTurns: 120,
     taskMaxTurns: 40,
-    directorMaxTurns: 20,
     reviewerMaxTurns: 12,
     externalizeBytes: 2048,
     maxGenerations: 12,

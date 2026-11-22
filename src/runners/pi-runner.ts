@@ -168,7 +168,9 @@ export class PiRunner {
     }));
 
     try {
-      for (let turn = 0; turn < req.maxTurns; turn++) {
+      const maxTurnsLimit = req.maxTurns > 0 ? req.maxTurns : Number.POSITIVE_INFINITY;
+      for (let turn = 0; turn < maxTurnsLimit; turn++) {
+        req.callbacks.onTurn?.(turn + 1);
         if (cancelled || runAbort.signal.aborted) {
           return { text: lastText, stopReason: cancelledStopReason(), usage: lastUsage };
         }

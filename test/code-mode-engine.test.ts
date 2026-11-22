@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "bun:test";
 import {
@@ -9,13 +9,16 @@ import {
   createCodeModeExecutor,
   effectiveCodeMode,
   exposedTools,
+  generatePythonDeclarations,
   generateSdkDeclarations,
   handleCodeModeTool,
   runCodeExec,
   toolSearch,
   type CodeExecOptions,
+  type CodeExecResult,
   type CodeExecToolEvent,
 } from "../src/code-mode/index.js";
+import { providePython } from "../src/code-mode/python.js";
 import type { ToolDefinition } from "../src/runners/types.js";
 
 const sandboxEnabled = effectiveCodeMode("collapsed") === "collapsed";
@@ -99,6 +102,33 @@ describe("Code Mode discovery", () => {
         assert.match(prompt, pattern);
       }
     }
+  });
+
+  it("generates Python declarations with valid Python Literal values for booleans and null", () => {
+    const enumTool: ToolDefinition = {
+      name: "set_flag",
+      description: "Set a mixed enum value",
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: { enum: [true, false, null, "ok"] },
+        },
+        required: ["value"],
+      },
+    };
+    const py = generatePythonDeclarations([enumTool]);
+    assert.match(py, /Literal\[True, False, None, ['"]ok['"]\]/);
+    assert.doesNotMatch(py, /Literal\[[^\]]*\b(?:true|false|null)\b/);
+  });
+
+  it("documents default 300s/1800s and custom timeout options in codeModePromptSection", () => {
+    if (!sandboxEnabled) {
+      assert.equal(codeModePromptSection("collapsed", { defaultTimeoutMs: 45_000, maxTimeoutMs: 120_000 }), "");
+      return;
+    }
+    assert.match(codeModePromptSection("collapsed"), /default 300s, maximum 1800s/);
+    assert.match(codeModePromptSection("hybrid", { defaultTimeoutMs: 45_000, maxTimeoutMs: 120_000 }), /default 45s, maximum 120s/);
+    assert.match(codeModePromptSection("collapsed", { defaultTimeoutMs: 500_000, maxTimeoutMs: 90_000 }), /default 90s, maximum 90s/);
   });
 });
 
@@ -371,5 +401,37 @@ describe("Code Mode execution", () => {
     assert.ok(result.preview.length < 512);
     assert.notEqual(result.output, payload);
     assert.deepEqual(readdirSync(scratchRoot), []);
+  });
+
+  it("rejects providePython immediately on an already-aborted AbortSignal without creating pythonCacheDir", async () => {
+    const cacheDir = join(root, "never-created-py-cache");
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+      providePython(["pyyaml==6.0.3"], cacheDir, controller.signal),
+      /Code Mode cancelled/,
+    );
+    assert.equal(existsSync(cacheDir), false);
+  });
+
+  itWithSandbox("forwards pythonCacheDir from createCodeModeExecutor into Python provisioning", async () => {
+    // Place a regular file at pythonCacheDir so providePython fails immediately at mkdir without network access.
+    const cacheBlocker = join(root, "python-cache-blocker");
+    writeFileSync(cacheBlocker, "not a directory");
+    const executor = createCodeModeExecutor({
+      mode: "collapsed",
+      allowedTools: () => [lookup],
+      async execute() { assert.fail("Unexpected direct tool delegation"); },
+      artifactsDir,
+      pythonCacheDir: cacheBlocker,
+      defaultTimeoutMs: 2_000,
+    });
+    const result = await executor.execute("code_exec", {
+      language: "python",
+      code: "from harness import output\noutput(1)",
+    }) as CodeExecResult;
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? "", /Python provisioning failed:/);
+    assert.ok((result.error ?? "").includes(cacheBlocker), `Expected error to reference pythonCacheDir (${cacheBlocker}), got: ${result.error}`);
   });
 });

@@ -139,6 +139,11 @@ export function buildRunActivitySummary(db: ControlPlaneDb, runId: string, now =
           const val = input?.[key];
           if (typeof val === "string" && val.trim()) candidatePaths.push(val.trim());
         }
+        // Fallback: parse path field from previewed `args` string emitted by AcpRunner/PiRunner
+        if (candidatePaths.length === 0 && typeof payload.args === "string") {
+          const m = /"(?:path|file_path|filePath|target_file|filename)"\s*:\s*"([^"]+)"/.exec(payload.args);
+          if (m?.[1]?.trim()) candidatePaths.push(m[1].trim());
+        }
         if (Array.isArray(payload.locations)) {
           for (const loc of payload.locations) {
             if (loc && typeof loc === "object" && typeof (loc as { path?: unknown }).path === "string") {

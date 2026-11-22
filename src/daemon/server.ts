@@ -1151,6 +1151,30 @@ export class HarnessDaemon {
         await this.orchestrator.stopRun(String(p.runId), typeof p.reason === "string" ? p.reason : "Stopped by user");
         return { stopped: true };
 
+      case "runs.stop_all": {
+        const reason = typeof p.reason === "string" && p.reason.trim() ? p.reason.trim() : "Stopped by user (/stop)";
+        const repoFilter = typeof p.repoRoot === "string" && p.repoRoot.trim() ? p.repoRoot.trim() : undefined;
+        const runs = this.db.listRuns(200).filter((r) => {
+          if (repoFilter && r.repoRoot !== repoFilter) return false;
+          const eff = this.orchestrator.getEffectiveRun(r.id);
+          return eff?.status === "active" || eff?.status === "paused_quota";
+        });
+        const stoppedRunIds: string[] = [];
+        for (const r of runs) {
+          await this.orchestrator.stopRun(r.id, reason);
+          stoppedRunIds.push(r.id);
+        }
+        const { cancelledChats, cancelledReviews } = await this.director.cancelAllActive(reason);
+        // Also cancel any pending wakeups so stopped runs don't immediately re-wake the Director
+        this.pendingWakeups.clear();
+        return {
+          stopped: true,
+          stoppedRunIds,
+          cancelledChats,
+          cancelledReviews,
+        };
+      }
+
       case "run.resume": {
         const runId = String(p.runId);
         return await this.orchestrator.resumeRun(runId, {

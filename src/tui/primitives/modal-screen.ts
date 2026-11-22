@@ -1,14 +1,20 @@
-import { TuiMainScreen, type Terminal, type TuiStopOptions } from "@earendil-works/pi-tui";
-import { DISABLE_MOUSE_WHEEL_SEQ, dispatchLeftPresses, ENABLE_MOUSE_WHEEL_SEQ } from "./mouse.js";
+import { TuiMainScreen, type Terminal } from "@earendil-works/pi-tui";
+import { DISABLE_MOUSE_WHEEL_SEQ, dispatchLeftPresses } from "./mouse.js";
 
 const FAINT = "\x1b[2m";
-// Reset (`0`/empty) and normal-intensity (`22`) SGRs would end the faint attribute mid-line.
-const INTENSITY_RESET = /\x1b\[(?:0|22)?m/g;
+// Reset (`0`/empty) and normal-intensity (`22`) SGRs (standalone or compound) would end the faint attribute mid-line.
+const SGR_SEQUENCE = /\x1b\[([0-9;]*)m/g;
 
-function dimLine(line: string): string {
+export function dimLine(line: string): string {
   // Image escape sequences must stay untouched at the line start.
   if (!line || line.includes("\x1b_G") || line.includes("\x1b]1337;File=")) return line;
-  return FAINT + line.replace(INTENSITY_RESET, (sgr) => sgr + FAINT);
+  return (
+    FAINT +
+    line.replace(SGR_SEQUENCE, (sgr, params: string) => {
+      const codes = params.split(";");
+      return codes.some((code) => code === "" || code === "0" || code === "22") ? sgr + FAINT : sgr;
+    })
+  );
 }
 
 /**
@@ -35,16 +41,6 @@ export class ModalScreen extends TuiMainScreen {
       width: previousWidth, height: previousLines.length, shift: false, alt: false, ctrl: false,
     });
     if (result?.handled && result.render !== false) this.requestRender();
-  }
-
-  protected override afterTerminalStart(): void {
-    super.afterTerminalStart();
-    this.terminal.write(ENABLE_MOUSE_WHEEL_SEQ);
-  }
-
-  protected override beforeTerminalStop(options: TuiStopOptions): void {
-    this.terminal.write(DISABLE_MOUSE_WHEEL_SEQ);
-    super.beforeTerminalStop(options);
   }
 
   protected override getExitRestorePrefix(): string {

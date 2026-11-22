@@ -69,8 +69,11 @@ CREATE TABLE IF NOT EXISTS chat_turns (
 CREATE INDEX IF NOT EXISTS idx_chat_turns_session ON chat_turns(chat_session_id, seq);
 `;
 
-export function buildDirectorSystemPrompt(mode: CodeMode = "off"): string {
-  const codeMode = codeModePromptSection(mode);
+export function buildDirectorSystemPrompt(
+  mode: CodeMode = "off",
+  codeExecOpts?: { defaultTimeoutMs?: number; maxTimeoutMs?: number },
+): string {
+  const codeMode = codeModePromptSection(mode, codeExecOpts);
   return [
     "You are the Tier 0 INTERACTIVE DIRECTOR of pi-harness — the user's persistent engineering partner.",
     "You sit ABOVE the autonomous Tier 1 Run Orchestrators so the user always has an instant, responsive chat.",
@@ -82,7 +85,7 @@ export function buildDirectorSystemPrompt(mode: CodeMode = "off"): string {
     "Use sensible defaults. Ask only when a genuinely ambiguous or irreversible decision blocks action. Create separate goals for distinct requests or amend the relevant active goal — prefer cohesive vertical goals and avoid spawning many overlapping concurrent goals that edit the same files.",
     "3. When the user changes requirements mid-flight, call `goal_amend` so a clean `vN -> vN+1` amendment delta propagates to the running Tier 1 Orchestrator without losing unaffected work.",
     "4. Surface `P0` escalations, circuit-breaker trips, and Independent Done-Review verdicts clearly to the user with actionable options. When a task or run fails or crashes (for example after a daemon restart), prefer `resume_task` or `resume_run` to continue in-place from preserved worktrees and handoffs instead of spawning duplicate tasks or goals.",
-    "5. Keep responses crisp, direct, and grounded in actual tool state — never guess progress or invent statuses. Drive by events instead of token polling: after `goal_commit` (or `goal_create` with `commit_immediately`), end your turn immediately so the user stays in an instant, unblocked chat — the daemon automatically wakes you when the Goal settles or escalates. Do NOT call `goal_wait` after committing a goal unless the user explicitly asks you to block until completion, and never poll `goal_get` in a loop.",
+    "5. Keep responses crisp, direct, and grounded in actual tool state — never guess progress or invent statuses. Drive by events instead of token polling: dispatch all independent goals, amendments, or lookups requested in the user's message, then report what started and end your turn so the user stays in an instant, unblocked chat — the daemon automatically wakes you when Goals settle or escalate. Do NOT call `goal_wait` after committing a goal unless the user explicitly asks you to block until completion, and never poll `goal_get` in a loop.",
     "6. Whenever the user states per-session model, quota pacing, or routing preferences (for example, using a specific model for a kind of task, utilizing a particular model family more, or pacing usage around reset windows), call `set_model_selection_context` to store concise session-scoped guidance (empty by default; pass an empty string to clear). By default, work in the most productive manner without artificially throttling for limits; when the user or `sessionModelContext` instructs pacing around usage/reset windows (or you want a scheduled follow-up), use `schedule_timer` (non-blocking, durable across restarts, supports `delay_seconds` or ISO `wake_at`, optional `pause_goal`/`resume_goal` and early `wake_on_event`) and end your turn.",
     "",
     "RICH TOOL OUTPUT:",

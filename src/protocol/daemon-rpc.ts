@@ -61,6 +61,7 @@ export type DaemonOp =
   | "run.list"
   | "run.get"
   | "run.stop"
+  | "runs.stop_all"
   | "run.resume"
   | "run.schedule_resume"
   | "replay.page"

@@ -267,12 +267,18 @@ export class EventCard implements Component {
     if (this.cachedWidth === width) return this.cachedLines;
 
     const event = this.event;
-    if (event.kind === "goal.committed") return new GoalNotice(this.theme, `${event.goalId} started`).render(width);
+    const cacheNotice = (text: string): readonly string[] => {
+      const lines = new GoalNotice(this.theme, text).render(width);
+      this.cachedWidth = width;
+      this.cachedLines = lines;
+      return lines;
+    };
+    if (event.kind === "goal.committed") return cacheNotice(`${event.goalId} started`);
     if (event.kind === "goal.settled" && event.runStatus === "completed" && event.openEscalations === 0) {
-      return new GoalNotice(this.theme, `${event.goalId} completed`).render(width);
+      return cacheNotice(`${event.goalId} completed`);
     }
     if (event.kind === "goal.reviewed" && event.status === "achieved" && !event.circuitBreakerTripped) {
-      return new GoalNotice(this.theme, `${event.goalId} achieved`).render(width);
+      return cacheNotice(`${event.goalId} achieved`);
     }
     const { icon, status, badge, headline, detail, tone } = this.describe(event);
     const paint =

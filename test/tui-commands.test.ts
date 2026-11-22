@@ -9,7 +9,7 @@ import {
   resolveCommand,
 } from "../src/tui/commands.js";
 
-const CHAT = ["runs", "goals", "sessions", "new", "model", "effort", "quota", "worktrees", "kb", "settings", "status", "clear", "help", "quit"];
+const CHAT = ["runs", "goals", "sessions", "new", "model", "effort", "quota", "worktrees", "kb", "settings", "status", "clear", "stop", "help", "quit"];
 const RUN = ["runs", "sessions", "stop", "help", "quit"];
 const REMOVED = ["models", "attach", "cli", "acp", "profile", "profiles", "review", "resume", "tree", "detach", "q", "exit"];
 
@@ -25,7 +25,7 @@ describe("slash command registry", () => {
     for (const mode of ["chat", "run"] as const) {
       for (const name of REMOVED) expect(resolveCommand(mode, `/${name}`)).toBeNull();
     }
-    expect(resolveCommand("chat", "/stop")).toBeNull();
+    expect(resolveCommand("chat", "/stop")).toMatchObject({ cmd: { name: "stop" }, arg: "" });
     expect(resolveCommand("run", "/model")).toBeNull();
     expect(resolveCommand("run", "/goals")).toBeNull();
     // Exact names only: no prefix matching.
@@ -64,9 +64,30 @@ describe("slash command registry", () => {
       expect(autocompleteCommands(mode).map((c) => c.name)).toEqual(cmds.map((c) => c.name));
       expect(completions(mode, "").map((c) => c.name)).toEqual(cmds.map((c) => c.name));
     }
-    expect(completions("chat", "/s").map((c) => c.name)).toEqual(["sessions", "settings", "status"]);
+    expect(completions("chat", "/s").map((c) => c.name)).toEqual(["sessions", "settings", "status", "stop"]);
     expect(completions("run", "s").map((c) => c.name)).toEqual(["sessions", "stop"]);
     expect(palette("run").find((p) => p.label === "/runs")?.shortcut).toBe("Ctrl+T");
+  });
+
+  test("help includes composer editing shortcuts and aligns all command & shortcut columns cleanly", () => {
+    for (const mode of ["chat", "run"] as const) {
+      const lines = renderHelp(mode);
+      const joined = lines.join("\n");
+      expect(joined).toContain("Ctrl+U / Ctrl+K / Ctrl+W");
+      expect(joined).toContain("Ctrl+- / Ctrl+Z");
+      expect(joined).toContain("Ctrl+X");
+
+      // Check every command & shortcut line aligns its description at the same column (>= 2 spaces padding).
+      const entryLines = lines.slice(1, mode === "run" ? -1 : undefined);
+      const descCols = new Set(
+        entryLines.map((line) => {
+          const m = /\s{2,}(?=\S)/.exec(line);
+          expect(m).not.toBeNull();
+          return m!.index + m![0].length;
+        }),
+      );
+      expect(descCols.size).toBe(1);
+    }
   });
 });
 

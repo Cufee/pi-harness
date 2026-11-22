@@ -735,6 +735,7 @@ export class ControlPlaneToolExecutor {
         allowedTools: () => toolsForTier(task.tier),
         execute: (inner, input, execSignal) => this.execute(runId, taskId, inner, input, execSignal ?? signal),
         artifactsDir: resolve(run.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts"),
+        pythonCacheDir: join(this.config.stateDir, "code-mode", "python"),
         saveOutput: (name, json) => writeCodeOutput(this.db, run, taskId, name, json),
         signal,
         onToolEvent: codeExecEventSink((ev) => this.db.emitEvent(runId, taskId, "agent.tool", ev)),

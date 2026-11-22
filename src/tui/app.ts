@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { fitWidth } from "./primitives/width.js";
-import { type Component, Container, Markdown, Spacer } from "@earendil-works/pi-tui";
+import { type Component, Container, isKeyRelease, Markdown, matchesKey, Spacer } from "@earendil-works/pi-tui";
 import type { CompiledModelCatalog } from "../catalog/compiler.js";
 import type { HarnessConfig } from "../config.js";
 import type { EscalationRecord, EventRecord, ReplayPage, RunRecord, TaskRecord } from "../control-plane/db.js";
@@ -328,6 +328,28 @@ export function preservePendingTools(pending: PendingTools, scrollback: Containe
     if (opts.cardsOnly && !(c instanceof ToolOutputCard)) continue;
     scrollback.addChild(c);
   }
+}
+
+const TOOL_CHAIN_TOGGLE_CLICK = {
+  type: "click" as const,
+  button: "left" as const,
+  x: 0,
+  y: 0,
+  screenX: 0,
+  screenY: 0,
+  width: 1,
+  height: 1,
+  shift: false,
+  alt: false,
+  ctrl: false,
+};
+
+/** Expands or collapses the latest `ToolChain` disclosure card in a `ToolTranscript` via keyboard. */
+export function toggleLatestToolChain(transcript: ToolTranscript): boolean {
+  for (let i = transcript.children.length - 1; i >= 0; i--) {
+    if (transcript.children[i]?.handleMouse?.(TOOL_CHAIN_TOGGLE_CLICK)?.handled) return true;
+  }
+  return false;
 }
 
 /**
@@ -1140,6 +1162,34 @@ export async function runDirectorChatTui(opts: {
         chatContainer.clear();
         chatContainer.addChild(new BannerCard(theme, "pi-harness", `Director Chat · ${session.id}`));
         return tui.requestRender(true);
+      case "stop":
+        return void (async () => {
+          try {
+            const res = (await opts.client.request("runs.stop_all", {
+              reason: "Stopped by user (/stop)",
+            })) as { stoppedRunIds: string[]; cancelledChats: number; cancelledReviews: number };
+            const totalStopped = res.stoppedRunIds.length + res.cancelledChats + res.cancelledReviews;
+            const detail =
+              totalStopped === 0
+                ? "No active agents, runs, or reviews were running."
+                : [
+                    res.stoppedRunIds.length > 0 ? `runs: ${res.stoppedRunIds.join(", ")}` : null,
+                    res.cancelledReviews > 0 ? `${res.cancelledReviews} review${res.cancelledReviews === 1 ? "" : "s"}` : null,
+                    res.cancelledChats > 0 ? `${res.cancelledChats} chat turn${res.cancelledChats === 1 ? "" : "s"}` : null,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ");
+            chatContainer.addChild(
+              new BannerCard(theme, totalStopped > 0 ? "Stopped all agents" : "Nothing running", detail),
+            );
+            await refreshGoals().catch(() => {});
+          } catch (err) {
+            chatContainer.addChild(
+              new BannerCard(theme, "Stop failed", err instanceof Error ? err.message : String(err)),
+            );
+          }
+          tui.requestRender();
+        })();
       case "help":
         return showHelpCard();
       case "quit":
@@ -1327,6 +1377,15 @@ export async function runDirectorChatTui(opts: {
       onResolveExitNote: () => resolveLeaveNote(opts.client),
       onShutdownCleanup: cleanupFullExit,
     },
+  });
+
+  tui.addInputListener((data) => {
+    if (isKeyRelease(data) || overlays.isOpen) return undefined;
+    if (data === "\x18" || matchesKey(data, "ctrl+x")) {
+      if (toggleLatestToolChain(chatContainer)) tui.requestRender();
+      return { consume: true };
+    }
+    return undefined;
   });
 
   composer.onSubmit = (raw) => {
@@ -1952,7 +2011,21 @@ export async function runNativeScrollbackTui(opts: {
         exitAction = { kind: "switch", targetId: arg, targetKind: arg.startsWith("run-") ? "run" : "chat" };
         return void term.shutdown(undefined, { overlays, spinner, cleanup: detachListenersOnly });
       case "stop":
-        return stopRun(opts.runId);
+        return void (async () => {
+          try {
+            const res = (await opts.client.request("runs.stop_all", {
+              reason: "Stopped by user (/stop)",
+            })) as { stoppedRunIds: string[]; cancelledChats: number; cancelledReviews: number };
+            const count = res.stoppedRunIds.length;
+            notice([
+              count > 0
+                ? `Stopped all active agents (${res.stoppedRunIds.join(", ")}).`
+                : "No active agents were running.",
+            ]);
+          } catch (err) {
+            notice([`Stop failed: ${err instanceof Error ? err.message : String(err)}`]);
+          }
+        })();
       case "help":
         return notice(renderHelp("run", theme));
       case "quit":
@@ -1992,6 +2065,15 @@ export async function runNativeScrollbackTui(opts: {
       onResolveExitNote: () => resolveLeaveNote(opts.client),
       onShutdownCleanup: cleanupFullExit,
     },
+  });
+
+  tui.addInputListener((data) => {
+    if (isKeyRelease(data) || overlays.isOpen) return undefined;
+    if (data === "\x18" || matchesKey(data, "ctrl+x")) {
+      if (toggleLatestToolChain(streamContainer)) tui.requestRender();
+      return { consume: true };
+    }
+    return undefined;
   });
 
   composer.onSubmit = (raw) => {

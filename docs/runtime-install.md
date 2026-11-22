@@ -45,7 +45,7 @@ Actual inventory, verified by running the installer with `PATH` limited to symli
 
 | Needed | For | Updated by |
 | --- | --- | --- |
-| `sh`, `uname`, `mkdir`, `mv`, `ln`, `rm`, `cp`, `cat`, `chmod`, `touch`, `dirname`, `find`, `sort`, `cut`, `awk`, `tr`, `grep`, `tar` | installer logic | the OS |
+| `sh`, `uname`, `mkdir`, `mv`, `ln`, `rm`, `cp`, `cat`, `chmod`, `touch`, `dirname`, `find`, `sort`, `cut`, `awk`, `grep`, `tar` | installer logic | the OS |
 | `curl`, `unzip` | fetching and unpacking Bun | the OS |
 | `sha256sum` or `shasum` | checksum verification | the OS |
 | `sysctl` (macOS) | Rosetta and AVX2 detection | the OS |

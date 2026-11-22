@@ -657,6 +657,7 @@ export class GoalEngine {
       blockingIssues?: string[];
       summary: string;
       diffHash: string;
+      spentUsd?: number;
     },
   ): { goal: GoalRecord; review: GoalReviewVerdict; circuitBreakerTripped?: string } {
     const goal = this.getGoal(goalIdStr);
@@ -667,17 +668,22 @@ export class GoalEngine {
     for (const c of goal.criteria) {
       if (!c.required) continue;
       const ev = byId.get(c.id);
-      if (!ev || !ev.passed || !ev.evidence.trim()) {
+      if (!ev || ev.passed !== true || typeof ev.evidence !== "string" || !ev.evidence.trim()) {
         unmetRequired.push(c.id);
       }
     }
 
-    // Mechanical anti-sycophancy guard: cannot approve while required criteria are unmet or unevidenced
+    // Mechanical anti-sycophancy guard: cannot approve while required criteria are unmet/unevidenced,
+    // any criterion explicitly failed, or non-empty blockingIssues were reported!
     let effectiveVerdict = input.verdict;
-    const blockingIssues = [...(input.blockingIssues ?? [])];
+    const blockingIssues = (input.blockingIssues ?? []).filter((b) => typeof b === "string" && b.trim().length > 0);
+    const anyReportedFailed = input.criteriaResults.some((r) => r.passed !== true);
     if (effectiveVerdict === "approved" && unmetRequired.length > 0) {
       effectiveVerdict = "changes_requested";
       blockingIssues.push(`Mechanical gate rejected premature approval; unmet/unevidenced required criteria: ${unmetRequired.join(", ")}`);
+    } else if (effectiveVerdict === "approved" && (blockingIssues.length > 0 || anyReportedFailed)) {
+      effectiveVerdict = "changes_requested";
+      blockingIssues.push("Mechanical gate rejected contradictory approval with blocking issues or non-passing criteria.");
     }
 
     const nextCycle = goal.reviewCycle + 1;
@@ -721,6 +727,14 @@ export class GoalEngine {
     ) {
       nextStatus = "awaiting_human";
       circuitBreakerTripped = `Wall-clock budget exceeded (${goal.budgets.maxWallClockMin} min)`;
+    } else if (
+      typeof goal.budgets.maxApiEquivUsd === "number" &&
+      goal.budgets.maxApiEquivUsd > 0 &&
+      typeof input.spentUsd === "number" &&
+      input.spentUsd >= goal.budgets.maxApiEquivUsd
+    ) {
+      nextStatus = "awaiting_human";
+      circuitBreakerTripped = `API-equivalent cost budget exceeded ($${input.spentUsd.toFixed(2)}/$${goal.budgets.maxApiEquivUsd.toFixed(2)})`;
     } else {
       nextStatus = "executing";
     }
@@ -806,7 +820,7 @@ export class GoalEngine {
       `Description: ${goal.description}`,
       "",
       "You are an INDEPENDENT, SKEPTICAL REVIEWER — NOT the generator.",
-      "Inspect actual code, diffs, and test outputs. Never approve stubbed implementations, missing edge cases, or unverified claims.",
+      "Inspect actual code, diffs, and test outputs. Focus on actionable correctness and contract failures; never approve stubbed implementations or unverified claims.",
       "",
       "## Acceptance Criteria (EVERY required criterion must have concrete evidence)",
       ...goal.criteria.map(

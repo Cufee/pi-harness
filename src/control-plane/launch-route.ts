@@ -69,7 +69,13 @@ export async function resolveLaunchRoute(config: HarnessConfig, selection: Launc
   }
   const healthyCandidates = candidates.filter((c) => !c.unavailable);
   const pool = healthyCandidates.length > 0 ? healthyCandidates : candidates;
-  const candidate = pool.find((route) => route.profile.id === preferred) ?? pool[0];
+  // Capability-aware routing: Tier 2/3 workspace roles need filesystem/shell tools (ACP profiles)
+  // rather than bare `pi` profiles (which only expose control-plane harness tools), unless only `pi` is available.
+  const capabilityPool =
+    tier >= 2 && profileId == null && pool.some((c) => c.profile.kind === "acp")
+      ? pool.filter((c) => c.profile.kind === "acp")
+      : pool;
+  const candidate = capabilityPool.find((route) => route.profile.id === preferred) ?? capabilityPool[0];
   if (candidate) return { profile: candidate.profile, model: candidate.model, wireModel: candidate.wireModel };
   throw new Error(`No eligible current catalog route for ${model ?? "an available model"} on ${profileId ?? "enabled profiles"} at tier ${tier}. Refresh the catalog and select an advertised model.`);
 }

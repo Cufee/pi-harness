@@ -98,7 +98,7 @@ export async function startStdioMcpBridge(opts?: { socketPath?: string; runId?: 
         args: (args ?? {}) as Record<string, unknown>,
       });
       return {
-        ...(name === CODE_EXEC_TOOL_NAME && (result as CodeExecResult).ok === false ? { isError: true } : {}),
+        ...(name === CODE_EXEC_TOOL_NAME && (result as CodeExecResult | null | undefined)?.ok === false ? { isError: true } : {}),
         content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result, null, 2) }],
       };
     } catch (err) {

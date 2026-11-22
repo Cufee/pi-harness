@@ -65,6 +65,11 @@ export function sandboxUnavailableReason(): string | null {
   return unavailableReason;
 }
 
+function probeTempBase(): string {
+  const sysTmp = tmpdir();
+  return Buffer.byteLength(join(sysTmp, "cm-XXXXXX", "ipc")) > 100 ? "/tmp" : sysTmp;
+}
+
 let available: boolean | undefined;
 let unavailableReason: string | null = null;
 export function sandboxAvailable(): boolean {
@@ -80,8 +85,7 @@ export function sandboxAvailable(): boolean {
   let listener: Bun.UnixSocketListener<undefined> | undefined;
   let tcp: Bun.TCPSocketListener<undefined> | undefined;
   try {
-    const sysTmp = tmpdir();
-    const probeBase = Buffer.byteLength(join(sysTmp, "cm-XXXXXX", "ipc")) > 100 ? "/tmp" : sysTmp;
+    const probeBase = probeTempBase();
     dir = realpathSync(mkdtempSync(join(probeBase, "cm-")));
     let socket = join(dir, "ipc");
     if (Buffer.byteLength(socket) >= 104 && probeBase !== "/tmp") {
@@ -167,25 +171,40 @@ const pythonFlags = ["-E", "-s", "-B", "-u", "-X", "utf8"];
 const pythonVerified = new Map<string, string | undefined>();
 
 export function pythonSandboxCommand(exe: string, roots: string[], dir: string, socket: string): string[] {
-  if (!sandboxAvailable()) throw new Error("Code Mode sandbox unavailable on this host");
+  if (!sandboxAvailable()) throw new Error(unavailableReason ?? "Code Mode sandbox unavailable on this host");
   if (!pythonVerified.has(exe)) {
     let probeDir: string | undefined, listener: Bun.UnixSocketListener<undefined> | undefined, tcp: Bun.TCPSocketListener<undefined> | undefined;
+    let timedOut = false;
     try {
-      probeDir = realpathSync(mkdtempSync(join(tmpdir(), "cm-")));
-      const probeSocket = join(probeDir, "ipc");
+      const probeBase = probeTempBase();
+      probeDir = realpathSync(mkdtempSync(join(probeBase, "cm-")));
+      let probeSocket = join(probeDir, "ipc");
+      if (Buffer.byteLength(probeSocket) >= 104 && probeBase !== "/tmp") {
+        rmSync(probeDir, { recursive: true, force: true });
+        probeDir = realpathSync(mkdtempSync(join("/tmp", "cm-")));
+        probeSocket = join(probeDir, "ipc");
+      }
+      if (Buffer.byteLength(probeSocket) >= 104) throw new Error("Code Mode IPC path too long");
       listener = Bun.listen({ unix: probeSocket, socket: { data() {} } });
       tcp = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
       const result = spawnSync(launcher, ["-p", sandboxProfile(exe, probeDir, probeSocket, roots), exe, ...pythonFlags, "-c", pythonProbe(tcp.port, probeSocket)], {
         cwd: probeDir, env: pythonSandboxEnv(probeDir), timeout: 10_000, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
       });
-      pythonVerified.set(exe, result.status === 0 && result.stdout.trim() === "sandbox probe complete" ? undefined : (result.stderr || result.error?.message || "probe failed").trim().slice(-500));
+      const errCode = (result.error as NodeJS.ErrnoException | undefined)?.code;
+      if (result.signal === "SIGTERM" || errCode === "ETIMEDOUT") {
+        timedOut = true;
+      } else {
+        pythonVerified.set(exe, result.status === 0 && result.stdout.trim() === "sandbox probe complete" ? undefined : (result.stderr || result.error?.message || "probe failed").trim().slice(-500));
+      }
     } catch (e) {
-      pythonVerified.set(exe, e instanceof Error ? e.message : String(e));
+      if ((e as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT") timedOut = true;
+      else pythonVerified.set(exe, e instanceof Error ? e.message : String(e));
     } finally {
       tcp?.stop(true);
       listener?.stop(true);
       if (probeDir) rmSync(probeDir, { recursive: true, force: true });
     }
+    if (timedOut) throw new Error("Code Mode sandbox probe timed out for managed Python");
   }
   const failure = pythonVerified.get(exe);
   if (failure) throw new Error(`Code Mode sandbox probe failed for managed Python: ${failure}`);

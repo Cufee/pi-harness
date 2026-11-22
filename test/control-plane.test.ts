@@ -40,7 +40,7 @@ describe("Tier role instructions", () => {
 
   it("assigns implementation and research to distinct tiers", () => {
     const prompt = buildImmutableSystemPrompt(1, "orchestrator", "off");
-    assert.match(prompt, /read-only workspace access.*never editing files or running mutating commands/i);
+    assert.match(prompt, /read-only file\/search access.*never editing files or running mutating commands/i);
     assert.match(prompt, /1 cohesive Tier 2 Worker/i);
     assert.match(prompt, /implementation to Tier 2 Workers with disjoint write_scopes.*Blackboard/i);
     assert.match(prompt, /always choose a concrete model ID from list_models/i);

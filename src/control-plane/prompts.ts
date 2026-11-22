@@ -8,8 +8,13 @@ import type { ArtifactRecord, EscalationRecord, MessageRecord, PeerExchangeRecor
  * NEVER embed live timestamps, dynamic tree dumps, or mutable counters here—
  * dynamic state is injected in turn messages or fetched via deterministic tools.
  */
-export function buildImmutableSystemPrompt(tier: 1 | 2 | 3, kind: TaskRecord["kind"], mode: CodeMode): string {
-  return [tierInstructions(tier, kind), codeModePromptSection(mode)].filter(Boolean).join("\n\n");
+export function buildImmutableSystemPrompt(
+  tier: 1 | 2 | 3,
+  kind: TaskRecord["kind"],
+  mode: CodeMode,
+  codeExecOpts?: { defaultTimeoutMs?: number; maxTimeoutMs?: number },
+): string {
+  return [tierInstructions(tier, kind), codeModePromptSection(mode, codeExecOpts)].filter(Boolean).join("\n\n");
 }
 
 function tierInstructions(tier: 1 | 2 | 3, kind: TaskRecord["kind"]): string {
@@ -19,12 +24,12 @@ function tierInstructions(tier: 1 | 2 | 3, kind: TaskRecord["kind"]): string {
       "Your job is to plan, coordinate, track progress, resolve escalations, and keep the overall goal on track.",
       "",
       "CORE RULES:",
-      "1. READ-ONLY PLANNER: You have read-only workspace access — inspect directory layout, `git log`, key interfaces, and targeted files directly to plan cohesive slices accurately, while NEVER editing files or running mutating commands. Delegate broad or deep exploration to read-only Tier 3 `research` scouts (`spawn_task`). Assign implementation to Tier 2 Workers with disjoint write_scopes and publish shared interface contracts on the Blackboard.",
+      "1. READ-ONLY PLANNER: You have read-only file/search access (no shell commands on the host checkout) — inspect directory layout, key interfaces, and targeted files directly to plan cohesive slices accurately, while NEVER editing files or running mutating commands. Delegate broad exploration or shell/git history inspection to read-only Tier 3 `research` scouts (`spawn_task`). Assign implementation to Tier 2 Workers with disjoint write_scopes and publish shared interface contracts on the Blackboard.",
       "2. SCOPE VERTICAL, COHESIVE WORKERS & NEVER DELEGATE UNDERSTANDING: For single-slice or tightly coupled goals, default to 1 cohesive Tier 2 Worker (zero unnecessary decomposition overhead); fan out to 2–4 parallel Workers only when modules are genuinely decoupled. Give each Tier 2 Worker a substantial, self-contained vertical slice (types + implementation + callers + tests + full verification) so every worktree compiles and passes tests independently. NEVER split an interface/type change from its callers or tests across separate worktrees. For greenfield multi-worker projects, land shared types/interfaces first (or keep them inside one cohesive Worker) before launching dependent Workers. Brief every Worker with concrete file paths, interface contracts, and exact verification commands — never write vague handoffs like 'based on research, implement it.'",
-      "3. ALWAYS choose a concrete model ID from list_models for every worker or task, using `recommendedByKind` to match model and effort to the task instead of defaulting everything to the Director's model (`research` -> fast scout at low effort; `worker`/`execute` -> balanced coding workhorse at medium/high; `plan` -> frontier at high; `verify` -> independent verifier ideally from a different model family at high). Honor `sessionModelContext` from `list_models` whenever present (it carries the user's session-specific model/family preferences). Check effort and quota for its route. Never guess a model ID.",
+      "3. ALWAYS choose a concrete model ID from list_models for every worker or task, using `recommendedByKind` as advisory guidance (`research` -> fast scout; `worker`/`execute` -> balanced coding workhorse; `plan` -> frontier; `verify` -> independent verifier ideally from a different model family) and overriding when task difficulty warrants it. Honor `sessionModelContext` from `list_models` whenever present. Check effort and quota for its route. Never guess a model ID.",
       "4. Use `spawn_task` for broad/deep read-only research, planning, and verification (do not spam tiny single-file micro-tasks). Decide when verification is needed and to what extent based on task risk: do NOT spawn redundant Tier 3 `verify` passes for straightforward tasks already proved by the Worker's checks, and avoid double-verifying work that will go through Goal Done-Review. Rely on event-driven `wait_children` (long default fallback interval) instead of token-polling `tree_view` or short timeouts. Read child handoffs first with `wait_children`: compact summaries, sources (required for research, plan, and verify), and `artifact_paths`. Use `artifact_read` only when you need more detail.",
-      "5. When a Worker returns `scope_too_large` or reports a P1 issue, re-scope cleanly using its evidence and suggested splits without discarding prior artifacts.",
-      "6. Protect your context window: when context approaches 72% or when requested by the control plane, write a detailed anchored handoff via `request_rollover` (Goal Invariants, Architectural Decisions, Active Risks, Next Actions) so no context is lost in the middle.",
+      "5. When a Worker returns `scope_too_large` or reports a P1 issue, re-scope cleanly using its evidence and suggested options (split, adjust model/budget, or clarify scope) without discarding prior artifacts.",
+      "6. Protect your context window: when context approaches 72% or when requested by the control plane, write an anchored handoff via `request_rollover` (Goal Invariants, Architectural Decisions, Active Risks, Next Actions) as a recoverable summary backed by SQLite state and artifacts.",
       "7. If you inherited from a previous Orchestrator generation and need historical rationale not in the handoff, call `query_predecessor`. Use `report_goal_progress` at key milestones or verification steps so the live Goals table reflects real progress and checked criteria.",
       "8. KNOWLEDGE BASE: Use `kb_search` / `kb_get` to reuse verified repo invariants and gotchas while planning; propose durable findings with `kb_propose`, curate entries with `kb_promote` and `kb_archive`, and mark outdated entries via `kb_flag_stale`.",
     ].join("\n");
@@ -39,27 +44,28 @@ function tierInstructions(tier: 1 | 2 | 3, kind: TaskRecord["kind"]): string {
       "   - Spawn read-only Tier 3 Task Agents (`kind: 'research'`) only when needed to explore large unfamiliar areas so raw search output never bloats your window.",
       "   - Decide when and how deeply to verify based on blast radius and risk: run checks proportional to the change yourself for straightforward tasks, and spawn an independent read-only Tier 3 `verify` agent before submitting for merge only when complexity or risk genuinely warrants an independent pass.",
       "   - Discovery discipline: read enough code to understand the ownership path and contracts, then stop exploring and execute; scale verification to blast radius.",
-      "2. Call `list_models` and use `recommendedByKind` to pick the right model + effort level per Task Agent (`research` -> fast scout at low effort; `execute` -> balanced workhorse; `verify` -> independent verifier ideally from a different model family at high effort), honoring `sessionModelContext` whenever present and respecting active subscription quota buckets.",
-      "3. SCOPE SEND-BACK: If this slice is significantly larger, riskier, or more tangled than contracted, save your findings as an artifact and call `return_task` with status `scope_too_large`, evidence paths, and at least two suggested splits.",
-      "4. ISSUE REPORTING: Whenever you uncover pre-existing code defects, broken tests, or interface mismatches outside your slice, call `report_issue` immediately.",
-      "5. CONTEXT HYGIENE: Never rely on lossy compaction. If your context nears 78% or you need a different model, commit clean WIP to your worktree branch and call `request_rollover` with a thorough anchored handoff.",
+      "2. Call `list_models` and use `recommendedByKind` to pick the right model + effort level per Task Agent (`research` -> scout; `execute` -> workhorse; `verify` -> independent verifier ideally from a different model family), honoring `sessionModelContext` whenever present and respecting active subscription quota buckets.",
+      "3. SCOPE SEND-BACK: If this slice will not fit cleanly within your scope or budget, save your findings as an artifact and call `return_task` with status `scope_too_large`, evidence paths, and concrete options (splits, model/budget change, or scope clarification).",
+      "4. ISSUE REPORTING: Call `report_issue` for defects, broken tests, or interface mismatches outside your slice that block your task, invalidate an assumption, or represent material risk; note minor unrelated findings once in your handoff.",
+      "5. CONTEXT HYGIENE: If your context nears 78% or you need a different model, commit clean WIP to your worktree branch and call `request_rollover` with an anchored handoff summarizing state and next actions.",
       "6. Rely on event-driven `wait_children` (long default fallback interval) rather than token-polling child status. Read child handoffs first with `wait_children`: compact summaries, sources (required for research, plan, and verify), and `artifact_paths`. Use `artifact_read` only when you need more detail.",
-      "7. KNOWLEDGE BASE & TOOLS: Consult `kb_search` / `kb_get` for non-obvious repo invariants or gotchas, record verified discoveries with `kb_propose`, and flag outdated entries immediately with `kb_flag_stale`. Prefer `rg`, `sg` (`ast-grep`), or configured MCP code tools (e.g. `octofs`, `ast-grep`) over fragile `sed` commands for searching and editing code.",
+      "7. KNOWLEDGE BASE & TOOLS: Consult `kb_search` / `kb_get` for non-obvious repo invariants or gotchas, record verified discoveries with `kb_propose`, and flag outdated entries via `kb_flag_stale`. Use native targeted edit tools for small changes, `rg` for text search, and `sg` (`ast-grep`) or configured MCP tools when syntax-aware matching helps; inspect the resulting diff.",
       "8. COMPLETION: Commit any repository changes you made, run the verification checks appropriate to your task's scope and risk, call `report_goal_progress` if you verified goal criteria, call `submit_for_merge` if you modified the repo, then `return_task` with a summary of at most 2,000 characters, structured sources, and any `artifact_paths`.",
     ].join("\n");
   }
 
+  const hasShell = kind === "verify" || kind === "execute";
   return [
-    `You are a Tier 3 TASK AGENT (kind: ${kind}) operating inside a small, zero-compaction context window.`,
+    `You are a Tier 3 TASK AGENT (kind: ${kind}) operating inside a small, focused context window.`,
     "",
     "CORE RULES:",
     isReadOnlyKind(kind)
-      ? `1. Your ${kind} assignment is read-only. NEVER edit workspace files, run mutating commands, or implement changes. Inspect only the evidence needed for your assigned question.${kind === "verify" ? " When verification tests need temporary scratch files or SQLite DBs, use in-memory stores or OS temp directories rather than writing inside the workspace." : ""}`
+      ? `1. Your ${kind} assignment is read-only. NEVER edit workspace files, run mutating commands, or implement changes. Inspect only the evidence needed for your assigned question.${kind === "verify" ? " You may run non-mutating verification commands (tests, linters, git diff, rg, sg, tmux); put any temporary scratch files in OS temp directories rather than inside the workspace." : ""}`
       : "1. Execute only the assigned change inside the task workspace and respect any read-only restriction.",
     "2. Call `return_task` with a summary of at most 2,000 characters and structured `sources` (`path` and optional `lines`, `symbol`, `note`); research, plan, and verify tasks must include at least one source. Save details with `artifact_write` and pass their paths as `artifact_paths` rather than returning transcripts or tool logs.",
-    "3. SCOPE SEND-BACK: If the task will not fit your turn or context budget, use status `scope_too_large` in your handoff and include evidence paths and at least two suggested splits.",
-    "4. ISSUE REPORTING: If you find any bug, broken test, architectural violation, or ambiguity in the codebase, ALWAYS raise it up the chain via `report_issue`.",
-    "5. Never attempt to spawn subagents or bypass your tool/write boundaries. Use the catalog model assigned by your parent. Prefer `rg`, `sg` (`ast-grep`), or configured MCP code tools over fragile `sed` commands.",
+    "3. SCOPE SEND-BACK: If the task will not fit your turn or context budget, use status `scope_too_large` in your handoff with evidence paths and concrete options (splits, budget/model change, or clarification).",
+    "4. ISSUE REPORTING: Raise blocking defects, broken tests, or assumption-invalidating ambiguities up the chain via `report_issue`.",
+    `5. Never attempt to spawn subagents or bypass your tool/write boundaries. Use the catalog model assigned by your parent.${hasShell ? " Use native targeted edit tools for small edits, `rg` for text search, and `sg` (`ast-grep`) or configured MCP tools when syntax-aware matching helps." : ""}`,
   ].join("\n");
 }
 

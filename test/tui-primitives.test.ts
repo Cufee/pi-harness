@@ -2,20 +2,25 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { visibleWidth, type Component } from "@earendil-works/pi-tui";
+import { visibleWidth, type Component, type Terminal } from "@earendil-works/pi-tui";
 import type { CompiledModelCatalog } from "../src/catalog/compiler.js";
 import type { RunnerProfileConfig } from "../src/config.js";
+import { toggleLatestToolChain } from "../src/tui/app.js";
 import { CommandPaletteOverlay, EffortPickerOverlay, ModelPickerOverlay, SessionsOverlay } from "../src/tui/overlays.js";
 import {
   AssistantCard,
   BannerCard,
   clampLine,
   createTheme,
+  DISABLE_MOUSE_WHEEL_SEQ,
+  ENABLE_MOUSE_WHEEL_SEQ,
   ErrorCard,
+  EventCard,
   fillLineBg,
   fitWidth,
   FooterHint,
   formatAgentError,
+  OverlayManager,
   Panel,
   renderFlexRow,
   renderProgressBar,
@@ -26,6 +31,8 @@ import {
   ToolPill,
   UserCard,
 } from "../src/tui/primitives/index.js";
+import { dimLine, ModalScreen } from "../src/tui/primitives/modal-screen.js";
+import { ToolTranscript } from "../src/tui/primitives/tool-chain.js";
 
 const WIDTHS = [8, 12, 20, 40, 80, 120];
 
@@ -360,5 +367,127 @@ describe("TUI Primitives Library", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test("ModalScreen leaves mouse tracking off on startup while OverlayManager scopes it to scrollable overlays", () => {
+    const writes: string[] = [];
+    const terminal: Terminal = {
+      start() {},
+      stop() {},
+      async drainInput() {},
+      write(data: string) {
+        writes.push(data);
+      },
+      columns: 80,
+      rows: 24,
+      kittyProtocolActive: false,
+      moveBy() {},
+      hideCursor() {},
+      showCursor() {},
+      clearLine() {},
+      clearFromCursor() {},
+      clearScreen() {},
+      setTitle() {},
+      setProgress() {},
+      setProgramStatus() {},
+    };
+    const screen = new ModalScreen(terminal);
+    screen.start();
+    expect(writes.join("")).not.toContain(ENABLE_MOUSE_WHEEL_SEQ);
+
+    const dummy: Component = { render: () => ["ok"], invalidate() {} };
+    const overlays = new OverlayManager(screen, theme, dummy);
+    writes.length = 0;
+
+    // Non-scrollable overlay must not turn on mouse capture.
+    const plain = overlays.push({ title: "Plain" }, dummy);
+    expect(writes.filter((w) => w === ENABLE_MOUSE_WHEEL_SEQ || w === DISABLE_MOUSE_WHEEL_SEQ)).toEqual([]);
+    plain.close();
+
+    // Scrollable overlays reference-count mouse wheel enable/disable around open modals.
+    const first = overlays.push({ title: "Runs" }, dummy, { captureMouseWheel: true });
+    const second = overlays.push({ title: "Transcript" }, dummy, { captureMouseWheel: true });
+    expect(writes.filter((w) => w === ENABLE_MOUSE_WHEEL_SEQ || w === DISABLE_MOUSE_WHEEL_SEQ)).toEqual([
+      ENABLE_MOUSE_WHEEL_SEQ,
+    ]);
+    second.close();
+    expect(writes.filter((w) => w === ENABLE_MOUSE_WHEEL_SEQ || w === DISABLE_MOUSE_WHEEL_SEQ)).toEqual([
+      ENABLE_MOUSE_WHEEL_SEQ,
+    ]);
+    first.close();
+    expect(writes.filter((w) => w === ENABLE_MOUSE_WHEEL_SEQ || w === DISABLE_MOUSE_WHEEL_SEQ)).toEqual([
+      ENABLE_MOUSE_WHEEL_SEQ,
+      DISABLE_MOUSE_WHEEL_SEQ,
+    ]);
+
+    screen.stop();
+  });
+
+  test("dimLine re-applies faint after standalone and compound SGR intensity resets", () => {
+    expect(dimLine("")).toBe("");
+    expect(dimLine("\x1b_Ga=T;data\x1b\\")).toBe("\x1b_Ga=T;data\x1b\\");
+    expect(dimLine("\x1b[32mgreen")).toBe("\x1b[2m\x1b[32mgreen");
+    expect(dimLine("\x1b[0;32mgreen")).toBe("\x1b[2m\x1b[0;32m\x1b[2mgreen");
+    expect(dimLine("\x1b[22;39mnormal")).toBe("\x1b[2m\x1b[22;39m\x1b[2mnormal");
+    expect(dimLine("\x1b[1;0;36mreset-mid")).toBe("\x1b[2m\x1b[1;0;36m\x1b[2mreset-mid");
+    expect(dimLine("\x1b[mshort-reset\x1b[;31mimplicit-zero")).toBe(
+      "\x1b[2m\x1b[m\x1b[2mshort-reset\x1b[;31m\x1b[2mimplicit-zero",
+    );
+  });
+
+  test("EventCard memoizes quiet GoalNotice renders at the same width", () => {
+    const events = [
+      { kind: "goal.committed" as const, goalId: "goal-1", goalVersion: 1, goalTitle: "Ship", runId: "run-1", criteriaCount: 2 },
+      {
+        kind: "goal.settled" as const,
+        goalId: "goal-2",
+        goalVersion: 1,
+        goalTitle: "Ship",
+        runId: "run-2",
+        runStatus: "completed" as const,
+        openEscalations: 0,
+      },
+      {
+        kind: "goal.reviewed" as const,
+        goalId: "goal-3",
+        goalVersion: 1,
+        cycle: 1,
+        verdict: "approved",
+        status: "achieved",
+        summary: "Done",
+      },
+    ];
+    for (const ev of events) {
+      const card = new EventCard(theme, ev);
+      const first = card.render(80);
+      const second = card.render(80);
+      expect(second).toBe(first);
+      const wider = card.render(100);
+      expect(wider).not.toBe(first);
+      expect(card.render(100)).toBe(wider);
+      card.invalidate();
+      expect(card.render(100)).not.toBe(wider);
+    }
+  });
+
+  test("toggleLatestToolChain expands and collapses the most recent ToolChain without mouse capture", () => {
+    const transcript = new ToolTranscript(theme);
+    expect(toggleLatestToolChain(transcript)).toBe(false);
+
+    transcript.addChild(new ToolPill(theme, "ok", "read_file", "a.ts"));
+    transcript.addChild(new AssistantCard(theme, "middle"));
+    transcript.addChild(new ToolPill(theme, "ok", "run_tests", "pass"));
+
+    const collapsed = transcript.render(80).join("\n");
+    expect(collapsed).not.toContain("run_tests");
+    expect(collapsed).not.toContain("read_file");
+
+    expect(toggleLatestToolChain(transcript)).toBe(true);
+    const expanded = transcript.render(80).join("\n");
+    expect(expanded).toContain("run_tests");
+    expect(expanded).not.toContain("read_file");
+
+    expect(toggleLatestToolChain(transcript)).toBe(true);
+    expect(transcript.render(80).join("\n")).not.toContain("run_tests");
   });
 });

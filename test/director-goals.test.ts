@@ -364,6 +364,44 @@ it("drives unattended auto-verification -> remediation relaunch -> achieved, pro
       assert.equal(ping.running, true);
       assert.match(ping.liveWork ?? "", /pending timer/);
       daemon.db.timers.cancel(timer.id, "cleanup");
+
+      // Verify contradictory approval (approved + blockingIssues) is rejected mechanically
+      const g2 = daemon.director.goals.createGoal({
+        repoRoot,
+        chatSessionId: chat.id,
+        title: "Contradictory verdict check",
+        description: "Verify blockers prevent approval",
+        criteria: [{ id: "c1", kind: "behavioral", description: "Works", required: true }],
+      });
+      const contra = daemon.director.goals.recordReviewVerdict(g2.id, {
+        verdict: "approved",
+        criteriaResults: [{ criterionId: "c1", passed: true, evidence: "Checked" }],
+        blockingIssues: ["Critical memory leak remains"],
+        summary: "Approving despite blocker",
+        diffHash: "abc123",
+      });
+      assert.equal(contra.review.verdict, "changes_requested");
+      assert.equal(contra.goal.status, "executing");
+
+      // Verify `runs.stop_all` (`/stop`) stops all active runs cleanly
+      const activeRun = daemon.db.createRun({ goal: "Stop me", repoRoot, baseBranch: "main", baseSha: "abc" });
+      const activeTask = daemon.db.createTask({
+        runId: activeRun.id,
+        tier: 1,
+        kind: "orchestrator",
+        title: "Running",
+        objective: "Run",
+        profileId: "acp:codex",
+      });
+      daemon.db.updateTask(activeTask.id, { status: "running" });
+      const stopAll = (await client.request("runs.stop_all", { reason: "User /stop" })) as {
+        stopped: boolean;
+        stoppedRunIds: string[];
+      };
+      assert.equal(stopAll.stopped, true);
+      assert.ok(stopAll.stoppedRunIds.includes(activeRun.id));
+      assert.equal(daemon.db.getRun(activeRun.id)?.status, "stopped");
+      assert.equal(daemon.db.getTask(activeTask.id)?.status, "cancelled");
     } finally {
       client.close();
       await daemon.stop();

@@ -131,7 +131,14 @@ export function pythonTools(tools: ToolDefinition[]): ToolDefinition[] {
 
 function pythonType(value: unknown): string {
   const schema = schemaObject(value);
-  if (Array.isArray(schema.enum) && schema.enum.length > 0) return `Literal[${schema.enum.map((item) => JSON.stringify(item) ?? "None").join(", ")}]`;
+  if (Array.isArray(schema.enum) && schema.enum.length > 0) {
+    return `Literal[${schema.enum.map((item) => {
+      if (item === true) return "True";
+      if (item === false) return "False";
+      if (item === null) return "None";
+      return JSON.stringify(item) ?? "None";
+    }).join(", ")}]`;
+  }
   switch (schema.type) {
     case "string": return "str";
     case "boolean": return "bool";
@@ -193,8 +200,12 @@ export function toolSearch(
   return { signatures: generateSdkDeclarations(tools), matched: tools.map(({ name }) => name), note: SCRIPT_FUNCTION_NOTE };
 }
 
-export function codeModePromptSection(mode: CodeMode): string {
+export function codeModePromptSection(mode: CodeMode, opts?: { defaultTimeoutMs?: number; maxTimeoutMs?: number }): string {
   if (effectiveCodeMode(mode) === "off") return "";
+  const maxMs = Math.max(1, Math.min(Number.isFinite(opts?.maxTimeoutMs) ? opts!.maxTimeoutMs! : 1_800_000, 1_800_000));
+  const defaultMs = Math.max(1, Math.min(Number.isFinite(opts?.defaultTimeoutMs) ? opts!.defaultTimeoutMs! : 300_000, maxMs));
+  const defaultSec = Math.max(1, Math.round(defaultMs / 1000));
+  const maxSec = Math.max(1, Math.round(maxMs / 1000));
   return [
     "## Code Mode",
     mode === "hybrid" ? "Call harness tools directly for single calls, or use code_exec to combine calls in a script." :
@@ -203,6 +214,6 @@ export function codeModePromptSection(mode: CodeMode): string {
     'Your client may prefix tool names (for example mcp__harness__code_exec) or wrap this server behind its own tool_search and code_exec. Then `harness` in the client\'s own script exports only code_exec and tool_search, so importing return_task or any other harness function there fails. Call the harness code_exec with `{ code }` and put the `import { ... } from "harness"` line inside that code string.',
     'In the Amp native wrapper, use `text(result)` to display the result of the nested call. Use `output(value)` inside the harness code_exec script to return a value to Amp.',
     'code_exec also accepts language: "python" (default TypeScript): `from harness import name, output`; tool_search with language "python" lists Python signatures; packages: ["name==version"] installs pinned wheels.',
-    "Set timeout_s for long waits (default 60s, maximum 600s unless configured lower). Results over the inline limit (default 20,000 characters) return a preview and artifact path.",
+    `Set timeout_s for long waits (default ${defaultSec}s, maximum ${maxSec}s unless configured lower). Results over the inline limit (default 20,000 characters) return a preview and artifact path.`,
   ].join("\n\n");
 }

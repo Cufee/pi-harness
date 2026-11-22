@@ -1,5 +1,4 @@
 import type { Component, OverlayHandle, TUI } from "@earendil-works/pi-tui";
-import { ModalScreen } from "./modal-screen.js";
 import { DISABLE_MOUSE_WHEEL_SEQ, ENABLE_MOUSE_WHEEL_SEQ } from "./mouse.js";
 import { Panel, type PanelOptions } from "./panel.js";
 import type { HarnessTheme } from "./theme.js";
@@ -30,7 +29,6 @@ export class OverlayManager {
   ) {}
 
   private writeTermSeq(seq: string): void {
-    if (this.tui instanceof ModalScreen) return;
     try {
       const term = (this.tui as unknown as { terminal?: { write?: (s: string) => void } }).terminal;
       term?.write?.(seq);

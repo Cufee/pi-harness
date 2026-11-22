@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -963,12 +964,22 @@ export class HarnessOrchestrator {
         }
         if (!wt || wt.runId !== task.runId) {
           const wtMgr = this.getWorktreeManager(run.repoRoot);
-          this.allocatingWorktrees.add(task.id);
-          try {
-            wt = await wtMgr.createForWorker(run.id, task.id);
-          } finally {
-            this.allocatingWorktrees.delete(task.id);
+          // If worktree concurrency cap is currently full across runs, wait cleanly for a slot instead of failing!
+          while (!wt && !exec.abort.signal.aborted) {
+            this.allocatingWorktrees.add(task.id);
+            try {
+              wt = await wtMgr.createForWorker(run.id, task.id);
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              if (!msg.includes("concurrency cap reached")) throw err;
+              this.allocatingWorktrees.delete(task.id);
+              await this.waitForWorktreeSlot(run.repoRoot, exec.abort.signal);
+              continue;
+            } finally {
+              this.allocatingWorktrees.delete(task.id);
+            }
           }
+          if (exec.abort.signal.aborted) return;
         }
       }
       if (toolPolicy === "read_write_workspace" && (!wt || wt.runId !== task.runId)) {
@@ -985,7 +996,7 @@ export class HarnessOrchestrator {
       const quotaResumeNote = this.taskResumeNotes.get(task.id) ?? null;
       if (quotaResumeNote) this.taskResumeNotes.delete(task.id);
 
-      const systemPrompt = buildImmutableSystemPrompt(task.tier, task.kind, this.config.codeMode);
+      const systemPrompt = buildImmutableSystemPrompt(task.tier, task.kind, this.config.codeMode, this.config.codeExec);
       const writeScopes = task.tier === 2 ? this.db.listActiveWriteScopes(run.id, task.id)
         : task.tier === 3 && task.parentId ? this.db.listActiveWriteScopes(run.id, task.parentId) : [];
       const scopedKbHints = task.tier === 2 ? this.db.kb.getScopedAmbientIndex(run.repoRoot, writeScopes, 5) : [];
@@ -1529,11 +1540,13 @@ export class HarnessOrchestrator {
   private async computeAutoRolloverFingerprint(runId: string, taskId: string, worktreePath: string | null): Promise<string> {
     let gitState = "no-wt";
     if (worktreePath && existsSync(worktreePath)) {
-      const [head, status] = await Promise.all([
+      const [head, status, diff] = await Promise.all([
         runGit(worktreePath, ["rev-parse", "HEAD"]).then((r) => r.stdout).catch(() => ""),
         runGit(worktreePath, ["status", "--porcelain"]).then((r) => r.stdout).catch(() => ""),
+        runGit(worktreePath, ["diff"]).then((r) => r.stdout).catch(() => ""),
       ]);
-      gitState = `${head}|${status}`;
+      const diffHash = createHash("sha256").update(diff).digest("hex").slice(0, 16);
+      gitState = `${head}|${status}|${diffHash}`;
     }
     const artCount = this.db.listArtifacts(runId, taskId, 200).length;
     const kids = this.db.listTasks(runId, { parentId: taskId });
@@ -1541,6 +1554,30 @@ export class HarnessOrchestrator {
     const bbKeys = Object.keys(this.db.blackboardGet(runId)).sort().join(",");
     const openEsc = this.db.listEscalations(runId, "open").map((e) => e.id).join(",");
     return `${gitState}::art=${artCount}::kids=${kidSig}::bb=${bbKeys}::esc=${openEsc}`;
+  }
+
+  private waitForWorktreeSlot(repoRoot: string, signal: AbortSignal): Promise<void> {
+    if (signal.aborted) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        unsub();
+        clearTimeout(timer);
+        signal.removeEventListener("abort", finish);
+        resolve();
+      };
+      const unsub = this.db.onEvent((ev) => {
+        if (ev.type === "worktree.removed" || ev.type === "merge.finished" || ev.type === "task.status") {
+          const evRun = this.db.getRun(ev.runId);
+          if (!evRun || evRun.repoRoot === repoRoot) finish();
+        }
+      });
+      const timer = setTimeout(finish, 10_000);
+      timer.unref?.();
+      signal.addEventListener("abort", finish, { once: true });
+    });
   }
 
   async steerTask(taskId: string, message: string): Promise<boolean> {
