@@ -1,3 +1,4 @@
+import { toolEventPreview } from "../protocol/tool-display.js";
 import {
   createModels,
   createProvider,
@@ -280,13 +281,13 @@ export class PiRunner {
 
       // Execute harness tool calls directly in-process
       for (const call of toolCalls) {
-        req.callbacks.onToolEvent?.({ name: call.name, status: "in_progress" });
+        req.callbacks.onToolEvent?.({ id: call.id, name: call.name, status: "in_progress", args: toolEventPreview(call.arguments) });
         try {
           if (!piTools.some((tool) => tool.name === call.name)) {
             throw new Error(`Tool ${call.name} is unavailable to this agent.`);
           }
           const out = await req.executeTool(call.name, call.arguments ?? {});
-          req.callbacks.onToolEvent?.({ name: call.name, status: "completed" });
+          req.callbacks.onToolEvent?.({ id: call.id, name: call.name, status: "completed", result: toolEventPreview(out) });
           messages.push({
             role: "toolResult",
             toolCallId: call.id,
@@ -296,7 +297,7 @@ export class PiRunner {
             timestamp: Date.now(),
           });
         } catch (err) {
-          req.callbacks.onToolEvent?.({ name: call.name, status: "failed" });
+          req.callbacks.onToolEvent?.({ id: call.id, name: call.name, status: "failed", error: toolEventPreview(err instanceof Error ? err.message : String(err)) });
           messages.push({
             role: "toolResult",
             toolCallId: call.id,

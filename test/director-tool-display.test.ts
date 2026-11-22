@@ -110,12 +110,13 @@ function goalsTable(ev: ToolEv | undefined): GoalsTableData {
 }
 
 describe("Director structured tool display", () => {
-  it("goal_list via in-process executeTool emits goals_table (empty and populated), persisted as tool_output turns", async () => {
+  it("presented goal_list results persist empty and populated goals_table turns", async () => {
     let phase = 0;
     await withDaemon(
       async (req) => {
         phase++;
-        const res = (await req.executeTool("goal_list", {})) as { goals: unknown[] };
+        const res = (await req.executeTool("goal_list", {})) as { goals: unknown[]; presentation_id: string };
+        await req.executeTool("present_result", { presentation_id: res.presentation_id });
         return `listed ${res.goals.length}`;
       },
       async ({ daemon, client, repoRoot, chatId, toolEvents }) => {
@@ -170,7 +171,8 @@ describe("Director structured tool display", () => {
     await withDaemon(
       async (req) => {
         prompts.push(req.initialPrompt);
-        await req.executeTool("goal_list", {});
+        const list = (await req.executeTool("goal_list", {})) as { presentation_id: string };
+        await req.executeTool("present_result", { presentation_id: list.presentation_id });
         return "ok";
       },
       async ({ daemon, client, repoRoot, chatId }) => {
@@ -183,7 +185,7 @@ describe("Director structured tool display", () => {
     );
   });
 
-  it("goal_list / goal_get through the ACP MCP bridge path (tool.call) reach the active chat sink; other tools emit no display", async () => {
+  it("present_result through the ACP MCP bridge reaches the active chat sink", async () => {
     let seeded: ReturnType<typeof seedGoals> | undefined;
     let sockPathRef = "";
     let bridgeResults: Record<string, unknown> = {};
@@ -197,9 +199,13 @@ describe("Director structured tool display", () => {
             bridge.request("tool.call", { runId: req.runId, taskId: req.taskId, name, args });
           const tools = (await call("__list_tools", {})) as ToolDefinition[];
           assert.ok(tools.some((t) => t.name === "goal_list"));
+          const list = (await call("goal_list", {})) as { presentation_id: string };
+          const get = (await call("goal_get", { goal_id: seeded!.reviewed.id })) as { presentation_id: string };
+          await call("present_result", { presentation_id: list.presentation_id });
+          await call("present_result", { presentation_id: get.presentation_id });
           bridgeResults = {
-            list: await call("goal_list", {}),
-            get: await call("goal_get", { goal_id: seeded!.reviewed.id }),
+            list,
+            get,
             read: await call("read_file", { path: "a.txt", exception_reason: "Check fixture bytes" }),
             kb: await call("kb_search", { query: "x" }),
           };
@@ -255,10 +261,10 @@ describe("Director structured tool display", () => {
         assert.equal(data.lastReview?.verdict, "changes_requested");
         assert.equal(data.lastReview?.cycle, reviewed.reviewCycle);
 
-        // Model-facing return values are unchanged apart from the rendered_in_ui note.
-        const list = bridgeResults.list as { goals: Array<{ id: string }>; rendered_in_ui: string };
+        // The structured result also carries the presentation ID.
+        const list = bridgeResults.list as { goals: Array<{ id: string }>; presentation_id: string };
         assert.equal(list.goals.length, 2);
-        assert.equal(typeof list.rendered_in_ui, "string");
+        assert.equal(typeof list.presentation_id, "string");
         assert.ok("reviews" in (bridgeResults.get as object));
         assert.ok(!("display" in (bridgeResults.read as object)));
 
@@ -269,15 +275,15 @@ describe("Director structured tool display", () => {
     );
   });
 
-  it("goal_list outside an active chat turn persists the turn without a sink", async () => {
+  it("goal_list outside an active chat turn returns data without persisting a card", async () => {
     await withDaemon(
       async () => "unused",
       async ({ daemon, chatId, toolEvents }) => {
-        await daemon.director.executeDirectorMcpTool(chatId, "goal_list", {});
+        const result = (await daemon.director.executeDirectorMcpTool(chatId, "goal_list", {})) as { goals: unknown[] };
+        assert.deepEqual(result.goals, []);
         assert.equal(toolEvents.length, 0);
         const turns = daemon.director.chats.getHistory(chatId);
-        assert.equal(turns.at(-1)?.role, "tool_output");
-        assert.deepEqual(turns.at(-1)?.display, { kind: "goals_table", title: "Goals", data: { goals: [] } });
+        assert.equal(turns.filter((turn) => turn.role === "tool_output").length, 0);
       },
     );
   });
@@ -325,18 +331,17 @@ describe("Director structured tool display", () => {
     assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE name = 'idx_chat_turns_session'").get());
   });
 
-  it("Director prompt and goal_list description carry the no-duplicate-table guidance", async () => {
+  it("Director prompt and tool descriptions describe explicit presentation", async () => {
     const prompt = buildDirectorSystemPrompt();
-    assert.match(prompt, /goal_list` renders the live Goals table directly in the user's UI/);
-    assert.match(prompt, /Never duplicate a rendered table/);
+    assert.match(prompt, /Use it directly for internal checks/);
+    assert.match(prompt, /call `present_result` once with the selected result/);
     await withDaemon(
       async () => "unused",
       async ({ daemon, chatId }) => {
         const tools = (await daemon.director.executeDirectorMcpTool(chatId, "__list_tools", {})) as ToolDefinition[];
         const desc = tools.find((t) => t.name === "goal_list")!.description;
-        assert.match(desc, /rendered as a live Goals table directly in the user's UI/);
-        assert.match(desc, /instead of printing or duplicating a Goals table/);
-        assert.match(tools.find((t) => t.name === "goal_get")!.description, /do not re-print it/);
+        assert.match(desc, /presentation_id to present_result/);
+        assert.match(tools.find((t) => t.name === "goal_get")!.description, /presentation_id to present_result/);
       },
     );
   });

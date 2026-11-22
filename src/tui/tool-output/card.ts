@@ -1,6 +1,6 @@
 import type { Component } from "@earendil-works/pi-tui";
 import type { HarnessTheme } from "../primitives/theme.js";
-import { clampLine } from "../primitives/width.js";
+import { SPACER, statusGlyph, titleRow } from "../primitives/rows.js";
 import { renderToolOutput } from "./registry.js";
 import { sanitizeText, type ToolDisplayPayload } from "./types.js";
 
@@ -25,7 +25,7 @@ export class ToolOutputCard implements Component {
     if (width <= 0) return [];
     if (this.cachedWidth === width) return this.cachedLines;
     this.cachedWidth = width;
-    this.cachedLines = ["", ...renderToolOutput(this.display, width, this.theme)];
+    this.cachedLines = [SPACER, ...renderToolOutput(this.display, width, this.theme)];
     return this.cachedLines;
   }
 }
@@ -45,6 +45,6 @@ export class ToolOutputNote implements Component {
 
   render(width: number): readonly string[] {
     if (width <= 0) return [];
-    return [clampLine(`  ${this.theme.success("✓")} ${this.theme.dim(this.text)}`, width)];
+    return [titleRow(this.theme, { glyph: statusGlyph(this.theme, "ok"), title: this.text }, width)];
   }
 }

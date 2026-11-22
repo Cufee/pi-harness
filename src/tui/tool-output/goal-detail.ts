@@ -1,5 +1,6 @@
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { HarnessTheme } from "../primitives/theme.js";
+import { secondary, titleText } from "../primitives/rows.js";
 import { renderProgressBar } from "../primitives/layout.js";
 import { clampLine, fillLineBg, fitWidth } from "../primitives/width.js";
 import { asInt, asIntOrNull, asRecord, sanitizeText, statusPaint, type ToolDisplayPayload } from "./types.js";
@@ -55,13 +56,13 @@ export function renderGoalDetail(display: ToolDisplayPayload, width: number, the
   };
 
   // Framed top rule + shaded header strip so printed Goals stand out cleanly from chat prose
-  const headerTag = `${theme.accent("◆")} ${theme.bold(`${id} v${version}`)}  ${statusPaint(status, theme)(`● ${status}`)}`;
+  const headerTag = `${titleText(theme, { glyph: theme.accent("◆"), title: `${id} v${version}` })}  ${statusPaint(status, theme)(`● ${status}`)}`;
   const topLabel = ` ${headerTag} `;
   const topFill = Math.max(0, width - 2 - visibleWidth(topLabel));
   out.push(clampLine(`${theme.border("╭─")}${topLabel}${theme.border("─".repeat(topFill))}`, width));
 
   const titleLines = wrapTextWithAnsi(title, Math.max(1, innerW));
-  for (const tl of titleLines.slice(0, 2)) {
+  for (const tl of titleLines) {
     const lineText = `${rail}${theme.bold(tl)}`;
     out.push(fillLineBg(fitWidth(lineText, width), width, theme.surfaceBg));
   }
@@ -85,7 +86,7 @@ export function renderGoalDetail(display: ToolDisplayPayload, width: number, the
     `Criteria ${passed}/${criteria.length} passed`,
   ];
   if (tasks.length > 0) meta.push(`Tasks ${tasks.length}`);
-  const metaText = theme.dim(meta.join(" · "));
+  const metaText = secondary(theme, meta.join(" · "));
   if (criteria.length > 0 && width >= 88) {
     const bar = renderProgressBar(passed / criteria.length, theme, { barWidth: 8 });
     subRow(`${metaText}  ${bar}`);

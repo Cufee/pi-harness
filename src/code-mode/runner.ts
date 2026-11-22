@@ -4,12 +4,13 @@ import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { nextUniqueFileName } from "../control-plane/ids.js";
+import { toolEventPreview } from "../protocol/tool-display.js";
 import type { ToolDefinition } from "../runners/types.js";
 import { guard, sandboxCommand, sandboxEnv } from "./sandbox.js";
 import { generateSdkDeclarations } from "./sdk.js";
 
 export interface CodeExecToolEvent {
-  phase: "start" | "end"; name: string; args: Record<string, unknown>; ok?: boolean; error?: string; via: "code_exec";
+  phase: "start" | "end"; name: string; args: Record<string, unknown>; ok?: boolean; error?: string; result?: string; via: "code_exec";
 }
 export interface CodeExecOptions {
   code: string; tools: ToolDefinition[];
@@ -118,7 +119,7 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
         if (!names.has(name)) throw new Error(`Tool not allowed: ${name}`);
         const value = await opts.callTool(name, args);
         reply({ ok: true, value });
-        opts.onToolEvent?.({ ...event, phase: "end", ok: true });
+        opts.onToolEvent?.({ ...event, phase: "end", ok: true, result: toolEventPreview(value) });
       } catch (e) {
         const error = message(e);
         opts.onToolEvent?.({ ...event, phase: "end", ok: false, error });
