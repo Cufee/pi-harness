@@ -1,9 +1,10 @@
+import { withFixtureCatalog } from "./fixtures/launch-config.js";
 import assert from "node:assert/strict";
 import { it } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import type { CodeExecResult } from "../src/code-mode/index.js";
+import { effectiveCodeMode, type CodeExecResult } from "../src/code-mode/index.js";
 import { loadConfig, type HarnessConfig } from "../src/config.js";
 import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
@@ -16,9 +17,9 @@ async function withDirector(
 ): Promise<void> {
   const repoRoot = mkdtempSync(join(tmpdir(), "director-code-"));
   const socketPath = join(repoRoot, "d.sock");
-  const daemon = new HarnessDaemon({
+  const daemon = new HarnessDaemon(withFixtureCatalog({
     ...loadConfig(repoRoot), stateDir: repoRoot, socketPath, codeMode: mode, codeExec: { maxOutputChars: 12 },
-  }, {
+  }), {
     dbPath: ":memory:",
     customRunnerFactory: () => ({
       run: async (req) => {
@@ -51,9 +52,9 @@ for (const mode of ["collapsed", "hybrid", "off"] as const) {
       const tools = await callBridge(bridge, req, "__list_tools", {}) as ToolDefinition[];
       assert.deepEqual(tools, req.tools);
       const names = tools.map((tool) => tool.name);
-      if (mode === "collapsed") assert.deepEqual(names, ["tool_search", "code_exec"]);
+      if (effectiveCodeMode(mode) === "collapsed") assert.deepEqual(names, ["tool_search", "code_exec"]);
       else assert.ok(names.includes("goal_list"));
-      if (mode === "off") {
+      if (effectiveCodeMode(mode) === "off") {
         assert.ok(!names.includes("tool_search") && !names.includes("code_exec"));
         assert.doesNotMatch(req.systemPrompt, /## Code Mode/);
         await assert.rejects(req.executeTool("code_exec", { code: "" }), /Unknown Director tool/);
@@ -68,10 +69,10 @@ for (const mode of ["collapsed", "hybrid", "off"] as const) {
   });
 }
 
-it("runs Director tools in the chat workspace and forwards nested MCP events", async () => {
+it.skipIf(effectiveCodeMode("collapsed") === "off")("runs Director tools in the chat workspace and forwards nested MCP events", async () => {
   const events: { id?: string; name: string; status: string; via?: string }[] = [];
   await withDirector("collapsed", async (req, bridge) => {
-    const code = 'import { read_file, output } from "harness"; output((await read_file({ path: "note.txt" })).content);';
+    const code = 'import { read_file, output } from "harness"; output((await read_file({ path: "note.txt", exception_reason: "Check fixture bytes" })).content);';
     const result = await callBridge(bridge, req, "code_exec", { code }) as CodeExecResult;
     assert.equal(result.ok, true, result.error);
     assert.equal(result.preview, '"Director wo');
@@ -89,7 +90,7 @@ it("runs Director tools in the chat workspace and forwards nested MCP events", a
   });
 });
 
-it("cancels both runner-local and MCP Code Mode calls with one chat cancellation", async () => {
+it.skipIf(effectiveCodeMode("collapsed") === "off")("cancels both runner-local and MCP Code Mode calls with one chat cancellation", async () => {
   let completedCalls = 0;
   const startedIds = new Set<string>();
   await withDirector("collapsed", async (req, bridge) => {
@@ -114,7 +115,7 @@ it("cancels both runner-local and MCP Code Mode calls with one chat cancellation
 
 it("keeps the independent reviewer read-only with its native verdict tool in collapsed mode", async () => {
   await withDirector("collapsed", async (req) => {
-    assert.equal(req.readOnly, true);
+    assert.equal(req.toolPolicy, "read_only_workspace");
     assert.deepEqual(req.tools.map((tool) => tool.name), ["submit_review_verdict"]);
     assert.doesNotMatch(req.systemPrompt, /## Code Mode/);
     await req.executeTool("submit_review_verdict", {

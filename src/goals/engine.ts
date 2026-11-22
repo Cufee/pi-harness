@@ -1,8 +1,7 @@
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
-import { promisify } from "node:util";
 import type { Database } from "bun:sqlite";
 import { runGit } from "../worktree/manager.js";
 
@@ -14,7 +13,48 @@ function canonicalRepoPath(p: string): string {
   }
 }
 
-const execFileAsync = promisify(execFile);
+async function runGate(command: string, cwd: string, signal?: AbortSignal): Promise<{ stdout: string; stderr: string }> {
+  signal?.throwIfAborted();
+  const child = spawn("/bin/sh", ["-lc", command], { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  let stopped: Error | undefined;
+  const stop = (reason: Error) => {
+    if (stopped) return;
+    stopped = reason;
+    // Gate commands can start additional processes. Terminate the shell's whole process group.
+    if (child.pid) {
+      try { process.kill(-child.pid, "SIGKILL"); }
+      catch (err) { if ((err as NodeJS.ErrnoException).code !== "ESRCH") child.kill("SIGKILL"); }
+    }
+  };
+  const abort = () => stop(new Error("Verification gate cancelled"));
+  const timeout = setTimeout(() => stop(new Error("Verification gate timed out")), 180_000);
+  signal?.addEventListener("abort", abort, { once: true });
+  const collect = (stream: NodeJS.ReadableStream, chunks: Buffer[]) => {
+    let bytes = 0;
+    stream.on("data", (chunk: Buffer) => {
+      bytes += chunk.length;
+      if (bytes > 8 * 1024 * 1024) stop(new Error("Verification gate exceeded its output limit"));
+      else chunks.push(chunk);
+    });
+  };
+  collect(child.stdout, stdout);
+  collect(child.stderr, stderr);
+  try {
+    const code = await new Promise<number | null>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", resolve);
+    });
+    if (stopped) throw stopped;
+    const output = { stdout: Buffer.concat(stdout).toString(), stderr: Buffer.concat(stderr).toString() };
+    if (code !== 0) throw new Error(output.stderr.trim() || output.stdout.trim() || `Gate exited with status ${code}`);
+    return output;
+  } finally {
+    signal?.removeEventListener("abort", abort);
+    clearTimeout(timeout);
+  }
+}
 
 export type GoalStatus =
   | "draft"
@@ -167,7 +207,7 @@ function reviewId(): string {
  * - Anti-spin circuit breakers (`maxReviewCycles` + `noProgressStreak` diff-hash/failure fingerprint)
  */
 export class GoalEngine {
-  constructor(private readonly db: Database) {
+  constructor(private readonly db: Database, private readonly onReviewInvalidated?: (goalId: string) => void) {
     this.db.exec(GOALS_SCHEMA);
   }
 
@@ -287,6 +327,7 @@ export class GoalEngine {
     this.db
       .prepare("UPDATE goals SET status = ?, last_review_summary = COALESCE(?, last_review_summary), updated_at = ? WHERE id = ?")
       .run(status, summary ?? null, Date.now(), goalIdStr);
+    if (status === "paused" || status === "cancelled") this.onReviewInvalidated?.(goalIdStr);
     return this.getGoal(goalIdStr)!;
   }
 
@@ -392,11 +433,12 @@ export class GoalEngine {
         now,
       );
 
+    this.onReviewInvalidated?.(goalIdStr);
     return { goal: this.getGoal(goalIdStr)!, delta };
   }
 
   /** Executes all `deterministic` criteria commands at $0 LLM cost and hashes repo diff for progress tracking. */
-  async runDeterministicGates(goalIdStr: string, baseSha?: string): Promise<DeterministicGateResult> {
+  async runDeterministicGates(goalIdStr: string, baseSha?: string, signal?: AbortSignal): Promise<DeterministicGateResult> {
     const goal = this.getGoal(goalIdStr);
     if (!goal) throw new Error(`Unknown goal ${goalIdStr}`);
     this.setStatus(goalIdStr, "verifying");
@@ -407,23 +449,20 @@ export class GoalEngine {
     for (const c of goal.criteria) {
       if (c.kind !== "deterministic" || !c.command) continue;
       try {
-        const { stdout, stderr } = await execFileAsync("/bin/sh", ["-lc", c.command], {
-          cwd: goal.repoRoot,
-          timeout: 180_000,
-          maxBuffer: 8 * 1024 * 1024,
-        });
+        const { stdout, stderr } = await runGate(c.command, goal.repoRoot, signal);
         results.push({
           criterionId: c.id,
           passed: true,
           evidence: `$ ${c.command} -> exit 0${stdout.trim() ? `: ${stdout.trim().slice(-300)}` : stderr.trim() ? `: ${stderr.trim().slice(-200)}` : ""}`,
         });
       } catch (err: unknown) {
-        const e = err as { stdout?: string; stderr?: string; message?: string };
+        signal?.throwIfAborted();
+        const message = err instanceof Error ? err.message : String(err);
         if (c.required) allPassed = false;
         results.push({
           criterionId: c.id,
           passed: false,
-          evidence: `$ ${c.command} -> FAILED\n${(e.stderr ?? e.stdout ?? e.message ?? "").slice(-600)}`,
+          evidence: `$ ${c.command} -> FAILED\n${message.slice(-600)}`,
           remediation: `Fix failures in deterministic check: ${c.command}`,
         });
       }
