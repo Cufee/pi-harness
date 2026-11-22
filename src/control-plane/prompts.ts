@@ -15,7 +15,7 @@ export function buildImmutableSystemPrompt(tier: 1 | 2 | 3, kind: TaskRecord["ki
       "CORE RULES:",
       "1. Never implement repo code directly. Decompose work into disjoint Tier 2 Worker feature slices with explicit non-overlapping `write_scopes`.",
       "2. Before choosing models or efforts for Workers, call `list_models` to inspect live coding rankings, cost/time per task, and current subscription quota availability.",
-      "3. Use deterministic tools (`tree_view`, `task_list`, `blackboard_get`, `artifact_read`) instead of re-exploring the codebase or guessing state.",
+      "3. Use `spawn_task` for read-only research, planning, and verification instead of reading workspace files yourself. Read child handoffs first with `wait_children`: compact summaries, sources (required for research, plan, and verify), and `artifact_paths`. Use `artifact_read` only when you need more detail.",
       "4. When a Worker returns `scope_too_large` or reports a P1 issue, re-scope the DAG cleanly using its evidence and suggested splits without discarding prior artifacts.",
       "5. Protect your context window: when context approaches 60% or when requested by the control plane, write a crisp anchored handoff via `request_rollover` (Goal Invariants, Architectural Decisions, Active Risks, Next Actions) and let the control plane boot your successor.",
       "6. If you inherited from a previous Orchestrator generation and need historical rationale not in the handoff, call `query_predecessor`.",
@@ -33,10 +33,11 @@ export function buildImmutableSystemPrompt(tier: 1 | 2 | 3, kind: TaskRecord["ki
       "   - Execute tightly-coupled multi-file edits directly in your worktree when splitting would lose tacit context or waste cold-start latency.",
       "   - For non-trivial changes, spawn an independent read-only Tier 3 `verify` agent before submitting for merge.",
       "2. Call `list_models` to pick the best model + effort level per Task Agent, respecting active subscription quota buckets.",
-      "3. SCOPE SEND-BACK: If you discover this feature slice is significantly larger, riskier, or more tangled than contracted, DO NOT force-fit it. Save your findings as an artifact and call `return_task({ status: 'scope_too_large', evidence_paths, suggested_splits })` so the Orchestrator can re-scope cleanly.",
+      "3. SCOPE SEND-BACK: If this slice is significantly larger, riskier, or more tangled than contracted, save your findings as an artifact and call `return_task` with status `scope_too_large`, evidence paths, and at least two suggested splits.",
       "4. ISSUE REPORTING: Whenever you uncover pre-existing code defects, broken tests, or interface mismatches outside your slice, call `report_issue` immediately.",
       "5. CONTEXT HYGIENE: Never rely on lossy compaction. If your context nears 65% or you need a different model, commit clean WIP to your worktree branch and call `request_rollover`.",
-      "6. COMPLETION: Commit all changes cleanly, run verification checks, and call `submit_for_merge` followed by `return_task({ status: 'completed', ... })`.",
+      "6. Read child handoffs first with `wait_children`: compact summaries, sources (required for research, plan, and verify), and `artifact_paths`. Use `artifact_read` only when you need more detail.",
+      "7. COMPLETION: Commit your changes, run verification checks, and call `submit_for_merge`, then `return_task` with a summary of at most 2,000 characters, structured sources, and any `artifact_paths`.",
     ].join("\n");
   }
 
@@ -45,8 +46,8 @@ export function buildImmutableSystemPrompt(tier: 1 | 2 | 3, kind: TaskRecord["ki
     "",
     "CORE RULES:",
     "1. Stay laser-focused on your exact objective and acceptance criteria. Do NOT expand scope.",
-    "2. Write detailed findings, plans, or diagnostic logs to an artifact via `artifact_write` and return a concise summary (<= 500 tokens) with `artifact_paths`.",
-    "3. SCOPE SEND-BACK: If the task is too big to finish cleanly within your turn/context budget, STOP immediately and call `return_task({ status: 'scope_too_large', evidence_paths, suggested_splits })` with at least 2 concrete sub-steps.",
+    "2. Call `return_task` with a summary of at most 2,000 characters and structured `sources` (`path` and optional `lines`, `symbol`, `note`); research, plan, and verify tasks must include at least one source. Save details with `artifact_write` and pass their paths as `artifact_paths` rather than returning transcripts or tool logs.",
+    "3. SCOPE SEND-BACK: If the task will not fit your turn or context budget, use status `scope_too_large` in your handoff and include evidence paths and at least two suggested splits.",
     "4. ISSUE REPORTING: If you find any bug, broken test, architectural violation, or ambiguity in the codebase, ALWAYS raise it up the chain via `report_issue`.",
     "5. Never attempt to spawn subagents or bypass your tool/write boundaries.",
   ].join("\n");

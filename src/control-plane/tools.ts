@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { basename, join, relative, resolve, sep } from "node:path";
 import type { ModelCatalogCompiler } from "../catalog/compiler.js";
 import type { ToolDefinition } from "../runners/types.js";
 import type { KbKind } from "../kb/store.js";
@@ -39,6 +40,45 @@ export interface ToolRuntimeHooks {
   getWorktreeManager: (repoRoot: string) => WorktreeManager;
   getMergeQueue: (repoRoot: string) => BisectingMergeQueue;
 }
+
+const READ_ONLY_TASK_ROLES = {
+  research: "codebase_research",
+  plan: "plan_synthesis",
+  verify: "independent_verifier",
+} as const;
+
+function isReadOnlyKind(kind: string): kind is keyof typeof READ_ONLY_TASK_ROLES {
+  return Object.hasOwn(READ_ONLY_TASK_ROLES, kind);
+}
+
+const SUMMARY_LIMIT = 2000;
+type TaskSource = { path: string; lines?: string; symbol?: string; note?: string };
+
+const waitChildrenTool: ToolDefinition = {
+  name: "wait_children",
+  description: "Wait for child tasks and read their summaries, sources, artifact paths, and escalations.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      ids: { type: "array", items: { type: "string" } },
+      mode: { type: "string", enum: ["any", "all"] },
+      timeout_s: { type: "number" },
+    },
+  },
+};
+
+const cancelChildTool: ToolDefinition = {
+  name: "cancel_child",
+  description: "Cancel a running child task cleanly and release its write leases.",
+  inputSchema: {
+    type: "object",
+    required: ["task_id", "reason"],
+    properties: {
+      task_id: { type: "string" },
+      reason: { type: "string" },
+    },
+  },
+};
 
 const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
   {
@@ -98,6 +138,22 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
   },
   {
     name: "spawn_task",
+    tiers: [1],
+    description: "Spawn a read-only Tier 3 research, plan, or verify task. Read its handoff with wait_children.",
+    inputSchema: {
+      type: "object",
+      required: ["kind", "title", "objective"],
+      properties: {
+        kind: { type: "string", enum: Object.keys(READ_ONLY_TASK_ROLES) },
+        title: { type: "string" },
+        objective: { type: "string" },
+        model: { type: "string" },
+        effort: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "spawn_task",
     tiers: [2],
     description:
       "Spawn a small, zero-compaction Tier 3 Task Agent (research, plan, execute, or verify) inside this Worker's worktree.",
@@ -109,7 +165,7 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
         title: { type: "string" },
         objective: { type: "string" },
         criteria: { type: "string" },
-        read_only: { type: "boolean", description: "Force strict read-only sandbox (default true for research/plan/verify)" },
+        read_only: { type: "boolean", description: "Opt an execute task into read-only access. Research, plan, and verify are always read-only." },
         profile_id: { type: "string" },
         model: { type: "string" },
         effort: { type: "string" },
@@ -118,19 +174,8 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
       },
     },
   },
-  {
-    name: "wait_children",
-    tiers: [1, 2],
-    description: "Wait for spawned child tasks to finish, escalate, or return_for_rescope.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        ids: { type: "array", items: { type: "string" } },
-        mode: { type: "string", enum: ["any", "all"] },
-        timeout_s: { type: "number" },
-      },
-    },
-  },
+  { ...waitChildrenTool, tiers: [1, 2] },
+  { ...waitChildrenTool, name: "wait_tasks", tiers: [1, 2] },
   {
     name: "steer_child",
     tiers: [1, 2],
@@ -144,19 +189,8 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
       },
     },
   },
-  {
-    name: "cancel_child",
-    tiers: [1, 2],
-    description: "Cancel a running child task cleanly and release its write leases.",
-    inputSchema: {
-      type: "object",
-      required: ["task_id", "reason"],
-      properties: {
-        task_id: { type: "string" },
-        reason: { type: "string" },
-      },
-    },
-  },
+  { ...cancelChildTool, tiers: [1, 2] },
+  { ...cancelChildTool, name: "cancel_task", tiers: [1] },
   {
     name: "return_task",
     tiers: [2, 3],
@@ -167,7 +201,16 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
       required: ["status", "summary"],
       properties: {
         status: { type: "string", enum: ["completed", "scope_too_large", "blocked"] },
-        summary: { type: "string" },
+        summary: { type: "string", description: "Compact handoff (up to 2,000 characters; longer summaries are saved as artifacts)." },
+        sources: {
+          type: "array",
+          description: "Evidence references. Required and non-empty for research, plan, and verify tasks.",
+          items: {
+            type: "object",
+            required: ["path"],
+            properties: { path: { type: "string" }, lines: { type: "string" }, symbol: { type: "string" }, note: { type: "string" } },
+          },
+        },
         artifact_paths: { type: "array", items: { type: "string" } },
         evidence_paths: { type: "array", items: { type: "string" } },
         suggested_splits: { type: "array", items: { type: "string" } },
@@ -273,7 +316,7 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
   {
     name: "artifact_read",
     tiers: [1, 2, 3],
-    description: "Read a previously written artifact by path or list indexed artifacts for a task.",
+    description: "Read a dossier by path (Tier 1: indexed dossiers in this run only) or list indexed artifacts for a task.",
     inputSchema: {
       type: "object",
       properties: {
@@ -613,9 +656,33 @@ export class ControlPlaneToolExecutor {
       }
 
       case "spawn_task": {
-        const kind = String(args.kind) as TaskKind;
-        const defaultReadOnly = kind !== "execute";
-        const readOnly = args.read_only === undefined ? defaultReadOnly : Boolean(args.read_only);
+        const kind = String(args.kind);
+        const readOnlyKind = isReadOnlyKind(kind);
+        const fromOrchestrator = task.tier === 1;
+        if (fromOrchestrator && !readOnlyKind) {
+          throw new Error("Tier 1 spawn_task only permits research, plan, and verify; use spawn_worker for implementation.");
+        }
+        if (!readOnlyKind && kind !== "execute") throw new Error(`Unknown spawn_task kind: ${kind}`);
+        if (task.status === "draining") throw new Error("Cannot spawn tasks while draining for rollover.");
+
+        let model = typeof args.model === "string" ? args.model : undefined;
+        let effort = typeof args.effort === "string" ? args.effort : undefined;
+        let profileId = !fromOrchestrator && typeof args.profile_id === "string" ? args.profile_id : undefined;
+        if (fromOrchestrator && readOnlyKind) {
+          const { models } = await this.catalog.getCatalog({ cwd: run.repoRoot, excludeExhausted: !model });
+          const requestedEffort = effort;
+          const candidates = requestedEffort ? models.filter((entry) => entry.efforts.includes(requestedEffort)) : models;
+          const selected = model
+            ? models.find((entry) => entry.id === model || entry.preferredRoute.wireModelId === model)
+            : candidates.find((entry) => entry.recommendedFor.includes(READ_ONLY_TASK_ROLES[kind])) ?? candidates[0];
+          if (selected) {
+            model = selected.preferredRoute.wireModelId;
+            profileId = selected.preferredRoute.profileId;
+            effort ??= ["default", "medium"].find((level) => selected.efforts.includes(level)) ?? selected.efforts[0];
+          } else if (!model) {
+            throw new Error("No available catalog model for this task. Specify a model or try again when quota is available.");
+          }
+        }
         const created = await this.hooks.spawnAndStartTask({
           runId,
           parentId: taskId,
@@ -623,30 +690,40 @@ export class ControlPlaneToolExecutor {
           kind,
           title: String(args.title),
           objective: String(args.objective),
-          criteria: typeof args.criteria === "string" ? args.criteria : "",
-          readOnly,
-          profileId: typeof args.profile_id === "string" ? args.profile_id : undefined,
-          model: typeof args.model === "string" ? args.model : undefined,
-          effort: typeof args.effort === "string" ? args.effort : undefined,
-          maxTurns: typeof args.max_turns === "number" ? args.max_turns : undefined,
-          dependsOn: Array.isArray(args.depends_on) ? (args.depends_on as string[]) : [],
+          criteria: !fromOrchestrator && typeof args.criteria === "string" ? args.criteria : "",
+          readOnly: readOnlyKind || args.read_only === true,
+          profileId,
+          model,
+          effort,
+          maxTurns: !fromOrchestrator && typeof args.max_turns === "number" ? args.max_turns : undefined,
+          dependsOn: !fromOrchestrator && Array.isArray(args.depends_on) ? (args.depends_on as string[]) : [],
         });
         return { spawned: created.id, kind: created.kind, readOnly: created.readOnly, status: created.status };
       }
 
+      case "wait_tasks":
       case "wait_children": {
         const ids = Array.isArray(args.ids) ? (args.ids as string[]) : undefined;
         const mode = args.mode === "any" ? "any" : "all";
         const timeoutMs = (typeof args.timeout_s === "number" ? args.timeout_s : 300) * 1000;
         const settled = await this.hooks.waitForChildren(taskId, ids, mode, timeoutMs);
+        const escalations = this.db.listEscalations(runId);
         return {
-          children: settled.map((c) => ({
-            id: c.id,
-            title: c.title,
-            status: c.status,
-            summary: c.summary,
-            result: c.resultJson ? JSON.parse(c.resultJson) : null,
-          })),
+          children: settled.map((c) => {
+            const result = c.resultJson ? JSON.parse(c.resultJson) : null;
+            // The runner stores its final text as a fallback summary when return_task was skipped.
+            const missingHandoff = typeof result?.text === "string" && typeof result?.summary !== "string";
+            return {
+              id: c.id,
+              title: c.title,
+              kind: c.kind,
+              status: c.status,
+              summary: missingHandoff ? "Task ended without a structured handoff." : c.summary?.slice(0, SUMMARY_LIMIT) ?? null,
+              sources: result?.sources ?? [],
+              artifact_paths: result?.artifact_paths ?? result?.artifactPaths ?? [],
+              escalations: escalations.filter((e) => e.fromTaskId === c.id),
+            };
+          }),
         };
       }
 
@@ -655,74 +732,100 @@ export class ControlPlaneToolExecutor {
         return { steered: ok };
       }
 
+      case "cancel_task":
       case "cancel_child": {
-        await this.hooks.cancelTask(String(args.task_id), String(args.reason));
-        return { cancelled: String(args.task_id) };
+        const childId = String(args.task_id);
+        const child = this.db.getTask(childId);
+        if (!child || child.runId !== runId || child.parentId !== taskId) throw new Error(`Unknown child task ${childId}`);
+        await this.hooks.cancelTask(childId, String(args.reason));
+        return { cancelled: childId };
       }
 
       case "return_task": {
         const status = String(args.status);
-        const summary = String(args.summary);
-        const artifactPaths = Array.isArray(args.artifact_paths) ? (args.artifact_paths as string[]) : [];
-
-        if (status === "scope_too_large") {
-          const evidencePaths = Array.isArray(args.evidence_paths) ? (args.evidence_paths as string[]) : artifactPaths;
-          const suggestedSplits = Array.isArray(args.suggested_splits) ? (args.suggested_splits as string[]) : [];
-          const esc = this.db.createEscalation({
-            runId,
-            fromTaskId: taskId,
-            toTaskId: task.parentId,
-            severity: task.tier === 2 ? "P1" : "P2",
-            category: "scope_too_large",
-            title: `Scope too large for ${task.title}: ${summary.slice(0, 140)}`,
-            evidencePaths,
-            suggestedSplits,
-            blocking: true,
-          });
-          this.db.updateTask(taskId, {
-            status: "returned_for_rescope",
-            summary,
-            resultJson: JSON.stringify({ status, summary, artifactPaths, escalationId: esc.id, suggestedSplits }),
-          });
-          return { returned: true, status: "returned_for_rescope", escalationId: esc.id };
+        if (status !== "completed" && status !== "blocked" && status !== "scope_too_large") {
+          throw new Error("return_task requires status completed, blocked, or scope_too_large");
         }
-
-        if (status === "blocked") {
-          this.db.updateTask(taskId, {
-            status: "blocked",
-            summary,
-            resultJson: JSON.stringify({ status, summary, artifactPaths }),
-          });
-          return { returned: true, status: "blocked" };
+        const fullSummary = args.summary;
+        if (typeof fullSummary !== "string") throw new Error("return_task requires a summary string");
+        let summary = fullSummary;
+        const artifactPaths = args.artifact_paths === undefined ? [] : args.artifact_paths;
+        if (!Array.isArray(artifactPaths) || !artifactPaths.every((path) => typeof path === "string")) {
+          throw new Error("return_task artifact_paths must be an array of strings");
         }
-
-        // Settlement gate: Tier 2 cannot complete while children are still running or worktree is dirty
-        const activeKids = this.db
-          .listTasks(runId, { parentId: taskId })
-          .filter((c) => ["running", "ready", "pending", "waiting_children", "merging"].includes(c.status));
-        if (activeKids.length > 0) {
-          throw new Error(
-            `Settlement gate rejected completion: ${activeKids.length} child task(s) are still active (${activeKids.map((k) => k.id).join(", ")}).`,
-          );
+        const rawSources = args.sources === undefined ? [] : args.sources;
+        if (!Array.isArray(rawSources) || (isReadOnlyKind(task.kind) && rawSources.length === 0)) {
+          throw new Error(`return_task requires a non-empty sources array for ${task.kind} tasks (each source needs a path)`);
         }
-        if (task.tier === 2 && task.worktreeId) {
-          const wt = this.db.getWorktree(task.worktreeId);
-          if (wt && wt.status === "active") {
-            const dirty = await this.hooks.getWorktreeManager(run.repoRoot).isDirty(wt.path);
-            if (dirty) {
-              throw new Error(
-                `Settlement gate rejected completion: worktree ${wt.path} has uncommitted changes. Commit and call submit_for_merge first.`,
-              );
+        const sources: TaskSource[] = rawSources.map((source) => {
+          const { path, lines, symbol, note } = source ?? {};
+          if (typeof path !== "string" || !path.trim() || [lines, symbol, note].some((v) => v !== undefined && typeof v !== "string")) {
+            throw new Error("return_task sources require a non-empty path and optional string lines, symbol, and note");
+          }
+          return { path, lines, symbol, note };
+        });
+
+        if (status === "completed") {
+          const activeKids = this.db
+            .listTasks(runId, { parentId: taskId })
+            .filter((c) => ["running", "ready", "pending", "waiting_children", "merging"].includes(c.status));
+          if (activeKids.length > 0) {
+            throw new Error(
+              `Settlement gate rejected completion: ${activeKids.length} child task(s) are still active (${activeKids.map((k) => k.id).join(", ")}).`,
+            );
+          }
+          if (task.tier === 2 && task.worktreeId) {
+            const wt = this.db.getWorktree(task.worktreeId);
+            if (wt && wt.status === "active" && await this.hooks.getWorktreeManager(run.repoRoot).isDirty(wt.path)) {
+              throw new Error(`Settlement gate rejected completion: worktree ${wt.path} has uncommitted changes. Commit and call submit_for_merge first.`);
             }
           }
         }
 
-        this.db.updateTask(taskId, {
-          status: "completed",
-          summary,
-          resultJson: JSON.stringify({ status: "completed", summary, artifactPaths }),
-        });
-        return { returned: true, status: "completed" };
+        const paths = [...artifactPaths];
+        let overflowPath: string | undefined;
+        if (summary.length > SUMMARY_LIMIT) {
+          const artifactPath = `.harness/artifacts/${taskId}-summary-${randomUUID()}.md`;
+          overflowPath = resolve(run.repoRoot, artifactPath);
+          mkdirSync(join(run.repoRoot, ".harness", "artifacts"), { recursive: true });
+          writeFileSync(overflowPath, summary, { encoding: "utf8", flag: "wx" });
+          paths.push(overflowPath);
+          const pointer = `\n\n[Full summary: ${artifactPath}]`;
+          summary = summary.slice(0, SUMMARY_LIMIT - pointer.length).trimEnd() + pointer;
+        }
+        const taskStatus = status === "scope_too_large" ? "returned_for_rescope" : status;
+        try {
+          return this.db.transaction(() => {
+            let escalationId: string | undefined;
+            let suggestedSplits: string[] | undefined;
+            if (status === "scope_too_large") {
+              suggestedSplits = Array.isArray(args.suggested_splits) ? (args.suggested_splits as string[]) : [];
+              escalationId = this.db.createEscalation({
+                runId,
+                fromTaskId: taskId,
+                toTaskId: task.parentId,
+                severity: task.tier === 2 ? "P1" : "P2",
+                category: "scope_too_large",
+                title: `Scope too large for ${task.title}: ${fullSummary.slice(0, 140)}`,
+                evidencePaths: Array.isArray(args.evidence_paths) ? (args.evidence_paths as string[]) : paths,
+                suggestedSplits,
+                blocking: true,
+              }).id;
+            }
+            if (overflowPath) {
+              this.db.recordArtifact({ runId, taskId, kind: "dossier", path: overflowPath, summary: "Full task summary" });
+            }
+            this.db.updateTask(taskId, {
+              status: taskStatus,
+              summary,
+              resultJson: JSON.stringify({ status, summary, sources, artifact_paths: paths, escalationId, suggestedSplits }),
+            });
+            return { returned: true, status: taskStatus, ...(escalationId ? { escalationId } : {}) };
+          });
+        } catch (error) {
+          if (overflowPath) rmSync(overflowPath, { force: true });
+          throw error;
+        }
       }
 
       case "report_issue": {
@@ -805,8 +908,16 @@ export class ControlPlaneToolExecutor {
 
       case "artifact_read": {
         if (typeof args.path === "string" && args.path) {
-          const target = resolve(args.path);
+          const target = resolve(run.repoRoot, args.path);
+          if (task.tier === 1 && !this.db.hasDossier(runId, target)) throw new Error(`No indexed dossier in this run: ${target}`);
           if (!existsSync(target)) throw new Error(`Artifact not found: ${target}`);
+          if (task.tier === 1) {
+            const repoRelative = relative(run.repoRoot, target);
+            if (!repoRelative.startsWith(`.harness${sep}artifacts${sep}`) ||
+                realpathSync(target) !== resolve(realpathSync(run.repoRoot), repoRelative)) {
+              throw new Error(`Dossier must be a non-symlink path under .harness/artifacts: ${target}`);
+            }
+          }
           const raw = readFileSync(target, "utf8");
           const max = typeof args.max_chars === "number" ? args.max_chars : 8000;
           return { path: target, truncated: raw.length > max, content: raw.slice(0, max) };
