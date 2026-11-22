@@ -9,7 +9,7 @@ import { agent } from "@agentclientprotocol/sdk/unstable";
 import { create, toJsonString } from "@bufbuild/protobuf";
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { loadConfig, type AcpProfileConfig } from "../src/config.js";
+import { defaultProfiles, loadConfig, type AcpProfileConfig } from "../src/config.js";
 import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import {
@@ -507,6 +507,8 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
     const port = (server.address() as { port: number }).port;
 
     const cfg = loadConfig(repoDir);
+    // Pin built-in profiles: the host ~/.pi-harness/config.json may omit acp:claude, which would silently remap Worker A to another profile.
+    cfg.profiles = defaultProfiles();
     cfg.stateDir = stateDir;
     cfg.socketPath = sockPath;
     cfg.quotaEndpoint = { url: `http://127.0.0.1:${port}/v1/quota`, format: "protojson", pollIntervalSec: 1 };
