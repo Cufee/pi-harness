@@ -2,7 +2,13 @@ import { randomUUID } from "node:crypto";
 import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { recommendModelsByTaskKind, type ModelCatalogCompiler } from "../catalog/compiler.js";
+import {
+  compareSemanticVersions,
+  parseClaudeFamilyVersion,
+  recommendModelsByTaskKind,
+  type ModelCatalogCompiler,
+} from "../catalog/compiler.js";
+import { vendorSuccessors } from "../catalog/lifecycle.js";
 import { createCodeModeExecutor, effectiveCodeMode } from "../code-mode/index.js";
 import type { HarnessConfig } from "../config.js";
 import { resolveLaunchRoute } from "../control-plane/launch-route.js";
@@ -679,6 +685,105 @@ export class DirectorRuntime {
     );
   }
 
+  /**
+   * Reconciles a persisted chat session's `model` against the current compiled catalog.
+   * When an unambiguous migration exists on the same profile (e.g. legacy `anthropic/opus` -> `anthropic/claude-opus-5-5`,
+   * renamed canonical prefix for the same model slug, or vendor-documented successor), persists the updated model and
+   * appends a one-line system notice. When no unambiguous match exists and `strict` is true, throws an actionable `/model` error.
+   */
+  async resolveOrMigrateSessionModel(
+    session: ChatSessionRecord,
+    opts?: { strict?: boolean },
+  ): Promise<ChatSessionRecord> {
+    const oldModel = session.model?.trim();
+    if (!oldModel) return session;
+
+    const profile = this.config.profiles.find((p) => p.enabled !== false && p.id === session.profileId);
+    if (!profile) return session;
+
+    const catalog = await this.catalog.getCatalog({ cwd: session.repoRoot });
+    if (catalog.models.length === 0) return session;
+
+    const profileEntries = catalog.models
+      .map((entry) => {
+        const routes = [entry.preferredRoute, ...entry.alternateRoutes].filter((r) => r?.profileId === session.profileId);
+        return routes.length > 0 ? { entry, routes } : null;
+      })
+      .filter((x): x is { entry: (typeof catalog.models)[number]; routes: Array<(typeof catalog.models)[number]["preferredRoute"]> } => x !== null);
+
+    const alreadyValid = profileEntries.some(({ entry, routes }) => {
+      const bareId = entry.id.slice(entry.id.lastIndexOf("/") + 1);
+      return oldModel === entry.id || oldModel === bareId || routes.some((r) => r.wireModelId === oldModel);
+    });
+    if (alreadyValid) return session;
+
+    let migrated: string | null = null;
+
+    // 1. Bare Claude family alias (`anthropic/opus`, `opus`, `claude-opus`) -> highest-versioned `anthropic/claude-<family>-*` on same profile
+    const claudeAlias = oldModel.match(/^(?:anthropic\/)?(?:claude-)?(opus|sonnet|haiku|fable)$/i);
+    if (claudeAlias) {
+      const family = claudeAlias[1]!.toLowerCase();
+      const familyCandidates = profileEntries
+        .map(({ entry }) => ({ entry, parsed: parseClaudeFamilyVersion(entry.id) }))
+        .filter(
+          (x): x is { entry: (typeof catalog.models)[number]; parsed: NonNullable<ReturnType<typeof parseClaudeFamilyVersion>> } =>
+            x.parsed !== null && x.parsed.family === family,
+        )
+        .sort((a, b) => compareSemanticVersions(b.parsed.version, a.parsed.version));
+      if (familyCandidates.length > 0) {
+        migrated = familyCandidates[0]!.entry.id;
+      }
+    }
+
+    // 2. Same model slug under a renamed canonical prefix (or dot/hyphen normalized slug) matching uniquely on same profile
+    if (!migrated) {
+      const oldSlug = (oldModel.includes("/") ? oldModel.slice(oldModel.lastIndexOf("/") + 1) : oldModel).toLowerCase();
+      const oldSlugDash = oldSlug.replace(/\./g, "-");
+      const slugMatches = profileEntries.filter(({ entry, routes }) => {
+        const entrySlug = entry.id.slice(entry.id.lastIndexOf("/") + 1).toLowerCase();
+        return (
+          entrySlug === oldSlug ||
+          entrySlug.replace(/\./g, "-") === oldSlugDash ||
+          routes.some((r) => r.wireModelId.toLowerCase() === oldSlug)
+        );
+      });
+      if (slugMatches.length === 1) {
+        migrated = slugMatches[0]!.entry.id;
+      }
+    }
+
+    // 3. Vendor-documented successor chain on the same profile
+    if (!migrated) {
+      const byLowerId = new Map(profileEntries.map(({ entry }) => [entry.id.toLowerCase(), entry.id]));
+      let cursor = oldModel.toLowerCase();
+      const visited = new Set<string>([cursor]);
+      while (true) {
+        const next = vendorSuccessors.get(cursor);
+        if (!next || visited.has(next.toLowerCase())) break;
+        visited.add(next.toLowerCase());
+        const hit = byLowerId.get(next.toLowerCase());
+        if (hit) {
+          migrated = hit;
+          break;
+        }
+        cursor = next.toLowerCase();
+      }
+    }
+
+    if (migrated) {
+      const updated = this.chats.updateSession(session.id, { model: migrated, resetAcpSession: true });
+      this.chats.appendTurn(updated.id, "system_notice", `Migrated session model from ${oldModel} to ${migrated}`);
+      return updated;
+    }
+
+    if (opts?.strict) {
+      throw new Error(
+        `Session model "${oldModel}" is no longer available in the current catalog on profile "${session.profileId}". Run /model to select an available model.`,
+      );
+    }
+    return session;
+  }
+
   async openDefaultChat(input: ChatSelection) {
     const project = input.projectId
       ? this.db.projects.resolveProject(input.projectId)
@@ -688,10 +793,11 @@ export class DirectorRuntime {
     if (project) this.db.projects.touchProject(project.id);
     const existing = (projectId ? this.chats.getProjectSession(projectId) : null) ?? this.chats.getWorkspaceSession(repoRoot);
     if (existing) {
-      if (projectId && existing.projectId !== projectId) {
-        return this.chats.updateSession(existing.id, { projectId, repoRoot });
-      }
-      return existing;
+      const bound =
+        projectId && existing.projectId !== projectId
+          ? this.chats.updateSession(existing.id, { projectId, repoRoot })
+          : existing;
+      return this.resolveOrMigrateSessionModel(bound);
     }
     return this.chats.getOrCreateDefault(
       await this.resolveChatSelection({
@@ -1516,10 +1622,11 @@ export class DirectorRuntime {
     onToolEvent?: RunnerCallbacks["onToolEvent"],
     opts?: { turnRole?: "user" | "system_notice"; event?: ChatControlEvent },
   ): Promise<{ userTurn: ChatTurnRecord; assistantTurn: ChatTurnRecord | null }> {
-    const session = this.chats.getSession(chatSessionId);
+    let session = this.chats.getSession(chatSessionId);
     if (!session) throw new Error(`Unknown chat session ${chatSessionId}`);
 
     if (this.activeChats.has(chatSessionId)) throw new Error(`Chat ${chatSessionId} already has an active turn`);
+    session = await this.resolveOrMigrateSessionModel(session, { strict: true });
     const typedEvent = opts?.event ?? null;
     if (!typedEvent) {
       // A fresh user message naturally supersedes any pending timer subscribed to `user_message` / `any`.

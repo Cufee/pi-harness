@@ -174,7 +174,10 @@ describe("Code Mode execution", () => {
     if (!sandboxEnabled) {
       assert.deepEqual(executor.tools(), allowed);
       assert.deepEqual(await executor.execute(lookup.name, { id: "g9" }), { bin: 13 });
-      await assert.rejects(executor.execute("code_exec", { code: "output(1)" }), /sandbox unavailable/);
+      await assert.rejects(
+        executor.execute("code_exec", { code: "output(1)" }),
+        /Code Mode sandbox (?:unavailable|is only supported on macOS)/i,
+      );
       assert.equal((await run("output(1)")).ok, false);
       assert.deepEqual(delegated, [{ name: lookup.name, args: { id: "g9" } }]);
       return;

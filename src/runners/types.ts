@@ -154,5 +154,7 @@ export interface RunAgentResult {
 export interface ProbedModelInfo {
   wireModelId: string;
   name?: string;
+  description?: string;
+  explicitModelId?: string;
   supportedEfforts?: string[];
 }

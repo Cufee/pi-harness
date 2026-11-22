@@ -13,7 +13,7 @@ import {
   type CompiledModelCatalog,
   type CompiledModelEntry,
 } from "../src/catalog/compiler.js";
-import { loadConfig } from "../src/config.js";
+import { loadConfig, type HarnessConfig, type RunnerProfileConfig } from "../src/config.js";
 import { deriveRunStatus } from "../src/control-plane/orchestrator.js";
 import { buildRunActivitySummary } from "../src/control-plane/telemetry.js";
 import { DaemonClient } from "../src/daemon/remote.js";
@@ -144,14 +144,102 @@ function sampleModels(): CompiledModelEntry[] {
   ];
 }
 
+/**
+ * Builds an isolated HarnessConfig with a pre-compiled deterministic catalog on disk so tests never
+ * depend on host CLI binaries (`codex-acp`, `claude-agent-acp`, `amp-acp`) or live network probes.
+ */
+function withScopedFixtureCatalog(repoDir: string, stateDir: string, sockPath: string): HarnessConfig {
+  const profiles: RunnerProfileConfig[] = [
+    {
+      id: "acp:codex",
+      kind: "acp",
+      adapter: "codex",
+      command: "codex-acp",
+      billing: "subscription",
+      enabled: true,
+    },
+    {
+      id: "acp:claude",
+      kind: "acp",
+      adapter: "claude",
+      command: "claude-agent-acp",
+      billing: "subscription",
+      enabled: true,
+    },
+    {
+      id: "acp:amp",
+      kind: "acp",
+      adapter: "generic",
+      command: "amp-acp",
+      billing: "subscription",
+      enabled: true,
+    },
+  ];
+  const base = loadConfig(repoDir);
+  const cfg: HarnessConfig = {
+    ...base,
+    stateDir,
+    socketPath: sockPath,
+    profiles,
+    defaultOrchestratorProfile: "acp:codex",
+    defaultWorkerProfile: "acp:codex",
+    defaultTaskProfile: "acp:codex",
+    catalog: {
+      ttlHours: 24,
+      modelFilterMode: "all",
+      disabledModels: [],
+      enabledModels: [],
+    },
+    quotaEndpoint: undefined,
+  };
+  const compiler = new ModelCatalogCompiler(cfg);
+  const catalog = compiler.compileFromData({
+    enabledProfiles: profiles,
+    inventory: new Map([
+      [
+        "acp:codex",
+        [
+          { wireModelId: "gpt-6.2-astra", name: "GPT-6.2 Astra", supportedEfforts: ["low", "medium", "high", "xhigh"] },
+          { wireModelId: "gpt-6.2-sol", name: "GPT-6.2 Sol", supportedEfforts: ["low", "medium", "high"] },
+        ],
+      ],
+      [
+        "acp:claude",
+        [
+          { wireModelId: "opus", name: "Opus 5.5", supportedEfforts: ["low", "medium", "high", "max"] },
+          { wireModelId: "sonnet", name: "Sonnet 5.5", supportedEfforts: ["low", "medium", "high"] },
+        ],
+      ],
+      [
+        "acp:amp",
+        [
+          { wireModelId: "google-vertex/gemini-4-argon", name: "Gemini 4 Argon", supportedEfforts: ["low", "medium", "high"] },
+          { wireModelId: "zhipuai/glm-5.3", name: "GLM 5.3" },
+        ],
+      ],
+    ]),
+    profileStatuses: [
+      { profileId: "acp:codex", status: "ok", modelCount: 2 },
+      { profileId: "acp:claude", status: "ok", modelCount: 2 },
+      { profileId: "acp:amp", status: "ok", modelCount: 2 },
+    ],
+    modelsDev: [],
+    openRouter: [],
+    litellmDep: new Map(),
+    benchmarks: [],
+    sources: [],
+  });
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(compiler.cachePath, JSON.stringify(catalog), "utf8");
+  return cfg;
+}
+
 describe("Session Scoping, Model Selection, Dynamic Telemetry & Timers", () => {
   it("scopes goals, runs.trees, and run.list strictly to the active chat session", async () => {
     const repoDir = initTempGitRepo();
     const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-scoping-"));
     const sockPath = join(stateDir, "d.sock");
-    const cfg = loadConfig(repoDir);
-    cfg.stateDir = stateDir;
-    cfg.socketPath = sockPath;
+    const cfg = withScopedFixtureCatalog(repoDir, stateDir, sockPath);
 
     const daemon = new HarnessDaemon(cfg, {
       dbPath: join(stateDir, "cp.sqlite"),
@@ -269,9 +357,7 @@ describe("Session Scoping, Model Selection, Dynamic Telemetry & Timers", () => {
     const repoDir = initTempGitRepo();
     const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-model-ctx-"));
     const sockPath = join(stateDir, "d.sock");
-    const cfg = loadConfig(repoDir);
-    cfg.stateDir = stateDir;
-    cfg.socketPath = sockPath;
+    const cfg = withScopedFixtureCatalog(repoDir, stateDir, sockPath);
 
     const daemon = new HarnessDaemon(cfg, {
       dbPath: join(stateDir, "cp.sqlite"),
@@ -403,9 +489,7 @@ describe("Session Scoping, Model Selection, Dynamic Telemetry & Timers", () => {
     const repoDir = initTempGitRepo();
     const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-dyn-status-"));
     const sockPath = join(stateDir, "d.sock");
-    const cfg = loadConfig(repoDir);
-    cfg.stateDir = stateDir;
-    cfg.socketPath = sockPath;
+    const cfg = withScopedFixtureCatalog(repoDir, stateDir, sockPath);
 
     const daemon = new HarnessDaemon(cfg, {
       dbPath: join(stateDir, "cp.sqlite"),
@@ -520,9 +604,7 @@ describe("Session Scoping, Model Selection, Dynamic Telemetry & Timers", () => {
     const repoDir = initTempGitRepo();
     const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-verify-mode-"));
     const sockPath = join(stateDir, "d.sock");
-    const cfg = loadConfig(repoDir);
-    cfg.stateDir = stateDir;
-    cfg.socketPath = sockPath;
+    const cfg = withScopedFixtureCatalog(repoDir, stateDir, sockPath);
 
     let reviewerRuns = 0;
     const daemon = new HarnessDaemon(cfg, {
@@ -669,9 +751,7 @@ describe("Session Scoping, Model Selection, Dynamic Telemetry & Timers", () => {
     const repoDir = initTempGitRepo();
     const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-events-wake-"));
     const sockPath = join(stateDir, "d.sock");
-    const cfg = loadConfig(repoDir);
-    cfg.stateDir = stateDir;
-    cfg.socketPath = sockPath;
+    const cfg = withScopedFixtureCatalog(repoDir, stateDir, sockPath);
     // Default fallback interval is long (600s = 10m) so agents don't thrash/poll
     assert.equal(cfg.events.fallbackWakeupIntervalSec, 600);
     assert.equal(cfg.events.wakeDirectorOnGoalSettle, true);
@@ -824,9 +904,7 @@ describe("Session Scoping, Model Selection, Dynamic Telemetry & Timers", () => {
     const repoDir = initTempGitRepo();
     const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-telemetry-test-"));
     const sockPath = join(stateDir, "d.sock");
-    const cfg = loadConfig(repoDir);
-    cfg.stateDir = stateDir;
-    cfg.socketPath = sockPath;
+    const cfg = withScopedFixtureCatalog(repoDir, stateDir, sockPath);
 
     let inspectGoalId: string;
     let statusRes: { activity?: { phase: string; counts: { verifyCompleted: number } }; presentation_id: string };
@@ -981,9 +1059,7 @@ describe("Session Scoping, Model Selection, Dynamic Telemetry & Timers", () => {
     const repoDir = initTempGitRepo();
     const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-ids-events-timers-"));
     const sockPath = join(stateDir, "d.sock");
-    const cfg = loadConfig(repoDir);
-    cfg.stateDir = stateDir;
-    cfg.socketPath = sockPath;
+    const cfg = withScopedFixtureCatalog(repoDir, stateDir, sockPath);
 
     const wakePrompts: string[] = [];
     const receivedChatEvents: Array<{ type: string; payload: Record<string, unknown> }> = [];
@@ -1205,6 +1281,101 @@ describe("Session Scoping, Model Selection, Dynamic Telemetry & Timers", () => {
       assert.equal(afterResume.generation, 2, "Resumed task must advance generation in-place");
       assert.ok(afterResume.handoffJson?.includes("Continue from preserved state after daemon restart"));
       assert.equal(daemon.db.getTask(doneWorker.id)?.generation, 1, "Completed sibling must remain untouched");
+    } finally {
+      client.close();
+      await daemon.stop();
+      rmSync(repoDir, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("auto-migrates stale session model IDs (e.g. anthropic/opus -> anthropic/claude-opus-5-5) and rejects truly removed models cleanly", async () => {
+    const repoDir = initTempGitRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-model-migrate-"));
+    const sockPath = join(stateDir, "d.sock");
+    const cfg = withScopedFixtureCatalog(repoDir, stateDir, sockPath);
+
+    const ranModels: string[] = [];
+    const daemon = new HarnessDaemon(cfg, {
+      dbPath: join(stateDir, "cp.sqlite"),
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          ranModels.push(req.model);
+          return { text: "ok", stopReason: "completed" };
+        },
+      }),
+    });
+    await daemon.start();
+    const client = new DaemonClient(sockPath);
+    await client.connect();
+
+    try {
+      // 1. Persisted legacy session with `anthropic/opus` auto-migrates to `anthropic/claude-opus-5-5` on `chat.open`
+      const legacyClaude = daemon.director.chats.createSession({
+        repoRoot: repoDir,
+        title: "Legacy Opus Session",
+        profileId: "acp:claude",
+        model: "anthropic/opus",
+      });
+      const opened = await client.request<{
+        session: { id: string; model: string | null };
+        history: Array<{ role: string; content: string }>;
+      }>("chat.open", { chatSessionId: legacyClaude.id, repoRoot: repoDir });
+
+      assert.equal(opened.session.model, "anthropic/claude-opus-5-5");
+      assert.equal(daemon.director.chats.getSession(legacyClaude.id)?.model, "anthropic/claude-opus-5-5");
+      assert.ok(
+        opened.history.some(
+          (t) => t.role === "system_notice" && t.content === "Migrated session model from anthropic/opus to anthropic/claude-opus-5-5",
+        ),
+        "Expected one-line migration system notice in chat history",
+      );
+
+      // Sending on the migrated session succeeds and dispatches exact wire model `claude-opus-5-5`
+      await daemon.director.sendChatMessage(legacyClaude.id, "hello after migration");
+      assert.deepEqual(ranModels, ["claude-opus-5-5"]);
+
+      // 2. Sending directly on a stale `opus` session without calling chat.open first also auto-migrates cleanly
+      const directStale = daemon.director.chats.createSession({
+        repoRoot: repoDir,
+        title: "Direct Stale Send",
+        profileId: "acp:claude",
+        model: "opus",
+      });
+      await daemon.director.sendChatMessage(directStale.id, "direct send");
+      assert.equal(daemon.director.chats.getSession(directStale.id)?.model, "anthropic/claude-opus-5-5");
+      assert.ok(
+        daemon.director.chats
+          .getHistory(directStale.id)
+          .some((t) => t.role === "system_notice" && t.content === "Migrated session model from opus to anthropic/claude-opus-5-5"),
+      );
+
+      // 3. Same model slug under renamed canonical prefix (`legacy-vendor/glm-5.3` -> `zai/glm-5.3`) auto-migrates cleanly
+      const renamedPrefix = daemon.director.chats.createSession({
+        repoRoot: repoDir,
+        title: "Renamed Prefix",
+        profileId: "acp:amp",
+        model: "legacy-vendor/glm-5.3",
+      });
+      const migratedPrefix = await daemon.director.resolveOrMigrateSessionModel(renamedPrefix);
+      assert.equal(migratedPrefix.model, "zai/glm-5.3");
+
+      // 4. Truly removed model with no unambiguous match: chat.open still succeeds, while sendChatMessage surfaces clear /model error
+      const removedSession = daemon.director.chats.createSession({
+        repoRoot: repoDir,
+        title: "Removed Model Session",
+        profileId: "acp:claude",
+        model: "anthropic/claude-retired-1-0",
+      });
+      const openedRemoved = await client.request<{ session: { id: string; model: string | null } }>("chat.open", {
+        chatSessionId: removedSession.id,
+        repoRoot: repoDir,
+      });
+      assert.equal(openedRemoved.session.id, removedSession.id);
+      await assert.rejects(
+        () => daemon.director.sendChatMessage(removedSession.id, "try removed"),
+        /no longer available in the current catalog.*Run \/model/i,
+      );
     } finally {
       client.close();
       await daemon.stop();

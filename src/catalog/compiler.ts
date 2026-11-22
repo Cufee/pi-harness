@@ -166,6 +166,7 @@ export interface ProfileProbeStatus {
   status: "ok" | "error";
   modelCount: number;
   error?: string;
+  probeWarning?: string;
 }
 
 export interface CompiledModelCatalog {
@@ -184,23 +185,80 @@ export interface CompiledModelCatalog {
 }
 
 const CLAUDE_BARE_FAMILY_RE = /^(?:anthropic\/)?(?:claude-)?(opus|sonnet|haiku|fable)(?:\[[^\]]+\])?$/i;
+const CLAUDE_EXPLICIT_ID_RE = /\b(?:anthropic\/)?(claude-(opus|sonnet|haiku|fable)-(\d+(?:[.-]\d+)*)(?:-\d{8})?)\b/i;
+const CLAUDE_VERSIONED_ID_RE = /^(?:anthropic\/)?claude-(opus|sonnet|haiku|fable)-(\d+(?:[.-]\d+)*)(?:-\d{8})?$/i;
 const CLAUDE_PROBED_NAME_VERSION_RE = /\b(?:claude\s+)?(opus|sonnet|haiku|fable)\s+(\d+(?:[.-]\d+)*)\b/i;
 
+const CLAUDE_FAMILY_ENV_VARS: Record<string, string> = {
+  opus: "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  sonnet: "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  haiku: "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  fable: "ANTHROPIC_DEFAULT_FABLE_MODEL",
+};
+
+export interface ResolveProbedModelOptions {
+  description?: string;
+  explicitModelId?: string;
+  env?: Record<string, string | undefined>;
+}
+
+export interface ResolvedProbedModelIdentity {
+  canonicalId: string;
+  wireModelId: string;
+  fromBareAlias?: boolean;
+  source?: "wire" | "metadata" | "env" | "display_name" | "bare_alias";
+}
+
+export function compareSemanticVersions(a: number[], b: number[]): number {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const diff = (a[i] ?? 0) - (b[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+export function parseClaudeFamilyVersion(
+  id: string,
+): { family: string; version: number[]; versionStr: string } | null {
+  const m = id.trim().match(CLAUDE_VERSIONED_ID_RE);
+  if (!m) return null;
+  const family = m[1]!.toLowerCase();
+  const versionStr = m[2]!.replace(/\./g, "-");
+  const version = versionStr.split("-").map(Number);
+  if (version.some((n) => !Number.isFinite(n))) return null;
+  return { family, version, versionStr };
+}
+
+function extractExplicitClaudeIdForFamily(
+  text: string | undefined,
+  family: string,
+): { canonicalId: string; wireModelId: string; version: number[] } | null {
+  if (!text) return null;
+  const m = text.match(CLAUDE_EXPLICIT_ID_RE);
+  if (!m || m[2]!.toLowerCase() !== family) return null;
+  const exactWire = m[1]!.toLowerCase().replace(/\./g, "-");
+  const version = m[3]!.split(/[.-]/).map(Number);
+  if (version.some((n) => !Number.isFinite(n))) return null;
+  return { canonicalId: `anthropic/${exactWire}`, wireModelId: exactWire, version };
+}
+
 /**
- * Resolves a probed wire model ID + human display name into a specific versioned canonical ID and wire ID.
+ * Resolves a probed wire model ID + metadata/display name into a specific versioned canonical ID and wire ID.
  * Returns `null` for synthetic meta-aliases like `"default"` (already surfaced as a CLI-default row).
  *
- * For Claude ACP (`claude-agent-acp`), wire values are family aliases (`"opus"`, `"sonnet"`, `"fable"`, `"haiku"`)
- * while the probed `name` carries the exact release (`"Opus 5.5"`, `"Fable 5.2"`). Only when `name` explicitly
- * states a concrete version do we promote BOTH `canonicalId` (`"anthropic/claude-opus-5-5"`) and `wireModelId`
- * (`"claude-opus-5-5"`), so `claude-agent-acp` enforces exact version compatibility on the wire and never
- * silently converts a specific user model selection into an unversioned/unknown alias under the hood.
+ * For Claude ACP (`claude-agent-acp`), wire values are family aliases (`"opus"`, `"sonnet"`, `"fable"`, `"haiku"`).
+ * Resolution precedence for bare family aliases:
+ * 1. Explicit `claude-<family>-<ver>` ID in `explicitModelId` / `description` / `probedName` metadata
+ * 2. `ANTHROPIC_DEFAULT_<FAMILY>_MODEL` env hint (when present and >= display-name version, or display name is unversioned)
+ * 3. Concrete version in display `name` (e.g. `"Opus 5.5"` -> `"claude-opus-5-5"`)
+ * 4. Unversioned bare alias (never silently guessed to an arbitrary release)
  */
 export function resolveProbedModelIdentity(
   wireModelId: string,
   providerName: string,
   probedName?: string,
-): { canonicalId: string; wireModelId: string } | null {
+  opts?: ResolveProbedModelOptions,
+): ResolvedProbedModelIdentity | null {
   const trimmed = wireModelId.trim();
   if (!trimmed) return null;
   if (trimmed.toLowerCase() === "default") return null;
@@ -209,22 +267,67 @@ export function resolveProbedModelIdentity(
   const bareMatch = inventoryId.match(CLAUDE_BARE_FAMILY_RE);
   if (bareMatch && (providerName.toLowerCase().includes("claude") || inventoryId.startsWith("anthropic/"))) {
     const family = bareMatch[1]!.toLowerCase();
-    const nameMatch = probedName?.match(CLAUDE_PROBED_NAME_VERSION_RE);
-    if (nameMatch && nameMatch[1]!.toLowerCase() === family) {
-      const ver = nameMatch[2]!.replace(/\./g, "-");
-      const exactWire = `claude-${family}-${ver}`;
-      return { canonicalId: `anthropic/${exactWire}`, wireModelId: exactWire };
+
+    // 1. Prefer explicit `claude-<family>-<ver>` metadata over fuzzy display-name parsing.
+    for (const metaField of [opts?.explicitModelId, opts?.description, probedName]) {
+      const explicit = extractExplicitClaudeIdForFamily(metaField, family);
+      if (explicit) {
+        return {
+          canonicalId: explicit.canonicalId,
+          wireModelId: explicit.wireModelId,
+          fromBareAlias: true,
+          source: "metadata",
+        };
+      }
     }
+
+    // 2. Compare `ANTHROPIC_DEFAULT_<FAMILY>_MODEL` env hint with probed display-name version.
+    const envVar = CLAUDE_FAMILY_ENV_VARS[family];
+    const envRaw = envVar ? opts?.env?.[envVar]?.trim() : undefined;
+    const envResolved = extractExplicitClaudeIdForFamily(envRaw, family);
+
+    const nameMatch = probedName?.match(CLAUDE_PROBED_NAME_VERSION_RE);
+    const nameResolved =
+      nameMatch && nameMatch[1]!.toLowerCase() === family
+        ? (() => {
+            const ver = nameMatch[2]!.replace(/\./g, "-");
+            const exactWire = `claude-${family}-${ver}`;
+            return {
+              canonicalId: `anthropic/${exactWire}`,
+              wireModelId: exactWire,
+              version: ver.split("-").map(Number),
+            };
+          })()
+        : null;
+
+    if (envResolved && (!nameResolved || compareSemanticVersions(envResolved.version, nameResolved.version) >= 0)) {
+      return {
+        canonicalId: envResolved.canonicalId,
+        wireModelId: envResolved.wireModelId,
+        fromBareAlias: true,
+        source: "env",
+      };
+    }
+    if (nameResolved) {
+      return {
+        canonicalId: nameResolved.canonicalId,
+        wireModelId: nameResolved.wireModelId,
+        fromBareAlias: true,
+        source: "display_name",
+      };
+    }
+    return { canonicalId: inventoryId, wireModelId: trimmed, fromBareAlias: true, source: "bare_alias" };
   }
-  return { canonicalId: inventoryId, wireModelId: trimmed };
+  return { canonicalId: inventoryId, wireModelId: trimmed, fromBareAlias: false, source: "wire" };
 }
 
 export function resolveProbedCanonicalId(
   wireModelId: string,
   providerName: string,
   probedName?: string,
+  opts?: ResolveProbedModelOptions,
 ): string | null {
-  return resolveProbedModelIdentity(wireModelId, providerName, probedName)?.canonicalId ?? null;
+  return resolveProbedModelIdentity(wireModelId, providerName, probedName, opts)?.canonicalId ?? null;
 }
 
 const EVIDENCE_STALE_AGE_MS = 30 * 86_400_000;
@@ -417,14 +520,14 @@ export class ModelCatalogCompiler {
     const enabledProfileIds = new Set(
       this.config.profiles.filter((p) => p.enabled !== false).map((p) => p.id),
     );
-    const hasProbeError = Boolean(
+    const hasProbeIssue = Boolean(
       catalog.profileStatuses?.some(
-        (s) => s.status === "error" && enabledProfileIds.has(s.profileId),
+        (s) => (s.status === "error" || Boolean(s.probeWarning)) && enabledProfileIds.has(s.profileId),
       ),
     );
     const normalTtlMs = this.config.catalog.ttlHours * 3_600_000;
     const ttlMs =
-      catalog.models.length === 0 || hasProbeError
+      catalog.models.length === 0 || hasProbeIssue
         ? Math.min(BROKEN_CATALOG_RETRY_TTL_MS, normalTtlMs)
         : normalTtlMs;
     return ageMs < ttlMs;
@@ -561,6 +664,7 @@ export class ModelCatalogCompiler {
   }
 
   async sync(cwd: string, injectedInventory?: Map<string, ProbedModelInfo[]>): Promise<CompiledModelCatalog> {
+    const previousCatalog = this.loadCached();
     const enabledProfiles = this.config.profiles.filter((p) => p.enabled !== false);
     const discovered = injectedInventory
       ? {
@@ -587,6 +691,8 @@ export class ModelCatalogCompiler {
       enabledProfiles,
       inventory: discovered.inventory,
       profileStatuses: discovered.statuses,
+      previousCatalog,
+      env: process.env,
       modelsDev,
       openRouter,
       litellmDep,
@@ -603,6 +709,8 @@ export class ModelCatalogCompiler {
     enabledProfiles: RunnerProfileConfig[];
     inventory: Map<string, ProbedModelInfo[]>;
     profileStatuses?: ProfileProbeStatus[];
+    previousCatalog?: CompiledModelCatalog | null;
+    env?: Record<string, string | undefined>;
     modelsDev: Awaited<ReturnType<typeof fetchModelsDev>>;
     openRouter: Awaited<ReturnType<typeof fetchOpenRouterMetadata>>;
     litellmDep: Awaited<ReturnType<typeof fetchLiteLlmDeprecations>>;
@@ -626,16 +734,80 @@ export class ModelCatalogCompiler {
       }
       if (!md.isCanonical) routeMetadata.set(`${md.provider}/${md.id}`, md);
     }
+
+    // Index previously verified versioned Claude entries per (profileId, family) so a bad fallback probe
+    // (unversioned bare alias with older built-in label like "Opus 4.7") cannot silently downgrade the catalog.
+    const previousClaudeByProfileFamily = new Map<
+      string,
+      { canonicalId: string; wireModelId: string; version: number[]; name: string }
+    >();
+    for (const entry of input.previousCatalog?.models ?? []) {
+      const parsedEntry = parseClaudeFamilyVersion(entry.id);
+      if (!parsedEntry) continue;
+      for (const route of [entry.preferredRoute, ...entry.alternateRoutes]) {
+        if (!route) continue;
+        const key = `${route.profileId}:${parsedEntry.family}`;
+        const prev = previousClaudeByProfileFamily.get(key);
+        if (!prev || compareSemanticVersions(parsedEntry.version, prev.version) > 0) {
+          previousClaudeByProfileFamily.set(key, {
+            canonicalId: entry.id,
+            wireModelId: route.wireModelId,
+            version: parsedEntry.version,
+            name: entry.name,
+          });
+        }
+      }
+    }
+
+    const probeWarningsByProfile = new Map<string, string[]>();
     const orById = new Map(input.openRouter.map((row) => [row.id, row]));
     const candidateMap = new Map<string, CandidateModel>();
     for (const profile of input.enabledProfiles) {
       const models = input.inventory.get(profile.id) ?? [];
       const providerName = profile.kind === "pi" ? profile.provider : profile.adapter;
+      const effectiveEnv: Record<string, string | undefined> = {
+        ...(input.env ?? {}),
+        ...(profile.kind === "acp" ? (profile.env ?? {}) : {}),
+      };
       for (const m of models) {
-        const resolved = resolveProbedModelIdentity(m.wireModelId, providerName, m.name);
+        const resolved = resolveProbedModelIdentity(m.wireModelId, providerName, m.name, {
+          description: m.description,
+          explicitModelId: m.explicitModelId,
+          env: effectiveEnv,
+        });
         if (!resolved) continue;
-        const inventoryId = resolved.canonicalId;
-        const effectiveWireModelId = resolved.wireModelId;
+        let inventoryId = resolved.canonicalId;
+        let effectiveWireModelId = resolved.wireModelId;
+        let effectiveName = m.name;
+
+        // Guard against silent Claude family version downgrades on unversioned bare alias probes.
+        // Explicit versioned wire IDs, explicit metadata IDs, explicit profile.models overrides, and
+        // explicit ANTHROPIC_DEFAULT_<FAMILY>_MODEL env overrides are always respected.
+        if (
+          !profile.models?.length &&
+          resolved.fromBareAlias &&
+          (resolved.source === "display_name" || resolved.source === "bare_alias")
+        ) {
+          const bareFamilyMatch = m.wireModelId.trim().match(CLAUDE_BARE_FAMILY_RE);
+          const family = bareFamilyMatch?.[1]?.toLowerCase();
+          if (family) {
+            const prev = previousClaudeByProfileFamily.get(`${profile.id}:${family}`);
+            if (prev) {
+              const probedVer = parseClaudeFamilyVersion(inventoryId);
+              if (!probedVer || compareSemanticVersions(probedVer.version, prev.version) < 0) {
+                inventoryId = prev.canonicalId;
+                effectiveWireModelId = prev.wireModelId;
+                effectiveName = prev.name;
+                const envHint = CLAUDE_FAMILY_ENV_VARS[family] ?? "ANTHROPIC_DEFAULT_*_MODEL";
+                const warn = `Kept cached ${prev.canonicalId} on ${profile.id} (probe returned bare alias "${m.wireModelId}"${m.name ? ` labeled "${m.name}"` : ""}; check ${envHint})`;
+                const list = probeWarningsByProfile.get(profile.id) ?? [];
+                list.push(warn);
+                probeWarningsByProfile.set(profile.id, list);
+              }
+            }
+          }
+        }
+
         const routeMd = routeMetadata.get(`${providerName}/${effectiveWireModelId}`) ?? routeMetadata.get(`${providerName}/${m.wireModelId}`);
         const linkedId = routeMd?.canonicalId ? canonicalModelId(routeMd.canonicalId, providerName) : undefined;
         // Some provider listings link dated or preview routes to an undated product page.
@@ -680,7 +852,7 @@ export class ModelCatalogCompiler {
             canonicalId,
             creator,
             wireModelId: bare,
-            name: md?.name ?? m.name ?? bare,
+            name: md?.name ?? effectiveName ?? bare,
             rawFamily: md?.family,
             releaseDate: md?.releaseDate,
             deprecated: isDeprecated,
@@ -781,6 +953,37 @@ export class ModelCatalogCompiler {
       entry.codingRank = previous?.codingScore === entry.codingScore ? previous.codingRank : index + 1;
     }
 
+    let finalProfileStatuses = input.profileStatuses
+      ? input.profileStatuses.map((s) => {
+          const warnings = probeWarningsByProfile.get(s.profileId);
+          return warnings?.length ? { ...s, probeWarning: [s.probeWarning, ...warnings].filter(Boolean).join("; ") } : s;
+        })
+      : undefined;
+    if (probeWarningsByProfile.size > 0) {
+      if (!finalProfileStatuses) {
+        finalProfileStatuses = input.enabledProfiles.map((p) => {
+          const warnings = probeWarningsByProfile.get(p.id);
+          return {
+            profileId: p.id,
+            status: "ok" as const,
+            modelCount: input.inventory.get(p.id)?.length ?? 0,
+            ...(warnings?.length ? { probeWarning: warnings.join("; ") } : {}),
+          };
+        });
+      } else {
+        for (const [profileId, warnings] of probeWarningsByProfile.entries()) {
+          if (!finalProfileStatuses.some((s) => s.profileId === profileId)) {
+            finalProfileStatuses.push({
+              profileId,
+              status: "ok",
+              modelCount: input.inventory.get(profileId)?.length ?? 0,
+              probeWarning: warnings.join("; "),
+            });
+          }
+        }
+      }
+    }
+
     const hasScores = compiled.some((entry) => entry.codingScore !== null);
     return {
       schemaVersion: CATALOG_SCHEMA_VERSION,
@@ -790,7 +993,7 @@ export class ModelCatalogCompiler {
       nextLifecycleChangeAt: Number.isFinite(nextLifecycleChange) ? new Date(nextLifecycleChange).toISOString() : undefined,
       rankingEvidence: hasScores ? evidence : undefined,
       ...(hasScores && isEvidenceStale(evidence, now) ? { rankingEvidenceStale: true } : {}),
-      profileStatuses: input.profileStatuses,
+      profileStatuses: finalProfileStatuses,
       models: compiled,
     };
   }
