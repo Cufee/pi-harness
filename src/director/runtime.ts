@@ -596,7 +596,7 @@ export class DirectorRuntime {
         readOnly: true,
         systemPrompt: buildDirectorSystemPrompt(),
         initialPrompt: prompt,
-        model: session.model,
+        model: (session.model && this.catalog?.resolveForProfile(profile.id, session.model)?.wireModelId) || session.model,
         effort: session.effort,
         maxTurns: 12,
         quotaRetryTimeoutMs: this.config.quotaRetry.nativeRetryTimeoutMs,
