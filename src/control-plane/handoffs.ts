@@ -34,7 +34,13 @@ export function compactTaskHandoff(task: TaskRecord, escalations: EscalationReco
   const unstructured = typeof result?.text === "string" && typeof result?.summary !== "string";
   let summary = task.summary?.slice(0, SUMMARY_LIMIT) ?? null;
   if (paused) summary = "Task paused for quota.";
-  else if (unstructured) summary = "Task ended without a structured handoff.";
+  else if (unstructured) {
+    // Tier 1 orchestrators have no return_task; their natural final reply is the handoff.
+    const reply = task.kind === "orchestrator" ? result.text.trim() : "";
+    summary = reply ? reply.slice(0, SUMMARY_LIMIT)
+      : task.kind === "orchestrator" ? "Task ended without a structured handoff or a final reply."
+      : "Task ended without a structured handoff.";
+  }
   return {
     id: task.id,
     title: task.title,
