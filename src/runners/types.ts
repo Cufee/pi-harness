@@ -106,8 +106,10 @@ export interface RunAgentRequest {
   /** Daemon Unix socket path + auth token for ACP stdio MCP bridge subprocesses */
   daemonSocketPath?: string;
   mcpBridgeEntrypoint?: string;
-  /** Optional external stdio MCP servers forwarded alongside the harness bridge (e.g. ast-grep, octofs, serena). */
+  /** Optional external stdio MCP servers forwarded alongside the harness bridge (e.g. octofs, ast-grep). */
   externalMcpServers?: ExternalMcpServerConfig[];
+  /** Extra directories prepended to PATH for shell-enabled ACP agents (bundled ast-grep / octofs). */
+  extraPathDirs?: string[];
   /** Permit shell execution (`Bash`/`shell_command`/`execute`) in `read_only_workspace` (used for verify/Done-Review in isolated checkouts). */
   allowShellInReadOnly?: boolean;
   signal: AbortSignal;

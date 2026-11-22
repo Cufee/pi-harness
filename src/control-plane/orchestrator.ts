@@ -11,6 +11,7 @@ import { toolPolicyForTask } from "../runners/types.js";
 import { resolveLaunchRoute } from "./launch-route.js";
 import type { RunAgentRequest, RunAgentResult, RunnerExecutionHandle } from "../runners/types.js";
 import { BisectingMergeQueue } from "../worktree/merge-queue.js";
+import { nativeToolsPathDirs, resolveExternalMcpServers } from "../tools/native-tools.js";
 import { runGit, WorktreeManager } from "../worktree/manager.js";
 import type { AgentTier, ControlPlaneDb, RunRecord, TaskKind, TaskRecord } from "./db.js";
 import { buildHydrationTurn, buildImmutableSystemPrompt, type AnchoredHandoff } from "./prompts.js";
@@ -1052,7 +1053,8 @@ export class HarnessOrchestrator {
         executeTool: (name, args) => this.toolExecutor.execute(run.id, task.id, name, args),
         daemonSocketPath: this.config.socketPath,
         mcpBridgeEntrypoint,
-        externalMcpServers: this.config.externalMcpServers,
+        externalMcpServers: resolveExternalMcpServers(this.config.stateDir, this.config.externalMcpServers),
+        extraPathDirs: nativeToolsPathDirs(this.config.stateDir),
         allowShellInReadOnly: task.kind === "verify",
         signal: exec.generationSignal,
         onHandle: (h) => {
@@ -1604,8 +1606,9 @@ export class HarnessOrchestrator {
     if (task && !["completed", "cancelled", "failed"].includes(task.status)) {
       this.db.updateTask(taskId, { status: "cancelled", summary: `Cancelled: ${reason}` });
     }
-    // Archive & tear down a cancelled worker's worktree immediately — unless a merge is actively draining it
-    if (task?.worktreeId) {
+    // Archive & tear down a cancelled Tier 2 worker's worktree immediately — NEVER tear down a parent's worktree
+    // when cancelling an inherited Tier 3 child, and never tear down while a merge is actively draining it!
+    if (task?.tier === 2 && task.worktreeId) {
       const run = this.db.getRun(task.runId);
       const wt = this.db.getWorktree(task.worktreeId);
       if (run && wt && !wt.cleanedAt && wt.status !== "merged" && wt.status !== "queued" && task.status !== "merging") {

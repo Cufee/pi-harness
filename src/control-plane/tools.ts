@@ -942,7 +942,7 @@ export class ControlPlaneToolExecutor {
                         ? { hint: "Fallback wakeup fired while child task(s) are still in progress; wait again with wait_children rather than short-polling." }
                         : {}),
               }
-            : stillRunning.length > 0
+            : mode === "all" && stillRunning.length > 0
               ? {
                   wakeReason: "fallback_interval",
                   hint: "Fallback wakeup fired while child task(s) are still in progress; wait again with wait_children rather than short-polling.",

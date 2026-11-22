@@ -26,6 +26,7 @@ import type { DaemonEventFrame, RpcRequest, RpcResponse } from "../protocol/daem
 import { attachNdjsonReader, writeDaemonMessage } from "../protocol/frames.js";
 import { buildGoalDetailDisplay, buildGoalsTableDisplay, summarizeToolDisplay } from "../protocol/tool-display.js";
 import { QuotaClient } from "../quota/client.js";
+import { ensureOctofs } from "../tools/native-tools.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
 import { PtyHost } from "./pty-host.js";
@@ -99,6 +100,7 @@ export class HarnessDaemon {
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
   private idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
   private autoQuitWhenIdle = false;
+  private hasCustomRunner = false;
   private startedAt = Date.now();
 
   constructor(
@@ -106,6 +108,7 @@ export class HarnessDaemon {
     opts?: { dbPath?: string; customRunnerFactory?: CustomRunnerFactory; autoQuitWhenIdle?: boolean },
   ) {
     this.autoQuitWhenIdle = Boolean(opts?.autoQuitWhenIdle);
+    this.hasCustomRunner = Boolean(opts?.customRunnerFactory);
     const dbPath = opts?.dbPath ?? join(config.stateDir, "control-plane.sqlite");
     this.db = new ControlPlaneDb(dbPath);
     this.quota = new QuotaClient(config.quotaEndpoint);
@@ -301,6 +304,11 @@ export class HarnessDaemon {
       // ignore local harvest errors on startup
     }
     void this.quota.sync(false).catch(() => {});
+
+    // Non-blocking background staging of native `octofs` MCP binary on real (non-test) daemons
+    if (!this.hasCustomRunner && this.config.externalMcpServers?.every((s) => s.name !== "octofs" || s.enabled !== false)) {
+      void ensureOctofs(this.config.stateDir).catch(() => {});
+    }
 
     return sockPath;
   }

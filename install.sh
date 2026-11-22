@@ -19,6 +19,15 @@ linux-x64-musl          9b6bdba1fa0914b6adfe48e4438212e2c106d9199b77ba642a9b8a39
 linux-x64-musl-baseline 96fb94108eed872ff623ed39007d6b5699a83a5d0086fcfba84921c18145e3e6
 '
 
+# Native octofs MCP binary pin (ships hash-verified view/batch_edit/AST search to all ACP agents)
+OCTOFS_VERSION=0.26.0
+OCTOFS_PINS='
+darwin-aarch64 aarch64-apple-darwin       6c2703bc519c0574a05da50582a6fd63f285372e9a76ad1c02898ced587d5e3f
+darwin-x64     x86_64-apple-darwin        f5cb45ca410cdeb41dd674825592b8476529399fd542045a665e461cd70a23c4
+linux-aarch64  aarch64-unknown-linux-musl b5f368faa66fe4c1b800d4185300d2f1951d5e186982aec043ae7f3e92d1b951
+linux-x64      x86_64-unknown-linux-musl  18b78be9c4099285832a1efeb2579a6029eb8bc4c7ac0ac7105da9207611eb03
+'
+
 die() { echo "install.sh: $*" >&2; exit 1; }
 log() { echo "install.sh: $*"; }
 
@@ -93,6 +102,29 @@ if [ "$("$BUN_HOME/bin/bun" --version 2>/dev/null || true)" != "$BUN_VERSION" ];
   mv "$STAGE/bun-home" "$BUN_HOME"
 fi
 BUN=$BUN_HOME/bin/bun
+
+# --- staged octofs (pinned checksum, verified before extraction) ------------
+octofs_key=$os-$arch
+octofs_triple=$(echo "$OCTOFS_PINS" | awk -v k="$octofs_key" '$1 == k { print $2 }')
+octofs_want=$(echo "$OCTOFS_PINS" | awk -v k="$octofs_key" '$1 == k { print $3 }')
+if [ -n "$octofs_triple" ] && [ -n "$octofs_want" ]; then
+  OCTOFS_HOME=$INSTALL_DIR/tools/octofs/$OCTOFS_VERSION-$octofs_triple
+  if [ ! -x "$OCTOFS_HOME/bin/octofs" ]; then
+    octofs_tgz=$INSTALL_DIR/cache/downloads/octofs-$OCTOFS_VERSION-$octofs_triple.tar.gz
+    if [ ! -f "$octofs_tgz" ] || [ "$(sha256 "$octofs_tgz" | cut -d' ' -f1)" != "$octofs_want" ]; then
+      log "downloading octofs $OCTOFS_VERSION ($octofs_triple)"
+      curl -fsSL --proto '=https' --tlsv1.2 -o "$octofs_tgz.part" \
+        "https://github.com/Muvon/octofs/releases/download/$OCTOFS_VERSION/octofs-$OCTOFS_VERSION-$octofs_triple.tar.gz"
+      mv "$octofs_tgz.part" "$octofs_tgz"
+    fi
+    [ "$(sha256 "$octofs_tgz" | cut -d' ' -f1)" = "$octofs_want" ] || { rm -f "$octofs_tgz"; die "octofs checksum mismatch for $octofs_triple"; }
+    mkdir -p "$STAGE/octofs-home/bin" "$INSTALL_DIR/tools/octofs"
+    tar -xzf "$octofs_tgz" -C "$STAGE/octofs-home/bin"
+    chmod +x "$STAGE/octofs-home/bin/octofs"
+    rm -rf "$OCTOFS_HOME"
+    mv "$STAGE/octofs-home" "$OCTOFS_HOME"
+  fi
+fi
 
 # --- release: content-addressed copy of the runtime files + frozen deps ----
 FILES="src proto package.json bun.lock tsconfig.json"

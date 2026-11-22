@@ -219,6 +219,10 @@ export class AcpRunner {
       toolPolicy: req.toolPolicy,
       allowShellInReadOnly: Boolean(req.allowShellInReadOnly),
     });
+    if (allowShell && req.extraPathDirs?.length) {
+      const existingPath = prepared.env.PATH ?? process.env.PATH ?? "";
+      prepared.env.PATH = [...req.extraPathDirs, existingPath].filter(Boolean).join(process.platform === "win32" ? ";" : ":");
+    }
 
     const child = testAgent
       ? null

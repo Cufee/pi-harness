@@ -421,7 +421,7 @@ export const EXTERNAL_MCP_PRESETS: Record<string, ExternalMcpServerConfig> = {
   octofs: {
     name: "octofs",
     command: "octofs",
-    args: [],
+    args: ["mcp"],
     enabled: true,
   },
   "ast-grep": {

@@ -38,6 +38,7 @@ import type { QuotaClient } from "../quota/client.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
 import type { RunnerCallbacks, RunnerExecutionHandle, ToolDefinition } from "../runners/types.js";
+import { nativeToolsPathDirs, resolveExternalMcpServers } from "../tools/native-tools.js";
 import { runGit } from "../worktree/manager.js";
 import { buildDirectorSystemPrompt, DirectorSessionStore, type ChatTurnRecord } from "./session.js";
 
@@ -1125,7 +1126,8 @@ export class DirectorRuntime {
           executeTool: reviewerExecuteTool,
           daemonSocketPath: this.config.socketPath,
           mcpBridgeEntrypoint,
-          externalMcpServers: this.config.externalMcpServers,
+          externalMcpServers: resolveExternalMcpServers(this.config.stateDir, this.config.externalMcpServers),
+          extraPathDirs: nativeToolsPathDirs(this.config.stateDir),
           signal: reviewerSignal,
           callbacks: {
             onTextDelta: (text) => emit("agent.text_delta", { text }),
