@@ -9,6 +9,8 @@ import { randomUUID } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { CODE_EXEC_TOOL_NAME } from "../code-mode/sdk.js";
+import type { CodeExecResult } from "../code-mode/runner.js";
 import { attachDaemonReader, writeNdjson } from "../protocol/frames.js";
 import type { RpcRequest, RpcResponse } from "../protocol/daemon-rpc.js";
 
@@ -96,6 +98,7 @@ export async function startStdioMcpBridge(opts?: { socketPath?: string; runId?: 
         args: (args ?? {}) as Record<string, unknown>,
       });
       return {
+        ...(name === CODE_EXEC_TOOL_NAME && (result as CodeExecResult).ok === false ? { isError: true } : {}),
         content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result, null, 2) }],
       };
     } catch (err) {

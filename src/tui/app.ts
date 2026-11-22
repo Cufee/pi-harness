@@ -53,8 +53,10 @@ import {
   TerminalSession,
   TimedSpinner,
   ToolPill,
+  GoalNotice,
   UserCard,
 } from "./primitives/index.js";
+import { ToolTranscript } from "./primitives/tool-chain.js";
 import { RunsTreeOverlay, type RunsTreesResult } from "./runs-tree.js";
 import { componentForHistoryTurn, extractDisplay, ToolOutputCard, type ToolDisplayPayload } from "./tool-output/index.js";
 import { SettingsOverlay } from "./settings-overlay.js";
@@ -285,12 +287,14 @@ export function historyTurnComponent(t: ChatTurnRecord, theme: HarnessTheme, mod
 /** Live tool components of the in-flight chat turn, keyed by tool event id, in arrival order. */
 export type PendingTools = Map<string, ToolPill | ToolOutputCard>;
 
+type ToolEvent = { id?: string; name?: string; status?: string; title?: string; args?: string; result?: string; error?: string };
+
 /**
  * Applies one `chat.tool` event to the pending tools area: a `ToolOutputCard` when the event carries a
  * structured display (contract/tool-display-v1), otherwise the compact `ToolPill` created or updated in place.
  */
 export function applyChatToolEvent(payload: unknown, pending: PendingTools, container: Container, theme: HarnessTheme): void {
-  const p = (payload ?? {}) as { id?: string; name?: string; status?: string; title?: string };
+  const p = (payload ?? {}) as ToolEvent;
   const display = extractDisplay(payload);
   if (display) {
     const key = p.id || `display-${pending.size}`;
@@ -304,12 +308,12 @@ export function applyChatToolEvent(payload: unknown, pending: PendingTools, cont
   const displayLabel = rawLabel.replace(/^mcp[._/]harness[._/]+/i, "harness:").replace(/^mcp__harness__/i, "harness:");
   const key = p.id || displayLabel;
   const st = p.status === "completed" ? "ok" : p.status === "failed" ? "error" : "running";
-  const detail = st === "ok" ? "" : st === "error" ? "failed" : "running…";
   const existing = pending.get(key);
-  if (existing instanceof ToolPill) {
-    existing.update(st, detail);
-  } else if (!existing) {
-    const pill = new ToolPill(theme, st, displayLabel, detail);
+  if (existing instanceof ToolPill && (p.id || st !== "running" || existing.status === "running")) {
+    existing.update(st, p.error ?? p.result, p.args);
+  } else if (!(existing instanceof ToolOutputCard)) {
+    const pill = new ToolPill(theme, st, displayLabel, p.args);
+    pill.update(st, p.error ?? p.result);
     pending.set(key, pill);
     container.addChild(pill);
   }
@@ -417,7 +421,7 @@ export async function runDirectorChatTui(opts: {
   const term = new TerminalSession();
   const tui = term.tui;
 
-  const chatContainer = new Container();
+  const chatContainer = new ToolTranscript(theme);
   const goalHeader = new GoalHeader(theme);
   const spinner = new TimedSpinner(tui, theme);
   const statusBar = new StatusBar(theme, {
@@ -1416,8 +1420,7 @@ export async function runDirectorChatTui(opts: {
       }
       appendDelta(delta);
     } else if (ev.type === "chat.tool" && busy) {
-      const p = ev.payload as { id?: string; name?: string; title?: string; status?: string };
-      const display = extractDisplay(p);
+      const p = ev.payload as ToolEvent;
       const name = p.title ?? p.name ?? "tool";
       const key = p.id || name;
       if (isSubagentWaitTool(p.name, p.title)) {
@@ -1430,43 +1433,30 @@ export async function runDirectorChatTui(opts: {
         syncActivityIndicator();
         refreshStatus();
       }
-      const previous = activeToolPills.get(key);
-      if (display) {
-        // Pi emits an unkeyed progress event before the independently keyed display.
-        const progress = previous ?? activeToolPills.get(name);
-        if (progress instanceof ToolPill) {
-          if (chatContainer.children.at(-1) === progress) chatContainer.removeChild(progress);
-          else progress.finishCall();
-        }
-      } else if (p.status !== "completed" && p.status !== "failed") {
-        if (!p.id) activeToolPills.delete(key);
-      } else if (previous instanceof ToolPill && chatContainer.children.at(-1) !== previous) {
-        // A command, notice or another tool arrived since this call started.
-        previous.finishCall();
-        activeToolPills.delete(key);
-      }
       applyChatToolEvent(p, activeToolPills, chatContainer, theme);
-      if (display && p.id && activeToolPills.has(name)) {
-        const card = activeToolPills.get(key);
-        if (card) activeToolPills.set(name, card);
-      }
       tui.requestRender();
     } else if (ev.type === "goal.progress") {
       void refreshGoals();
     } else if (ev.type === "goal.reviewed") {
-      const p = ev.payload as { goalId: string; version: number; cycle: number; verdict: string; status: string; summary: string };
-      appendSystem(
-        [`[${p.goalId} v${p.version}] Review #${p.cycle}: ${p.verdict.toUpperCase()} (${p.status}) — ${p.summary}`],
-        p.verdict === "approved" ? "success" : "warning",
-      );
+      const p = ev.payload as { goalId: string; version: number; cycle: number; verdict: string; status: string; summary: string; circuitBreakerTripped?: string };
+      if (p.status === "achieved" && !p.circuitBreakerTripped) {
+        chatContainer.addChild(new GoalNotice(theme, `${p.goalId} achieved`));
+        tui.requestRender();
+      } else {
+        appendSystem(
+          [`[${p.goalId} v${p.version}] Review #${p.cycle}: ${p.verdict.toUpperCase()} (${p.status}) — ${p.summary}`],
+          "warning",
+        );
+      }
       void refreshGoals();
     } else if (ev.type === "goal.amended") {
       const p = ev.payload as { goalId: string; delta: { fromVersion: number; toVersion: number; rationale: string } };
       appendSystem([`[${p.goalId}] Amended v${p.delta.fromVersion} → v${p.delta.toVersion}: ${p.delta.rationale}`], "info");
       void refreshGoals();
     } else if (ev.type === "goal.committed") {
-      const p = ev.payload as { goalId: string; version: number; title: string };
-      appendSystem([`[${p.goalId} v${p.version}] Autonomous execution started: ${p.title}`], "success");
+      const p = ev.payload as { goalId: string };
+      chatContainer.addChild(new GoalNotice(theme, `${p.goalId} started`));
+      tui.requestRender();
       void refreshGoals();
     } else if (ev.type === "quota.agent_paused") {
       const p = ev.payload as {
@@ -1581,7 +1571,7 @@ export async function runNativeScrollbackTui(opts: {
   const term = new TerminalSession();
   const tui = term.tui;
 
-  const streamContainer = new Container();
+  const streamContainer = new ToolTranscript(theme);
   const pendingContainer = new Container();
   const pendingMarkdown = new Markdown("", 1, 0, theme.toMarkdownTheme());
   const spinner = new TimedSpinner(tui, theme);
@@ -1689,17 +1679,17 @@ export async function runNativeScrollbackTui(opts: {
     const prefix = ev.taskId ? `[${ev.taskId}]` : `[run]`;
 
     if (ev.type === "agent.tool") {
-      const p = ev.payload as { id?: string; name?: string; status?: string; title?: string };
+      const p = ev.payload as ToolEvent;
       const rawLabel = p.title ?? p.name ?? "tool";
       const displayLabel = rawLabel.replace(/^mcp[._/]harness[._/]+/i, "harness:").replace(/^mcp__harness__/i, "harness:");
       const key = p.id ? `${ev.taskId ?? ""}:${p.id}` : `${ev.taskId ?? ""}:${displayLabel}`;
       const st = p.status === "completed" ? "ok" : p.status === "failed" ? "error" : "running";
-      const detail = st === "ok" ? "" : st === "error" ? "failed" : "running…";
       const existing = activeRunToolPills.get(key);
-      if (existing) {
-        existing.update(st, detail);
+      if (existing && (p.id || st !== "running" || existing.status === "running")) {
+        existing.update(st, p.error ?? p.result, p.args);
       } else {
-        const pill = new ToolPill(theme, st, `${prefix} ${displayLabel}`, detail);
+        const pill = new ToolPill(theme, st, `${prefix} ${displayLabel}`, p.args);
+        pill.update(st, p.error ?? p.result);
         activeRunToolPills.set(key, pill);
         streamContainer.addChild(pill);
       }

@@ -25,7 +25,16 @@ CLI-first, daemonized **Tier 0 Interactive Director + 3-Tier Multi-Agent Coding 
   - Persistent `harnessd` survives terminal close; thin `@earendil-works/pi-tui` (`TuiMainScreen`) client renders width-safe, memoized native-scrollback cards (`< 4ms` daemon handshake, `< 0.02ms`/frame memoized redraws) and attaches remotely over `ssh://host`.
   - Interactive overlays: `/model` (searchable tabular catalog), `/effort`, `/quota`, `/goals`, `/runs`, `/worktrees`, `/kb`, `/settings` (`Ctrl+,`), `Ctrl+O` Command Palette, `Ctrl+T` DFS Agent Tree Switcher, `Ctrl+C`/`Ctrl+D` clean exit, and `Ctrl+]` tmux-style detach.
 
-## Quick Start
+## Install
+
+```bash
+sh install.sh                 # clean host: pinned Bun, locked deps, launcher; re-run to update
+~/.local/bin/pi-harness --help
+```
+
+This stages a checksum-verified upstream Bun and the frozen `bun.lock` dependencies under `~/.pi-harness/install`, so no global Bun, Node or Python is needed. Prerequisites, layout, platform support (Code Mode is macOS-only), update steps and the Nix/mise/pixi comparison: [docs/runtime-install.md](docs/runtime-install.md).
+
+## Quick Start (development checkout)
 
 ```bash
 bun install

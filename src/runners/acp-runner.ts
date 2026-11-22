@@ -1,3 +1,4 @@
+import { toolEventPreview } from "../protocol/tool-display.js";
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { constants } from "node:fs";
@@ -647,6 +648,8 @@ export class AcpRunner {
             status,
             kind: update.kind ? String(update.kind) : undefined,
             title: resolvedTitle,
+            args: toolEventPreview(update.rawInput),
+            ...(status === "failed" ? { error: toolEventPreview(update.rawOutput) } : { result: toolEventPreview(update.rawOutput) }),
           });
           for (const art of extractArtifactsFromToolUpdate(update)) {
             req.callbacks.onArtifact?.(art);

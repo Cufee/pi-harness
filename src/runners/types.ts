@@ -59,6 +59,10 @@ export interface RunnerCallbacks {
     status: string;
     kind?: string;
     title?: string;
+    args?: string;
+    result?: string;
+    error?: string;
+    via?: "code_exec";
     /** Structured rich output (contract/tool-display-v1); events without it render as a compact tool pill. */
     display?: ToolDisplayPayload;
   }) => void;

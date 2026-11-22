@@ -31,17 +31,17 @@ export function validateTaskHandoff(kind: TaskKind, args: Record<string, unknown
 export function compactTaskHandoff(task: TaskRecord, escalations: EscalationRecord[] = []) {
   const result = task.resultJson ? JSON.parse(task.resultJson) : null;
   const paused = task.status === "paused_quota" || task.summary?.startsWith("Paused (quota):");
-  const hasRawText = typeof result?.text === "string" && result.text.trim().length > 0;
   const unstructured = typeof result?.text === "string" && typeof result?.summary !== "string";
   let summary = task.summary?.slice(0, SUMMARY_LIMIT) ?? null;
   if (paused) summary = "Task paused for quota.";
   else if (unstructured) {
-    // Tier 1 Orchestrators do not have `return_task`; preserve their saved final reply instead of masking it.
-    if (task.kind === "orchestrator" && hasRawText) {
-      summary = result.text.trim().slice(0, SUMMARY_LIMIT);
-    } else {
-      summary = "Task ended without a structured handoff.";
-    }
+    // Tier 1 orchestrators have no return_task; their natural final reply is the handoff.
+    const reply = task.kind === "orchestrator" ? result.text.trim() : "";
+    summary = reply
+      ? reply.slice(0, SUMMARY_LIMIT)
+      : task.kind === "orchestrator"
+        ? "Task ended without a structured handoff or a final reply."
+        : "Task ended without a structured handoff.";
   }
   return {
     id: task.id,

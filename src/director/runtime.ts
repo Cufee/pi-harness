@@ -117,17 +117,27 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
     name: "goal_list",
     description:
-      "List all Goals for this workspace with their version, status, review cycles, and linked run ID. The result is rendered as a live Goals table directly in the user's UI: call this instead of printing or duplicating a Goals table in prose, and afterwards add only brief commentary.",
+      "List Goals in this workspace with their version, status, review cycles, and linked run IDs. Pass the returned presentation_id to present_result to show the Goals table.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "goal_get",
     description:
-      "Inspect a Goal's full criteria, latest review scorecard, linked run tree, and open escalations. The result is rendered as a Goal detail card directly in the user's UI: do not re-print it in prose; add only brief commentary.",
+      "Inspect a Goal's criteria, latest review, linked run tree, and open escalations. Pass the returned presentation_id to present_result to show the Goal detail card.",
     inputSchema: {
       type: "object",
       required: ["goal_id"],
       properties: { goal_id: { type: "string" } },
+    },
+  },
+  {
+    name: "present_result",
+    description:
+      "Show one native card or table in the user's chat using a presentation_id from a result in this turn. Select the desired result from a batch and pass its ID directly. The original operation is already complete, and each ID can be used once.",
+    inputSchema: {
+      type: "object",
+      required: ["presentation_id"],
+      properties: { presentation_id: { type: "string" } },
     },
   },
   {
@@ -248,7 +258,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
     name: "run_status",
     description:
-      "Inspect and render a structured live telemetry card for a run (or Goal's linked run) and all its subagents (current actions, models, tool calls, files edited, phase, escalations) automatically harvested by the control plane.",
+      "Inspect run and subagent telemetry. Pass the returned presentation_id to present_result to show the Run Activity card.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1293,11 +1303,27 @@ export class DirectorRuntime {
   }
 
   private directorExecutor(session: { id: string; repoRoot: string }, signal: AbortSignal, onToolEvent?: RunnerCallbacks["onToolEvent"]) {
+    const presentations = new Map<string, { toolName: string; build: () => ToolDisplayPayload }>();
     return createCodeModeExecutor({
       ...this.config.codeExec,
       mode: effectiveCodeMode(this.config.codeMode),
       allowedTools: () => DIRECTOR_TOOLS,
-      execute: (name, args) => this.executeDirectorTool(session.id, session.repoRoot, name, args, signal),
+      execute: async (name, args) => {
+        if (name === "present_result") {
+          signal.throwIfAborted();
+          const id = String(args.presentation_id);
+          const selected = presentations.get(id);
+          if (!selected) throw new Error("Unknown or already presented result in this turn");
+          this.emitToolDisplay(session.id, selected.toolName, selected.build());
+          presentations.delete(id);
+          return { presented: true };
+        }
+        return this.executeDirectorTool(session.id, session.repoRoot, name, args, signal, (build) => {
+          const id = randomUUID();
+          presentations.set(id, { toolName: name, build });
+          return id;
+        });
+      },
       artifactsDir: resolve(session.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts"),
       saveOutput: async (name, json) => {
         signal.throwIfAborted();
@@ -1500,23 +1526,15 @@ export class DirectorRuntime {
     this.activeChats.get(chatSessionId)?.onToolEvent?.({ id: `display-${randomUUID()}`, name: toolName, status: "completed", display });
   }
 
-  /** Builds and emits a native Goal Detail UI card into the chat transcript. */
-  private emitGoalDetailDisplay(chatSessionId: string, toolName: string, goal: GoalRecord): {
-    goal: GoalRecord;
-    reviews: GoalReviewVerdict[];
-    tasks: ReturnType<ControlPlaneDb["listTasks"]>;
-    openEscalations: ReturnType<ControlPlaneDb["listEscalations"]>;
-  } {
-    const activity = goal.linkedRunId ? buildRunActivitySummary(this.db, goal.linkedRunId) : null;
-    const detail = {
+  private goalDisplayData(goal: GoalRecord) {
+    const runId = goal.linkedRunId;
+    return {
       goal,
       reviews: this.goals.listReviews(goal.id),
-      tasks: goal.linkedRunId ? this.db.listTasks(goal.linkedRunId) : [],
-      openEscalations: goal.linkedRunId ? this.db.listEscalations(goal.linkedRunId, "open") : [],
-      activity,
+      tasks: runId ? this.db.listTasks(runId) : [],
+      openEscalations: runId ? this.db.listEscalations(runId, "open") : [],
+      activity: runId ? buildRunActivitySummary(this.db, runId) : null,
     };
-    this.emitToolDisplay(chatSessionId, toolName, buildGoalDetailDisplay(detail));
-    return detail;
   }
 
   private async executeDirectorTool(
@@ -1525,7 +1543,9 @@ export class DirectorRuntime {
     name: string,
     args: Record<string, unknown>,
     signal: AbortSignal,
+    offerPresentation: (build: () => ToolDisplayPayload) => string,
   ): Promise<unknown> {
+    const presentGoal = (goal: GoalRecord) => offerPresentation(() => buildGoalDetailDisplay(this.goalDisplayData(goal)));
     if (args.goal_id !== undefined) {
       const goal = this.goals.getGoal(String(args.goal_id));
       if (!goal || realpathSync(goal.repoRoot) !== realpathSync(repoRoot)) throw new Error("Unknown goal in this workspace");
@@ -1594,11 +1614,9 @@ export class DirectorRuntime {
             model: String(args.model), profileId: args.profile_id as string | undefined,
             effort: typeof args.effort === "string" ? args.effort : undefined,
           });
-          this.emitGoalDetailDisplay(chatSessionId, name, committed);
-          return { ...committed, rendered_in_ui: "Goal detail card shown to the user; do not repeat it." };
+          return { ...committed, presentation_id: presentGoal(committed) };
         }
-        this.emitGoalDetailDisplay(chatSessionId, name, created);
-        return { ...created, rendered_in_ui: "Goal detail card shown to the user; do not repeat it." };
+        return { ...created, presentation_id: presentGoal(created) };
       }
 
       case "goal_commit": {
@@ -1607,8 +1625,7 @@ export class DirectorRuntime {
           model: typeof args.model === "string" ? args.model : undefined,
           effort: typeof args.effort === "string" ? args.effort : undefined,
         });
-        this.emitGoalDetailDisplay(chatSessionId, name, committed);
-        return { ...committed, rendered_in_ui: "Goal detail card shown to the user; do not repeat it." };
+        return { ...committed, presentation_id: presentGoal(committed) };
       }
 
       case "goal_amend": {
@@ -1621,26 +1638,13 @@ export class DirectorRuntime {
           removeCriteriaIds: Array.isArray(args.remove_criteria_ids) ? (args.remove_criteria_ids as string[]) : undefined,
           nonGoals: Array.isArray(args.non_goals) ? (args.non_goals as string[]) : undefined,
         });
-        this.emitGoalDetailDisplay(chatSessionId, name, amended.goal);
-        return { ...amended, rendered_in_ui: "Goal detail card shown to the user; do not repeat it." };
+        return { ...amended, presentation_id: presentGoal(amended.goal) };
       }
 
       case "goal_list": {
         const goals = this.goals.listGoals({ repoRoot, chatSessionId });
-        this.emitToolDisplay(
-          chatSessionId,
-          name,
-          buildGoalsTableDisplay(
-            goals.map((goal) => ({
-              goal,
-              reviews: this.goals.listReviews(goal.id),
-              tasks: goal.linkedRunId ? this.db.listTasks(goal.linkedRunId) : [],
-              activity: goal.linkedRunId ? buildRunActivitySummary(this.db, goal.linkedRunId) : null,
-              openEscalations: goal.linkedRunId ? this.db.listEscalations(goal.linkedRunId, "open") : [],
-            })),
-          ),
-        );
-        return { goals, rendered_in_ui: "Goals table shown to the user; do not repeat it." };
+        const presentation_id = offerPresentation(() => buildGoalsTableDisplay(goals.map((goal) => this.goalDisplayData(goal))));
+        return { goals, presentation_id };
       }
 
       case "report_goal_progress": {
@@ -1673,8 +1677,12 @@ export class DirectorRuntime {
       case "goal_get": {
         const g = this.goals.getGoal(String(args.goal_id));
         if (!g) throw new Error(`Unknown goal ${args.goal_id}`);
-        const detail = this.emitGoalDetailDisplay(chatSessionId, name, g);
-        return { ...detail, tasks: detail.tasks.map((t) => compactTaskHandoff(t, detail.openEscalations)), rendered_in_ui: "Goal detail shown to the user; do not repeat it." };
+        const detail = this.goalDisplayData(g);
+        return {
+          ...detail,
+          tasks: detail.tasks.map((t) => compactTaskHandoff(t, detail.openEscalations)),
+          presentation_id: offerPresentation(() => buildGoalDetailDisplay(detail)),
+        };
       }
 
       case "goal_wait": {
@@ -1700,22 +1708,19 @@ export class DirectorRuntime {
               : undefined,
           summary: typeof args.summary === "string" ? args.summary : undefined,
         });
-        this.emitGoalDetailDisplay(chatSessionId, name, reviewed.goal);
-        return { ...reviewed, rendered_in_ui: "Goal detail card shown to the user; do not repeat it." };
+        return { ...reviewed, presentation_id: presentGoal(reviewed.goal) };
       }
 
       case "goal_pause": {
         const g = this.goals.setStatus(String(args.goal_id), "paused", "Paused by Director");
         if (g.linkedRunId) await this.orchestrator.stopRun(g.linkedRunId, "Goal paused");
-        this.emitGoalDetailDisplay(chatSessionId, name, g);
-        return { ...g, rendered_in_ui: "Goal detail card shown to the user; do not repeat it." };
+        return { ...g, presentation_id: presentGoal(g) };
       }
 
       case "goal_cancel": {
         const g = this.goals.setStatus(String(args.goal_id), "cancelled", "Cancelled by Director");
         if (g.linkedRunId) await this.orchestrator.stopRun(g.linkedRunId, "Goal cancelled");
-        this.emitGoalDetailDisplay(chatSessionId, name, g);
-        return { ...g, rendered_in_ui: "Goal detail card shown to the user; do not repeat it." };
+        return { ...g, presentation_id: presentGoal(g) };
       }
 
       case "read_file": {
@@ -1790,8 +1795,7 @@ export class DirectorRuntime {
         const run = this.orchestrator.getEffectiveRun(runId);
         if (!run) throw new Error(`Unknown run ${runId}`);
         const activity = buildRunActivitySummary(this.db, runId);
-        this.emitToolDisplay(chatSessionId, name, buildRunActivityDisplay(activity));
-        return { run, activity, rendered_in_ui: "Run activity card shown to the user; do not repeat it." };
+        return { run, activity, presentation_id: offerPresentation(() => buildRunActivityDisplay(activity)) };
       }
 
       case "steer_run": {
@@ -1825,9 +1829,10 @@ export class DirectorRuntime {
           trigger: "manual",
           note: typeof args.note === "string" ? args.note : undefined,
         });
-        const activity = buildRunActivitySummary(this.db, res.run.id);
-        this.emitToolDisplay(chatSessionId, "run_status", buildRunActivityDisplay(activity));
-        return res;
+        return {
+          ...res,
+          presentation_id: offerPresentation(() => buildRunActivityDisplay(buildRunActivitySummary(this.db, res.run.id))),
+        };
       }
 
       case "schedule_timer": {

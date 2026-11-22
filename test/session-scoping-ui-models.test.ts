@@ -702,7 +702,7 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
       assert.equal(daemon.db.getTask(staleTask.id)?.status, "failed");
       assert.equal(daemon.db.getRun(staleRun.id)?.status, "failed");
 
-      // 3. Native goal UI printing for BOTH user (`goal.get` / `goal.table_display`) AND Director (`goal_create`)
+      // 3. Native goal UI printing for the user and structured Director goal creation
       const chat = await client.request<{ session: { id: string } }>("chat.create", {
         repoRoot: repoDir,
         title: "Goals Print Test",
@@ -712,8 +712,8 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
         description: "Verify native card rendering",
         criteria: [{ id: "c1", kind: "deterministic", description: "Tests pass", command: "bun test" }],
         non_goals: ["Unrelated refactor"],
-      })) as { id: string; rendered_in_ui?: string };
-      assert.ok(created.rendered_in_ui?.includes("Goal detail card"));
+      })) as { id: string; presentation_id?: string };
+      assert.ok(created.presentation_id);
 
       const detailRes = await client.request<{ display: ToolDisplayPayload }>("goal.get", {
         goalId: created.id,
@@ -1125,10 +1125,16 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
     cfg.stateDir = stateDir;
     cfg.socketPath = sockPath;
 
+    let inspectGoalId: string;
+    let statusRes: { activity?: { phase: string; counts: { verifyCompleted: number } }; presentation_id: string };
     const daemon = new HarnessDaemon(cfg, {
       dbPath: join(stateDir, "cp.sqlite"),
       customRunnerFactory: () => ({
-        run: async () => ({ text: "ok", stopReason: "completed" }),
+        run: async (req) => {
+          statusRes = (await req.executeTool("run_status", { goal_id: inspectGoalId })) as typeof statusRes;
+          await req.executeTool("present_result", { presentation_id: statusRes.presentation_id });
+          return { text: "ok", stopReason: "completed" };
+        },
       }),
     });
     await daemon.start();
@@ -1276,11 +1282,9 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
       assert.equal(updatedGoal.liveProgress?.verificationStatus, "passed");
       assert.equal(updatedGoal.liveProgress?.criteriaResults?.[0]?.passed, true);
 
-      // Verify run_status Director tool resolves goal_id and emits native run_activity display card into history
-      const statusRes = (await daemon.director.executeDirectorMcpTool(chat.session.id, "run_status", {
-        goal_id: goal.id,
-      })) as { activity?: { phase: string; counts: { verifyCompleted: number } }; rendered_in_ui?: string };
-      assert.equal(statusRes.activity?.counts.verifyCompleted, 1);
+      inspectGoalId = goal.id;
+      await client.request("chat.send", { chatSessionId: chat.session.id, text: "Show linked run activity" });
+      assert.equal(statusRes!.activity?.counts.verifyCompleted, 1);
       const turns = await client.request<Array<{ role: string; toolName?: string; display?: ToolDisplayPayload }>>("chat.history", {
         chatSessionId: chat.session.id,
       });

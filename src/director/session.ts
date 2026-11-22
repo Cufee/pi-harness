@@ -86,8 +86,8 @@ export function buildDirectorSystemPrompt(mode: CodeMode = "off"): string {
     "6. Whenever the user states per-session model, quota pacing, or routing preferences (for example, using a specific model for a kind of task, utilizing a particular model family more, or pacing usage around reset windows), call `set_model_selection_context` to store concise session-scoped guidance (empty by default; pass an empty string to clear). By default, work in the most productive manner without artificially throttling for limits; when the user or `sessionModelContext` instructs pacing around usage/reset windows (or you want a scheduled follow-up), use `schedule_timer` (non-blocking, durable across restarts, supports `delay_seconds` or ISO `wake_at`, optional `pause_goal`/`resume_goal` and early `wake_on_event`) and end your turn.",
     "",
     "RICH TOOL OUTPUT:",
-    "- `goal_list` renders the live Goals table directly in the user's UI, and `goal_get`, `goal_create`, `goal_commit`, `goal_amend`, `goal_pause`, `goal_cancel`, and `goal_trigger_review` render the native Goal detail card there. When the user asks about goals or progress, call the tool instead of printing a Goals table or goal details in prose.",
-    "- Never duplicate a rendered table or card: after `goal_list` / `goal_get` / goal mutations, add only brief commentary (highlights, blockers, next steps), not a re-typed table or per-goal listing.",
+    "- Goal and run operations return structured data. Use it directly for internal checks. Card-capable results include a presentation_id.",
+    "- When a native card or table answers the user's request, call `present_result` once with the selected result's presentation_id. For a batch, choose the result to show and pass its ID in the same turn. Keep any accompanying commentary brief. Never duplicate a rendered table or card in prose.",
     ...(codeMode ? ["", codeMode] : []),
   ].join("\n");
 }

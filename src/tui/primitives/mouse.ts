@@ -1,4 +1,4 @@
-/** Enable X10 button/wheel tracking + SGR extended coordinates (only while scrollable overlays are open). */
+/** Enable button/wheel tracking and SGR extended coordinates. */
 export const ENABLE_MOUSE_WHEEL_SEQ = "\x1b[?1000h\x1b[?1006h";
 
 /** Disable SGR extended coordinates + X10 mouse tracking (restores native terminal scrollback). */
@@ -13,6 +13,16 @@ export interface ParsedMouseInput {
 
 const SGR_MOUSE_RX = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g;
 const X10_MOUSE_RX = /\x1b\[M([\s\S]{3})/g;
+
+export function dispatchLeftPresses(data: string, onPress: (x: number, y: number) => void): string {
+  return data.replace(SGR_MOUSE_RX, (_, button, col, row, kind) => {
+    if (kind === "M" && Number(button) === 0) onPress(Number(col) - 1, Number(row) - 1);
+    return "";
+  }).replace(X10_MOUSE_RX, (_, bytes: string) => {
+    if (bytes.charCodeAt(0) === 32) onPress(bytes.charCodeAt(1) - 33, bytes.charCodeAt(2) - 33);
+    return "";
+  });
+}
 
 /**
  * Parses SGR (`\x1b[<btn;col;rowM`) and X10 (`\x1b[Mcb cx cy`) mouse escape sequences,
