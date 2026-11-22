@@ -8,7 +8,9 @@ export interface TerminalSessionCallbacks {
   clearComposerText: () => void;
   isAutocompleteOpen: () => boolean;
   isBusy: () => boolean;
-  onAbortGeneration: () => void;
+  onAbortGeneration: (key: "escape" | "ctrl+c") => void;
+  onSteer?: () => void;
+  onRecallQueued?: () => boolean;
   onOpenSettings?: () => void;
   onOpenPalette?: () => void;
   onOpenTree?: () => void;
@@ -141,8 +143,8 @@ export class TerminalSession {
           return { consume: true };
         }
         if (callbacks.isBusy()) {
-          callbacks.onAbortGeneration();
-          this.armCtrlC(footerHint, "Cancelled · press Ctrl+C again to exit", () => {
+          callbacks.onAbortGeneration("ctrl+c");
+          this.armCtrlC(footerHint, "Stopping · press Ctrl+C again to exit", () => {
             footerHint.clear();
             this.tui.requestRender();
           });
@@ -172,6 +174,18 @@ export class TerminalSession {
         return undefined; // Let Editor handle deleteCharForward when text is present
       }
 
+      if (!overlays.isOpen && callbacks.isBusy()) {
+        if (matchesKey(data, "ctrl+s") && callbacks.onSteer) {
+          disarmCtrlC();
+          callbacks.onSteer();
+          return { consume: true };
+        }
+        if (matchesKey(data, "ctrl+r") && callbacks.onRecallQueued?.()) {
+          disarmCtrlC();
+          return { consume: true };
+        }
+      }
+
       // Esc: autocomplete -> overlay -> abort busy turn
       if (data === "\x1b" || matchesKey(data, "escape")) {
         disarmCtrlC();
@@ -183,7 +197,7 @@ export class TerminalSession {
           return undefined; // Let Editor dismiss autocomplete
         }
         if (callbacks.isBusy()) {
-          callbacks.onAbortGeneration();
+          callbacks.onAbortGeneration("escape");
           return { consume: true };
         }
         return undefined;

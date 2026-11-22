@@ -16,6 +16,6 @@ export { AssistantCard, BannerCard, ErrorCard, SystemCard, ToolPill, UserCard } 
 export { OverlayManager } from "./overlay-stack.js";
 export { Panel, type PanelOptions } from "./panel.js";
 export { TimedSpinner } from "./spinner.js";
-export { FooterHint, StatusBar, type StatusBarState } from "./status-bar.js";
+export { FooterHint, GoalHeader, StatusBar, type StatusBarState } from "./status-bar.js";
 export { createTheme, type HarnessTheme } from "./theme.js";
 export { clampLine, fillLineBg, fitWidth } from "./width.js";

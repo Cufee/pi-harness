@@ -1,7 +1,36 @@
 import type { Component } from "@earendil-works/pi-tui";
+import type { GoalRecord } from "../../goals/engine.js";
+import { sanitizeText, statusPaint } from "../tool-output/types.js";
 import { badge, keyHint, renderFlexRow, statusDot, type SemanticTone } from "./layout.js";
 import type { HarnessTheme } from "./theme.js";
 import { fitWidth } from "./width.js";
+
+/** Workspace goals remain next to the composer as the transcript scrolls. */
+export class GoalHeader implements Component {
+  private goals: GoalRecord[] = [];
+
+  constructor(private readonly theme: HarnessTheme) {}
+
+  update(goals: GoalRecord[]): void {
+    const active = (g: GoalRecord) => ["executing", "reviewing", "verifying"].includes(g.status);
+    this.goals = [...goals].sort((a, b) =>
+      Number(active(b)) - Number(active(a)) || b.updatedAt - a.updatedAt || a.id.localeCompare(b.id),
+    );
+  }
+
+  invalidate(): void {}
+
+  render(width: number): readonly string[] {
+    if (width <= 0) return [];
+    return this.goals.slice(0, 2).map((goal, index) => {
+      const overflow = index === 1 && this.goals.length > 2 ? `  +${this.goals.length - 2} more` : "";
+      const status = goal.status.replaceAll("_", " ");
+      const titleWidth = Math.max(0, width - status.length - overflow.length - 4);
+      const title = fitWidth(sanitizeText(goal.title || goal.description), titleWidth);
+      return fitWidth(` ${statusPaint(goal.status, this.theme)(status)} · ${title}${this.theme.dim(overflow)}`, width);
+    });
+  }
+}
 
 export interface StatusBarState {
   tone: SemanticTone;

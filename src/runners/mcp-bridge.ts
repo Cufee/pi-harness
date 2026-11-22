@@ -9,14 +9,14 @@ import { randomUUID } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { attachNdjsonReader, writeNdjson } from "../protocol/frames.js";
+import { attachDaemonReader, writeNdjson } from "../protocol/frames.js";
 import type { RpcRequest, RpcResponse } from "../protocol/daemon-rpc.js";
 
 async function daemonCall(socketPath: string, op: RpcRequest["op"], params: Record<string, unknown>): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const id = randomUUID();
     const sock = createConnection(socketPath);
-    const detach = attachNdjsonReader(sock, {
+    const detach = attachDaemonReader(sock, {
       onMessage(msg) {
         const frame = msg as RpcResponse;
         if (frame.kind === "res" && frame.id === id) {

@@ -9,6 +9,7 @@ import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import type { DaemonEventFrame } from "../src/protocol/daemon-rpc.js";
 import { runGit } from "../src/worktree/manager.js";
+import { withFixtureCatalog } from "./fixtures/launch-config.js";
 
 type WatchStartResult = { watchId: string; replay: EventRecord[]; lastSeq: number; run?: RunRecord; task?: TaskRecord };
 type RunsTreesResult = { generatedAt: number; runs: Array<{ run: RunRecord; tasks: TaskRecord[]; escalations: unknown[] }> };
@@ -37,7 +38,7 @@ describe("Daemon read-only runs.trees + watch.start/stop", () => {
     const repoRoot = await makeTempRepo();
     const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-wstate-"));
     const sockPath = join(stateDir, "d.sock");
-    const config = { ...loadConfig(repoRoot), stateDir, socketPath: sockPath };
+    const config = withFixtureCatalog({ ...loadConfig(repoRoot), stateDir, socketPath: sockPath });
     const daemon = new HarnessDaemon(config, {
       dbPath: ":memory:",
       customRunnerFactory: () => ({
@@ -64,9 +65,9 @@ describe("Daemon read-only runs.trees + watch.start/stop", () => {
     try {
       const baseSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout.trim();
       const run = db.createRun({ goal: "Watch me", repoRoot, baseBranch: "main", baseSha });
-      const t1 = db.createTask({ runId: run.id, tier: 1, kind: "orchestrator", title: "Orch", objective: "o", readOnly: true, profileId: "p" });
+      const t1 = db.createTask({ runId: run.id, tier: 1, kind: "orchestrator", title: "Orch", objective: "o", readOnly: true, profileId: "pi:local", model: "fixture" });
       const mk = (title: string, status?: TaskRecord["status"]) => {
-        const t = db.createTask({ runId: run.id, parentId: t1.id, tier: 2, kind: "worker", title, objective: title, profileId: "p", readOnly: true });
+        const t = db.createTask({ runId: run.id, parentId: t1.id, tier: 2, kind: "worker", title, objective: title, profileId: "pi:local", model: "fixture", readOnly: true });
         if (status) db.updateTask(t.id, { status });
         return t;
       };
@@ -91,7 +92,7 @@ describe("Daemon read-only runs.trees + watch.start/stop", () => {
       const a = await connect(sockPath);
       const b = await connect(sockPath);
       clients.push(a.client, b.client);
-      await a.client.request("chat.open", { repoRoot });
+      await a.client.request("chat.open", { repoRoot, profileId: "pi:local", model: "fixture" });
       await b.client.request("attach", { runId: run.id });
 
       const review = (await a.client.request("goal.review", { goalId: goal.id })) as { review: { verdict: string } };
