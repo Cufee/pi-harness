@@ -1,5 +1,6 @@
 import { fuzzyFilter, Input, matchesKey } from "@earendil-works/pi-tui";
-import { clamp, fit, sanitizeLine } from "./text.js";
+import { type ColumnSpec, computeColumnLayout, formatColumnRow } from "./layout.js";
+import { clamp, fillLineBg, fit, sanitizeLine } from "./text.js";
 import type { Theme } from "./tokens.js";
 import { parseMouseWheel, Viewport } from "./viewport.js";
 
@@ -8,13 +9,29 @@ export interface ListItem<T> {
   value: T;
   /** Searchable text used by `/` fuzzy filter. */
   searchText: string;
-  /** Render the row to fit `width` columns (`selected` indicates active cursor). */
-  render: (width: number, selected: boolean, theme: Theme) => string;
+  /** Optional structured cells used when `columns` are configured on the list/table. */
+  cells?: (selected: boolean, theme: Theme) => Record<string, string>;
+  /** Custom row renderer (used when `columns` are not set). */
+  render?: (width: number, selected: boolean, theme: Theme) => string;
+}
+
+export interface TableListItem<T> {
+  id: string;
+  value: T;
+  searchText: string;
+  cells: (selected: boolean, theme: Theme) => Record<string, string>;
 }
 
 /**
- * Uniform keyboard + mouse-wheel list component used across Work Navigator tabs,
- * Go-To-Anything palette, model/session/KB pickers, and drill-down sub-lists.
+ * Uniform keyboard + mouse-wheel list & aligned-table component used across Work Navigator tabs,
+ * Go-To-Anything palette, Settings, Model/Session/KB pickers, and drill-down sub-lists.
+ *
+ * Features:
+ *  - Optional `columns: ColumnSpec[]` renders a sticky header + `─` rule above the scrollable viewport
+ *    with priority-shedding aligned columns per row.
+ *  - Full-width calibrated `badgeBg` highlight (`fillLineBg`) on the selected row alongside `▸ `.
+ *  - Decoupled mouse-wheel scrolling so wheel scrolling never snaps back on render until a key moves selection.
+ *  - Layered `/` fuzzy filter (`Esc` clears active filter before closing the screen).
  */
 export class ListView<T> {
   private allItems: ListItem<T>[] = [];
@@ -24,10 +41,20 @@ export class ListView<T> {
   private filterActive = false;
   private filterInput = new Input();
   private filterQuery = "";
+  private wheelScrolled = false;
+  private columns: ColumnSpec[] | null = null;
+  private columnGap = 2;
   emptyText = "Nothing here.";
 
-  constructor(opts?: { emptyText?: string }) {
+  constructor(opts?: { emptyText?: string; columns?: ColumnSpec[]; gap?: number }) {
     if (opts?.emptyText) this.emptyText = opts.emptyText;
+    if (opts?.columns) this.columns = opts.columns;
+    if (opts?.gap != null) this.columnGap = opts.gap;
+  }
+
+  setColumns(columns: ColumnSpec[] | null, gap = 2): void {
+    this.columns = columns;
+    this.columnGap = gap;
   }
 
   setItems(items: ListItem<T>[], preserveSelectionId?: string): void {
@@ -44,6 +71,10 @@ export class ListView<T> {
     return this.allItems.length;
   }
 
+  get selectedIndex(): number {
+    return this.selectedIdx;
+  }
+
   get isFiltering(): boolean {
     return this.filterActive;
   }
@@ -55,13 +86,40 @@ export class ListView<T> {
   startFilter(): void {
     this.filterActive = true;
     this.filterInput.setValue(this.filterQuery);
+    if (this.filterQuery) this.filterInput.handleInput("\x05");
+  }
+
+  /** Pre-populates a filter query (e.g. from `/kb <query>`) without grabbing typing focus unless requested. */
+  setInitialFilter(query: string, activate = false): void {
+    const clean = sanitizeLine(query);
+    this.filterQuery = clean;
+    this.filterInput.setValue(clean);
+    if (clean) this.filterInput.handleInput("\x05");
+    this.filterActive = activate;
+    this.wheelScrolled = false;
+    this.recomputeFilter();
   }
 
   clearFilter(): void {
     this.filterActive = false;
     this.filterQuery = "";
     this.filterInput.setValue("");
+    this.wheelScrolled = false;
     this.recomputeFilter(this.selectedItem()?.id);
+  }
+
+  /** Layered Escape handler: closes/clears filter if active or non-empty; returns true if consumed. */
+  handleEscape(): boolean {
+    if (this.filterActive) {
+      if (this.filterQuery) this.clearFilter();
+      else this.filterActive = false;
+      return true;
+    }
+    if (this.filterQuery) {
+      this.clearFilter();
+      return true;
+    }
+    return false;
   }
 
   selectedItem(): ListItem<T> | undefined {
@@ -72,6 +130,7 @@ export class ListView<T> {
     const idx = this.filtered.findIndex((i) => i.id === id);
     if (idx < 0) return false;
     this.selectedIdx = idx;
+    this.wheelScrolled = false;
     this.viewport.ensureVisible(idx);
     return true;
   }
@@ -83,17 +142,18 @@ export class ListView<T> {
       const idx = this.filtered.findIndex((i) => i.id === preserveId);
       if (idx >= 0) {
         this.selectedIdx = idx;
-        this.viewport.ensureVisible(idx);
+        if (!this.wheelScrolled) this.viewport.ensureVisible(idx);
         return;
       }
     }
     this.selectedIdx = Math.max(0, Math.min(this.selectedIdx, Math.max(0, this.filtered.length - 1)));
-    this.viewport.ensureVisible(this.selectedIdx);
+    if (!this.wheelScrolled) this.viewport.ensureVisible(this.selectedIdx);
   }
 
   move(delta: number): void {
     if (this.filtered.length === 0) return;
     this.selectedIdx = Math.max(0, Math.min(this.filtered.length - 1, this.selectedIdx + delta));
+    this.wheelScrolled = false;
     this.viewport.ensureVisible(this.selectedIdx);
   }
 
@@ -104,7 +164,10 @@ export class ListView<T> {
   handleInput(data: string): "select" | "handled" | "ignored" {
     const wheel = parseMouseWheel(data);
     if (wheel.hadMouse) {
-      if (wheel.delta !== 0) this.viewport.scrollBy(wheel.delta);
+      if (wheel.delta !== 0) {
+        this.wheelScrolled = true;
+        this.viewport.scrollBy(wheel.delta);
+      }
       return "handled";
     }
 
@@ -121,11 +184,11 @@ export class ListView<T> {
         this.filterActive = false;
         return this.filtered.length > 0 ? "select" : "handled";
       }
-      if (matchesKey(data, "up")) {
+      if (matchesKey(data, "up") || matchesKey(data, "ctrl+p")) {
         this.move(-1);
         return "handled";
       }
-      if (matchesKey(data, "down")) {
+      if (matchesKey(data, "down") || matchesKey(data, "ctrl+n")) {
         this.move(1);
         return "handled";
       }
@@ -133,6 +196,7 @@ export class ListView<T> {
       const nextQ = sanitizeLine(this.filterInput.getValue());
       if (nextQ !== this.filterQuery) {
         this.filterQuery = nextQ;
+        this.wheelScrolled = false;
         this.recomputeFilter();
       }
       return "handled";
@@ -142,11 +206,11 @@ export class ListView<T> {
       this.startFilter();
       return "handled";
     }
-    if (matchesKey(data, "up") || data === "k") {
+    if (matchesKey(data, "up") || data === "k" || matchesKey(data, "ctrl+p")) {
       this.move(-1);
       return "handled";
     }
-    if (matchesKey(data, "down") || data === "j") {
+    if (matchesKey(data, "down") || data === "j" || matchesKey(data, "ctrl+n")) {
       this.move(1);
       return "handled";
     }
@@ -160,11 +224,13 @@ export class ListView<T> {
     }
     if (data === "g" || matchesKey(data, "home")) {
       this.selectedIdx = 0;
+      this.wheelScrolled = false;
       this.viewport.scrollToTop();
       return "handled";
     }
     if (data === "G" || matchesKey(data, "end")) {
       this.selectedIdx = Math.max(0, this.filtered.length - 1);
+      this.wheelScrolled = false;
       this.viewport.ensureVisible(this.selectedIdx);
       return "handled";
     }
@@ -184,10 +250,36 @@ export class ListView<T> {
       bodyHeight = Math.max(1, h - 1);
       if (this.filterActive) {
         const rendered = (this.filterInput.render(Math.max(4, w - 3))[0] ?? "").replace(/^>\s?/, "");
-        out.push(clamp(`${theme.accentBold("/ ")}${rendered}`, w));
+        const countTag = this.filterQuery ? ` ${theme.dim(`(${this.filtered.length}/${this.allItems.length})`)}` : "";
+        out.push(clamp(`${theme.accentBold("/ ")}${rendered}${countTag}`, w));
       } else {
-        out.push(clamp(`${theme.accentBold("/ ")}${this.filterQuery} ${theme.muted(`(${this.filtered.length}/${this.allItems.length})`)}`, w));
+        out.push(
+          clamp(
+            `${theme.accentBold("/ ")}${this.filterQuery} ${theme.muted(`(${this.filtered.length}/${this.allItems.length}) · Esc clear`)}`,
+            w,
+          ),
+        );
       }
+    }
+
+    const hasColumns = Boolean(this.columns && this.columns.length > 0);
+    const hasHeader = hasColumns && this.columns!.some((c) => c.header) && bodyHeight >= 3;
+
+    // Reserve scrollbar gutter width consistently between sticky header and rows
+    const estRowsHeight = hasHeader ? Math.max(1, bodyHeight - 2) : bodyHeight;
+    const needsScrollbar = this.filtered.length > estRowsHeight && w >= 6;
+    const viewportBodyW = needsScrollbar ? w - 2 : w;
+    const contentWidth = Math.max(1, viewportBodyW - 2); // 2-col pointer prefix ("▸ " / "  ")
+
+    const colLayout = hasColumns ? computeColumnLayout(this.columns!, contentWidth, this.columnGap) : null;
+
+    if (hasHeader && colLayout) {
+      bodyHeight = Math.max(1, bodyHeight - 2);
+      const hdrCells: Record<string, string> = {};
+      for (const c of colLayout.active) hdrCells[c.key] = c.header ?? "";
+      const hdrLine = formatColumnRow(colLayout, hdrCells, (s) => theme.dim(theme.bold(s)));
+      out.push(clamp(`  ${hdrLine}`, w));
+      out.push(theme.border(theme.glyphs.barH.repeat(w)));
     }
 
     if (this.filtered.length === 0) {
@@ -196,16 +288,38 @@ export class ListView<T> {
       return out;
     }
 
-    const rowWidth = this.filtered.length > bodyHeight && w >= 6 ? w - 4 : w - 2;
     const rows = this.filtered.map((item, idx) => {
       const selected = idx === this.selectedIdx;
       const prefix = selected ? theme.accentBold(`${theme.glyphs.pointer} `) : "  ";
-      const content = item.render(Math.max(1, rowWidth), selected, theme);
-      return selected ? `${prefix}${content}` : `${prefix}${content}`;
+      let content: string;
+      if (colLayout && item.cells) {
+        content = formatColumnRow(colLayout, item.cells(selected, theme));
+      } else if (item.render) {
+        content = item.render(contentWidth, selected, theme);
+      } else {
+        content = fit(sanitizeLine(item.searchText), contentWidth);
+      }
+      const row = `${prefix}${content}`;
+      return selected ? fillLineBg(row, viewportBodyW, theme.badgeBg) : clamp(row, viewportBodyW);
     });
 
-    this.viewport.ensureVisible(this.selectedIdx, bodyHeight);
+    if (!this.wheelScrolled) {
+      this.viewport.ensureVisible(this.selectedIdx, bodyHeight);
+    }
     out.push(...this.viewport.render(rows, w, bodyHeight, theme));
     return out;
+  }
+}
+
+/**
+ * Convenience typed alias/subclass of `ListView<T>` configured with sticky aligned columns.
+ */
+export class TableListView<T> extends ListView<T> {
+  constructor(opts: { columns: ColumnSpec[]; emptyText?: string; gap?: number }) {
+    super(opts);
+  }
+
+  setTableItems(items: TableListItem<T>[], preserveSelectionId?: string): void {
+    this.setItems(items, preserveSelectionId);
   }
 }

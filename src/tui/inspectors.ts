@@ -2,8 +2,10 @@ import { matchesKey } from "@earendil-works/pi-tui";
 import type {
   ArtifactRecord,
   EscalationRecord,
+  EventRecord,
   MergeQueueRecord,
   MessageRecord,
+  ReplayPage,
   RunRecord,
   TaskRecord,
   WorktreeRecord,
@@ -14,6 +16,7 @@ import type { GoalRecord, GoalReviewVerdict, GoalRevisionRecord } from "../goals
 import type { DaemonEventFrame } from "../protocol/daemon-rpc.js";
 import {
   clamp,
+  type ColumnSpec,
   divider,
   type TuiEntityRef as EntityRef,
   firstLine,
@@ -22,25 +25,30 @@ import {
   formatClock,
   formatCountdown,
   formatDuration,
+  formatToolLabel,
   Frame,
+  handleTabKeys,
   type Hint,
+  isPopKey,
   kvRow,
-  ListView,
   middleEllipsis,
+  type Navigator,
   parseDurationMs,
   parseMouseWheel,
   sanitizeLine,
   sanitizeText,
   type Screen,
   type ScreenContext,
-  splitRow,
   statusBadge,
+  TableListView,
   tag,
   type Theme,
   Viewport,
   wrap,
   yankText,
 } from "./core/index.js";
+import { QuotaWaitPickerScreen } from "./quota-wait-picker.js";
+import { consumeReplay } from "./replay.js";
 import type { WorkStore } from "./store.js";
 
 export interface InspectorDeps {
@@ -82,7 +90,9 @@ export function openEntityInspector(ref: EntityRef, deps: InspectorDeps, ctx: Sc
       ctx.navigator.push(new MergeInspectorScreen(ref.id, deps));
       return;
     case "transcript":
-      ctx.navigator.push(new LiveTranscriptScreen(ref.runId ?? ref.id, ref.id !== ref.runId ? ref.id : undefined, deps));
+      ctx.navigator.push(
+        new LiveTranscriptScreen(ref.runId ?? ref.id, ref.id !== ref.runId ? ref.id : undefined, deps),
+      );
       return;
     default:
       ctx.navigator.push(new GenericDetailScreen(ref));
@@ -90,7 +100,11 @@ export function openEntityInspector(ref: EntityRef, deps: InspectorDeps, ctx: Sc
   }
 }
 
-function handleViewportScrollKeys(data: string, viewport: Viewport): boolean {
+function handleViewportScrollKeys(
+  data: string,
+  viewport: Viewport,
+  opts?: { allowG?: boolean },
+): boolean {
   const wheel = parseMouseWheel(data);
   if (wheel.hadMouse) {
     if (wheel.delta !== 0) viewport.scrollBy(wheel.delta);
@@ -112,11 +126,11 @@ function handleViewportScrollKeys(data: string, viewport: Viewport): boolean {
     viewport.pageDown();
     return true;
   }
-  if (data === "g" || matchesKey(data, "home")) {
+  if (matchesKey(data, "home") || (opts?.allowG !== false && data === "g")) {
     viewport.scrollToTop();
     return true;
   }
-  if (data === "G" || matchesKey(data, "end")) {
+  if (matchesKey(data, "end") || (opts?.allowG !== false && data === "G")) {
     viewport.scrollToBottom();
     return true;
   }
@@ -132,10 +146,11 @@ interface EscalationDetailData {
   goal: GoalRecord | null;
 }
 
-class EscalationInspectorScreen implements Screen {
+export class EscalationInspectorScreen implements Screen {
   readonly variant = "sheet" as const;
   readonly title: string;
   private readonly frame = new Frame();
+  private nav: Navigator | null = null;
   private readonly viewport = new Viewport();
   private data: EscalationDetailData | null = null;
   private loading = true;
@@ -149,6 +164,7 @@ class EscalationInspectorScreen implements Screen {
   }
 
   onShow(ctx: ScreenContext): void {
+    this.nav = ctx.navigator;
     void this.load(ctx);
   }
 
@@ -176,6 +192,7 @@ class EscalationInspectorScreen implements Screen {
       { key: "t", label: "task" },
       ...(this.data?.goal ? [{ key: "g", label: "goal" }] : []),
       { key: "y", label: "copy" },
+      { key: "Home/End", label: "top/bot" },
       { key: "Esc", label: "back" },
     ];
 
@@ -183,7 +200,7 @@ class EscalationInspectorScreen implements Screen {
       width,
       maxHeight,
       theme,
-      breadcrumbs: ["Work", "Escalations", this.escalationId],
+      breadcrumbs: this.nav?.breadcrumbs ?? [this.escalationId],
       rightHeader: esc ? statusBadge(esc.status, theme) : undefined,
       hints,
       renderBody: (innerW, bodyH) => {
@@ -198,8 +215,15 @@ class EscalationInspectorScreen implements Screen {
           kvRow("Escalation ID", esc.id, innerW, theme),
           kvRow("Status", statusBadge(esc.status, theme), innerW, theme),
           kvRow("Run", esc.runId, innerW, theme),
-          kvRow("From Task", `${esc.fromTaskId}${this.data?.fromTask ? ` (${this.data.fromTask.status} · ${sanitizeLine(this.data.fromTask.title)})` : ""}`, innerW, theme),
-          ...(this.data?.goal ? [kvRow("Goal", `${this.data.goal.id} v${this.data.goal.version}: ${sanitizeLine(this.data.goal.title)}`, innerW, theme)] : []),
+          kvRow(
+            "From Task",
+            `${esc.fromTaskId}${this.data?.fromTask ? ` (${this.data.fromTask.status} · ${sanitizeLine(this.data.fromTask.title)})` : ""}`,
+            innerW,
+            theme,
+          ),
+          ...(this.data?.goal
+            ? [kvRow("Goal", `${this.data.goal.id} v${this.data.goal.version}: ${sanitizeLine(this.data.goal.title)}`, innerW, theme)]
+            : []),
           kvRow("Created", `${formatClock(esc.createdAt)} (${formatAge(esc.createdAt)})`, innerW, theme),
           ...(esc.resolution ? [kvRow("Resolution", theme.ok(sanitizeLine(esc.resolution)), innerW, theme)] : []),
           ...(esc.evidencePaths.length > 0
@@ -220,15 +244,24 @@ class EscalationInspectorScreen implements Screen {
 
   handleInput(data: string, ctx: ScreenContext): void {
     if (this.frame.handleInlineInput(data, ctx.requestRender)) return;
-    if (matchesKey(data, "escape") || data === "q") {
+    if (isPopKey(data, ctx)) {
       ctx.navigator.pop();
       return;
     }
-    if (handleViewportScrollKeys(data, this.viewport)) {
+
+    const esc = this.data?.escalation ?? this.deps.store.getEscalation(this.escalationId);
+
+    // Bind `g` to open linked Goal BEFORE viewport scroll (Home/End handles top/bottom scroll)
+    if (data === "g" && this.data?.goal) {
+      ctx.navigator.push(new GoalInspectorScreen(this.data.goal.id, this.deps));
+      return;
+    }
+
+    if (handleViewportScrollKeys(data, this.viewport, { allowG: false })) {
       ctx.requestRender();
       return;
     }
-    const esc = this.data?.escalation ?? this.deps.store.getEscalation(this.escalationId);
+
     if (!esc) return;
 
     if (data === "r") {
@@ -251,7 +284,7 @@ class EscalationInspectorScreen implements Screen {
 
     if (data === "a") {
       this.frame.askPrompt({
-        label: "Acknowledge note (stays open)",
+        label: "Acknowledge note (stays unresolved)",
         initialValue: "Acknowledged by user",
         onSubmit: async (note) => {
           await this.deps.client.request("escalation.ack", {
@@ -272,11 +305,6 @@ class EscalationInspectorScreen implements Screen {
       return;
     }
 
-    if (data === "g" && this.data?.goal) {
-      ctx.navigator.push(new GoalInspectorScreen(this.data.goal.id, this.deps));
-      return;
-    }
-
     if (data === "y") {
       const text = [
         `${esc.id} [${esc.severity}/${esc.category}] ${esc.title}`,
@@ -289,20 +317,50 @@ class EscalationInspectorScreen implements Screen {
       const ok = yankText(text, ctx.writeTerminal);
       this.frame.setNotice(ok ? "Copied escalation to clipboard" : "Clipboard unavailable", ok ? "ok" : "warn");
       ctx.requestRender();
-      return;
     }
   }
 }
 
 /* ───────────────────────────── Goal Inspector ─────────────────────────────── */
 
-class GoalInspectorScreen implements Screen {
+type GoalTabId = "overview" | "tasks" | "reviews" | "revisions";
+const GOAL_TABS: readonly GoalTabId[] = ["overview", "tasks", "reviews", "revisions"];
+
+const GOAL_SUB_COLUMNS: Record<Exclude<GoalTabId, "overview">, ColumnSpec[]> = {
+  tasks: [
+    { key: "status", header: "STATUS", width: 13, priority: 0 },
+    { key: "id", header: "TASK", width: 12, priority: 0 },
+    { key: "tier", header: "TIER", width: 12, priority: 2 },
+    { key: "title", header: "TITLE", minWidth: 16, priority: 0 },
+    { key: "age", header: "UPDATED", width: 8, align: "right", priority: 1 },
+  ],
+  reviews: [
+    { key: "verdict", header: "VERDICT", width: 16, priority: 0 },
+    { key: "cycle", header: "CYCLE", width: 8, priority: 0 },
+    { key: "summary", header: "SUMMARY", minWidth: 18, priority: 0 },
+    { key: "age", header: "AGE", width: 8, align: "right", priority: 1 },
+  ],
+  revisions: [
+    { key: "ver", header: "VER", width: 6, priority: 0 },
+    { key: "rationale", header: "RATIONALE / TITLE", minWidth: 20, priority: 0 },
+    { key: "age", header: "AGE", width: 8, align: "right", priority: 1 },
+  ],
+};
+
+function isGoalResumable(g: GoalRecord, linkedRunStatus?: string | null): boolean {
+  if (g.status === "achieved" || g.status === "cancelled") return false;
+  if (g.status === "draft" || g.status === "paused" || g.status === "awaiting_human") return true;
+  return linkedRunStatus === "paused_quota" || linkedRunStatus === "stopped";
+}
+
+export class GoalInspectorScreen implements Screen {
   readonly variant = "sheet" as const;
   readonly title: string;
   private readonly frame = new Frame();
+  private nav: Navigator | null = null;
   private readonly viewport = new Viewport();
-  private activeTab: "overview" | "tasks" | "reviews" | "revisions" = "overview";
-  private subList = new ListView<{ ref: EntityRef }>();
+  private activeTab: GoalTabId = "overview";
+  private readonly subList = new TableListView<{ ref: EntityRef }>({ columns: GOAL_SUB_COLUMNS.tasks });
   private unsub: (() => void) | null = null;
 
   constructor(
@@ -313,6 +371,7 @@ class GoalInspectorScreen implements Screen {
   }
 
   onShow(ctx: ScreenContext): void {
+    this.nav = ctx.navigator;
     this.unsub = this.deps.store.subscribe(() => {
       this.rebuildSubList();
       ctx.requestRender();
@@ -330,31 +389,40 @@ class GoalInspectorScreen implements Screen {
     return this.deps.store.getGoalEntry(this.goalId);
   }
 
+  private setTab(next: GoalTabId): void {
+    this.activeTab = next;
+    this.subList.clearFilter();
+    this.rebuildSubList();
+  }
+
   private rebuildSubList(): void {
     const entry = this.getEntry();
     if (!entry) return;
     const run = entry.goal.linkedRunId ? this.deps.store.getRunEntry(entry.goal.linkedRunId) : undefined;
 
     if (this.activeTab === "tasks") {
+      this.subList.setColumns(GOAL_SUB_COLUMNS.tasks);
       const tasks = run?.tasks ?? [];
       this.subList.emptyText = "No tasks yet for this goal.";
-      this.subList.setItems(
+      this.subList.setTableItems(
         tasks.map((t) => ({
           id: t.id,
           value: { ref: { kind: "task", id: t.id, runId: t.runId, goalId: this.goalId, label: `${t.id} ${t.title}` } },
           searchText: `${t.id} ${t.status} ${t.kind} ${t.title}`,
-          render: (w, _sel, theme) =>
-            splitRow(
-              `${statusBadge(t.status, theme)} ${theme.bold(t.id)} ${tag(`T${t.tier}/${t.kind}`, "muted", theme)} ${sanitizeLine(t.title)}`,
-              theme.muted(formatAge(t.updatedAt)),
-              w,
-            ),
+          cells: (sel, theme) => ({
+            status: statusBadge(t.status, theme),
+            id: sel ? theme.accentBold(t.id) : theme.bold(t.id),
+            tier: tag(`T${t.tier}/${t.kind}`, "muted", theme),
+            title: sanitizeLine(t.title),
+            age: theme.dim(formatAge(t.updatedAt)),
+          }),
         })),
       );
     } else if (this.activeTab === "reviews") {
+      this.subList.setColumns(GOAL_SUB_COLUMNS.reviews);
       const reviews = entry.reviews ?? [];
       this.subList.emptyText = "No reviews recorded yet.";
-      this.subList.setItems(
+      this.subList.setTableItems(
         reviews.map((rev: GoalReviewVerdict) => ({
           id: rev.id,
           value: {
@@ -367,18 +435,19 @@ class GoalInspectorScreen implements Screen {
             },
           },
           searchText: `${rev.id} ${rev.verdict} ${rev.summary}`,
-          render: (w, _sel, theme) =>
-            splitRow(
-              `${statusBadge(rev.verdict, theme)} ${theme.bold(`#${rev.cycle}`)} v${rev.goalVersion} ${firstLine(rev.summary, 70)}`,
-              theme.muted(formatAge(rev.createdAt)),
-              w,
-            ),
+          cells: (sel, theme) => ({
+            verdict: statusBadge(rev.verdict, theme),
+            cycle: sel ? theme.accentBold(`#${rev.cycle} v${rev.goalVersion}`) : theme.bold(`#${rev.cycle} v${rev.goalVersion}`),
+            summary: firstLine(rev.summary, 70),
+            age: theme.dim(formatAge(rev.createdAt)),
+          }),
         })),
       );
     } else if (this.activeTab === "revisions") {
+      this.subList.setColumns(GOAL_SUB_COLUMNS.revisions);
       const revs = entry.revisions ?? [];
       this.subList.emptyText = "No revision history.";
-      this.subList.setItems(
+      this.subList.setTableItems(
         revs.map((rev: GoalRevisionRecord) => ({
           id: `v${rev.version}`,
           value: {
@@ -391,12 +460,11 @@ class GoalInspectorScreen implements Screen {
             },
           },
           searchText: `v${rev.version} ${rev.rationale} ${rev.title}`,
-          render: (w, _sel, theme) =>
-            splitRow(
-              `${theme.accentBold(`v${rev.version}`)} ${sanitizeLine(rev.rationale || rev.title)}`,
-              theme.muted(formatAge(rev.createdAt)),
-              w,
-            ),
+          cells: (sel, theme) => ({
+            ver: sel ? theme.accentBold(`v${rev.version}`) : theme.accent(`v${rev.version}`),
+            rationale: sanitizeLine(rev.rationale || rev.title),
+            age: theme.dim(formatAge(rev.createdAt)),
+          }),
         })),
       );
     }
@@ -406,7 +474,8 @@ class GoalInspectorScreen implements Screen {
     const entry = this.getEntry();
     const g = entry?.goal;
     const run = g?.linkedRunId ? this.deps.store.getRunEntry(g.linkedRunId) : undefined;
-    const openEscs = run ? run.escalations.filter((e) => e.status === "open") : [];
+    const openEscs = run ? run.escalations.filter((e) => e.status === "open" || e.status === "acked") : [];
+    const canResume = g ? isGoalResumable(g, run?.run.status) : false;
 
     const tabs = [
       { id: "overview", label: "Overview" },
@@ -416,14 +485,18 @@ class GoalInspectorScreen implements Screen {
     ];
 
     const hints: Hint[] = [
-      { key: "1-4", label: "tab" },
+      { key: "←→/Tab/1-4", label: "tabs" },
       ...(g?.status === "draft" ? [{ key: "c", label: "commit" }] : []),
       { key: "v", label: "review" },
       { key: "m", label: "amend" },
-      ...(g?.status === "paused" || g?.status === "awaiting_human" ? [{ key: "u", label: "resume" }] : [{ key: "p", label: "pause" }]),
+      ...(canResume
+        ? [{ key: "u", label: "resume" }]
+        : g && g.status !== "achieved" && g.status !== "cancelled"
+          ? [{ key: "p", label: "pause" }]
+          : []),
       ...(run ? [{ key: "R", label: "run" }] : []),
       ...(openEscs.length > 0 ? [{ key: "e", label: `esc(${openEscs.length})` }] : []),
-      { key: "x", label: "cancel" },
+      ...(g && g.status !== "achieved" && g.status !== "cancelled" ? [{ key: "x", label: "cancel" }] : []),
       { key: "Esc", label: "back" },
     ];
 
@@ -431,7 +504,7 @@ class GoalInspectorScreen implements Screen {
       width,
       maxHeight,
       theme,
-      breadcrumbs: ["Work", "Goals", this.goalId],
+      breadcrumbs: this.nav?.breadcrumbs ?? [this.goalId],
       rightHeader: g ? `${statusBadge(g.status, theme)} ${theme.muted(`v${g.version}`)}` : undefined,
       subtitle: g ? sanitizeLine(g.title) : undefined,
       tabs,
@@ -451,7 +524,7 @@ class GoalInspectorScreen implements Screen {
           kvRow("Review Cycles", String(g.reviewCycle), innerW, theme),
           kvRow("Updated", `${formatClock(g.updatedAt)} (${formatAge(g.updatedAt)})`, innerW, theme),
           ...(openEscs.length > 0
-            ? [kvRow("Open Escalations", theme.danger(`${openEscs.length} open — press 'e' to inspect`), innerW, theme)]
+            ? [kvRow("Unresolved Esc", theme.danger(`${openEscs.length} — press 'e' to inspect`), innerW, theme)]
             : []),
           "",
           divider(innerW, theme, "Description"),
@@ -462,7 +535,7 @@ class GoalInspectorScreen implements Screen {
           lines.push("", divider(innerW, theme, `Acceptance Criteria (${g.criteria.length})`));
           for (const c of g.criteria) {
             const req = c.required ? theme.accent("*") : theme.muted("·");
-            const cmd = c.command ? theme.muted(`  $ ${sanitizeLine(c.command)}`) : "";
+            const cmd = c.command ? theme.code(`  $ ${sanitizeLine(c.command)}`) : "";
             lines.push(...wrap(`${req} ${theme.bold(c.id)}: ${sanitizeLine(c.description)}${cmd}`, innerW));
           }
         }
@@ -483,22 +556,30 @@ class GoalInspectorScreen implements Screen {
 
   handleInput(data: string, ctx: ScreenContext): void {
     if (this.frame.handleInlineInput(data, ctx.requestRender)) return;
-    if (matchesKey(data, "escape") || data === "q") {
+
+    // Check subList.isFiltering BEFORE Esc/q/tab keys!
+    if (this.activeTab !== "overview" && this.subList.isFiltering) {
+      const res = this.subList.handleInput(data);
+      if (res === "select") {
+        const item = this.subList.selectedItem();
+        if (item) openEntityInspector(item.value.ref, this.deps, ctx);
+        return;
+      }
+      ctx.requestRender();
+      return;
+    }
+
+    if (this.activeTab !== "overview" && matchesKey(data, "escape") && this.subList.handleEscape()) {
+      ctx.requestRender();
+      return;
+    }
+
+    if (isPopKey(data, ctx)) {
       ctx.navigator.pop();
       return;
     }
 
-    const tabOrder: Array<"overview" | "tasks" | "reviews" | "revisions"> = ["overview", "tasks", "reviews", "revisions"];
-    if (data >= "1" && data <= "4") {
-      this.activeTab = tabOrder[Number(data) - 1]!;
-      this.rebuildSubList();
-      ctx.requestRender();
-      return;
-    }
-    if (matchesKey(data, "tab")) {
-      const next = (tabOrder.indexOf(this.activeTab) + 1) % tabOrder.length;
-      this.activeTab = tabOrder[next]!;
-      this.rebuildSubList();
+    if (handleTabKeys(data, GOAL_TABS, this.activeTab, (next) => this.setTab(next))) {
       ctx.requestRender();
       return;
     }
@@ -572,7 +653,7 @@ class GoalInspectorScreen implements Screen {
       return;
     }
 
-    if (data === "p") {
+    if (data === "p" && g.status !== "achieved" && g.status !== "cancelled") {
       this.frame.askConfirm({
         message: `Pause ${g.id} and stop its active run?`,
         onConfirm: async () => {
@@ -585,13 +666,21 @@ class GoalInspectorScreen implements Screen {
       return;
     }
 
-    if (data === "u") {
+    if (data === "u" && isGoalResumable(g, run?.run.status)) {
       this.frame.askPrompt({
         label: "Resume note (optional)",
         initialValue: "Resumed from TUI",
+        allowEmpty: true,
         onSubmit: async (note) => {
-          await this.deps.client.request("goal.resume", { goalId: g.id, note });
-          this.frame.setNotice(`Resumed ${g.id}`, "ok");
+          const res = await this.deps.client.request<{ resumed?: boolean; reason?: string }>("goal.resume", {
+            goalId: g.id,
+            ...(note ? { note } : {}),
+          });
+          if (res && res.resumed === false) {
+            this.frame.setNotice(res.reason || `Could not resume ${g.id}`, "warn");
+          } else {
+            this.frame.setNotice(`Resumed ${g.id}`, "ok");
+          }
           await this.deps.store.refresh();
         },
       });
@@ -599,7 +688,7 @@ class GoalInspectorScreen implements Screen {
       return;
     }
 
-    if (data === "x") {
+    if (data === "x" && g.status !== "achieved" && g.status !== "cancelled") {
       this.frame.askConfirm({
         message: `Cancel ${g.id} permanently?`,
         onConfirm: async () => {
@@ -618,20 +707,32 @@ class GoalInspectorScreen implements Screen {
     }
 
     if (data === "e" && run) {
-      const firstOpen = run.escalations.find((e) => e.status === "open");
+      const firstOpen =
+        run.escalations.find((e) => e.status === "open") ??
+        run.escalations.find((e) => e.status === "acked");
       if (firstOpen) ctx.navigator.push(new EscalationInspectorScreen(firstOpen.id, this.deps));
-      return;
     }
   }
 }
 
 /* ────────────────────────────── Run Inspector ─────────────────────────────── */
 
-class RunInspectorScreen implements Screen {
+const RUN_TASK_COLUMNS: ColumnSpec[] = [
+  { key: "tree", header: "TASK TREE", minWidth: 24, priority: 0 },
+  { key: "status", header: "STATUS", width: 13, priority: 0 },
+  { key: "tier", header: "TIER", width: 11, priority: 2 },
+  { key: "updated", header: "UPDATED", width: 8, align: "right", priority: 1 },
+];
+
+export class RunInspectorScreen implements Screen {
   readonly variant = "sheet" as const;
   readonly title: string;
   private readonly frame = new Frame();
-  private readonly taskList = new ListView<TaskRecord>({ emptyText: "No tasks in this run." });
+  private nav: Navigator | null = null;
+  private readonly taskList = new TableListView<TaskRecord>({
+    columns: RUN_TASK_COLUMNS,
+    emptyText: "No tasks in this run.",
+  });
   private unsub: (() => void) | null = null;
 
   constructor(
@@ -642,6 +743,7 @@ class RunInspectorScreen implements Screen {
   }
 
   onShow(ctx: ScreenContext): void {
+    this.nav = ctx.navigator;
     this.unsub = this.deps.store.subscribe(() => {
       this.rebuild();
       ctx.requestRender();
@@ -665,30 +767,43 @@ class RunInspectorScreen implements Screen {
       arr.push(t);
       byParent.set(key, arr);
     }
-    const ordered: Array<{ task: TaskRecord; depth: number }> = [];
-    const visit = (parentId: string, depth: number) => {
-      for (const child of byParent.get(parentId) ?? []) {
-        ordered.push({ task: child, depth });
-        visit(child.id, depth + 1);
-      }
+
+    // Build accurate tree connectors (`├─` branchMid vs `└─` branchEnd + `│ ` vertical continuations)
+    const ordered: Array<{ task: TaskRecord; guides: boolean[]; isLast: boolean; depth: number }> = [];
+    const visit = (parentId: string, guides: boolean[], depth: number) => {
+      const children = byParent.get(parentId) ?? [];
+      children.forEach((child, idx) => {
+        const isLast = idx === children.length - 1;
+        ordered.push({ task: child, guides: [...guides], isLast, depth });
+        visit(child.id, depth === 0 ? guides : [...guides, !isLast], depth + 1);
+      });
     };
-    visit("__root__", 0);
-    // Include any orphans whose parent wasn't found
+    visit("__root__", [], 0);
+
     const seen = new Set(ordered.map((o) => o.task.id));
     for (const t of entry.tasks) {
-      if (!seen.has(t.id)) ordered.push({ task: t, depth: 0 });
+      if (!seen.has(t.id)) ordered.push({ task: t, guides: [], isLast: true, depth: 0 });
     }
 
-    this.taskList.setItems(
-      ordered.map(({ task, depth }) => ({
+    this.taskList.setTableItems(
+      ordered.map(({ task, guides, isLast, depth }) => ({
         id: task.id,
         value: task,
         searchText: `${task.id} ${task.status} ${task.kind} ${task.title} ${task.profileId ?? ""}`,
-        render: (w, _sel, theme) => {
-          const indent = depth > 0 ? `${"  ".repeat(Math.min(depth, 4))}${theme.muted(theme.glyphs.branchEnd)} ` : "";
-          const left = `${indent}${statusBadge(task.status, theme)} ${theme.bold(task.id)} ${tag(`T${task.tier}/${task.kind}`, "muted", theme)} ${sanitizeLine(task.title)}`;
-          const right = theme.muted(formatAge(task.updatedAt));
-          return splitRow(left, right, w);
+        cells: (sel, theme) => {
+          const g = theme.glyphs;
+          let prefix = "";
+          if (depth > 0) {
+            const cont = guides.map((hasMore) => (hasMore ? g.branchCont : "  ")).join("");
+            const branch = isLast ? g.branchEnd : g.branchMid;
+            prefix = `${theme.muted(`${cont}${branch}`)} `;
+          }
+          return {
+            tree: `${prefix}${sel ? theme.accentBold(task.id) : theme.bold(task.id)} ${sanitizeLine(task.title)}`,
+            status: statusBadge(task.status, theme),
+            tier: tag(`T${task.tier}/${task.kind}`, "muted", theme),
+            updated: theme.dim(formatAge(task.updatedAt)),
+          };
         },
       })),
     );
@@ -698,8 +813,9 @@ class RunInspectorScreen implements Screen {
     const entry = this.deps.store.getRunEntry(this.runId);
     const run = entry?.run;
     const hints: Hint[] = [
-      { key: "Enter", label: "inspect task" },
+      { key: "Enter", label: "task" },
       { key: "L", label: "live log" },
+      { key: "w", label: "quota wait" },
       { key: "u", label: "resume" },
       { key: "s", label: "schedule" },
       { key: "p", label: "stop" },
@@ -715,7 +831,7 @@ class RunInspectorScreen implements Screen {
       width,
       maxHeight,
       theme,
-      breadcrumbs: ["Work", "Runs", this.runId],
+      breadcrumbs: this.nav?.breadcrumbs ?? [this.runId],
       rightHeader: run ? statusBadge(run.status, theme) : undefined,
       subtitle: sub,
       hints,
@@ -728,10 +844,29 @@ class RunInspectorScreen implements Screen {
 
   handleInput(data: string, ctx: ScreenContext): void {
     if (this.frame.handleInlineInput(data, ctx.requestRender)) return;
-    if (matchesKey(data, "escape") || data === "q") {
+
+    // Check taskList.isFiltering BEFORE Esc/q!
+    if (this.taskList.isFiltering) {
+      const res = this.taskList.handleInput(data);
+      if (res === "select") {
+        const sel = this.taskList.selectedItem();
+        if (sel) ctx.navigator.push(new TaskInspectorScreen(sel.value.id, this.deps));
+        return;
+      }
+      ctx.requestRender();
+      return;
+    }
+
+    if (matchesKey(data, "escape") && this.taskList.handleEscape()) {
+      ctx.requestRender();
+      return;
+    }
+
+    if (isPopKey(data, ctx)) {
       ctx.navigator.pop();
       return;
     }
+
     const res = this.taskList.handleInput(data);
     if (res === "select") {
       const sel = this.taskList.selectedItem();
@@ -752,12 +887,28 @@ class RunInspectorScreen implements Screen {
       this.deps.onAttachRun(this.runId, this.taskList.selectedItem()?.value.id);
       return;
     }
+    if (data === "w") {
+      const entry = this.deps.store.getRunEntry(this.runId);
+      ctx.navigator.push(
+        new QuotaWaitPickerScreen(this.deps.client, {
+          runId: this.runId,
+          reason: entry?.quotaPause?.reason,
+          resumeAt: entry?.quotaPause?.resumeAt,
+          onDone: async (msg) => {
+            this.frame.setNotice(msg, "ok");
+            await this.deps.store.refresh();
+          },
+        }),
+      );
+      return;
+    }
     if (data === "u") {
       this.frame.askPrompt({
         label: "Resume guidance (optional)",
         initialValue: "Continue",
+        allowEmpty: true,
         onSubmit: async (message) => {
-          await this.deps.client.request("run.resume", { runId: this.runId, message });
+          await this.deps.client.request("run.resume", { runId: this.runId, ...(message ? { message } : {}) });
           this.frame.setNotice(`Resumed ${this.runId}`, "ok");
           await this.deps.store.refresh();
         },
@@ -768,10 +919,14 @@ class RunInspectorScreen implements Screen {
     if (data === "s") {
       this.frame.askPrompt({
         label: "Schedule resume in (e.g. 15m, 1h30m)",
-        initialValue: "15m",
+        placeholder: "15m",
         onSubmit: async (raw) => {
           const delayMs = parseDurationMs(raw);
-          if (!delayMs) throw new Error(`Invalid duration: ${raw}`);
+          if (!delayMs) {
+            this.frame.setNotice(`Invalid duration: ${raw}`, "warn");
+            ctx.requestRender();
+            return;
+          }
           await this.deps.client.request("run.schedule_resume", { runId: this.runId, delayMs });
           this.frame.setNotice(`Scheduled resume in ${formatDuration(delayMs)}`, "ok");
           await this.deps.store.refresh();
@@ -782,7 +937,7 @@ class RunInspectorScreen implements Screen {
     }
     if (data === "p") {
       this.frame.askConfirm({
-        message: `Stop run ${this.runId} and all its active agents?`,
+        message: `Stop run ${this.runId}?`,
         onConfirm: async () => {
           await this.deps.client.request("run.stop", { runId: this.runId, reason: "Stopped from TUI" });
           this.frame.setNotice(`Stopped ${this.runId}`, "warn");
@@ -790,16 +945,22 @@ class RunInspectorScreen implements Screen {
         },
       });
       ctx.requestRender();
-      return;
     }
   }
 }
 
 /* ────────────────────────────── Task Inspector ────────────────────────────── */
 
+interface TaskHandoffSummary {
+  summary?: string | null;
+  lastError?: string | null;
+  openEscalations?: number;
+  [k: string]: unknown;
+}
+
 interface TaskDetailData {
   task: TaskRecord;
-  handoff: Record<string, unknown> | null;
+  handoff?: TaskHandoffSummary | string | null;
   run: RunRecord | null;
   escalations: EscalationRecord[];
   artifacts: ArtifactRecord[];
@@ -810,10 +971,93 @@ interface TaskDetailData {
   writeScopes: string[];
 }
 
-class TaskInspectorScreen implements Screen {
+class ArtifactPickerScreen implements Screen {
+  readonly variant = "dialog" as const;
+  readonly title = "Artifacts";
+  private readonly frame = new Frame();
+  private nav: Navigator | null = null;
+  private readonly list = new TableListView<ArtifactRecord>({
+    columns: [
+      { key: "kind", header: "KIND", width: 12, priority: 1 },
+      { key: "path", header: "PATH", minWidth: 20, priority: 0 },
+      { key: "summary", header: "SUMMARY", minWidth: 14, priority: 2 },
+    ],
+    emptyText: "No artifacts recorded.",
+  });
+
+  constructor(
+    private readonly runId: string,
+    private readonly artifacts: ArtifactRecord[],
+    private readonly deps: InspectorDeps,
+  ) {
+    this.list.setTableItems(
+      artifacts.map((a) => ({
+        id: a.id || a.path,
+        value: a,
+        searchText: `${a.kind} ${a.path} ${a.summary ?? ""}`,
+        cells: (sel, theme) => ({
+          kind: tag(a.kind, "info", theme),
+          path: sel ? theme.accentBold(middleEllipsis(a.path, 42)) : theme.bold(middleEllipsis(a.path, 42)),
+          summary: theme.muted(firstLine(a.summary, 40) || "—"),
+        }),
+      })),
+    );
+  }
+
+  onShow(ctx: ScreenContext): void {
+    this.nav = ctx.navigator;
+  }
+
+  render(width: number, maxHeight: number, theme: Theme): string[] {
+    return this.frame.render({
+      width,
+      maxHeight,
+      theme,
+      breadcrumbs: this.nav?.breadcrumbs ?? ["Artifacts"],
+      subtitle: `${this.artifacts.length} artifact(s) in ${this.runId}`,
+      hints: [
+        { key: "Enter", label: "read" },
+        { key: "/", label: "filter" },
+        { key: "Esc", label: "back" },
+      ],
+      renderBody: (innerW, bodyH) => this.list.render(innerW, bodyH, theme),
+    });
+  }
+
+  handleInput(data: string, ctx: ScreenContext): void {
+    if (this.list.isFiltering) {
+      const res = this.list.handleInput(data);
+      if (res === "select") {
+        const sel = this.list.selectedItem()?.value;
+        if (sel) ctx.navigator.push(new ArtifactInspectorScreen(this.runId, sel.path, this.deps));
+        return;
+      }
+      ctx.requestRender();
+      return;
+    }
+    if (matchesKey(data, "escape") && this.list.handleEscape()) {
+      ctx.requestRender();
+      return;
+    }
+    if (isPopKey(data, ctx)) {
+      ctx.navigator.pop();
+      return;
+    }
+    const res = this.list.handleInput(data);
+    if (res === "select") {
+      const sel = this.list.selectedItem()?.value;
+      if (sel) ctx.navigator.push(new ArtifactInspectorScreen(this.runId, sel.path, this.deps));
+      return;
+    }
+    if (res === "handled") ctx.requestRender();
+  }
+}
+
+export class TaskInspectorScreen implements Screen {
   readonly variant = "sheet" as const;
   readonly title: string;
   private readonly frame = new Frame();
+  private nav: Navigator | null = null;
   private readonly viewport = new Viewport();
   private data: TaskDetailData | null = null;
   private loading = true;
@@ -827,6 +1071,7 @@ class TaskInspectorScreen implements Screen {
   }
 
   onShow(ctx: ScreenContext): void {
+    this.nav = ctx.navigator;
     void this.load(ctx);
   }
 
@@ -847,9 +1092,9 @@ class TaskInspectorScreen implements Screen {
   render(width: number, maxHeight: number, theme: Theme): string[] {
     const t = this.data?.task;
     const hints: Hint[] = [
+      { key: "L", label: "live log" },
       { key: "s", label: "steer" },
       { key: "u", label: "resume" },
-      { key: "L", label: "live log" },
       ...(this.data?.artifacts.length ? [{ key: "a", label: `artifacts(${this.data.artifacts.length})` }] : []),
       ...(this.data?.escalations.length ? [{ key: "e", label: `esc(${this.data.escalations.length})` }] : []),
       ...(this.data?.worktree ? [{ key: "w", label: "worktree" }] : []),
@@ -861,7 +1106,7 @@ class TaskInspectorScreen implements Screen {
       width,
       maxHeight,
       theme,
-      breadcrumbs: ["Work", t?.runId ?? "Run", this.taskId],
+      breadcrumbs: this.nav?.breadcrumbs ?? [this.taskId],
       rightHeader: t ? statusBadge(t.status, theme) : undefined,
       subtitle: t ? sanitizeLine(t.title) : undefined,
       hints,
@@ -885,6 +1130,23 @@ class TaskInspectorScreen implements Screen {
           lines.push("", divider(innerW, theme, "Summary"), ...wrap(sanitizeText(t.summary), innerW));
         }
 
+        if (this.data.handoff) {
+          const handoffText =
+            typeof this.data.handoff === "string"
+              ? this.data.handoff
+              : this.data.handoff.summary || JSON.stringify(this.data.handoff);
+          if (handoffText && handoffText !== t.summary) {
+            lines.push("", divider(innerW, theme, "Handoff"), ...wrap(sanitizeText(handoffText), innerW));
+          }
+        }
+
+        if (this.data.children.length > 0) {
+          lines.push("", divider(innerW, theme, `Child Tasks (${this.data.children.length})`));
+          for (const ch of this.data.children.slice(0, 10)) {
+            lines.push(clamp(`  ${statusBadge(ch.status, theme)} ${theme.bold(ch.id)} ${tag(`T${ch.tier}/${ch.kind}`, "muted", theme)} ${sanitizeLine(ch.title)}`, innerW));
+          }
+        }
+
         if (this.data.escalations.length > 0) {
           lines.push("", divider(innerW, theme, `Escalations (${this.data.escalations.length})`));
           for (const e of this.data.escalations) {
@@ -900,9 +1162,22 @@ class TaskInspectorScreen implements Screen {
         }
 
         if (this.data.merges.length > 0) {
-          lines.push("", divider(innerW, theme, "Merges"));
+          lines.push("", divider(innerW, theme, `Merges (${this.data.merges.length})`));
           for (const m of this.data.merges) {
             lines.push(clamp(`  ${statusBadge(m.status, theme)} ${m.id} ${m.branch}`, innerW));
+          }
+        }
+
+        if (this.data.messages.length > 0) {
+          lines.push("", divider(innerW, theme, `Messages (${this.data.messages.length})`));
+          for (const m of this.data.messages.slice(-8)) {
+            const ans = m.answer ? ` → ${sanitizeLine(m.answer)}` : "";
+            lines.push(
+              ...wrap(
+                `  ${theme.dim(formatClock(m.createdAt))} ${theme.accent(`${m.fromTaskId} → ${m.toTaskId}`)} [${m.status}]: ${sanitizeLine(m.question)}${ans}`,
+                innerW,
+              ),
+            );
           }
         }
 
@@ -920,7 +1195,7 @@ class TaskInspectorScreen implements Screen {
 
   handleInput(data: string, ctx: ScreenContext): void {
     if (this.frame.handleInlineInput(data, ctx.requestRender)) return;
-    if (matchesKey(data, "escape") || data === "q") {
+    if (isPopKey(data, ctx)) {
       ctx.navigator.pop();
       return;
     }
@@ -935,8 +1210,11 @@ class TaskInspectorScreen implements Screen {
       this.frame.askPrompt({
         label: `Steer ${t.id}`,
         onSubmit: async (message) => {
-          await this.deps.client.request("task.steer", { taskId: t.id, message });
-          this.frame.setNotice(`Steered ${t.id}`, "ok");
+          const res = await this.deps.client.request<{ steered?: boolean }>("task.steer", { taskId: t.id, message });
+          this.frame.setNotice(
+            res?.steered === false ? `${t.id} is not actively running (steer not delivered)` : `Steered ${t.id}`,
+            res?.steered === false ? "warn" : "ok",
+          );
           await this.load(ctx);
         },
       });
@@ -948,8 +1226,10 @@ class TaskInspectorScreen implements Screen {
       this.frame.askPrompt({
         label: `Resume ${t.id} with note`,
         initialValue: "Continue",
-        onSubmit: async (message) => {
-          await this.deps.client.request("task.resume", { taskId: t.id, message });
+        allowEmpty: true,
+        onSubmit: async (note) => {
+          // Daemon `task.resume` reads `note`, NOT `message`!
+          await this.deps.client.request("task.resume", { taskId: t.id, ...(note ? { note } : {}) });
           this.frame.setNotice(`Resumed ${t.id}`, "ok");
           await Promise.all([this.load(ctx), this.deps.store.refresh()]);
         },
@@ -977,20 +1257,25 @@ class TaskInspectorScreen implements Screen {
     }
 
     if (data === "e" && this.data.escalations.length > 0) {
-      const target = this.data.escalations.find((e) => e.status === "open") ?? this.data.escalations[0]!;
+      const target =
+        this.data.escalations.find((e) => e.status === "open") ??
+        this.data.escalations.find((e) => e.status === "acked") ??
+        this.data.escalations[0]!;
       ctx.navigator.push(new EscalationInspectorScreen(target.id, this.deps));
       return;
     }
 
     if (data === "a" && this.data.artifacts.length > 0) {
-      const first = this.data.artifacts[0]!;
-      ctx.navigator.push(new ArtifactInspectorScreen(t.runId, first.path, this.deps));
+      if (this.data.artifacts.length === 1) {
+        ctx.navigator.push(new ArtifactInspectorScreen(t.runId, this.data.artifacts[0]!.path, this.deps));
+      } else {
+        ctx.navigator.push(new ArtifactPickerScreen(t.runId, this.data.artifacts, this.deps));
+      }
       return;
     }
 
     if (data === "w" && this.data.worktree) {
       ctx.navigator.push(new WorktreeInspectorScreen(this.data.worktree.id, this.deps));
-      return;
     }
   }
 }
@@ -1010,6 +1295,7 @@ class ArtifactInspectorScreen implements Screen {
   readonly variant = "sheet" as const;
   readonly title: string;
   private readonly frame = new Frame();
+  private nav: Navigator | null = null;
   private readonly viewport = new Viewport();
   private result: ArtifactReadResult | null = null;
   private offset = 0;
@@ -1026,6 +1312,7 @@ class ArtifactInspectorScreen implements Screen {
   }
 
   onShow(ctx: ScreenContext): void {
+    this.nav = ctx.navigator;
     void this.load(ctx);
   }
 
@@ -1058,13 +1345,16 @@ class ArtifactInspectorScreen implements Screen {
       { key: "Esc", label: "back" },
     ];
     const total = this.result?.totalChars;
-    const right = total != null ? theme.muted(`${formatBytes(this.offset)}..${formatBytes(this.offset + (this.result?.content.length ?? 0))} / ${formatBytes(total)}`) : undefined;
+    const right =
+      total != null
+        ? theme.muted(`${formatBytes(this.offset)}..${formatBytes(this.offset + (this.result?.content.length ?? 0))} / ${formatBytes(total)}`)
+        : undefined;
 
     return this.frame.render({
       width,
       maxHeight,
       theme,
-      breadcrumbs: ["Work", "Artifact", this.title],
+      breadcrumbs: this.nav?.breadcrumbs ?? ["Artifact", this.title],
       rightHeader: right,
       subtitle: `${this.runId} · ${this.artifactPath}`,
       hints,
@@ -1079,7 +1369,7 @@ class ArtifactInspectorScreen implements Screen {
 
   handleInput(data: string, ctx: ScreenContext): void {
     if (this.frame.handleInlineInput(data, ctx.requestRender)) return;
-    if (matchesKey(data, "escape") || data === "q") {
+    if (isPopKey(data, ctx)) {
       ctx.navigator.pop();
       return;
     }
@@ -1111,12 +1401,17 @@ class TimerInspectorScreen implements Screen {
   readonly variant = "dialog" as const;
   readonly title: string;
   private readonly frame = new Frame();
+  private nav: Navigator | null = null;
 
   constructor(
     private readonly timerId: string,
     private readonly deps: InspectorDeps,
   ) {
     this.title = timerId;
+  }
+
+  onShow(ctx: ScreenContext): void {
+    this.nav = ctx.navigator;
   }
 
   render(width: number, maxHeight: number, theme: Theme): string[] {
@@ -1129,7 +1424,7 @@ class TimerInspectorScreen implements Screen {
       width,
       maxHeight,
       theme,
-      breadcrumbs: ["Work", "Timers", this.timerId],
+      breadcrumbs: this.nav?.breadcrumbs ?? [this.timerId],
       rightHeader: timer ? statusBadge(timer.status, theme) : undefined,
       hints,
       renderBody: (innerW) => {
@@ -1151,7 +1446,7 @@ class TimerInspectorScreen implements Screen {
 
   handleInput(data: string, ctx: ScreenContext): void {
     if (this.frame.handleInlineInput(data, ctx.requestRender)) return;
-    if (matchesKey(data, "escape") || data === "q") {
+    if (isPopKey(data, ctx)) {
       ctx.navigator.pop();
       return;
     }
@@ -1185,6 +1480,7 @@ class WorktreeInspectorScreen implements Screen {
   readonly variant = "sheet" as const;
   readonly title: string;
   private readonly frame = new Frame();
+  private nav: Navigator | null = null;
   private readonly viewport = new Viewport();
   private data: WorktreeDetailData | null = null;
   private loading = true;
@@ -1197,6 +1493,7 @@ class WorktreeInspectorScreen implements Screen {
   }
 
   onShow(ctx: ScreenContext): void {
+    this.nav = ctx.navigator;
     void this.load(ctx);
   }
 
@@ -1215,7 +1512,6 @@ class WorktreeInspectorScreen implements Screen {
 
   render(width: number, maxHeight: number, theme: Theme): string[] {
     const wt = this.data?.worktree ?? this.deps.store.getWorktree(this.worktreeId);
-    const wtId = wt?.id ?? this.worktreeId;
     const hints: Hint[] = [
       ...(wt?.taskId ? [{ key: "t", label: "task" }] : []),
       ...(wt?.id ? [{ key: "x", label: "archive & remove" }] : []),
@@ -1225,18 +1521,19 @@ class WorktreeInspectorScreen implements Screen {
       width,
       maxHeight,
       theme,
-      breadcrumbs: ["Work", "Worktrees", wtId],
+      breadcrumbs: this.nav?.breadcrumbs ?? [wt?.id ?? this.worktreeId],
       rightHeader: wt ? statusBadge(wt.status, theme) : undefined,
       hints,
       renderBody: (innerW, bodyH) => {
         if (this.loading && !wt) return [theme.muted("Loading worktree...")];
         if (!wt) return [theme.muted("Worktree not found.")];
+        const onDisk = this.data?.existsOnDisk ?? ("existsOnDisk" in wt ? wt.existsOnDisk : false);
         const lines: string[] = [
           kvRow("Worktree ID", wt.id ?? "(untracked)", innerW, theme),
           kvRow("Status", statusBadge(wt.status, theme), innerW, theme),
           kvRow("Branch", wt.branch, innerW, theme),
-          kvRow("Path", middleEllipsis(wt.path, Math.max(16, innerW - 16)), innerW, theme),
-          kvRow("On Disk", (this.data?.existsOnDisk ?? ("existsOnDisk" in wt ? wt.existsOnDisk : false)) ? theme.ok("yes") : theme.muted("no"), innerW, theme),
+          kvRow("Path", middleEllipsis(wt.path, Math.max(16, innerW - 18)), innerW, theme),
+          kvRow("On Disk", onDisk ? theme.ok("yes") : theme.muted("no"), innerW, theme),
           kvRow("Run / Task", `${wt.runId ?? "—"} / ${wt.taskId ?? "—"}`, innerW, theme),
           ...(this.data?.gitStatus ? ["", divider(innerW, theme, "git status --short"), ...wrap(sanitizeText(this.data.gitStatus), innerW)] : []),
           ...(this.data?.diffStat ? ["", divider(innerW, theme, "git diff --stat"), ...wrap(sanitizeText(this.data.diffStat), innerW)] : []),
@@ -1248,7 +1545,7 @@ class WorktreeInspectorScreen implements Screen {
 
   handleInput(data: string, ctx: ScreenContext): void {
     if (this.frame.handleInlineInput(data, ctx.requestRender)) return;
-    if (matchesKey(data, "escape") || data === "q") {
+    if (isPopKey(data, ctx)) {
       ctx.navigator.pop();
       return;
     }
@@ -1284,6 +1581,7 @@ class MergeInspectorScreen implements Screen {
   readonly variant = "sheet" as const;
   readonly title: string;
   private readonly frame = new Frame();
+  private nav: Navigator | null = null;
   private readonly viewport = new Viewport();
 
   constructor(
@@ -1291,6 +1589,10 @@ class MergeInspectorScreen implements Screen {
     private readonly deps: InspectorDeps,
   ) {
     this.title = mergeId;
+  }
+
+  onShow(ctx: ScreenContext): void {
+    this.nav = ctx.navigator;
   }
 
   render(width: number, maxHeight: number, theme: Theme): string[] {
@@ -1304,7 +1606,7 @@ class MergeInspectorScreen implements Screen {
       width,
       maxHeight,
       theme,
-      breadcrumbs: ["Work", "Merges", this.mergeId],
+      breadcrumbs: this.nav?.breadcrumbs ?? [this.mergeId],
       rightHeader: m ? statusBadge(m.status, theme) : undefined,
       hints,
       renderBody: (innerW, bodyH) => {
@@ -1326,7 +1628,7 @@ class MergeInspectorScreen implements Screen {
 
   handleInput(data: string, ctx: ScreenContext): void {
     if (this.frame.handleInlineInput(data, ctx.requestRender)) return;
-    if (matchesKey(data, "escape") || data === "q") {
+    if (isPopKey(data, ctx)) {
       ctx.navigator.pop();
       return;
     }
@@ -1350,15 +1652,25 @@ class MergeInspectorScreen implements Screen {
 
 /* ─────────────────────────── Live Transcript Viewer ───────────────────────── */
 
-class LiveTranscriptScreen implements Screen {
+/**
+ * Read-only live transcript viewer backed by `watch.start` (`scope: "task"` or `"run"`) + `replay.page`.
+ * Buffers early watch frames until `watchId` settles, drains paginated replay + fragments, handles
+ * `agent.tool`, `agent.thought_delta`, `agent.rollover`, `agent.error`, and `quota.*`, and guards
+ * `onClose()` so late-resolving watches are stopped immediately without leaking.
+ */
+export class LiveTranscriptScreen implements Screen {
   readonly variant = "sheet" as const;
   readonly title: string;
   private readonly frame = new Frame();
+  private nav: Navigator | null = null;
   private readonly viewport = new Viewport({ follow: true });
   private watchId: string | null = null;
+  private closed = false;
   private detach: (() => void) | null = null;
+  private earlyBuffer: DaemonEventFrame[] = [];
   private rawLines: string[] = [];
   private textBuf = "";
+  private thoughtBuf = "";
 
   constructor(
     private readonly runId: string,
@@ -1369,27 +1681,61 @@ class LiveTranscriptScreen implements Screen {
   }
 
   onShow(ctx: ScreenContext): void {
-    this.detach = this.deps.client.onEvent((ev) => this.onEvent(ev, ctx));
+    this.nav = ctx.navigator;
+    this.closed = false;
+    this.earlyBuffer = [];
+
+    // Register listener BEFORE watch.start so zero frames are dropped during handshake
+    this.detach = this.deps.client.onEvent((ev) => {
+      if (!ev.watchId || this.closed) return;
+      if (this.watchId === null) {
+        this.earlyBuffer.push(ev);
+        return;
+      }
+      if (ev.watchId !== this.watchId) return;
+      this.ingestEvent(ev);
+      ctx.requestRender();
+    });
+
+    const params = this.taskId
+      ? { scope: "task" as const, runId: this.runId, taskId: this.taskId }
+      : { scope: "run" as const, runId: this.runId };
+
     void this.deps.client
-      .request<{ watchId: string; replay?: DaemonEventFrame[] }>("watch.start", {
-        runId: this.runId,
-        ...(this.taskId ? { taskId: this.taskId } : {}),
-        limit: 200,
-      })
-      .then((res) => {
+      .request<ReplayPage & { watchId: string }>("watch.start", params)
+      .then(async (res) => {
+        if (this.closed) {
+          // Screen closed while watch.start was in-flight: stop immediately so no watch leaks!
+          void this.deps.client.request("watch.stop", { watchId: res.watchId }).catch(() => {});
+          return;
+        }
         this.watchId = res.watchId;
-        for (const ev of res.replay ?? []) this.ingestEvent(ev);
+        await consumeReplay(
+          this.deps.client,
+          res,
+          { watchId: res.watchId },
+          (ev) => this.ingestEvent(ev),
+          () => this.closed,
+        );
+        if (this.closed) return;
+        const buffered = this.earlyBuffer.splice(0);
+        for (const ev of buffered) {
+          if (ev.watchId === this.watchId) this.ingestEvent(ev);
+        }
         ctx.requestRender();
       })
       .catch((err) => {
+        if (this.closed) return;
         this.rawLines.push(`Failed to start live watch: ${err instanceof Error ? err.message : String(err)}`);
         ctx.requestRender();
       });
   }
 
   onClose(): void {
+    this.closed = true;
     this.detach?.();
     this.detach = null;
+    this.earlyBuffer.length = 0;
     if (this.watchId) {
       const id = this.watchId;
       this.watchId = null;
@@ -1397,27 +1743,71 @@ class LiveTranscriptScreen implements Screen {
     }
   }
 
-  private onEvent(ev: DaemonEventFrame, ctx: ScreenContext): void {
-    if (!this.watchId || ev.watchId !== this.watchId) return;
-    this.ingestEvent(ev);
-    ctx.requestRender();
+  private flushPendingBuffers(): void {
+    if (this.thoughtBuf.trim()) {
+      this.rawLines.push(`… ${sanitizeLine(this.thoughtBuf)}`);
+      this.thoughtBuf = "";
+    }
+    if (this.textBuf) {
+      this.rawLines.push(sanitizeLine(this.textBuf));
+      this.textBuf = "";
+    }
   }
 
-  private ingestEvent(ev: DaemonEventFrame): void {
+  private ingestEvent(ev: EventRecord | DaemonEventFrame): void {
     const p = (ev.payload ?? {}) as Record<string, unknown>;
+    const who = !this.taskId && ev.taskId ? `[${ev.taskId}] ` : "";
+
     if (ev.type === "agent.text_delta") {
+      if (this.thoughtBuf.trim()) {
+        this.rawLines.push(`… ${sanitizeLine(this.thoughtBuf)}`);
+        this.thoughtBuf = "";
+      }
       const delta = String(p.text ?? p.delta ?? "");
       this.textBuf += delta;
       const parts = this.textBuf.split(/\r?\n/);
       this.textBuf = parts.pop() ?? "";
-      for (const line of parts) this.rawLines.push(sanitizeLine(line));
+      for (const line of parts) this.rawLines.push(`${who}${sanitizeLine(line)}`);
+    } else if (ev.type === "agent.thought_delta") {
+      const delta = String(p.text ?? p.delta ?? "");
+      this.thoughtBuf += delta;
+      const parts = this.thoughtBuf.split(/\r?\n/);
+      this.thoughtBuf = parts.pop() ?? "";
+      for (const line of parts) {
+        if (line.trim()) this.rawLines.push(`${who}… ${sanitizeLine(line)}`);
+      }
+    } else if (ev.type === "agent.tool") {
+      this.flushPendingBuffers();
+      const name = formatToolLabel(String(p.title ?? p.name ?? p.toolName ?? "tool"));
+      const st = String(p.status ?? "running");
+      const icon = st === "completed" || st === "ok" ? "✓" : st === "failed" || st === "error" ? "✗" : "▶";
+      const detail = p.error ?? p.result ?? p.args ?? "";
+      const detailStr = detail ? ` — ${firstLine(typeof detail === "string" ? detail : JSON.stringify(detail), 90)}` : "";
+      this.rawLines.push(`[${formatClock(ev.createdAt)}] ${who}${icon} ${name}${detailStr}`);
     } else if (ev.type === "agent.tool_start" || ev.type === "agent.tool_end") {
-      const name = String(p.toolName ?? p.name ?? p.title ?? "tool");
-      this.rawLines.push(`[${formatClock(ev.createdAt)}] ${ev.type === "agent.tool_start" ? "▶" : "✓"} ${sanitizeLine(name)}`);
-    } else if (ev.type !== "agent.thought_delta") {
-      const summary = p.summary ?? p.status ?? p.title ?? p.message ?? "";
-      this.rawLines.push(`[${formatClock(ev.createdAt)}] ${ev.type}${summary ? ` · ${sanitizeLine(String(summary))}` : ""}`);
+      this.flushPendingBuffers();
+      const name = formatToolLabel(String(p.toolName ?? p.name ?? p.title ?? "tool"));
+      this.rawLines.push(`[${formatClock(ev.createdAt)}] ${who}${ev.type === "agent.tool_start" ? "▶" : "✓"} ${name}`);
+    } else if (ev.type === "agent.rollover") {
+      this.flushPendingBuffers();
+      const gen = p.generation ?? p.nextGeneration ?? "";
+      const reason = p.reason ? ` (${sanitizeLine(String(p.reason))})` : "";
+      this.rawLines.push(`[${formatClock(ev.createdAt)}] ${who}↻ rollover${gen ? ` → gen ${gen}` : ""}${reason}`);
+    } else if (ev.type === "agent.error") {
+      this.flushPendingBuffers();
+      const msg = sanitizeLine(String(p.message ?? p.error ?? "agent error"));
+      this.rawLines.push(`[${formatClock(ev.createdAt)}] ${who}✗ ERROR: ${msg}`);
+    } else if (ev.type.startsWith("quota.")) {
+      this.flushPendingBuffers();
+      const reason = sanitizeLine(String(p.reason ?? p.mode ?? ""));
+      const wake = p.resumeAt ? ` · resume ${formatCountdown(p.resumeAt as number | string)}` : "";
+      this.rawLines.push(`[${formatClock(ev.createdAt)}] ⏸ ${ev.type}${reason ? ` · ${reason}` : ""}${wake}`);
+    } else {
+      this.flushPendingBuffers();
+      const summary = p.summary ?? p.status ?? p.to ?? p.title ?? p.message ?? "";
+      this.rawLines.push(`[${formatClock(ev.createdAt)}] ${who}${ev.type}${summary ? ` · ${sanitizeLine(String(summary))}` : ""}`);
     }
+
     if (this.rawLines.length > 2000) this.rawLines.splice(0, this.rawLines.length - 1500);
   }
 
@@ -1425,17 +1815,22 @@ class LiveTranscriptScreen implements Screen {
     const hints: Hint[] = [
       { key: "f", label: this.viewport.follow ? "follow:on" : "follow:off" },
       { key: "y", label: "copy" },
+      { key: "↑↓/PgUp/PgDn/wheel", label: "scroll" },
       { key: "Esc", label: "close" },
     ];
     return this.frame.render({
       width,
       maxHeight,
       theme,
-      breadcrumbs: ["Work", this.runId, this.taskId ?? "Live Log"],
-      rightHeader: this.viewport.follow ? theme.ok("● live") : theme.muted(this.viewport.statusText()),
+      breadcrumbs: this.nav?.breadcrumbs ?? [this.title],
+      rightHeader: this.viewport.follow ? theme.ok(`${theme.glyphs.running} live`) : theme.muted(this.viewport.statusText()),
       hints,
       renderBody: (innerW, bodyH) => {
-        const all = this.textBuf ? [...this.rawLines, sanitizeLine(this.textBuf)] : this.rawLines;
+        const all = [
+          ...this.rawLines,
+          ...(this.thoughtBuf.trim() ? [theme.dim(`… ${sanitizeLine(this.thoughtBuf)}`)] : []),
+          ...(this.textBuf ? [sanitizeLine(this.textBuf)] : []),
+        ];
         if (all.length === 0) return [theme.muted("Waiting for live events...")];
         const wrapped = all.flatMap((l) => wrap(l, innerW));
         return this.viewport.render(wrapped, innerW, bodyH, theme);
@@ -1444,7 +1839,7 @@ class LiveTranscriptScreen implements Screen {
   }
 
   handleInput(data: string, ctx: ScreenContext): void {
-    if (matchesKey(data, "escape") || data === "q") {
+    if (isPopKey(data, ctx)) {
       ctx.navigator.pop();
       return;
     }
@@ -1472,10 +1867,15 @@ class GenericDetailScreen implements Screen {
   readonly variant = "sheet" as const;
   readonly title: string;
   private readonly frame = new Frame();
+  private nav: Navigator | null = null;
   private readonly viewport = new Viewport();
 
   constructor(private readonly ref: EntityRef) {
     this.title = middleEllipsis(ref.label || ref.id, 30);
+  }
+
+  onShow(ctx: ScreenContext): void {
+    this.nav = ctx.navigator;
   }
 
   render(width: number, maxHeight: number, theme: Theme): string[] {
@@ -1483,7 +1883,7 @@ class GenericDetailScreen implements Screen {
       width,
       maxHeight,
       theme,
-      breadcrumbs: ["Inspect", this.ref.kind, this.title],
+      breadcrumbs: this.nav?.breadcrumbs ?? ["Inspect", this.ref.kind, this.title],
       hints: [
         { key: "y", label: "copy" },
         { key: "Esc", label: "back" },
@@ -1502,7 +1902,7 @@ class GenericDetailScreen implements Screen {
   }
 
   handleInput(data: string, ctx: ScreenContext): void {
-    if (matchesKey(data, "escape") || data === "q") {
+    if (isPopKey(data, ctx)) {
       ctx.navigator.pop();
       return;
     }

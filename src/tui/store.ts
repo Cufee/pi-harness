@@ -22,9 +22,11 @@ export interface AttachableSession {
   status: string;
   running: boolean;
   attached: boolean;
+  attachedByMe?: boolean;
   activeGoals?: number;
   profileId?: string;
   model?: string | null;
+  effort?: string | null;
   updatedAt: number;
 }
 
@@ -201,6 +203,10 @@ export class WorkStore {
 
   get openEscalationsCount(): number {
     return this.snapshot.escalations.filter((e) => e.status === "open").length;
+  }
+
+  get unresolvedEscalationsCount(): number {
+    return this.snapshot.escalations.filter((e) => e.status === "open" || e.status === "acked").length;
   }
 
   get pendingTimersCount(): number {

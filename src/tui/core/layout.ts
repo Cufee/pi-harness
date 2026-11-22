@@ -24,12 +24,33 @@ export function divider(width: number, theme: Theme, title?: string): string {
 }
 
 /** Single key-value detail row with aligned label column. */
-export function kvRow(label: string, value: string, width: number, theme: Theme, labelWidth = 14): string {
+export function kvRow(label: string, value: string, width: number, theme: Theme, labelWidth = 16): string {
   const w = Math.max(1, Math.floor(width));
   const lw = Math.min(labelWidth, Math.max(6, Math.floor(w * 0.35)));
   const k = fit(theme.muted(label), lw);
-  const v = clamp(value, Math.max(1, w - lw - 1));
-  return clamp(`${k} ${v}`, w);
+  const v = clamp(value, Math.max(1, w - lw - 2));
+  return clamp(`${k}  ${v}`, w);
+}
+
+/** Colored capacity progress bar (`████████░░  80%`), using ASCII `#`/`.` when `theme.glyphs.ascii`. */
+export function renderProgressBar(
+  remainingRatio: number | null | undefined,
+  theme: Theme,
+  opts?: { barWidth?: number; showPercent?: boolean },
+): string {
+  const barWidth = opts?.barWidth ?? 10;
+  const showPercent = opts?.showPercent !== false;
+  const full = theme.glyphs.barFull;
+  const empty = theme.glyphs.barEmpty;
+  if (remainingRatio == null || !Number.isFinite(remainingRatio)) {
+    return theme.dim(empty.repeat(barWidth)) + (showPercent ? theme.dim("  --%") : "");
+  }
+  const clamped = Math.max(0, Math.min(1, remainingRatio));
+  const filled = Math.round(clamped * barWidth);
+  const paint = clamped <= 0.1 ? theme.danger : clamped <= 0.25 ? theme.warn : theme.ok;
+  const bar = paint(full.repeat(filled)) + theme.dim(empty.repeat(barWidth - filled));
+  const pct = showPercent ? ` ${String(Math.round(clamped * 100)).padStart(3)}%` : "";
+  return `${bar}${pct}`;
 }
 
 export interface ColumnSpec {
@@ -43,23 +64,20 @@ export interface ColumnSpec {
   priority?: number;
 }
 
-/**
- * Priority-aware column layout that cleanly drops low-priority columns on narrow terminals
- * and guarantees exact visual width safety (20..200+ cols).
- */
-export function layoutColumns(
-  specs: ColumnSpec[],
-  rows: Array<Record<string, string>>,
-  width: number,
-  opts?: { gap?: number; headerStyle?: (s: string) => string; sepStyle?: (s: string) => string },
-): string[] {
-  const w = Math.max(1, Math.floor(width));
-  const gap = opts?.gap ?? 2;
+export interface ComputedColumnLayout {
+  active: ColumnSpec[];
+  widths: Map<string, number>;
+  gap: number;
+  width: number;
+}
 
-  // Drop highest-priority-number optional columns until minimum widths fit cleanly
-  let active = [...specs];
+/** Computes active priority-shedding columns and exact column widths for `width` columns. */
+export function computeColumnLayout(specs: ColumnSpec[], width: number, gap = 2): ComputedColumnLayout {
+  const w = Math.max(1, Math.floor(width));
+  const active = [...specs];
   const minNeeded = (cols: ColumnSpec[]) =>
     cols.reduce((sum, c) => sum + (c.width ?? c.minWidth ?? 8), 0) + Math.max(0, cols.length - 1) * gap;
+
   while (active.length > 1 && minNeeded(active) > w) {
     let dropIdx = -1;
     let maxPrio = -1;
@@ -81,7 +99,10 @@ export function layoutColumns(
   let rem = avail;
   for (let i = 0; i < flexCols.length; i++) {
     const col = flexCols[i]!;
-    const share = i === flexCols.length - 1 ? Math.max(1, rem) : Math.max(col.minWidth ?? 6, Math.floor(avail / flexCols.length));
+    const share =
+      i === flexCols.length - 1
+        ? Math.max(1, rem)
+        : Math.max(col.minWidth ?? 6, Math.floor(avail / flexCols.length));
     widths.set(col.key, share);
     rem -= share;
   }
@@ -89,26 +110,45 @@ export function layoutColumns(
     if (col.width != null) widths.set(col.key, col.width);
   }
 
-  const formatRow = (cells: Record<string, string>, style?: (s: string) => string) => {
-    const parts = active.map((col) => {
-      const cw = Math.max(1, widths.get(col.key) ?? 8);
-      const val = cells[col.key] ?? "";
-      const rendered = col.align === "right" ? padLeft(val, cw) : fit(val, cw);
-      return style ? style(rendered) : rendered;
-    });
-    return clamp(parts.join(" ".repeat(gap)), w);
-  };
+  return { active, widths, gap, width: w };
+}
 
+/** Formats one row of cells against a precomputed `ComputedColumnLayout`. */
+export function formatColumnRow(
+  layout: ComputedColumnLayout,
+  cells: Record<string, string>,
+  style?: (s: string) => string,
+): string {
+  const parts = layout.active.map((col) => {
+    const cw = Math.max(1, layout.widths.get(col.key) ?? 8);
+    const val = cells[col.key] ?? "";
+    const rendered = col.align === "right" ? padLeft(val, cw) : fit(val, cw);
+    return style ? style(rendered) : rendered;
+  });
+  return clamp(parts.join(" ".repeat(layout.gap)), layout.width);
+}
+
+/**
+ * Priority-aware column layout that cleanly drops low-priority columns on narrow terminals
+ * and guarantees exact visual width safety (20..200+ cols).
+ */
+export function layoutColumns(
+  specs: ColumnSpec[],
+  rows: Array<Record<string, string>>,
+  width: number,
+  opts?: { gap?: number; headerStyle?: (s: string) => string; sepStyle?: (s: string) => string; sepChar?: string },
+): string[] {
+  const layout = computeColumnLayout(specs, width, opts?.gap ?? 2);
   const out: string[] = [];
-  if (active.some((c) => c.header)) {
+  if (layout.active.some((c) => c.header)) {
     const headerRow: Record<string, string> = {};
-    for (const c of active) headerRow[c.key] = c.header ?? "";
-    out.push(formatRow(headerRow, opts?.headerStyle));
-    const rule = "─".repeat(w);
+    for (const c of layout.active) headerRow[c.key] = c.header ?? "";
+    out.push(formatColumnRow(layout, headerRow, opts?.headerStyle));
+    const rule = (opts?.sepChar ?? "─").repeat(layout.width);
     out.push(opts?.sepStyle ? opts.sepStyle(rule) : rule);
   }
   for (const row of rows) {
-    out.push(formatRow(row));
+    out.push(formatColumnRow(layout, row));
   }
   return out;
 }

@@ -44,6 +44,23 @@ export function padLeft(line: string, width: number): string {
   return pad > 0 ? " ".repeat(pad) + clamped : clamped;
 }
 
+/**
+ * Wraps an ANSI-styled line with a full-width background surface fill, ensuring exact `width`.
+ * Re-applies the background sequence after any full SGR reset (`\x1b[0m`, `\x1b[m`) or background
+ * reset (`\x1b[49m`) inside the line so the surface remains solid across styled spans.
+ * In NO_COLOR mode (`bgFn("")` is empty), cleanly returns `fit(line, width)`.
+ */
+export function fillLineBg(line: string, width: number, bgFn: (s: string) => string): string {
+  const fitted = fit(line, width);
+  const bgPrefix = bgFn("").replace(/\x1b\[49m$/, "");
+  if (!bgPrefix) return fitted;
+  const painted =
+    bgPrefix +
+    fitted.replace(/\x1b\[(0|49|)m/g, (match) => `${match}${bgPrefix}`) +
+    "\x1b[49m";
+  return clamp(painted, width);
+}
+
 /** Middle-ellipsis clamp for file paths, branches, and long IDs (preserves prefix & filename). */
 export function middleEllipsis(raw: string, maxWidth: number): string {
   const text = sanitizeLine(raw);

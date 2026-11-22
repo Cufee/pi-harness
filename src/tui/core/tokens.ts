@@ -1,4 +1,11 @@
-import type { EditorTheme, MarkdownTheme } from "@earendil-works/pi-tui";
+import {
+  backgroundAnsi,
+  foregroundAnsi,
+  getTerminalColorMode,
+  rgbColor,
+  type EditorTheme,
+  type MarkdownTheme,
+} from "@earendil-works/pi-tui";
 
 export type Tone = "default" | "accent" | "info" | "ok" | "warn" | "danger" | "muted" | "dim";
 
@@ -6,6 +13,8 @@ export interface Glyphs {
   ascii: boolean;
   prompt: string;
   bullet: string;
+  diamond: string;
+  rail: string;
   sep: string;
   crumb: string;
   pointer: string;
@@ -19,8 +28,17 @@ export interface Glyphs {
   foldClosed: string;
   branchMid: string;
   branchEnd: string;
+  branchCont: string;
   barH: string;
   barV: string;
+  boxTL: string;
+  boxTR: string;
+  boxBL: string;
+  boxBR: string;
+  boxML: string;
+  boxMR: string;
+  barFull: string;
+  barEmpty: string;
   scrollTrack: string;
   scrollThumb: string;
   slots: readonly string[];
@@ -30,6 +48,8 @@ const UNICODE_GLYPHS: Glyphs = {
   ascii: false,
   prompt: "›",
   bullet: "•",
+  diamond: "◆",
+  rail: "▎",
   sep: "·",
   crumb: "▸",
   pointer: "▸",
@@ -43,8 +63,17 @@ const UNICODE_GLYPHS: Glyphs = {
   foldClosed: "▸",
   branchMid: "├─",
   branchEnd: "└─",
+  branchCont: "│ ",
   barH: "─",
   barV: "│",
+  boxTL: "╭",
+  boxTR: "╮",
+  boxBL: "╰",
+  boxBR: "╯",
+  boxML: "├",
+  boxMR: "┤",
+  barFull: "█",
+  barEmpty: "░",
   scrollTrack: "┆",
   scrollThumb: "┃",
   slots: ["1", "2", "3", "4", "5", "6", "7", "8", "9"],
@@ -54,6 +83,8 @@ const ASCII_GLYPHS: Glyphs = {
   ascii: true,
   prompt: ">",
   bullet: "*",
+  diamond: "*",
+  rail: "|",
   sep: "|",
   crumb: ">",
   pointer: ">",
@@ -67,20 +98,29 @@ const ASCII_GLYPHS: Glyphs = {
   foldClosed: ">",
   branchMid: "|-",
   branchEnd: "`-",
+  branchCont: "| ",
   barH: "-",
   barV: "|",
+  boxTL: "+",
+  boxTR: "+",
+  boxBL: "+",
+  boxBR: "+",
+  boxML: "+",
+  boxMR: "+",
+  barFull: "#",
+  barEmpty: ".",
   scrollTrack: ":",
   scrollThumb: "#",
   slots: ["1", "2", "3", "4", "5", "6", "7", "8", "9"],
 };
 
-const RESET = "\x1b[0m";
-
 export interface Theme {
   color: boolean;
   glyphs: Glyphs;
+  text: (text: string) => string;
   paint: (tone: Tone, text: string) => string;
   bold: (text: string) => string;
+  italic: (text: string) => string;
   dim: (text: string) => string;
   muted: (text: string) => string;
   accent: (text: string) => string;
@@ -89,47 +129,131 @@ export interface Theme {
   ok: (text: string) => string;
   warn: (text: string) => string;
   danger: (text: string) => string;
+  code: (text: string) => string;
   border: (text: string) => string;
+  borderFocused: (text: string) => string;
+  surfaceBg: (text: string) => string;
+  userBg: (text: string) => string;
+  statusBg: (text: string) => string;
+  badgeBg: (text: string) => string;
   selectedBg: (text: string) => string;
+  tabActive: (text: string) => string;
   toEditorTheme: () => EditorTheme;
   toMarkdownTheme: () => MarkdownTheme;
 }
 
-const ANSI_TONE: Record<Tone, string> = {
-  default: "",
-  accent: "\x1b[36m",
-  info: "\x1b[34m",
-  ok: "\x1b[32m",
-  warn: "\x1b[33m",
-  danger: "\x1b[31m",
-  muted: "\x1b[90m",
-  dim: "\x1b[2m",
-};
+function makeFg(color: boolean, r: number, g: number, b: number, fallback256: number): (s: string) => string {
+  if (!color) return (s) => s;
+  const mode = getTerminalColorMode();
+  const code =
+    mode === "truecolor"
+      ? foregroundAnsi(rgbColor(r, g, b), "truecolor")
+      : `\x1b[38;5;${fallback256}m`;
+  return (s: string) => (s ? `${code}${s}\x1b[39m` : "");
+}
+
+function makeBg(color: boolean, r: number, g: number, b: number, fallback256: number): (s: string) => string {
+  if (!color) return (s) => s;
+  const mode = getTerminalColorMode();
+  const code =
+    mode === "truecolor"
+      ? backgroundAnsi(rgbColor(r, g, b), "truecolor")
+      : `\x1b[48;5;${fallback256}m`;
+  return (s: string) => `${code}${s}\x1b[49m`;
+}
+
+/** Fast, zero-dependency syntax highlighter for fenced code blocks inside Markdown. */
+function highlightCodeLines(
+  code: string,
+  color: boolean,
+  c: {
+    ok: (s: string) => string;
+    warn: (s: string) => string;
+    info: (s: string) => string;
+    dim: (s: string) => string;
+  },
+): string[] {
+  if (!color) return code.split("\n");
+  const KEYWORDS =
+    /\b(import|export|from|const|let|var|function|async|await|return|if|else|for|while|switch|case|break|continue|class|interface|type|enum|extends|implements|new|try|catch|finally|throw|def|fn|pub|struct|impl|match|use|mod|package|func|go|defer|SELECT|FROM|WHERE|INSERT|UPDATE|CREATE|TABLE)\b/g;
+
+  return code.split("\n").map((line) => {
+    const trimmed = line.trimStart();
+    if (trimmed.startsWith("//") || trimmed.startsWith("#") || trimmed.startsWith("--")) {
+      return c.dim(line);
+    }
+    return (
+      line
+        .replace(/(["'`])(?:\\.|(?!\1).)*\1/g, (m) => c.ok(m))
+        .replace(KEYWORDS, (m) => c.info(m))
+        .replace(/\b(\d+(?:\.\d+)?)\b/g, (m) => c.warn(m)) + "\x1b[39m"
+    );
+  });
+}
 
 export function createTheme(opts?: { color?: boolean; ascii?: boolean }): Theme {
   const color = opts?.color ?? (process.env.NO_COLOR === undefined && process.env.TERM !== "dumb");
   const ascii = opts?.ascii ?? Boolean(process.env.PI_HARNESS_ASCII || process.env.TERM === "dumb");
   const glyphs = ascii ? ASCII_GLYPHS : UNICODE_GLYPHS;
 
-  const wrapCode = (code: string) => (text: string) => (color && code && text ? `${code}${text}${RESET}` : text);
-  const paint = (tone: Tone, text: string) => wrapCode(ANSI_TONE[tone])(text);
-  const bold = wrapCode("\x1b[1m");
-  const dim = wrapCode("\x1b[2m");
-  const muted = wrapCode("\x1b[90m");
-  const accent = wrapCode("\x1b[36m");
-  const accentBold = wrapCode("\x1b[1;36m");
-  const info = wrapCode("\x1b[34m");
-  const ok = wrapCode("\x1b[32m");
-  const warn = wrapCode("\x1b[33m");
-  const danger = wrapCode("\x1b[31m");
-  const border = wrapCode("\x1b[90m");
-  const selectedBg = wrapCode("\x1b[7m");
+  // Calibrated truecolor / 256-color palette from v1 with selective SGR resets (\x1b[39m / \x1b[49m)
+  const accent = makeFg(color, 110, 200, 255, 81);
+  const muted = makeFg(color, 145, 152, 166, 245);
+  const dim = makeFg(color, 102, 108, 122, 240);
+  const ok = makeFg(color, 110, 224, 145, 114);
+  const warn = makeFg(color, 245, 198, 105, 221);
+  const danger = makeFg(color, 255, 118, 118, 203);
+  const info = makeFg(color, 166, 154, 255, 147);
+  const code = makeFg(color, 235, 196, 130, 222);
+  const border = makeFg(color, 78, 84, 98, 238);
+  const borderFocused = makeFg(color, 110, 200, 255, 81);
+
+  const surfaceBg = makeBg(color, 26, 29, 36, 235);
+  const userBg = makeBg(color, 34, 39, 49, 236);
+  const statusBg = makeBg(color, 24, 27, 34, 234);
+  const badgeBg = makeBg(color, 44, 51, 64, 237);
+
+  const bold = (s: string) => (color && s ? `\x1b[1m${s}\x1b[22m` : s);
+  const italic = (s: string) => (color && s ? `\x1b[3m${s}\x1b[23m` : s);
+  const underline = (s: string) => (color && s ? `\x1b[4m${s}\x1b[24m` : s);
+  const strikethrough = (s: string) => (color && s ? `\x1b[9m${s}\x1b[29m` : s);
+  const accentBold = (s: string) => bold(accent(s));
+
+  const paint = (tone: Tone, text: string): string => {
+    switch (tone) {
+      case "accent":
+        return accent(text);
+      case "info":
+        return info(text);
+      case "ok":
+        return ok(text);
+      case "warn":
+        return warn(text);
+      case "danger":
+        return danger(text);
+      case "muted":
+        return muted(text);
+      case "dim":
+        return dim(text);
+      default:
+        return text;
+    }
+  };
+
+  // Distinct active tab pill: subtle lifted badge surface + accentBold in color mode, `[label]` in NO_COLOR
+  const tabActive = (label: string) =>
+    color ? badgeBg(` ${accentBold(label)} `) : `[${label}]`;
+
+  // Selection highlight uses calibrated badgeBg rather than harsh \x1b[7m reverse video
+  const selectedBg = (text: string) => (color ? badgeBg(accentBold(text)) : text);
 
   return {
     color,
     glyphs,
+    text: (s) => s,
     paint,
     bold,
+    italic,
     dim,
     muted,
     accent,
@@ -138,36 +262,44 @@ export function createTheme(opts?: { color?: boolean; ascii?: boolean }): Theme 
     ok,
     warn,
     danger,
+    code,
     border,
+    borderFocused,
+    surfaceBg,
+    userBg,
+    statusBg,
+    badgeBg,
     selectedBg,
+    tabActive,
     toEditorTheme(): EditorTheme {
       return {
-        borderColor: border,
+        borderColor: borderFocused,
         selectList: {
           selectedPrefix: accentBold,
-          selectedText: selectedBg,
+          selectedText: accentBold,
           description: muted,
-          scrollInfo: muted,
-          noMatch: muted,
+          scrollInfo: dim,
+          noMatch: warn,
         },
       };
     },
     toMarkdownTheme(): MarkdownTheme {
       return {
         heading: accentBold,
-        link: info,
-        linkUrl: muted,
-        code: accent,
+        link: (t) => underline(accent(t)),
+        linkUrl: dim,
+        code,
         codeBlock: (s) => s,
         codeBlockBorder: border,
-        quote: muted,
+        quote: (t) => italic(muted(t)),
         quoteBorder: border,
         hr: border,
         listBullet: accent,
         bold,
-        italic: wrapCode("\x1b[3m"),
-        strikethrough: wrapCode("\x1b[9m"),
-        underline: wrapCode("\x1b[4m"),
+        italic,
+        strikethrough,
+        underline,
+        highlightCode: (src, _lang) => highlightCodeLines(src, color, { ok, warn, info, dim }),
       };
     },
   };
@@ -185,15 +317,17 @@ export function statusTone(status: string): Tone {
     case "fired":
     case "ok":
     case "available":
+    case "reported":
+    case "active":
       return "ok";
     case "executing":
-    case "active":
     case "running":
     case "verifying":
     case "reviewing":
     case "merging":
     case "draining":
     case "in_progress":
+    case "busy":
       return "accent";
     case "awaiting_human":
     case "paused":
@@ -205,6 +339,8 @@ export function statusTone(status: string): Tone {
     case "throttled":
     case "stale":
     case "waiting_children":
+    case "partial":
+    case "candidate":
     case "p1":
     case "acked":
     case "open":
@@ -237,6 +373,7 @@ export function statusGlyph(status: string, g: Glyphs): string {
     case "approved":
     case "passed":
     case "resolved":
+    case "reported":
       return g.check;
     case "failed":
     case "conflict":
@@ -244,6 +381,7 @@ export function statusGlyph(status: string, g: Glyphs): string {
     case "cancelled":
     case "stopped":
     case "error":
+    case "exhausted":
       return g.cross;
     case "awaiting_human":
     case "blocked":
@@ -251,6 +389,8 @@ export function statusGlyph(status: string, g: Glyphs): string {
     case "returned_for_rescope":
     case "p0":
     case "p1":
+    case "open":
+    case "acked":
       return g.warn;
     case "paused":
     case "paused_quota":
@@ -262,6 +402,7 @@ export function statusGlyph(status: string, g: Glyphs): string {
     case "reviewing":
     case "merging":
     case "in_progress":
+    case "busy":
       return g.running;
     default:
       return g.pending;

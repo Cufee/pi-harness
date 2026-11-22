@@ -1,6 +1,6 @@
 import { Input, matchesKey } from "@earendil-works/pi-tui";
 import { type Hint, renderHintBar } from "./keymap.js";
-import { clamp, fit, sanitizeLine, splitRow, visibleWidth } from "./text.js";
+import { clamp, fillLineBg, fit, sanitizeLine, splitRow, visibleWidth } from "./text.js";
 import type { Theme, Tone } from "./tokens.js";
 
 export interface FrameTab {
@@ -20,13 +20,57 @@ export interface FramePrompt {
   label: string;
   placeholder?: string;
   initialValue?: string;
+  /** When true, submitting an empty string invokes `onSubmit("")` (e.g. clearing Quota Endpoint URL). */
+  allowEmpty?: boolean;
   onSubmit: (value: string) => void | Promise<void>;
 }
 
 /**
+ * Unified tab navigation helper shared by every tabbed screen (Work Navigator, Settings, Model Picker, Goal Inspector).
+ * Supports Left/Right arrows (`←`/`→`), `Tab` / `Shift+Tab`, and `1`..`9` direct selection.
+ * Callers MUST NOT invoke this while a list's `/` filter or an inline prompt/confirm is active!
+ */
+export function handleTabKeys<T extends string>(
+  data: string,
+  tabs: readonly T[],
+  active: T,
+  onSelect: (next: T) => void,
+  opts?: { allowTab?: boolean; allowArrows?: boolean; allowNumbers?: boolean },
+): boolean {
+  if (tabs.length <= 1) return false;
+  const allowTab = opts?.allowTab !== false;
+  const allowArrows = opts?.allowArrows !== false;
+  const allowNumbers = opts?.allowNumbers !== false;
+
+  if (allowNumbers && data.length === 1 && data >= "1" && data <= "9") {
+    const idx = Number(data) - 1;
+    if (idx < tabs.length) {
+      const target = tabs[idx]!;
+      if (target !== active) onSelect(target);
+      return true;
+    }
+  }
+  if ((allowArrows && matchesKey(data, "right")) || (allowTab && matchesKey(data, "tab"))) {
+    const next = tabs[(tabs.indexOf(active) + 1) % tabs.length]!;
+    onSelect(next);
+    return true;
+  }
+  if ((allowArrows && matchesKey(data, "left")) || (allowTab && matchesKey(data, "shift+tab"))) {
+    const prev = tabs[(tabs.indexOf(active) - 1 + tabs.length) % tabs.length]!;
+    onSelect(prev);
+    return true;
+  }
+  return false;
+}
+
+/**
  * Single uniform chrome primitive for every sheet, inspector, and picker dialog.
- * Provides breadcrumbs, optional tab bar, bounded body height, inline confirm/prompt footer,
- * status toast, and a 1-line HintBar. Guarantees every rendered line <= `width` and total rows <= `maxHeight`.
+ * - Rounded cyan `borderFocused` frame (`╭─╮│╰─╯`) with opaque `surfaceBg` surface fill
+ * - Generous 2-column horizontal inner padding (`paddingX: 2`) and 1-row breathing space above/below body
+ * - Distinct styled tab strip (no harsh `\x1b[7m` reverse video; clean NO_COLOR `[tab]` fallback)
+ * - Explicit `├───┤` rule above the footer HintBar
+ * - Inline confirm / prompt (with optional `allowEmpty`) + status notice
+ * - Guarantees every rendered line <= `width` and total rows <= `maxHeight`.
  */
 export class Frame {
   private confirmState: FrameConfirm | null = null;
@@ -45,7 +89,11 @@ export class Frame {
   askPrompt(spec: FramePrompt): void {
     this.confirmState = null;
     const input = new Input();
-    if (spec.initialValue) input.setValue(spec.initialValue);
+    if (spec.initialValue) {
+      input.setValue(spec.initialValue);
+      // pi-tui Input.setValue keeps cursor at 0; move cursor to end so Backspace / Ctrl+U work immediately!
+      input.handleInput("\x05");
+    }
     this.promptState = { spec, input };
   }
 
@@ -87,11 +135,11 @@ export class Frame {
       }
       if (matchesKey(data, "enter") || matchesKey(data, "return")) {
         const val = this.promptState.input.getValue().trim();
-        const fn = this.promptState.spec.onSubmit;
+        const { onSubmit, allowEmpty } = this.promptState.spec;
         this.promptState = null;
         requestRender();
-        if (val) {
-          void Promise.resolve(fn(val)).catch((err) => {
+        if (val || allowEmpty) {
+          void Promise.resolve(onSubmit(val)).catch((err) => {
             this.setNotice(err instanceof Error ? err.message : String(err), "danger");
             requestRender();
           });
@@ -107,13 +155,18 @@ export class Frame {
   }
 
   /** Computes exact available body height inside this frame given `maxHeight`. */
-  bodyHeight(maxHeight: number, opts?: { hasTabs?: boolean; hasSubtitle?: boolean }): number {
-    // top border (1) + header (1) + optional subtitle (1) + optional tabs (1) + sep (1) + footer (1) + bottom border (1)
-    let chrome = 5;
+  bodyHeight(
+    maxHeight: number,
+    opts?: { hasTabs?: boolean; hasSubtitle?: boolean; padY?: boolean },
+  ): number {
+    // top(1) + header(1) + [sub(1)] + [tabs(1)] + midRule(1) + [topPad(1)+botPad(1)] + [inline/notice(1)] + footRule(1) + footer(1) + bot(1)
+    let chrome = 6;
     if (opts?.hasSubtitle) chrome += 1;
     if (opts?.hasTabs) chrome += 1;
     if (this.confirmState || this.promptState || this.notice) chrome += 1;
-    return Math.max(3, Math.floor(maxHeight) - chrome);
+    const usePadY = opts?.padY ?? maxHeight >= chrome + 5;
+    if (usePadY) chrome += 2;
+    return Math.max(2, Math.floor(maxHeight) - chrome);
   }
 
   render(opts: {
@@ -129,14 +182,25 @@ export class Frame {
     renderBody: (innerWidth: number, bodyHeight: number) => string[];
   }): string[] {
     const w = Math.max(12, Math.floor(opts.width));
-    const innerW = Math.max(4, w - 4);
+    const maxH = Math.max(6, Math.floor(opts.maxHeight));
+    const padX = w >= 20 ? 2 : 1;
+    const innerW = Math.max(4, w - 2 - padX * 2);
+    const padStr = " ".repeat(padX);
     const theme = opts.theme;
     const g = theme.glyphs;
 
-    const topBorder = theme.border(`┌${g.barH.repeat(Math.max(1, w - 2))}┐`);
-    const midBorder = theme.border(`├${g.barH.repeat(Math.max(1, w - 2))}┤`);
-    const botBorder = theme.border(`└${g.barH.repeat(Math.max(1, w - 2))}┘`);
-    const boxRow = (content: string) => `${theme.border(g.barV)} ${fit(content, innerW)} ${theme.border(g.barV)}`;
+    const bdr = theme.borderFocused;
+    const topBorder = fillLineBg(bdr(`${g.boxTL}${g.barH.repeat(Math.max(1, w - 2))}${g.boxTR}`), w, theme.surfaceBg);
+    const midBorder = fillLineBg(bdr(`${g.boxML}${g.barH.repeat(Math.max(1, w - 2))}${g.boxMR}`), w, theme.surfaceBg);
+    const subtleRule = fillLineBg(
+      `${bdr(g.boxML)}${theme.border(g.barH.repeat(Math.max(1, w - 2)))}${bdr(g.boxMR)}`,
+      w,
+      theme.surfaceBg,
+    );
+    const botBorder = fillLineBg(bdr(`${g.boxBL}${g.barH.repeat(Math.max(1, w - 2))}${g.boxBR}`), w, theme.surfaceBg);
+
+    const boxRow = (content: string) =>
+      fillLineBg(`${bdr(g.barV)}${padStr}${fit(content, innerW)}${padStr}${bdr(g.barV)}`, w, theme.surfaceBg);
 
     const crumbText = opts.breadcrumbs
       .map((c, i) => (i === opts.breadcrumbs.length - 1 ? theme.accentBold(c) : theme.muted(c)))
@@ -144,6 +208,9 @@ export class Frame {
     const headerLine = splitRow(crumbText, opts.rightHeader ?? "", innerW);
 
     const out: string[] = [topBorder, boxRow(headerLine)];
+
+    const hasSubtitle = Boolean(opts.subtitle);
+    const hasTabs = Boolean(opts.tabs && opts.tabs.length > 0);
 
     if (opts.subtitle) {
       out.push(boxRow(theme.muted(sanitizeLine(opts.subtitle))));
@@ -155,7 +222,7 @@ export class Frame {
         const badge = tab.count != null && tab.count > 0 ? ` (${tab.count})` : "";
         const num = idx < 9 ? `${idx + 1}:` : "";
         const raw = `${num}${tab.label}${badge}`;
-        if (active) return theme.selectedBg(` ${raw} `);
+        if (active) return theme.tabActive(raw);
         if (tab.count && tab.count > 0 && tab.tone) return theme.paint(tab.tone, raw);
         return theme.muted(raw);
       });
@@ -164,16 +231,19 @@ export class Frame {
 
     out.push(midBorder);
 
-    const availBody = this.bodyHeight(opts.maxHeight, {
-      hasTabs: Boolean(opts.tabs && opts.tabs.length > 0),
-      hasSubtitle: Boolean(opts.subtitle),
-    });
+    const baseChrome = 6 + (hasSubtitle ? 1 : 0) + (hasTabs ? 1 : 0) + (this.confirmState || this.promptState || this.notice ? 1 : 0);
+    const padY = maxH >= baseChrome + 5;
+    const availBody = this.bodyHeight(maxH, { hasTabs, hasSubtitle, padY });
+
+    if (padY) out.push(boxRow(""));
+
     const bodyLines = opts.renderBody(innerW, availBody).slice(0, availBody);
     for (const line of bodyLines) {
       out.push(boxRow(line));
     }
-    // Keep stable height at least 1 line
     if (bodyLines.length === 0) out.push(boxRow(""));
+
+    if (padY) out.push(boxRow(""));
 
     if (this.confirmState) {
       const label = this.confirmState.confirmLabel ?? "y/Enter confirm · n/Esc cancel";
@@ -181,11 +251,17 @@ export class Frame {
     } else if (this.promptState) {
       const lbl = theme.accentBold(`${this.promptState.spec.label}: `);
       const inpW = Math.max(4, innerW - visibleWidth(lbl) - 1);
-      const rendered = this.promptState.input.render(inpW)[0] ?? "";
-      out.push(boxRow(clamp(`${lbl}${rendered}`, innerW)));
+      const rendered = (this.promptState.input.render(inpW)[0] ?? "").replace(/^>\s?/, "");
+      const placeholder =
+        !this.promptState.input.getValue() && this.promptState.spec.placeholder
+          ? ` ${theme.dim(this.promptState.spec.placeholder)}`
+          : "";
+      out.push(boxRow(clamp(`${lbl}${rendered}${placeholder}`, innerW)));
     } else if (this.notice) {
       out.push(boxRow(theme.paint(this.notice.tone, this.notice.text)));
     }
+
+    out.push(subtleRule);
 
     const footerHints = this.confirmState
       ? [
@@ -201,6 +277,6 @@ export class Frame {
 
     out.push(boxRow(renderHintBar(footerHints, innerW, theme)));
     out.push(botBorder);
-    return out.slice(0, Math.max(4, opts.maxHeight));
+    return out.slice(0, maxH);
   }
 }

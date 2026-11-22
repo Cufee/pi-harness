@@ -17,8 +17,10 @@ const SGR_RX = /\x1b\[([0-9;]*)m/g;
 /**
  * Applies dim styling across a line while re-applying FAINT after standalone (`\x1b[0m`, `\x1b[m`,
  * `\x1b[22m`) and compound (`\x1b[0;32m`, `\x1b[22;39m`) SGR resets so dimmed backdrops stay dimmed.
+ * Leaves inline terminal image escape sequences untouched.
  */
 export function dimLine(line: string): string {
+  if (!line || line.includes("\x1b_G") || line.includes("\x1b]1337;File=")) return line;
   const reapplied = line.replace(SGR_RX, (match, rawParams: string) => {
     const codes = rawParams.split(";");
     const resetsFaint = codes.some((c) => c === "" || c === "0" || c === "22");
@@ -28,9 +30,12 @@ export function dimLine(line: string): string {
 }
 
 /**
- * Main-screen TUI wrapper. Deliberately NEVER enables terminal mouse tracking on the main screen
- * so native terminal scrollback and mouse-drag selection work seamlessly. Mouse wheel capture
- * is scoped strictly to open overlays via `Navigator`.
+ * Main-screen TUI wrapper.
+ * - Deliberately NEVER enables terminal mouse tracking on the main screen so native terminal
+ *   scrollback and mouse-drag selection work seamlessly.
+ * - Mouse wheel capture is scoped strictly to open overlays via `Navigator`.
+ * - Overrides `compositeOverlays` to dim the visible viewport beneath open modals while leaving
+ *   scrollback above the viewport untouched.
  */
 export class ModalScreen extends TuiMainScreen {
   constructor(terminal: Terminal) {
@@ -41,8 +46,20 @@ export class ModalScreen extends TuiMainScreen {
     return [...super.render(width)];
   }
 
-  getExitRestorePrefix(): string {
-    return DISABLE_MOUSE_WHEEL_SEQ;
+  protected override getExitRestorePrefix(): string {
+    return DISABLE_MOUSE_WHEEL_SEQ + super.getExitRestorePrefix();
+  }
+
+  /** Public helper used by `TerminalSession.stop()` to restore terminal state cleanly. */
+  exitRestoreSequence(): string {
+    return this.getExitRestorePrefix();
+  }
+
+  protected override compositeOverlays(lines: string[], termWidth: number, termHeight: number): string[] {
+    if (!this.hasOverlay()) return super.compositeOverlays(lines, termWidth, termHeight);
+    const viewportStart = Math.max(0, lines.length - termHeight);
+    const dimmed = lines.map((line, i) => (i >= viewportStart ? dimLine(line) : line));
+    return super.compositeOverlays(dimmed, termWidth, termHeight);
   }
 }
 
@@ -65,8 +82,18 @@ export interface Screen {
 }
 
 /**
+ * Standard "back / close" key check outside text inputs:
+ * `Esc`, `q`, or `Backspace` when `ctx.navigator.depth > 1`.
+ */
+export function isPopKey(data: string, ctx: ScreenContext, opts?: { allowQ?: boolean }): boolean {
+  if (matchesKey(data, "escape")) return true;
+  if (opts?.allowQ !== false && data === "q") return true;
+  if (ctx.navigator.depth > 1 && matchesKey(data, "backspace")) return true;
+  return false;
+}
+
+/**
  * Single modal/sheet stack manager with breadcrumbs and overlay-only mouse-wheel capture.
- * Replaces all ad-hoc `OverlayManager` / multi-backdrop / duplicated modal plumbing.
  */
 export class Navigator {
   private stack: Screen[] = [];
@@ -87,7 +114,7 @@ export class Navigator {
         const top = this.current;
         if (!top) return [];
         const rows = Math.max(10, this.terminal.rows || 30);
-        const maxH = top.variant === "dialog" ? Math.min(22, Math.max(10, rows - 6)) : Math.max(12, rows - 4);
+        const maxH = top.variant === "dialog" ? Math.min(24, Math.max(12, rows - 6)) : Math.max(14, rows - 4);
         return top.render(width, maxH, this.theme);
       },
       invalidate: () => {},
@@ -171,9 +198,9 @@ export class Navigator {
     }
     this.handle = this.tui.showOverlay(this.hostComponent, {
       anchor: isDialog ? "center" : "bottom-center",
-      width: isDialog ? "76%" : "96%",
-      minWidth: isDialog ? 44 : 52,
-      maxHeight: isDialog ? "75%" : "86%",
+      width: isDialog ? "80%" : "96%",
+      minWidth: isDialog ? 46 : 54,
+      maxHeight: isDialog ? "78%" : "88%",
       margin: { top: 1, bottom: 1, left: 1, right: 1 },
     });
     this.onChange?.();
@@ -210,25 +237,50 @@ export class Navigator {
 
 export interface TerminalSessionOptions {
   terminal?: Terminal;
+  /** Inspect composer draft before Ctrl+C / Ctrl+D exit logic. */
+  getComposerText?: () => string;
+  clearComposerText?: () => void;
+  isOverlayOpen?: () => boolean;
+  isBusy?: () => boolean;
+  /** Called on Ctrl+C (when not double-pressed) or confirmed Escape during busy turn. */
   onInterrupt?: () => "consumed" | "exit";
+  /** Called on second confirmed Esc during an active turn. */
+  onCancelActiveTurn?: () => void;
+  /** Banner text updates for Ctrl+C arm / double-Esc confirmation (null clears). */
+  onTransientHint?: (msg: string | null) => void;
+  /** Async hook run after `tui.stop()` and before `done` resolves (e.g. `session.leave`). */
+  onBeforeExit?: () => void | Promise<void>;
   onExit?: () => void;
+  /** Duration of double-Esc cancel confirmation window in ms (default 2500). */
+  escConfirmMs?: number;
 }
 
 /**
- * Bulletproof terminal lifecycle wrapper: owns ProcessTerminal, ModalScreen,
- * global Ctrl+C / Ctrl+D / Ctrl+] exit safety, and clean shutdown restore.
+ * Bulletproof terminal lifecycle wrapper:
+ * - Owns ProcessTerminal + ModalScreen
+ * - Restores `await terminal.drainInput(300, 60)` before `tui.stop()` so Kitty/DA1 replies never leak
+ * - Cleans up on `SIGINT`, `SIGTERM`, and `SIGHUP`
+ * - `Ctrl+D` exits cleanly on empty idle input
+ * - `Ctrl+C` closes overlay -> clears unsent draft -> aborts active turn -> press twice (within 1.5s) to exit
+ * - Double-`Esc` cancel confirmation for active turns
+ * - `Ctrl+]` detaches immediately
  */
 export class TerminalSession {
   readonly terminal: Terminal;
   readonly tui: ModalScreen;
   private started = false;
-  private stopped = false;
-  private lastCtrlC = 0;
+  private stopping = false;
+  private ctrlCArmedUntil = 0;
+  private ctrlCTimer: ReturnType<typeof setTimeout> | null = null;
+  private escArmedUntil = 0;
+  private escTimer: ReturnType<typeof setTimeout> | null = null;
   private cleanupInputListener: (() => void) | null = null;
+  private readonly signalHandlers: Array<[NodeJS.Signals, () => void]> = [];
   private resolveDone: (() => void) | null = null;
   readonly done: Promise<void>;
 
   constructor(private readonly opts: TerminalSessionOptions = {}) {
+    process.env.PI_PROGRAM_STATUS ??= "0";
     this.terminal = opts.terminal ?? new ProcessTerminal();
     this.tui = new ModalScreen(this.terminal);
     this.done = new Promise<void>((resolve) => {
@@ -236,46 +288,179 @@ export class TerminalSession {
     });
   }
 
+  private disarmCtrlC(): void {
+    const had = this.ctrlCArmedUntil > 0 || this.ctrlCTimer !== null;
+    this.ctrlCArmedUntil = 0;
+    if (this.ctrlCTimer) {
+      clearTimeout(this.ctrlCTimer);
+      this.ctrlCTimer = null;
+    }
+    if (had && this.escArmedUntil === 0) this.opts.onTransientHint?.(null);
+  }
+
+  private armCtrlC(message: string): void {
+    this.ctrlCArmedUntil = Date.now() + 1500;
+    this.opts.onTransientHint?.(message);
+    if (this.ctrlCTimer) clearTimeout(this.ctrlCTimer);
+    this.ctrlCTimer = setTimeout(() => {
+      this.ctrlCArmedUntil = 0;
+      this.ctrlCTimer = null;
+      if (this.escArmedUntil === 0) this.opts.onTransientHint?.(null);
+    }, 1500);
+    this.ctrlCTimer.unref?.();
+  }
+
+  private disarmEsc(): void {
+    const had = this.escArmedUntil > 0 || this.escTimer !== null;
+    this.escArmedUntil = 0;
+    if (this.escTimer) {
+      clearTimeout(this.escTimer);
+      this.escTimer = null;
+    }
+    if (had && this.ctrlCArmedUntil === 0) this.opts.onTransientHint?.(null);
+  }
+
+  private armEsc(): void {
+    const ms = Math.max(250, this.opts.escConfirmMs ?? 2500);
+    this.escArmedUntil = Date.now() + ms;
+    this.opts.onTransientHint?.("Press Esc again to stop active turn");
+    if (this.escTimer) clearTimeout(this.escTimer);
+    this.escTimer = setTimeout(() => {
+      this.escArmedUntil = 0;
+      this.escTimer = null;
+      if (this.ctrlCArmedUntil === 0) this.opts.onTransientHint?.(null);
+    }, ms);
+    this.escTimer.unref?.();
+  }
+
   start(inputInterceptor?: (data: string) => { data?: string; consume?: boolean } | undefined): void {
     if (this.started) return;
     this.started = true;
+
     this.cleanupInputListener = this.tui.addInputListener((data) => {
       if (isKeyRelease(data)) return undefined;
-      if (matchesKey(data, "ctrl+]")) {
-        this.stop();
+
+      // Ctrl+]: immediate detach
+      if (data === "\x1d" || matchesKey(data, "ctrl+]")) {
+        this.disarmCtrlC();
+        this.disarmEsc();
+        void this.stop();
         return { consume: true };
       }
-      if (matchesKey(data, "ctrl+c")) {
+
+      // Ctrl+C: second press within 1.5s ALWAYS exits; first press clears overlay -> draft -> busy -> arms exit
+      if (data === "\x03" || matchesKey(data, "ctrl+c")) {
+        this.disarmEsc();
+        const now = Date.now();
+        if (now < this.ctrlCArmedUntil) {
+          this.disarmCtrlC();
+          void this.stop();
+          return { consume: true };
+        }
+        // Clear unsent draft first (when no overlay is open)
+        const hasDraft = !this.opts.isOverlayOpen?.() && (this.opts.getComposerText?.().length ?? 0) > 0;
+        if (hasDraft) {
+          this.opts.clearComposerText?.();
+          this.armCtrlC("Draft cleared · press Ctrl+C again to exit");
+          return { consume: true };
+        }
         const res = this.opts.onInterrupt?.() ?? "exit";
         if (res === "exit") {
-          this.stop();
+          // If draft/busy/overlay hooks are configured, require twice to exit; otherwise honor direct exit
+          if (this.opts.onTransientHint) {
+            this.armCtrlC("Press Ctrl+C again (or Ctrl+D) to detach & exit");
+            return { consume: true };
+          }
+          void this.stop();
           return { consume: true };
         }
-        const now = Date.now();
-        if (now - this.lastCtrlC < 900) {
-          this.stop();
-          return { consume: true };
-        }
-        this.lastCtrlC = now;
+        this.armCtrlC("Stopping · press Ctrl+C again to exit");
         return { consume: true };
       }
+
+      // Ctrl+D: clean exit on empty idle main screen
+      if (data === "\x04" || matchesKey(data, "ctrl+d")) {
+        if (
+          !this.opts.isOverlayOpen?.() &&
+          !this.opts.isBusy?.() &&
+          (this.opts.getComposerText?.().length ?? 0) === 0
+        ) {
+          this.disarmCtrlC();
+          this.disarmEsc();
+          void this.stop();
+          return { consume: true };
+        }
+        return undefined;
+      }
+
+      // Esc on main screen while busy: double-Esc cancel confirmation
+      if ((data === "\x1b" || matchesKey(data, "escape")) && !this.opts.isOverlayOpen?.()) {
+        this.disarmCtrlC();
+        if (this.opts.isBusy?.() && this.opts.onCancelActiveTurn) {
+          if (Date.now() < this.escArmedUntil) {
+            this.disarmEsc();
+            this.opts.onCancelActiveTurn();
+          } else {
+            this.armEsc();
+          }
+          return { consume: true };
+        }
+        this.disarmEsc();
+        return undefined;
+      }
+
+      // Any other key clears armed Ctrl+C / Esc confirmation hints
+      if (this.escArmedUntil > 0) this.disarmEsc();
+      if (this.ctrlCArmedUntil > 0) this.disarmCtrlC();
+
       return inputInterceptor?.(data);
     });
+
+    for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as NodeJS.Signals[]) {
+      const handler = () => {
+        void this.stop();
+      };
+      process.on(sig, handler);
+      this.signalHandlers.push([sig, handler]);
+    }
+
     this.tui.start();
   }
 
-  stop(): void {
-    if (this.stopped) return;
-    this.stopped = true;
+  async stop(): Promise<void> {
+    if (this.stopping) return this.done;
+    this.stopping = true;
+
+    this.disarmCtrlC();
+    this.disarmEsc();
     this.cleanupInputListener?.();
     this.cleanupInputListener = null;
+
+    for (const [sig, fn] of this.signalHandlers) {
+      process.off(sig, fn);
+    }
+    this.signalHandlers.length = 0;
+
+    // Drain any in-flight Kitty keyboard / DA1 replies BEFORE restoring terminal mode
     try {
-      this.terminal.write(this.tui.getExitRestorePrefix());
+      await this.terminal.drainInput(300, 60);
+    } catch {
+      // ignore
+    }
+
+    try {
+      this.terminal.write(this.tui.exitRestoreSequence());
     } catch {
       // ignore
     }
     try {
       this.tui.stop();
+    } catch {
+      // ignore
+    }
+
+    try {
+      await this.opts.onBeforeExit?.();
     } catch {
       // ignore
     }

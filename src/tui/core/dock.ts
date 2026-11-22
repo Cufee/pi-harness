@@ -5,9 +5,11 @@ import {
   Editor,
   Markdown,
   matchesKey,
+  type TUI,
 } from "@earendil-works/pi-tui";
+import { renderToolOutput, type ToolDisplayPayload } from "../tool-output/index.js";
 import { type EntityRef, type Hint, renderHintBar } from "./keymap.js";
-import { clamp, fit, sanitizeLine, sanitizeText, splitRow, visibleWidth, wrap } from "./text.js";
+import { clamp, fillLineBg, fit, sanitizeLine, sanitizeText, splitRow, visibleWidth, wrap } from "./text.js";
 import { statusGlyph, statusTone, type Theme, type Tone } from "./tokens.js";
 
 /**
@@ -50,14 +52,16 @@ export class LiveTurnTail implements Component {
   private thought = "";
   private tools: LiveToolPill[] = [];
   private active = false;
+  private modelLabel: string | undefined;
 
   constructor(private readonly theme: Theme) {}
 
-  begin(): void {
+  begin(modelLabel?: string): void {
     this.active = true;
     this.text = "";
     this.thought = "";
     this.tools = [];
+    this.modelLabel = modelLabel;
   }
 
   appendText(delta: string): void {
@@ -77,8 +81,8 @@ export class LiveTurnTail implements Component {
     else this.tools.push(pill);
   }
 
-  snapshot(): { text: string; thought: string; tools: LiveToolPill[] } {
-    return { text: this.text, thought: this.thought, tools: [...this.tools] };
+  snapshot(): { text: string; thought: string; tools: LiveToolPill[]; modelLabel?: string } {
+    return { text: this.text, thought: this.thought, tools: [...this.tools], modelLabel: this.modelLabel };
   }
 
   clear(): void {
@@ -86,6 +90,7 @@ export class LiveTurnTail implements Component {
     this.text = "";
     this.thought = "";
     this.tools = [];
+    this.modelLabel = undefined;
   }
 
   get isActive(): boolean {
@@ -119,6 +124,9 @@ export class LiveTurnTail implements Component {
     }
 
     if (this.text.trim()) {
+      if (this.modelLabel) {
+        out.push(clamp(` ${this.theme.accent(g.diamond)} ${this.theme.muted(sanitizeLine(this.modelLabel))}`, w));
+      }
       const md = new Markdown(sanitizeText(this.text), 1, 0, this.theme.toMarkdownTheme());
       out.push(...md.render(w).map((l) => clamp(l, w)));
     }
@@ -130,7 +138,7 @@ export class LiveTurnTail implements Component {
 }
 
 /**
- * Append-only transcript container. Every committed turn/receipt is immutable.
+ * Append-only transcript container. Every committed turn, tool-output card, and receipt is immutable.
  */
 export class ImmutableTranscript extends Container {
   readonly liveTail: LiveTurnTail;
@@ -152,28 +160,89 @@ export class ImmutableTranscript extends Container {
     this.frozenContainer.addChild(new FrozenBlock((w) => copy.flatMap((l) => wrap(l, w))));
   }
 
-  appendUserTurn(text: string): void {
-    const clean = sanitizeText(text).trim();
-    if (!clean) return;
+  /** Compact session header rendered once at the top of scrollback. */
+  appendBanner(title: string, subtitle: string, hint?: string): void {
     const t = this.theme;
+    const g = t.glyphs;
     this.frozenContainer.addChild(
       new FrozenBlock((w) => {
-        const prefix = `${t.accentBold(t.glyphs.prompt)} `;
-        const wrapped = wrap(clean, Math.max(4, w - 2));
-        return ["", ...wrapped.map((line, i) => (i === 0 ? `${prefix}${t.bold(line)}` : `  ${t.bold(line)}`))];
+        const head = splitRow(
+          ` ${t.accentBold(g.diamond)} ${t.bold(sanitizeLine(title))}`,
+          `${t.muted(sanitizeLine(subtitle))} `,
+          w,
+        );
+        const hintLines = hint
+          ? wrap(t.dim(sanitizeLine(hint)), Math.max(1, w - 2)).map((l) => clamp(` ${l}`, w))
+          : [];
+        return [head, ...hintLines, t.border(g.barH.repeat(w))];
       }),
     );
   }
 
-  appendAssistantTurn(markdownText: string): void {
+  /**
+   * Generous immutable UserCard: left accent rail (`▎`), `› ` cue, inset padding,
+   * and subtle calibrated `userBg` surface fill.
+   */
+  appendUserTurn(text: string): void {
+    const clean = sanitizeText(text).trim();
+    if (!clean) return;
+    const t = this.theme;
+    const g = t.glyphs;
+    this.frozenContainer.addChild(
+      new FrozenBlock((w) => {
+        const inner = Math.max(4, w - 5);
+        const wrapped = wrap(clean, inner);
+        const bar = t.accent(g.rail);
+        const out: string[] = [""];
+        for (let i = 0; i < wrapped.length; i++) {
+          const prefix = i === 0 ? `${bar} ${t.accentBold(g.prompt)} ` : `${bar}   `;
+          out.push(fillLineBg(`${prefix}${t.bold(wrapped[i]!)}`, w, t.userBg));
+        }
+        return out;
+      }),
+    );
+  }
+
+  /**
+   * Immutable AssistantCard: optional `◆ <model>` attribution header + syntax-highlighted Markdown.
+   */
+  appendAssistantTurn(markdownText: string, meta?: string): void {
     const clean = sanitizeText(markdownText).trim();
     if (!clean) return;
-    const mdTheme = this.theme.toMarkdownTheme();
+    const t = this.theme;
+    const g = t.glyphs;
+    const mdTheme = t.toMarkdownTheme();
+    const cleanMeta = meta ? sanitizeLine(meta) : "";
     this.frozenContainer.addChild(
       new FrozenBlock((w) => {
         const md = new Markdown(clean, 1, 0, mdTheme);
-        return ["", ...md.render(w)];
+        const out: string[] = [""];
+        if (cleanMeta) {
+          out.push(clamp(` ${t.accent(g.diamond)} ${t.muted(cleanMeta)}`, w));
+        }
+        out.push(...md.render(w));
+        return out;
       }),
+    );
+  }
+
+  /**
+   * Immutable structured Tool-Output Card (`goals_table`, `goal_detail`, `run_activity`).
+   * Identical layout both live (from `chat.tool`) and replayed (from `turn.role === "tool_output"`).
+   */
+  appendToolOutput(display: ToolDisplayPayload): void {
+    const t = this.theme;
+    this.frozenContainer.addChild(
+      new FrozenBlock((w) => ["", ...renderToolOutput(display, w, t)]),
+    );
+  }
+
+  /** Compact dim note for a persisted `tool_output` turn lacking a valid structured display. */
+  appendToolOutputNote(text: string): void {
+    const clean = sanitizeLine(text) || "tool output";
+    const t = this.theme;
+    this.frozenContainer.addChild(
+      new FrozenBlock((w) => [clamp(`  ${t.ok(t.glyphs.check)} ${t.muted(clean)}`, w)]),
     );
   }
 
@@ -193,7 +262,7 @@ export class ImmutableTranscript extends Container {
     const tone = opts.tone ?? "muted";
     const cleanText = sanitizeLine(opts.text);
     const tagPart = opts.tag ? `${t.paint(tone, `[${sanitizeLine(opts.tag)}]`)} ` : "";
-    const inspectHint = opts.ref ? t.muted("  (Ctrl+X inspect)") : "";
+    const inspectHint = opts.ref ? t.dim("  (Ctrl+X inspect)") : "";
     this.frozenContainer.addChild(
       new FrozenBlock((w) => {
         const left = `  ${t.paint(tone, glyph)} ${tagPart}${cleanText}`;
@@ -223,6 +292,8 @@ export interface DockState {
   /** Row 2: left phase/action + spinner; right model/quota/queue summary. */
   busy: boolean;
   phaseText: string;
+  /** Optional transient Ctrl+C or double-Esc confirmation hint shown in status row without changing height. */
+  transientHint?: string | null;
   rightStatus: string;
   queuedCount: number;
   /** Bottom hint strip (always 1 line). */
@@ -232,19 +303,69 @@ export interface DockState {
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /**
+ * Editor subclass that captures undo snapshots on normal typing directly inside `handleInput`
+ * (so `Ctrl+Z` / `Ctrl+-` works seamlessly when the editor holds focus) and renders a `› ` prompt cue
+ * inside its 2-column horizontal padding without shifting cursor geometry.
+ */
+export class UndoableEditor extends Editor {
+  private readonly undoHistory: string[] = [];
+  private lastUndoValue = "";
+
+  constructor(
+    tui: TUI,
+    private readonly harnessTheme: Theme,
+  ) {
+    super(tui, harnessTheme.toEditorTheme(), { paddingX: 2 });
+  }
+
+  clearUndoHistory(): void {
+    this.undoHistory.length = 0;
+    this.lastUndoValue = "";
+  }
+
+  override handleInput(data: string): void {
+    if (matchesKey(data, "ctrl+z") || matchesKey(data, "ctrl+-")) {
+      const prev = this.undoHistory.pop();
+      if (prev !== undefined) {
+        this.setText(prev);
+        this.lastUndoValue = prev;
+      }
+      return;
+    }
+    const before = this.getText();
+    super.handleInput(data);
+    const after = this.getText();
+    if (after !== before && before !== this.lastUndoValue) {
+      this.undoHistory.push(before);
+      if (this.undoHistory.length > 50) this.undoHistory.shift();
+      this.lastUndoValue = before;
+    }
+  }
+
+  override render(width: number): string[] {
+    const lines = super.render(width);
+    // With paddingX: 2, line[0] is the top border and line[1] starts with 2 spaces;
+    // swap those 2 spaces for the 2-col prompt cue `› ` so cursor alignment stays exact.
+    if (lines.length >= 2 && lines[1]!.startsWith("  ")) {
+      const cue = `${this.harnessTheme.accentBold(this.harnessTheme.glyphs.prompt)} `;
+      lines[1] = `${cue}${lines[1]!.slice(2)}`;
+    }
+    return lines;
+  }
+}
+
+/**
  * Constant-height bottom dock!
- * Eliminates the 0..6 row height oscillation that caused viewport jumps in v1:
- *   Row 1: Attention / Active Goals strip (always 1 row)
- *   Row 2: Unified Status / Spinner / Model / Quota / Queue bar (always 1 row)
- *   Row 3+: Composer (`Editor`, steady border height; grows only while user types multiline)
+ *   Row 1: Top separator rule (always 1 row)
+ *   Row 2: Attention / Active Goals strip with `Alt+1`..`Alt+5` badges (always 1 row)
+ *   Row 3: Unified Status / Spinner / Model / Quota / Queue bar with `statusBg` fill (always 1 row)
+ *   Row 4+: Composer (`UndoableEditor` with `paddingX: 2` & `› ` prompt cue)
  *   Last Row: Keybinding HintBar (always 1 row)
  */
 export class FixedDock implements Component {
-  readonly editor: Editor;
+  readonly editor: UndoableEditor;
   private state: DockState;
   private spinnerIdx = 0;
-  private undoStack: string[] = [];
-  private lastUndoValue = "";
 
   constructor(
     tui: Component & { requestRender: () => void },
@@ -256,11 +377,10 @@ export class FixedDock implements Component {
     },
   ) {
     this.state = opts.initialState;
-    this.editor = new Editor(tui as never, theme.toEditorTheme(), { paddingX: 1 });
+    this.editor = new UndoableEditor(tui as unknown as TUI, theme);
     if (opts.autocomplete) this.editor.setAutocompleteProvider(opts.autocomplete);
     this.editor.onSubmit = (raw) => {
-      this.undoStack = [];
-      this.lastUndoValue = "";
+      this.editor.clearUndoHistory();
       opts.onSubmit(raw);
     };
   }
@@ -280,23 +400,7 @@ export class FixedDock implements Component {
   }
 
   handleInput(data: string): void {
-    // Undo shortcut (`Ctrl+Z` / `Ctrl+-`) matching v1 composer ergonomics
-    if (matchesKey(data, "ctrl+z") || matchesKey(data, "ctrl+-")) {
-      const prev = this.undoStack.pop();
-      if (prev !== undefined) {
-        this.editor.setText(prev);
-        this.lastUndoValue = prev;
-      }
-      return;
-    }
-    const before = this.editor.getText();
     this.editor.handleInput(data);
-    const after = this.editor.getText();
-    if (after !== before && before !== this.lastUndoValue) {
-      this.undoStack.push(before);
-      if (this.undoStack.length > 40) this.undoStack.shift();
-      this.lastUndoValue = before;
-    }
   }
 
   private renderAttentionRow(width: number): string {
@@ -310,13 +414,15 @@ export class FixedDock implements Component {
     const sepW = visibleWidth(sep);
     const pieces: string[] = [];
     let used = 1;
-    for (const s of slots) {
+    for (let i = 0; i < slots.length; i++) {
+      const s = slots[i]!;
       const tone = statusTone(s.status);
       const glyph = statusGlyph(s.status, g);
       const extra = s.badge ? ` ${t.paint(tone, s.badge)}` : "";
-      const item = `${t.muted(`[${s.slot}]`)} ${t.paint(tone, `${glyph} ${sanitizeLine(s.label)}`)}${extra}`;
+      const keyTag = i === 0 ? `Alt+${s.slot}` : `${s.slot}`;
+      const item = `${t.dim(`[${keyTag}]`)} ${t.paint(tone, `${glyph} ${sanitizeLine(s.label)}`)}${extra}`;
       const pw = visibleWidth(item);
-      if (pieces.length > 0 && used + sepW + pw > width - 2) {
+      if (pieces.length > 0 && used + sepW + pw > width - 3) {
         pieces.push(t.muted(`+${slots.length - pieces.length}`));
         break;
       }
@@ -328,18 +434,25 @@ export class FixedDock implements Component {
 
   private renderStatusRow(width: number): string {
     const t = this.theme;
+    const g = t.glyphs;
+    if (this.state.transientHint) {
+      const left = ` ${t.warn(g.warn)} ${t.warn(sanitizeLine(this.state.transientHint))}`;
+      const right = this.state.rightStatus ? `${t.muted(this.state.rightStatus)} ` : "";
+      return fillLineBg(splitRow(left, right, width), width, t.statusBg);
+    }
     const spin = this.state.busy
       ? t.accentBold(SPINNER_FRAMES[this.spinnerIdx]!)
-      : t.ok(t.glyphs.check);
+      : t.ok(g.check);
     const q = this.state.queuedCount > 0 ? `  ${t.warn(`+${this.state.queuedCount} queued`)}` : "";
     const left = ` ${spin} ${sanitizeLine(this.state.phaseText)}${q}`;
-    const right = this.state.rightStatus ? `${this.state.rightStatus} ` : "";
-    return splitRow(left, right, width);
+    const right = this.state.rightStatus ? `${t.muted(this.state.rightStatus)} ` : "";
+    return fillLineBg(splitRow(left, right, width), width, t.statusBg);
   }
 
   render(width: number): string[] {
     const w = Math.max(12, Math.floor(width));
     const lines: string[] = [
+      this.theme.border(this.theme.glyphs.barH.repeat(w)),
       this.renderAttentionRow(w),
       this.renderStatusRow(w),
       ...this.editor.render(w).map((l) => clamp(l, w)),
