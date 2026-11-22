@@ -4,6 +4,7 @@ import {
   Editor,
   type SlashCommand,
   type TUI,
+  type TuiMouseEvent,
 } from "@earendil-works/pi-tui";
 import type { HarnessTheme } from "./theme.js";
 import { clampLine, fitWidth } from "./width.js";
@@ -13,6 +14,7 @@ export interface ComposerOptions {
   slashCommands?: SlashCommand[];
   cwd?: string;
   autocompleteMaxVisible?: number;
+  maxRows?: (width: number) => number;
 }
 
 /**
@@ -24,16 +26,23 @@ export interface ComposerOptions {
  */
 export class Composer extends Editor {
   private placeholder: string;
+  private sourceRows?: number[];
+  private selectedLine = "";
 
   constructor(
     tui: TUI,
     private readonly harnessTheme: HarnessTheme,
-    opts: ComposerOptions = {},
+    private readonly opts: ComposerOptions = {},
   ) {
-    super(tui, harnessTheme.toEditorTheme(), {
+    const editorTheme = harnessTheme.toEditorTheme();
+    super(tui, editorTheme, {
       paddingX: 2,
       autocompleteMaxVisible: opts.autocompleteMaxVisible ?? 6,
     });
+    // Locate the native selection in the rendered rows without interpreting
+    // its arrow, ANSI colors, or the editor's private picker state.
+    const paintSelected = editorTheme.selectList.selectedText;
+    editorTheme.selectList.selectedText = (text) => (this.selectedLine = paintSelected(text));
     this.placeholder = opts.placeholder ?? "";
 
     if (opts.slashCommands || opts.cwd) {
@@ -77,12 +86,30 @@ export class Composer extends Editor {
   }
 
   override render(width: number): string[] {
+    this.sourceRows = undefined;
+    this.selectedLine = "";
     if (width <= 0) return [""];
-    const lines = super.render(width);
+    let lines = super.render(width);
     if (lines.length < 3) {
       return lines.map((l) => clampLine(l, width));
     }
 
+    const rows = Math.max(this.isShowingAutocomplete() ? 2 : 1, this.opts.maxRows?.(width) ?? lines.length);
+    if (lines.length > rows) {
+      const cursor = Math.max(1, lines.findIndex((line) => line.includes(CURSOR_MARKER)));
+      const selected = this.selectedLine ? lines.findLastIndex((line) => line.includes(this.selectedLine)) : -1;
+      if (selected > cursor) {
+        // Pin the edit cursor; spend the remaining rows around the native selection.
+        const count = Math.min(rows - 1, lines.length - cursor - 1);
+        const start = Math.max(cursor + 1, Math.min(selected - Math.floor((count - 1) / 2), lines.length - count));
+        this.sourceRows = [cursor, ...Array.from({ length: count }, (_, i) => start + i)];
+      } else {
+        const start = Math.max(1, Math.min(cursor - Math.floor(rows / 2), lines.length - 1 - rows));
+        this.sourceRows = Array.from({ length: rows }, (_, i) => start + i);
+      }
+      lines = this.sourceRows.map((i) => lines[i]!);
+    }
+    const firstInput = this.sourceRows ? 0 : 1;
     const chevron = this.focused ? this.harnessTheme.accentBold("›") : this.harnessTheme.muted("›");
     const isEmpty = this.getText().length === 0;
 
@@ -92,12 +119,16 @@ export class Composer extends Editor {
       const availForPlaceholder = Math.max(0, width - 6);
       const hint = availForPlaceholder > 2 ? this.harnessTheme.dim(this.placeholder) : "";
       const content = `${chevron} ${marker}${cursor}${hint}`;
-      lines[1] = fitWidth(content, width);
-    } else if (lines[1]!.startsWith("  ")) {
+      lines[firstInput] = fitWidth(content, width);
+    } else if (lines[firstInput]!.startsWith("  ")) {
       // Replace the 2-column left padding on the first visual line with `› ` (identical visible width = 2)
-      lines[1] = clampLine(`${chevron} ${lines[1]!.slice(2)}`, width);
+      lines[firstInput] = clampLine(`${chevron} ${lines[firstInput]!.slice(2)}`, width);
     }
 
     return lines.map((l) => clampLine(l, width));
+  }
+
+  override handleMouse(event: TuiMouseEvent) {
+    return super.handleMouse({ ...event, y: this.sourceRows?.[event.y] ?? event.y });
   }
 }

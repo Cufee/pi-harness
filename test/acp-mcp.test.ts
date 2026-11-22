@@ -1,15 +1,95 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "bun:test";
 import { agent } from "@agentclientprotocol/sdk/unstable";
 import { loadConfig, type AcpProfileConfig } from "../src/config.js";
+import { withFixtureCatalog } from "./fixtures/launch-config.js";
 import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import { AcpRunner } from "../src/runners/acp-runner.js";
 import { buildNewSessionParams, buildPostSessionActions, prepareAcpSpawn } from "../src/runners/acp-shims.js";
-import type { PassiveQuotaSignal, RunnerUsage } from "../src/runners/types.js";
+import type { PassiveQuotaSignal, RunAgentRequest, RunnerUsage } from "../src/runners/types.js";
+
+const trustedAgent = { name: "@agentclientprotocol/claude-agent-acp", version: "0.109.1" };
+const profile = (adapter: AcpProfileConfig["adapter"]): AcpProfileConfig => ({
+  id: `acp:${adapter}`, kind: "acp", adapter, command: "unused", billing: "subscription",
+});
+
+describe("ACP control-plane policy", () => {
+  const request: RunAgentRequest = {
+    // Director and T1 both call the runner as tier 1, with different tool inventories.
+    runId: "fixture", taskId: "fixture", tier: 1, kind: "orchestrator", toolPolicy: "control_plane_only",
+    cwd: process.cwd(), systemPrompt: "Fixture role", initialPrompt: "Fixture turn", model: "opus", maxTurns: 1,
+    tools: [], executeTool: async () => ({}), signal: new AbortController().signal, callbacks: {},
+  };
+
+  it("rejects unsupported adapter policies before initialize", async () => {
+    let inits = 0;
+    const fixture = agent().onRequest("initialize", async () => { inits++; return { protocolVersion: 1, agentCapabilities: {} }; });
+    for (const adapter of ["claude", "codex", "gemini", "generic"] as const) {
+      const runner = new AcpRunner(profile(adapter));
+      await assert.rejects(runner.run({ ...request, tier: 3, kind: "research", toolPolicy: "read_only_workspace" }, fixture), /does not support read_only_workspace/);
+      if (adapter !== "claude") await assert.rejects(runner.run(request, fixture), /does not support control_plane_only/);
+    }
+    assert.equal(inits, 0);
+  });
+
+  it("rejects an unaudited Claude version before session creation", async () => {
+    let sessions = 0;
+    const fixture = agent().onRequest("initialize", async () => ({
+      protocolVersion: 1, agentCapabilities: {}, agentInfo: { ...trustedAgent, version: "0.109.0" },
+    })).onRequest("session/new", async () => { sessions++; return { sessionId: "fixture" }; });
+    await assert.rejects(new AcpRunner(profile("claude")).run(request, fixture), /requires claude-agent-acp 0\.109\.1/);
+    assert.equal(sessions, 0);
+  });
+
+  for (const [role, roleTool, bridge] of [["Director", "goal_list", true], ["T1", "tree_view", true], ["T1 without bridge", "tree_view", false]] as const) {
+    it(`disables native tools and gates role MCP permissions for ${role}`, async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "acp-policy-"));
+      const path = join(cwd, "fixture.txt");
+      try {
+        writeFileSync(path, "original");
+        const fixture = agent().onRequest("initialize", async ({ params }) => {
+          assert.deepEqual(params.clientCapabilities?.fs, { readTextFile: false, writeTextFile: false });
+          return { protocolVersion: 1, agentCapabilities: {}, agentInfo: trustedAgent };
+        }).onRequest("session/new", async ({ params }) => {
+          const options = (params._meta?.claudeCode as { options: { tools: string[]; disallowedTools: string[]; strictMcpConfig: boolean } }).options;
+          assert.deepEqual(options.tools, []);
+          assert.equal(options.strictMcpConfig, true);
+          for (const tool of ["Read", "Grep", "Glob", "Bash", "Write", "Edit", "Agent", "Task"]) assert.ok(options.disallowedTools.includes(tool), tool);
+          assert.deepEqual(params.mcpServers.map(s => s.name), bridge ? ["harness"] : []);
+          return { sessionId: "fixture", models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] } };
+        }).onRequest("session/prompt", async ({ client, params: { sessionId } }) => {
+          await assert.rejects(client.request("fs/read_text_file", { sessionId, path }), { data: { details: "Read denied: agent is running in control-plane-only mode" } });
+          await assert.rejects(client.request("fs/write_text_file", { sessionId, path, content: "changed" }), { data: { details: "Write denied: agent is running in control-plane-only mode" } });
+          const permission = async (kind: "read" | "search" | "edit" | "execute" | "other", tool?: string) => {
+            const res = await client.request("session/request_permission", {
+              sessionId, toolCall: { toolCallId: `call-${kind}-${tool ?? "native"}`, title: roleTool, kind, locations: [{ path }],
+                ...(tool && { _meta: { claudeCode: { toolName: `mcp__harness__${tool}`, mcpServer: { name: "harness", source: "dynamic" } } } }),
+              }, options: [{ kind: "allow_once", optionId: "allow", name: "Allow" }, { kind: "reject_once", optionId: "deny", name: "Deny" }],
+            });
+            return res.outcome.outcome === "selected" ? res.outcome.optionId : res.outcome.outcome;
+          };
+          for (const kind of ["read", "search", "edit", "execute", "other"] as const) assert.equal(await permission(kind), "deny", kind);
+          assert.equal(await permission("other", "unlisted"), "deny");
+          assert.equal(await permission("other", roleTool), bridge ? "allow" : "deny");
+          await client.notify("session/update", { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "checked" } } });
+          return { stopReason: "end_turn" };
+        });
+        const result = await new AcpRunner(profile("claude")).run({ ...request, cwd,
+          ...(bridge && { daemonSocketPath: "/unused/socket", mcpBridgeEntrypoint: "/unused/bridge" }),
+          tools: [{ name: roleTool, description: roleTool, inputSchema: {} }],
+        }, fixture);
+        assert.equal(result.text, "checked");
+        assert.equal(readFileSync(path, "utf8"), "original");
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+});
 
 describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", () => {
   it("applies the 4 verified per-adapter shims cleanly (Claude, Codex, Gemini)", () => {
@@ -21,14 +101,14 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
       command: "claude-agent-acp",
       billing: "subscription",
     };
-    const claudeSpawn = prepareAcpSpawn(claudeProfile, { systemPrompt: "Role", toolPolicy: "read_only_workspace" });
+    const claudeSpawn = prepareAcpSpawn(claudeProfile, { systemPrompt: "Role", toolPolicy: "read_write_workspace" });
     assert.equal(claudeSpawn.env.DISABLE_COMPACT, "1");
     claudeSpawn.cleanup();
 
     const claudeNew = buildNewSessionParams("claude", {
       cwd: "/tmp",
       systemPrompt: "Role",
-      toolPolicy: "read_only_workspace",
+      toolPolicy: "read_write_workspace",
       model: "claude-opus-5-5",
       effort: "high",
       mcpServers: [],
@@ -36,9 +116,9 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
     });
     const meta = (claudeNew.params._meta as { claudeCode: { options: { disallowedTools: string[] } } }).claudeCode.options;
     assert.ok(meta.disallowedTools.includes("Agent"));
-    assert.ok(meta.disallowedTools.includes("Write"));
+    for (const tool of ["Write", "Edit", "Bash"]) assert.ok(!meta.disallowedTools.includes(tool), tool);
 
-    // 2. Codex shim: blocks internal multi_agent + post-new set_config_option + read-only mode
+    // 2. Writable Codex still blocks internal multi_agent and configures model + effort.
     const codexProfile: AcpProfileConfig = {
       id: "acp:codex",
       kind: "acp",
@@ -46,15 +126,12 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
       command: "codex-acp",
       billing: "subscription",
     };
-    const codexSpawn = prepareAcpSpawn(codexProfile, { systemPrompt: "Role", toolPolicy: "read_only_workspace" });
+    const codexSpawn = prepareAcpSpawn(codexProfile, { systemPrompt: "Role", toolPolicy: "read_write_workspace" });
     assert.ok(codexSpawn.args.includes("features.multi_agent=false"));
-    assert.equal(codexSpawn.env.INITIAL_AGENT_MODE, "read-only");
     codexSpawn.cleanup();
 
-    const codexPost = buildPostSessionActions("codex", "s1", {}, { toolPolicy: "read_only_workspace", model: "gpt-6.2-sol", effort: "high" });
-    assert.equal(codexPost[0]?.method, "session/set_mode");
-    assert.equal(codexPost[1]?.method, "session/set_config_option");
-    assert.equal(codexPost[2]?.params.configId, "reasoning_effort");
+    const codexPost = buildPostSessionActions("codex", "s1", {}, { toolPolicy: "read_write_workspace", model: "gpt-6.2-sol", effort: "high" });
+    assert.deepEqual(codexPost.map(action => action.params.configId), ["model", "reasoning_effort"]);
 
     // 3. Gemini shim: GEMINI_SYSTEM_MD env file + legacy session/set_model
     const geminiProfile: AcpProfileConfig = {
@@ -65,11 +142,11 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
       args: ["--acp"],
       billing: "subscription",
     };
-    const geminiSpawn = prepareAcpSpawn(geminiProfile, { systemPrompt: "Gemini role", toolPolicy: "read_only_workspace" });
+    const geminiSpawn = prepareAcpSpawn(geminiProfile, { systemPrompt: "Gemini role", toolPolicy: "read_write_workspace" });
     assert.ok(geminiSpawn.env.GEMINI_SYSTEM_MD?.endsWith("system.md"));
     geminiSpawn.cleanup();
 
-    const geminiPost = buildPostSessionActions("gemini", "s1", {}, { toolPolicy: "read_only_workspace", model: "gemini-4-neon" });
+    const geminiPost = buildPostSessionActions("gemini", "s1", {}, { toolPolicy: "read_write_workspace", model: "gemini-4-neon" });
     assert.equal(geminiPost.find((a) => a.method === "session/set_model")?.params.modelId, "gemini-4-neon");
   });
 
@@ -81,6 +158,7 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
     const mockAgent = agent()
       .onRequest("initialize", async () => ({
         protocolVersion: 1,
+        agentInfo: trustedAgent,
         agentCapabilities: { sessionCapabilities: { systemPrompt: {}, options: {} } },
         _meta: { steering: { supported: true } },
       } as never))
@@ -90,7 +168,7 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
         cancelReceived = true;
       })
       .onRequest("session/prompt", async ({ client: acpClient }) => {
-        // Test read-only permission enforcement: write denied, harness MCP allowed
+        // Control-plane permission enforcement: write denied, harness MCP allowed
         const writePerm = (await acpClient.request("session/request_permission", {
           sessionId: "sess-1",
           toolCall: { toolCallId: "tc-w", title: "Write file", kind: "edit" },
@@ -157,10 +235,10 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
       {
         runId: "run-1",
         taskId: "t-1",
-        tier: 2,
-        kind: "worker",
+        tier: 1,
+        kind: "orchestrator",
         cwd: process.cwd(),
-        toolPolicy: "read_only_workspace",
+        toolPolicy: "control_plane_only",
         systemPrompt: "sys",
         initialPrompt: "hello",
         maxTurns: 5,
@@ -229,7 +307,7 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
   it("supports exclusive session takeover, default-to-last session, sessions.list, and idle session.leave detection", async () => {
     const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-takeover-"));
     const sockPath = join(stateDir, "d.sock");
-    const config = { ...loadConfig(), stateDir, socketPath: sockPath };
+    const config = withFixtureCatalog({ ...loadConfig(), stateDir, socketPath: sockPath });
     const daemon = new HarnessDaemon(config, { dbPath: ":memory:" });
 
     await daemon.start();

@@ -44,6 +44,18 @@ type ClientWatch = { throughSeq: number; pendingSeq?: number; next?: ReplayCurso
   | { scope: "task"; runId: string; taskId: string }
 );
 
+function chatSelection(params: Record<string, unknown>) {
+  const { repoRoot, profileId, model, effort } = params;
+  if (profileId != null && typeof profileId !== "string") throw new Error("Expected a profile ID");
+  if (model != null && typeof model !== "string") throw new Error("Expected a model ID");
+  return {
+    repoRoot: String(repoRoot ?? process.cwd()),
+    profileId: profileId ?? undefined,
+    model,
+    effort: typeof effort === "string" ? effort : null,
+  };
+}
+
 function isRunsWatchEvent(type: string): boolean {
   return (
     type.startsWith("run.") ||
@@ -119,7 +131,8 @@ export class HarnessDaemon {
     this.quota = new QuotaClient(next.quotaEndpoint);
     this.orchestrator.quota = this.quota;
     this.catalog = new ModelCatalogCompiler(next, this.quota);
-    this.director.updateConfig(next);
+    this.orchestrator.catalog = this.catalog;
+    this.director.updateConfig(next, this.catalog, this.quota);
     saveGlobalConfig(next);
 
     if (opts?.profilesChanged) {
@@ -425,6 +438,7 @@ export class HarnessDaemon {
   }
 
   private bindChatSocket(socket: Socket, chatSessionId: string): { tookOver: boolean } {
+    if (socket.destroyed || this.takenOverSockets.has(socket)) throw new Error("Chat connection closed or taken over");
     this.cancelIdleShutdown();
     const curChat = this.socketToChatId.get(socket);
     if (curChat !== chatSessionId) {
@@ -608,13 +622,6 @@ export class HarnessDaemon {
       }
 
       case "chat.open": {
-        const repoRoot = String(p.repoRoot ?? process.cwd());
-        const profileId =
-          (typeof p.profileId === "string" ? p.profileId : undefined) ??
-          this.config.defaultOrchestratorProfile ??
-          this.config.profiles[0]?.id ??
-          "acp:claude";
-
         let session =
           typeof p.chatSessionId === "string" && p.chatSessionId
             ? this.director.chats.getSession(p.chatSessionId)
@@ -626,12 +633,7 @@ export class HarnessDaemon {
           throw new Error(`Unknown chat session: ${p.chatSessionId}`);
         }
         if (!session) {
-          session = this.director.chats.getOrCreateDefault({
-            repoRoot,
-            profileId,
-            model: typeof p.model === "string" ? p.model : null,
-            effort: typeof p.effort === "string" ? p.effort : null,
-          });
+          session = await this.director.openDefaultChat(chatSelection(p));
         }
         const { tookOver } = this.bindChatSocket(socket, session.id);
         const turn = this.chatTurns.get(session.id);
@@ -652,18 +654,9 @@ export class HarnessDaemon {
       }
 
       case "chat.create": {
-        const repoRoot = String(p.repoRoot ?? process.cwd());
-        const profileId =
-          (typeof p.profileId === "string" ? p.profileId : undefined) ??
-          this.config.defaultOrchestratorProfile ??
-          this.config.profiles[0]?.id ??
-          "acp:claude";
-        const session = this.director.chats.createSession({
-          repoRoot,
-          profileId,
+        const session = await this.director.createChat({
+          ...chatSelection(p),
           title: typeof p.title === "string" ? p.title : undefined,
-          model: typeof p.model === "string" ? p.model : null,
-          effort: typeof p.effort === "string" ? p.effort : null,
         });
         this.bindChatSocket(socket, session.id);
         return {

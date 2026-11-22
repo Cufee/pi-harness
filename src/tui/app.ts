@@ -382,12 +382,14 @@ export async function runDirectorChatTui(opts: {
     effortLabel: session.effort,
     goalsSummary: `${goals.length} goals`,
   });
+  const header = new Container();
+  const footerHint = new FooterHint(theme);
   const composer = new Composer(tui, theme, {
     placeholder: "Ask Director to design or launch a Goal…  (/help · Ctrl+O commands · Ctrl+C exit)",
     slashCommands: autocompleteCommands("chat"),
     cwd: opts.repoRoot,
+    maxRows: (width) => tui.terminal.rows - header.render(width).length - footerHint.render(width).length,
   });
-  const footerHint = new FooterHint(theme);
   const overlays = new OverlayManager(tui, theme, composer);
 
   const seedTranscript = (payload: ChatOpenPayload, notice?: string) => {
@@ -412,22 +414,23 @@ export async function runDirectorChatTui(opts: {
   tui.addChild(chatContainer);
   tui.addChild(new Spacer(1));
   tui.addChild(spinner);
-  tui.addChild(goalHeader);
-  tui.addChild(statusBar);
-  tui.addChild({
+  header.addChild(goalHeader);
+  header.addChild(statusBar);
+  header.addChild({
     invalidate() {},
     render(width) {
       if (!busy) return [];
       const lines: string[] = [];
       if (queuedMessages.length) {
         lines.push(fitWidth(` Queued (${queuedMessages.length}): ${queuedMessages[0]}`, width));
-        lines.push(fitWidth(" Esc to stop & send queued · Ctrl+S steer · Ctrl+R recall", width));
+        lines.push(fitWidth(" Esc stop & send · Ctrl+S steer · Ctrl+R recall", width));
       } else {
         lines.push(fitWidth(" Enter queue · Ctrl+S steer now · Esc stop", width));
       }
       return lines;
     },
   });
+  tui.addChild(header);
   tui.addChild(composer);
   tui.addChild(footerHint);
   tui.setFocus(composer);
