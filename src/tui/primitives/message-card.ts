@@ -235,6 +235,16 @@ export class ErrorCard implements Component {
  * Distinct typed control-plane Event card rendered differently from conversational chat turns.
  * Switches strictly on `event.kind` — never parses string prefixes like `[Event]`.
  */
+export class GoalNotice implements Component {
+  constructor(private readonly theme: HarnessTheme, private readonly text: string) {}
+
+  invalidate(): void {}
+
+  render(width: number): readonly string[] {
+    return width > 0 ? [clampLine(this.theme.muted(`  ${this.text}`), width)] : [];
+  }
+}
+
 export class EventCard implements Component {
   private cachedWidth = -1;
   private cachedLines: readonly string[] = [];
@@ -252,6 +262,14 @@ export class EventCard implements Component {
     if (width <= 0) return [];
     if (this.cachedWidth === width) return this.cachedLines;
 
+    const event = this.event;
+    if (event.kind === "goal.committed") return new GoalNotice(this.theme, `${event.goalId} started`).render(width);
+    if (event.kind === "goal.settled" && event.runStatus === "completed" && event.openEscalations === 0) {
+      return new GoalNotice(this.theme, `${event.goalId} completed`).render(width);
+    }
+    if (event.kind === "goal.reviewed" && event.status === "achieved" && !event.circuitBreakerTripped) {
+      return new GoalNotice(this.theme, `${event.goalId} achieved`).render(width);
+    }
     const { icon, badge, headline, detail, tone } = this.describe();
     const paint =
       tone === "success"

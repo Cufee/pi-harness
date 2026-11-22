@@ -53,6 +53,7 @@ import {
   TerminalSession,
   TimedSpinner,
   ToolPill,
+  GoalNotice,
   UserCard,
 } from "./primitives/index.js";
 import { RunsTreeOverlay, type RunsTreesResult } from "./runs-tree.js";
@@ -1465,8 +1466,9 @@ export async function runDirectorChatTui(opts: {
       appendSystem([`[${p.goalId}] Amended v${p.delta.fromVersion} → v${p.delta.toVersion}: ${p.delta.rationale}`], "info");
       void refreshGoals();
     } else if (ev.type === "goal.committed") {
-      const p = ev.payload as { goalId: string; version: number; title: string };
-      appendSystem([`[${p.goalId} v${p.version}] Autonomous execution started: ${p.title}`], "success");
+      const p = ev.payload as { goalId: string };
+      chatContainer.addChild(new GoalNotice(theme, `${p.goalId} started`));
+      tui.requestRender();
       void refreshGoals();
     } else if (ev.type === "quota.agent_paused") {
       const p = ev.payload as {
