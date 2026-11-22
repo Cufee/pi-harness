@@ -430,7 +430,7 @@ export async function runDirectorChatTui(opts: {
   const header = new Container();
   const footerHint = new FooterHint(theme);
   const composer = new Composer(tui, theme, {
-    placeholder: "Ask Director to design or launch a Goal…  (/help · Ctrl+O commands · Ctrl+C exit)",
+    placeholder: "Message Director…",
     slashCommands: autocompleteCommands("chat"),
     cwd: opts.repoRoot,
     maxRows: (width) => tui.terminal.rows - header.render(width).length - footerHint.render(width).length,
@@ -464,17 +464,8 @@ export async function runDirectorChatTui(opts: {
   header.addChild({
     invalidate() {},
     render(width) {
-      if (!busy) return [];
-      const lines: string[] = [];
-      if (queuedMessages.length) {
-        lines.push(fitWidth(` Queued (${queuedMessages.length}): ${queuedMessages[0]}`, width));
-        lines.push(fitWidth(" Esc stop & send · Ctrl+S send to Director now · Ctrl+R recall", width));
-      } else if (isWaitingOnSubagent()) {
-        lines.push(fitWidth(" Waiting on subagents — type & press Enter anytime to message Director · Esc stop", width));
-      } else {
-        lines.push(fitWidth(" Enter queue · Ctrl+S send to Director now · Esc stop", width));
-      }
-      return lines;
+      if (!busy || queuedMessages.length === 0) return [];
+      return [fitWidth(` Queued (${queuedMessages.length}): ${queuedMessages[0]}`, width)];
     },
   });
   tui.addChild(header);
@@ -1298,6 +1289,25 @@ export async function runDirectorChatTui(opts: {
       isBusy: () => busy,
       onAbortGeneration: (key) => void controlTurn(key),
       onSteer: () => void controlTurn("steer"),
+      onEnqueue: () => {
+        if (buffering) return false;
+        const text = composer.getExpandedText().trim();
+        if (!text) return false;
+        composer.clear();
+        composer.addToHistory(text);
+        const slash = parseSlashInput("chat", text);
+        if (slash && "error" in slash) {
+          appendSystem([slash.error], "warning");
+          return true;
+        }
+        if (slash) {
+          runChatCommand(slash.cmd, slash.arg);
+          return true;
+        }
+        queuedMessages.push(text);
+        tui.requestRender();
+        return true;
+      },
       onRecallQueued: () => {
         if (controlling || buffering || !queuedMessages.length) return false;
         const recalled = queuedMessages.shift()!;
@@ -1328,9 +1338,9 @@ export async function runDirectorChatTui(opts: {
     if (slash) return runChatCommand(slash.cmd, slash.arg);
 
     if (busy) {
-      // If the Director is only blocked waiting on background subagents, deliver the message straight
-      // to the Director immediately instead of blocking it in a queue!
-      if (isWaitingOnSubagent() && !controlling) {
+      // Default for Director chat: Enter sends immediately (steer/deliver now).
+      // Use Ctrl+Q / Alt+Enter to explicitly enqueue for after the current turn.
+      if (!controlling) {
         void controlTurn("steer", text);
         return;
       }
@@ -1578,14 +1588,9 @@ export async function runNativeScrollbackTui(opts: {
     modeLabel: opts.runId,
     modelLabel: focusedTaskId ?? "ALL",
     goalsSummary: `${tasks.filter((t) => t.status === "running").length} running`,
-    rightHints: [
-      ["Ctrl+T", "runs"],
-      ["Ctrl+]", "quit"],
-      ["Ctrl+C", "exit"],
-    ],
   });
   const composer = new Composer(tui, theme, {
-    placeholder: "Steer focused agent…  (Ctrl+T runs · /stop · Ctrl+] quit)",
+    placeholder: "Steer focused agent…",
     slashCommands: autocompleteCommands("run"),
   });
   const footerHint = new FooterHint(theme);
@@ -1596,7 +1601,6 @@ export async function runNativeScrollbackTui(opts: {
       theme,
       `pi-harness run ${opts.runId}`,
       `status: ${run.status} · focus: ${focusedTaskId ?? "ALL"}`,
-      "Type to steer focused agent · Ctrl+T runs · /stop · Ctrl+] quit · Ctrl+C exit",
     ),
   );
 

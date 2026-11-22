@@ -10,6 +10,7 @@ export interface TerminalSessionCallbacks {
   isBusy: () => boolean;
   onAbortGeneration: (key: "escape" | "ctrl+c") => void;
   onSteer?: () => void;
+  onEnqueue?: () => boolean;
   onRecallQueued?: () => boolean;
   onOpenSettings?: () => void;
   onOpenPalette?: () => void;
@@ -175,6 +176,10 @@ export class TerminalSession {
       }
 
       if (!overlays.isOpen && callbacks.isBusy()) {
+        if ((data === "\x11" || data === "\x1b\r" || matchesKey(data, "ctrl+q") || matchesKey(data, "alt+enter")) && callbacks.onEnqueue?.()) {
+          disarmCtrlC();
+          return { consume: true };
+        }
         if (matchesKey(data, "ctrl+s") && callbacks.onSteer) {
           disarmCtrlC();
           callbacks.onSteer();

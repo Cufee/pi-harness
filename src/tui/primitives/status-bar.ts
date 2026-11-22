@@ -126,15 +126,11 @@ export class StatusBar implements Component {
     if (s.alertText) leftParts.push(badge(s.alertText, "error", this.theme));
     const left = leftParts.join(this.theme.dim(" │ "));
 
-    const hints = s.rightHints ?? [
-      ["Ctrl+O", "cmd"],
-      ["Ctrl+,", "settings"],
-      ["Ctrl+C", "exit"],
-    ];
+    const hints = s.rightHints ?? [];
     let right = "";
-    if (width >= 105) {
+    if (hints.length > 0 && width >= 105) {
       right = hints.map(([k, d]) => keyHint(k, d, this.theme)).join(this.theme.dim(" · ")) + " ";
-    } else if (width >= 76) {
+    } else if (hints.length > 0 && width >= 76) {
       right = hints.slice(0, 2).map(([k, d]) => keyHint(k, d, this.theme)).join(this.theme.dim(" · ")) + " ";
     }
 

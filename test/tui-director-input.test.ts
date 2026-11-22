@@ -39,8 +39,12 @@ async function openChat() {
     else process.env.PI_PROGRAM_STATUS = status;
   }
   const submit = (text: string) => { for (const char of text) key(char); key("\r"); };
+  const enqueue = (text: string, bind: "ctrl+q" | "alt+enter" = "ctrl+q") => {
+    for (const char of text) key(char);
+    key(bind === "alt+enter" ? "\x1b\r" : "\x11");
+  };
   return {
-    key, submit, requests,
+    key, submit, enqueue, requests,
     sends: () => requests.filter(r => r.op === "chat.send").map(r => r.params.text),
     end(turnId: string) {
       emit({ kind: "event", seq: 1, runId: "", taskId: null, createdAt: 0, type: "chat.turn.end",
@@ -51,10 +55,38 @@ async function openChat() {
 }
 
 describe("Director chat input", () => {
+  test("Enter while busy sends immediately to Director by default; Ctrl+Q and Alt+Enter explicitly enqueue", async () => {
+    const chat = await openChat();
+    try {
+      chat.submit("active");
+      // Default Enter while busy immediately sends via chat.steer (not queued)
+      chat.submit("urgent");
+      const [active, steer] = chat.requests;
+      expect(steer?.op).toBe("chat.steer");
+      expect(steer!.params).toEqual({ chatSessionId: "chat-input", turnId: active!.params.turnId!, message: "urgent" });
+      steer!.resolve({ steered: true });
+      await Promise.resolve();
+      expect(chat.sends()).toEqual(["active"]);
+
+      // Explicit Ctrl+Q and Alt+Enter enqueue FIFO without interrupting active turn
+      chat.enqueue("queued-1", "ctrl+q");
+      chat.enqueue("queued-2", "alt+enter");
+      expect(chat.requests.length).toBe(2);
+      active!.resolve({});
+      await Promise.resolve();
+      expect(chat.sends()).toEqual(["active", "queued-1"]);
+      chat.requests[2]!.resolve({});
+      await Promise.resolve();
+      expect(chat.sends()).toEqual(["active", "queued-1", "queued-2"]);
+    } finally { await chat.close(); }
+  });
+
   test("Esc waits for cancel acknowledgement, sends the queue head once, then drains FIFO", async () => {
     const chat = await openChat();
     try {
-      for (const text of ["active", "first", "second"]) chat.submit(text);
+      chat.submit("active");
+      chat.enqueue("first");
+      chat.enqueue("second");
       chat.key("\x1b");
       const [active, cancel] = chat.requests;
       expect(cancel?.op).toBe("chat.cancel");
@@ -74,12 +106,13 @@ describe("Director chat input", () => {
   });
 
   for (const native of [true, false]) {
-    test(`Ctrl+S ${native ? "steers the active turn" : "falls back to stop and send"} without losing queued input`, async () => {
+    test(`Enter ${native ? "steers the active turn" : "falls back to stop and send"} without losing queued input`, async () => {
       const chat = await openChat();
       try {
-        for (const text of ["active", "first", "second"]) chat.submit(text);
-        chat.key("!"); // A draft takes priority over the head for steering.
-        chat.key("\x13");
+        chat.submit("active");
+        chat.enqueue("first");
+        chat.enqueue("second");
+        chat.submit("!"); // Enter sends draft immediately, ahead of queued messages.
         const [active, steer] = chat.requests;
         expect(steer?.op).toBe("chat.steer");
         expect(steer!.params).toEqual({ chatSessionId: "chat-input", turnId: active!.params.turnId!, message: "!" });
@@ -100,7 +133,9 @@ describe("Director chat input", () => {
   test("steering the queue head during settlement consumes it only on acceptance", async () => {
     const chat = await openChat();
     try {
-      for (const text of ["active", "first", "second"]) chat.submit(text);
+      chat.submit("active");
+      chat.enqueue("first");
+      chat.enqueue("second");
       chat.key("\x13");
       const [active, steer] = chat.requests;
       expect(steer?.op).toBe("chat.steer");
@@ -118,7 +153,9 @@ describe("Director chat input", () => {
     test(`${cause} recalls the queue into editable input instead of auto-sending`, async () => {
       const chat = await openChat();
       try {
-        for (const text of ["active", "first", "second"]) chat.submit(text);
+        chat.submit("active");
+        chat.enqueue("first");
+        chat.enqueue("second");
         const active = chat.requests[0]!;
         if (cause === "Ctrl+C") {
           chat.key("\x03");

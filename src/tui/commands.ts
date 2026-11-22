@@ -76,6 +76,11 @@ export function paletteCommands(mode: CommandMode, run: (cmd: SlashCommand) => v
 
 const SHORTCUTS: Record<CommandMode, Array<[string, string]>> = {
   chat: [
+    ["Enter", "Send message immediately (steers active turn if busy)"],
+    ["Ctrl+Q / Alt+Enter", "Enqueue message for after the active turn"],
+    ["Ctrl+S", "Send queued message immediately"],
+    ["Ctrl+R", "Recall queued message into input"],
+    ["Esc", "Cancel active turn / close overlay"],
     ["Ctrl+O", "Command palette (keeps your draft)"],
     ["Ctrl+C", "Clear input / cancel turn; twice to quit"],
   ],

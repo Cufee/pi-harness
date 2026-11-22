@@ -13,7 +13,7 @@ export class BannerCard implements Component {
     private readonly theme: HarnessTheme,
     private readonly title: string,
     private readonly subtitle: string,
-    private readonly hint = "Type to chat · /model · /effort · /goals · /runs · /quota · Ctrl+, settings · Ctrl+O commands",
+    private readonly hint = "",
   ) {}
 
   invalidate(): void {
@@ -25,11 +25,11 @@ export class BannerCard implements Component {
     if (this.cachedWidth === width) return this.cachedLines;
     const inner = Math.max(1, width - 2);
     const l1 = ` ${this.theme.accentBold("◆")} ${this.theme.bold(this.title)}  ${this.theme.muted(this.subtitle)}`;
-    const l2 = this.theme.dim(this.hint);
+    const hintLines = this.hint ? wrapTextWithAnsi(this.theme.dim(this.hint), inner).map((l) => clampLine(` ${l}`, width)) : [];
     this.cachedWidth = width;
     this.cachedLines = [
       clampLine(l1, width),
-      ...wrapTextWithAnsi(l2, inner).map((l) => clampLine(` ${l}`, width)),
+      ...hintLines,
       this.theme.border("─".repeat(width)),
     ];
     return this.cachedLines;
