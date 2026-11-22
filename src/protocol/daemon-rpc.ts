@@ -72,6 +72,7 @@ export type DaemonOp =
   | "watch.stop"
   | "task.steer"
   | "task.cancel"
+  | "task.resume"
   | "escalation.ack"
   | "models.list"
   | "models.sync"

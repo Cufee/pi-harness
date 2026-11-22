@@ -591,7 +591,9 @@ export class RunsTreeOverlay implements Component {
       const n = row.entry.tasks.length;
       const act = row.entry.activity;
       const primaryTask = row.entry.tasks.find((x) => x.tier === 1) ?? row.entry.tasks[0];
-      const thinkingTag = primaryTask?.effort ? ` · thinking:${primaryTask.effort}` : "";
+      const modelTag = primaryTask?.model
+        ? ` · ${primaryTask.model}${primaryTask.effort ? ` · ${primaryTask.effort}` : ""}`
+        : "";
       const phaseTag =
         effStatus === "active" && act?.phase && !["active", "idle", "completed", "failed", "stopped"].includes(act.phase)
           ? ` ${t.accent(act.phase)}`
@@ -600,14 +602,14 @@ export class RunsTreeOverlay implements Component {
       const quota = qp
         ? ` ${badge(`⏸ ${qp.resumeAt ? `resume ${formatResetCountdown(qp.resumeAt)}` : "quota paused"}`, "warning", t)}`
         : "";
-      return `${marker}${t.muted(fold)} ${badge("RUN", "info", t)} ${badge(statusLabel(effStatus), runTone(effStatus), t)} ${id(run.id)} ${firstLine(run.goal)} ${t.dim(`(${n} agent${n === 1 ? "" : "s"}${thinkingTag}${editsTag})`)}${phaseTag}${esc}${quota}`;
+      return `${marker}${t.muted(fold)} ${badge("RUN", "info", t)} ${badge(statusLabel(effStatus), runTone(effStatus), t)} ${id(run.id)} ${firstLine(run.goal)} ${t.dim(`(${n} agent${n === 1 ? "" : "s"}${modelTag}${editsTag})`)}${phaseTag}${esc}${quota}`;
     }
 
     const task = row.task!;
     const tier = tierLabel(task);
     const tierBadge = badge(tier, task.kind === "verify" ? "info" : "accent", t);
     const ctx = task.contextSize > 0 ? ` ${Math.round((task.contextUsed / task.contextSize) * 100)}%` : "";
-    const effortTag = task.effort ? ` (${task.effort})` : "";
+    const effortTag = task.effort ? ` · ${task.effort}` : "";
     const model = task.model ? `${task.model}${effortTag} · ${task.profileId}` : `${task.profileId}${effortTag}`;
     const taskAct = row.entry.activity?.tasks.find((x) => x.id === task.id);
     const liveAction =

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import type { HarnessConfig, RunnerProfileConfig } from "../config.js";
@@ -144,6 +145,7 @@ export class HarnessOrchestrator {
       getWorktreeManager: (repoRoot) => this.getWorktreeManager(repoRoot),
       getMergeQueue: (repoRoot) => this.getMergeQueue(repoRoot),
       getTaskSignal: (taskId) => this.active.get(taskId)?.generationSignal,
+      resumeTask: (taskId, opts) => this.resumeTask(taskId, opts),
     }, config);
   }
 
@@ -723,6 +725,141 @@ export class HarnessOrchestrator {
     }
 
     return { resumed: true, resumedTaskIds, run: this.db.getRun(runId)! };
+  }
+
+  /**
+   * Resumes a single failed, crashed, cancelled, blocked, or paused task IN-PLACE (same taskId,
+   * bumped generation, preserved worktree/WIP, deterministic recovery handoff) instead of spawning a duplicate.
+   */
+  async resumeTask(
+    taskId: string,
+    opts?: { note?: string; profileId?: string; model?: string; effort?: string },
+  ): Promise<TaskRecord> {
+    const task = this.db.getTask(taskId);
+    if (!task) throw new Error(`Unknown task ${taskId}`);
+    if (task.profileId === "director") throw new Error(`Task ${task.id} is a synthetic Director owner and cannot be resumed.`);
+    if (task.status === "completed") throw new Error(`Task ${task.id} is already completed.`);
+    if (this.active.has(task.id)) throw new Error(`Task ${task.id} is already running.`);
+
+    const run = this.db.getRun(task.runId);
+    if (!run) throw new Error(`Unknown run ${task.runId}`);
+
+    const toolPolicy = toolPolicyForTask(task.tier, task.kind, task.readOnly);
+    let wt = task.worktreeId ? this.db.getWorktree(task.worktreeId) : null;
+    if (toolPolicy === "read_write_workspace") {
+      const wtMgr = this.getWorktreeManager(run.repoRoot);
+      if (!wt || wt.runId !== run.id || !existsSync(wt.path)) {
+        wt = await wtMgr.createForWorker(run.id, task.id);
+      } else if (wt.status !== "active") {
+        this.db.updateWorktree(wt.id, { status: "active", cleanedAt: null });
+      }
+    }
+
+    const cwd = wt?.path ?? run.repoRoot;
+    const { profile, model } = await this.taskRoute(task, cwd, {
+      profileId: opts?.profileId,
+      model: opts?.model,
+    });
+    this.quota.clearPassiveExhaustion(profile.id);
+
+    const priorReason = task.summary?.trim() || `previous status was '${task.status}'`;
+    const priorHandoff = task.handoffJson ? (JSON.parse(task.handoffJson) as AnchoredHandoff) : null;
+    const handoff = await this.buildCleanRolloverHandoff({
+      runId: run.id,
+      task,
+      priorHandoff,
+      explicitHandoff: null,
+      worktreePath: wt?.path ?? null,
+      result: { text: priorReason, stopReason: "error" },
+    });
+    if (opts?.note?.trim()) {
+      handoff.nextActions.unshift(`Resume guidance: ${opts.note.trim()}`);
+    }
+
+    this.clearRunQuotaTimers(run.id);
+    this.runQuotaStates.delete(run.id);
+    this.taskQuotaHints.delete(task.id);
+    this.taskResumeNotes.set(task.id, {
+      reason: priorReason,
+      userMessage: opts?.note?.trim() || "Continue from preserved worktree/artifacts without redoing completed steps.",
+    });
+
+    if (run.status !== "active") {
+      this.db.updateRunStatus(run.id, "active");
+    }
+
+    // If a Goal is linked to this run and was paused/stopped, flip it back to executing
+    try {
+      this.db.db
+        .prepare("UPDATE goals SET status = 'executing', updated_at = ? WHERE linked_run_id = ? AND status NOT IN ('achieved','cancelled')")
+        .run(Date.now(), run.id);
+    } catch {
+      // goals table may not exist in unit tests using ControlPlaneDb alone
+    }
+
+    const nextGen = task.generation + 1;
+    this.db.updateTask(task.id, {
+      status: "ready",
+      generation: nextGen,
+      turnsUsed: 0,
+      profileId: profile.id,
+      model,
+      effort: opts?.effort !== undefined ? opts.effort : task.effort,
+      summary: null,
+      sessionId: null,
+      handoffJson: JSON.stringify(handoff),
+    });
+
+    this.db.emitEvent(run.id, task.id, "task.resumed", {
+      taskId: task.id,
+      fromStatus: task.status,
+      generation: nextGen,
+      model,
+      effort: opts?.effort !== undefined ? opts.effort : task.effort,
+      note: opts?.note ?? null,
+    });
+
+    this.launchTaskLoop(task.id);
+    return this.db.getTask(task.id)!;
+  }
+
+  /**
+   * Resumes a run in-place: delegates quota-paused runs to `resumeRunFromQuota`, and resumes
+   * crashed/failed/stopped/cancelled tasks in-place while keeping completed work untouched.
+   */
+  async resumeRun(
+    runId: string,
+    opts?: { trigger?: "manual" | "auto_timer" | "quota_recovered" | "user_timer"; userMessage?: string; note?: string },
+  ): Promise<{ resumed: boolean; resumedTaskIds: string[]; run: RunRecord }> {
+    const run = this.db.getRun(runId);
+    if (!run) throw new Error(`Unknown run ${runId}`);
+
+    const tasks = this.db.listTasks(run.id);
+    if (run.status === "paused_quota" || tasks.some((t) => t.status === "paused_quota")) {
+      return this.resumeRunFromQuota(run.id, opts);
+    }
+
+    const RESUMABLE = new Set(["failed", "cancelled", "blocked", "returned_for_rescope"]);
+    const candidates = tasks.filter(
+      (t) => t.profileId !== "director" && RESUMABLE.has(t.status) && !this.active.has(t.id),
+    );
+    if (candidates.length === 0) {
+      return { resumed: false, resumedTaskIds: [], run: this.getEffectiveRun(run.id) ?? run };
+    }
+
+    const note = opts?.note ?? opts?.userMessage;
+    const resumedTaskIds: string[] = [];
+    for (const t of candidates) {
+      const resumed = await this.resumeTask(t.id, note ? { note } : undefined);
+      resumedTaskIds.push(resumed.id);
+    }
+    this.db.emitEvent(run.id, null, "run.resumed", {
+      runId: run.id,
+      trigger: opts?.trigger ?? "manual",
+      resumedTaskIds,
+      note: note ?? null,
+    });
+    return { resumed: resumedTaskIds.length > 0, resumedTaskIds, run: this.db.getRun(run.id)! };
   }
 
   private async runTaskWithRollovers(taskId: string, exec: ActiveTaskExecution): Promise<void> {

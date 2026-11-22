@@ -48,6 +48,7 @@ export interface ToolRuntimeHooks {
   getWorktreeManager: (repoRoot: string) => WorktreeManager;
   getMergeQueue: (repoRoot: string) => BisectingMergeQueue;
   getTaskSignal: (taskId: string) => AbortSignal | undefined;
+  resumeTask?: (taskId: string, opts?: { note?: string; profileId?: string; model?: string; effort?: string }) => Promise<TaskRecord>;
 }
 
 function requiredModel(args: Record<string, unknown>) {
@@ -618,6 +619,23 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
       type: "object",
       required: ["timer_id"],
       properties: { timer_id: { type: "string" }, reason: { type: "string" } },
+    },
+  },
+  {
+    name: "resume_task",
+    tiers: [1],
+    description:
+      "Resume a failed, crashed, or cancelled child task in-place (preserving its worktree, WIP commits, and recovery handoff) instead of spawning a duplicate task.",
+    inputSchema: {
+      type: "object",
+      required: ["task_id"],
+      properties: {
+        task_id: { type: "string", description: "Failed/crashed child task ID (e.g. t-2)." },
+        note: { type: "string", description: "Optional guidance for the resumed generation." },
+        model: { type: "string", description: "Optional replacement model ID from list_models." },
+        effort: { type: "string", description: "Optional reasoning effort override." },
+        profile_id: { type: "string", description: "Optional ACP/Pi profile override." },
+      },
     },
   },
 ];
@@ -1241,6 +1259,21 @@ export class ControlPlaneToolExecutor {
         );
         if (!cancelled) throw new Error(`Unknown timer ${args.timer_id}`);
         return { timer: cancelled };
+      }
+
+      case "resume_task": {
+        if (!this.hooks.resumeTask) throw new Error("resume_task hook is not available");
+        const target = this.db.getTask(String(args.task_id));
+        if (!target || target.runId !== runId || target.parentId !== taskId) {
+          throw new Error(`Unknown child task ${args.task_id}`);
+        }
+        const resumed = await this.hooks.resumeTask(target.id, {
+          note: typeof args.note === "string" ? args.note : undefined,
+          model: typeof args.model === "string" ? args.model : undefined,
+          effort: typeof args.effort === "string" ? args.effort : undefined,
+          profileId: optionalProfile(args.profile_id),
+        });
+        return { task: resumed, resumed: true };
       }
 
       default:

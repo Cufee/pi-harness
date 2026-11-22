@@ -251,12 +251,11 @@ export class AgentTranscriptOverlay implements Component {
     const t = this.opts.theme;
     this.lastWidth = width;
     const modelBase = this.opts.model || this.opts.profileId || "";
-    const modelStr = modelBase
-      ? this.opts.effort
-        ? `${modelBase} (${this.opts.effort})`
-        : modelBase
-      : "";
-    const modelPart = modelStr ? ` ${t.accent(`[${modelStr}]`)}` : "";
+    const modelParts = [
+      ...(modelBase ? [modelBase] : []),
+      ...(this.opts.effort ? [this.opts.effort] : []),
+    ];
+    const modelPart = modelParts.length > 0 ? ` ${t.dim("·")} ${t.accent(modelParts.join(" · "))}` : "";
     const header = fitWidth(
       `${t.accentBold(this.opts.taskId)} ${this.opts.title}${modelPart} ${t.dim(`· ${this.opts.runId} · read-only`)}`,
       width,

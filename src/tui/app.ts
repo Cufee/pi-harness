@@ -200,11 +200,11 @@ export function openRunsOverlay(ctx: {
       requestRender: ctx.requestRender,
     });
     const modelBase = row.model || row.profileId || "";
-    const modelTag = modelBase ? (row.effort ? `${modelBase} (thinking: ${row.effort})` : modelBase) : "";
+    const subParts = [row.runId, row.taskId, ...(modelBase ? [modelBase] : []), ...(row.effort ? [row.effort] : [])];
     handle = ctx.overlays.push(
       {
-        title: `Agent Transcript${row.effort ? ` · thinking: ${row.effort}` : ""}`,
-        subtitle: `${row.runId} · ${row.taskId}${modelTag ? ` · ${modelTag}` : ""}`,
+        title: "Agent Transcript",
+        subtitle: subParts.join(" · "),
         footer: "mouse wheel / ↑↓ scroll · read-only · Esc back to /runs",
       },
       comp,
@@ -1607,18 +1607,17 @@ export async function runNativeScrollbackTui(opts: {
   const footerHint = new FooterHint(theme);
   const overlays = new OverlayManager(tui, theme, composer);
 
-  const bannerMeta = [
-    `status: ${run.status}`,
-    `focus: ${focusedTaskId ?? "ALL"}`,
-    ...(initialModel ? [`model: ${initialModel}`] : []),
-    ...(initialEffort ? [`thinking: ${initialEffort}`] : []),
+  const runTitle = [
+    `pi-harness run ${opts.runId}`,
+    ...(initialModel ? [initialModel] : []),
+    ...(initialEffort ? [initialEffort] : []),
   ].join(" · ");
 
   streamContainer.addChild(
     new BannerCard(
       theme,
-      `pi-harness run ${opts.runId}${initialEffort ? ` [thinking: ${initialEffort}]` : ""}`,
-      bannerMeta,
+      runTitle,
+      `status: ${run.status} · focus: ${focusedTaskId ?? "ALL"}`,
     ),
   );
 

@@ -1100,10 +1100,21 @@ export class HarnessDaemon {
 
       case "run.resume": {
         const runId = String(p.runId);
-        return await this.orchestrator.resumeRunFromQuota(runId, {
+        return await this.orchestrator.resumeRun(runId, {
           trigger: "manual",
           userMessage: typeof p.message === "string" && p.message.trim() ? p.message.trim() : undefined,
+          note: typeof p.note === "string" && p.note.trim() ? p.note.trim() : undefined,
         });
+      }
+
+      case "task.resume": {
+        const task = await this.orchestrator.resumeTask(String(p.taskId), {
+          note: typeof p.note === "string" ? p.note : undefined,
+          model: typeof p.model === "string" ? p.model : undefined,
+          effort: typeof p.effort === "string" ? p.effort : undefined,
+          profileId: typeof p.profileId === "string" ? p.profileId : undefined,
+        });
+        return { resumed: true, task };
       }
 
       case "run.schedule_resume": {

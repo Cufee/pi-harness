@@ -266,6 +266,35 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
     },
   },
   {
+    name: "resume_task",
+    description:
+      "Resume a failed, crashed, or stopped task in-place (preserving its worktree, WIP commits, artifacts, and deterministic recovery handoff) instead of spawning a new duplicate task.",
+    inputSchema: {
+      type: "object",
+      required: ["task_id"],
+      properties: {
+        task_id: { type: "string", description: "Task ID to resume (e.g. t-2)." },
+        note: { type: "string", description: "Optional guidance for the resumed task." },
+        model: { type: "string", description: "Optional replacement model ID from list_models." },
+        effort: { type: "string", description: "Optional reasoning effort override." },
+        profile_id: { type: "string", description: "Optional ACP/Pi profile override." },
+      },
+    },
+  },
+  {
+    name: "resume_run",
+    description:
+      "Resume a failed, crashed, stopped, or quota-paused run (or Goal's linked run) in-place, restarting interrupted tasks with their preserved worktrees/handoffs while keeping completed work untouched.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        run_id: { type: "string", description: "Run ID to resume (e.g. run-1)." },
+        goal_id: { type: "string", description: "Goal ID whose linked run should be resumed (e.g. goal-1)." },
+        note: { type: "string", description: "Optional guidance for resumed tasks." },
+      },
+    },
+  },
+  {
     name: "schedule_timer",
     description:
       "Schedule a durable non-blocking timer (survives daemon restarts) to wake the Director after a delay or at an ISO timestamp (e.g. a model quota reset time), optionally pausing a Goal now and auto-resuming it when the timer fires. Work productively by default — use timers for self-pacing around usage/reset limits when instructed by the user or sessionModelContext, or for explicit reminders. End your turn after scheduling so the user stays unblocked.",
@@ -1508,6 +1537,34 @@ export class DirectorRuntime {
         const orch = this.db.listTasks(g.linkedRunId).find((t) => t.tier === 1);
         if (!orch) throw new Error("Orchestrator task not found");
         return { steered: await this.orchestrator.steerTask(orch.id, String(args.message)) };
+      }
+
+      case "resume_task": {
+        const resumed = await this.orchestrator.resumeTask(String(args.task_id), {
+          note: typeof args.note === "string" ? args.note : undefined,
+          model: typeof args.model === "string" ? args.model : undefined,
+          effort: typeof args.effort === "string" ? args.effort : undefined,
+          profileId: typeof args.profile_id === "string" && args.profile_id.trim() ? args.profile_id.trim() : undefined,
+        });
+        return { resumed: true, task: resumed };
+      }
+
+      case "resume_run": {
+        let runId = typeof args.run_id === "string" && args.run_id.trim() ? args.run_id.trim() : "";
+        if (!runId && typeof args.goal_id === "string" && args.goal_id.trim()) {
+          const g = this.goals.getGoal(args.goal_id.trim());
+          if (!g) throw new Error(`Unknown goal ${args.goal_id}`);
+          if (!g.linkedRunId) throw new Error(`Goal ${g.id} has no linked run yet`);
+          runId = g.linkedRunId;
+        }
+        if (!runId) throw new Error("resume_run requires run_id or goal_id");
+        const res = await this.orchestrator.resumeRun(runId, {
+          trigger: "manual",
+          note: typeof args.note === "string" ? args.note : undefined,
+        });
+        const activity = buildRunActivitySummary(this.db, res.run.id);
+        this.emitToolDisplay(chatSessionId, "run_status", buildRunActivityDisplay(activity));
+        return res;
       }
 
       case "schedule_timer": {

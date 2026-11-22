@@ -1047,7 +1047,7 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
         requestRender: () => {},
       });
       const headerLine = tr.render(100)[0]!.replace(/\x1b\[[0-9;]*m/g, "");
-      assert.ok(headerLine.includes("google/gemini-4-neon (high)"));
+      assert.ok(headerLine.includes("google/gemini-4-neon · high"));
 
       // 5. User message while Director is blocked in goal_wait immediately unblocks the wait without killing background work
       const waitChat = await client.request<{ session: { id: string } }>("chat.create", {
@@ -1473,6 +1473,58 @@ describe("Session Scoping, GoalHeader Separation, Mouse Wheel Transcript Scrolli
       })) as { timer: { id: string; status: string } };
       assert.equal(cancelled.timer.id, "timer-3");
       assert.equal(cancelled.timer.status, "cancelled");
+
+      // 5. Resuming crashed/failed tasks & runs in-place (preserving taskId, worktree, bumped generation & recovery handoff)
+      const crashGoal = daemon.director.goals.createGoal({
+        repoRoot: repoDir,
+        chatSessionId: chat.session.id,
+        title: "Crash recovery goal",
+        description: "Resume failed tasks in-place instead of spawning duplicates",
+        criteria: [{ kind: "deterministic", description: "Pass", command: "true" }],
+      });
+      const crashRun = daemon.db.createRun({ goal: crashGoal.title, repoRoot: repoDir, baseBranch: "main", baseSha: "abc" });
+      daemon.director.goals.linkRunAndStart(crashGoal.id, crashRun.id);
+
+      const doneWorker = daemon.db.createTask({
+        runId: crashRun.id,
+        tier: 2,
+        kind: "worker",
+        title: "Already finished worker",
+        objective: "Done before crash",
+        profileId: "acp:codex",
+        model: "openai/gpt-6.2-sol",
+        readOnly: true,
+      });
+      daemon.db.updateTask(doneWorker.id, { status: "completed", summary: "Finished cleanly" });
+
+      const crashedWorker = daemon.db.createTask({
+        runId: crashRun.id,
+        tier: 2,
+        kind: "worker",
+        title: "Interrupted worker",
+        objective: "Mid-flight when daemon restarted",
+        profileId: "acp:codex",
+        model: "openai/gpt-6.2-sol",
+        effort: "medium",
+        readOnly: true,
+      });
+      daemon.db.updateTask(crashedWorker.id, { status: "failed", summary: "Daemon restarted while task was in progress" });
+      daemon.db.updateRunStatus(crashRun.id, "failed");
+      const taskCountBefore = daemon.db.listTasks(crashRun.id).length;
+
+      // Director resumes the failed run via `resume_run` (passing goal_id) — NO duplicate task created!
+      const resumeRes = (await daemon.director.executeDirectorMcpTool(chat.session.id, "resume_run", {
+        goal_id: crashGoal.id,
+        note: "Continue from preserved state after daemon restart",
+      })) as { resumed: boolean; resumedTaskIds: string[] };
+      assert.equal(resumeRes.resumed, true);
+      assert.deepEqual(resumeRes.resumedTaskIds, [crashedWorker.id]);
+      assert.equal(daemon.db.listTasks(crashRun.id).length, taskCountBefore, "Resuming must not spawn duplicate tasks");
+
+      const afterResume = daemon.db.getTask(crashedWorker.id)!;
+      assert.equal(afterResume.generation, 2, "Resumed task must advance generation in-place");
+      assert.ok(afterResume.handoffJson?.includes("Continue from preserved state after daemon restart"));
+      assert.equal(daemon.db.getTask(doneWorker.id)?.generation, 1, "Completed sibling must remain untouched");
     } finally {
       client.close();
       await daemon.stop();
