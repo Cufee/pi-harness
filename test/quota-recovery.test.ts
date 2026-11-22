@@ -9,6 +9,7 @@ import { agent } from "@agentclientprotocol/sdk/unstable";
 import { create, toJsonString } from "@bufbuild/protobuf";
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import { ModelCatalogCompiler } from "../src/catalog/compiler.js";
 import { defaultProfiles, loadConfig, type AcpProfileConfig } from "../src/config.js";
 import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
@@ -38,6 +39,35 @@ function initTempGitRepo(): string {
   return dir;
 }
 
+function quotaRunConfig(repoDir: string, stateDir: string) {
+  const cfg = loadConfig(repoDir);
+  cfg.stateDir = stateDir;
+  cfg.socketPath = join(stateDir, "d.sock");
+  cfg.quotaEndpoint = undefined;
+  cfg.quotaRetry.autoResumeEnabled = true;
+  cfg.catalog = { ttlHours: 24 };
+  cfg.worktree = { dir: ".harness/worktrees", archiveRetentionDays: 7, maxConcurrentWorkers: 2 };
+  cfg.codeMode = "off";
+  cfg.profiles = [
+    ...defaultProfiles().filter((profile) => ["acp:claude", "acp:codex"].includes(profile.id)),
+    { id: "pi:local", kind: "pi", provider: "fixture", billing: "local", models: ["coordinator"] },
+  ];
+  cfg.defaultOrchestratorProfile = "pi:local";
+  const compiler = new ModelCatalogCompiler(cfg);
+  const catalog = compiler.compileFromData({
+    enabledProfiles: cfg.profiles,
+    inventory: new Map([
+      ["pi:local", [{ wireModelId: "coordinator" }]],
+      ["acp:claude", [{ wireModelId: "claude-sonnet-4-5" }]],
+      ["acp:codex", [{ wireModelId: "gpt-5" }]],
+    ]),
+    profileStatuses: cfg.profiles.map((profile) => ({ profileId: profile.id, status: "ok", modelCount: 1 })),
+    modelsDev: [], openRouter: [], litellmDep: new Map(), benchmarks: [], sources: [],
+  });
+  writeFileSync(compiler.cachePath, JSON.stringify(catalog));
+  return cfg;
+}
+
 async function waitUntil(pred: () => boolean, timeoutMs = 4000, stepMs = 25): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -50,15 +80,15 @@ async function waitUntil(pred: () => boolean, timeoutMs = 4000, stepMs = 25): Pr
 describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quota State Machine", () => {
   it("recovers when an ACP agent stops silently after a failed tool call, and lets the model report inability cleanly", async () => {
     let promptCalls = 0;
-    let bareHarnessAllowed = false;
+    let titleOnlyRequestDenied = false;
 
     const mockAgent = agent()
-      .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
-      .onRequest("session/new", async () => ({ sessionId: "sess-rec" } as never))
+      .onRequest("initialize", async () => ({ protocolVersion: 1, agentInfo: { name: "@agentclientprotocol/claude-agent-acp", version: "0.109.1" } } as never))
+      .onRequest("session/new", async () => ({ sessionId: "sess-rec", models: { currentModelId: "fixture", availableModels: [{ modelId: "fixture", name: "Fixture" }] } } as never))
       .onRequest("session/prompt", async ({ client: acpClient }) => {
         promptCalls++;
         if (promptCalls === 1) {
-          // Bare harness tool name (like amp-acp emits) should be ALLOWED even in read-only mode
+          // A display title cannot authorize native execution.
           const perm = (await acpClient.request("session/request_permission", {
             sessionId: "sess-rec",
             toolCall: { toolCallId: "tc-h", title: "goal_create", kind: "execute" },
@@ -67,7 +97,7 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
               { optionId: "deny", kind: "reject_once", name: "Deny" },
             ],
           } as never)) as unknown as { outcome: { optionId?: string } };
-          bareHarnessAllowed = perm.outcome.optionId === "allow";
+          titleOnlyRequestDenied = perm.outcome.optionId === "deny";
 
           // Simulate a failing tool followed by silent end_turn (the bug that caused `(done)`)
           await acpClient.notify("session/update", {
@@ -95,9 +125,9 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
       });
 
     const runner = new AcpRunner({
-      id: "acp:amp",
+      id: "acp:claude",
       kind: "acp",
-      adapter: "generic",
+      adapter: "claude",
       command: "noop",
       billing: "subscription",
     });
@@ -109,7 +139,8 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
         tier: 1,
         kind: "orchestrator",
         cwd: process.cwd(),
-        readOnly: true,
+        toolPolicy: "control_plane_only",
+        model: "fixture",
         systemPrompt: "Director",
         initialPrompt: "Edit a file",
         maxTurns: 5,
@@ -121,19 +152,19 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
       mockAgent,
     );
 
-    assert.equal(bareHarnessAllowed, true);
+    assert.equal(titleOnlyRequestDenied, true);
     assert.equal(promptCalls, 2);
     assert.equal(res.stopReason, "completed");
     assert.ok(res.text.includes("unable to modify files"));
 
-    // Verify writable amp-acp sessions automatically enable permission=bypass
+    // Writable sessions retain per-call approval.
     const post = buildPostSessionActions(
       "generic",
       "s1",
       { configOptions: [{ id: "permission", options: [{ value: "default" }, { value: "bypass" }] }] },
-      { readOnly: false },
+      { toolPolicy: "read_write_workspace", model: "fixture" },
     );
-    assert.ok(post.some((a) => a.method === "session/set_config_option" && a.params.configId === "permission" && a.params.value === "bypass"));
+    assert.ok(!post.some((a) => a.method === "session/set_config_option" && a.params.configId === "permission" && a.params.value === "bypass"));
   });
 
   it("never trips circuit breaker on exploratory failures with successes, but breaks wedged 6x identical failure loops", async () => {
@@ -141,7 +172,7 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
     let exploratoryPrompts = 0;
     const exploratoryAgent = agent()
       .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
-      .onRequest("session/new", async () => ({ sessionId: "sess-exp" } as never))
+      .onRequest("session/new", async () => ({ sessionId: "sess-exp", models: { currentModelId: "fixture", availableModels: [{ modelId: "fixture", name: "Fixture" }] } } as never))
       .onRequest("session/prompt", async ({ client: acpClient }) => {
         exploratoryPrompts++;
         for (let i = 0; i < 10; i++) {
@@ -189,7 +220,8 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
         tier: 2,
         kind: "worker",
         cwd: process.cwd(),
-        readOnly: false,
+        toolPolicy: "read_write_workspace",
+        model: "fixture",
         systemPrompt: "Worker",
         initialPrompt: "Explore",
         maxTurns: 10,
@@ -209,7 +241,7 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
     let cancelHit = false;
     const wedgedAgent = agent()
       .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
-      .onRequest("session/new", async () => ({ sessionId: "sess-wedge" } as never))
+      .onRequest("session/new", async () => ({ sessionId: "sess-wedge", models: { currentModelId: "fixture", availableModels: [{ modelId: "fixture", name: "Fixture" }] } } as never))
       .onNotification("session/cancel", async () => {
         cancelHit = true;
       })
@@ -248,7 +280,8 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
         tier: 2,
         kind: "worker",
         cwd: process.cwd(),
-        readOnly: false,
+        toolPolicy: "read_write_workspace",
+        model: "fixture",
         systemPrompt: "Worker",
         initialPrompt: "Call service",
         maxTurns: 10,
@@ -278,7 +311,7 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
     const retryEvents1: QuotaRetryStateEvent[] = [];
     const recoveringAgent = agent()
       .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
-      .onRequest("session/new", async () => ({ sessionId: "sess-pool-ok" } as never))
+      .onRequest("session/new", async () => ({ sessionId: "sess-pool-ok", models: { currentModelId: "fixture", availableModels: [{ modelId: "fixture", name: "Fixture" }] } } as never))
       .onRequest("session/prompt", async ({ client: acpClient }) => {
         for (let i = 0; i < 2; i++) {
           await acpClient.notify("session/update", {
@@ -310,7 +343,8 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
         tier: 2,
         kind: "worker",
         cwd: process.cwd(),
-        readOnly: false,
+        toolPolicy: "read_write_workspace",
+        model: "fixture",
         systemPrompt: "Worker",
         initialPrompt: "Work",
         maxTurns: 5,
@@ -333,7 +367,7 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
     let cancelSignaled = false;
     const stalledAgent = agent()
       .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
-      .onRequest("session/new", async () => ({ sessionId: "sess-stall" } as never))
+      .onRequest("session/new", async () => ({ sessionId: "sess-stall", models: { currentModelId: "fixture", availableModels: [{ modelId: "fixture", name: "Fixture" }] } } as never))
       .onNotification("session/cancel", async () => {
         cancelSignaled = true;
       })
@@ -360,7 +394,8 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
         tier: 2,
         kind: "worker",
         cwd: process.cwd(),
-        readOnly: false,
+        toolPolicy: "read_write_workspace",
+        model: "fixture",
         systemPrompt: "Worker",
         initialPrompt: "Work",
         maxTurns: 5,
@@ -381,16 +416,12 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
   it("handles quiescence barrier without Quota Endpoint (manual stop + user-chosen wait timer + manual resume reset & re-pause)", async () => {
     const repoDir = initTempGitRepo();
     const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-qstate-"));
-    const sockPath = join(stateDir, "d.sock");
 
     let quotaStillExhausted = true;
     let runAttempts = 0;
     let lastHydratedPrompt = "";
 
-    const cfg = loadConfig(repoDir);
-    cfg.stateDir = stateDir;
-    cfg.socketPath = sockPath;
-    cfg.quotaEndpoint = undefined; // NO Quota Endpoint wired!
+    const cfg = quotaRunConfig(repoDir, stateDir);
 
     const daemon = new HarnessDaemon(cfg, {
       dbPath: join(stateDir, "cp.sqlite"),
@@ -420,7 +451,7 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
     });
 
     await daemon.start();
-    const client = new DaemonClient(sockPath);
+    const client = new DaemonClient(cfg.socketPath);
     await client.connect();
 
     try {
@@ -463,7 +494,6 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
   it("auto-resumes after quiescence using live Quota Endpoint nextAvailableAt while letting healthy siblings finish first", async () => {
     const repoDir = initTempGitRepo();
     const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-qep-"));
-    const sockPath = join(stateDir, "d.sock");
 
     let endpointAvailable = false;
     let resetAtMs = Date.now() + 350;
@@ -506,11 +536,7 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
     const port = (server.address() as { port: number }).port;
 
-    const cfg = loadConfig(repoDir);
-    // Pin built-in profiles: the host ~/.pi-harness/config.json may omit acp:claude, which would silently remap Worker A to another profile.
-    cfg.profiles = defaultProfiles();
-    cfg.stateDir = stateDir;
-    cfg.socketPath = sockPath;
+    const cfg = quotaRunConfig(repoDir, stateDir);
     cfg.quotaEndpoint = { url: `http://127.0.0.1:${port}/v1/quota`, format: "protojson", pollIntervalSec: 1 };
     cfg.quotaRetry.earlyWakePollMs = 5_000;
 
@@ -531,12 +557,14 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
                 objective: "Slice A",
                 write_scopes: ["a/**"],
                 profile_id: "acp:claude",
+                model: "claude-sonnet-4-5",
               });
               await req.executeTool("spawn_worker", {
                 title: "Worker B (healthy)",
                 objective: "Slice B",
                 write_scopes: ["b/**"],
                 profile_id: "acp:codex",
+                model: "gpt-5",
               });
             }
             await req.executeTool("wait_children", { mode: "all", timeout_s: 5 });
@@ -581,7 +609,7 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
       const { run } = await daemon.orchestrator.startRun({
         goal: "Parallel workers with one quota-paused and one healthy",
         repoRoot: repoDir,
-        profileId: "acp:codex",
+        profileId: "pi:local",
       });
 
       // Wait for quiescence barrier: Worker B MUST finish before run enters paused_quota!
