@@ -1,8 +1,9 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AcpAdapterKind, AcpProfileConfig } from "../config.js";
+import type { AcpAdapterKind, AcpProfileConfig, RunnerProfileConfig } from "../config.js";
 import type { ArtifactRecord } from "../control-plane/db.js";
+import type { ToolPolicy } from "./types.js";
 
 export interface PreparedAcpSpawn {
   command: string;
@@ -21,19 +22,27 @@ export interface AcpMcpServerEntry {
 }
 
 /**
- * Implements the 4 verified per-adapter shims discovered in our live ACP audit:
- * 1. System prompt injection (Claude native, Codex append, Gemini GEMINI_SYSTEM_MD env shim)
- * 2. Model & effort selection (Claude session/new configOptions, Codex post-new set_config_option, Gemini set_model)
- * 3. Strict read-only & anti-subagent guards (Claude disallowedTools, Codex read-only + multi_agent=false, Gemini plan + fs proxy)
- * 4. Artifact indexing off kind + locations + content.diff (rawInput/rawOutput optional because Gemini omits them)
+ * Workspace policies constrain ACP filesystem callbacks and approvals. A CLI
+ * can perform native operations internally under its own sandbox rules.
+ * Control-plane sessions additionally require native tools to be disabled.
  */
+export function supportsToolPolicy(profile: RunnerProfileConfig, policy: ToolPolicy): boolean {
+  if (profile.enabled === false) return false;
+  if (profile.kind === "pi") return true;
+  if (policy === "control_plane_only") return profile.adapter === "claude";
+  return policy === "read_write_workspace" || profile.adapter !== "generic";
+}
+
 export function prepareAcpSpawn(
   profile: AcpProfileConfig,
   opts: {
     systemPrompt: string;
-    readOnly: boolean;
+    toolPolicy: ToolPolicy;
   },
 ): PreparedAcpSpawn {
+  if (!supportsToolPolicy(profile, opts.toolPolicy)) {
+    throw new Error(`Profile ${profile.id} does not support ${opts.toolPolicy}. Select a compatible enabled profile.`);
+  }
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v !== undefined) env[k] = v;
@@ -52,7 +61,7 @@ export function prepareAcpSpawn(
   } else if (profile.adapter === "codex") {
     // Block Codex's internal multi_agent subagents so all subagents stay in our harness tree
     args.push("-c", "features.multi_agent=false");
-    if (opts.readOnly) {
+    if (opts.toolPolicy !== "read_write_workspace") {
       env.INITIAL_AGENT_MODE = "read-only";
     }
   } else if (profile.adapter === "gemini") {
@@ -66,7 +75,7 @@ export function prepareAcpSpawn(
     prependSystemPromptToTurn1 = true;
   }
 
-  if (opts.readOnly && profile.readOnlyArgs?.length) {
+  if (opts.toolPolicy !== "read_write_workspace" && profile.readOnlyArgs?.length) {
     args.push(...profile.readOnlyArgs);
   }
 
@@ -92,8 +101,8 @@ export function buildNewSessionParams(
   opts: {
     cwd: string;
     systemPrompt: string;
-    readOnly: boolean;
-    model?: string | null;
+    toolPolicy: ToolPolicy;
+    model: string;
     effort?: string | null;
     mcpServers: AcpMcpServerEntry[];
     agentCapabilities?: Record<string, unknown>;
@@ -127,16 +136,21 @@ export function buildNewSessionParams(
   // Shim 2 & 3 for Claude: initial configOptions + disallowedTools via _meta.claudeCode.options
   if (adapter === "claude") {
     const disallowed = ["Agent", "Task"];
-    if (opts.readOnly) {
+    if (opts.toolPolicy !== "read_write_workspace") {
       disallowed.push("Write", "Edit", "MultiEdit", "NotebookEdit", "Bash");
     }
+    if (opts.toolPolicy === "control_plane_only") disallowed.push("Read", "Grep", "Glob");
     const claudeOptions: Record<string, unknown> = {
       disallowedTools: disallowed,
+      ...(opts.toolPolicy === "control_plane_only" ? {
+        tools: [],
+        settingSources: [],
+        strictMcpConfig: true,
+        allowDangerouslySkipPermissions: false,
+      } : {}),
       settings: { autoCompactEnabled: false },
     };
-    // Never hand Claude Code a company prefix (`anthropic/claude-opus-5-5` -> `claude-opus-5-5`)
-    const nativeModel = opts.model ? stripSingleVendorPrefix(adapter, opts.model) : null;
-    if (nativeModel) claudeOptions.model = nativeModel;
+    claudeOptions.model = opts.model;
     if (opts.effort) claudeOptions.effort = opts.effort;
 
     params._meta = {
@@ -147,7 +161,7 @@ export function buildNewSessionParams(
 
     if (sessionCaps.options) {
       const cfg: Array<{ configId: string; value: string }> = [];
-      if (nativeModel) cfg.push({ configId: "model", value: nativeModel });
+      cfg.push({ configId: "model", value: opts.model });
       if (opts.effort) cfg.push({ configId: "effort", value: opts.effort });
       if (cfg.length > 0) params.configOptions = cfg;
     }
@@ -159,89 +173,21 @@ export function buildNewSessionParams(
 export interface PostSessionAction {
   method: "session/set_mode" | "session/set_config_option" | "session/set_model";
   params: Record<string, unknown>;
+  /** Prompting is unsafe unless this setter succeeds for the exact wire ID. */
+  requiredModel?: string;
 }
 
-export interface NativeModelCandidate {
-  value: string;
-  name?: string;
-}
+interface SelectValue { value: string; name?: string }
 
-interface AcpConfigOption {
+export interface AcpConfigOption {
   id: string;
   category?: string;
   currentValue?: unknown;
-  options?: Array<{ value: string; name?: string }>;
+  options?: Array<SelectValue | { options: SelectValue[] }>;
 }
 
-/** Vendor prefixes each single-vendor adapter never accepts on the wire. */
-const SINGLE_VENDOR_PREFIXES: Partial<Record<AcpAdapterKind, string[]>> = {
-  claude: ["anthropic/"],
-  codex: ["openai/"],
-  gemini: ["google/"],
-};
-
-/** `google-vertex/gemini-4-carbon` -> `gemini-4-carbon` */
-export function stripVendorPrefix(model: string): string {
-  return model.includes("/") ? model.slice(model.lastIndexOf("/") + 1) : model;
-}
-
-/** Strips only the company prefix a single-vendor adapter can never accept (`openai/` for Codex, etc.). */
-export function stripSingleVendorPrefix(adapter: AcpAdapterKind, model: string): string {
-  const prefix = SINGLE_VENDOR_PREFIXES[adapter]?.find((p) => model.toLowerCase().startsWith(p));
-  return prefix ? model.slice(prefix.length) : model;
-}
-
-/** `Claude Opus 5.5` / `claude-opus-5.5` / `opus-5-5` -> `opus-5-5` */
-function normalizeModelName(raw: string): string {
-  return stripVendorPrefix(raw)
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .replace(/^claude-/, "");
-}
-
-const CLAUDE_FAMILIES = ["opus", "sonnet", "haiku", "fable"];
-
-/** `claude-opus-5-5` / `opus` / `Opus 5.5` -> `opus` */
-function modelFamily(raw: string): string | null {
-  const norm = normalizeModelName(raw);
-  return CLAUDE_FAMILIES.find((f) => norm === f || norm.startsWith(`${f}-`)) ?? null;
-}
-
-/**
- * Resolves a requested model (canonical `vendor/name`, bare, or wire ID) to the adapter's native option value.
- * Priority: exact value; bare name on both sides; normalized name; Claude family alias (`claude-opus-*` <-> `opus`);
- * then, for single-vendor adapters, the requested ID with its company prefix stripped. Returns null when a
- * multi-vendor adapter (generic/amp) advertises nothing that matches.
- */
-export function resolveNativeModelOption(
-  adapter: AcpAdapterKind,
-  requested: string,
-  candidates: NativeModelCandidate[],
-): string | null {
-  const exact = candidates.find((c) => c.value === requested);
-  if (exact) return exact.value;
-
-  const bare = stripVendorPrefix(requested).toLowerCase();
-  const bareMatch = candidates.find((c) => stripVendorPrefix(c.value).toLowerCase() === bare);
-  if (bareMatch) return bareMatch.value;
-
-  const norm = normalizeModelName(requested);
-  const normMatch = candidates.find(
-    (c) => normalizeModelName(c.value) === norm || (c.name !== undefined && normalizeModelName(c.name) === norm),
-  );
-  if (normMatch) return normMatch.value;
-
-  const family = modelFamily(requested);
-  if (family) {
-    const familyMatch =
-      candidates.find((c) => normalizeModelName(c.value) === family) ??
-      candidates.find((c) => modelFamily(c.value) === family) ??
-      candidates.find((c) => c.name !== undefined && modelFamily(c.name) === family);
-    if (familyMatch) return familyMatch.value;
-  }
-
-  return SINGLE_VENDOR_PREFIXES[adapter] ? stripSingleVendorPrefix(adapter, requested) : null;
+export function selectValues(option?: AcpConfigOption): SelectValue[] | undefined {
+  return option?.options?.flatMap((item) => "options" in item ? item.options : [item]);
 }
 
 /**
@@ -252,7 +198,7 @@ export function buildPostSessionActions(
   adapter: AcpAdapterKind,
   sessionId: string,
   newSessionResponse: Record<string, unknown>,
-  opts: { readOnly: boolean; model?: string | null; effort?: string | null },
+  opts: { toolPolicy: ToolPolicy; model: string; effort?: string | null },
 ): PostSessionAction[] {
   const actions: PostSessionAction[] = [];
   const configOptions = (newSessionResponse.configOptions ?? []) as AcpConfigOption[];
@@ -260,22 +206,11 @@ export function buildPostSessionActions(
     | { currentModelId?: string; availableModels?: Array<{ modelId: string; name?: string }> }
     | undefined;
 
-  // Read-only mode selection (and automatic bypass permission for writable autonomous workers when supported, e.g. amp-acp)
-  if (opts.readOnly) {
+  if (opts.toolPolicy === "read_only_workspace") {
     if (adapter === "codex") {
       actions.push({ method: "session/set_mode", params: { sessionId, modeId: "read-only" } });
     } else if (adapter === "claude" || adapter === "gemini") {
       actions.push({ method: "session/set_mode", params: { sessionId, modeId: "plan" } });
-    }
-  } else {
-    const permOpt = configOptions.find(
-      (c) => c.id === "permission" && c.options?.some((o) => o.value === "bypass"),
-    );
-    if (permOpt) {
-      actions.push({
-        method: "session/set_config_option",
-        params: { sessionId, configId: permOpt.id, value: "bypass" },
-      });
     }
   }
 
@@ -284,49 +219,30 @@ export function buildPostSessionActions(
     (c) => c.category === "thought_level" || c.id === "reasoning_effort" || c.id === "effort",
   );
 
-  // Model selection: reconcile the requested ID against what the adapter advertises
-  if (opts.model) {
-    const candidates: NativeModelCandidate[] = [
-      ...(modelOpt?.options ?? []),
-      ...(legacyModels?.availableModels ?? []).map((m) => ({ value: m.modelId, name: m.name })),
-    ];
-    const advertised = new Set(candidates.map((c) => c.value));
-    const resolved = resolveNativeModelOption(adapter, opts.model, candidates);
-    const current = modelOpt?.currentValue ?? legacyModels?.currentModelId;
-
-    if (adapter === "gemini") {
-      // gemini --acp only honors the legacy session/set_model
-      if (resolved && resolved !== current) {
-        actions.push({ method: "session/set_model", params: { sessionId, modelId: resolved } });
-      }
-    } else if (adapter === "claude") {
-      // Initial model went via _meta on session/new; only correct it to an advertised native option
-      if (modelOpt && resolved && advertised.has(resolved) && resolved !== current) {
-        actions.push({
-          method: "session/set_config_option",
-          params: { sessionId, configId: modelOpt.id, value: resolved },
-        });
-      }
-    } else if (adapter === "codex" || modelOpt) {
-      // Codex does not apply initial session.options on session/new — set model first, then reasoning_effort.
-      // When options are advertised, only send one of them; otherwise trust the resolved/requested ID.
-      const value = candidates.length > 0 ? (resolved && advertised.has(resolved) ? resolved : null) : (resolved ?? opts.model);
-      if (value && value !== current) {
-        actions.push({
-          method: "session/set_config_option",
-          params: { sessionId, configId: modelOpt?.id ?? "model", value },
-        });
-      }
-    } else if (resolved && resolved !== current) {
-      actions.push({ method: "session/set_model", params: { sessionId, modelId: resolved } });
-    }
+  const model = opts.model;
+  if (!model?.trim()) throw new Error(`${adapter}: a nonblank wire model ID is required`);
+  // Never translate the catalog's selected wire ID. Check the list belonging to
+  // the setter we will use, not the union of two potentially different lists.
+  const useConfig = adapter !== "gemini" && (modelOpt !== undefined || adapter === "codex" || (adapter === "claude" && !legacyModels));
+  const configIds = selectValues(modelOpt)?.map((o) => o.value);
+  const legacyIds = legacyModels?.availableModels?.map((m) => m.modelId);
+  const advertised = useConfig ? configIds ?? legacyIds : legacyIds ?? configIds;
+  if (advertised && !advertised.includes(model)) {
+    throw new Error(`${adapter}: requested model '${model}' is not advertised by this session`);
+  }
+  const current = useConfig ? modelOpt?.currentValue ?? legacyModels?.currentModelId : legacyModels?.currentModelId ?? modelOpt?.currentValue;
+  if (model !== current) {
+    actions.push(useConfig
+      ? { method: "session/set_config_option", params: { sessionId, configId: modelOpt?.id ?? "model", value: model }, requiredModel: model }
+      : { method: "session/set_model", params: { sessionId, modelId: model }, requiredModel: model });
   }
 
   // Effort selection: only send a value the adapter advertises; skip cleanly otherwise
   if (opts.effort) {
     const wanted = opts.effort.toLowerCase();
-    if (effortOpt?.options?.length) {
-      const match = effortOpt.options.find(
+    const efforts = selectValues(effortOpt);
+    if (effortOpt && efforts?.length) {
+      const match = efforts.find(
         (o) => o.value.toLowerCase() === wanted || o.name?.toLowerCase() === wanted,
       );
       if (match && match.value !== effortOpt.currentValue) {
