@@ -552,6 +552,7 @@ export class DirectorRuntime {
         model: session.model,
         effort: session.effort,
         maxTurns: 12,
+        quotaRetryTimeoutMs: this.config.quotaRetry.nativeRetryTimeoutMs,
         tools: DIRECTOR_TOOLS,
         executeTool: (name, args) => this.executeDirectorTool(session.id, session.repoRoot, name, args),
         daemonSocketPath: this.config.socketPath,
@@ -560,10 +561,23 @@ export class DirectorRuntime {
         callbacks: {
           onTextDelta: onDelta,
           onToolEvent,
+          onPassiveQuota: (sig) => this.quota.ingestPassiveSignal(sig),
         },
       });
 
-      const assistantTurn = this.chats.appendTurn(chatSessionId, "assistant", res.text.trim() || "(done)");
+      let content = res.text.trim();
+      if (res.stopReason === "quota_paused") {
+        const qp = res.quotaPause;
+        const resetNote = qp?.resetAt ? ` · estimated reset: ${qp.resetAt}` : "";
+        const pauseLine = `Paused early due to quota / rate limit (${qp?.reason ?? "quota exhausted"}${resetNote}). Send another message anytime to retry or switch models with /model.`;
+        content = content ? `${content}\n\n${pauseLine}` : pauseLine;
+      } else if (!content && res.toolFailures?.length) {
+        content = `Stopped after tool failure without a final response:\n${res.toolFailures.map((f) => `- ${f}`).join("\n")}`;
+      } else if (!content) {
+        content = "(done)";
+      }
+
+      const assistantTurn = this.chats.appendTurn(chatSessionId, "assistant", content);
       return { userTurn, assistantTurn };
     } finally {
       if (this.activeChatAborts.get(chatSessionId) === abort) {

@@ -41,13 +41,49 @@ export function formatResetCountdown(iso?: string | null): string {
   const diffMs = Date.parse(iso) - Date.now();
   if (!Number.isFinite(diffMs)) return "";
   if (diffMs <= 0) return "resetting now";
+  const secs = Math.ceil(diffMs / 1000);
+  if (secs < 60) return `in ${secs}s`;
   const mins = Math.ceil(diffMs / 60_000);
-  if (mins < 60) return `resets in ${mins}m`;
+  if (mins < 60) return `in ${mins}m`;
   const hrs = Math.floor(mins / 60);
   const rem = mins % 60;
-  if (hrs < 24) return `resets in ${hrs}h ${rem}m`;
+  if (hrs < 24) return `in ${hrs}h ${rem}m`;
   const days = Math.floor(hrs / 24);
-  return `resets in ${days}d ${hrs % 24}h`;
+  return `in ${days}d ${hrs % 24}h`;
+}
+
+/**
+ * Parses human wait durations like `"30s"`, `"15m"`, `"1h"`, `"1h30m"`, or plain minutes (`"10"` -> 10m).
+ * Returns milliseconds or `null` if invalid.
+ */
+export function parseDurationMs(raw: string): number | null {
+  const s = raw.trim().toLowerCase().replace(/^in\s+/, "");
+  if (!s) return null;
+  if (/^\d+$/.test(s)) {
+    const mins = Number(s);
+    return mins > 0 ? mins * 60_000 : null;
+  }
+  const rx = /(\d+(?:\.\d+)?)\s*(ms|seconds|second|secs|sec|s|minutes|minute|mins|min|m|hours|hour|hrs|hr|h)(?=\s|\d|$)/g;
+  let totalMs = 0;
+  let matchedAny = false;
+  let consumed = "";
+  let m: RegExpExecArray | null;
+  while ((m = rx.exec(s)) !== null) {
+    matchedAny = true;
+    consumed += m[0];
+    const val = Number(m[1]);
+    const unit = m[2]!;
+    if (!Number.isFinite(val) || val <= 0) return null;
+    if (unit === "ms") totalMs += val;
+    else if (unit.startsWith("s")) totalMs += val * 1000;
+    else if (unit.startsWith("m")) totalMs += val * 60_000;
+    else if (unit.startsWith("h")) totalMs += val * 3_600_000;
+  }
+  if (!matchedAny || totalMs <= 0) return null;
+  // Reject strings with unrecognized trailing junk
+  const leftover = s.replace(rx, "").trim();
+  if (leftover.length > 0) return null;
+  return Math.round(totalMs);
 }
 
 /** Strips `pi-tui` Input's built-in `> ` prefix so search bars render cleanly with a single icon. */
@@ -954,7 +990,7 @@ export class RunsOverlay implements Component {
   constructor(
     private readonly theme: HarnessTheme,
     private runs: RunRecord[],
-    private readonly onAction: (action: "inspect" | "stop", run: RunRecord) => void,
+    private readonly onAction: (action: "inspect" | "stop" | "resume" | "wait", run: RunRecord) => void,
     private readonly onClose: () => void,
     private readonly rerender: () => void,
   ) {}
@@ -974,6 +1010,12 @@ export class RunsOverlay implements Component {
       const r = this.runs[this.selected]!;
       if (matchesKey(data, "enter")) {
         this.onAction("inspect", r);
+        this.onClose();
+      } else if (data === "r") {
+        this.onAction("resume", r);
+        this.onClose();
+      } else if (data === "w") {
+        this.onAction("wait", r);
         this.onClose();
       } else if (data === "x") {
         this.onAction("stop", r);
@@ -1003,7 +1045,7 @@ export class RunsOverlay implements Component {
         },
         {
           header: "STATUS",
-          width: 11,
+          width: 14,
           priority: 0,
           render: ({ r }) => {
             const tone =
@@ -1011,10 +1053,13 @@ export class RunsOverlay implements Component {
                 ? "success"
                 : r.status === "failed" || r.status === "stopped"
                   ? "error"
-                  : r.status === "active"
-                    ? "accent"
-                    : "neutral";
-            return badge(r.status.toUpperCase(), tone, this.theme);
+                  : r.status === "paused_quota"
+                    ? "warning"
+                    : r.status === "active"
+                      ? "accent"
+                      : "neutral";
+            const label = r.status === "paused_quota" ? "PAUSED QUOTA" : r.status.toUpperCase();
+            return badge(label, tone, this.theme);
           },
         },
         {
@@ -1028,6 +1073,146 @@ export class RunsOverlay implements Component {
       width,
       this.theme,
     );
+  }
+}
+
+/**
+ * Interactive Quota Resume / Wait-Duration Picker (`/resume` or `w` in `/runs`):
+ * Lets the user either resume immediately (resetting the quota state machine) or
+ * choose how long to wait before automatic restart when no Quota Endpoint is configured.
+ */
+export class QuotaWaitPickerOverlay implements Component, Focusable {
+  private selected = 0;
+  private customMode = false;
+  private customInput: Input;
+  private customError = "";
+  private _focused = true;
+
+  private readonly choices: Array<{
+    id: string;
+    label: string;
+    description: string;
+    delayMs?: number;
+  }> = [
+    { id: "now", label: "Resume now", description: "Reset quota state machine & restart paused tasks immediately" },
+    { id: "5m", label: "Wait 5 minutes", description: "Auto-resume in 5m (good for short rate-limit windows)", delayMs: 5 * 60_000 },
+    { id: "15m", label: "Wait 15 minutes", description: "Auto-resume in 15m", delayMs: 15 * 60_000 },
+    { id: "30m", label: "Wait 30 minutes", description: "Auto-resume in 30m", delayMs: 30 * 60_000 },
+    { id: "1h", label: "Wait 1 hour", description: "Auto-resume in 1h", delayMs: 60 * 60_000 },
+    { id: "2h", label: "Wait 2 hours", description: "Auto-resume in 2h", delayMs: 2 * 60 * 60_000 },
+    { id: "custom", label: "Custom wait…", description: "Enter any duration (e.g. 90s, 10m, 1h30m, 4h)" },
+  ];
+
+  constructor(
+    private readonly theme: HarnessTheme,
+    private readonly runId: string,
+    private readonly reason: string,
+    private readonly currentResumeAt: string | null,
+    private readonly onChoose: (choice: { kind: "now" } | { kind: "wait"; delayMs: number }) => void,
+    private readonly onClose: () => void,
+    private readonly rerender: () => void,
+  ) {
+    this.customInput = new Input();
+    this.customInput.focused = true;
+    this.customInput.onEscape = () => {
+      this.customMode = false;
+      this.customError = "";
+      this.rerender();
+    };
+    this.customInput.onSubmit = (val) => {
+      const ms = parseDurationMs(val);
+      if (!ms) {
+        this.customError = 'Enter a valid duration like "10m", "90s", or "1h30m".';
+        this.rerender();
+        return;
+      }
+      this.onClose();
+      this.onChoose({ kind: "wait", delayMs: ms });
+    };
+  }
+
+  get focused(): boolean {
+    return this._focused;
+  }
+
+  set focused(val: boolean) {
+    this._focused = val;
+    this.customInput.focused = val;
+  }
+
+  handleInput(data: string): void {
+    if (this.customMode) {
+      this.customInput.handleInput(data);
+      this.rerender();
+      return;
+    }
+    if (matchesKey(data, "escape") || data === "q") {
+      this.onClose();
+      return;
+    }
+    if (matchesKey(data, "up") || data === "k") {
+      this.selected = Math.max(0, this.selected - 1);
+      this.rerender();
+    } else if (matchesKey(data, "down") || data === "j") {
+      this.selected = Math.min(this.choices.length - 1, this.selected + 1);
+      this.rerender();
+    } else if (matchesKey(data, "enter")) {
+      const item = this.choices[this.selected];
+      if (!item) return;
+      if (item.id === "now") {
+        this.onClose();
+        this.onChoose({ kind: "now" });
+      } else if (item.id === "custom") {
+        this.customMode = true;
+        this.customError = "";
+        this.customInput.setValue("");
+        this.rerender();
+      } else if (item.delayMs) {
+        this.onClose();
+        this.onChoose({ kind: "wait", delayMs: item.delayMs });
+      }
+    }
+  }
+
+  invalidate(): void {
+    this.customInput.invalidate();
+  }
+
+  render(width: number): readonly string[] {
+    const out: string[] = [];
+    out.push(fitWidth(`${this.theme.bold(`Run ${this.runId}`)} · ${this.theme.warning(this.reason)}`, width));
+    if (this.currentResumeAt) {
+      out.push(
+        fitWidth(
+          this.theme.dim(`Currently scheduled: ${formatResetCountdown(this.currentResumeAt)} (${this.currentResumeAt})`),
+          width,
+        ),
+      );
+    }
+    out.push(this.theme.border("─".repeat(width)));
+
+    if (this.customMode) {
+      out.push(fitWidth(this.theme.text("Enter wait duration before automatic resume:"), width));
+      out.push(renderCleanSearchLine(this.customInput, "⏱", "e.g. 10m, 45m, 1h30m, 90s", width, this.theme));
+      if (this.customError) {
+        out.push(fitWidth(this.theme.error(this.customError), width));
+      }
+      out.push(fitWidth(this.theme.dim("Enter: schedule timer · Esc: back"), width));
+      return out;
+    }
+
+    const labelW = 18;
+    const descW = Math.max(10, width - 2 - labelW - 2);
+    for (let i = 0; i < this.choices.length; i++) {
+      const c = this.choices[i]!;
+      const active = i === this.selected;
+      const marker = active ? this.theme.accentBold("▸ ") : "  ";
+      const label = fitWidth(active ? this.theme.accentBold(c.label) : this.theme.bold(c.label), labelW);
+      const desc = fitWidth(active ? this.theme.text(c.description) : this.theme.muted(c.description), descW);
+      const row = `${marker}${label}  ${desc}`;
+      out.push(active ? fillLineBg(row, width, this.theme.badgeBg) : clampLine(row, width));
+    }
+    return out;
   }
 }
 
@@ -1352,9 +1537,11 @@ export class TreeOverlay implements Component {
           ? "success"
           : t.status === "failed" || t.status === "cancelled"
             ? "error"
-            : t.status === "running"
-              ? "accent"
-              : "neutral";
+            : t.status === "paused_quota"
+              ? "warning"
+              : t.status === "running"
+                ? "accent"
+                : "neutral";
       const ctx = t.contextSize > 0 ? ` ${Math.round((t.contextUsed / t.contextSize) * 100)}%` : "";
       const row = `${marker}${indent}${badge(`T${t.tier}:${t.status}`, statusTone, this.theme)} ${active ? this.theme.accentBold(t.id) : this.theme.bold(t.id)} ${t.title} ${this.theme.dim(`(${t.model ?? t.profileId}${ctx})`)}`;
       lines.push(active ? fillLineBg(row, width, this.theme.badgeBg) : fitWidth(row, width));

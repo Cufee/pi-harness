@@ -81,6 +81,25 @@ export interface CatalogConfig {
   preferSubscription?: boolean;
 }
 
+export interface QuotaRetryConfig {
+  /**
+   * How long to let an ACP/pi runner natively retry 429 / rate-limit errors (e.g. while a
+   * subscription pool proxy switches accounts) before stopping the agent cleanly (default 45_000 ms).
+   */
+  nativeRetryTimeoutMs: number;
+  /**
+   * Fallback cooldown in seconds when neither Quota Endpoint nor passive headers report a reset time.
+   * Exponentially backs off across consecutive auto-resumes up to maxCooldownSec (default 60s).
+   */
+  fallbackCooldownSec: number;
+  /** Maximum fallback backoff cooldown in seconds (default 900s = 15m). */
+  maxCooldownSec: number;
+  /** Automatically restart quota-paused runs once quota becomes available (default true). */
+  autoResumeEnabled: boolean;
+  /** While paused on quota, poll interval (ms) to detect early recovery from Quota Endpoint (default 30_000 ms). */
+  earlyWakePollMs: number;
+}
+
 export interface HarnessConfig {
   stateDir: string;
   socketPath: string;
@@ -91,6 +110,7 @@ export interface HarnessConfig {
   rollover: RolloverConfig;
   worktree: WorktreeConfig;
   catalog: CatalogConfig;
+  quotaRetry: QuotaRetryConfig;
   quotaEndpoint?: QuotaEndpointConfig;
 }
 
@@ -184,6 +204,16 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
     ...(repoCfg.catalog as Partial<CatalogConfig> | undefined),
   };
 
+  const quotaRetry: QuotaRetryConfig = {
+    nativeRetryTimeoutMs: 45_000,
+    fallbackCooldownSec: 60,
+    maxCooldownSec: 900,
+    autoResumeEnabled: true,
+    earlyWakePollMs: 30_000,
+    ...(globalCfg.quotaRetry as Partial<QuotaRetryConfig> | undefined),
+    ...(repoCfg.quotaRetry as Partial<QuotaRetryConfig> | undefined),
+  };
+
   const profiles = (merged.profiles && merged.profiles.length > 0 ? merged.profiles : defaultProfiles());
 
   return {
@@ -196,6 +226,7 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
     rollover,
     worktree,
     catalog,
+    quotaRetry,
     quotaEndpoint: merged.quotaEndpoint,
   };
 }
@@ -215,6 +246,7 @@ export function saveGlobalConfig(config: HarnessConfig): string {
     rollover: config.rollover,
     worktree: config.worktree,
     catalog: config.catalog,
+    quotaRetry: config.quotaRetry,
     ...(config.quotaEndpoint ? { quotaEndpoint: config.quotaEndpoint } : {}),
   };
   writeFileSync(filePath, JSON.stringify(serialized, null, 2) + "\n", "utf8");

@@ -57,6 +57,8 @@ export type DaemonOp =
   | "run.list"
   | "run.get"
   | "run.stop"
+  | "run.resume"
+  | "run.schedule_resume"
   | "attach"
   | "detach"
   | "tree.get"

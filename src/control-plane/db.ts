@@ -13,6 +13,7 @@ export type TaskStatus =
   | "draining"
   | "waiting_children"
   | "blocked"
+  | "paused_quota"
   | "returned_for_rescope"
   | "merging"
   | "completed"
@@ -43,7 +44,7 @@ export interface RunRecord {
   baseSha: string;
   coordinationGroup: string | null;
   isolationMode: "standalone" | "coordinated";
-  status: "active" | "completed" | "failed" | "stopped";
+  status: "active" | "paused_quota" | "completed" | "failed" | "stopped";
   createdAt: number;
   updatedAt: number;
 }

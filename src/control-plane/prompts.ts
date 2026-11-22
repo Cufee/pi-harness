@@ -73,6 +73,7 @@ export function buildHydrationTurn(input: {
   scopedKbHints?: KbCard[];
   worktreePath?: string | null;
   worktreeBranch?: string | null;
+  quotaResumeNote?: { reason?: string; userMessage?: string | null } | null;
 }): string {
   const lines: string[] = [
     `# Task Assignment (${input.task.id}, tier=${input.task.tier}, gen=${input.task.generation})`,
@@ -82,6 +83,16 @@ export function buildHydrationTurn(input: {
   if (input.task.criteria) lines.push(`Acceptance Criteria: ${input.task.criteria}`);
   if (input.worktreePath) lines.push(`Worktree: ${input.worktreePath} (branch: ${input.worktreeBranch ?? "unknown"})`);
   if (input.task.readOnly) lines.push(`Access Mode: STRICTLY READ-ONLY`);
+
+  if (input.quotaResumeNote) {
+    lines.push("", "## Resumed After Quota Pause");
+    lines.push(
+      `This task was paused early due to quota/rate limits (${input.quotaResumeNote.reason ?? "quota limit"}). Your git worktree, uncommitted WIP, and prior artifacts were preserved intact — inspect current files/git status and continue seamlessly without redoing completed work.`,
+    );
+    if (input.quotaResumeNote.userMessage) {
+      lines.push(`Human Resume Instruction: ${input.quotaResumeNote.userMessage}`);
+    }
+  }
 
   if (input.handoff) {
     lines.push("", "## Predecessor Anchored Handoff (use `query_predecessor` if deeper rationale is needed)");

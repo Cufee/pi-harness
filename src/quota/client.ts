@@ -34,6 +34,152 @@ export class QuotaClient {
 
   constructor(private readonly config?: QuotaEndpointConfig) {}
 
+  isConfigured(): boolean {
+    return Boolean(this.config?.url);
+  }
+
+  /**
+   * Clears cached passive exhaustion / rate-limit state (used when a user manually resumes
+   * or an auto-resume timer fires so the quota state machine resets cleanly).
+   */
+  clearPassiveExhaustion(profileId?: string): void {
+    if (!profileId) {
+      this.passiveExhaustedProfiles.clear();
+      this.passiveBuckets.clear();
+      return;
+    }
+    for (const key of [...this.passiveExhaustedProfiles.keys()]) {
+      if (key.startsWith(`${profileId}:`)) {
+        this.passiveExhaustedProfiles.delete(key);
+      }
+    }
+    for (const key of [...this.passiveBuckets.keys()]) {
+      if (key.startsWith(`${profileId}:`)) {
+        this.passiveBuckets.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Resolves when quota-paused tasks should automatically restart, consulting:
+   * 1. Live `proto/quota.proto` Quota Endpoint (refreshed on demand)
+   * 2. Passive ACP `resetsAt` / `Retry-After` hints harvested from rate-limit responses
+   * 3. Otherwise returns `resumeAtMs: null` so caller applies exponential fallback backoff.
+   */
+  async resolveResumeSchedule(
+    queries: Array<{
+      profileId: string;
+      provider: string;
+      wireModelId: string;
+      canonicalModelId?: string;
+      hintResetAt?: string | null;
+    }>,
+    opts?: { forceSync?: boolean },
+  ): Promise<{
+    availableNow: boolean;
+    resumeAtMs: number | null;
+    source: "quota_endpoint" | "passive_reset" | "unknown";
+    detail: string;
+  }> {
+    let syncedEndpoint = false;
+    if (this.config?.url) {
+      try {
+        const snap = await this.sync(opts?.forceSync ?? true);
+        syncedEndpoint = Boolean(snap);
+      } catch {
+        // Endpoint unreachable — fall back to cached snapshot / passive hints
+      }
+    }
+
+    const now = Date.now();
+    const SAFETY_CUSHION_MS = 3_000;
+    const endpointResets: number[] = [];
+    const passiveResets: number[] = [];
+    let endpointMatchedAny = false;
+    let endpointAllAvailable = true;
+
+    for (const q of queries) {
+      if (q.hintResetAt) {
+        const ts = Date.parse(q.hintResetAt);
+        if (Number.isFinite(ts) && ts > now) {
+          passiveResets.push(ts + SAFETY_CUSHION_MS);
+        }
+      }
+
+      // Check authoritative Quota Endpoint snapshot directly (ignoring local passiveFailure override)
+      if (this.snapshot) {
+        const merged = new Map<string, QuotaBucket>();
+        for (const b of this.snapshot.buckets ?? []) {
+          merged.set(b.bucketId, clone(QuotaBucketSchema, b));
+        }
+        const match = findBestModelCapacity(this.snapshot.models ?? [], q);
+        if (match) {
+          endpointMatchedAny = true;
+          const resolved = resolveModelCapacity(match, merged);
+          const isAvail =
+            !resolved.exhausted &&
+            resolved.availability !== AvailabilityStatus.EXHAUSTED &&
+            resolved.availability !== AvailabilityStatus.THROTTLED;
+          if (!isAvail) {
+            endpointAllAvailable = false;
+            if (resolved.nextAvailableAt) {
+              const ts = Date.parse(resolved.nextAvailableAt);
+              if (Number.isFinite(ts) && ts > now) {
+                endpointResets.push(ts + SAFETY_CUSHION_MS);
+              }
+            }
+          }
+        }
+      }
+
+      // Also check passive ACP buckets (`_claude/rateLimit` `resetsAt`)
+      const passiveResolved = this.resolveForModel(q);
+      if (passiveResolved?.nextAvailableAt) {
+        const ts = Date.parse(passiveResolved.nextAvailableAt);
+        if (Number.isFinite(ts) && ts > now) {
+          passiveResets.push(ts + SAFETY_CUSHION_MS);
+        }
+      }
+    }
+
+    if (syncedEndpoint && endpointMatchedAny && endpointAllAvailable && queries.length > 0) {
+      return {
+        availableNow: true,
+        resumeAtMs: now + 1_500,
+        source: "quota_endpoint",
+        detail: "Quota endpoint reports capacity available now",
+      };
+    }
+
+    if (endpointResets.length > 0) {
+      // Pick earliest reset among paused tasks so work unblocks as soon as any required bucket opens
+      const earliest = Math.min(...endpointResets);
+      return {
+        availableNow: false,
+        resumeAtMs: earliest,
+        source: "quota_endpoint",
+        detail: `Scheduled from Quota Endpoint (nextAvailableAt ${new Date(earliest).toISOString()})`,
+      };
+    }
+
+    if (passiveResets.length > 0) {
+      const earliest = Math.min(...passiveResets);
+      return {
+        availableNow: false,
+        resumeAtMs: earliest,
+        source: "passive_reset",
+        detail: `Scheduled from passive rate-limit reset (${new Date(earliest).toISOString()})`,
+      };
+    }
+
+    return {
+      availableNow: false,
+      resumeAtMs: null,
+      source: "unknown",
+      detail: "No explicit reset timestamp reported; using fallback cooldown",
+    };
+  }
+
   getCurrentSnapshot(): QuotaSnapshot | null {
     return this.snapshot;
   }

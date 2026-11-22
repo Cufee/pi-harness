@@ -15,6 +15,7 @@ import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import { googleProvider } from "@earendil-works/pi-ai/providers/google";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import type { PiProfileConfig } from "../config.js";
+import { detectQuotaErrorText } from "./quota-detect.js";
 import type { ProbedModelInfo, RunAgentRequest, RunAgentResult, RunnerUsage } from "./types.js";
 
 const BUILTIN_PROVIDERS = new Map<string, [() => Provider<Api>, string]>([
@@ -153,21 +154,90 @@ export class PiRunner {
         tools: piTools,
       };
 
-      const s = models.streamSimple(resolvedModel, context, {
-        apiKey: apiKey ?? "local",
-        signal: req.signal,
-        reasoning: (req.effort as never) ?? undefined,
-      });
+      const quotaTimeoutMs = Math.max(0, req.quotaRetryTimeoutMs ?? 45_000);
+      const retryStartMs = Date.now();
+      let retryCount = 0;
+      let finalMsg: Awaited<ReturnType<ReturnType<typeof models.streamSimple>["result"]>> | null = null;
 
-      for await (const ev of s) {
-        if (ev.type === "text_delta") {
-          req.callbacks.onTextDelta?.(ev.delta);
-        } else if (ev.type === "thinking_delta") {
-          req.callbacks.onThoughtDelta?.(ev.delta);
+      while (true) {
+        try {
+          const s = models.streamSimple(resolvedModel, context, {
+            apiKey: apiKey ?? "local",
+            signal: req.signal,
+            reasoning: (req.effort as never) ?? undefined,
+          });
+
+          for await (const ev of s) {
+            if (ev.type === "text_delta") {
+              req.callbacks.onTextDelta?.(ev.delta);
+            } else if (ev.type === "thinking_delta") {
+              req.callbacks.onThoughtDelta?.(ev.delta);
+            }
+          }
+
+          finalMsg = await s.result();
+          if (retryCount > 0) {
+            req.callbacks.onQuotaRetryState?.({
+              state: "recovered",
+              retryCount,
+              timeoutMs: quotaTimeoutMs,
+            });
+          }
+          break;
+        } catch (err) {
+          if (cancelled || req.signal.aborted) {
+            return { text: lastText, stopReason: "cancelled", usage: lastUsage };
+          }
+          const msg = err instanceof Error ? err.message : String(err);
+          const detected = detectQuotaErrorText(msg);
+          if (!detected.isQuota) throw err;
+
+          retryCount += 1;
+          const elapsed = Date.now() - retryStartMs;
+          const remaining = quotaTimeoutMs - elapsed;
+          // For transient 429s (e.g. subscription pool rotation), retry within quotaTimeoutMs
+          if (!detected.isHardExhaustion && remaining > 500) {
+            if (retryCount === 1) {
+              req.callbacks.onQuotaRetryState?.({
+                state: "retrying",
+                retryCount,
+                timeoutMs: quotaTimeoutMs,
+                reason: detected.summary,
+                resetAt: detected.resetAtIso ?? null,
+              });
+            }
+            const delayMs = Math.min(remaining, Math.min(8_000, 1_000 * 2 ** (retryCount - 1)));
+            await new Promise((r) => setTimeout(r, delayMs));
+            continue;
+          }
+
+          req.callbacks.onPassiveQuota?.({
+            profileId: this.profile.id,
+            model: modelId,
+            raw: {
+              sessionFailure: detected.isHardExhaustion ? "quota_exhausted" : "rate_limited",
+              ...(detected.resetAtIso ? { resetAt: detected.resetAtIso } : {}),
+            },
+            observedAt: Date.now(),
+          });
+          return {
+            text: lastText,
+            stopReason: "quota_paused",
+            usage: lastUsage,
+            quotaPause: {
+              reason: detected.summary,
+              resetAt: detected.resetAtIso ?? null,
+              retryCount,
+              watchdogTimedOut: !detected.isHardExhaustion && remaining <= 500,
+              isHardExhaustion: detected.isHardExhaustion,
+            },
+          };
         }
       }
 
-      const finalMsg = await s.result();
+      if (!finalMsg) {
+        return { text: lastText, stopReason: "cancelled", usage: lastUsage };
+      }
       messages.push(finalMsg);
 
       const used = (finalMsg.usage?.input ?? 0) + (finalMsg.usage?.cacheRead ?? 0) + (finalMsg.usage?.output ?? 0);

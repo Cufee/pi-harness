@@ -19,6 +19,29 @@ interface ActiveTaskExecution {
   promise: Promise<void>;
 }
 
+interface TaskQuotaPauseMeta {
+  profileId: string;
+  model: string | null;
+  reason: string;
+  resetAt: string | null;
+  pausedAt: number;
+}
+
+export interface RunQuotaPauseStatus {
+  runId: string;
+  pausedTaskIds: string[];
+  mode: "auto_timer" | "user_timer" | "manual";
+  source: "quota_endpoint" | "passive_reset" | "user_timer" | "none";
+  resumeAt: string | null;
+  reason: string;
+  pausedAt: number;
+}
+
+interface InternalRunQuotaState extends RunQuotaPauseStatus {
+  timer: ReturnType<typeof setTimeout> | null;
+  earlyWakePoller: ReturnType<typeof setInterval> | null;
+}
+
 export type CustomRunnerFactory = (profile: RunnerProfileConfig) => {
   run: (req: RunAgentRequest) => Promise<RunAgentResult>;
 };
@@ -31,13 +54,17 @@ export class HarnessOrchestrator {
     string,
     { handoff: AnchoredHandoff; target?: { profileId?: string; model?: string; effort?: string } }
   >();
+  private taskQuotaHints = new Map<string, TaskQuotaPauseMeta>();
+  private taskResumeNotes = new Map<string, { reason?: string; userMessage?: string | null }>();
+  private runQuotaStates = new Map<string, InternalRunQuotaState>();
+  private quiescenceCheckPending = new Set<string>();
   readonly toolExecutor: ControlPlaneToolExecutor;
 
   constructor(
     readonly db: ControlPlaneDb,
     readonly config: HarnessConfig,
     readonly catalog: ModelCatalogCompiler,
-    readonly quota: QuotaClient,
+    public quota: QuotaClient,
     private readonly customRunnerFactory?: CustomRunnerFactory,
   ) {
     this.toolExecutor = new ControlPlaneToolExecutor(db, catalog, {
@@ -59,6 +86,61 @@ export class HarnessOrchestrator {
 
   activeTaskCount(): number {
     return this.active.size;
+  }
+
+  /** Number of runs currently holding an armed auto-resume or user-scheduled quota timer. */
+  scheduledQuotaResumeCount(): number {
+    let n = 0;
+    for (const st of this.runQuotaStates.values()) {
+      if (st.timer || st.earlyWakePoller) n++;
+    }
+    return n;
+  }
+
+  getRunQuotaStatus(runId: string): RunQuotaPauseStatus | null {
+    const st = this.runQuotaStates.get(runId);
+    if (!st) return null;
+    return {
+      runId: st.runId,
+      pausedTaskIds: [...st.pausedTaskIds],
+      mode: st.mode,
+      source: st.source,
+      resumeAt: st.resumeAt,
+      reason: st.reason,
+      pausedAt: st.pausedAt,
+    };
+  }
+
+  listQuotaPausedRuns(): RunQuotaPauseStatus[] {
+    return [...this.runQuotaStates.values()].map((st) => ({
+      runId: st.runId,
+      pausedTaskIds: [...st.pausedTaskIds],
+      mode: st.mode,
+      source: st.source,
+      resumeAt: st.resumeAt,
+      reason: st.reason,
+      pausedAt: st.pausedAt,
+    }));
+  }
+
+  dispose(): void {
+    for (const runId of [...this.runQuotaStates.keys()]) {
+      this.clearRunQuotaTimers(runId);
+    }
+    this.runQuotaStates.clear();
+  }
+
+  private clearRunQuotaTimers(runId: string): void {
+    const st = this.runQuotaStates.get(runId);
+    if (!st) return;
+    if (st.timer) {
+      clearTimeout(st.timer);
+      st.timer = null;
+    }
+    if (st.earlyWakePoller) {
+      clearInterval(st.earlyWakePoller);
+      st.earlyWakePoller = null;
+    }
   }
 
   isRunActiveInMemory(runId: string): boolean {
@@ -205,21 +287,251 @@ export class HarnessOrchestrator {
       const t = this.db.getTask(taskId);
       if (t) {
         const readyTasks = this.db.listTasks(t.runId, { status: "ready" });
+        let launchedAny = false;
         for (const rt of readyTasks) {
           if (!this.active.has(rt.id)) {
             this.launchTaskLoop(rt.id);
+            launchedAny = true;
           }
+        }
+        // Quiescence barrier: once ALL active tasks in this run have exited and at least one
+        // task was stopped early due to quota, pause the run & arm timer (if quota data exists).
+        if (!launchedAny && !this.isRunActiveInMemory(t.runId)) {
+          void this.checkRunQuotaQuiescence(t.runId).catch(() => {});
         }
       }
     });
     this.active.set(taskId, entry);
   }
 
+  /**
+   * Quiescence Barrier: called when 0 tasks are actively running in `runId`.
+   * If any tasks are in `paused_quota`:
+   *  - Transitions the run to `paused_quota`.
+   *  - If a Quota Endpoint is wired OR passive ACP rate-limit data provided a concrete reset time
+   *    (and `autoResumeEnabled` is true): arms an automatic daemon timer (+ early-wakeup poller).
+   *  - Otherwise (no Quota Endpoint & no reset time): stops cleanly and waits for the user to
+   *    resume manually or pick a wait duration!
+   */
+  private async checkRunQuotaQuiescence(runId: string): Promise<void> {
+    if (this.quiescenceCheckPending.has(runId)) return;
+    const run = this.db.getRun(runId);
+    if (!run || ["stopped", "cancelled", "completed", "failed"].includes(run.status)) return;
+    if (this.isRunActiveInMemory(runId)) return;
+
+    const tasks = this.db.listTasks(runId);
+    const pausedTasks = tasks.filter((t) => t.status === "paused_quota");
+    if (pausedTasks.length === 0) return;
+
+    this.quiescenceCheckPending.add(runId);
+    try {
+      // Query quota status for tasks that actually hit quota (excluding parents paused only to wait on children)
+      const directlyQuotaPaused = pausedTasks.filter((t) => this.taskQuotaHints.has(t.id));
+      const queryTargets = directlyQuotaPaused.length > 0 ? directlyQuotaPaused : pausedTasks;
+      const queries = queryTargets.map((t) => {
+        const hint = this.taskQuotaHints.get(t.id);
+        const profile = this.config.profiles.find((p) => p.id === t.profileId);
+        const provider =
+          profile?.kind === "pi"
+            ? profile.provider
+            : profile?.adapter && profile.adapter !== "generic"
+              ? profile.adapter
+              : t.profileId;
+        return {
+          profileId: t.profileId,
+          provider,
+          wireModelId: t.model ?? "*",
+          canonicalModelId: t.model ?? undefined,
+          hintResetAt: hint?.resetAt ?? null,
+        };
+      });
+
+      const schedule = await this.quota.resolveResumeSchedule(queries, { forceSync: true });
+
+      // Ensure run wasn't manually resumed or stopped while we queried the Quota Endpoint
+      const freshRun = this.db.getRun(runId);
+      if (!freshRun || freshRun.status === "stopped" || this.isRunActiveInMemory(runId)) return;
+      const stillPaused = this.db.listTasks(runId).filter((t) => t.status === "paused_quota");
+      if (stillPaused.length === 0) return;
+
+      this.clearRunQuotaTimers(runId);
+      this.db.updateRunStatus(runId, "paused_quota");
+
+      const firstReason =
+        stillPaused.map((t) => this.taskQuotaHints.get(t.id)?.reason ?? t.summary).find(Boolean) ?? "Quota limit reached";
+      const autoEnabled = this.config.quotaRetry.autoResumeEnabled !== false;
+      const canAutoSchedule = autoEnabled && schedule.resumeAtMs !== null;
+
+      const state: InternalRunQuotaState = {
+        runId,
+        pausedTaskIds: stillPaused.map((t) => t.id),
+        mode: canAutoSchedule ? "auto_timer" : "manual",
+        source: canAutoSchedule ? (schedule.source === "unknown" ? "none" : schedule.source) : "none",
+        resumeAt: canAutoSchedule && schedule.resumeAtMs ? new Date(schedule.resumeAtMs).toISOString() : null,
+        reason: firstReason,
+        pausedAt: Date.now(),
+        timer: null,
+        earlyWakePoller: null,
+      };
+
+      if (canAutoSchedule && schedule.resumeAtMs) {
+        const delayMs = Math.max(250, schedule.resumeAtMs - Date.now());
+        state.timer = setTimeout(() => {
+          void this.resumeRunFromQuota(runId, { trigger: "auto_timer" }).catch(() => {});
+        }, delayMs);
+        state.timer.unref?.();
+
+        // If a Quota Endpoint is wired and the wait is long, also poll periodically to wake up early if quota returns!
+        const pollMs = Math.max(5_000, this.config.quotaRetry.earlyWakePollMs ?? 30_000);
+        if (this.quota.isConfigured() && delayMs > pollMs) {
+          state.earlyWakePoller = setInterval(() => {
+            void this.quota
+              .resolveResumeSchedule(queries, { forceSync: true })
+              .then((check) => {
+                if (check.availableNow && this.runQuotaStates.has(runId)) {
+                  void this.resumeRunFromQuota(runId, { trigger: "quota_recovered" }).catch(() => {});
+                }
+              })
+              .catch(() => {});
+          }, pollMs);
+          state.earlyWakePoller.unref?.();
+        }
+      }
+
+      this.runQuotaStates.set(runId, state);
+      this.db.emitEvent(runId, null, "quota.run_paused", {
+        runId,
+        pausedTaskIds: state.pausedTaskIds,
+        mode: state.mode,
+        source: state.source,
+        resumeAt: state.resumeAt,
+        reason: state.reason,
+        hasQuotaEndpoint: this.quota.isConfigured(),
+        detail: canAutoSchedule
+          ? schedule.detail
+          : "No Quota Endpoint or reset time available — paused cleanly. Resume anytime or choose a wait duration.",
+      });
+    } finally {
+      this.quiescenceCheckPending.delete(runId);
+    }
+  }
+
+  /**
+   * Lets the user choose how long to wait before automatically resuming a quota-paused run
+   * (especially useful when no Quota Endpoint is wired up!).
+   */
+  scheduleRunQuotaResume(runId: string, delayMs: number): RunQuotaPauseStatus {
+    const run = this.db.getRun(runId);
+    if (!run) throw new Error(`Unknown run ${runId}`);
+    const pausedTasks = this.db.listTasks(runId).filter((t) => t.status === "paused_quota");
+    if (pausedTasks.length === 0 && run.status !== "paused_quota") {
+      throw new Error(`Run ${runId} has no quota-paused tasks to schedule`);
+    }
+
+    const clampedMs = Math.max(1_000, Math.min(delayMs, 24 * 60 * 60 * 1000));
+    this.clearRunQuotaTimers(runId);
+    const prev = this.runQuotaStates.get(runId);
+    const resumeAtIso = new Date(Date.now() + clampedMs).toISOString();
+
+    const state: InternalRunQuotaState = {
+      runId,
+      pausedTaskIds: pausedTasks.map((t) => t.id),
+      mode: "user_timer",
+      source: "user_timer",
+      resumeAt: resumeAtIso,
+      reason: prev?.reason ?? pausedTasks[0]?.summary ?? "Quota limit reached",
+      pausedAt: prev?.pausedAt ?? Date.now(),
+      timer: null,
+      earlyWakePoller: null,
+    };
+
+    state.timer = setTimeout(() => {
+      void this.resumeRunFromQuota(runId, { trigger: "user_timer" }).catch(() => {});
+    }, clampedMs);
+    state.timer.unref?.();
+
+    this.runQuotaStates.set(runId, state);
+    if (run.status !== "paused_quota") {
+      this.db.updateRunStatus(runId, "paused_quota");
+    }
+    this.db.emitEvent(runId, null, "quota.run_scheduled", {
+      runId,
+      pausedTaskIds: state.pausedTaskIds,
+      resumeAt: resumeAtIso,
+      delayMs: clampedMs,
+      source: "user_timer",
+    });
+    return this.getRunQuotaStatus(runId)!;
+  }
+
+  /**
+   * Resumes a quota-paused run (manually, via user-chosen wait timer, via Quota Endpoint timer,
+   * or early wakeup) and COMPLETELY RESETS the quota pause state machine.
+   * If no quota is actually available when resumed, the restarted tasks naturally walk through
+   * the exact same states (native retry up to timeout -> paused_quota -> quiescence -> pause again).
+   */
+  async resumeRunFromQuota(
+    runId: string,
+    opts?: { trigger?: "manual" | "auto_timer" | "quota_recovered" | "user_timer"; userMessage?: string },
+  ): Promise<{ resumed: boolean; resumedTaskIds: string[]; run: RunRecord }> {
+    const run = this.db.getRun(runId);
+    if (!run) throw new Error(`Unknown run ${runId}`);
+
+    const trigger = opts?.trigger ?? "manual";
+    this.clearRunQuotaTimers(runId);
+    this.runQuotaStates.delete(runId);
+
+    const tasks = this.db.listTasks(runId);
+    const pausedTasks = tasks.filter((t) => t.status === "paused_quota");
+    if (pausedTasks.length === 0) {
+      if (run.status === "paused_quota") {
+        this.db.updateRunStatus(runId, "active");
+      }
+      return { resumed: false, resumedTaskIds: [], run: this.db.getRun(runId)! };
+    }
+
+    // Reset passive quota exhaustion state for all affected profiles so the state machine starts fresh!
+    const affectedProfiles = new Set(pausedTasks.map((t) => t.profileId));
+    for (const pid of affectedProfiles) {
+      this.quota.clearPassiveExhaustion(pid);
+    }
+
+    this.db.updateRunStatus(runId, "active");
+    const resumedTaskIds: string[] = [];
+
+    for (const t of pausedTasks) {
+      const hint = this.taskQuotaHints.get(t.id);
+      this.taskQuotaHints.delete(t.id);
+      this.taskResumeNotes.set(t.id, {
+        reason: hint?.reason ?? t.summary ?? "quota limit",
+        userMessage: opts?.userMessage ?? null,
+      });
+      this.db.updateTask(t.id, {
+        status: "ready",
+        sessionId: null,
+      });
+      resumedTaskIds.push(t.id);
+    }
+
+    this.db.emitEvent(runId, null, "quota.run_resumed", {
+      runId,
+      trigger,
+      resumedTaskIds,
+      userMessage: opts?.userMessage ?? null,
+    });
+
+    for (const id of resumedTaskIds) {
+      this.launchTaskLoop(id);
+    }
+
+    return { resumed: true, resumedTaskIds, run: this.db.getRun(runId)! };
+  }
+
   private async runTaskWithRollovers(taskId: string, exec: ActiveTaskExecution): Promise<void> {
     while (!exec.abort.signal.aborted) {
       const task = this.db.getTask(taskId);
       if (!task) return;
-      if (["completed", "cancelled", "failed", "returned_for_rescope"].includes(task.status)) return;
+      if (["completed", "cancelled", "failed", "returned_for_rescope", "paused_quota"].includes(task.status)) return;
 
       const run = this.db.getRun(task.runId);
       if (!run) return;
@@ -231,6 +543,9 @@ export class HarnessOrchestrator {
       this.db.updateTask(task.id, { status: "running" });
 
       const handoff = task.handoffJson ? (JSON.parse(task.handoffJson) as AnchoredHandoff) : null;
+      const quotaResumeNote = this.taskResumeNotes.get(task.id) ?? null;
+      if (quotaResumeNote) this.taskResumeNotes.delete(task.id);
+
       const systemPrompt = buildImmutableSystemPrompt(task.tier, task.kind);
       const scopedKbHints =
         task.tier === 2 ? this.db.kb.getScopedAmbientIndex(run.repoRoot, this.db.listActiveWriteScopes(run.id), 5) : [];
@@ -245,6 +560,7 @@ export class HarnessOrchestrator {
         scopedKbHints,
         worktreePath: wt?.path ?? null,
         worktreeBranch: wt?.branch ?? null,
+        quotaResumeNote,
       });
 
       const rolloverThreshold =
@@ -269,6 +585,7 @@ export class HarnessOrchestrator {
         effort: task.effort,
         maxTurns: task.maxTurns,
         rolloverThreshold,
+        quotaRetryTimeoutMs: this.config.quotaRetry.nativeRetryTimeoutMs,
         tools: toolsForTier(task.tier),
         executeTool: (name, args) => this.toolExecutor.execute(run.id, task.id, name, args),
         daemonSocketPath: this.config.socketPath,
@@ -297,6 +614,14 @@ export class HarnessOrchestrator {
           onPassiveQuota: (sig) => {
             this.quota.ingestPassiveSignal(sig);
             this.db.emitEvent(run.id, task.id, "quota.passive_signal", sig);
+          },
+          onQuotaRetryState: (ev) => {
+            this.db.emitEvent(run.id, task.id, ev.state === "retrying" ? "quota.agent_retrying" : "quota.agent_recovered", {
+              ...ev,
+              profileId: task.profileId,
+              model: task.model,
+              title: task.title,
+            });
           },
           onToolEvent: (ev) => {
             this.db.emitEvent(run.id, task.id, "agent.tool", ev);
@@ -343,10 +668,48 @@ export class HarnessOrchestrator {
           continue; // Immediately boot generation N+1 cleanly!
         }
 
+        // Agent stopped early due to quota / rate-limit timeout: preserve worktree & WIP, do NOT fail!
+        if (res.stopReason === "quota_paused") {
+          const qp = res.quotaPause;
+          const reason = qp?.reason ?? "Quota / rate limit reached";
+          this.taskQuotaHints.set(task.id, {
+            profileId: latest.profileId,
+            model: latest.model,
+            reason,
+            resetAt: qp?.resetAt ?? null,
+            pausedAt: Date.now(),
+          });
+          this.db.updateTask(task.id, {
+            status: "paused_quota",
+            summary: `Paused (quota): ${reason}`.slice(0, 1000),
+          });
+          this.db.emitEvent(run.id, task.id, "quota.agent_paused", {
+            runId: run.id,
+            taskId: task.id,
+            tier: latest.tier,
+            title: latest.title,
+            profileId: latest.profileId,
+            model: latest.model,
+            reason,
+            resetAt: qp?.resetAt ?? null,
+            retryCount: qp?.retryCount ?? 1,
+            watchdogTimedOut: Boolean(qp?.watchdogTimedOut),
+          });
+          return;
+        }
+
         // If task already transitioned via `return_task`, keep that status
         if (["completed", "returned_for_rescope", "blocked", "cancelled"].includes(latest.status)) {
           if (latest.tier === 1 && latest.status === "completed") {
-            this.db.updateRunStatus(run.id, "completed");
+            const hasPausedChildren = this.db.listTasks(run.id).some((t) => t.id !== latest.id && t.status === "paused_quota");
+            if (hasPausedChildren) {
+              this.db.updateTask(task.id, {
+                status: "paused_quota",
+                summary: "Waiting for quota-paused child task(s) to resume",
+              });
+            } else {
+              this.db.updateRunStatus(run.id, "completed");
+            }
           }
           return;
         }
@@ -354,6 +717,18 @@ export class HarnessOrchestrator {
         if (res.stopReason === "cancelled" || exec.abort.signal.aborted) {
           this.db.updateTask(task.id, { status: "cancelled", summary: "Cancelled" });
           return;
+        }
+
+        // If Tier 1 exited while child tasks are paused on quota, pause Tier 1 too instead of closing the run!
+        if (latest.tier === 1) {
+          const hasPausedChildren = this.db.listTasks(run.id).some((t) => t.id !== latest.id && t.status === "paused_quota");
+          if (hasPausedChildren) {
+            this.db.updateTask(task.id, {
+              status: "paused_quota",
+              summary: "Waiting for quota-paused child task(s) to resume",
+            });
+            return;
+          }
         }
 
         // Agent finished its turn naturally without calling `return_task`
@@ -402,6 +777,8 @@ export class HarnessOrchestrator {
   }
 
   async stopRun(runId: string, reason = "Stopped by user"): Promise<void> {
+    this.clearRunQuotaTimers(runId);
+    this.runQuotaStates.delete(runId);
     const tasks = this.db.listTasks(runId);
     await Promise.all(tasks.map((t) => this.cancelTask(t.id, reason)));
     this.db.updateRunStatus(runId, "stopped");
@@ -416,7 +793,7 @@ export class HarnessOrchestrator {
     const parent = this.db.getTask(parentId);
     if (!parent) throw new Error(`Unknown parent task ${parentId}`);
 
-    const terminal = new Set(["completed", "failed", "cancelled", "returned_for_rescope", "blocked"]);
+    const terminal = new Set(["completed", "failed", "cancelled", "returned_for_rescope", "blocked", "paused_quota"]);
     const deadline = Date.now() + timeoutMs;
 
     const getTargets = () => {

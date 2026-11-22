@@ -3,7 +3,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const DAEMON_PROTOCOL_REV = 3;
+export const DAEMON_PROTOCOL_REV = 4;
 
 export function currentDaemonBuildId(): string {
   try {
@@ -93,6 +93,7 @@ export class HarnessDaemon {
     this.config = next;
     Object.assign(this.orchestrator.config, next);
     this.quota = new QuotaClient(next.quotaEndpoint);
+    this.orchestrator.quota = this.quota;
     this.catalog = new ModelCatalogCompiler(next, this.quota);
     this.director.updateConfig(next);
     saveGlobalConfig(next);
@@ -153,6 +154,7 @@ export class HarnessDaemon {
       clearInterval(this.sweepTimer);
       this.sweepTimer = null;
     }
+    this.orchestrator.dispose();
     this.unsubEvents?.();
     this.ptyHost.closeAll();
     for (const sock of this.allSockets) {
@@ -201,7 +203,13 @@ export class HarnessDaemon {
       if (att.taskId && ev.taskId && att.taskId !== ev.taskId) continue;
       writeNdjson(att.socket, frame);
     }
-    if (ev.type.startsWith("goal.")) {
+    if (
+      ev.type.startsWith("goal.") ||
+      ev.type === "quota.agent_paused" ||
+      ev.type === "quota.run_paused" ||
+      ev.type === "quota.run_scheduled" ||
+      ev.type === "quota.run_resumed"
+    ) {
       for (const sock of this.chatSubscribers) {
         if (!this.attachments.has(sock)) {
           writeNdjson(sock, frame);
@@ -221,6 +229,7 @@ export class HarnessDaemon {
     running: boolean;
     activeChats: number;
     activeTasks: number;
+    scheduledQuotaResumes: number;
     activeReviews: number;
     activePtys: number;
     otherTuiClients: number;
@@ -228,20 +237,23 @@ export class HarnessDaemon {
   } {
     const activeChats = this.director.activeChatCount();
     const activeTasks = this.orchestrator.activeTaskCount();
+    const scheduledQuotaResumes = this.orchestrator.scheduledQuotaResumeCount();
     const activeReviews = this.director.activeReviewCount();
     const activePtys = this.ptyHost.activePtyCount();
     const otherTuiClients = this.tuiSockets.size;
     const parts: string[] = [];
     if (activeTasks > 0) parts.push(`${activeTasks} active agent task${activeTasks === 1 ? "" : "s"}`);
+    if (scheduledQuotaResumes > 0) parts.push(`${scheduledQuotaResumes} scheduled quota resume${scheduledQuotaResumes === 1 ? "" : "s"}`);
     if (activeChats > 0) parts.push(`${activeChats} in-flight chat${activeChats === 1 ? "" : "s"}`);
     if (activeReviews > 0) parts.push(`${activeReviews} goal review${activeReviews === 1 ? "" : "s"}`);
     if (activePtys > 0) parts.push(`${activePtys} open shell${activePtys === 1 ? "" : "s"}`);
     if (otherTuiClients > 0) parts.push(`${otherTuiClients} other attached terminal${otherTuiClients === 1 ? "" : "s"}`);
-    const running = activeChats + activeTasks + activeReviews + activePtys + otherTuiClients > 0;
+    const running = activeChats + activeTasks + scheduledQuotaResumes + activeReviews + activePtys + otherTuiClients > 0;
     return {
       running,
       activeChats,
       activeTasks,
+      scheduledQuotaResumes,
       activeReviews,
       activePtys,
       otherTuiClients,
@@ -439,6 +451,9 @@ export class HarnessDaemon {
           ...(patch.rollover ? { rollover: { ...this.config.rollover, ...(patch.rollover as HarnessConfig["rollover"]) } } : {}),
           ...(patch.worktree ? { worktree: { ...this.config.worktree, ...(patch.worktree as HarnessConfig["worktree"]) } } : {}),
           ...(patch.catalog ? { catalog: { ...this.config.catalog, ...(patch.catalog as HarnessConfig["catalog"]) } } : {}),
+          ...(patch.quotaRetry
+            ? { quotaRetry: { ...this.config.quotaRetry, ...(patch.quotaRetry as HarnessConfig["quotaRetry"]) } }
+            : {}),
           ...("quotaEndpoint" in patch
             ? { quotaEndpoint: (patch.quotaEndpoint as HarnessConfig["quotaEndpoint"] | null) ?? undefined }
             : {}),
@@ -563,13 +578,14 @@ export class HarnessDaemon {
         const runs = this.db.listRuns(20).map((r) => {
           const bound = this.runBindings.get(r.id);
           const live = this.orchestrator.isRunActiveInMemory(r.id);
+          const quotaSt = this.orchestrator.getRunQuotaStatus(r.id);
           return {
             id: r.id,
             kind: "run" as const,
             title: (r.goal.split("\n")[0] ?? r.goal).slice(0, 80),
             repoRoot: r.repoRoot,
-            status: live ? "running" : r.status,
-            running: live,
+            status: live ? "running" : quotaSt ? (quotaSt.resumeAt ? "quota (timer)" : "paused_quota") : r.status,
+            running: live || Boolean(quotaSt),
             attached: Boolean(bound),
             attachedByMe: bound === socket,
             model: null,
@@ -747,12 +763,30 @@ export class HarnessDaemon {
           tasks: this.db.listTasks(runId),
           escalations: this.db.listEscalations(runId),
           worktrees: this.db.listWorktrees(runId),
+          quotaPause: this.orchestrator.getRunQuotaStatus(runId),
         };
       }
 
       case "run.stop":
         await this.orchestrator.stopRun(String(p.runId), typeof p.reason === "string" ? p.reason : "Stopped by user");
         return { stopped: true };
+
+      case "run.resume": {
+        const runId = String(p.runId);
+        return await this.orchestrator.resumeRunFromQuota(runId, {
+          trigger: "manual",
+          userMessage: typeof p.message === "string" && p.message.trim() ? p.message.trim() : undefined,
+        });
+      }
+
+      case "run.schedule_resume": {
+        const runId = String(p.runId);
+        const delayMs = Number(p.delayMs);
+        if (!Number.isFinite(delayMs) || delayMs <= 0) {
+          throw new Error("delayMs must be a positive number of milliseconds");
+        }
+        return this.orchestrator.scheduleRunQuotaResume(runId, delayMs);
+      }
 
       case "attach": {
         const runId = String(p.runId);
@@ -766,6 +800,7 @@ export class HarnessDaemon {
           run: this.db.getRun(runId),
           tasks: this.db.listTasks(runId),
           escalations: this.db.listEscalations(runId, "open"),
+          quotaPause: this.orchestrator.getRunQuotaStatus(runId),
           replay,
         };
       }
@@ -781,6 +816,7 @@ export class HarnessDaemon {
           tasks: this.db.listTasks(runId),
           escalations: this.db.listEscalations(runId, "open"),
           worktrees: this.db.listWorktrees(runId),
+          quotaPause: this.orchestrator.getRunQuotaStatus(runId),
         };
       }
 

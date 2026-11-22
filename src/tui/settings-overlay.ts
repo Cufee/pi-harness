@@ -373,6 +373,20 @@ export class SettingsOverlay implements Component {
         values: ["protojson", "protobuf"],
       },
       {
+        id: "quotaNativeRetryTimeout",
+        label: "Quota Native Retry Timeout",
+        description: "How long to let ACP CLIs retry 429s natively (e.g. sub pool switching) before pausing",
+        currentValue: `${Math.round((this.config.quotaRetry?.nativeRetryTimeoutMs ?? 45_000) / 1000)}s`,
+        values: ["15s", "30s", "45s", "60s", "90s", "120s"],
+      },
+      {
+        id: "quotaAutoResume",
+        label: "Quota Auto-Resume (when reset known)",
+        description: "Automatically restart paused runs once Quota Endpoint / reset time indicates capacity",
+        currentValue: this.config.quotaRetry?.autoResumeEnabled !== false ? "on" : "off",
+        values: ["on", "off"],
+      },
+      {
         id: "orchestratorThreshold",
         label: "Orchestrator Rollover Threshold",
         description: "Context utilization triggering Clean Relay Rollover before compaction",
@@ -426,6 +440,13 @@ export class SettingsOverlay implements Component {
       await this.patchConfig({ [id]: newValue });
     } else if (id === "quotaFormat" && this.config.quotaEndpoint?.url) {
       await this.patchConfig({ quotaEndpoint: { ...this.config.quotaEndpoint, format: newValue } });
+    } else if (id === "quotaNativeRetryTimeout") {
+      const sec = Number(newValue.replace(/s$/i, ""));
+      if (Number.isFinite(sec) && sec > 0) {
+        await this.patchConfig({ quotaRetry: { ...this.config.quotaRetry, nativeRetryTimeoutMs: sec * 1000 } });
+      }
+    } else if (id === "quotaAutoResume") {
+      await this.patchConfig({ quotaRetry: { ...this.config.quotaRetry, autoResumeEnabled: newValue === "on" } });
     } else if (id === "orchestratorThreshold") {
       await this.patchConfig({
         rollover: { ...this.config.rollover, orchestratorThreshold: Number(newValue.replace("%", "")) / 100 },

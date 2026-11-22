@@ -7,7 +7,7 @@ import { loadConfig, type AcpProfileConfig } from "./config.js";
 import { DaemonClient, runStdioSocketBridge } from "./daemon/remote.js";
 import { currentDaemonBuildId, DAEMON_PROTOCOL_REV, HarnessDaemon } from "./daemon/server.js";
 import { runDirectorChatTui, runNativeScrollbackTui, type TuiExitAction } from "./tui/app.js";
-import type { AttachableSession } from "./tui/overlays.js";
+import { parseDurationMs, type AttachableSession } from "./tui/overlays.js";
 
 function parseArgs(argv: string[]): { positional: string[]; flags: Record<string, string | boolean> } {
   const positional: string[] = [];
@@ -137,6 +137,7 @@ Usage:
   pi-harness runs [--remote ssh://host]
   pi-harness tree <run-id> [--remote ssh://host]
   pi-harness steer <task-id> "<message>" [--remote ssh://host]
+  pi-harness resume <run-id> [--in 15m] [--message "<msg>"] [--remote ssh://host]
   pi-harness stop <run-id> [--remote ssh://host]
   pi-harness models [list | sync] [--role name] [--remote ssh://host]
   pi-harness quota [show | sync] [--remote ssh://host]
@@ -406,6 +407,28 @@ async function main(): Promise<void> {
         const runId = positional[1];
         if (!runId) throw new Error("Usage: pi-harness stop <run-id>");
         console.log(JSON.stringify(await client.request("run.stop", { runId }), null, 2));
+        break;
+      }
+
+      case "resume": {
+        const runId = positional[1];
+        if (!runId) throw new Error('Usage: pi-harness resume <run-id> [--in 15m] [--message "<msg>"]');
+        if (typeof flags.in === "string") {
+          const delayMs = parseDurationMs(flags.in);
+          if (!delayMs) throw new Error(`Invalid duration for --in: ${flags.in} (examples: 30s, 15m, 1h30m)`);
+          console.log(JSON.stringify(await client.request("run.schedule_resume", { runId, delayMs }), null, 2));
+        } else {
+          console.log(
+            JSON.stringify(
+              await client.request("run.resume", {
+                runId,
+                message: typeof flags.message === "string" ? flags.message : undefined,
+              }),
+              null,
+              2,
+            ),
+          );
+        }
         break;
       }
 

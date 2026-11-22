@@ -18,6 +18,22 @@ export interface PassiveQuotaSignal {
   observedAt: number;
 }
 
+export interface QuotaRetryStateEvent {
+  state: "retrying" | "recovered";
+  retryCount: number;
+  timeoutMs: number;
+  reason?: string;
+  resetAt?: string | null;
+}
+
+export interface QuotaPauseInfo {
+  reason: string;
+  resetAt?: string | null;
+  retryCount: number;
+  watchdogTimedOut: boolean;
+  isHardExhaustion: boolean;
+}
+
 export interface RunnerCallbacks {
   onSessionId?: (sessionId: string) => void;
   onTextDelta?: (text: string) => void;
@@ -25,6 +41,7 @@ export interface RunnerCallbacks {
   onUsage?: (usage: RunnerUsage) => void;
   onArtifact?: (artifact: Omit<ArtifactRecord, "id" | "runId" | "taskId" | "createdAt">) => void;
   onPassiveQuota?: (signal: PassiveQuotaSignal) => void;
+  onQuotaRetryState?: (ev: QuotaRetryStateEvent) => void;
   onToolEvent?: (ev: { id?: string; name: string; status: string; kind?: string; title?: string }) => void;
 }
 
@@ -52,6 +69,8 @@ export interface RunAgentRequest {
   effort?: string | null;
   maxTurns: number;
   rolloverThreshold?: number;
+  /** Soft timeout (ms) allowing native 429/rate-limit retries across subscription pools before pausing early. */
+  quotaRetryTimeoutMs?: number;
   /** Role-scoped harness tools exposed via in-process callback (Pi) or MCP bridge (ACP) */
   tools: ToolDefinition[];
   executeTool: (name: string, args: Record<string, unknown>) => Promise<unknown>;
@@ -65,9 +84,11 @@ export interface RunAgentRequest {
 
 export interface RunAgentResult {
   text: string;
-  stopReason: "completed" | "cancelled" | "rollover_requested" | "max_turns" | "error";
+  stopReason: "completed" | "cancelled" | "rollover_requested" | "quota_paused" | "max_turns" | "error";
   usage?: RunnerUsage;
   sessionId?: string;
+  quotaPause?: QuotaPauseInfo;
+  toolFailures?: string[];
 }
 
 export interface ProbedModelInfo {

@@ -176,12 +176,22 @@ export function buildPostSessionActions(
     options?: Array<{ value: string }>;
   }>;
 
-  // Read-only mode selection
+  // Read-only mode selection (and automatic bypass permission for writable autonomous workers when supported, e.g. amp-acp)
   if (opts.readOnly) {
     if (adapter === "codex") {
       actions.push({ method: "session/set_mode", params: { sessionId, modeId: "read-only" } });
     } else if (adapter === "claude" || adapter === "gemini") {
       actions.push({ method: "session/set_mode", params: { sessionId, modeId: "plan" } });
+    }
+  } else {
+    const permOpt = configOptions.find(
+      (c) => c.id === "permission" && c.options?.some((o) => o.value === "bypass"),
+    );
+    if (permOpt) {
+      actions.push({
+        method: "session/set_config_option",
+        params: { sessionId, configId: permOpt.id, value: "bypass" },
+      });
     }
   }
 

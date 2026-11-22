@@ -2,6 +2,7 @@ import { Container, Markdown, Spacer, type SlashCommand } from "@earendil-works/
 import type { CompiledModelCatalog } from "../catalog/compiler.js";
 import type { HarnessConfig } from "../config.js";
 import type { EscalationRecord, RunRecord, TaskRecord } from "../control-plane/db.js";
+import type { RunQuotaPauseStatus } from "../control-plane/orchestrator.js";
 import type { DaemonClient } from "../daemon/remote.js";
 import type { ChatSessionRecord, ChatTurnRecord } from "../director/session.js";
 import type { GoalRecord, GoalReviewVerdict } from "../goals/engine.js";
@@ -14,10 +15,13 @@ import {
   EffortPickerOverlay,
   formatGoalDetailCard,
   formatGoalReviewCard,
+  formatResetCountdown,
   GoalsOverlay,
   KbOverlay,
   ModelPickerOverlay,
+  parseDurationMs,
   QuotaOverlay,
+  QuotaWaitPickerOverlay,
   RunsOverlay,
   SessionsOverlay,
   TreeOverlay,
@@ -58,7 +62,8 @@ const DIRECTOR_SLASH_COMMANDS: SlashCommand[] = [
   { name: "effort", description: "Pick reasoning effort (low / medium / high / xhigh / max / ultra)", argumentHint: "[level]" },
   { name: "quota", description: "Visual subscription & API quota buckets with reset countdowns" },
   { name: "goals", description: "Interactive Goal Dashboard (inspect, review, pause, cancel)" },
-  { name: "runs", description: "Interactive autonomous runs dashboard (inspect tree or stop)" },
+  { name: "runs", description: "Interactive autonomous runs dashboard (inspect, resume, schedule wait, stop)" },
+  { name: "resume", description: "Resume a quota-paused run now or pick a wait timer", argumentHint: "[run-id] [now|15m]" },
   { name: "review", description: "Run deterministic gates + Independent Skeptical Done-Review", argumentHint: "<goal-id>" },
   { name: "worktrees", description: "List & clean stale/orphaned git worktrees" },
   { name: "kb", description: "Browse 2-stage Knowledge Base (cards → full context)", argumentHint: "[query]" },
@@ -74,6 +79,7 @@ const RUN_SLASH_COMMANDS: SlashCommand[] = [
   { name: "attach", description: "Switch to & take over another chat or run session", argumentHint: "[session-id]" },
   { name: "sessions", description: "Alias for /attach" },
   { name: "tree", description: "Open Agent Tree Switcher (Ctrl+T)" },
+  { name: "resume", description: "Resume quota-paused run now or pick a wait duration", argumentHint: "[now|15m]" },
   { name: "stop", description: "Stop this autonomous run" },
   { name: "detach", description: "Detach (or quit fully if nothing is running) (Ctrl+])" },
   { name: "help", description: "Show attached-run commands" },
@@ -535,6 +541,115 @@ export async function runDirectorChatTui(opts: {
       .catch((err) => appendError(err, "quota.get"));
   };
 
+  const resumeRunNow = (runId: string) => {
+    void opts.client
+      .request<{ resumed: boolean; resumedTaskIds: string[] }>("run.resume", { runId })
+      .then((res) => {
+        if (res.resumed) {
+          appendSystem([`Resumed ${theme.bold(runId)} (${res.resumedTaskIds.length} task(s) restarted; quota state reset).`], "success");
+        } else {
+          appendSystem([`Run ${runId} had no quota-paused tasks.`], "muted");
+        }
+      })
+      .catch((err) => appendError(err, `run.resume:${runId}`));
+  };
+
+  const scheduleRunWait = (runId: string, delayMs: number) => {
+    void opts.client
+      .request<RunQuotaPauseStatus>("run.schedule_resume", { runId, delayMs })
+      .then((st) => {
+        appendSystem(
+          [
+            `Scheduled ${theme.bold(runId)} to auto-resume ${formatResetCountdown(st.resumeAt)} (${st.resumeAt ?? ""}).`,
+            theme.dim(`Run /resume ${runId} now anytime to override and resume immediately.`),
+          ],
+          "info",
+        );
+      })
+      .catch((err) => appendError(err, `run.schedule_resume:${runId}`));
+  };
+
+  const openQuotaWaitPicker = (runId: string, reason = "Paused due to quota limit", currentResumeAt: string | null = null) => {
+    let handle: ReturnType<OverlayManager["push"]> | null = null;
+    const comp = new QuotaWaitPickerOverlay(
+      theme,
+      runId,
+      reason,
+      currentResumeAt,
+      (choice) => {
+        if (choice.kind === "now") resumeRunNow(runId);
+        else scheduleRunWait(runId, choice.delayMs);
+      },
+      () => handle?.close(),
+      () => handle?.rerender(),
+    );
+    handle = overlays.push(
+      {
+        title: "Quota Pause — Resume or Schedule Wait",
+        subtitle: runId,
+        footer: "↑/↓ move · Enter apply · Esc keep paused",
+      },
+      comp,
+      { width: "80%" },
+    );
+  };
+
+  const handleResumeSlashCommand = (argStr: string) => {
+    const tokens = argStr.trim().split(/\s+/).filter(Boolean);
+    let targetRunId = tokens[0]?.startsWith("run-") ? tokens.shift()! : "";
+    const rest = tokens.join(" ");
+
+    const proceed = (runId: string, reason?: string, resumeAt?: string | null) => {
+      if (!rest) {
+        openQuotaWaitPicker(runId, reason ?? "Paused due to quota limit", resumeAt ?? null);
+        return;
+      }
+      if (rest.toLowerCase() === "now") {
+        resumeRunNow(runId);
+        return;
+      }
+      const ms = parseDurationMs(rest);
+      if (ms) {
+        scheduleRunWait(runId, ms);
+      } else {
+        void opts.client
+          .request<{ resumed: boolean; resumedTaskIds: string[] }>("run.resume", { runId, message: rest })
+          .then((res) => {
+            appendSystem(
+              res.resumed
+                ? [`Resumed ${theme.bold(runId)} with instruction (${res.resumedTaskIds.length} task(s)).`]
+                : [`Run ${runId} had no quota-paused tasks.`],
+              res.resumed ? "success" : "muted",
+            );
+          })
+          .catch((err) => appendError(err, `run.resume:${runId}`));
+      }
+    };
+
+    if (targetRunId) {
+      void opts.client
+        .request<{ quotaPause?: RunQuotaPauseStatus | null }>("run.get", { runId: targetRunId })
+        .then((d) => proceed(targetRunId, d.quotaPause?.reason, d.quotaPause?.resumeAt))
+        .catch(() => proceed(targetRunId));
+      return;
+    }
+
+    void opts.client
+      .request<RunRecord[]>("run.list", { limit: 20 })
+      .then((runs) => {
+        const paused = runs.find((r) => r.status === "paused_quota");
+        if (!paused) {
+          appendSystem(["No quota-paused runs found. Open /runs to inspect all runs."], "muted");
+          return;
+        }
+        void opts.client
+          .request<{ quotaPause?: RunQuotaPauseStatus | null }>("run.get", { runId: paused.id })
+          .then((d) => proceed(paused.id, d.quotaPause?.reason, d.quotaPause?.resumeAt))
+          .catch(() => proceed(paused.id));
+      })
+      .catch((err) => appendError(err, "run.list"));
+  };
+
   const openRuns = () => {
     void opts.client
       .request<RunRecord[]>("run.list", { limit: 20 })
@@ -549,13 +664,32 @@ export async function runDirectorChatTui(opts: {
                 .request("run.stop", { runId: run.id })
                 .then(() => appendSystem([`Stopped run ${theme.bold(run.id)}.`], "warning"))
                 .catch((err) => appendError(err, "run.stop"));
+            } else if (action === "resume") {
+              resumeRunNow(run.id);
+            } else if (action === "wait") {
+              void opts.client
+                .request<{ quotaPause?: RunQuotaPauseStatus | null }>("run.get", { runId: run.id })
+                .then((d) => openQuotaWaitPicker(run.id, d.quotaPause?.reason ?? "Paused due to quota", d.quotaPause?.resumeAt ?? null))
+                .catch(() => openQuotaWaitPicker(run.id));
             } else {
               void opts.client
-                .request<{ run: RunRecord; tasks: TaskRecord[]; escalations: EscalationRecord[] }>("tree.get", { runId: run.id })
+                .request<{ run: RunRecord; tasks: TaskRecord[]; escalations: EscalationRecord[]; quotaPause?: RunQuotaPauseStatus | null }>(
+                  "tree.get",
+                  { runId: run.id },
+                )
                 .then((detail) => {
                   const lines = [
                     `${theme.bold(`Run ${detail.run.id}`)} [${detail.run.status.toUpperCase()}] — ${detail.run.goal.split("\n")[0]}`,
                     theme.dim(`Repo: ${detail.run.repoRoot} │ Attach: pi-harness attach ${detail.run.id}`),
+                    ...(detail.quotaPause
+                      ? [
+                          theme.warning(
+                            `Quota pause (${detail.quotaPause.mode}): ${detail.quotaPause.reason}${
+                              detail.quotaPause.resumeAt ? ` · resumes ${formatResetCountdown(detail.quotaPause.resumeAt)}` : " · run /resume to restart or set wait"
+                            }`,
+                          ),
+                        ]
+                      : []),
                     ...detail.tasks.map(
                       (t) =>
                         `${"  ".repeat(t.tier - 1)}• [T${t.tier}:${t.status}] ${theme.accent(t.id)} ${t.title} (${t.model ?? t.profileId})`,
@@ -576,7 +710,7 @@ export async function runDirectorChatTui(opts: {
           {
             title: "Autonomous Runs",
             subtitle: `${runs.length} recent`,
-            footer: "Enter inspect task tree · x stop run · Esc close",
+            footer: "Enter inspect · r resume now · w schedule wait · x stop · Esc close",
           },
           comp,
           { width: "90%" },
@@ -728,7 +862,8 @@ export async function runDirectorChatTui(opts: {
         `${theme.accent("/effort")} [level]       Pick reasoning effort (low / medium / high / xhigh / max / ultra)`,
         `${theme.accent("/quota")}                Subscription & API quota buckets with reset timers`,
         `${theme.accent("/goals")}                Goal Dashboard (inspect, review, pause, cancel)`,
-        `${theme.accent("/runs")}                 Autonomous Runs Dashboard (inspect task tree or stop)`,
+        `${theme.accent("/runs")}                 Autonomous Runs Dashboard (inspect, resume, wait, stop)`,
+        `${theme.accent("/resume")} [id] [wait]   Resume quota-paused run now or pick a wait timer (e.g. /resume 15m)`,
         `${theme.accent("/review")} <goal-id>     Run deterministic gates + Skeptical Done-Review`,
         `${theme.accent("/worktrees")}            List & clean stale/orphaned git worktrees`,
         `${theme.accent("/kb")} [query]           Browse 2-stage Knowledge Base`,
@@ -750,7 +885,8 @@ export async function runDirectorChatTui(opts: {
       { id: "effort", label: "Reasoning Effort", shortcut: "/effort", description: "Adjust reasoning budget", run: () => openEffortPicker() },
       { id: "quota", label: "View Quotas", shortcut: "/quota", description: "Live subscription & API bucket bars", run: openQuota },
       { id: "goals", label: "Goals Dashboard", shortcut: "/goals", description: "Inspect, review, pause, or cancel goals", run: () => void refreshGoals().then(openGoals) },
-      { id: "runs", label: "Autonomous Runs", shortcut: "/runs", description: "Inspect running/past agent trees or stop", run: openRuns },
+      { id: "runs", label: "Autonomous Runs", shortcut: "/runs", description: "Inspect, resume, schedule wait, or stop runs", run: openRuns },
+      { id: "resume", label: "Resume / Schedule Quota Wait", shortcut: "/resume", description: "Resume a quota-paused run now or pick wait timer", run: () => handleResumeSlashCommand("") },
       { id: "settings", label: "Settings & CLIs", shortcut: "Ctrl+,", description: "Configure CLIs, defaults & quota endpoint", run: openSettings },
       { id: "worktrees", label: "Git Worktrees", shortcut: "/worktrees", description: "List & sweep stale/orphaned worktrees", run: openWorktrees },
       { id: "kb", label: "Knowledge Base", shortcut: "/kb", description: "Browse 2-stage curated learnings", run: () => openKb("") },
@@ -941,6 +1077,10 @@ export async function runDirectorChatTui(opts: {
       return;
     }
     if (text === "/runs") return openRuns();
+    if (text === "/resume" || text.startsWith("/resume ")) {
+      handleResumeSlashCommand(text.slice("/resume".length).trim());
+      return;
+    }
     if (text === "/worktrees") return openWorktrees();
     if (text === "/kb" || text.startsWith("/kb ")) return openKb(text.slice("/kb".length).trim());
     if (text === "/status") return showStatusCard();
@@ -1013,6 +1153,57 @@ export async function runDirectorChatTui(opts: {
       const p = ev.payload as { goalId: string; version: number; title: string };
       appendSystem([`[${p.goalId} v${p.version}] Autonomous execution started: ${p.title}`], "success");
       void refreshGoals();
+    } else if (ev.type === "quota.agent_paused") {
+      const p = ev.payload as {
+        runId: string;
+        taskId: string;
+        tier: number;
+        title: string;
+        profileId: string;
+        model?: string | null;
+        reason: string;
+        resetAt?: string | null;
+      };
+      const eta = p.resetAt ? ` (reset ${formatResetCountdown(p.resetAt)})` : "";
+      appendSystem(
+        [
+          `${theme.bold(`⏸ Agent paused early (quota)`)} · ${theme.accent(p.taskId)} [T${p.tier}] "${p.title}" (${p.model ?? p.profileId})`,
+          `${p.reason}${eta} — worktree & WIP preserved; healthy sibling tasks continue.`,
+        ],
+        "warning",
+      );
+    } else if (ev.type === "quota.run_paused") {
+      const p = ev.payload as {
+        runId: string;
+        pausedTaskIds: string[];
+        mode: "auto_timer" | "user_timer" | "manual";
+        source: string;
+        resumeAt?: string | null;
+        reason: string;
+      };
+      const actionLine =
+        p.mode === "auto_timer" && p.resumeAt
+          ? `Auto-resume scheduled ${formatResetCountdown(p.resumeAt)} (${p.source}). Run /resume ${p.runId} now to override or pick a wait timer.`
+          : `No Quota Endpoint / reset time wired — paused cleanly. Run /resume ${p.runId} to resume now or pick how long to wait (e.g. /resume 15m).`;
+      appendSystem(
+        [
+          `${theme.bold(`⏸ Run ${p.runId} paused (quota)`)} — all active workers exited (${p.pausedTaskIds.length} task(s) waiting)`,
+          actionLine,
+        ],
+        "warning",
+      );
+    } else if (ev.type === "quota.run_scheduled") {
+      const p = ev.payload as { runId: string; resumeAt: string };
+      appendSystem(
+        [`⏱ Run ${theme.bold(p.runId)} scheduled to auto-resume ${formatResetCountdown(p.resumeAt)} (${p.resumeAt}).`],
+        "info",
+      );
+    } else if (ev.type === "quota.run_resumed") {
+      const p = ev.payload as { runId: string; trigger: string; resumedTaskIds: string[] };
+      appendSystem(
+        [`▶ Run ${theme.bold(p.runId)} resumed (${p.trigger}) — restarted ${p.resumedTaskIds.length} task(s).`],
+        "success",
+      );
     }
   });
 
@@ -1042,16 +1233,19 @@ export async function runNativeScrollbackTui(opts: {
   initialTaskId?: string | null;
 }): Promise<TuiExitAction> {
   // Handshake BEFORE touching terminal raw mode
-  const snap = await opts.client.request<{ run: RunRecord; tasks: TaskRecord[]; escalations: EscalationRecord[] }>(
-    "tree.get",
-    { runId: opts.runId },
-  );
+  const snap = await opts.client.request<{
+    run: RunRecord;
+    tasks: TaskRecord[];
+    escalations: EscalationRecord[];
+    quotaPause?: RunQuotaPauseStatus | null;
+  }>("tree.get", { runId: opts.runId });
 
   let focusedTaskId: string | null = opts.initialTaskId ?? null;
   let lastSeq = 0;
   let run: RunRecord = snap.run;
   let tasks: TaskRecord[] = snap.tasks;
   let escalations: EscalationRecord[] = snap.escalations;
+  let quotaPause: RunQuotaPauseStatus | null = snap.quotaPause ?? null;
   let streamingBuffer = "";
   let exitAction: TuiExitAction = { kind: "exit" };
   let evictedByTakeover = false;
@@ -1103,12 +1297,20 @@ export async function runNativeScrollbackTui(opts: {
 
   const refreshStatus = () => {
     const running = tasks.filter((t) => t.status === "running").length;
+    const pausedQuota = tasks.filter((t) => t.status === "paused_quota").length;
+    const isQuotaPaused = run.status === "paused_quota" || (running === 0 && pausedQuota > 0);
+    const quotaAlert = isQuotaPaused
+      ? quotaPause?.resumeAt
+        ? `⏸ quota (${formatResetCountdown(quotaPause.resumeAt)})`
+        : "⏸ quota (/resume)"
+      : null;
+
     statusBar.update({
-      tone: escalations.length > 0 ? "error" : running > 0 ? "accent" : "success",
+      tone: escalations.length > 0 ? "error" : isQuotaPaused ? "warning" : running > 0 ? "accent" : "success",
       modeLabel: `${opts.runId} (${run.status})`,
       modelLabel: `focus:${focusedTaskId ?? "ALL"}`,
-      goalsSummary: `${running} running`,
-      alertText: escalations.length > 0 ? `${escalations.length} esc` : null,
+      goalsSummary: isQuotaPaused ? `${pausedQuota} paused` : `${running} running`,
+      alertText: escalations.length > 0 ? `${escalations.length} esc` : quotaAlert,
     });
   };
 
@@ -1190,6 +1392,80 @@ export async function runNativeScrollbackTui(opts: {
     } else if (ev.type === "agent.error") {
       const formatted = formatAgentError(String((ev.payload as { error?: string })?.error ?? "Agent error"));
       streamContainer.addChild(new ErrorCard(theme, formatted));
+    } else if (
+      ev.type === "quota.agent_retrying" ||
+      ev.type === "quota.agent_recovered" ||
+      ev.type === "quota.agent_paused" ||
+      ev.type === "quota.run_paused" ||
+      ev.type === "quota.run_scheduled" ||
+      ev.type === "quota.run_resumed"
+    ) {
+      const p = (ev.payload ?? {}) as Record<string, unknown>;
+      if (ev.type === "quota.agent_retrying") {
+        streamContainer.addChild(
+          new SystemCard(
+            theme,
+            [
+              `${prefix} Rate-limited (${String(p.reason ?? "429")}) — letting CLI retry natively (watchdog ${Math.round(Number(p.timeoutMs ?? 45000) / 1000)}s)…`,
+            ],
+            "muted",
+          ),
+        );
+      } else if (ev.type === "quota.agent_recovered") {
+        streamContainer.addChild(
+          new SystemCard(theme, [`${prefix} Recovered after ${String(p.retryCount ?? 1)} transient 429 retry(ies).`], "success"),
+        );
+      } else if (ev.type === "quota.agent_paused") {
+        const eta = p.resetAt ? ` · reset ${formatResetCountdown(String(p.resetAt))}` : "";
+        streamContainer.addChild(
+          new SystemCard(
+            theme,
+            [`${prefix} ⏸ Stopped early due to quota (${String(p.reason ?? "quota")}${eta}) — worktree & WIP preserved.`],
+            "warning",
+          ),
+        );
+      } else if (ev.type === "quota.run_paused") {
+        const resumeAt = typeof p.resumeAt === "string" ? p.resumeAt : null;
+        const mode = String(p.mode ?? "manual");
+        const msg =
+          mode === "auto_timer" && resumeAt
+            ? `⏸ All workers exited — run paused on quota. Auto-resuming ${formatResetCountdown(resumeAt)}. Send any message or run /resume to override.`
+            : `⏸ All workers exited — run paused on quota (no Quota Endpoint wired). Send any message to resume now, or run /resume to pick a wait timer.`;
+        streamContainer.addChild(new SystemCard(theme, [msg], "warning"));
+      } else if (ev.type === "quota.run_scheduled") {
+        streamContainer.addChild(
+          new SystemCard(
+            theme,
+            [`⏱ Auto-resume scheduled ${formatResetCountdown(String(p.resumeAt ?? ""))} (${String(p.resumeAt ?? "")}). Send any message to resume sooner.`],
+            "info",
+          ),
+        );
+      } else if (ev.type === "quota.run_resumed") {
+        quotaPause = null;
+        streamContainer.addChild(
+          new SystemCard(
+            theme,
+            [`▶ Run resumed (${String(p.trigger ?? "manual")}) — restarted ${Array.isArray(p.resumedTaskIds) ? p.resumedTaskIds.length : 0} task(s).`],
+            "success",
+          ),
+        );
+      }
+      void opts.client
+        .request<{
+          run: RunRecord;
+          tasks: TaskRecord[];
+          escalations: EscalationRecord[];
+          quotaPause?: RunQuotaPauseStatus | null;
+        }>("tree.get", { runId: opts.runId })
+        .then((fresh) => {
+          run = fresh.run;
+          tasks = fresh.tasks;
+          escalations = fresh.escalations;
+          quotaPause = fresh.quotaPause ?? null;
+          refreshStatus();
+          tui.requestRender();
+        })
+        .catch(() => {});
     } else if (
       ev.type === "task.created" ||
       ev.type === "task.status" ||
@@ -1312,6 +1588,48 @@ export async function runNativeScrollbackTui(opts: {
       return;
     }
     if (text === "/tree") return openTree();
+    if (text === "/resume" || text.startsWith("/resume ")) {
+      const arg = text.slice("/resume".length).trim();
+      if (!arg) {
+        let handle: ReturnType<OverlayManager["push"]> | null = null;
+        const comp = new QuotaWaitPickerOverlay(
+          theme,
+          opts.runId,
+          quotaPause?.reason ?? "Paused due to quota limit",
+          quotaPause?.resumeAt ?? null,
+          (choice) => {
+            if (choice.kind === "now") {
+              void opts.client.request("run.resume", { runId: opts.runId }).catch(() => {});
+            } else {
+              void opts.client.request("run.schedule_resume", { runId: opts.runId, delayMs: choice.delayMs }).catch(() => {});
+            }
+          },
+          () => handle?.close(),
+          () => handle?.rerender(),
+        );
+        handle = overlays.push(
+          {
+            title: "Quota Pause — Resume or Schedule Wait",
+            subtitle: opts.runId,
+            footer: "↑/↓ move · Enter apply · Esc keep paused",
+          },
+          comp,
+          { width: "80%" },
+        );
+        return;
+      }
+      if (arg.toLowerCase() === "now") {
+        void opts.client.request("run.resume", { runId: opts.runId }).catch(() => {});
+        return;
+      }
+      const delayMs = parseDurationMs(arg);
+      if (delayMs) {
+        void opts.client.request("run.schedule_resume", { runId: opts.runId, delayMs }).catch(() => {});
+        return;
+      }
+      void opts.client.request("run.resume", { runId: opts.runId, message: arg }).catch(() => {});
+      return;
+    }
     if (text === "/stop") {
       void opts.client.request("run.stop", { runId: opts.runId }).then(() => {
         void term.shutdown(undefined, {
@@ -1327,11 +1645,28 @@ export async function runNativeScrollbackTui(opts: {
       streamContainer.addChild(
         new SystemCard(
           theme,
-          ["Commands: /attach [id] · /tree (Ctrl+T) · /stop · /detach (Ctrl+]) · type text to steer focused task"],
+          [
+            "Commands: /attach [id] · /tree (Ctrl+T) · /resume [now|15m] · /stop · /detach (Ctrl+]) · type text to steer (or resume if quota-paused)",
+          ],
           "info",
         ),
       );
       tui.requestRender();
+      return;
+    }
+
+    // Sending ANY message while the run is paused on quota manually resumes & resets the quota state machine!
+    const hasPausedTasks = tasks.some((t) => t.status === "paused_quota");
+    if (run.status === "paused_quota" || (hasPausedTasks && !tasks.some((t) => t.status === "running"))) {
+      void opts.client
+        .request<{ resumed: boolean; resumedTaskIds: string[] }>("run.resume", { runId: opts.runId, message: text })
+        .then((res) => {
+          streamContainer.addChild(new UserCard(theme, `[▶ resume] ${text}`));
+          if (!res.resumed) {
+            streamContainer.addChild(new SystemCard(theme, ["No quota-paused tasks remained to resume."], "muted"));
+          }
+          tui.requestRender();
+        });
       return;
     }
 
