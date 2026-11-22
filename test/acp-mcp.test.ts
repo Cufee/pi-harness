@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "bun:test";
@@ -8,8 +8,8 @@ import { loadConfig, type AcpProfileConfig } from "../src/config.js";
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
 import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
-import { AcpRunner } from "../src/runners/acp-runner.js";
-import { buildNewSessionParams, buildPostSessionActions, prepareAcpSpawn } from "../src/runners/acp-shims.js";
+import { AcpRunner, describeToolPolicyMode, detectCodexCodeModeMisconfig } from "../src/runners/acp-runner.js";
+import { buildNewSessionParams, buildPostSessionActions, hasCodexCodeModeHost, prepareAcpSpawn } from "../src/runners/acp-shims.js";
 import { detectQuotaErrorText } from "../src/runners/quota-detect.js";
 import type { PassiveQuotaSignal, RunAgentRequest, RunnerExecutionHandle, RunnerUsage } from "../src/runners/types.js";
 
@@ -73,8 +73,9 @@ describe("ACP role policies", () => {
           assert.deepEqual(params.mcpServers.map(s => s.name), bridge ? ["harness"] : []);
           return { sessionId: "fixture", models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] } };
         }).onRequest("session/prompt", async ({ client, params: { sessionId } }) => {
-          await assert.rejects(client.request("fs/read_text_file", { sessionId, path }), { data: { details: "Read denied: agent is running in control-plane-only mode" } });
-          await assert.rejects(client.request("fs/write_text_file", { sessionId, path, content: "changed" }), { data: { details: "Write denied: agent is running in control-plane-only mode" } });
+          const ctrlMode = describeToolPolicyMode("control_plane_only", false);
+          await assert.rejects(client.request("fs/read_text_file", { sessionId, path }), { data: { details: `Read denied: agent is running in ${ctrlMode} mode` } });
+          await assert.rejects(client.request("fs/write_text_file", { sessionId, path, content: "changed" }), { data: { details: `Write denied: agent is running in ${ctrlMode} mode` } });
           const permission = async (kind: "read" | "search" | "edit" | "execute" | "other", tool?: string) => {
             const res = await client.request("session/request_permission", {
               sessionId, toolCall: { toolCallId: `call-${kind}-${tool ?? "native"}`, title: roleTool, kind, locations: [{ path }],
@@ -891,6 +892,229 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
       );
       assert.equal(res.stopReason, "completed");
       assert.equal(res.text, "checked");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("proactively disables Codex features.code_mode_host when codex-code-mode-host is absent and surfaces clear misconfig errors", async () => {
+    const emptyBinDir = mkdtempSync(join(tmpdir(), "codex-no-host-"));
+    const hostBinDir = mkdtempSync(join(tmpdir(), "codex-with-host-"));
+    try {
+      const fakeHost = join(hostBinDir, "codex-code-mode-host");
+      writeFileSync(fakeHost, "#!/bin/sh\nexit 0\n", "utf8");
+      chmodSync(fakeHost, 0o755);
+
+      const fakeCodex = join(hostBinDir, "codex-acp");
+      writeFileSync(fakeCodex, "#!/bin/sh\nexit 0\n", "utf8");
+      chmodSync(fakeCodex, 0o755);
+
+      // 1. Missing codex-code-mode-host -> proactively adds -c features.code_mode_host=false & CODEX_CONFIG override
+      assert.equal(hasCodexCodeModeHost("codex-acp", { PATH: emptyBinDir }), false);
+      const missingProfile: AcpProfileConfig = {
+        id: "acp:codex",
+        kind: "acp",
+        adapter: "codex",
+        command: "codex-acp",
+        billing: "subscription",
+        env: { PATH: emptyBinDir },
+      };
+      const missingSpawn = prepareAcpSpawn(missingProfile, { systemPrompt: "Director", toolPolicy: "control_plane_only" });
+      assert.ok(missingSpawn.args.includes("features.code_mode_host=false"));
+      assert.equal(JSON.parse(missingSpawn.env.CODEX_CONFIG ?? "{}").features?.code_mode_host, false);
+      assert.equal(JSON.parse(missingSpawn.env.CODEX_CONFIG ?? "{}").features?.multi_agent, false);
+      missingSpawn.cleanup();
+
+      // 2. Discoverable codex-code-mode-host (in binary dir even when PATH is empty) -> does NOT force code_mode_host=false
+      assert.equal(hasCodexCodeModeHost(fakeCodex, { PATH: emptyBinDir }), true);
+      assert.equal(hasCodexCodeModeHost("codex-acp", { PATH: hostBinDir }), true);
+      const presentProfile: AcpProfileConfig = {
+        id: "acp:codex",
+        kind: "acp",
+        adapter: "codex",
+        command: fakeCodex,
+        billing: "subscription",
+        env: { PATH: emptyBinDir },
+      };
+      const presentSpawn = prepareAcpSpawn(presentProfile, { systemPrompt: "Director", toolPolicy: "control_plane_only" });
+      assert.equal(presentSpawn.args.includes("features.code_mode_host=false"), false);
+      assert.equal(JSON.parse(presentSpawn.env.CODEX_CONFIG ?? "{}").features?.code_mode_host, undefined);
+      presentSpawn.cleanup();
+
+      // 3. Explicit user CODEX_CONFIG override is preserved
+      const explicitProfile: AcpProfileConfig = {
+        id: "acp:codex",
+        kind: "acp",
+        adapter: "codex",
+        command: "codex-acp",
+        billing: "subscription",
+        env: { PATH: emptyBinDir, CODEX_CONFIG: JSON.stringify({ features: { code_mode_host: true } }) },
+      };
+      const explicitSpawn = prepareAcpSpawn(explicitProfile, { systemPrompt: "Director", toolPolicy: "control_plane_only" });
+      assert.equal(explicitSpawn.args.includes("features.code_mode_host=false"), false);
+      assert.equal(JSON.parse(explicitSpawn.env.CODEX_CONFIG ?? "{}").features?.code_mode_host, true);
+      explicitSpawn.cleanup();
+
+      // 4. Error classifier detects Codex Code Mode fail-closed errors and surfaces actionable Profile misconfigured error
+      const classified = detectCodexCodeModeMisconfig("Code Mode is unavailable (codex-code-mode-host not found); fail closed");
+      assert.ok(classified?.includes("Profile misconfigured"));
+      assert.ok(classified?.includes("codex-code-mode-host"));
+      assert.ok(classified?.includes("features.code_mode_host=false"));
+      assert.equal(detectCodexCodeModeMisconfig("normal unrelated failure"), null);
+
+      const failClosedFixture = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {} }))
+        .onRequest("session/new", async () => ({
+          sessionId: "s-codex-broken",
+          models: { currentModelId: "gpt-6.2-sol", availableModels: [{ modelId: "gpt-6.2-sol" }] },
+        }))
+        .onRequest("session/prompt", async ({ client, params: { sessionId } }) => {
+          await client.notify("session/update", {
+            sessionId,
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: "tc-1",
+              title: "goal_list",
+              kind: "execute",
+              status: "failed",
+              rawOutput: { error: "Code Mode is unavailable (codex-code-mode-host missing); fail closed" },
+            },
+          });
+          await client.notify("session/update", {
+            sessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Unable to call tools." } },
+          });
+          return { stopReason: "end_turn" };
+        });
+
+      await assert.rejects(
+        () =>
+          new AcpRunner(profile("codex")).run(
+            {
+              runId: "r-codex",
+              taskId: "t-codex",
+              tier: 1,
+              kind: "orchestrator",
+              cwd: emptyBinDir,
+              model: "gpt-6.2-sol",
+              systemPrompt: "Director",
+              initialPrompt: "list goals",
+              maxTurns: 1,
+              toolPolicy: "control_plane_only",
+              tools: [{ name: "goal_list", description: "list", inputSchema: {} }],
+              executeTool: async () => ({}),
+              signal: new AbortController().signal,
+              callbacks: {},
+            },
+            failClosedFixture,
+          ),
+        /Profile misconfigured.*codex-code-mode-host.*features\.code_mode_host=false/,
+      );
+    } finally {
+      rmSync(emptyBinDir, { recursive: true, force: true });
+      rmSync(hostBinDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports accurate tool policy descriptions across all modes without falsely claiming strictly read-only", async () => {
+    assert.equal(
+      describeToolPolicyMode("control_plane_only", false),
+      "control-plane-only (harness MCP tools only; no workspace reads, writes, or shell)",
+    );
+    assert.equal(
+      describeToolPolicyMode("read_only_workspace", false),
+      "read-only workspace (no file writes or shell)",
+    );
+    assert.equal(
+      describeToolPolicyMode("read_only_workspace", true),
+      "read-only workspace with verification shell (no file writes)",
+    );
+    assert.equal(describeToolPolicyMode("read_write_workspace", false), "read-write workspace");
+
+    const cwd = mkdtempSync(join(tmpdir(), "acp-policy-msg-"));
+    try {
+      const target = join(cwd, "check.txt");
+      writeFileSync(target, "hello", "utf8");
+      const recoveryPrompts: string[] = [];
+      let promptCalls = 0;
+
+      const verifyFixture = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {} }))
+        .onRequest("session/new", async () => ({
+          sessionId: "s-verify",
+          models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+        }))
+        .onRequest("session/prompt", async ({ client, params }) => {
+          promptCalls += 1;
+          const text = ((params.prompt as Array<{ text?: string }>) ?? []).map((b) => b.text ?? "").join("\n");
+          recoveryPrompts.push(text);
+          if (promptCalls === 1) {
+            // Write attempt must report "read-only workspace with verification shell (no file writes)", never "strictly read-only"
+            await assert.rejects(client.request("fs/write_text_file", { sessionId: params.sessionId, path: target, content: "mutated" }), {
+              data: { details: "Write denied: agent is running in read-only workspace with verification shell (no file writes) mode" },
+            });
+            // Denied edit permission triggers continuation recovery on silent stop
+            const perm = await client.request("session/request_permission", {
+              sessionId: params.sessionId,
+              toolCall: { toolCallId: "edit-1", title: "edit_file", kind: "edit", locations: [{ path: target }] },
+              options: [
+                { kind: "allow_once", optionId: "allow", name: "Allow" },
+                { kind: "reject_once", optionId: "deny", name: "Deny" },
+              ],
+            });
+            assert.equal(perm.outcome.outcome === "selected" ? perm.outcome.optionId : perm.outcome.outcome, "deny");
+            // Shell execute IS allowed in verify mode
+            const shellPerm = await client.request("session/request_permission", {
+              sessionId: params.sessionId,
+              toolCall: { toolCallId: "exec-1", title: "bun test", kind: "execute" },
+              options: [
+                { kind: "allow_once", optionId: "allow", name: "Allow" },
+                { kind: "reject_once", optionId: "deny", name: "Deny" },
+              ],
+            });
+            assert.equal(shellPerm.outcome.outcome === "selected" ? shellPerm.outcome.optionId : shellPerm.outcome.outcome, "allow");
+            return { stopReason: "end_turn" };
+          }
+          await client.notify("session/update", {
+            sessionId: params.sessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Verified via shell." } },
+          });
+          return { stopReason: "end_turn" };
+        });
+
+      const res = await new AcpRunner(profile("claude")).run(
+        {
+          runId: "r-verify",
+          taskId: "t-verify",
+          tier: 3,
+          kind: "verify",
+          cwd,
+          model: "opus",
+          systemPrompt: "Verifier",
+          initialPrompt: "verify",
+          maxTurns: 3,
+          toolPolicy: "read_only_workspace",
+          allowShellInReadOnly: true,
+          tools: [],
+          executeTool: async () => ({}),
+          signal: new AbortController().signal,
+          callbacks: {},
+        },
+        verifyFixture,
+      );
+
+      assert.equal(res.stopReason, "completed");
+      assert.equal(res.text, "Verified via shell.");
+      assert.equal(recoveryPrompts.length, 2);
+      assert.ok(
+        recoveryPrompts[1]!.includes("read-only workspace with verification shell (no file writes)"),
+        `Expected accurate policy phrasing in recovery prompt, got: ${recoveryPrompts[1]}`,
+      );
+      assert.equal(
+        recoveryPrompts[1]!.includes("strictly read-only"),
+        false,
+        "Must never claim 'strictly read-only' when verification shell is enabled",
+      );
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }

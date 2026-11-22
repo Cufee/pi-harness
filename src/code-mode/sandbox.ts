@@ -78,7 +78,7 @@ export function sandboxAvailable(): boolean {
   // Linux (including NixOS) needs an additional verified kernel policy.
   if (process.platform !== "darwin") {
     available = false;
-    unavailableReason = `Code Mode sandbox is only supported on macOS (platform: ${process.platform})`;
+    unavailableReason = `Code Mode sandbox unavailable: only supported on macOS (platform: ${process.platform})`;
     return false;
   }
   let dir: string | undefined;

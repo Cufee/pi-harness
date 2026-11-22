@@ -1818,6 +1818,7 @@ export class HarnessDaemon {
           session = this.director.chats.updateSession(session.id, { projectId: boundProject.id });
         }
         if (boundProject) this.db.projects.touchProject(boundProject.id);
+        session = await this.director.resolveOrMigrateSessionModel(session);
 
         const { tookOver } = this.bindChatSocket(socket, session.id);
         const turn = this.chatTurns.get(session.id);

@@ -1,6 +1,6 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, constants, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import type { AcpAdapterKind, AcpProfileConfig } from "../config.js";
 import type { ArtifactRecord } from "../control-plane/db.js";
 import type { ToolPolicy } from "./types.js";
@@ -174,6 +174,63 @@ const AMP_READ_ONLY_SHELL_ALLOW_PATTERNS = [
   "sqlite3 -readonly *",
 ];
 
+function isExecutableBinary(filePath: string): boolean {
+  try {
+    if (!statSync(filePath).isFile()) return false;
+    accessSync(filePath, process.platform === "win32" ? constants.F_OK : constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function findBinaryInDirs(binaryName: string, dirs: Iterable<string>): string | null {
+  const candidates = process.platform === "win32" ? [binaryName, `${binaryName}.exe`] : [binaryName];
+  const seen = new Set<string>();
+  for (const rawDir of dirs) {
+    const dir = rawDir.trim();
+    if (!dir || seen.has(dir)) continue;
+    seen.add(dir);
+    for (const name of candidates) {
+      const full = join(dir, name);
+      if (isExecutableBinary(full)) return full;
+    }
+  }
+  return null;
+}
+
+/**
+ * Checks whether `codex-code-mode-host` is discoverable on `PATH` or alongside the Codex ACP binary
+ * (including the binary's resolved symlink target directory).
+ */
+export function hasCodexCodeModeHost(command: string, env: Record<string, string | undefined>): boolean {
+  const pathDirs = (env.PATH ?? "").split(delimiter).filter(Boolean);
+  const searchDirs: string[] = [];
+
+  const trimmed = command.trim();
+  if (trimmed) {
+    let resolvedCmd: string | null = null;
+    if (trimmed.includes("/") || trimmed.includes("\\")) {
+      searchDirs.push(dirname(trimmed));
+      if (isExecutableBinary(trimmed)) resolvedCmd = trimmed;
+    } else {
+      resolvedCmd = findBinaryInDirs(trimmed, pathDirs);
+      if (resolvedCmd) searchDirs.push(dirname(resolvedCmd));
+    }
+    if (resolvedCmd) {
+      try {
+        const real = realpathSync(resolvedCmd);
+        searchDirs.push(dirname(real));
+      } catch {
+        // ignore symlink resolution errors
+      }
+    }
+  }
+
+  searchDirs.push(...pathDirs);
+  return findBinaryInDirs("codex-code-mode-host", searchDirs) !== null;
+}
+
 export function isAmpAcpProfile(profile: Pick<AcpProfileConfig, "id" | "adapter" | "command" | "args">): boolean {
   if (profile.adapter !== "generic") return false;
   const hay = [profile.id, profile.command, ...(profile.args ?? [])].join(" ").toLowerCase();
@@ -223,9 +280,21 @@ export function prepareAcpSpawn(
       existingCodexCfg.features && typeof existingCodexCfg.features === "object" && !Array.isArray(existingCodexCfg.features)
         ? (existingCodexCfg.features as Record<string, unknown>)
         : {};
+    const hasExplicitCodeModeHost =
+      existingFeatures.code_mode_host !== undefined ||
+      args.some((a) => /(?:^|\s)features\.code_mode_host\s*=/.test(a));
+    const disableCodeModeHost = !hasExplicitCodeModeHost && !hasCodexCodeModeHost(profile.command, env);
+    if (disableCodeModeHost) {
+      // Codex CLI 0.170+ fails closed on MCP tools if `codex-code-mode-host` is absent and code_mode_host stays enabled.
+      args.push("-c", "features.code_mode_host=false");
+    }
     env.CODEX_CONFIG = JSON.stringify({
       ...existingCodexCfg,
-      features: { ...existingFeatures, multi_agent: false },
+      features: {
+        ...existingFeatures,
+        multi_agent: false,
+        ...(disableCodeModeHost ? { code_mode_host: false } : {}),
+      },
     });
     env.DISABLE_MCP_CONFIG_FILTERING = "true";
     if (opts.toolPolicy !== "read_write_workspace") env.INITIAL_AGENT_MODE = "read-only";
@@ -428,9 +497,10 @@ export interface PostSessionAction {
   requiredModel?: string;
 }
 
-interface SelectValue { value: string; name?: string }
+interface SelectValue { value: string; name?: string; description?: string }
 
 const CLAUDE_VERSIONED_MODEL_RE = /^claude-(opus|sonnet|haiku|fable)-(\d+(?:[.-]\d+)*)(?:-\d{8})?$/i;
+const CLAUDE_EXPLICIT_METADATA_ID_RE = /\b(?:anthropic\/)?(claude-(opus|sonnet|haiku|fable)-(\d+(?:[.-]\d+)*)(?:-\d{8})?)\b/i;
 const CLAUDE_OPTION_NAME_VERSION_RE = /\b(?:claude\s+)?(opus|sonnet|haiku|fable)\s+(\d+(?:[.-]\d+)*)\b/i;
 
 /**
@@ -441,11 +511,21 @@ const CLAUDE_OPTION_NAME_VERSION_RE = /\b(?:claude\s+)?(opus|sonnet|haiku|fable)
 export function claudeOptionMatchesExactModel(opt: SelectValue, requestedModel: string): boolean {
   if (opt.value === requestedModel) return true;
   const reqMatch = requestedModel.trim().match(CLAUDE_VERSIONED_MODEL_RE);
-  if (!reqMatch || !opt.name) return false;
-  const optMatch = opt.name.match(CLAUDE_OPTION_NAME_VERSION_RE);
-  if (!optMatch) return false;
+  if (!reqMatch) return false;
   const reqFamily = reqMatch[1]!.toLowerCase();
   const reqVer = reqMatch[2]!.replace(/\./g, "-");
+  for (const field of [opt.description, opt.name]) {
+    if (!field) continue;
+    const explicit = field.match(CLAUDE_EXPLICIT_METADATA_ID_RE);
+    if (explicit) {
+      const expFamily = explicit[2]!.toLowerCase();
+      const expVer = explicit[3]!.replace(/\./g, "-");
+      if (expFamily === reqFamily && expVer === reqVer) return true;
+    }
+  }
+  if (!opt.name) return false;
+  const optMatch = opt.name.match(CLAUDE_OPTION_NAME_VERSION_RE);
+  if (!optMatch) return false;
   const optFamily = optMatch[1]!.toLowerCase();
   const optVer = optMatch[2]!.replace(/\./g, "-");
   return reqFamily === optFamily && reqVer === optVer;
@@ -482,7 +562,7 @@ export function selectValues(option?: AcpConfigOption): SelectValue[] | undefine
 
 export interface AcpModelState {
   configOptions?: AcpConfigOption[];
-  models?: { currentModelId?: string; availableModels?: Array<{ modelId: string }> };
+  models?: { currentModelId?: string; availableModels?: Array<{ modelId: string; name?: string; description?: string }> };
   modes?: { currentModeId?: string; availableModes?: Array<{ id: string; name?: string }> };
 }
 

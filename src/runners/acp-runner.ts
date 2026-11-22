@@ -22,7 +22,32 @@ import {
 } from "./acp-shims.js";
 import { detectQuotaErrorText } from "./quota-detect.js";
 import { validateRunPolicy } from "./types.js";
-import type { ProbedModelInfo, QuotaPauseInfo, RunAgentRequest, RunAgentResult, RunnerCost, RunnerUsage } from "./types.js";
+import type { ProbedModelInfo, QuotaPauseInfo, RunAgentRequest, RunAgentResult, RunnerCost, RunnerUsage, ToolPolicy } from "./types.js";
+
+/** Returns an accurate, human-readable description of the active tool policy and permissions. */
+export function describeToolPolicyMode(toolPolicy: ToolPolicy, allowShellInReadOnly = false): string {
+  if (toolPolicy === "control_plane_only") {
+    return "control-plane-only (harness MCP tools only; no workspace reads, writes, or shell)";
+  }
+  if (toolPolicy === "read_only_workspace") {
+    return allowShellInReadOnly
+      ? "read-only workspace with verification shell (no file writes)"
+      : "read-only workspace (no file writes or shell)";
+  }
+  return "read-write workspace";
+}
+
+const CODEX_CODE_MODE_UNAVAILABLE_RE = /code\s+mode\s+is\s+unavailable|codex-code-mode-host/i;
+
+/** Detects Codex 0.170+ fail-closed MCP breakage caused by a missing `codex-code-mode-host` binary. */
+export function detectCodexCodeModeMisconfig(text: string): string | null {
+  if (!CODEX_CODE_MODE_UNAVAILABLE_RE.test(text)) return null;
+  return (
+    "Profile misconfigured: Codex Code Mode is unavailable (`codex-code-mode-host` is missing or failed closed), " +
+    "blocking the harness MCP tool bridge. Install `codex-code-mode-host` alongside `codex-acp` on PATH, " +
+    "or disable it with `features.code_mode_host=false` (CLI `-c features.code_mode_host=false` or `CODEX_CONFIG`)."
+  );
+}
 
 const terminatingChildren = new WeakSet<ChildProcess>();
 
@@ -215,6 +240,7 @@ export class AcpRunner {
     const controlOnly = req.toolPolicy === "control_plane_only";
     const canWrite = req.toolPolicy === "read_write_workspace";
     const allowShell = canWrite || (req.toolPolicy === "read_only_workspace" && Boolean(req.allowShellInReadOnly));
+    const policyModeDesc = describeToolPolicyMode(req.toolPolicy, Boolean(req.allowShellInReadOnly));
     const prepared = prepareAcpSpawn(this.profile, {
       systemPrompt: req.systemPrompt,
       toolPolicy: req.toolPolicy,
@@ -795,7 +821,7 @@ export class AcpRunner {
         if (!sessionId || params.sessionId !== sessionId || !(workspaceCall || (hasHarnessBridge && (claudeCall || codexCall || geminiCall || genericCall)))) {
           const deniedLabel = title || toolKind || "native tool";
           turnDeniedTools.push(deniedLabel);
-          allToolFailures.push(`${deniedLabel} (blocked by ${req.toolPolicy})`);
+          allToolFailures.push(`${deniedLabel} (blocked by ${policyModeDesc})`);
           return (
             denyOpt
               ? { outcome: { outcome: "selected", optionId: denyOpt.optionId } }
@@ -811,7 +837,7 @@ export class AcpRunner {
       .onRequest("fs/read_text_file", async ({ params }) => {
         if (sessionId && params.sessionId === sessionId) resetIdleWatchdog();
         if (!sessionId || params.sessionId !== sessionId || controlOnly) {
-          throw new Error("Read denied: agent is running in control-plane-only mode");
+          throw new Error(`Read denied: agent is running in ${policyModeDesc} mode`);
         }
         const p = params as unknown as { path: string; line?: number; limit?: number };
         const file = await openWorkspaceFile(workspace, p.path, false);
@@ -839,7 +865,7 @@ export class AcpRunner {
       .onRequest("fs/write_text_file", async ({ params }) => {
         if (sessionId && params.sessionId === sessionId) resetIdleWatchdog();
         if (!sessionId || params.sessionId !== sessionId || !canWrite) {
-          throw new Error(`Write denied: agent is running in ${controlOnly ? "control-plane-only" : "strictly read-only"} mode`);
+          throw new Error(`Write denied: agent is running in ${policyModeDesc} mode`);
         }
         const p = params as unknown as { path: string; content: string };
         const file = await openWorkspaceFile(workspace, p.path, true);
@@ -1181,8 +1207,8 @@ export class AcpRunner {
             ...turnFailedTools.map((f) => `- Tool "${f.title}" failed${f.detail ? `: ${f.detail}` : ""}`),
             ...turnDeniedTools.map((d) =>
               canWrite
-                ? `- Tool "${d}" was blocked: execution permission denied by harness policy`
-                : `- Tool "${d}" was blocked because this session is ${controlOnly ? "control-plane-only" : "strictly read-only"}`,
+                ? `- Tool "${d}" was blocked: execution permission denied by harness policy (${policyModeDesc})`
+                : `- Tool "${d}" was blocked by harness policy (${policyModeDesc})`,
             ),
           ].join("\n");
           nextPromptText = [
@@ -1249,6 +1275,14 @@ export class AcpRunner {
         };
       }
 
+      if (this.profile.adapter === "codex" && turnSucceededTools === 0) {
+        const codexMisconfig = detectCodexCodeModeMisconfig(`${stderrBuf}\n${allToolFailures.join("\n")}`);
+        if (codexMisconfig) {
+          const detail = stderrBuf.trim() ? ` (stderr: ${stderrBuf.trim().slice(-500)})` : "";
+          throw new Error(`ACP runner (${this.profile.id}): ${codexMisconfig}${detail}`);
+        }
+      }
+
       const stopReason: RunAgentResult["stopReason"] = rolloverTriggered
         ? "rollover_requested"
         : maxTurnsTriggered || rawStop === "max_turn_requests"
@@ -1265,6 +1299,15 @@ export class AcpRunner {
         toolFailures: allToolFailures.length > 0 ? allToolFailures : undefined,
       };
     } catch (err) {
+      if (this.profile.adapter === "codex" && turnSucceededTools === 0) {
+        const primaryMsg = (spawnErr ?? err) instanceof Error ? (spawnErr ?? err as Error).message : String(spawnErr ?? err);
+        const codexMisconfig = detectCodexCodeModeMisconfig(`${primaryMsg}\n${stderrBuf}\n${allToolFailures.join("\n")}`);
+        if (codexMisconfig) {
+          if (primaryMsg.includes(codexMisconfig)) throw (spawnErr ?? err);
+          const detail = stderrBuf.trim() ? ` (stderr: ${stderrBuf.trim().slice(-500)})` : "";
+          throw new Error(`ACP runner (${this.profile.id}): ${codexMisconfig}${detail}`);
+        }
+      }
       if (rolloverTriggered) {
         return {
           text: accumulatedText,
@@ -1338,6 +1381,13 @@ export class AcpRunner {
       }
 
       const detail = stderrBuf.trim() ? ` (stderr: ${stderrBuf.trim().slice(-500)})` : "";
+      if (this.profile.adapter === "codex") {
+        const codexMisconfig = detectCodexCodeModeMisconfig(combined);
+        if (codexMisconfig) {
+          if (errMsg.includes(codexMisconfig)) throw new Error(errMsg);
+          throw new Error(`ACP runner (${this.profile.id}): ${codexMisconfig}${detail}`);
+        }
+      }
       throw new Error(`ACP runner (${this.profile.id}) failed: ${errMsg}${detail}`);
     } finally {
       flushCost();
@@ -1358,29 +1408,35 @@ export class AcpRunner {
    * Probes an ACP CLI out-of-band to discover its currently runnable models & effort options
    * for the automated Model Catalog compiler.
    */
-  async probeModels(cwd: string, timeoutMs = 15_000): Promise<ProbedModelInfo[]> {
+  async probeModels(cwd: string, timeoutMs = 15_000, testAgent?: AgentApp): Promise<ProbedModelInfo[]> {
     if (this.profile.models && this.profile.models.length > 0) {
       return this.profile.models.map((wireModelId) => ({ wireModelId }));
     }
 
-    const child = spawn(this.profile.command, this.profile.args ?? [], {
-      cwd,
-      env: { ...process.env, ...(this.profile.env ?? {}) },
-      detached: process.platform !== "win32",
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    child.on("error", () => {});
-    child.stdin?.on("error", () => {});
-    child.stdout?.on("error", () => {});
-    child.stderr?.on("error", () => {});
+    const child = testAgent
+      ? null
+      : spawn(this.profile.command, this.profile.args ?? [], {
+          cwd,
+          env: { ...process.env, ...(this.profile.env ?? {}) },
+          detached: process.platform !== "win32",
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+    if (child) {
+      child.on("error", () => {});
+      child.stdin?.on("error", () => {});
+      child.stdout?.on("error", () => {});
+      child.stderr?.on("error", () => {});
+    }
 
     const app = client();
-    const conn = app.connect(
-      ndJsonStream(
-        Writable.toWeb(child.stdin!) as unknown as WritableStream<Uint8Array>,
-        Readable.toWeb(child.stdout!) as unknown as ReadableStream<Uint8Array>,
-      ),
-    );
+    const conn = testAgent
+      ? app.connect(testAgent)
+      : app.connect(
+          ndJsonStream(
+            Writable.toWeb(child!.stdin!) as unknown as WritableStream<Uint8Array>,
+            Readable.toWeb(child!.stdout!) as unknown as ReadableStream<Uint8Array>,
+          ),
+        );
 
     const timer = setTimeout(() => {
       try {
@@ -1411,17 +1467,43 @@ export class AcpRunner {
       );
       const supportedEfforts = selectValues(effortOpt)?.map((o) => o.value);
 
+      const legacyModels = (
+        res.models as { availableModels?: Array<{ modelId: string; name?: string; description?: string }> } | undefined
+      )?.availableModels;
+      const legacyById = new Map((legacyModels ?? []).map((m) => [m.modelId, m]));
+      const explicitClaudeByFamily = new Map<string, string>();
+      for (const m of legacyModels ?? []) {
+        const match = m.modelId.match(/^(?:anthropic\/)?(claude-(opus|sonnet|haiku|fable)-\d+(?:[.-]\d+)*(?:-\d{8})?)$/i);
+        if (match) {
+          const family = match[2]!.toLowerCase();
+          if (!explicitClaudeByFamily.has(family)) {
+            explicitClaudeByFamily.set(family, match[1]!);
+          }
+        }
+      }
+
       const modelOpt = configOptions.find((c) => c.category === "model" || c.id === "model");
       for (const opt of selectValues(modelOpt) ?? []) {
-        results.push({ wireModelId: opt.value, name: opt.name, supportedEfforts });
+        const legacy = legacyById.get(opt.value);
+        const bareClaude = opt.value.trim().match(/^(?:anthropic\/)?(?:claude-)?(opus|sonnet|haiku|fable)$/i);
+        const explicitModelId = bareClaude ? explicitClaudeByFamily.get(bareClaude[1]!.toLowerCase()) : undefined;
+        results.push({
+          wireModelId: opt.value,
+          name: opt.name ?? legacy?.name,
+          ...(opt.description ?? legacy?.description ? { description: opt.description ?? legacy?.description } : {}),
+          ...(explicitModelId ? { explicitModelId } : {}),
+          supportedEfforts,
+        });
       }
 
       // Legacy fallback (gemini --acp `models.availableModels`)
-      const legacyModels = (res.models as { availableModels?: Array<{ modelId: string; name?: string }> } | undefined)
-        ?.availableModels;
       if (results.length === 0 && legacyModels) {
         for (const m of legacyModels) {
-          results.push({ wireModelId: m.modelId, name: m.name });
+          results.push({
+            wireModelId: m.modelId,
+            name: m.name,
+            ...(m.description ? { description: m.description } : {}),
+          });
         }
       }
 
