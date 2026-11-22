@@ -138,6 +138,7 @@ export function codeModePromptSection(mode: CodeMode): string {
       "The only callable harness tools are tool_search and code_exec. Every other harness tool named in these instructions (return_task, wait_children, spawn_worker, and so on) is a function inside a code_exec script. Calling it as a tool fails because it is not in your tool list.",
     'Find allowed tools with tool_search. In code_exec, use `import { ... } from "harness"`, top-level await, and output(value) for the final JSON result.',
     'Your client may prefix tool names (for example mcp__harness__code_exec) or wrap this server behind its own tool_search and code_exec. Then `harness` in the client\'s own script exports only code_exec and tool_search, so importing return_task or any other harness function there fails. Call the harness code_exec with `{ code }` and put the `import { ... } from "harness"` line inside that code string.',
+    'In the Amp native wrapper, use `text(result)` to display the result of the nested call. Use `output(value)` inside the harness code_exec script to return a value to Amp.',
     "Set timeout_s for long waits (default 60s, maximum 600s unless configured lower). Results over the inline limit (default 20,000 characters) return a preview and artifact path.",
   ].join("\n\n");
 }
