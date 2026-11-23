@@ -63,7 +63,8 @@ export class DaemonClient {
           reject(new Error(`SSH spawn failed: ${err.message}`));
         });
       });
-      proc.once("exit", (code) => {
+      // "close" fires after stdout ends and stderr is drained, so a failed bridge reports its stderr.
+      proc.once("close", (code) => {
         if (code && code !== 0 && stderrBuf.trim()) {
           for (const p of this.pending.values()) {
             p.reject(new Error(`SSH bridge exited (${code}): ${stderrBuf.trim()}`));
@@ -72,7 +73,7 @@ export class DaemonClient {
         }
         this.handleDisconnect(proc.stdin!);
       });
-      this.attachTransportReader(proc.stdin!);
+      this.attachTransportReader(proc.stdin!, false);
       await Promise.race([
         this.request("ping"),
         spawnErr,
@@ -100,7 +101,7 @@ export class DaemonClient {
     this.attachTransportReader(this.writable);
   }
 
-  private attachTransportReader(transport: Writable | null): void {
+  private attachTransportReader(transport: Writable | null, disconnectOnEnd = true): void {
     if (!this.readable) return;
     this.detachReader = attachDaemonReader(this.readable, {
       onMessage: (raw) => {
@@ -123,7 +124,9 @@ export class DaemonClient {
         }
       },
       onError: () => this.handleDisconnect(transport),
-      onEnd: () => this.handleDisconnect(transport),
+      onEnd: () => {
+        if (disconnectOnEnd) this.handleDisconnect(transport);
+      },
     });
   }
 

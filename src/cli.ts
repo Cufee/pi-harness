@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, realpathSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ProjectBrowseResult, ProjectSummary } from "./control-plane/projects.js";
@@ -246,10 +246,15 @@ export async function ensureLocalDaemon(socketPath: string): Promise<DaemonClien
   mkdirSync(logDir, { recursive: true });
   const logPath = join(logDir, "daemon.log");
   const logFd = openSync(logPath, "a");
+  const logStart = fstatSync(logFd).size;
+  let exitStatus: string | null = null;
   try {
     const child = spawn(process.execPath, [cliPath, "daemon", "serve"], {
       detached: true,
       stdio: ["ignore", logFd, logFd],
+    });
+    child.once("exit", (code, signal) => {
+      exitStatus = signal ?? String(code);
     });
     child.unref();
   } finally {
@@ -258,15 +263,20 @@ export async function ensureLocalDaemon(socketPath: string): Promise<DaemonClien
 
   for (let i = 0; i < 40; i++) {
     await new Promise((r) => setTimeout(r, 80));
-    if (!existsSync(socketPath)) continue;
-    const check = new DaemonClient(socketPath);
-    try {
-      await check.connect();
-      const info = (await check.request("ping")) as { buildId?: string };
-      if (info.buildId === expectedBuildId) return check;
-      check.close();
-    } catch {
-      check.close();
+    if (existsSync(socketPath)) {
+      const check = new DaemonClient(socketPath);
+      try {
+        await check.connect();
+        const info = (await check.request("ping")) as { buildId?: string };
+        if (info.buildId === expectedBuildId) return check;
+        check.close();
+      } catch {
+        check.close();
+      }
+    }
+    if (exitStatus !== null) {
+      const logged = readFileSync(logPath).subarray(logStart).toString("utf8").trim().slice(-2000);
+      throw new Error(`harnessd exited (${exitStatus}) before listening on ${socketPath}: ${logged || `no output in ${logPath}`}`);
     }
   }
   throw new Error(`Timed out waiting for harnessd to listen on ${socketPath}`);
