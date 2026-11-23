@@ -1,10 +1,46 @@
 import { clamp, fit } from "./text.js";
 import type { Theme } from "./tokens.js";
 
-export const ENABLE_MOUSE_WHEEL_SEQ = "\x1b[?1000h\x1b[?1006h";
-export const DISABLE_MOUSE_WHEEL_SEQ = "\x1b[?1000l\x1b[?1006l";
+export const ENABLE_MOUSE_SEQ = "\x1b[?1002h\x1b[?1006h";
+export const DISABLE_MOUSE_SEQ = "\x1b[?1002l\x1b[?1006l";
 
 const SGR_MOUSE_RX = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g;
+
+export interface ScreenMouseEvent {
+  type: "press" | "drag" | "release" | "wheel";
+  button: "left" | "middle" | "right" | "none";
+  /** 0-based column coordinate. */
+  x: number;
+  /** 0-based row coordinate. */
+  y: number;
+  /** Net wheel delta (-3 up, +3 down, 0 for non-wheel). */
+  wheelDelta: number;
+}
+
+/** Parses SGR mouse sequences (`\x1b[<b;x;yM/m`) into 0-based events. */
+export function parseMouseEvents(data: string): ScreenMouseEvent[] {
+  const out: ScreenMouseEvent[] = [];
+  SGR_MOUSE_RX.lastIndex = 0;
+  for (const m of data.matchAll(SGR_MOUSE_RX)) {
+    const b = Number(m[1]);
+    const x = Math.max(0, Number(m[2]) - 1);
+    const y = Math.max(0, Number(m[3]) - 1);
+    const suffix = m[4];
+    if ((b & 64) !== 0) {
+      const low = b & 3;
+      const wheelDelta = low === 0 ? -3 : low === 1 ? 3 : 0;
+      out.push({ type: "wheel", button: "none", x, y, wheelDelta });
+      continue;
+    }
+    const low = b & 3;
+    const button: ScreenMouseEvent["button"] =
+      low === 0 ? "left" : low === 1 ? "middle" : low === 2 ? "right" : "none";
+    const type: ScreenMouseEvent["type"] =
+      (b & 32) !== 0 ? "drag" : suffix === "M" ? "press" : "release";
+    out.push({ type, button, x, y, wheelDelta: 0 });
+  }
+  return out;
+}
 
 /** Extracts net wheel delta (negative = up, positive = down) from SGR mouse sequences. */
 export function parseMouseWheel(data: string): { delta: number; hadMouse: boolean } {

@@ -72,10 +72,19 @@ export function handleTabKeys<T extends string>(
  * - Inline confirm / prompt (with optional `allowEmpty`) + status notice
  * - Guarantees every rendered line <= `width` and total rows <= `maxHeight`.
  */
+export interface FrameBodyRect {
+  row: number;
+  col: number;
+  width: number;
+  height: number;
+}
+
 export class Frame {
   private confirmState: FrameConfirm | null = null;
   private promptState: { spec: FramePrompt; input: Input } | null = null;
   private notice: { text: string; tone: Tone } | null = null;
+  /** Overlay-local bounds of the rendered body area from the most recent `render()`. */
+  bodyRect: FrameBodyRect | null = null;
 
   get hasInlineModal(): boolean {
     return this.confirmState !== null || this.promptState !== null;
@@ -237,11 +246,18 @@ export class Frame {
 
     if (padY) out.push(boxRow(""));
 
+    const bodyRow = out.length;
     const bodyLines = opts.renderBody(innerW, availBody).slice(0, availBody);
     for (const line of bodyLines) {
       out.push(boxRow(line));
     }
     if (bodyLines.length === 0) out.push(boxRow(""));
+    this.bodyRect = {
+      row: bodyRow,
+      col: 1 + padX,
+      width: innerW,
+      height: Math.min(Math.max(1, bodyLines.length), Math.max(0, maxH - bodyRow)),
+    };
 
     if (padY) out.push(boxRow(""));
 
