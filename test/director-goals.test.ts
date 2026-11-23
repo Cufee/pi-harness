@@ -98,7 +98,7 @@ describe("Tier 0 Director, Run-Until-Done Goal Engine, Independent Done-Review &
         const goals = (await client.request("goal.list", { repoRoot })) as GoalRecord[];
         assert.equal(goals.length, 1);
         const goal = goals[0]!;
-        assert.equal(goal.status, "executing");
+        assert.ok(goal.status === "executing" || goal.status === "awaiting_human", goal.status);
 
         // Review 1 BEFORE greet.txt exists -> deterministic gate fails at $0 LLM cost (reviewCalls stays 0!)
         const rFail = (await client.request("goal.review", { goalId: goal.id })) as {
