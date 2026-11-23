@@ -229,7 +229,14 @@ export class WorktreeManager {
       throw err;
     }
 
-    return this.db.recordWorktree({ runId, taskId, path: wtPath, branch, baseSha: sha });
+    return this.db.recordWorktree({
+      runId,
+      taskId,
+      path: wtPath,
+      branch,
+      baseSha: sha,
+      creationIdentityJson: serializeCreationIdentity(identity),
+    });
   }
 
   /**
@@ -404,6 +411,12 @@ export class WorktreeManager {
         throw new Error(`Worktree ${worktreeId} is on branch ${reg.branch}, not ${wt.branch}; left in place`);
       }
       verifyCheckoutBacklink(reg, await this.commonDir());
+      // Common dir and backlink also describe a later registration at this path; only the creation identity proves it is ours.
+      if (wt.creationIdentityJson) {
+        verifyCreationIdentity(reg, parseCreationIdentity(wt.creationIdentityJson));
+      } else if (reg.branch === null) {
+        throw new Error(`Worktree ${worktreeId} is detached with no recorded creation identity; left in place`);
+      }
     } else if (existsSync(wt.path)) {
       throw new Error(`Worktree ${worktreeId} at ${wt.path} is not registered with Git; left in place`);
     }
@@ -665,6 +678,35 @@ function sameIdentity(a: FileIdentity, b: FileIdentity): boolean {
   return a.dev === b.dev && a.ino === b.ino && a.birthtimeNs === b.birthtimeNs;
 }
 
+function serializeCreationIdentity(id: CreationIdentity): string {
+  const file = (f: FileIdentity) => ({ dev: f.dev.toString(), ino: f.ino.toString(), birthtimeNs: f.birthtimeNs.toString() });
+  return JSON.stringify({ adminDir: id.adminDir, adminStat: file(id.adminStat), dotGitStat: file(id.dotGitStat) });
+}
+
+/** Parses serializeCreationIdentity output; throws on anything malformed so removal fails closed. */
+function parseCreationIdentity(raw: string): CreationIdentity {
+  const bad = () => new Error("Recorded creation identity is malformed; left in place");
+  let v: unknown;
+  try {
+    v = JSON.parse(raw);
+  } catch {
+    throw bad();
+  }
+  const int = (x: unknown): bigint => {
+    if (typeof x !== "string" || !/^\d+$/.test(x)) throw bad();
+    return BigInt(x);
+  };
+  const file = (x: unknown): FileIdentity => {
+    if (!x || typeof x !== "object") throw bad();
+    const f = x as Record<string, unknown>;
+    return { dev: int(f.dev), ino: int(f.ino), birthtimeNs: int(f.birthtimeNs) };
+  };
+  if (!v || typeof v !== "object") throw bad();
+  const o = v as Record<string, unknown>;
+  if (typeof o.adminDir !== "string" || !isAbsolute(o.adminDir)) throw bad();
+  return { adminDir: o.adminDir, adminStat: file(o.adminStat), dotGitStat: file(o.dotGitStat) };
+}
+
 /** Records the admin entry and `.git` file a just-added worktree got, so later removal targets only that creation. */
 function captureCreationIdentity(wtPath: string, expectedCommonDir: string): CreationIdentity {
   const adminDir = resolveAdminDir(wtPath, expectedCommonDir);
@@ -694,7 +736,7 @@ function verifyCreationIdentity(reg: PorcelainWorktree, identity: CreationIdenti
 
 /**
  * Refuses when removing targetCanon would also destroy another checkout: a registered worktree below it,
- * or any `.git` file or directory below it on disk (foreign repositories, submodules). Symlinks are not followed.
+ * or any `.git` entry below it on disk in any letter case (foreign repositories, submodules). Symlinks are not followed.
  */
 function assertNoNestedCheckouts(targetCanon: string, entries: PorcelainWorktree[]): void {
   for (const e of entries) {
@@ -706,8 +748,19 @@ function assertNoNestedCheckouts(targetCanon: string, entries: PorcelainWorktree
   const stack = [targetCanon];
   while (stack.length > 0) {
     const dir = stack.pop()!;
+    if (dir !== targetCanon) {
+      // Ask the filesystem, which resolves `.git` the way Git does (case-insensitively on such volumes).
+      let found = true;
+      try {
+        lstatSync(join(dir, ".git"));
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        found = false;
+      }
+      if (found) throw new Error(`${targetCanon} contains nested git checkout ${dir}; left in place`);
+    }
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name === ".git") {
+      if (entry.name.toLowerCase() === ".git") {
         if (dir !== targetCanon) throw new Error(`${targetCanon} contains nested git checkout ${dir}; left in place`);
         continue;
       }
