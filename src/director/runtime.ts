@@ -2988,7 +2988,15 @@ export class DirectorRuntime {
 
           // Fallback JSON parse if reviewer returned JSON text instead of calling submit_review_verdict
           if (!verdictBox.value && res) {
-            verdictBox.value = parseReviewerVerdictJson<SubmittedVerdict>(res.text);
+            const parsed = parseReviewerVerdictJson<Partial<SubmittedVerdict>>(res.text);
+            if (parsed) {
+              verdictBox.value = {
+                verdict: parsed.verdict as SubmittedVerdict["verdict"],
+                criteriaResults: parsed.criteriaResults ?? [],
+                blockingIssues: parsed.blockingIssues ?? [],
+                summary: typeof parsed.summary === "string" ? parsed.summary : "",
+              };
+            }
           }
           if (verdictBox.value) break;
 
@@ -3084,6 +3092,7 @@ export class DirectorRuntime {
         reviewerSignal.throwIfAborted();
         throw new Error(`${failedSummary} (${detail}; turns=${turnsUsed})`);
       } finally {
+        activeAttempt = 0;
         clearTimeout(reviewerTimeout);
         this.activeReviewerTools.delete(reviewerTask.id);
         unsubscribe();
