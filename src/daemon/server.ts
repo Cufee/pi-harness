@@ -17,6 +17,7 @@ export function currentDaemonBuildId(): string {
 import { ModelCatalogCompiler } from "../catalog/compiler.js";
 import {
   diffHarnessConfig,
+  findMisplacedConfigKeys,
   isPlainObject,
   normalizeWorktreeRoots,
   readRepoConfig,
@@ -27,6 +28,7 @@ import {
   validateConfigRaw,
   type GoalsConfig,
   type HarnessConfig,
+  type MisplacedConfigKey,
   type RemoteHostConfig,
   type RunnerProfileConfig,
 } from "../config.js";
@@ -123,6 +125,11 @@ const CONFIG_UPDATE_FIELDS: ReadonlySet<string> = new Set([
   "quotaRetry",
   "quotaEndpoint",
 ]);
+
+/** Warning lines for known config keys found at unsupported locations; built from schema names only, never values. */
+function formatMisplacedConfigWarnings(fileLabel: "config.json" | ".pi-harness.json", items: MisplacedConfigKey[]): string[] {
+  return items.map((m) => `${fileLabel}: "${m.path}" is ignored; supported location: ${m.supported}`);
+}
 
 export const MAX_PEER_MESSAGE_HOPS = 10;
 
@@ -225,6 +232,10 @@ export class HarnessDaemon {
   private lastConfigRaw = "";
   /** Repository overlay snapshotted at startup; reloads layer `config.json` beneath it. */
   private readonly repoOverlay: Record<string, unknown>;
+  /** Misplaced keys in the startup repo overlay; fixed for the daemon lifetime. */
+  private readonly repoConfigWarnings: string[];
+  /** Misplaced keys in the `config.json` text the effective config was last built from. */
+  private globalConfigWarnings: string[] = [];
   /** Without a repo root, the constructor config is the layer beneath `config.json` on reload. */
   private readonly reloadBase: HarnessConfig | undefined;
   private autoQuitWhenIdle = false;
@@ -242,6 +253,10 @@ export class HarnessDaemon {
     },
   ) {
     this.repoOverlay = readRepoConfig(opts?.repoRoot);
+    this.repoConfigWarnings = formatMisplacedConfigWarnings(
+      ".pi-harness.json",
+      findMisplacedConfigKeys(this.repoOverlay, "repo"),
+    );
     // Cloned because the orchestrator mutates the constructor config in place.
     this.reloadBase = opts?.repoRoot ? undefined : structuredClone(config);
     this.autoQuitWhenIdle = Boolean(opts?.autoQuitWhenIdle);
@@ -424,6 +439,21 @@ export class HarnessDaemon {
     const serialized = serializeGlobalConfig(this.config);
     saveGlobalConfig(this.config);
     this.lastConfigRaw = serialized;
+    this.setGlobalConfigWarnings(JSON.parse(serialized), false);
+  }
+
+  /** Stores the misplaced-key warnings for a parsed `config.json`; logs them when announced or changed. */
+  private setGlobalConfigWarnings(parsed: unknown, announce: boolean): void {
+    const next = formatMisplacedConfigWarnings("config.json", findMisplacedConfigKeys(parsed, "global"));
+    const changed = !stableEqual(this.globalConfigWarnings, next);
+    this.globalConfigWarnings = next;
+    if (next.length > 0 && (announce || changed)) {
+      for (const w of next) console.error(`[harnessd ${new Date().toISOString()}] config warning: ${w}`);
+    } else if (next.length === 0 && changed) {
+      console.error(
+        `[harnessd ${new Date().toISOString()}] config warnings cleared: ${join(this.config.stateDir, "config.json")}`,
+      );
+    }
   }
 
   /**
@@ -465,15 +495,17 @@ export class HarnessDaemon {
         this.reloadBase,
       ),
     );
-    if (diffHarnessConfig(prev, next).length === 0) return;
-    const applied = this.applyConfigMutation(next, {
-      profilesChanged: !stableEqual(next.profiles, prev.profiles),
-      skipSave: true,
-    });
-    const changes = diffHarnessConfig(prev, applied);
-    if (changes.length > 0) {
-      console.error(`[harnessd ${new Date().toISOString()}] config reload applied ${cfgFile} changes=${JSON.stringify(changes)}`);
+    if (diffHarnessConfig(prev, next).length > 0) {
+      const applied = this.applyConfigMutation(next, {
+        profilesChanged: !stableEqual(next.profiles, prev.profiles),
+        skipSave: true,
+      });
+      const changes = diffHarnessConfig(prev, applied);
+      if (changes.length > 0) {
+        console.error(`[harnessd ${new Date().toISOString()}] config reload applied ${cfgFile} changes=${JSON.stringify(changes)}`);
+      }
     }
+    this.setGlobalConfigWarnings(parsed, true);
   }
 
   private stopConfigWatcher(): void {
@@ -502,6 +534,15 @@ export class HarnessDaemon {
       }
     } catch {
       return;
+    }
+    if (this.lastConfigRaw.trim()) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(this.lastConfigRaw);
+      } catch {
+        // Invalid JSON yields no warnings; the next valid edit goes through the reload path.
+      }
+      this.setGlobalConfigWarnings(parsed, true);
     }
 
     try {
@@ -591,6 +632,9 @@ export class HarnessDaemon {
 
     // Live-watch `<stateDir>/config.json` so external edits apply immediately without restart
     this.startConfigWatcher();
+    for (const w of this.repoConfigWarnings) {
+      console.error(`[harnessd ${new Date().toISOString()}] config warning: ${w}`);
+    }
 
     // Recover any durable inbound peer wakeups that were persisted before a crash/restart
     for (const pending of this.db.sessionMessages.listPendingInboundWakes()) {
@@ -1793,6 +1837,7 @@ export class HarnessDaemon {
           uptimeMs: Date.now() - this.startedAt,
           socketPath: this.config.socketPath,
           configPath: join(this.config.stateDir, "config.json"),
+          configWarnings: [...this.globalConfigWarnings, ...this.repoConfigWarnings],
           effectiveLimits: {
             maxConcurrentGoals: this.config.goals.maxConcurrentGoals ?? 4,
             maxConcurrentWorkers: this.config.worktree.maxConcurrentWorkers ?? 4,
@@ -1937,6 +1982,12 @@ export class HarnessDaemon {
         const unsupported = Object.keys(patch).filter((key) => !CONFIG_UPDATE_FIELDS.has(key));
         if (unsupported.length > 0) {
           throw new Error(`Invalid config patch: unsupported config.update field: ${unsupported.join(", ")}`);
+        }
+        const misplaced = findMisplacedConfigKeys(patch, "global");
+        if (misplaced.length > 0) {
+          throw new Error(
+            `Invalid config patch: ${misplaced.map((m) => `"${m.path}" is not supported; supported location: ${m.supported}`).join("; ")}`,
+          );
         }
         const patchErrors = validateConfigRaw(patch);
         if (patchErrors.length > 0) throw new Error(`Invalid config patch: ${patchErrors.join("; ")}`);

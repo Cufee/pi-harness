@@ -216,6 +216,167 @@ export interface HarnessConfig {
   quotaEndpoint?: QuotaEndpointConfig;
 }
 
+/** Top-level keys whose value is a nested section (neither a string nor a list). */
+type ConfigSection = {
+  [K in keyof HarnessConfig]-?: NonNullable<HarnessConfig[K]> extends string | readonly unknown[] ? never : K;
+}[keyof HarnessConfig];
+
+/** Every key each section supports. Adding or removing a key in a section interface fails typecheck here. */
+const CONFIG_SECTION_KEYS: { [S in ConfigSection]: { [K in keyof NonNullable<HarnessConfig[S]>]-?: true } } = {
+  codeExec: { defaultTimeoutMs: true, maxTimeoutMs: true, maxOutputChars: true },
+  rollover: {
+    orchestratorThreshold: true,
+    workerThreshold: true,
+    orchestratorMaxTurns: true,
+    workerMaxTurns: true,
+    taskMaxTurns: true,
+    reviewerMaxTurns: true,
+    externalizeBytes: true,
+    maxGenerations: true,
+  },
+  worktree: {
+    dir: true,
+    artifactsDir: true,
+    setupCommand: true,
+    ciCommands: true,
+    ciTimeoutMs: true,
+    gitAuthorName: true,
+    gitAuthorEmail: true,
+    archiveRetentionDays: true,
+    maxConcurrentWorkers: true,
+    extraReadRoots: true,
+    extraWriteRoots: true,
+  },
+  goals: {
+    defaultMaxReviewCycles: true,
+    defaultMaxNoProgressCycles: true,
+    gateTimeoutMs: true,
+    autoVerifyOnSettle: true,
+    maxConcurrentGoals: true,
+    gateShell: true,
+    gateEnv: true,
+  },
+  events: { fallbackWakeupIntervalSec: true, wakeDirectorOnGoalSettle: true },
+  catalog: {
+    ttlHours: true,
+    artificialAnalysisKeyEnv: true,
+    allowPreview: true,
+    preferSubscription: true,
+    modelFilterMode: true,
+    disabledModels: true,
+    enabledModels: true,
+  },
+  quotaRetry: {
+    nativeRetryTimeoutMs: true,
+    fallbackCooldownSec: true,
+    maxCooldownSec: true,
+    autoResumeEnabled: true,
+    earlyWakePollMs: true,
+  },
+  quotaEndpoint: { url: true, headers: true, pollIntervalSec: true, timeoutMs: true, format: true },
+};
+
+/** Top-level keys a config file may set; stateDir always comes from the environment. */
+const CONFIG_TOP_LEVEL_KEYS: { [K in Exclude<keyof HarnessConfig, "stateDir">]-?: true } = {
+  socketPath: true,
+  profiles: true,
+  remotes: true,
+  externalMcpServers: true,
+  codeMode: true,
+  codeExec: true,
+  defaultOrchestratorProfile: true,
+  defaultWorkerProfile: true,
+  defaultTaskProfile: true,
+  rollover: true,
+  worktree: true,
+  goals: true,
+  events: true,
+  catalog: true,
+  quotaRetry: true,
+  quotaEndpoint: true,
+};
+
+/** Honored only in the global config.json; resolveConfig strips these from the repo layer. */
+const GLOBAL_ONLY_CONFIG_KEYS: ReadonlySet<string> = new Set([
+  "remotes",
+  "worktree.extraReadRoots",
+  "worktree.extraWriteRoots",
+  "goals.gateShell",
+  "goals.gateEnv",
+]);
+
+const CONFIG_SECTIONS = Object.keys(CONFIG_SECTION_KEYS) as ConfigSection[];
+const TOP_LEVEL_KEYS: ReadonlySet<string> = new Set(Object.keys(CONFIG_TOP_LEVEL_KEYS));
+/** Each nested key mapped to its one section; keys with two homes or equal to a top-level key are left out. */
+const SECTION_OF_KEY: ReadonlyMap<string, ConfigSection> = (() => {
+  const map = new Map<string, ConfigSection>();
+  const ambiguous = new Set<string>();
+  for (const section of CONFIG_SECTIONS) {
+    for (const key of Object.keys(CONFIG_SECTION_KEYS[section])) {
+      if (map.has(key) || TOP_LEVEL_KEYS.has(key)) ambiguous.add(key);
+      else map.set(key, section);
+    }
+  }
+  for (const key of ambiguous) map.delete(key);
+  return map;
+})();
+
+export interface MisplacedConfigKey {
+  /** Where the key was found, such as `extraReadRoots` or `goals.maxConcurrentWorkers`. */
+  path: string;
+  /** Where the key is supported, as display text. */
+  supported: string;
+}
+
+function isMisplacedIn(section: ConfigSection, key: string): boolean {
+  const home = SECTION_OF_KEY.get(key);
+  return home !== undefined ? home !== section : TOP_LEVEL_KEYS.has(key);
+}
+
+/** Known config keys found where they are not supported in a raw layer document. Never reads or returns values. */
+export function findMisplacedConfigKeys(raw: unknown, layer: "global" | "repo"): MisplacedConfigKey[] {
+  if (!isPlainObject(raw)) return [];
+  const out: MisplacedConfigKey[] = [];
+  const supported = (target: string) =>
+    layer === "repo" && GLOBAL_ONLY_CONFIG_KEYS.has(target) ? `"${target}" in the global config.json` : `"${target}"`;
+  for (const key of Object.keys(raw)) {
+    const home = SECTION_OF_KEY.get(key);
+    if (home !== undefined) {
+      out.push({ path: key, supported: supported(`${home}.${key}`) });
+    } else if (layer === "repo" && TOP_LEVEL_KEYS.has(key) && GLOBAL_ONLY_CONFIG_KEYS.has(key)) {
+      out.push({ path: key, supported: supported(key) });
+    }
+  }
+  for (const section of CONFIG_SECTIONS) {
+    const value = raw[section];
+    if (!Object.hasOwn(raw, section) || !isPlainObject(value)) continue;
+    for (const key of Object.keys(value)) {
+      const home = SECTION_OF_KEY.get(key);
+      const path = `${section}.${key}`;
+      if (home !== undefined) {
+        if (home !== section) out.push({ path, supported: supported(`${home}.${key}`) });
+        else if (layer === "repo" && GLOBAL_ONLY_CONFIG_KEYS.has(path)) out.push({ path, supported: supported(path) });
+      } else if (TOP_LEVEL_KEYS.has(key)) {
+        out.push({ path, supported: supported(key) });
+      }
+    }
+  }
+  return out;
+}
+
+/** Copy of a raw layer whose sections hold no keys that belong elsewhere, so those keys never reach the effective config. */
+function dropMisplacedSectionKeys(raw: Record<string, unknown>): Record<string, unknown> {
+  let out = raw;
+  for (const section of CONFIG_SECTIONS) {
+    const sec = raw[section];
+    if (!Object.hasOwn(raw, section) || !isPlainObject(sec)) continue;
+    if (!Object.keys(sec).some((key) => isMisplacedIn(section, key))) continue;
+    const clean = Object.fromEntries(Object.entries(sec).filter(([key]) => !isMisplacedIn(section, key)));
+    out = { ...out, [section]: clean };
+  }
+  return out;
+}
+
 export function defaultStateDir(): string {
   return process.env.PI_HARNESS_HOME || join(homedir(), ".pi-harness");
 }
@@ -370,7 +531,7 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
  * Builds the effective config from layers: `base` (or built-in defaults) < global `config.json` < repo `.pi-harness.json`.
  * Nested sections merge per key; arrays and scalars replace whole. `remotes` and worktree access roots never come
  * from the repo layer. When `base` is given it replaces the built-in defaults, so a removed global key falls back
- * to the base value.
+ * to the base value. Known keys inside a section they do not belong to are dropped, never honored.
  */
 export function resolveConfig(
   globalCfg: Record<string, unknown>,
@@ -381,6 +542,8 @@ export function resolveConfig(
   // Startup stays tolerant of non-object roots; the reload and config.update boundaries reject them.
   if (!isPlainObject(globalCfg)) globalCfg = {};
   if (!isPlainObject(repoCfg)) repoCfg = {};
+  globalCfg = dropMisplacedSectionKeys(globalCfg);
+  repoCfg = dropMisplacedSectionKeys(repoCfg);
   const stateDir = runtime.stateDir;
   const merged = { ...globalCfg, ...repoCfg } as Partial<HarnessConfig>;
   const rollover: RolloverConfig = {
