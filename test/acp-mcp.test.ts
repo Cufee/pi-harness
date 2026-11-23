@@ -432,9 +432,14 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
       assert.equal(taken.session.id, s2.session.id);
       assert.equal(taken.tookOver, true);
 
-      // Wait briefly for `session.taken_over` frame to arrive on c1
+      // Wait briefly for `session.control_changed` frame to arrive on c1
       await new Promise((r) => setTimeout(r, 40));
-      assert.ok(evictedEvents.some((e) => e.type === "session.taken_over"));
+      const controlChanged = evictedEvents.find((e) => e.type === "session.control_changed");
+      assert.ok(controlChanged);
+      const controlPayload = controlChanged.payload as { sessionId?: string; kind?: string; reason?: string };
+      assert.equal(controlPayload.sessionId, s2.session.id);
+      assert.equal(controlPayload.kind, "chat");
+      assert.equal(controlPayload.reason, "attached");
 
       const listed = (await c2.request("sessions.list")) as Array<{
         id: string;
@@ -447,7 +452,11 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
 
       // Switching c2 to s1 makes s1 the most-recent session
       await c2.request("chat.open", { repoRoot: stateDir, chatSessionId: s1.session.id });
-      const leaveRes = (await c2.request("session.leave")) as { running: boolean };
+      // Non-destructive takeover keeps c1 attached as a viewer, so c2 leaving still reports another attached terminal
+      const c2LeaveRes = (await c2.request("session.leave")) as { running: boolean };
+      assert.equal(c2LeaveRes.running, true);
+      // Once c1 also leaves, the daemon is idle
+      const leaveRes = (await c1.request("session.leave")) as { running: boolean };
       assert.equal(leaveRes.running, false);
 
       c1.close();
