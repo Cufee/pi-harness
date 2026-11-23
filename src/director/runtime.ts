@@ -1423,10 +1423,14 @@ export class DirectorRuntime {
         ]
           .filter(Boolean)
           .join("\n");
+        const isStillAmendedExecuting = () => {
+          const latest = this.goals.getGoal(goal.id);
+          return latest !== null && latest.version === goal.version && latest.status === "executing";
+        };
         let delivered = await this.orchestrator.steerTask(orch.id, steerMsg).catch(() => false);
-        if (!delivered && goal.status === "executing") {
+        if (!delivered && goal.status === "executing" && isStillAmendedExecuting()) {
           delivered = await this.orchestrator
-            .resumeTask(orch.id, { allowCompleted: true, note: steerMsg })
+            .resumeTask(orch.id, { allowCompleted: true, note: steerMsg, validateBeforeActivate: isStillAmendedExecuting })
             .then(() => true, () => false);
         }
         if (!delivered) amendedGoal = this.handOffStrandedGoal(goal, "amendment could not be delivered to its run");
@@ -1920,7 +1924,11 @@ export class DirectorRuntime {
     const { review, circuitBreakerTripped } = outcome;
     const reviewedVersion = review.goalVersion;
     let goal = outcome.goal;
-    if (goal.status === "executing") {
+    const isStillCurrentExecuting = () => {
+      const latest = this.goals.getGoal(goal.id);
+      return latest !== null && latest.version === reviewedVersion && latest.status === "executing";
+    };
+    if (goal.status === "executing" && isStillCurrentExecuting()) {
       // Wake / steer Tier 1 Orchestrator — or relaunch in-place if Tier 1 already settled!
       const orch = goal.linkedRunId ? this.db.listTasks(goal.linkedRunId).find((t) => t.tier === 1) : undefined;
       let delivered = false;
@@ -1933,13 +1941,13 @@ export class DirectorRuntime {
           ...review.blockingIssues.map((b) => `- Blocker: ${b}`),
         ].join("\n");
         delivered = await this.orchestrator.steerTask(orch.id, msg).catch(() => false);
-        if (!delivered) {
+        if (!delivered && isStillCurrentExecuting()) {
           delivered = await this.orchestrator
-            .resumeTask(orch.id, { allowCompleted: true, note: msg })
+            .resumeTask(orch.id, { allowCompleted: true, note: msg, validateBeforeActivate: isStillCurrentExecuting })
             .then(() => true, () => false);
         }
       }
-      if (!delivered) {
+      if (!delivered && isStillCurrentExecuting()) {
         const reason = !goal.linkedRunId
           ? "no linked run to apply requested changes"
           : orch
