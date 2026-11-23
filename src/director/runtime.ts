@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readSync, realpathSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -46,6 +46,7 @@ import {
 import type { QuotaClient } from "../quota/client.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
+import { isProtectedWritePath } from "../runners/protected-paths.js";
 import type { RunnerCallbacks, RunnerExecutionHandle, ToolDefinition } from "../runners/types.js";
 import { nativeToolsPathDirs, resolveExternalMcpServers } from "../tools/native-tools.js";
 import { runGit } from "../worktree/manager.js";
@@ -2566,13 +2567,44 @@ export class DirectorRuntime {
         if (!matchedRoot) {
           throw new Error("write_note path must be inside .harness/goals/, .harness/notes/, or a configured extraWriteRoots directory");
         }
-        mkdirSync(dirname(expandedTarget), { recursive: true });
-        const realParent = realpathSync(dirname(expandedTarget));
-        const parentRel = relative(existsSync(matchedRoot) ? realpathSync(matchedRoot) : matchedRoot, realParent);
-        if (parentRel === ".." || parentRel.startsWith(`..${sep}`) || isAbsolute(parentRel)) {
+        const checkTarget = (path: string) => {
+          const rel = relative(matchedRoot, path);
+          if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+            throw new Error("write_note parent symlink escapes allowed write root");
+          }
+          if (isProtectedWritePath(matchedRoot, path)) throw new Error("write_note target is protected");
+        };
+        checkTarget(expandedTarget);
+        let ancestor = dirname(expandedTarget);
+        while (!lstatSync(ancestor, { throwIfNoEntry: false })) ancestor = dirname(ancestor);
+        const realAncestor = realpathSync(ancestor);
+        // A new note root may not exist yet. Its existing prefix must not redirect creation.
+        if (lstatSync(matchedRoot, { throwIfNoEntry: false })) {
+          checkTarget(realAncestor);
+        } else if (realAncestor !== ancestor) {
           throw new Error("write_note parent symlink escapes allowed write root");
         }
-        writeFileSync(expandedTarget, content, "utf8");
+        const target = resolve(realAncestor, relative(ancestor, expandedTarget));
+        checkTarget(target);
+        const existing = lstatSync(target, { throwIfNoEntry: false });
+        if (existing) checkTarget(realpathSync(target));
+        else mkdirSync(dirname(target), { recursive: true });
+        checkTarget(realpathSync(dirname(target)));
+        const fd = openSync(target, constants.O_WRONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK |
+          (existing ? 0 : constants.O_CREAT | constants.O_EXCL));
+        try {
+          const actual = realpathSync(target);
+          checkTarget(actual);
+          const opened = fstatSync(fd);
+          const current = statSync(actual);
+          if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== current.dev || opened.ino !== current.ino) {
+            throw new Error("write_note requires a regular file with a single link");
+          }
+          ftruncateSync(fd, 0);
+          writeFileSync(fd, content, "utf8");
+        } finally {
+          closeSync(fd);
+        }
         this.chats.appendTurn(
           chatSessionId,
           "system_notice",
