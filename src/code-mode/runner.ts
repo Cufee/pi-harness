@@ -43,6 +43,7 @@ function bridge(socket: string): string {
   return `import { createConnection } from 'node:net';
 const sock = createConnection(${JSON.stringify(socket)});
 await new Promise((res,rej) => {sock.once('connect',res); sock.once('error',rej)});
+class ToolError extends Error { constructor(m) { super(m); this.name = 'ToolError'; } }
 const pending = new Map(); let next = 0, buf = '';
 sock.setEncoding('utf8'); sock.unref();
 sock.on('close', () => { for (const p of pending.values()) p.reject(new Error('Code Mode IPC closed')); pending.clear() });
@@ -50,7 +51,7 @@ sock.on('data', chunk => { buf += chunk; let n;
   while ((n = buf.indexOf('\\n')) >= 0) {
     const r = JSON.parse(buf.slice(0,n)); buf = buf.slice(n+1);
     const p = pending.get(r.id); pending.delete(r.id);
-    if (r.ok) p.resolve(r.value); else p.reject(new Error(r.error));
+    if (r.ok) p.resolve(r.value); else p.reject(new ToolError(r.error));
   } if (!pending.size) sock.unref();
 });
 function send(msg) {
@@ -65,19 +66,27 @@ globalThis.output = output;
 
 const message = (err: unknown) => err instanceof Error ? err.message : String(err);
 const SANDBOX_DENIAL = /\b(EPERM|EACCES)\b|operation not permitted|PermissionError|Blocked by Code Mode sandbox/i;
-function formatScriptError(raw: string, stderrTail: string, lastIpcError: string, toolNames: Iterable<string>): string {
-  // Ignore echoed script source (Bun code frames, Python traceback lines) so tokens in the code itself do not match.
+// Harness tool rejections surface as ToolError (Bun "ToolError:", Python "_cm_bridge.ToolError:"); their text is not a sandbox denial.
+const TOOL_ERROR = /^\s*(?:[\w.]+\.)?ToolError:/;
+const BLOCK_END = /^\s+at |^Traceback \(most recent call last\):|^(?:During handling of the above exception|The above exception was the direct cause)|^\s*\d+ \| |^[A-Za-z_][\w.]*(?:Error|Exception):/;
+function formatScriptError(raw: string, stderrTail: string, toolNames: Iterable<string>): string {
+  // Ignore echoed script source (Bun code frames, indented Python source excerpts) so tokens in the code itself do not match.
   const lines = stderrTail.split("\n");
-  const diagnostics = lines.filter((line, i) => !/^\s*\d+ \| /.test(line) && !/^\s*File ".*", line \d+/.test(lines[i - 1] ?? "")).join("\n");
+  let inToolError = false;
+  const diagnostics = lines.filter((line, i) => {
+    if (TOOL_ERROR.test(line)) { inToolError = true; return false; }
+    if (inToolError && !BLOCK_END.test(line)) return false;
+    inToolError = false;
+    if (/^\s*\d+ \| /.test(line)) return false;
+    return !(/^\s+/.test(line) && /^\s*File ".*", line \d+/.test(lines[i - 1] ?? ""));
+  }).join("\n");
   if (!SANDBOX_DENIAL.test(diagnostics)) return raw;
-  // An uncaught harness tool rejection is not a sandbox denial, even when its message names a permission error.
-  if (lastIpcError && SANDBOX_DENIAL.test(lastIpcError) && stderrTail.includes(lastIpcError)) return raw;
   const available = new Set(toolNames);
   const readers = (["read_file", "artifact_read"] as const).filter((name) => available.has(name));
   const guidance = readers.length > 0
     ? `Read files with ${readers.join(" or ")} from "harness" and pass the data into the script.`
     : "Read files with your own file tools outside code_exec and pass the data into the script.";
-  return `${raw}\n\nHint: if this failed on a direct filesystem, subprocess, or network call, code_exec runs in an OS sandbox that blocks workspace file reads, writes, subprocesses, and network outside its scratch directory. ${guidance}`;
+  return `${raw}\n\nHint: if this failed on a direct filesystem, subprocess, or network call, code_exec runs in an OS sandbox that blocks workspace file reads, all writes, subprocesses, and network. ${guidance}`;
 }
 const IPC_BYTES = 16 * 1024 * 1024;
 
@@ -97,7 +106,6 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
   const sockets = new Set<Socket>();
   const execAbort = new AbortController();
   let pending = 0, pendingBytes = 0;
-  let lastIpcError = "";
   let child: ChildProcess | undefined, dir: string | undefined, output: unknown, stopped = false;
   function kill() {
     if (child?.pid) try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
@@ -160,7 +168,6 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
         opts.onToolEvent?.({ ...event, phase: "end", ok: true, result: toolEventPreview(value) });
       } catch (e) {
         const error = message(e);
-        lastIpcError = error;
         opts.onToolEvent?.({ ...event, phase: "end", ok: false, error });
         reply({ ok: false, error });
       }
@@ -206,12 +213,16 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
       stream.setEncoding("utf8");
       stream.on("data", (s: string) => { result.logs += s.slice(0, Math.max(0, 8192 - result.logs.length)); tail = (tail + s).slice(-2048); });
     }
-    child.stderr!.on("data", (s: string) => { stderrTail = (stderrTail + s).slice(-2048); });
+    child.stderr!.on("data", (s: string) => {
+      stderrTail += s;
+      // Keep whole lines only, so a truncated leading fragment cannot break frame-header detection.
+      if (stderrTail.length > 4096) { stderrTail = stderrTail.slice(-4096); stderrTail = stderrTail.slice(stderrTail.indexOf("\n") + 1); }
+    });
     const status = await new Promise<number | null>((resolve, reject) => { child!.once("error", reject); child!.once("close", resolve); });
     child = undefined;
     if (stopped) return result;
     clearTimeout(timer); opts.signal?.removeEventListener("abort", abort);
-    if (status !== 0) throw new Error(formatScriptError(tail.trim() || `${python ? "Python" : "Bun"} exited with status ${status}`, stderrTail, lastIpcError, names));
+    if (status !== 0) throw new Error(formatScriptError(tail.trim() || `${python ? "Python" : "Bun"} exited with status ${status}`, stderrTail, names));
     const json = JSON.stringify(output) ?? "";
     const limit = Math.max(0, opts.maxOutputChars ?? 20_000);
     result.preview = json.slice(0, limit);
