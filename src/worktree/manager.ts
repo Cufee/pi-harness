@@ -367,12 +367,14 @@ export class WorktreeManager {
     let archiveRef: string | null = wt.archiveRef;
     if (opts?.archiveBeforeRemove) {
       archiveRef = (await this.snapshotToArchiveRef(wt)) ?? (existsSync(wt.path) ? null : wt.archiveRef);
-      if (opts.requireArchive && !archiveRef && existsSync(wt.path)) {
-        const statusRes = await runGit(wt.path, ["status", "--porcelain"]).catch(() => ({ stdout: "", exitCode: 1 }));
-        const aheadRes = await runGit(this.repoRoot, ["rev-list", "--count", `${wt.baseSha}..${wt.branch}`]).catch(() => ({
-          stdout: "0",
-          exitCode: 1,
-        }));
+      const mustArchive = opts.requireArchive ?? true;
+      if (mustArchive && !archiveRef && existsSync(wt.path)) {
+        // runGit throws on a non-zero exit; an uninspectable tree fails closed instead of reading as clean.
+        const statusRes = await runGit(wt.path, ["status", "--porcelain"]).catch(() => null);
+        const aheadRes = await runGit(this.repoRoot, ["rev-list", "--count", `${wt.baseSha}..${wt.branch}`]).catch(() => null);
+        if (!statusRes || !aheadRes) {
+          throw new Error(`Refusing to remove worktree ${worktreeId}: archiving failed and Git could not inspect its state.`);
+        }
         const hasChanges = Boolean(statusRes.stdout.trim()) || Number(aheadRes.stdout.trim()) > 0;
         if (hasChanges) {
           throw new Error(`Refusing to remove worktree ${worktreeId}: archiving unmerged/dirty work failed.`);
