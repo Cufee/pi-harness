@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "bun:test";
 import type { Terminal } from "@earendil-works/pi-tui";
-import { parseArgs, resolveLocalStartup } from "../src/cli.js";
+import { chooseRemoteProject, parseArgs, resolveLocalStartup } from "../src/cli.js";
 import { loadConfig } from "../src/config.js";
 import { findProjectContainingPath, type ProjectSummary } from "../src/control-plane/projects.js";
 import { DaemonClient } from "../src/daemon/remote.js";
@@ -213,5 +213,55 @@ describe("CLI startup project picker and --resume", () => {
     escTerm.sendInput("\x1b");
     const cancelled = await escPromise;
     assert.equal(cancelled, null);
+  });
+
+  it("shows the empty picker for an empty remote project list and tracks picker liveness in daemon TUI sockets", async () => {
+    const root = realpathSync(mkdtempSync("/tmp/pi-startup-remote-"));
+    const stateDir = join(root, "state");
+    const sockPath = join(stateDir, "d.sock");
+    const cfg = loadConfig(root);
+    cfg.stateDir = stateDir;
+    cfg.socketPath = sockPath;
+
+    const daemon = new HarnessDaemon(cfg);
+    await daemon.start();
+    const pickerClient = new DaemonClient(sockPath);
+    const chatClient = new DaemonClient(sockPath);
+    await pickerClient.connect();
+    await chatClient.connect();
+
+    try {
+      // Open a chat on chatClient, then open the remote picker on pickerClient with 0 projects
+      await chatClient.request("chat.open", { repoRoot: root });
+      const remoteProjectsBefore = await pickerClient.request<ProjectSummary[]>("project.list", { includeRemotes: false });
+      assert.equal(remoteProjectsBefore.length, 1); // chat.open auto-registered root
+
+      // Remove project so remote project list is genuinely empty
+      await pickerClient.request("project.remove", { projectId: remoteProjectsBefore[0]!.id });
+      const emptyList = await pickerClient.request<ProjectSummary[]>("project.list", { includeRemotes: false });
+      assert.equal(emptyList.length, 0);
+
+      // chooseRemoteProject must show the picker (not return preferLastProject chat start) and register TUI liveness
+      const pickerTerm = makeFakeTerminal();
+      const pickPromise = chooseRemoteProject(pickerClient, "gpu-box", { terminal: pickerTerm.terminal });
+      await new Promise((r) => setTimeout(r, 40));
+
+      // Leaving the only attached chat while picker is open must still report running === true (picker is live!)
+      const chatLeave = await chatClient.request<{ running: boolean }>("session.leave");
+      assert.equal(chatLeave.running, true, "open picker must keep daemon live when last chat leaves");
+
+      // Cancelling the empty picker resolves to null (never auto-opens daemon cwd), and releasing leaves daemon idle
+      pickerTerm.sendInput("\x1b");
+      const picked = await pickPromise;
+      assert.equal(picked, null);
+
+      const pickerLeave = await pickerClient.request<{ running: boolean }>("session.leave");
+      assert.equal(pickerLeave.running, false, "cancelling lone picker must release TUI liveness");
+    } finally {
+      pickerClient.close();
+      chatClient.close();
+      await daemon.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

@@ -231,6 +231,8 @@ export class HarnessDaemon {
   private runBindings = new Map<string, Socket>();
   /** Per-chat controller socket (at most one controller per chat; viewers live in `socketToChatId`). */
   private chatBindings = new Map<string, Socket>();
+  /** Monotonic per-session ownership sequence (`chat:<id>` or `run:<id>`), incremented on every control change. */
+  private controlSeqs = new Map<string, number>();
   private chatTurns = new Map<string, { id: string; text: string; cancelling: boolean }>();
   private pendingWakeups = new Map<string, ChatControlEvent[]>();
   /** The goal's review invalidation epoch when a review-derived event was raised; a later epoch means the goal moved past it. */
@@ -810,6 +812,7 @@ export class HarnessDaemon {
     this.attachments.clear();
     this.chatBindings.clear();
     this.runBindings.clear();
+    this.controlSeqs.clear();
     this.socketToChatId.clear();
     this.chatSubscribers.clear();
     this.tuiSockets.clear();
@@ -1061,6 +1064,41 @@ export class HarnessDaemon {
     };
   }
 
+  private resolveChatSessionId(raw: string): string {
+    const trimmed = raw.trim();
+    if (!trimmed) return trimmed;
+    try {
+      return this.director.chats.getSession(trimmed)?.id ?? trimmed;
+    } catch {
+      return trimmed;
+    }
+  }
+
+  private resolveRunId(raw: string): string {
+    const trimmed = raw.trim();
+    if (!trimmed) return trimmed;
+    try {
+      return this.db.getRun(trimmed)?.id ?? trimmed;
+    } catch {
+      return trimmed;
+    }
+  }
+
+  private controlKey(kind: "chat" | "run", sessionId: string): string {
+    return `${kind}:${sessionId}`;
+  }
+
+  private bumpControlSeq(kind: "chat" | "run", sessionId: string): number {
+    const key = this.controlKey(kind, sessionId);
+    const next = (this.controlSeqs.get(key) ?? 0) + 1;
+    this.controlSeqs.set(key, next);
+    return next;
+  }
+
+  private currentControlSeq(kind: "chat" | "run", sessionId: string): number {
+    return this.controlSeqs.get(this.controlKey(kind, sessionId)) ?? 0;
+  }
+
   private clientId(socket: Socket): string {
     let id = this.clientIds.get(socket);
     if (!id) {
@@ -1087,14 +1125,16 @@ export class HarnessDaemon {
   }
 
   private controlState(socket: Socket, kind: "chat" | "run", sessionId: string): SessionControlState {
+    const id = kind === "chat" ? this.resolveChatSessionId(sessionId) : this.resolveRunId(sessionId);
     const myId = this.clientId(socket);
-    const controller = kind === "chat" ? this.chatBindings.get(sessionId) : this.runBindings.get(sessionId);
+    const controller = kind === "chat" ? this.chatBindings.get(id) : this.runBindings.get(id);
     return {
-      sessionId,
+      sessionId: id,
       kind,
       clientId: myId,
       controllerClientId: controller ? this.clientId(controller) : null,
       hasControl: controller === socket,
+      controlSeq: this.currentControlSeq(kind, id),
     };
   }
 
@@ -1104,36 +1144,40 @@ export class HarnessDaemon {
     reason: SessionControlReason,
     except?: Socket,
   ): void {
-    const controller = kind === "chat" ? this.chatBindings.get(sessionId) : this.runBindings.get(sessionId);
+    const id = kind === "chat" ? this.resolveChatSessionId(sessionId) : this.resolveRunId(sessionId);
+    const controller = kind === "chat" ? this.chatBindings.get(id) : this.runBindings.get(id);
     const payload: SessionControlPayload = {
-      sessionId,
+      sessionId: id,
       kind,
       controllerClientId: controller ? this.clientId(controller) : null,
       reason,
+      controlSeq: this.currentControlSeq(kind, id),
     };
     const frame: DaemonEventFrame = {
       kind: "event",
       seq: 0,
-      runId: sessionId,
-      taskId: sessionId,
+      runId: id,
+      taskId: id,
       type: "session.control_changed",
       payload,
       createdAt: Date.now(),
     };
-    const viewers = kind === "chat" ? this.chatViewers(sessionId) : this.runViewers(sessionId);
+    const viewers = kind === "chat" ? this.chatViewers(id) : this.runViewers(id);
     for (const viewer of viewers) {
       if (viewer !== except) writeDaemonMessage(viewer, frame);
     }
   }
 
   private requireChatControlIfViewer(socket: Socket, chatSessionId: string): void {
-    if (this.socketToChatId.get(socket) === chatSessionId && this.chatBindings.get(chatSessionId) !== socket) {
+    const id = this.resolveChatSessionId(chatSessionId);
+    if (this.socketToChatId.get(socket) === id && this.chatBindings.get(id) !== socket) {
       throw new Error(SESSION_READ_ONLY_ERROR);
     }
   }
 
   private requireRunControlIfViewer(socket: Socket, runId: string): void {
-    if (this.attachments.get(socket)?.runId === runId && this.runBindings.get(runId) !== socket) {
+    const id = this.resolveRunId(runId);
+    if (this.attachments.get(socket)?.runId === id && this.runBindings.get(id) !== socket) {
       throw new Error(SESSION_READ_ONLY_ERROR);
     }
   }
@@ -1144,6 +1188,7 @@ export class HarnessDaemon {
       this.socketToChatId.delete(socket);
       if (this.chatBindings.get(oldChat) === socket) {
         this.chatBindings.delete(oldChat);
+        this.bumpControlSeq("chat", oldChat);
         this.broadcastControl("chat", oldChat, reason);
       }
     }
@@ -1152,13 +1197,15 @@ export class HarnessDaemon {
       this.attachments.delete(socket);
       if (this.runBindings.get(oldAtt.runId) === socket) {
         this.runBindings.delete(oldAtt.runId);
+        this.bumpControlSeq("run", oldAtt.runId);
         this.broadcastControl("run", oldAtt.runId, reason);
       }
     }
   }
 
   private requireChatOwner(socket: Socket, chatSessionId: string): void {
-    if (this.chatBindings.get(chatSessionId) !== socket) throw new Error(SESSION_READ_ONLY_ERROR);
+    const id = this.resolveChatSessionId(chatSessionId);
+    if (this.chatBindings.get(id) !== socket) throw new Error(SESSION_READ_ONLY_ERROR);
   }
 
   private sendChatEvent(
@@ -1204,39 +1251,43 @@ export class HarnessDaemon {
 
   private bindChatSocket(socket: Socket, chatSessionId: string): { tookOver: boolean } {
     if (socket.destroyed) throw new Error("Chat connection closed");
+    const id = this.resolveChatSessionId(chatSessionId);
     this.cancelIdleShutdown();
     const curChat = this.socketToChatId.get(socket);
-    if (curChat !== chatSessionId) {
+    if (curChat !== id) {
       this.unbindSocketSession(socket);
     }
-    const prev = this.chatBindings.get(chatSessionId);
+    const prev = this.chatBindings.get(id);
     const tookOver = Boolean(prev && prev !== socket);
-    this.chatBindings.set(chatSessionId, socket);
-    this.socketToChatId.set(socket, chatSessionId);
+    this.chatBindings.set(id, socket);
+    this.socketToChatId.set(socket, id);
     this.chatSubscribers.add(socket);
     this.tuiSockets.add(socket);
-    this.director.chats.touchSession(chatSessionId);
+    this.director.chats.touchSession(id);
     if (prev !== socket) {
-      this.broadcastControl("chat", chatSessionId, "attached", socket);
+      this.bumpControlSeq("chat", id);
+      this.broadcastControl("chat", id, "attached", socket);
     }
     return { tookOver };
   }
 
   private bindRunSocket(socket: Socket, runId: string, taskId: string | null): { tookOver: boolean } {
     if (socket.destroyed) throw new Error("Run connection closed");
+    const id = this.resolveRunId(runId);
     this.cancelIdleShutdown();
     const curAtt = this.attachments.get(socket);
-    if (!curAtt || curAtt.runId !== runId) {
+    if (!curAtt || curAtt.runId !== id) {
       this.unbindSocketSession(socket);
     }
-    const prev = this.runBindings.get(runId);
+    const prev = this.runBindings.get(id);
     const tookOver = Boolean(prev && prev !== socket);
-    this.runBindings.set(runId, socket);
+    this.runBindings.set(id, socket);
     const boundAtSeq = this.db.getLatestEventSeq();
-    this.attachments.set(socket, { id: randomBytes(8).toString("hex"), boundAtSeq, throughSeq: boundAtSeq, socket, runId, taskId });
+    this.attachments.set(socket, { id: randomBytes(8).toString("hex"), boundAtSeq, throughSeq: boundAtSeq, socket, runId: id, taskId });
     this.tuiSockets.add(socket);
     if (prev !== socket) {
-      this.broadcastControl("run", runId, "attached", socket);
+      this.bumpControlSeq("run", id);
+      this.broadcastControl("run", id, "attached", socket);
     }
     return { tookOver };
   }
@@ -1613,6 +1664,7 @@ export class HarnessDaemon {
     if (!targetSession) {
       throw new Error(`Unknown target chat session "${input.toSessionId}" on host "${this.peers.localHostName}"`);
     }
+    const toSessionId = targetSession.id;
 
     const { record, inserted } = this.db.sessionMessages.recordInbound({
       id: input.id,
@@ -1622,7 +1674,7 @@ export class HarnessDaemon {
       fromProjectName: input.fromProjectName ?? null,
       toNode: this.nodeId,
       toHost: this.peers.localHostName,
-      toSessionId: input.toSessionId,
+      toSessionId,
       body: input.body,
       replyToId: input.replyToId ?? null,
       expectReply: input.expectReply !== false,
@@ -1633,21 +1685,21 @@ export class HarnessDaemon {
       return { record, duplicate: true, woke: false, circuitBreakerTripped: false };
     }
 
-    const sinceUser = this.lastUserTurnTimestamp(input.toSessionId);
+    const sinceUser = this.lastUserTurnTimestamp(toSessionId);
     // Bound anti-loop window to 30m since last user turn so headless sessions without user turns aren't muted forever
     const hopWindowStart = Math.max(sinceUser, Date.now() - PEER_HOP_WINDOW_MS);
-    const inboundInWindow = this.db.sessionMessages.countInboundSince(input.toSessionId, hopWindowStart);
+    const inboundInWindow = this.db.sessionMessages.countInboundSince(toSessionId, hopWindowStart);
     const hopCount = Math.max(record.hopCount, inboundInWindow);
     const circuitBreakerTripped = hopCount > MAX_PEER_MESSAGE_HOPS;
 
     // Emit live event to all attached TUI viewers so users immediately see peer traffic
-    const viewers = this.chatViewers(input.toSessionId);
+    const viewers = this.chatViewers(toSessionId);
     if (viewers.length > 0) {
       const msgFrame: DaemonEventFrame = {
         kind: "event",
         seq: 0,
-        runId: input.toSessionId,
-        taskId: input.toSessionId,
+        runId: toSessionId,
+        taskId: toSessionId,
         type: "session.message_received",
         payload: {
           messageId: record.id,
@@ -1668,7 +1720,7 @@ export class HarnessDaemon {
     if (circuitBreakerTripped) {
       this.db.sessionMessages.markWakeStatus(record.id, "tripped");
       this.director.chats.appendTurn(
-        input.toSessionId,
+        toSessionId,
         "system_notice",
         `[PEER MESSAGE from ${record.fromHost}:${record.fromSessionId}] Auto-wakeup paused by anti-loop circuit breaker (${hopCount}/${MAX_PEER_MESSAGE_HOPS} consecutive peer hops without human input). Message: ${record.body}`,
       );
@@ -1685,7 +1737,7 @@ export class HarnessDaemon {
       expectReply: record.expectReply,
       hopCount,
     };
-    this.scheduleDirectorWakeup(input.toSessionId, event);
+    this.scheduleDirectorWakeup(toSessionId, event);
     return { record, duplicate: false, woke: true, circuitBreakerTripped: false };
   }
 
@@ -2340,7 +2392,7 @@ export class HarnessDaemon {
       }
 
       case "chat.set_project": {
-        const chatSessionId = String(p.chatSessionId);
+        const chatSessionId = this.resolveChatSessionId(String(p.chatSessionId));
         this.requireChatControlIfViewer(socket, chatSessionId);
         const projectRef = String(p.projectId ?? p.project ?? "");
         const { session, project } = this.director.switchChatProject(chatSessionId, projectRef);
@@ -2460,8 +2512,14 @@ export class HarnessDaemon {
         });
 
       case "session.send_message": {
-        const fromSessionId = String(p.fromSessionId ?? this.socketToChatId.get(socket) ?? "").trim();
-        if (!fromSessionId) throw new Error("fromSessionId is required");
+        const boundChatId = this.socketToChatId.get(socket);
+        if (boundChatId) this.requireChatControlIfViewer(socket, boundChatId);
+        const boundAtt = this.attachments.get(socket);
+        if (boundAtt) this.requireRunControlIfViewer(socket, boundAtt.runId);
+        const rawFrom = String(p.fromSessionId ?? boundChatId ?? "").trim();
+        if (!rawFrom) throw new Error("fromSessionId is required");
+        const fromSessionId = this.resolveChatSessionId(rawFrom);
+        this.requireChatControlIfViewer(socket, fromSessionId);
         const target = String(p.target ?? "").trim();
         const body = String(p.body ?? p.message ?? "").trim();
         if (!target) throw new Error("target is required");
@@ -2538,23 +2596,36 @@ export class HarnessDaemon {
         const kind: "chat" | "run" | null = chatId ? "chat" : att ? "run" : null;
         const sessionId = chatId ?? att?.runId ?? null;
         if (!kind || !sessionId) throw new Error("Not attached to a session");
-        const requestedId = typeof p.sessionId === "string" && p.sessionId.trim() ? p.sessionId.trim() : null;
+        const requestedRaw = typeof p.sessionId === "string" && p.sessionId.trim() ? p.sessionId.trim() : null;
+        const requestedId = requestedRaw
+          ? kind === "chat"
+            ? this.resolveChatSessionId(requestedRaw)
+            : this.resolveRunId(requestedRaw)
+          : null;
         if (requestedId && requestedId !== sessionId) {
-          throw new Error(`Not attached to ${requestedId}`);
+          throw new Error(`Not attached to ${requestedRaw}`);
         }
         const bindings = kind === "chat" ? this.chatBindings : this.runBindings;
         const prev = bindings.get(sessionId);
         const tookOver = prev !== socket;
         if (tookOver) {
           bindings.set(sessionId, socket);
+          this.bumpControlSeq(kind, sessionId);
           if (kind === "chat") this.director.chats.touchSession(sessionId);
           this.broadcastControl(kind, sessionId, "taken", socket);
         }
         return { ...this.controlState(socket, kind, sessionId), tookOver };
       }
 
+      case "tui.register": {
+        if (socket.destroyed) throw new Error("TUI connection closed");
+        this.cancelIdleShutdown();
+        this.tuiSockets.add(socket);
+        return { registered: true };
+      }
+
       case "chat.send": {
-        const chatSessionId = String(p.chatSessionId);
+        const chatSessionId = this.resolveChatSessionId(String(p.chatSessionId));
         this.requireChatOwner(socket, chatSessionId);
         if (this.chatTurns.has(chatSessionId)) throw new Error("Director is already responding");
         const id = typeof p.turnId === "string" && p.turnId ? p.turnId : req.id;
@@ -2587,14 +2658,20 @@ export class HarnessDaemon {
 
       case "chat.steer":
       case "chat.cancel": {
-        const chatSessionId = String(p.chatSessionId);
+        const chatSessionId = this.resolveChatSessionId(String(p.chatSessionId));
         this.requireChatOwner(socket, chatSessionId);
         const turn = this.chatTurns.get(chatSessionId);
         if (!turn || turn.id !== p.turnId || turn.cancelling) return { steered: false, cancelled: false };
         if (req.op === "chat.steer") {
           const message = String(p.message);
           if (await this.director.steerChat(chatSessionId, message, { role: "user" })) {
-            this.sendChatEvent(chatSessionId, turn.id, "chat.steered", { message, role: "user" });
+            this.sendChatEvent(
+              chatSessionId,
+              turn.id,
+              "chat.steered",
+              { message, role: "user", originClientId: this.clientId(socket) },
+              socket,
+            );
             return { steered: true };
           }
           this.requireChatOwner(socket, chatSessionId);
@@ -2608,18 +2685,20 @@ export class HarnessDaemon {
         }
       }
 
-      case "chat.history":
+      case "chat.history": {
+        const chatSessionId = this.resolveChatSessionId(String(p.chatSessionId));
         if (typeof p.afterSeq === "number" && typeof p.throughSeq === "number") {
-          return this.chatHistoryPage(String(p.chatSessionId), p.afterSeq, p.throughSeq);
+          return this.chatHistoryPage(chatSessionId, p.afterSeq, p.throughSeq);
         }
         return this.director.chats.getHistory(
-          String(p.chatSessionId),
+          chatSessionId,
           typeof p.sinceSeq === "number" ? p.sinceSeq : 0,
           Math.min(100, Math.max(1, Number(p.limit) || 100)),
         );
+      }
 
       case "chat.update": {
-        const chatSessionId = String(p.chatSessionId);
+        const chatSessionId = this.resolveChatSessionId(String(p.chatSessionId));
         this.requireChatControlIfViewer(socket, chatSessionId);
         return this.director.chats.updateSession(chatSessionId, {
           profileId: typeof p.profileId === "string" ? p.profileId : undefined,
@@ -2823,7 +2902,7 @@ export class HarnessDaemon {
       }
 
       case "run.get": {
-        const runId = String(p.runId);
+        const runId = this.resolveRunId(String(p.runId));
         return {
           run: this.orchestrator.getEffectiveRun(runId),
           tasks: this.db.listTasks(runId),
@@ -2834,7 +2913,7 @@ export class HarnessDaemon {
       }
 
       case "run.stop": {
-        const runId = String(p.runId);
+        const runId = this.resolveRunId(String(p.runId));
         this.requireRunControlIfViewer(socket, runId);
         const reason = typeof p.reason === "string" ? p.reason : "Stopped by user";
         let cancelledChat = false;
@@ -2899,7 +2978,7 @@ export class HarnessDaemon {
       }
 
       case "run.resume": {
-        const runId = String(p.runId);
+        const runId = this.resolveRunId(String(p.runId));
         this.requireRunControlIfViewer(socket, runId);
         this.director.assertRunGoalNotTerminal(runId);
         const priorRunStatus = this.orchestrator.getEffectiveRun(runId)?.status;
@@ -2914,7 +2993,10 @@ export class HarnessDaemon {
 
       case "task.resume": {
         const taskBefore = this.db.getTask(String(p.taskId));
-        if (taskBefore) this.director.assertRunGoalNotTerminal(taskBefore.runId);
+        if (taskBefore) {
+          this.requireRunControlIfViewer(socket, taskBefore.runId);
+          this.director.assertRunGoalNotTerminal(taskBefore.runId);
+        }
         const priorRunStatus = taskBefore ? this.orchestrator.getEffectiveRun(taskBefore.runId)?.status : undefined;
         const res = await this.orchestrator.resumeTaskDetailed(String(p.taskId), {
           note: typeof p.note === "string" ? p.note : undefined,
@@ -2936,7 +3018,7 @@ export class HarnessDaemon {
       }
 
       case "run.schedule_resume": {
-        const runId = String(p.runId);
+        const runId = this.resolveRunId(String(p.runId));
         this.requireRunControlIfViewer(socket, runId);
         const delayMs = Number(p.delayMs);
         if (!Number.isFinite(delayMs) || delayMs <= 0) {
@@ -2946,8 +3028,10 @@ export class HarnessDaemon {
       }
 
       case "attach": {
-        const runId = String(p.runId);
-        const taskId = typeof p.taskId === "string" ? p.taskId : null;
+        const rawRunId = String(p.runId);
+        const run = this.db.getRun(rawRunId);
+        const runId = run?.id ?? rawRunId.trim();
+        const taskId = typeof p.taskId === "string" ? (this.db.getTask(p.taskId)?.id ?? p.taskId) : null;
         const sinceSeq = typeof p.sinceSeq === "number" ? p.sinceSeq : 0;
         const { tookOver } = this.bindRunSocket(socket, runId, taskId);
         const attachment = this.attachments.get(socket)!;
@@ -2958,7 +3042,7 @@ export class HarnessDaemon {
           attached: true,
           tookOver,
           control: this.controlState(socket, "run", runId),
-          run: this.db.getRun(runId),
+          run,
           tasks: this.db.listTasks(runId),
           escalations: this.db.listEscalations(runId, "open"),
           quotaPause: this.orchestrator.getRunQuotaStatus(runId),
@@ -2994,7 +3078,7 @@ export class HarnessDaemon {
         return { detached: true };
 
       case "tree.get": {
-        const runId = String(p.runId);
+        const runId = this.resolveRunId(String(p.runId));
         return {
           run: this.db.getRun(runId),
           tasks: this.db.listTasks(runId),

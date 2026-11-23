@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import { describe, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Terminal } from "@earendil-works/pi-tui";
 import { loadConfig } from "../src/config.js";
 import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import type { DaemonEventFrame, SessionControlPayload, SessionControlState } from "../src/protocol/daemon-rpc.js";
+import { runDirectorChatTui } from "../src/tui/app.js";
+import { stripTerminalSequences } from "../src/tui/core/index.js";
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
 
 const tick = (ms = 40) => new Promise((r) => setTimeout(r, ms));
@@ -251,5 +254,368 @@ describe("Non-destructive session takeover and control reclaim", () => {
       await daemon.stop();
       rmSync(stateDir, { recursive: true, force: true });
     }
+  });
+
+  it("canonicalizes session and run aliases across control binding, checks, events, and gates session.send_message for viewers", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-ctrl-alias-"));
+    const projB = join(stateDir, "proj-b");
+    mkdirSync(projB, { recursive: true });
+    const sockPath = join(stateDir, "d.sock");
+    const config = withFixtureCatalog({ ...loadConfig(), stateDir, socketPath: sockPath });
+    const daemon = new HarnessDaemon(config, { dbPath: ":memory:" });
+
+    await daemon.start();
+    try {
+      const run = daemon.db.createRun({ goal: "Alias test", repoRoot: stateDir, baseBranch: "main", baseSha: "abc" });
+      const runAlias = run.id.toUpperCase(); // e.g. RUN-1 -> run-1
+      const c1 = await connect(sockPath);
+      const c2 = await connect(sockPath);
+      const c3 = await connect(sockPath);
+      try {
+        // Run alias takeover: attaching via alias resolves to canonical run.id and takes over c1
+        await c1.client.request("attach", { runId: run.id });
+        const a2 = (await c2.client.request("attach", { runId: runAlias })) as {
+          tookOver: boolean;
+          control: SessionControlState;
+        };
+        assert.equal(a2.tookOver, true);
+        assert.equal(a2.control.sessionId, run.id);
+        assert.equal(a2.control.hasControl, true);
+
+        const runEv = await waitFor(() => controlEvents(c1.frames)[0]);
+        assert.equal(runEv.sessionId, run.id);
+        assert.equal(runEv.controllerClientId, a2.control.clientId);
+
+        // Canonical run event reaches the alias-attached socket too
+        daemon.db.emitEvent(run.id, null, "agent.text_delta", { text: "alias-event" });
+        await waitFor(() => c1.frames.find((f) => f.type === "agent.text_delta"));
+        await waitFor(() => c2.frames.find((f) => f.type === "agent.text_delta"));
+
+        // Viewer cannot bypass run gate via alias
+        await assert.rejects(
+          () => c1.client.request("run.schedule_resume", { runId: runAlias, delayMs: -1 }),
+          /read-only/i,
+        );
+
+        // Chat alias: chat.set_project and session.send_message cannot bypass viewer gate via alias
+        const p2 = (await c3.client.request("project.create", { path: projB, name: "proj-b", createDir: false })) as { id: string };
+        const chat1 = (await c1.client.request("chat.open", { repoRoot: stateDir })) as { session: { id: string; projectId: string | null } };
+        const chatAlias = chat1.session.id.toUpperCase();
+        await c2.client.request("chat.open", { chatSessionId: chatAlias });
+
+        await assert.rejects(
+          () => c1.client.request("chat.set_project", { chatSessionId: chatAlias, projectId: p2.id }),
+          /read-only/i,
+        );
+        assert.notEqual(daemon.director.chats.getSession(chat1.session.id)?.projectId, p2.id);
+
+        // Viewer cannot call session.send_message (bound or aliased), while unattached c3 can
+        const otherChat = (await c3.client.request("chat.create", { projectId: p2.id, headless: true })) as { session: { id: string } };
+        await assert.rejects(
+          () => c1.client.request("session.send_message", { target: otherChat.session.id, body: "blocked-viewer" }),
+          /read-only/i,
+        );
+        await assert.rejects(
+          () =>
+            c1.client.request("session.send_message", {
+              fromSessionId: chatAlias,
+              target: otherChat.session.id,
+              body: "blocked-alias",
+            }),
+          /read-only/i,
+        );
+        const unattachedSend = (await c3.client.request("session.send_message", {
+          fromSessionId: "cli",
+          target: otherChat.session.id,
+          body: "allowed-oneshot",
+          expectReply: false,
+        })) as { status: string };
+        assert.equal(unattachedSend.status, "delivered");
+      } finally {
+        c1.client.close();
+        c2.client.close();
+        c3.client.close();
+      }
+    } finally {
+      await daemon.stop();
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("gates task.resume on run controller so read-only viewers cannot resume tasks or send guidance", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-ctrl-task-resume-"));
+    const sockPath = join(stateDir, "d.sock");
+    const config = withFixtureCatalog({ ...loadConfig(), stateDir, socketPath: sockPath });
+    const daemon = new HarnessDaemon(config, { dbPath: ":memory:" });
+
+    await daemon.start();
+    try {
+      const run = daemon.db.createRun({ goal: "Task resume gate", repoRoot: stateDir, baseBranch: "main", baseSha: "abc" });
+      const task = daemon.db.createTask({
+        runId: run.id,
+        tier: 1,
+        kind: "orchestrator",
+        title: "Orch",
+        objective: "test",
+        readOnly: true,
+        profileId: "pi:local",
+        model: "fixture",
+      });
+      daemon.db.updateTask(task.id, { status: "completed", summary: "done" });
+
+      const c1 = await connect(sockPath);
+      const c2 = await connect(sockPath);
+      const c3 = await connect(sockPath);
+      try {
+        await c1.client.request("attach", { runId: run.id });
+        await c2.client.request("attach", { runId: run.id });
+
+        // Viewer c1 is rejected by the read-only gate
+        await assert.rejects(
+          () => c1.client.request("task.resume", { taskId: task.id, note: "viewer note" }),
+          /read-only/i,
+        );
+
+        // Controller c2 and unattached c3 are NOT blocked by the read-only gate
+        for (const allowed of [c2.client, c3.client]) {
+          try {
+            await allowed.request("task.resume", { taskId: task.id });
+          } catch (err) {
+            assert.doesNotMatch(err instanceof Error ? err.message : String(err), /read-only/i);
+          }
+        }
+      } finally {
+        c1.client.close();
+        c2.client.close();
+        c3.client.close();
+      }
+    } finally {
+      await daemon.stop();
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores a stale session.take_control reply when a newer session.control_changed event arrives first, and excludes steer origin", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-ctrl-seq-"));
+    const sockPath = join(stateDir, "d.sock");
+    const config = withFixtureCatalog({ ...loadConfig(), stateDir, socketPath: sockPath });
+
+    // 1. Real daemon monotonic controlSeq + steer echo exclusion (even when ownership transfers mid-steer)
+    let releaseTurn!: () => void;
+    const turnBarrier = new Promise<void>((r) => {
+      releaseTurn = r;
+    });
+    let markHandleReady!: () => void;
+    const handleReady = new Promise<void>((r) => {
+      markHandleReady = r;
+    });
+    let markSteerEntered!: () => void;
+    const steerEntered = new Promise<void>((r) => {
+      markSteerEntered = r;
+    });
+    let releaseSteer!: () => void;
+    const steerBarrier = new Promise<void>((r) => {
+      releaseSteer = r;
+    });
+    const daemon = new HarnessDaemon(config, {
+      dbPath: ":memory:",
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          req.onHandle?.({
+            steer: async () => {
+              markSteerEntered();
+              await steerBarrier;
+              return true;
+            },
+            cancel: async () => {
+              releaseSteer();
+              releaseTurn();
+            },
+          });
+          markHandleReady();
+          await turnBarrier;
+          return { text: "done", stopReason: "completed" };
+        },
+      }),
+    });
+
+    await daemon.start();
+    try {
+      const c1 = await connect(sockPath);
+      const c2 = await connect(sockPath);
+      try {
+        const o1 = (await c1.client.request("chat.open", { repoRoot: stateDir })) as {
+          session: { id: string };
+          control: SessionControlState;
+        };
+        const chatSessionId = o1.session.id;
+        const o2 = (await c2.client.request("chat.open", { chatSessionId })) as { control: SessionControlState };
+        assert.ok((o2.control.controlSeq ?? 0) > (o1.control.controlSeq ?? 0));
+
+        const ev1 = await waitFor(() => controlEvents(c1.frames)[0]);
+        assert.equal(ev1.controlSeq, o2.control.controlSeq);
+
+        const r1 = (await c1.client.request("session.take_control")) as SessionControlState & { tookOver: boolean };
+        const r2 = (await c2.client.request("session.take_control")) as SessionControlState & { tookOver: boolean };
+        assert.ok((r1.controlSeq ?? 0) > (o2.control.controlSeq ?? 0));
+        assert.ok((r2.controlSeq ?? 0) > (r1.controlSeq ?? 0));
+
+        // Mid-steer ownership transfer: c2 steers, c1 takes control while steer awaits; c1 gets chat.steered with originClientId=c2, c2 does not
+        c1.frames.length = 0;
+        c2.frames.length = 0;
+        const sendPromise = c2.client.request("chat.send", { chatSessionId, turnId: "turn-steer", text: "go" });
+        await handleReady;
+        const steerPromise = c2.client.request("chat.steer", {
+          chatSessionId,
+          turnId: "turn-steer",
+          message: "change course",
+        }) as Promise<{ steered: boolean }>;
+        await steerEntered;
+        await c1.client.request("session.take_control");
+        releaseSteer();
+        const steerRes = await steerPromise;
+        assert.equal(steerRes.steered, true);
+        const steerEv = await waitFor(() => c1.frames.find((f) => f.type === "chat.steered"));
+        assert.equal((steerEv.payload as { originClientId?: string }).originClientId, o2.control.clientId);
+        await tick(40);
+        assert.ok(!c2.frames.some((f) => f.type === "chat.steered"), "steer broadcast must exclude originating socket");
+        releaseTurn();
+        await sendPromise;
+      } finally {
+        c1.client.close();
+        c2.client.close();
+      }
+    } finally {
+      await daemon.stop();
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+
+    // 2. TUI ordering: event granting cli-b (seq 4) arrives before awaited session.take_control reply for cli-a (seq 3) resolves
+    let onDataCb: ((data: string) => void) | null = null;
+    const sendInput = (data: string) => onDataCb?.(data);
+    const writes: string[] = [];
+    const terminal: Terminal = {
+      columns: 100,
+      rows: 30,
+      kittyProtocolActive: false,
+      start(onData) {
+        onDataCb = onData;
+      },
+      stop() {
+        onDataCb = null;
+      },
+      async drainInput() {},
+      write(d) {
+        writes.push(d);
+      },
+      moveBy() {},
+      hideCursor() {},
+      showCursor() {},
+      clearLine() {},
+      clearFromCursor() {},
+      clearScreen() {},
+      setTitle() {},
+      setProgress() {},
+      setProgramStatus() {},
+    };
+
+    const eventListeners = new Set<(ev: DaemonEventFrame) => void>();
+    const calls: Array<{ op: string; params: Record<string, unknown> }> = [];
+    const emit = (ev: DaemonEventFrame) => {
+      for (const fn of eventListeners) fn(ev);
+    };
+    const mockClient = {
+      async request<T = unknown>(op: string, params: Record<string, unknown> = {}): Promise<T> {
+        calls.push({ op, params });
+        if (op === "chat.open") {
+          return {
+            session: {
+              id: "chat-99",
+              projectId: null,
+              repoRoot: "/repo",
+              title: "Race Test",
+              profileId: "acp:codex",
+              model: "openai/gpt-6.2-sol",
+              effort: "high",
+              acpSessionId: null,
+              modelSelectionContext: null,
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+            },
+            history: [],
+            historyNext: null,
+            historyThrough: 0,
+            activeTurnId: null,
+            activeText: "",
+            activePartial: "",
+            tookOver: false,
+            control: { sessionId: "chat-99", kind: "chat", clientId: "cli-a", controllerClientId: "cli-b", hasControl: false, controlSeq: 2 },
+            busy: false,
+          } as T;
+        }
+        if (op === "session.take_control") {
+          // Simulate single-chunk race: reply for seq 3 resolves, then event for seq 4 runs synchronously before await resumes
+          return await new Promise<T>((resolve) => {
+            setTimeout(() => {
+              resolve({
+                sessionId: "chat-99",
+                kind: "chat",
+                clientId: "cli-a",
+                controllerClientId: "cli-a",
+                hasControl: true,
+                controlSeq: 3,
+                tookOver: true,
+              } as T);
+              emit({
+                kind: "event",
+                seq: 0,
+                runId: "chat-99",
+                taskId: "chat-99",
+                type: "session.control_changed",
+                createdAt: Date.now(),
+                payload: {
+                  sessionId: "chat-99",
+                  kind: "chat",
+                  controllerClientId: "cli-b",
+                  reason: "taken",
+                  controlSeq: 4,
+                },
+              });
+            }, 5);
+          });
+        }
+        if (op === "work.snapshot") {
+          return { generatedAt: Date.now(), latestSeq: 0, goals: [], runs: [], escalations: [], timers: [], merges: [], worktrees: [], messages: [], inbox: [] } as T;
+        }
+        if (op === "session.leave") return { daemonWillQuit: false } as T;
+        return {} as T;
+      },
+      onEvent(fn: (ev: DaemonEventFrame) => void) {
+        eventListeners.add(fn);
+        return () => eventListeners.delete(fn);
+      },
+      onClose() {
+        return () => {};
+      },
+      close() {},
+    } as unknown as DaemonClient;
+
+    const tuiPromise = runDirectorChatTui({ client: mockClient, repoRoot: "/repo", terminal });
+    await tick(40);
+
+    // Trigger Ctrl+Y reclaim; stale seq 3 reply must NOT overwrite newer seq 4 event granting cli-b
+    writes.length = 0;
+    sendInput("\x19");
+    await tick(50);
+
+    // Must still be READ-ONLY: typing + Enter must NOT call chat.send, and another Ctrl+Y must still trigger take_control
+    for (const ch of "blocked") sendInput(ch);
+    sendInput("\r");
+    await tick(30);
+    assert.equal(calls.filter((c) => c.op === "chat.send").length, 0, "losing TUI must remain read-only after stale reply");
+    assert.ok(writes.map(stripTerminalSequences).join("\n").includes("READ-ONLY"));
+
+    sendInput("\x1d");
+    await tuiPromise;
   });
 });

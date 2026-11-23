@@ -36,6 +36,8 @@ export interface SessionControlPayload {
   /** null: no terminal has input control. */
   controllerClientId: string | null;
   reason: SessionControlReason;
+  /** Monotonic per-session ownership sequence; clients ignore older updates. */
+  controlSeq?: number;
 }
 
 /** Returned as `control` by chat.open, chat.create and attach, and as the result of session.take_control. */
@@ -45,6 +47,8 @@ export interface SessionControlState {
   clientId: string;
   controllerClientId: string | null;
   hasControl: boolean;
+  /** Monotonic per-session ownership sequence; clients ignore older updates. */
+  controlSeq?: number;
 }
 
 export type DaemonOp =
@@ -86,6 +90,7 @@ export type DaemonOp =
   | "sessions.list"
   | "session.leave"
   | "session.take_control"
+  | "tui.register"
   | "kb.search"
   | "kb.get"
   | "goal.create"
