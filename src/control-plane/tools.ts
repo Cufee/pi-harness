@@ -1085,9 +1085,9 @@ export class ControlPlaneToolExecutor {
         const childId = String(args.task_id);
         const child = this.db.getTask(childId);
         if (!child || child.runId !== runId || child.parentId !== taskId) throw new Error(`Unknown child task ${childId}`);
-        if (name === "steer_child") return { steered: await this.hooks.steerTask(childId, String(args.message)) };
-        await this.hooks.cancelTask(childId, String(args.reason));
-        return { cancelled: childId };
+        if (name === "steer_child") return { steered: await this.hooks.steerTask(child.id, String(args.message)) };
+        await this.hooks.cancelTask(child.id, String(args.reason));
+        return { cancelled: child.id };
       }
 
       case "report_goal_progress": {
