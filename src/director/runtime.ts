@@ -1959,11 +1959,14 @@ export class DirectorRuntime {
       }
     }
 
-    // An amendment while the verdict was being delivered supersedes it: report the verdict against the
-    // version it reviewed and leave the newer contract's run, escalations, and Director untouched.
+    // An amendment, pause, or cancel while the verdict was being delivered invalidates it: report the
+    // verdict against the version it reviewed with the goal's current status, and leave the run,
+    // escalations, and Director untouched.
     const current = this.goals.getGoal(goal.id);
     const superseded = current !== null && current.version !== reviewedVersion;
-    if (superseded) {
+    const invalidated =
+      superseded || (current !== null && (current.status === "paused" || current.status === "cancelled"));
+    if (current) {
       goal = current;
       outcome.goal = current;
     }
@@ -1979,8 +1982,8 @@ export class DirectorRuntime {
         summary: review.summary,
       });
 
-      if (superseded) {
-        // Nothing to act on for the newer version.
+      if (invalidated) {
+        // Nothing to act on for a newer version or a paused or cancelled goal.
       } else if (goal.status === "achieved") {
         this.db.updateRunStatus(goal.linkedRunId, "completed");
         this.autoResolveGoalEscalations(goal.linkedRunId, `Auto-resolved: goal ${goal.id} achieved`);
@@ -2015,7 +2018,7 @@ export class DirectorRuntime {
         ...(circuitBreakerTripped ? { circuitBreakerTripped } : {}),
       };
       const willWakeDirector = Boolean(
-        !superseded &&
+        !invalidated &&
           opts?.autoTriggered &&
           this.config.events?.wakeDirectorOnGoalSettle !== false &&
           (goal.status === "achieved" || goal.status === "awaiting_human"),
