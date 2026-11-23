@@ -63,11 +63,30 @@ export function nativeToolsPathDirs(stateDir: string): string[] {
   return dirs;
 }
 
+function normalizeMcpServerName(name: unknown): string {
+  return typeof name === "string" ? name.trim().toLowerCase() : "";
+}
+
+/**
+ * Returns whether the daemon should stage the bundled `octofs` binary.
+ * Stages by default (when omitted, empty, or absent from `externalMcpServers`) or when
+ * the first `octofs` entry is enabled and invokes bare `octofs` via `PATH`.
+ */
+export function shouldStageOctofs(configured?: ExternalMcpServerConfig[]): boolean {
+  const first = (configured ?? []).find((s) => normalizeMcpServerName(s?.name) === "octofs");
+  if (!first) return true;
+  return first.enabled !== false && typeof first.command === "string" && first.command.trim() === "octofs";
+}
+
 /** Resolves an installed `octofs` binary from `install.sh` staging, stateDir cache, or `PATH`. */
 export function resolveOctofsBin(stateDir: string): string | null {
   const target = currentOctofsTarget();
   if (target) {
+    const installDir = process.env.PI_HARNESS_INSTALL_DIR?.trim();
     const candidates = [
+      ...(installDir
+        ? [join(resolve(installDir), "tools", "octofs", `${OCTOFS_VERSION}-${target.triple}`, "bin", "octofs")]
+        : []),
       join(stateDir, "install", "tools", "octofs", `${OCTOFS_VERSION}-${target.triple}`, "bin", "octofs"),
       join(stateDir, "tools", "octofs", `${OCTOFS_VERSION}-${target.triple}`, "bin", "octofs"),
     ];
@@ -155,9 +174,15 @@ export function resolveExternalMcpServers(
   stateDir: string,
   configured?: ExternalMcpServerConfig[],
 ): ExternalMcpServerConfig[] {
-  const list = [...(configured ?? [])];
-  const hasOctofsEntry = list.some((s) => s.name.trim() === "octofs");
-  if (!hasOctofsEntry) {
+  const list: ExternalMcpServerConfig[] = [];
+  const seen = new Set<string>();
+  for (const entry of configured ?? []) {
+    const normalized = normalizeMcpServerName(entry?.name);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    list.push(entry);
+  }
+  if (!seen.has("octofs")) {
     const octofsBin = resolveOctofsBin(stateDir);
     if (octofsBin) {
       list.unshift({
