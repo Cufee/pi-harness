@@ -865,6 +865,8 @@ export class HarnessOrchestrator {
       allowCompleted?: boolean;
       position?: QueuePositionInput;
       forceStart?: boolean;
+      /** Re-checked before any state is mutated and again after the last await; resume aborts if it returns false. */
+      validateBeforeActivate?: () => boolean;
     },
   ): Promise<TaskRecord> {
     const task = this.db.getTask(taskId);
@@ -881,6 +883,8 @@ export class HarnessOrchestrator {
     let reacquiredLeases = false;
     let profile: RunnerProfileConfig;
     let model: string;
+    const preconditionFailed = () => new Error(`Task ${task.id} resume cancelled: precondition no longer holds.`);
+    if (opts?.validateBeforeActivate && !opts.validateBeforeActivate()) throw preconditionFailed();
     try {
       if (toolPolicy === "read_write_workspace") {
         if (wt && wt.status === "merged") {
@@ -945,6 +949,12 @@ export class HarnessOrchestrator {
     });
     if (opts?.note?.trim()) {
       handoff.nextActions.unshift(`Resume guidance: ${opts.note.trim()}`);
+    }
+    if (opts?.validateBeforeActivate && !opts.validateBeforeActivate()) {
+      if (reacquiredLeases) {
+        this.db.db.prepare("UPDATE write_leases SET active = 0 WHERE task_id = ?").run(task.id);
+      }
+      throw preconditionFailed();
     }
 
     this.clearRunQuotaTimers(run.id);
