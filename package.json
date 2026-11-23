@@ -12,6 +12,7 @@
     "harness": "./src/cli.ts"
   },
   "scripts": {
+    "install": "if [ \"$npm_command\" = \"run-script\" ] && [ -z \"$PI_HARNESS_IN_INSTALL_SH\" ]; then sh ./install.sh; fi",
     "proto:gen": "mkdir -p src/gen && protoc --proto_path=proto --plugin=protoc-gen-es=./node_modules/.bin/protoc-gen-es --es_out=src/gen --es_opt=target=ts proto/quota.proto",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build": "bun run proto:gen && tsc -p tsconfig.json",
