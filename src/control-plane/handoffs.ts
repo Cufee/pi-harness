@@ -33,7 +33,13 @@ export function compactTaskHandoff(task: TaskRecord, escalations: EscalationReco
   const paused = task.status === "paused_quota" || task.summary?.startsWith("Paused (quota):");
   const unstructured = typeof result?.text === "string" && typeof result?.summary !== "string";
   let summary = task.summary?.slice(0, SUMMARY_LIMIT) ?? null;
-  if (paused) summary = "Task paused for quota.";
+  if (paused) {
+    const reason = task.summary?.startsWith("Paused (quota):") ? task.summary.slice("Paused (quota):".length).trim() : task.summary?.trim() ?? "";
+    summary =
+      `Task ${task.id} in run ${task.runId} is paused on provider quota (${reason || "cause not recorded"}). ` +
+      `Not a failure; its work and handoff are kept and it continues in place when run ${task.runId} resumes ` +
+      "(automatic when a reset time is known, otherwise resume_run). Do not respawn or cancel it.";
+  }
   else if (unstructured) {
     // Tier 1 orchestrators have no return_task; their natural final reply is the handoff.
     const reply = task.kind === "orchestrator" ? result.text.trim() : "";

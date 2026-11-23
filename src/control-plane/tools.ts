@@ -49,6 +49,7 @@ export interface ToolRuntimeHooks {
     writeScopes?: string[];
     position?: QueuePositionInput;
     forceStart?: boolean;
+    signal?: AbortSignal;
   }) => Promise<TaskRecord>;
   waitForChildren: (
     parentId: string,
@@ -78,6 +79,11 @@ export interface ToolRuntimeHooks {
       forceStart?: boolean;
     },
   ) => Promise<TaskRecord>;
+  /** Idempotent resume with a structured outcome (preferred over resumeTask when available). */
+  resumeTaskDetailed?: (
+    taskId: string,
+    opts?: { note?: string; profileId?: string; model?: string; effort?: string },
+  ) => Promise<{ task: TaskRecord; outcome: string; message: string; queuePosition?: number; noteDelivered?: boolean }>;
   forceStartWorker?: (taskId: string, opts?: { bypassQuota?: boolean; reason?: string }) => Promise<unknown>;
 }
 
@@ -91,6 +97,9 @@ function optionalProfile(value: unknown): string | undefined {
   if (typeof value !== "string" || !value.trim()) throw new Error("Select an enabled runner profile.");
   return value;
 }
+
+const MAX_TURNS_DESCRIPTION =
+  "Optional advisory progress-reminder threshold in tool-call turns (default: config rollover.taskMaxTurns). After this many turns the task may receive one progress reminder and keeps working; it never stops or fails the task. The task decides when its work is ready and hands it back with return_task.";
 
 const waitChildrenTool: ToolDefinition = {
   name: "wait_children",
@@ -203,7 +212,7 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
         objective: { type: "string" },
         model: { type: "string" },
         effort: { type: "string" },
-        max_turns: { type: "number", description: "Tool-call turn budget (default: config rollover.taskMaxTurns). The task fails when it runs out before return_task." },
+        max_turns: { type: "number", description: MAX_TURNS_DESCRIPTION },
       },
     },
   },
@@ -224,7 +233,7 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
         profile_id: { type: "string" },
         model: { type: "string" },
         effort: { type: "string" },
-        max_turns: { type: "number" },
+        max_turns: { type: "number", description: MAX_TURNS_DESCRIPTION },
         depends_on: { type: "array", items: { type: "string" } },
       },
     },
@@ -234,7 +243,7 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
   {
     name: "steer_child",
     tiers: [1, 2],
-    description: "Send mid-turn steering guidance to a running child agent.",
+    description: "Send mid-turn steering guidance to a running child agent. Steering never restarts a settled child; use resume_task with a note for that.",
     inputSchema: {
       type: "object",
       required: ["task_id", "message"],
@@ -694,7 +703,7 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
     name: "resume_task",
     tiers: [1],
     description:
-      "Resume a failed, crashed, blocked, or cancelled child task in-place with a recovery handoff instead of spawning a duplicate task. A Worker keeps its worktree and WIP commits when the worktree still exists; a cancelled Worker's worktree was archived, so it restarts in a fresh worktree from the base branch.",
+      "Resume a failed, crashed, blocked, or cancelled child task in-place with a recovery handoff instead of spawning a duplicate task. A Worker keeps its worktree and WIP commits when the worktree still exists; a cancelled Worker's worktree was archived, so it restarts in a fresh worktree from the base branch. Safe to repeat: when the task is already running, queued, waiting, or completed it returns its current state (outcome + message) without restarting anything.",
     inputSchema: {
       type: "object",
       required: ["task_id"],
@@ -769,7 +778,18 @@ export class ControlPlaneToolExecutor {
     return exposedTools(toolsForTier(tier), this.config.codeMode);
   }
 
-  async execute(runId: string, taskId: string, name: string, args: Record<string, unknown>, scriptSignal?: AbortSignal): Promise<unknown> {
+  /**
+   * `callerSignal` is the calling turn's abort signal (e.g. a Director chat turn). Unlike `scriptSignal`
+   * it does not imply code_exec, so it never trips the active-generation gate for synthetic owners.
+   */
+  async execute(
+    runId: string,
+    taskId: string,
+    name: string,
+    args: Record<string, unknown>,
+    scriptSignal?: AbortSignal,
+    callerSignal?: AbortSignal,
+  ): Promise<unknown> {
     const task = this.db.getTask(taskId);
     if (!task || task.runId !== runId) {
       throw new Error(`Task ${taskId} not found in run ${runId}`);
@@ -940,6 +960,7 @@ export class ControlPlaneToolExecutor {
           writeScopes,
           ...(posArg !== undefined ? { position: posArg } : {}),
           ...(args.force_start !== undefined ? { forceStart: Boolean(args.force_start) } : {}),
+          signal: callerSignal ?? scriptSignal ?? this.hooks.getTaskCancelSignal?.(taskId),
         });
         const qEntry = this.db.admissionQueue.get("worker", created.id);
         return {
@@ -1011,6 +1032,7 @@ export class ControlPlaneToolExecutor {
           effort: typeof args.effort === "string" ? args.effort : undefined,
           maxTurns: typeof args.max_turns === "number" ? args.max_turns : undefined,
           dependsOn: Array.isArray(args.depends_on) ? (args.depends_on as string[]) : [],
+          signal: callerSignal ?? scriptSignal ?? this.hooks.getTaskCancelSignal?.(taskId),
         });
         return { spawned: created.id, kind: created.kind, readOnly: created.readOnly, status: created.status };
       }
@@ -1582,12 +1604,24 @@ export class ControlPlaneToolExecutor {
         if (!target || target.runId !== runId || target.parentId !== taskId) {
           throw new Error(`Unknown child task ${args.task_id}`);
         }
-        const resumed = await this.hooks.resumeTask(target.id, {
+        const resumeOpts = {
           note: typeof args.note === "string" ? args.note : undefined,
           model: typeof args.model === "string" ? args.model : undefined,
           effort: typeof args.effort === "string" ? args.effort : undefined,
           profileId: optionalProfile(args.profile_id),
-        });
+        };
+        if (this.hooks.resumeTaskDetailed) {
+          const res = await this.hooks.resumeTaskDetailed(target.id, resumeOpts);
+          return {
+            task: res.task,
+            resumed: res.outcome === "resumed",
+            outcome: res.outcome,
+            message: res.message,
+            ...(res.queuePosition !== undefined ? { queuePosition: res.queuePosition } : {}),
+            ...(res.noteDelivered !== undefined ? { noteDelivered: res.noteDelivered } : {}),
+          };
+        }
+        const resumed = await this.hooks.resumeTask(target.id, resumeOpts);
         return { task: resumed, resumed: true };
       }
 

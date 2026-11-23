@@ -347,6 +347,24 @@ const GOAL_SUB_COLUMNS: Record<Exclude<GoalTabId, "overview">, ColumnSpec[]> = {
   ],
 };
 
+/**
+ * Notice for an idempotent resume result: "resumed" (or a legacy reply without an outcome) is ok;
+ * already running/queued/completed is informational; nothing resumed is a warning with its reason.
+ */
+function resumeNotice(
+  res: { resumed?: boolean; reason?: string; outcome?: string; message?: string } | null | undefined,
+  okText: string,
+  failText: string,
+): [string, "ok" | "info" | "warn"] {
+  if (!res || res.outcome === "resumed" || (res.outcome === undefined && res.resumed !== false)) {
+    return [res?.message || okText, "ok"];
+  }
+  if (res.outcome && ["already_active", "already_queued", "waiting", "already_completed"].includes(res.outcome)) {
+    return [res.message || res.reason || okText, "info"];
+  }
+  return [res.message || res.reason || failText, "warn"];
+}
+
 function isGoalResumable(g: GoalRecord, linkedRunStatus?: string | null): boolean {
   if (g.status === "achieved" || g.status === "cancelled") return false;
   if (g.status === "draft" || g.status === "paused" || g.status === "awaiting_human") return true;
@@ -610,8 +628,8 @@ export class GoalInspectorScreen implements Screen {
       this.frame.askConfirm({
         message: `Commit ${g.id} and launch autonomous run?`,
         onConfirm: async () => {
-          await this.deps.client.request("goal.commit", { goalId: g.id });
-          this.frame.setNotice(`Committed ${g.id}`, "ok");
+          const res = await this.deps.client.request<{ message?: string }>("goal.commit", { goalId: g.id });
+          this.frame.setNotice(res?.message || `Committed ${g.id}`, "ok");
           await this.deps.store.refresh();
         },
       });
@@ -673,15 +691,11 @@ export class GoalInspectorScreen implements Screen {
         initialValue: "Resumed from TUI",
         allowEmpty: true,
         onSubmit: async (note) => {
-          const res = await this.deps.client.request<{ resumed?: boolean; reason?: string }>("goal.resume", {
+          const res = await this.deps.client.request<{ resumed?: boolean; reason?: string; outcome?: string; message?: string }>("goal.resume", {
             goalId: g.id,
             ...(note ? { note } : {}),
           });
-          if (res && res.resumed === false) {
-            this.frame.setNotice(res.reason || `Could not resume ${g.id}`, "warn");
-          } else {
-            this.frame.setNotice(`Resumed ${g.id}`, "ok");
-          }
+          this.frame.setNotice(...resumeNotice(res, `Resumed ${g.id}`, `Could not resume ${g.id}`));
           await this.deps.store.refresh();
         },
       });
@@ -909,8 +923,11 @@ export class RunInspectorScreen implements Screen {
         initialValue: "Continue",
         allowEmpty: true,
         onSubmit: async (message) => {
-          await this.deps.client.request("run.resume", { runId: this.runId, ...(message ? { message } : {}) });
-          this.frame.setNotice(`Resumed ${this.runId}`, "ok");
+          const res = await this.deps.client.request<{ resumed?: boolean; reason?: string; outcome?: string; message?: string }>(
+            "run.resume",
+            { runId: this.runId, ...(message ? { message } : {}) },
+          );
+          this.frame.setNotice(...resumeNotice(res, `Resumed ${this.runId}`, `Could not resume ${this.runId}`));
           await this.deps.store.refresh();
         },
       });
@@ -1230,8 +1247,11 @@ export class TaskInspectorScreen implements Screen {
         allowEmpty: true,
         onSubmit: async (note) => {
           // Daemon `task.resume` reads `note`, NOT `message`!
-          await this.deps.client.request("task.resume", { taskId: t.id, ...(note ? { note } : {}) });
-          this.frame.setNotice(`Resumed ${t.id}`, "ok");
+          const res = await this.deps.client.request<{ resumed?: boolean; reason?: string; outcome?: string; message?: string }>(
+            "task.resume",
+            { taskId: t.id, ...(note ? { note } : {}) },
+          );
+          this.frame.setNotice(...resumeNotice(res, `Resumed ${t.id}`, `Could not resume ${t.id}`));
           await Promise.all([this.load(ctx), this.deps.store.refresh()]);
         },
       });

@@ -33,7 +33,7 @@ import {
 import { ControlPlaneDb, type ReplayCursor, type EventRecord } from "../control-plane/db.js";
 import { readRunDossier, readWorkspaceArtifact } from "../control-plane/dossiers.js";
 import { compactTaskHandoff } from "../control-plane/handoffs.js";
-import { HarnessOrchestrator, type CustomRunnerFactory } from "../control-plane/orchestrator.js";
+import { HarnessOrchestrator, isDirectorTaskContainer, type CustomRunnerFactory } from "../control-plane/orchestrator.js";
 import { loadOrCreateNodeId, parseSessionAddress, type SessionMessageRecord } from "../control-plane/session-messages.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { summarizeCost } from "../cost/ledger.js";
@@ -1672,7 +1672,7 @@ export class HarnessDaemon {
         const proj = this.db.projects.resolveProject(ref);
         if (!proj) throw new Error(`Unknown project: ${ref}`);
         const all = await this.db.projects.listProjects();
-        return all.find((x) => x.id === proj.id) ?? proj;
+        return { ...(all.find((x) => x.id === proj.id) ?? proj), nodeId: this.nodeId };
       }
       case "project.create": {
         const cloneUrl = typeof p.cloneUrl === "string" && p.cloneUrl.trim() ? p.cloneUrl.trim() : undefined;
@@ -2012,13 +2012,16 @@ export class HarnessDaemon {
         const host = typeof p.host === "string" ? p.host.trim() : undefined;
         if (host && !this.isLocalHostTarget(host)) {
           const remote = (await this.peers.callRemote<Record<string, unknown>>(host, "project.get", { ...p, host: undefined })) ?? {};
-          return { ...remote, host };
+          const remoteNodeId =
+            this.peers.findLink(host)?.remoteIdentity?.nodeId ?? this.peers.getKnownNodeId(host) ??
+            (typeof remote.nodeId === "string" ? remote.nodeId : null);
+          return { ...remote, host, nodeId: remoteNodeId ?? null };
         }
         const ref = String(p.projectId ?? p.id ?? p.name ?? p.path ?? "");
         const proj = this.db.projects.resolveProject(ref);
         if (!proj) throw new Error(`Unknown project: ${ref}`);
         const all = await this.db.projects.listProjects();
-        return { ...(all.find((x) => x.id === proj.id) ?? proj), host: "local" };
+        return { ...(all.find((x) => x.id === proj.id) ?? proj), host: "local", nodeId: this.nodeId };
       }
 
       case "project.create": {
@@ -2370,12 +2373,42 @@ export class HarnessDaemon {
               : undefined,
         });
 
-      case "goal.commit":
-        return await this.director.commitGoal(String(p.goalId), {
+      case "goal.commit": {
+        const g = this.director.goals.getGoal(String(p.goalId));
+        if (!g) throw new Error(`Unknown goal ${p.goalId}`);
+        if (g.status === "achieved" || g.status === "cancelled") {
+          throw new Error(`Goal ${g.id} is ${g.status} and cannot be started again. Create a new goal for follow-up work.`);
+        }
+        if (["executing", "verifying", "reviewing"].includes(g.status)) {
+          return {
+            ...g,
+            outcome: "already_active",
+            message: `Goal ${g.id} is already ${g.status}${g.linkedRunId ? ` on run ${g.linkedRunId}` : ""}; nothing was started again.`,
+          };
+        }
+        // A paused or stopped goal with an unfinished linked run continues in place instead of starting a second run.
+        const linked = g.linkedRunId ? this.orchestrator.getEffectiveRun(g.linkedRunId) : null;
+        if (linked && linked.status !== "completed") {
+          const res = await this.orchestrator.resumeRun(linked.id, { trigger: "manual" });
+          if (res.outcome === "resumed" || res.outcome === "already_active") {
+            const goal = this.director.goals.getGoal(g.id)!;
+            const updated = goal.status === "executing" ? goal : this.director.goals.setStatus(g.id, "executing", "Resumed in place");
+            return { ...updated, outcome: res.outcome, message: `Goal ${g.id}: ${res.message}` };
+          }
+        }
+        const committed = await this.director.commitGoal(g.id, {
           profileId: typeof p.profileId === "string" ? p.profileId : undefined,
           model: typeof p.model === "string" ? p.model : undefined,
           effort: typeof p.effort === "string" ? p.effort : undefined,
         });
+        return {
+          ...committed,
+          outcome: committed.linkedRunId && committed.linkedRunId !== g.linkedRunId ? "started" : committed.status,
+          message: committed.linkedRunId && committed.linkedRunId !== g.linkedRunId
+            ? `Goal ${g.id} started on run ${committed.linkedRunId}.`
+            : `Goal ${g.id} is ${committed.status}${committed.linkedRunId ? ` (run ${committed.linkedRunId})` : ""}.`,
+        };
+      }
 
       case "goal.amend":
         return await this.director.amendGoal(String(p.goalId), {
@@ -2451,22 +2484,41 @@ export class HarnessDaemon {
             trigger: "manual",
             note: typeof p.note === "string" ? p.note : undefined,
           });
-          if (res.resumed) {
-            this.director.goals.setStatus(g.id, "executing", "Resumed by user");
-            return { resumed: true, goal: this.director.goals.getGoal(g.id)!, resumedTaskIds: res.resumedTaskIds };
+          if (res.resumed || res.outcome === "already_active") {
+            const fresh = this.director.goals.getGoal(g.id)!;
+            if (fresh.status !== "executing") this.director.goals.setStatus(g.id, "executing", "Resumed by user");
+            return {
+              resumed: res.resumed,
+              goal: this.director.goals.getGoal(g.id)!,
+              resumedTaskIds: res.resumedTaskIds,
+              outcome: res.outcome,
+              runStatus: res.runStatus,
+              message: `Goal ${g.id}: ${res.message}`,
+              ...(res.resumed ? {} : { reason: res.message }),
+            };
           }
           return {
             resumed: false,
             goal: g,
             resumedTaskIds: [],
-            reason: `Linked run ${g.linkedRunId} has no paused or resumable tasks`,
+            outcome: res.outcome,
+            runStatus: res.runStatus,
+            ...(res.cause ? { cause: res.cause } : {}),
+            reason: `Goal ${g.id}: ${res.message}`,
+            message: `Goal ${g.id}: ${res.message}`,
           };
         }
         if (g.status !== "draft" && g.status !== "paused" && g.status !== "awaiting_human") {
           throw new Error(`Cannot resume ${g.id} in status ${g.status}`);
         }
         const committed = await this.director.commitGoal(g.id);
-        return { resumed: true, goal: committed, resumedTaskIds: [] };
+        return {
+          resumed: true,
+          goal: committed,
+          resumedTaskIds: [],
+          outcome: "started",
+          message: `Goal ${g.id} is ${committed.status}${committed.linkedRunId ? ` on run ${committed.linkedRunId}` : ""}.`,
+        };
       }
 
       case "goal.review":
@@ -2532,13 +2584,34 @@ export class HarnessDaemon {
         };
       }
 
-      case "run.stop":
-        await this.orchestrator.stopRun(String(p.runId), typeof p.reason === "string" ? p.reason : "Stopped by user");
-        return { stopped: true };
+      case "run.stop": {
+        const runId = String(p.runId);
+        const reason = typeof p.reason === "string" ? p.reason : "Stopped by user";
+        let cancelledChat = false;
+        if (isDirectorTaskContainer(runId)) {
+          // Stop the chat's live turn first so it cannot delegate again, then cancel the container's children.
+          cancelledChat = await this.director.cancelChat(runId.slice("director-tasks-".length));
+        }
+        await this.orchestrator.stopRun(runId, reason);
+        return { stopped: true, ...(cancelledChat ? { cancelledChat } : {}) };
+      }
 
       case "runs.stop_all": {
         const reason = typeof p.reason === "string" && p.reason.trim() ? p.reason.trim() : "Stopped by user (/stop)";
         const repoFilter = typeof p.repoRoot === "string" && p.repoRoot.trim() ? p.repoRoot.trim() : undefined;
+        // An explicit stop wins over every older in-flight resume or launch.
+        this.orchestrator.bumpGlobalStopEpoch();
+        // Abort live Director turns and reviews FIRST so none of them can delegate or resume after the stop.
+        const { cancelledChats, cancelledReviews } = await this.director.cancelAllActive(reason);
+        // Pending chat timers that would resume a goal must not undo the stop.
+        let cancelledTimers = 0;
+        for (const t of this.db.timers.list({ ownerKind: "chat", status: "pending" })) {
+          if (!t.resumeGoal) continue;
+          if (repoFilter && t.goalId && this.director.goals.getGoal(t.goalId)?.repoRoot !== repoFilter) continue;
+          if (this.db.timers.cancel(t.id, reason)) cancelledTimers++;
+        }
+        // Also cancel any pending wakeups so stopped runs don't immediately re-wake the Director
+        this.pendingWakeups.clear();
         const runs = this.db.listRuns(200).filter((r) => {
           if (repoFilter && r.repoRoot !== repoFilter) return false;
           const eff = this.orchestrator.getEffectiveRun(r.id);
@@ -2546,17 +2619,16 @@ export class HarnessDaemon {
         });
         const stoppedRunIds: string[] = [];
         for (const r of runs) {
+          // Director delegation containers only have their children cancelled; they are never poisoned to "stopped".
           await this.orchestrator.stopRun(r.id, reason);
           stoppedRunIds.push(r.id);
         }
-        const { cancelledChats, cancelledReviews } = await this.director.cancelAllActive(reason);
-        // Also cancel any pending wakeups so stopped runs don't immediately re-wake the Director
-        this.pendingWakeups.clear();
         return {
           stopped: true,
           stoppedRunIds,
           cancelledChats,
           cancelledReviews,
+          cancelledTimers,
         };
       }
 
@@ -2570,13 +2642,21 @@ export class HarnessDaemon {
       }
 
       case "task.resume": {
-        const task = await this.orchestrator.resumeTask(String(p.taskId), {
+        const res = await this.orchestrator.resumeTaskDetailed(String(p.taskId), {
           note: typeof p.note === "string" ? p.note : undefined,
           model: typeof p.model === "string" ? p.model : undefined,
           effort: typeof p.effort === "string" ? p.effort : undefined,
           profileId: typeof p.profileId === "string" ? p.profileId : undefined,
         });
-        return { resumed: true, task };
+        return {
+          resumed: res.outcome === "resumed",
+          task: res.task,
+          outcome: res.outcome,
+          message: res.message,
+          runStatus: this.orchestrator.getEffectiveRun(res.task.runId)?.status ?? null,
+          ...(res.queuePosition !== undefined ? { queuePosition: res.queuePosition } : {}),
+          ...(res.noteDelivered !== undefined ? { noteDelivered: res.noteDelivered } : {}),
+        };
       }
 
       case "run.schedule_resume": {
@@ -2925,8 +3005,11 @@ export class HarnessDaemon {
         };
       }
 
-      case "task.steer":
+      case "task.steer": {
+        const refusal = this.orchestrator.describeSteerRefusal(String(p.taskId));
+        if (refusal) return { steered: false, taskId: String(p.taskId), reason: refusal };
         return { steered: await this.orchestrator.steerTask(String(p.taskId), String(p.message)) };
+      }
 
       case "task.cancel":
         await this.orchestrator.cancelTask(String(p.taskId), String(p.reason ?? "Cancelled by user"));
