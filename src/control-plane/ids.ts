@@ -86,6 +86,19 @@ export function nextFriendlyId(db: Database, prefix: string, existingTable?: str
   throw new Error(`Exhausted friendly ID allocation for prefix ${prefix}`);
 }
 
+/** Returns the next value of a durable monotonic integer sequence; values are never reissued, even across restarts. */
+export function nextSequenceValue(db: Database, prefix: string): number {
+  ensureSequenceTable(db);
+  const row = db
+    .prepare(
+      `INSERT INTO id_sequences(prefix, next_value) VALUES (?, 1)
+       ON CONFLICT(prefix) DO UPDATE SET next_value = next_value + 1
+       RETURNING next_value`,
+    )
+    .get(prefix) as { next_value: number };
+  return row.next_value;
+}
+
 /**
  * Produces ordered lookup candidates for a model-supplied ID:
  *   1. Exact trimmed string (always matches first — preserves legacy hex IDs like `goal-95d485df`)
@@ -129,7 +142,7 @@ function scanMaxFileIndex(dir: string, stem: string, ext: string): number {
   for (const entry of entries) {
     if (entry.length <= prefix.length + ext.length || !entry.startsWith(prefix) || !entry.endsWith(ext)) continue;
     const mid = entry.slice(prefix.length, entry.length - ext.length);
-    if (!/^[0-9]{1,10}$/.test(mid)) continue;
+    if (!/^[1-9][0-9]{0,9}$/.test(mid)) continue;
     const n = Number.parseInt(mid, 10);
     if (n < 0x80000000 && n > max) max = n;
   }
@@ -148,21 +161,50 @@ function tryCreateExclusive(path: string, content: string): boolean {
   try {
     const buf = Buffer.from(content, "utf8");
     let off = 0;
-    while (off < buf.length) off += writeSync(fd, buf, off, buf.length - off);
+    while (off < buf.length) {
+      let written: number;
+      try {
+        written = writeSync(fd, buf, off, buf.length - off);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "EINTR" || code === "EAGAIN") continue;
+        throw error;
+      }
+      if (written <= 0) throw new Error(`Short write creating ${path}`);
+      off += written;
+    }
   } catch (error) {
-    closeSync(fd);
+    try {
+      closeSync(fd);
+    } catch {
+      // The write error is the one to report; still remove the partial file below.
+    }
     rmSync(path, { force: true });
     throw error;
   }
-  closeSync(fd);
+  try {
+    closeSync(fd);
+  } catch (error) {
+    try {
+      rmSync(path, { force: true });
+    } catch {
+      // Report the close error.
+    }
+    throw error;
+  }
   return true;
 }
 
 /**
  * Creates a new file `<stem>-<n><ext>` in dir (O_CREAT|O_EXCL, mode 0o600) holding content and returns its basename.
- * Never overwrites, truncates, or deletes an existing entry. dir must exist.
+ * Never overwrites, truncates, or deletes an existing entry. dir must exist. stem and ext must be plain name parts
+ * (no separators or NUL). When minIndex is a positive integer, n is at least minIndex, so a durable sequence can
+ * keep indices of deleted files from being reused.
  */
-export function writeUniqueFile(dir: string, stem: string, ext: string, content: string): string {
+export function writeUniqueFile(dir: string, stem: string, ext: string, content: string, minIndex = 0): string {
+  if (!stem || stem === "." || stem === ".." || /[\/\\\0]/.test(stem) || /[\/\\\0]/.test(ext)) {
+    throw new Error("Invalid unique filename stem or extension");
+  }
   let canonDir: string;
   try {
     canonDir = realpathSync(dir);
@@ -170,7 +212,8 @@ export function writeUniqueFile(dir: string, stem: string, ext: string, content:
     canonDir = resolve(dir);
   }
   const key = `${canonDir}\0${stem}\0${ext}`;
-  let n = Math.max(fileNameCounters.get(key) ?? 0, scanMaxFileIndex(dir, stem, ext));
+  const floor = Number.isSafeInteger(minIndex) && minIndex > 0 ? minIndex - 1 : 0;
+  let n = Math.max(fileNameCounters.get(key) ?? 0, scanMaxFileIndex(dir, stem, ext), floor);
   for (let attempt = 0; attempt < 64; attempt++) {
     n++;
     const name = `${stem}-${n}${ext}`;
