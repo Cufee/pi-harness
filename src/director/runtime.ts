@@ -2184,16 +2184,11 @@ export class DirectorRuntime {
   ): Promise<{ verifyCwd: string; verifyRef: string; isolated: boolean; cleanup: () => Promise<void> }> {
     let verifyCwd = goal.repoRoot;
     let verifyRef = run?.baseBranch || "HEAD";
-    let worktreePath: string | null = null;
+    let verifyScratch: { path: string; remove: () => Promise<void> } | null = null;
     const cleanup = async () => {
-      if (!worktreePath) return;
-      const p = worktreePath;
-      worktreePath = null;
-      await runGit(goal.repoRoot, ["worktree", "remove", "--force", p]).catch(async () => {
-        const { rmSync } = await import("node:fs");
-        rmSync(p, { recursive: true, force: true });
-      });
-      await runGit(goal.repoRoot, ["worktree", "prune"]).catch(() => {});
+      const scratch = verifyScratch;
+      verifyScratch = null;
+      await scratch?.remove();
     };
     if (run?.baseBranch) {
       const targetSha = await runGit(goal.repoRoot, ["rev-parse", "--verify", `${run.baseBranch}^{commit}`])
@@ -2201,17 +2196,16 @@ export class DirectorRuntime {
         .catch(() => null);
       if (targetSha) {
         const wtMgr = this.orchestrator.getWorktreeManager(goal.repoRoot);
-        const candidatePath = join(wtMgr.baseDir, "_verify", `${goal.id}-${randomUUID().slice(0, 8)}`);
-        mkdirSync(join(wtMgr.baseDir, "_verify"), { recursive: true });
-        await runGit(goal.repoRoot, ["worktree", "add", "--detach", candidatePath, targetSha]);
-        worktreePath = candidatePath;
-        verifyCwd = candidatePath;
+        const scratch = await wtMgr.addScratchWorktree("_verify", `${goal.id}-${randomUUID().slice(0, 8)}`, targetSha);
+        verifyScratch = scratch;
+        verifyCwd = scratch.path;
         verifyRef = targetSha;
         try {
           // Do NOT silently swallow bootstrap failures — fail verification cleanly if setupCommand fails
-          await wtMgr.bootstrapWorktree(candidatePath);
+          await wtMgr.bootstrapWorktree(scratch.path);
         } catch (err) {
-          await cleanup();
+          verifyScratch = null;
+          await scratch.remove();
           throw err;
         }
       } else {
@@ -2226,7 +2220,7 @@ export class DirectorRuntime {
         }
       }
     }
-    return { verifyCwd, verifyRef, isolated: worktreePath !== null, cleanup };
+    return { verifyCwd, verifyRef, isolated: Boolean(verifyScratch), cleanup };
   }
 
   /**
