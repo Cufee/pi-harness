@@ -147,8 +147,16 @@ export class PiRunner {
     const cancelledStopReason = (): RunAgentResult["stopReason"] =>
       cancelReason === "clean_rollover" ? "rollover_requested" : "cancelled";
 
+    // One missing-return wrap-up prompt when the agent stops without settling its task, then at most 3 more turns.
+    let wrapUpAttempted = false;
+    let wrapUpTurnsLeft = 0;
+    // Set once the run can take no more turns: a steer arriving then is refused instead of being acknowledged and dropped.
+    let runEnded = false;
+
     req.onHandle?.({
       steer: async (msg: string) => {
+        // The final wrap-up turn is already running: no later turn exists to deliver this message.
+        if (runEnded || (wrapUpAttempted && wrapUpTurnsLeft <= 1)) return false;
         steeringQueue.push(msg);
         return true;
       },
@@ -170,9 +178,6 @@ export class PiRunner {
     try {
       // maxTurns is an advisory reminder threshold; the loop ends only when the agent stops calling tools.
       let turnReminderSent = false;
-      // One missing-return wrap-up prompt when the agent stops without settling its task, then at most 3 more turns.
-      let wrapUpAttempted = false;
-      let wrapUpTurnsLeft = 0;
       let preWrapUpText = "";
       // Distinct substantive text of each wrap-up turn, in order, so intermediate findings survive a closing "ok".
       const wrapUpTexts: string[] = [];
@@ -441,12 +446,15 @@ export class PiRunner {
         }
 
         if (toolCalls.length === 0) {
-          if (steerContinuations < MAX_RUNNER_STEER_CONTINUATIONS) {
+          // Every wrap-up turn counts against the three-turn bound, steering continuations included; once the
+          // current turn is the last one allowed, nothing is drained that could not run.
+          if (steerContinuations < MAX_RUNNER_STEER_CONTINUATIONS && (!wrapUpAttempted || wrapUpTurnsLeft > 1)) {
             const late = req.drainPendingSteers?.() ?? [];
             if (late.length > 0) steeringQueue.push(...late);
             if (steeringQueue.length > 0) {
               // Steering that arrived during the turn opens the next one instead of being dropped.
               steerContinuations += 1;
+              if (wrapUpAttempted) wrapUpTurnsLeft -= 1;
               continue;
             }
           }
@@ -487,6 +495,7 @@ export class PiRunner {
         }
       }
     } finally {
+      runEnded = true;
       req.signal.removeEventListener("abort", onReqAbort);
     }
   }

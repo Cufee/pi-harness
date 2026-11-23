@@ -299,6 +299,10 @@ export class HarnessOrchestrator {
   private waitingChildrenTasks = new Map<string, number>();
   /** Steering continuation turns reserved by the current execution of a task. */
   private steerContinuations = new Map<string, number>();
+  /** Tasks whose queued steering batch holds one continuation reservation (released if a wait_children takes the batch). */
+  private steerReservedBatches = new Set<string>();
+  /** The note-free base message of resume results, so a joined caller never inherits the first caller's note prose. */
+  private resumeBaseMessages = new WeakMap<object, string>();
   readonly toolExecutor: ControlPlaneToolExecutor;
 
   constructor(
@@ -314,7 +318,7 @@ export class HarnessOrchestrator {
         this.waitForChildrenEventDriven(parentId, ids, mode, timeoutMs, signal),
       steerTask: (taskId, message) => this.steerTask(taskId, message),
       steerTaskDetailed: (taskId, message) => this.steerTaskDetailed(taskId, message),
-      drainPendingSteers: (taskId) => this.drainPendingSteers(taskId),
+      drainPendingSteers: (taskId) => this.drainPendingSteers(taskId, { viaWait: true }),
       cancelTask: (taskId, reason) => this.cancelTask(taskId, reason),
       stopTaskForBlockingIssue: (taskId, reason) => {
         const exec = this.active.get(taskId);
@@ -546,11 +550,26 @@ export class HarnessOrchestrator {
         if (timedOut && aborted && this.active.get(id) === aborted) {
           this.active.delete(id);
           this.pendingRollovers.delete(id);
+          // The evicted entry's finally is identity-guarded and will not release task-keyed steering state.
+          this.disposeSteeringState(id);
           const task = this.db.getTask(id);
           if (task) this.db.emitEvent(task.runId, id, "task.cancel_unwind_timeout", { taskId: id });
         }
       }),
     );
+  }
+
+  /** Drops a task's steering reservations and queue, reporting every steer that was never delivered. */
+  private disposeSteeringState(taskId: string): void {
+    this.steerContinuations.delete(taskId);
+    this.steerReservedBatches.delete(taskId);
+    this.waitingChildrenTasks.delete(taskId);
+    const undelivered = this.pendingSteers.get(taskId);
+    this.pendingSteers.delete(taskId);
+    const owner = this.db.getTask(taskId);
+    if (undelivered?.length && owner) {
+      this.db.emitEvent(owner.runId, taskId, "agent.steer_undelivered", { messages: undelivered });
+    }
   }
 
   /** Resolves when a write lease in `repoRoot` is released, on abort, or after a 15 s safety interval. */
@@ -855,8 +874,10 @@ export class HarnessOrchestrator {
     const taskId = name === "spawn_task" || typeof args.task_id !== "string" ? "" : args.task_id.trim();
     const taskRunId = taskId ? this.db.getTask(taskId)?.runId : undefined;
     const root = canonicalProjectPath(repoRoot);
+    // A cancel never reaches into another workspace's bucket: scope is enforced here, not left to the caller.
+    const taskBucket = taskRunId && directorTaskRunOwner(taskRunId) === ownerId ? this.db.getRun(taskRunId) : null;
     const run =
-      (taskRunId && directorTaskRunOwner(taskRunId) === ownerId ? this.db.getRun(taskRunId) : null) ??
+      (taskBucket && (name !== "cancel_task" || canonicalProjectPath(taskBucket.repoRoot) === root) ? taskBucket : null) ??
       (name === "spawn_task"
         ? await this.ensureDirectorTaskRun(ownerId, repoRoot)
         : this.listDirectorTaskRuns(ownerId).find((r) => canonicalProjectPath(r.repoRoot) === root));
@@ -1098,14 +1119,7 @@ export class HarnessOrchestrator {
       if (this.active.get(taskId) === entry) {
         this.active.delete(taskId);
         this.pendingRollovers.delete(taskId);
-        this.steerContinuations.delete(taskId);
-        this.waitingChildrenTasks.delete(taskId);
-        const undelivered = this.pendingSteers.get(taskId);
-        this.pendingSteers.delete(taskId);
-        const owner = this.db.getTask(taskId);
-        if (undelivered?.length && owner) {
-          this.db.emitEvent(owner.runId, taskId, "agent.steer_undelivered", { messages: undelivered });
-        }
+        this.disposeSteeringState(taskId);
       }
       for (const item of entry.pendingSteers?.splice(0) ?? []) item.onOutcome?.(false, "generation_ended_without_handle");
       const t = this.db.getTask(taskId);
@@ -1544,11 +1558,10 @@ export class HarnessOrchestrator {
   ): Promise<ResumeTaskResult> {
     const res = await inflight.promise;
     const note = opts?.note?.trim();
-    if (!note) {
-      // The first caller's note delivery is not this caller's.
-      const { noteDelivered: _first, noteDelivery: _firstDelivery, ...shared } = res;
-      return shared;
-    }
+    // The first caller's note delivery (and the prose describing it) is not this caller's.
+    const { noteDelivered: _first, noteDelivery: _firstDelivery, ...shared } = res;
+    const baseMessage = this.resumeBaseMessages.get(res) ?? res.message;
+    if (!note) return { ...shared, message: baseMessage };
     if (note === inflight.note) return res;
     // This caller's own precondition guards its note: a failed guard never forwards it.
     let valid: boolean;
@@ -1560,23 +1573,26 @@ export class HarnessOrchestrator {
     if (!valid) {
       throw new Error(`Task ${taskId} resume cancelled: precondition no longer holds. Your note was not delivered.`);
     }
-    const delivered = await this.deliverNoteToTask(taskId, note);
+    const own = await this.deliverNoteToTaskDetailed(taskId, note);
+    const sentence = own.delivery
+      ? own.delivered
+        ? "Your note was delivered as steering."
+        : `Your note could not be delivered as steering yet: ${own.delivery.reason}`
+      : own.delivered
+        ? "Your note was also delivered to the task."
+        : "Your note could not be delivered: the task is not live.";
     return {
-      ...res,
-      noteDelivered: delivered,
-      message: `${res.message} ${delivered ? "Your note was also delivered to the task." : "Your note could not be delivered: the task is not live."}`,
+      ...shared,
+      message: `${baseMessage} ${sentence}`,
+      noteDelivered: own.delivered,
+      ...(own.delivery ? { noteDelivery: own.delivery } : {}),
     };
   }
 
   /**
    * Delivers a note to a task that was just resumed or is running: appended to a resume note its new generation
-   * has not read yet, otherwise steered into the live session. False when neither is possible.
+   * has not read yet, otherwise steered into the live session. Reports the steering outcome when it was steered.
    */
-  private async deliverNoteToTask(taskId: string, note: string): Promise<boolean> {
-    return (await this.deliverNoteToTaskDetailed(taskId, note)).delivered;
-  }
-
-  /** deliverNoteToTask plus the steering outcome when the note was steered into a live session. */
   private async deliverNoteToTaskDetailed(taskId: string, note: string): Promise<{ delivered: boolean; delivery?: SteerTaskResult }> {
     const pending = this.taskResumeNotes.get(taskId);
     if (pending?.kind === "resume" || pending?.kind === "quota") {
@@ -1607,25 +1623,30 @@ export class HarnessOrchestrator {
       if (opts?.forceStart) this.db.admissionQueue.markForceStart("worker", task.id);
       const entry = this.db.admissionQueue.get("worker", task.id) ?? queued;
       const note = opts?.note?.trim();
-      return {
+      const baseMessage = `Task ${task.id} in ${where} is already queued for a worker slot (#${entry.position}${entry.forceStart ? ", force-start" : ""}); nothing was restarted.`;
+      const result: ResumeTaskResult = {
         task,
         outcome: "already_queued",
         queuePosition: entry.position,
-        message: `Task ${task.id} in ${where} is already queued for a worker slot (#${entry.position}${entry.forceStart ? ", force-start" : ""}); nothing was restarted.` +
-          (note ? " The note was not delivered: the task has no live session yet." : ""),
+        message: baseMessage + (note ? " The note was not delivered: the task has no live session yet." : ""),
         ...(note ? { noteDelivered: false } : {}),
       };
+      this.resumeBaseMessages.set(result, baseMessage);
+      return result;
     }
     if (this.isLiveExecution(task.id) || this.allocatingWorktrees.has(task.id)) {
       const noteDelivery = opts?.note?.trim() ? await this.steerTaskDetailed(task.id, opts.note.trim()) : undefined;
       const noteDelivered = noteDelivery?.steered;
-      return {
+      const baseMessage = `Task ${task.id} in ${where} is already ${task.status} (generation ${task.generation}); nothing was restarted.`;
+      const result: ResumeTaskResult = {
         task: this.db.getTask(task.id)!,
         outcome: "already_active",
-        message: `Task ${task.id} in ${where} is already ${task.status} (generation ${task.generation}); nothing was restarted.` +
+        message: baseMessage +
           (noteDelivered === true ? " The note was delivered as steering." : noteDelivered === false ? ` The note could not be delivered as steering yet: ${noteDelivery?.reason ?? "no live session"}` : ""),
         ...(noteDelivery ? { noteDelivered, noteDelivery } : {}),
       };
+      this.resumeBaseMessages.set(result, baseMessage);
+      return result;
     }
     if (task.status === "ready") {
       const won = this.stopWonSince(task, snap);
@@ -2218,6 +2239,9 @@ export class HarnessOrchestrator {
       // Set before the prompt is built so a steer queued right after knows the generation it targets.
       const runnerGen = task.generation;
       exec.runnerGeneration = runnerGen;
+      // Continuation reservations belong to one generation; queued steers are kept and open this one's first turn.
+      this.steerContinuations.delete(task.id);
+      this.steerReservedBatches.delete(task.id);
       const systemPrompt = buildImmutableSystemPrompt(task.tier, task.kind, this.config.codeMode, this.config.codeExec);
       const writeScopes = task.tier === 2 ? this.db.listActiveWriteScopes(run.id, task.id)
         : task.tier === 3 && task.parentId ? this.db.listActiveWriteScopes(run.id, task.parentId) : [];
@@ -2349,6 +2373,10 @@ export class HarnessOrchestrator {
                 return;
               }
               const accepted = await h.steer(item.message).catch(() => false);
+              if (!isCurrent() || item.generation !== runnerGen || exec.handle !== h || exec.runnerGeneration !== runnerGen) {
+                item.onOutcome?.(false, "generation_superseded");
+                return;
+              }
               this.db.emitEvent(run.id, task.id, "agent.steered", { message: item.message, accepted });
               item.onOutcome?.(accepted, accepted ? "delivered" : "steer_rejected");
             }).catch(() => {});
@@ -3212,16 +3240,23 @@ export class HarnessOrchestrator {
 
     // Phase 1 (the only await): a task blocked in wait_children gets the message through that wait instead.
     let native = false;
-    if ((this.waitingChildrenTasks.get(taskId) ?? 0) === 0 && exec.handle) {
+    // The generation and handle the native steer targets: a completion for an older one is never accepted.
+    const sentGeneration = exec.runnerGeneration;
+    const sentHandle = exec.handle;
+    if ((this.waitingChildrenTasks.get(taskId) ?? 0) === 0 && sentHandle) {
       try {
-        native = await this.steerHandleChained(exec, exec.handle, message);
+        native = await this.steerHandleChained(exec, sentHandle, message);
       } catch {
         native = false;
       }
     }
 
     // Phase 2 (sync, no await before return): re-read everything.
-    const late = refuseExec(exec) ?? refuseSettledOrStopped();
+    const late = refuseExec(exec) ?? (
+      exec.runnerGeneration !== sentGeneration || exec.handle !== sentHandle
+        ? refuse("no_session", `Steering was not delivered: task ${taskId} moved to a new session while the steer was in flight.`, resumeHint(this.db.getTask(taskId) ?? task))
+        : null
+    ) ?? refuseSettledOrStopped();
     if (late) return late;
     const current = this.db.getTask(taskId)!;
     const accept = (mode: "native" | "queued_wait" | "queued_turn"): SteerTaskResult => {
@@ -3248,15 +3283,26 @@ export class HarnessOrchestrator {
     }
     this.pendingSteers.set(taskId, [...queue, message]);
     // A delivery is already owed when messages are queued, so batching onto it is free.
-    if (queued === 0) this.steerContinuations.set(taskId, used + 1);
+    if (queued === 0) {
+      this.steerContinuations.set(taskId, used + 1);
+      this.steerReservedBatches.add(taskId);
+    }
     return accept("queued_turn");
   }
 
-  /** Takes every queued steering message of a task (oldest first); drains are never refused. */
-  drainPendingSteers(taskId: string): string[] {
+  /**
+   * Takes every queued steering message of a task (oldest first); drains are never refused. A batch taken by a
+   * wait_children (`viaWait`) used no continuation turn, so the continuation it reserved is released.
+   */
+  drainPendingSteers(taskId: string, opts?: { viaWait?: boolean }): string[] {
     const q = this.pendingSteers.get(taskId);
     if (!q?.length) return [];
     this.pendingSteers.delete(taskId);
+    if (this.steerReservedBatches.delete(taskId) && opts?.viaWait) {
+      const used = (this.steerContinuations.get(taskId) ?? 0) - 1;
+      if (used > 0) this.steerContinuations.set(taskId, used);
+      else this.steerContinuations.delete(taskId);
+    }
     return q;
   }
 
@@ -3266,9 +3312,12 @@ export class HarnessOrchestrator {
    */
   private steerHandleChained(exec: ActiveTaskExecution, handle: RunnerExecutionHandle, message: string): Promise<boolean> {
     const expectedGen = exec.runnerGeneration;
+    const stale = () => exec.handle !== handle || exec.runnerGeneration !== expectedGen || exec.abort.signal.aborted;
     const step = (exec.steerChain ?? Promise.resolve()).then(async () => {
-      if (exec.handle !== handle || exec.runnerGeneration !== expectedGen || exec.abort.signal.aborted) return false;
-      return handle.steer(message);
+      if (stale()) return false;
+      const accepted = await handle.steer(message);
+      // A completion that arrives after the session rolled over or ended belongs to no live session.
+      return accepted && !stale();
     });
     exec.steerChain = step.then(() => {}, () => {});
     return step;
@@ -3289,7 +3338,16 @@ export class HarnessOrchestrator {
     if (!exec || exec.abort.signal.aborted) return { delivered: false, mode: "none" };
     if (exec.promptBuilt !== true) return { delivered: true, mode: "initial_prompt" };
     if (exec.handle) {
-      const ok = await this.steerHandleChained(exec, exec.handle, message).catch(() => false);
+      const sentGeneration = exec.runnerGeneration;
+      const sentHandle = exec.handle;
+      const ok = await this.steerHandleChained(exec, sentHandle, message).catch(() => false);
+      // A completion for an older session must not be recorded against (or wake) its successor.
+      if (
+        this.active.get(taskId) !== exec || exec.abort.signal.aborted || exec.phase === "settling" ||
+        exec.runnerGeneration !== sentGeneration || exec.handle !== sentHandle
+      ) {
+        return { delivered: false, mode: "none" };
+      }
       const task = this.db.getTask(taskId);
       if (task) this.db.emitEvent(task.runId, taskId, "agent.steered", { message, accepted: ok });
       return { delivered: ok, mode: ok ? "steer" : "none" };
