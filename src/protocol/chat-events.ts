@@ -243,7 +243,10 @@ export function formatChatEventSummary(event: ChatControlEvent): string {
         `inspect it with \`pi-harness tree ${event.runId}\`, or send a new request.`;
       const quotaReason = settledQuotaReason(event);
       if (quotaReason !== null) {
-        return `${head}: run ${event.runId} paused on provider quota: ${quotaReason}${esc}. No quota reset time is known, so no automatic resume is scheduled. ${recovery}`;
+        return (
+          `${head}: run ${event.runId} paused on provider quota: ${quotaReason}${esc}. No quota reset time is known, so it will not resume by itself. ` +
+          `Continue it in place with \`pi-harness resume ${event.runId}\` once quota is back, inspect it with \`pi-harness tree ${event.runId}\`, or send a new request.`
+        );
       }
       if (event.cause === "escalation") {
         return `${head}: run ${event.runId} needs human input: ${settledCauseText(event)}${esc}. Inspect it with \`pi-harness tree ${event.runId}\` and answer the escalation, or send a new request.`;
