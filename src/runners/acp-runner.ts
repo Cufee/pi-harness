@@ -476,9 +476,66 @@ export class AcpRunner {
         clearTimeout(cancelGraceTimer);
         cancelGraceTimer = null;
       }
+      if (childExitFlushTimer) {
+        clearTimeout(childExitFlushTimer);
+        childExitFlushTimer = null;
+      }
       resolveActivePromptOnGrace = null;
       rejectActivePromptOnIdle = null;
+      rejectActivePromptOnChildExit = null;
     };
+
+    // Child exit/close + PID liveness detection: a dead ACP child fails the active turn promptly instead of
+    // waiting out the idle watchdog (which an in-flight tool call stretches to 30 minutes).
+    let rejectActivePromptOnChildExit: ((err: Error) => void) | null = null;
+    let childExitFlushTimer: ReturnType<typeof setTimeout> | null = null;
+    let childGoneError: Error | null = null;
+    const childExitMessage = (code: number | null, signal: NodeJS.Signals | null) =>
+      `ACP agent process exited during an active turn (code=${code ?? "null"}, signal=${signal ?? "null"})`;
+    const onChildGone = (code: number | null, signal: NodeJS.Signals | null, fromClose: boolean) => {
+      // Abort, rollover, idle timeout, and cancel grace terminate the child on purpose.
+      if (req.signal.aborted || rolloverTriggered || idleTimedOut || cancelGraceTimer) return;
+      if (!rejectActivePromptOnChildExit) return;
+      const rejectNow = () => {
+        const cb = rejectActivePromptOnChildExit;
+        if (!cb || req.signal.aborted || rolloverTriggered || idleTimedOut || cancelGraceTimer) return;
+        childGoneError = new Error(childExitMessage(code ?? child?.exitCode ?? null, signal ?? child?.signalCode ?? null));
+        clearIdleWatchdog();
+        terminateChild(child);
+        cb(childGoneError);
+      };
+      if (fromClose) {
+        rejectNow();
+        return;
+      }
+      // Give a final JSON-RPC response already buffered on stdout a moment to resolve the prompt cleanly.
+      if (childExitFlushTimer) return;
+      childExitFlushTimer = setTimeout(() => {
+        childExitFlushTimer = null;
+        rejectNow();
+      }, 250);
+      childExitFlushTimer.unref?.();
+    };
+    const onChildExit = (code: number | null, signal: NodeJS.Signals | null) => onChildGone(code, signal, false);
+    const onChildClose = (code: number | null, signal: NodeJS.Signals | null) => onChildGone(code, signal, true);
+    let livenessTimer: ReturnType<typeof setInterval> | null = null;
+    if (child) {
+      child.once("exit", onChildExit);
+      child.once("close", onChildClose);
+      livenessTimer = setInterval(() => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          onChildGone(child.exitCode, child.signalCode, false);
+        } else if (typeof child.pid === "number") {
+          try {
+            process.kill(child.pid, 0);
+          } catch (err) {
+            // EPERM means the PID exists but belongs to someone else: treat as alive.
+            if ((err as NodeJS.ErrnoException).code === "ESRCH") onChildGone(child.exitCode, child.signalCode, false);
+          }
+        }
+      }, 5_000);
+      livenessTimer.unref?.();
+    }
     const armCancelGraceTimer = (stopReason: string) => {
       if (cancelGraceTimer || !resolveActivePromptOnGrace) return;
       const graceMs = idleTimeoutMs > 0 ? Math.min(5_000, Math.max(100, idleTimeoutMs * 2)) : 5_000;
@@ -1433,6 +1490,15 @@ export class AcpRunner {
 
         promptRes = await new Promise<Record<string, unknown>>((resolvePrompt, rejectPrompt) => {
           resolveActivePromptOnGrace = resolvePrompt;
+          rejectActivePromptOnChildExit = rejectPrompt;
+          if (child && (child.exitCode !== null || child.signalCode !== null)) {
+            // The child died before this prompt started: fail now rather than wait on a dead pipe.
+            childGoneError = new Error(childExitMessage(child.exitCode, child.signalCode));
+            clearIdleWatchdog();
+            promptPromise.catch(() => {});
+            rejectPrompt(childGoneError);
+            return;
+          }
           if (idleTimeoutMs > 0) {
             rejectActivePromptOnIdle = rejectPrompt;
             resetIdleWatchdog();
@@ -1727,7 +1793,11 @@ export class AcpRunner {
       const combined = `${errMsg}\n${stderrBuf}`;
       const detected = detectQuotaErrorText(combined);
 
-      if (quotaWatchdogTriggered || detected.isQuota || errData?.errorKind === "rate_limit" || Boolean(errRateLimit)) {
+      // A sudden child exit is a crash, not a quota pause, unless live quota signals fired during the run.
+      const quotaSignal = childGoneError && primary === childGoneError
+        ? quotaWatchdogTriggered || quotaRejected || quotaRetryHits > 0
+        : quotaWatchdogTriggered || detected.isQuota || errData?.errorKind === "rate_limit" || Boolean(errRateLimit);
+      if (quotaSignal) {
         const reason = lastQuotaReason || detected.summary || errMsg;
         const resetAt = lastQuotaResetAt ?? detected.resetAtIso ?? null;
         const isHard = lastQuotaHard || detected.isHardExhaustion;
@@ -1769,6 +1839,9 @@ export class AcpRunner {
     } finally {
       flushCost();
       clearIdleWatchdog();
+      if (livenessTimer) clearInterval(livenessTimer);
+      child?.off("exit", onChildExit);
+      child?.off("close", onChildClose);
       disarmQuotaWatchdog(false);
       req.signal.removeEventListener("abort", onAbort);
       try {
