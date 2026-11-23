@@ -1601,14 +1601,14 @@ export class HarnessDaemon {
     const session = this.director.chats.getSession(sessionId);
     if (!session) throw new Error(`Unknown chat session: ${sessionId}`);
     const project = session.projectId ? this.db.projects.getById(session.projectId) : null;
-    const recentHistory = this.director.chats.getRecentHistory(sessionId, bounded);
+    const recentHistory = this.director.chats.getRecentHistory(session.id, bounded);
     const turns = recentHistory.map((t) => ({
       seq: t.seq,
       role: t.role,
       content: t.content,
       createdAt: t.createdAt,
     }));
-    const messages = this.db.sessionMessages.listForSession(sessionId, 20);
+    const messages = this.db.sessionMessages.listForSession(session.id, 20);
     return {
       host: "local",
       address: `local:${session.id}`,
@@ -1636,7 +1636,8 @@ export class HarnessDaemon {
         { target: sessionId, limit },
         15_000,
       );
-      return { ...res, host, address: `${host}:${sessionId}` };
+      const canonicalId = (res?.session as { id?: string } | undefined)?.id ?? sessionId;
+      return { ...res, host, address: `${host}:${canonicalId}` };
     }
     return this.readLocalSession(sessionId, limit);
   }
@@ -1752,6 +1753,7 @@ export class HarnessDaemon {
     if (!toSessionId) throw new Error(`Invalid target session address: "${input.target}"`);
 
     const fromSess = this.director.chats.getSession(input.fromSessionId);
+    const fromSessionId = fromSess?.id ?? input.fromSessionId;
     const fromProject = fromSess?.projectId ? this.db.projects.getById(fromSess.projectId) : null;
     const prevMsg = input.replyToId ? this.db.sessionMessages.getById(input.replyToId) : null;
     const hopCount = prevMsg ? prevMsg.hopCount + 1 : 1;
@@ -1763,7 +1765,7 @@ export class HarnessDaemon {
         id,
         fromNode: this.nodeId,
         fromHost: "local",
-        fromSessionId: input.fromSessionId,
+        fromSessionId,
         fromProjectName: fromProject?.name ?? null,
         toSessionId,
         body: input.body,
@@ -1773,7 +1775,7 @@ export class HarnessDaemon {
       });
       return {
         messageId: delivered.record.id,
-        target: `local:${toSessionId}`,
+        target: `local:${delivered.record.toSessionId}`,
         status: "delivered",
         woke: delivered.woke,
         circuitBreakerTripped: delivered.circuitBreakerTripped,
@@ -1795,7 +1797,7 @@ export class HarnessDaemon {
     const record = this.db.sessionMessages.enqueueOutbound({
       fromNode: this.nodeId,
       fromHost: this.peers.localHostName,
-      fromSessionId: input.fromSessionId,
+      fromSessionId,
       fromProjectName: fromProject?.name ?? null,
       toNode: resolvedToNode,
       toHost: targetHost,
@@ -1817,7 +1819,7 @@ export class HarnessDaemon {
     }
 
     try {
-      const res = await link.request<{ woke?: boolean; circuitBreakerTripped?: boolean }>(
+      const res = await link.request<{ record?: { toSessionId?: string }; woke?: boolean; circuitBreakerTripped?: boolean }>(
         "session.deliver_message",
         {
           id: record.id,
@@ -1834,9 +1836,10 @@ export class HarnessDaemon {
         15_000,
       );
       this.db.sessionMessages.markDelivered(record.id);
+      const deliveredTo = typeof res?.record?.toSessionId === "string" && res.record.toSessionId ? res.record.toSessionId : toSessionId;
       return {
         messageId: record.id,
-        target: `${targetHost}:${toSessionId}`,
+        target: `${targetHost}:${deliveredTo}`,
         status: "delivered",
         woke: Boolean(res?.woke),
         circuitBreakerTripped: Boolean(res?.circuitBreakerTripped),
@@ -2044,7 +2047,10 @@ export class HarnessDaemon {
       case "session.list_messages": {
         const { host, sessionId } = parseSessionAddress(String(p.sessionId ?? p.target ?? ""));
         if (host && !this.isLocalHostTarget(host)) throw new Error("Cross-host forwarding is not permitted over a peer link");
-        return this.db.sessionMessages.listForSession(sessionId, typeof p.limit === "number" ? p.limit : 50);
+        return this.db.sessionMessages.listForSession(
+          this.resolveChatSessionId(sessionId),
+          typeof p.limit === "number" ? p.limit : 50,
+        );
       }
       case "session.read": {
         const rawTarget = String(p.target ?? p.sessionId ?? "").trim();
@@ -2557,7 +2563,7 @@ export class HarnessDaemon {
         if (host && !this.isLocalHostTarget(host)) {
           return await this.peers.callRemote(host, "session.list_messages", { sessionId, limit });
         }
-        return this.db.sessionMessages.listForSession(sessionId, limit);
+        return this.db.sessionMessages.listForSession(this.resolveChatSessionId(sessionId), limit);
       }
 
       case "session.read": {
@@ -3031,7 +3037,8 @@ export class HarnessDaemon {
         const rawRunId = String(p.runId);
         const run = this.db.getRun(rawRunId);
         const runId = run?.id ?? rawRunId.trim();
-        const taskId = typeof p.taskId === "string" ? (this.db.getTask(p.taskId)?.id ?? p.taskId) : null;
+        const rawTaskId = typeof p.taskId === "string" && p.taskId.trim() ? p.taskId.trim() : null;
+        const taskId = rawTaskId ? (this.db.getTask(rawTaskId)?.id ?? rawTaskId) : null;
         const sinceSeq = typeof p.sinceSeq === "number" ? p.sinceSeq : 0;
         const { tookOver } = this.bindRunSocket(socket, runId, taskId);
         const attachment = this.attachments.get(socket)!;
@@ -3043,6 +3050,7 @@ export class HarnessDaemon {
           tookOver,
           control: this.controlState(socket, "run", runId),
           run,
+          taskId,
           tasks: this.db.listTasks(runId),
           escalations: this.db.listEscalations(runId, "open"),
           quotaPause: this.orchestrator.getRunQuotaStatus(runId),

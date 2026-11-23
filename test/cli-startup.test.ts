@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "bun:test";
 import type { Terminal } from "@earendil-works/pi-tui";
-import { chooseRemoteProject, parseArgs, resolveLocalStartup } from "../src/cli.js";
+import { chooseRemoteProject, parseArgs, probeHostSwitchClient, resolveLocalStartup } from "../src/cli.js";
 import { loadConfig } from "../src/config.js";
 import { findProjectContainingPath, type ProjectSummary } from "../src/control-plane/projects.js";
 import { DaemonClient } from "../src/daemon/remote.js";
@@ -260,6 +260,62 @@ describe("CLI startup project picker and --resume", () => {
     } finally {
       pickerClient.close();
       chatClient.close();
+      await daemon.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("closes a failed host-switch probe on nodeId mismatch without sending session.leave", async () => {
+    const root = realpathSync(mkdtempSync("/tmp/pi-startup-mismatch-"));
+    const stateDir = join(root, "state");
+    const sockPath = join(stateDir, "d.sock");
+    const cfg = loadConfig(root);
+    cfg.stateDir = stateDir;
+    cfg.socketPath = sockPath;
+
+    const daemon = new HarnessDaemon(cfg);
+    await daemon.start();
+    const sentOps: string[] = [];
+    let closed = false;
+
+    try {
+      await assert.rejects(
+        () =>
+          probeHostSwitchClient({
+            connect: async () => {
+              const raw = new DaemonClient(sockPath);
+              await raw.connect();
+              const origRequest = raw.request.bind(raw);
+              const origClose = raw.close.bind(raw);
+              raw.request = (<T = unknown>(op: Parameters<typeof origRequest>[0], params?: Record<string, unknown>) => {
+                sentOps.push(op);
+                return origRequest<T>(op, params);
+              }) as typeof raw.request;
+              raw.close = () => {
+                closed = true;
+                origClose();
+              };
+              return raw;
+            },
+            targetHostLabel: "gpu-box",
+            expectedNodeId: "expected-other-node",
+          }),
+        /alias mismatch/,
+      );
+
+      assert.deepEqual(sentOps, ["ping"]);
+      assert.equal(closed, true);
+
+      // Daemon remains reachable after failed unregistered probe closes
+      const verify = new DaemonClient(sockPath);
+      await verify.connect();
+      try {
+        const pong = await verify.request<{ pong: boolean }>("ping");
+        assert.equal(pong.pong, true);
+      } finally {
+        verify.close();
+      }
+    } finally {
       await daemon.stop();
       rmSync(root, { recursive: true, force: true });
     }
