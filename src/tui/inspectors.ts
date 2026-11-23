@@ -1680,6 +1680,12 @@ class MergeInspectorScreen implements Screen {
 
 /* ─────────────────────────── Live Transcript Viewer ───────────────────────── */
 
+interface StyledLine {
+  rows: string[];
+  /** Character offset in the logical line's text where each row starts. */
+  offs: number[];
+}
+
 interface LiveRowLayout {
   lines: TranscriptLine[];
   indexByKey: Map<string, number>;
@@ -1688,9 +1694,11 @@ interface LiveRowLayout {
   rowCount: number[];
   /** Logical line index of each wrapped row. */
   rowLine: number[];
+  /** Source character offset (within its logical line) at which each wrapped row starts. */
+  rowOffset: number[];
 }
 
-const EMPTY_LAYOUT: LiveRowLayout = { lines: [], indexByKey: new Map(), rowStart: [], rowCount: [], rowLine: [] };
+const EMPTY_LAYOUT: LiveRowLayout = { lines: [], indexByKey: new Map(), rowStart: [], rowCount: [], rowLine: [], rowOffset: [] };
 
 /**
  * Read-only live transcript viewer backed by `watch.start` (`scope: "task"` or `"run"`) + `replay.page`.
@@ -1714,10 +1722,11 @@ export class LiveTranscriptScreen implements Screen {
   private earlyBuffer: DaemonEventFrame[] = [];
   private readonly model: LiveTranscriptModel;
   private layout: LiveRowLayout = EMPTY_LAYOUT;
-  private readonly rowCache = new Map<string, { sig: string; rows: string[] }>();
+  private readonly rowCache = new Map<string, { sig: string } & StyledLine>();
   private cursorKey: string | null = null;
   private selectAnchorKey: string | null = null;
-  private readAnchor: { key: string; delta: number } | null = null;
+  /** Top visible source position: logical line + character offset, so it survives any re-wrap width. */
+  private readAnchor: { key: string; offset: number } | null = null;
   private pausedAtLines = 0;
   /** Tool block just expanded: its rows are scrolled into view after the next layout. */
   private revealBlockId: number | null = null;
@@ -1821,48 +1830,64 @@ export class LiveTranscriptScreen implements Screen {
     return [Math.min(a, c), Math.max(a, c)];
   }
 
-  private styleLine(line: TranscriptLine, width: number, theme: Theme): string[] {
+  /**
+   * Styled display rows for one logical line plus the character offset of each row inside `line.text`
+   * (the stable source position that survives re-wrapping). `width` is the full row budget: wrapping
+   * reserves the widest of the first/continuation prefixes so no wrapped row is ever clipped.
+   */
+  private styleLine(line: TranscriptLine, width: number, theme: Theme): StyledLine {
     const g = theme.glyphs;
-    const indented = (first: string, rest: string, styled: string): string[] => {
-      const avail = Math.max(1, width - visibleWidth(first));
-      return wrap(styled, avail).map((r, i) => `${i === 0 ? first : rest}${r}`);
+    const plain = (s: string): string => s;
+    const indented = (first: string, rest: string, style: (s: string) => string = plain, text = line.text): StyledLine => {
+      const avail = Math.max(1, width - Math.max(visibleWidth(first), visibleWidth(rest)));
+      const parts = wrap(text, avail);
+      const offs: number[] = [];
+      let pos = 0;
+      for (const part of parts) {
+        const at = part ? text.indexOf(part, pos) : -1;
+        offs.push(at >= 0 ? at : pos);
+        if (at >= 0) pos = at + part.length;
+      }
+      return { rows: parts.map((r, i) => `${i === 0 ? first : rest}${style(r)}`), offs };
     };
     switch (line.role) {
       case "spacer":
-        return [""];
+        return { rows: [""], offs: [0] };
       case "assistant-header":
-        return indented(`${theme.accent(g.diamond)} `, "  ", theme.bold(line.text));
+        return indented(`${theme.accent(g.diamond)} `, "  ", (s) => theme.bold(s));
       case "thought-header":
-        return indented(theme.dim("… "), "  ", theme.dim(theme.italic(line.text)));
+        return indented(theme.dim("… "), "  ", (s) => theme.dim(theme.italic(s)));
       case "heading":
-        return indented("  ", "  ", theme.accentBold(line.text));
+        return indented("  ", "  ", (s) => theme.accentBold(s));
       case "list":
-        return indented("  ", "    ", line.text);
+        return indented("  ", "    ");
       case "fence":
-        return [`  ${theme.muted(line.text ? `${g.boxTL}${g.barH} ${line.text}` : `${g.boxBL}${g.barH}`)}`];
+        return line.text
+          ? indented(`  ${theme.muted(`${g.boxTL}${g.barH} `)}`, "     ", (s) => theme.muted(s))
+          : { rows: [`  ${theme.muted(`${g.boxBL}${g.barH}`)}`], offs: [0] };
       case "code": {
         const bar = `  ${theme.muted(g.barV)} `;
-        return indented(bar, bar, theme.code(line.text));
+        return indented(bar, bar, (s) => theme.code(s));
       }
       case "thought":
-        return indented("  ", "  ", theme.dim(theme.italic(line.text)));
+        return indented("  ", "  ", (s) => theme.dim(theme.italic(s)));
       case "tool-header": {
         const st = line.tool?.status ?? "running";
         const tone: Tone = st === "ok" ? "ok" : st === "error" ? "danger" : "accent";
         const fold = theme.muted(`${line.tool?.expanded ? g.foldOpen : g.foldClosed} `);
-        return indented(fold, "  ", theme.paint(tone, line.text));
+        return indented(fold, "  ", (s) => theme.paint(tone, s));
       }
       case "tool-label":
-        return indented("    ", "    ", theme.muted(line.text));
+        return indented("    ", "    ", (s) => theme.muted(s));
       case "tool-body":
       case "tool-error": {
         const bar = `    ${theme.muted(g.barV)} `;
-        return indented(bar, bar, line.role === "tool-error" ? theme.danger(line.text) : line.text);
+        return indented(bar, bar, line.role === "tool-error" ? (s) => theme.danger(s) : plain);
       }
       case "event":
-        return indented("", "  ", theme.paint(line.tone ?? "muted", line.text));
+        return indented("", "  ", (s) => theme.paint(line.tone ?? "muted", s));
       default:
-        return indented("  ", "  ", line.text);
+        return indented("  ", "  ");
     }
   }
 
@@ -1871,7 +1896,7 @@ export class LiveTranscriptScreen implements Screen {
     const lines = this.model.lines();
     const indexByKey = new Map<string, number>();
     lines.forEach((l, i) => indexByKey.set(l.key, i));
-    this.layout = { lines, indexByKey, rowStart: [], rowCount: [], rowLine: [] };
+    this.layout = { lines, indexByKey, rowStart: [], rowCount: [], rowLine: [], rowOffset: [] };
     // Re-key cursor/anchor to surviving lines (a collapsed tool's sub-line falls back to its header).
     this.cursorKey = this.keyAt(this.resolveIndex(this.cursorKey));
     this.selectAnchorKey = this.keyAt(this.resolveIndex(this.selectAnchorKey));
@@ -1887,7 +1912,7 @@ export class LiveTranscriptScreen implements Screen {
       const sig = `${bodyW}\u0000${theme.color}\u0000${line.role}\u0000${line.tone ?? ""}\u0000${line.tool?.status ?? ""}\u0000${line.tool?.expanded ?? ""}\u0000${line.text}`;
       let cached = this.rowCache.get(line.key);
       if (!cached || cached.sig !== sig) {
-        cached = { sig, rows: this.styleLine(line, bodyW, theme) };
+        cached = { sig, ...this.styleLine(line, bodyW, theme) };
         this.rowCache.set(line.key, cached);
       }
       const inSel = sel !== null && i >= sel[0] && i <= sel[1];
@@ -1899,6 +1924,7 @@ export class LiveTranscriptScreen implements Screen {
         const row = gutter + r;
         rows.push(inSel || isCursor ? fillLineBg(row, rowW, theme.badgeBg) : row);
         this.layout.rowLine.push(i);
+        this.layout.rowOffset.push(cached.offs[j] ?? 0);
       });
     }
     return rows;
@@ -1909,7 +1935,7 @@ export class LiveTranscriptScreen implements Screen {
   private captureAnchor(): void {
     const idx = this.layout.rowLine[this.viewport.offset];
     if (idx === undefined) return;
-    this.readAnchor = { key: this.layout.lines[idx]!.key, delta: this.viewport.offset - this.layout.rowStart[idx]! };
+    this.readAnchor = { key: this.layout.lines[idx]!.key, offset: this.layout.rowOffset[this.viewport.offset] ?? 0 };
   }
 
   private restoreAnchor(): void {
@@ -1917,7 +1943,12 @@ export class LiveTranscriptScreen implements Screen {
     const exact = this.layout.indexByKey.get(this.readAnchor.key);
     const idx = exact ?? this.resolveIndex(this.readAnchor.key);
     if (idx < 0) return;
-    const delta = exact === undefined ? 0 : Math.min(this.readAnchor.delta, this.layout.rowCount[idx]! - 1);
+    // Land on the wrapped row that contains the remembered character, whatever the current width.
+    let delta = 0;
+    if (exact !== undefined) {
+      const start = this.layout.rowStart[idx]!;
+      while (delta + 1 < this.layout.rowCount[idx]! && (this.layout.rowOffset[start + delta + 1] ?? 0) <= this.readAnchor.offset) delta++;
+    }
     this.viewport.offset = this.layout.rowStart[idx]! + delta;
   }
 
@@ -1988,11 +2019,19 @@ export class LiveTranscriptScreen implements Screen {
       { key: "Y", label: "copy all" },
       { key: "Esc", label: this.selectAnchorKey ? "clear" : "close" },
     ];
+    // Narrow terminals shed detail instead of letting the frame drop the whole header.
+    const room = Math.max(8, Math.max(4, width - 2 - (width >= 20 ? 4 : 2)) - 6);
     const header = (): string => {
       if (this.viewport.follow) return theme.ok(`${theme.glyphs.running} live`);
       const newLines = Math.max(0, this.layout.lines.length - this.pausedAtLines);
-      const lead = newLines > 0 ? theme.warn(`+${newLines} new · End resumes `) : theme.muted("paused ");
-      return `${lead}${theme.muted(this.viewport.statusText())}`;
+      const status = this.viewport.statusText();
+      const variants = [
+        newLines > 0 ? `+${newLines} new · End resumes ${status}` : `paused ${status}`,
+        newLines > 0 ? `+${newLines} new · End` : `paused ${status}`,
+        newLines > 0 ? `+${newLines} new` : "paused",
+      ].map((v) => v.trimEnd());
+      const text = variants.find((v) => visibleWidth(v) <= room) ?? variants[variants.length - 1]!;
+      return newLines > 0 ? theme.warn(text) : theme.muted(text);
     };
     // The header reflects the layout the body pass computes, so re-render once when that pass changed it.
     const before = header();
@@ -2016,8 +2055,10 @@ export class LiveTranscriptScreen implements Screen {
         }
         // Reserve the scrollbar gutter up front so rows never get truncated when it appears.
         const rows = this.layoutRows(Math.max(4, innerW - 2), theme);
+        let restoredAt = -1;
         if (!this.viewport.follow) {
           this.restoreAnchor();
+          restoredAt = this.viewport.offset;
           if (this.revealBlockId !== null) {
             const idxs = this.layout.lines.flatMap((l, i) => (l.blockId === this.revealBlockId ? [i] : []));
             if (idxs.length > 0) this.revealLines(idxs[0]!, idxs[idxs.length - 1]!);
@@ -2025,7 +2066,9 @@ export class LiveTranscriptScreen implements Screen {
         }
         this.revealBlockId = null;
         const out = this.viewport.render(rows, innerW, bodyH, theme);
-        if (!this.viewport.follow) this.captureAnchor();
+        // Keep the remembered source position while the viewport still shows it; re-capturing the
+        // restored row would round the anchor down to a row start and drift on every resize.
+        if (!this.viewport.follow && (restoredAt !== this.viewport.offset || this.readAnchor === null)) this.captureAnchor();
         return out;
       },
     });
