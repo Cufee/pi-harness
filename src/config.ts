@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, isAbsolute, join, resolve } from "node:path";
 import type { CodeMode } from "./code-mode/sdk.js";
@@ -389,9 +389,32 @@ export function defaultSocketPath(stateDir: string): string {
   // Keep Unix socket paths short (<104 bytes on macOS) while avoiding world-writable /tmp root races
   const candidate = join(stateDir, "daemon.sock");
   if (candidate.length < 96) return candidate;
-  const uidDir = join(tmpdir(), `pi-harness-${process.getuid?.() ?? "u"}`);
+  const uidDir = join(ensureTempDir(), `pi-harness-${process.getuid?.() ?? "u"}`);
   mkdirSync(uidDir, { recursive: true, mode: 0o700 });
   return join(uidDir, "daemon.sock");
+}
+
+/** Resolves this host's writable temp directory and exports it as TMPDIR so child processes inherit it. */
+export function ensureTempDir(): string {
+  const requested = process.env.TMPDIR?.trim() ? process.env.TMPDIR : undefined;
+  // Bun's tmpdir() returns a whitespace-only TMPDIR verbatim, so blank must be removed to get the platform default.
+  delete process.env.TMPDIR;
+  const fallback = tmpdir();
+  const failures: string[] = [];
+  for (const dir of requested ? [requested, fallback] : [fallback]) {
+    try {
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      accessSync(dir, constants.W_OK | constants.X_OK);
+    } catch (err) {
+      failures.push(`${dir}: ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
+    if (failures.length) console.error(`[pi-harness] TMPDIR ${failures[0]}; using ${dir} instead.`);
+    process.env.TMPDIR = dir;
+    return dir;
+  }
+  if (requested) process.env.TMPDIR = requested;
+  throw new Error(`No usable temp directory (${failures.join("; ")}). Set TMPDIR to a writable directory.`);
 }
 
 export function defaultProfiles(): RunnerProfileConfig[] {
