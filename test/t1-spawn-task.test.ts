@@ -103,6 +103,7 @@ it.each(["research", "plan", "verify"] as const)("lets Tier 1 spawn and await a 
     let expectedSummary = summary;
     assert.ok(dossierPath);
     const artifactPaths = [dossierPath];
+    let overflowMeta: Record<string, unknown> = {};
     if (summary.length > 2000) {
       const [handoff] = result.children;
       assert.ok(handoff);
@@ -116,13 +117,23 @@ it.each(["research", "plan", "verify"] as const)("lets Tier 1 spawn and await a 
       assert.deepEqual(await execute("artifact_read", { path }), { path, content: summary, truncated: false });
       expectedSummary = handoff.summary;
       artifactPaths.push(path);
+      const keptChars = expectedSummary.slice(0, expectedSummary.indexOf("\n\n[Full summary: ")).length;
+      overflowMeta = {
+        truncated: true,
+        full_summary: {
+          path,
+          next_offset: keptChars,
+          total_chars: summary.length,
+          read_with: "artifact_read { path, offset: next_offset, task_id }",
+        },
+      };
     }
     assert.deepEqual(await execute("artifact_read", { path: dossierPath }), {
       path: dossierPath, content: "Deployment evidence", truncated: false,
     });
     const expected = {
       id: spawned, title: assignment.title, kind, status: "completed", summary: expectedSummary,
-      sources, artifact_paths: artifactPaths, escalations: [],
+      ...overflowMeta, sources, artifact_paths: artifactPaths, escalations: [],
     };
     assert.deepEqual(result, { children: [expected] });
     assert.deepEqual(await execute("wait_children", { ids: [spawned] }), { children: [expected] });

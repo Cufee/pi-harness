@@ -527,6 +527,36 @@ export async function resolveGateEnv(o: {
 }
 
 /**
+ * Runs `bin args` directly without a shell in its own process group (stdin closed), preserving process-group
+ * kill, timeout, abort, and output cap. Resolves bare `bin` names against `o.env.PATH`.
+ */
+export async function runArgv(
+  bin: string,
+  args: string[],
+  o: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    timeoutMs: number;
+    maxOutputBytes: number;
+    signal?: AbortSignal;
+  },
+): Promise<{ stdout: string; stderr: string; exitCode: number | null; stopped?: GateCommandFailure }> {
+  o.signal?.throwIfAborted();
+  let executable = bin;
+  if (!isAbsolute(bin) && !bin.includes("/")) {
+    const found = await findExecutable(bin, pathSegments(o.env.PATH));
+    if (found) executable = found;
+  }
+  const r = await spawnGroup(executable, args, { ...o, captureStderr: true });
+  return {
+    stdout: r.stdout,
+    stderr: r.stderr,
+    exitCode: r.exitCode,
+    ...(r.stopped ? { stopped: r.stopped } : {}),
+  };
+}
+
+/**
  * Runs `command` with `<resolved.shell> -c` in its own process group (stdin closed). Throws
  * GateCommandError on non-zero exit, timeout, cancellation, output overflow or spawn failure.
  */

@@ -640,6 +640,279 @@ export function isSafeReadOnlyShellCommand(rawCommand: string, scope?: ReadOnlyS
   return true;
 }
 
+const INSPECT_COMMAND_BINS = new Set([
+  "git",
+  "rg",
+  "ls",
+  "cat",
+  "head",
+  "tail",
+  "wc",
+  "nl",
+  "stat",
+  "bun",
+  "bunx",
+]);
+
+const INSPECT_SHELL_OPERATORS = new Set(["|", "||", "&", "&&", ";", ">", ">>", "<", "2>", "2>&1", "$(", "`"]);
+
+const GIT_REMOTE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const GIT_PLAIN_REF_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+const GIT_FETCH_BOOL_FLAGS = new Set([
+  "--all",
+  "--prune",
+  "-p",
+  "--no-tags",
+  "--tags",
+  "-t",
+  "--quiet",
+  "-q",
+  "--verbose",
+  "-v",
+  "--dry-run",
+  "--unshallow",
+  "--no-recurse-submodules",
+  "--no-write-fetch-head",
+]);
+const GIT_LS_REMOTE_BOOL_FLAGS = new Set([
+  "--heads",
+  "--tags",
+  "-h",
+  "-t",
+  "--refs",
+  "-q",
+  "--quiet",
+  "--symref",
+]);
+
+function isPlainGitRef(ref: string): boolean {
+  return GIT_PLAIN_REF_RE.test(ref) && !ref.includes("..");
+}
+
+/**
+ * Validator for read-only git network subcommands (`fetch` and `ls-remote`) invoked via `inspect_command`.
+ * Requires a configured remote name (no URLs, `ext::`, `file://`, or local paths) and plain ref names without
+ * destination mappings (`:`), force (`+`), ranges (`..`), or globs (`*`).
+ */
+export function isReadOnlyGitNetworkCommand(sub: string, args: string[]): boolean {
+  if (sub !== "fetch" && sub !== "ls-remote") return false;
+  let endOfOpts = false;
+  let allRemotes = false;
+  const positionals: string[] = [];
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (!endOfOpts && arg === "--") {
+      endOfOpts = true;
+      continue;
+    }
+    if (!endOfOpts && arg.startsWith("-")) {
+      if (sub === "fetch") {
+        if (GIT_FETCH_BOOL_FLAGS.has(arg)) {
+          if (arg === "--all") allRemotes = true;
+          continue;
+        }
+        if (/^-[ptqv]+$/.test(arg)) continue;
+        if (/^--(?:depth|deepen)=\d+$/.test(arg)) continue;
+        if (arg === "--depth" || arg === "--deepen") {
+          const next = args[i + 1];
+          if (next === undefined || !/^\d+$/.test(next)) return false;
+          i++;
+          continue;
+        }
+        if (arg.startsWith("--shallow-since=")) {
+          if (arg.length <= "--shallow-since=".length) return false;
+          continue;
+        }
+        if (arg === "--shallow-since") {
+          const next = args[i + 1];
+          if (!next || next.startsWith("-")) return false;
+          i++;
+          continue;
+        }
+        return false;
+      }
+      // ls-remote
+      if (GIT_LS_REMOTE_BOOL_FLAGS.has(arg)) continue;
+      if (/^-[htq]+$/.test(arg)) continue;
+      if (arg.startsWith("--sort=")) {
+        const key = arg.slice("--sort=".length);
+        if (!/^-?[A-Za-z0-9:._-]+$/.test(key)) return false;
+        continue;
+      }
+      if (arg === "--sort") {
+        const next = args[i + 1];
+        if (!next || !/^-?[A-Za-z0-9:._-]+$/.test(next)) return false;
+        i++;
+        continue;
+      }
+      return false;
+    }
+    positionals.push(arg);
+  }
+
+  if (sub === "fetch" && allRemotes) {
+    return positionals.length === 0;
+  }
+  if (positionals.length === 0) return false;
+  const [remote, ...refs] = positionals;
+  if (!remote || !GIT_REMOTE_NAME_RE.test(remote)) return false;
+  return refs.every(isPlainGitRef);
+}
+
+/**
+ * Validator for `inspect_command` argv execution (no shell). Reuses `READ_ONLY_ARG_CHECKS`,
+ * `isReadOnlyGitCommand`, `pathOperandsInsideRoots`, and `CONTROL_CHARS` from `isSafeReadOnlyShellCommand`.
+ */
+export function checkReadOnlyArgv(
+  argv: string[],
+  scope: ReadOnlyShellScope,
+): { ok: true } | { ok: false; reason: string } {
+  if (!Array.isArray(argv) || argv.length === 0 || !argv.every((a) => typeof a === "string")) {
+    return { ok: false, reason: "argv must be a non-empty array of strings" };
+  }
+  if (argv.some((a) => CONTROL_CHARS.test(a))) {
+    return { ok: false, reason: "arguments must not contain control characters" };
+  }
+  const bin = argv[0]!;
+  if (!bin || bin.includes("/") || bin.startsWith("=")) {
+    return { ok: false, reason: `command must be a bare allowlisted name (got '${bin}')` };
+  }
+  if (!INSPECT_COMMAND_BINS.has(bin)) {
+    return { ok: false, reason: `command '${bin}' is not in the read-only allowlist` };
+  }
+  const args = argv.slice(1);
+  if (args.some((a) => INSPECT_SHELL_OPERATORS.has(a))) {
+    return { ok: false, reason: "no shell: pipes, redirection and chaining are not supported; run one command per call" };
+  }
+
+  if (bin === "git") {
+    let g = 0;
+    while (g < args.length && (args[g] === "--no-pager" || args[g] === "-P" || args[g] === "--no-optional-locks")) {
+      g++;
+    }
+    const sub = args[g];
+    if (sub === "fetch" || sub === "ls-remote") {
+      if (!isReadOnlyGitNetworkCommand(sub, args.slice(g + 1))) {
+        return { ok: false, reason: `git ${sub} arguments are not allowed in read-only mode` };
+      }
+      return { ok: true };
+    }
+    if (!READ_ONLY_ARG_CHECKS.git!(args)) {
+      return { ok: false, reason: "git subcommand or option is not allowed in read-only mode" };
+    }
+    if (!pathOperandsInsideRoots(args.slice(g + 1), scope)) {
+      return { ok: false, reason: "path operand is outside allowed read roots or targets a protected path" };
+    }
+    return { ok: true };
+  }
+
+  if (bin === "bun") {
+    if (args[0] !== "test") {
+      return { ok: false, reason: "only 'bun test' is allowed for bun" };
+    }
+    const testArgs = args.slice(1);
+    const pathArgs: string[] = [];
+    for (let i = 0; i < testArgs.length; i++) {
+      const a = testArgs[i]!;
+      if (a === "--") {
+        pathArgs.push(...testArgs.slice(i + 1));
+        break;
+      }
+      if (!a.startsWith("-")) {
+        pathArgs.push(a);
+        continue;
+      }
+      if (a === "-t" || a === "--test-name-pattern") {
+        if (i + 1 >= testArgs.length) {
+          return { ok: false, reason: `bun test option '${a}' requires a pattern value` };
+        }
+        i++;
+        continue;
+      }
+      if (a.startsWith("--test-name-pattern=")) continue;
+      if (a === "--timeout" || a === "--rerun-each") {
+        const next = testArgs[i + 1];
+        if (next === undefined || !/^\d+$/.test(next)) {
+          return { ok: false, reason: `bun test option '${a}' requires a numeric value` };
+        }
+        i++;
+        continue;
+      }
+      if (/^--(?:timeout|rerun-each)=\d+$/.test(a)) continue;
+      if (a === "--bail" || /^--bail=\d+$/.test(a) || a === "--only" || a === "--todo") continue;
+      return { ok: false, reason: `bun test option '${a}' is not allowed in read-only mode` };
+    }
+    if (!pathOperandsInsideRoots(pathArgs, scope)) {
+      return { ok: false, reason: "path operand is outside allowed read roots or targets a protected path" };
+    }
+    return { ok: true };
+  }
+
+  if (bin === "bunx") {
+    if (args[0] !== "tsc") {
+      return { ok: false, reason: "only 'bunx tsc --noEmit' is allowed for bunx" };
+    }
+    const tscArgs = args.slice(1);
+    let hasNoEmit = false;
+    const pathArgs: string[] = [];
+    for (let i = 0; i < tscArgs.length; i++) {
+      const a = tscArgs[i]!;
+      if (a === "--noEmit") {
+        hasNoEmit = true;
+        continue;
+      }
+      if (a === "--skipLibCheck" || a === "--pretty=true" || a === "--pretty=false") continue;
+      if (a === "--pretty") {
+        if (tscArgs[i + 1] === "true" || tscArgs[i + 1] === "false") i++;
+        continue;
+      }
+      if (a === "-p" || a === "--project") {
+        const next = tscArgs[i + 1];
+        if (!next || next.startsWith("-")) {
+          return { ok: false, reason: `tsc option '${a}' requires a project path` };
+        }
+        pathArgs.push(next);
+        i++;
+        continue;
+      }
+      if (a.startsWith("--project=")) {
+        const val = a.slice("--project=".length);
+        if (!val) return { ok: false, reason: "tsc --project= requires a project path" };
+        pathArgs.push(val);
+        continue;
+      }
+      if (a.startsWith("-")) {
+        return { ok: false, reason: `tsc option '${a}' is not allowed in read-only mode` };
+      }
+      pathArgs.push(a);
+    }
+    if (!hasNoEmit) {
+      return { ok: false, reason: "bunx tsc requires --noEmit" };
+    }
+    if (!pathOperandsInsideRoots(pathArgs, scope)) {
+      return { ok: false, reason: "path operand is outside allowed read roots or targets a protected path" };
+    }
+    const localTsc = join(scope.cwd, "node_modules", ".bin", "tsc");
+    try {
+      if (!statSync(localTsc).isFile()) {
+        return { ok: false, reason: "bunx tsc requires local node_modules/.bin/tsc (no package downloads)" };
+      }
+    } catch {
+      return { ok: false, reason: "bunx tsc requires local node_modules/.bin/tsc (no package downloads)" };
+    }
+    return { ok: true };
+  }
+
+  if (Object.hasOwn(READ_ONLY_ARG_CHECKS, bin) && !READ_ONLY_ARG_CHECKS[bin]!(args)) {
+    return { ok: false, reason: `${bin} option is not allowed in read-only mode` };
+  }
+  if (!pathOperandsInsideRoots(args, scope)) {
+    return { ok: false, reason: "path operand is outside allowed read roots or targets a protected path" };
+  }
+  return { ok: true };
+}
+
 // Amp's static permission rules cannot check shell operands against the workspace roots.
 const AMP_RESTRICTED_DISABLED_TOOLS = [
   ...AMP_READ_ONLY_DISABLED_TOOLS,

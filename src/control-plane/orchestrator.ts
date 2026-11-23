@@ -2543,7 +2543,7 @@ export class HarnessOrchestrator {
         const finalReply = res.text.trim();
         if (finalReply.length > SUMMARY_LIMIT) {
           // Tier 1's natural reply is its handoff: keep the full text readable from a dossier, bound the summary.
-          let spill: { summary: string; overflowPath?: string } | null = null;
+          let spill: { summary: string; overflowPath?: string; keptChars?: number; totalChars?: number } | null = null;
           let spillError = "";
           try {
             spill = spillSummaryOverflow(this.db, run, task.id, finalReply);
@@ -2564,6 +2564,15 @@ export class HarnessOrchestrator {
                   text: res.text,
                   summary: saved.summary,
                   artifact_paths: saved.overflowPath ? [saved.overflowPath] : [],
+                  ...(saved.overflowPath
+                    ? {
+                        summary_overflow: {
+                          path: saved.overflowPath,
+                          next_offset: saved.keptChars ?? 0,
+                          total_chars: saved.totalChars ?? finalReply.length,
+                        },
+                      }
+                    : {}),
                 }),
               });
             });

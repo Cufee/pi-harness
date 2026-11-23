@@ -44,7 +44,11 @@ Every other key can come from `.pi-harness.json`, including `profiles`, `externa
 - An agent that receives write roots can also read them. Read-only task agents cannot perform harness-mediated structured writes, and Done-Reviewers receive `extraReadRoots` only.
 - Protected paths: harness-mediated structured writes refuse any path containing a `.git` segment and any path under `.harness/worktrees` relative to the admitting root, even inside a configured root. For read-only agents, structured reads, read and search permission checks, and restricted-shell paths refuse the same paths under extra roots, and under the agent's own workspace unless that workspace has a regular `.git` file (as in a linked git worktree); read and search permission checks inspect reported locations and search prefixes, and restricted shell checks the command's working directory and existing canonical operands. A custom `worktree.dir` is not covered by the `.harness/worktrees` rule.
 - Claude adapter sessions that are not control-plane-only also receive the resolved roots as Claude Code `additionalDirectories`. If an agent CLI applies its own OS sandbox, that sandbox is configured in that CLI.
-- Director `read_file` does not use these roots; its path rules are under [Director tools](#director-tools). Code Mode `code_exec` scripts never receive them: they run in the macOS sandbox described in [Python in Code Mode](./code-mode-python.md#sandbox) and cannot read workspace files directly.
+- Director `read_file` does not use these roots and already reads user-level paths such as `~/agents/memories` by default; its path rules are under [Director tools](#director-tools). To let task agents read a shared user-level directory such as `~/agents/memories`, add it under `worktree.extraReadRoots` in `$PI_HARNESS_HOME/config.json`:
+  ```json
+  { "worktree": { "extraReadRoots": ["~/agents/memories"] } }
+  ```
+  The grant takes effect at the next task launch (running sessions keep the roots they started with). Code Mode `code_exec` scripts never receive them: they run in the macOS sandbox described in [Python in Code Mode](./code-mode-python.md#sandbox) and cannot read workspace files directly.
 - Reload: read for each newly started worker, task agent, and Done-Reviewer, and on each `write_note` call; no daemon restart is required. Sessions already running keep the roots they started with.
 - Least privilege:
   - List the narrowest directory that works.
