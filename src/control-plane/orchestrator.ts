@@ -97,6 +97,11 @@ export class RunStartStoppedError extends Error {
   }
 }
 
+/** The Director's independent Done-Reviewer: review activity, not execution, so it never drives run status. */
+function isDoneReviewTask(t: TaskRecord): boolean {
+  return t.tier === 3 && t.kind === "verify" && t.title.startsWith("Done-Review:");
+}
+
 /**
  * Computes the authoritative dynamic status of a Run from its live in-memory execution state
  * and current SQLite tasks so a run NEVER displays `completed` while work is still running,
@@ -111,20 +116,25 @@ export function deriveRunStatus(
   // An explicit stop is sticky: status reads never undo it; only an explicit resume or launch writes "active".
   if (run.status === "stopped") return "stopped";
   if (liveInMemory === true) return "active";
-  if (tasks.some((t) => LIVE_TASK_STATUSES.has(t.status))) return "active";
-  if (tasks.length === 0) return run.status;
+  // A running Done-Reviewer must never flip a settled run back to active (a snapshot would then abort the review).
+  const execTasks = tasks.filter((t) => !isDoneReviewTask(t));
+  if (execTasks.some((t) => LIVE_TASK_STATUSES.has(t.status))) return "active";
+  if (execTasks.length === 0) return run.status;
 
-  if (tasks.some((t) => t.status === "paused_quota")) return "paused_quota";
+  if (execTasks.some((t) => t.status === "paused_quota")) return "paused_quota";
 
-  const hasQueued = tasks.some((t) => IN_FLIGHT_TASK_STATUSES.has(t.status));
+  const hasQueued = execTasks.some((t) => IN_FLIGHT_TASK_STATUSES.has(t.status));
   if (hasQueued) {
     if (liveInMemory === false) {
-      return tasks.some((t) => t.status === "failed") ? "failed" : "stopped";
+      return execTasks.some((t) => t.status === "failed") ? "failed" : "stopped";
     }
     return run.status === "active" ? "active" : run.status;
   }
 
-  const realOrch = tasks.find((t) => t.tier === 1 && t.profileId !== "director");
+  // An explicit completion (e.g. accepted failed-run verification) is authoritative until an explicit resume.
+  if (run.status === "completed") return "completed";
+
+  const realOrch = execTasks.find((t) => t.tier === 1 && t.profileId !== "director");
   if (realOrch) {
     if (realOrch.status === "failed") return "failed";
     if (realOrch.status === "cancelled") return "stopped";
@@ -132,13 +142,13 @@ export function deriveRunStatus(
     if (realOrch.status === "blocked" || realOrch.status === "returned_for_rescope") return "failed";
     if (realOrch.status === "completed") {
       // Do not falsely declare a run completed if non-orchestrator workers are blocked with unresolved work
-      const realChildren = tasks.filter((t) => t.id !== realOrch.id && t.profileId !== "director");
+      const realChildren = execTasks.filter((t) => t.id !== realOrch.id && t.profileId !== "director");
       if (realChildren.some((t) => t.status === "blocked")) return "failed";
       return "completed";
     }
   }
 
-  const realTasks = tasks.filter((t) => t.profileId !== "director");
+  const realTasks = execTasks.filter((t) => t.profileId !== "director");
   if (realTasks.length === 0) return run.status === "active" ? "completed" : run.status;
   if (realTasks.some((t) => t.status === "failed")) return "failed";
   if (realTasks.every((t) => t.status === "cancelled")) return "stopped";
