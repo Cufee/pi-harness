@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { WorktreeConfig } from "../config.js";
 import type { ControlPlaneDb, WorktreeRecord } from "../control-plane/db.js";
+import { type GateRuntimeConfig, resolveGateEnv, runGateCommand } from "../tools/gate-env.js";
 
 export function canonicalPath(p: string): string {
   const abs = resolve(p);
@@ -63,11 +64,13 @@ export class WorktreeManager {
     private readonly db: ControlPlaneDb,
     private readonly repoRoot: string,
     private config: WorktreeConfig,
+    private gate: GateRuntimeConfig = {},
   ) {}
 
-  /** Applies live worktree config updates (e.g. `maxConcurrentWorkers`, `setupCommand`, `ciTimeoutMs`). */
-  updateConfig(next: WorktreeConfig): void {
+  /** Applies live worktree config updates (e.g. `maxConcurrentWorkers`, `setupCommand`, `ciTimeoutMs`) and gate env settings. */
+  updateConfig(next: WorktreeConfig, gate: GateRuntimeConfig = this.gate): void {
     this.config = next;
+    this.gate = gate;
   }
 
   get maxConcurrentWorkers(): number {
@@ -107,10 +110,17 @@ export class WorktreeManager {
   async bootstrapWorktree(wtPath: string): Promise<void> {
     // Optional fast workspace setup hook (e.g., APFS clone-on-write node_modules)
     if (this.config.setupCommand) {
-      await execFileAsync("/bin/sh", ["-lc", this.config.setupCommand], {
+      const resolved = await resolveGateEnv({
         cwd: wtPath,
-        env: { ...process.env, HARNESS_REPO_ROOT: this.repoRoot, HARNESS_WORKTREE_PATH: wtPath },
-        timeout: 120_000,
+        config: this.gate,
+        extraEnv: { HARNESS_REPO_ROOT: this.repoRoot, HARNESS_WORKTREE_PATH: wtPath },
+      });
+      await runGateCommand(this.config.setupCommand, {
+        cwd: wtPath,
+        resolved,
+        timeoutMs: 120_000,
+        maxOutputBytes: 16 * 1024 * 1024,
+        label: "Worktree setup",
       });
     } else {
       await this.linkIgnoredNodeModules(wtPath);

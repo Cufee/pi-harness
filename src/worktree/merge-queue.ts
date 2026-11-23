@@ -1,13 +1,17 @@
-import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { promisify } from "node:util";
 import type { WorktreeConfig } from "../config.js";
 import type { ControlPlaneDb, MergeQueueRecord } from "../control-plane/db.js";
 import { KnowledgeMaintainer } from "../kb/maintainer.js";
+import {
+  GateCommandError,
+  GateConfigError,
+  type GateRuntimeConfig,
+  type ResolvedGateEnv,
+  resolveGateEnv,
+  runGateCommand,
+} from "../tools/gate-env.js";
 import { canonicalPath, runGit, type WorktreeManager } from "./manager.js";
-
-const execFileAsync = promisify(execFile);
 
 export interface MergeOutcome {
   item: MergeQueueRecord;
@@ -125,10 +129,12 @@ export class BisectingMergeQueue {
     private readonly worktrees: WorktreeManager,
     private readonly repoRoot: string,
     private config: WorktreeConfig,
+    private gate: GateRuntimeConfig = {},
   ) {}
 
-  updateConfig(next: WorktreeConfig): void {
+  updateConfig(next: WorktreeConfig, gate: GateRuntimeConfig = this.gate): void {
     this.config = next;
+    this.gate = gate;
   }
 
   private async withLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
@@ -346,15 +352,19 @@ export class BisectingMergeQueue {
 
       // Run deterministic computational CI gates (abortable on task cancellation)
       const ciLogs: string[] = [];
+      let resolved: ResolvedGateEnv | undefined;
       for (const cmd of this.config.ciCommands ?? []) {
         if (isTaskCancelledOrTerminal()) {
           return await abortMerge("Merge aborted before CI: task cancelled.");
         }
         try {
-          const { stdout, stderr } = await execFileAsync("/bin/sh", ["-lc", cmd], {
+          resolved ??= await resolveGateEnv({ cwd: intPath, config: this.gate, signal: opts?.signal });
+          const { stdout, stderr } = await runGateCommand(cmd, {
             cwd: intPath,
-            timeout: this.config.ciTimeoutMs ?? 300_000,
-            maxBuffer: 16 * 1024 * 1024,
+            resolved,
+            timeoutMs: this.config.ciTimeoutMs ?? 300_000,
+            maxOutputBytes: 16 * 1024 * 1024,
+            label: "CI gate",
             signal: opts?.signal,
           });
           ciLogs.push(`$ ${cmd} -> OK\n${stdout.slice(-1000)}${stderr ? "\n" + stderr.slice(-500) : ""}`);
@@ -363,7 +373,15 @@ export class BisectingMergeQueue {
             return await abortMerge("Merge aborted during CI: task cancelled.");
           }
           const e = err as { stdout?: string; stderr?: string; message?: string };
-          const log = `CI gate failed: ${cmd}\n${(e.stdout ?? "").slice(-2000)}\n${(e.stderr ?? e.message ?? "").slice(-2000)}`;
+          // Config errors and timeouts/overflows often leave stderr empty; keep the reason visible.
+          const reason =
+            err instanceof GateConfigError || (err instanceof GateCommandError && err.reason !== "exit")
+              ? `\n${err.message}`
+              : "";
+          const stderrTail = e.stderr ?? (reason ? "" : (e.message ?? ""));
+          const log = `CI gate failed: ${cmd}${reason}\n${(e.stdout ?? "").slice(-2000)}\n${stderrTail.slice(-2000)}${
+            resolved ? `\n[gate-env] ${resolved.provenance}` : ""
+          }`;
           return this.bounce(next, "ci_failed", log, targetBranch, opts);
         }
       }

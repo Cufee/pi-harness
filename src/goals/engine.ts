@@ -1,11 +1,10 @@
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
-import { homedir } from "node:os";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { GoalsConfig } from "../config.js";
 import { friendlyIdCandidates, nextFriendlyId } from "../control-plane/ids.js";
+import { type ResolvedGateEnv, resolveGateEnv, runGateCommand } from "../tools/gate-env.js";
 import { runGit } from "../worktree/manager.js";
 
 function canonicalRepoPath(p: string): string {
@@ -13,70 +12,6 @@ function canonicalRepoPath(p: string): string {
     return realpathSync(p);
   } catch {
     return resolve(p);
-  }
-}
-
-function buildGateEnv(): NodeJS.ProcessEnv {
-  const home = homedir();
-  const candidates = [
-    join(home, ".local", "share", "mise", "shims"),
-    join(home, ".mise", "shims"),
-    join(home, ".local", "bin"),
-    dirname(process.execPath),
-    "/opt/homebrew/bin",
-  ];
-  const existing = (process.env.PATH ?? "").split(delimiter).filter(Boolean);
-  const existingSet = new Set(existing);
-  const prepend = candidates.filter((dir) => dir && !existingSet.has(dir) && existsSync(dir));
-  if (prepend.length === 0) return process.env;
-  return { ...process.env, PATH: [...prepend, ...existing].join(delimiter) };
-}
-
-async function runGate(
-  command: string,
-  cwd: string,
-  signal?: AbortSignal,
-  timeoutMs = 180_000,
-): Promise<{ stdout: string; stderr: string }> {
-  signal?.throwIfAborted();
-  const child = spawn("/bin/sh", ["-lc", command], { cwd, env: buildGateEnv(), detached: true, stdio: ["ignore", "pipe", "pipe"] });
-  const stdout: Buffer[] = [];
-  const stderr: Buffer[] = [];
-  let stopped: Error | undefined;
-  const stop = (reason: Error) => {
-    if (stopped) return;
-    stopped = reason;
-    // Gate commands can start additional processes. Terminate the shell's whole process group.
-    if (child.pid) {
-      try { process.kill(-child.pid, "SIGKILL"); }
-      catch (err) { if ((err as NodeJS.ErrnoException).code !== "ESRCH") child.kill("SIGKILL"); }
-    }
-  };
-  const abort = () => stop(new Error("Verification gate cancelled"));
-  const timeout = setTimeout(() => stop(new Error("Verification gate timed out")), timeoutMs);
-  signal?.addEventListener("abort", abort, { once: true });
-  const collect = (stream: NodeJS.ReadableStream, chunks: Buffer[]) => {
-    let bytes = 0;
-    stream.on("data", (chunk: Buffer) => {
-      bytes += chunk.length;
-      if (bytes > 8 * 1024 * 1024) stop(new Error("Verification gate exceeded its output limit"));
-      else chunks.push(chunk);
-    });
-  };
-  collect(child.stdout, stdout);
-  collect(child.stderr, stderr);
-  try {
-    const code = await new Promise<number | null>((resolve, reject) => {
-      child.once("error", reject);
-      child.once("close", resolve);
-    });
-    if (stopped) throw stopped;
-    const output = { stdout: Buffer.concat(stdout).toString(), stderr: Buffer.concat(stderr).toString() };
-    if (code !== 0) throw new Error(output.stderr.trim() || output.stdout.trim() || `Gate exited with status ${code}`);
-    return output;
-  } finally {
-    signal?.removeEventListener("abort", abort);
-    clearTimeout(timeout);
   }
 }
 
@@ -273,33 +208,44 @@ export function shouldRunIndependentReview(goal: GoalRecord, overrideMode?: Veri
   return goal.criteria.some((c) => c.required && c.kind !== "deterministic");
 }
 
+/** Goals config plus the operator gate keys (`goals.gateShell` / `goals.gateEnv`), validated when gates run. */
+export type GoalEngineConfig = GoalsConfig & { gateShell?: unknown; gateEnv?: unknown };
+
 export class GoalEngine {
-  private cfg: GoalsConfig;
+  private cfg: GoalEngineConfig;
+  private readonly stateDir?: string;
 
   constructor(
     private readonly db: Database,
     private readonly onReviewInvalidated?: (goalId: string) => void,
-    config?: Partial<GoalsConfig>,
+    config?: Partial<GoalEngineConfig>,
     private readonly onReconciled?: () => void,
+    opts?: { stateDir?: string },
   ) {
+    this.stateDir = opts?.stateDir;
     this.cfg = {
       defaultMaxReviewCycles: config?.defaultMaxReviewCycles ?? 4,
       defaultMaxNoProgressCycles: config?.defaultMaxNoProgressCycles ?? 2,
       gateTimeoutMs: config?.gateTimeoutMs ?? 180_000,
       autoVerifyOnSettle: config?.autoVerifyOnSettle ?? true,
       maxConcurrentGoals: config?.maxConcurrentGoals ?? 4,
+      gateShell: config?.gateShell,
+      gateEnv: config?.gateEnv,
     };
     this.db.exec(GOALS_SCHEMA);
     this.migrateGoals();
   }
 
-  updateConfig(config?: Partial<GoalsConfig>): void {
+  updateConfig(config?: Partial<GoalEngineConfig>): void {
     this.cfg = {
       defaultMaxReviewCycles: config?.defaultMaxReviewCycles ?? this.cfg.defaultMaxReviewCycles,
       defaultMaxNoProgressCycles: config?.defaultMaxNoProgressCycles ?? this.cfg.defaultMaxNoProgressCycles,
       gateTimeoutMs: config?.gateTimeoutMs ?? this.cfg.gateTimeoutMs,
       autoVerifyOnSettle: config?.autoVerifyOnSettle ?? this.cfg.autoVerifyOnSettle,
       maxConcurrentGoals: config?.maxConcurrentGoals ?? this.cfg.maxConcurrentGoals ?? 4,
+      // Gate keys are taken verbatim so removing them from config clears them.
+      gateShell: config ? config.gateShell : this.cfg.gateShell,
+      gateEnv: config ? config.gateEnv : this.cfg.gateEnv,
     };
   }
 
@@ -690,6 +636,7 @@ export class GoalEngine {
     const targetRef = opts?.targetRef ?? "HEAD";
     const results: CriterionEvaluation[] = [];
     let allPassed = true;
+    let resolved: ResolvedGateEnv | undefined;
 
     for (const c of goal.criteria) {
       if (c.kind !== "deterministic") continue;
@@ -704,7 +651,18 @@ export class GoalEngine {
         continue;
       }
       try {
-        const { stdout, stderr } = await runGate(c.command, gateCwd, signal, this.cfg.gateTimeoutMs);
+        resolved ??= await resolveGateEnv({
+          cwd: gateCwd,
+          config: { gateShell: this.cfg.gateShell, gateEnv: this.cfg.gateEnv, stateDir: this.stateDir },
+          signal,
+        });
+        const { stdout, stderr } = await runGateCommand(c.command, {
+          cwd: gateCwd,
+          resolved,
+          timeoutMs: this.cfg.gateTimeoutMs,
+          maxOutputBytes: 8 * 1024 * 1024,
+          signal,
+        });
         results.push({
           criterionId: c.id,
           passed: true,
@@ -717,7 +675,7 @@ export class GoalEngine {
         results.push({
           criterionId: c.id,
           passed: false,
-          evidence: `$ ${c.command} -> FAILED\n${message.slice(-600)}`,
+          evidence: `$ ${c.command} -> FAILED\n${message.slice(-600)}${resolved ? `\n[gate-env] ${resolved.provenance}` : ""}`,
           remediation: `Fix failures in deterministic check: ${c.command}`,
         });
       }
