@@ -219,8 +219,9 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
       if (opts.saveOutput) {
         result.artifactPath = await opts.saveOutput("code-exec.json", json);
       } else {
-        await mkdir(opts.artifactsDir, { recursive: true });
-        result.artifactPath = join(opts.artifactsDir, writeUniqueFile(opts.artifactsDir, "code-exec", ".json", json));
+        const directDir = join(opts.artifactsDir, "direct");
+        await mkdir(directDir, { recursive: true });
+        result.artifactPath = join(directDir, writeUniqueFile(directDir, "direct-code-exec", ".json", json));
       }
     } else if (output !== undefined) result.output = output;
     result.ok = true;
