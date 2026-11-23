@@ -184,18 +184,27 @@ async function resolveExtraRoots(rawRoots: string[] | undefined): Promise<string
   return out;
 }
 
+/**
+ * Which allowed roots veto reads of `.git` and `.harness/worktrees` (same predicate as writes):
+ * `extra` only the extra roots, `all` the primary root too.
+ */
+type ReadProtection = "none" | "extra" | "all";
+
 async function resolveAllowedTarget(
   primaryRoot: string,
   extraRoots: string[],
   requested: string,
   allowNew: boolean,
   protectWrites = false,
+  protectReads: ReadProtection = "none",
 ): Promise<{ path: string; exists: boolean; root: string }> {
   let firstErr: unknown;
   for (const root of [primaryRoot, ...extraRoots]) {
-    // Writes: refuse protected targets before any side effect, checking the lexical path first and the
-    // canonical path once resolved. A protected hit is final and never falls through to later roots.
+    const readProtected = protectReads === "all" || (protectReads === "extra" && root !== primaryRoot);
+    // Refuse protected targets before any side effect, checking the lexical path first and the canonical
+    // path once resolved. A protected hit is final and never falls through to later roots.
     if (protectWrites && isProtectedWritePath(root, requested)) throw PROTECTED_WRITE_ERROR();
+    if (readProtected && isProtectedWritePath(root, requested)) throw PROTECTED_READ_ERROR();
     let target: { path: string; exists: boolean };
     try {
       target = await workspaceTarget(root, requested, allowNew);
@@ -204,15 +213,35 @@ async function resolveAllowedTarget(
       continue;
     }
     if (protectWrites && isProtectedWritePath(root, target.path)) throw PROTECTED_WRITE_ERROR();
+    if (readProtected && isProtectedWritePath(root, target.path)) throw PROTECTED_READ_ERROR();
     return { ...target, root };
   }
   throw firstErr ?? new Error("ACP filesystem path is outside allowed roots");
 }
 
 const PROTECTED_WRITE_ERROR = () => new Error("ACP filesystem write target is protected (.git or .harness/worktrees)");
+const PROTECTED_READ_ERROR = () => new Error("ACP filesystem read target is protected (.git or .harness/worktrees)");
 
-async function openWorkspaceFile(primaryRoot: string, extraRoots: string[], requested: string, write: boolean) {
-  const { path: target, exists, root } = await resolveAllowedTarget(primaryRoot, extraRoots, requested, write, write);
+/**
+ * Read protection for a policy: writers keep unrestricted reads; read-only agents never read `.git` or
+ * `.harness/worktrees` through extra roots, nor through the primary root unless the workspace is itself a
+ * linked git worktree (a task or `_verify` checkout, whose `.git` is a file) so a reviewer can inspect its own
+ * checkout.
+ */
+async function readProtectionFor(workspace: string, canWrite: boolean): Promise<ReadProtection> {
+  if (canWrite) return "none";
+  const dotGit = await lstat(resolve(workspace, ".git")).catch(() => undefined);
+  return dotGit?.isFile() ? "extra" : "all";
+}
+
+async function openWorkspaceFile(
+  primaryRoot: string,
+  extraRoots: string[],
+  requested: string,
+  write: boolean,
+  protectReads: ReadProtection = "none",
+) {
+  const { path: target, exists, root } = await resolveAllowedTarget(primaryRoot, extraRoots, requested, write, write, protectReads);
   if (write && !exists) {
     await mkdir(dirname(target), { recursive: true });
     const actualParent = await realpath(dirname(target));
@@ -225,6 +254,8 @@ async function openWorkspaceFile(primaryRoot: string, extraRoots: string[], requ
     const actual = await realpath(target);
     requireWorkspacePath(root, actual);
     if (write && isProtectedWritePath(root, actual)) throw PROTECTED_WRITE_ERROR();
+    if (!write && (protectReads === "all" || (protectReads === "extra" && root !== primaryRoot)) &&
+        isProtectedWritePath(root, actual)) throw PROTECTED_READ_ERROR();
     const opened = await file.stat();
     const current = await stat(actual);
     if (!opened.isFile() || (write && opened.nlink !== 1) || opened.dev !== current.dev || opened.ino !== current.ino) {
@@ -339,6 +370,7 @@ export class AcpRunner {
     const controlOnly = req.toolPolicy === "control_plane_only";
     const canWrite = req.toolPolicy === "read_write_workspace";
     const allowShell = canWrite || (req.toolPolicy === "read_only_workspace" && Boolean(req.allowShellInReadOnly));
+    const readProtection = await readProtectionFor(workspace, canWrite);
     const policyModeDesc = describeToolPolicyMode(req.toolPolicy, Boolean(req.allowShellInReadOnly));
     const prepared = prepareAcpSpawn(this.profile, {
       systemPrompt: req.systemPrompt,
@@ -348,6 +380,9 @@ export class AcpRunner {
     if ((allowShell || !controlOnly) && req.extraPathDirs?.length) {
       const existingPath = prepared.env.PATH ?? process.env.PATH ?? "";
       prepared.env.PATH = [...req.extraPathDirs, existingPath].filter(Boolean).join(process.platform === "win32" ? ";" : ":");
+    }
+    for (const [key, value] of Object.entries(req.extraEnv ?? {})) {
+      if (typeof value === "string" && !/^path$/i.test(key)) prepared.env[key] = value;
     }
 
     const child = testAgent
@@ -1005,7 +1040,7 @@ export class AcpRunner {
             if (rawPath.startsWith("~")) return false; // never expanded here, so its target is unprovable
             if (hasGlob(rawPath) && /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(rawPath)) return false;
             try {
-              await resolveAllowedTarget(workspace, extraReadRoots, bindToWorkspace(extractGlobPrefix(rawPath)), true);
+              await resolveAllowedTarget(workspace, extraReadRoots, bindToWorkspace(extractGlobPrefix(rawPath)), true, false, readProtection);
             } catch {
               return false;
             }
@@ -1038,7 +1073,7 @@ export class AcpRunner {
                 const base = baseValues[0];
                 if (typeof base !== "string" || !base.trim() || base.trim().startsWith("~")) return false;
                 effectiveBase = (
-                  await resolveAllowedTarget(workspace, extraReadRoots, bindToWorkspace(base.trim()), true)
+                  await resolveAllowedTarget(workspace, extraReadRoots, bindToWorkspace(base.trim()), true, false, readProtection)
                 ).path;
               }
               const prefix = extractGlobPrefix(pattern);
@@ -1047,6 +1082,8 @@ export class AcpRunner {
                 extraReadRoots,
                 isAbsolute(prefix) ? prefix : resolve(effectiveBase, prefix),
                 true,
+                false,
+                readProtection,
               );
             } catch {
               return false;
@@ -1085,7 +1122,7 @@ export class AcpRunner {
           if (named.length === 0) return workspace;
           if (named.length > 1 || typeof named[0] !== "string" || !named[0]) return undefined;
           try {
-            const target = await resolveAllowedTarget(workspace, extraReadRoots, named[0], false);
+            const target = await resolveAllowedTarget(workspace, extraReadRoots, named[0], false, false, readProtection);
             return (await stat(target.path)).isDirectory() ? target.path : undefined;
           } catch {
             return undefined;
@@ -1128,7 +1165,12 @@ export class AcpRunner {
               const shellCwd = cmd.length > 0 ? await resolveShellCwd() : undefined;
               workspaceCall =
                 shellCwd !== undefined &&
-                isSafeReadOnlyShellCommand(cmd, { cwd: shellCwd, readRoots: [workspace, ...extraReadRoots] });
+                isSafeReadOnlyShellCommand(cmd, {
+                  cwd: shellCwd,
+                  readRoots: [workspace, ...extraReadRoots],
+                  protectedRoots:
+                    readProtection === "all" ? [workspace, ...extraReadRoots] : readProtection === "extra" ? extraReadRoots.filter((root) => root !== workspace) : [],
+                });
             }
           } else if (toolKind === "think") {
             workspaceCall = true;
@@ -1160,7 +1202,7 @@ export class AcpRunner {
           throw new Error(`Read denied: agent is running in ${policyModeDesc} mode`);
         }
         const p = params as unknown as { path: string; line?: number; limit?: number };
-        const file = await openWorkspaceFile(workspace, extraReadRoots, p.path, false);
+        const file = await openWorkspaceFile(workspace, extraReadRoots, p.path, false, readProtection);
         let raw: string;
         try {
           raw = await file.readFile("utf8");
@@ -1272,6 +1314,7 @@ export class AcpRunner {
         effort: req.effort,
         mcpServers,
         agentCapabilities,
+        additionalDirectories: [...new Set([...extraReadRoots, ...extraWriteRoots])],
       });
 
       const newSessionRes = (await withTimeout(
