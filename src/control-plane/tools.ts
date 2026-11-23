@@ -66,6 +66,8 @@ export interface ToolRuntimeHooks {
   getWorktreeManager: (repoRoot: string) => WorktreeManager;
   getMergeQueue: (repoRoot: string) => BisectingMergeQueue;
   getTaskSignal: (taskId: string) => AbortSignal | undefined;
+  /** Recorded cause of a run's current state (stop reason, quota pause, P0), or null when none was recorded. */
+  describeRunCause?: (runId: string) => string | null;
   /** True task cancellation signal (does NOT fire on clean rollover, so in-flight merges aren't aborted). */
   getTaskCancelSignal?: (taskId: string) => AbortSignal | undefined;
   resumeTask?: (
@@ -822,7 +824,10 @@ export class ControlPlaneToolExecutor {
         const runStatus = this.db.getRun(runId)?.status;
         const why =
           runStatus === "stopped" && !isDirectorTaskContainer(runId)
-            ? `run ${runId} is stopped`
+            ? `run ${runId} is stopped (${
+                (this.hooks.describeRunCause?.(runId) ?? this.db.getLastRunStatusReason(runId))?.trim() ||
+                `no cause was recorded; inspect with \`pi-harness tree ${runId}\``
+              })`
             : task.status === "cancelled"
               ? `task ${taskId} was cancelled (${task.summary?.trim() || "no reason recorded"})`
               : signal?.aborted
