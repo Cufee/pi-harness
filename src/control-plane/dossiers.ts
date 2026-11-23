@@ -224,18 +224,12 @@ export function readRunDossier(db: ControlPlaneDb, run: RunRecord, args: Record<
     } catch {
       expectedStat = null;
     }
-    // Case/Unicode-folded basename: a candidate alias, confirmed only when it resolves to the same inode.
-    const expectedBaseNorm = basename(found.rel).normalize("NFD").toLowerCase();
     for (const p of db.listDistinctDossierPaths()) {
       try {
         if (p.endsWith(suffix)) {
           const prefix = p.slice(0, p.length - suffix.length) || sep;
           if (prefix === rawRoot || realpathSync(prefix) === realRoot) ownerPaths.add(p);
-        } else if (
-          expectedStat !== null &&
-          !expectedStat.isSymbolicLink() &&
-          basename(p).normalize("NFD").toLowerCase() === expectedBaseNorm
-        ) {
+        } else if (expectedStat !== null && !expectedStat.isSymbolicLink()) {
           const pStat = statSync(p, { bigint: true });
           if (pStat.dev === expectedStat.dev && pStat.ino === expectedStat.ino) ownerPaths.add(p);
         }
