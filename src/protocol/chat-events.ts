@@ -15,7 +15,10 @@ export type ChatControlEvent =
       runId: string;
       runStatus: "completed" | "failed" | "stopped";
       openEscalations: number;
+      /** Recorded cause text (stop reason, quota reason, escalation title, verification error). */
       detail?: string;
+      /** Cause category: "explicit_stop", "run_failed", "quota_paused", "escalation", or "verification_error". */
+      cause?: string;
     }
   | {
       kind: "goal.committed";
@@ -102,6 +105,8 @@ export function parseChatControlEvent(raw: unknown): ChatControlEvent | null {
         runId: r.runId,
         runStatus,
         openEscalations: typeof r.openEscalations === "number" ? r.openEscalations : 0,
+        ...(typeof r.detail === "string" && r.detail ? { detail: r.detail } : {}),
+        ...(typeof r.cause === "string" && r.cause ? { cause: r.cause } : {}),
       };
     }
     case "goal.committed": {
@@ -229,8 +234,26 @@ export function parseChatControlEvent(raw: unknown): ChatControlEvent | null {
 /** Concise plain-text summary stored in `chat_turns.content` for history context and plain-text logs. */
 export function formatChatEventSummary(event: ChatControlEvent): string {
   switch (event.kind) {
-    case "goal.settled":
-      return `Goal ${event.goalId} v${event.goalVersion} ("${event.goalTitle}") run ${event.runId} ${event.runStatus}${event.openEscalations ? ` (${event.openEscalations} open escalation(s))` : ""}.`;
+    case "goal.settled": {
+      const head = `Goal ${event.goalId} v${event.goalVersion} ("${event.goalTitle}")`;
+      const esc = event.openEscalations ? ` (${event.openEscalations} open escalation(s))` : "";
+      if (event.runStatus === "completed") return `${head} run ${event.runId} completed${esc}.`;
+      const recovery =
+        `Nothing restarts automatically. Continue it in place with \`pi-harness resume ${event.runId}\`, ` +
+        `inspect it with \`pi-harness tree ${event.runId}\`, or send a new request.`;
+      const quotaReason = settledQuotaReason(event);
+      if (quotaReason !== null) {
+        return (
+          `${head}: run ${event.runId} paused on provider quota: ${quotaReason}${esc}. No quota reset time is known, so it will not resume by itself. ` +
+          `Continue it in place with \`pi-harness resume ${event.runId}\` once quota is back, inspect it with \`pi-harness tree ${event.runId}\`, or send a new request.`
+        );
+      }
+      if (event.cause === "escalation") {
+        return `${head}: run ${event.runId} needs human input: ${settledCauseText(event)}${esc}. Inspect it with \`pi-harness tree ${event.runId}\` and answer the escalation, or send a new request.`;
+      }
+      const verb = event.runStatus === "stopped" ? "was stopped" : "failed";
+      return `${head}: run ${event.runId} ${verb}: ${settledCauseText(event)}${esc}. ${recovery}`;
+    }
     case "goal.committed":
       return `Goal ${event.goalId} v${event.goalVersion} started autonomous run ${event.runId} (${event.criteriaCount} criteria).`;
     case "goal.amended":
@@ -257,13 +280,37 @@ export function formatChatEventSummary(event: ChatControlEvent): string {
 export function formatChatEventForModel(event: ChatControlEvent): string {
   const summary = formatChatEventSummary(event);
   switch (event.kind) {
-    case "goal.settled":
-      return [
-        summary,
-        event.runStatus === "completed"
-          ? `The autonomous run (${event.runId}) for Goal ${event.goalId} finished. Inspect/settle the goal with \`goal_trigger_review\` (using the appropriate \`verification_mode\` for this task) or report the outcome concisely to the user.`
-          : `The autonomous run (${event.runId}) for Goal ${event.goalId} ended with status '${event.runStatus}'. Inspect the goal via \`goal_get\` and report the status, any blockers, and recommended next steps to the user.`,
-      ].join("\n");
+    case "goal.settled": {
+      if (event.runStatus === "completed") {
+        return [
+          summary,
+          `The autonomous run (${event.runId}) for Goal ${event.goalId} finished. Inspect/settle the goal with \`goal_trigger_review\` (using the appropriate \`verification_mode\` for this task) or report the outcome concisely to the user.`,
+        ].join("\n");
+      }
+      const resume = `resume_run({ goal_id: "${event.goalId}" })`;
+      const noCause = event.detail
+        ? ""
+        : ` No cause was recorded; inspect with run_status({ run_id: "${event.runId}" }) (operator: \`pi-harness tree ${event.runId}\`).`;
+      let guidance: string;
+      if (settledQuotaReason(event) !== null) {
+        guidance =
+          `Run ${event.runId} for Goal ${event.goalId} is paused on provider quota. Nothing was lost; paused tasks keep their worktrees and handoffs. ` +
+          `It will not resume by itself because no quota reset time is known. Tell the user, then call ${resume} once quota is back (or schedule_timer with resume_goal). Do not create a new goal.`;
+      } else if (event.runStatus === "stopped") {
+        guidance =
+          `Run ${event.runId} for Goal ${event.goalId} was explicitly stopped; this is not a failure and not a turn or budget limit. Do not restart it yourself. ` +
+          `If the user asks to continue, call ${resume} or goal_commit; both continue the same run in place without creating a second run.${noCause}`;
+      } else if (event.cause === "escalation") {
+        guidance =
+          `Run ${event.runId} for Goal ${event.goalId} raised an escalation that needs human input. Surface it to the user with actionable options; ` +
+          `once it is resolved, ${resume} continues the same run in place.`;
+      } else {
+        guidance =
+          `Run ${event.runId} for Goal ${event.goalId} failed. Inspect it with run_status({ goal_id: "${event.goalId}" }). ` +
+          `If it is recoverable, ${resume} or resume_task for one task continues it in place; otherwise report the cause and options to the user.${noCause}`;
+      }
+      return [summary, guidance].join("\n");
+    }
     case "timer.fired":
       return [
         summary,
@@ -285,4 +332,19 @@ export function formatChatEventForModel(event: ChatControlEvent): string {
     default:
       return summary;
   }
+}
+
+const MANUAL_QUOTA_PREFIX = "paused_quota (manual): ";
+
+/** The provider quota reason when a goal.settled event reports a manual quota pause, else null. */
+function settledQuotaReason(event: Extract<ChatControlEvent, { kind: "goal.settled" }>): string | null {
+  const detail = event.detail?.trim();
+  if (detail?.startsWith(MANUAL_QUOTA_PREFIX)) return detail.slice(MANUAL_QUOTA_PREFIX.length).trim() || "quota limit reached";
+  if (event.cause === "quota_paused") return detail || "quota limit reached";
+  return null;
+}
+
+/** The recorded cause, or an explicit notice that none was recorded naming the inspect command. */
+function settledCauseText(event: Extract<ChatControlEvent, { kind: "goal.settled" }>): string {
+  return event.detail?.trim() || `no cause was recorded; inspect with \`pi-harness tree ${event.runId}\``;
 }

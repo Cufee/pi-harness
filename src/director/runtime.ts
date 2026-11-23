@@ -107,7 +107,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
     name: "goal_commit",
     description:
-      "Commit a draft Goal Contract and launch its autonomous Tier 1 Run-Until-Done Orchestrator. If maxConcurrentGoals is full (and force_start is not set), enqueues the goal cleanly in the unified admission queue at `position` (defaults to back) and starts it automatically as soon as capacity opens.",
+      "Commit a draft Goal Contract and launch its autonomous Tier 1 Run-Until-Done Orchestrator. If maxConcurrentGoals is full (and force_start is not set), enqueues the goal cleanly in the unified admission queue at `position` (defaults to back) and starts it automatically as soon as capacity opens. Safe to repeat and never creates a second run: a launching, running or queued goal returns its current state (`outcome`, `runId`, `goalStatus`), and a paused or stopped goal resumes its existing linked run in place.",
     inputSchema: {
       type: "object",
       required: ["goal_id", "model"],
@@ -415,7 +415,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
     name: "resume_task",
     description:
-      "Resume a failed, crashed, or stopped task in-place (preserving its worktree, WIP commits, artifacts, and deterministic recovery handoff) instead of spawning a new duplicate task.",
+      "Resume a failed, crashed, or stopped task in-place (preserving its worktree, WIP commits, artifacts, and deterministic recovery handoff) instead of spawning a new duplicate task. Safe to repeat: a task that is already running, queued or completed returns its current state (`outcome`) and nothing is restarted.",
     inputSchema: {
       type: "object",
       required: ["task_id"],
@@ -431,7 +431,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
     name: "resume_run",
     description:
-      "Resume a failed, crashed, stopped, or quota-paused run (or Goal's linked run) in-place, restarting interrupted tasks with their preserved worktrees/handoffs while keeping completed work untouched.",
+      "Resume a failed, crashed, stopped, or quota-paused run (or Goal's linked run) in-place, restarting the orchestrator and interrupted tasks with their preserved worktrees/handoffs while keeping completed work untouched. Tasks cancelled by a stop are not revived. Safe to repeat: an already running run returns its current state (`outcome`).",
     inputSchema: {
       type: "object",
       properties: {
@@ -560,6 +560,13 @@ export interface DirectorPeerBridge {
   readSession(input: { target: string; limit?: number }): Promise<unknown>;
 }
 
+/** Result of a start-or-resume goal commit; `goal.linkedRunId` is the one run the goal uses. */
+export interface GoalCommitResult {
+  goal: GoalRecord;
+  outcome: "started" | "queued" | "already_active" | "resumed" | "already_settled" | "nothing_to_resume" | "stopped";
+  message: string;
+}
+
 interface ChatSelection {
   repoRoot: string;
   projectId?: string | null;
@@ -600,7 +607,7 @@ export class DirectorRuntime {
   private wakeHandler: ((chatSessionId: string, event: ChatControlEvent) => void) | null = null;
   private peerBridge: DirectorPeerBridge | null = null;
   private notifiedSettledGoals = new Set<string>();
-  private launchingGoals = new Set<string>();
+  private launchingGoals = new Map<string, Promise<GoalRecord>>();
   private pendingDrainRepos = new Set<string>();
   private pendingDrainAll = false;
 
@@ -752,6 +759,7 @@ export class DirectorRuntime {
         runStatus: "failed",
         openEscalations: openEsc.length,
         detail: `P0 escalation: ${p.title ?? "human input required"}`,
+        cause: "escalation",
       });
       return;
     }
@@ -774,7 +782,8 @@ export class DirectorRuntime {
         runId: ev.runId,
         runStatus: "stopped",
         openEscalations: this.db.listEscalations(ev.runId, "open").length,
-        detail: `paused_quota (manual): ${p.reason ?? "quota limit reached"}`,
+        detail: `paused_quota (manual): ${p.reason ?? this.orchestrator.getRunQuotaStatus(ev.runId)?.reason ?? "quota limit reached"}`,
+        cause: "quota_paused",
       });
       return;
     }
@@ -851,6 +860,7 @@ export class DirectorRuntime {
           runStatus: "failed",
           openEscalations: openEscCount,
           detail: `verification_error: ${msg.slice(0, 160)}`,
+          cause: "verification_error",
         });
       });
       return;
@@ -859,8 +869,16 @@ export class DirectorRuntime {
     // A settled run no longer occupies a goal slot: hand the goal to a human and admit queued goals.
     // Open escalations on the run already carry the human hand-off, so the goal keeps its status for them.
     const openEscalations = this.db.listEscalations(ev.runId, "open").length;
+    // The recorded stop/failure cause travels with the hand-off note and the Director wake.
+    const recordedCause = status === "completed" ? null : this.orchestrator.describeRunCause(ev.runId);
     if ((status === "failed" || status === "stopped") && goal.status === "executing" && openEscalations === 0) {
-      this.goals.setStatus(goal.id, "awaiting_human", `Linked run ${ev.runId} ${status} before goal verification; resume or review.`);
+      this.goals.setStatus(
+        goal.id,
+        "awaiting_human",
+        `Linked run ${ev.runId} ${status === "stopped" ? "was stopped" : "failed"} before goal verification ` +
+          `(${recordedCause ?? `no cause was recorded; inspect with \`pi-harness tree ${ev.runId}\``}). ` +
+          `Nothing restarts automatically; \`pi-harness resume ${ev.runId}\` or goal_commit continues the same run in place, or review the goal.`,
+      );
     } else if (
       status === "completed" &&
       this.config.goals?.autoVerifyOnSettle !== false &&
@@ -882,6 +900,8 @@ export class DirectorRuntime {
       runId: ev.runId,
       runStatus: status,
       openEscalations,
+      ...(recordedCause ? { detail: recordedCause } : {}),
+      ...(status !== "completed" ? { cause: status === "stopped" ? "explicit_stop" : "run_failed" } : {}),
     };
     this.wakeHandler?.(goal.chatSessionId, event);
   }
@@ -1135,19 +1155,42 @@ export class DirectorRuntime {
     }
   }
 
-  private async launchCommittedGoal(
+  /**
+   * Launches a committed goal's run. Single-flight per goal: concurrent callers share one in-flight
+   * launch and receive the linked GoalRecord, so no second run or queue entry is ever created.
+   */
+  private launchCommittedGoal(
     goal: GoalRecord,
     opts?: { profileId?: string; model?: string; effort?: string },
     fromQueueDrain = false,
   ): Promise<GoalRecord> {
-    if (this.launchingGoals.has(goal.id)) return this.goals.getGoal(goal.id) ?? goal;
-    // Claim the slot before the first await so concurrent admission decisions see it.
-    this.launchingGoals.add(goal.id);
+    const inflight = this.launchingGoals.get(goal.id);
+    if (inflight) return inflight;
+    let settle!: { resolve: (g: GoalRecord) => void; reject: (err: unknown) => void };
+    const slot = new Promise<GoalRecord>((resolve, reject) => {
+      settle = { resolve, reject };
+    });
+    slot.catch(() => {});
+    // Claim the slot before the first await so concurrent admission decisions and commits see it.
+    this.launchingGoals.set(goal.id, slot);
+    this.launchCommittedGoalBody(goal, opts, fromQueueDrain, slot).then(settle.resolve, settle.reject);
+    return slot;
+  }
+
+  private async launchCommittedGoalBody(
+    goal: GoalRecord,
+    opts: { profileId?: string; model?: string; effort?: string } | undefined,
+    fromQueueDrain: boolean,
+    slot: Promise<GoalRecord>,
+  ): Promise<GoalRecord> {
     let started: GoalRecord;
     let runId: string;
     let launched = false;
     try {
       this.db.admissionQueue.remove("goal", goal.id);
+      // A goal another caller already launched or settled is never launched a second time.
+      const current = this.goals.getGoal(goal.id) ?? goal;
+      if (["executing", "verifying", "reviewing", "achieved", "cancelled"].includes(current.status)) return current;
       const criteriaSummary = goal.criteria
         .map((c) => `- [${c.id}] (${c.kind}${c.required ? "*" : ""}) ${c.description}${c.command ? ` [cmd: ${c.command}]` : ""}`)
         .join("\n");
@@ -1160,6 +1203,7 @@ export class DirectorRuntime {
         ...(goal.nonGoals.length ? ["", "Non-Goals:", ...goal.nonGoals.map((n) => `- ${n}`)] : []),
       ].join("\n");
 
+      const epochBefore = this.orchestrator.getGlobalStopEpoch();
       const { run } = await this.orchestrator.startRun({
         goal: runObjective,
         repoRoot: goal.repoRoot,
@@ -1168,11 +1212,36 @@ export class DirectorRuntime {
         effort: opts?.effort,
       });
 
+      // An explicit /stop, pause or cancel issued while the run was starting wins over this older launch:
+      // stop the new run, keep the link so a later commit resumes it in place, and keep the goal's status.
+      const after = this.goals.getGoal(goal.id);
+      const stoppedAll = this.orchestrator.getGlobalStopEpoch() !== epochBefore;
+      if (!after) {
+        await this.orchestrator.stopRun(run.id, `Goal ${goal.id} was deleted while its run was starting`);
+        throw new Error(`Goal ${goal.id} was deleted while its run was starting; run ${run.id} was stopped.`);
+      }
+      if (stoppedAll || after.status === "paused" || after.status === "cancelled") {
+        const keep = after.status === "cancelled" ? "cancelled" : "paused";
+        const reason = stoppedAll
+          ? `All runs were stopped while goal ${goal.id}'s run was starting`
+          : `Goal ${goal.id} was ${keep} while its run was starting`;
+        this.goals.linkRunAndStart(goal.id, run.id);
+        started = this.goals.setStatus(
+          goal.id,
+          keep,
+          keep === "paused"
+            ? `${reason}; run ${run.id} was stopped. goal_commit or \`pi-harness resume ${run.id}\` continues it in place.`
+            : `${reason}; run ${run.id} was stopped.`,
+        );
+        await this.orchestrator.stopRun(run.id, reason);
+        return started;
+      }
+
       started = this.goals.linkRunAndStart(goal.id, run.id);
       runId = run.id;
       launched = true;
     } finally {
-      this.launchingGoals.delete(goal.id);
+      if (this.launchingGoals.get(goal.id) === slot) this.launchingGoals.delete(goal.id);
       if (!launched) {
         // The released slot must reach queued waiters; a queue drain handles its own failures.
         this.syncQueuedGoalProgress();
@@ -1205,9 +1274,70 @@ export class DirectorRuntime {
     goalId: string,
     opts?: { profileId?: string; model?: string; effort?: string; position?: QueuePositionInput; forceStart?: boolean },
   ): Promise<GoalRecord> {
+    return (await this.commitGoalDetailed(goalId, opts)).goal;
+  }
+
+  /**
+   * Start-or-resume, safe to repeat. A launching, live, queued or settled goal returns its current state;
+   * a paused, awaiting_human or stopped goal with an unfinished linked run resumes that same run in place.
+   * Only a goal without a resumable linked run starts a new run (through the admission queue).
+   */
+  async commitGoalDetailed(
+    goalId: string,
+    opts?: { profileId?: string; model?: string; effort?: string; position?: QueuePositionInput; forceStart?: boolean },
+  ): Promise<GoalCommitResult> {
     let goal = this.goals.getGoal(goalId);
     if (!goal) throw new Error(`Unknown goal ${goalId}`);
-    if (this.launchingGoals.has(goal.id)) return goal;
+    const result = (g: GoalRecord, outcome: GoalCommitResult["outcome"], message: string): GoalCommitResult => ({
+      goal: g,
+      outcome,
+      message,
+    });
+    const activeMessage = (g: GoalRecord) =>
+      `Goal ${g.id} is already ${g.status}${g.linkedRunId ? ` on run ${g.linkedRunId}` : ""}; nothing was started again.`;
+
+    const inflight = this.launchingGoals.get(goal.id);
+    if (inflight) {
+      const linked = await inflight;
+      return result(linked, "already_active", activeMessage(linked));
+    }
+    if (goal.status === "achieved" || goal.status === "cancelled") {
+      return result(
+        goal,
+        "already_settled",
+        `Goal ${goal.id} is ${goal.status}; nothing was started. Create a new goal with goal_create for follow-up work.`,
+      );
+    }
+    const linked = goal.linkedRunId ? this.orchestrator.getEffectiveRun(goal.linkedRunId) : null;
+    const linkedResumable = Boolean(linked && linked.status !== "completed" && linked.status !== "active");
+    if (
+      goal.status === "verifying" ||
+      goal.status === "reviewing" ||
+      (goal.status === "executing" && !linkedResumable)
+    ) {
+      return result(goal, "already_active", activeMessage(goal));
+    }
+    const queued = this.db.admissionQueue.get("goal", goal.id);
+    if (queued && !opts?.position && !opts?.forceStart) {
+      return result(goal, "queued", `Goal ${goal.id} is already queued at #${queued.position}; nothing was enqueued again.`);
+    }
+    if (linked && linked.status !== "completed") {
+      const res = await this.orchestrator.resumeRun(linked.id, { trigger: "manual" });
+      if (res.outcome === "resumed" || res.outcome === "already_active") {
+        this.db.admissionQueue.remove("goal", goal.id);
+        const fresh = this.goals.getGoal(goal.id)!;
+        // A pause or cancel that arrived while resuming wins; its own stopRun stops the run again.
+        const keep = ["executing", "verifying", "reviewing", "paused", "cancelled", "achieved"].includes(fresh.status);
+        const updated = keep ? fresh : this.goals.setStatus(goal.id, "executing", "Resumed in place");
+        this.syncQueuedGoalProgress();
+        return result(updated, res.outcome === "resumed" ? "resumed" : "already_active", `Goal ${goal.id}: ${res.message}`);
+      }
+      if (res.outcome === "nothing_to_resume") {
+        return result(this.goals.getGoal(goal.id) ?? goal, "nothing_to_resume", `Goal ${goal.id}: ${res.message}`);
+      }
+      // already_completed: the run finished; fall through and start the goal's next run.
+    }
+
     const repoRoot = goal.repoRoot;
     // Counting slots can synchronously settle runs and drain the queue, which may admit this goal itself.
     const refreshUnlessAdmitted = (): GoalRecord | null => {
@@ -1216,11 +1346,15 @@ export class DirectorRuntime {
       goal = fresh;
       return this.launchingGoals.has(fresh.id) || ["executing", "verifying", "reviewing"].includes(fresh.status) ? fresh : null;
     };
+    const admittedResult = async (g: GoalRecord): Promise<GoalCommitResult> => {
+      const linkedGoal = (await this.launchingGoals.get(g.id)) ?? g;
+      return result(linkedGoal, "started", `Goal ${linkedGoal.id} started${linkedGoal.linkedRunId ? ` on run ${linkedGoal.linkedRunId}` : ""}.`);
+    };
 
     const limit = Math.max(1, this.config.goals.maxConcurrentGoals ?? 4);
     let activeCount = this.countActiveGoals(repoRoot);
     let admitted = refreshUnlessAdmitted();
-    if (admitted) return admitted;
+    if (admitted) return admittedResult(admitted);
     const listQueuedAhead = () =>
       this.db.admissionQueue.list({ lane: "goal", repoRoot }).filter((e) => e.targetId !== goalId);
     let queuedAhead = listQueuedAhead();
@@ -1228,10 +1362,10 @@ export class DirectorRuntime {
       // Free slots go to goals already waiting (FIFO) before this goal decides whether to queue.
       await this.drainGoalQueue(repoRoot);
       admitted = refreshUnlessAdmitted();
-      if (admitted) return admitted;
+      if (admitted) return admittedResult(admitted);
       activeCount = this.countActiveGoals(repoRoot);
       admitted = refreshUnlessAdmitted();
-      if (admitted) return admitted;
+      if (admitted) return admittedResult(admitted);
       queuedAhead = listQueuedAhead();
     }
 
@@ -1250,10 +1384,38 @@ export class DirectorRuntime {
         note: goal.title,
       });
       this.syncQueuedGoalProgress();
-      return this.goals.getGoal(goal.id)!;
+      const entry = this.db.admissionQueue.get("goal", goal.id);
+      return result(
+        this.goals.getGoal(goal.id)!,
+        "queued",
+        `Goal ${goal.id} is queued${entry ? ` at #${entry.position}` : ""} (${activeCount}/${limit} concurrent goals active); it starts automatically when a slot frees.`,
+      );
     }
 
-    return await this.launchCommittedGoal(goal, opts);
+    const launchedGoal = await this.launchCommittedGoal(goal, opts);
+    if (launchedGoal.status === "paused" || launchedGoal.status === "cancelled") {
+      return result(
+        launchedGoal,
+        "stopped",
+        `Goal ${launchedGoal.id} was ${launchedGoal.status === "paused" ? "paused or stopped" : "cancelled"} while its run was starting; run ${launchedGoal.linkedRunId} was stopped and nothing is left running.`,
+      );
+    }
+    if (launchedGoal.status !== "executing") return result(launchedGoal, "already_active", activeMessage(launchedGoal));
+    return result(launchedGoal, "started", `Goal ${launchedGoal.id} started on run ${launchedGoal.linkedRunId}.`);
+  }
+
+  /** Tool result for goal_commit / goal_create(commit_immediately): the goal plus its idempotent start-or-resume state. */
+  private goalCommitToolResult(res: GoalCommitResult, presentationId: string | undefined): Record<string, unknown> {
+    const qEntry = this.db.admissionQueue.get("goal", res.goal.id);
+    return {
+      ...res.goal,
+      ...(qEntry ? { queued: true, queuePosition: qEntry.position } : {}),
+      runId: res.goal.linkedRunId,
+      goalStatus: res.goal.status,
+      outcome: res.outcome,
+      message: res.message,
+      presentation_id: presentationId,
+    };
   }
 
   private drainingGoals = false;
@@ -1442,8 +1604,9 @@ export class DirectorRuntime {
         let delivered = await this.orchestrator.steerTask(orch.id, steerMsg).catch(() => false);
         if (!delivered && goal.status === "executing" && isStillAmendedExecuting()) {
           delivered = await this.orchestrator
-            .resumeTask(orch.id, { allowCompleted: true, note: steerMsg, validateBeforeActivate: isStillAmendedExecuting })
-            .then(() => true, () => false);
+            .resumeTaskDetailed(orch.id, { allowCompleted: true, note: steerMsg, validateBeforeActivate: isStillAmendedExecuting })
+            // An idempotent "already active" return delivers the note only when it was steered in.
+            .then((r) => r.outcome === "resumed" || r.noteDelivered === true, () => false);
         }
         if (!delivered) amendedGoal = this.handOffStrandedGoal(goal, "amendment could not be delivered to its run");
       } else {
@@ -1867,7 +2030,7 @@ export class DirectorRuntime {
         }
         reviewerSignal.throwIfAborted();
         assertCurrent();
-        if (res.stopReason !== "completed" && res.stopReason !== "max_turns") {
+        if (res.stopReason !== "completed") {
           throw new Error(`Reviewer stopped: ${res.stopReason}. ${res.text}`);
         }
 
@@ -1955,8 +2118,9 @@ export class DirectorRuntime {
         delivered = await this.orchestrator.steerTask(orch.id, msg).catch(() => false);
         if (!delivered && isStillCurrentExecuting()) {
           delivered = await this.orchestrator
-            .resumeTask(orch.id, { allowCompleted: true, note: msg, validateBeforeActivate: isStillCurrentExecuting })
-            .then(() => true, () => false);
+            .resumeTaskDetailed(orch.id, { allowCompleted: true, note: msg, validateBeforeActivate: isStillCurrentExecuting })
+            // An idempotent "already active" return delivers the note only when it was steered in.
+            .then((r) => r.outcome === "resumed" || r.noteDelivered === true, () => false);
         }
       }
       if (!delivered && isStillCurrentExecuting()) {
@@ -2059,8 +2223,17 @@ export class DirectorRuntime {
     return open.length;
   }
 
-  /** Cancels all active Director turns and in-flight Done-Reviews (used by `/stop`). */
-  async cancelAllActive(reason = "Stopped by user"): Promise<{ cancelledChats: number; cancelledReviews: number }> {
+  /**
+   * Cancels all active Director turns, in-flight Done-Reviews, and pending chat timers that would resume a
+   * goal (used by `/stop`), so nothing scheduled earlier undoes the explicit stop.
+   */
+  async cancelAllActive(
+    reason = "Stopped by user",
+  ): Promise<{ cancelledChats: number; cancelledReviews: number; cancelledTimers: number }> {
+    let cancelledTimers = 0;
+    for (const t of this.db.timers.list({ ownerKind: "chat", status: "pending" })) {
+      if (t.resumeGoal === true && this.db.timers.cancel(t.id, reason)) cancelledTimers++;
+    }
     let cancelledChats = 0;
     for (const chatId of [...this.activeChats.keys()]) {
       if (await this.cancelChat(chatId)) cancelledChats++;
@@ -2071,7 +2244,7 @@ export class DirectorRuntime {
       this.activeReviews.delete(goalId);
       cancelledReviews++;
     }
-    return { cancelledChats, cancelledReviews };
+    return { cancelledChats, cancelledReviews, cancelledTimers };
   }
 
   /** Cancels an in-flight Tier 0 Director turn immediately (e.g. when user presses Esc). */
@@ -2525,8 +2698,19 @@ export class DirectorRuntime {
         if (!targetId || !message) throw new Error("task_id and message are required");
         const targetTask = this.db.getTask(targetId);
         if (!targetTask) throw new Error(`Unknown task ${targetId}`);
+        // steerTask throws an actionable refusal for settled tasks and stopped runs; steering never undoes a stop.
         const steered = await this.orchestrator.steerTask(targetTask.id, message);
-        return { steered, taskId: targetTask.id, runId: targetTask.runId };
+        return {
+          steered,
+          taskId: targetTask.id,
+          runId: targetTask.runId,
+          ...(steered
+            ? {}
+            : {
+                status: this.db.getTask(targetTask.id)?.status ?? targetTask.status,
+                reason: `Steering was not delivered: task ${targetTask.id} is not running yet (no live agent session). Nothing was changed; retry once it is running, or cancel_task and delegate again.`,
+              }),
+        };
       }
       case "goal_accept": {
         const goalId = String(args.goal_id ?? "").trim();
@@ -2643,34 +2827,24 @@ export class DirectorRuntime {
             typeof args.max_review_cycles === "number" ? { maxReviewCycles: args.max_review_cycles } : undefined,
         });
         if (args.commit_immediately) {
-          const committed = await this.commitGoal(created.id, {
+          const res = await this.commitGoalDetailed(created.id, {
             model: String(args.model), profileId: args.profile_id as string | undefined,
             effort: typeof args.effort === "string" ? args.effort : undefined,
           });
-          const qEntry = this.db.admissionQueue.get("goal", committed.id);
-          return {
-            ...committed,
-            ...(qEntry ? { queued: true, queuePosition: qEntry.position } : {}),
-            presentation_id: presentGoal(committed),
-          };
+          return this.goalCommitToolResult(res, presentGoal(res.goal));
         }
         return { ...created, presentation_id: presentGoal(created) };
       }
 
       case "goal_commit": {
-        const committed = await this.commitGoal(String(args.goal_id), {
+        const res = await this.commitGoalDetailed(String(args.goal_id), {
           profileId: typeof args.profile_id === "string" ? args.profile_id : undefined,
           model: typeof args.model === "string" ? args.model : undefined,
           effort: typeof args.effort === "string" ? args.effort : undefined,
           position: args.position as QueuePositionInput | undefined,
           forceStart: Boolean(args.force_start),
         });
-        const qEntry = this.db.admissionQueue.get("goal", committed.id);
-        return {
-          ...committed,
-          ...(qEntry ? { queued: true, queuePosition: qEntry.position } : {}),
-          presentation_id: presentGoal(committed),
-        };
+        return this.goalCommitToolResult(res, presentGoal(res.goal));
       }
 
       case "queue_list": {
@@ -3133,13 +3307,20 @@ export class DirectorRuntime {
       }
 
       case "resume_task": {
-        const resumed = await this.orchestrator.resumeTask(String(args.task_id), {
+        const res = await this.orchestrator.resumeTaskDetailed(String(args.task_id), {
           note: typeof args.note === "string" ? args.note : undefined,
           model: typeof args.model === "string" ? args.model : undefined,
           effort: typeof args.effort === "string" ? args.effort : undefined,
           profileId: typeof args.profile_id === "string" && args.profile_id.trim() ? args.profile_id.trim() : undefined,
         });
-        return { resumed: true, task: resumed };
+        return {
+          resumed: res.outcome === "resumed",
+          outcome: res.outcome,
+          message: res.message,
+          task: res.task,
+          ...(res.queuePosition !== undefined ? { queuePosition: res.queuePosition } : {}),
+          ...(res.noteDelivered !== undefined ? { noteDelivered: res.noteDelivered } : {}),
+        };
       }
 
       case "resume_run": {

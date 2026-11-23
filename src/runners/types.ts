@@ -152,9 +152,8 @@ export function validateRunPolicy(req: RunAgentRequest): void {
 
 export interface RunAgentResult {
   text: string;
-  // "max_turns" stays in the union only for compatibility with an existing Director comparison;
-  // no runner ever returns it (turn counts are advisory reminders, never stops).
-  stopReason: "completed" | "cancelled" | "rollover_requested" | "quota_paused" | "max_turns" | "error";
+  // Turn counts are advisory reminders, never stops, so there is no turn-limit stop reason.
+  stopReason: "completed" | "cancelled" | "rollover_requested" | "quota_paused" | "error";
   usage?: RunnerUsage;
   sessionId?: string;
   quotaPause?: QuotaPauseInfo;
