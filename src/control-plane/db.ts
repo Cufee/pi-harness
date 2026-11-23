@@ -1383,18 +1383,11 @@ export class ControlPlaneDb {
     return max;
   }
 
-  /**
-   * Dossier paths (any run) ending with suffix, compared case-insensitively so spellings that alias the same file on
-   * a case-insensitive filesystem are found too. Lengths are in code points, matching SQLite's length()/substr().
-   */
-  listDossierPathsWithSuffix(suffix: string): string[] {
-    const codePoints = [...suffix].length;
-    if (codePoints === 0) return [];
+  /** Every distinct path indexed as a dossier by any run. */
+  listDistinctDossierPaths(): string[] {
     const rows = this.db
-      .prepare(
-        "SELECT DISTINCT path FROM artifacts WHERE kind = 'dossier' AND length(path) >= ? AND lower(substr(path, length(path) - ? + 1)) = lower(?)",
-      )
-      .all(codePoints, codePoints, suffix) as Array<{ path: string }>;
+      .prepare("SELECT DISTINCT path FROM artifacts WHERE kind = 'dossier'")
+      .all() as Array<{ path: string }>;
     return rows.map(r => String(r.path));
   }
 

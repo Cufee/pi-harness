@@ -241,6 +241,8 @@ export function writeUniqueFile(
         return name;
       }
     }
+    // Durable mode never falls back to an unreserved name.
+    throw Object.assign(new Error(`EEXIST: could not allocate a unique file for ${stem}-N${ext} in ${dir}`), { code: "EEXIST" });
   } else {
     let n = Math.max(fileNameCounters.get(key) ?? 0, scanMaxFileIndex(dir, stem, ext));
     for (let attempt = 0; attempt < 64; attempt++) {
@@ -251,10 +253,10 @@ export function writeUniqueFile(
         return name;
       }
     }
-  }
-  for (let attempt = 0; attempt < 8; attempt++) {
-    const name = `${stem}-${Date.now()}-${randomBytes(8).toString("hex")}${ext}`;
-    if (tryCreateExclusive(join(dir, name), content)) return name;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const name = `${stem}-${Date.now()}-${randomBytes(8).toString("hex")}${ext}`;
+      if (tryCreateExclusive(join(dir, name), content)) return name;
+    }
   }
   throw Object.assign(new Error(`EEXIST: could not allocate a unique file for ${stem}-N${ext} in ${dir}`), { code: "EEXIST" });
 }
