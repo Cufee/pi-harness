@@ -84,8 +84,8 @@ const fatalEvents = ['uncaughtException', 'unhandledRejection'], onceRan = {};
 const origKey = Symbol(), origRaw = process.rawListeners;
 const orig = {};
 for (const m of ['on', 'addListener', 'once', 'prependListener', 'prependOnceListener', 'removeListener']) orig[m] = process[m];
-const findWrapper = (event, fn) => origRaw.call(process, event).find(l => l && l[origKey] === fn);
-const hasCallback = (event, fn) => origRaw.call(process, event).some(l => l === fn || (l && l[origKey] === fn));
+const findWrapper = (event, fn) => typeof fn === 'function' ? origRaw.call(process, event).find(l => l && l[origKey] === fn) : undefined;
+const hasCallback = (event, fn) => typeof fn === 'function' && origRaw.call(process, event).some(l => l === fn || (l && l[origKey] === fn));
 let fatalHandled = false;
 for (const m of ['on', 'addListener', 'once', 'prependListener']) process[m] = function (event, fn) {
   if (fatalEvents.includes(event) && typeof fn === 'function' && findWrapper(event, fn)) return this;
@@ -103,7 +103,7 @@ process.prependOnceListener = function (event, fn) {
   return orig.prependListener.call(this, event, wrapped);
 };
 process.removeListener = process.off = function (event, fn) {
-  if (!fatalEvents.includes(event)) return orig.removeListener.call(this, event, fn);
+  if (!fatalEvents.includes(event) || typeof fn !== 'function') return orig.removeListener.call(this, event, fn);
   orig.removeListener.call(this, event, findWrapper(event, fn) ?? fn);
   return this;
 };
