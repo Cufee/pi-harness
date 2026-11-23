@@ -666,6 +666,12 @@ export interface GoalCommitResult {
   queuePosition?: number;
 }
 
+/** Stop and pause epochs captured when a commit began; a later /stop, pause or cancel stops its launch. */
+interface GoalLaunchFence {
+  stop: { global: number; repo: number };
+  pauseEpoch: number;
+}
+
 interface ChatSelection {
   repoRoot: string;
   projectId?: string | null;
@@ -824,9 +830,19 @@ export class DirectorRuntime {
         if (g && g.status === "paused") {
           const linkedRun = g.linkedRunId ? this.db.getRun(g.linkedRunId) : null;
           if (linkedRun?.status === "paused_quota") {
+            const pauseEpochBefore = this.goalPauseEpoch.get(g.id) ?? 0;
+            const stopFence = this.orchestrator.launchStopFence(g.repoRoot);
             await this.orchestrator.resumeRunFromQuota(linkedRun.id, { trigger: "user_timer" });
-            this.goals.setStatus(g.id, "executing");
-            resumedGoal = true;
+            // A pause, cancel or /stop issued while resuming wins: the goal keeps that status.
+            const fresh = this.goals.getGoal(g.id);
+            const superseded =
+              (this.goalPauseEpoch.get(g.id) ?? 0) !== pauseEpochBefore ||
+              this.orchestrator.launchFenceBroken(g.repoRoot, stopFence) ||
+              fresh?.status !== "paused";
+            if (!superseded) {
+              this.goals.setStatus(g.id, "executing");
+              resumedGoal = true;
+            }
           } else {
             await this.commitGoal(g.id);
             resumedGoal = true;
@@ -1388,6 +1404,7 @@ export class DirectorRuntime {
     goal: GoalRecord,
     opts?: { profileId?: string; model?: string; effort?: string },
     fromQueueDrain = false,
+    entryFence?: GoalLaunchFence,
   ): Promise<GoalCommitResult> {
     const inflight = this.launchingGoals.get(goal.id);
     if (inflight) return inflight;
@@ -1398,7 +1415,7 @@ export class DirectorRuntime {
     slot.catch(() => {});
     // Claim the slot before the first await so concurrent admission decisions and commits see it.
     this.launchingGoals.set(goal.id, slot);
-    this.launchCommittedGoalBody(goal, opts, fromQueueDrain, slot).then(settle.resolve, settle.reject);
+    this.launchCommittedGoalBody(goal, opts, fromQueueDrain, slot, entryFence).then(settle.resolve, settle.reject);
     return slot;
   }
 
@@ -1407,14 +1424,15 @@ export class DirectorRuntime {
     opts: { profileId?: string; model?: string; effort?: string } | undefined,
     fromQueueDrain: boolean,
     slot: Promise<GoalCommitResult>,
+    entryFence?: GoalLaunchFence,
   ): Promise<GoalCommitResult> {
     let started: GoalRecord;
     let runId: string;
     let launched = false;
-    // Captured synchronously at launch start: only a stop, pause or cancel issued after this point stops the launch;
-    // a goal that was already paused before its first launch starts cleanly.
-    const stopFence = this.orchestrator.launchStopFence(goal.repoRoot);
-    const pauseEpochBefore = this.goalPauseEpoch.get(goal.id) ?? 0;
+    // Captured synchronously at launch start (or at the committing call's entry, when given): only a stop, pause or
+    // cancel issued after this point stops the launch; a goal that was already paused before its first launch starts cleanly.
+    const stopFence = entryFence?.stop ?? this.orchestrator.launchStopFence(goal.repoRoot);
+    const pauseEpochBefore = entryFence?.pauseEpoch ?? this.goalPauseEpoch.get(goal.id) ?? 0;
     try {
       this.db.admissionQueue.remove("goal", goal.id);
       // A goal another caller already launched or settled is never launched a second time.
@@ -1581,6 +1599,11 @@ export class DirectorRuntime {
   ): Promise<GoalCommitResult> {
     let goal = this.goals.getGoal(goalId);
     if (!goal) throw new Error(`Unknown goal ${goalId}`);
+    // Captured synchronously before any await: a /stop, pause or cancel issued after this commit began wins over it.
+    const entryFence: GoalLaunchFence = {
+      stop: this.orchestrator.launchStopFence(goal.repoRoot),
+      pauseEpoch: this.goalPauseEpoch.get(goal.id) ?? 0,
+    };
     const result = (g: GoalRecord, outcome: GoalCommitResult["outcome"], message: string): GoalCommitResult => ({
       goal: g,
       outcome,
@@ -1675,6 +1698,20 @@ export class DirectorRuntime {
       queuedAhead = listQueuedAhead();
     }
 
+    // Neither queue nor launch a goal whose commit was overtaken by a /stop, pause or cancel.
+    const beforeAdmission = this.goals.getGoal(goal.id) ?? goal;
+    if (
+      (this.goalPauseEpoch.get(goal.id) ?? 0) !== entryFence.pauseEpoch ||
+      this.orchestrator.launchFenceBroken(repoRoot, entryFence.stop) ||
+      beforeAdmission.status === "cancelled"
+    ) {
+      return result(
+        beforeAdmission,
+        "stopped",
+        `Goal ${goal.id} was not started: a stop, pause or cancel was issued while it was being committed, so no run was created and it was not queued. Commit the goal again to start it.`,
+      );
+    }
+
     if (!opts?.forceStart && (activeCount >= limit || queuedAhead.length > 0)) {
       this.db.admissionQueue.enqueue({
         lane: "goal",
@@ -1701,7 +1738,7 @@ export class DirectorRuntime {
       };
     }
 
-    return this.launchCommittedGoal(goal, opts);
+    return this.launchCommittedGoal(goal, opts, false, entryFence);
   }
 
   /**
@@ -1839,11 +1876,18 @@ export class DirectorRuntime {
     const qEntry = this.db.admissionQueue.get("goal", goal.id);
     if (qEntry) {
       this.db.admissionQueue.markForceStart("goal", goal.id);
-      const launched = await this.launchCommittedGoal(
-        goal,
-        (qEntry.launchOpts ?? {}) as { profileId?: string; model?: string; effort?: string },
-      );
-      return { goal: launched, action: "force_started_queued_goal", warning };
+      const res = await this.commitGoalDetailed(goal.id, {
+        ...((qEntry.launchOpts ?? {}) as { profileId?: string; model?: string; effort?: string }),
+        forceStart: true,
+      });
+      const started = res.outcome === "started" || res.outcome === "resumed";
+      return {
+        goal: res.goal,
+        outcome: res.outcome,
+        message: res.message,
+        action: started ? "force_started_queued_goal" : `force_start_${res.outcome}`,
+        warning,
+      };
     }
 
     // If the goal's linked run is quota-paused and bypassQuota is true, force-resume it immediately!
