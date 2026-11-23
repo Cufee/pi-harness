@@ -1,8 +1,8 @@
-import { randomUUID } from "node:crypto";
-import { constants, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { constants, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ControlPlaneDb, RunRecord } from "./db.js";
-import { writeUniqueFile } from "./ids.js";
+import { scanMaxFileIndex, writeUniqueFile } from "./ids.js";
 
 export function dossierDirectory(repoRoot: string, ...parts: string[]): string {
   let path = realpathSync(repoRoot);
@@ -44,17 +44,24 @@ function codeOutputName(name: string): { stem: string; ext: string } {
 }
 
 /**
- * Writes Code Mode output to a new, never-overwritten `<runId>-<stem>-<n><ext>` file under .harness/artifacts and
- * indexes it. The run prefix keeps runs and unindexed writers out of each other's names; a durable per-run sequence
- * keeps a deleted file's name from being reissued after a restart.
+ * Writes Code Mode output to a new, never-overwritten `spill-<runTag>-<stem>-<n><ext>` file under .harness/artifacts
+ * and indexes it. runTag is a fixed-width hash of the run ID, so distinct runs never share a name prefix, and the
+ * `spill-` prefix keeps other writers' names apart. n comes from one global durable sequence, seeded above any index
+ * already on disk, and every attempted n is reserved before its file is created, so no name is ever reissued.
  */
 export function writeCodeOutput(db: ControlPlaneDb, run: RunRecord, taskId: string, name: string, json: string) {
   const dir = dossierDirectory(run.repoRoot);
-  const safeRunId = run.id.replace(/[^a-zA-Z0-9._-]/g, "_").replace(/^\.+/, "").slice(0, 64) || "run";
   const { stem, ext } = codeOutputName(name);
-  const scopedStem = `${safeRunId}-${stem}`;
-  const minIndex = typeof db.nextArtifactSeq === "function" ? db.nextArtifactSeq(`${safeRunId}:${stem}${ext}`) : 0;
-  const path = join(dir, writeUniqueFile(dir, scopedStem, ext, json, minIndex));
+  const runTag = createHash("sha256").update(run.id).digest("hex").slice(0, 16);
+  const scopedStem = `spill-${runTag}-${stem}`;
+  let allocateIndex: (() => number) | undefined;
+  if (typeof db.nextArtifactSeq === "function") {
+    if (typeof db.advanceArtifactSeqFloor === "function") {
+      db.advanceArtifactSeqFloor("code-output", scanMaxFileIndex(dir, scopedStem, ext));
+    }
+    allocateIndex = () => db.nextArtifactSeq("code-output");
+  }
+  const path = join(dir, writeUniqueFile(dir, scopedStem, ext, json, allocateIndex));
   try {
     return db.recordArtifact({ runId: run.id, taskId, kind: "dossier", path, summary: "Code Mode output" }).path;
   } catch (error) {
@@ -122,6 +129,7 @@ export function findRunDossier(
     }
     if (realRoot !== null) {
       for (const path of db.listDossierPathsWithSuffix(sep + rel)) {
+        if (!path.endsWith(sep + rel)) continue;
         try {
           if (realpathSync(path.slice(0, path.length - rel.length - 1) || sep) === realRoot) candidates.push(path);
         } catch {
@@ -193,15 +201,42 @@ export function readRunDossier(db: ControlPlaneDb, run: RunRecord, args: Record<
   const found = findRunDossier(db, run, args.path);
   const shown = found?.recordedPath ?? resolve(run.repoRoot, args.path);
   if (!found) throw new Error(`No indexed dossier in this run: ${shown}`);
-  // A legacy flat path indexed by several runs cannot prove which run's bytes it now holds.
-  if (typeof db.countDossierOwners === "function" && db.countDossierOwners(found.candidates) > 1) {
-    throw new Error(`Dossier path has ambiguous multi-run ownership: ${shown}`);
-  }
   const nonSymlink = `Dossier must be a non-symlink path under .harness/artifacts: ${shown}`;
   if (found.rel === null) throw new Error(nonSymlink);
   // Built from the requested path, not from realpath(target): equality below holds only when no component
   // from .harness down to the file is a symlink.
-  const expected = join(realpathSync(run.repoRoot), found.rel);
+  const realRoot = realpathSync(run.repoRoot);
+  const expected = join(realRoot, found.rel);
+  // A path indexed by several runs (under any root spelling, or a case alias of the same file) cannot prove which
+  // run's bytes it now holds.
+  const ownerPaths = new Set(found.candidates);
+  if (typeof db.listDossierPathsWithSuffix === "function") {
+    const suffix = sep + found.rel;
+    const rawRoot = resolve(run.repoRoot);
+    let expectedStat: { dev: number; ino: number } | null = null;
+    try {
+      expectedStat = statSync(expected);
+    } catch {
+      expectedStat = null;
+    }
+    for (const p of db.listDossierPathsWithSuffix(suffix)) {
+      try {
+        if (p.endsWith(suffix)) {
+          const prefix = p.slice(0, p.length - suffix.length) || sep;
+          if (prefix === rawRoot || realpathSync(prefix) === realRoot) ownerPaths.add(p);
+        } else if (expectedStat) {
+          // Case-folded match: the same file only when the filesystem resolves it to the same inode.
+          const st = statSync(p);
+          if (st.dev === expectedStat.dev && st.ino === expectedStat.ino) ownerPaths.add(p);
+        }
+      } catch {
+        // Unresolvable spelling: cannot be the same file.
+      }
+    }
+  }
+  if (typeof db.countDossierOwners === "function" && db.countDossierOwners([...ownerPaths]) > 1) {
+    throw new Error(`Dossier path has ambiguous multi-run ownership: ${shown}`);
+  }
   if (lstatSync(expected).isSymbolicLink() || realpathSync(expected) !== expected) throw new Error(nonSymlink);
   return readArtifact(expected, args.max_chars, args.offset, { label: shown, pinned: true, nonSymlinkError: nonSymlink });
 }
