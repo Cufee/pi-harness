@@ -18,7 +18,7 @@ import { resolveLaunchRoute } from "../control-plane/launch-route.js";
 import { compactTaskHandoff, toolsForTier } from "../control-plane/tools.js";
 import { findRunDossier, readRunDossier, writeCodeOutput, writeTaskDossier } from "../control-plane/dossiers.js";
 import type { AdmissionLane, QueuePositionInput } from "../control-plane/admission-queue.js";
-import type { ArtifactRecord, ControlPlaneDb, EscalationRecord, RunRecord } from "../control-plane/db.js";
+import type { ArtifactRecord, ControlPlaneDb, EscalationRecord, EventRecord, RunRecord } from "../control-plane/db.js";
 import { RunStartStoppedError, type CustomRunnerFactory, type HarnessOrchestrator } from "../control-plane/orchestrator.js";
 import { directorTaskRunOwner } from "../control-plane/ids.js";
 import { canonicalProjectPath, type ProjectRecord } from "../control-plane/projects.js";
@@ -719,8 +719,14 @@ export class DirectorRuntime {
   private launchingGoals = new Map<string, Promise<GoalCommitResult>>();
   /** Bumped by every explicit goal pause or cancel, so a pause issued during a launch wins over it. */
   private goalPauseEpoch = new Map<string, number>();
-  /** Amendments whose steer has not been acknowledged by the run's Tier 1; recovered once the run settles. */
-  private readonly undeliveredAmendments = new Map<string, { version: number; steerMsg: string; reason: string }>();
+  /**
+   * Amendments whose steer has not been acknowledged by the run's Tier 1; recovered once the run settles.
+   * `inFlight` marks a live steer still awaiting its answer: a settlement arriving meanwhile is deferred until it resolves.
+   */
+  private readonly undeliveredAmendments = new Map<
+    string,
+    { version: number; steerMsg: string; reason: string; inFlight?: boolean; deferredSettlementEvent?: EventRecord }
+  >();
   private pendingDrainRepos = new Set<string>();
   private pendingDrainAll = false;
 
@@ -866,7 +872,7 @@ export class DirectorRuntime {
     this.wakeHandler?.(timer.ownerId, event);
   }
 
-  private handleControlPlaneEvent(ev: { runId: string; taskId?: string | null; type: string; payload: unknown }): void {
+  private handleControlPlaneEvent(ev: EventRecord): void {
     // Wake any subagent task timers waiting early on a child settlement
     if (ev.type === "task.status" && ev.taskId) {
       const payload = ev.payload as { to?: string; status?: string } | null;
@@ -988,6 +994,29 @@ export class DirectorRuntime {
       }
     }
 
+    // An explicit blocker (blocked phase or blocked task) goes to a human without running verification gates.
+    const blocker =
+      (status === "completed" || status === "failed") && goal.status === "executing" && cause !== "daemon_restart"
+        ? this.detectExplicitBlocker(goal, ev.runId)
+        : null;
+
+    // The run settled on a contract its Tier 1 never acknowledged: relaunch it on the amendment instead of verifying stale work.
+    // Checked before deduplication so the relaunched run's own settlement (same key) still counts as a first notice.
+    const pendingAmend = this.undeliveredAmendments.get(goal.id);
+    if (
+      pendingAmend &&
+      pendingAmend.version === goal.version &&
+      goal.status === "executing" &&
+      !blocker &&
+      cause !== "daemon_restart" &&
+      (status === "completed" || status === "failed")
+    ) {
+      // A live steer still awaiting its answer decides: accepted replays this settlement, refused relaunches Tier 1.
+      if (pendingAmend.inFlight) pendingAmend.deferredSettlementEvent = ev;
+      else queueMicrotask(() => void this.recoverUndeliveredAmendment(goal.id, goal.version).catch(() => {}));
+      return;
+    }
+
     const dedupeKey = `${goal.id}:v${goal.version}:c${goal.reviewCycle}:${ev.runId}:${status}`;
     // Deduplicates verification launches and wakeups only; slot hand-off and queue admission always run.
     const firstNotice = !this.notifiedSettledGoals.has(dedupeKey);
@@ -1015,25 +1044,7 @@ export class DirectorRuntime {
       return;
     }
 
-    // An explicit blocker (blocked phase or blocked task) goes to a human without running verification gates.
-    const blocker =
-      (status === "completed" || status === "failed") && goal.status === "executing"
-        ? this.detectExplicitBlocker(goal, ev.runId)
-        : null;
     if (blocker && firstNotice) this.parkBlockedGoal(goal, ev.runId, blocker);
-
-    // The run settled on a contract its Tier 1 never acknowledged: relaunch it on the amendment instead of verifying stale work.
-    const pendingAmend = this.undeliveredAmendments.get(goal.id);
-    if (
-      pendingAmend &&
-      pendingAmend.version === goal.version &&
-      goal.status === "executing" &&
-      !blocker &&
-      (status === "completed" || status === "failed")
-    ) {
-      queueMicrotask(() => void this.recoverUndeliveredAmendment(goal.id, goal.version).catch(() => {}));
-      return;
-    }
 
     // Control-plane-driven automatic verification on run completion (removes LLM single point of failure)
     if (
@@ -1570,6 +1581,8 @@ export class DirectorRuntime {
         };
       }
 
+      // A fresh run starts on the current contract; amendments pending for an older run no longer apply.
+      this.undeliveredAmendments.delete(goal.id);
       started = this.goals.linkRunAndStart(goal.id, run.id);
       runId = run.id;
       launched = true;
@@ -1614,6 +1627,8 @@ export class DirectorRuntime {
           `Full current contract: blackboard_get({ key: "${latestKey}" }); launch baseline: goal_contract_v${launchedGoal.version}.`,
         ].join("\n");
         const tracker = this.trackAmendmentDelivery(goal.id, latestAfterLaunch.version, run.id, orchestratorTaskId, steerMsg);
+        // Armed before the await: a run settling while the steer awaits its answer must not verify the stale contract.
+        if (latestAfterLaunch.status === "executing") tracker.armInFlight();
         const res = await this.orchestrator
           .deliverOrQueueLiveSteer(orchestratorTaskId, steerMsg, { onOutcome: tracker.onOutcome })
           .catch(() => ({ delivered: false, mode: "none" as const }));
@@ -1623,17 +1638,20 @@ export class DirectorRuntime {
           return g !== null && g.version === latestAfterLaunch.version && g.status === "executing";
         };
         if (delivered) {
-          this.undeliveredAmendments.delete(goal.id);
+          tracker.markDelivered();
         } else if (res.mode === "queued_before_handle") {
           tracker.armQueued();
-        } else if (isStillLatestExecuting()) {
-          const orch = this.db.getTask(orchestratorTaskId);
-          if (orch && ["completed", "failed", "cancelled", "blocked", "returned_for_rescope"].includes(orch.status)) {
-            delivered = await this.orchestrator
-              .resumeTaskDetailed(orchestratorTaskId, { allowCompleted: true, note: steerMsg, validateBeforeActivate: isStillLatestExecuting })
-              .then((r) => r.outcome === "resumed" || r.noteDelivered === true, () => false);
+        } else {
+          tracker.markAnswered();
+          if (isStillLatestExecuting()) {
+            const orch = this.db.getTask(orchestratorTaskId);
+            if (orch && ["completed", "failed", "cancelled", "blocked", "returned_for_rescope"].includes(orch.status)) {
+              delivered = await this.orchestrator
+                .resumeTaskDetailed(orchestratorTaskId, { allowCompleted: true, note: steerMsg, validateBeforeActivate: isStillLatestExecuting })
+                .then((r) => r.outcome === "resumed" || r.noteDelivered === true, () => false);
+            }
+            if (delivered) this.clearUndeliveredAmendment(goal.id, latestAfterLaunch.version);
           }
-          if (delivered) this.undeliveredAmendments.delete(goal.id);
         }
         if (!delivered && res.mode !== "queued_before_handle") {
           tracker.markUndelivered("mid-launch amendment could not be delivered to its run");
@@ -1747,6 +1765,8 @@ export class DirectorRuntime {
       const extra = { runStatus: res.runStatus, resumedTaskIds: res.resumedTaskIds };
       if (res.outcome === "resumed" || res.outcome === "already_active") {
         this.db.admissionQueue.remove("goal", goal.id);
+        // The resumed Tier 1 reads the current contract from its run row.
+        if (res.outcome === "resumed") this.undeliveredAmendments.delete(goal.id);
         // Every in-place resume (RPC, Director tool, timer) starts the new epoch here, before the goal is re-read.
         this.onRunResumed(linked.id, linked.status, res.outcome === "resumed");
         const fresh = this.goals.getGoal(goal.id)!;
@@ -2139,17 +2159,20 @@ export class DirectorRuntime {
         // A Tier 1 still launching reads the updated row in its initial prompt; one spawning gets the steer queued and
         // reports its acknowledgement later, so it is not counted as delivered here.
         const tracker = this.trackAmendmentDelivery(goal.id, goal.version, goal.linkedRunId, orch.id, steerMsg);
+        // Armed before the await: a run settling while the steer awaits its answer must not verify the stale contract.
+        if (goal.status === "executing") tracker.armInFlight();
         const res = await this.orchestrator
           .deliverOrQueueLiveSteer(orch.id, steerMsg, { onOutcome: tracker.onOutcome })
           .catch(() => ({ delivered: false, mode: "none" as const }));
         if (res.delivered) {
-          this.undeliveredAmendments.delete(goal.id);
+          tracker.markDelivered();
           delivery = { delivered: true, via: "steer" };
         } else if (res.mode === "queued_before_handle") {
           const reason = "queued for runner handle; awaiting acknowledgement";
           tracker.armQueued();
           delivery = { delivered: false, via: "none", reason };
         } else {
+          tracker.markAnswered();
           let delivered = false;
           if (goal.status === "executing" && isStillAmendedExecuting()) {
             delivered = await this.orchestrator
@@ -2158,7 +2181,7 @@ export class DirectorRuntime {
               .then((r) => r.outcome === "resumed" || r.noteDelivered === true, () => false);
           }
           if (delivered) {
-            this.undeliveredAmendments.delete(goal.id);
+            this.clearUndeliveredAmendment(goal.id, goal.version);
             delivery = { delivered: true, via: "resume" };
           } else {
             tracker.markUndelivered("amendment could not be delivered to its run");
@@ -2217,34 +2240,72 @@ export class DirectorRuntime {
    */
   private trackAmendmentDelivery(goalId: string, version: number, runId: string, orchId: string, steerMsg: string) {
     let reported = false;
+    /** A settlement deferred while the steer was in flight, taken off the entry for `version`. */
+    const takeDeferred = (): EventRecord | undefined => {
+      const prior = this.undeliveredAmendments.get(goalId);
+      return prior?.version === version ? prior.deferredSettlementEvent : undefined;
+    };
     const record = (reason: string, eventReason: string): boolean => {
       const current = this.goals.getGoal(goalId);
       if (!current || current.version !== version) return false;
-      this.undeliveredAmendments.set(goalId, { version, steerMsg, reason });
+      this.undeliveredAmendments.set(goalId, { version, steerMsg, reason, inFlight: false });
       this.db.emitEvent(runId, orchId, "goal.amendment_undelivered", { goalId, version, reason: eventReason });
       return true;
+    };
+    /** The steer (or initial prompt) carried the amendment: a settlement deferred meanwhile is handled now. */
+    const markDelivered = () => {
+      const deferred = takeDeferred();
+      this.clearUndeliveredAmendment(goalId, version);
+      if (deferred) queueMicrotask(() => this.handleControlPlaneEvent(deferred));
     };
     return {
       onOutcome: (accepted: boolean, reason: string) => {
         reported = true;
         if (accepted || reason === "rolled_over") {
-          if (this.undeliveredAmendments.get(goalId)?.version === version) this.undeliveredAmendments.delete(goalId);
+          markDelivered();
           return;
         }
         if (record(reason, reason)) {
           queueMicrotask(() => void this.recoverUndeliveredAmendment(goalId, version).catch(() => {}));
         }
       },
+      /** A live steer is about to be awaited: settlements arriving before its answer are deferred, never verified. */
+      armInFlight: () => {
+        if (this.goals.getGoal(goalId)?.version !== version) return;
+        this.undeliveredAmendments.set(goalId, { version, steerMsg, reason: "amendment delivery awaiting acknowledgement", inFlight: true });
+      },
+      markDelivered,
+      /** The live steer was refused; a settlement arriving during the fallback below is no longer deferred. */
+      markAnswered: () => {
+        const prior = this.undeliveredAmendments.get(goalId);
+        if (prior?.version === version) prior.inFlight = false;
+      },
       /** A steer queued for the runner handle: pending until its outcome arrives (unless it already did). */
       armQueued: () => {
         if (reported) return;
-        this.undeliveredAmendments.set(goalId, { version, steerMsg, reason: "queued for runner handle; awaiting acknowledgement" });
+        const deferred = takeDeferred();
+        this.undeliveredAmendments.set(goalId, {
+          version,
+          steerMsg,
+          reason: "queued for runner handle; awaiting acknowledgement",
+          inFlight: false,
+          ...(deferred ? { deferredSettlementEvent: deferred } : {}),
+        });
+        if (deferred) queueMicrotask(() => void this.recoverUndeliveredAmendment(goalId, version).catch(() => {}));
       },
       /** No live steer or resume reached the run; a still-live run recovers it when it settles. */
       markUndelivered: (reason: string) => {
-        record(reason, "steer_rejected");
+        const deferred = takeDeferred();
+        if (record(reason, "steer_rejected") && deferred) {
+          queueMicrotask(() => void this.recoverUndeliveredAmendment(goalId, version).catch(() => {}));
+        }
       },
     };
+  }
+
+  /** Clears the pending amendment of a goal, only for `version` when given, so an older one never wipes a newer one. */
+  private clearUndeliveredAmendment(goalId: string, version?: number): void {
+    if (version === undefined || this.undeliveredAmendments.get(goalId)?.version === version) this.undeliveredAmendments.delete(goalId);
   }
 
   /** Relaunches a settled run's Tier 1 with an amendment it never acknowledged, or hands the goal to a human. */
@@ -2253,12 +2314,12 @@ export class DirectorRuntime {
     if (!pending || pending.version !== version) return;
     const current = this.goals.getGoal(goalId);
     if (!current || current.version !== version || current.status !== "executing") {
-      this.undeliveredAmendments.delete(goalId);
+      this.clearUndeliveredAmendment(goalId, version);
       return;
     }
     // Still live: its settlement runs recovery again if the amendment is still unacknowledged.
     if (this.isRunOccupyingGoalSlot(current.linkedRunId)) return;
-    this.undeliveredAmendments.delete(goalId);
+    this.clearUndeliveredAmendment(goalId, version);
     const orch = current.linkedRunId ? this.db.listTasks(current.linkedRunId).find((t) => t.tier === 1) : undefined;
     const resumed = orch
       ? await this.orchestrator
@@ -2588,6 +2649,7 @@ export class DirectorRuntime {
         // best-effort
       }
     };
+    this.undeliveredAmendments.delete(goal.id);
     attempt(() => this.db.admissionQueue.remove("goal", goal.id));
     const runId = goal.linkedRunId;
     if (runId) {
@@ -2728,6 +2790,10 @@ export class DirectorRuntime {
       if (current?.version !== goal.version || current.status === "paused" || current.status === "cancelled" ||
           (run && this.db.getRun(run.id)?.status === "stopped")) {
         throw new Error(`Goal ${goal.id} changed or stopped during review`);
+      }
+      const pendingAmend = this.undeliveredAmendments.get(goal.id);
+      if (pendingAmend && pendingAmend.version === goal.version) {
+        throw new Error(`Goal ${goal.id} v${goal.version} has an unacknowledged amendment (${pendingAmend.reason})`);
       }
       if (opts?.settledRunStatus === "failed" && run && this.orchestrator.isRunActiveInMemory(run.id)) {
         throw new Error("Run resumed during failed-run verification");
@@ -3407,6 +3473,7 @@ export class DirectorRuntime {
       if (invalidated) {
         // Nothing to act on for a newer version or a paused or cancelled goal.
       } else if (goal.status === "achieved") {
+        this.undeliveredAmendments.delete(goal.id);
         this.db.updateRunStatus(goal.linkedRunId, "completed");
         this.autoResolveGoalEscalations(goal.linkedRunId, `Auto-resolved: goal ${goal.id} achieved`);
         void this.drainGoalQueue(goal.repoRoot).catch(() => {});
