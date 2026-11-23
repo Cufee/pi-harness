@@ -131,6 +131,8 @@ export interface RunAgentRequest {
   extraReadRoots?: string[];
   /** Additional allowed writable directories outside `cwd` (e.g. main `.harness/goals`, `extraWriteRoots`). */
   extraWriteRoots?: string[];
+  /** Extra environment variables for ACP agent subprocesses (e.g. `HARNESS_GOAL_EVIDENCE_DIR`); never overrides PATH. */
+  extraEnv?: Record<string, string>;
   /** Permit shell execution (`Bash`/`shell_command`/`execute`) in `read_only_workspace` (used for verify/Done-Review in isolated checkouts). */
   allowShellInReadOnly?: boolean;
   signal: AbortSignal;
