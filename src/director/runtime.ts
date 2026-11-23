@@ -951,7 +951,7 @@ export class DirectorRuntime {
     const known = input.projectId ? this.db.projects.resolveProject(input.projectId) : this.db.projects.getByPath(input.repoRoot);
     const selection = await this.resolveChatSelection({
       ...input,
-      repoRoot: known?.rootPath ?? input.repoRoot,
+      repoRoot: known?.rootPath ?? canonicalProjectPath(input.repoRoot),
       projectId: known?.id ?? input.projectId ?? null,
       profileId: input.profileId ?? known?.defaultProfileId ?? undefined,
       model: input.model !== undefined ? input.model : known?.defaultModel ?? undefined,
@@ -1085,7 +1085,7 @@ export class DirectorRuntime {
   /** openDefaultChat that also reports whether it registered the workspace as a new project (and noted it in the chat). */
   async openDefaultChatDetailed(input: ChatSelection): Promise<{ session: ChatSessionRecord; projectRegistered: boolean }> {
     const known = input.projectId ? this.db.projects.resolveProject(input.projectId) : this.db.projects.getByPath(input.repoRoot);
-    const repoRoot = known?.rootPath ?? input.repoRoot;
+    const repoRoot = known?.rootPath ?? canonicalProjectPath(input.repoRoot);
     const knownId = known?.id ?? input.projectId ?? null;
     const existing = (knownId ? this.chats.getProjectSession(knownId) : null) ?? this.chats.getWorkspaceSession(repoRoot);
     const selection = existing
@@ -1103,18 +1103,19 @@ export class DirectorRuntime {
     const project = ensured?.project ?? known;
     const projectId = project?.id ?? input.projectId ?? null;
     if (project) this.db.projects.touchProject(project.id);
-    let session: ChatSessionRecord;
+    const projectRegistered = Boolean(ensured?.created);
     if (existing) {
       const bound =
         projectId && existing.projectId !== projectId
           ? this.chats.updateSession(existing.id, { projectId, repoRoot: project?.rootPath ?? repoRoot })
           : existing;
-      session = await this.resolveOrMigrateSessionModel(bound);
-    } else {
-      session = this.chats.getOrCreateDefault({ ...selection!, repoRoot: project?.rootPath ?? repoRoot, projectId });
+      // Note the registration before the model reconciliation await, so a failed reconciliation cannot lose it.
+      if (projectRegistered) this.noteProjectRegistered(bound.id, ensured!.project);
+      return { session: await this.resolveOrMigrateSessionModel(bound), projectRegistered };
     }
-    if (ensured?.created) this.noteProjectRegistered(session.id, ensured.project);
-    return { session, projectRegistered: Boolean(ensured?.created) };
+    const session = this.chats.getOrCreateDefault({ ...selection!, repoRoot: project?.rootPath ?? repoRoot, projectId });
+    if (projectRegistered) this.noteProjectRegistered(session.id, ensured!.project);
+    return { session, projectRegistered };
   }
 
   switchChatProject(chatSessionId: string, projectRef: string): { session: ChatSessionRecord; project: ReturnType<ControlPlaneDb["projects"]["resolveProject"]> } {
@@ -3032,11 +3033,16 @@ export class DirectorRuntime {
 
       case "session_create": {
         if (!this.peerBridge) {
-          const created = await this.createChat({
+          const { session: created, projectRegistered } = await this.createChatDetailed({
             repoRoot,
             title: typeof args.title === "string" ? args.title : undefined,
           });
-          return { host: "local", address: `local:${created.id}`, session: created };
+          return {
+            host: "local",
+            address: `local:${created.id}`,
+            session: created,
+            ...(projectRegistered ? { projectRegistered: true } : {}),
+          };
         }
         return await this.peerBridge.createSession({
           localFallbackRepoRoot: repoRoot,

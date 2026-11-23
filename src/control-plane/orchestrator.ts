@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { HarnessConfig, RunnerProfileConfig } from "../config.js";
 import type { ModelCatalogCompiler } from "../catalog/compiler.js";
 import type { QuotaClient } from "../quota/client.js";
@@ -517,7 +517,7 @@ export class HarnessOrchestrator {
       const runs = this.listDirectorTaskRuns(ownerId);
       if (runs.length === 0) return { children: [] };
       const [primary, ...others] = runs.map((r) => ownerTask(r.id).id);
-      const ids = Array.isArray(args.ids) ? args.ids.map(String) : undefined;
+      const ids = Array.isArray(args.ids) ? args.ids.map((id) => this.db.getTask(String(id))?.id ?? String(id)) : undefined;
       const fallbackSec =
         typeof args.fallback_interval_s === "number"
           ? args.fallback_interval_s
@@ -545,8 +545,15 @@ export class HarnessOrchestrator {
     const root = canonicalProjectPath(repoRoot);
     const run =
       (taskRunId && directorTaskRunOwner(taskRunId) === ownerId ? this.db.getRun(taskRunId) : null) ??
-      (name === "spawn_task" ? null : this.listDirectorTaskRuns(ownerId).find((r) => canonicalProjectPath(r.repoRoot) === root)) ??
-      (await this.ensureDirectorTaskRun(ownerId, repoRoot));
+      (name === "spawn_task"
+        ? await this.ensureDirectorTaskRun(ownerId, repoRoot)
+        : this.listDirectorTaskRuns(ownerId).find((r) => canonicalProjectPath(r.repoRoot) === root));
+    if (!run) {
+      // Reads and cancels never create a bucket; answer as an empty bucket would.
+      if (name === "cancel_task") throw new Error(`Unknown child task ${String(args.task_id)}`);
+      if (typeof args.path === "string" && args.path) throw new Error(`No indexed dossier in this run: ${resolve(root, args.path)}`);
+      return { artifacts: [] };
+    }
     signal?.throwIfAborted();
     // The caller's turn signal travels separately from code_exec's scriptSignal (the synthetic owner is completed).
     return this.toolExecutor.execute(run.id, ownerTask(run.id).id, name, args, undefined, signal);
@@ -2357,7 +2364,6 @@ export class HarnessOrchestrator {
       return { children: targets, wakeReason: "already_settled", inactiveTaskIds: [] };
     }
 
-    const targetIdSet = new Set(targets.map((t) => t.id));
     if (parent.status === "running") this.db.updateTask(parentId, { status: "waiting_children" });
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -2394,8 +2400,9 @@ export class HarnessOrchestrator {
         if (!runIds.has(ev.runId)) return;
         if (ev.type === "escalation.created") {
           const p = ev.payload as { fromTaskId?: string; severity?: string } | null;
-          if ((p?.fromTaskId && targetIdSet.has(p.fromTaskId)) || p?.severity === "P0" || p?.severity === "P1") {
-            targets = getTargets();
+          // Re-read the targets so a child added after the wait started can wake it with its own escalation.
+          targets = getTargets();
+          if ((p?.fromTaskId && targets.some((t) => t.id === p.fromTaskId)) || p?.severity === "P0" || p?.severity === "P1") {
             finish("escalation");
             return;
           }
