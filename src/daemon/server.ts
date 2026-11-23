@@ -38,7 +38,7 @@ import { compactTaskHandoff } from "../control-plane/handoffs.js";
 import { directorTaskRunOwner } from "../control-plane/ids.js";
 import { canonicalProjectPath, type ProjectRecord } from "../control-plane/projects.js";
 import type { ChatSessionRecord } from "../director/session.js";
-import { HarnessOrchestrator, isDirectorTaskContainer, type CustomRunnerFactory } from "../control-plane/orchestrator.js";
+import { deriveRunStatus, HarnessOrchestrator, isDirectorTaskContainer, type CustomRunnerFactory } from "../control-plane/orchestrator.js";
 import { loadOrCreateNodeId, parseSessionAddress, type SessionMessageRecord } from "../control-plane/session-messages.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { summarizeCost } from "../cost/ledger.js";
@@ -339,7 +339,7 @@ export class HarnessDaemon {
       if (next.kind === "goal.reviewed") {
         const curGoal = this.director.goals.getGoal(next.goalId);
         if (!curGoal || curGoal.version > next.goalVersion || curGoal.status === "cancelled") continue;
-        if (next.status === "awaiting_human" && ["executing", "verifying", "reviewing"].includes(curGoal.status)) continue;
+        if (next.status === "awaiting_human" && ["executing", "verifying", "reviewing", "achieved"].includes(curGoal.status)) continue;
       }
       void this.runDirectorWakeupTurn(chatSessionId, next);
       return;
@@ -2474,17 +2474,13 @@ export class HarnessDaemon {
         });
 
       case "goal.commit": {
-        // One shared start-or-resume contract: the Director's detailed result is returned as is.
-        const priorRunId = this.director.goals.getGoal(String(p.goalId))?.linkedRunId ?? null;
-        const priorRunStatus = priorRunId ? this.orchestrator.getEffectiveRun(priorRunId)?.status : undefined;
+        // One shared start-or-resume contract (it also clears the previous epoch's claims on an in-place resume);
+        // the Director's detailed result, read after that clear, is returned as is.
         const res = await this.director.commitGoalDetailed(String(p.goalId), {
           profileId: typeof p.profileId === "string" ? p.profileId : undefined,
           model: typeof p.model === "string" ? p.model : undefined,
           effort: typeof p.effort === "string" ? p.effort : undefined,
         });
-        if (priorRunId && res.goal.linkedRunId === priorRunId) {
-          this.director.onRunResumed(priorRunId, priorRunStatus, res.outcome === "resumed");
-        }
         return {
           ...res.goal,
           outcome: res.outcome,
@@ -2568,17 +2564,12 @@ export class HarnessDaemon {
         return this.director.goals.listRevisions(String(p.goalId));
 
       case "goal.resume": {
-        const before = this.director.goals.getGoal(String(p.goalId));
-        if (!before) throw new Error(`Unknown goal ${p.goalId}`);
-        const priorRunStatus = before.linkedRunId ? this.orchestrator.getEffectiveRun(before.linkedRunId)?.status : undefined;
+        if (!this.director.goals.getGoal(String(p.goalId))) throw new Error(`Unknown goal ${p.goalId}`);
         // Delegated once to the shared contract; never re-derives or overwrites a newer pause after the await.
         const res = await this.director.resumeGoalDetailed(String(p.goalId), {
           note: typeof p.note === "string" ? p.note : undefined,
         });
         const resumed = res.outcome === "resumed" || res.outcome === "started";
-        if (before.linkedRunId && res.goal.linkedRunId === before.linkedRunId) {
-          this.director.onRunResumed(before.linkedRunId, priorRunStatus, res.outcome === "resumed");
-        }
         return {
           resumed,
           goal: res.goal,
@@ -2866,8 +2857,10 @@ export class HarnessDaemon {
           .filter((r): r is NonNullable<typeof r> => r !== null)
           .sort((a, b) => b.createdAt - a.createdAt)
           .map((raw) => {
-            const run = this.orchestrator.getEffectiveRun(raw.id) ?? raw;
-            const tasks = this.db.listTasks(run.id);
+            // Read-only projection: derive the status in memory; never persist it from a snapshot.
+            const tasks = this.db.listTasks(raw.id);
+            const status = deriveRunStatus(raw, tasks, this.orchestrator.isRunActiveInMemory(raw.id));
+            const run = status === raw.status ? raw : { ...raw, status };
             const escalations = this.db.listEscalations(run.id);
             return {
               run,

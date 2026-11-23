@@ -27,7 +27,6 @@ import { timerMatchesGoalSettlement, type TimerRecord } from "../control-plane/t
 import {
   ensureGoalEvidenceDir,
   GoalEngine,
-  goalEvidenceDir,
   parseGoalCriterionPatches,
   shouldRunIndependentReview,
   type CriterionEvaluation,
@@ -37,7 +36,7 @@ import {
   type GoalReviewVerdict,
   type VerificationMode,
 } from "../goals/engine.js";
-import { isBlockedPhase, isCurrentClaim, type GoalLiveProgress, type GoalProgressSource } from "../goals/live-progress.js";
+import { isAuthoritativeSource, isBlockedPhase, isCurrentClaim, type GoalLiveProgress, type GoalProgressSource } from "../goals/live-progress.js";
 import {
   formatChatEventForModel,
   formatChatEventSummary,
@@ -1626,6 +1625,8 @@ export class DirectorRuntime {
       const extra = { runStatus: res.runStatus, resumedTaskIds: res.resumedTaskIds };
       if (res.outcome === "resumed" || res.outcome === "already_active") {
         this.db.admissionQueue.remove("goal", goal.id);
+        // Every in-place resume (RPC, Director tool, timer) starts the new epoch here, before the goal is re-read.
+        this.onRunResumed(linked.id, linked.status, res.outcome === "resumed");
         const fresh = this.goals.getGoal(goal.id)!;
         // A pause or cancel that arrived while resuming wins; its own stopRun stops the run again.
         const pausedSince = (this.goalPauseEpoch.get(goal.id) ?? 0) !== pauseEpochBefore;
@@ -2056,7 +2057,7 @@ export class DirectorRuntime {
     if (!lp || lp.verificationStatus !== "failed") return null;
     if (hasClaimProvenance(lp)) {
       if (!isCurrentClaim(goal, lp)) return null;
-      if (lp.source !== "coordinator" && lp.source !== "director" && lp.source !== "verify_task") return null;
+      if (!isAuthoritativeSource(lp.verificationSource ?? lp.source)) return null;
     } else {
       const tier1 = goal.linkedRunId
         ? this.db.listTasks(goal.linkedRunId).find((t) => t.tier === 1 && t.profileId !== "director")
@@ -2068,10 +2069,12 @@ export class DirectorRuntime {
         ...this.goals.listReviews(goal.id).filter((r) => r.goalVersion === goal.version).map((r) => r.createdAt),
       );
       const revisionAt = this.goals.getLatestRevisionCreatedAt(goal.id, goal.version) ?? 0;
-      if (lp.updatedAt <= newestReview || lp.updatedAt <= revisionAt) return null;
+      // Summary-only patches refresh updatedAt; claimedAt keeps when the legacy status was reported.
+      const claimedAt = lp.claimedAt ?? lp.updatedAt;
+      if (claimedAt <= newestReview || claimedAt <= revisionAt) return null;
     }
     return {
-      source: lp.source ?? "coordinator",
+      source: lp.verificationSource ?? lp.source ?? "coordinator",
       summary: lp.summary,
       criteriaResults: (lp.criteriaResults ?? []).filter((c) => !c.passed),
       claimedAt: lp.claimedAt ?? lp.updatedAt,
@@ -2289,6 +2292,10 @@ export class DirectorRuntime {
       const summary =
         `[${by} ACCEPTED OVERRIDE] ${reason} (${evidenceSummary})` +
         (failedDeterministic.length ? ` [deterministic override: ${failedDeterministic.join(", ")}]` : "");
+      // A pause, amend or cancel during the gates aborts this slot: never commit over it.
+      if (slot.signal.aborted) {
+        throw slot.signal.reason instanceof Error ? slot.signal.reason : new Error(`goal_accept for ${goal.id} was interrupted`);
+      }
       const outcome = this.goals.acceptGoalOverride(goal.id, {
         expectedVersion: goal.version,
         criteriaResults,
@@ -2302,9 +2309,9 @@ export class DirectorRuntime {
     } catch (err) {
       if (!committed) {
         try {
+          // Undo only the gates' own "verifying" state; a newer pause, cancel or other transition stands.
           const current = this.goals.getGoal(goal.id);
-          if (current && current.version === goal.version && current.status !== prevStatus && current.status !== "achieved" &&
-              current.status !== "cancelled") {
+          if (current && current.version === goal.version && current.status === "verifying" && prevStatus !== "verifying") {
             this.goals.setStatus(goal.id, prevStatus);
           }
         } catch {
@@ -2537,7 +2544,10 @@ export class DirectorRuntime {
           .at(-1);
         const lp = goal.liveProgress;
         const confirmedAfterBounce =
-          lp != null && isCurrentClaim(goal, lp) && (lp.verificationStatus === "passed" || lp.verificationStatus === "not_needed");
+          lp != null &&
+          isCurrentClaim(goal, lp) &&
+          isAuthoritativeSource(lp.verificationSource ?? lp.source) &&
+          (lp.verificationStatus === "passed" || lp.verificationStatus === "not_needed");
         const unconfirmedBounce = !coordinatorFailure && lastReview?.source === "coordinator_failed" && !confirmedAfterBounce;
         if (coordinatorFailure || unconfirmedBounce) {
           const coveredIds = new Set(gateResult.results.map((r) => r.criterionId));
@@ -2614,15 +2624,20 @@ export class DirectorRuntime {
       const reviewerMaxTurns = this.config.rollover.reviewerMaxTurns;
       const goalsDir = join(goal.repoRoot, ".harness", "goals");
       const artifactsDir = resolve(goal.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts");
-      const evidenceDir = ensureGoalEvidenceDir(goal.repoRoot, goal.id) ?? goalEvidenceDir(goal.repoRoot, goal.id);
+      // A rejected (e.g. symlinked) evidence directory is never advertised or granted to the reviewer.
+      const evidenceDir = ensureGoalEvidenceDir(goal.repoRoot, goal.id);
       const reviewerPrompt = this.goals.buildReviewerPrompt(goal, gateResult, diffStat, diffPatch, {
         reviewerMaxTurns,
-        evidence: {
-          goalEvidenceDir: evidenceDir,
-          goalsDir,
-          artifactsDir,
-          ...(run ? { runArtifactsDir: join(artifactsDir, run.id) } : {}),
-        },
+        ...(evidenceDir !== null
+          ? {
+              evidence: {
+                goalEvidenceDir: evidenceDir,
+                goalsDir,
+                artifactsDir,
+                ...(run ? { runArtifactsDir: join(artifactsDir, run.id) } : {}),
+              },
+            }
+          : {}),
         ...(coordinatorFailure ? { coordinatorFailure } : {}),
       });
       // Prefer an independent model family different from the authoring run's Tier 1/Tier 2 model
@@ -2708,7 +2723,7 @@ export class DirectorRuntime {
       const failedSummary = "Independent reviewer failed before completing verification.";
       const failReviewer = (msg: string) => {
         if (this.db.getTask(reviewerTask.id)?.status !== "running") return;
-        if (reviewerSignal.aborted) {
+        if (reviewerSignal.aborted && !(timedOut && !signal.aborted)) {
           this.db.updateTask(reviewerTask.id, { status: "cancelled", summary: "Reviewer cancelled" });
           return;
         }
@@ -2786,10 +2801,12 @@ export class DirectorRuntime {
             extraReadRoots: [
               goalsDir,
               join(goal.repoRoot, ".harness", "artifacts"),
+              // The advertised (possibly nondefault) artifacts root must be readable too.
+              ...(artifactsDir !== join(goal.repoRoot, ".harness", "artifacts") ? [artifactsDir] : []),
               ...(this.config.worktree.extraReadRoots ?? []),
             ],
             extraEnv: {
-              HARNESS_GOAL_EVIDENCE_DIR: evidenceDir,
+              ...(evidenceDir !== null ? { HARNESS_GOAL_EVIDENCE_DIR: evidenceDir } : {}),
               HARNESS_GOAL_ID: goal.id,
               HARNESS_GOALS_DIR: goalsDir,
               HARNESS_ARTIFACTS_DIR: artifactsDir,
@@ -2891,6 +2908,13 @@ export class DirectorRuntime {
       } catch (err) {
         const detail = err instanceof Error ? err.message : String(err);
         failReviewer(detail);
+        // A wall-clock timeout without a verdict is a reviewer failure with the full diagnostic, not a bare abort.
+        if (timedOut && !signal.aborted) {
+          throw new Error(
+            `${failedSummary} (Reviewer did not return a structured verdict before the 10-minute wall-clock limit: ` +
+              `stopReason=timeout, turnsUsed=${turnsUsed}, reviewerMaxTurns=${reviewerMaxTurns} advisory; ${detail})`,
+          );
+        }
         reviewerSignal.throwIfAborted();
         throw new Error(`${failedSummary} (${detail}; turns=${turnsUsed})`);
       } finally {
@@ -3392,7 +3416,8 @@ export class DirectorRuntime {
               .map((stored) => {
                 const g = reconcileGoalWithLiveRun(stored);
                 const queued = g.status === "draft" && g.liveProgress?.phase === "queued" ? g.liveProgress.summary : undefined;
-                const ver = queued ?? (g.reviewCycle > 0 ? `${g.reviewCycle} rev` : deriveGoalVerificationLabel(g));
+                // Live verifying state outranks the review count from earlier cycles.
+                const ver = queued ?? deriveGoalVerificationLabel(g);
                 return `- ${g.id} v${g.version} [${g.status}] "${g.title}" (${ver})`;
               })
               .join("\n")}${
@@ -3857,8 +3882,8 @@ export class DirectorRuntime {
       }
 
       case "goal_list": {
+        // Read-only: queue progress is kept current by admission-queue changes, not by reads.
         const allProjects = Boolean(args.all_projects);
-        this.syncQueuedGoalProgress();
         const goals = (allProjects ? this.goals.listGoals({}) : this.goals.listGoals({ repoRoot, chatSessionId })).map(
           reconcileGoalWithLiveRun,
         );
@@ -3998,7 +4023,6 @@ export class DirectorRuntime {
       }
 
       case "goal_get": {
-        this.syncQueuedGoalProgress();
         const g = this.goals.getGoal(String(args.goal_id));
         if (!g) throw new Error(`Unknown goal ${args.goal_id}`);
         const detail = this.goalDisplayData(g);
@@ -4510,13 +4534,12 @@ function hasClaimProvenance(lp: GoalLiveProgress): boolean {
   return lp.goalVersion !== undefined || lp.runId !== undefined || lp.reviewCycle !== undefined;
 }
 
-/** The goal's canonical evidence directory (created when possible), or null for an id that is not a safe segment. */
+/**
+ * The goal's canonical evidence directory (created when possible), or null when it is not a safe segment or a
+ * path component is not a real directory (e.g. a symlink). A rejected path is never advertised.
+ */
 function goalEvidenceDirOrNull(goal: GoalRecord): string | null {
-  try {
-    return ensureGoalEvidenceDir(goal.repoRoot, goal.id) ?? goalEvidenceDir(goal.repoRoot, goal.id);
-  } catch {
-    return null;
-  }
+  return ensureGoalEvidenceDir(goal.repoRoot, goal.id);
 }
 
 function evidenceDirLines(goal: GoalRecord): string[] {
