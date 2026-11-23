@@ -20,7 +20,7 @@ import type { ArtifactRecord, ControlPlaneDb, RunRecord } from "../control-plane
 import type { CustomRunnerFactory, HarnessOrchestrator } from "../control-plane/orchestrator.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { recordCostInvocation, summarizeCost } from "../cost/ledger.js";
-import type { TimerRecord } from "../control-plane/timers.js";
+import { timerMatchesGoalSettlement, type TimerRecord } from "../control-plane/timers.js";
 import {
   GoalEngine,
   shouldRunIndependentReview,
@@ -436,7 +436,11 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
         delay_seconds: { type: "number", description: "Seconds from now until the timer fires." },
         wake_at: { type: "string", description: "ISO-8601 UTC timestamp to wake at (e.g. quota resetsAt)." },
         reason: { type: "string", description: "Concise description of what to resume or check when the timer fires." },
-        goal_id: { type: "string", description: "Optional Goal ID (e.g. goal-1) associated with this timer." },
+        goal_id: {
+          type: "string",
+          description:
+            "Goal ID (e.g. goal-1) this timer is bound to. Required for wake_on_event 'goal_settled' and for pause_goal/resume_goal. With 'any' it limits the goal-settlement trigger to this Goal.",
+        },
         pause_goal: {
           type: "boolean",
           description: "If true (with goal_id), cleanly pause the Goal now while waiting for the timer.",
@@ -448,7 +452,8 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
         wake_on_event: {
           type: "string",
           enum: ["none", "user_message", "goal_settled", "any"],
-          description: "Optional early-wake/cancel trigger (default: 'none').",
+          description:
+            "Early cancel trigger (default: 'none'). 'user_message': a new user message supersedes the timer. 'goal_settled': requires goal_id; the timer is cancelled when that Goal's run settles, and settlement handling takes over. 'any': a user message, or goal_id settling; without goal_id, ANY Goal of this chat settling.",
         },
       },
     },
@@ -787,10 +792,11 @@ export class DirectorRuntime {
     if (!goal) return;
     if (["achieved", "cancelled", "paused", "verifying", "reviewing"].includes(goal.status)) return;
 
-    // Cancel any chat timers subscribed to `goal_settled` / `any` for this goal (we're handling settlement now)
+    // Cancel this chat's timers whose settlement subscription covers this goal (we're handling settlement now).
+    // A timer bound to a Goal matches only that Goal; only an unbound `any` timer matches every Goal of the chat.
     if (goal.chatSessionId) {
       for (const t of this.db.timers.list({ ownerKind: "chat", ownerId: goal.chatSessionId, status: "pending" })) {
-        if ((t.wakeOnEvent === "goal_settled" || t.wakeOnEvent === "any") && (!t.goalId || t.goalId === goal.id)) {
+        if (timerMatchesGoalSettlement(t, goal)) {
           this.db.timers.cancel(t.id, `goal_settled:${goal.id}`);
         }
       }
@@ -2972,8 +2978,22 @@ export class DirectorRuntime {
         let goalId: string | null = null;
         let runId: string | null = null;
         let pausedGoal = false;
-        if (typeof args.goal_id === "string" && args.goal_id.trim()) {
-          const g = this.goals.getGoal(args.goal_id.trim());
+        // Validate before the pause below so a rejected call never pauses a Goal.
+        const rawWake = args.wake_on_event ?? "none";
+        if (rawWake !== "none" && rawWake !== "user_message" && rawWake !== "goal_settled" && rawWake !== "any") {
+          throw new Error(
+            `Unknown wake_on_event "${String(args.wake_on_event)}". Allowed values: none, user_message, goal_settled, any.`,
+          );
+        }
+        const wakeOnEvent = rawWake;
+        const goalRef = args.goal_id == null ? "" : String(args.goal_id).trim();
+        if (wakeOnEvent === "goal_settled" && !goalRef) {
+          throw new Error(
+            'wake_on_event "goal_settled" requires goal_id (the Goal whose settlement should cancel this timer). To react to a user message or to any Goal of this chat settling, use wake_on_event "any" without goal_id.',
+          );
+        }
+        if (goalRef) {
+          const g = this.goals.getGoal(goalRef);
           if (!g) throw new Error(`Unknown goal ${args.goal_id}`);
           goalId = g.id;
           runId = g.linkedRunId;
@@ -2983,10 +3003,6 @@ export class DirectorRuntime {
             pausedGoal = true;
           }
         }
-        const wakeOnEvent =
-          args.wake_on_event === "user_message" || args.wake_on_event === "goal_settled" || args.wake_on_event === "any"
-            ? args.wake_on_event
-            : "none";
         const timer = this.db.timers.schedule({
           ownerKind: "chat",
           ownerId: chatSessionId,
