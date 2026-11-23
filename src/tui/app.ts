@@ -404,7 +404,7 @@ function createSharedShell(spec: SharedShellContext) {
         tag: "stop",
         text:
           summaryParts.length > 0
-            ? `Stopped ${summaryParts.join(", ")}. Nothing restarts by itself; resume with \`pi-harness resume <run-id>\` or ask the Director to continue.`
+            ? `Stopped ${summaryParts.join(", ")}. Nothing restarts by itself; resume with \`pi-harness resume <run-id>${remoteFlag(spec.remoteHost)}\` or ask the Director to continue.`
             : "No active runs, chats, or reviews were running.",
       });
       await store.refresh();
@@ -763,8 +763,11 @@ function createSharedShell(spec: SharedShellContext) {
               transcript.appendReceipt({ tone: "ok", tag: "resume", text: `Scheduled resume in ${formatDuration(delayMs)}` });
             }
           } else {
-            await spec.client.request("run.resume", { runId: spec.runId, message: parsed.args || undefined });
-            transcript.appendReceipt({ tone: "ok", tag: "resume", text: `Resumed ${spec.runId}` });
+            const res = await spec.client.request<{ resumed?: boolean; outcome?: string; message?: string } | null>("run.resume", {
+              runId: spec.runId,
+              message: parsed.args || undefined,
+            });
+            transcript.appendReceipt({ ...resumeReceipt(res, spec.runId), tag: "resume" });
           }
         } catch (err) {
           transcript.appendReceipt({
@@ -1313,7 +1316,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       }
     } else if (turn.role === "system_notice") {
       const parsed = turn.event ? parseChatControlEvent(turn.event) : null;
-      const summary = parsed ? settledReceiptText(parsed, turn.event) : turn.content;
+      const summary = parsed ? settledReceiptText(parsed, opts.remoteHost) : turn.content;
       const ref: EntityRef | undefined =
         parsed && "goalId" in parsed && parsed.goalId
           ? { kind: "goal", id: parsed.goalId, label: `${parsed.goalId}` }
@@ -1487,7 +1490,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       const ref: EntityRef | undefined = goalId ? { kind: "goal", id: goalId, runId: ev.runId || undefined, label: goalId } : undefined;
       if (ref) shell.recordRef(ref);
       const summary = parsed
-        ? settledReceiptText(parsed, p)
+        ? settledReceiptText(parsed, opts.remoteHost)
         : sanitizeLine(String(p.summary ?? p.title ?? p.status ?? ev.type));
       shell.transcript.appendReceipt({
         glyph: shell.theme.glyphs.diamond,
@@ -1752,7 +1755,7 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
         text:
           `${ev.type}: ${status}${p.summary ? ` — ${sanitizeLine(String(p.summary))}` : ""}` +
           (ev.type === "run.status" && p.reason ? ` — ${sanitizeLine(String(p.reason))}` : "") +
-          (ev.type === "run.status" && status === "stopped" ? ` (resume: pi-harness resume ${ev.runId})` : ""),
+          (ev.type === "run.status" && status === "stopped" ? ` (resume: pi-harness resume ${ev.runId}${remoteFlag(opts.remoteHost)})` : ""),
         ref,
       });
       shell.session.tui.requestRender();
@@ -1807,14 +1810,25 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
   }
 }
 
-/**
- * Receipt text for a chat control event. A goal.settled that did not complete also shows the recorded
- * cause from the raw event (when present) and the concrete resume command for its run.
- */
-function settledReceiptText(parsed: NonNullable<ReturnType<typeof parseChatControlEvent>>, raw: unknown): string {
-  const base = formatChatEventSummary(parsed);
-  if (parsed.kind !== "goal.settled" || parsed.runStatus === "completed") return base;
-  const detail = raw && typeof raw === "object" ? (raw as { detail?: unknown }).detail : undefined;
-  const cause = typeof detail === "string" && detail.trim() ? sanitizeLine(detail.trim()) : `no cause recorded; inspect with pi-harness tree ${parsed.runId}`;
-  return `${base} — ${cause} (resume: pi-harness resume ${parsed.runId})`;
+/** Receipt text for a chat control event; CLI commands it cites target `remoteHost` when attached to one. */
+function settledReceiptText(parsed: NonNullable<ReturnType<typeof parseChatControlEvent>>, remoteHost?: string | null): string {
+  return sanitizeLine(formatChatEventSummary(parsed, { remoteHost }));
+}
+
+function remoteFlag(remoteHost?: string | null): string {
+  return remoteHost ? ` --remote ${remoteHost}` : "";
+}
+
+/** Receipt for a run.resume reply: success only when the daemon reports it resumed something. */
+function resumeReceipt(
+  res: { resumed?: boolean; outcome?: string; message?: string } | null | undefined,
+  runId: string,
+): { tone: "ok" | "info" | "warn"; text: string } {
+  const outcome = res?.outcome ?? (res?.resumed ? "resumed" : undefined);
+  const message = res?.message?.trim();
+  if (outcome === "resumed") return { tone: "ok", text: message || `Resumed ${runId}` };
+  if (outcome === "already_active" || outcome === "already_queued" || outcome === "already_completed" || outcome === "waiting") {
+    return { tone: "info", text: message || `${runId}: ${outcome.replace(/_/g, " ")}` };
+  }
+  return { tone: "warn", text: message || `${runId} was not resumed${outcome ? ` (${outcome.replace(/_/g, " ")})` : " (no reply from the daemon)"}` };
 }
