@@ -152,11 +152,16 @@ export class PiRunner {
     let wrapUpTurnsLeft = 0;
     // Set once the run can take no more turns: a steer arriving then is refused instead of being acknowledged and dropped.
     let runEnded = false;
+    // Loop guard for turns opened only to deliver queued steering (runner-wide budget).
+    let steerContinuations = 0;
+    // Both budgets bound a steering turn: the runner-wide continuation cap and the three-turn wrap-up window.
+    const canScheduleSteeringTurn = () =>
+      steerContinuations < MAX_RUNNER_STEER_CONTINUATIONS && (!wrapUpAttempted || wrapUpTurnsLeft > 1);
 
     req.onHandle?.({
       steer: async (msg: string) => {
-        // The final wrap-up turn is already running: no later turn exists to deliver this message.
-        if (runEnded || (wrapUpAttempted && wrapUpTurnsLeft <= 1)) return false;
+        // No later turn can deliver this message (final wrap-up turn running, or the steering budget spent).
+        if (runEnded || !canScheduleSteeringTurn()) return false;
         steeringQueue.push(msg);
         return true;
       },
@@ -181,8 +186,6 @@ export class PiRunner {
       let preWrapUpText = "";
       // Distinct substantive text of each wrap-up turn, in order, so intermediate findings survive a closing "ok".
       const wrapUpTexts: string[] = [];
-      // Loop guard for turns opened only to deliver queued steering.
-      let steerContinuations = 0;
       for (let turn = 0; ; turn++) {
         req.callbacks.onTurn?.(turn + 1);
         if (cancelled || runAbort.signal.aborted) {
@@ -448,7 +451,7 @@ export class PiRunner {
         if (toolCalls.length === 0) {
           // Every wrap-up turn counts against the three-turn bound, steering continuations included; once the
           // current turn is the last one allowed, nothing is drained that could not run.
-          if (steerContinuations < MAX_RUNNER_STEER_CONTINUATIONS && (!wrapUpAttempted || wrapUpTurnsLeft > 1)) {
+          if (canScheduleSteeringTurn()) {
             const late = req.drainPendingSteers?.() ?? [];
             if (late.length > 0) steeringQueue.push(...late);
             if (steeringQueue.length > 0) {

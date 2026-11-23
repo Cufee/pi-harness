@@ -1028,9 +1028,20 @@ export class DirectorRuntime {
     // Deduplicates verification launches and wakeups only; slot hand-off and queue admission always run.
     // A settlement blocked on a P0 whose arrival already woke the Director is reported by that wake.
     const notifiedP0 = this.notifiedP0Escalations.get(ev.runId);
+    // Matched by identity: every escalation actually blocking the run must be a P0 already reported, so an unrelated
+    // open P0 never hides a distinct blocking escalation.
     const blockedOnNotifiedP0 =
       status === "failed" && cause === "blocked_escalation" && Boolean(notifiedP0) &&
-      this.db.listEscalations(ev.runId, "open").some((e) => e.severity === "P0" && notifiedP0!.has(e.id));
+      (() => {
+        const blockedIds = new Set(
+          this.db
+            .listTasks(ev.runId)
+            .filter((t) => t.profileId !== "director" && (t.status === "blocked" || t.status === "returned_for_rescope"))
+            .map((t) => t.id),
+        );
+        const blocking = this.db.listEscalations(ev.runId, "open").filter((e) => e.blocking && blockedIds.has(e.fromTaskId));
+        return blocking.length > 0 && blocking.every((e) => e.severity === "P0" && notifiedP0!.has(e.id));
+      })();
     const firstNotice = !blockedOnNotifiedP0 && !this.notifiedSettledGoals.has(dedupeKey);
     this.notifiedSettledGoals.add(dedupeKey);
 

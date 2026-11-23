@@ -270,6 +270,11 @@ async function openWorkspaceFile(
 
 /** Flattens JSON-RPC RequestError.data (the ACP SDK wraps thrown agent errors as -32603 `{ details }`, or as the parsed object when the message was JSON). Walks `cause` so re-wrapped errors keep their detail. */
 function acpErrorDetail(err: unknown): string {
+  return acpErrorParts(err).join(" | ").slice(0, 1000);
+}
+
+/** The individual diagnostic strings acpErrorDetail joins, in walk order. */
+function acpErrorParts(err: unknown): string[] {
   const parts: string[] = [];
   // True when `v` carries detail, even if an earlier hop already recorded the same text.
   const push = (v: unknown): boolean => {
@@ -299,7 +304,7 @@ function acpErrorDetail(err: unknown): string {
       break;
     }
   }
-  return parts.join(" | ").slice(0, 1000);
+  return parts;
 }
 
 /**
@@ -1530,7 +1535,11 @@ export class AcpRunner {
               const detail = `${err instanceof Error ? err.message : String(err)} ${acpErrorDetail(err)}`;
               const code = (err as { code?: unknown } | null)?.code;
               const name = err instanceof Error ? err.name : "";
-              const explicitCancel = /\brequest cancel+ed\b|\boperation cancel+ed\b/i;
+              // Only a complete diagnostic field counts: a cancellation phrase quoted inside a longer error is prose.
+              const wholeCancel = /^(?:(?:request|operation|prompt|turn)\s+)?(?:cancell?ed|aborted)(?:\s+by\s+(?:user|client))?\.?$/i;
+              const explicitCancel = [err instanceof Error ? err.message : String(err), ...acpErrorParts(err)].some((f) =>
+                wholeCancel.test(f.trim()),
+              );
               // Structured codes decide first: -32800 (plain or wrapped by an internal error) is a cancellation and any
               // other specific code, however its prose reads, is a genuine RPC error. Only a wrapper with no specific
               // code falls back to a whole-phrase "request cancelled", or a code-less abort.
@@ -1538,8 +1547,8 @@ export class AcpRunner {
               const isCancelled =
                 code === -32800 ||
                 (typeof nested === "number" && nested === -32800) ||
-                (nested === undefined && code === -32603 && explicitCancel.test(detail)) ||
-                (nested === undefined && typeof code !== "number" && (name === "AbortError" || /\babort(ed)?\b/i.test(detail) || explicitCancel.test(detail)));
+                (nested === undefined && code === -32603 && explicitCancel) ||
+                (nested === undefined && typeof code !== "number" && (name === "AbortError" || explicitCancel));
               if (isCancelled && !detectQuotaErrorText(detail).isQuota) {
                 resolvePrompt({ stopReason: "end_turn" });
                 return;
