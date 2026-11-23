@@ -84,6 +84,14 @@ class FailedRunGatesError extends Error {
   }
 }
 
+/** Thrown when a review is requested while an amendment steer is still unacknowledged; the goal state is left untouched. */
+class PendingAmendmentError extends Error {
+  constructor(goalId: string, version: number, reason: string) {
+    super(`Goal ${goalId} v${version} has an unacknowledged amendment (${reason})`);
+    this.name = "PendingAmendmentError";
+  }
+}
+
 const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
     name: "goal_create",
@@ -727,8 +735,9 @@ export class DirectorRuntime {
    */
   private readonly undeliveredAmendments = new Map<
     string,
-    { version: number; steerMsg: string; reason: string; inFlight?: boolean; deferredSettlementEvent?: EventRecord }
+    { attemptId: number; version: number; steerMsg: string; reason: string; inFlight?: boolean; deferredSettlementEvent?: EventRecord }
   >();
+  private nextAmendmentAttemptId = 1;
   private pendingDrainRepos = new Set<string>();
   private pendingDrainAll = false;
 
@@ -1175,6 +1184,8 @@ export class DirectorRuntime {
 
   /** Wakes the Director when automatic verification of a settled run could not finish, with the run's real status. */
   private notifyAutoVerifyFailure(goal: GoalRecord, runId: string, err: unknown): void {
+    // A premature review leaves the pending amendment to decide the settlement; it is not a verification failure.
+    if (err instanceof PendingAmendmentError) return;
     if (!this.unsubRunEvents || !goal.chatSessionId || !this.config.events?.wakeDirectorOnGoalSettle) return;
     const runStatus = this.db.getRun(runId)?.status;
     // A resumed run notifies again when it next settles.
@@ -2270,28 +2281,45 @@ export class DirectorRuntime {
    * recovery, which relaunches Tier 1 on the amended contract once the run settles.
    */
   private trackAmendmentDelivery(goalId: string, version: number, runId: string, orchId: string, steerMsg: string) {
+    const attemptId = this.nextAmendmentAttemptId++;
     let reported = false;
-    /** A settlement deferred while the steer was in flight, taken off the entry for `version`. */
+    /** Set once this attempt wrote the pending entry; from then on only its own still-present entry may act. */
+    let armed = false;
+    const isActive = () => this.undeliveredAmendments.get(goalId)?.attemptId === attemptId;
+    /**
+     * Whether this attempt may still record or settle the amendment. An armed attempt whose entry was consumed by
+     * recovery, acknowledged, or cleared by pause, cancel or a newer amendment is finished: late outcomes are ignored.
+     */
+    const owns = () => {
+      if (armed) return isActive();
+      const entry = this.undeliveredAmendments.get(goalId);
+      return !entry || entry.attemptId === attemptId || entry.version !== version;
+    };
+    /** A settlement deferred while the steer was in flight, taken off this attempt's entry. */
     const takeDeferred = (): EventRecord | undefined => {
       const prior = this.undeliveredAmendments.get(goalId);
-      return prior?.version === version ? prior.deferredSettlementEvent : undefined;
+      return prior?.attemptId === attemptId ? prior.deferredSettlementEvent : undefined;
     };
     const record = (reason: string, eventReason: string): boolean => {
+      if (!owns()) return false;
       const current = this.goals.getGoal(goalId);
       if (!current || current.version !== version) return false;
-      this.undeliveredAmendments.set(goalId, { version, steerMsg, reason, inFlight: false });
+      armed = true;
+      this.undeliveredAmendments.set(goalId, { attemptId, version, steerMsg, reason, inFlight: false });
       this.db.emitEvent(runId, orchId, "goal.amendment_undelivered", { goalId, version, reason: eventReason });
       return true;
     };
     /** The steer (or initial prompt) carried the amendment: a settlement deferred meanwhile is handled now. */
     const markDelivered = () => {
+      if (!owns()) return;
       const deferred = takeDeferred();
-      this.clearUndeliveredAmendment(goalId, version);
+      if (isActive()) this.undeliveredAmendments.delete(goalId);
       if (deferred) queueMicrotask(() => this.handleControlPlaneEvent(deferred));
     };
     return {
       onOutcome: (accepted: boolean, reason: string) => {
         reported = true;
+        if (!owns()) return;
         if (accepted || reason === "rolled_over") {
           markDelivered();
           return;
@@ -2303,19 +2331,28 @@ export class DirectorRuntime {
       /** A live steer is about to be awaited: settlements arriving before its answer are deferred, never verified. */
       armInFlight: () => {
         if (this.goals.getGoal(goalId)?.version !== version) return;
-        this.undeliveredAmendments.set(goalId, { version, steerMsg, reason: "amendment delivery awaiting acknowledgement", inFlight: true });
+        armed = true;
+        this.undeliveredAmendments.set(goalId, {
+          attemptId,
+          version,
+          steerMsg,
+          reason: "amendment delivery awaiting acknowledgement",
+          inFlight: true,
+        });
       },
       markDelivered,
       /** The live steer was refused; a settlement arriving during the fallback below is no longer deferred. */
       markAnswered: () => {
         const prior = this.undeliveredAmendments.get(goalId);
-        if (prior?.version === version) prior.inFlight = false;
+        if (prior?.attemptId === attemptId) prior.inFlight = false;
       },
       /** A steer queued for the runner handle: pending until its outcome arrives (unless it already did). */
       armQueued: () => {
-        if (reported) return;
+        if (reported || !owns()) return;
         const deferred = takeDeferred();
+        armed = true;
         this.undeliveredAmendments.set(goalId, {
+          attemptId,
           version,
           steerMsg,
           reason: "queued for runner handle; awaiting acknowledgement",
@@ -2750,6 +2787,9 @@ export class DirectorRuntime {
     if (!goal) throw new Error(`Unknown goal ${goalId}`);
     if (this.activeReviews.has(goal.id)) throw new Error(`Review already in progress for ${goal.id}`);
     if (goal.status === "paused" || goal.status === "cancelled") throw new Error(`Goal is ${goal.status}`);
+    // An unacknowledged amendment decides this settlement itself: reject without touching the goal or its recovery.
+    const pendingAmend = this.undeliveredAmendments.get(goal.id);
+    if (pendingAmend && pendingAmend.version === goal.version) throw new PendingAmendmentError(goal.id, goal.version, pendingAmend.reason);
     const abort = new AbortController();
     this.activeReviews.set(goal.id, abort);
     const reviewSignal = signal ? AbortSignal.any([abort.signal, signal]) : abort.signal;
@@ -2776,7 +2816,7 @@ export class DirectorRuntime {
         try {
           const current = this.goals.getGoal(goal.id);
           if (current?.version === goal.version && ["executing", "verifying", "reviewing"].includes(current.status)) {
-            if (this.isRunOccupyingGoalSlot(current.linkedRunId)) {
+            if (error instanceof PendingAmendmentError || this.isRunOccupyingGoalSlot(current.linkedRunId)) {
               if (current.status !== goal.status) this.goals.setStatus(goal.id, goal.status);
             } else {
               const msg = error instanceof Error ? error.message : String(error);
@@ -2824,7 +2864,7 @@ export class DirectorRuntime {
       }
       const pendingAmend = this.undeliveredAmendments.get(goal.id);
       if (pendingAmend && pendingAmend.version === goal.version) {
-        throw new Error(`Goal ${goal.id} v${goal.version} has an unacknowledged amendment (${pendingAmend.reason})`);
+        throw new PendingAmendmentError(goal.id, goal.version, pendingAmend.reason);
       }
       if (opts?.settledRunStatus === "failed" && run && this.orchestrator.isRunActiveInMemory(run.id)) {
         throw new Error("Run resumed during failed-run verification");
