@@ -76,6 +76,7 @@ export type DaemonOp =
   | "goal.resume"
   | "goal.table_display"
   | "goal.review"
+  | "goal.accept"
   | "goal.pause"
   | "goal.cancel"
   | "run.create"
