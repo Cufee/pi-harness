@@ -193,7 +193,9 @@ export class WorkStore {
     if (this.disposed) return this.snapshot;
     if (this.inflight) {
       this.pendingRefresh = true;
-      return this.inflight;
+      await this.inflight;
+      if (this.inflight) return this.inflight;
+      return this.snapshot;
     }
     this.inflight = this.client
       .request<WorkSnapshot>("work.snapshot", {

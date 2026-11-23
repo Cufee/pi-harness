@@ -77,6 +77,8 @@ export interface GoalsConfig {
   gateTimeoutMs: number;
   /** Automatically run deterministic gates + independent Done-Review when a Goal's linked run settles completed (default true). */
   autoVerifyOnSettle?: boolean;
+  /** Max concurrent in-progress goals per repository (default 4; additional committed goals wait in the admission queue). */
+  maxConcurrentGoals?: number;
 }
 
 export interface EventsConfig {
@@ -295,6 +297,7 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
     defaultMaxNoProgressCycles: 2,
     gateTimeoutMs: 180_000,
     autoVerifyOnSettle: true,
+    maxConcurrentGoals: 4,
     ...(globalCfg.goals as Partial<GoalsConfig> | undefined),
     ...(repoCfg.goals as Partial<GoalsConfig> | undefined),
   };

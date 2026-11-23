@@ -13,7 +13,8 @@ import { resolveLaunchRoute } from "./launch-route.js";
 import type { RunAgentRequest, RunAgentResult, RunnerExecutionHandle } from "../runners/types.js";
 import { BisectingMergeQueue } from "../worktree/merge-queue.js";
 import { nativeToolsPathDirs, resolveExternalMcpServers } from "../tools/native-tools.js";
-import { runGit, WorktreeManager } from "../worktree/manager.js";
+import { runGit, WorktreeConcurrencyLimitError, WorktreeManager } from "../worktree/manager.js";
+import type { QueuePositionInput } from "./admission-queue.js";
 import type { AgentTier, ControlPlaneDb, RunRecord, TaskKind, TaskRecord } from "./db.js";
 import { buildHydrationTurn, buildImmutableSystemPrompt, type AnchoredHandoff } from "./prompts.js";
 import { ControlPlaneToolExecutor, compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./tools.js";
@@ -173,7 +174,22 @@ export class HarnessOrchestrator {
       getTaskSignal: (taskId) => this.active.get(taskId)?.generationSignal,
       getTaskCancelSignal: (taskId) => this.active.get(taskId)?.abort.signal,
       resumeTask: (taskId, opts) => this.resumeTask(taskId, opts),
+      forceStartWorker: (taskId, opts) => this.forceStartWorker(taskId, opts),
     }, config);
+  }
+
+  /** Applies live configuration updates across all cached WorktreeManagers & MergeQueues and wakes queued workers immediately. */
+  updateConfig(next: HarnessConfig, catalog = this.catalog, quota = this.quota): void {
+    Object.assign(this.config, next);
+    this.catalog = catalog;
+    this.quota = quota;
+    for (const mgr of this.worktreeManagers.values()) {
+      mgr.updateConfig(next.worktree);
+    }
+    for (const mq of this.mergeQueues.values()) {
+      mq.updateConfig(next.worktree);
+    }
+    this.db.admissionQueue.notify("worker");
   }
 
   activeTaskCount(): number {
@@ -441,6 +457,8 @@ export class HarnessOrchestrator {
     maxTurns?: number;
     dependsOn?: string[];
     writeScopes?: string[];
+    position?: QueuePositionInput;
+    forceStart?: boolean;
   }): Promise<TaskRecord> {
     const run = this.db.getRun(input.runId);
     if (!run) throw new Error(`Unknown run ${input.runId}`);
@@ -471,18 +489,43 @@ export class HarnessOrchestrator {
 
     // Tier 2 Workers get their own isolated git worktree automatically when ready (deferred for `pending`
     // tasks waiting on `depends_on` so they branch off fresh HEAD after their dependency merges!).
-    // Plain non-git project folders run workers directly in `run.repoRoot` without failing on git worktree setup.
+    // If `maxConcurrentWorkers` is reached, queue the worker cleanly in `admissionQueue` instead of failing!
     if (task.tier === 2 && task.status === "ready") {
       const wtMgr = this.getWorktreeManager(run.repoRoot);
       if (wtMgr.isGitRepo()) {
-        this.allocatingWorktrees.add(task.id);
-        try {
-          await wtMgr.createForWorker(run.id, task.id);
-        } catch (error) {
-          this.db.updateTask(task.id, { status: "failed", summary: "Could not allocate the worker worktree." });
-          throw error;
-        } finally {
-          this.allocatingWorktrees.delete(task.id);
+        const queuedAhead = this.db.admissionQueue.list({ lane: "worker", repoRoot: run.repoRoot });
+        if (!input.forceStart && queuedAhead.length > 0) {
+          const qEntry = this.db.admissionQueue.enqueue({
+            lane: "worker",
+            repoRoot: run.repoRoot,
+            targetId: task.id,
+            position: input.position,
+            forceStart: false,
+            note: task.title,
+          });
+          this.db.updateTask(task.id, { summary: `Queued for worker slot (#${qEntry.position})` });
+        } else {
+          this.allocatingWorktrees.add(task.id);
+          try {
+            await wtMgr.createForWorker(run.id, task.id, undefined, { force: Boolean(input.forceStart) });
+          } catch (error) {
+            if (error instanceof WorktreeConcurrencyLimitError || String(error).includes("concurrency cap reached")) {
+              const qEntry = this.db.admissionQueue.enqueue({
+                lane: "worker",
+                repoRoot: run.repoRoot,
+                targetId: task.id,
+                position: input.position,
+                forceStart: false,
+                note: task.title,
+              });
+              this.db.updateTask(task.id, { summary: `Queued for worker slot (#${qEntry.position})` });
+            } else {
+              this.db.updateTask(task.id, { status: "failed", summary: "Could not allocate the worker worktree." });
+              throw error;
+            }
+          } finally {
+            this.allocatingWorktrees.delete(task.id);
+          }
         }
       }
     } else if (task.tier === 3 && input.parentId) {
@@ -799,7 +842,15 @@ export class HarnessOrchestrator {
    */
   async resumeTask(
     taskId: string,
-    opts?: { note?: string; profileId?: string; model?: string; effort?: string; allowCompleted?: boolean },
+    opts?: {
+      note?: string;
+      profileId?: string;
+      model?: string;
+      effort?: string;
+      allowCompleted?: boolean;
+      position?: QueuePositionInput;
+      forceStart?: boolean;
+    },
   ): Promise<TaskRecord> {
     const task = this.db.getTask(taskId);
     if (!task) throw new Error(`Unknown task ${taskId}`);
@@ -828,7 +879,24 @@ export class HarnessOrchestrator {
         const wtMgr = this.getWorktreeManager(run.repoRoot);
         if (wtMgr.isGitRepo()) {
           if (!wt || wt.runId !== run.id || !existsSync(wt.path)) {
-            wt = await wtMgr.createForWorker(run.id, task.id);
+            try {
+              wt = await wtMgr.createForWorker(run.id, task.id, undefined, { force: Boolean(opts?.forceStart) });
+            } catch (err) {
+              if (err instanceof WorktreeConcurrencyLimitError || String(err).includes("concurrency cap reached")) {
+                // Queue cleanly instead of failing!
+                this.db.admissionQueue.enqueue({
+                  lane: "worker",
+                  repoRoot: run.repoRoot,
+                  targetId: task.id,
+                  position: opts?.position,
+                  forceStart: Boolean(opts?.forceStart),
+                  note: task.title,
+                });
+                wt = null;
+              } else {
+                throw err;
+              }
+            }
           } else if (wt.status !== "active") {
             this.db.updateWorktree(wt.id, { status: "active", cleanedAt: null });
           }
@@ -971,14 +1039,31 @@ export class HarnessOrchestrator {
         }
         if (!wt || wt.runId !== task.runId) {
           const wtMgr = this.getWorktreeManager(run.repoRoot);
-          // If worktree concurrency cap is currently full across runs, wait cleanly for a slot instead of failing!
+          // If worktree concurrency cap is currently full across runs, wait cleanly in strict queue order instead of failing!
           while (!wt && wtMgr.isGitRepo() && !exec.abort.signal.aborted) {
+            let qEntry = this.db.admissionQueue.get("worker", task.id);
+            if (!qEntry) {
+              qEntry = this.db.admissionQueue.enqueue({
+                lane: "worker",
+                repoRoot: run.repoRoot,
+                targetId: task.id,
+                note: task.title,
+              });
+            }
+            if (!this.db.admissionQueue.isFrontOrForced("worker", run.repoRoot, task.id)) {
+              await this.waitForWorktreeSlot(run.repoRoot, exec.abort.signal);
+              continue;
+            }
             this.allocatingWorktrees.add(task.id);
             try {
-              wt = await wtMgr.createForWorker(run.id, task.id);
+              wt = await wtMgr.createForWorker(run.id, task.id, undefined, { force: qEntry.forceStart });
+              this.db.admissionQueue.remove("worker", task.id);
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
-              if (!msg.includes("concurrency cap reached")) throw err;
+              if (!(err instanceof WorktreeConcurrencyLimitError) && !msg.includes("concurrency cap reached")) {
+                this.db.admissionQueue.remove("worker", task.id);
+                throw err;
+              }
               this.allocatingWorktrees.delete(task.id);
               await this.waitForWorktreeSlot(run.repoRoot, exec.abort.signal);
               continue;
@@ -986,10 +1071,13 @@ export class HarnessOrchestrator {
               this.allocatingWorktrees.delete(task.id);
             }
           }
-          if (exec.abort.signal.aborted) return;
+          if (exec.abort.signal.aborted) {
+            this.db.admissionQueue.remove("worker", task.id);
+            return;
+          }
         }
       }
-      if (toolPolicy === "read_write_workspace" && (!wt || wt.runId !== task.runId)) {
+      if (toolPolicy === "read_write_workspace" && this.getWorktreeManager(run.repoRoot).isGitRepo() && (!wt || wt.runId !== task.runId)) {
         throw new Error("A writable agent requires its assigned worktree.");
       }
       const cwd = wt?.path ?? run.repoRoot;
@@ -1588,21 +1676,81 @@ export class HarnessOrchestrator {
       const finish = () => {
         if (done) return;
         done = true;
-        unsub();
+        unsubEvents();
+        unsubQueue();
         clearTimeout(timer);
         signal.removeEventListener("abort", finish);
         resolve();
       };
-      const unsub = this.db.onEvent((ev) => {
+      const unsubEvents = this.db.onEvent((ev) => {
         if (ev.type === "worktree.removed" || ev.type === "merge.finished" || ev.type === "task.status") {
           const evRun = this.db.getRun(ev.runId);
           if (!evRun || evRun.repoRoot === repoRoot) finish();
         }
       });
+      const unsubQueue = this.db.admissionQueue.onChange((lane) => {
+        if (!lane || lane === "worker") finish();
+      });
       const timer = setTimeout(finish, 10_000);
       timer.unref?.();
       signal.addEventListener("abort", finish, { once: true });
     });
+  }
+
+  /**
+   * Emergency force-start for a queued worker (bypasses `maxConcurrentWorkers`) or a quota-paused
+   * worker (clears passive quota exhaustion when `bypassQuota` is true).
+   */
+  async forceStartWorker(
+    taskId: string,
+    opts?: { bypassQuota?: boolean; reason?: string },
+  ): Promise<{ task: TaskRecord; action: string; warning: string }> {
+    const task = this.db.getTask(taskId);
+    if (!task) throw new Error(`Unknown task ${taskId}`);
+    const warning = "Force-start bypasses admission/quota protections; use sparingly for urgent work only.";
+
+    if (task.status === "paused_quota") {
+      if (!opts?.bypassQuota) {
+        throw new Error(`Task ${taskId} is paused on quota; pass bypass_quota: true to force-start despite quota exhaustion.`);
+      }
+      this.quota.clearPassiveExhaustion(task.profileId);
+      const resumed = await this.resumeTask(taskId, {
+        forceStart: true,
+        note: opts.reason ?? "Force-started bypassing quota pause",
+      });
+      return { task: resumed, action: "force_resumed_from_quota", warning };
+    }
+
+    if (task.status === "pending") {
+      throw new Error(`Task ${taskId} is waiting on unmet depends_on prerequisites, not the concurrency queue.`);
+    }
+
+    const qEntry = this.db.admissionQueue.get("worker", taskId);
+    if (qEntry) {
+      this.db.admissionQueue.markForceStart("worker", taskId);
+      if (!this.active.has(taskId) && task.status === "ready") {
+        this.launchTaskLoop(taskId);
+      }
+      return { task: this.db.getTask(taskId)!, action: "force_admitted_from_queue", warning };
+    }
+
+    if (task.status === "ready") {
+      const run = this.db.getRun(task.runId);
+      if (run) {
+        this.db.admissionQueue.enqueue({
+          lane: "worker",
+          repoRoot: run.repoRoot,
+          targetId: taskId,
+          position: "front",
+          forceStart: true,
+          note: opts?.reason ?? task.title,
+        });
+      }
+      if (!this.active.has(taskId)) this.launchTaskLoop(taskId);
+      return { task: this.db.getTask(taskId)!, action: "force_started_ready_task", warning };
+    }
+
+    throw new Error(`Task ${taskId} is in status '${task.status}' and cannot be force-started.`);
   }
 
   async steerTask(taskId: string, message: string): Promise<boolean> {
@@ -1617,6 +1765,7 @@ export class HarnessOrchestrator {
   }
 
   async cancelTask(taskId: string, reason: string): Promise<void> {
+    this.db.admissionQueue.remove("worker", taskId);
     const exec = this.active.get(taskId);
     if (exec) {
       exec.abort.abort(new Error(reason));

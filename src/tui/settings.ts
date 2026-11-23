@@ -455,6 +455,14 @@ export class SettingsScreen implements Screen {
         values: ["65%", "70%", "75%", "78%", "82%", "85%"],
       },
       {
+        id: "maxConcurrentGoals",
+        label: "Max Concurrent Goals",
+        value: String(c.goals?.maxConcurrentGoals ?? 4),
+        note: "1 | 2 | 3 | 4 | 5 | 6 | 7 | 8",
+        kind: "cycle",
+        values: ["1", "2", "3", "4", "5", "6", "7", "8"],
+      },
+      {
         id: "maxConcurrentWorkers",
         label: "Max Concurrent Workers",
         value: String(c.worktree?.maxConcurrentWorkers ?? 4),
@@ -667,6 +675,13 @@ export class SettingsScreen implements Screen {
         void this.patchConfig(
           { rollover: { ...c.rollover, workerThreshold: Number(nextValue.replace("%", "")) / 100 } },
           `Worker Rollover → ${nextValue}`,
+          ctx,
+        );
+        return;
+      case "maxConcurrentGoals":
+        void this.patchConfig(
+          { goals: { ...c.goals, maxConcurrentGoals: Number(nextValue) } },
+          `Max Concurrent Goals → ${nextValue}`,
           ctx,
         );
         return;

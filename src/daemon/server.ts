@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, realpathSync, statSync, unlinkSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, watch, type FSWatcher } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -180,6 +180,9 @@ export class HarnessDaemon {
   private unsubEvents: (() => void) | null = null;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
   private idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
+  private configWatcher: FSWatcher | null = null;
+  private configReloadTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastConfigRaw = "";
   private autoQuitWhenIdle = false;
   private hasCustomRunner = false;
   private startedAt = Date.now();
@@ -325,7 +328,10 @@ export class HarnessDaemon {
     }
   }
 
-  private applyConfigMutation(next: HarnessConfig, opts?: { profilesChanged?: boolean }): HarnessConfig {
+  private applyConfigMutation(
+    next: HarnessConfig,
+    opts?: { profilesChanged?: boolean; skipSave?: boolean },
+  ): HarnessConfig {
     // Keep default profile pointers valid if a profile was removed or disabled
     const enabledIds = next.profiles.filter((p) => p.enabled !== false).map((p) => p.id);
     const fallback = enabledIds[0];
@@ -343,16 +349,29 @@ export class HarnessDaemon {
 
     const prevEndpoint = JSON.stringify(this.config.quotaEndpoint ?? null);
     const nextEndpoint = JSON.stringify(next.quotaEndpoint ?? null);
+    const prevRemotes = JSON.stringify(this.config.remotes ?? []);
+    const nextRemotes = JSON.stringify(next.remotes ?? []);
     this.config = next;
-    Object.assign(this.orchestrator.config, next);
     if (prevEndpoint !== nextEndpoint) {
       this.quota = new QuotaClient(next.quotaEndpoint);
-      this.orchestrator.quota = this.quota;
     }
     this.catalog = new ModelCatalogCompiler(next, this.quota);
-    this.orchestrator.catalog = this.catalog;
+    // Live-propagate into Orchestrator (WorktreeManagers + MergeQueues + worker queue wakeup) and Director (GoalEngine + goal queue drain)
+    this.orchestrator.updateConfig(next, this.catalog, this.quota);
     this.director.updateConfig(next, this.catalog, this.quota);
-    saveGlobalConfig(next);
+    if (prevRemotes !== nextRemotes) {
+      this.peers.syncRemotes(next.remotes ?? []);
+    }
+
+    if (!opts?.skipSave) {
+      saveGlobalConfig(next);
+      try {
+        const cfgFile = join(next.stateDir, "config.json");
+        if (existsSync(cfgFile)) this.lastConfigRaw = readFileSync(cfgFile, "utf8");
+      } catch {
+        // ignore
+      }
+    }
 
     if (opts?.profilesChanged) {
       this.catalog.invalidateCache();
@@ -360,6 +379,86 @@ export class HarnessDaemon {
       void this.catalog.sync(process.cwd()).catch(() => {});
     }
     return next;
+  }
+
+  /** Watches `<stateDir>/config.json` so edits on disk apply live without restarting `harnessd`. */
+  private startConfigWatcher(): void {
+    const stateDir = this.config.stateDir;
+    const cfgFile = join(stateDir, "config.json");
+    try {
+      mkdirSync(stateDir, { recursive: true });
+      if (existsSync(cfgFile)) {
+        this.lastConfigRaw = readFileSync(cfgFile, "utf8");
+      }
+    } catch {
+      return;
+    }
+
+    const reloadFromDisk = () => {
+      if (!existsSync(cfgFile)) return;
+      let raw: string;
+      try {
+        raw = readFileSync(cfgFile, "utf8");
+      } catch {
+        return;
+      }
+      if (!raw.trim() || raw === this.lastConfigRaw) return;
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        return; // Ignore transient partial writes while editor saves
+      }
+      this.lastConfigRaw = raw;
+      const prevProfiles = JSON.stringify(this.config.profiles);
+      const next: HarnessConfig = {
+        ...this.config,
+        ...(Array.isArray(parsed.profiles) && parsed.profiles.length > 0
+          ? { profiles: parsed.profiles as RunnerProfileConfig[] }
+          : {}),
+        ...(Array.isArray(parsed.remotes) ? { remotes: parsed.remotes as RemoteHostConfig[] } : {}),
+        ...(Array.isArray(parsed.externalMcpServers)
+          ? { externalMcpServers: parsed.externalMcpServers as HarnessConfig["externalMcpServers"] }
+          : {}),
+        ...(typeof parsed.defaultOrchestratorProfile === "string"
+          ? { defaultOrchestratorProfile: parsed.defaultOrchestratorProfile }
+          : {}),
+        ...(typeof parsed.defaultWorkerProfile === "string" ? { defaultWorkerProfile: parsed.defaultWorkerProfile } : {}),
+        ...(typeof parsed.defaultTaskProfile === "string" ? { defaultTaskProfile: parsed.defaultTaskProfile } : {}),
+        ...(parsed.codeMode === "collapsed" || parsed.codeMode === "hybrid" || parsed.codeMode === "off"
+          ? { codeMode: parsed.codeMode }
+          : {}),
+        ...(parsed.codeExec ? { codeExec: { ...this.config.codeExec, ...(parsed.codeExec as HarnessConfig["codeExec"]) } } : {}),
+        ...(parsed.rollover ? { rollover: { ...this.config.rollover, ...(parsed.rollover as HarnessConfig["rollover"]) } } : {}),
+        ...(parsed.worktree ? { worktree: { ...this.config.worktree, ...(parsed.worktree as HarnessConfig["worktree"]) } } : {}),
+        ...(parsed.goals ? { goals: { ...this.config.goals, ...(parsed.goals as HarnessConfig["goals"]) } } : {}),
+        ...(parsed.events ? { events: { ...this.config.events, ...(parsed.events as HarnessConfig["events"]) } } : {}),
+        ...(parsed.catalog ? { catalog: { ...this.config.catalog, ...(parsed.catalog as HarnessConfig["catalog"]) } } : {}),
+        ...(parsed.quotaRetry
+          ? { quotaRetry: { ...this.config.quotaRetry, ...(parsed.quotaRetry as HarnessConfig["quotaRetry"]) } }
+          : {}),
+        ...("quotaEndpoint" in parsed
+          ? { quotaEndpoint: (parsed.quotaEndpoint as HarnessConfig["quotaEndpoint"] | null) ?? undefined }
+          : {}),
+      };
+      const profilesChanged = JSON.stringify(next.profiles) !== prevProfiles;
+      this.applyConfigMutation(next, { profilesChanged, skipSave: true });
+    };
+
+    try {
+      this.configWatcher = watch(stateDir, (_eventType, filename) => {
+        if (filename && filename !== "config.json") return;
+        if (this.configReloadTimer) clearTimeout(this.configReloadTimer);
+        this.configReloadTimer = setTimeout(() => {
+          this.configReloadTimer = null;
+          reloadFromDisk();
+        }, 120);
+        this.configReloadTimer.unref?.();
+      });
+      this.configWatcher.unref?.();
+    } catch {
+      // ignore unsupported fs.watch environments
+    }
   }
 
   async start(): Promise<string> {
@@ -425,6 +524,9 @@ export class HarnessDaemon {
     // Start auto-connect peer links for any configured remote hosts
     this.peers.syncRemotes(this.config.remotes ?? []);
 
+    // Live-watch `<stateDir>/config.json` so external edits apply immediately without restart
+    this.startConfigWatcher();
+
     // Recover any durable inbound peer wakeups that were persisted before a crash/restart
     for (const pending of this.db.sessionMessages.listPendingInboundWakes()) {
       if (!this.director.chats.getSession(pending.toSessionId)) {
@@ -454,6 +556,18 @@ export class HarnessDaemon {
     if (this.sweepTimer) {
       clearInterval(this.sweepTimer);
       this.sweepTimer = null;
+    }
+    if (this.configReloadTimer) {
+      clearTimeout(this.configReloadTimer);
+      this.configReloadTimer = null;
+    }
+    if (this.configWatcher) {
+      try {
+        this.configWatcher.close();
+      } catch {
+        // ignore
+      }
+      this.configWatcher = null;
     }
     for (const t of this.flushRetryTimers.values()) clearTimeout(t);
     this.flushRetryTimers.clear();
@@ -2280,14 +2394,20 @@ export class HarnessDaemon {
         });
 
       case "goal.pause": {
-        const g = this.director.goals.setStatus(String(p.goalId), "paused", "Paused by user");
+        const gid = String(p.goalId);
+        this.db.admissionQueue.remove("goal", gid);
+        const g = this.director.goals.setStatus(gid, "paused", "Paused by user");
         if (g.linkedRunId) await this.orchestrator.stopRun(g.linkedRunId, "Goal paused");
+        void this.director.drainGoalQueue(g.repoRoot).catch(() => {});
         return g;
       }
 
       case "goal.cancel": {
-        const g = this.director.goals.setStatus(String(p.goalId), "cancelled", "Cancelled by user");
+        const gid = String(p.goalId);
+        this.db.admissionQueue.remove("goal", gid);
+        const g = this.director.goals.setStatus(gid, "cancelled", "Cancelled by user");
         if (g.linkedRunId) await this.orchestrator.stopRun(g.linkedRunId, "Goal cancelled");
+        void this.director.drainGoalQueue(g.repoRoot).catch(() => {});
         return g;
       }
 

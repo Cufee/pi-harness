@@ -14,6 +14,7 @@ import type { HarnessConfig } from "../config.js";
 import { resolveLaunchRoute } from "../control-plane/launch-route.js";
 import { compactTaskHandoff, toolsForTier } from "../control-plane/tools.js";
 import { writeCodeOutput, writeTaskDossier } from "../control-plane/dossiers.js";
+import type { AdmissionLane, QueuePositionInput } from "../control-plane/admission-queue.js";
 import type { ControlPlaneDb } from "../control-plane/db.js";
 import type { CustomRunnerFactory, HarnessOrchestrator } from "../control-plane/orchestrator.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
@@ -96,7 +97,8 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   },
   {
     name: "goal_commit",
-    description: "Commit a draft Goal Contract and launch its autonomous Tier 1 Run-Until-Done Orchestrator.",
+    description:
+      "Commit a draft Goal Contract and launch its autonomous Tier 1 Run-Until-Done Orchestrator. If maxConcurrentGoals is full (and force_start is not set), enqueues the goal cleanly in the unified admission queue at `position` (defaults to back) and starts it automatically as soon as capacity opens.",
     inputSchema: {
       type: "object",
       required: ["goal_id", "model"],
@@ -105,6 +107,49 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
         profile_id: { type: "string" },
         model: { type: "string" },
         effort: { type: "string" },
+        position: { description: "Optional queue position when at maxConcurrentGoals: 1-based integer (1 = front), 'front', or 'back'." },
+        force_start: {
+          type: "boolean",
+          description: "Emergency override: start immediately bypassing maxConcurrentGoals. Do NOT abuse — use only for urgent work or explicit user requests.",
+        },
+      },
+    },
+  },
+  {
+    name: "queue_list",
+    description: "Inspect the unified Goal & Worker admission queue (queued items, 1-based positions, active counts, and live concurrency limits).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        lane: { type: "string", enum: ["goal", "worker"], description: "Optional lane filter ('goal' or 'worker')." },
+      },
+    },
+  },
+  {
+    name: "queue_reorder",
+    description: "Move a queued goal or worker to any 1-based position in the unified admission queue ('front', 'back', or integer >= 1).",
+    inputSchema: {
+      type: "object",
+      required: ["target_id", "position"],
+      properties: {
+        lane: { type: "string", enum: ["goal", "worker"], description: "Queue lane (defaults to 'goal' for goal-* IDs, 'worker' for t-* IDs)." },
+        target_id: { type: "string", description: "Queued goal ID (e.g. goal-3) or worker task ID (e.g. t-4)." },
+        position: { description: "Target position: 1-based integer (1 = next up), 'front', or 'back'." },
+      },
+    },
+  },
+  {
+    name: "queue_force_start",
+    description:
+      "Emergency override: force-start a queued goal or worker immediately bypassing maxConcurrentGoals/maxConcurrentWorkers (and optionally bypassing a quota pause when bypass_quota=true). WARNING: Do NOT abuse — use only for urgent high-priority work or explicit user requests.",
+    inputSchema: {
+      type: "object",
+      required: ["target_id"],
+      properties: {
+        lane: { type: "string", enum: ["goal", "worker"], description: "Queue lane (auto-detected from goal-* vs t-* ID if omitted)." },
+        target_id: { type: "string", description: "Goal ID (e.g. goal-3) or worker task ID (e.g. t-4)." },
+        bypass_quota: { type: "boolean", description: "If true, also force-resume a quota-paused goal/worker despite quota exhaustion (use sparingly!)." },
+        reason: { type: "string", description: "Brief justification for bypassing the concurrency or quota limit." },
       },
     },
   },
@@ -729,6 +774,8 @@ export class DirectorRuntime {
     this.config = next;
     this.catalog = catalog;
     this.quota = quota;
+    this.goals.updateConfig(next.goals);
+    void this.drainGoalQueue().catch(() => {});
   }
 
   private async resolveChatSelection(input: ChatSelection) {
@@ -914,10 +961,16 @@ export class DirectorRuntime {
     return this.activeChats.has(chatSessionId);
   }
 
-  async commitGoal(goalId: string, opts?: { profileId?: string; model?: string; effort?: string }): Promise<GoalRecord> {
-    const goal = this.goals.getGoal(goalId);
-    if (!goal) throw new Error(`Unknown goal ${goalId}`);
+  private countActiveGoals(repoRoot: string): number {
+    const ACTIVE = new Set(["executing", "verifying", "reviewing"]);
+    return this.goals.listGoals({ repoRoot }).filter((g) => ACTIVE.has(g.status)).length;
+  }
 
+  private async launchCommittedGoal(
+    goal: GoalRecord,
+    opts?: { profileId?: string; model?: string; effort?: string },
+  ): Promise<GoalRecord> {
+    this.db.admissionQueue.remove("goal", goal.id);
     const criteriaSummary = goal.criteria
       .map((c) => `- [${c.id}] (${c.kind}${c.required ? "*" : ""}) ${c.description}${c.command ? ` [cmd: ${c.command}]` : ""}`)
       .join("\n");
@@ -958,6 +1011,134 @@ export class DirectorRuntime {
     }
     this.db.emitEvent(run.id, null, "goal.committed", { goalId: started.id, version: started.version, title: started.title });
     return started;
+  }
+
+  async commitGoal(
+    goalId: string,
+    opts?: { profileId?: string; model?: string; effort?: string; position?: QueuePositionInput; forceStart?: boolean },
+  ): Promise<GoalRecord> {
+    const goal = this.goals.getGoal(goalId);
+    if (!goal) throw new Error(`Unknown goal ${goalId}`);
+
+    const limit = Math.max(1, this.config.goals.maxConcurrentGoals ?? 4);
+    const activeCount = this.countActiveGoals(goal.repoRoot);
+    const queuedAhead = this.db.admissionQueue.list({ lane: "goal", repoRoot: goal.repoRoot }).filter((e) => e.targetId !== goal.id);
+
+    if (!opts?.forceStart && (activeCount >= limit || queuedAhead.length > 0)) {
+      const qEntry = this.db.admissionQueue.enqueue({
+        lane: "goal",
+        repoRoot: goal.repoRoot,
+        targetId: goal.id,
+        position: opts?.position,
+        forceStart: false,
+        launchOpts: {
+          ...(opts?.profileId ? { profileId: opts.profileId } : {}),
+          ...(opts?.model ? { model: opts.model } : {}),
+          ...(opts?.effort ? { effort: opts.effort } : {}),
+        },
+        note: goal.title,
+      });
+      return this.goals.reportProgress(goal.id, {
+        phase: "queued",
+        summary: `Queued at #${qEntry.position} (${activeCount}/${limit} concurrent goals active)`,
+      });
+    }
+
+    return await this.launchCommittedGoal(goal, opts);
+  }
+
+  private drainingGoals = false;
+
+  /** Admits queued goals in strict queue order whenever capacity opens or `maxConcurrentGoals` increases. */
+  async drainGoalQueue(repoRoot?: string): Promise<string[]> {
+    if (this.disposed || this.drainingGoals) return [];
+    this.drainingGoals = true;
+    const startedIds: string[] = [];
+    try {
+      const limit = Math.max(1, this.config.goals.maxConcurrentGoals ?? 4);
+      const repos = repoRoot
+        ? [repoRoot]
+        : [...new Set(this.db.admissionQueue.list({ lane: "goal" }).map((e) => e.repoRoot))];
+      for (const repo of repos) {
+        while (!this.disposed) {
+          const next = this.db.admissionQueue.peekNext("goal", repo);
+          if (!next) break;
+          const goal = this.goals.getGoal(next.targetId);
+          if (!goal || goal.status === "achieved" || goal.status === "cancelled" || goal.status === "executing") {
+            this.db.admissionQueue.remove("goal", next.targetId);
+            continue;
+          }
+          const activeCount = this.countActiveGoals(repo);
+          if (!next.forceStart && activeCount >= limit) break;
+          const launchOpts = (next.launchOpts ?? {}) as { profileId?: string; model?: string; effort?: string };
+          try {
+            await this.launchCommittedGoal(goal, launchOpts);
+            startedIds.push(goal.id);
+          } catch (err) {
+            this.db.admissionQueue.remove("goal", next.targetId);
+            this.goals.reportProgress(goal.id, {
+              phase: "queue_launch_error",
+              summary: `Failed to launch from queue: ${err instanceof Error ? err.message : String(err)}`,
+            });
+          }
+        }
+      }
+    } finally {
+      this.drainingGoals = false;
+    }
+    return startedIds;
+  }
+
+  /** Emergency force-start for a queued/paused goal or worker (optionally bypassing quota pause). */
+  async forceStartQueuedItem(input: {
+    lane?: AdmissionLane;
+    targetId: string;
+    bypassQuota?: boolean;
+    reason?: string;
+  }): Promise<Record<string, unknown>> {
+    const targetId = input.targetId.trim();
+    const lane: AdmissionLane =
+      input.lane ?? (targetId.startsWith("goal-") || this.goals.getGoal(targetId) ? "goal" : "worker");
+    const warning = "Force-start bypasses admission/quota protections; use sparingly for urgent work only.";
+
+    if (lane === "worker") {
+      return await this.orchestrator.forceStartWorker(targetId, {
+        bypassQuota: input.bypassQuota,
+        reason: input.reason,
+      });
+    }
+
+    const goal = this.goals.getGoal(targetId);
+    if (!goal) throw new Error(`Unknown goal ${targetId}`);
+
+    // If the goal is queued in the admission queue, mark forced and launch immediately!
+    const qEntry = this.db.admissionQueue.get("goal", goal.id);
+    if (qEntry) {
+      this.db.admissionQueue.markForceStart("goal", goal.id);
+      const launched = await this.launchCommittedGoal(
+        goal,
+        (qEntry.launchOpts ?? {}) as { profileId?: string; model?: string; effort?: string },
+      );
+      return { goal: launched, action: "force_started_queued_goal", warning };
+    }
+
+    // If the goal's linked run is quota-paused and bypassQuota is true, force-resume it immediately!
+    if (goal.linkedRunId) {
+      const run = this.db.getRun(goal.linkedRunId);
+      const quotaSt = this.orchestrator.getRunQuotaStatus(goal.linkedRunId);
+      if (run?.status === "paused_quota" || quotaSt) {
+        if (!input.bypassQuota) {
+          throw new Error(`Goal ${goal.id} (${goal.linkedRunId}) is paused on quota; pass bypass_quota: true to force-start despite quota.`);
+        }
+        const resumed = await this.orchestrator.resumeRunFromQuota(goal.linkedRunId, {
+          trigger: "manual",
+          userMessage: input.reason ?? "Force-started bypassing quota pause",
+        });
+        return { goal: this.goals.getGoal(goal.id)!, resumed, action: "force_resumed_goal_from_quota", warning };
+      }
+    }
+
+    throw new Error(`Goal ${goal.id} (status: ${goal.status}) is neither queued nor paused on quota.`);
   }
 
   async amendGoal(
@@ -1501,7 +1682,9 @@ export class DirectorRuntime {
 
       if (goal.status === "achieved") {
         this.db.updateRunStatus(goal.linkedRunId, "completed");
+        void this.drainGoalQueue(goal.repoRoot).catch(() => {});
       } else if (goal.status === "awaiting_human") {
+        void this.drainGoalQueue(goal.repoRoot).catch(() => {});
         const orch = this.db.listTasks(goal.linkedRunId).find((t) => t.tier === 1);
         if (orch) {
           this.db.createEscalation({
@@ -1982,8 +2165,54 @@ export class DirectorRuntime {
           profileId: typeof args.profile_id === "string" ? args.profile_id : undefined,
           model: typeof args.model === "string" ? args.model : undefined,
           effort: typeof args.effort === "string" ? args.effort : undefined,
+          position: args.position as QueuePositionInput | undefined,
+          forceStart: Boolean(args.force_start),
         });
-        return { ...committed, presentation_id: presentGoal(committed) };
+        const qEntry = this.db.admissionQueue.get("goal", committed.id);
+        return {
+          ...committed,
+          ...(qEntry ? { queued: true, queuePosition: qEntry.position } : {}),
+          presentation_id: presentGoal(committed),
+        };
+      }
+
+      case "queue_list": {
+        const lane = args.lane === "goal" || args.lane === "worker" ? (args.lane as AdmissionLane) : undefined;
+        const entries = this.db.admissionQueue.list({ lane, repoRoot });
+        return {
+          repoRoot,
+          activeGoals: this.countActiveGoals(repoRoot),
+          limits: {
+            maxConcurrentGoals: this.config.goals.maxConcurrentGoals ?? 4,
+            maxConcurrentWorkers: this.config.worktree.maxConcurrentWorkers ?? 4,
+          },
+          entries,
+        };
+      }
+
+      case "queue_reorder": {
+        const targetId = String(args.target_id ?? "").trim();
+        if (!targetId) throw new Error("target_id is required");
+        const lane: AdmissionLane =
+          args.lane === "goal" || args.lane === "worker"
+            ? args.lane
+            : targetId.startsWith("goal-") || this.goals.getGoal(targetId)
+              ? "goal"
+              : "worker";
+        const updated = this.db.admissionQueue.reorder(lane, targetId, args.position as QueuePositionInput);
+        return { reordered: updated, queue: this.db.admissionQueue.list({ lane, repoRoot: updated.repoRoot }) };
+      }
+
+      case "queue_force_start": {
+        const targetId = String(args.target_id ?? "").trim();
+        if (!targetId) throw new Error("target_id is required");
+        const lane = args.lane === "goal" || args.lane === "worker" ? (args.lane as AdmissionLane) : undefined;
+        return await this.forceStartQueuedItem({
+          lane,
+          targetId,
+          bypassQuota: Boolean(args.bypass_quota),
+          reason: typeof args.reason === "string" ? args.reason : undefined,
+        });
       }
 
       case "goal_amend": {
@@ -2151,14 +2380,20 @@ export class DirectorRuntime {
       }
 
       case "goal_pause": {
-        const g = this.goals.setStatus(String(args.goal_id), "paused", "Paused by Director");
+        const gid = String(args.goal_id);
+        this.db.admissionQueue.remove("goal", gid);
+        const g = this.goals.setStatus(gid, "paused", "Paused by Director");
         if (g.linkedRunId) await this.orchestrator.stopRun(g.linkedRunId, "Goal paused");
+        void this.drainGoalQueue(g.repoRoot).catch(() => {});
         return { ...g, presentation_id: presentGoal(g) };
       }
 
       case "goal_cancel": {
-        const g = this.goals.setStatus(String(args.goal_id), "cancelled", "Cancelled by Director");
+        const gid = String(args.goal_id);
+        this.db.admissionQueue.remove("goal", gid);
+        const g = this.goals.setStatus(gid, "cancelled", "Cancelled by Director");
         if (g.linkedRunId) await this.orchestrator.stopRun(g.linkedRunId, "Goal cancelled");
+        void this.drainGoalQueue(g.repoRoot).catch(() => {});
         return { ...g, presentation_id: presentGoal(g) };
       }
 

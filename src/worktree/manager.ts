@@ -48,12 +48,31 @@ export interface CleanupReport {
   errors: Array<{ target: string; error: string }>;
 }
 
+export class WorktreeConcurrencyLimitError extends Error {
+  constructor(
+    readonly activeCount: number,
+    readonly limit: number,
+  ) {
+    super(`Worktree concurrency cap reached (${activeCount}/${limit}). Finish or clean a worker first.`);
+    this.name = "WorktreeConcurrencyLimitError";
+  }
+}
+
 export class WorktreeManager {
   constructor(
     private readonly db: ControlPlaneDb,
     private readonly repoRoot: string,
-    private readonly config: WorktreeConfig,
+    private config: WorktreeConfig,
   ) {}
+
+  /** Applies live worktree config updates (e.g. `maxConcurrentWorkers`, `setupCommand`, `ciTimeoutMs`). */
+  updateConfig(next: WorktreeConfig): void {
+    this.config = next;
+  }
+
+  get maxConcurrentWorkers(): number {
+    return Math.max(1, this.config.maxConcurrentWorkers ?? 4);
+  }
 
   get baseDir(): string {
     return resolve(canonicalPath(this.repoRoot), this.config.dir ?? ".harness/worktrees");
@@ -98,7 +117,12 @@ export class WorktreeManager {
     }
   }
 
-  async createForWorker(runId: string, taskId: string, baseSha?: string): Promise<WorktreeRecord> {
+  async createForWorker(
+    runId: string,
+    taskId: string,
+    baseSha?: string,
+    opts?: { force?: boolean },
+  ): Promise<WorktreeRecord> {
     const repoCanon = canonicalPath(this.repoRoot);
     const active = this.db.listWorktrees().filter((w) => {
       if (w.status !== "active" && w.status !== "queued" && w.status !== "bounced") return false;
@@ -110,9 +134,9 @@ export class WorktreeManager {
       }
       return existsSync(w.path);
     });
-    const limit = this.config.maxConcurrentWorkers ?? 4;
-    if (active.length >= limit) {
-      throw new Error(`Worktree concurrency cap reached (${active.length}/${limit}). Finish or clean a worker first.`);
+    const limit = this.maxConcurrentWorkers;
+    if (!opts?.force && active.length >= limit) {
+      throw new WorktreeConcurrencyLimitError(active.length, limit);
     }
 
     const run = this.db.getRun(runId);

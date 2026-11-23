@@ -124,8 +124,12 @@ export class BisectingMergeQueue {
     private readonly db: ControlPlaneDb,
     private readonly worktrees: WorktreeManager,
     private readonly repoRoot: string,
-    private readonly config: WorktreeConfig,
+    private config: WorktreeConfig,
   ) {}
+
+  updateConfig(next: WorktreeConfig): void {
+    this.config = next;
+  }
 
   private async withLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.lockChains.get(lockKey) ?? Promise.resolve();

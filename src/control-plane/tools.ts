@@ -8,6 +8,7 @@ import type { ToolDefinition } from "../runners/types.js";
 import type { KbKind } from "../kb/store.js";
 import type { BisectingMergeQueue } from "../worktree/merge-queue.js";
 import { runGit, type WorktreeManager } from "../worktree/manager.js";
+import type { AdmissionLane, QueuePositionInput } from "./admission-queue.js";
 import { nextUniqueFileName } from "./ids.js";
 import type {
   AgentTier,
@@ -46,6 +47,8 @@ export interface ToolRuntimeHooks {
     maxTurns?: number;
     dependsOn?: string[];
     writeScopes?: string[];
+    position?: QueuePositionInput;
+    forceStart?: boolean;
   }) => Promise<TaskRecord>;
   waitForChildren: (
     parentId: string,
@@ -65,8 +68,17 @@ export interface ToolRuntimeHooks {
   getTaskCancelSignal?: (taskId: string) => AbortSignal | undefined;
   resumeTask?: (
     taskId: string,
-    opts?: { note?: string; profileId?: string; model?: string; effort?: string; allowCompleted?: boolean },
+    opts?: {
+      note?: string;
+      profileId?: string;
+      model?: string;
+      effort?: string;
+      allowCompleted?: boolean;
+      position?: QueuePositionInput;
+      forceStart?: boolean;
+    },
   ) => Promise<TaskRecord>;
+  forceStartWorker?: (taskId: string, opts?: { bypassQuota?: boolean; reason?: string }) => Promise<unknown>;
 }
 
 function requiredModel(args: Record<string, unknown>) {
@@ -167,6 +179,13 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
         model: { type: "string" },
         effort: { type: "string" },
         depends_on: { type: "array", items: { type: "string" } },
+        position: {
+          description: "Optional queue position if maxConcurrentWorkers is full: 1-based integer (1 = next up), 'front', or 'back' (default).",
+        },
+        force_start: {
+          type: "boolean",
+          description: "Emergency override: start immediately bypassing maxConcurrentWorkers. Do NOT abuse — use only for urgent blockers.",
+        },
       },
     },
   },
@@ -688,6 +707,46 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
       },
     },
   },
+  {
+    name: "queue_list",
+    tiers: [1, 2],
+    description: "Inspect the unified admission queue (queued goals & workers, 1-based positions, and active concurrency limits).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        lane: { type: "string", enum: ["goal", "worker"], description: "Optional lane filter ('goal' or 'worker')." },
+      },
+    },
+  },
+  {
+    name: "queue_reorder",
+    tiers: [1, 2],
+    description: "Move a queued worker (or goal) in the admission queue to any 1-based position ('front', 'back', or integer >= 1).",
+    inputSchema: {
+      type: "object",
+      required: ["target_id", "position"],
+      properties: {
+        lane: { type: "string", enum: ["goal", "worker"], description: "Queue lane (defaults to 'worker' for t-* IDs, 'goal' for goal-* IDs)." },
+        target_id: { type: "string", description: "Queued task ID (e.g. t-4) or goal ID (e.g. goal-2)." },
+        position: { description: "Target position: 1-based integer (1 = next up), 'front', or 'back'." },
+      },
+    },
+  },
+  {
+    name: "queue_force_start",
+    tiers: [1],
+    description:
+      "Emergency override: force-start a queued worker immediately bypassing maxConcurrentWorkers (and optionally bypassing a quota pause when bypass_quota=true). WARNING: Do NOT abuse this override — use only for urgent blockers or explicit user requests.",
+    inputSchema: {
+      type: "object",
+      required: ["target_id"],
+      properties: {
+        target_id: { type: "string", description: "Queued or quota-paused worker task ID (e.g. t-4)." },
+        bypass_quota: { type: "boolean", description: "If true, also force-resume even when paused on quota (use sparingly!)." },
+        reason: { type: "string", description: "Brief justification for bypassing the limit." },
+      },
+    },
+  },
 ];
 
 export function toolsForTier(tier: AgentTier): ToolDefinition[] {
@@ -864,6 +923,7 @@ export class ControlPlaneToolExecutor {
             );
           }
         }
+        const posArg = args.position as QueuePositionInput | undefined;
         const created = await this.hooks.spawnAndStartTask({
           runId,
           parentId: taskId,
@@ -878,8 +938,53 @@ export class ControlPlaneToolExecutor {
           effort: typeof args.effort === "string" ? args.effort : undefined,
           dependsOn: Array.isArray(args.depends_on) ? (args.depends_on as string[]) : [],
           writeScopes,
+          ...(posArg !== undefined ? { position: posArg } : {}),
+          ...(args.force_start !== undefined ? { forceStart: Boolean(args.force_start) } : {}),
         });
-        return { spawned: created.id, status: created.status, worktreeId: created.worktreeId };
+        const qEntry = this.db.admissionQueue.get("worker", created.id);
+        return {
+          spawned: created.id,
+          status: created.status,
+          worktreeId: created.worktreeId,
+          ...(qEntry ? { queued: true, queuePosition: qEntry.position } : {}),
+        };
+      }
+
+      case "queue_list": {
+        const lane = args.lane === "goal" || args.lane === "worker" ? (args.lane as AdmissionLane) : undefined;
+        const entries = this.db.admissionQueue.list({ lane, repoRoot: run.repoRoot });
+        return {
+          repoRoot: run.repoRoot,
+          limits: {
+            maxConcurrentGoals: this.config.goals.maxConcurrentGoals ?? 4,
+            maxConcurrentWorkers: this.config.worktree.maxConcurrentWorkers ?? 4,
+          },
+          entries,
+        };
+      }
+
+      case "queue_reorder": {
+        const targetId = String(args.target_id ?? "").trim();
+        if (!targetId) throw new Error("target_id is required");
+        const lane: AdmissionLane =
+          args.lane === "goal" || args.lane === "worker"
+            ? args.lane
+            : targetId.startsWith("goal-")
+              ? "goal"
+              : "worker";
+        const position = args.position as QueuePositionInput;
+        const updated = this.db.admissionQueue.reorder(lane, targetId, position);
+        return { reordered: updated, queue: this.db.admissionQueue.list({ lane, repoRoot: updated.repoRoot }) };
+      }
+
+      case "queue_force_start": {
+        if (!this.hooks.forceStartWorker) throw new Error("queue_force_start is not available in this runtime");
+        const targetId = String(args.target_id ?? "").trim();
+        if (!targetId) throw new Error("target_id is required");
+        return await this.hooks.forceStartWorker(targetId, {
+          bypassQuota: Boolean(args.bypass_quota),
+          reason: typeof args.reason === "string" ? args.reason : undefined,
+        });
       }
 
       case "spawn_task": {

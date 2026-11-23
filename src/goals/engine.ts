@@ -257,7 +257,7 @@ export function shouldRunIndependentReview(goal: GoalRecord, overrideMode?: Veri
 }
 
 export class GoalEngine {
-  private readonly cfg: GoalsConfig;
+  private cfg: GoalsConfig;
 
   constructor(
     private readonly db: Database,
@@ -268,9 +268,21 @@ export class GoalEngine {
       defaultMaxReviewCycles: config?.defaultMaxReviewCycles ?? 4,
       defaultMaxNoProgressCycles: config?.defaultMaxNoProgressCycles ?? 2,
       gateTimeoutMs: config?.gateTimeoutMs ?? 180_000,
+      autoVerifyOnSettle: config?.autoVerifyOnSettle ?? true,
+      maxConcurrentGoals: config?.maxConcurrentGoals ?? 4,
     };
     this.db.exec(GOALS_SCHEMA);
     this.migrateGoals();
+  }
+
+  updateConfig(config?: Partial<GoalsConfig>): void {
+    this.cfg = {
+      defaultMaxReviewCycles: config?.defaultMaxReviewCycles ?? this.cfg.defaultMaxReviewCycles,
+      defaultMaxNoProgressCycles: config?.defaultMaxNoProgressCycles ?? this.cfg.defaultMaxNoProgressCycles,
+      gateTimeoutMs: config?.gateTimeoutMs ?? this.cfg.gateTimeoutMs,
+      autoVerifyOnSettle: config?.autoVerifyOnSettle ?? this.cfg.autoVerifyOnSettle,
+      maxConcurrentGoals: config?.maxConcurrentGoals ?? this.cfg.maxConcurrentGoals ?? 4,
+    };
   }
 
   private migrateGoals(): void {

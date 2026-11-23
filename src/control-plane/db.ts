@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { Database } from "bun:sqlite";
+import { AdmissionQueue } from "./admission-queue.js";
 import { friendlyIdCandidates, nextFriendlyId } from "./ids.js";
 import { ProjectStore } from "./projects.js";
 import { SessionMessageStore } from "./session-messages.js";
@@ -508,6 +509,7 @@ export class ControlPlaneDb {
   readonly timers: TimerManager;
   readonly projects: ProjectStore;
   readonly sessionMessages: SessionMessageStore;
+  readonly admissionQueue: AdmissionQueue;
   private listeners = new Set<(event: EventRecord) => void>();
 
   constructor(dbPath: string) {
@@ -520,6 +522,7 @@ export class ControlPlaneDb {
     this.timers = new TimerManager(this.db);
     this.projects = new ProjectStore(this.db);
     this.sessionMessages = new SessionMessageStore(this.db);
+    this.admissionQueue = new AdmissionQueue(this.db);
   }
 
   close(): void {
