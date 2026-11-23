@@ -28,6 +28,22 @@ export function validateTaskHandoff(kind: TaskKind, args: Record<string, unknown
   return { summary: fullSummary, sources, artifactPaths };
 }
 
+function matchRecordedArtifactPath(pointerPath: string, artifactPaths: unknown): string | null {
+  if (!Array.isArray(artifactPaths) || artifactPaths.length === 0) return null;
+  const trimmed = pointerPath.trim().replaceAll("\\", "/").replace(/^\.\//, "");
+  if (!trimmed || trimmed.split("/").includes("..")) return null;
+  const isRel = !trimmed.startsWith("/");
+  for (const raw of artifactPaths) {
+    if (typeof raw !== "string") continue;
+    const candidate = raw.trim().replaceAll("\\", "/").replace(/^\.\//, "");
+    if (!candidate) continue;
+    if (candidate === trimmed || (isRel && candidate.endsWith(`/${trimmed}`))) {
+      return raw;
+    }
+  }
+  return null;
+}
+
 export function compactTaskHandoff(task: TaskRecord, escalations: EscalationRecord[] = []) {
   const result = task.resultJson ? JSON.parse(task.resultJson) : null;
   const paused = task.status === "paused_quota" || task.summary?.startsWith("Paused (quota):");
@@ -54,6 +70,7 @@ export function compactTaskHandoff(task: TaskRecord, escalations: EscalationReco
         ? "Task ended without a structured handoff or a final reply."
         : "Task ended without a structured handoff.";
   }
+  const artifactPaths = paused ? [] : result?.artifact_paths ?? result?.artifactPaths ?? fallback?.artifact_paths ?? [];
   let overflow: { path: string; next_offset: number; total_chars?: number } | null = null;
   if (!paused) {
     const meta = result?.summary_overflow;
@@ -65,10 +82,12 @@ export function compactTaskHandoff(task: TaskRecord, escalations: EscalationReco
       };
     } else if (fallback) {
       const m = /\n\[Full output: ([^\]]+)\]$/.exec(fallback.summary);
-      if (m?.[1]) overflow = { path: m[1], next_offset: 0 };
+      const matched = m?.[1] ? matchRecordedArtifactPath(m[1], artifactPaths) : null;
+      if (matched) overflow = { path: matched, next_offset: 0 };
     } else if (typeof task.summary === "string") {
       const m = /\n\n\[Full summary: ([^\]]+)\]$/.exec(task.summary);
-      if (m?.[1]) overflow = { path: m[1], next_offset: 0 };
+      const matched = m?.[1] ? matchRecordedArtifactPath(m[1], artifactPaths) : null;
+      if (matched) overflow = { path: matched, next_offset: 0 };
     }
   }
   return {
@@ -89,7 +108,7 @@ export function compactTaskHandoff(task: TaskRecord, escalations: EscalationReco
         }
       : {}),
     sources: paused ? [] : result?.sources ?? [],
-    artifact_paths: paused ? [] : result?.artifact_paths ?? result?.artifactPaths ?? fallback?.artifact_paths ?? [],
+    artifact_paths: artifactPaths,
     escalations: escalations.filter((entry) => entry.fromTaskId === task.id),
   };
 }

@@ -689,13 +689,40 @@ function isPlainGitRef(ref: string): boolean {
   return GIT_PLAIN_REF_RE.test(ref) && !ref.includes("..");
 }
 
+export type ParsedGitNetworkCommand =
+  | { sub: "fetch"; allRemotes: true }
+  | { sub: "fetch" | "ls-remote"; allRemotes: false; remote: string };
+
 /**
- * Validator for read-only git network subcommands (`fetch` and `ls-remote`) invoked via `inspect_command`.
+ * Validates that a resolved git remote URL uses an allowed network transport:
+ * `https://`, `ssh://`, `git://`, or SCP-like SSH form (`user@host:path`, e.g. `git@github.com:org/repo.git`).
+ * Rejects `ext::`, `file://`, `http://`, local paths, leading-dash host/user injection, and anything else.
+ */
+export function isSafeGitRemoteUrl(rawUrl: string): boolean {
+  const url = rawUrl.trim();
+  if (!url || CONTROL_CHARS.test(url) || /\s/.test(url)) return false;
+  if (/^(?:https|ssh|git):\/\/[^/\s]/i.test(url)) {
+    try {
+      const parsed = new URL(url);
+      const proto = parsed.protocol.toLowerCase();
+      if (proto !== "https:" && proto !== "ssh:" && proto !== "git:") return false;
+      if (!parsed.hostname || parsed.hostname.startsWith("-")) return false;
+      if (parsed.username.startsWith("-")) return false;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return /^[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9.-]*:[^\s:][^\s]*$/.test(url);
+}
+
+/**
+ * Parses and validates read-only git network subcommands (`fetch` and `ls-remote`) invoked via `inspect_command`.
  * Requires a configured remote name (no URLs, `ext::`, `file://`, or local paths) and plain ref names without
  * destination mappings (`:`), force (`+`), ranges (`..`), or globs (`*`).
  */
-export function isReadOnlyGitNetworkCommand(sub: string, args: string[]): boolean {
-  if (sub !== "fetch" && sub !== "ls-remote") return false;
+export function parseReadOnlyGitNetworkCommand(sub: string, args: string[]): ParsedGitNetworkCommand | null {
+  if (sub !== "fetch" && sub !== "ls-remote") return null;
   let endOfOpts = false;
   let allRemotes = false;
   const positionals: string[] = [];
@@ -716,48 +743,56 @@ export function isReadOnlyGitNetworkCommand(sub: string, args: string[]): boolea
         if (/^--(?:depth|deepen)=\d+$/.test(arg)) continue;
         if (arg === "--depth" || arg === "--deepen") {
           const next = args[i + 1];
-          if (next === undefined || !/^\d+$/.test(next)) return false;
+          if (next === undefined || !/^\d+$/.test(next)) return null;
           i++;
           continue;
         }
         if (arg.startsWith("--shallow-since=")) {
-          if (arg.length <= "--shallow-since=".length) return false;
+          if (arg.length <= "--shallow-since=".length) return null;
           continue;
         }
         if (arg === "--shallow-since") {
           const next = args[i + 1];
-          if (!next || next.startsWith("-")) return false;
+          if (!next || next.startsWith("-")) return null;
           i++;
           continue;
         }
-        return false;
+        return null;
       }
       // ls-remote
       if (GIT_LS_REMOTE_BOOL_FLAGS.has(arg)) continue;
       if (/^-[htq]+$/.test(arg)) continue;
       if (arg.startsWith("--sort=")) {
         const key = arg.slice("--sort=".length);
-        if (!/^-?[A-Za-z0-9:._-]+$/.test(key)) return false;
+        if (!/^-?[A-Za-z0-9:._-]+$/.test(key)) return null;
         continue;
       }
       if (arg === "--sort") {
         const next = args[i + 1];
-        if (!next || !/^-?[A-Za-z0-9:._-]+$/.test(next)) return false;
+        if (!next || !/^-?[A-Za-z0-9:._-]+$/.test(next)) return null;
         i++;
         continue;
       }
-      return false;
+      return null;
     }
     positionals.push(arg);
   }
 
   if (sub === "fetch" && allRemotes) {
-    return positionals.length === 0;
+    return positionals.length === 0 ? { sub: "fetch", allRemotes: true } : null;
   }
-  if (positionals.length === 0) return false;
+  if (positionals.length === 0) return null;
   const [remote, ...refs] = positionals;
-  if (!remote || !GIT_REMOTE_NAME_RE.test(remote)) return false;
-  return refs.every(isPlainGitRef);
+  if (!remote || !GIT_REMOTE_NAME_RE.test(remote)) return null;
+  if (!refs.every(isPlainGitRef)) return null;
+  return { sub, allRemotes: false, remote };
+}
+
+/**
+ * Validator for read-only git network subcommands (`fetch` and `ls-remote`) invoked via `inspect_command`.
+ */
+export function isReadOnlyGitNetworkCommand(sub: string, args: string[]): boolean {
+  return parseReadOnlyGitNetworkCommand(sub, args) !== null;
 }
 
 /**
