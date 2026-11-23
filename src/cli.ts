@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ControlPlaneDb, type EscalationRecord } from "./control-plane/db.js";
-import type { ProjectBrowseResult, ProjectSummary } from "./control-plane/projects.js";
+import { findProjectContainingPath, type ProjectBrowseResult, type ProjectSummary } from "./control-plane/projects.js";
 import { ensureTempDir, loadConfig, type AcpProfileConfig } from "./config.js";
 import { loadOrCreateNodeId } from "./control-plane/session-messages.js";
 import { qualifyRemoteCliHints } from "./protocol/chat-events.js";
@@ -31,6 +31,7 @@ const BOOLEAN_LONG_FLAGS = new Set([
   "no-create",
   "exclude-exhausted",
   "direct",
+  "resume",
 ]);
 
 export interface ParsedArgs {
@@ -375,8 +376,9 @@ function printHelp(): void {
   console.log(`pi-harness — CLI-first, daemonized interactive Director + 3-tier multi-agent coding harness
 
 Usage:
-  pi-harness [-p <project>] [--remote <alias|ssh://host>]
-                                                    Resume last session for project/workspace (remote picks a remote project)
+  pi-harness [--resume] [-p <project>] [--remote <alias|ssh://host>]
+                                                    Open the project picker; --resume opens the local project containing
+                                                    the current directory; -p/--repo open directly; --remote always picks
   pi-harness remotes | remote [list | add <name> <ssh> | rm <name> | connect <name> | disconnect <name>]
                                                     Manage remote SSH peer hosts
   pi-harness projects [--host <name>] [--json]      List local & connected remote projects
@@ -387,9 +389,9 @@ Usage:
                                                     Open Director Chat bound to a project
   pi-harness project rm <name|id> [--host <name>]   Unregister a project (never deletes files on disk)
   pi-harness project browse [path] [--host <name>]  Browse directories on local or remote host
-  pi-harness attach [session-or-run-id]             Attach to & take over last active session (or specific chat-/run- ID)
+  pi-harness attach [session-or-run-id]             Attach to & take input control of last active session (or specific chat-/run- ID)
   pi-harness sessions [--host <name>] [--json]      List local & connected remote Director Chat & run sessions
-  pi-harness chat [-p <project>] [--remote <alias|ssh://host>]
+  pi-harness chat [--resume] [-p <project>] [--remote <alias|ssh://host>]
   pi-harness chat send <target> "<message>" [--from <chat-id>] [--no-reply]
                                                     Send a message to any local (chat-1) or remote (gpu-box:chat-4) chat
   pi-harness goals [list | review <id> | pause <id> | cancel <id>]
@@ -423,6 +425,42 @@ type ChatStart = {
   preferLastProject?: boolean;
 };
 
+type StartNotice = { tone: "info" | "warn" | "danger" | "ok"; text: string };
+type PickerStart = { kind: "picker"; repoRoot?: string; notice?: StartNotice };
+
+export function resolveLocalStartup(input: {
+  cwd: string;
+  explicitRepoRoot?: string;
+  projectFlag?: string;
+  resume: boolean;
+  projects: ReadonlyArray<{ id: string; rootPath: string }>;
+}): ChatStart | PickerStart {
+  if (input.explicitRepoRoot) {
+    return {
+      kind: "chat",
+      repoRoot: input.explicitRepoRoot,
+      ...(input.projectFlag ? { projectId: input.projectFlag } : {}),
+    };
+  }
+  if (input.projectFlag) {
+    return { kind: "chat", projectId: input.projectFlag };
+  }
+  if (input.resume) {
+    const match = findProjectContainingPath(input.projects, input.cwd);
+    if (match) {
+      return { kind: "chat", projectId: match.id, repoRoot: match.rootPath };
+    }
+    return {
+      kind: "picker",
+      notice: {
+        tone: "warn",
+        text: `--resume: no registered project contains ${input.cwd}. Pick a project, or press n to add one.`,
+      },
+    };
+  }
+  return { kind: "picker" };
+}
+
 /**
  * Lets the user pick one of the daemon host's own projects. Falls back to the most recent project
  * when none are registered; resolves to `null` when the picker is cancelled.
@@ -436,7 +474,7 @@ async function chooseRemoteProject(client: DaemonClient, hostLabel: string | nul
 
 async function runInteractiveSessionLoop(
   initialClient: DaemonClient,
-  initial: ChatStart | { kind: "run"; repoRoot?: string; runId: string; initialTaskId?: string | null },
+  initial: ChatStart | PickerStart | { kind: "run"; repoRoot?: string; runId: string; initialTaskId?: string | null },
   hostCtx: {
     localSocketPath: string;
     localNodeId: string;
@@ -449,7 +487,7 @@ async function runInteractiveSessionLoop(
   let current = initial;
   let currentRemoteHost = hostCtx.remoteHost;
   let currentRemoteSelector = hostCtx.remoteSelector ?? hostCtx.remoteHost;
-  let pendingNotice: { tone: "info" | "warn" | "danger" | "ok"; text: string } | null = null;
+  let pendingNotice: StartNotice | null = initial.kind === "picker" ? initial.notice ?? null : null;
 
   try {
     while (true) {
@@ -457,7 +495,25 @@ async function runInteractiveSessionLoop(
       const noticeForTurn = pendingNotice;
       pendingNotice = null;
       let action: TuiExitAction;
-      if (current.kind === "chat") {
+      if (current.kind === "picker") {
+        const picked = await pickProjectTui({
+          client,
+          currentHost: currentRemoteHost,
+          includeRemotes: !currentRemoteHost,
+          initialNotice: noticeForTurn,
+        });
+        if (!picked) return;
+        const pickedHost = picked.host && picked.host !== "local" ? picked.host : undefined;
+        action = {
+          kind: "switch",
+          targetKind: "chat",
+          targetId: "__project__",
+          projectId: picked.id,
+          repoRoot: picked.rootPath,
+          ...(pickedHost ? { targetHost: pickedHost } : {}),
+          ...(picked.nodeId ? { targetNodeId: picked.nodeId } : {}),
+        };
+      } else if (current.kind === "chat") {
         action = await runDirectorChatTui({
           client,
           remoteHost: currentRemoteHost,
@@ -631,7 +687,7 @@ async function main(): Promise<void> {
   }
 
   // Zero-arg default on a TTY:
-  //  - Local: resume last session for the current directory (or --project)
+  //  - Local: show project picker (--resume opens deepest registered project containing cwd; -p/--repo open directly)
   //  - Remote SSH without --repo/--project: pick a remote project (never send local Mac cwd to remote host!)
   if (!cmd || cmd === "chat") {
     if (!process.stdout.isTTY) {
@@ -639,24 +695,45 @@ async function main(): Promise<void> {
       return;
     }
     const client = await connectClient(config.socketPath, remoteSpec.target, remoteSpec.bridgeCommand);
-    let initial: ChatStart = {
-      kind: "chat",
-      repoRoot: explicitRepoFlag ? repoRoot : projectFlag ? undefined : repoRoot,
-      ...(projectFlag ? { projectId: projectFlag } : {}),
-    };
-    if (remoteSpec.target && !explicitRepoFlag && !projectFlag) {
-      let picked: ChatStart | null;
-      try {
-        picked = await chooseRemoteProject(client, remoteSpec.hostLabel);
-      } catch (err) {
-        client.close();
-        throw err;
+    let initial: ChatStart | PickerStart;
+    if (remoteSpec.target) {
+      initial = {
+        kind: "chat",
+        repoRoot: explicitRepoFlag ? repoRoot : projectFlag ? undefined : repoRoot,
+        ...(projectFlag ? { projectId: projectFlag } : {}),
+      };
+      if (!explicitRepoFlag && !projectFlag) {
+        let picked: ChatStart | null;
+        try {
+          picked = await chooseRemoteProject(client, remoteSpec.hostLabel);
+        } catch (err) {
+          client.close();
+          throw err;
+        }
+        if (!picked) {
+          client.close();
+          return;
+        }
+        initial = picked;
       }
-      if (!picked) {
-        client.close();
-        return;
+    } else {
+      const resumeFlag = flags.resume === true;
+      let projects: ProjectSummary[] = [];
+      if (resumeFlag && !explicitRepoFlag && !projectFlag) {
+        try {
+          projects = await client.request<ProjectSummary[]>("project.list", { includeRemotes: false });
+        } catch (err) {
+          client.close();
+          throw err;
+        }
       }
-      initial = picked;
+      initial = resolveLocalStartup({
+        cwd: repoRoot,
+        explicitRepoRoot: explicitRepoFlag ? repoRoot : undefined,
+        projectFlag,
+        resume: resumeFlag,
+        projects,
+      });
     }
     await runInteractiveSessionLoop(client, initial, hostCtx);
     return;

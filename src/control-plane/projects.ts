@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { Database } from "bun:sqlite";
 import { friendlyIdCandidates, nextFriendlyId } from "./ids.js";
@@ -78,6 +78,17 @@ export function canonicalProjectPath(rawPath: string): string {
   } catch {
     return abs;
   }
+}
+
+/** Deepest project whose root equals `dirPath` or is an ancestor of it. Both sides must be canonical paths. */
+export function findProjectContainingPath<T extends { rootPath: string }>(projects: readonly T[], dirPath: string): T | null {
+  let best: T | null = null;
+  for (const p of projects) {
+    const rel = relative(p.rootPath, dirPath);
+    const outside = rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
+    if (!outside && (!best || p.rootPath.length > best.rootPath.length)) best = p;
+  }
+  return best;
 }
 
 /** Fast synchronous check for whether `dirPath` is inside a git repository. */
