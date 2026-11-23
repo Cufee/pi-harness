@@ -393,7 +393,7 @@ Usage:
   pi-harness chat send <target> "<message>" [--from <chat-id>] [--no-reply]
                                                     Send a message to any local (chat-1) or remote (gpu-box:chat-4) chat
   pi-harness goals [list | review <id> | pause <id> | cancel <id>]
-  pi-harness escalations [list] [--status open|acked|resolved|all] [--run <run-id>] [--json] [--remote <alias|ssh://host>]
+  pi-harness escalations [list] [--status open|acked|resolved|all] [--run <run-id>] [--limit <n>] [--json] [--remote <alias|ssh://host>]
   pi-harness escalations reconcile [--direct [--db <path>]] [--json] [--remote <alias|ssh://host>]
   pi-harness escalations resolve <escalation-id> --reason "<text>" [--json] [--remote <alias|ssh://host>]
   pi-harness profiles [list | add <id> <cmd> [args...] | remove <id> | probe <id>]
@@ -745,8 +745,36 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Validate every escalations invocation before connectClient, so malformed ones never open a DB or start a daemon.
+  if (cmd === "escalations") {
+    const sub = positional[1] ?? "list";
+    if (sub !== "list" && sub !== "reconcile" && sub !== "resolve") {
+      throw new Error(`Unknown escalations subcommand: ${sub}. Expected list, reconcile, or resolve.`);
+    }
+    if (Object.prototype.hasOwnProperty.call(flags, "db")) {
+      if (sub !== "reconcile" || !flags.direct) throw new Error("--db can only be used with 'escalations reconcile --direct'");
+      if (typeof flags.db !== "string" || !flags.db.trim()) throw new Error("--db requires a non-empty file path");
+    }
+    if (flags.direct && sub !== "reconcile") throw new Error("--direct is only supported for 'escalations reconcile'");
+    if (flags.direct && remoteSpec.target) {
+      throw new Error("--direct uses the local SQLite file and cannot be combined with --remote");
+    }
+    if (sub === "list") {
+      const listUsage = "Usage: pi-harness escalations [list] [--status open|acked|resolved|all] [--run <run-id>] [--limit <n>] [--json]";
+      const status = flags.status;
+      if (status !== undefined && !(typeof status === "string" && ["open", "acked", "resolved", "all"].includes(status))) {
+        throw new Error(listUsage);
+      }
+      if (flags.limit !== undefined && !(typeof flags.limit === "string" && /^[1-9]\d*$/.test(flags.limit.trim()))) {
+        throw new Error(`--limit must be a positive integer. ${listUsage}`);
+      }
+    }
+    if (sub === "resolve" && !(positional[2]?.trim() && typeof flags.reason === "string" && flags.reason.trim())) {
+      throw new Error('Usage: pi-harness escalations resolve <escalation-id> --reason "<text>" [--json]');
+    }
+  }
+
   if (cmd === "escalations" && positional[1] === "reconcile" && flags.direct) {
-    if (remoteSpec.target) throw new Error("--direct uses the local SQLite file and cannot be combined with --remote");
     const rawDb = typeof flags.db === "string" ? flags.db.trim() : "";
     const dbPath = rawDb
       ? resolve(rawDb === "~" || rawDb.startsWith("~/") ? join(homedir(), rawDb.slice(1)) : rawDb)
@@ -1072,14 +1100,28 @@ async function main(): Promise<void> {
         const sub = positional[1] ?? "list";
         if (sub === "list") {
           const status = flags.status;
-          if (status !== undefined && !(typeof status === "string" && ["open", "acked", "resolved", "all"].includes(status))) {
-            throw new Error("Usage: pi-harness escalations [list] [--status open|acked|resolved|all] [--run <run-id>] [--json]");
-          }
-          const params: Record<string, unknown> = {};
+          const limit = typeof flags.limit === "string" ? Math.max(1, Math.min(1000, Number(flags.limit))) : 500;
+          const params: Record<string, unknown> = { limit };
           if (typeof flags.run === "string" && flags.run.trim()) params.runId = flags.run.trim();
-          if (status === "open" || status === "acked" || status === "resolved") params.status = status;
-          let items = await client.request<EscalationRecord[]>("escalation.list", params);
-          if (status === undefined) items = items.filter((e) => e.status === "open" || e.status === "acked");
+          let items: EscalationRecord[];
+          let truncated: boolean;
+          if (status === undefined) {
+            // Unresolved = open + acked. Query each status separately so the row limit applies after the status
+            // filter (resolved rows never crowd them out), on every daemon version.
+            const [open, acked] = await Promise.all([
+              client.request<EscalationRecord[]>("escalation.list", { ...params, status: "open" }),
+              client.request<EscalationRecord[]>("escalation.list", { ...params, status: "acked" }),
+            ]);
+            const byId = new Map<string, EscalationRecord>();
+            for (const e of [...open, ...acked]) byId.set(e.id, e);
+            items = [...byId.values()].sort((a, b) => b.createdAt - a.createdAt);
+            truncated = open.length >= limit || acked.length >= limit;
+          } else {
+            if (status === "open" || status === "acked" || status === "resolved") params.status = status;
+            items = await client.request<EscalationRecord[]>("escalation.list", params);
+            // Older daemons cap each page at 100 rows regardless of the requested limit.
+            truncated = items.length >= limit || items.length === 100;
+          }
           if (flags.json) {
             console.log(JSON.stringify(items, null, 2));
           } else if (items.length === 0) {
@@ -1088,9 +1130,11 @@ async function main(): Promise<void> {
             for (const e of items) {
               console.log(`${e.id}  ${e.severity}  ${e.category}  ${e.status}  ${e.runId}  ${e.title}`);
             }
+            if (truncated) {
+              console.log(`(showing first ${items.length} matching escalation(s); narrow with --run or raise --limit)`);
+            }
           }
         } else if (sub === "reconcile") {
-          if (flags.db !== undefined) throw new Error("--db can only be used with --direct");
           let out: { mode: string } & ReconcileResult;
           try {
             out = { mode: "daemon", ...(await client.request<ReconcileResult>("escalation.reconcile")) };
@@ -1101,11 +1145,8 @@ async function main(): Promise<void> {
           }
           printReconcileResult(out, Boolean(flags.json));
         } else if (sub === "resolve") {
-          const escalationId = positional[2]?.trim();
-          const reason = typeof flags.reason === "string" ? flags.reason.trim() : "";
-          if (!escalationId || !reason) {
-            throw new Error('Usage: pi-harness escalations resolve <escalation-id> --reason "<text>" [--json]');
-          }
+          const escalationId = positional[2]!.trim();
+          const reason = (flags.reason as string).trim();
           const res = await client.request<{ alreadyResolved?: boolean; remainingOpen?: number }>("escalation.resolve", {
             escalationId,
             reason,
@@ -1116,8 +1157,6 @@ async function main(): Promise<void> {
             const head = res.alreadyResolved ? `Escalation ${escalationId} was already resolved.` : `Resolved escalation ${escalationId}.`;
             console.log(typeof res.remainingOpen === "number" ? `${head} ${res.remainingOpen} open escalation(s) remain.` : head);
           }
-        } else {
-          throw new Error(`Unknown escalations subcommand: ${sub}. Expected list, reconcile, or resolve.`);
         }
         break;
       }
