@@ -1519,6 +1519,12 @@ export class ControlPlaneToolExecutor {
           "-c", "protocol.ext.allow=never",
           "-c", "protocol.file.allow=never",
         ];
+        const gitNetworkSafePrefix = [
+          "-c", "core.sshCommand=ssh",
+          "-c", "core.gitProxy=",
+          "-c", "credential.helper=",
+        ];
+        let isGitNetwork = false;
         if (bin === "git") {
           let g = 1;
           while (g < argv.length && (argv[g] === "--no-pager" || argv[g] === "-P" || argv[g] === "--no-optional-locks")) {
@@ -1526,6 +1532,7 @@ export class ControlPlaneToolExecutor {
           }
           const gitSub = argv[g];
           if (gitSub === "fetch" || gitSub === "ls-remote") {
+            isGitNetwork = true;
             const parsed = parseReadOnlyGitNetworkCommand(gitSub, argv.slice(g + 1));
             if (!parsed) {
               throw new Error(`inspect_command rejected: git ${gitSub} arguments are not allowed in read-only mode`);
@@ -1555,6 +1562,26 @@ export class ControlPlaneToolExecutor {
               remotesToCheck = [parsed.remote];
             }
             for (const remoteName of remotesToCheck) {
+              const escapedRemote = remoteName.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+              const vcsRes = await runArgv(
+                executable,
+                [...gitSafePrefix, "config", "--get-regexp", "--", `^remote\\.${escapedRemote}\\.vcs$`],
+                {
+                  cwd,
+                  env,
+                  timeoutMs: probeTimeoutMs,
+                  maxOutputBytes: 256 * 1024,
+                  signal,
+                },
+              );
+              if (vcsRes.stopped || (vcsRes.exitCode !== 0 && vcsRes.exitCode !== 1)) {
+                throw new Error(`inspect_command rejected: failed to inspect git config for remote '${remoteName}'`);
+              }
+              if (vcsRes.exitCode === 0) {
+                throw new Error(
+                  `inspect_command rejected: remote helper selection via remote.${remoteName}.vcs is not allowed`,
+                );
+              }
               const urlRes = await runArgv(executable, [...gitSafePrefix, "remote", "get-url", "--all", "--", remoteName], {
                 cwd,
                 env,
@@ -1571,16 +1598,30 @@ export class ControlPlaneToolExecutor {
                 .filter(Boolean);
               if (urls.length === 0 || urls.some((u) => !isSafeGitRemoteUrl(u))) {
                 throw new Error(
-                  `inspect_command rejected: git remote '${remoteName}' URL must use https://, ssh://, git@host:, or git://`,
+                  `inspect_command rejected: git remote '${remoteName}' URL must use https://, ssh://, or user@host:path`,
                 );
               }
             }
           }
         }
-        const execArgs = bin === "git" ? [...gitSafePrefix, ...argv.slice(1)] : argv.slice(1);
+        const execArgs = bin === "git"
+          ? [...gitSafePrefix, ...(isGitNetwork ? gitNetworkSafePrefix : []), ...argv.slice(1)]
+          : argv.slice(1);
+        let execEnv = env;
+        if (isGitNetwork) {
+          execEnv = {
+            ...env,
+            ...(process.env.SSH_AUTH_SOCK ? { SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK } : {}),
+          };
+          delete execEnv.GIT_SSH;
+          delete execEnv.GIT_SSH_COMMAND;
+          delete execEnv.GIT_PROXY_COMMAND;
+          delete execEnv.GIT_ASKPASS;
+          delete execEnv.SSH_ASKPASS;
+        }
         const r = await runArgv(executable, execArgs, {
           cwd,
-          env,
+          env: execEnv,
           timeoutMs,
           maxOutputBytes: 8 * 1024 * 1024,
           signal,
