@@ -522,6 +522,7 @@ export class GoalInspectorScreen implements Screen {
           kvRow("Linked Run", g.linkedRunId ?? theme.muted("(none)"), innerW, theme),
           kvRow("Verification", g.verificationMode ?? "auto", innerW, theme),
           kvRow("Review Cycles", String(g.reviewCycle), innerW, theme),
+          ...(g.liveProgress?.summary ? [kvRow("Progress", sanitizeLine(g.liveProgress.summary), innerW, theme)] : []),
           kvRow("Updated", `${formatClock(g.updatedAt)} (${formatAge(g.updatedAt)})`, innerW, theme),
           ...(openEscs.length > 0
             ? [kvRow("Unresolved Esc", theme.danger(`${openEscs.length} — press 'e' to inspect`), innerW, theme)]

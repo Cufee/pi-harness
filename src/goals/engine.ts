@@ -280,6 +280,7 @@ export class GoalEngine {
     private readonly db: Database,
     private readonly onReviewInvalidated?: (goalId: string) => void,
     config?: Partial<GoalsConfig>,
+    private readonly onReconciled?: () => void,
   ) {
     this.cfg = {
       defaultMaxReviewCycles: config?.defaultMaxReviewCycles ?? 4,
@@ -453,7 +454,18 @@ export class GoalEngine {
     this.db
       .prepare("UPDATE goals SET linked_run_id = ?, status = 'executing', updated_at = ? WHERE id = ?")
       .run(runId, Date.now(), g.id);
+    this.clearQueuedProgress(g.id);
     return this.getGoal(g.id)!;
+  }
+
+  /** Drops admission-queue progress (`queued`/`queue_launch_error`) once a goal is no longer waiting for a slot. */
+  clearQueuedProgress(goalIdStr: string): void {
+    const g = this.getGoal(goalIdStr);
+    const lp = g?.liveProgress;
+    if (!g || !lp || (lp.phase !== "queued" && lp.phase !== "queue_launch_error")) return;
+    const { phase: _phase, summary: _summary, ...rest } = lp;
+    const next = !rest.verificationStatus && !rest.criteriaResults ? null : JSON.stringify(rest);
+    this.db.prepare("UPDATE goals SET live_progress_json = ?, updated_at = ? WHERE id = ?").run(next, Date.now(), g.id);
   }
 
   /** Persists live model-reported progress, verification status, and criterion checks onto the Goal. */
@@ -486,7 +498,10 @@ export class GoalEngine {
     this.db
       .prepare("UPDATE goals SET status = ?, last_review_summary = COALESCE(?, last_review_summary), updated_at = ? WHERE id = ?")
       .run(status, summary ?? null, Date.now(), g.id);
-    if (status === "paused" || status === "cancelled") this.onReviewInvalidated?.(g.id);
+    if (status === "paused" || status === "cancelled") {
+      this.clearQueuedProgress(g.id);
+      this.onReviewInvalidated?.(g.id);
+    }
     return this.getGoal(g.id)!;
   }
 
@@ -612,7 +627,10 @@ export class GoalEngine {
     return { goal: this.getGoal(cur.id)!, delta };
   }
 
-  /** Reconciles goals stranded in `verifying`/`reviewing` or `executing` with dead runs after a daemon restart. */
+  /**
+   * Reconciles goals stranded in `verifying`/`reviewing` or `executing` with settled, missing, or dead runs after a
+   * daemon restart. A completed run is not acceptance, so those goals wait for human review instead of `achieved`.
+   */
   reconcileStaleGoalsOnStartup(): number {
     const now = Date.now();
     const res1 = this.db
@@ -626,6 +644,17 @@ export class GoalEngine {
       .run(now);
     let res2Changes = 0;
     try {
+      res2Changes += this.db
+        .prepare(
+          `UPDATE goals
+           SET status = 'awaiting_human',
+               last_review_summary = COALESCE(last_review_summary, 'Linked run completed before goal verification; review or accept to finish.'),
+               updated_at = ?
+           WHERE status = 'executing'
+             AND linked_run_id IS NOT NULL
+             AND EXISTS (SELECT 1 FROM runs r WHERE r.id = goals.linked_run_id AND r.status = 'completed')`,
+        )
+        .run(now).changes;
       const res2 = this.db
         .prepare(
           `UPDATE goals
@@ -633,14 +662,16 @@ export class GoalEngine {
                last_review_summary = COALESCE(last_review_summary, 'Linked run ended before goal verification; resume or review.'),
                updated_at = ?
            WHERE status = 'executing'
-             AND linked_run_id IS NOT NULL
-             AND EXISTS (SELECT 1 FROM runs r WHERE r.id = goals.linked_run_id AND r.status IN ('failed', 'stopped'))`,
+             AND (linked_run_id IS NULL
+               OR NOT EXISTS (SELECT 1 FROM runs r WHERE r.id = goals.linked_run_id)
+               OR EXISTS (SELECT 1 FROM runs r WHERE r.id = goals.linked_run_id AND r.status IN ('failed', 'stopped')))`,
         )
         .run(now);
-      res2Changes = res2.changes;
+      res2Changes += res2.changes;
     } catch {
       // runs table may not exist in standalone GoalEngine unit tests
     }
+    this.onReconciled?.();
     return res1.changes + res2Changes;
   }
 

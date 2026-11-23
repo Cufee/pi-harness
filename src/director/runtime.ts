@@ -573,7 +573,9 @@ export class DirectorRuntime {
     { tools: ToolDefinition[]; execute: (name: string, args: Record<string, unknown>) => Promise<unknown> }
   >();
   private unsubRunEvents: (() => void) | null = null;
+  private unsubGoalQueue: (() => void) | null = null;
   private disposed = false;
+  private syncingQueuedProgress = false;
   private wakeHandler: ((chatSessionId: string, event: ChatControlEvent) => void) | null = null;
   private peerBridge: DirectorPeerBridge | null = null;
   private notifiedSettledGoals = new Set<string>();
@@ -591,8 +593,17 @@ export class DirectorRuntime {
       db.db,
       (id) => this.activeReviews.get(id)?.abort(new Error("Goal changed during review")),
       config.goals,
+      () => {
+        // Startup reconciliation frees slots held by settled runs; refresh queued progress and admit waiting goals.
+        if (this.disposed) return;
+        this.syncQueuedGoalProgress();
+        void this.drainGoalQueue().catch(() => {});
+      },
     );
     this.unsubRunEvents = this.db.onEvent((ev) => this.handleControlPlaneEvent(ev));
+    this.unsubGoalQueue = this.db.admissionQueue.onChange((lane) => {
+      if (!this.disposed && (!lane || lane === "goal")) this.syncQueuedGoalProgress();
+    });
     this.db.timers.setOnFire((timer, wakeReason) => {
       void this.handleTimerFired(timer, wakeReason);
     });
@@ -621,6 +632,8 @@ export class DirectorRuntime {
     this.disposed = true;
     this.unsubRunEvents?.();
     this.unsubRunEvents = null;
+    this.unsubGoalQueue?.();
+    this.unsubGoalQueue = null;
     for (const [chatId, active] of [...this.activeChats.entries()]) {
       active.abort.abort(new Error("Daemon shutting down"));
       void active.handle?.cancel("daemon_shutdown").catch(() => {});
@@ -690,10 +703,12 @@ export class DirectorRuntime {
       }
     }
 
-    if (!this.config.events?.wakeDirectorOnGoalSettle) return;
+    // Goal settlement and queue admission always run; only Director wakeups are gated by this setting.
+    const wakeOnSettle = Boolean(this.config.events?.wakeDirectorOnGoalSettle);
 
     // Wake Director immediately on P0 escalations or manual quota pauses for any linked Goal
     if (ev.type === "escalation.created") {
+      if (!wakeOnSettle) return;
       const p = ev.payload as { severity?: string; title?: string } | null;
       if (p?.severity !== "P0") return;
       const row = this.db.db
@@ -717,6 +732,7 @@ export class DirectorRuntime {
     }
 
     if (ev.type === "quota.run_paused") {
+      if (!wakeOnSettle) return;
       const p = ev.payload as { mode?: string; reason?: string } | null;
       if (p?.mode !== "manual") return;
       const row = this.db.db
@@ -740,6 +756,10 @@ export class DirectorRuntime {
 
     if (ev.type !== "run.status") return;
     const status = String((ev.payload as { status?: string } | null)?.status ?? "");
+    if (status === "active" || status === "paused_quota") {
+      this.syncQueuedGoalProgress();
+      return;
+    }
     if (status !== "completed" && status !== "failed" && status !== "stopped") return;
 
     // Find any active Goal linked to this run and either run deterministic verification automatically
@@ -774,7 +794,7 @@ export class DirectorRuntime {
     ) {
       if (!this.unsubRunEvents) return; // daemon disposed
       void this.verifyAndReviewGoal(goal.id, undefined, { autoTriggered: true }).catch((err) => {
-        if (!this.unsubRunEvents || !goal.chatSessionId) return;
+        if (!this.unsubRunEvents || !goal.chatSessionId || !this.config.events?.wakeDirectorOnGoalSettle) return;
         const msg = err instanceof Error ? err.message : String(err);
         let openEscCount = 0;
         try {
@@ -796,9 +816,24 @@ export class DirectorRuntime {
       return;
     }
 
-    if (!goal.chatSessionId) return;
+    // A settled run no longer occupies a goal slot: hand the goal to a human and admit queued goals.
+    // Open escalations on the run already carry the human hand-off, so the goal keeps its status for them.
+    const openEscalations = this.db.listEscalations(ev.runId, "open").length;
+    if ((status === "failed" || status === "stopped") && goal.status === "executing" && openEscalations === 0) {
+      this.goals.setStatus(goal.id, "awaiting_human", `Linked run ${ev.runId} ${status} before goal verification; resume or review.`);
+    } else if (
+      status === "completed" &&
+      this.config.goals?.autoVerifyOnSettle !== false &&
+      goal.verificationMode === "none" &&
+      goal.status === "executing"
+    ) {
+      this.goals.setStatus(goal.id, "awaiting_human", "Linked run completed (verification_mode=none); review or accept to finish.");
+    }
+    void this.drainGoalQueue(goal.repoRoot).catch(() => {});
+    this.syncQueuedGoalProgress();
 
-    const openEsc = this.db.listEscalations(ev.runId, "open");
+    if (!wakeOnSettle || !goal.chatSessionId) return;
+
     const event: ChatControlEvent = {
       kind: "goal.settled",
       goalId: goal.id,
@@ -806,7 +841,7 @@ export class DirectorRuntime {
       goalTitle: goal.title,
       runId: ev.runId,
       runStatus: status,
-      openEscalations: openEsc.length,
+      openEscalations,
     };
     this.wakeHandler?.(goal.chatSessionId, event);
   }
@@ -1002,9 +1037,54 @@ export class DirectorRuntime {
     return this.activeChats.has(chatSessionId);
   }
 
+  private isRunOccupyingGoalSlot(runId: string | null): boolean {
+    if (!runId) return false;
+    const run = this.orchestrator.getEffectiveRun(runId);
+    return run !== null && (run.status === "active" || run.status === "paused_quota");
+  }
+
+  /** A goal holds a concurrency slot only while its run is live or an in-process review is running for it. */
+  private isGoalOccupyingSlot(goal: GoalRecord): boolean {
+    if (goal.status === "verifying" || goal.status === "reviewing") return this.activeReviews.has(goal.id);
+    if (goal.status !== "executing") return false;
+    return this.isRunOccupyingGoalSlot(goal.linkedRunId);
+  }
+
   private countActiveGoals(repoRoot: string): number {
-    const ACTIVE = new Set(["executing", "verifying", "reviewing"]);
-    return this.goals.listGoals({ repoRoot }).filter((g) => ACTIVE.has(g.status)).length;
+    return this.goals.listGoals({ repoRoot }).filter((g) => this.isGoalOccupyingSlot(g)).length;
+  }
+
+  /**
+   * Rewrites queued goals' progress from the live queue order and slot usage; clears it for goals no longer queued.
+   * Covers every repo so callers holding a non-canonical repo path never miss or wrongly clear entries.
+   */
+  syncQueuedGoalProgress(): void {
+    if (this.disposed || this.syncingQueuedProgress) return;
+    this.syncingQueuedProgress = true;
+    try {
+      const limit = Math.max(1, this.config.goals.maxConcurrentGoals ?? 4);
+      const entries = this.db.admissionQueue.list({ lane: "goal" });
+      const activeByRepo = new Map<string, number>();
+      for (const entry of entries) {
+        const goal = this.goals.getGoal(entry.targetId);
+        if (!goal) continue;
+        let activeCount = activeByRepo.get(entry.repoRoot);
+        if (activeCount === undefined) {
+          activeCount = this.countActiveGoals(entry.repoRoot);
+          activeByRepo.set(entry.repoRoot, activeCount);
+        }
+        const summary = `Queued at #${entry.position} (${activeCount}/${limit} concurrent goals active)`;
+        if (goal.liveProgress?.phase !== "queued" || goal.liveProgress?.summary !== summary) {
+          this.goals.reportProgress(goal.id, { phase: "queued", summary });
+        }
+      }
+      const queuedIds = new Set(entries.map((e) => e.targetId));
+      for (const g of this.goals.listGoals({ status: "draft" })) {
+        if (g.liveProgress?.phase === "queued" && !queuedIds.has(g.id)) this.goals.clearQueuedProgress(g.id);
+      }
+    } finally {
+      this.syncingQueuedProgress = false;
+    }
   }
 
   private async launchCommittedGoal(
@@ -1033,6 +1113,7 @@ export class DirectorRuntime {
     });
 
     const started = this.goals.linkRunAndStart(goal.id, run.id);
+    this.syncQueuedGoalProgress();
     if (started.chatSessionId) {
       const committedEvent: ChatControlEvent = {
         kind: "goal.committed",
@@ -1062,11 +1143,19 @@ export class DirectorRuntime {
     if (!goal) throw new Error(`Unknown goal ${goalId}`);
 
     const limit = Math.max(1, this.config.goals.maxConcurrentGoals ?? 4);
-    const activeCount = this.countActiveGoals(goal.repoRoot);
-    const queuedAhead = this.db.admissionQueue.list({ lane: "goal", repoRoot: goal.repoRoot }).filter((e) => e.targetId !== goal.id);
+    let activeCount = this.countActiveGoals(goal.repoRoot);
+    const listQueuedAhead = () =>
+      this.db.admissionQueue.list({ lane: "goal", repoRoot: goal.repoRoot }).filter((e) => e.targetId !== goal.id);
+    let queuedAhead = listQueuedAhead();
+    if (!opts?.forceStart && activeCount < limit && queuedAhead.length > 0) {
+      // Free slots go to goals already waiting (FIFO) before this goal decides whether to queue.
+      await this.drainGoalQueue(goal.repoRoot);
+      activeCount = this.countActiveGoals(goal.repoRoot);
+      queuedAhead = listQueuedAhead();
+    }
 
     if (!opts?.forceStart && (activeCount >= limit || queuedAhead.length > 0)) {
-      const qEntry = this.db.admissionQueue.enqueue({
+      this.db.admissionQueue.enqueue({
         lane: "goal",
         repoRoot: goal.repoRoot,
         targetId: goal.id,
@@ -1079,10 +1168,8 @@ export class DirectorRuntime {
         },
         note: goal.title,
       });
-      return this.goals.reportProgress(goal.id, {
-        phase: "queued",
-        summary: `Queued at #${qEntry.position} (${activeCount}/${limit} concurrent goals active)`,
-      });
+      this.syncQueuedGoalProgress();
+      return this.goals.getGoal(goal.id)!;
     }
 
     return await this.launchCommittedGoal(goal, opts);
@@ -1105,7 +1192,7 @@ export class DirectorRuntime {
           const next = this.db.admissionQueue.peekNext("goal", repo);
           if (!next) break;
           const goal = this.goals.getGoal(next.targetId);
-          if (!goal || goal.status === "achieved" || goal.status === "cancelled" || goal.status === "executing") {
+          if (!goal || ["achieved", "cancelled", "executing", "verifying", "reviewing"].includes(goal.status)) {
             this.db.admissionQueue.remove("goal", next.targetId);
             continue;
           }
@@ -1123,6 +1210,7 @@ export class DirectorRuntime {
             });
           }
         }
+        this.syncQueuedGoalProgress();
       }
     } finally {
       this.drainingGoals = false;
@@ -1187,6 +1275,7 @@ export class DirectorRuntime {
     patch: Parameters<GoalEngine["amendGoal"]>[1],
   ): Promise<{ goal: GoalRecord; delta: ReturnType<GoalEngine["amendGoal"]>["delta"] }> {
     const { goal, delta } = this.goals.amendGoal(goalId, patch);
+    let amendedGoal = goal;
 
     if (goal.linkedRunId) {
       // Persist updated Goal Contract text onto runs.goal and Blackboard so rollovers/resumes never see stale v1 requirements
@@ -1248,11 +1337,18 @@ export class DirectorRuntime {
         ]
           .filter(Boolean)
           .join("\n");
-        const steered = await this.orchestrator.steerTask(orch.id, steerMsg).catch(() => false);
-        if (!steered && goal.status === "executing") {
-          await this.orchestrator.resumeTask(orch.id, { allowCompleted: true, note: steerMsg }).catch(() => {});
+        let delivered = await this.orchestrator.steerTask(orch.id, steerMsg).catch(() => false);
+        if (!delivered && goal.status === "executing") {
+          delivered = await this.orchestrator
+            .resumeTask(orch.id, { allowCompleted: true, note: steerMsg })
+            .then(() => true, () => false);
         }
+        if (!delivered) amendedGoal = this.handOffStrandedGoal(goal, "amendment could not be delivered to its run");
+      } else {
+        amendedGoal = this.handOffStrandedGoal(goal, "linked run has no orchestrator to apply the amendment");
       }
+    } else {
+      amendedGoal = this.handOffStrandedGoal(goal, "no linked run to apply the amendment");
     }
 
     if (goal.chatSessionId) {
@@ -1272,7 +1368,15 @@ export class DirectorRuntime {
       );
     }
 
-    return { goal, delta };
+    return { goal: amendedGoal, delta };
+  }
+
+  /** Moves an `executing` goal whose run is not live to `awaiting_human` and releases its slot to the queue. */
+  private handOffStrandedGoal(goal: GoalRecord, reason: string): GoalRecord {
+    if (goal.status !== "executing" || this.isRunOccupyingGoalSlot(goal.linkedRunId)) return goal;
+    const updated = this.goals.setStatus(goal.id, "awaiting_human", `Goal ${goal.id} needs attention: ${reason}; resume or review.`);
+    void this.drainGoalQueue(goal.repoRoot).catch(() => {});
+    return updated;
   }
 
   /**
@@ -1305,8 +1409,13 @@ export class DirectorRuntime {
       if (!this.disposed) {
         try {
           const current = this.goals.getGoal(goal.id);
-          if (current?.version === goal.version && (current.status === "verifying" || current.status === "reviewing")) {
-            this.goals.setStatus(goal.id, goal.status);
+          if (current?.version === goal.version && ["executing", "verifying", "reviewing"].includes(current.status)) {
+            if (this.isRunOccupyingGoalSlot(current.linkedRunId)) {
+              if (current.status !== goal.status) this.goals.setStatus(goal.id, goal.status);
+            } else {
+              const msg = error instanceof Error ? error.message : String(error);
+              this.goals.setStatus(goal.id, "awaiting_human", `Verification failed: ${msg.slice(0, 240)}`);
+            }
           }
         } catch {
           // DB may already be closing during shutdown
@@ -1316,6 +1425,10 @@ export class DirectorRuntime {
     } finally {
       unsubscribe();
       this.activeReviews.delete(goal.id);
+      if (!this.disposed) {
+        const latest = this.goals.getGoal(goal.id);
+        if (latest && !this.isGoalOccupyingSlot(latest)) void this.drainGoalQueue(latest.repoRoot).catch(() => {});
+      }
     }
   }
 
@@ -1756,10 +1869,15 @@ export class DirectorRuntime {
             ...unmet.map((u) => `- ${u.criterionId}: ${u.evidence}${u.remediation ? ` | Fix: ${u.remediation}` : ""}`),
             ...review.blockingIssues.map((b) => `- Blocker: ${b}`),
           ].join("\n");
-          const steered = await this.orchestrator.steerTask(orch.id, msg).catch(() => false);
-          if (!steered) {
-            await this.orchestrator.resumeTask(orch.id, { allowCompleted: true, note: msg }).catch(() => {});
+          let delivered = await this.orchestrator.steerTask(orch.id, msg).catch(() => false);
+          if (!delivered) {
+            delivered = await this.orchestrator
+              .resumeTask(orch.id, { allowCompleted: true, note: msg })
+              .then(() => true, () => false);
           }
+          if (!delivered) this.handOffStrandedGoal(goal, "requested changes could not be delivered to its run");
+        } else {
+          this.handOffStrandedGoal(goal, "linked run has no orchestrator to apply requested changes");
         }
       }
     }
@@ -2011,7 +2129,8 @@ export class DirectorRuntime {
         bannerGoals.length > 0
           ? `\n\nActive/Recent Goals:\n${bannerGoals
               .map((g) => {
-                const ver = g.reviewCycle > 0 ? `${g.reviewCycle} rev` : g.liveProgress?.verificationStatus ?? g.status;
+                const queued = g.status === "draft" && g.liveProgress?.phase === "queued" ? g.liveProgress.summary : undefined;
+                const ver = queued ?? (g.reviewCycle > 0 ? `${g.reviewCycle} rev` : g.liveProgress?.verificationStatus ?? g.status);
                 return `- ${g.id} v${g.version} [${g.status}] "${g.title}" (${ver})`;
               })
               .join("\n")}${
@@ -2303,7 +2422,12 @@ export class DirectorRuntime {
             model: String(args.model), profileId: args.profile_id as string | undefined,
             effort: typeof args.effort === "string" ? args.effort : undefined,
           });
-          return { ...committed, presentation_id: presentGoal(committed) };
+          const qEntry = this.db.admissionQueue.get("goal", committed.id);
+          return {
+            ...committed,
+            ...(qEntry ? { queued: true, queuePosition: qEntry.position } : {}),
+            presentation_id: presentGoal(committed),
+          };
         }
         return { ...created, presentation_id: presentGoal(created) };
       }
@@ -2326,6 +2450,7 @@ export class DirectorRuntime {
 
       case "queue_list": {
         const lane = args.lane === "goal" || args.lane === "worker" ? (args.lane as AdmissionLane) : undefined;
+        this.syncQueuedGoalProgress();
         const entries = this.db.admissionQueue.list({ lane, repoRoot });
         return {
           repoRoot,
@@ -2378,6 +2503,7 @@ export class DirectorRuntime {
 
       case "goal_list": {
         const allProjects = Boolean(args.all_projects);
+        this.syncQueuedGoalProgress();
         const goals = allProjects ? this.goals.listGoals({}) : this.goals.listGoals({ repoRoot, chatSessionId });
         const presentation_id = offerPresentation(() => buildGoalsTableDisplay(goals.map((goal) => this.goalDisplayData(goal))));
         return { goals, presentation_id };
@@ -2491,6 +2617,7 @@ export class DirectorRuntime {
       }
 
       case "goal_get": {
+        this.syncQueuedGoalProgress();
         const g = this.goals.getGoal(String(args.goal_id));
         if (!g) throw new Error(`Unknown goal ${args.goal_id}`);
         const detail = this.goalDisplayData(g);
