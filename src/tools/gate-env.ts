@@ -128,7 +128,8 @@ interface SpawnResult {
 
 /**
  * Spawns `bin args` in its own process group and collects output. Never rejects. On timeout, abort,
- * overflow or early settle the whole group gets SIGKILL, so background children cannot outlive it.
+ * overflow or early settle the whole group gets SIGKILL, so background children cannot outlive it,
+ * and the result settles at once instead of waiting for pipe EOF.
  */
 function spawnGroup(
   bin: string,
@@ -161,28 +162,42 @@ function spawnGroup(
       resolve({ stdout: "", stderr: "", exitCode: null, stopped: "spawn", spawnError: e as Error });
       return;
     }
+    /** Best-effort SIGKILL of the whole group, then the leader; never throws (ESRCH/EPERM ignored). */
     const killGroup = () => {
       if (!child.pid) return;
       try {
         process.kill(-child.pid, "SIGKILL");
-      } catch (e) {
-        if ((e as NodeJS.ErrnoException).code !== "ESRCH") child.kill("SIGKILL");
+        return;
+      } catch {
+        // Group already gone or not signalable; fall back to the leader.
+      }
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Already exited.
       }
     };
-    const cleanup = () => {
-      clearTimeout(timer);
-      o.signal?.removeEventListener("abort", onAbort);
-    };
-    const finish = (r: Omit<SpawnResult, "stdout" | "stderr">) => {
+    /**
+     * Settles exactly once. With `kill`, also kills the group and releases the pipes so the result
+     * never waits for EOF from a helper in another process group that inherited stdout/stderr.
+     */
+    const finish = (r: Omit<SpawnResult, "stdout" | "stderr">, kill: boolean) => {
       if (done) return;
       done = true;
-      cleanup();
+      clearTimeout(timer);
+      o.signal?.removeEventListener("abort", onAbort);
+      if (kill) {
+        killGroup();
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        child.unref?.();
+      }
       resolve({ stdout: text(out), stderr: text(err), ...r });
     };
     const stop = (reason: NonNullable<SpawnResult["stopped"]>) => {
-      if (stopped) return;
+      if (done) return;
       stopped = reason;
-      killGroup();
+      finish({ exitCode: null, stopped: reason }, true);
     };
     const onAbort = () => stop("cancelled");
     const timer = setTimeout(() => stop("timeout"), o.timeoutMs);
@@ -196,28 +211,18 @@ function spawnGroup(
         bytes += chunk.length;
         if (bytes > o.maxOutputBytes) return stop("output_limit");
         chunks.push(chunk);
-        if (watch && o.settleOn && !stopped) {
+        if (watch && o.settleOn) {
           const settled = o.settleOn(text(chunks));
-          if (settled !== undefined) {
-            // Do not wait for `close`: rc-file helpers (e.g. gitstatusd) may keep the pipe open.
-            killGroup();
-            child.stdout?.destroy();
-            finish({ exitCode: null, settled });
-          }
+          // Do not wait for `close`: rc-file helpers (e.g. gitstatusd) may keep the pipe open.
+          if (settled !== undefined) finish({ exitCode: null, settled }, true);
         }
       });
     };
     collect(child.stdout, out, true);
     collect(child.stderr, err, false);
-    child.once("error", (e) => {
-      killGroup();
-      finish({ exitCode: null, stopped: stopped ?? "spawn", spawnError: e });
-    });
-    child.once("close", (code) => {
-      // Reap leftover group members (backgrounded jobs) once the leader has exited.
-      if (o.settleOn) killGroup();
-      finish({ exitCode: code, stopped });
-    });
+    child.once("error", (e) => finish({ exitCode: null, stopped: stopped ?? "spawn", spawnError: e }, true));
+    // With settleOn, reap leftover group members (backgrounded jobs) once the leader has exited.
+    child.once("close", (code) => finish({ exitCode: code, stopped }, Boolean(o.settleOn)));
   });
 }
 
@@ -241,11 +246,20 @@ const LOGIN_OK_TTL_MS = 15 * 60_000;
 const LOGIN_FAIL_TTL_MS = 5 * 60_000;
 const probeCache = new Map<string, ProbeEntry>();
 const fallbackCache = new Map<string, Promise<string[]>>();
+/** Bumped by invalidateGateEnvCache; probes started in an older generation never write the cache. */
+let cacheGeneration = 0;
 
-/** Marks cached login PATHs stale (keeping last-good values) and drops cached fallback dirs. */
+/**
+ * Marks cached login PATHs stale (keeping last-good values), detaches in-flight probes so the next
+ * caller starts a fresh one, and drops cached fallback dirs.
+ */
 export function invalidateGateEnvCache(): void {
-  for (const entry of probeCache.values()) entry.expiresAt = 0;
+  cacheGeneration += 1;
   fallbackCache.clear();
+  for (const entry of probeCache.values()) {
+    entry.expiresAt = 0;
+    entry.inflight = undefined;
+  }
 }
 
 async function pickProbeShell(): Promise<string> {
@@ -321,23 +335,34 @@ async function loginPath(signal?: AbortSignal): Promise<LoginResult> {
   let inflight = entry.inflight;
   if (!inflight) {
     const e = entry;
-    inflight = e.inflight = probeLoginPath(shell)
+    const myGen = cacheGeneration;
+    const flight: Promise<LoginResult> = probeLoginPath(shell)
       .catch(() => null)
       .then((res) => {
+        const current = myGen === cacheGeneration;
+        let result: LoginResult;
         if (res) {
-          e.result = res;
-          e.lastGood = res;
-          e.expiresAt = Date.now() + LOGIN_OK_TTL_MS;
+          result = res;
+          if (current) {
+            e.lastGood = res;
+            e.expiresAt = Date.now() + LOGIN_OK_TTL_MS;
+          }
         } else {
-          console.error(`[gate-env] login PATH probe failed for ${shell}; gates use daemon PATH and fallbacks`);
-          e.result = e.lastGood
+          result = e.lastGood
             ? { dirs: e.lastGood.dirs, desc: e.lastGood.desc.replace("login=ok", "login=stale") }
             : { dirs: [], desc: `login=failed(${basename(shell)})` };
-          e.expiresAt = Date.now() + LOGIN_FAIL_TTL_MS;
+          console.error(
+            e.lastGood
+              ? `[gate-env] login PATH probe failed for ${shell}; gates keep the previous cached login PATH`
+              : `[gate-env] login PATH probe failed for ${shell}; gates use daemon PATH and fallbacks`,
+          );
+          if (current) e.expiresAt = Date.now() + LOGIN_FAIL_TTL_MS;
         }
-        e.inflight = undefined;
-        return e.result;
+        if (current) e.result = result;
+        if (e.inflight === flight) e.inflight = undefined;
+        return result;
       });
+    inflight = e.inflight = flight;
   }
   return raceSignal(inflight, signal);
 }
@@ -428,7 +453,7 @@ async function miseEnv(
   let path: string[] = [];
   for (const [k, v] of entries as Array<[string, string]>) {
     if (k === "PATH") path = await sanitizePath(v);
-    else if (ENV_NAME_RE.test(k) && !k.startsWith("HARNESS_") && !v.includes("\0")) vars[k] = v;
+    else if (ENV_NAME_RE.test(k) && k !== "__proto__" && !k.startsWith("HARNESS_") && !v.includes("\0")) vars[k] = v;
   }
   return { vars, path };
 }
@@ -460,8 +485,12 @@ export async function resolveGateEnv(o: {
 
   if (!isBlank(config.gateShell) && (!norm.gateShell || !(await isExecutableFile(norm.gateShell)))) {
     const raw = config.gateShell;
-    const shown = typeof raw === "string" && !CONTROL_RE.test(raw) ? raw : JSON.stringify(raw);
-    throw new GateConfigError(`goals.gateShell '${shown?.slice(0, 200)}' is not an executable absolute path (${OPERATOR_ERROR})`);
+    // Never echo non-string input: an object could embed arbitrary fields or secrets.
+    const shown =
+      typeof raw === "string"
+        ? `'${(CONTROL_RE.test(raw) ? JSON.stringify(raw) : raw).slice(0, 200)}'`
+        : `of type ${raw === null ? "null" : Array.isArray(raw) ? "array" : typeof raw}`;
+    throw new GateConfigError(`goals.gateShell ${shown} is not an executable absolute path (${OPERATOR_ERROR})`);
   }
   const envIssues = norm.issues.filter((i) => i.startsWith("goals.gateEnv"));
   if (envIssues.length > 0) throw new GateConfigError(`${envIssues.join("; ")} (${OPERATOR_ERROR})`);

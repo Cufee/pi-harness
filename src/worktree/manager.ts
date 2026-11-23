@@ -108,14 +108,17 @@ export class WorktreeManager {
   }
 
   async bootstrapWorktree(wtPath: string): Promise<void> {
-    // Optional fast workspace setup hook (e.g., APFS clone-on-write node_modules)
-    if (this.config.setupCommand) {
+    // Optional fast workspace setup hook (e.g., APFS clone-on-write node_modules).
+    // Snapshot command and gate config together so a live reload mid-bootstrap cannot mix revisions.
+    const setupCommand = this.config.setupCommand;
+    const gate = this.gate;
+    if (setupCommand) {
       const resolved = await resolveGateEnv({
         cwd: wtPath,
-        config: this.gate,
+        config: gate,
         extraEnv: { HARNESS_REPO_ROOT: this.repoRoot, HARNESS_WORKTREE_PATH: wtPath },
       });
-      await runGateCommand(this.config.setupCommand, {
+      await runGateCommand(setupCommand, {
         cwd: wtPath,
         resolved,
         timeoutMs: 120_000,
