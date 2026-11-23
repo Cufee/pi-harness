@@ -302,6 +302,29 @@ function acpErrorDetail(err: unknown): string {
   return parts.join(" | ").slice(0, 1000);
 }
 
+/**
+ * The specific JSON-RPC code an outer error wraps (data.code, data.error.code, or a `cause` chain), skipping the
+ * generic internal-error -32603 that SDK wrappers add. Structured codes are authoritative; diagnostic prose never is.
+ */
+function nestedRpcCode(err: unknown): number | undefined {
+  let cur: unknown = err;
+  for (let depth = 0; cur && typeof cur === "object" && depth < 4; depth++) {
+    try {
+      const candidates: unknown[] = [];
+      if (depth > 0) candidates.push((cur as { code?: unknown }).code);
+      const data = (cur as { data?: unknown }).data;
+      if (data && typeof data === "object") {
+        candidates.push((data as { code?: unknown }).code, ((data as { error?: unknown }).error as { code?: unknown } | undefined)?.code);
+      }
+      for (const c of candidates) if (typeof c === "number" && c !== -32603) return c;
+      cur = (cur as { cause?: unknown }).cause;
+    } catch {
+      break;
+    }
+  }
+  return undefined;
+}
+
 /** Last whole stderr lines that fit in `max` chars, without Node process warnings (never the failure reason). */
 function stderrTail(buf: string, max = 500): string {
   const lines = buf
@@ -1507,13 +1530,16 @@ export class AcpRunner {
               const detail = `${err instanceof Error ? err.message : String(err)} ${acpErrorDetail(err)}`;
               const code = (err as { code?: unknown } | null)?.code;
               const name = err instanceof Error ? err.name : "";
-              const explicitCancel = /-32800|\brequest cancel+ed\b|\boperation cancel+ed\b/i;
-              // Only an explicit request-cancelled answer counts: -32800, an internal error wrapping it, or a code-less
-              // abort. Any other specific code (e.g. -32602 mentioning "cancelToken") is a genuine RPC error.
+              const explicitCancel = /\brequest cancel+ed\b|\boperation cancel+ed\b/i;
+              // Structured codes decide first: -32800 (plain or wrapped by an internal error) is a cancellation and any
+              // other specific code, however its prose reads, is a genuine RPC error. Only a wrapper with no specific
+              // code falls back to a whole-phrase "request cancelled", or a code-less abort.
+              const nested = code === undefined || code === -32603 || typeof code !== "number" ? nestedRpcCode(err) : undefined;
               const isCancelled =
                 code === -32800 ||
-                (code === -32603 && explicitCancel.test(detail)) ||
-                (typeof code !== "number" && (name === "AbortError" || /\babort(ed)?\b/i.test(detail) || explicitCancel.test(detail)));
+                (typeof nested === "number" && nested === -32800) ||
+                (nested === undefined && code === -32603 && explicitCancel.test(detail)) ||
+                (nested === undefined && typeof code !== "number" && (name === "AbortError" || /\babort(ed)?\b/i.test(detail) || explicitCancel.test(detail)));
               if (isCancelled && !detectQuotaErrorText(detail).isQuota) {
                 resolvePrompt({ stopReason: "end_turn" });
                 return;

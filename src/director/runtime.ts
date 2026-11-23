@@ -713,6 +713,8 @@ export class DirectorRuntime {
   private wakeHandler: ((chatSessionId: string, event: ChatControlEvent) => void) | null = null;
   private peerBridge: DirectorPeerBridge | null = null;
   private notifiedSettledGoals = new Set<string>();
+  /** Open P0 escalations per run whose arrival already woke the Director; consumed only by the blocked settlement they cause. */
+  private notifiedP0Escalations = new Map<string, Set<string>>();
   /** Runs whose escalation is being created by a path that wakes the Director itself; skips the P0 wake. */
   private suppressEscalationWakeRuns = new Set<string>();
   /** In-flight launches; joiners receive the launch's actual outcome (started, stopped, already_active ...). */
@@ -908,9 +910,13 @@ export class DirectorRuntime {
       const goal = this.goals.getGoal(row.id);
       if (!goal?.chatSessionId || ["achieved", "cancelled"].includes(goal.status)) return;
       const openEsc = this.db.listEscalations(ev.runId, "open");
-      // This wake already reports the P0; the "failed" status the blocked run derives next must not wake again.
-      // The key is cleared when the run becomes active again.
-      this.notifiedSettledGoals.add(`${goal.id}:v${goal.version}:c${goal.reviewCycle}:${ev.runId}:failed`);
+      // This wake already reports the P0; a "failed" settlement blocked on this escalation must not wake again.
+      // Only that settlement is matched: no generic settlement is marked processed.
+      if (p.id) {
+        const ids = this.notifiedP0Escalations.get(ev.runId) ?? new Set<string>();
+        ids.add(String(p.id));
+        this.notifiedP0Escalations.set(ev.runId, ids);
+      }
       // An escalation is not a settlement: report the run's real status (a plain read; getEffectiveRun reconciles and emits).
       this.wakeHandler?.(goal.chatSessionId, {
         kind: "goal.escalated",
@@ -964,6 +970,7 @@ export class DirectorRuntime {
       // A resumed run can settle again with the same goal version; let that settlement through.
       if (status === "active") {
         for (const key of this.notifiedSettledGoals) if (key.includes(`:${ev.runId}:`)) this.notifiedSettledGoals.delete(key);
+        this.notifiedP0Escalations.delete(ev.runId);
       }
       // Deferred: a resume reactivates the run before its task is relaunched, and counting slots
       // in between would derive the run as settled again from its not-yet-live tasks.
@@ -1019,7 +1026,12 @@ export class DirectorRuntime {
 
     const dedupeKey = `${goal.id}:v${goal.version}:c${goal.reviewCycle}:${ev.runId}:${status}`;
     // Deduplicates verification launches and wakeups only; slot hand-off and queue admission always run.
-    const firstNotice = !this.notifiedSettledGoals.has(dedupeKey);
+    // A settlement blocked on a P0 whose arrival already woke the Director is reported by that wake.
+    const notifiedP0 = this.notifiedP0Escalations.get(ev.runId);
+    const blockedOnNotifiedP0 =
+      status === "failed" && cause === "blocked_escalation" && Boolean(notifiedP0) &&
+      this.db.listEscalations(ev.runId, "open").some((e) => e.severity === "P0" && notifiedP0!.has(e.id));
+    const firstNotice = !blockedOnNotifiedP0 && !this.notifiedSettledGoals.has(dedupeKey);
     this.notifiedSettledGoals.add(dedupeKey);
 
     // A daemon restart interrupted the run: not a failure. Hand the goal to a human (non-terminal, frees the slot)
@@ -4125,11 +4137,13 @@ export class DirectorRuntime {
         const targetTask = this.db.getTask(targetId);
         if (targetTask) {
           const targetRun = this.db.getRun(targetTask.runId);
-          // Any task of this workspace this chat may control, not just synthetic Director tasks.
-          if (targetRun && this.directorMayControlRun(chatSessionId, repoRoot, targetRun, targetTask.id, "cancel")) {
-            await this.orchestrator.cancelTask(targetTask.id, typeof args.reason === "string" ? args.reason : "Cancelled by Director");
-            return { cancelled: targetTask.id, runId: targetTask.runId };
+          // Throws for another chat's run; false means another repository, which is never cancellable from this workspace.
+          if (!targetRun || !this.directorMayControlRun(chatSessionId, repoRoot, targetRun, targetTask.id, "cancel")) {
+            throw new Error(`Task ${targetId} does not belong to this workspace; this chat may not cancel it. The operator can use \`pi-harness stop ${targetTask.runId}\`.`);
           }
+          // Any task of this workspace this chat may control, not just synthetic Director tasks.
+          await this.orchestrator.cancelTask(targetTask.id, typeof args.reason === "string" ? args.reason : "Cancelled by Director");
+          return { cancelled: targetTask.id, runId: targetTask.runId };
         }
         return this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, name, args, signal);
       }
