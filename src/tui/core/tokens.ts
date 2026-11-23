@@ -179,6 +179,7 @@ function highlightCodeLines(
   if (!color) return code.split("\n");
 
   return code.split("\n").map((line) => {
+    if (line.includes("\x1b")) return line;
     const trimmed = line.trimStart();
     if (trimmed.startsWith("//") || trimmed.startsWith("#") || trimmed.startsWith("--")) {
       return c.dim(line);
