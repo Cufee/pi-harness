@@ -412,7 +412,7 @@ export class WorktreeManager {
       }
       verifyCheckoutBacklink(reg, await this.commonDir());
       // Common dir and backlink also describe a later registration at this path; only the creation identity proves it is ours.
-      if (wt.creationIdentityJson) {
+      if (wt.creationIdentityJson != null) {
         verifyCreationIdentity(reg, parseCreationIdentity(wt.creationIdentityJson));
       } else if (reg.branch === null) {
         throw new Error(`Worktree ${worktreeId} is detached with no recorded creation identity; left in place`);
