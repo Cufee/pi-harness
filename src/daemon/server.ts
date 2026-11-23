@@ -22,6 +22,7 @@ import {
   resolveConfig,
   saveGlobalConfig,
   validateConfigRaw,
+  type GoalsConfig,
   type HarnessConfig,
   type RemoteHostConfig,
   type RunnerProfileConfig,
@@ -92,6 +93,17 @@ function isRunsWatchEvent(type: string): boolean {
     type.startsWith("escalation.") ||
     type === "agent.rollover"
   );
+}
+
+/**
+ * Shallow-merges a validated `config.update` goals patch. A `gateEnv` map replaces the previous one whole;
+ * `gateShell: null | ""` and `gateEnv: null` remove the key instead of storing null.
+ */
+function patchGoals(prev: GoalsConfig, patch: Record<string, unknown>): GoalsConfig {
+  const next = { ...prev, ...patch } as Record<string, unknown>;
+  if (next.gateShell === null || next.gateShell === "") delete next.gateShell;
+  if (next.gateEnv === null) delete next.gateEnv;
+  return next as unknown as GoalsConfig;
 }
 
 export const MAX_PEER_MESSAGE_HOPS = 10;
@@ -1907,7 +1919,7 @@ export class HarnessDaemon {
             ...(roots.extraReadRoots !== undefined ? { extraReadRoots: roots.extraReadRoots } : {}),
             ...(roots.extraWriteRoots !== undefined ? { extraWriteRoots: roots.extraWriteRoots } : {}),
           } } : {}),
-          ...(patch.goals ? { goals: { ...this.config.goals, ...(patch.goals as HarnessConfig["goals"]) } } : {}),
+          ...(patch.goals ? { goals: patchGoals(this.config.goals, patch.goals as Record<string, unknown>) } : {}),
           ...(patch.events ? { events: { ...this.config.events, ...(patch.events as HarnessConfig["events"]) } } : {}),
           ...(patch.catalog ? { catalog: { ...this.config.catalog, ...(patch.catalog as HarnessConfig["catalog"]) } } : {}),
           ...(patch.quotaRetry

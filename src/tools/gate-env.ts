@@ -4,7 +4,10 @@ import { constants } from "node:fs";
 import { access, stat } from "node:fs/promises";
 import { homedir, userInfo } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
+import { normalizeGateConfig } from "../config.js";
 import { nativeToolsPathDirs } from "./native-tools.js";
+
+export { normalizeGateConfig } from "../config.js";
 
 /**
  * Shared environment and runner for verification gates (goal criteria, merge-queue CI, worktree setup).
@@ -52,63 +55,11 @@ export class GateCommandError extends Error {
 
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const CONTROL_RE = /[\u0000-\u001f\u007f]/;
-const MAX_ENV_VALUE_BYTES = 32 * 1024;
 const MAX_PATH_ENTRIES = 256;
 const OPERATOR_ERROR = "operator config error, not a code defect";
 
 function isBlank(v: unknown): boolean {
   return v === undefined || v === null || v === "";
-}
-
-function displayName(k: string): string {
-  return ENV_NAME_RE.test(k) ? k : JSON.stringify(k.slice(0, 64));
-}
-
-/**
- * Pure validation of `goals.gateShell` / `goals.gateEnv`. Issues name offending keys only, never values.
- */
-export function normalizeGateConfig(goals: unknown): {
-  gateShell?: string;
-  gateEnv?: Record<string, string>;
-  issues: string[];
-} {
-  const issues: string[] = [];
-  const out: { gateShell?: string; gateEnv?: Record<string, string>; issues: string[] } = { issues };
-  if (!goals || typeof goals !== "object") return out;
-  const { gateShell, gateEnv } = goals as Record<string, unknown>;
-
-  if (!isBlank(gateShell)) {
-    if (typeof gateShell === "string" && gateShell.trim() === gateShell && !CONTROL_RE.test(gateShell) && isAbsolute(gateShell)) {
-      out.gateShell = gateShell;
-    } else {
-      issues.push("goals.gateShell must be an absolute path string");
-    }
-  }
-
-  if (gateEnv !== undefined && gateEnv !== null) {
-    if (typeof gateEnv !== "object" || Array.isArray(gateEnv)) {
-      issues.push("goals.gateEnv must be an object of string values");
-    } else {
-      const clean: Record<string, string> = {};
-      const bad: string[] = [];
-      for (const [key, val] of Object.entries(gateEnv as Record<string, unknown>)) {
-        const name = displayName(key);
-        if (!ENV_NAME_RE.test(key)) bad.push(`${name} (invalid name)`);
-        else if (key.startsWith("HARNESS_")) bad.push(`${name} (HARNESS_* names are reserved)`);
-        else if (typeof val !== "string" || val.includes("\0")) bad.push(`${name} (value must be a string without NUL)`);
-        else if (Buffer.byteLength(val, "utf8") > MAX_ENV_VALUE_BYTES) bad.push(`${name} (value exceeds 32 KiB)`);
-        else if (
-          key === "PATH" &&
-          (val === "" || val.split(delimiter).some((seg) => !seg || !isAbsolute(seg) || CONTROL_RE.test(seg)))
-        ) {
-          bad.push(`${name} (must be absolute directories joined by '${delimiter}')`);
-        } else clean[key] = val;
-      }
-      if (bad.length > 0) issues.push(`goals.gateEnv has invalid entries: ${bad.join(", ")}`);
-      else out.gateEnv = clean;
-    }
-  }
-  return out;
 }
 
 async function isExecutableFile(p: string): Promise<boolean> {

@@ -208,17 +208,22 @@ export function shouldRunIndependentReview(goal: GoalRecord, overrideMode?: Veri
   return goal.criteria.some((c) => c.required && c.kind !== "deterministic");
 }
 
-/** Goals config plus the operator gate keys (`goals.gateShell` / `goals.gateEnv`), validated when gates run. */
-export type GoalEngineConfig = GoalsConfig & { gateShell?: unknown; gateEnv?: unknown };
+/** The operator gate keys present in `config`, omitting unset ones. */
+function gateKeys(config?: Partial<GoalsConfig>): Pick<GoalsConfig, "gateShell" | "gateEnv"> {
+  return {
+    ...(config?.gateShell !== undefined ? { gateShell: config.gateShell } : {}),
+    ...(config?.gateEnv !== undefined ? { gateEnv: config.gateEnv } : {}),
+  };
+}
 
 export class GoalEngine {
-  private cfg: GoalEngineConfig;
+  private cfg: GoalsConfig;
   private readonly stateDir?: string;
 
   constructor(
     private readonly db: Database,
     private readonly onReviewInvalidated?: (goalId: string) => void,
-    config?: Partial<GoalEngineConfig>,
+    config?: Partial<GoalsConfig>,
     private readonly onReconciled?: () => void,
     opts?: { stateDir?: string },
   ) {
@@ -229,23 +234,21 @@ export class GoalEngine {
       gateTimeoutMs: config?.gateTimeoutMs ?? 180_000,
       autoVerifyOnSettle: config?.autoVerifyOnSettle ?? true,
       maxConcurrentGoals: config?.maxConcurrentGoals ?? 4,
-      gateShell: config?.gateShell,
-      gateEnv: config?.gateEnv,
+      ...gateKeys(config),
     };
     this.db.exec(GOALS_SCHEMA);
     this.migrateGoals();
   }
 
-  updateConfig(config?: Partial<GoalEngineConfig>): void {
+  updateConfig(config?: Partial<GoalsConfig>): void {
     this.cfg = {
       defaultMaxReviewCycles: config?.defaultMaxReviewCycles ?? this.cfg.defaultMaxReviewCycles,
       defaultMaxNoProgressCycles: config?.defaultMaxNoProgressCycles ?? this.cfg.defaultMaxNoProgressCycles,
       gateTimeoutMs: config?.gateTimeoutMs ?? this.cfg.gateTimeoutMs,
       autoVerifyOnSettle: config?.autoVerifyOnSettle ?? this.cfg.autoVerifyOnSettle,
       maxConcurrentGoals: config?.maxConcurrentGoals ?? this.cfg.maxConcurrentGoals ?? 4,
-      // Gate keys are taken verbatim so removing them from config clears them.
-      gateShell: config ? config.gateShell : this.cfg.gateShell,
-      gateEnv: config ? config.gateEnv : this.cfg.gateEnv,
+      // Gate keys are taken verbatim (validated when gates run) so removing them from config clears them.
+      ...gateKeys(config ?? this.cfg),
     };
   }
 
