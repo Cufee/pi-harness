@@ -844,8 +844,8 @@ export class DirectorRuntime {
               resumedGoal = true;
             }
           } else {
-            await this.commitGoal(g.id);
-            resumedGoal = true;
+            const commitRes = await this.commitGoalDetailed(g.id);
+            resumedGoal = commitRes.outcome === "started" || commitRes.outcome === "resumed";
           }
         }
       } catch {
