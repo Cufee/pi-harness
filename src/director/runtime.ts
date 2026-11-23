@@ -613,6 +613,7 @@ export class DirectorRuntime {
         this.syncQueuedGoalProgress();
         void this.drainGoalQueue().catch(() => {});
       },
+      { stateDir: config.stateDir },
     );
     this.unsubRunEvents = this.db.onEvent((ev) => this.handleControlPlaneEvent(ev));
     this.unsubGoalQueue = this.db.admissionQueue.onChange((lane) => {
