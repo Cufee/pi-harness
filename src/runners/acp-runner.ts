@@ -23,6 +23,7 @@ import {
   type AcpConfigOption,
   type AcpMcpServerEntry,
 } from "./acp-shims.js";
+import { isProtectedWritePath } from "./protected-paths.js";
 import { detectQuotaErrorText } from "./quota-detect.js";
 import { validateRunPolicy } from "./types.js";
 import type { ProbedModelInfo, QuotaPauseInfo, RunAgentRequest, RunAgentResult, RunnerCost, RunnerUsage, ToolPolicy } from "./types.js";
@@ -188,21 +189,30 @@ async function resolveAllowedTarget(
   extraRoots: string[],
   requested: string,
   allowNew: boolean,
+  protectWrites = false,
 ): Promise<{ path: string; exists: boolean; root: string }> {
   let firstErr: unknown;
   for (const root of [primaryRoot, ...extraRoots]) {
+    // Writes: refuse protected targets before any side effect, checking the lexical path first and the
+    // canonical path once resolved. A protected hit is final and never falls through to later roots.
+    if (protectWrites && isProtectedWritePath(root, requested)) throw PROTECTED_WRITE_ERROR();
+    let target: { path: string; exists: boolean };
     try {
-      const target = await workspaceTarget(root, requested, allowNew);
-      return { ...target, root };
+      target = await workspaceTarget(root, requested, allowNew);
     } catch (err) {
       if (!firstErr) firstErr = err;
+      continue;
     }
+    if (protectWrites && isProtectedWritePath(root, target.path)) throw PROTECTED_WRITE_ERROR();
+    return { ...target, root };
   }
   throw firstErr ?? new Error("ACP filesystem path is outside allowed roots");
 }
 
+const PROTECTED_WRITE_ERROR = () => new Error("ACP filesystem write target is protected (.git or .harness/worktrees)");
+
 async function openWorkspaceFile(primaryRoot: string, extraRoots: string[], requested: string, write: boolean) {
-  const { path: target, exists, root } = await resolveAllowedTarget(primaryRoot, extraRoots, requested, write);
+  const { path: target, exists, root } = await resolveAllowedTarget(primaryRoot, extraRoots, requested, write, write);
   if (write && !exists) {
     await mkdir(dirname(target), { recursive: true });
     const actualParent = await realpath(dirname(target));
@@ -214,6 +224,7 @@ async function openWorkspaceFile(primaryRoot: string, extraRoots: string[], requ
   try {
     const actual = await realpath(target);
     requireWorkspacePath(root, actual);
+    if (write && isProtectedWritePath(root, actual)) throw PROTECTED_WRITE_ERROR();
     const opened = await file.stat();
     const current = await stat(actual);
     if (!opened.isFile() || (write && opened.nlink !== 1) || opened.dev !== current.dev || opened.ino !== current.ino) {
@@ -939,24 +950,39 @@ export class AcpRunner {
 
         const unwrapShellArgv = (argv: string[]): string => {
           if (argv.length >= 3) {
-            const firstBin = argv[0]!.includes("/") ? argv[0]!.split("/").pop()! : argv[0]!;
-            if ((firstBin === "sh" || firstBin === "bash" || firstBin === "zsh") && /^-[a-zA-Z]*c$/.test(argv[1]!)) {
+            // Only a system shell wrapper in plain or login mode counts as transparent (other startup flags, such
+            // as interactive mode, change parsing); anything else is validated as a command.
+            if (/^(?:\/(?:usr\/)?bin\/)?(?:sh|bash|zsh)$/.test(argv[0]!) && /^-l?c$/.test(argv[1]!)) {
               return argv[2]!;
             }
           }
-          return argv.join(" ");
+          // A direct argv runs without a shell: single-quote each element so the validator sees the exact vector.
+          return argv.map((a) => `'${a.replaceAll("'", `'\\''`)}'`).join(" ");
         };
 
+        // Only the command the adapter will actually run is validated. The display title is adapter-rendered
+        // text that is not tied to the executed command, so a call without a command field is denied.
         const extractShellCommand = (): string => {
-          if (rawInput) {
-            if (typeof rawInput.command === "string") return rawInput.command;
-            if (typeof rawInput.cmd === "string") return rawInput.cmd;
-            if (Array.isArray(rawInput.command)) return unwrapShellArgv(rawInput.command.map(String));
-            if (Array.isArray(rawInput.argv)) return unwrapShellArgv(rawInput.argv.map(String));
+          const fields = ["command", "cmd", "argv"].filter((key) => rawInput?.[key] !== undefined);
+          if (fields.length !== 1) return ""; // none, or several that could disagree about what runs
+          const value = rawInput![fields[0]!];
+          if (typeof value === "string" && fields[0] !== "argv") return value;
+          if (Array.isArray(value) && value.length > 0 && value.every((a) => typeof a === "string")) return unwrapShellArgv(value);
+          return "";
+        };
+
+        // The shell's working directory: the workspace unless the call names one, which must itself be inside
+        // an allowed read root. Returns undefined when the named directory is not provably inside.
+        const resolveShellCwd = async (): Promise<string | undefined> => {
+          const named = ["cwd", "workdir", "directory", "dir"].map((key) => rawInput?.[key]).filter((v) => v !== undefined);
+          if (named.length === 0) return workspace;
+          if (named.length > 1 || typeof named[0] !== "string" || !named[0]) return undefined;
+          try {
+            const target = await resolveAllowedTarget(workspace, extraReadRoots, named[0], false);
+            return (await stat(target.path)).isDirectory() ? target.path : undefined;
+          } catch {
+            return undefined;
           }
-          // Strip common adapter prefixes from title like `shell_command: git status` or `Run command: rg foo`
-          const stripped = title.replace(/^(?:shell_command|bash|run_command|execute|terminal)\s*:\s*/i, "").trim();
-          return stripped;
         };
 
         const READ_ONLY_OTHER_TOOL_RE =
@@ -973,11 +999,17 @@ export class AcpRunner {
             workspaceCall = await validateReadLocations();
           } else if (canWrite && isWrite) {
             try {
-              const locations = p.toolCall?.locations ?? [];
-              for (const location of locations) {
-                await resolveAllowedTarget(workspace, extraWriteRoots, location.path, toolKind === "edit" || toolKind === "move");
+              // Check every reported target: locations plus any path the tool input names, since either may be
+              // what the adapter writes. Non-string path values are unprovable and deny.
+              const targets = (p.toolCall?.locations ?? []).map((location) => location.path as unknown);
+              for (const key of ["path", "file_path", "filePath", "target_file", "notebook_path", "old_path", "new_path", "source", "destination"]) {
+                if (rawInput?.[key] !== undefined) targets.push(rawInput[key]);
               }
-              workspaceCall = locations.length > 0;
+              for (const target of targets) {
+                if (typeof target !== "string" || !target.trim()) throw new Error("unprovable write target");
+                await resolveAllowedTarget(workspace, extraWriteRoots, target, toolKind === "edit" || toolKind === "move", true);
+              }
+              workspaceCall = targets.length > 0;
             } catch {
               workspaceCall = false;
             }
@@ -986,7 +1018,10 @@ export class AcpRunner {
               workspaceCall = true;
             } else {
               const cmd = extractShellCommand();
-              workspaceCall = cmd.length > 0 && isSafeReadOnlyShellCommand(cmd);
+              const shellCwd = cmd.length > 0 ? await resolveShellCwd() : undefined;
+              workspaceCall =
+                shellCwd !== undefined &&
+                isSafeReadOnlyShellCommand(cmd, { cwd: shellCwd, readRoots: [workspace, ...extraReadRoots] });
             }
           } else if (toolKind === "think") {
             workspaceCall = true;
