@@ -702,7 +702,7 @@ export class GoalEngine {
     }));
     nextCriteria = [...nextCriteria, ...addedCriteria];
 
-    if (nextCriteria.length === 0) {
+    if (nextCriteria.length === 0 && (cur.verificationMode !== "none" || cur.criteria.length > 0)) {
       throw new Error("Goal amendment cannot remove all acceptance criteria");
     }
     for (const c of nextCriteria) {

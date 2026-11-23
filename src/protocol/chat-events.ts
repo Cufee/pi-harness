@@ -292,8 +292,15 @@ export function formatChatEventSummary(event: ChatControlEvent, opts?: { remoteH
       const head = `Goal ${event.goalId} v${event.goalVersion} ("${event.goalTitle}")`;
       const esc = event.openEscalations ? ` (${event.openEscalations} open escalation(s))` : "";
       const treeCmd = cliCommand("tree", event.runId, opts?.remoteHost);
+      const resumeCmd = cliCommand("resume", event.runId, opts?.remoteHost);
       const verificationError = settledVerificationError(event);
       if (verificationError !== null) {
+        if (event.runStatus === "stopped") {
+          return `${head}: run ${event.runId} is stopped, and automatic goal verification failed to run: ${verificationError}${esc}. Goal ${event.goalId} is awaiting_human. Inspect the goal (goal_get) or run (${treeCmd}); nothing restarts automatically.`;
+        }
+        if (event.runStatus === "failed") {
+          return `${head}: run ${event.runId} failed, and automatic goal verification also failed to run: ${verificationError}${esc}. Goal ${event.goalId} is awaiting_human. Inspect the goal (goal_get) or run (${treeCmd}), fix the verification issue, or continue in place with ${resumeCmd}.`;
+        }
         return (
           `${head}: run ${event.runId} completed, but goal verification failed to run: ${verificationError}${esc}. The run itself did not fail. ` +
           `Re-run verification (Director: goal_trigger_review) or inspect the goal (goal_get); inspect the run with ${treeCmd}.`
@@ -303,7 +310,6 @@ export function formatChatEventSummary(event: ChatControlEvent, opts?: { remoteH
         const detail = event.detail?.replace(/\s+/g, " ").trim();
         return `${head} run ${event.runId} completed${esc}${detail ? `: ${detail}` : ""}.`;
       }
-      const resumeCmd = cliCommand("resume", event.runId, opts?.remoteHost);
       const recovery = `Nothing restarts automatically. Continue it in place with ${resumeCmd}, inspect it with ${treeCmd}, or send a new request.`;
       const quotaReason = settledQuotaReason(event);
       if (quotaReason !== null) {
@@ -363,6 +369,19 @@ export function formatChatEventForModel(event: ChatControlEvent): string {
         event.openEscalations > 0
           ? " Open escalations stay open until disposed; close any handled finding with `resolve_escalation({ escalation_id, reason })`."
           : "";
+      const resume = `resume_run({ goal_id: "${event.goalId}" })`;
+      if (settledVerificationError(event) !== null && event.runStatus === "stopped") {
+        return [
+          summary,
+          `Run ${event.runId} for Goal ${event.goalId} is stopped, and automatic goal verification failed to run; Goal ${event.goalId} is awaiting_human. Do not restart the run yourself. Inspect the goal with goal_get({ goal_id: "${event.goalId}" }) and report the verification error and stop status to the user.${escNote}`,
+        ].join("\n");
+      }
+      if (settledVerificationError(event) !== null && event.runStatus === "failed") {
+        return [
+          summary,
+          `Run ${event.runId} for Goal ${event.goalId} failed, and automatic goal verification also failed to run; Goal ${event.goalId} is awaiting_human. Inspect the goal with goal_get({ goal_id: "${event.goalId}" }) and the run with run_status({ goal_id: "${event.goalId}" }); fix the verification issue, resume in place with ${resume} if recoverable, or report to the user.${escNote}`,
+        ].join("\n");
+      }
       if (settledVerificationError(event) !== null) {
         return [
           summary,
@@ -384,7 +403,6 @@ export function formatChatEventForModel(event: ChatControlEvent): string {
           `The autonomous run (${event.runId}) for Goal ${event.goalId} finished. Inspect/settle the goal with \`goal_trigger_review\` (using the appropriate \`verification_mode\` for this task) or report the outcome concisely to the user.${escNote}`,
         ].join("\n");
       }
-      const resume = `resume_run({ goal_id: "${event.goalId}" })`;
       const inspect = `run_status({ run_id: "${event.runId}" }) (operator: \`pi-harness tree ${event.runId}\`)`;
       const noCause = event.detail ? "" : ` No cause was recorded; inspect with ${inspect}.`;
       let guidance: string;
