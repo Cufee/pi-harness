@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { type BigIntStats, constants, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ControlPlaneDb, RunRecord } from "./db.js";
 import { scanMaxFileIndex, writeUniqueFile } from "./ids.js";
@@ -57,7 +57,10 @@ export function writeCodeOutput(db: ControlPlaneDb, run: RunRecord, taskId: stri
   let allocateIndex: (() => number) | undefined;
   if (typeof db.nextArtifactSeq === "function") {
     if (typeof db.advanceArtifactSeqFloor === "function") {
-      db.advanceArtifactSeqFloor("code-output", scanMaxFileIndex(dir, scopedStem, ext));
+      // Seed above both files on disk and historical index rows whose files were deleted.
+      const diskMax = scanMaxFileIndex(dir, scopedStem, ext);
+      const dbMax = typeof db.maxIndexedArtifactSeq === "function" ? db.maxIndexedArtifactSeq(scopedStem, ext) : 0;
+      db.advanceArtifactSeqFloor("code-output", Math.max(diskMax, dbMax));
     }
     allocateIndex = () => db.nextArtifactSeq("code-output");
   }
@@ -119,7 +122,7 @@ export function findRunDossier(
       // Unresolvable root: only the lexical candidates apply.
     }
   }
-  if (rel !== null && typeof db.listDossierPathsWithSuffix === "function") {
+  if (rel !== null && typeof db.listDistinctDossierPaths === "function") {
     // Other runs may have recorded this file under another spelling of the same root (e.g. via a symlink).
     let realRoot: string | null = null;
     try {
@@ -128,10 +131,12 @@ export function findRunDossier(
       realRoot = null;
     }
     if (realRoot !== null) {
-      for (const path of db.listDossierPathsWithSuffix(sep + rel)) {
-        if (!path.endsWith(sep + rel)) continue;
+      const suffix = sep + rel;
+      for (const path of db.listDistinctDossierPaths()) {
+        if (!path.endsWith(suffix)) continue;
+        const prefix = path.slice(0, path.length - suffix.length) || sep;
         try {
-          if (realpathSync(path.slice(0, path.length - rel.length - 1) || sep) === realRoot) candidates.push(path);
+          if (prefix === rawRoot || realpathSync(prefix) === realRoot) candidates.push(path);
         } catch {
           // Unresolvable root spelling: cannot be the same file.
         }
@@ -210,24 +215,29 @@ export function readRunDossier(db: ControlPlaneDb, run: RunRecord, args: Record<
   // A path indexed by several runs (under any root spelling, or a case alias of the same file) cannot prove which
   // run's bytes it now holds.
   const ownerPaths = new Set(found.candidates);
-  if (typeof db.listDossierPathsWithSuffix === "function") {
+  if (typeof db.listDistinctDossierPaths === "function") {
     const suffix = sep + found.rel;
     const rawRoot = resolve(run.repoRoot);
-    let expectedStat: { dev: number; ino: number } | null = null;
+    let expectedStat: BigIntStats | null = null;
     try {
-      expectedStat = statSync(expected);
+      expectedStat = lstatSync(expected, { bigint: true });
     } catch {
       expectedStat = null;
     }
-    for (const p of db.listDossierPathsWithSuffix(suffix)) {
+    // Case/Unicode-folded basename: a candidate alias, confirmed only when it resolves to the same inode.
+    const expectedBaseNorm = basename(found.rel).normalize("NFD").toLowerCase();
+    for (const p of db.listDistinctDossierPaths()) {
       try {
         if (p.endsWith(suffix)) {
           const prefix = p.slice(0, p.length - suffix.length) || sep;
           if (prefix === rawRoot || realpathSync(prefix) === realRoot) ownerPaths.add(p);
-        } else if (expectedStat) {
-          // Case-folded match: the same file only when the filesystem resolves it to the same inode.
-          const st = statSync(p);
-          if (st.dev === expectedStat.dev && st.ino === expectedStat.ino) ownerPaths.add(p);
+        } else if (
+          expectedStat !== null &&
+          !expectedStat.isSymbolicLink() &&
+          basename(p).normalize("NFD").toLowerCase() === expectedBaseNorm
+        ) {
+          const pStat = statSync(p, { bigint: true });
+          if (pStat.dev === expectedStat.dev && pStat.ino === expectedStat.ino) ownerPaths.add(p);
         }
       } catch {
         // Unresolvable spelling: cannot be the same file.
