@@ -73,7 +73,9 @@ export class DaemonClient {
         }
         this.handleDisconnect(proc.stdin!);
       });
-      this.attachTransportReader(proc.stdin!, false);
+      // Before the ping succeeds, stdout end waits for "close" so a failed bridge reports its stderr.
+      let connected = false;
+      this.attachTransportReader(proc.stdin!, () => connected);
       await Promise.race([
         this.request("ping"),
         spawnErr,
@@ -85,6 +87,8 @@ export class DaemonClient {
         this.close();
         throw err;
       });
+      connected = true;
+      stderrBuf = "";
       return;
     } else {
       const sock = createConnection(this.target);
@@ -101,7 +105,7 @@ export class DaemonClient {
     this.attachTransportReader(this.writable);
   }
 
-  private attachTransportReader(transport: Writable | null, disconnectOnEnd = true): void {
+  private attachTransportReader(transport: Writable | null, disconnectOnEnd: () => boolean = () => true): void {
     if (!this.readable) return;
     this.detachReader = attachDaemonReader(this.readable, {
       onMessage: (raw) => {
@@ -125,7 +129,7 @@ export class DaemonClient {
       },
       onError: () => this.handleDisconnect(transport),
       onEnd: () => {
-        if (disconnectOnEnd) this.handleDisconnect(transport);
+        if (disconnectOnEnd()) this.handleDisconnect(transport);
       },
     });
   }
