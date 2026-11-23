@@ -89,7 +89,12 @@ export interface GoalCriterion {
   id: string;
   description: string;
   kind: CriterionKind;
-  /** Runnable shell command for `deterministic` criteria (executed at $0 LLM cost) */
+  /**
+   * Runnable shell command for `deterministic` criteria (executed at $0 LLM cost).
+   * Runs with `cwd` set to an isolated `_verify` scratch worktree checked out at the goal's target branch when a linked
+   * run resolves one (otherwise `goal.repoRoot`), and receives `HARNESS_REPO_ROOT` (the canonical main checkout),
+   * `HARNESS_GOAL_EVIDENCE_DIR` (when the evidence directory is valid), and `HARNESS_GOAL_ID` in its environment.
+   */
   command?: string;
   required: boolean;
 }
@@ -922,6 +927,7 @@ export class GoalEngine {
           extraEnv: {
             ...(verifiedEvDir !== null ? { HARNESS_GOAL_EVIDENCE_DIR: verifiedEvDir } : {}),
             HARNESS_GOAL_ID: goal.id,
+            HARNESS_REPO_ROOT: goal.repoRoot,
           },
           signal,
         });
