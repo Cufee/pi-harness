@@ -11,6 +11,7 @@ import { DaemonClient, runStdioSocketBridge } from "./daemon/remote.js";
 import { currentDaemonBuildId, DAEMON_PROTOCOL_REV, HarnessDaemon } from "./daemon/server.js";
 import { runDirectorChatTui, runNativeScrollbackTui, type TuiExitAction } from "./tui/app.js";
 import { parseDurationMs } from "./tui/core/index.js";
+import { type FederatedProjectSummary, pickProjectTui } from "./tui/projects.js";
 import type { AttachableSession } from "./tui/store.js";
 
 const BOOLEAN_SHORT_FLAGS = new Set(["h"]);
@@ -308,7 +309,7 @@ function printHelp(): void {
 
 Usage:
   pi-harness [-p <project>] [--remote <alias|ssh://host>]
-                                                    Resume last session for project/workspace (remote uses last remote project)
+                                                    Resume last session for project/workspace (remote picks a remote project)
   pi-harness remotes | remote [list | add <name> <ssh> | rm <name> | connect <name> | disconnect <name>]
                                                     Manage remote SSH peer hosts
   pi-harness projects [--host <name>] [--json]      List local & connected remote projects
@@ -343,11 +344,29 @@ Usage:
 `);
 }
 
+type ChatStart = {
+  kind: "chat";
+  repoRoot?: string;
+  projectId?: string;
+  chatSessionId?: string;
+  preferLastGlobal?: boolean;
+  preferLastProject?: boolean;
+};
+
+/**
+ * Lets the user pick one of the daemon host's own projects. Falls back to the most recent project
+ * when none are registered; resolves to `null` when the picker is cancelled.
+ */
+async function chooseRemoteProject(client: DaemonClient, hostLabel: string | null): Promise<ChatStart | null> {
+  const projects = await client.request<FederatedProjectSummary[]>("project.list", { includeRemotes: false });
+  if (projects.length === 0) return { kind: "chat", preferLastProject: true };
+  const picked = await pickProjectTui({ client, currentHost: hostLabel, initialProjects: projects, includeRemotes: false });
+  return picked ? { kind: "chat", projectId: picked.id, repoRoot: picked.rootPath } : null;
+}
+
 async function runInteractiveSessionLoop(
   initialClient: DaemonClient,
-  initial:
-    | { kind: "chat"; repoRoot?: string; projectId?: string; chatSessionId?: string; preferLastGlobal?: boolean; preferLastProject?: boolean }
-    | { kind: "run"; repoRoot?: string; runId: string; initialTaskId?: string | null },
+  initial: ChatStart | { kind: "run"; repoRoot?: string; runId: string; initialTaskId?: string | null },
   hostCtx: {
     localSocketPath: string;
     localNodeId: string;
@@ -394,6 +413,7 @@ async function runInteractiveSessionLoop(
       //  - Map any row belonging to our own local nodeId back to "local"
       //  - Only permit "local" or an explicitly configured local remote alias (never execute arbitrary daemon-supplied strings!)
       //  - Connect BEFORE closing the current client so failures keep the user safely inside the TUI
+      let hostStart: ChatStart | null = null;
       const effectiveTargetHost =
         action.targetNodeId && action.targetNodeId === hostCtx.localNodeId ? "local" : action.targetHost;
       if (effectiveTargetHost) {
@@ -410,9 +430,9 @@ async function runInteractiveSessionLoop(
         const nextHostLabel = isLocal ? null : matchedRemote!.name;
         const nextTarget = isLocal ? undefined : matchedRemote!.sshTarget;
         const nextBridgeCommand = isLocal ? undefined : matchedRemote!.bridgeCommand;
-        if (nextHostLabel !== currentRemoteHost) {
-          let nextClient: DaemonClient | null = null;
-          try {
+        let nextClient: DaemonClient | null = null;
+        try {
+          if (nextHostLabel !== currentRemoteHost) {
             nextClient = await connectClient(hostCtx.localSocketPath, nextTarget, nextBridgeCommand);
             if (action.targetNodeId) {
               const info = await nextClient.request<{ nodeId?: string }>("ping");
@@ -422,24 +442,34 @@ async function runInteractiveSessionLoop(
                 );
               }
             }
+          }
+          // Cancelling the remote project picker keeps the current connection and session
+          if (action.targetId === "__host__" && nextHostLabel) {
+            hostStart = await chooseRemoteProject(nextClient ?? client, nextHostLabel);
+            if (!hostStart) {
+              nextClient?.close();
+              continue;
+            }
+          }
+          if (nextClient) {
             client.close();
             client = nextClient;
             currentRemoteHost = nextHostLabel;
-          } catch (err) {
-            nextClient?.close();
-            pendingNotice = {
-              tone: "danger",
-              text: `Failed to connect to "${effectiveTargetHost}": ${err instanceof Error ? err.message : String(err)}`,
-            };
-            continue;
           }
+        } catch (err) {
+          nextClient?.close();
+          pendingNotice = {
+            tone: "danger",
+            text: `Failed to connect to "${effectiveTargetHost}": ${err instanceof Error ? err.message : String(err)}`,
+          };
+          continue;
         }
       }
 
       if (action.targetKind === "run") {
         current = { kind: "run", repoRoot: action.repoRoot ?? current.repoRoot, runId: action.targetId, initialTaskId: action.taskId };
       } else if (action.targetId === "__host__") {
-        current = { kind: "chat", preferLastProject: Boolean(currentRemoteHost), preferLastGlobal: !currentRemoteHost };
+        current = hostStart ?? { kind: "chat", preferLastGlobal: true };
       } else if (action.targetId === "__project__" && action.projectId) {
         current = { kind: "chat", projectId: action.projectId, repoRoot: action.repoRoot };
       } else if (action.targetId === "__new__") {
@@ -526,23 +556,33 @@ async function main(): Promise<void> {
 
   // Zero-arg default on a TTY:
   //  - Local: resume last session for the current directory (or --project)
-  //  - Remote SSH without --repo/--project: open last used remote project (never send local Mac cwd to remote host!)
+  //  - Remote SSH without --repo/--project: pick a remote project (never send local Mac cwd to remote host!)
   if (!cmd || cmd === "chat") {
     if (!process.stdout.isTTY) {
       printHelp();
       return;
     }
     const client = await connectClient(config.socketPath, remoteSpec.target, remoteSpec.bridgeCommand);
-    const preferRemoteLast = Boolean(remoteSpec.target && !explicitRepoFlag && !projectFlag);
-    await runInteractiveSessionLoop(
-      client,
-      {
-        kind: "chat",
-        ...(preferRemoteLast ? { preferLastProject: true } : { repoRoot: explicitRepoFlag ? repoRoot : projectFlag ? undefined : repoRoot }),
-        ...(projectFlag ? { projectId: projectFlag } : {}),
-      },
-      hostCtx,
-    );
+    let initial: ChatStart = {
+      kind: "chat",
+      repoRoot: explicitRepoFlag ? repoRoot : projectFlag ? undefined : repoRoot,
+      ...(projectFlag ? { projectId: projectFlag } : {}),
+    };
+    if (remoteSpec.target && !explicitRepoFlag && !projectFlag) {
+      let picked: ChatStart | null;
+      try {
+        picked = await chooseRemoteProject(client, remoteSpec.hostLabel);
+      } catch (err) {
+        client.close();
+        throw err;
+      }
+      if (!picked) {
+        client.close();
+        return;
+      }
+      initial = picked;
+    }
+    await runInteractiveSessionLoop(client, initial, hostCtx);
     return;
   }
 
