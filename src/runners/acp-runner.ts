@@ -494,7 +494,7 @@ export class AcpRunner {
     let childExitInfo: { code: number | null; signal: NodeJS.Signals | null } | null = null;
     const childExitMessage = (code: number | null, signal: NodeJS.Signals | null) =>
       `ACP agent process exited during an active turn (code=${code ?? "null"}, signal=${signal ?? "null"})`;
-    const onChildGone = (code: number | null, signal: NodeJS.Signals | null, fromClose: boolean) => {
+    const onChildGone = (code: number | null, signal: NodeJS.Signals | null) => {
       if (!childExitInfo && (code !== null || signal !== null)) childExitInfo = { code, signal };
       // Abort, rollover, idle timeout, and cancel grace terminate the child on purpose.
       if (req.signal.aborted || rolloverTriggered || idleTimedOut || cancelGraceTimer) return;
@@ -507,11 +507,9 @@ export class AcpRunner {
         terminateChild(child);
         cb(childGoneError);
       };
-      if (fromClose) {
-        rejectNow();
-        return;
-      }
-      // Give a final JSON-RPC response already buffered on stdout a moment to resolve the prompt cleanly.
+      // Exit and close only mean the process and its OS pipes are gone, not that the stream adapter and SDK have
+      // delivered every buffered message. Give a final JSON-RPC response (success or error) already on stdout a bounded
+      // moment to settle the prompt; settling clears this timer. Keep an armed timer instead of resetting it.
       if (childExitFlushTimer) return;
       childExitFlushTimer = setTimeout(() => {
         childExitFlushTimer = null;
@@ -519,21 +517,20 @@ export class AcpRunner {
       }, 250);
       childExitFlushTimer.unref?.();
     };
-    const onChildExit = (code: number | null, signal: NodeJS.Signals | null) => onChildGone(code, signal, false);
-    const onChildClose = (code: number | null, signal: NodeJS.Signals | null) => onChildGone(code, signal, true);
+    const onChildExit = (code: number | null, signal: NodeJS.Signals | null) => onChildGone(code, signal);
     let livenessTimer: ReturnType<typeof setInterval> | null = null;
     if (child) {
       child.once("exit", onChildExit);
-      child.once("close", onChildClose);
+      child.once("close", onChildExit);
       livenessTimer = setInterval(() => {
         if (child.exitCode !== null || child.signalCode !== null) {
-          onChildGone(child.exitCode, child.signalCode, false);
+          onChildGone(child.exitCode, child.signalCode);
         } else if (typeof child.pid === "number") {
           try {
             process.kill(child.pid, 0);
           } catch (err) {
             // EPERM means the PID exists but belongs to someone else: treat as alive.
-            if ((err as NodeJS.ErrnoException).code === "ESRCH") onChildGone(child.exitCode, child.signalCode, false);
+            if ((err as NodeJS.ErrnoException).code === "ESRCH") onChildGone(child.exitCode, child.signalCode);
           }
         }
       }, 5_000);
@@ -1819,12 +1816,19 @@ export class AcpRunner {
       const combined = `${errMsg}\n${stderrBuf}`;
       // For a child death the stderr tail is history (live stderr quota lines already drive quotaRetrying), so only
       // the error itself is scanned.
-      const detected = detectQuotaErrorText(childGoneError && primary === childGoneError ? errMsg : combined);
+      const isChildExit = Boolean(childGoneError && primary === childGoneError);
+      const detected = detectQuotaErrorText(isChildExit ? errMsg : combined);
 
-      // Classify from quota state that is still unresolved now (quotaRetrying clears on forward progress), never
-      // from lifetime retry history: a recovered worker that later crashes fails instead of pausing.
+      // A child death (including transport EOF reconciled with the exit above) is classified from quota state that is
+      // still unresolved now (quotaRetrying clears on forward progress), never from lifetime retry history: a recovered
+      // worker that later crashes fails instead of pausing. Any other error, such as an explicit JSON-RPC error from a
+      // live agent, pauses only when the error itself signals quota.
       const quotaSignal =
-        quotaWatchdogTriggered || quotaRetrying || detected.isQuota || errData?.errorKind === "rate_limit" || Boolean(errRateLimit);
+        quotaWatchdogTriggered ||
+        (isChildExit && quotaRetrying) ||
+        detected.isQuota ||
+        errData?.errorKind === "rate_limit" ||
+        Boolean(errRateLimit);
       if (quotaSignal) {
         const reason = lastQuotaReason || detected.summary || errMsg;
         const resetAt = lastQuotaResetAt ?? detected.resetAtIso ?? null;
@@ -1869,7 +1873,7 @@ export class AcpRunner {
       clearIdleWatchdog();
       if (livenessTimer) clearInterval(livenessTimer);
       child?.off("exit", onChildExit);
-      child?.off("close", onChildClose);
+      child?.off("close", onChildExit);
       disarmQuotaWatchdog(false);
       req.signal.removeEventListener("abort", onAbort);
       try {
