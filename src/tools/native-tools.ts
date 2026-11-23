@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -35,8 +35,9 @@ export function currentOctofsTarget(): { key: string; triple: string; sha256: st
 }
 
 /**
- * Resolves directories containing bundled native CLI tools (`ast-grep` / `sg` from `@ast-grep/cli`
- * and staged `octofs`) so ACP agents always have them on `PATH` without manual host installation.
+ * Resolves directories containing bundled native CLI tools (`ast-grep` / `sg` from `@ast-grep/cli`,
+ * staged `octofs`, and the running `bun`/`bunx` runtime) so ACP agents and gates always have them
+ * on `PATH` without manual host installation.
  */
 export function nativeToolsPathDirs(stateDir: string): string[] {
   const dirs: string[] = [];
@@ -59,6 +60,16 @@ export function nativeToolsPathDirs(stateDir: string): string[] {
   const octofsBin = resolveOctofsBin(stateDir);
   if (octofsBin) {
     addIfExists(dirname(octofsBin));
+  }
+
+  let execPath = process.execPath;
+  try {
+    execPath = realpathSync(execPath);
+  } catch {
+    // Fall back to unresolved process.execPath if realpath fails.
+  }
+  if (execPath) {
+    addIfExists(dirname(execPath));
   }
   return dirs;
 }

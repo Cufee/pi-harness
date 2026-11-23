@@ -166,12 +166,8 @@ export function deriveRunStatus(
     if (realOrch.status === "cancelled") return "stopped";
     // A blocked coordinator never settled its work: report failed (there is no blocked run status), never completed.
     if (realOrch.status === "blocked" || realOrch.status === "returned_for_rescope") return "failed";
-    if (realOrch.status === "completed") {
-      // Do not falsely declare a run completed if non-orchestrator workers are blocked with unresolved work
-      const realChildren = execTasks.filter((t) => t.id !== realOrch.id && t.profileId !== "director");
-      if (realChildren.some((t) => t.status === "blocked")) return "failed";
-      return "completed";
-    }
+    // A completed root coordinator settles the run on its own outcome even when leftover children remain blocked.
+    if (realOrch.status === "completed") return "completed";
   }
 
   const realTasks = execTasks.filter((t) => t.profileId !== "director");
