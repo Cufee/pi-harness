@@ -225,16 +225,24 @@ export function readRunDossier(db: ControlPlaneDb, run: RunRecord, args: Record<
       expectedStat = null;
     }
     for (const p of db.listDistinctDossierPaths()) {
-      try {
-        if (p.endsWith(suffix)) {
-          const prefix = p.slice(0, p.length - suffix.length) || sep;
-          if (prefix === rawRoot || realpathSync(prefix) === realRoot) ownerPaths.add(p);
-        } else if (expectedStat !== null && !expectedStat.isSymbolicLink()) {
+      if (p.endsWith(suffix)) {
+        const prefix = p.slice(0, p.length - suffix.length) || sep;
+        try {
+          if (prefix === rawRoot || realpathSync(prefix) === realRoot) {
+            ownerPaths.add(p);
+            continue;
+          }
+        } catch {
+          // Unresolvable prefix; still fall through to inode check below.
+        }
+      }
+      if (expectedStat !== null && !expectedStat.isSymbolicLink()) {
+        try {
           const pStat = statSync(p, { bigint: true });
           if (pStat.dev === expectedStat.dev && pStat.ino === expectedStat.ino) ownerPaths.add(p);
+        } catch {
+          // Unresolvable spelling: cannot be the same file.
         }
-      } catch {
-        // Unresolvable spelling: cannot be the same file.
       }
     }
   }
