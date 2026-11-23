@@ -1012,7 +1012,12 @@ export class HarnessOrchestrator {
         `Task ${initial.id} is the Director's delegation container, not a runnable task. Resume the delegated task itself with resume_task, or delegate again with spawn_task.`,
       );
     }
-    if (!runSnapshot) await this.stoppingRuns.get(initial.runId)?.catch(() => {});
+    // A resume issued while a stop is in progress waits for it and then applies; otherwise the stop
+    // epochs are captured now, at request time, so any stop issued after this call wins.
+    const pendingStop = runSnapshot ? undefined : this.stoppingRuns.get(initial.runId);
+    const requestSnapshot = runSnapshot ?? (pendingStop ? null : this.stopEpochSnapshot(initial.runId));
+    const requestTaskEpoch = pendingStop ? null : this.stopEpoch.get(initial.id) ?? 0;
+    if (pendingStop) await pendingStop.catch(() => {});
     const inflight = this.resumingTasks.get(taskId);
     if (inflight) return inflight;
 
@@ -1063,14 +1068,21 @@ export class HarnessOrchestrator {
       };
     }
 
-    const snapshot = runSnapshot ?? this.stopEpochSnapshot(task.runId);
-    const taskEpoch = this.stopEpoch.get(task.id) ?? 0;
-    const stopWon = () =>
-      (this.stopEpoch.get(task.id) ?? 0) !== taskEpoch ||
-      (this.stopEpoch.get(task.runId) ?? 0) !== snapshot.run ||
-      this.globalStopEpoch !== snapshot.global ||
-      this.stoppingRuns.has(task.runId);
-    if (stopWon()) throw new Error(this.resumeNotAppliedMessage(task));
+    const snapshot = requestSnapshot ?? this.stopEpochSnapshot(task.runId);
+    const taskEpoch = requestTaskEpoch ?? this.stopEpoch.get(task.id) ?? 0;
+    // Which newer stop (if any) beat this resume: the whole run / all runs, or this task alone.
+    const stopWon = (): "run" | "task" | null =>
+      (this.stopEpoch.get(task.runId) ?? 0) !== snapshot.run || this.globalStopEpoch !== snapshot.global || this.stoppingRuns.has(task.runId)
+        ? "run"
+        : (this.stopEpoch.get(task.id) ?? 0) !== taskEpoch
+          ? "task"
+          : null;
+    const won = stopWon();
+    if (won) {
+      // Report the newest stop's recorded cause once it has been written.
+      await this.stoppingRuns.get(task.runId)?.catch(() => {});
+      throw new Error(this.resumeNotAppliedMessage(task, won));
+    }
     const p = this.performTaskResume(task, opts, stopWon);
     this.resumingTasks.set(task.id, p);
     try {
@@ -1080,13 +1092,17 @@ export class HarnessOrchestrator {
     }
   }
 
-  private resumeNotAppliedMessage(task: TaskRecord): string {
+  private resumeNotAppliedMessage(task: TaskRecord, by: "run" | "task"): string {
     const latest = this.db.getTask(task.id) ?? task;
-    const cause = latest.status === "cancelled" ? latest.summary : this.describeRunCause(task.runId);
+    const cause = by === "run" ? (this.describeRunCause(task.runId) ?? latest.summary) : latest.summary;
     return `Resume of task ${task.id} in run ${task.runId} was not applied: it was stopped after the resume was requested (${this.causeOrHint(task.runId, cause)}). Nothing was started. Resume it again to continue.`;
   }
 
-  private async performTaskResume(task: TaskRecord, opts: ResumeTaskOptions | undefined, stopWon: () => boolean): Promise<ResumeTaskResult> {
+  private async performTaskResume(
+    task: TaskRecord,
+    opts: ResumeTaskOptions | undefined,
+    stopWon: () => "run" | "task" | null,
+  ): Promise<ResumeTaskResult> {
     const run = this.db.getRun(task.runId);
     if (!run) throw new Error(`Unknown run ${task.runId}`);
 
@@ -1177,9 +1193,10 @@ export class HarnessOrchestrator {
       handoff.nextActions.unshift(`Resume guidance: ${opts.note.trim()}`);
     }
     // Re-check after the last await: an explicit stop issued meanwhile always wins over this older resume.
-    if (stopWon()) {
+    const won = stopWon();
+    if (won) {
       this.db.admissionQueue.remove("worker", task.id);
-      return abandon(new Error(this.resumeNotAppliedMessage(task)));
+      return abandon(new Error(this.resumeNotAppliedMessage(task, won)));
     }
     if (opts?.validateBeforeActivate && !opts.validateBeforeActivate()) {
       return abandon(preconditionFailed());
