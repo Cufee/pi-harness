@@ -1023,7 +1023,7 @@ export class AcpRunner {
               const dirPart = lastSlash >= 0 ? pattern.slice(0, lastSlash + 1) : "";
               const filePart = lastSlash >= 0 ? pattern.slice(lastSlash + 1) : pattern;
               if (dirPart.includes("{") || dirPart.includes("}")) return false;
-              if (!/^(?:[^{}]|\{[^{}/\\]+\})+$/.test(filePart)) return false;
+              if (!/^(?:[^{}]|\{(?:(?!\.\.)[^{}/\\,])+(?:,(?:(?!\.\.)[^{}/\\,])+)+\})+$/.test(filePart)) return false;
             }
             if (/(?:^|[{,])\s*~/.test(pattern)) return false;
             if (/(?:^|[\\/{,])\.\.(?:[\\/},]|$)/.test(pattern)) return false;
