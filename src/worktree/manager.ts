@@ -281,10 +281,12 @@ export class WorktreeManager {
   ): Promise<string | null> {
     const wt = this.db.getWorktree(worktreeId);
     if (!wt) return null;
+    // Idempotent: a repeated teardown (e.g. cancel and an abandoned resume) never clears the recorded archive ref.
+    if (wt.cleanedAt && !existsSync(wt.path)) return wt.archiveRef;
 
     let archiveRef: string | null = wt.archiveRef;
     if (opts?.archiveBeforeRemove) {
-      archiveRef = await this.snapshotToArchiveRef(wt);
+      archiveRef = (await this.snapshotToArchiveRef(wt)) ?? (existsSync(wt.path) ? null : wt.archiveRef);
       if (opts.requireArchive && !archiveRef && existsSync(wt.path)) {
         const statusRes = await runGit(wt.path, ["status", "--porcelain"]).catch(() => ({ stdout: "", exitCode: 1 }));
         const aheadRes = await runGit(this.repoRoot, ["rev-list", "--count", `${wt.baseSha}..${wt.branch}`]).catch(() => ({
