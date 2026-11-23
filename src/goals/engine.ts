@@ -46,6 +46,44 @@ export interface GoalCriterion {
   required: boolean;
 }
 
+/** Partial criterion update merged by `id`; omitted fields keep their current values. */
+export type GoalCriterionPatch = Partial<Omit<GoalCriterion, "id">> & { id: string };
+
+const CRITERION_KINDS: readonly CriterionKind[] = ["deterministic", "behavioral", "architectural"];
+
+/** Validates untrusted criterion patches (tool or RPC input), dropping unknown keys. */
+export function parseGoalCriterionPatches(raw: unknown, field = "updateCriteria"): GoalCriterionPatch[] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!Array.isArray(raw)) throw new Error(`${field} must be an array`);
+  return raw.map((entry: unknown, i) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new Error(`${field}[${i}].id must be a non-empty string`);
+    }
+    const e = entry as Record<string, unknown>;
+    if (typeof e.id !== "string" || !e.id.trim()) throw new Error(`${field}[${i}].id must be a non-empty string`);
+    const patch: GoalCriterionPatch = { id: e.id };
+    if (e.description !== undefined) {
+      if (typeof e.description !== "string") throw new Error(`${field}[${i}].description must be a string`);
+      patch.description = e.description;
+    }
+    if (e.kind !== undefined) {
+      if (typeof e.kind !== "string" || !CRITERION_KINDS.includes(e.kind as CriterionKind)) {
+        throw new Error(`${field}[${i}].kind must be one of deterministic, behavioral, architectural`);
+      }
+      patch.kind = e.kind as CriterionKind;
+    }
+    if (e.command !== undefined) {
+      if (typeof e.command !== "string") throw new Error(`${field}[${i}].command must be a string`);
+      patch.command = e.command;
+    }
+    if (e.required !== undefined) {
+      if (typeof e.required !== "boolean") throw new Error(`${field}[${i}].required must be a boolean`);
+      patch.required = e.required;
+    }
+    return patch;
+  });
+}
+
 export interface GoalBudgets {
   maxReviewCycles: number;
   maxNoProgressCycles: number;
@@ -93,6 +131,11 @@ export interface GoalAmendmentDelta {
   modifiedCriteria: GoalCriterion[];
   descriptionChanged: boolean;
   nonGoalsChanged: boolean;
+  /** Absent on deltas recorded before append/replace tracking existed. */
+  descriptionMode?: "append" | "replace";
+  appendedDescription?: string;
+  previousDescriptionLength?: number;
+  descriptionLength?: number;
 }
 
 export interface GoalRevisionRecord {
@@ -219,15 +262,25 @@ function gateKeys(config?: Partial<GoalsConfig>): Pick<GoalsConfig, "gateShell" 
 export class GoalEngine {
   private cfg: GoalsConfig;
   private readonly stateDir?: string;
+  private readonly onGoalSettled?: (goal: GoalRecord) => void;
+  private readonly onGoalAmended?: (goal: GoalRecord, delta: GoalAmendmentDelta) => string[];
 
   constructor(
     private readonly db: Database,
     private readonly onReviewInvalidated?: (goalId: string) => void,
     config?: Partial<GoalsConfig>,
     private readonly onReconciled?: () => void,
-    opts?: { stateDir?: string },
+    opts?: {
+      stateDir?: string;
+      /** Called after a goal becomes achieved or cancelled; resolves escalations on its linked run. */
+      onGoalSettled?: (goal: GoalRecord) => void;
+      /** Called after an amendment; supersedes verification_failed escalations and returns their ids. */
+      onGoalAmended?: (goal: GoalRecord, delta: GoalAmendmentDelta) => string[];
+    },
   ) {
     this.stateDir = opts?.stateDir;
+    this.onGoalSettled = opts?.onGoalSettled;
+    this.onGoalAmended = opts?.onGoalAmended;
     this.cfg = {
       defaultMaxReviewCycles: config?.defaultMaxReviewCycles ?? 4,
       defaultMaxNoProgressCycles: config?.defaultMaxNoProgressCycles ?? 2,
@@ -451,7 +504,45 @@ export class GoalEngine {
       this.clearQueuedProgress(g.id);
       this.onReviewInvalidated?.(g.id);
     }
-    return this.getGoal(g.id)!;
+    const updated = this.getGoal(g.id)!;
+    if (status === "achieved" || status === "cancelled") this.settleEscalations(updated, status);
+    return updated;
+  }
+
+  /** Resolves escalations on a settled goal's linked run; a failure here never fails the committed transition. */
+  private settleEscalations(goal: GoalRecord, status: "achieved" | "cancelled"): void {
+    if (!goal.linkedRunId) return;
+    if (this.onGoalSettled) {
+      try {
+        this.onGoalSettled(goal);
+      } catch {
+        // Audit hook failures must not undo the status change.
+      }
+      return;
+    }
+    this.resolveLinkedEscalationsFallback(goal.linkedRunId, `Auto-resolved: goal ${goal.id} ${status}`);
+  }
+
+  /** Direct SQL fallback when no hook is wired; the escalations table is absent in standalone engines. */
+  private resolveLinkedEscalationsFallback(runId: string, resolution: string, category?: string): string[] {
+    try {
+      const categorySql = category !== undefined ? " AND category = ?" : "";
+      const params = category !== undefined ? [runId, category] : [runId];
+      const ids = (
+        this.db
+          .prepare(`SELECT id FROM escalations WHERE run_id = ? AND status IN ('open', 'acked')${categorySql}`)
+          .all(...params) as Array<{ id: string }>
+      ).map((r) => r.id);
+      if (ids.length === 0) return [];
+      const now = Date.now();
+      const update = this.db.prepare(
+        "UPDATE escalations SET status = 'resolved', resolution = ?, acked_at = ? WHERE id = ?",
+      );
+      for (const id of ids) update.run(resolution, now, id);
+      return ids;
+    } catch {
+      return [];
+    }
   }
 
   /**
@@ -465,14 +556,19 @@ export class GoalEngine {
     goalIdStr: string,
     patch: {
       title?: string;
+      /** Full replacement of the description. */
       description?: string;
+      /** Text appended to the existing description after a blank line. */
+      appendDescription?: string;
+      /** Required to replace the description with shorter text. */
+      confirmReplaceDescription?: boolean;
       addCriteria?: Array<Omit<GoalCriterion, "id" | "required"> & { id?: string; required?: boolean }>;
       removeCriteriaIds?: string[];
-      updateCriteria?: Array<Partial<GoalCriterion> & { id: string }>;
+      updateCriteria?: GoalCriterionPatch[];
       nonGoals?: string[];
       rationale: string;
     },
-  ): { goal: GoalRecord; delta: GoalAmendmentDelta } {
+  ): { goal: GoalRecord; delta: GoalAmendmentDelta; supersededEscalationIds: string[] } {
     const cur = this.getGoal(goalIdStr);
     if (!cur) throw new Error(`Unknown goal ${goalIdStr}`);
     if (cur.status === "cancelled") throw new Error("Cannot amend a cancelled goal");
@@ -495,6 +591,10 @@ export class GoalEngine {
         };
         nextCriteria[idx] = merged;
         modifiedCriteria.push(merged);
+      } else {
+        throw new Error(
+          `Unknown criterion id '${upd.id}' in updateCriteria (current: ${nextCriteria.map((c) => c.id).join(", ")})`,
+        );
       }
     }
 
@@ -520,7 +620,33 @@ export class GoalEngine {
 
     const nextVersion = cur.version + 1;
     const nextTitle = patch.title?.trim() ?? cur.title;
-    const nextDesc = patch.description?.trim() ?? cur.description;
+    if (patch.description !== undefined && patch.appendDescription !== undefined) {
+      throw new Error("Provide either description (full replacement) or appendDescription (extend), not both.");
+    }
+    let nextDesc: string;
+    let descriptionMode: "append" | "replace" | undefined;
+    let appendedDescription: string | undefined;
+    if (patch.appendDescription !== undefined) {
+      const appended = patch.appendDescription.trim();
+      if (!appended) throw new Error("appendDescription must be a non-empty string.");
+      nextDesc = cur.description ? `${cur.description.trimEnd()}\n\n${appended}` : appended;
+      descriptionMode = "append";
+      appendedDescription = appended;
+    } else if (patch.description !== undefined) {
+      const replaced = patch.description.trim();
+      if (!replaced) {
+        throw new Error("description replacement cannot be empty; omit it to keep the current description.");
+      }
+      if (replaced !== cur.description && replaced.length < cur.description.length && !patch.confirmReplaceDescription) {
+        throw new Error(
+          `Refusing to replace goal ${cur.id} description (${cur.description.length} chars) with shorter text (${replaced.length} chars). "description" replaces the whole description. Use append_description/appendDescription to add instructions, or pass confirm_replace_description/confirmReplaceDescription: true.`,
+        );
+      }
+      nextDesc = replaced;
+      if (nextDesc !== cur.description) descriptionMode = "replace";
+    } else {
+      nextDesc = cur.description;
+    }
     const nextNonGoals = patch.nonGoals ?? cur.nonGoals;
     const nextStatus: GoalStatus =
       cur.status === "draft" || cur.status === "paused" ? cur.status : "executing";
@@ -534,7 +660,13 @@ export class GoalEngine {
       modifiedCriteria,
       descriptionChanged: nextDesc !== cur.description,
       nonGoalsChanged: JSON.stringify(nextNonGoals) !== JSON.stringify(cur.nonGoals),
+      ...(descriptionMode ? { descriptionMode } : {}),
+      ...(appendedDescription !== undefined ? { appendedDescription } : {}),
     };
+    if (delta.descriptionChanged) {
+      delta.previousDescriptionLength = cur.description.length;
+      delta.descriptionLength = nextDesc.length;
+    }
 
     const now = Date.now();
     this.db
@@ -572,8 +704,27 @@ export class GoalEngine {
         now,
       );
 
+    // An amendment disposes of vN's verification state only: supersede verification_failed escalations, keep the rest.
+    const updatedGoal = this.getGoal(cur.id)!;
+    let supersededEscalationIds: string[] = [];
+    if (updatedGoal.linkedRunId) {
+      if (this.onGoalAmended) {
+        try {
+          supersededEscalationIds = this.onGoalAmended(updatedGoal, delta);
+        } catch {
+          supersededEscalationIds = [];
+        }
+      } else {
+        supersededEscalationIds = this.resolveLinkedEscalationsFallback(
+          updatedGoal.linkedRunId,
+          `Superseded by goal ${updatedGoal.id} amendment v${delta.fromVersion} -> v${delta.toVersion}: ${delta.rationale.slice(0, 200)}`,
+          "verification_failed",
+        );
+      }
+    }
+
     this.onReviewInvalidated?.(cur.id);
-    return { goal: this.getGoal(cur.id)!, delta };
+    return { goal: updatedGoal, delta, supersededEscalationIds };
   }
 
   /**
@@ -847,7 +998,9 @@ export class GoalEngine {
       createdAt: now,
     };
 
-    return { goal: this.getGoal(goal.id)!, review, circuitBreakerTripped };
+    const updatedGoal = this.getGoal(goal.id)!;
+    if (nextStatus === "achieved") this.settleEscalations(updatedGoal, "achieved");
+    return { goal: updatedGoal, review, circuitBreakerTripped };
   }
 
   listRevisions(goalIdStr: string): GoalRevisionRecord[] {

@@ -100,6 +100,8 @@ export type DaemonOp =
   | "escalation.list"
   | "escalation.get"
   | "escalation.ack"
+  | "escalation.resolve"
+  | "escalation.reconcile"
   | "artifact.list"
   | "artifact.read"
   | "timer.list"

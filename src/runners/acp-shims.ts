@@ -1,7 +1,7 @@
 import { accessSync, constants, lstatSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { AcpAdapterKind, AcpProfileConfig } from "../config.js";
+import { ensureTempDir, type AcpAdapterKind, type AcpProfileConfig } from "../config.js";
 import type { ArtifactRecord } from "../control-plane/db.js";
 import type { ToolPolicy } from "./types.js";
 
@@ -720,6 +720,8 @@ export function prepareAcpSpawn(
   if (profile.env) {
     Object.assign(env, profile.env);
   }
+  // A profile env can blank TMPDIR; agents always get this host's resolved temp directory instead.
+  if (!env.TMPDIR?.trim()) env.TMPDIR = ensureTempDir();
 
   const args = [...(profile.args ?? [])];
   const tempDirs: string[] = [];

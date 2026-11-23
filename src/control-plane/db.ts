@@ -517,6 +517,7 @@ export class ControlPlaneDb {
       mkdirSync(dirname(dbPath), { recursive: true });
     }
     this.db = new Database(dbPath);
+    this.db.exec("PRAGMA busy_timeout = 5000;");
     this.db.exec(SCHEMA);
     this.kb = new KnowledgeBaseStore(this.db);
     this.timers = new TimerManager(this.db);
@@ -1603,7 +1604,12 @@ export class ControlPlaneDb {
     };
   }
 
-  ackEscalation(id: string, resolution: string, resolve = true): EscalationRecord {
+  ackEscalation(
+    id: string,
+    resolution: string,
+    resolve = true,
+    auditExtra?: Record<string, unknown>,
+  ): EscalationRecord {
     const esc = this.getEscalation(id);
     if (!esc) throw new Error(`Unknown escalation ${id}`);
     const now = Date.now();
@@ -1612,8 +1618,95 @@ export class ControlPlaneDb {
       .prepare("UPDATE escalations SET status = ?, resolution = ?, acked_at = ? WHERE id = ?")
       .run(status, resolution, now, esc.id);
     const updated = this.getEscalation(esc.id)!;
-    this.emitEvent(esc.runId, esc.fromTaskId, "escalation.updated", { id: esc.id, status, resolution });
+    this.emitEvent(esc.runId, esc.fromTaskId, "escalation.updated", {
+      ...(auditExtra ?? {}),
+      id: esc.id,
+      status,
+      resolution,
+      previousStatus: esc.status,
+    });
     return updated;
+  }
+
+  /** Resolves every open or acked escalation on a run, optionally limited to some categories. */
+  resolveOpenEscalationsForRun(
+    runId: string,
+    resolution: string,
+    auditExtra?: Record<string, unknown>,
+    filter?: { categories?: EscalationCategory[] },
+  ): EscalationRecord[] {
+    const categories = filter?.categories;
+    if (categories && categories.length === 0) return [];
+    const categorySql = categories ? ` AND category IN (${categories.map(() => "?").join(", ")})` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT id FROM escalations WHERE run_id = ? AND status IN ('open', 'acked')${categorySql} ORDER BY created_at ASC`,
+      )
+      .all(runId, ...(categories ?? [])) as Array<{ id: string }>;
+    return rows.map((row) => this.ackEscalation(row.id, resolution, true, auditExtra));
+  }
+
+  /**
+   * Idempotently resolves open or acked escalations on runs whose linked goals are all achieved or cancelled.
+   * Runs with any goal in another status (awaiting_human, executing, paused, ...) are left untouched.
+   */
+  reconcileSettledGoalEscalations(): {
+    resolved: number;
+    goals: number;
+    runs: number;
+    items: Array<{
+      escalationId: string;
+      runId: string;
+      goalId: string;
+      goalStatus: "achieved" | "cancelled";
+      previousStatus: "open" | "acked";
+    }>;
+  } {
+    let rows: Array<{
+      escalationId: string;
+      runId: string;
+      goalId: string;
+      goalStatus: "achieved" | "cancelled";
+      previousStatus: "open" | "acked";
+    }>;
+    try {
+      rows = this.db
+        .prepare(
+          `SELECT e.id AS escalationId, e.run_id AS runId, g.id AS goalId, g.status AS goalStatus, e.status AS previousStatus
+           FROM escalations e
+           JOIN goals g ON g.linked_run_id = e.run_id
+           WHERE e.status IN ('open', 'acked')
+             AND g.status IN ('achieved', 'cancelled')
+             AND NOT EXISTS (
+               SELECT 1 FROM goals g2
+               WHERE g2.linked_run_id = e.run_id AND g2.status NOT IN ('achieved', 'cancelled')
+             )
+           ORDER BY g.updated_at DESC, e.created_at ASC`,
+        )
+        .all() as typeof rows;
+    } catch {
+      // Standalone ControlPlaneDb without a GoalEngine has no goals table.
+      return { resolved: 0, goals: 0, runs: 0, items: [] };
+    }
+    const seen = new Set<string>();
+    const items: typeof rows = [];
+    for (const row of rows) {
+      if (seen.has(row.escalationId)) continue;
+      seen.add(row.escalationId);
+      this.ackEscalation(row.escalationId, `Auto-resolved: goal ${row.goalId} ${row.goalStatus} (reconciled)`, true, {
+        reconciled: true,
+        resolvedBy: "reconcile",
+        goalId: row.goalId,
+        goalStatus: row.goalStatus,
+      });
+      items.push(row);
+    }
+    return {
+      resolved: items.length,
+      goals: new Set(items.map((i) => i.goalId)).size,
+      runs: new Set(items.map((i) => i.runId)).size,
+      items,
+    };
   }
 
   // ---- Blackboard & Mediated Messaging ----
