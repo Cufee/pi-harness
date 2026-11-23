@@ -1,17 +1,19 @@
-import { matchesKey } from "@earendil-works/pi-tui";
+import { matchesKey, type Terminal } from "@earendil-works/pi-tui";
 import type { ProjectBrowseEntry, ProjectBrowseResult, ProjectRecord, ProjectSummary } from "../control-plane/projects.js";
 import type { DaemonClient } from "../daemon/remote.js";
 import {
   type ColumnSpec,
+  createTheme,
   Frame,
   type Hint,
   isPopKey,
   middleEllipsis,
-  type Navigator,
+  Navigator,
   sanitizeLine,
   type Screen,
   type ScreenContext,
   TableListView,
+  TerminalSession,
   type Theme,
 } from "./core/index.js";
 
@@ -233,11 +235,20 @@ export class ProjectsScreen implements Screen {
       onOpenProject: (project: FederatedProjectSummary) => void | Promise<void>;
       onSwitchCurrentSession?: (project: FederatedProjectSummary) => void | Promise<void>;
       onOpenRemotes?: () => void;
+      includeRemotes?: boolean;
+      initialProjects?: FederatedProjectSummary[];
+      cancelLabel?: string;
     },
   ) {}
 
   onShow(ctx: ScreenContext): void {
     this.nav = ctx.navigator;
+    if (this.opts.initialProjects) {
+      this.projects = this.opts.initialProjects;
+      this.loading = false;
+      this.rebuild();
+      return;
+    }
     void this.load(ctx);
   }
 
@@ -245,7 +256,9 @@ export class ProjectsScreen implements Screen {
     this.loading = true;
     ctx.requestRender();
     try {
-      this.projects = await this.client.request<FederatedProjectSummary[]>("project.list", { includeRemotes: true });
+      this.projects = await this.client.request<FederatedProjectSummary[]>("project.list", {
+        includeRemotes: this.opts.includeRemotes ?? true,
+      });
       this.rebuild(selectId);
     } catch (err) {
       this.frame.setNotice(err instanceof Error ? err.message : String(err), "danger");
@@ -307,7 +320,7 @@ export class ProjectsScreen implements Screen {
       ...(this.opts.onOpenRemotes ? [{ key: "m", label: "remotes" }] : []),
       { key: "x", label: "remove" },
       { key: "/", label: "filter" },
-      { key: "Esc", label: "close" },
+      { key: "Esc", label: this.opts.cancelLabel ?? "close" },
     ];
     const sel = this.list.selectedItem()?.value;
     const hostDisplay = sel?.host && sel.host !== "local" ? sel.host : this.opts.currentHost || "local";
@@ -494,4 +507,53 @@ export class ProjectsScreen implements Screen {
     ctx.navigator.closeAll();
     void Promise.resolve(this.opts.onOpenProject(sel)).catch(() => {});
   }
+}
+
+/**
+ * Standalone full-terminal project picker used before any chat session is opened.
+ * Resolves to the project chosen with `Enter`, or `null` when the picker is cancelled
+ * (`Esc`, `q`, `Ctrl+C`, `Ctrl+]`) or the daemon connection closes.
+ */
+export async function pickProjectTui(opts: {
+  client: DaemonClient;
+  currentHost?: string | null;
+  initialProjects?: FederatedProjectSummary[];
+  includeRemotes?: boolean;
+  terminal?: Terminal;
+}): Promise<FederatedProjectSummary | null> {
+  let picked: FederatedProjectSummary | null = null;
+  let navigator!: Navigator;
+  const session = new TerminalSession({
+    terminal: opts.terminal,
+    isOverlayOpen: () => navigator?.isOpen ?? false,
+    onInterrupt: () => {
+      navigator.closeAll();
+      return "consumed";
+    },
+  });
+  // `closeAll()` fires `onChange` before `onOpenProject`; `picked` is still set synchronously before `stop()` resolves `done`.
+  navigator = new Navigator(session.tui, session.terminal, createTheme(), {
+    onChange: () => {
+      if (!navigator.isOpen) void session.stop();
+    },
+  });
+  const detachClose = opts.client.onClose(() => {
+    picked = null;
+    void session.stop();
+  });
+  session.start();
+  navigator.push(
+    new ProjectsScreen(opts.client, {
+      currentHost: opts.currentHost,
+      includeRemotes: opts.includeRemotes,
+      initialProjects: opts.initialProjects,
+      cancelLabel: "cancel",
+      onOpenProject: (project) => {
+        picked = project;
+      },
+    }),
+  );
+  await session.done;
+  detachClose();
+  return picked;
 }
