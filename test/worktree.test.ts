@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "bun:test";
 import { ControlPlaneDb } from "../src/control-plane/db.js";
-import { canonicalPath, HARNESS_LOCK_REASON, runGit, WorktreeManager } from "../src/worktree/manager.js";
+import { canonicalPath, runGit, WorktreeManager } from "../src/worktree/manager.js";
 import { BisectingMergeQueue, checkTestIntegrity } from "../src/worktree/merge-queue.js";
 
 async function initTempRepo(): Promise<string> {
@@ -554,7 +554,7 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
 
       const wt = await mgr.createForWorker(run.id, worker.id, baseSha);
       const initialBlock = findBlock(await porcelainBlocks(repo), wt.path);
-      assert.ok(initialBlock?.split(/\r?\n/).includes(`locked ${HARNESS_LOCK_REASON}`));
+      assert.ok(initialBlock?.split(/\r?\n/).includes("locked pi-harness"));
 
       // Hide both the locked worker checkout and an unlocked control checkout, then run prune
       renameSync(wt.path, `${wt.path}.hidden`);
@@ -566,7 +566,7 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
 
       const afterPrune = await porcelainBlocks(repo);
       const wtAfterPrune = findBlock(afterPrune, wt.path);
-      assert.ok(wtAfterPrune?.split(/\r?\n/).includes(`locked ${HARNESS_LOCK_REASON}`));
+      assert.ok(wtAfterPrune?.split(/\r?\n/).includes("locked pi-harness"));
       assert.equal(findBlock(afterPrune, ctrlPath), undefined, "unlocked control registration must be pruned");
 
       renameSync(`${wt.path}.hidden`, wt.path);
@@ -705,11 +705,73 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
 
       const s = await mgr.addScratchWorktree("_verify", "x", baseSha);
       const block = findBlock(await porcelainBlocks(repo), s.path);
-      assert.ok(block?.split(/\r?\n/).includes(`locked ${HARNESS_LOCK_REASON}`));
+      assert.ok(block?.split(/\r?\n/).includes("locked pi-harness"));
 
       await s.remove();
       assert.equal(findBlock(await porcelainBlocks(repo), s.path), undefined);
       assert.equal(existsSync(s.path), false);
+      db.close();
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("foreign lock taken during teardown archive is left in place", async () => {
+    const repo = await initTempRepo();
+    try {
+      const db = new ControlPlaneDb(":memory:");
+      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
+      const run = db.createRun({ goal: "Mid-teardown lock", repoRoot: repo, baseBranch, baseSha });
+      const worker = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Mid-teardown worker",
+        objective: "Acquire foreign lock during archive",
+        profileId: "acp:claude",
+      });
+
+      const wt = await mgr.createForWorker(run.id, worker.id, baseSha);
+      writeFileSync(join(wt.path, "dirty.txt"), "uncommitted\n", "utf8");
+      db.updateTask(worker.id, { status: "completed" });
+
+      const origSnapshot = mgr.snapshotToArchiveRef.bind(mgr);
+      mgr.snapshotToArchiveRef = async (rec) => {
+        const ref = await origSnapshot(rec);
+        await runGit(repo, ["worktree", "unlock", rec.path]);
+        await runGit(repo, ["worktree", "lock", "--reason", "taken mid-teardown", rec.path]);
+        return ref;
+      };
+
+      await assert.rejects(
+        () => mgr.teardown(wt.id, { archiveBeforeRemove: true }),
+        /locked \(taken mid-teardown\); left in place/,
+      );
+      assert.equal(existsSync(wt.path), true);
+      const lockedBlock = findBlock(await porcelainBlocks(repo), wt.path);
+      assert.ok(lockedBlock?.split(/\r?\n/).includes("locked taken mid-teardown"));
+      assert.equal(db.getWorktree(wt.id)?.cleanedAt, null);
+      assert.ok(db.getWorktree(wt.id)?.archiveRef);
+      const branchStillExists = await runGit(repo, ["show-ref", "--verify", "--quiet", `refs/heads/${wt.branch}`]).then(
+        () => true,
+        () => false,
+      );
+      assert.equal(branchStillExists, true);
+
+      // Unlocked at initial check, then bare-locked during archive
+      await runGit(repo, ["worktree", "unlock", wt.path]);
+      mgr.snapshotToArchiveRef = async (rec) => {
+        const ref = await origSnapshot(rec);
+        await runGit(repo, ["worktree", "lock", rec.path]);
+        return ref;
+      };
+
+      await assert.rejects(() => mgr.teardown(wt.id, { archiveBeforeRemove: true }), /locked; left in place/);
+      assert.equal(existsSync(wt.path), true);
+      const bareLockedBlock = findBlock(await porcelainBlocks(repo), wt.path);
+      assert.ok(bareLockedBlock?.split(/\r?\n/).includes("locked"));
+      assert.equal(db.getWorktree(wt.id)?.cleanedAt, null);
       db.close();
     } finally {
       rmSync(repo, { recursive: true, force: true });

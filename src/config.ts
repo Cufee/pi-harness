@@ -357,7 +357,9 @@ function suggestConfigKey(key: string, section?: ConfigSection): string | undefi
   let best: string | undefined;
   let bestDist = (key.length <= 4 ? 1 : 2) + 1;
   for (const path of candidates) {
-    const dist = keyDistance(key, path.slice(path.lastIndexOf(".") + 1));
+    const name = path.slice(path.lastIndexOf(".") + 1);
+    if (Math.abs(key.length - name.length) >= bestDist) continue;
+    const dist = keyDistance(key, name);
     if (dist < bestDist) {
       best = path;
       bestDist = dist;
