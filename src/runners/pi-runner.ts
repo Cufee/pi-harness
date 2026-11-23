@@ -170,6 +170,9 @@ export class PiRunner {
     try {
       // maxTurns is an advisory reminder threshold; the loop ends only when the agent stops calling tools.
       let turnReminderSent = false;
+      // One missing-return wrap-up prompt when the agent stops without settling its task, then at most 3 more turns.
+      let wrapUpAttempted = false;
+      let wrapUpTurnsLeft = 0;
       for (let turn = 0; ; turn++) {
         req.callbacks.onTurn?.(turn + 1);
         if (cancelled || runAbort.signal.aborted) {
@@ -426,7 +429,16 @@ export class PiRunner {
         }
 
         if (toolCalls.length === 0) {
-          return { text: lastText, stopReason: "completed", usage: lastUsage };
+          if (!wrapUpAttempted && req.missingReturnWrapUpPrompt && !req.isTaskSettled?.()) {
+            wrapUpAttempted = true;
+            wrapUpTurnsLeft = 3;
+            messages.push({ role: "user", content: req.missingReturnWrapUpPrompt, timestamp: Date.now() });
+            continue;
+          }
+          return { text: lastText, stopReason: "completed", usage: lastUsage, ...(wrapUpAttempted ? { wrapUpAttempted: true } : {}) };
+        }
+        if (wrapUpAttempted && (req.isTaskSettled?.() || --wrapUpTurnsLeft <= 0)) {
+          return { text: lastText, stopReason: "completed", usage: lastUsage, wrapUpAttempted: true };
         }
 
         // Work continues (tool calls pending): send ONE advisory progress reminder at the threshold.

@@ -9,6 +9,18 @@ import { SessionMessageStore } from "./session-messages.js";
 import { TimerManager } from "./timers.js";
 import { KnowledgeBaseStore } from "../kb/store.js";
 
+/** A requested write scope overlaps an active lease on the same (repo root, target branch). */
+export class WriteScopeConflictError extends Error {
+  constructor(
+    message: string,
+    readonly requested: string,
+    readonly holders: Array<{ runId: string; taskId: string; glob: string }>,
+  ) {
+    super(message);
+    this.name = "WriteScopeConflictError";
+  }
+}
+
 export type AgentTier = 1 | 2 | 3;
 
 export type TaskStatus =
@@ -885,7 +897,7 @@ export class ControlPlaneDb {
     }));
   }
 
-  updateRunStatus(id: string, status: RunRecord["status"], reason?: string): void {
+  updateRunStatus(id: string, status: RunRecord["status"], reason?: string, cause?: string): void {
     const now = Date.now();
     const prev = this.db.prepare("SELECT status FROM runs WHERE id = ?").get(id) as { status: string } | undefined;
     this.db.prepare("UPDATE runs SET status = ?, updated_at = ? WHERE id = ?").run(status, now, id);
@@ -905,7 +917,7 @@ export class ControlPlaneDb {
         )
         .run(id);
     }
-    this.emitEvent(id, null, "run.status", reason ? { status, reason } : { status });
+    this.emitEvent(id, null, "run.status", { status, ...(reason ? { reason } : {}), ...(cause ? { cause } : {}) });
   }
 
   /** Active and quota-paused runs, newest first, without a row cap (unlike listRuns). */
@@ -1009,6 +1021,7 @@ export class ControlPlaneDb {
       }
 
       if (!input.readOnly && scopes.length > 0) {
+        this.purgeNonLiveWriteLeases(run.repoRoot);
         const activeLeases = this.db
           .prepare(
             `SELECT wl.run_id, wl.target_branch, wl.task_id, wl.glob_pattern
@@ -1025,8 +1038,10 @@ export class ControlPlaneDb {
             if (depAncestors.has(existing.task_id)) continue; // Sequential dependent task will wait until predecessor completes
             if (!globsOverlap(requested, existing.glob_pattern)) continue;
             if (existing.target_branch === run.baseBranch) {
-              throw new Error(
+              throw new WriteScopeConflictError(
                 `Write-scope conflict on (${run.repoRoot}:${run.baseBranch}): '${requested}' overlaps active lease '${existing.glob_pattern}' held by task ${existing.task_id} (run ${existing.run_id})`,
+                requested,
+                [{ runId: existing.run_id, taskId: existing.task_id, glob: existing.glob_pattern }],
               );
             }
             crossBranchOverlaps.push({
@@ -1289,6 +1304,34 @@ export class ControlPlaneDb {
 
   releaseWriteLeasesForRun(runId: string): void {
     this.db.prepare("UPDATE write_leases SET active = 0 WHERE run_id = ? AND active = 1").run(runId);
+  }
+
+  /**
+   * Deactivates active leases in `repoRoot` whose holder can no longer write: the holder task is missing or not
+   * pending, ready, live or quota-paused, or its run is terminal and the holder is neither live nor quota-paused.
+   * Quota-paused holders always keep their leases.
+   */
+  purgeNonLiveWriteLeases(repoRoot: string): number {
+    const res = this.db
+      .prepare(
+        `UPDATE write_leases SET active = 0
+         WHERE repo_root = ? AND active = 1
+           AND (
+             NOT EXISTS (
+               SELECT 1 FROM tasks t WHERE t.id = write_leases.task_id
+                 AND t.status IN ('pending', 'ready', 'running', 'draining', 'waiting_children', 'merging', 'paused_quota')
+             )
+             OR (
+               EXISTS (SELECT 1 FROM runs r WHERE r.id = write_leases.run_id AND r.status IN ('completed', 'failed', 'stopped'))
+               AND NOT EXISTS (
+                 SELECT 1 FROM tasks t WHERE t.id = write_leases.task_id
+                   AND t.status IN ('running', 'draining', 'waiting_children', 'merging', 'paused_quota')
+               )
+             )
+           )`,
+      )
+      .run(repoRoot);
+    return res.changes;
   }
 
   /**
@@ -2041,6 +2084,7 @@ export class ControlPlaneDb {
       const scopes = this.listAssignedWriteScopes(runId, taskId);
       if (scopes.length === 0) return [];
 
+      this.purgeNonLiveWriteLeases(run.repoRoot);
       const activeLeases = this.db
         .prepare("SELECT run_id, target_branch, task_id, glob_pattern FROM write_leases WHERE repo_root = ? AND active = 1 AND task_id != ?")
         .all(run.repoRoot, taskId) as Array<{ run_id: string; target_branch: string; task_id: string; glob_pattern: string }>;
@@ -2048,8 +2092,10 @@ export class ControlPlaneDb {
         for (const existing of activeLeases) {
           if (existing.target_branch !== run.baseBranch) continue;
           if (!globsOverlap(requested, existing.glob_pattern)) continue;
-          throw new Error(
+          throw new WriteScopeConflictError(
             `Write-scope conflict re-acquiring lease on (${run.repoRoot}:${run.baseBranch}): '${requested}' overlaps active lease '${existing.glob_pattern}' held by task ${existing.task_id} (run ${existing.run_id})`,
+            requested,
+            [{ runId: existing.run_id, taskId: existing.task_id, glob: existing.glob_pattern }],
           );
         }
       }

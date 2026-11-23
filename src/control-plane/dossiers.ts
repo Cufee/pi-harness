@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { type BigIntStats, constants, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ControlPlaneDb, RunRecord } from "./db.js";
+import { SUMMARY_LIMIT } from "./handoffs.js";
 import { scanMaxFileIndex, writeUniqueFile } from "./ids.js";
 
 export function dossierDirectory(repoRoot: string, ...parts: string[]): string {
@@ -27,6 +28,40 @@ export function writeTaskDossier(db: ControlPlaneDb, run: RunRecord, taskId: str
     rmSync(temp, { force: true });
   }
   return db.recordArtifact({ runId: run.id, taskId, kind: "dossier", path, summary });
+}
+
+/**
+ * Bounds a task summary to SUMMARY_LIMIT. A longer text is written in full to a new, never-overwritten
+ * `.harness/artifacts/<taskId>-summary-<n>.md` file and the bounded text ends with a pointer to it. The caller
+ * records `overflowPath` as a dossier artifact inside its own transaction.
+ */
+export function spillSummaryOverflow(
+  db: ControlPlaneDb,
+  run: RunRecord,
+  taskId: string,
+  fullText: string,
+): { summary: string; overflowPath?: string } {
+  if (fullText.length <= SUMMARY_LIMIT) return { summary: fullText };
+  const artifactsDir = dossierDirectory(run.repoRoot);
+  const stem = `${taskId}-summary`;
+  const seqKey = `summary:${taskId}`;
+  let allocateIndex: (() => number) | undefined;
+  if (typeof db.nextArtifactSeq === "function") {
+    if (typeof db.advanceArtifactSeqFloor === "function") {
+      // Seed above indices already on disk or recorded in the index (including deleted files).
+      const diskMax = scanMaxFileIndex(artifactsDir, stem, ".md");
+      const dbMax = typeof db.maxIndexedArtifactSeq === "function" ? db.maxIndexedArtifactSeq(stem, ".md", taskId) : 0;
+      db.advanceArtifactSeqFloor(seqKey, Math.max(diskMax, dbMax));
+    }
+    allocateIndex = () => db.nextArtifactSeq(seqKey);
+  }
+  const fileName = writeUniqueFile(artifactsDir, stem, ".md", fullText, allocateIndex);
+  const artifactPath = `.harness/artifacts/${fileName}`;
+  const pointer = `\n\n[Full summary: ${artifactPath}]`;
+  return {
+    summary: fullText.slice(0, SUMMARY_LIMIT - pointer.length).trimEnd() + pointer,
+    overflowPath: resolve(run.repoRoot, artifactPath),
+  };
 }
 
 /** Parses a suggested output name into a safe `<stem>`/`<ext>` pair; invalid names degrade to `code-exec`/`.json`. */

@@ -138,6 +138,13 @@ export interface RunAgentRequest {
   signal: AbortSignal;
   callbacks: RunnerCallbacks;
   onHandle?: (handle: RunnerExecutionHandle) => void;
+  /** True once the task has settled (return_task, report_issue, cancel) or its generation moved on. */
+  isTaskSettled?: () => boolean;
+  /**
+   * Sent once as a bounded wrap-up turn when the agent ends its turn naturally while the task is still unsettled
+   * (no return_task). Absent means no wrap-up turn (Tier 1 finishes by ending its turn).
+   */
+  missingReturnWrapUpPrompt?: string;
 }
 
 /** Reject a stale or overprivileged launch request before contacting the provider. */
@@ -160,6 +167,8 @@ export interface RunAgentResult {
   sessionId?: string;
   quotaPause?: QuotaPauseInfo;
   toolFailures?: string[];
+  /** True when the runner sent the missing-return wrap-up turn during this run. */
+  wrapUpAttempted?: boolean;
 }
 
 export interface ProbedModelInfo {

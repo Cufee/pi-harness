@@ -342,6 +342,8 @@ function extractToolErrorSnippet(update: Record<string, unknown>): string | unde
 
 const MAX_CONSECUTIVE_SILENT_RECOVERIES = 4;
 const MAX_TOTAL_RECOVERY_CONTINUATIONS = 10;
+/** Wall-clock cap on the single missing-return wrap-up turn. */
+const WRAP_UP_TIMEOUT_MS = 180_000;
 const IDENTICAL_FAILURE_BREAKER = 6;
 const DEFAULT_QUOTA_RETRY_TIMEOUT_MS = 45_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 45_000;
@@ -450,6 +452,8 @@ export class AcpRunner {
     };
     let rolloverTriggered = false;
     let rolloverWarningSent = false;
+    let wrapUpAttempted = false;
+    let wrapUpTimer: ReturnType<typeof setTimeout> | null = null;
     // maxTurns is an advisory progress-reminder threshold: one reminder, never a stop.
     let turnReminderSent = false;
     let turnsUsed = 0;
@@ -1472,6 +1476,8 @@ export class AcpRunner {
       // Upstream adapter request limit (rawStop "max_turn_requests"): the harness has no turn limit, so a
       // productive turn is re-prompted on the same session; a limit hit with zero progress ends with an error.
       let upstreamLimitStalled = false;
+      // One bounded wrap-up turn when the agent ends naturally without settling its task (no return_task).
+      let wrapUpTimedOut = false;
 
       for (let recoveryAttempt = 0; recoveryAttempt <= MAX_TOTAL_RECOVERY_CONTINUATIONS; recoveryAttempt++) {
         turnsUsed += 1;
@@ -1566,6 +1572,12 @@ export class AcpRunner {
         flushCost(Array.isArray(turnModels) ? turnModels.length : 0);
 
         rawStop = String(promptRes.stopReason ?? "end_turn");
+        if (wrapUpTimer) {
+          clearTimeout(wrapUpTimer);
+          wrapUpTimer = null;
+        }
+        // A wrap-up turn the harness cut off at its time cap ends as a normal turn end, not a self-cancel.
+        if (wrapUpTimedOut && rawStop === "cancelled") rawStop = "end_turn";
 
         const turnQuotaDetected = detectQuotaErrorText(quotaRejected ? textSinceQuotaRejection || accumulatedText : accumulatedText);
         // Require either a real rejection/rate-limit signal OR a short hard-exhaustion message with 0 successful tools,
@@ -1590,6 +1602,9 @@ export class AcpRunner {
         ) {
           break;
         }
+
+        // The wrap-up turn is final: no breaker, silent-recovery or adapter-limit continuation after it.
+        if (wrapUpAttempted) break;
 
         if (rawStop === "max_turn_requests") {
           if (turnSucceededTools === 0) {
@@ -1652,6 +1667,26 @@ export class AcpRunner {
             "Do NOT silently stop here. Figure out an allowed alternative approach if possible — OR if this task/action genuinely cannot be completed, clearly report that you are unable to do it and explain the blocker.",
           ].join("\n");
           if (accumulatedText.length > 0) needsParagraphBreak = true;
+          continue;
+        }
+        if (
+          rawStop !== "cancelled" &&
+          req.missingReturnWrapUpPrompt &&
+          !wrapUpAttempted &&
+          !req.isTaskSettled?.()
+        ) {
+          wrapUpAttempted = true;
+          nextPromptText = req.missingReturnWrapUpPrompt;
+          if (accumulatedText.length > 0) needsParagraphBreak = true;
+          wrapUpTimer = setTimeout(() => {
+            wrapUpTimer = null;
+            wrapUpTimedOut = true;
+            if (sessionId) void conn.agent.notify("session/cancel", { sessionId }).catch(() => {});
+            armCancelGraceTimer("end_turn");
+          }, WRAP_UP_TIMEOUT_MS);
+          wrapUpTimer.unref?.();
+          // Does not consume the failure-recovery budget.
+          recoveryAttempt -= 1;
           continue;
         }
         break;
@@ -1743,6 +1778,7 @@ export class AcpRunner {
         usage: lastUsage,
         sessionId,
         toolFailures: allToolFailures.length > 0 ? allToolFailures : undefined,
+        ...(wrapUpAttempted ? { wrapUpAttempted: true } : {}),
       };
     } catch (err) {
       if (this.profile.adapter === "codex" && turnSucceededTools === 0) {
@@ -1872,6 +1908,7 @@ export class AcpRunner {
       flushCost();
       clearIdleWatchdog();
       if (livenessTimer) clearInterval(livenessTimer);
+      if (wrapUpTimer) clearTimeout(wrapUpTimer);
       child?.off("exit", onChildExit);
       child?.off("close", onChildExit);
       disarmQuotaWatchdog(false);
