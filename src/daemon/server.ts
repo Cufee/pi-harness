@@ -17,10 +17,13 @@ export function currentDaemonBuildId(): string {
 import { ModelCatalogCompiler } from "../catalog/compiler.js";
 import {
   diffHarnessConfig,
+  isPlainObject,
   normalizeWorktreeRoots,
   readRepoConfig,
   resolveConfig,
   saveGlobalConfig,
+  serializeGlobalConfig,
+  stableEqual,
   validateConfigRaw,
   type GoalsConfig,
   type HarnessConfig,
@@ -105,6 +108,21 @@ function patchGoals(prev: GoalsConfig, patch: Record<string, unknown>): GoalsCon
   if (next.gateEnv === null) delete next.gateEnv;
   return next as unknown as GoalsConfig;
 }
+
+/** Top-level fields `config.update` applies; profiles and remotes have dedicated ops, runtime paths are fixed. */
+const CONFIG_UPDATE_FIELDS: ReadonlySet<string> = new Set([
+  "defaultOrchestratorProfile",
+  "defaultWorkerProfile",
+  "defaultTaskProfile",
+  "codeMode",
+  "rollover",
+  "worktree",
+  "goals",
+  "events",
+  "catalog",
+  "quotaRetry",
+  "quotaEndpoint",
+]);
 
 export const MAX_PEER_MESSAGE_HOPS = 10;
 
@@ -341,24 +359,25 @@ export class HarnessDaemon {
     }
   }
 
+  /** Points default profiles that are unset, unknown, or disabled at the first enabled profile, when one exists. */
+  private normalizeDefaultProfiles(config: HarnessConfig): HarnessConfig {
+    const enabledIds = config.profiles.filter((p) => p.enabled !== false).map((p) => p.id);
+    const fallback = enabledIds[0];
+    if (!fallback) return config;
+    let next = config;
+    for (const key of ["defaultOrchestratorProfile", "defaultWorkerProfile", "defaultTaskProfile"] as const) {
+      const id = next[key];
+      if (!id || !enabledIds.includes(id)) next = { ...next, [key]: fallback };
+    }
+    return next;
+  }
+
   private applyConfigMutation(
     next: HarnessConfig,
     opts?: { profilesChanged?: boolean; skipSave?: boolean },
   ): HarnessConfig {
     // Keep default profile pointers valid if a profile was removed or disabled
-    const enabledIds = next.profiles.filter((p) => p.enabled !== false).map((p) => p.id);
-    const fallback = enabledIds[0];
-    if (fallback) {
-      if (!next.defaultOrchestratorProfile || !enabledIds.includes(next.defaultOrchestratorProfile)) {
-        next = { ...next, defaultOrchestratorProfile: fallback };
-      }
-      if (!next.defaultWorkerProfile || !enabledIds.includes(next.defaultWorkerProfile)) {
-        next = { ...next, defaultWorkerProfile: fallback };
-      }
-      if (!next.defaultTaskProfile || !enabledIds.includes(next.defaultTaskProfile)) {
-        next = { ...next, defaultTaskProfile: fallback };
-      }
-    }
+    next = this.normalizeDefaultProfiles(next);
 
     const prevEndpoint = JSON.stringify(this.config.quotaEndpoint ?? null);
     const nextEndpoint = JSON.stringify(next.quotaEndpoint ?? null);
@@ -393,13 +412,9 @@ export class HarnessDaemon {
 
   /** Saves the effective config and records the written text so the watcher ignores the daemon's own write. */
   private persistConfig(): void {
+    const serialized = serializeGlobalConfig(this.config);
     saveGlobalConfig(this.config);
-    try {
-      const cfgFile = join(this.config.stateDir, "config.json");
-      if (existsSync(cfgFile)) this.lastConfigRaw = readFileSync(cfgFile, "utf8");
-    } catch {
-      // ignore
-    }
+    this.lastConfigRaw = serialized;
   }
 
   /**
@@ -421,8 +436,9 @@ export class HarnessDaemon {
     try {
       parsed = JSON.parse(raw);
       errors = validateConfigRaw(parsed);
-    } catch (err) {
-      errors = [err instanceof Error ? err.message : String(err)];
+    } catch {
+      // Never log the parser message: it can quote fragments of the file, which may hold credentials.
+      errors = ["Invalid JSON syntax"];
     }
     if (errors.length > 0) {
       console.error(
@@ -432,15 +448,17 @@ export class HarnessDaemon {
     }
     // Snapshot: until the first mutation, this.config is the object the orchestrator updates in place.
     const prev = structuredClone(this.config);
-    const next = resolveConfig(
-      parsed as Record<string, unknown>,
-      this.repoOverlay,
-      { stateDir: prev.stateDir, socketPath: prev.socketPath },
-      this.reloadBase,
+    const next = this.normalizeDefaultProfiles(
+      resolveConfig(
+        parsed as Record<string, unknown>,
+        this.repoOverlay,
+        { stateDir: prev.stateDir, socketPath: prev.socketPath },
+        this.reloadBase,
+      ),
     );
     if (diffHarnessConfig(prev, next).length === 0) return;
     const applied = this.applyConfigMutation(next, {
-      profilesChanged: JSON.stringify(next.profiles) !== JSON.stringify(prev.profiles),
+      profilesChanged: !stableEqual(next.profiles, prev.profiles),
       skipSave: true,
     });
     const changes = diffHarnessConfig(prev, applied);
@@ -1816,6 +1834,8 @@ export class HarnessDaemon {
         const existing = (this.config.remotes ?? []).filter((r) => r.name.toLowerCase() !== name.toLowerCase());
         const nextRemotes = [...existing, entry];
         this.config = { ...this.config, remotes: nextRemotes };
+        this.orchestrator.updateConfig(this.config, this.catalog, this.quota);
+        this.director.updateConfig(this.config, this.catalog, this.quota);
         this.persistConfig();
         this.peers.syncRemotes(nextRemotes, p.connectNow === false ? { skipConnectNames: new Set([name.toLowerCase()]) } : undefined);
         if (p.connectNow !== false) {
@@ -1835,7 +1855,10 @@ export class HarnessDaemon {
         const nextRemotes = before.filter((r) => r.name.toLowerCase() !== name.toLowerCase());
         if (nextRemotes.length === before.length) throw new Error(`Unknown remote host: ${name}`);
         const knownNodeId = this.peers.getKnownNodeId(name);
-        this.config = { ...this.config, remotes: nextRemotes };
+        const { remotes: _removed, ...rest } = this.config;
+        this.config = nextRemotes.length > 0 ? { ...rest, remotes: nextRemotes } : rest;
+        this.orchestrator.updateConfig(this.config, this.catalog, this.quota);
+        this.director.updateConfig(this.config, this.catalog, this.quota);
         this.persistConfig();
         this.peers.syncRemotes(nextRemotes);
         const failedQueued = this.db.sessionMessages.failQueuedForHost(name, knownNodeId, `Remote host "${name}" was removed`);
@@ -1898,7 +1921,14 @@ export class HarnessDaemon {
         return this.config;
 
       case "config.update": {
+        if (p.patch === null || (p.patch !== undefined && !isPlainObject(p.patch))) {
+          throw new Error("Invalid config patch: config must be a JSON object");
+        }
         const patch = (p.patch ?? {}) as Record<string, unknown>;
+        const unsupported = Object.keys(patch).filter((key) => !CONFIG_UPDATE_FIELDS.has(key));
+        if (unsupported.length > 0) {
+          throw new Error(`Invalid config patch: unsupported config.update field: ${unsupported.join(", ")}`);
+        }
         const patchErrors = validateConfigRaw(patch);
         if (patchErrors.length > 0) throw new Error(`Invalid config patch: ${patchErrors.join("; ")}`);
         const { roots } = normalizeWorktreeRoots(patch.worktree);
