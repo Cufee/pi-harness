@@ -632,137 +632,13 @@ export function isSafeReadOnlyShellCommand(rawCommand: string, scope?: ReadOnlyS
   return true;
 }
 
-/** Wraps a regex body so it behaves the same whether Amp matches regex patterns anchored or unanchored. */
-const ampRegex = (body: string): string => `/^[\\s\\S]*${body}[\\s\\S]*$/`;
-const ampToolRegex = (tool: string, body: string): string => `/^${tool}\\s(?:[\\s\\S]*\\s)?${body}[\\s\\S]*$/`;
-
-/**
- * Amp never sends permission callbacks, so read-only Amp agents get a static `amp.permissions` list.
- * Allow patterns anchor only the first command word, so the reject list must make every allowed line a
- * single simple command whose words are literal: no separators, redirections, expansions, or quote,
- * escape, or glob characters inside an option name. Path containment is not expressible here.
- * Patterns that start and end with `/` are regexes in Amp's matcher.
- */
-const AMP_READ_ONLY_SHELL_REJECT_PATTERNS = [
-  "*>*",
-  "*<*",
-  "*;*",
-  "*&&*",
-  "*||*",
-  "*&*",
-  "*|*",
-  "*$*",
-  "*`*",
-  "*\n*",
-  "*\r*",
-  "*{*",
-  "*}*",
-  ampRegex(String.raw`(?:^|[\s=:])~`),
-  ampRegex(String.raw`(?:^|\s)-[^\s=]*['"\\*?[]`),
-  ampRegex(String.raw`['"\\]-`),
-  ampRegex(String.raw`(?:^|\s)[*?[]`),
-  ampRegex(String.raw`[*?\]]\S*\(`),
-  "*--ou*",
-  "*--ext*",
-  "*--textc*",
-  "*--no-i*",
-  "*--filt*",
-  "*--op*",
-  "*--pre*",
-  "*--hostname-bin*",
-  "*--search-zip*",
-  "*--comp*",
-  "*--temporary-directory*",
-  "*--update-all*",
-  "*--rewrite*",
-  "*--interactive*",
-  "*--in-place*",
-  "*--library-path*",
-  "*--from-file*",
-  "*-exec*",
-  "*-ok*",
-  "*-delete*",
-  "*-fprint*",
-  "*-fls*",
-  "*sed *-i*",
-  ampToolRegex(String.raw`git\s+grep`, "-[A-Za-z]*O"),
-  ampToolRegex("rg", "-[A-Za-z0-9]*z"),
-  ampToolRegex("sort", "(?:-[A-Za-z0-9]*[oT]|--(?:o|co|t))"),
-  ampToolRegex("(?:sg|ast-grep)", "-[A-Za-z]*[Ui]"),
-  ampToolRegex("tree", "-[A-Za-z0-9]*[oRHl]"),
-  ampToolRegex("file", "-[A-Za-z]*C"),
-  ampToolRegex("jq", "-[A-Za-z]*[fL]"),
-  ampRegex(String.raw`^jq\s[\s\S]*\b(?:env|import|include)\b`),
-];
-
-const AMP_SED_ADDRESS = String.raw`(?:\d+|/[^/'"\\\n]*/)`;
-const AMP_SED_SCRIPT = String.raw`${AMP_SED_ADDRESS}(?:,${AMP_SED_ADDRESS})?p`;
-
-const AMP_READ_ONLY_SHELL_ALLOW_PATTERNS = [
-  "rg",
-  "rg *",
-  "sg -*",
-  "sg run *",
-  "sg scan",
-  "sg scan *",
-  "ast-grep -*",
-  "ast-grep run *",
-  "ast-grep scan",
-  "ast-grep scan *",
-  "cat *",
-  "head *",
-  "tail *",
-  "nl *",
-  // sed -n with one address-print script and plain file operands
-  String.raw`/^sed -n (?:'${AMP_SED_SCRIPT}'|"${AMP_SED_SCRIPT}"|\d+(?:,\d+)?p)(?: [^\s'"\\-][^\s'"\\]*)*$/`,
-  "wc *",
-  "ls",
-  "ls *",
-  "find *",
-  "tree",
-  "tree *",
-  "stat *",
-  "file *",
-  "pwd",
-  "which *",
-  "readlink *",
-  "realpath *",
-  "basename *",
-  "dirname *",
-  "grep *",
-  "diff *",
-  "cmp *",
-  "md5 *",
-  "shasum *",
-  "sha256sum *",
-  "jq *",
-  "sort *",
-  "cut *",
-  "tr *",
-  "git status",
-  "git status *",
-  "git log",
-  "git log *",
-  "git show",
-  "git show *",
-  "git diff",
-  "git diff *",
-  "git rev-parse *",
-  "git ls-files",
-  "git ls-files *",
-  "git ls-tree *",
-  "git grep *",
-  "git blame *",
-  "git describe *",
-  "git cat-file *",
-  "git merge-base *",
-  "git shortlog",
-  "git shortlog *",
-  "git rev-list *",
-  String.raw`/^git tag(?: (?:-l|--list)(?: [^\s'"\\-][^\s'"\\]*)?)?$/`,
-  String.raw`/^git branch(?: (?:-a|-r|-v|-vv|-av|-avv|-l|--list|--all|--remotes|--verbose|--show-current))*$/`,
-  "git remote",
-  "git remote -v",
+// Amp's static permission rules cannot check shell operands against the workspace roots.
+const AMP_RESTRICTED_DISABLED_TOOLS = [
+  ...AMP_READ_ONLY_DISABLED_TOOLS,
+  "Bash",
+  "shell_command",
+  "shell_command_status",
+  "shell_command_kill",
 ];
 
 function isExecutableBinary(filePath: string): boolean {
@@ -951,22 +827,13 @@ export function prepareAcpSpawn(
                   ],
                 }
               : {
-                  // Modern Amp CLI exposes no native Read/Grep/glob tools — file inspection goes through `shell_command`.
-                  // Instead of disabling `shell_command` (which blinds read-only Amp agents, see esc-19/esc-20), keep
-                  // write/subagent tools disabled/rejected and enforce a strict read-only `amp.permissions` allowlist for shell tools.
                   "amp.dangerouslyAllowAll": false,
-                  "amp.tools.disable": AMP_READ_ONLY_DISABLED_TOOLS,
+                  "amp.tools.disable": AMP_RESTRICTED_DISABLED_TOOLS,
                   "amp.permissions": [
                     { tool: "mcp__harness__*", action: "allow" },
                     ...[...OCTOFS_READ_ONLY_TOOLS].map((t) => ({ tool: `mcp__octofs__${t}`, action: "allow" })),
                     { tool: "mcp__ast-grep__*", action: "allow" },
-                    ...AMP_READ_ONLY_DISABLED_TOOLS.map((tool) => ({ tool, action: "reject" })),
-                    { tool: "shell_command", action: "reject", matches: { command: AMP_READ_ONLY_SHELL_REJECT_PATTERNS } },
-                    { tool: "shell_command", action: "allow", matches: { command: AMP_READ_ONLY_SHELL_ALLOW_PATTERNS } },
-                    { tool: "shell_command", action: "reject" },
-                    { tool: "Bash", action: "reject", matches: { cmd: AMP_READ_ONLY_SHELL_REJECT_PATTERNS } },
-                    { tool: "Bash", action: "allow", matches: { cmd: AMP_READ_ONLY_SHELL_ALLOW_PATTERNS } },
-                    { tool: "Bash", action: "reject" },
+                    ...AMP_RESTRICTED_DISABLED_TOOLS.map((tool) => ({ tool, action: "reject" })),
                   ],
                 };
       writeFileSync(settingsPath, JSON.stringify(ampSettings, null, 2), "utf8");
