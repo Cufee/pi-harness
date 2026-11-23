@@ -1660,7 +1660,7 @@ export class DirectorRuntime {
             if (orch && ["completed", "failed", "cancelled", "blocked", "returned_for_rescope"].includes(orch.status)) {
               delivered = await this.orchestrator
                 .resumeTaskDetailed(orchestratorTaskId, { allowCompleted: true, note: steerMsg, validateBeforeActivate: isStillLatestExecuting })
-                .then((r) => r.outcome === "resumed" || r.noteDelivered === true, () => false);
+                .then((r) => r.outcome === "resumed" || (r.noteDelivered === true && r.noteDelivery?.mode === "native"), () => false);
             }
             if (delivered) this.clearUndeliveredAmendment(goal.id, latestAfterLaunch.version);
           }
@@ -2186,11 +2186,19 @@ export class DirectorRuntime {
         } else {
           tracker.markAnswered();
           let delivered = false;
-          if (goal.status === "executing" && isStillAmendedExecuting()) {
+          // A live Tier 1 that refused the steer is never resumed: its fallback only queues the note for a turn
+          // the stale generation may never take. Its settlement relaunches it with the amendment instead.
+          const freshOrch = this.db.getTask(orch.id);
+          if (
+            goal.status === "executing" &&
+            isStillAmendedExecuting() &&
+            freshOrch &&
+            ["completed", "failed", "cancelled", "blocked", "returned_for_rescope"].includes(freshOrch.status)
+          ) {
             delivered = await this.orchestrator
               .resumeTaskDetailed(orch.id, { allowCompleted: true, note: steerMsg, validateBeforeActivate: isStillAmendedExecuting })
-              // An idempotent "already active" return delivers the note only when it was steered in.
-              .then((r) => r.outcome === "resumed" || r.noteDelivered === true, () => false);
+              // An idempotent "already active" return delivers the note only when the live session took it natively.
+              .then((r) => r.outcome === "resumed" || (r.noteDelivered === true && r.noteDelivery?.mode === "native"), () => false);
           }
           if (delivered) {
             this.clearUndeliveredAmendment(goal.id, goal.version);
@@ -2343,7 +2351,7 @@ export class DirectorRuntime {
               return g !== null && g.version === version && g.status === "executing";
             },
           })
-          .then((r) => r.outcome === "resumed" || r.noteDelivered === true, () => false)
+          .then((r) => r.outcome === "resumed" || (r.noteDelivered === true && r.noteDelivery?.mode === "native"), () => false)
       : false;
     if (!resumed) this.handOffStrandedGoal(current, pending.reason);
   }
