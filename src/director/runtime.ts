@@ -3061,7 +3061,7 @@ export class DirectorRuntime {
           const next = alignedOffset + contentBytes;
           const hasMore = next < effectiveSize && next > reqOffset;
           let lines: { startLine: number; endLine: number } | undefined;
-          if (firstLine !== undefined && contentBytes > 0) {
+          if (firstLine !== undefined && content.length > 0) {
             let newlines = 0;
             for (let i = content.indexOf("\n"); i !== -1; i = content.indexOf("\n", i + 1)) newlines++;
             lines = { startLine: firstLine, endLine: firstLine + newlines - (content.endsWith("\n") ? 1 : 0) };
