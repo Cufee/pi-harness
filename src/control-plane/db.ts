@@ -2074,10 +2074,10 @@ export class ControlPlaneDb {
   }
 
   /**
-   * Atomically validates and re-activates a task's assigned write leases before launching or resuming it.
-   * Throws a clear conflict error if another active task on `(repo_root, target_branch)` now owns an overlapping scope.
+   * Atomically validates and re-activates a task's assigned write leases before launching or resuming it
+   * (with `dryRun`, only validates). Throws a clear conflict error if another active task on `(repo_root, target_branch)` now owns an overlapping scope.
    */
-  reacquireWriteLeasesForTask(runId: string, taskId: string): string[] {
+  reacquireWriteLeasesForTask(runId: string, taskId: string, opts?: { dryRun?: boolean }): string[] {
     return this.transaction(() => {
       const run = this.getRun(runId);
       if (!run) throw new Error(`Unknown run ${runId}`);
@@ -2099,7 +2099,8 @@ export class ControlPlaneDb {
           );
         }
       }
-      this.db.prepare("UPDATE write_leases SET active = 1 WHERE run_id = ? AND task_id = ?").run(runId, taskId);
+      // A dry run only checks for conflicts (fast-fail before slow setup); nothing is acquired.
+      if (!opts?.dryRun) this.db.prepare("UPDATE write_leases SET active = 1 WHERE run_id = ? AND task_id = ?").run(runId, taskId);
       return scopes;
     });
   }

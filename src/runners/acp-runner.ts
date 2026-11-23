@@ -1360,7 +1360,9 @@ export class AcpRunner {
           env: [
             { name: "PI_HARNESS_SOCKET", value: req.daemonSocketPath },
             { name: "PI_HARNESS_RUN_ID", value: req.runId },
-            { name: "PI_HARNESS_TASK_ID", value: req.taskId },
+            // `<taskId>@g<generation>` is an execution token the bridge forwards verbatim, so the daemon refuses tool
+            // calls from this bridge once that generation is no longer the task's live one.
+            { name: "PI_HARNESS_TASK_ID", value: req.taskGeneration !== undefined ? `${req.taskId}@g${req.taskGeneration}` : req.taskId },
           ],
         });
       }
@@ -1494,8 +1496,22 @@ export class AcpRunner {
           prompt: [{ type: "text", text: nextPromptText }],
         } as never) as unknown as Promise<Record<string, unknown>>;
 
-        promptRes = await new Promise<Record<string, unknown>>((resolvePrompt, rejectPrompt) => {
+        promptRes = await new Promise<Record<string, unknown>>((resolvePrompt, rejectPromptRaw) => {
           resolveActivePromptOnGrace = resolvePrompt;
+          // When the harness cut the wrap-up turn off at its time cap, an adapter that answers session/cancel by
+          // rejecting the pending prompt ("Request cancelled") ends the turn normally, like a cancelled response would.
+          // Abort, rollover, idle timeout, child death, quota and any other RPC error still reject.
+          const rejectPrompt = (err: unknown) => {
+            if (wrapUpTimedOut && !req.signal.aborted && !rolloverTriggered && !idleTimedOut && !(childGoneError && err === childGoneError)) {
+              const detail = `${err instanceof Error ? err.message : String(err)} ${acpErrorDetail(err)}`;
+              const code = (err as { code?: unknown } | null)?.code;
+              if ((code === -32800 || /cancel/i.test(detail)) && !detectQuotaErrorText(detail).isQuota) {
+                resolvePrompt({ stopReason: "end_turn" });
+                return;
+              }
+            }
+            rejectPromptRaw(err);
+          };
           rejectActivePromptOnChildExit = rejectPrompt;
           if (child && (child.exitCode !== null || child.signalCode !== null)) {
             // The child died before this prompt started: fail now rather than wait on a dead pipe.
