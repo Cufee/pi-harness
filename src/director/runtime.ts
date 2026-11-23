@@ -1443,17 +1443,19 @@ export class DirectorRuntime {
       if (current.status === "achieved" || current.status === "cancelled") {
         return { goal: current, outcome: "already_settled", message: `Goal ${current.id} is ${current.status}; nothing was started.` };
       }
-      const criteriaSummary = goal.criteria
+      // Tier 1 launches with the latest revision; its exact text becomes the blackboard baseline below.
+      const launchedGoal = this.goals.getGoal(goal.id) ?? goal;
+      const criteriaSummary = launchedGoal.criteria
         .map((c) => `- [${c.id}] (${c.kind}${c.required ? "*" : ""}) ${c.description}${c.command ? ` [cmd: ${c.command}]` : ""}`)
         .join("\n");
       const runObjective = [
-        `Goal ${goal.id} v${goal.version}: ${goal.title}`,
-        goal.description,
+        `Goal ${launchedGoal.id} v${launchedGoal.version}: ${launchedGoal.title}`,
+        launchedGoal.description,
         "",
         "Acceptance Criteria:",
         criteriaSummary,
-        ...(goal.nonGoals.length ? ["", "Non-Goals:", ...goal.nonGoals.map((n) => `- ${n}`)] : []),
-        ...evidenceDirLines(goal),
+        ...(launchedGoal.nonGoals.length ? ["", "Non-Goals:", ...launchedGoal.nonGoals.map((n) => `- ${n}`)] : []),
+        ...evidenceDirLines(launchedGoal),
       ].join("\n");
 
       let run: RunRecord;
@@ -1526,22 +1528,73 @@ export class DirectorRuntime {
       runId = run.id;
       launched = true;
       try {
-        // The launched contract is the baseline later amendments point back to.
+        // The launched contract is the baseline later amendments point back to: exactly what Tier 1 received.
         this.db.blackboardSet(
           run.id,
-          `goal_contract_v${started.version}`,
+          `goal_contract_v${launchedGoal.version}`,
           {
-            version: started.version,
-            title: started.title,
-            description: started.description,
-            criteria: started.criteria,
-            nonGoals: started.nonGoals,
+            version: launchedGoal.version,
+            title: launchedGoal.title,
+            description: launchedGoal.description,
+            criteria: launchedGoal.criteria,
+            nonGoals: launchedGoal.nonGoals,
             delta: null,
           },
           orchestratorTaskId,
         );
       } catch {
         // Blackboard is advisory; the run is already launched.
+      }
+      // An amendment that landed while startRun was awaiting had no run to steer; deliver it now.
+      const latestAfterLaunch = this.goals.getGoal(goal.id);
+      if (latestAfterLaunch && latestAfterLaunch.version > launchedGoal.version) {
+        const latestCriteria = latestAfterLaunch.criteria
+          .map((c) => `- [${c.id}] (${c.kind}${c.required ? ", required" : ""}): ${c.description}${c.command ? ` [cmd: ${c.command}]` : ""}`)
+          .join("\n");
+        const updatedObjective = [
+          `GOAL ${latestAfterLaunch.id} (v${latestAfterLaunch.version}): ${latestAfterLaunch.title}`,
+          latestAfterLaunch.description,
+          "",
+          "Acceptance Criteria:",
+          latestCriteria,
+          ...(latestAfterLaunch.nonGoals.length ? ["", "Non-Goals:", ...latestAfterLaunch.nonGoals.map((n) => `- ${n}`)] : []),
+          ...evidenceDirLines(latestAfterLaunch),
+        ].join("\n");
+        this.db.updateRunGoal(run.id, updatedObjective);
+        this.db.updateTask(orchestratorTaskId, {
+          title: `Goal ${latestAfterLaunch.id} v${latestAfterLaunch.version}: ${latestAfterLaunch.title}`,
+          objective: updatedObjective,
+        });
+        const latestKey = `goal_contract_v${latestAfterLaunch.version}`;
+        try {
+          const revisionDelta = this.goals.listRevisions(goal.id).find((r) => r.version === latestAfterLaunch.version)?.delta ?? null;
+          this.db.blackboardSet(
+            run.id,
+            latestKey,
+            {
+              version: latestAfterLaunch.version,
+              title: latestAfterLaunch.title,
+              description: latestAfterLaunch.description,
+              criteria: latestAfterLaunch.criteria,
+              nonGoals: latestAfterLaunch.nonGoals,
+              delta: revisionDelta,
+            },
+            orchestratorTaskId,
+          );
+        } catch {
+          // Blackboard is advisory; the steer below still carries the full objective.
+        }
+        void this.orchestrator
+          .steerTask(
+            orchestratorTaskId,
+            [
+              `[GOAL AMENDED: ${goal.id} v${launchedGoal.version} -> v${latestAfterLaunch.version}]`,
+              "The goal was amended while this run was starting; your launch objective is outdated. Current contract:",
+              updatedObjective,
+              `Full current contract: blackboard_get({ key: "${latestKey}" }); launch baseline: goal_contract_v${launchedGoal.version}.`,
+            ].join("\n"),
+          )
+          .catch(() => false);
       }
     } finally {
       if (this.launchingGoals.get(goal.id) === slot) this.launchingGoals.delete(goal.id);
@@ -2445,10 +2498,15 @@ export class DirectorRuntime {
     this.activeReviews.set(goal.id, abort);
     const reviewSignal = signal ? AbortSignal.any([abort.signal, signal]) : abort.signal;
     const unsubscribe = this.db.onEvent(ev => {
-      if (ev.runId !== goal.linkedRunId || ev.type !== "run.status") return;
-      const runStatus = (ev.payload as { status?: string } | null)?.status;
+      if (ev.runId !== goal.linkedRunId) return;
+      const runStatus = ev.type === "run.status" ? (ev.payload as { status?: string } | null)?.status : undefined;
       if (runStatus === "stopped") abort.abort(new Error("Run stopped during review"));
-      if (opts?.settledRunStatus === "failed" && runStatus === "active") {
+      // Only a genuine resume aborts: the Done-Reviewer running on this run, or a snapshot deriving
+      // "active" from it, must never cancel the review it belongs to.
+      if (
+        opts?.settledRunStatus === "failed" &&
+        (ev.type === "task.resumed" || (runStatus === "active" && this.orchestrator.isRunActiveInMemory(ev.runId)))
+      ) {
         abort.abort(new Error("Run resumed during failed-run verification"));
       }
     });
@@ -2507,6 +2565,12 @@ export class DirectorRuntime {
       }
     };
     assertCurrent();
+    // Approving a failed run resolves its escalations; an outstanding P0 (possibly reopened mid-verification) needs a human.
+    const assertNoOpenP0ForFailedRunApproval = () => {
+      if (opts?.settledRunStatus !== "failed") return;
+      const openP0 = goal.linkedRunId ? this.db.listEscalations(goal.linkedRunId, "open").find((e) => e.severity === "P0") : undefined;
+      if (openP0) throw new Error(`Cannot auto-approve failed run while P0 escalation ${openP0.id} (${openP0.title}) is open`);
+    };
     // Read once, before gates move the goal's status: a current failed claim by the coordinator blocks approval.
     const coordinatorFailure = this.detectCoordinatorFailure(goal);
 
@@ -2545,6 +2609,8 @@ export class DirectorRuntime {
     const verifyCwd = checkout.verifyCwd;
     const verifyRef = checkout.verifyRef;
     try {
+      // Gates mark the goal's current revision verifying: a review made stale during checkout must stop first.
+      assertCurrent();
       const gateResult = await this.goals.runDeterministicGates(goal.id, run?.baseSha, signal, {
         cwd: verifyCwd,
         targetRef: verifyRef,
@@ -2556,8 +2622,10 @@ export class DirectorRuntime {
         if (opts?.settledRunStatus === "failed") {
           // A failed run is not bounced back to Tier 1: no review cycle, breaker, escalation or relaunch.
           const failed = gateResult.results.filter((r) => !r.passed);
+          const requiredIds = new Set(goal.criteria.filter((c) => c.required).map((c) => c.id));
+          const failedRequired = failed.filter((r) => requiredIds.has(r.criterionId));
           const evidenceTail = failed.map((r) => `${r.criterionId}: ${r.evidence}`).join(" | ").slice(-500);
-          throw new FailedRunGatesError(failed.map((r) => r.criterionId), evidenceTail);
+          throw new FailedRunGatesError((failedRequired.length ? failedRequired : failed).map((r) => r.criterionId), evidenceTail);
         }
         const outcome = this.goals.recordReviewVerdict(goal.id, {
           verdict: "changes_requested",
@@ -2627,6 +2695,7 @@ export class DirectorRuntime {
               evidence: opts?.summary?.trim() || `Verified without separate LLM review (${effectiveMode}).`,
             })),
         ];
+        assertNoOpenP0ForFailedRunApproval();
         const outcome = this.goals.recordReviewVerdict(goal.id, {
           verdict: "approved",
           criteriaResults: allResults,
@@ -2922,6 +2991,7 @@ export class DirectorRuntime {
           submittedVerdict?.summary ??
           `Incomplete review output (stopReason=${stopReason}, turns=${turnsUsed}, reminder threshold=${reviewerMaxTurns})`;
 
+        if (submittedVerdict?.verdict === "approved") assertNoOpenP0ForFailedRunApproval();
         outcome = this.db.transaction(() => {
           const recorded = this.goals.recordReviewVerdict(goal.id, {
             verdict: submittedVerdict?.verdict ?? "changes_requested",
@@ -3178,16 +3248,17 @@ export class DirectorRuntime {
     runStatus: string | null;
     remainingOpen: number;
   } {
-    const reason = input.reason.trim().slice(0, 2000);
+    const reason = typeof input.reason === "string" ? input.reason.trim().slice(0, 2000) : "";
     if (!reason) throw new Error("reason must be a non-empty string");
     const esc = this.db.getEscalation(input.escalationId);
-    if (!esc) throw new Error(`Unknown escalation ${input.escalationId}`);
     if (input.chatSessionId) {
+      // Scoped callers get one error for missing and foreign IDs, so existence elsewhere is not revealed.
       const repoRoot = input.repoRoot ?? this.chats.getSession(input.chatSessionId)?.repoRoot;
-      if (!repoRoot || !this.ownedDossierRuns(input.chatSessionId, repoRoot).some((r) => r.id === esc.runId)) {
+      if (!esc || !repoRoot || !this.ownedDossierRuns(input.chatSessionId, repoRoot).some((r) => r.id === esc.runId)) {
         throw new Error("Unknown escalation in this workspace");
       }
     }
+    if (!esc) throw new Error(`Unknown escalation ${input.escalationId}`);
     const row = this.db.db
       .prepare("SELECT id FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1")
       .get(esc.runId) as { id: string } | undefined;
@@ -4110,9 +4181,10 @@ export class DirectorRuntime {
       }
 
       case "resolve_escalation": {
+        if (typeof args.reason !== "string" || !args.reason.trim()) throw new Error("reason must be a non-empty string");
         return this.resolveEscalation({
           escalationId: String(args.escalation_id ?? ""),
-          reason: String(args.reason ?? ""),
+          reason: args.reason,
           chatSessionId,
           repoRoot,
           resolvedBy: "director",
