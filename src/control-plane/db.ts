@@ -886,7 +886,24 @@ export class ControlPlaneDb {
 
   updateRunStatus(id: string, status: RunRecord["status"]): void {
     const now = Date.now();
+    const prev = this.db.prepare("SELECT status FROM runs WHERE id = ?").get(id) as { status: string } | undefined;
     this.db.prepare("UPDATE runs SET status = ?, updated_at = ? WHERE id = ?").run(status, now, id);
+    const terminal = ["completed", "failed", "stopped"];
+    if (prev && !terminal.includes(prev.status) && terminal.includes(status)) {
+      // Entering a terminal state releases leases held by tasks that can no longer write;
+      // live and quota-paused tasks keep theirs so a later resume stays conflict-free.
+      this.db
+        .prepare(
+          `UPDATE write_leases SET active = 0
+           WHERE run_id = ? AND active = 1
+             AND NOT EXISTS (
+               SELECT 1 FROM tasks t
+               WHERE t.id = write_leases.task_id
+                 AND t.status IN ('running', 'draining', 'waiting_children', 'merging', 'paused_quota')
+             )`,
+        )
+        .run(id);
+    }
     this.emitEvent(id, null, "run.status", { status });
   }
 
@@ -948,7 +965,10 @@ export class ControlPlaneDb {
             `SELECT wl.run_id, wl.target_branch, wl.task_id, wl.glob_pattern
              FROM write_leases wl
              JOIN tasks t ON t.id = wl.task_id
-             WHERE wl.repo_root = ? AND (wl.active = 1 OR t.status = 'pending')`,
+             LEFT JOIN runs r ON r.id = wl.run_id
+             WHERE wl.repo_root = ?
+               AND (wl.active = 1
+                    OR (t.status = 'pending' AND r.status NOT IN ('completed', 'failed', 'stopped')))`,
           )
           .all(run.repoRoot) as Array<{ run_id: string; target_branch: string; task_id: string; glob_pattern: string }>;
         for (const requested of scopes) {
@@ -1220,6 +1240,25 @@ export class ControlPlaneDb {
 
   releaseWriteLeasesForRun(runId: string): void {
     this.db.prepare("UPDATE write_leases SET active = 0 WHERE run_id = ? AND active = 1").run(runId);
+  }
+
+  /**
+   * Deactivates every active lease not owned by a quota-paused task, across all runs.
+   * Only safe at daemon startup while no task is live in memory.
+   */
+  purgeStaleWriteLeasesOnStartup(): number {
+    const res = this.db
+      .prepare(
+        `UPDATE write_leases SET active = 0
+         WHERE active = 1
+           AND NOT EXISTS (
+             SELECT 1 FROM tasks t
+             WHERE t.id = write_leases.task_id
+               AND t.status = 'paused_quota'
+           )`,
+      )
+      .run();
+    return res.changes;
   }
 
   failStaleMergesForRun(runId: string, reason: string): number {
