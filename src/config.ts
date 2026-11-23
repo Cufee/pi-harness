@@ -265,9 +265,11 @@ export function defaultProfiles(): RunnerProfileConfig[] {
   ];
 }
 
+/** Reads a JSON object file; a missing file or a non-object root (number, string, array, null) yields `undefined`. */
 function readJsonIfExists(path: string): Record<string, unknown> | undefined {
   if (!existsSync(path)) return undefined;
-  return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+  const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+  return isPlainObject(parsed) ? parsed : undefined;
 }
 
 export function interpolateEnv(value: string): string {
@@ -375,6 +377,9 @@ export function resolveConfig(
   runtime: { stateDir: string; socketPath?: string },
   base?: HarnessConfig,
 ): HarnessConfig {
+  // Startup stays tolerant of non-object roots; the reload and config.update boundaries reject them.
+  if (!isPlainObject(globalCfg)) globalCfg = {};
+  if (!isPlainObject(repoCfg)) repoCfg = {};
   const stateDir = runtime.stateDir;
   const merged = { ...globalCfg, ...repoCfg } as Partial<HarnessConfig>;
   const rollover: RolloverConfig = {
@@ -526,8 +531,25 @@ export function resolveConfig(
   };
 }
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/**
+ * Deep JSON equality: plain-object member order is ignored, array order is significant, and members whose value is
+ * `undefined` count as absent (as in `JSON.stringify`).
+ */
+export function stableEqual(a: unknown, b: unknown): boolean {
+  if (a === b || Object.is(a, b)) return true;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => stableEqual(x, b[i]));
+  }
+  if (!isPlainObject(a) || !isPlainObject(b)) return false;
+  const keysA = Object.keys(a).filter((k) => a[k] !== undefined);
+  const keysB = Object.keys(b).filter((k) => b[k] !== undefined);
+  return keysA.length === keysB.length && keysA.every((k) => b[k] !== undefined && stableEqual(a[k], b[k]));
 }
 
 /**
@@ -558,9 +580,9 @@ export function validateConfigRaw(raw: unknown): string[] {
   const NON_NEG: Rule = [isFiniteNonNegative, "a finite number >= 0"];
   const POSITIVE: Rule = [isFinitePositive, "a finite number > 0"];
 
-  const checkFields = (obj: Record<string, unknown>, path: string, rules: Record<string, Rule>) => {
+  const checkFields = (obj: Record<string, unknown>, path: string, rules: Record<string, Rule>, required = false) => {
     for (const [key, [check, expectation]] of Object.entries(rules)) {
-      if (!(key in obj)) continue;
+      if (!required && !(key in obj)) continue;
       if (!check(obj[key])) errors.push(`${path}.${key} must be ${expectation}`);
     }
   };
@@ -595,21 +617,25 @@ export function validateConfigRaw(raw: unknown): string[] {
     if (!isNonEmptyString(profile.id)) errors.push(`${path}.id must be a non-empty string`);
     else if (profileIds.has(profile.id as string)) errors.push(`${path}.id must be unique`);
     else profileIds.add(profile.id as string);
-    checkFields(profile, path, {
-      billing: [oneOf("subscription", "api", "local"), '"subscription", "api", or "local"'],
-      enabled: BOOLEAN,
-      models: STRINGS,
-    });
+    checkFields(profile, path, { billing: [oneOf("subscription", "api", "local"), '"subscription", "api", or "local"'] }, true);
+    checkFields(profile, path, { enabled: BOOLEAN, models: STRINGS });
     if (profile.kind === "acp") {
-      if (!isNonEmptyString(profile.command)) errors.push(`${path}.command must be a non-empty string`);
+      checkFields(
+        profile,
+        path,
+        {
+          adapter: [oneOf("claude", "codex", "gemini", "generic"), '"claude", "codex", "gemini", or "generic"'],
+          command: NON_EMPTY,
+        },
+        true,
+      );
       checkFields(profile, path, {
-        adapter: [oneOf("claude", "codex", "gemini", "generic"), '"claude", "codex", "gemini", or "generic"'],
         args: STRINGS,
         readOnlyArgs: STRINGS,
         env: STRING_MAP,
       });
     } else if (profile.kind === "pi") {
-      if (!isNonEmptyString(profile.provider)) errors.push(`${path}.provider must be a non-empty string`);
+      checkFields(profile, path, { provider: NON_EMPTY }, true);
       checkFields(profile, path, {
         api: [
           oneOf("openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"),
@@ -745,48 +771,73 @@ export interface ConfigChange {
   changed?: string[];
 }
 
-/** Reports what changed between two configs without exposing secret-bearing values (env, args, commands, URLs, headers). */
+/**
+ * Reports what changed between two configs without exposing secret-bearing values (env, args, commands, URLs, headers).
+ * Tolerates malformed data on either side (e.g. a startup config holding `[null]`), reporting a path-level change
+ * instead of throwing, so a valid replacement can always be applied.
+ */
 export function diffHarnessConfig(prev: HarnessConfig, next: HarnessConfig): ConfigChange[] {
   const changes: ConfigChange[] = [];
-  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
   const isPrintable = (v: unknown) => v === undefined || typeof v === "number" || typeof v === "boolean";
 
   for (const key of ["codeMode", "defaultOrchestratorProfile", "defaultWorkerProfile", "defaultTaskProfile"] as const) {
-    if (prev[key] !== next[key]) changes.push({ path: key, from: prev[key], to: next[key] });
+    const a: unknown = prev[key];
+    const b: unknown = next[key];
+    if (stableEqual(a, b)) continue;
+    const showValues = [a, b].every((v) => isPrintable(v) || typeof v === "string");
+    changes.push(showValues ? { path: key, from: a, to: b } : { path: key });
   }
 
   for (const key of ["codeExec", "rollover", "worktree", "goals", "events", "catalog", "quotaRetry"] as const) {
-    const a = (prev[key] ?? {}) as Record<string, unknown>;
-    const b = (next[key] ?? {}) as Record<string, unknown>;
-    for (const sub of new Set([...Object.keys(a), ...Object.keys(b)])) {
-      if (same(a[sub], b[sub])) continue;
+    const rawA: unknown = prev[key] ?? {};
+    const rawB: unknown = next[key] ?? {};
+    if (!isPlainObject(rawA) || !isPlainObject(rawB)) {
+      if (!stableEqual(rawA, rawB)) changes.push({ path: key });
+      continue;
+    }
+    for (const sub of new Set([...Object.keys(rawA), ...Object.keys(rawB)])) {
+      if (stableEqual(rawA[sub], rawB[sub])) continue;
       const path = `${key}.${sub}`;
-      const showValues = (isPrintable(a[sub]) && isPrintable(b[sub])) || path === "catalog.modelFilterMode";
-      changes.push(showValues ? { path, from: a[sub], to: b[sub] } : { path });
+      const showValues =
+        (isPrintable(rawA[sub]) && isPrintable(rawB[sub])) ||
+        (path === "catalog.modelFilterMode" && typeof rawA[sub] !== "object" && typeof rawB[sub] !== "object");
+      changes.push(showValues ? { path, from: rawA[sub], to: rawB[sub] } : { path });
     }
   }
 
-  const diffList = <T>(path: string, a: T[] | undefined, b: T[] | undefined, keyOf: (item: T) => string) => {
-    const before = new Map((a ?? []).map((item) => [keyOf(item), item]));
-    const after = new Map((b ?? []).map((item) => [keyOf(item), item]));
+  const diffList = (path: string, a: unknown, b: unknown, key: string) => {
+    const entries = (list: unknown) => {
+      const map = new Map<string, unknown>();
+      if (Array.isArray(list)) {
+        for (const item of list) {
+          if (isPlainObject(item) && typeof item[key] === "string") map.set(item[key] as string, item);
+        }
+      }
+      return map;
+    };
+    const before = entries(a);
+    const after = entries(b);
     const added = [...after.keys()].filter((k) => !before.has(k));
     const removed = [...before.keys()].filter((k) => !after.has(k));
-    const changed = [...after.keys()].filter((k) => before.has(k) && !same(before.get(k), after.get(k)));
+    const changed = [...after.keys()].filter((k) => before.has(k) && !stableEqual(before.get(k), after.get(k)));
     if (added.length || removed.length || changed.length) changes.push({ path, added, removed, changed });
-    else if (!same(a ?? [], b ?? [])) changes.push({ path, changed: [] }); // order or duplicate entries only
+    else if (!stableEqual(a ?? [], b ?? [])) changes.push({ path, changed: [] }); // order, duplicate, or malformed entries
   };
-  diffList("profiles", prev.profiles, next.profiles, (p) => p.id);
-  diffList("remotes", prev.remotes, next.remotes, (r) => r.name);
-  diffList("externalMcpServers", prev.externalMcpServers, next.externalMcpServers, (s) => s.name);
+  diffList("profiles", prev.profiles, next.profiles, "id");
+  diffList("remotes", prev.remotes, next.remotes, "name");
+  diffList("externalMcpServers", prev.externalMcpServers, next.externalMcpServers, "name");
 
-  const pe = prev.quotaEndpoint;
-  const ne = next.quotaEndpoint;
+  const pe: unknown = prev.quotaEndpoint;
+  const ne: unknown = next.quotaEndpoint;
   if (!pe !== !ne) {
     changes.push({ path: "quotaEndpoint", from: pe ? "set" : "unset", to: ne ? "set" : "unset" });
-  } else if (pe && ne && !same(pe, ne)) {
-    const keys = new Set([...Object.keys(pe), ...Object.keys(ne)]);
-    const changed = [...keys].filter((k) => !same((pe as unknown as Record<string, unknown>)[k], (ne as unknown as Record<string, unknown>)[k]));
-    changes.push({ path: "quotaEndpoint", changed });
+  } else if (pe && ne && !stableEqual(pe, ne)) {
+    if (isPlainObject(pe) && isPlainObject(ne)) {
+      const keys = new Set([...Object.keys(pe), ...Object.keys(ne)]);
+      changes.push({ path: "quotaEndpoint", changed: [...keys].filter((k) => !stableEqual(pe[k], ne[k])) });
+    } else {
+      changes.push({ path: "quotaEndpoint", changed: [] });
+    }
   }
   return changes;
 }
@@ -798,6 +849,12 @@ export function diffHarnessConfig(prev: HarnessConfig, next: HarnessConfig): Con
 export function saveGlobalConfig(config: HarnessConfig): string {
   mkdirSync(config.stateDir, { recursive: true });
   const filePath = join(config.stateDir, "config.json");
+  writeFileSync(filePath, serializeGlobalConfig(config), "utf8");
+  return filePath;
+}
+
+/** The exact `config.json` text `saveGlobalConfig` writes for `config`. */
+export function serializeGlobalConfig(config: HarnessConfig): string {
   const serialized = {
     profiles: config.profiles,
     ...(config.remotes?.length ? { remotes: config.remotes } : {}),
@@ -816,8 +873,7 @@ export function saveGlobalConfig(config: HarnessConfig): string {
     ...(config.socketPath !== defaultSocketPath(config.stateDir) ? { socketPath: config.socketPath } : {}),
     ...(config.quotaEndpoint ? { quotaEndpoint: config.quotaEndpoint } : {}),
   };
-  writeFileSync(filePath, JSON.stringify(serialized, null, 2) + "\n", "utf8");
-  return filePath;
+  return JSON.stringify(serialized, null, 2) + "\n";
 }
 
 export const ACP_PROFILE_PRESETS: Record<string, Omit<AcpProfileConfig, "id">> = {
