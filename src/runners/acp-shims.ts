@@ -695,17 +695,17 @@ export type ParsedGitNetworkCommand =
 
 /**
  * Validates that a resolved git remote URL uses an allowed network transport:
- * `https://`, `ssh://`, `git://`, or SCP-like SSH form (`user@host:path`, e.g. `git@github.com:org/repo.git`).
- * Rejects `ext::`, `file://`, `http://`, local paths, leading-dash host/user injection, and anything else.
+ * `https://`, `ssh://`, or SCP-like SSH form (`user@host:path`, e.g. `git@github.com:org/repo.git`).
+ * Rejects `ext::`, `file://`, `http://`, `git://`, local paths, leading-dash host/user injection, and anything else.
  */
 export function isSafeGitRemoteUrl(rawUrl: string): boolean {
   const url = rawUrl.trim();
   if (!url || CONTROL_CHARS.test(url) || /\s/.test(url)) return false;
-  if (/^(?:https|ssh|git):\/\/[^/\s]/i.test(url)) {
+  if (/^(?:https|ssh):\/\/[^/\s]/i.test(url)) {
     try {
       const parsed = new URL(url);
       const proto = parsed.protocol.toLowerCase();
-      if (proto !== "https:" && proto !== "ssh:" && proto !== "git:") return false;
+      if (proto !== "https:" && proto !== "ssh:") return false;
       if (!parsed.hostname || parsed.hostname.startsWith("-")) return false;
       if (parsed.username.startsWith("-")) return false;
       return true;
