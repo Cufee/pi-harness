@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "bun:test";
 import { ControlPlaneDb } from "../src/control-plane/db.js";
-import { runGit, WorktreeManager } from "../src/worktree/manager.js";
+import { canonicalPath, HARNESS_LOCK_REASON, runGit, WorktreeManager } from "../src/worktree/manager.js";
 import { BisectingMergeQueue, checkTestIntegrity } from "../src/worktree/merge-queue.js";
 
 async function initTempRepo(): Promise<string> {
@@ -517,6 +517,199 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
       assert.equal(db.getTask(wCancel.id)?.status, "cancelled", "Cancelled task must NOT be resurrected to running");
       assert.equal(existsSync(join(repo, "cancelled.txt")), false, "Cancelled branch must NOT land on main");
 
+      db.close();
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  async function porcelainBlocks(repo: string): Promise<string[]> {
+    const { stdout } = await runGit(repo, ["worktree", "list", "--porcelain"]);
+    return stdout ? stdout.split(/\r?\n\r?\n/) : [];
+  }
+
+  function findBlock(blocks: string[], targetPath: string): string | undefined {
+    const canon = canonicalPath(targetPath);
+    return blocks.find((b) => {
+      const line = b.split(/\r?\n/).find((l) => l.startsWith("worktree "));
+      return line ? canonicalPath(line.slice("worktree ".length)) === canon : false;
+    });
+  }
+
+  it("locks harness worktrees so prune keeps a hidden live registration, then teardown removes it", async () => {
+    const repo = await initTempRepo();
+    try {
+      const db = new ControlPlaneDb(":memory:");
+      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
+      const run = db.createRun({ goal: "Lock protection", repoRoot: repo, baseBranch, baseSha });
+      const worker = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Locked worker",
+        objective: "Test worktree lock",
+        profileId: "acp:claude",
+      });
+
+      const wt = await mgr.createForWorker(run.id, worker.id, baseSha);
+      const initialBlock = findBlock(await porcelainBlocks(repo), wt.path);
+      assert.ok(initialBlock?.split(/\r?\n/).includes(`locked ${HARNESS_LOCK_REASON}`));
+
+      // Hide both the locked worker checkout and an unlocked control checkout, then run prune
+      renameSync(wt.path, `${wt.path}.hidden`);
+      const ctrlPath = join(repo, ".harness", "ctrl");
+      await runGit(repo, ["worktree", "add", "--detach", ctrlPath, "HEAD"]);
+      renameSync(ctrlPath, `${ctrlPath}.hidden`);
+
+      await runGit(repo, ["worktree", "prune"]);
+
+      const afterPrune = await porcelainBlocks(repo);
+      const wtAfterPrune = findBlock(afterPrune, wt.path);
+      assert.ok(wtAfterPrune?.split(/\r?\n/).includes(`locked ${HARNESS_LOCK_REASON}`));
+      assert.equal(findBlock(afterPrune, ctrlPath), undefined, "unlocked control registration must be pruned");
+
+      renameSync(`${wt.path}.hidden`, wt.path);
+      db.updateTask(worker.id, { status: "completed" });
+      await mgr.teardown(wt.id);
+
+      assert.equal(findBlock(await porcelainBlocks(repo), wt.path), undefined);
+      assert.equal(existsSync(wt.path), false);
+      const branchExists = await runGit(repo, ["show-ref", "--verify", "--quiet", `refs/heads/${wt.branch}`]).then(
+        () => true,
+        () => false,
+      );
+      assert.equal(branchExists, false);
+      assert.ok(db.getWorktree(wt.id)?.cleanedAt != null);
+      db.close();
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("a foreign lock is left in place", async () => {
+    const repo = await initTempRepo();
+    try {
+      const db = new ControlPlaneDb(":memory:");
+      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
+      const run = db.createRun({ goal: "Foreign lock", repoRoot: repo, baseBranch, baseSha });
+      const worker = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Foreign locked worker",
+        objective: "Keep foreign lock",
+        profileId: "acp:claude",
+      });
+
+      const wt = await mgr.createForWorker(run.id, worker.id, baseSha);
+      await runGit(repo, ["worktree", "unlock", wt.path]);
+      await runGit(repo, ["worktree", "lock", "--reason", "keep me", wt.path]);
+      db.updateTask(worker.id, { status: "completed" });
+
+      await assert.rejects(() => mgr.teardown(wt.id), /locked \(keep me\); left in place/);
+      assert.equal(existsSync(wt.path), true);
+      assert.ok(findBlock(await porcelainBlocks(repo), wt.path));
+
+      // Repeat with a bare lock (no reason)
+      await runGit(repo, ["worktree", "unlock", wt.path]);
+      await runGit(repo, ["worktree", "lock", wt.path]);
+      await assert.rejects(() => mgr.teardown(wt.id), /locked/);
+      assert.equal(existsSync(wt.path), true);
+      assert.ok(findBlock(await porcelainBlocks(repo), wt.path));
+
+      // sweep reports it in errors and leaves it in place
+      const cleanup = await mgr.sweep({ runId: run.id });
+      assert.equal(cleanup.removed.length, 0);
+      assert.equal(cleanup.errors.length, 1);
+      assert.match(cleanup.errors[0]!.error, /locked/);
+      assert.equal(existsSync(wt.path), true);
+      assert.ok(findBlock(await porcelainBlocks(repo), wt.path));
+      db.close();
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("pre-lock unlocked rows still tear down", async () => {
+    const repo = await initTempRepo();
+    try {
+      const db = new ControlPlaneDb(":memory:");
+      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
+      const run = db.createRun({ goal: "Legacy unlocked", repoRoot: repo, baseBranch, baseSha });
+      const worker = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Unlocked worker",
+        objective: "Legacy teardown",
+        profileId: "acp:claude",
+      });
+
+      const wt = await mgr.createForWorker(run.id, worker.id, baseSha);
+      await runGit(repo, ["worktree", "unlock", wt.path]);
+      db.updateTask(worker.id, { status: "completed" });
+
+      await mgr.teardown(wt.id);
+      assert.equal(findBlock(await porcelainBlocks(repo), wt.path), undefined);
+      assert.equal(existsSync(wt.path), false);
+      const branchExists = await runGit(repo, ["show-ref", "--verify", "--quiet", `refs/heads/${wt.branch}`]).then(
+        () => true,
+        () => false,
+      );
+      assert.equal(branchExists, false);
+      db.close();
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("retired harness-locked row whose checkout was deleted is finalised", async () => {
+    const repo = await initTempRepo();
+    try {
+      const db = new ControlPlaneDb(":memory:");
+      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
+      const run = db.createRun({ goal: "Deleted checkout", repoRoot: repo, baseBranch, baseSha });
+      const worker = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Deleted worker",
+        objective: "Finalise missing checkout",
+        profileId: "acp:claude",
+      });
+
+      const wt = await mgr.createForWorker(run.id, worker.id, baseSha);
+      db.updateTask(worker.id, { status: "completed" });
+      rmSync(wt.path, { recursive: true, force: true });
+
+      const cleanup = await mgr.sweep({ runId: run.id });
+      assert.deepEqual(cleanup.errors, []);
+      assert.equal(findBlock(await porcelainBlocks(repo), wt.path), undefined);
+      assert.ok(db.getWorktree(wt.id)?.cleanedAt != null);
+      db.close();
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("scratch worktrees are locked and removable", async () => {
+    const repo = await initTempRepo();
+    try {
+      const db = new ControlPlaneDb(":memory:");
+      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const { baseSha } = await mgr.resolveRepoInfo();
+
+      const s = await mgr.addScratchWorktree("_verify", "x", baseSha);
+      const block = findBlock(await porcelainBlocks(repo), s.path);
+      assert.ok(block?.split(/\r?\n/).includes(`locked ${HARNESS_LOCK_REASON}`));
+
+      await s.remove();
+      assert.equal(findBlock(await porcelainBlocks(repo), s.path), undefined);
+      assert.equal(existsSync(s.path), false);
       db.close();
     } finally {
       rmSync(repo, { recursive: true, force: true });

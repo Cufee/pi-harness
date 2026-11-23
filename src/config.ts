@@ -324,31 +324,79 @@ const SECTION_OF_KEY: ReadonlyMap<string, ConfigSection> = (() => {
   return map;
 })();
 
+/** Every key any section supports. */
+const ALL_SECTION_KEYS: ReadonlySet<string> = new Set(CONFIG_SECTIONS.flatMap((s) => Object.keys(CONFIG_SECTION_KEYS[s])));
+
+/** Case-insensitive optimal string alignment distance (insert, delete, substitute, swap adjacent). */
+function keyDistance(a: string, b: string): number {
+  a = a.toLowerCase();
+  b = b.toLowerCase();
+  const d = Array.from({ length: a.length + 1 }, (_, i) =>
+    Array.from({ length: b.length + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0)),
+  );
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      d[i]![j] = Math.min(d[i - 1]![j]! + 1, d[i]![j - 1]! + 1, d[i - 1]![j - 1]! + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        d[i]![j] = Math.min(d[i]![j]!, d[i - 2]![j - 2]! + 1);
+      }
+    }
+  }
+  return d[a.length]![b.length]!;
+}
+
+/** Closest known key path to an unknown key, or undefined when none is within the typo threshold. */
+function suggestConfigKey(key: string, section?: ConfigSection): string | undefined {
+  const nested = (s: ConfigSection) => [...SECTION_KEY_SETS[s]].map((k) => `${s}.${k}`);
+  const candidates = [
+    ...(section ? nested(section) : []),
+    ...TOP_LEVEL_KEYS,
+    ...CONFIG_SECTIONS.filter((s) => s !== section).flatMap(nested),
+  ];
+  let best: string | undefined;
+  let bestDist = (key.length <= 4 ? 1 : 2) + 1;
+  for (const path of candidates) {
+    const dist = keyDistance(key, path.slice(path.lastIndexOf(".") + 1));
+    if (dist < bestDist) {
+      best = path;
+      bestDist = dist;
+    }
+  }
+  return best;
+}
+
 export interface MisplacedConfigKey {
   /** Where the key was found, such as `extraReadRoots` or `goals.maxConcurrentWorkers`. */
   path: string;
   /** Where the key is supported, as display text. */
   supported: string;
+  /** Closest known key when the key is unknown (a likely typo). */
+  suggestion?: string;
 }
 
-function isMisplacedIn(section: ConfigSection, key: string): boolean {
-  if (SECTION_KEY_SETS[section].has(key)) return false;
-  const home = SECTION_OF_KEY.get(key);
-  return home !== undefined ? home !== section : TOP_LEVEL_KEYS.has(key);
-}
-
-/** Known config keys found where they are not supported in a raw layer document. Never reads or returns values. */
+/** Known config keys found where they are not supported, and unknown keys (with a did-you-mean suggestion). Never reads or returns values. */
 export function findMisplacedConfigKeys(raw: unknown, layer: "global" | "repo"): MisplacedConfigKey[] {
   if (!isPlainObject(raw)) return [];
   const out: MisplacedConfigKey[] = [];
   const supported = (target: string) =>
     layer === "repo" && GLOBAL_ONLY_CONFIG_KEYS.has(target) ? `"${target}" in the global config.json` : `"${target}"`;
+  const unknown = (path: string, key: string, section?: ConfigSection): MisplacedConfigKey => {
+    const suggestion = suggestConfigKey(key, section);
+    return suggestion
+      ? { path, supported: `none (unknown key; did you mean ${supported(suggestion)}?)`, suggestion }
+      : { path, supported: "none (unknown key)" };
+  };
   for (const key of Object.keys(raw)) {
     const home = SECTION_OF_KEY.get(key);
     if (home !== undefined) {
       out.push({ path: key, supported: supported(`${home}.${key}`) });
     } else if (layer === "repo" && TOP_LEVEL_KEYS.has(key) && GLOBAL_ONLY_CONFIG_KEYS.has(key)) {
       out.push({ path: key, supported: supported(key) });
+    } else if (key === "stateDir") {
+      out.push({ path: key, supported: "none (set the PI_HARNESS_HOME environment variable instead)" });
+    } else if (!TOP_LEVEL_KEYS.has(key) && !ALL_SECTION_KEYS.has(key)) {
+      out.push(unknown(key, key));
     }
   }
   for (const section of CONFIG_SECTIONS) {
@@ -365,20 +413,22 @@ export function findMisplacedConfigKeys(raw: unknown, layer: "global" | "repo"):
         out.push({ path, supported: supported(`${home}.${key}`) });
       } else if (TOP_LEVEL_KEYS.has(key)) {
         out.push({ path, supported: supported(key) });
+      } else if (!ALL_SECTION_KEYS.has(key)) {
+        out.push(unknown(path, key, section));
       }
     }
   }
   return out;
 }
 
-/** Copy of a raw layer whose sections hold no keys that belong elsewhere; omits `quotaEndpoint` when stripping empties it. */
-function dropMisplacedSectionKeys(raw: Record<string, unknown>): Record<string, unknown> {
+/** Copy of a raw layer whose sections keep only keys the section supports; omits `quotaEndpoint` when stripping empties it. */
+function dropUnsupportedSectionKeys(raw: Record<string, unknown>): Record<string, unknown> {
   let out = raw;
   for (const section of CONFIG_SECTIONS) {
     const sec = raw[section];
     if (!Object.hasOwn(raw, section) || !isPlainObject(sec)) continue;
-    if (!Object.keys(sec).some((key) => isMisplacedIn(section, key))) continue;
-    const remaining = Object.entries(sec).filter(([key]) => !isMisplacedIn(section, key));
+    if (!Object.keys(sec).some((key) => !SECTION_KEY_SETS[section].has(key))) continue;
+    const remaining = Object.entries(sec).filter(([key]) => SECTION_KEY_SETS[section].has(key));
     if (section === "quotaEndpoint" && remaining.length === 0) {
       out = Object.fromEntries(Object.entries(out).filter(([k]) => k !== section));
     } else {
@@ -576,7 +626,7 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
  * Builds the effective config from layers: `base` (or built-in defaults) < global `config.json` < repo `.pi-harness.json`.
  * Nested sections merge per key; arrays and scalars replace whole. `remotes` and worktree access roots never come
  * from the repo layer. When `base` is given it replaces the built-in defaults, so a removed global key falls back
- * to the base value. Known keys inside a section they do not belong to are dropped, never honored.
+ * to the base value. Keys a section does not support, misplaced or unknown, are dropped, never honored.
  */
 export function resolveConfig(
   globalCfg: Record<string, unknown>,
@@ -587,8 +637,8 @@ export function resolveConfig(
   // Startup stays tolerant of non-object roots; the reload and config.update boundaries reject them.
   if (!isPlainObject(globalCfg)) globalCfg = {};
   if (!isPlainObject(repoCfg)) repoCfg = {};
-  globalCfg = dropMisplacedSectionKeys(globalCfg);
-  repoCfg = dropMisplacedSectionKeys(repoCfg);
+  globalCfg = dropUnsupportedSectionKeys(globalCfg);
+  repoCfg = dropUnsupportedSectionKeys(repoCfg);
   const stateDir = runtime.stateDir;
   const merged = { ...globalCfg, ...repoCfg } as Partial<HarnessConfig>;
   const rollover: RolloverConfig = {
@@ -769,14 +819,14 @@ export function stableEqual(a: unknown, b: unknown): boolean {
 }
 
 /**
- * Validates the shape of a global `config.json` document or a `config.update` patch. Unknown keys are ignored,
- * and sections emptied only by misplaced keys are omitted before validation.
+ * Validates the shape of a global `config.json` document or a `config.update` patch. Unknown top-level keys are ignored;
+ * unsupported section keys are dropped before validation.
  * Returns one message per problem, naming the path and expectation; values are never echoed (they may be secrets).
  */
 export function validateConfigRaw(raw: unknown): string[] {
   const errors: string[] = [];
   if (!isPlainObject(raw)) return ["config must be a JSON object"];
-  const doc = dropMisplacedSectionKeys(raw);
+  const doc = dropUnsupportedSectionKeys(raw);
 
   const isString = (v: unknown) => typeof v === "string";
   const isNonEmptyString = (v: unknown) => typeof v === "string" && v.trim().length > 0;
