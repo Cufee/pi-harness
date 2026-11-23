@@ -42,7 +42,7 @@ case "$INSTALL_DIR$BIN_DIR" in
   *[\"\$\`\\]*) die 'paths must not contain " $ ` or \' ;;
 esac
 
-for tool in curl unzip tar grep find sort cut awk uname; do
+for tool in curl tar grep find sort cut awk uname; do
   command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
 done
 if command -v sha256sum >/dev/null 2>&1; then sha256() { sha256sum "$@"; }
@@ -86,6 +86,7 @@ mkdir -p "$STAGE" "$INSTALL_DIR/cache/downloads" "$INSTALL_DIR/cache/bun" "$INST
 # --- staged Bun (pinned checksum, verified before extraction) ---------------
 BUN_HOME=$INSTALL_DIR/bun/$BUN_VERSION-$target
 if [ "$("$BUN_HOME/bin/bun" --version 2>/dev/null || true)" != "$BUN_VERSION" ]; then
+  command -v unzip >/dev/null 2>&1 || die "missing required tool: unzip"
   zip=$INSTALL_DIR/cache/downloads/bun-v$BUN_VERSION-$target.zip
   if [ ! -f "$zip" ] || [ "$(sha256 "$zip" | cut -d' ' -f1)" != "$want" ]; then
     log "downloading Bun $BUN_VERSION ($target)"
@@ -103,6 +104,7 @@ if [ "$("$BUN_HOME/bin/bun" --version 2>/dev/null || true)" != "$BUN_VERSION" ];
   mv "$STAGE/bun-home" "$BUN_HOME"
 fi
 BUN=$BUN_HOME/bin/bun
+ln -sfn bun "$BUN_HOME/bin/bunx"
 
 # --- staged octofs (pinned checksum, verified before extraction) ------------
 octofs_key=$os-$arch
