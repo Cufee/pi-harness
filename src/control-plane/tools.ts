@@ -1144,7 +1144,8 @@ export class ControlPlaneToolExecutor {
         let overflowPath: string | undefined;
         if (summary.length > SUMMARY_LIMIT) {
           const artifactsDir = dossierDirectory(run.repoRoot);
-          const fileName = writeUniqueFile(artifactsDir, `${taskId}-summary`, ".md", summary);
+          const minIndex = typeof this.db.nextArtifactSeq === "function" ? this.db.nextArtifactSeq(`${taskId}-summary.md`) : 0;
+          const fileName = writeUniqueFile(artifactsDir, `${taskId}-summary`, ".md", summary, minIndex);
           const artifactPath = `.harness/artifacts/${fileName}`;
           overflowPath = resolve(run.repoRoot, artifactPath);
           paths.push(overflowPath);

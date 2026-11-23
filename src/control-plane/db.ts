@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { Database } from "bun:sqlite";
 import { AdmissionQueue } from "./admission-queue.js";
-import { friendlyIdCandidates, nextFriendlyId } from "./ids.js";
+import { friendlyIdCandidates, nextFriendlyId, nextSequenceValue } from "./ids.js";
 import { ProjectStore } from "./projects.js";
 import { SessionMessageStore } from "./session-messages.js";
 import { TimerManager } from "./timers.js";
@@ -1351,6 +1351,31 @@ export class ControlPlaneDb {
 
   hasDossier(runId: string, path: string): boolean {
     return !!this.db.prepare("SELECT 1 FROM artifacts WHERE run_id = ? AND path = ? AND kind = 'dossier' LIMIT 1").get(runId, path);
+  }
+
+  /** Durable monotonic sequence for spill file indices, so a deleted file's name is never reissued across restarts. */
+  nextArtifactSeq(scopeKey: string): number {
+    return nextSequenceValue(this.db, `artseq:${scopeKey}`);
+  }
+
+  /** Dossier paths (any run) ending with suffix, for matching other spellings of the same repo root. */
+  listDossierPathsWithSuffix(suffix: string): string[] {
+    if (!suffix) return [];
+    const rows = this.db
+      .prepare("SELECT DISTINCT path FROM artifacts WHERE kind = 'dossier' AND length(path) > ? AND substr(path, -?) = ?")
+      .all(suffix.length, suffix.length, suffix) as Array<{ path: string }>;
+    return rows.map(r => r.path);
+  }
+
+  /** Number of distinct runs that index any of paths as a dossier. */
+  countDossierOwners(paths: string[]): number {
+    const unique = [...new Set(paths)];
+    if (unique.length === 0) return 0;
+    const placeholders = unique.map(() => "?").join(", ");
+    const row = this.db
+      .prepare(`SELECT COUNT(DISTINCT run_id) AS n FROM artifacts WHERE kind = 'dossier' AND path IN (${placeholders})`)
+      .get(...unique) as { n: number };
+    return Number(row?.n ?? 0);
   }
 
   listArtifacts(runId: string, taskId?: string, limit = 100, kind?: ArtifactRecord["kind"]): ArtifactRecord[] {

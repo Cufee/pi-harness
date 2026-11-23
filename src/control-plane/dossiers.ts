@@ -43,11 +43,18 @@ function codeOutputName(name: string): { stem: string; ext: string } {
   return { stem, ext };
 }
 
-/** Writes Code Mode output to a new, never-overwritten `<stem>-<n><ext>` file under .harness/artifacts and indexes it. */
+/**
+ * Writes Code Mode output to a new, never-overwritten `<runId>-<stem>-<n><ext>` file under .harness/artifacts and
+ * indexes it. The run prefix keeps runs and unindexed writers out of each other's names; a durable per-run sequence
+ * keeps a deleted file's name from being reissued after a restart.
+ */
 export function writeCodeOutput(db: ControlPlaneDb, run: RunRecord, taskId: string, name: string, json: string) {
   const dir = dossierDirectory(run.repoRoot);
+  const safeRunId = run.id.replace(/[^a-zA-Z0-9._-]/g, "_").replace(/^\.+/, "").slice(0, 64) || "run";
   const { stem, ext } = codeOutputName(name);
-  const path = join(dir, writeUniqueFile(dir, stem, ext, json));
+  const scopedStem = `${safeRunId}-${stem}`;
+  const minIndex = typeof db.nextArtifactSeq === "function" ? db.nextArtifactSeq(`${safeRunId}:${stem}${ext}`) : 0;
+  const path = join(dir, writeUniqueFile(dir, scopedStem, ext, json, minIndex));
   try {
     return db.recordArtifact({ runId: run.id, taskId, kind: "dossier", path, summary: "Code Mode output" }).path;
   } catch (error) {
@@ -92,7 +99,7 @@ export function findRunDossier(
   db: ControlPlaneDb,
   run: RunRecord,
   requested: string,
-): { recordedPath: string; rel: string | null } | null {
+): { recordedPath: string; rel: string | null; candidates: string[] } | null {
   const rawRoot = resolve(run.repoRoot);
   const abs = resolve(rawRoot, requested);
   const rel = artifactRel(rawRoot, abs);
@@ -105,8 +112,27 @@ export function findRunDossier(
       // Unresolvable root: only the lexical candidates apply.
     }
   }
-  for (const candidate of new Set(candidates)) {
-    if (db.hasDossier(run.id, candidate)) return { recordedPath: candidate, rel };
+  if (rel !== null && typeof db.listDossierPathsWithSuffix === "function") {
+    // Other runs may have recorded this file under another spelling of the same root (e.g. via a symlink).
+    let realRoot: string | null = null;
+    try {
+      realRoot = realpathSync(rawRoot);
+    } catch {
+      realRoot = null;
+    }
+    if (realRoot !== null) {
+      for (const path of db.listDossierPathsWithSuffix(sep + rel)) {
+        try {
+          if (realpathSync(path.slice(0, path.length - rel.length - 1) || sep) === realRoot) candidates.push(path);
+        } catch {
+          // Unresolvable root spelling: cannot be the same file.
+        }
+      }
+    }
+  }
+  const unique = [...new Set(candidates)];
+  for (const candidate of unique) {
+    if (db.hasDossier(run.id, candidate)) return { recordedPath: candidate, rel, candidates: unique };
   }
   return null;
 }
@@ -156,12 +182,21 @@ function readArtifact(
 
 export function readRunDossier(db: ControlPlaneDb, run: RunRecord, args: Record<string, unknown>) {
   if (typeof args.path !== "string" || !args.path) {
-    const taskId = typeof args.task_id === "string" ? args.task_id : undefined;
+    const rawTaskId = typeof args.task_id === "string" ? args.task_id.trim() : "";
+    const taskId = rawTaskId
+      ? typeof db.getTask === "function"
+        ? (db.getTask(rawTaskId)?.id ?? rawTaskId)
+        : rawTaskId
+      : undefined;
     return { artifacts: db.listArtifacts(run.id, taskId, 50, "dossier") };
   }
   const found = findRunDossier(db, run, args.path);
   const shown = found?.recordedPath ?? resolve(run.repoRoot, args.path);
   if (!found) throw new Error(`No indexed dossier in this run: ${shown}`);
+  // A legacy flat path indexed by several runs cannot prove which run's bytes it now holds.
+  if (typeof db.countDossierOwners === "function" && db.countDossierOwners(found.candidates) > 1) {
+    throw new Error(`Dossier path has ambiguous multi-run ownership: ${shown}`);
+  }
   const nonSymlink = `Dossier must be a non-symlink path under .harness/artifacts: ${shown}`;
   if (found.rel === null) throw new Error(nonSymlink);
   // Built from the requested path, not from realpath(target): equality below holds only when no component
