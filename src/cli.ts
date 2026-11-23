@@ -828,17 +828,22 @@ async function main(): Promise<void> {
           let useHost = hostFlag;
           const colon = ref.indexOf(":");
           if (!useHost && colon > 0) {
-            const prefix = ref.slice(0, colon);
-            const alias = config.remotes?.find((r) => r.name.toLowerCase() === prefix.toLowerCase());
-            if (alias && ref.slice(colon + 1).trim()) {
-              useHost = alias.name;
+            const prefix = ref.slice(0, colon).toLowerCase();
+            const alias = config.remotes?.find((r) => r.name.toLowerCase() === prefix);
+            const matchesRemote = Boolean(remoteSpec.target && remoteSpec.hostLabel?.toLowerCase() === prefix);
+            if ((alias || matchesRemote) && ref.slice(colon + 1).trim()) {
+              useHost = alias?.name ?? remoteSpec.hostLabel ?? undefined;
               ref = ref.slice(colon + 1).trim();
             }
           }
-          if (useHost && remoteSpec.target && useHost.toLowerCase() !== (remoteSpec.hostLabel ?? "").toLowerCase()) {
-            throw new Error(`Cannot combine --remote ${rawRemote} with --host ${useHost} on \`project use\`; specify one target host.`);
+          if (useHost && remoteSpec.target) {
+            if (useHost.toLowerCase() !== (remoteSpec.hostLabel ?? "").toLowerCase()) {
+              throw new Error(`Cannot combine --remote ${rawRemote} with --host ${useHost} on \`project use\`; specify one target host.`);
+            }
+            // Already connected to that daemon: the client-side alias need not be the remote's own host name.
+            useHost = undefined;
           }
-          const proj = await client.request<ProjectSummary & { host?: string }>("project.get", {
+          const proj = await client.request<ProjectSummary & { host?: string; nodeId?: string | null }>("project.get", {
             projectId: ref,
             ...(useHost ? { host: useHost } : {}),
           });
@@ -853,6 +858,16 @@ async function main(): Promise<void> {
             client.close();
             targetClient = await connectClient(config.socketPath, spec.target, spec.bridgeCommand);
             targetHostLabel = spec.hostLabel;
+          }
+          // The project ID is numbered per daemon: open it only on the node that owns it.
+          if (proj.nodeId) {
+            const info = await targetClient.request<{ nodeId?: string }>("ping");
+            if (info.nodeId && info.nodeId !== proj.nodeId) {
+              if (targetClient !== client) targetClient.close();
+              throw new Error(
+                `Host "${targetHostLabel ?? "local"}" resolved to node ${info.nodeId}, but project ${proj.id} belongs to node ${proj.nodeId} (alias mismatch); not opening it.`,
+              );
+            }
           }
           handoffClientToTui = true;
           await runInteractiveSessionLoop(

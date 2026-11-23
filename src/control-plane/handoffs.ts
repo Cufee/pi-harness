@@ -36,9 +36,11 @@ export function compactTaskHandoff(task: TaskRecord, escalations: EscalationReco
   if (paused) {
     const reason = task.summary?.startsWith("Paused (quota):") ? task.summary.slice("Paused (quota):".length).trim() : task.summary?.trim() ?? "";
     summary =
-      `Task ${task.id} in run ${task.runId} is paused on provider quota (${reason || "cause not recorded"}). ` +
-      `Not a failure; its work and handoff are kept and it continues in place when run ${task.runId} resumes ` +
-      "(automatic when a reset time is known, otherwise resume_run). Do not respawn or cancel it.";
+      `Task ${task.id} in run ${task.runId} is paused on provider quota (${reason || `cause not recorded; inspect with \`pi-harness tree ${task.runId}\``}). ` +
+      `Not a failure; its work and handoff are kept and it continues in place when run ${task.runId} resumes. ` +
+      "The run resumes by itself only if the harness scheduled an automatic quota resume; otherwise the Director " +
+      `(resume_run) or the operator (\`pi-harness resume ${task.runId}\`) resumes it, so escalate if you need it sooner. ` +
+      "Do not respawn or cancel it.";
   }
   else if (unstructured) {
     // Tier 1 orchestrators have no return_task; their natural final reply is the handoff.

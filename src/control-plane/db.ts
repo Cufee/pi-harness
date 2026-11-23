@@ -908,20 +908,45 @@ export class ControlPlaneDb {
     this.emitEvent(id, null, "run.status", reason ? { status, reason } : { status });
   }
 
-  /** Reason recorded on the latest run.status / quota.run_paused event for a run, or null when none was recorded. */
+  /** Active and quota-paused runs, newest first, without a row cap (unlike listRuns). */
+  listActiveOrQuotaPausedRuns(): RunRecord[] {
+    const rows = this.db
+      .prepare("SELECT id FROM runs WHERE status IN ('active', 'paused_quota') ORDER BY created_at DESC, id DESC")
+      .all() as { id: string }[];
+    return rows.map((r) => this.getRun(r.id)).filter((r): r is RunRecord => r !== null);
+  }
+
+  /**
+   * Reason recorded on the latest run.status / quota.run_paused event for a run. When that event has no
+   * reason, falls back to the summary of a failed or cancelled task (root tasks first, newest first) that
+   * says more than its bare status. Null when no cause was recorded anywhere.
+   */
   getLastRunStatusReason(runId: string): string | null {
     const row = this.db
       .prepare(
         "SELECT payload_json FROM events WHERE run_id = ? AND type IN ('run.status', 'quota.run_paused') ORDER BY seq DESC LIMIT 1",
       )
       .get(runId) as { payload_json: string } | undefined;
-    if (!row) return null;
-    try {
-      const reason = (JSON.parse(row.payload_json) as { reason?: unknown } | null)?.reason;
-      return typeof reason === "string" && reason.trim() ? reason.trim() : null;
-    } catch {
-      return null;
+    if (row) {
+      try {
+        const reason = (JSON.parse(row.payload_json) as { reason?: unknown } | null)?.reason;
+        if (typeof reason === "string" && reason.trim()) return reason.trim();
+      } catch {
+        // Fall through to task summaries.
+      }
     }
+    const tasks = this.db
+      .prepare(
+        `SELECT id, status, summary FROM tasks WHERE run_id = ? AND status IN ('failed', 'cancelled') AND summary IS NOT NULL
+         ORDER BY (parent_id IS NULL) DESC, updated_at DESC, created_at DESC`,
+      )
+      .all(runId) as { id: string; status: string; summary: string }[];
+    for (const t of tasks) {
+      const summary = t.summary.trim();
+      if (!summary || /^(cancelled|failed|stopped)\.?$/i.test(summary)) continue;
+      return `task ${t.id} ${t.status}: ${summary.slice(0, 400)}`;
+    }
+    return null;
   }
 
   /** Re-points a run at another repository (used when a Director chat switches projects). */

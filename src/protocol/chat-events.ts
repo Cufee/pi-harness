@@ -243,8 +243,11 @@ export function parseChatControlEvent(raw: unknown): ChatControlEvent | null {
   }
 }
 
-/** Concise plain-text summary stored in `chat_turns.content` for history context and plain-text logs. */
-export function formatChatEventSummary(event: ChatControlEvent): string {
+/**
+ * Concise plain-text summary stored in `chat_turns.content` for history context and plain-text logs.
+ * `remoteHost` (a client attached to a remote daemon) qualifies cited CLI commands with `--remote <host>`.
+ */
+export function formatChatEventSummary(event: ChatControlEvent, opts?: { remoteHost?: string | null }): string {
   switch (event.kind) {
     case "goal.settled": {
       const head = `Goal ${event.goalId} v${event.goalVersion} ("${event.goalTitle}")`;
@@ -253,21 +256,31 @@ export function formatChatEventSummary(event: ChatControlEvent): string {
         const detail = event.detail?.trim();
         return `${head} run ${event.runId} completed${esc}${detail ? `: ${detail}` : ""}.`;
       }
-      const recovery =
-        `Nothing restarts automatically. Continue it in place with \`pi-harness resume ${event.runId}\`, ` +
-        `inspect it with \`pi-harness tree ${event.runId}\`, or send a new request.`;
+      const resumeCmd = cliCommand("resume", event.runId, opts?.remoteHost);
+      const treeCmd = cliCommand("tree", event.runId, opts?.remoteHost);
+      const recovery = `Nothing restarts automatically. Continue it in place with ${resumeCmd}, inspect it with ${treeCmd}, or send a new request.`;
       const quotaReason = settledQuotaReason(event);
       if (quotaReason !== null) {
         return (
-          `${head}: run ${event.runId} paused on provider quota: ${quotaReason}${esc}. No quota reset time is known, so it will not resume by itself. ` +
-          `Continue it in place with \`pi-harness resume ${event.runId}\` once quota is back, inspect it with \`pi-harness tree ${event.runId}\`, or send a new request.`
+          `${head}: run ${event.runId} paused on provider quota: ${quotaReason}${esc}. Automatic resume is not scheduled (manual quota mode), so it will not resume by itself. ` +
+          `Continue it in place with ${resumeCmd} once quota is back, inspect it with ${treeCmd}, or send a new request.`
         );
       }
       if (event.cause === "escalation") {
-        return `${head}: run ${event.runId} needs human input: ${settledCauseText(event)}${esc}. Inspect it with \`pi-harness tree ${event.runId}\` and answer the escalation, or send a new request.`;
+        return `${head}: run ${event.runId} needs human input: ${settledCauseText(event, treeCmd)}${esc}. Inspect it with ${treeCmd} and answer the escalation, or send a new request.`;
       }
-      const verb = event.runStatus === "stopped" ? "was stopped" : "failed";
-      return `${head}: run ${event.runId} ${verb}: ${settledCauseText(event)}${esc}. ${recovery}`;
+      const verificationError = settledVerificationError(event);
+      if (verificationError !== null) {
+        return (
+          `${head}: run ${event.runId} completed, but goal verification failed to run: ${verificationError}${esc}. The run itself did not fail. ` +
+          `Re-run verification (Director: goal_trigger_review) or inspect the goal (goal_get); inspect the run with ${treeCmd}.`
+        );
+      }
+      if (event.runStatus === "stopped") {
+        if (isExplicitStop(event)) return `${head}: run ${event.runId} was stopped: ${event.detail!.trim()}${esc}. ${recovery}`;
+        return `${head}: run ${event.runId} is stopped: ${settledCauseText(event, treeCmd, "no explicit stop was recorded")}${esc}. ${recovery}`;
+      }
+      return `${head}: run ${event.runId} failed: ${settledCauseText(event, treeCmd)}${esc}. ${recovery}`;
     }
     case "goal.committed":
       return `Goal ${event.goalId} v${event.goalVersion} started autonomous run ${event.runId} (${event.criteriaCount} criteria).`;
@@ -306,22 +319,30 @@ export function formatChatEventForModel(event: ChatControlEvent): string {
         ].join("\n");
       }
       const resume = `resume_run({ goal_id: "${event.goalId}" })`;
-      const noCause = event.detail
-        ? ""
-        : ` No cause was recorded; inspect with run_status({ run_id: "${event.runId}" }) (operator: \`pi-harness tree ${event.runId}\`).`;
+      const inspect = `run_status({ run_id: "${event.runId}" }) (operator: \`pi-harness tree ${event.runId}\`)`;
+      const noCause = event.detail ? "" : ` No cause was recorded; inspect with ${inspect}.`;
       let guidance: string;
       if (settledQuotaReason(event) !== null) {
         guidance =
           `Run ${event.runId} for Goal ${event.goalId} is paused on provider quota. Nothing was lost; paused tasks keep their worktrees and handoffs. ` +
-          `It will not resume by itself because no quota reset time is known. Tell the user, then call ${resume} once quota is back (or schedule_timer with resume_goal). Do not create a new goal.`;
-      } else if (event.runStatus === "stopped") {
-        guidance =
-          `Run ${event.runId} for Goal ${event.goalId} was explicitly stopped; this is not a failure and not a turn or budget limit. Do not restart it yourself. ` +
-          `If the user asks to continue, call ${resume} or goal_commit; both continue the same run in place without creating a second run.${noCause}`;
+          `Automatic resume is not scheduled (manual quota mode: no reset time is known or auto-resume is off), so it will not resume by itself. ` +
+          `Tell the user, then call ${resume} once quota is back (or schedule_timer with resume_goal). Do not create a new goal.`;
       } else if (event.cause === "escalation") {
         guidance =
           `Run ${event.runId} for Goal ${event.goalId} raised an escalation that needs human input. Surface it to the user with actionable options; ` +
           `once it is resolved, ${resume} continues the same run in place.`;
+      } else if (settledVerificationError(event) !== null) {
+        guidance =
+          `Run ${event.runId} for Goal ${event.goalId} completed; the failure is in goal verification after completion, not in the run. Do not resume or restart the run for it. ` +
+          `Inspect the goal with goal_get({ goal_id: "${event.goalId}" }) and re-run verification with goal_trigger_review once the cause is fixed, or report the verification error to the user.`;
+      } else if (event.runStatus === "stopped" && isExplicitStop(event)) {
+        guidance =
+          `Run ${event.runId} for Goal ${event.goalId} was explicitly stopped; this is not a failure and not a turn or budget limit. Do not restart it yourself. ` +
+          `If the user asks to continue, call ${resume} or goal_commit; both continue the same run in place without creating a second run.`;
+      } else if (event.runStatus === "stopped") {
+        guidance =
+          `Run ${event.runId} for Goal ${event.goalId} is stopped, but no explicit stop by the operator was recorded; its tasks may have ended on their own. ` +
+          `Inspect it with ${inspect} before reporting why. Do not restart it yourself; if the user asks to continue, ${resume} or goal_commit continues the same run in place.`;
       } else {
         guidance =
           `Run ${event.runId} for Goal ${event.goalId} failed. Inspect it with run_status({ goal_id: "${event.goalId}" }). ` +
@@ -362,7 +383,31 @@ function settledQuotaReason(event: Extract<ChatControlEvent, { kind: "goal.settl
   return null;
 }
 
+const VERIFICATION_ERROR_PREFIX = "verification_error:";
+
+/** The verification error when a goal.settled event reports a failed post-completion verification, else null. */
+function settledVerificationError(event: Extract<ChatControlEvent, { kind: "goal.settled" }>): string | null {
+  const detail = event.detail?.trim() ?? "";
+  if (detail.startsWith(VERIFICATION_ERROR_PREFIX)) return detail.slice(VERIFICATION_ERROR_PREFIX.length).trim() || "unknown error";
+  if (event.cause === "verification_error") return detail || "unknown error";
+  return null;
+}
+
+/** True only when the stop was recorded as explicit and carries its recorded reason. */
+function isExplicitStop(event: Extract<ChatControlEvent, { kind: "goal.settled" }>): boolean {
+  return event.cause === "explicit_stop" && Boolean(event.detail?.trim());
+}
+
+/** A cited CLI command, qualified with `--remote <host>` when the reader is attached to a remote daemon. */
+function cliCommand(verb: "resume" | "tree", runId: string, remoteHost?: string | null): string {
+  return `\`pi-harness ${verb} ${runId}${remoteHost ? ` --remote ${remoteHost}` : ""}\``;
+}
+
 /** The recorded cause, or an explicit notice that none was recorded naming the inspect command. */
-function settledCauseText(event: Extract<ChatControlEvent, { kind: "goal.settled" }>): string {
-  return event.detail?.trim() || `no cause was recorded; inspect with \`pi-harness tree ${event.runId}\``;
+function settledCauseText(
+  event: Extract<ChatControlEvent, { kind: "goal.settled" }>,
+  treeCmd: string,
+  missing = "no cause was recorded",
+): string {
+  return event.detail?.trim() || `${missing}; inspect with ${treeCmd}`;
 }

@@ -348,21 +348,25 @@ const GOAL_SUB_COLUMNS: Record<Exclude<GoalTabId, "overview">, ColumnSpec[]> = {
 };
 
 /**
- * Notice for an idempotent resume result: "resumed" (or a legacy reply without an outcome) is ok;
- * already running/queued/completed is informational; nothing resumed is a warning with its reason.
+ * Notice for an idempotent resume/commit result: started or resumed (or a legacy reply with
+ * `resumed: true`) is ok; already running/queued/completed is informational; an error is danger;
+ * anything else, including an absent or empty reply, is a warning with its reason.
  */
 function resumeNotice(
-  res: { resumed?: boolean; reason?: string; outcome?: string; message?: string } | null | undefined,
+  res: { resumed?: boolean; reason?: string; outcome?: string; message?: string; error?: string } | null | undefined,
   okText: string,
   failText: string,
-): [string, "ok" | "info" | "warn"] {
-  if (!res || res.outcome === "resumed" || (res.outcome === undefined && res.resumed !== false)) {
+): [string, "ok" | "info" | "warn" | "danger"] {
+  const outcome = res?.outcome;
+  // "executing" is the goal status a legacy goal.commit reply reports as its outcome.
+  if (outcome === "resumed" || outcome === "started" || outcome === "executing" || (outcome === undefined && res?.resumed === true)) {
     return [res?.message || okText, "ok"];
   }
-  if (res.outcome && ["already_active", "already_queued", "waiting", "already_completed"].includes(res.outcome)) {
-    return [res.message || res.reason || okText, "info"];
+  if (outcome && ["already_active", "already_queued", "queued", "waiting", "already_completed", "already_settled"].includes(outcome)) {
+    return [res?.message || res?.reason || okText, "info"];
   }
-  return [res.message || res.reason || failText, "warn"];
+  if (outcome === "error" || res?.error) return [res?.message || res?.error || res?.reason || failText, "danger"];
+  return [res?.message || res?.reason || failText, "warn"];
 }
 
 function isGoalResumable(g: GoalRecord, linkedRunStatus?: string | null): boolean {
@@ -628,8 +632,8 @@ export class GoalInspectorScreen implements Screen {
       this.frame.askConfirm({
         message: `Commit ${g.id} and launch autonomous run?`,
         onConfirm: async () => {
-          const res = await this.deps.client.request<{ message?: string }>("goal.commit", { goalId: g.id });
-          this.frame.setNotice(res?.message || `Committed ${g.id}`, "ok");
+          const res = await this.deps.client.request<{ outcome?: string; message?: string } | null>("goal.commit", { goalId: g.id });
+          this.frame.setNotice(...resumeNotice(res, `Committed ${g.id}`, `Could not commit ${g.id}`));
           await this.deps.store.refresh();
         },
       });
