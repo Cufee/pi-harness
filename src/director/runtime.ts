@@ -41,6 +41,7 @@ import { isAuthoritativeSource, isBlockedPhase, isCurrentClaim, type GoalLivePro
 import {
   formatChatEventForModel,
   formatChatEventSummary,
+  isReviewInvalidated,
   type ChatControlEvent,
 } from "../protocol/chat-events.js";
 import {
@@ -89,6 +90,14 @@ class PendingAmendmentError extends Error {
   constructor(goalId: string, version: number, reason: string) {
     super(`Goal ${goalId} v${version} has an unacknowledged amendment (${reason})`);
     this.name = "PendingAmendmentError";
+  }
+}
+
+/** Thrown by a wake turn whose event was invalidated before it was persisted or delivered; nothing was written. */
+export class StaleWakeEventError extends Error {
+  constructor(message = "Wake event invalidated before delivery") {
+    super(message);
+    this.name = "StaleWakeEventError";
   }
 }
 
@@ -729,6 +738,16 @@ export class DirectorRuntime {
   private launchingGoals = new Map<string, Promise<GoalCommitResult>>();
   /** Bumped by every explicit goal pause or cancel, so a pause issued during a launch wins over it. */
   private goalPauseEpoch = new Map<string, number>();
+  /** Bumped on amend, pause, cancel, or settled-run resume/relaunch so resumed goals cannot resurrect older review transitions or queued notices. */
+  private goalReviewEpoch = new Map<string, number>();
+
+  getReviewInvalidationEpoch(goalId: string): number {
+    return this.goalReviewEpoch.get(goalId) ?? 0;
+  }
+
+  private bumpReviewInvalidationEpoch(goalId: string): void {
+    this.goalReviewEpoch.set(goalId, (this.goalReviewEpoch.get(goalId) ?? 0) + 1);
+  }
   /**
    * Amendments whose steer has not been acknowledged by the run's Tier 1; recovered once the run settles.
    * `inFlight` marks a live steer still awaiting its answer: a settlement arriving meanwhile is deferred until it resolves.
@@ -752,7 +771,10 @@ export class DirectorRuntime {
     this.chats = new DirectorSessionStore(db.db);
     this.goals = new GoalEngine(
       db.db,
-      (id) => this.activeReviews.get(id)?.abort(new Error("Goal changed during review")),
+      (id) => {
+        this.bumpReviewInvalidationEpoch(id);
+        this.activeReviews.get(id)?.abort(new Error("Goal changed during review"));
+      },
       config.goals,
       () => {
         // Startup reconciliation frees slots held by settled runs; refresh queued progress and admit waiting goals.
@@ -1087,9 +1109,13 @@ export class DirectorRuntime {
       !this.activeReviews.has(goal.id)
     ) {
       if (!this.unsubRunEvents || !firstNotice) return; // daemon disposed or already launched
-      void this.verifyAndReviewGoal(goal.id, undefined, { autoTriggered: true }).catch((err) =>
-        this.notifyAutoVerifyFailure(goal, ev.runId, err),
-      );
+      const reviewLaunch = { reviewEpoch: this.getReviewInvalidationEpoch(goal.id), aborted: false };
+      void this.verifyAndReviewGoal(goal.id, undefined, {
+        autoTriggered: true,
+        onInvalidatedAbort: () => {
+          reviewLaunch.aborted = true;
+        },
+      }).catch((err) => this.notifyAutoVerifyFailure(goal, ev.runId, err, reviewLaunch));
       return;
     }
 
@@ -1108,9 +1134,14 @@ export class DirectorRuntime {
       !this.db.listEscalations(ev.runId, "unresolved").some((e) => e.severity === "P0")
     ) {
       if (!this.unsubRunEvents || !firstNotice) return;
-      void this.verifyAndReviewGoal(goal.id, undefined, { autoTriggered: true, settledRunStatus: "failed" }).catch((err) =>
-        this.notifyAutoVerifyFailure(goal, ev.runId, err),
-      );
+      const reviewLaunch = { reviewEpoch: this.getReviewInvalidationEpoch(goal.id), aborted: false };
+      void this.verifyAndReviewGoal(goal.id, undefined, {
+        autoTriggered: true,
+        settledRunStatus: "failed",
+        onInvalidatedAbort: () => {
+          reviewLaunch.aborted = true;
+        },
+      }).catch((err) => this.notifyAutoVerifyFailure(goal, ev.runId, err, reviewLaunch));
       return;
     }
 
@@ -1183,15 +1214,23 @@ export class DirectorRuntime {
   }
 
   /** Wakes the Director when automatic verification of a settled run could not finish, with the run's real status. */
-  private notifyAutoVerifyFailure(goal: GoalRecord, runId: string, err: unknown): void {
+  private notifyAutoVerifyFailure(
+    goal: GoalRecord,
+    runId: string,
+    err: unknown,
+    launch?: { reviewEpoch: number; aborted: boolean },
+  ): void {
     // A premature review leaves the pending amendment to decide the settlement; it is not a verification failure.
     if (err instanceof PendingAmendmentError) return;
+    // A review superseded by a stop, resume or pause is not a verification failure either.
+    if (launch?.aborted) return;
     if (!this.unsubRunEvents || !goal.chatSessionId || !this.config.events?.wakeDirectorOnGoalSettle) return;
     const runStatus = this.db.getRun(runId)?.status;
     // A resumed run notifies again when it next settles.
     if (runStatus !== "completed" && runStatus !== "failed" && runStatus !== "stopped") return;
     const latest = this.goals.getGoal(goal.id);
     if (!latest || latest.version !== goal.version || ["achieved", "cancelled", "paused"].includes(latest.status)) return;
+    if (launch && this.getReviewInvalidationEpoch(goal.id) !== launch.reviewEpoch) return;
     let openEscCount = 0;
     try {
       openEscCount = this.db.listEscalations(runId, "unresolved").length;
@@ -1618,6 +1657,7 @@ export class DirectorRuntime {
       // A fresh run starts on the current contract; amendments pending for an older run no longer apply.
       this.undeliveredAmendments.delete(goal.id);
       started = this.goals.linkRunAndStart(goal.id, run.id);
+      this.bumpReviewInvalidationEpoch(goal.id);
       runId = run.id;
       launched = true;
       const contractValue = (g: Pick<GoalRecord, "version" | "title" | "description" | "criteria" | "nonGoals">, delta: unknown) => ({
@@ -1808,6 +1848,8 @@ export class DirectorRuntime {
         const pausedSince = (this.goalPauseEpoch.get(goal.id) ?? 0) !== pauseEpochBefore;
         const keep = pausedSince || ["executing", "verifying", "reviewing", "cancelled", "achieved"].includes(fresh.status);
         const updated = keep ? fresh : this.goals.setStatus(goal.id, "executing", "Resumed in place");
+        // Leaving human review for execution invalidates earlier review notices even when no new run generation started.
+        if (!keep) this.bumpReviewInvalidationEpoch(goal.id);
         this.syncQueuedGoalProgress();
         return { ...result(updated, res.outcome === "resumed" ? "resumed" : "already_active", `Goal ${goal.id}: ${res.message}`), ...extra };
       }
@@ -1922,6 +1964,7 @@ export class DirectorRuntime {
   /** Bumps the goal's pause epoch and cancels earlier pending chat timers that would resume it. Returns the cancelled count. */
   noteGoalPaused(goalId: string, reason: string): number {
     this.goalPauseEpoch.set(goalId, (this.goalPauseEpoch.get(goalId) ?? 0) + 1);
+    this.bumpReviewInvalidationEpoch(goalId);
     let cancelled = 0;
     for (const t of this.db.timers.list({ ownerKind: "chat", status: "pending" })) {
       if (t.resumeGoal === true && t.goalId === goalId && this.db.timers.cancel(t.id, reason)) cancelled++;
@@ -2424,7 +2467,10 @@ export class DirectorRuntime {
     if (!resumed || !priorRunStatus || !["completed", "failed", "stopped"].includes(priorRunStatus)) return;
     try {
       const rows = this.db.db.prepare("SELECT id FROM goals WHERE linked_run_id = ?").all(runId) as Array<{ id: string }>;
-      for (const row of rows) this.goals.clearStaleVerificationStatus(row.id, { clearBlockedPhase: true });
+      for (const row of rows) {
+        this.bumpReviewInvalidationEpoch(row.id);
+        this.goals.clearStaleVerificationStatus(row.id, { clearBlockedPhase: true });
+      }
     } catch {
       // Goals table may be absent or closing.
     }
@@ -2777,7 +2823,7 @@ export class DirectorRuntime {
   async verifyAndReviewGoal(
     goalId: string,
     signal?: AbortSignal,
-    opts?: { verificationMode?: VerificationMode; summary?: string; autoTriggered?: boolean; settledRunStatus?: "failed" },
+    opts?: { verificationMode?: VerificationMode; summary?: string; autoTriggered?: boolean; settledRunStatus?: "failed"; onInvalidatedAbort?: () => void },
   ): Promise<{
     goal: GoalRecord;
     review: GoalReviewVerdict;
@@ -2793,10 +2839,16 @@ export class DirectorRuntime {
     const abort = new AbortController();
     this.activeReviews.set(goal.id, abort);
     const reviewSignal = signal ? AbortSignal.any([abort.signal, signal]) : abort.signal;
+    const reviewEpoch = this.getReviewInvalidationEpoch(goal.id);
+    // A stop arriving mid-review cannot settle the goal while the review holds it; it is replayed once the review has unwound.
+    let deferredStopEvent = null as EventRecord | null;
     const unsubscribe = this.db.onEvent(ev => {
       if (ev.runId !== goal.linkedRunId) return;
       const runStatus = ev.type === "run.status" ? (ev.payload as { status?: string } | null)?.status : undefined;
-      if (runStatus === "stopped") abort.abort(new Error("Run stopped during review"));
+      if (runStatus === "stopped") {
+        deferredStopEvent = ev;
+        abort.abort(new Error("Run stopped during review"));
+      }
       // Only a genuine resume aborts: the Done-Reviewer running on this run, or a snapshot deriving
       // "active" from it, must never cancel the review it belongs to.
       // A real execution activating (registered in the orchestrator, which the Done-Reviewer never is) also counts.
@@ -2815,8 +2867,15 @@ export class DirectorRuntime {
       if (!this.disposed) {
         try {
           const current = this.goals.getGoal(goal.id);
-          if (current?.version === goal.version && ["executing", "verifying", "reviewing"].includes(current.status)) {
-            if (error instanceof PendingAmendmentError || this.isRunOccupyingGoalSlot(current.linkedRunId)) {
+          // An invalidated review (pause, resume, stop, amend) must not touch the goal or its latest summary.
+          const epochMatches = this.getReviewInvalidationEpoch(goal.id) === reviewEpoch;
+          if (epochMatches && current?.version === goal.version && ["executing", "verifying", "reviewing"].includes(current.status)) {
+            if (
+              error instanceof PendingAmendmentError ||
+              deferredStopEvent ||
+              abort.signal.aborted ||
+              this.isRunOccupyingGoalSlot(current.linkedRunId)
+            ) {
               if (current.status !== goal.status) this.goals.setStatus(goal.id, goal.status);
             } else {
               const msg = error instanceof Error ? error.message : String(error);
@@ -2833,11 +2892,24 @@ export class DirectorRuntime {
           // DB may already be closing during shutdown
         }
       }
+      if (abort.signal.aborted) opts?.onInvalidatedAbort?.();
       throw error;
     } finally {
       unsubscribe();
-      this.activeReviews.delete(goal.id);
+      if (this.activeReviews.get(goal.id) === abort) this.activeReviews.delete(goal.id);
       if (!this.disposed) {
+        // Replayed while the run is still stopped, even after a pause/resume invalidated the review: a stop of
+        // a resumed-then-stopped run still has to hand the goal over, and a run resumed since is not replayed.
+        if (deferredStopEvent && this.db.getRun(deferredStopEvent.runId)?.status === "stopped") {
+          const settled = this.goals.getGoal(goal.id);
+          if (
+            settled &&
+            settled.version === goal.version &&
+            !["achieved", "cancelled", "paused", "verifying", "reviewing"].includes(settled.status)
+          ) {
+            this.handleControlPlaneEvent(deferredStopEvent);
+          }
+        }
         this.syncQueuedGoalProgress();
         const latest = this.goals.getGoal(goal.id);
         if (latest && !this.isGoalOccupyingSlot(latest)) void this.drainGoalQueue(latest.repoRoot).catch(() => {});
@@ -2915,7 +2987,7 @@ export class DirectorRuntime {
           source: "none",
         });
       });
-      await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
+      await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered, signal });
       return outcome;
     }
 
@@ -2954,7 +3026,7 @@ export class DirectorRuntime {
           spentUsd: this.sumRunCostUsd(goal.linkedRunId),
           source: "deterministic",
         });
-        await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
+        await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered, signal });
         return outcome;
       }
 
@@ -2999,7 +3071,7 @@ export class DirectorRuntime {
             spentUsd: this.sumRunCostUsd(goal.linkedRunId),
             source: "coordinator_failed",
           });
-          await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
+          await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered, signal });
           return outcome;
         }
         const coveredIds = new Set(gateResult.results.map((r) => r.criterionId));
@@ -3030,7 +3102,7 @@ export class DirectorRuntime {
             source: "deterministic",
           });
         });
-        await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
+        await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered, signal });
         return outcome;
       }
 
@@ -3414,7 +3486,7 @@ export class DirectorRuntime {
         unsubscribe();
       }
 
-      await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
+      await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered, signal });
       return outcome;
     } finally {
       await checkout.cleanup();
@@ -3470,14 +3542,19 @@ export class DirectorRuntime {
       review: GoalReviewVerdict;
       circuitBreakerTripped?: string;
     },
-    opts?: { autoTriggered?: boolean },
+    opts?: { autoTriggered?: boolean; signal?: AbortSignal },
   ): Promise<void> {
     const { review, circuitBreakerTripped } = outcome;
     const reviewedVersion = review.goalVersion;
     let goal = outcome.goal;
+    const reviewEpoch = this.getReviewInvalidationEpoch(goal.id);
+    const isInvalidated = (g: GoalRecord) =>
+      Boolean(opts?.signal?.aborted) ||
+      this.getReviewInvalidationEpoch(goal.id) !== reviewEpoch ||
+      isReviewInvalidated(g, review);
     const isStillCurrentExecuting = () => {
       const latest = this.goals.getGoal(goal.id);
-      return latest !== null && latest.version === reviewedVersion && latest.status === "executing";
+      return latest !== null && !isInvalidated(latest) && latest.status === "executing";
     };
     if (goal.status === "executing" && isStillCurrentExecuting()) {
       // Wake / steer Tier 1 Orchestrator — or relaunch in-place if Tier 1 already settled!
@@ -3510,13 +3587,13 @@ export class DirectorRuntime {
       }
     }
 
-    // An amendment, pause, or cancel while the verdict was being delivered invalidates it: report the
-    // verdict against the version it reviewed with the goal's current status, and leave the run,
-    // escalations, and Director untouched.
+    // An amendment, pause, cancel, or later review while the verdict was being delivered invalidates it. The verdict
+    // stays in goal_reviews; nothing announces it, and the run, escalations, and Director are left untouched.
     const current = this.goals.getGoal(goal.id);
-    const superseded = current !== null && current.version !== reviewedVersion;
-    const invalidated =
-      superseded || (current !== null && (current.status === "paused" || current.status === "cancelled"));
+    if (current && isInvalidated(current)) {
+      outcome.goal = current;
+      return;
+    }
     if (current) {
       goal = current;
       outcome.goal = current;
@@ -3524,7 +3601,6 @@ export class DirectorRuntime {
     // Decided before the escalation below so its P0 wake can be suppressed in favour of the single review wake.
     const willWakeDirector = Boolean(
       goal.chatSessionId &&
-        !invalidated &&
         opts?.autoTriggered &&
         this.config.events?.wakeDirectorOnGoalSettle !== false &&
         (goal.status === "achieved" || goal.status === "awaiting_human"),
@@ -3541,9 +3617,7 @@ export class DirectorRuntime {
         summary: review.summary,
       });
 
-      if (invalidated) {
-        // Nothing to act on for a newer version or a paused or cancelled goal.
-      } else if (goal.status === "achieved") {
+      if (goal.status === "achieved") {
         this.undeliveredAmendments.delete(goal.id);
         this.db.updateRunStatus(goal.linkedRunId, "completed");
         this.autoResolveGoalEscalations(goal.linkedRunId, `Auto-resolved: goal ${goal.id} achieved`);
@@ -3837,7 +3911,12 @@ export class DirectorRuntime {
     userMessage: string,
     onDelta?: (delta: string) => void,
     onToolEvent?: RunnerCallbacks["onToolEvent"],
-    opts?: { turnRole?: "user" | "system_notice"; event?: ChatControlEvent },
+    opts?: {
+      turnRole?: "user" | "system_notice";
+      event?: ChatControlEvent;
+      /** Re-checks a wake event after the async model and route resolution; null means it went stale and nothing is delivered. */
+      revalidateEvent?: (event: ChatControlEvent) => ChatControlEvent | null;
+    },
   ): Promise<{ userTurn: ChatTurnRecord; assistantTurn: ChatTurnRecord | null }> {
     let session = this.chats.getSession(chatSessionId);
     if (!session) throw new Error(`Unknown chat session ${chatSessionId}`);
@@ -3865,8 +3944,18 @@ export class DirectorRuntime {
     });
     try {
       session = await this.resolveOrMigrateSessionModel(session, { strict: true });
-      const typedEvent = opts?.event ?? null;
-      if (!typedEvent) {
+      let typedEvent = opts?.event ?? null;
+      let resolvedRoute: Awaited<ReturnType<typeof resolveLaunchRoute>> | null = null;
+      if (typedEvent) {
+        // Resolve the route before the final freshness check so no await separates it from persisting and delivering the notice.
+        resolvedRoute = await resolveLaunchRoute(this.config, {
+          tier: 0, cwd: session.repoRoot, profileId: session.profileId, model: session.model, catalog: this.catalog, quota: this.quota,
+        });
+        if (opts?.revalidateEvent) {
+          typedEvent = opts.revalidateEvent(typedEvent);
+          if (!typedEvent) throw new StaleWakeEventError();
+        }
+      } else {
         // A fresh user message naturally supersedes any pending timer subscribed to `user_message` / `any`.
         for (const t of this.db.timers.list({ ownerKind: "chat", ownerId: chatSessionId, status: "pending" })) {
           if (t.wakeOnEvent === "user_message" || t.wakeOnEvent === "any") {
@@ -3935,9 +4024,11 @@ export class DirectorRuntime {
       const bridgeExt = import.meta.url.endsWith(".js") ? "mcp-bridge.js" : "mcp-bridge.ts";
       const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", bridgeExt);
 
-      const { profile, model, wireModel } = await resolveLaunchRoute(this.config, {
-        tier: 0, cwd: session.repoRoot, profileId: session.profileId, model: session.model, catalog: this.catalog, quota: this.quota,
-      });
+      const { profile, model, wireModel } =
+        resolvedRoute ??
+        (await resolveLaunchRoute(this.config, {
+          tier: 0, cwd: session.repoRoot, profileId: session.profileId, model: session.model, catalog: this.catalog, quota: this.quota,
+        }));
       if (abort.signal.aborted) return finishCancelled();
       this.chats.updateSession(chatSessionId, { profileId: profile.id, model });
       const runner = this.customRunnerFactory
@@ -4013,6 +4104,7 @@ export class DirectorRuntime {
       const assistantTurn = this.flushChatPartial(chatSessionId, active);
       return { userTurn, assistantTurn };
     } catch (error) {
+      if (error instanceof StaleWakeEventError) throw error;
       if (abort.signal.aborted) return finishCancelled();
       this.flushChatPartial(chatSessionId, active);
       throw error;

@@ -42,9 +42,15 @@ import { deriveRunStatus, HarnessOrchestrator, isDirectorTaskContainer, type Cus
 import { loadOrCreateNodeId, parseSessionAddress, type SessionMessageRecord } from "../control-plane/session-messages.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { summarizeCost } from "../cost/ledger.js";
-import { DirectorRuntime } from "../director/runtime.js";
+import { DirectorRuntime, StaleWakeEventError } from "../director/runtime.js";
 import { parseGoalCriterionPatches, type GoalCriterion } from "../goals/engine.js";
-import { coalesceGoalEvents, formatChatEventSummary, isGoalLifecycleEvent, type ChatControlEvent } from "../protocol/chat-events.js";
+import {
+  coalesceGoalEvents,
+  formatChatEventSummary,
+  isGoalLifecycleEvent,
+  isReviewInvalidated,
+  type ChatControlEvent,
+} from "../protocol/chat-events.js";
 import type {
   DaemonEventFrame,
   DaemonOp,
@@ -218,6 +224,10 @@ export class HarnessDaemon {
   private chatBindings = new Map<string, Socket>();
   private chatTurns = new Map<string, { id: string; text: string; cancelling: boolean }>();
   private pendingWakeups = new Map<string, ChatControlEvent[]>();
+  /** The goal's review invalidation epoch when a review-derived event was raised; a later epoch means the goal moved past it. */
+  private eventReviewEpochs = new WeakMap<ChatControlEvent, number>();
+  /** The review cycle a review-derived failure settlement was raised under; a later committed cycle supersedes it. */
+  private eventReviewCycles = new WeakMap<ChatControlEvent, number>();
   private socketToChatId = new Map<Socket, string>();
   private chatSubscribers = new Set<Socket>();
   private tuiSockets = new Set<Socket>();
@@ -300,6 +310,8 @@ export class HarnessDaemon {
   private scheduleDirectorWakeup(chatSessionId: string, event: ChatControlEvent): void {
     // The Director caused this goal event itself (e.g. its own goal_accept); waking it would be a self-wake.
     if (isDirectorSourcedGoalEvent(event)) return;
+    this.stampReviewEpoch(event);
+    if (event.kind === "goal.reviewed" && this.isStaleQueuedEvent(event)) return;
     const activeTurn = this.chatTurns.get(chatSessionId);
     if (activeTurn) {
       // Queue background goal/timer/peer events until the active Director turn finishes instead of interrupting mid-turn!
@@ -339,9 +351,44 @@ export class HarnessDaemon {
     const goalEvents = q.filter(isGoalLifecycleEvent);
     // The only place the remainder is written back.
     persist(q.filter((e) => !isGoalLifecycleEvent(e)));
-    const live = coalesceGoalEvents(goalEvents).filter((e) => !this.isStaleQueuedEvent(e));
+    const live = coalesceGoalEvents(goalEvents.filter((e) => !this.isStaleQueuedEvent(e)));
     if (live.length === 0) return this.drainPendingWakeup(chatSessionId);
     void this.runDirectorWakeupTurn(chatSessionId, live.length === 1 ? live[0]! : { kind: "goal.events_batch", events: live });
+  }
+
+  /** Records the invalidation epoch a review-derived event was raised under, once, so later invalidations (incl. pause then resume) are detectable. */
+  private stampReviewEpoch(event: ChatControlEvent): void {
+    if (event.kind === "goal.events_batch") {
+      for (const e of event.events) this.stampReviewEpoch(e);
+      return;
+    }
+    if (
+      event.kind === "goal.reviewed" ||
+      (event.kind === "goal.settled" && (event.cause === "verification_error" || event.cause === "gates_failed"))
+    ) {
+      if (!this.eventReviewEpochs.has(event)) {
+        this.eventReviewEpochs.set(event, this.director.getReviewInvalidationEpoch(event.goalId));
+      }
+      if (event.kind === "goal.settled" && !this.eventReviewCycles.has(event)) {
+        const g = this.director.goals.getGoal(event.goalId);
+        if (g) this.eventReviewCycles.set(event, g.reviewCycle);
+      }
+    }
+  }
+
+  private isReviewEpochStale(event: ChatControlEvent, goalId: string): boolean {
+    const epoch = this.eventReviewEpochs.get(event);
+    return epoch !== undefined && this.director.getReviewInvalidationEpoch(goalId) !== epoch;
+  }
+
+  /** The still-live part of a wake event after asynchronous preparation: a batch keeps its live members; null when nothing is left. */
+  private revalidateWakeEvent(event: ChatControlEvent): ChatControlEvent | null {
+    if (event.kind === "goal.events_batch") {
+      const live = event.events.filter((e) => !this.isStaleQueuedEvent(e));
+      if (live.length === 0) return null;
+      return live.length === 1 ? live[0]! : { kind: "goal.events_batch", events: live };
+    }
+    return this.isStaleQueuedEvent(event) ? null : event;
   }
 
   /** A queued event the goal or run has since moved past, or one the Director caused itself. */
@@ -352,6 +399,13 @@ export class HarnessDaemon {
       const curRun = this.db.getRun(next.runId);
       const curGoal = this.director.goals.getGoal(next.goalId);
       if (curRun?.status === "active") return true;
+      // A review failure of a goal the user has since paused is not reported, as when it is raised (notifyAutoVerifyFailure).
+      if (curGoal?.status === "paused" && (next.cause === "verification_error" || next.cause === "gates_failed")) return true;
+      if ((next.cause === "verification_error" || next.cause === "gates_failed") && this.isReviewEpochStale(next, next.goalId)) return true;
+      if (next.cause === "verification_error" || next.cause === "gates_failed") {
+        const recordedCycle = this.eventReviewCycles.get(next);
+        if (curGoal && recordedCycle !== undefined && curGoal.reviewCycle !== recordedCycle) return true;
+      }
       if (curGoal && ["achieved", "cancelled", "reviewing", "verifying"].includes(curGoal.status)) return true;
       // An amended goal produces its own events; a settlement of the older version is stale.
       if (curGoal && curGoal.version !== next.goalVersion) return true;
@@ -362,11 +416,11 @@ export class HarnessDaemon {
       if (curGoal && ["achieved", "cancelled"].includes(curGoal.status)) return true;
     }
     if (isDirectorSourcedGoalEvent(next)) return true;
-    // Drop queued review notices the goal has since moved past (amended, cancelled, or resumed after escalation).
+    // Drop queued review notices the goal has since moved past: amended, paused, cancelled, re-reviewed, accepted, or resumed.
     if (next.kind === "goal.reviewed") {
       const curGoal = this.director.goals.getGoal(next.goalId);
-      if (!curGoal || curGoal.version > next.goalVersion || curGoal.status === "cancelled") return true;
-      if (next.status === "awaiting_human" && ["executing", "verifying", "reviewing", "achieved"].includes(curGoal.status)) return true;
+      if (!curGoal || isReviewInvalidated(curGoal, next) || curGoal.status !== next.status) return true;
+      if (this.isReviewEpochStale(next, next.goalId)) return true;
     }
     return false;
   }
@@ -379,6 +433,13 @@ export class HarnessDaemon {
       return;
     }
     if (!this.director.chats.getSession(chatSessionId)) return;
+    this.stampReviewEpoch(event);
+    const liveEvent = this.revalidateWakeEvent(event);
+    if (!liveEvent) {
+      this.drainPendingWakeup(chatSessionId);
+      return;
+    }
+    event = liveEvent;
     const id = `wake-${randomBytes(4).toString("hex")}`;
     const turn = { id, text: "", cancelling: false };
     this.chatTurns.set(chatSessionId, turn);
@@ -398,7 +459,7 @@ export class HarnessDaemon {
         (tool) => {
           this.sendChatEvent(chatSessionId, id, "chat.tool", tool);
         },
-        { event },
+        { event, revalidateEvent: (ev) => this.revalidateWakeEvent(ev) },
       );
       this.sendChatEvent(chatSessionId, id, "chat.turn.end", {
         assistantTurn: result.assistantTurn,
@@ -408,10 +469,17 @@ export class HarnessDaemon {
         this.db.sessionMessages.markWakeStatus(event.messageId, "done");
       }
     } catch (err) {
-      this.sendChatEvent(chatSessionId, id, "chat.turn.end", {
-        error: err instanceof Error ? err.message : String(err),
-        cancelled: turn.cancelling,
-      });
+      if (err instanceof StaleWakeEventError) {
+        this.sendChatEvent(chatSessionId, id, "chat.turn.end", {
+          assistantTurn: null,
+          cancelled: turn.cancelling,
+        });
+      } else {
+        this.sendChatEvent(chatSessionId, id, "chat.turn.end", {
+          error: err instanceof Error ? err.message : String(err),
+          cancelled: turn.cancelling,
+        });
+      }
     } finally {
       this.chatTurns.delete(chatSessionId);
       this.drainPendingWakeup(chatSessionId);
