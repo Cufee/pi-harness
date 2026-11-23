@@ -361,7 +361,16 @@ export class HarnessDaemon {
 
   /** Points default profiles that are unset, unknown, or disabled at the first enabled profile, when one exists. */
   private normalizeDefaultProfiles(config: HarnessConfig): HarnessConfig {
-    const enabledIds = config.profiles.filter((p) => p.enabled !== false).map((p) => p.id);
+    const enabledIds = (Array.isArray(config.profiles) ? config.profiles : [])
+      .filter(
+        (p): p is RunnerProfileConfig =>
+          Boolean(p) &&
+          typeof p === "object" &&
+          typeof (p as { id?: unknown }).id === "string" &&
+          (p as { id: string }).id.length > 0 &&
+          p.enabled !== false,
+      )
+      .map((p) => p.id);
     const fallback = enabledIds[0];
     if (!fallback) return config;
     let next = config;

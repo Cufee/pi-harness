@@ -502,7 +502,14 @@ export function resolveConfig(
 
   const codeMode = merged.codeMode ?? base?.codeMode ?? "collapsed";
   if (!["collapsed", "hybrid", "off"].includes(codeMode)) throw new Error(`Unknown codeMode: ${codeMode}`);
-  const firstEnabledProfileId = profiles.find((p) => p.enabled !== false)?.id;
+  const firstEnabledProfileId = profiles.find(
+    (p) =>
+      Boolean(p) &&
+      typeof p === "object" &&
+      typeof (p as { id?: unknown }).id === "string" &&
+      (p as { id: string }).id.length > 0 &&
+      p.enabled !== false,
+  )?.id;
   return {
     stateDir,
     socketPath: runtime.socketPath ?? (merged.socketPath ? resolve(merged.socketPath) : defaultSocketPath(stateDir)),
@@ -829,12 +836,15 @@ export function diffHarnessConfig(prev: HarnessConfig, next: HarnessConfig): Con
 
   const pe: unknown = prev.quotaEndpoint;
   const ne: unknown = next.quotaEndpoint;
-  if (!pe !== !ne) {
-    changes.push({ path: "quotaEndpoint", from: pe ? "set" : "unset", to: ne ? "set" : "unset" });
-  } else if (pe && ne && !stableEqual(pe, ne)) {
+  const pePresent = pe !== undefined && pe !== null;
+  const nePresent = ne !== undefined && ne !== null;
+  if (pePresent !== nePresent) {
+    changes.push({ path: "quotaEndpoint", from: pePresent ? "set" : "unset", to: nePresent ? "set" : "unset" });
+  } else if (pePresent && nePresent && !stableEqual(pe, ne)) {
     if (isPlainObject(pe) && isPlainObject(ne)) {
       const keys = new Set([...Object.keys(pe), ...Object.keys(ne)]);
-      changes.push({ path: "quotaEndpoint", changed: [...keys].filter((k) => !stableEqual(pe[k], ne[k])) });
+      const changed = [...keys].filter((k) => !stableEqual(pe[k], ne[k]));
+      changes.push({ path: "quotaEndpoint", changed });
     } else {
       changes.push({ path: "quotaEndpoint", changed: [] });
     }
