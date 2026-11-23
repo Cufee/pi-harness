@@ -37,7 +37,7 @@ import type {
 import { attachDaemonReader, writeDaemonMessage } from "../protocol/frames.js";
 import { buildGoalDetailDisplay, buildGoalsTableDisplay, summarizeToolDisplay } from "../protocol/tool-display.js";
 import { QuotaClient } from "../quota/client.js";
-import { ensureOctofs } from "../tools/native-tools.js";
+import { ensureOctofs, shouldStageOctofs } from "../tools/native-tools.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
 import { runGit } from "../worktree/manager.js";
@@ -329,6 +329,8 @@ export class HarnessDaemon {
     const nextEndpoint = JSON.stringify(next.quotaEndpoint ?? null);
     const prevRemotes = JSON.stringify(this.config.remotes ?? []);
     const nextRemotes = JSON.stringify(next.remotes ?? []);
+    const prevExternalMcp = JSON.stringify(this.config.externalMcpServers ?? []);
+    const nextExternalMcp = JSON.stringify(next.externalMcpServers ?? []);
     this.config = next;
     if (prevEndpoint !== nextEndpoint) {
       this.quota = new QuotaClient(next.quotaEndpoint);
@@ -339,6 +341,9 @@ export class HarnessDaemon {
     this.director.updateConfig(next, this.catalog, this.quota);
     if (prevRemotes !== nextRemotes) {
       this.peers.syncRemotes(next.remotes ?? []);
+    }
+    if (!this.hasCustomRunner && prevExternalMcp !== nextExternalMcp && shouldStageOctofs(next.externalMcpServers)) {
+      void ensureOctofs(next.stateDir).catch(() => {});
     }
 
     if (!opts?.skipSave) {
@@ -396,9 +401,10 @@ export class HarnessDaemon {
           ? { profiles: parsed.profiles as RunnerProfileConfig[] }
           : {}),
         ...(Array.isArray(parsed.remotes) ? { remotes: parsed.remotes as RemoteHostConfig[] } : {}),
-        ...(Array.isArray(parsed.externalMcpServers)
-          ? { externalMcpServers: parsed.externalMcpServers as HarnessConfig["externalMcpServers"] }
-          : {}),
+        externalMcpServers:
+          Array.isArray(parsed.externalMcpServers) && parsed.externalMcpServers.length > 0
+            ? (parsed.externalMcpServers as HarnessConfig["externalMcpServers"])
+            : undefined,
         ...(typeof parsed.defaultOrchestratorProfile === "string"
           ? { defaultOrchestratorProfile: parsed.defaultOrchestratorProfile }
           : {}),
@@ -499,7 +505,7 @@ export class HarnessDaemon {
     void this.quota.sync(false).catch(() => {});
 
     // Non-blocking background staging of native `octofs` MCP binary on real (non-test) daemons
-    if (!this.hasCustomRunner && this.config.externalMcpServers?.every((s) => s.name !== "octofs" || s.enabled !== false)) {
+    if (!this.hasCustomRunner && shouldStageOctofs(this.config.externalMcpServers)) {
       void ensureOctofs(this.config.stateDir).catch(() => {});
     }
 

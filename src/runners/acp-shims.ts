@@ -849,7 +849,7 @@ export function buildNewSessionParams(
     if (opts.toolPolicy === "read_only_workspace") {
       allowedTools.push("Read", "Grep", "Glob");
       if (opts.allowShellInReadOnly) allowedTools.push("Bash");
-      if (opts.mcpServers.some((s) => s.name === "octofs")) {
+      if (opts.mcpServers.some((s) => s.name.trim().toLowerCase() === "octofs")) {
         allowedTools.push(...[...OCTOFS_READ_ONLY_TOOLS].map((t) => `mcp__octofs__${t}`));
       }
       if (opts.mcpServers.some((s) => s.name === "ast-grep" || s.name === "ast_grep")) {

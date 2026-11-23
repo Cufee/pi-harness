@@ -315,7 +315,9 @@ export class AcpRunner {
     const claudeToolNames = new Set(req.tools.map(({ name }) => `mcp__harness__${name}`));
     const externalMcpNames = new Set(
       !controlOnly
-        ? (req.externalMcpServers ?? []).filter((s) => s.enabled !== false && s.name.trim()).map((s) => s.name.trim())
+        ? (req.externalMcpServers ?? [])
+            .filter((s) => s?.enabled !== false && typeof s?.name === "string" && s.name.trim())
+            .map((s) => s.name.trim())
         : [],
     );
     const codexHarnessCalls = new Set<string>();
@@ -1106,13 +1108,18 @@ export class AcpRunner {
         });
       }
       if (!controlOnly && req.externalMcpServers?.length) {
+        const seen = new Set(mcpServers.map((s) => s.name.trim().toLowerCase()));
         for (const ext of req.externalMcpServers) {
-          if (ext.enabled === false || !ext.name?.trim() || !ext.command?.trim() || ext.name.trim() === "harness") continue;
+          const name = typeof ext?.name === "string" ? ext.name.trim() : "";
+          const normalized = name.toLowerCase();
+          if (!normalized || normalized === "harness" || seen.has(normalized)) continue;
+          seen.add(normalized);
+          if (ext.enabled === false || typeof ext.command !== "string" || !ext.command.trim()) continue;
           mcpServers.push({
-            name: ext.name.trim(),
+            name,
             command: ext.command.trim(),
             args: ext.args ?? [],
-            env: Object.entries(ext.env ?? {}).map(([name, val]) => ({ name, value: interpolateEnv(val) })),
+            env: Object.entries(ext.env ?? {}).map(([envName, val]) => ({ name: envName, value: interpolateEnv(val) })),
           });
         }
       }
