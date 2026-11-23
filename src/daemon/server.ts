@@ -3378,7 +3378,10 @@ export class HarnessDaemon {
         return { ok: true };
 
       case "tool.call": {
-        const taskId = String(p.taskId);
+        // An orchestrator task's bridge sends `<taskId>@g<generation>` (see AcpRunner); callers may also pass expectedGeneration.
+        const token = /^(.+)@g(\d+)$/.exec(String(p.taskId));
+        const taskId = token ? token[1]! : String(p.taskId);
+        const expectedGeneration = p.expectedGeneration ?? (token ? Number(token[2]) : undefined);
         const name = String(p.name);
         const args = (p.args ?? {}) as Record<string, unknown>;
         if (taskId.startsWith("chat-")) {
@@ -3386,6 +3389,10 @@ export class HarnessDaemon {
         }
         if (this.director.hasActiveReviewer(taskId)) {
           return await this.director.executeReviewerMcpTool(taskId, name, args);
+        }
+        // A bridge started for an older generation (evicted, cancelled, rolled over or resumed runner) is refused.
+        if (expectedGeneration !== undefined && expectedGeneration !== null) {
+          this.orchestrator.assertCurrentToolGeneration(taskId, Number(expectedGeneration));
         }
         return await this.orchestrator.toolExecutor.execute(String(p.runId), taskId, name, args);
       }

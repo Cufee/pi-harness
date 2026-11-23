@@ -173,6 +173,7 @@ export class PiRunner {
       // One missing-return wrap-up prompt when the agent stops without settling its task, then at most 3 more turns.
       let wrapUpAttempted = false;
       let wrapUpTurnsLeft = 0;
+      let preWrapUpText = "";
       for (let turn = 0; ; turn++) {
         req.callbacks.onTurn?.(turn + 1);
         if (cancelled || runAbort.signal.aborted) {
@@ -366,7 +367,10 @@ export class PiRunner {
           .filter((c: { type: string }): c is { type: "text"; text: string } => c.type === "text")
           .map((c: { text: string }) => c.text);
         if (textParts.length > 0) {
-          lastText = textParts.join("\n");
+          const turnText = textParts.join("\n");
+          // Wrap-up turns add to the answer that triggered the wrap-up; an acknowledgement never replaces it.
+          if (!wrapUpAttempted || !preWrapUpText.trim()) lastText = turnText;
+          else if (turnText.trim() && turnText.trim() !== preWrapUpText.trim()) lastText = `${preWrapUpText}\n\n${turnText}`;
         }
 
         const toolCalls = finalMsg.content.filter((c) => c.type === "toolCall");
@@ -432,6 +436,7 @@ export class PiRunner {
           if (!wrapUpAttempted && req.missingReturnWrapUpPrompt && !req.isTaskSettled?.()) {
             wrapUpAttempted = true;
             wrapUpTurnsLeft = 3;
+            preWrapUpText = lastText;
             messages.push({ role: "user", content: req.missingReturnWrapUpPrompt, timestamp: Date.now() });
             continue;
           }

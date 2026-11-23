@@ -31,6 +31,29 @@ export function writeTaskDossier(db: ControlPlaneDb, run: RunRecord, taskId: str
 }
 
 /**
+ * Writes harness-generated content to a new, never-overwritten `<stem>-<n><ext>` file in the task's dossier
+ * directory (exclusive create, so a task's own artifact of any name is never replaced) and indexes it.
+ */
+export function writeUniqueTaskDossier(
+  db: ControlPlaneDb,
+  run: RunRecord,
+  taskId: string,
+  stem: string,
+  ext: string,
+  content: string,
+  summary: string,
+) {
+  const dir = dossierDirectory(run.repoRoot, run.id, taskId);
+  const path = join(dir, writeUniqueFile(dir, stem, ext, content));
+  try {
+    return db.recordArtifact({ runId: run.id, taskId, kind: "dossier", path, summary });
+  } catch (error) {
+    rmSync(path, { force: true });
+    throw error;
+  }
+}
+
+/**
  * Bounds a task summary to SUMMARY_LIMIT. A longer text is written in full to a new, never-overwritten
  * `.harness/artifacts/<taskId>-summary-<n>.md` file and the bounded text ends with a pointer to it. The caller
  * records `overflowPath` as a dossier artifact inside its own transaction.
