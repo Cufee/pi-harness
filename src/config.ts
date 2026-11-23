@@ -329,14 +329,15 @@ export function normalizeGateConfig(goals: unknown): {
   }
 
   if (gateEnv !== undefined && gateEnv !== null) {
-    if (typeof gateEnv !== "object" || Array.isArray(gateEnv)) {
+    if (!isPlainObject(gateEnv)) {
       issues.push("goals.gateEnv must be an object of string values");
     } else {
       const clean: Record<string, string> = {};
       const bad: string[] = [];
-      for (const [key, val] of Object.entries(gateEnv as Record<string, unknown>)) {
+      for (const [key, val] of Object.entries(gateEnv)) {
         const name = GATE_ENV_NAME_RE.test(key) ? key : JSON.stringify(key.slice(0, 64));
         if (!GATE_ENV_NAME_RE.test(key)) bad.push(`${name} (invalid name)`);
+        else if (key === "__proto__") bad.push(`${name} (reserved name)`);
         else if (key.startsWith("HARNESS_")) bad.push(`${name} (HARNESS_* names are reserved)`);
         else if (typeof val !== "string" || val.includes("\0")) bad.push(`${name} (value must be a string without NUL)`);
         else if (Buffer.byteLength(val, "utf8") > MAX_GATE_ENV_VALUE_BYTES) bad.push(`${name} (value exceeds 32 KiB)`);
@@ -805,9 +806,11 @@ export function diffHarnessConfig(prev: HarnessConfig, next: HarnessConfig): Con
     for (const sub of new Set([...Object.keys(rawA), ...Object.keys(rawB)])) {
       if (stableEqual(rawA[sub], rawB[sub])) continue;
       const path = `${key}.${sub}`;
+      const neverShowValues = path === "goals.gateShell" || path === "goals.gateEnv";
       const showValues =
-        (isPrintable(rawA[sub]) && isPrintable(rawB[sub])) ||
-        (path === "catalog.modelFilterMode" && typeof rawA[sub] !== "object" && typeof rawB[sub] !== "object");
+        !neverShowValues &&
+        ((isPrintable(rawA[sub]) && isPrintable(rawB[sub])) ||
+          (path === "catalog.modelFilterMode" && typeof rawA[sub] !== "object" && typeof rawB[sub] !== "object"));
       changes.push(showValues ? { path, from: rawA[sub], to: rawB[sub] } : { path });
     }
   }
