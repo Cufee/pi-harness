@@ -4,7 +4,7 @@ This reference covers `pi-harness` configuration files, precedence, extra filesy
 
 ## Config files and precedence
 
-- **Global file**: `$PI_HARNESS_HOME/config.json` (default `~/.pi-harness/config.json`). The state directory itself comes from the `PI_HARNESS_HOME` environment variable, not from a config key.
+- **Global file**: `$PI_HARNESS_HOME/config.json` (default `~/.pi-harness/config.json`). The state directory itself comes from the `PI_HARNESS_HOME` environment variable; a `stateDir` key in `config.json` does not set it (though a non-string value is still rejected on reload).
 - **Repository overlay**: `<repoRoot>/.pi-harness.json`.
 - **Precedence** (lowest to highest): built-in defaults, global file, repository overlay.
 - **Merge rules**: `codeExec`, `rollover`, `worktree`, `goals`, `events`, `catalog`, and `quotaRetry` merge key by key. Scalars, arrays, and `quotaEndpoint` replace whole (`"quotaEndpoint": null` clears an inherited endpoint). An empty `profiles` array falls back to the built-in default profiles.
@@ -42,7 +42,7 @@ Every other key can come from `.pi-harness.json`, including `profiles`, `externa
 - These keys govern harness-side checks in ACP sessions: structured text reads and writes, permission requests from an agent's native read, search, write, edit, move, and delete tools that the harness classifies, and the restricted-shell path check for read-only agents without shell execution (such as research and plan tasks). Done-Reviewers receive `extraReadRoots`. The Director's `write_note` accepts `extraWriteRoots`.
 - These keys are not checked against: shell commands of agents with shell execution enabled (write-capable workers, verify tasks, and Done-Reviewers running in a verification worktree); tools of external MCP servers, including `octofs`; and adapter tools the harness does not classify.
 - An agent that receives write roots can also read them. Read-only task agents cannot perform harness-mediated structured writes, and Done-Reviewers receive `extraReadRoots` only.
-- Protected paths: harness-mediated structured writes refuse any path containing a `.git` segment and any path under `.harness/worktrees` relative to the admitting root, even inside a configured root. For read-only agents, structured reads, read and search permission checks, and restricted-shell paths refuse the same paths under extra roots, and under the agent's own workspace unless that workspace is a linked git worktree (a task or verification checkout). A custom `worktree.dir` is not covered by the `.harness/worktrees` rule.
+- Protected paths: harness-mediated structured writes refuse any path containing a `.git` segment and any path under `.harness/worktrees` relative to the admitting root, even inside a configured root. For read-only agents, structured reads, read and search permission checks, and restricted-shell paths refuse the same paths under extra roots, and under the agent's own workspace unless that workspace has a regular `.git` file (as in a linked git worktree); read and search permission checks inspect reported locations and search prefixes, and restricted shell checks the command's working directory and existing canonical operands. A custom `worktree.dir` is not covered by the `.harness/worktrees` rule.
 - Claude adapter sessions that are not control-plane-only also receive the resolved roots as Claude Code `additionalDirectories`. If an agent CLI applies its own OS sandbox, that sandbox is configured in that CLI.
 - Director `read_file` does not use these roots; its path rules are under [Director tools](#director-tools). Code Mode `code_exec` scripts never receive them: they run in the macOS sandbox described in [Python in Code Mode](./code-mode-python.md#sandbox) and cannot read workspace files directly.
 - Reload: read for each newly started worker, task agent, and Done-Reviewer, and on each `write_note` call; no daemon restart is required. Sessions already running keep the roots they started with.
@@ -100,7 +100,7 @@ A value in your config file overrides the default; an older file that sets `revi
 | `worktree.gitAuthorName` | `pi-harness` | Git author name for automated merge commits. |
 | `worktree.gitAuthorEmail` | `harness@local` | Git author email for automated merge commits. |
 | `worktree.archiveRetentionDays` | `7` | Days to retain archive git refs before GC (`>= 0`). |
-| `worktree.maxConcurrentWorkers` | `4` | Active Tier 2 worker worktree concurrency limit; further workers wait in the admission queue. |
+| `worktree.maxConcurrentWorkers` | `4` | Active Tier 2 worker worktree concurrency limit (positive integer); further workers wait in the admission queue. |
 | `worktree.extraReadRoots` | Unset | Global-only; see [Extra read and write roots](#extra-read-and-write-roots). |
 | `worktree.extraWriteRoots` | Unset | Global-only; see [Extra read and write roots](#extra-read-and-write-roots). |
 
@@ -111,8 +111,8 @@ A value in your config file overrides the default; an older file that sets `revi
 | `goals.defaultMaxReviewCycles` | `4` | Review cycles before escalating to a human (positive integer); copied into each new goal contract. |
 | `goals.defaultMaxNoProgressCycles` | `2` | Consecutive no-progress review cycles before escalating (positive integer); copied into each new goal contract. |
 | `goals.gateTimeoutMs` | `180000` | Timeout in ms per verification shell gate (positive integer). |
-| `goals.autoVerifyOnSettle` | `true` | Automatically run gates and Done-Review when a goal's linked run completes (not when it stops or fails, and not for verification mode `none`). |
-| `goals.maxConcurrentGoals` | `4` | Active goals per repository; further committed goals wait in the admission queue. |
+| `goals.autoVerifyOnSettle` | `true` | Automatically start the configured verification workflow when a goal's linked run completes (not when it stops or fails, and not for verification mode `none`; whether Done-Review runs depends on verification mode, criteria, and gate results). |
+| `goals.maxConcurrentGoals` | `4` | Active goals per repository (positive integer); further committed goals wait in the admission queue. |
 | `goals.gateShell` | `/bin/sh` | Global-only; absolute path of an executable invoked with `-c`. A syntactically invalid live edit is rejected on reload and the previous valid settings stay active. An invalid value at startup, or an accepted absolute path that is not executable, makes gates fail at execution instead of falling back to another shell. Used for goal criteria gates, merge-queue CI commands, and `worktree.setupCommand`. |
 | `goals.gateEnv` | Unset | Global-only map of string values. `PATH` is prepended to the resolved gate `PATH` (never a replacement) and must contain absolute directories. Names starting with `HARNESS_` are rejected. A syntactically invalid live edit is rejected on reload; an invalid value at startup makes gates fail at execution. Remove the key from `config.json` to clear it. |
 
@@ -135,7 +135,7 @@ A value in your config file overrides the default; an older file that sets `revi
 | `quotaRetry.autoResumeEnabled` | `true` | Automatically resume quota-paused runs at the scheduled time. |
 | `quotaRetry.earlyWakePollMs` | `30000` | Poll interval in ms for early recovery during a scheduled quota wait (accepts `> 0`; runtime floor 5 s). Polls only with a configured `quotaEndpoint` and a wait longer than the interval. |
 
-When no reset time is reported, a quota-paused run waits for a manual resume (or `pi-harness resume <run-id> --in <dur>`) instead of starting a fallback timer.
+When neither a reset time nor confirmed current capacity provides a schedule (or when `autoResumeEnabled` is `false`), no fallback timer is started and the run waits for a manual resume (or `pi-harness resume <run-id> --in <dur>`).
 
 ### `quotaEndpoint`, `profiles`, `remotes`, and `externalMcpServers`
 
@@ -157,12 +157,12 @@ When no reset time is reported, a quota-paused run waits for a manual resume (or
 
 | Takes effect | Settings |
 | --- | --- |
-| Immediately | `worktree` keys other than the roots (raising `maxConcurrentWorkers` starts queued workers); `goals.gateTimeoutMs`, `gateShell`, `gateEnv`, `autoVerifyOnSettle`, and `maxConcurrentGoals` (raising it starts queued goals); `remotes`; `quotaEndpoint`; `catalog`; `profiles`; `worktree.extraWriteRoots` for Director `write_note`; `events` for Director settlement and wait handlers (a wait already in progress keeps the value read when it started); `codeMode` and `codeExec` for an existing task's next Code Mode dispatch; `externalMcpServers` for daemon config, `daemon status`, and background `octofs` staging; `quotaRetry.fallbackCooldownSec`, `maxCooldownSec`, `autoResumeEnabled`, and `earlyWakePollMs` when the next quota pause is handled (timers already armed are not reconfigured) |
+| Immediately | `worktree` keys other than the roots (raising `maxConcurrentWorkers` starts queued workers); `goals.gateTimeoutMs`, `gateShell`, `gateEnv`, `autoVerifyOnSettle`, and `maxConcurrentGoals` (raising it starts queued goals); `remotes`; `quotaEndpoint`; `catalog`; `profiles`; `worktree.extraWriteRoots` for Director `write_note`; `events` for Director settlement and wait handlers (a wait already in progress keeps the value read when it started); `codeMode` and `codeExec` for an existing task's next MCP tool discovery (`tools/list`) and Code Mode dispatch; `externalMcpServers` for daemon config, `daemon status`, and background `octofs` staging; `quotaRetry.fallbackCooldownSec`, `maxCooldownSec`, `autoResumeEnabled`, and `earlyWakePollMs` when the next quota pause is handled (timers already armed are not reconfigured) |
 | When a task or goal is created | `rollover.orchestratorMaxTurns`, `workerMaxTurns`, and `taskMaxTurns` (copied into the task record and kept for its later generations); `goals.defaultMaxReviewCycles` and `defaultMaxNoProgressCycles` (copied into the new goal contract; existing goals keep theirs) |
-| At agent launch or generation (running sessions keep theirs) | `worktree.extraReadRoots`, `worktree.extraWriteRoots`; `externalMcpServers` entries for newly started ACP sessions; `codeMode` and `codeExec` prompt and tool exposure; `quotaRetry.nativeRetryTimeoutMs`; `rollover.reviewerMaxTurns`, `orchestratorThreshold`, `workerThreshold`, and `maxGenerations`; default profiles |
+| At agent launch or generation (running sessions keep theirs) | `worktree.extraReadRoots`, `worktree.extraWriteRoots`; `externalMcpServers` entries for newly started ACP sessions; `codeMode` and `codeExec` initial prompt and runner tool list (later MCP tool discovery and Code Mode dispatches read the current mode and limits); `quotaRetry.nativeRetryTimeoutMs`; `rollover.reviewerMaxTurns`, `orchestratorThreshold`, `workerThreshold`, and `maxGenerations`; default profiles |
 | Only after a daemon restart | state directory (`PI_HARNESS_HOME`), `socketPath`, the repository overlay |
 
-To change `socketPath` or `PI_HARNESS_HOME`, run `pi-harness daemon stop` while the old setting is still in effect, change the setting, then start the daemon at the new address: `pi-harness daemon restart` stops only the daemon at the newly configured address and leaves the old one running. Start or restart from the intended overlay directory.
+To change `socketPath` or `PI_HARNESS_HOME`, run `pi-harness daemon stop` while the old setting is still in effect, change the setting, then start the daemon at the new address: `pi-harness daemon restart` targets the newly configured address and leaves the old daemon running if the effective socket path changes. Start or restart from the intended overlay directory.
 
 ## Inspecting effective settings
 
@@ -190,7 +190,7 @@ An empty `extraReadRoots` after you set roots can mean the key is misplaced, it 
 | `read_file` | Reads UTF-8 text from the workspace, harness goals, notes, and artifacts, or any file the operator's account can read (absolute or `~/`). Returns one page per call (32 KiB by default, up to 2 MiB with `max_bytes`). Select lines with `start_line`/`end_line` or page with `offset` and the returned `nextOffset` (line range and offset cannot be combined). `exception_reason` is optional. Path rules apply to the canonical path, case-insensitively: inside the current repository it refuses any `.git` segment and top-level `.harness/*` except `.harness/artifacts`, `.harness/goals`, and `.harness/notes`; outside it refuses any `.git` segment and any literal `.harness/worktrees` segment pair (it does not compare against `$PI_HARNESS_HOME` or a custom `worktree.dir`). Refuses directories and other non-regular files, and fails when the returned byte slice is not valid UTF-8 (not a whole-file binary check). Available directly in collapsed Code Mode. |
 | `write_note` | Logged writer scoped to `.harness/goals/`, `.harness/notes/`, or a configured `extraWriteRoots` directory; requires `path`, `content`, and `reason`. |
 | `goal_accept` | Director override that marks a goal achieved. Requires `goal_id`, `reason`, and `evidence_paths`; recorded in the goal's review history as an approved review and completes the linked run. It does not run the goal's gates or a Done-Review. |
-| `steer_task` | Looks up a task of any tier on the daemon by ID and delivers a steering message to it; unlike `cancel_task`, it does not check that the task's run belongs to this repository. |
+| `steer_task` | Looks up a task of any tier on the daemon by ID and attempts to steer a live task (returns `steered: false` when the task has no live runner session or the runner does not accept the message, and refuses settled tasks or stopped runs); unlike `cancel_task`, it does not check that the task's run belongs to this repository. |
 | `cancel_task` | Cancels any task whose run belongs to this repository. |
 | `schedule_timer` | Schedules a durable wakeup timer; `wake_on_event: "goal_settled"` requires `goal_id`, while `"any"` without `goal_id` reacts to any goal of the chat settling. When settlement wakes are enabled (`events.wakeDirectorOnGoalSettle`), a settling goal cancels the chat's matching timer. |
 
