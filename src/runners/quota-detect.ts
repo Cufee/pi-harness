@@ -16,7 +16,7 @@ const HARD_QUOTA_PATTERNS: RegExp[] = [
   /quota exceeded/i,
   /budget[_\s-]exhausted/i,
   /hit your (?:usage |daily |weekly |five[- ]hour )?limit/i,
-  /(?:usage|session|daily|weekly|five[- ]hour) limit reached/i,
+  /(?:usage|session|daily|weekly|five[- ]hour)[_\s-]limit[_\s-]reached/i,
   /out of (?:extra )?(?:usage|quota|credits)/i,
   /billing hard limit/i,
   /plan limit reached/i,

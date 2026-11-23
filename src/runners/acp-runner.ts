@@ -237,6 +237,52 @@ async function openWorkspaceFile(primaryRoot: string, extraRoots: string[], requ
   }
 }
 
+/** Flattens JSON-RPC RequestError.data (the ACP SDK wraps thrown agent errors as -32603 `{ details }`, or as the parsed object when the message was JSON). Walks `cause` so re-wrapped errors keep their detail. */
+function acpErrorDetail(err: unknown): string {
+  const parts: string[] = [];
+  const push = (v: unknown) => {
+    if (typeof v !== "string") return;
+    const s = v.trim();
+    if (s && !parts.includes(s)) parts.push(s);
+  };
+  let cur: unknown = err;
+  for (let depth = 0; cur && typeof cur === "object" && depth < 3; depth++) {
+    const data = (cur as { data?: unknown }).data;
+    if (typeof data === "string") push(data);
+    else if (data && typeof data === "object") {
+      const d = data as Record<string, unknown>;
+      const before = parts.length;
+      push(d.details);
+      push(d.message);
+      push(typeof d.error === "string" ? d.error : (d.error as { message?: unknown } | undefined)?.message);
+      if (parts.length === before && Object.keys(d).length > 0) {
+        try {
+          push(JSON.stringify(d));
+        } catch {
+          // Unserializable data carries no usable detail.
+        }
+      }
+    }
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return parts.join(" | ").slice(0, 1000);
+}
+
+/** Last whole stderr lines that fit in `max` chars, without Node process warnings (never the failure reason). */
+function stderrTail(buf: string, max = 500): string {
+  const lines = buf
+    .split(/\r?\n/)
+    .map((l) => l.trimEnd())
+    .filter((l) => l.trim() && !/^\(node:\d+\)\s/.test(l) && !/^\(Use `node --trace-/.test(l));
+  let out = "";
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const next = out ? `${lines[i]}\n${out}` : lines[i]!;
+    if (next.length > max) break;
+    out = next;
+  }
+  return out || (lines.at(-1)?.slice(-max) ?? "");
+}
+
 function extractToolErrorSnippet(update: Record<string, unknown>): string | undefined {
   const rawOut = update.rawOutput;
   if (typeof rawOut === "string" && rawOut.trim()) return rawOut.trim().slice(0, 220);
@@ -843,11 +889,15 @@ export class AcpRunner {
           (canWrite || isReadOnlyExternalMcpTool(normalizedExt.server, normalizedExt.tool));
 
         const claude = p.toolCall?._meta?.claudeCode;
+        // Adapter 0.109 sends `_meta.claudeCode` only for MCP/subagent calls; native tools carry the name in `toolCall.name`.
+        const claudeToolName =
+          claude?.toolName ??
+          (this.profile.adapter === "claude" && typeof p.toolCall?.name === "string" ? p.toolCall.name : undefined);
         const claudeUntrustedSource =
           claude?.mcpServer?.source === "project" ||
           claude?.mcpServer?.source === "user" ||
           claude?.mcpServer?.source === "local";
-        const claudeExtParsed = claude?.toolName ? extractExternalMcp(claude.toolName) : null;
+        const claudeExtParsed = claudeToolName ? extractExternalMcp(claudeToolName) : null;
         const claudeExternalMcp =
           this.profile.adapter === "claude" &&
           claude?.mcpServer?.name !== undefined &&
@@ -856,20 +906,20 @@ export class AcpRunner {
           (canWrite ||
             isReadOnlyExternalMcpTool(
               claude.mcpServer.name,
-              claudeExtParsed?.tool ?? claude.toolName ?? "",
+              claudeExtParsed?.tool ?? claudeToolName ?? "",
             ));
         // Allow Claude's built-in ToolSearch (required to load deferred MCP tools) and harness MCP calls across
         // any non-user/project/local MCP server source (`dynamic`, `sdk`, `acp`, `inline`, etc.) and any toolKind.
         const claudeToolSearch =
           this.profile.adapter === "claude" &&
-          claude?.toolName === "ToolSearch" &&
+          claudeToolName === "ToolSearch" &&
           (hasHarnessBridge || externalMcpNames.size > 0);
         const claudeHarnessMcp =
           this.profile.adapter === "claude" &&
           !claudeUntrustedSource &&
-          claude?.toolName !== undefined &&
-          claudeToolNames.has(claude.toolName) &&
-          (claude.mcpServer === undefined || claude.mcpServer.name === "harness");
+          claudeToolName !== undefined &&
+          claudeToolNames.has(claudeToolName) &&
+          (claude?.mcpServer === undefined || claude.mcpServer.name === "harness");
 
         const codexRawServer = typeof rawInput?.server === "string" ? rawInput.server : undefined;
         const codexRawTool = typeof rawInput?.tool === "string" ? rawInput.tool : undefined;
@@ -933,6 +983,11 @@ export class AcpRunner {
               const val = rawInput[key];
               if (typeof val === "string" && val.trim()) paths.push(val.trim());
             }
+          }
+          // Glob's pattern can name its own root (`/etc/**`); Grep's pattern is a regex, so only Glob is checked.
+          if (p.toolCall?.name === "Glob" && typeof rawInput?.pattern === "string") {
+            const pattern = rawInput.pattern.trim();
+            if (/^[\/~]/.test(pattern) || pattern === ".." || pattern.startsWith("../")) paths.push(pattern);
           }
           for (const rawPath of paths) {
             // Strip trailing glob segment (e.g. `src/**/*.ts` -> `src`) so search globs validate cleanly inside workspace
@@ -1187,7 +1242,12 @@ export class AcpRunner {
         try {
           reply = await conn.agent.request(action.method as never, action.params as never);
         } catch (err) {
-          if (action.requiredModel) throw new Error(`Could not select model ${action.requiredModel}: ${err}`);
+          if (action.requiredModel) {
+            throw new Error(
+              `Could not select model ${action.requiredModel}: ${err instanceof Error ? err.message : String(err)}`,
+              { cause: err },
+            );
+          }
           continue; // Effort is optional.
         }
         const currentModels = reportedModels(reply, modelConfigIds);
@@ -1481,7 +1541,8 @@ export class AcpRunner {
       if (this.profile.adapter === "codex" && turnSucceededTools === 0) {
         const codexMisconfig = detectCodexCodeModeMisconfig(`${stderrBuf}\n${allToolFailures.join("\n")}`);
         if (codexMisconfig) {
-          const detail = stderrBuf.trim() ? ` (stderr: ${stderrBuf.trim().slice(-500)})` : "";
+          const tail = stderrTail(stderrBuf);
+          const detail = tail ? ` (stderr: ${tail})` : "";
           throw new Error(`ACP runner (${this.profile.id}): ${codexMisconfig}${detail}`);
         }
       }
@@ -1507,7 +1568,8 @@ export class AcpRunner {
         const codexMisconfig = detectCodexCodeModeMisconfig(`${primaryMsg}\n${stderrBuf}\n${allToolFailures.join("\n")}`);
         if (codexMisconfig) {
           if (primaryMsg.includes(codexMisconfig)) throw (spawnErr ?? err);
-          const detail = stderrBuf.trim() ? ` (stderr: ${stderrBuf.trim().slice(-500)})` : "";
+          const tail = stderrTail(stderrBuf);
+          const detail = tail ? ` (stderr: ${tail})` : "";
           throw new Error(`ACP runner (${this.profile.id}): ${codexMisconfig}${detail}`);
         }
       }
@@ -1533,9 +1595,13 @@ export class AcpRunner {
         throw new Error(`ACP runner (${this.profile.id}) timed out after ${idleTimeoutMs}ms of inactivity`);
       }
       const primary = spawnErr ?? err;
-      const errMsg = primary instanceof Error ? primary.message : String(primary);
+      const baseMsg = primary instanceof Error ? primary.message : String(primary);
+      const errDetail = acpErrorDetail(primary);
+      const errMsg = errDetail && !baseMsg.includes(errDetail) ? `${baseMsg}: ${errDetail}` : baseMsg;
       // Harvest structured `rateLimit` info from ACP JSON-RPC error data (e.g. Claude `turnErrorData` when refused before first usage)
-      const errData = (primary && typeof primary === "object" ? (primary as { data?: Record<string, unknown> }).data : undefined);
+      const rawData =
+        (primary as { data?: unknown } | null)?.data ?? (primary as { cause?: { data?: unknown } } | null)?.cause?.data;
+      const errData = rawData && typeof rawData === "object" ? (rawData as Record<string, unknown>) : undefined;
       const errRateLimit =
         errData && typeof errData === "object" && errData.rateLimit && typeof errData.rateLimit === "object"
           ? (errData.rateLimit as Record<string, unknown>)
@@ -1583,7 +1649,8 @@ export class AcpRunner {
         };
       }
 
-      const detail = stderrBuf.trim() ? ` (stderr: ${stderrBuf.trim().slice(-500)})` : "";
+      const tail = stderrTail(stderrBuf);
+      const detail = tail ? ` (stderr: ${tail})` : "";
       if (this.profile.adapter === "codex") {
         const codexMisconfig = detectCodexCodeModeMisconfig(combined);
         if (codexMisconfig) {
