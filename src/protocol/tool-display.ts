@@ -133,6 +133,10 @@ export function deriveGoalVerificationLabel(
   const runningVerify = activity?.counts.verifyRunning ?? verifyTasks.filter((t) => ["running", "ready", "pending", "draining"].includes(t.status)).length;
   const completedVerify = activity?.counts.verifyCompleted ?? verifyTasks.filter((t) => t.status === "completed").length;
 
+  if (goal.liveProgress?.phase === "queued") {
+    const position = goal.liveProgress.summary?.match(/#\d+/)?.[0];
+    return position ? `queued ${position}` : "queued";
+  }
   if (runningVerify > 0 || goal.status === "verifying" || goal.status === "reviewing" || goal.liveProgress?.verificationStatus === "in_progress") {
     return runningVerify > 1 ? `verifying (${runningVerify})` : "verifying";
   }

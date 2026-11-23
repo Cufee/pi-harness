@@ -196,6 +196,10 @@ export class WorkNavigatorScreen implements Screen {
               if (openEsc > 0) actParts.push(tag(`!${openEsc} esc`, "danger", theme));
               if (running > 0) actParts.push(tag(`${running}w`, "accent", theme));
               if (reviews.length > 0) actParts.push(theme.dim(`r#${reviews.length}`));
+              if (goal.status === "draft" && goal.liveProgress?.phase === "queued") {
+                const position = goal.liveProgress.summary?.match(/#\d+/)?.[0];
+                actParts.push(tag(position ? `queued ${position}` : "queued", "info", theme));
+              }
               return {
                 status: statusBadge(goal.status, theme),
                 goal: `${sel ? theme.accentBold(goal.id) : theme.bold(goal.id)} ${theme.dim(`v${goal.version}`)}`,
