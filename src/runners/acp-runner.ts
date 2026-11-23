@@ -997,21 +997,34 @@ export class AcpRunner {
             return stripped || (prefix.startsWith("/") ? "/" : ".");
           };
           const hasGlob = (s: string) => /[*?[{]/.test(s);
+          // The tool resolves relative paths against the workspace, so bind them there before validation;
+          // otherwise a relative path that escapes the workspace could match a nonexistent path under an extra
+          // read root.
+          const bindToWorkspace = (raw: string): string => (isAbsolute(raw) ? raw : resolve(workspace, raw));
           for (const rawPath of paths) {
             if (rawPath.startsWith("~")) return false; // never expanded here, so its target is unprovable
             if (hasGlob(rawPath) && /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(rawPath)) return false;
             try {
-              await resolveAllowedTarget(workspace, extraReadRoots, extractGlobPrefix(rawPath), true);
+              await resolveAllowedTarget(workspace, extraReadRoots, bindToWorkspace(extractGlobPrefix(rawPath)), true);
             } catch {
               return false;
             }
           }
           // Glob's pattern can name its own root (`/etc/**`, `{/etc,src}/**`, `**/../..`); Grep's pattern is a
           // regex, so only Glob is checked.
-          if (p.toolCall?.name === "Glob" && rawInput?.pattern !== undefined) {
-            if (typeof rawInput.pattern !== "string") return false;
+          if (p.toolCall?.name === "Glob") {
+            if (typeof rawInput?.pattern !== "string") return false;
             const pattern = rawInput.pattern.trim();
             if (!pattern || pattern.includes("\0")) return false;
+            // Braces may only alternate file names or extensions after the final `/`; a brace that selects a
+            // directory, or a malformed one, could make the search root differ from the validated prefix.
+            if (pattern.includes("{") || pattern.includes("}")) {
+              const lastSlash = pattern.lastIndexOf("/");
+              const dirPart = lastSlash >= 0 ? pattern.slice(0, lastSlash + 1) : "";
+              const filePart = lastSlash >= 0 ? pattern.slice(lastSlash + 1) : pattern;
+              if (dirPart.includes("{") || dirPart.includes("}")) return false;
+              if (!/^(?:[^{}]|\{[^{}/\\]+\})+$/.test(filePart)) return false;
+            }
             if (/(?:^|[{,])\s*~/.test(pattern)) return false;
             if (/(?:^|[\\/{,])\.\.(?:[\\/},]|$)/.test(pattern)) return false;
             if (/[{,]\s*\//.test(pattern)) return false;
@@ -1024,7 +1037,9 @@ export class AcpRunner {
               if (baseValues.length === 1) {
                 const base = baseValues[0];
                 if (typeof base !== "string" || !base.trim() || base.trim().startsWith("~")) return false;
-                effectiveBase = (await resolveAllowedTarget(workspace, extraReadRoots, base.trim(), true)).path;
+                effectiveBase = (
+                  await resolveAllowedTarget(workspace, extraReadRoots, bindToWorkspace(base.trim()), true)
+                ).path;
               }
               const prefix = extractGlobPrefix(pattern);
               await resolveAllowedTarget(
