@@ -69,14 +69,27 @@ export const reportError = e => send({kind:'error',value: !!e && !(e instanceof 
 
 // Appended to the preload guard so script.ts stays the entrypoint while its terminal exception, from module
 // evaluation, a timer, or an unhandled rejection, still reports provenance before Bun exits nonzero.
-// A script that installs its own handler for the event keeps control of it. Bun dispatches a rejection left by the
-// last timer only after beforeExit and then exits without awaiting its handler, so one extra turn lets the report finish.
+// A script that installs its own handler for the event keeps control of it. Bun calls these listeners natively, and a
+// once-listener ahead of ours removes itself before ours runs, so once registrations mark the dispatch they handled.
+// Bun dispatches a rejection left by the last timer only after beforeExit and may exit before the report is
+// acknowledged; the report is written before the first await, exitCode keeps the exit nonzero, and the host drains it.
 const fatalHook = `
 import { reportError } from './bridge.mjs';
-let fatalHandled = false, extraTurn = false;
-process.on('beforeExit', () => { if (!extraTurn) { extraTurn = true; setImmediate(() => {}); } });
-for (const event of ['uncaughtException', 'unhandledRejection']) process.on(event, async e => {
-  if (fatalHandled || process.listenerCount(event) > 1) return;
+const fatalEvents = ['uncaughtException', 'unhandledRejection'], onceRan = {};
+let fatalHandled = false;
+for (const method of ['once', 'prependOnceListener']) {
+  const register = method === 'once' ? 'on' : 'prependListener', original = process[method];
+  process[method] = function (event, fn) {
+    if (!fatalEvents.includes(event) || typeof fn !== 'function') return original.call(this, event, fn);
+    function wrapped(...args) { process.removeListener(event, wrapped); onceRan[event] = true; return fn.apply(this, args); }
+    wrapped.listener = fn;
+    return process[register](event, wrapped);
+  };
+}
+for (const event of fatalEvents) process.on(event, async e => {
+  const handled = onceRan[event] || process.listenerCount(event) > 1;
+  onceRan[event] = false;
+  if (fatalHandled || handled) return;
   fatalHandled = true; process.exitCode = 1;
   console.error(e);
   await reportError(e).catch(() => {});
@@ -224,6 +237,11 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     child = undefined;
     if (stopped) return result;
     clearTimeout(timer); opts.signal?.removeEventListener("abort", abort);
+    // An error report written just before exit may still be buffered on the IPC socket; read it before attributing.
+    if (status !== 0 && sockets.size > 0) await Promise.race([
+      Promise.all([...sockets].map(s => new Promise(resolve => s.once("close", resolve)))),
+      new Promise(resolve => setTimeout(resolve, 100)),
+    ]);
     if (status !== 0) throw new Error(formatScriptError(tail.trim() || `${python ? "Python" : "Bun"} exited with status ${status}`, sandboxDenial, names));
     const json = JSON.stringify(output) ?? "";
     const limit = Math.max(0, opts.maxOutputChars ?? 20_000);
