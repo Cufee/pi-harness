@@ -8,6 +8,7 @@ import { ControlPlaneDb, type EscalationRecord } from "./control-plane/db.js";
 import type { ProjectBrowseResult, ProjectSummary } from "./control-plane/projects.js";
 import { ensureTempDir, loadConfig, type AcpProfileConfig } from "./config.js";
 import { loadOrCreateNodeId } from "./control-plane/session-messages.js";
+import { qualifyRemoteCliHints } from "./protocol/chat-events.js";
 import type { RemoteHostStatus } from "./daemon/peer.js";
 import { DaemonClient, runStdioSocketBridge } from "./daemon/remote.js";
 import { currentDaemonBuildId, DAEMON_PROTOCOL_REV, HarnessDaemon } from "./daemon/server.js";
@@ -152,6 +153,7 @@ async function handleResumeCommand(
   client: Pick<DaemonClient, "request">,
   runId: string | undefined,
   flags: Record<string, string | boolean>,
+  remoteSelector?: string | null,
 ): Promise<void> {
   const trimmedRunId = runId?.trim();
   if (!trimmedRunId) throw new Error('Usage: pi-harness resume <run-id> [--in 15m | --message "<msg>"]');
@@ -168,7 +170,9 @@ async function handleResumeCommand(
   }
   const res = await client.request<Record<string, unknown>>("run.resume", { runId: trimmedRunId, message });
   // Lead with the idempotent outcome and its message (resumed, already_active, already_completed, nothing_to_resume).
-  const { outcome, message: resultMessage, ...rest } = res ?? {};
+  const { outcome, message: rawMessage, ...rest } = res ?? {};
+  // Hints in the daemon's message name its own CLI; qualify them so they reach the same remote daemon.
+  const resultMessage = typeof rawMessage === "string" ? qualifyRemoteCliHints(rawMessage, remoteSelector) : rawMessage;
   console.log(JSON.stringify({ ...(outcome !== undefined ? { outcome, message: resultMessage } : {}), ...rest }, null, 2));
 }
 
@@ -305,27 +309,32 @@ export async function ensureLocalDaemon(socketPath: string): Promise<DaemonClien
 function resolveRemoteSpec(
   rawRemote: string | undefined,
   remotes: ReadonlyArray<{ name: string; sshTarget: string; bridgeCommand?: string }> | undefined,
-): { target?: string; bridgeCommand?: string; hostLabel: string | null } {
+): { target?: string; bridgeCommand?: string; hostLabel: string | null; selector: string | null } {
+  // `hostLabel` is for display; `selector` is what `--remote` must be given to reconnect to the same daemon.
   if (!rawRemote || rawRemote.trim().toLowerCase() === "local") {
-    return { target: undefined, hostLabel: null };
+    return { target: undefined, hostLabel: null, selector: null };
   }
   const trimmed = rawRemote.trim();
   const saved = remotes?.find((r) => r.name.toLowerCase() === trimmed.toLowerCase());
   if (saved) {
-    return { target: saved.sshTarget, bridgeCommand: saved.bridgeCommand, hostLabel: saved.name };
+    return { target: saved.sshTarget, bridgeCommand: saved.bridgeCommand, hostLabel: saved.name, selector: saved.name };
   }
   if (trimmed.startsWith("ssh://")) {
     try {
       const u = new URL(trimmed);
-      return { target: trimmed, hostLabel: u.hostname || trimmed };
+      return { target: trimmed, hostLabel: u.hostname || trimmed, selector: trimmed };
     } catch {
-      return { target: trimmed, hostLabel: trimmed };
+      return { target: trimmed, hostLabel: trimmed, selector: trimmed };
     }
   }
   if (trimmed.startsWith("/") || trimmed.startsWith("./")) {
-    return { target: trimmed, hostLabel: trimmed };
+    return { target: trimmed, hostLabel: trimmed, selector: trimmed };
   }
-  return { target: `ssh://${trimmed}`, hostLabel: trimmed.includes("@") ? trimmed.split("@")[1]! : trimmed };
+  return {
+    target: `ssh://${trimmed}`,
+    hostLabel: trimmed.includes("@") ? trimmed.split("@")[1]! : trimmed,
+    selector: trimmed,
+  };
 }
 
 type ReconcileResult = ReturnType<ControlPlaneDb["reconcileSettledGoalEscalations"]>;
@@ -432,12 +441,14 @@ async function runInteractiveSessionLoop(
     localSocketPath: string;
     localNodeId: string;
     remoteHost: string | null;
+    remoteSelector?: string | null;
     getRemotes: () => ReadonlyArray<{ name: string; sshTarget: string; bridgeCommand?: string }> | undefined;
   },
 ): Promise<void> {
   let client = initialClient;
   let current = initial;
   let currentRemoteHost = hostCtx.remoteHost;
+  let currentRemoteSelector = hostCtx.remoteSelector ?? hostCtx.remoteHost;
   let pendingNotice: { tone: "info" | "warn" | "danger" | "ok"; text: string } | null = null;
 
   try {
@@ -450,6 +461,7 @@ async function runInteractiveSessionLoop(
         action = await runDirectorChatTui({
           client,
           remoteHost: currentRemoteHost,
+          remoteSelector: currentRemoteSelector,
           localRemotes,
           initialNotice: noticeForTurn,
           repoRoot: current.repoRoot,
@@ -462,6 +474,7 @@ async function runInteractiveSessionLoop(
         action = await runNativeScrollbackTui({
           client,
           remoteHost: currentRemoteHost,
+          remoteSelector: currentRemoteSelector,
           localRemotes,
           initialNotice: noticeForTurn,
           runId: current.runId,
@@ -516,6 +529,7 @@ async function runInteractiveSessionLoop(
             client.close();
             client = nextClient;
             currentRemoteHost = nextHostLabel;
+            currentRemoteSelector = nextHostLabel;
           }
         } catch (err) {
           nextClient?.close();
@@ -586,6 +600,7 @@ async function main(): Promise<void> {
     localSocketPath: config.socketPath,
     localNodeId: loadOrCreateNodeId(config.stateDir),
     remoteHost: remoteSpec.hostLabel,
+    remoteSelector: remoteSpec.selector,
     getRemotes: () => loadConfig(repoRoot).remotes,
   };
 
@@ -870,19 +885,23 @@ async function main(): Promise<void> {
           }
           let targetClient = client;
           let targetHostLabel = remoteSpec.hostLabel;
+          let targetSelector = remoteSpec.selector;
           if (useHost && useHost.toLowerCase() !== "local" && !remoteSpec.target) {
             const spec = resolveRemoteSpec(useHost, config.remotes);
             client.close();
             targetClient = await connectClient(config.socketPath, spec.target, spec.bridgeCommand);
             targetHostLabel = spec.hostLabel;
+            targetSelector = spec.selector;
           }
           // The project ID is numbered per daemon: open it only on the node that owns it.
           if (proj.nodeId) {
             const info = await targetClient.request<{ nodeId?: string }>("ping");
-            if (info.nodeId && info.nodeId !== proj.nodeId) {
+            if (info.nodeId !== proj.nodeId) {
               if (targetClient !== client) targetClient.close();
               throw new Error(
-                `Host "${targetHostLabel ?? "local"}" resolved to node ${info.nodeId}, but project ${proj.id} belongs to node ${proj.nodeId} (alias mismatch); not opening it.`,
+                info.nodeId
+                  ? `Host "${targetHostLabel ?? "local"}" resolved to node ${info.nodeId}, but project ${proj.id} belongs to node ${proj.nodeId} (alias mismatch); not opening it.`
+                  : `Host "${targetHostLabel ?? "local"}" did not report its node ID, so it cannot be confirmed as node ${proj.nodeId}, which owns project ${proj.id}; not opening it.`,
               );
             }
           }
@@ -890,7 +909,7 @@ async function main(): Promise<void> {
           await runInteractiveSessionLoop(
             targetClient,
             { kind: "chat", projectId: proj.id, repoRoot: proj.rootPath },
-            { ...hostCtx, remoteHost: targetHostLabel },
+            { ...hostCtx, remoteHost: targetHostLabel, remoteSelector: targetSelector },
           );
           return;
         }
@@ -928,7 +947,7 @@ async function main(): Promise<void> {
       case "run": {
         const resumeRunId = resolveRunResumeAlias(parsed);
         if (resumeRunId) {
-          await handleResumeCommand(client, resumeRunId, flags);
+          await handleResumeCommand(client, resumeRunId, flags, remoteSpec.selector);
           break;
         }
         const goal = positional.slice(1).join(" ").trim();
@@ -1177,7 +1196,7 @@ async function main(): Promise<void> {
       }
 
       case "resume": {
-        await handleResumeCommand(client, positional[1], flags);
+        await handleResumeCommand(client, positional[1], flags, remoteSpec.selector);
         break;
       }
 
