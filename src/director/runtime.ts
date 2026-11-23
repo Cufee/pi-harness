@@ -18,7 +18,7 @@ import { resolveLaunchRoute } from "../control-plane/launch-route.js";
 import { compactTaskHandoff, toolsForTier } from "../control-plane/tools.js";
 import { findRunDossier, readRunDossier, writeCodeOutput, writeTaskDossier } from "../control-plane/dossiers.js";
 import type { AdmissionLane, QueuePositionInput } from "../control-plane/admission-queue.js";
-import type { ArtifactRecord, ControlPlaneDb, RunRecord } from "../control-plane/db.js";
+import type { ArtifactRecord, ControlPlaneDb, EscalationRecord, RunRecord } from "../control-plane/db.js";
 import { RunStartStoppedError, type CustomRunnerFactory, type HarnessOrchestrator } from "../control-plane/orchestrator.js";
 import { canonicalProjectPath, type ProjectRecord } from "../control-plane/projects.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
@@ -28,6 +28,7 @@ import {
   ensureGoalEvidenceDir,
   GoalEngine,
   goalEvidenceDir,
+  parseGoalCriterionPatches,
   shouldRunIndependentReview,
   type CriterionEvaluation,
   type GoalAcceptOverrideAudit,
@@ -71,6 +72,17 @@ const READ_FILE_DEFAULT_PAGE_BYTES = 32 * 1024;
 // One page must fit a 16 MiB code_exec IPC frame even if JSON escaping expands every byte sixfold.
 const READ_FILE_MAX_PAGE_BYTES = 2 * 1024 * 1024;
 const READ_FILE_SCAN_BYTES = 1024 * 1024;
+
+/** Thrown when a failed run's required deterministic gates still fail; the goal goes to a human without a review cycle. */
+class FailedRunGatesError extends Error {
+  constructor(
+    readonly failedIds: string[],
+    readonly evidenceTail: string,
+  ) {
+    super(`required deterministic gate(s) still fail after the run failed (${failedIds.join(", ")})${evidenceTail ? `: ${evidenceTail}` : ""}`);
+    this.name = "FailedRunGatesError";
+  }
+}
 
 const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
@@ -222,7 +234,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
     name: "goal_amend",
     description:
-      "Dynamically amend an active or draft Goal Contract (vN -> vN+1), invalidating stale reviews and notifying the running Tier 1 Orchestrator with the exact delta.",
+      "Amend an active or draft Goal Contract (vN -> vN+1), invalidating stale reviews and notifying the running Tier 1 Orchestrator with the exact delta. description REPLACES the entire description; use append_description to add instructions while keeping the existing text. add_criteria adds, update_criteria merges by id, remove_criteria_ids removes. Amending supersedes this goal's open verification_failed escalations only; other escalations stay open.",
     inputSchema: {
       type: "object",
       required: ["goal_id", "rationale"],
@@ -230,9 +242,35 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
         goal_id: { type: "string" },
         rationale: { type: "string" },
         title: { type: "string" },
-        description: { type: "string" },
+        description: {
+          type: "string",
+          description:
+            "FULL REPLACEMENT of the goal description; anything not repeated here is discarded. A replacement shorter than the current description is rejected unless confirm_replace_description is true. To add instructions use append_description.",
+        },
+        append_description: {
+          type: "string",
+          description: "Text appended to the existing description after a blank line; the existing description is kept. Cannot be combined with description.",
+        },
+        confirm_replace_description: {
+          type: "boolean",
+          description: "Confirms that description intentionally replaces a longer existing description.",
+        },
         add_criteria: { type: "array", items: { type: "object" } },
-        update_criteria: { type: "array", items: { type: "object" } },
+        update_criteria: {
+          type: "array",
+          description: "Partial updates merged into existing criteria by id; omitted fields keep their current values. An unknown id is rejected.",
+          items: {
+            type: "object",
+            required: ["id"],
+            properties: {
+              id: { type: "string", description: "Id of an existing criterion, such as c1." },
+              description: { type: "string" },
+              kind: { type: "string", enum: ["deterministic", "behavioral", "architectural"] },
+              command: { type: "string", description: "Shell command; required when the resulting kind is deterministic." },
+              required: { type: "boolean" },
+            },
+          },
+        },
         remove_criteria_ids: { type: "array", items: { type: "string" } },
         non_goals: { type: "array", items: { type: "string" } },
       },
@@ -375,6 +413,19 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
       type: "object",
       required: ["goal_id"],
       properties: { goal_id: { type: "string" } },
+    },
+  },
+  {
+    name: "resolve_escalation",
+    description:
+      "Resolve one open or acknowledged escalation on a run owned by this chat's goals and record the reason in the audit trail. Works after the run settled or its orchestrator exited. Use it only when the finding is handled or no longer applies; it does not resume the run.",
+    inputSchema: {
+      type: "object",
+      required: ["escalation_id", "reason"],
+      properties: {
+        escalation_id: { type: "string", description: "Escalation id, such as esc-29." },
+        reason: { type: "string", description: "Why the escalation is handled or no longer applies." },
+      },
     },
   },
   ...toolsForTier(1).filter(tool => ["spawn_task", "wait_tasks", "wait_children", "cancel_task", "artifact_read"].includes(tool.name)),
@@ -684,7 +735,34 @@ export class DirectorRuntime {
         this.syncQueuedGoalProgress();
         void this.drainGoalQueue().catch(() => {});
       },
-      { stateDir: config.stateDir },
+      {
+        stateDir: config.stateDir,
+        onGoalSettled: (goal) => {
+          if (!goal.linkedRunId) return;
+          this.db.resolveOpenEscalationsForRun(goal.linkedRunId, `Auto-resolved: goal ${goal.id} ${goal.status}`, {
+            resolvedBy: "goal_settled",
+            goalId: goal.id,
+            goalStatus: goal.status,
+          });
+        },
+        onGoalAmended: (goal, delta) => {
+          if (!goal.linkedRunId) return [];
+          return this.db
+            .resolveOpenEscalationsForRun(
+              goal.linkedRunId,
+              `Superseded by goal ${goal.id} amendment v${delta.fromVersion} -> v${delta.toVersion}: ${delta.rationale.slice(0, 200)}`,
+              {
+                supersededByAmendment: true,
+                resolvedBy: "amendment",
+                goalId: goal.id,
+                fromVersion: delta.fromVersion,
+                toVersion: delta.toVersion,
+              },
+              { categories: ["verification_failed"] },
+            )
+            .map((e) => e.id);
+        },
+      },
     );
     this.unsubRunEvents = this.db.onEvent((ev) => this.handleControlPlaneEvent(ev));
     this.unsubGoalQueue = this.db.admissionQueue.onChange((lane) => {
@@ -797,7 +875,7 @@ export class DirectorRuntime {
       if (!wakeOnSettle) return;
       // The caller creating this escalation wakes the Director itself (blocked settle or review transition).
       if (this.suppressEscalationWakeRuns.has(ev.runId)) return;
-      const p = ev.payload as { severity?: string; title?: string } | null;
+      const p = ev.payload as { id?: string; severity?: string; title?: string } | null;
       if (p?.severity !== "P0") return;
       const row = this.db.db
         .prepare("SELECT id FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1")
@@ -806,16 +884,18 @@ export class DirectorRuntime {
       const goal = this.goals.getGoal(row.id);
       if (!goal?.chatSessionId || ["achieved", "cancelled"].includes(goal.status)) return;
       const openEsc = this.db.listEscalations(ev.runId, "open");
+      // An escalation is not a settlement: report the run's real status (a plain read; getEffectiveRun reconciles and emits).
       this.wakeHandler?.(goal.chatSessionId, {
-        kind: "goal.settled",
+        kind: "goal.escalated",
         goalId: goal.id,
         goalVersion: goal.version,
         goalTitle: goal.title,
         runId: ev.runId,
-        runStatus: "failed",
+        runStatus: this.db.getRun(ev.runId)?.status ?? "unknown",
+        escalationId: String(p.id ?? "unknown"),
+        severity: "P0",
+        title: p.title ?? "human input required",
         openEscalations: openEsc.length,
-        detail: `P0 escalation: ${p.title ?? "human input required"}`,
-        cause: "escalation",
       });
       return;
     }
@@ -906,53 +986,65 @@ export class DirectorRuntime {
       !this.activeReviews.has(goal.id)
     ) {
       if (!this.unsubRunEvents || !firstNotice) return; // daemon disposed or already launched
-      void this.verifyAndReviewGoal(goal.id, undefined, { autoTriggered: true }).catch((err) => {
-        if (!this.unsubRunEvents || !goal.chatSessionId || !this.config.events?.wakeDirectorOnGoalSettle) return;
-        const msg = err instanceof Error ? err.message : String(err);
-        let openEscCount = 0;
-        try {
-          openEscCount = this.db.listEscalations(ev.runId, "open").length;
-        } catch {
-          return;
-        }
-        this.wakeHandler?.(goal.chatSessionId, {
-          kind: "goal.settled",
-          goalId: goal.id,
-          goalVersion: goal.version,
-          goalTitle: goal.title,
-          runId: ev.runId,
-          runStatus: "failed",
-          openEscalations: openEscCount,
-          detail: `verification_error: ${msg.slice(0, 160)}`,
-          cause: "verification_error",
-        });
-      });
+      void this.verifyAndReviewGoal(goal.id, undefined, { autoTriggered: true }).catch((err) =>
+        this.notifyAutoVerifyFailure(goal, ev.runId, err),
+      );
+      return;
+    }
+
+    // A failed run whose required deterministic gates may already pass is checked once; failing gates go to a human
+    // without a review cycle. Never over a pending P0 (a human decision) or an explicit blocked phase.
+    if (
+      !blocker &&
+      status === "failed" &&
+      this.config.goals?.autoVerifyOnSettle !== false &&
+      goal.status === "executing" &&
+      goal.verificationMode !== "none" &&
+      goal.criteria.some((c) => c.required && c.kind === "deterministic") &&
+      goal.liveProgress?.phase !== "blocked" &&
+      !this.activeReviews.has(goal.id) &&
+      !this.db.listEscalations(ev.runId, "open").some((e) => e.severity === "P0")
+    ) {
+      if (!this.unsubRunEvents || !firstNotice) return;
+      void this.verifyAndReviewGoal(goal.id, undefined, { autoTriggered: true, settledRunStatus: "failed" }).catch((err) =>
+        this.notifyAutoVerifyFailure(goal, ev.runId, err),
+      );
       return;
     }
 
     // A settled run no longer occupies a goal slot: hand the goal to a human and admit queued goals.
-    // Open escalations on the run already carry the human hand-off, so the goal keeps its status for them.
+    // Open escalations stay open here; they are counted in the hand-off and disposed of explicitly.
     const openEscalations = this.db.listEscalations(ev.runId, "open").length;
     // The recorded stop/failure cause travels with the hand-off note and the Director wake.
     const recordedCause = status === "completed" ? null : this.orchestrator.describeRunCause(ev.runId);
     const explicitStopReason = status === "stopped" ? ((ev.payload as { reason?: string } | null)?.reason?.trim() || null) : null;
     if (blocker) {
       // Parked above: awaiting_human with the blocker's escalation.
-    } else if ((status === "failed" || status === "stopped") && goal.status === "executing" && openEscalations === 0) {
-      this.goals.setStatus(
-        goal.id,
-        "awaiting_human",
-        `Linked run ${ev.runId} ${status === "stopped" ? "was stopped" : "failed"} before goal verification ` +
-          `(${recordedCause ?? `no cause was recorded; inspect with \`pi-harness tree ${ev.runId}\``}). ` +
-          `Nothing restarts automatically; \`pi-harness resume ${ev.runId}\` or goal_commit continues the same run in place, or review the goal.`,
-      );
-    } else if (
-      status === "completed" &&
-      this.config.goals?.autoVerifyOnSettle !== false &&
-      goal.verificationMode === "none" &&
-      goal.status === "executing"
-    ) {
-      this.goals.setStatus(goal.id, "awaiting_human", "Linked run completed (verification_mode=none); review or accept to finish.");
+    } else if (goal.status === "executing" && !this.activeReviews.has(goal.id)) {
+      if (status === "failed" || status === "stopped") {
+        const ended = status === "stopped" ? "was stopped" : "failed";
+        this.goals.setStatus(
+          goal.id,
+          "awaiting_human",
+          openEscalations > 0
+            ? `Linked run ${ev.runId} ${ended} with ${openEscalations} open escalation(s)` +
+                `${recordedCause ? ` (${recordedCause})` : ""}; resolve them, then resume or review.`
+            : `Linked run ${ev.runId} ${ended} before goal verification ` +
+                `(${recordedCause ?? `no cause was recorded; inspect with \`pi-harness tree ${ev.runId}\``}). ` +
+                `Nothing restarts automatically; \`pi-harness resume ${ev.runId}\` or goal_commit continues the same run in place, or review the goal.`,
+        );
+      } else {
+        // Completed and automatic verification did not launch (disabled, or verification_mode=none).
+        this.goals.setStatus(
+          goal.id,
+          "awaiting_human",
+          goal.verificationMode === "none"
+            ? "Linked run completed (verification_mode=none); review or accept to finish."
+            : goal.reviewCycle > 0
+              ? undefined
+              : "Linked run completed (auto-verify disabled); trigger review or accept to finish.",
+        );
+      }
     }
     void this.drainGoalQueue(goal.repoRoot).catch(() => {});
     this.syncQueuedGoalProgress();
@@ -978,6 +1070,35 @@ export class DirectorRuntime {
           }),
     };
     this.wakeHandler?.(goal.chatSessionId, event);
+  }
+
+  /** Wakes the Director when automatic verification of a settled run could not finish, with the run's real status. */
+  private notifyAutoVerifyFailure(goal: GoalRecord, runId: string, err: unknown): void {
+    if (!this.unsubRunEvents || !goal.chatSessionId || !this.config.events?.wakeDirectorOnGoalSettle) return;
+    const runStatus = this.db.getRun(runId)?.status;
+    // A resumed run notifies again when it next settles.
+    if (runStatus !== "completed" && runStatus !== "failed" && runStatus !== "stopped") return;
+    const latest = this.goals.getGoal(goal.id);
+    if (!latest || latest.version !== goal.version || ["achieved", "cancelled", "paused"].includes(latest.status)) return;
+    let openEscCount = 0;
+    try {
+      openEscCount = this.db.listEscalations(runId, "open").length;
+    } catch {
+      return; // DB may be closing
+    }
+    const gates = err instanceof FailedRunGatesError;
+    const msg = err instanceof Error ? err.message : String(err);
+    this.wakeHandler?.(goal.chatSessionId, {
+      kind: "goal.settled",
+      goalId: goal.id,
+      goalVersion: goal.version,
+      goalTitle: goal.title,
+      runId,
+      runStatus,
+      openEscalations: openEscCount,
+      cause: gates ? "gates_failed" : "verification_error",
+      detail: (gates ? "deterministic_gates_failed: " : "verification_error: ") + msg.slice(0, 240),
+    });
   }
 
   updateConfig(next: HarnessConfig, catalog = this.orchestrator.catalog, quota = this.orchestrator.quota): void {
@@ -1319,10 +1440,12 @@ export class DirectorRuntime {
       ].join("\n");
 
       let run: RunRecord;
+      let orchestratorTaskId: string;
       const prevLinkedRunId = current.linkedRunId ?? null;
       let linkedEarly: string | null = null;
       try {
-        ({ run } = await this.orchestrator.startRun({
+        let orchestratorTask: { id: string };
+        ({ run, orchestratorTask } = await this.orchestrator.startRun({
           goal: runObjective,
           repoRoot: goal.repoRoot,
           profileId: opts?.profileId,
@@ -1336,6 +1459,7 @@ export class DirectorRuntime {
             linkedEarly = created.id;
           },
         }));
+        orchestratorTaskId = orchestratorTask.id;
       } catch (err) {
         if (linkedEarly) {
           this.db.db
@@ -1384,6 +1508,24 @@ export class DirectorRuntime {
       started = this.goals.linkRunAndStart(goal.id, run.id);
       runId = run.id;
       launched = true;
+      try {
+        // The launched contract is the baseline later amendments point back to.
+        this.db.blackboardSet(
+          run.id,
+          `goal_contract_v${started.version}`,
+          {
+            version: started.version,
+            title: started.title,
+            description: started.description,
+            criteria: started.criteria,
+            nonGoals: started.nonGoals,
+            delta: null,
+          },
+          orchestratorTaskId,
+        );
+      } catch {
+        // Blackboard is advisory; the run is already launched.
+      }
     } finally {
       if (this.launchingGoals.get(goal.id) === slot) this.launchingGoals.delete(goal.id);
       if (!launched) {
@@ -1725,9 +1867,21 @@ export class DirectorRuntime {
   async amendGoal(
     goalId: string,
     patch: Parameters<GoalEngine["amendGoal"]>[1],
-  ): Promise<{ goal: GoalRecord; delta: ReturnType<GoalEngine["amendGoal"]>["delta"] }> {
-    const { goal, delta } = this.goals.amendGoal(goalId, patch);
+  ): Promise<{
+    goal: GoalRecord;
+    delta: ReturnType<GoalEngine["amendGoal"]>["delta"];
+    delivery: { delivered: boolean; via: "steer" | "resume" | "none"; reason?: string };
+    supersededEscalationIds: string[];
+    openEscalations: Array<Pick<EscalationRecord, "id" | "severity" | "category" | "title">>;
+  }> {
+    const { goal, delta, supersededEscalationIds } = this.goals.amendGoal(goalId, patch);
     let amendedGoal = goal;
+    let delivery: { delivered: boolean; via: "steer" | "resume" | "none"; reason?: string } = { delivered: false, via: "none" };
+    const strand = (reason: string) => {
+      delivery = { delivered: false, via: "none", reason };
+      amendedGoal = this.handOffStrandedGoal(goal, reason);
+    };
+    const cap = (text: string, max: number) => (text.length > max ? `${text.slice(0, max)}... [truncated]` : text);
 
     if (goal.linkedRunId) {
       // Persist updated Goal Contract text onto runs.goal and Blackboard so rollovers/resumes never see stale v1 requirements
@@ -1770,6 +1924,23 @@ export class DirectorRuntime {
           objective: updatedObjective,
           ...(updatedHandoffJson !== orch.handoffJson ? { handoffJson: updatedHandoffJson } : {}),
         });
+        try {
+          // Runs launched before contracts were written at launch get their previous version backfilled from revisions.
+          const prevKey = `goal_contract_v${delta.fromVersion}`;
+          if (!this.db.blackboardGet(goal.linkedRunId, prevKey)[prevKey]) {
+            const prev = this.goals.listRevisions(goal.id).find((r) => r.version === delta.fromVersion);
+            if (prev) {
+              this.db.blackboardSet(
+                goal.linkedRunId,
+                prevKey,
+                { version: prev.version, title: prev.title, description: prev.description, criteria: prev.criteria, nonGoals: prev.nonGoals, delta: prev.delta },
+                orch.id,
+              );
+            }
+          }
+        } catch {
+          // Backfill is best effort.
+        }
         this.db.blackboardSet(
           goal.linkedRunId,
           `goal_contract_v${goal.version}`,
@@ -1779,6 +1950,13 @@ export class DirectorRuntime {
         const steerMsg = [
           `[GOAL AMENDED: ${goal.id} v${delta.fromVersion} -> v${delta.toVersion}]`,
           `Rationale: ${delta.rationale}`,
+          delta.descriptionMode === "append" && delta.appendedDescription
+            ? `Description extended (existing text unchanged). Appended:\n${cap(delta.appendedDescription, 4000)}`
+            : null,
+          delta.descriptionMode === "replace"
+            ? `Description REPLACED (${delta.previousDescriptionLength ?? "?"} -> ${delta.descriptionLength ?? goal.description.length} chars). New description:\n${cap(goal.description, 4000)}\nPrevious description: blackboard goal_contract_v${delta.fromVersion}.`
+            : null,
+          delta.nonGoalsChanged ? `Non-goals now: ${goal.nonGoals.length ? goal.nonGoals.join("; ") : "(none)"}` : null,
           delta.addedCriteria.length
             ? `Added criteria: ${delta.addedCriteria.map((c) => `${c.id}: ${c.description}`).join("; ")}`
             : null,
@@ -1786,6 +1964,7 @@ export class DirectorRuntime {
           delta.modifiedCriteria.length
             ? `Modified criteria: ${delta.modifiedCriteria.map((c) => `${c.id}: ${c.description}`).join("; ")}`
             : null,
+          `Full current contract: blackboard_get({ key: "goal_contract_v${goal.version}" }).`,
           "Reconcile active Tier 2 Workers: KEEP unaffected workers, STEER adjustable workers, CANCEL_AND_REPLACE invalidated workers.",
         ]
           .filter(Boolean)
@@ -1795,18 +1974,20 @@ export class DirectorRuntime {
           return latest !== null && latest.version === goal.version && latest.status === "executing";
         };
         let delivered = await this.orchestrator.steerTask(orch.id, steerMsg).catch(() => false);
+        if (delivered) delivery = { delivered: true, via: "steer" };
         if (!delivered && goal.status === "executing" && isStillAmendedExecuting()) {
           delivered = await this.orchestrator
             .resumeTaskDetailed(orch.id, { allowCompleted: true, note: steerMsg, validateBeforeActivate: isStillAmendedExecuting })
             // An idempotent "already active" return delivers the note only when it was steered in.
             .then((r) => r.outcome === "resumed" || r.noteDelivered === true, () => false);
+          if (delivered) delivery = { delivered: true, via: "resume" };
         }
-        if (!delivered) amendedGoal = this.handOffStrandedGoal(goal, "amendment could not be delivered to its run");
+        if (!delivered) strand("amendment could not be delivered to its run");
       } else {
-        amendedGoal = this.handOffStrandedGoal(goal, "linked run has no orchestrator to apply the amendment");
+        strand("linked run has no orchestrator to apply the amendment");
       }
     } else {
-      amendedGoal = this.handOffStrandedGoal(goal, "no linked run to apply the amendment");
+      strand("no linked run to apply the amendment");
     }
 
     if (goal.chatSessionId) {
@@ -1826,7 +2007,17 @@ export class DirectorRuntime {
       );
     }
 
-    return { goal: amendedGoal, delta };
+    let openEscalations: Array<Pick<EscalationRecord, "id" | "severity" | "category" | "title">> = [];
+    if (goal.linkedRunId) {
+      try {
+        openEscalations = this.db
+          .listEscalations(goal.linkedRunId, "open")
+          .map((e) => ({ id: e.id, severity: e.severity, category: e.category, title: e.title }));
+      } catch {
+        // Escalations table may be absent.
+      }
+    }
+    return { goal: amendedGoal, delta, delivery, supersededEscalationIds, openEscalations };
   }
 
   /** Moves an `executing` goal whose run is not live to `awaiting_human` and releases its slot to the queue. */
@@ -2195,7 +2386,7 @@ export class DirectorRuntime {
   async verifyAndReviewGoal(
     goalId: string,
     signal?: AbortSignal,
-    opts?: { verificationMode?: VerificationMode; summary?: string; autoTriggered?: boolean },
+    opts?: { verificationMode?: VerificationMode; summary?: string; autoTriggered?: boolean; settledRunStatus?: "failed" },
   ): Promise<{
     goal: GoalRecord;
     review: GoalReviewVerdict;
@@ -2210,7 +2401,11 @@ export class DirectorRuntime {
     const reviewSignal = signal ? AbortSignal.any([abort.signal, signal]) : abort.signal;
     const unsubscribe = this.db.onEvent(ev => {
       if (ev.runId !== goal.linkedRunId || ev.type !== "run.status") return;
-      if ((ev.payload as { status: string }).status === "stopped") abort.abort(new Error("Run stopped during review"));
+      const runStatus = (ev.payload as { status?: string } | null)?.status;
+      if (runStatus === "stopped") abort.abort(new Error("Run stopped during review"));
+      if (opts?.settledRunStatus === "failed" && runStatus === "active") {
+        abort.abort(new Error("Run resumed during failed-run verification"));
+      }
     });
     try {
       return await this.verifyAndReviewGoalInner(goal, reviewSignal, opts);
@@ -2223,7 +2418,13 @@ export class DirectorRuntime {
               if (current.status !== goal.status) this.goals.setStatus(goal.id, goal.status);
             } else {
               const msg = error instanceof Error ? error.message : String(error);
-              this.goals.setStatus(goal.id, "awaiting_human", `Verification failed: ${msg.slice(0, 240)}`);
+              this.goals.setStatus(
+                goal.id,
+                "awaiting_human",
+                error instanceof FailedRunGatesError
+                  ? `Linked run ${current.linkedRunId ?? "unknown"} failed and required deterministic gate(s) still fail (${error.failedIds.join(", ")}); resume or review.`
+                  : `Verification failed: ${msg.slice(0, 240)}`,
+              );
             }
           }
         } catch {
@@ -2245,7 +2446,7 @@ export class DirectorRuntime {
   private async verifyAndReviewGoalInner(
     goal: GoalRecord,
     signal: AbortSignal,
-    opts?: { verificationMode?: VerificationMode; summary?: string; autoTriggered?: boolean },
+    opts?: { verificationMode?: VerificationMode; summary?: string; autoTriggered?: boolean; settledRunStatus?: "failed" },
   ): Promise<{
     goal: GoalRecord;
     review: GoalReviewVerdict;
@@ -2307,6 +2508,12 @@ export class DirectorRuntime {
 
       // If deterministic gates failed, record immediately without burning LLM review tokens!
       if (!gateResult.allPassed) {
+        if (opts?.settledRunStatus === "failed") {
+          // A failed run is not bounced back to Tier 1: no review cycle, breaker, escalation or relaunch.
+          const failed = gateResult.results.filter((r) => !r.passed);
+          const evidenceTail = failed.map((r) => `${r.criterionId}: ${r.evidence}`).join(" | ").slice(-500);
+          throw new FailedRunGatesError(failed.map((r) => r.criterionId), evidenceTail);
+        }
         const outcome = this.goals.recordReviewVerdict(goal.id, {
           verdict: "changes_requested",
           criteriaResults: gateResult.results,
@@ -2888,11 +3095,63 @@ export class DirectorRuntime {
   /** Resolves all open/acked escalations on a settled goal's run so stale escalations never linger. */
   autoResolveGoalEscalations(runId: string | null | undefined, resolution: string): number {
     if (!runId) return 0;
-    const open = this.db.listEscalations(runId).filter((e) => e.status === "open" || e.status === "acked");
-    for (const esc of open) {
-      this.db.ackEscalation(esc.id, resolution, true);
+    return this.db.resolveOpenEscalationsForRun(runId, resolution, { resolvedBy: "goal_settled" }).length;
+  }
+
+  /**
+   * Resolves one escalation with a recorded reason, independent of run state or a live Tier 1. With a chat
+   * session, only escalations on runs that chat owns in its workspace are reachable. Repeats are no-ops.
+   */
+  resolveEscalation(input: {
+    escalationId: string;
+    reason: string;
+    chatSessionId?: string;
+    repoRoot?: string;
+    resolvedBy: "director" | "operator";
+  }): {
+    escalation: EscalationRecord;
+    alreadyResolved: boolean;
+    goalId: string | null;
+    goalStatus: string | null;
+    runStatus: string | null;
+    remainingOpen: number;
+  } {
+    const reason = input.reason.trim().slice(0, 2000);
+    if (!reason) throw new Error("reason must be a non-empty string");
+    const esc = this.db.getEscalation(input.escalationId);
+    if (!esc) throw new Error(`Unknown escalation ${input.escalationId}`);
+    if (input.chatSessionId) {
+      const repoRoot = input.repoRoot ?? this.chats.getSession(input.chatSessionId)?.repoRoot;
+      if (!repoRoot || !this.ownedDossierRuns(input.chatSessionId, repoRoot).some((r) => r.id === esc.runId)) {
+        throw new Error("Unknown escalation in this workspace");
+      }
     }
-    return open.length;
+    const row = this.db.db
+      .prepare("SELECT id FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1")
+      .get(esc.runId) as { id: string } | undefined;
+    const goal = row ? this.goals.getGoal(row.id) : null;
+    const goalId = goal?.id ?? null;
+    const runStatus = this.db.getRun(esc.runId)?.status ?? null;
+    const remaining = () => this.db.listEscalations(esc.runId).filter((e) => e.status === "open" || e.status === "acked").length;
+    if (esc.status === "resolved") {
+      return { escalation: esc, alreadyResolved: true, goalId, goalStatus: goal?.status ?? null, runStatus, remainingOpen: remaining() };
+    }
+    const updated = this.db.ackEscalation(esc.id, reason, true, {
+      resolvedBy: input.resolvedBy,
+      chatSessionId: input.chatSessionId ?? null,
+      goalId,
+      goalVersion: goal?.version ?? null,
+      runStatus,
+    });
+    const noticeSession = goal?.chatSessionId ?? input.chatSessionId;
+    if (noticeSession) {
+      this.chats.appendTurn(
+        noticeSession,
+        "system_notice",
+        `Escalation ${esc.id} [${esc.severity}/${esc.category}] on run ${esc.runId} resolved by ${input.resolvedBy}: ${reason}`,
+      );
+    }
+    return { escalation: updated, alreadyResolved: false, goalId, goalStatus: goal?.status ?? null, runStatus, remainingOpen: remaining() };
   }
 
   /**
@@ -3587,8 +3846,10 @@ export class DirectorRuntime {
           rationale: String(args.rationale),
           title: typeof args.title === "string" ? args.title : undefined,
           description: typeof args.description === "string" ? args.description : undefined,
+          appendDescription: typeof args.append_description === "string" ? args.append_description : undefined,
+          confirmReplaceDescription: args.confirm_replace_description === true ? true : undefined,
           addCriteria: Array.isArray(args.add_criteria) ? (args.add_criteria as GoalCriterion[]) : undefined,
-          updateCriteria: Array.isArray(args.update_criteria) ? (args.update_criteria as GoalCriterion[]) : undefined,
+          updateCriteria: parseGoalCriterionPatches(args.update_criteria, "update_criteria"),
           removeCriteriaIds: Array.isArray(args.remove_criteria_ids) ? (args.remove_criteria_ids as string[]) : undefined,
           nonGoals: Array.isArray(args.non_goals) ? (args.non_goals as string[]) : undefined,
         });
@@ -3784,6 +4045,16 @@ export class DirectorRuntime {
       case "goal_cancel": {
         const g = await this.pauseGoal(String(args.goal_id), "Cancelled by Director", "cancelled");
         return { ...g, presentation_id: presentGoal(g) };
+      }
+
+      case "resolve_escalation": {
+        return this.resolveEscalation({
+          escalationId: String(args.escalation_id ?? ""),
+          reason: String(args.reason ?? ""),
+          chatSessionId,
+          repoRoot,
+          resolvedBy: "director",
+        });
       }
 
       case "read_file": {

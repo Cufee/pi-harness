@@ -43,7 +43,7 @@ import { loadOrCreateNodeId, parseSessionAddress, type SessionMessageRecord } fr
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { summarizeCost } from "../cost/ledger.js";
 import { DirectorRuntime } from "../director/runtime.js";
-import type { GoalCriterion } from "../goals/engine.js";
+import { parseGoalCriterionPatches, type GoalCriterion } from "../goals/engine.js";
 import { formatChatEventSummary, type ChatControlEvent } from "../protocol/chat-events.js";
 import type {
   DaemonEventFrame,
@@ -326,6 +326,13 @@ export class HarnessDaemon {
         const curGoal = this.director.goals.getGoal(next.goalId);
         if (curRun?.status === "active") continue;
         if (curGoal && ["achieved", "cancelled", "reviewing", "verifying"].includes(curGoal.status)) continue;
+        // An amended goal produces its own events; a settlement of the older version is stale.
+        if (curGoal && curGoal.version !== next.goalVersion) continue;
+      } else if (next.kind === "goal.escalated") {
+        // Escalations are raised on live runs too, so an active run never drops them; only a disposed one does.
+        if (this.db.getEscalation(next.escalationId)?.status !== "open") continue;
+        const curGoal = this.director.goals.getGoal(next.goalId);
+        if (curGoal && ["achieved", "cancelled"].includes(curGoal.status)) continue;
       }
       if (isDirectorSourcedGoalEvent(next)) continue;
       // Drop queued review notices the goal has since moved past (amended, cancelled, or resumed after escalation).
@@ -617,6 +624,12 @@ export class HarnessDaemon {
     // so immediate wakeups / MCP bridges can connect without racing socket creation!
     this.orchestrator.reconcileStaleRunsOnStartup();
     this.director.goals.reconcileStaleGoalsOnStartup();
+    try {
+      // Escalations left open on runs whose goals all settled (achieved/cancelled) are resolved once at startup.
+      this.db.reconcileSettledGoalEscalations();
+    } catch {
+      // Best effort; the escalations stay listable and resolvable.
+    }
     this.db.timers.restorePending();
 
     // Non-blocking startup orphan worktree sweep + periodic hourly sweep across known repos
@@ -2487,7 +2500,10 @@ export class HarnessDaemon {
           rationale: String(p.rationale ?? "Amended by user"),
           title: typeof p.title === "string" ? p.title : undefined,
           description: typeof p.description === "string" ? p.description : undefined,
+          appendDescription: typeof p.appendDescription === "string" ? p.appendDescription : undefined,
+          confirmReplaceDescription: p.confirmReplaceDescription === true ? true : undefined,
           addCriteria: Array.isArray(p.addCriteria) ? (p.addCriteria as GoalCriterion[]) : undefined,
+          updateCriteria: parseGoalCriterionPatches(p.updateCriteria),
           removeCriteriaIds: Array.isArray(p.removeCriteriaIds) ? (p.removeCriteriaIds as string[]) : undefined,
           nonGoals: Array.isArray(p.nonGoals) ? (p.nonGoals as string[]) : undefined,
         });
@@ -3022,7 +3038,12 @@ export class HarnessDaemon {
           }
         }
         const sevRank = { P0: 0, P1: 1, P2: 2, info: 3 };
-        inbox.sort((a, b) => sevRank[a.severity] - sevRank[b.severity] || b.createdAt - a.createdAt);
+        // At equal severity an escalation (the concrete finding) precedes the derived items it causes, such as its
+        // goal awaiting a human after the run settled.
+        const kindRank = (item: InboxItem) => (item.kind === "escalation" ? 0 : 1);
+        inbox.sort(
+          (a, b) => sevRank[a.severity] - sevRank[b.severity] || kindRank(a) - kindRank(b) || b.createdAt - a.createdAt,
+        );
 
         return {
           generatedAt: Date.now(),
@@ -3114,6 +3135,17 @@ export class HarnessDaemon {
         const resolution = String(p.resolution ?? (resolveFlag ? "Resolved" : "Acknowledged"));
         return this.db.ackEscalation(String(p.escalationId), resolution, resolveFlag);
       }
+
+      case "escalation.resolve": {
+        const escalationId = String(p.escalationId ?? "");
+        const reason = String(p.reason ?? p.resolution ?? "");
+        const chatSessionId = typeof p.chatSessionId === "string" ? p.chatSessionId : undefined;
+        const repoRoot = chatSessionId ? this.director.chats.getSession(chatSessionId)?.repoRoot : undefined;
+        return this.director.resolveEscalation({ escalationId, reason, chatSessionId, repoRoot, resolvedBy: "operator" });
+      }
+
+      case "escalation.reconcile":
+        return { mode: "daemon", ...this.db.reconcileSettledGoalEscalations() };
 
       case "artifact.list": {
         const runId = String(p.runId);
