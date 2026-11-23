@@ -28,12 +28,21 @@ const BOOLEAN_LONG_FLAGS = new Set([
   "exclude-exhausted",
 ]);
 
-export function parseArgs(argv: string[]): { positional: string[]; flags: Record<string, string | boolean> } {
+export interface ParsedArgs {
+  positional: string[];
+  flags: Record<string, string | boolean>;
+  /** Index in `positional` of the first argument that followed a literal `--`; null when argv had no `--`. */
+  doubleDashAt: number | null;
+}
+
+export function parseArgs(argv: string[]): ParsedArgs {
   const positional: string[] = [];
   const flags: Record<string, string | boolean> = {};
+  let doubleDashAt: number | null = null;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === "--") {
+      doubleDashAt = positional.length;
       positional.push(...argv.slice(i + 1));
       break;
     }
@@ -64,7 +73,69 @@ export function parseArgs(argv: string[]): { positional: string[]; flags: Record
       positional.push(arg);
     }
   }
-  return { positional, flags };
+  return { positional, flags, doubleDashAt };
+}
+
+function requireStringFlag(flags: Record<string, string | boolean>, name: string): string | undefined {
+  const v = flags[name];
+  if (v === undefined) return undefined;
+  if (typeof v !== "string" || !v.trim()) {
+    throw new Error(`Flag --${name} requires a value`);
+  }
+  return v.trim();
+}
+
+const RUN_ID_TOKEN_RE = /^run[-_](\d+|[0-9a-f]{8})$/i;
+const RUN_CREATE_ONLY_FLAGS = ["profile", "model", "effort"] as const;
+const RUN_RESUME_USAGE = [
+  'Usage: pi-harness run resume <run-id> [--in 15m] [--message "<msg>"]',
+  'To start a new run whose goal begins with "resume", quote the goal or use: pi-harness run -- resume ...',
+].join("\n");
+
+/**
+ * Returns the run ID when argv is `run resume <run-id>`, null when argv is an ordinary `run <goal...>`.
+ * Throws a usage Error when a resume was evidently intended but the command is malformed, so an
+ * attempted resume never falls through to creating a new run.
+ */
+export function resolveRunResumeAlias(parsed: ParsedArgs): string | null {
+  const { positional, flags, doubleDashAt } = parsed;
+  if (positional[0] !== "run" || positional[1] !== "resume") return null;
+  if (doubleDashAt !== null && doubleDashAt <= 1) return null;
+  const rest = positional.slice(2);
+  const idMatch = rest.length > 0 ? RUN_ID_TOKEN_RE.exec(rest[0]!) : null;
+  const hasResumeFlag = flags.in !== undefined || flags.message !== undefined;
+  if (!idMatch || rest.length !== 1) {
+    const evident = rest.length === 0 || hasResumeFlag || idMatch !== null || (rest.length === 1 && /^#?\d+$/.test(rest[0]!));
+    if (evident) throw new Error(RUN_RESUME_USAGE);
+    return null;
+  }
+  const conflicting = RUN_CREATE_ONLY_FLAGS.filter((k) => flags[k] !== undefined);
+  if (conflicting.length > 0) {
+    throw new Error(
+      `${conflicting.map((k) => `--${k}`).join(", ")} cannot be used with \`pi-harness run resume\`: ${conflicting.length > 1 ? "they apply" : "it applies"} only when creating a new run.`,
+    );
+  }
+  return `run-${idMatch[1]!.toLowerCase()}`;
+}
+
+async function handleResumeCommand(
+  client: Pick<DaemonClient, "request">,
+  runId: string | undefined,
+  flags: Record<string, string | boolean>,
+): Promise<void> {
+  if (!runId) throw new Error('Usage: pi-harness resume <run-id> [--in 15m] [--message "<msg>"]');
+  const delaySpec = requireStringFlag(flags, "in");
+  const message = requireStringFlag(flags, "message");
+  if (delaySpec && message) {
+    throw new Error("--in and --message cannot be combined: scheduled resumes do not accept a message.");
+  }
+  if (delaySpec) {
+    const delayMs = parseDurationMs(delaySpec);
+    if (!delayMs) throw new Error(`Invalid duration for --in: ${delaySpec} (examples: 30s, 15m, 1h30m)`);
+    console.log(JSON.stringify(await client.request("run.schedule_resume", { runId, delayMs }), null, 2));
+    return;
+  }
+  console.log(JSON.stringify(await client.request("run.resume", { runId, message }), null, 2));
 }
 
 async function stopLocalDaemon(socketPath: string): Promise<boolean> {
@@ -230,6 +301,9 @@ Usage:
   pi-harness profiles [list | add <id> <cmd> [args...] | remove <id> | probe <id>]
   pi-harness daemon serve | status | stop | restart [--remote <alias|ssh://host>]
   pi-harness run "<goal>" [-p <project>] [--profile id] [--model id] [--effort level] [--detach] [--remote <alias|ssh://host>]
+  pi-harness run resume <run-id> [--in 15m] [--message "<msg>"] [--remote <alias|ssh://host>]
+                                                    Alias for \`pi-harness resume\`; to start a new run whose goal begins
+                                                    with "resume", quote the goal or use \`pi-harness run -- resume ...\`
   pi-harness runs [--json] [--remote <alias|ssh://host>]
   pi-harness tree <run-id> [--remote <alias|ssh://host>]
   pi-harness steer <task-id> "<message>" [--remote <alias|ssh://host>]
@@ -368,26 +442,19 @@ async function runInteractiveSessionLoop(
 }
 
 async function main(): Promise<void> {
-  const { positional, flags } = parseArgs(process.argv.slice(2));
+  const parsed = parseArgs(process.argv.slice(2));
+  const { positional, flags } = parsed;
   const cmd = positional[0];
   if (cmd === "help" || flags.help || flags.h) {
     printHelp();
     return;
   }
 
-  const requireStringFlag = (name: string): string | undefined => {
-    const v = flags[name];
-    if (v === undefined) return undefined;
-    if (typeof v !== "string" || !v.trim()) {
-      throw new Error(`Flag --${name} requires a value`);
-    }
-    return v.trim();
-  };
-  const rawRemote = requireStringFlag("remote");
-  const hostFlag = requireStringFlag("host");
+  const rawRemote = requireStringFlag(flags, "remote");
+  const hostFlag = requireStringFlag(flags, "host");
   if (flags.p === true) throw new Error("Flag -p requires a project name/id/path");
-  const projectFlag = requireStringFlag("project") ?? (typeof flags.p === "string" ? flags.p.trim() : undefined);
-  const explicitRepoFlag = requireStringFlag("repo");
+  const projectFlag = requireStringFlag(flags, "project") ?? (typeof flags.p === "string" ? flags.p.trim() : undefined);
+  const explicitRepoFlag = requireStringFlag(flags, "repo");
   const rawRepoRoot = explicitRepoFlag ?? process.cwd();
   let repoRoot: string;
   try {
@@ -694,6 +761,11 @@ async function main(): Promise<void> {
       }
 
       case "run": {
+        const resumeRunId = resolveRunResumeAlias(parsed);
+        if (resumeRunId) {
+          await handleResumeCommand(client, resumeRunId, flags);
+          break;
+        }
         const goal = positional.slice(1).join(" ").trim();
         if (!goal) throw new Error('Usage: pi-harness run "<goal>"');
         let targetRepoRoot = repoRoot;
@@ -886,24 +958,7 @@ async function main(): Promise<void> {
       }
 
       case "resume": {
-        const runId = positional[1];
-        if (!runId) throw new Error('Usage: pi-harness resume <run-id> [--in 15m] [--message "<msg>"]');
-        if (typeof flags.in === "string") {
-          const delayMs = parseDurationMs(flags.in);
-          if (!delayMs) throw new Error(`Invalid duration for --in: ${flags.in} (examples: 30s, 15m, 1h30m)`);
-          console.log(JSON.stringify(await client.request("run.schedule_resume", { runId, delayMs }), null, 2));
-        } else {
-          console.log(
-            JSON.stringify(
-              await client.request("run.resume", {
-                runId,
-                message: typeof flags.message === "string" ? flags.message : undefined,
-              }),
-              null,
-              2,
-            ),
-          );
-        }
+        await handleResumeCommand(client, positional[1], flags);
         break;
       }
 
