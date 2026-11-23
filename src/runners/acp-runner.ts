@@ -240,30 +240,33 @@ async function openWorkspaceFile(primaryRoot: string, extraRoots: string[], requ
 /** Flattens JSON-RPC RequestError.data (the ACP SDK wraps thrown agent errors as -32603 `{ details }`, or as the parsed object when the message was JSON). Walks `cause` so re-wrapped errors keep their detail. */
 function acpErrorDetail(err: unknown): string {
   const parts: string[] = [];
-  const push = (v: unknown) => {
-    if (typeof v !== "string") return;
+  // True when `v` carries detail, even if an earlier hop already recorded the same text.
+  const push = (v: unknown): boolean => {
+    if (typeof v !== "string") return false;
     const s = v.trim();
-    if (s && !parts.includes(s)) parts.push(s);
+    if (!s) return false;
+    if (!parts.includes(s)) parts.push(s);
+    return true;
   };
   let cur: unknown = err;
   for (let depth = 0; cur && typeof cur === "object" && depth < 3; depth++) {
-    const data = (cur as { data?: unknown }).data;
-    if (typeof data === "string") push(data);
-    else if (data && typeof data === "object") {
-      const d = data as Record<string, unknown>;
-      const before = parts.length;
-      push(d.details);
-      push(d.message);
-      push(typeof d.error === "string" ? d.error : (d.error as { message?: unknown } | undefined)?.message);
-      if (parts.length === before && Object.keys(d).length > 0) {
-        try {
-          push(JSON.stringify(d));
-        } catch {
-          // Unserializable data carries no usable detail.
-        }
+    // Throwing getters or cyclic data end the walk instead of escaping from error reporting.
+    try {
+      const data = (cur as { data?: unknown }).data;
+      if (typeof data === "string") push(data);
+      else if (data && typeof data === "object") {
+        const d = data as Record<string, unknown>;
+        const found = [
+          push(d.details),
+          push(d.message),
+          push(typeof d.error === "string" ? d.error : (d.error as { message?: unknown } | undefined)?.message),
+        ].some(Boolean);
+        if (!found && Object.keys(d).length > 0) push(JSON.stringify(d));
       }
+      cur = (cur as { cause?: unknown }).cause;
+    } catch {
+      break;
     }
-    cur = (cur as { cause?: unknown }).cause;
   }
   return parts.join(" | ").slice(0, 1000);
 }
@@ -984,18 +987,52 @@ export class AcpRunner {
               if (typeof val === "string" && val.trim()) paths.push(val.trim());
             }
           }
-          // Glob's pattern can name its own root (`/etc/**`); Grep's pattern is a regex, so only Glob is checked.
-          if (p.toolCall?.name === "Glob" && typeof rawInput?.pattern === "string") {
-            const pattern = rawInput.pattern.trim();
-            if (/^[\/~]/.test(pattern) || pattern === ".." || pattern.startsWith("../")) paths.push(pattern);
-          }
+          // The literal directory before the first glob metacharacter (`src/**/*.ts` -> `src`); a rooted glob
+          // keeps `/` so it can never collapse to the workspace.
+          const extractGlobPrefix = (raw: string): string => {
+            const globIdx = raw.search(/[*?[{]/);
+            if (globIdx < 0) return raw;
+            const prefix = raw.slice(0, globIdx);
+            const stripped = prefix.replace(/\/+$/, "");
+            return stripped || (prefix.startsWith("/") ? "/" : ".");
+          };
+          const hasGlob = (s: string) => /[*?[{]/.test(s);
           for (const rawPath of paths) {
-            // Strip trailing glob segment (e.g. `src/**/*.ts` -> `src`) so search globs validate cleanly inside workspace
-            const cleaned = rawPath.includes("*") || rawPath.includes("?") || rawPath.includes("[")
-              ? (rawPath.split(/[*?[]/)[0]?.replace(/\/+$/, "") || ".")
-              : rawPath;
+            if (rawPath.startsWith("~")) return false; // never expanded here, so its target is unprovable
+            if (hasGlob(rawPath) && /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(rawPath)) return false;
             try {
-              await resolveAllowedTarget(workspace, extraReadRoots, cleaned, true);
+              await resolveAllowedTarget(workspace, extraReadRoots, extractGlobPrefix(rawPath), true);
+            } catch {
+              return false;
+            }
+          }
+          // Glob's pattern can name its own root (`/etc/**`, `{/etc,src}/**`, `**/../..`); Grep's pattern is a
+          // regex, so only Glob is checked.
+          if (p.toolCall?.name === "Glob" && rawInput?.pattern !== undefined) {
+            if (typeof rawInput.pattern !== "string") return false;
+            const pattern = rawInput.pattern.trim();
+            if (!pattern || pattern.includes("\0")) return false;
+            if (/(?:^|[{,])\s*~/.test(pattern)) return false;
+            if (/(?:^|[\\/{,])\.\.(?:[\\/},]|$)/.test(pattern)) return false;
+            if (/[{,]\s*\//.test(pattern)) return false;
+            const baseValues = ["path", "directory", "dir", "cwd", "SearchPath"]
+              .map((key) => rawInput[key])
+              .filter((v) => v !== undefined);
+            if (baseValues.length > 1) return false; // several bases could disagree about where Glob searches
+            try {
+              let effectiveBase = workspace;
+              if (baseValues.length === 1) {
+                const base = baseValues[0];
+                if (typeof base !== "string" || !base.trim() || base.trim().startsWith("~")) return false;
+                effectiveBase = (await resolveAllowedTarget(workspace, extraReadRoots, base.trim(), true)).path;
+              }
+              const prefix = extractGlobPrefix(pattern);
+              await resolveAllowedTarget(
+                workspace,
+                extraReadRoots,
+                isAbsolute(prefix) ? prefix : resolve(effectiveBase, prefix),
+                true,
+              );
             } catch {
               return false;
             }
