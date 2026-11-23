@@ -2763,11 +2763,12 @@ export class DirectorRuntime {
         runTasks.find((t) => t.tier === 1 && t.model)?.model ??
         undefined;
       const { profile, model, wireModel, effort: reviewerEffort } = await this.resolveReviewerRoute(verifyCwd, authorModel);
-      const runner = this.customRunnerFactory
-        ? this.customRunnerFactory(profile)
-        : profile.kind === "acp"
-          ? new AcpRunner(profile)
-          : new PiRunner(profile);
+      const makeRunner = () =>
+        this.customRunnerFactory
+          ? this.customRunnerFactory(profile)
+          : profile.kind === "acp"
+            ? new AcpRunner(profile)
+            : new PiRunner(profile);
 
       type SubmittedVerdict = {
         verdict: "approved" | "changes_requested" | "escalate_human";
@@ -2854,8 +2855,11 @@ export class DirectorRuntime {
       const submittedBeforeTimeout = () => timedOut && verdictBox.value !== null && !signal.aborted;
       const bridgeExt = import.meta.url.endsWith(".js") ? "mcp-bridge.js" : "mcp-bridge.ts";
       const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", bridgeExt);
-      const reviewerExecuteTool = async (name: string, args: Record<string, unknown>) => {
+      // Each reviewer session gets its own executor; one from an ended session can never fill the verdict.
+      let activeAttempt = 0;
+      const makeReviewerExecuteTool = (attempt: number) => async (name: string, args: Record<string, unknown>) => {
         if (name === "submit_review_verdict") {
+          if (attempt !== activeAttempt) throw new Error("submit_review_verdict: this reviewer session has ended");
           const v = normalizeReviewerVerdict<Partial<SubmittedVerdict>>(args);
           if (!v) {
             throw new Error(
@@ -2872,106 +2876,144 @@ export class DirectorRuntime {
         }
         throw new Error(`Unknown reviewer tool ${name}`);
       };
-      this.activeReviewerTools.set(reviewerTask.id, { tools: [submitTool], execute: reviewerExecuteTool });
-      const reviewerTimeout = setTimeout(() => {
-        timedOut = true;
-        abort.abort(new Error("Independent Done-Reviewer timed out after 10 minutes"));
-      }, 600_000);
-      reviewerTimeout.unref?.();
+      // The 10-minute wall-clock limit applies to each reviewer session.
+      let reviewerTimeout: ReturnType<typeof setTimeout> | undefined;
+      const armReviewerTimeout = () => {
+        clearTimeout(reviewerTimeout);
+        reviewerTimeout = setTimeout(() => {
+          timedOut = true;
+          abort.abort(new Error("Independent Done-Reviewer timed out after 10 minutes"));
+        }, 600_000);
+        reviewerTimeout.unref?.();
+      };
+      const retryNote =
+        "RETRY: an earlier reviewer session for this exact review ended without a usable verdict (no accepted submit_review_verdict call and no parseable JSON verdict in its final message). " +
+        "Verify independently again, then call submit_review_verdict exactly once before you end your turn; if the tool is unavailable, end with one fenced json verdict object. " +
+        "Ending without a verdict fails this review.";
       try {
         if (this.db.getTask(reviewerTask.id)?.status === "cancelled") abort.abort(new Error("Reviewer cancelled"));
         this.db.updateTask(reviewerTask.id, { status: reviewerSignal.aborted ? "cancelled" : "running" });
         reviewerSignal.throwIfAborted();
-        const cost = recordCostInvocation(this.db, {
-          chatSessionId: goal.chatSessionId ?? undefined,
-          runId: reviewRun.id,
-          taskId: reviewerTask.id,
-          activity: "done_review",
-          profile,
-          model,
-          wireModel,
-        });
-        let res: Awaited<ReturnType<typeof runner.run>> | null = null;
-        try {
-          res = await runner.run({
+        for (let attempt = 1; ; attempt++) {
+          if (attempt > 1) {
+            // A cancelled, stopped or otherwise settled reviewer task ends the review between sessions.
+            reviewerSignal.throwIfAborted();
+            if (this.db.getTask(reviewerTask.id)?.status !== "running") throw new Error("Reviewer cancelled");
+          }
+          activeAttempt = attempt;
+          verdictBox.value = null;
+          turnsUsed = 0;
+          armReviewerTimeout();
+          const executeTool = makeReviewerExecuteTool(attempt);
+          this.activeReviewerTools.set(reviewerTask.id, { tools: [submitTool], execute: executeTool });
+          const runner = makeRunner();
+          const cost = recordCostInvocation(this.db, {
+            chatSessionId: goal.chatSessionId ?? undefined,
             runId: reviewRun.id,
             taskId: reviewerTask.id,
-            tier: 3,
-            kind: "verify",
-            cwd: verifyCwd,
-            toolPolicy: "read_only_workspace",
-            allowShellInReadOnly: checkout.isolated,
-            model: wireModel,
-            effort: reviewerEffort,
-            systemPrompt:
-              "You are an independent read-only Done-Reviewer operating in a disposable verification checkout of the target branch. Inspect the implementation, diffs, and verification evidence for each required criterion — you may run tests, linters, git diff, rg, sg, or tmux checks freely to verify behavior, but never edit tracked repository code or delegate. Call submit_review_verdict if available, or return the requested JSON verdict with concrete sources for every required criterion. " +
-              `You may get one advisory progress check-in around ${reviewerMaxTurns} tool-call turns; the harness does not stop you by turn count. The review has a hard 10-minute wall-clock limit. Submit as soon as every required criterion has evidence; a changes_requested verdict with partial evidence is better than none.`,
-            initialPrompt: reviewerPrompt,
-            maxTurns: reviewerMaxTurns,
-            tools: [submitTool],
-            executeTool: reviewerExecuteTool,
-            daemonSocketPath: this.config.socketPath,
-            mcpBridgeEntrypoint,
-            externalMcpServers: resolveExternalMcpServers(this.config.stateDir, this.config.externalMcpServers),
-            extraPathDirs: nativeToolsPathDirs(this.config.stateDir),
-            extraReadRoots: [
-              goalsDir,
-              join(goal.repoRoot, ".harness", "artifacts"),
-              // The advertised (possibly nondefault) artifacts root must be readable too.
-              ...(artifactsDir !== join(goal.repoRoot, ".harness", "artifacts") ? [artifactsDir] : []),
-              ...(this.config.worktree.extraReadRoots ?? []),
-            ],
-            extraEnv: {
-              ...(evidenceDir !== null ? { HARNESS_GOAL_EVIDENCE_DIR: evidenceDir } : {}),
-              HARNESS_GOAL_ID: goal.id,
-              HARNESS_GOALS_DIR: goalsDir,
-              HARNESS_ARTIFACTS_DIR: artifactsDir,
-            },
-            signal: reviewerSignal,
-            callbacks: {
-              onSessionId: (sid) => {
-                this.db.updateTask(reviewerTask.id, { sessionId: sid });
-                cost.onSessionId(sid);
-              },
-              onTextDelta: (text) => emit("agent.text_delta", { text }),
-              onThoughtDelta: (text) => emit("agent.thought_delta", { text }),
-              onToolEvent: (ev) => emit("agent.tool", ev),
-              onUsage: (usage) => {
-                this.db.updateTask(reviewerTask.id, { contextUsed: usage.used, contextSize: usage.size });
-                emit("agent.usage", usage);
-                cost.onUsage(usage);
-              },
-              onTurn: (n) => {
-                turnsUsed = n;
-              },
-              onPassiveQuota: (sig) => this.quota.ingestPassiveSignal(sig),
-            },
+            activity: "done_review",
+            profile,
+            model,
+            wireModel,
           });
-        } catch (err) {
-          if (!submittedBeforeTimeout()) throw err;
-        } finally {
-          cost.finish();
-        }
-        const keepSubmitted = submittedBeforeTimeout();
-        if (!keepSubmitted) {
-          reviewerSignal.throwIfAborted();
-          if (res && res.stopReason !== "completed") {
-            throw new Error(`Reviewer stopped: ${res.stopReason}. ${res.text}`);
+          let res: Awaited<ReturnType<typeof runner.run>> | null = null;
+          try {
+            res = await runner.run({
+              runId: reviewRun.id,
+              taskId: reviewerTask.id,
+              tier: 3,
+              kind: "verify",
+              cwd: verifyCwd,
+              toolPolicy: "read_only_workspace",
+              allowShellInReadOnly: checkout.isolated,
+              model: wireModel,
+              effort: reviewerEffort,
+              systemPrompt:
+                "You are an independent read-only Done-Reviewer operating in a disposable verification checkout of the target branch. Inspect the implementation, diffs, and verification evidence for each required criterion — you may run tests, linters, git diff, rg, sg, or tmux checks freely to verify behavior, but never edit tracked repository code or delegate. Call submit_review_verdict if available, or return the requested JSON verdict with concrete sources for every required criterion. " +
+                `You may get one advisory progress check-in around ${reviewerMaxTurns} tool-call turns; the harness does not stop you by turn count. The review has a hard 10-minute wall-clock limit. Submit as soon as every required criterion has evidence; a changes_requested verdict with partial evidence is better than none.`,
+              initialPrompt: attempt === 1 ? reviewerPrompt : `${reviewerPrompt}\n\n${retryNote}`,
+              maxTurns: reviewerMaxTurns,
+              tools: [submitTool],
+              executeTool,
+              daemonSocketPath: this.config.socketPath,
+              mcpBridgeEntrypoint,
+              externalMcpServers: resolveExternalMcpServers(this.config.stateDir, this.config.externalMcpServers),
+              extraPathDirs: nativeToolsPathDirs(this.config.stateDir),
+              extraReadRoots: [
+                goalsDir,
+                join(goal.repoRoot, ".harness", "artifacts"),
+                // The advertised (possibly nondefault) artifacts root must be readable too.
+                ...(artifactsDir !== join(goal.repoRoot, ".harness", "artifacts") ? [artifactsDir] : []),
+                ...(this.config.worktree.extraReadRoots ?? []),
+              ],
+              extraEnv: {
+                ...(evidenceDir !== null ? { HARNESS_GOAL_EVIDENCE_DIR: evidenceDir } : {}),
+                HARNESS_GOAL_ID: goal.id,
+                HARNESS_GOALS_DIR: goalsDir,
+                HARNESS_ARTIFACTS_DIR: artifactsDir,
+              },
+              signal: reviewerSignal,
+              callbacks: {
+                onSessionId: (sid) => {
+                  this.db.updateTask(reviewerTask.id, { sessionId: sid });
+                  cost.onSessionId(sid);
+                },
+                onTextDelta: (text) => emit("agent.text_delta", { text }),
+                onThoughtDelta: (text) => emit("agent.thought_delta", { text }),
+                onToolEvent: (ev) => emit("agent.tool", ev),
+                onUsage: (usage) => {
+                  this.db.updateTask(reviewerTask.id, { contextUsed: usage.used, contextSize: usage.size });
+                  emit("agent.usage", usage);
+                  cost.onUsage(usage);
+                },
+                onTurn: (n) => {
+                  turnsUsed = n;
+                },
+                onPassiveQuota: (sig) => this.quota.ingestPassiveSignal(sig),
+              },
+            });
+          } catch (err) {
+            if (!submittedBeforeTimeout()) throw err;
+          } finally {
+            cost.finish();
           }
-        }
-        assertCurrent();
+          const keepSubmitted = submittedBeforeTimeout();
+          if (!keepSubmitted) {
+            reviewerSignal.throwIfAborted();
+            if (res && res.stopReason !== "completed") {
+              throw new Error(`Reviewer stopped: ${res.stopReason}. ${res.text}`);
+            }
+          }
+          assertCurrent();
 
-        // Fallback JSON parse if reviewer returned JSON text instead of calling submit_review_verdict
-        if (!verdictBox.value && res) {
-          verdictBox.value = parseReviewerVerdictJson<SubmittedVerdict>(res.text);
+          // Fallback JSON parse if reviewer returned JSON text instead of calling submit_review_verdict
+          if (!verdictBox.value && res) {
+            const parsed = parseReviewerVerdictJson<Partial<SubmittedVerdict>>(res.text);
+            if (parsed) {
+              verdictBox.value = {
+                verdict: parsed.verdict as SubmittedVerdict["verdict"],
+                criteriaResults: parsed.criteriaResults ?? [],
+                blockingIssues: parsed.blockingIssues ?? [],
+                summary: typeof parsed.summary === "string" ? parsed.summary : "",
+              };
+            }
+          }
+          if (verdictBox.value) break;
+
+          // A completed session without a usable verdict is retried in a fresh session; nothing is recorded for it.
+          const noVerdict =
+            `Reviewer returned no usable verdict (attempt ${attempt}/${REVIEWER_VERDICT_ATTEMPTS}, stopReason=${res?.stopReason ?? "unknown"}, ` +
+            `turnsUsed=${turnsUsed}, reviewerMaxTurns=${reviewerMaxTurns} advisory). Output tail: ${(res?.text ?? "").slice(-300)}`;
+          if (attempt >= REVIEWER_VERDICT_ATTEMPTS) throw new Error(noVerdict);
+          emit("agent.error", { error: `${noVerdict} Retrying in a fresh reviewer session.` });
         }
 
         const submittedVerdict = verdictBox.value;
-        const stopReason = keepSubmitted ? "timeout_after_verdict" : (res?.stopReason ?? "unknown");
+        if (!submittedVerdict) throw new Error("Reviewer returned no usable verdict");
 
         // Merge deterministic gate pass results with reviewer evaluations so deterministic criteria stay evidenced
         const mergedResults: CriterionEvaluation[] = [...gateResult.results];
-        for (const r of submittedVerdict?.criteriaResults ?? []) {
+        for (const r of submittedVerdict.criteriaResults ?? []) {
           if (!mergedResults.some((m) => m.criterionId === r.criterionId)) {
             mergedResults.push(r);
           }
@@ -2987,33 +3029,28 @@ export class DirectorRuntime {
             });
           }
         }
-        const noVerdictIssue =
-          `Reviewer did not return a structured verdict (stopReason=${stopReason}, turnsUsed=${turnsUsed}, reviewerMaxTurns=${reviewerMaxTurns} advisory). ` +
-          `Output tail: ${(res?.text ?? "").slice(-300)}`;
         const notes = [
           coordinatorFailure && coordinatorFailure.criteriaResults.length === 0
             ? "(coordinator-reported failure was shown to the reviewer)"
             : null,
           authorModel && model === authorModel ? "(reviewer model equals author model: no independent route available)" : null,
         ].filter(Boolean);
-        const baseSummary =
-          submittedVerdict?.summary ??
-          `Incomplete review output (stopReason=${stopReason}, turns=${turnsUsed}, reminder threshold=${reviewerMaxTurns})`;
+        const baseSummary = submittedVerdict.summary;
 
-        if (submittedVerdict?.verdict === "approved") assertNoOpenP0ForFailedRunApproval();
+        if (submittedVerdict.verdict === "approved") assertNoOpenP0ForFailedRunApproval();
         // A coordinator failure reported after the reviewer's prompt was built was never seen: it blocks approval.
         const postReviewGoal = this.goals.getGoal(goal.id);
         const lateFailure = postReviewGoal ? this.detectCoordinatorFailure(postReviewGoal) : null;
         const unseenFailure =
-          submittedVerdict?.verdict === "approved" &&
+          submittedVerdict.verdict === "approved" &&
           lateFailure &&
           (!coordinatorFailure || (lateFailure.claimedAt ?? 0) > (coordinatorFailure.claimedAt ?? 0))
             ? lateFailure
             : null;
-        const blockingIssues = submittedVerdict?.blockingIssues ?? (submittedVerdict ? [] : [noVerdictIssue]);
+        const blockingIssues = submittedVerdict.blockingIssues ?? [];
         outcome = this.db.transaction(() => {
           const recorded = this.goals.recordReviewVerdict(goal.id, {
-            verdict: unseenFailure ? "changes_requested" : (submittedVerdict?.verdict ?? "changes_requested"),
+            verdict: unseenFailure ? "changes_requested" : submittedVerdict.verdict,
             criteriaResults: mergedResults,
             blockingIssues: unseenFailure
               ? [
@@ -3055,6 +3092,7 @@ export class DirectorRuntime {
         reviewerSignal.throwIfAborted();
         throw new Error(`${failedSummary} (${detail}; turns=${turnsUsed})`);
       } finally {
+        activeAttempt = 0;
         clearTimeout(reviewerTimeout);
         this.activeReviewerTools.delete(reviewerTask.id);
         unsubscribe();
@@ -4749,6 +4787,8 @@ export function resolveDirectorEvidencePath(repoRoot: string, rawPath: string): 
 }
 
 const REVIEWER_VERDICTS = ["approved", "changes_requested", "escalate_human"];
+/** Reviewer sessions per review: a completed run without a usable verdict is retried in a fresh session. */
+const REVIEWER_VERDICT_ATTEMPTS = 2;
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === "object" && !Array.isArray(v);
