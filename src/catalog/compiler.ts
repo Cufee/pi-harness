@@ -83,9 +83,19 @@ function pickEffort(supported: string[], preferred: string[]): string | undefine
  */
 export function recommendModelsByTaskKind(
   models: CompiledModelEntry[],
-  opts?: { avoidModelId?: string | null },
+  opts?: { avoidModelId?: string | null; enabledProfiles?: RunnerProfileConfig[]; preferAcp?: boolean },
 ): Record<"orchestrator" | "worker" | "research" | "plan" | "execute" | "verify", TaskModelRecommendation | null> {
-  const pool = models.filter((m) => m.enabled !== false && !isQuotaUnavailable(m.quota));
+  // With `enabledProfiles`, recommend only routes on enabled profiles (ACP first when `preferAcp`);
+  // without it, every model recommends its preferred route as before.
+  const enabledById = opts?.enabledProfiles
+    ? new Map(opts.enabledProfiles.filter((p) => p.enabled !== false).map((p) => [p.id, p]))
+    : null;
+  const routeFor = (m: CompiledModelEntry): ModelRoute | undefined => {
+    if (!enabledById) return m.preferredRoute;
+    const routes = [m.preferredRoute, ...m.alternateRoutes].filter((r) => r && enabledById.has(r.profileId));
+    return (opts?.preferAcp ? routes.find((r) => enabledById.get(r.profileId)?.kind === "acp") : undefined) ?? routes[0];
+  };
+  const pool = models.filter((m) => m.enabled !== false && !isQuotaUnavailable(m.quota) && routeFor(m) !== undefined);
   const byRank = [...pool].sort((a, b) => (b.codingScore ?? -1) - (a.codingScore ?? -1) || a.id.localeCompare(b.id));
 
   const pickByRoles = (
@@ -113,10 +123,11 @@ export function recommendModelsByTaskKind(
             (b.codingScore ?? -1) - (a.codingScore ?? -1),
         )[0]!
       : candidates[0]!;
-    const effort = pickEffort(chosen.preferredRoute.supportedEfforts ?? chosen.efforts, preferredEfforts);
+    const route = routeFor(chosen)!;
+    const effort = pickEffort(route.supportedEfforts ?? chosen.efforts, preferredEfforts);
     return {
       model: chosen.id,
-      profile: chosen.preferredRoute.profileId,
+      profile: route.profileId,
       ...(effort !== undefined ? { effort } : {}),
       rationale,
     };
@@ -536,15 +547,18 @@ export class ModelCatalogCompiler {
   /**
    * Translates a canonical (`google/gemini-4-carbon`), bare (`gemini-4-carbon`), or wire
    * (`google-vertex/gemini-4-carbon`) model ID into the exact wire ID that `profileId` probed,
-   * using the cached catalog. Returns null when there is no catalog or no route on that profile
-   * matches; callers then pass the original string through unchanged.
+   * using `catalogSnapshot` or else the cached catalog when it is fresh. Returns null when there is
+   * no usable catalog or no route on that profile matches; callers then pass the original string
+   * through unchanged.
    */
   resolveForProfile(
     profileId: string,
     model: string,
     effort?: string,
+    catalogSnapshot?: CompiledModelCatalog,
   ): { wireModelId: string; canonicalId: string; effort?: string } | null {
-    const catalog = this.loadCached();
+    const cached = catalogSnapshot ? null : this.loadCached();
+    const catalog = catalogSnapshot ?? (this.isCacheFresh(cached) ? cached : null);
     if (!catalog || !model) return null;
 
     const candidates = catalog.models.flatMap((entry) =>
@@ -593,9 +607,16 @@ export class ModelCatalogCompiler {
 
     this.quotaClient?.harvestLocal(this.config.profiles);
     await this.quotaClient?.sync(false).catch(() => {});
+    const enabledProfileIds = new Set(
+      this.config.profiles.filter((p) => p.enabled !== false).map((p) => p.id),
+    );
     const enrichedModels = catalog.models
-      .map((m) => {
-        const allRoutes = [m.preferredRoute, ...m.alternateRoutes];
+      .flatMap((m) => {
+        // Never return a route on a disabled or unknown profile; drop models left without a route.
+        const allRoutes = [m.preferredRoute, ...m.alternateRoutes].filter(
+          (route) => route && enabledProfileIds.has(route.profileId),
+        );
+        if (allRoutes.length === 0) return [];
         const resolvedRoutes = allRoutes.map((route) => ({
           route,
           quota:
@@ -619,11 +640,12 @@ export class ModelCatalogCompiler {
 
         const chosen = resolvedRoutes[chosenIndex]!;
         const preferredRoute = chosen.route;
+        const promoted = preferredRoute !== m.preferredRoute;
         const alternateRoutes = resolvedRoutes
           .filter((_, idx) => idx !== chosenIndex)
           .map((r) => r.route);
         const costPerTaskUsd =
-          chosenIndex === 0
+          !promoted
             ? m.costPerTaskUsd
             : preferredRoute.billing === "subscription" || preferredRoute.billing === "local"
               ? 0
@@ -632,15 +654,15 @@ export class ModelCatalogCompiler {
           (e) => e.trim() && e.toLowerCase() !== "default",
         );
         const efforts =
-          chosenIndex === 0
+          !promoted
             ? m.efforts
             : promotedEfforts?.length
               ? promotedEfforts
               : m.efforts;
 
         const enabled = isModelEnabledInCatalog(m.id, this.config.catalog);
-        const quota = chosen.quota ?? (chosenIndex === 0 ? (m.quota ?? null) : null);
-        return {
+        const quota = chosen.quota ?? (!promoted ? (m.quota ?? null) : null);
+        return [{
           ...m,
           preferredRoute,
           alternateRoutes,
@@ -648,7 +670,7 @@ export class ModelCatalogCompiler {
           efforts,
           quota,
           enabled,
-        };
+        }];
       })
       .filter((m) => {
         if (!opts?.includeDisabled && m.enabled === false) return false;
