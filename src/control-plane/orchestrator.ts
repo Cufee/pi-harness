@@ -166,8 +166,12 @@ export function deriveRunStatus(
     if (realOrch.status === "cancelled") return "stopped";
     // A blocked coordinator never settled its work: report failed (there is no blocked run status), never completed.
     if (realOrch.status === "blocked" || realOrch.status === "returned_for_rescope") return "failed";
-    // A completed root coordinator settles the run on its own outcome even when leftover children remain blocked.
-    if (realOrch.status === "completed") return "completed";
+    if (realOrch.status === "completed") {
+      // Read-only tasks own no unmerged work, so a leftover blocked scout or reviewer must not fail a run whose orchestrator completed.
+      const realChildren = execTasks.filter((t) => t.id !== realOrch.id && t.profileId !== "director");
+      if (realChildren.some((t) => t.status === "blocked" && !isReadOnlyKind(t.kind))) return "failed";
+      return "completed";
+    }
   }
 
   const realTasks = execTasks.filter((t) => t.profileId !== "director");
