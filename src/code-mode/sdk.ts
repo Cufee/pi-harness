@@ -13,7 +13,7 @@ export const TOOL_SEARCH_TOOL_NAME = "tool_search";
 
 export const CODE_EXEC_TOOL: ToolDefinition = {
   name: CODE_EXEC_TOOL_NAME,
-  description: 'Chain allowed tools in a Bun TypeScript script with top-level await. Use import { ... } from "harness" and output(value) to return JSON. Find signatures with tool_search. Each serialized IPC message must fit in 16 MiB. Cancellation stops the script, not tool actions already started. Set language: "python" to run Python instead: use `from harness import name, output` (find Python signatures with tool_search language "python") and list third-party wheels in packages as "name==version". Scripts run in an OS sandbox that blocks workspace file reads, all writes, subprocesses, and network. Direct node:fs or open() reads of workspace files fail with EPERM; read files with harness functions listed by tool_search (artifact_read, or read_file where available) or with your own file tools outside code_exec.',
+  description: 'Chain allowed tools in a Bun TypeScript script with top-level await. Use import { ... } from "harness" and output(value) to return JSON. Find signatures with tool_search. Each serialized IPC message must fit in 16 MiB. Cancellation stops the script, not tool actions already started. Set language: "python" to run Python instead: use `from harness import name, output` (find Python signatures with tool_search language "python") and list third-party wheels in packages as "name==version". Scripts run in an OS sandbox that blocks direct file reads outside the script\'s scratch directory, all writes, subprocesses, and network. Direct node:fs or open() calls on workspace or other host files fail with EPERM; read files with harness functions listed by tool_search (artifact_read, or read_file where available) or with your own file tools outside code_exec.',
   inputSchema: {
     type: "object",
     required: ["code"],
@@ -42,9 +42,9 @@ export const TOOL_SEARCH_TOOL: ToolDefinition = {
   },
 };
 
-export function exposedTools(allowed: ToolDefinition[], mode: CodeMode): ToolDefinition[] {
+export function exposedTools(allowed: ToolDefinition[], mode: CodeMode, direct: readonly string[] = []): ToolDefinition[] {
   if (effectiveCodeMode(mode) === "off") return allowed;
-  if (mode === "collapsed") return [TOOL_SEARCH_TOOL, CODE_EXEC_TOOL];
+  if (mode === "collapsed") return [...allowed.filter((tool) => direct.includes(tool.name)), TOOL_SEARCH_TOOL, CODE_EXEC_TOOL];
   return [...allowed.filter((tool) => !isCodeModeTool(tool.name)), TOOL_SEARCH_TOOL, CODE_EXEC_TOOL];
 }
 
@@ -200,8 +200,17 @@ export function toolSearch(
   return { signatures: generateSdkDeclarations(tools), matched: tools.map(({ name }) => name), note: SCRIPT_FUNCTION_NOTE };
 }
 
-export function codeModePromptSection(mode: CodeMode, opts?: { defaultTimeoutMs?: number; maxTimeoutMs?: number }): string {
+export function codeModePromptSection(
+  mode: CodeMode,
+  opts?: { defaultTimeoutMs?: number; maxTimeoutMs?: number; directTools?: readonly string[] },
+): string {
   if (effectiveCodeMode(mode) === "off") return "";
+  const directTools = opts?.directTools ?? [];
+  const callable = [...directTools, TOOL_SEARCH_TOOL_NAME, CODE_EXEC_TOOL_NAME];
+  const callableList = callable.length === 2 ? callable.join(" and ") : `${callable.slice(0, -1).join(", ")}, and ${callable.at(-1)}`;
+  const directNote = directTools.length > 0
+    ? ` ${directTools.length === 1 ? directTools[0] : `${directTools.slice(0, -1).join(", ")} and ${directTools.at(-1)}`} can also be imported inside a script.`
+    : "";
   const maxMs = Math.max(1, Math.min(Number.isFinite(opts?.maxTimeoutMs) ? opts!.maxTimeoutMs! : 1_800_000, 1_800_000));
   const defaultMs = Math.max(1, Math.min(Number.isFinite(opts?.defaultTimeoutMs) ? opts!.defaultTimeoutMs! : 300_000, maxMs));
   const defaultSec = Math.max(1, Math.round(defaultMs / 1000));
@@ -209,12 +218,12 @@ export function codeModePromptSection(mode: CodeMode, opts?: { defaultTimeoutMs?
   return [
     "## Code Mode",
     mode === "hybrid" ? "Call harness tools directly for single calls, or use code_exec to combine calls in a script." :
-      "The only callable harness tools are tool_search and code_exec. Every other harness tool named in these instructions (return_task, wait_children, spawn_worker, and so on) is a function inside a code_exec script. Calling it as a tool fails because it is not in your tool list.",
+      `The only callable harness tools are ${callableList}. Every other harness tool named in these instructions (return_task, wait_children, spawn_worker, and so on) is a function inside a code_exec script. Calling it as a tool fails because it is not in your tool list.${directNote}`,
     'Find allowed tools with tool_search. In code_exec, use `import { ... } from "harness"`, top-level await, and output(value) for the final JSON result.',
     'Your client may prefix tool names (for example mcp__harness__code_exec) or wrap this server behind its own tool_search and code_exec. Then `harness` in the client\'s own script exports only code_exec and tool_search, so importing return_task or any other harness function there fails. Call the harness code_exec with `{ code }` and put the `import { ... } from "harness"` line inside that code string.',
     'In the Amp native wrapper, use `text(result)` to display the result of the nested call. Use `output(value)` inside the harness code_exec script to return a value to Amp.',
     'code_exec also accepts language: "python" (default TypeScript): `from harness import name, output`; tool_search with language "python" lists Python signatures; packages: ["name==version"] installs pinned wheels.',
-    "Scripts run in an OS sandbox that blocks workspace file reads, all writes, subprocesses, and network. Direct node:fs or Python open() reads of workspace files fail with EPERM; read files with harness functions listed by tool_search (artifact_read, or read_file where available) or with your own file tools outside code_exec.",
+    "Scripts run in an OS sandbox that blocks direct file reads outside the script's scratch directory, all writes, subprocesses, and network. Direct node:fs or Python open() calls on workspace or other host files fail with EPERM; read files with harness functions listed by tool_search (artifact_read, or read_file where available) or with your own file tools outside code_exec.",
     `Set timeout_s for long waits (default ${defaultSec}s, maximum ${maxSec}s unless configured lower). Results over the inline limit (default 20,000 characters) return a preview and artifact path.`,
   ].join("\n\n");
 }

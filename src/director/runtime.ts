@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { open as openFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -52,10 +53,16 @@ import { nativeToolsPathDirs, resolveExternalMcpServers } from "../tools/native-
 import { runGit } from "../worktree/manager.js";
 import {
   buildDirectorSystemPrompt,
+  DIRECTOR_DIRECT_TOOLS,
   DirectorSessionStore,
   type ChatSessionRecord,
   type ChatTurnRecord,
 } from "./session.js";
+
+const READ_FILE_DEFAULT_PAGE_BYTES = 32 * 1024;
+// One page must fit a 16 MiB code_exec IPC frame even if JSON escaping expands every byte sixfold.
+const READ_FILE_MAX_PAGE_BYTES = 2 * 1024 * 1024;
+const READ_FILE_SCAN_BYTES = 1024 * 1024;
 
 const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
@@ -340,16 +347,18 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   ...toolsForTier(1).filter(tool => ["spawn_task", "wait_tasks", "wait_children", "cancel_task", "artifact_read"].includes(tool.name)),
   {
     name: "read_file",
-    description: "Read UTF-8 text from the workspace, .harness/goals, .harness/notes, .harness/artifacts, or operator-granted roots, one logged page at a time (default 4096 bytes; set max_bytes up to 65536). When hasMore is true, call again with offset set to nextOffset. Delegate broad or multi-file inspection to spawn_task.",
+    description: "Read a UTF-8 text file: any workspace file, harness goals, notes, and artifacts, or any other file on this machine that the operator's account can read (absolute or ~/ path). Returns one page (default 32768 bytes, up to 2097152 with max_bytes) that ends on a line boundary when possible. Select lines with start_line and end_line, or page by bytes with offset. When hasMore is true, call again with offset set to nextOffset to continue to end of file. .git internals, task worktrees, and harness-internal state are refused. Binary files and directories are not supported.",
     inputSchema: {
       type: "object",
-      required: ["path", "exception_reason"],
+      required: ["path"],
       properties: {
-        path: { type: "string" },
-        exception_reason: { type: "string", minLength: 1, description: "Short purpose, recorded in the session log." },
-        offset: { type: "number", description: "Byte offset to start from (default 0). Pass the previous result's nextOffset." },
-        max_bytes: { type: "number", description: "Page size in bytes (default 4096, maximum 65536)." },
+        path: { type: "string", description: "Workspace-relative, absolute, or ~/ path." },
+        start_line: { type: "number", description: "1-based first line to return. Cannot be combined with offset." },
+        end_line: { type: "number", description: "1-based last line to return, inclusive. Defaults to as many lines as fit in the page." },
+        offset: { type: "number", description: "Byte offset to start from (default 0). Pass the previous result's nextOffset to continue. A negative value counts back from end of file." },
+        max_bytes: { type: "number", description: "Page size in bytes (default 32768, maximum 2097152)." },
         max_chars: { type: "number", description: "Optional: trim the page to at most this many UTF-16 characters (minimum 1; never splits a surrogate pair)." },
+        exception_reason: { type: "string", description: "Optional note recorded with the read in the session log." },
       },
     },
   },
@@ -2135,6 +2144,7 @@ export class DirectorRuntime {
       ...this.config.codeExec,
       mode: effectiveCodeMode(this.config.codeMode),
       allowedTools: () => DIRECTOR_TOOLS,
+      directTools: DIRECTOR_DIRECT_TOOLS,
       execute: async (name, args, execSignal) => {
         const effectiveSignal = execSignal ?? signal;
         if (name === "present_result") {
@@ -2891,84 +2901,142 @@ export class DirectorRuntime {
       }
 
       case "read_file": {
+        const rawPath = typeof args.path === "string" ? args.path.trim() : "";
+        if (!rawPath) throw new Error("read_file requires path");
         const reason = typeof args.exception_reason === "string" ? args.exception_reason.trim() : "";
-        if (!reason) throw new Error("read_file requires exception_reason");
-        const rawPath = String(args.path ?? "").trim();
+        const int = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? Math.floor(v) : undefined);
+        const startLineArg = int(args.start_line);
+        const endLine = int(args.end_line);
+        const offsetArg = int(args.offset);
+        const lineMode = startLineArg !== undefined || endLine !== undefined;
+        if (lineMode && offsetArg !== undefined) throw new Error("read_file takes either offset or start_line/end_line, not both");
+        const startLine = startLineArg ?? 1;
+        if (startLine < 1) throw new Error("start_line must be 1 or greater");
+        if (endLine !== undefined && endLine < startLine) throw new Error("end_line must not be less than start_line");
+
         const root = realpathSync(repoRoot);
-        const expandRoot = (r: string) => {
-          const t = r.trim();
-          const exp = t === "~" ? homedir() : t.startsWith("~/") ? resolve(homedir(), t.slice(2)) : resolve(t);
-          return existsSync(exp) ? realpathSync(exp) : exp;
-        };
-        const candidate = rawPath.startsWith("~/") ? resolve(homedir(), rawPath.slice(2)) : resolve(root, rawPath);
+        const candidate = rawPath === "~" ? homedir()
+          : rawPath.startsWith("~/") ? resolve(homedir(), rawPath.slice(2))
+          : resolve(root, rawPath);
         const target = realpathSync(candidate);
-        const extraRoots = [...(this.config.worktree.extraReadRoots ?? []), ...(this.config.worktree.extraWriteRoots ?? [])]
-          .filter((r) => typeof r === "string" && r.trim().length > 0)
-          .map(expandRoot);
         const relToRepo = relative(root, target);
         const inRepo = relToRepo !== ".." && !relToRepo.startsWith(`..${sep}`) && !isAbsolute(relToRepo);
         const path = inRepo ? relToRepo : target;
-        const inExtraRoot = extraRoots.some((r) => {
-          const rel = relative(r, target);
-          return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
-        });
-        if (!inRepo && !inExtraRoot) {
-          throw new Error("File outside the permitted workspace or operator-granted roots (worktree.extraReadRoots / extraWriteRoots in the global config)");
-        }
+        const protectedMessage = "read_file cannot read protected paths (.git, task worktrees, or harness-internal state)";
         if (inRepo) {
           const parts = relToRepo.split(sep).map((p) => p.toLowerCase());
           // Block .git and .harness/worktrees, while permitting .harness/goals, .harness/artifacts, and .harness/notes.
           if (parts.includes(".git") || (parts[0] === ".harness" && !["artifacts", "goals", "notes"].includes(parts[1] ?? ""))) {
-            throw new Error("File outside the permitted workspace");
+            throw new Error(protectedMessage);
           }
         } else {
-          // Check the whole canonical path so the veto holds regardless of which grant matched or how grants nest.
+          // Check the whole canonical path so the veto holds wherever the file lives.
           const parts = target.split(sep).map((p) => p.toLowerCase());
           if (parts.includes(".git") || parts.some((p, i) => p === ".harness" && parts[i + 1] === "worktrees")) {
-            throw new Error("File outside the permitted workspace");
+            throw new Error(protectedMessage);
           }
         }
-        const fd = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+
+        const pageBytes = Math.min(READ_FILE_MAX_PAGE_BYTES, Math.max(4, int(args.max_bytes) ?? READ_FILE_DEFAULT_PAGE_BYTES));
+        const file = await openFile(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
         try {
-          const stat = fstatSync(fd);
+          const stat = await file.stat();
           if (!stat.isFile()) throw new Error("Expected a regular file");
-          const pageBytes = typeof args.max_bytes === "number" && Number.isFinite(args.max_bytes)
-            ? Math.min(65536, Math.max(4, Math.floor(args.max_bytes)))
-            : 4096;
-          const reqOffset = typeof args.offset === "number" && Number.isFinite(args.offset) ? Math.max(0, Math.floor(args.offset)) : 0;
-          if (reqOffset >= stat.size) {
-            const emptyEvent: ChatControlEvent = { kind: "director.read_file", path, bytes: 0, reason, ...(reqOffset > 0 ? { offset: reqOffset } : {}) };
-            this.chats.appendTurn(chatSessionId, "system_notice", formatChatEventSummary(emptyEvent), undefined, emptyEvent);
-            return { path, offset: reqOffset, nextOffset: null, totalBytes: stat.size, truncated: false, hasMore: false, content: "" };
+          const log = (bytes: number, at: number) => {
+            const event: ChatControlEvent = { kind: "director.read_file", path, bytes, ...(reason ? { reason } : {}), ...(at > 0 ? { offset: at } : {}) };
+            this.chats.appendTurn(chatSessionId, "system_notice", formatChatEventSummary(event), undefined, event);
+          };
+
+          // Find the starting byte: a caller offset (negative counts back from end of file) or the start of start_line.
+          let reqOffset = offsetArg === undefined ? 0 : offsetArg < 0 ? Math.max(0, stat.size + offsetArg) : offsetArg;
+          let totalLines: number | undefined;
+          if (lineMode && startLine > 1) {
+            const scan = Buffer.allocUnsafe(Math.max(1, Math.min(READ_FILE_SCAN_BYTES, stat.size)));
+            let line = 1;
+            let pos = 0;
+            let last = 0x0a;
+            let found = false;
+            while (!found) {
+              signal?.throwIfAborted();
+              const { bytesRead } = await file.read(scan, 0, scan.length, pos);
+              if (bytesRead === 0) break;
+              const chunk = scan.subarray(0, bytesRead);
+              let i = 0;
+              while (line < startLine) {
+                const nl = chunk.indexOf(0x0a, i);
+                if (nl === -1) break;
+                line++;
+                i = nl + 1;
+              }
+              if (line === startLine) {
+                reqOffset = pos + i;
+                found = true;
+              }
+              last = chunk[bytesRead - 1]!;
+              pos += bytesRead;
+            }
+            if (!found) {
+              totalLines = line - 1 + (pos > 0 && last !== 0x0a ? 1 : 0);
+              reqOffset = pos;
+            }
           }
-          const buf = Buffer.alloc(pageBytes);
-          const count = readSync(fd, buf, 0, pageBytes, reqOffset);
-          // A short read means the file ended (or was truncated) after fstat; treat where it stopped as end of file.
-          const effectiveSize = count < pageBytes ? reqOffset + count : stat.size;
-          if (count === 0) {
-            const emptyEvent: ChatControlEvent = { kind: "director.read_file", path, bytes: 0, reason, ...(reqOffset > 0 ? { offset: reqOffset } : {}) };
-            this.chats.appendTurn(chatSessionId, "system_notice", formatChatEventSummary(emptyEvent), undefined, emptyEvent);
-            return { path, offset: reqOffset, nextOffset: null, totalBytes: effectiveSize, truncated: false, hasMore: false, content: "" };
-          }
-          // Skip continuation bytes when the caller's offset lands inside a multi-byte character.
+          const firstLine = lineMode ? startLine : reqOffset === 0 ? 1 : undefined;
+          const empty = (size: number) => {
+            log(0, reqOffset);
+            return {
+              path, offset: reqOffset, nextOffset: null, totalBytes: size, truncated: false, hasMore: false, content: "",
+              ...(lineMode ? { totalLines: totalLines ?? startLine - 1 } : {}),
+            };
+          };
+          if (reqOffset >= stat.size) return empty(stat.size);
+
+          const want = Math.min(pageBytes, stat.size - reqOffset);
+          const buf = Buffer.alloc(want);
+          const { bytesRead: count } = await file.read(buf, 0, want, reqOffset);
+          // A short read means the file ended (or was truncated) after stat; treat where it stopped as end of file.
+          const effectiveSize = count < want ? reqOffset + count : stat.size;
+          if (count === 0) return empty(effectiveSize);
+          // Skip continuation bytes when the caller's byte offset lands inside a multi-byte character.
           let skip = 0;
-          if (reqOffset > 0) {
+          if (!lineMode && reqOffset > 0) {
             const maxSkip = Math.min(3, count);
             while (skip < maxSkip && (buf[skip]! & 0xc0) === 0x80) skip++;
           }
           const alignedOffset = reqOffset + skip;
-          // Hold back a multi-byte character split by the page end; at end of file decode everything so truncation fails.
-          let validEnd = count;
-          if (reqOffset + count < effectiveSize && count > skip) {
-            for (let i = count - 1; i >= Math.max(skip, count - 3); i--) {
-              const b = buf[i]!;
-              if ((b & 0xc0) === 0x80) continue;
-              const seqLen = (b & 0xe0) === 0xc0 ? 2 : (b & 0xf0) === 0xe0 ? 3 : (b & 0xf8) === 0xf0 ? 4 : 1;
-              if (count - i < seqLen) validEnd = i;
-              break;
+
+          // End the page at end_line if reached; otherwise, when the file continues, after the last newline,
+          // or else before a multi-byte character split by the page end. At end of file decode everything so truncation fails.
+          let end = count;
+          let rangeDone = false;
+          if (endLine !== undefined) {
+            let remaining = endLine - startLine + 1;
+            let i = skip;
+            while (remaining > 0) {
+              const nl = buf.indexOf(0x0a, i);
+              if (nl === -1 || nl >= count) break;
+              remaining--;
+              i = nl + 1;
+            }
+            if (remaining === 0) {
+              end = i;
+              rangeDone = true;
             }
           }
-          const slice = buf.subarray(skip, validEnd);
+          if (!rangeDone && reqOffset + count < effectiveSize && count > skip) {
+            const nl = buf.lastIndexOf(0x0a, count - 1);
+            if (nl >= skip) {
+              end = nl + 1;
+            } else {
+              for (let i = count - 1; i >= Math.max(skip, count - 3); i--) {
+                const b = buf[i]!;
+                if ((b & 0xc0) === 0x80) continue;
+                const seqLen = (b & 0xe0) === 0xc0 ? 2 : (b & 0xf0) === 0xe0 ? 3 : (b & 0xf8) === 0xf0 ? 4 : 1;
+                if (count - i < seqLen) end = i;
+                break;
+              }
+            }
+          }
+          const slice = buf.subarray(skip, end);
           let decoded: string;
           try {
             decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: alignedOffset > 0 }).decode(slice);
@@ -2988,15 +3056,23 @@ export class DirectorRuntime {
               trimmed = content.length < decoded.length;
             }
           }
-          const contentBytes = trimmed ? (hasBom ? 3 : 0) + Buffer.byteLength(content, "utf8") : validEnd - skip;
+          if (trimmed) rangeDone = false;
+          const contentBytes = trimmed ? (hasBom ? 3 : 0) + Buffer.byteLength(content, "utf8") : end - skip;
           const next = alignedOffset + contentBytes;
           const hasMore = next < effectiveSize && next > reqOffset;
-          const nextOffset = hasMore ? next : null;
-          const readEvent: ChatControlEvent = { kind: "director.read_file", path, bytes: contentBytes, reason, ...(alignedOffset > 0 ? { offset: alignedOffset } : {}) };
-          this.chats.appendTurn(chatSessionId, "system_notice", formatChatEventSummary(readEvent), undefined, readEvent);
-          return { path, offset: alignedOffset, nextOffset, totalBytes: effectiveSize, truncated: hasMore, hasMore, content };
+          let lines: { startLine: number; endLine: number } | undefined;
+          if (firstLine !== undefined && contentBytes > 0) {
+            let newlines = 0;
+            for (let i = content.indexOf("\n"); i !== -1; i = content.indexOf("\n", i + 1)) newlines++;
+            lines = { startLine: firstLine, endLine: firstLine + newlines - (content.endsWith("\n") ? 1 : 0) };
+          }
+          log(contentBytes, alignedOffset);
+          return {
+            path, offset: alignedOffset, nextOffset: hasMore ? next : null, totalBytes: effectiveSize,
+            truncated: hasMore && !rangeDone, hasMore, content, ...lines,
+          };
         } finally {
-          closeSync(fd);
+          await file.close();
         }
       }
 

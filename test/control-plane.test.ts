@@ -26,11 +26,11 @@ async function makeTempGitRepo(): Promise<string> {
 describe("Tier role instructions", () => {
   it("directs T0 to delegate lookups and act on clear requests", () => {
     const prompt = buildDirectorSystemPrompt("off");
-    assert.match(prompt, /never edit code, run shell commands, or inspect repository files directly/i);
+    assert.match(prompt, /never edit code or run shell commands yourself/i);
     assert.match(prompt, /delegate lookups.*read-only research, plan, or verify.*spawn_task/i);
     assert.match(prompt, /concrete model from list_models/i);
     assert.match(prompt, /summary and sources via wait_tasks.*artifacts on demand/i);
-    assert.match(prompt, /read_file only as a rare logged exception.*exception_reason/i);
+    assert.match(prompt, /read files directly with read_file/i);
     assert.match(prompt, /goal_create.*commit it immediately.*clear action request/i);
     assert.match(prompt, /sensible defaults.*ask only.*ambiguous or irreversible/i);
     assert.match(prompt, /separate goals for distinct requests.*amend the relevant active goal/i);

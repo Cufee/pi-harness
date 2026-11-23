@@ -51,11 +51,13 @@ export interface CodeModeExecutorOptions {
   signal?: AbortSignal;
   defaultTimeoutMs?: number; maxTimeoutMs?: number; maxOutputChars?: number;
   onToolEvent?: (ev: CodeExecToolEvent) => void;
+  /** Allowed tools that stay directly callable in collapsed mode. */
+  directTools?: readonly string[];
 }
 
 export function createCodeModeExecutor(opts: CodeModeExecutorOptions) {
   return {
-    tools: () => exposedTools(opts.allowedTools(), opts.mode),
+    tools: () => exposedTools(opts.allowedTools(), opts.mode, opts.directTools),
     async execute(name: string, args: Record<string, unknown>): Promise<unknown> {
       if (opts.mode !== "off" && (name === CODE_EXEC_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME)) {
         return dispatch(name, args, {
