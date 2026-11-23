@@ -65,14 +65,19 @@ globalThis.output = output;
 
 const message = (err: unknown) => err instanceof Error ? err.message : String(err);
 const SANDBOX_DENIAL = /\b(EPERM|EACCES)\b|operation not permitted|PermissionError|Blocked by Code Mode sandbox/i;
-function formatScriptError(raw: string, toolNames: Iterable<string>): string {
-  if (!SANDBOX_DENIAL.test(raw)) return raw;
+function formatScriptError(raw: string, stderrTail: string, lastIpcError: string, toolNames: Iterable<string>): string {
+  // Ignore echoed script source (Bun code frames, Python traceback lines) so tokens in the code itself do not match.
+  const lines = stderrTail.split("\n");
+  const diagnostics = lines.filter((line, i) => !/^\s*\d+ \| /.test(line) && !/^\s*File ".*", line \d+/.test(lines[i - 1] ?? "")).join("\n");
+  if (!SANDBOX_DENIAL.test(diagnostics)) return raw;
+  // An uncaught harness tool rejection is not a sandbox denial, even when its message names a permission error.
+  if (lastIpcError && SANDBOX_DENIAL.test(lastIpcError) && stderrTail.includes(lastIpcError)) return raw;
   const available = new Set(toolNames);
   const readers = (["read_file", "artifact_read"] as const).filter((name) => available.has(name));
   const guidance = readers.length > 0
     ? `Read files with ${readers.join(" or ")} from "harness" and pass the data into the script.`
     : "Read files with your own file tools outside code_exec and pass the data into the script.";
-  return `${raw}\n\nHint: code_exec scripts run in an OS sandbox with no filesystem access outside their scratch directory, no subprocesses, and no network. ${guidance}`;
+  return `${raw}\n\nHint: if this failed on a direct filesystem, subprocess, or network call, code_exec runs in an OS sandbox that blocks workspace file reads, writes, subprocesses, and network outside its scratch directory. ${guidance}`;
 }
 const IPC_BYTES = 16 * 1024 * 1024;
 
@@ -92,6 +97,7 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
   const sockets = new Set<Socket>();
   const execAbort = new AbortController();
   let pending = 0, pendingBytes = 0;
+  let lastIpcError = "";
   let child: ChildProcess | undefined, dir: string | undefined, output: unknown, stopped = false;
   function kill() {
     if (child?.pid) try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
@@ -154,6 +160,7 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
         opts.onToolEvent?.({ ...event, phase: "end", ok: true, result: toolEventPreview(value) });
       } catch (e) {
         const error = message(e);
+        lastIpcError = error;
         opts.onToolEvent?.({ ...event, phase: "end", ok: false, error });
         reply({ ok: false, error });
       }
@@ -194,16 +201,17 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socket, resolve); });
     if (stopped) return result;
     child = spawn(cmd!, args, { cwd: dir, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
-    let tail = "";
+    let tail = "", stderrTail = "";
     for (const stream of [child.stdout!, child.stderr!]) {
       stream.setEncoding("utf8");
       stream.on("data", (s: string) => { result.logs += s.slice(0, Math.max(0, 8192 - result.logs.length)); tail = (tail + s).slice(-2048); });
     }
+    child.stderr!.on("data", (s: string) => { stderrTail = (stderrTail + s).slice(-2048); });
     const status = await new Promise<number | null>((resolve, reject) => { child!.once("error", reject); child!.once("close", resolve); });
     child = undefined;
     if (stopped) return result;
     clearTimeout(timer); opts.signal?.removeEventListener("abort", abort);
-    if (status !== 0) throw new Error(formatScriptError(tail.trim() || `${python ? "Python" : "Bun"} exited with status ${status}`, names));
+    if (status !== 0) throw new Error(formatScriptError(tail.trim() || `${python ? "Python" : "Bun"} exited with status ${status}`, stderrTail, lastIpcError, names));
     const json = JSON.stringify(output) ?? "";
     const limit = Math.max(0, opts.maxOutputChars ?? 20_000);
     result.preview = json.slice(0, limit);

@@ -348,7 +348,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
         exception_reason: { type: "string", minLength: 1, description: "Short purpose, recorded in the session log." },
         offset: { type: "number", description: "Byte offset to start from (default 0). Pass the previous result's nextOffset." },
         max_bytes: { type: "number", description: "Page size in bytes (default 4096, maximum 65536)." },
-        max_chars: { type: "number", description: "Optional: trim the page to at most this many characters." },
+        max_chars: { type: "number", description: "Optional: trim the page to at most this many UTF-16 characters (minimum 1; never splits a surrogate pair)." },
       },
     },
   },
@@ -2871,15 +2871,11 @@ export class DirectorRuntime {
         const relToRepo = relative(root, target);
         const inRepo = relToRepo !== ".." && !relToRepo.startsWith(`..${sep}`) && !isAbsolute(relToRepo);
         const path = inRepo ? relToRepo : target;
-        let matchedExtraRel: string | null = null;
-        for (const r of extraRoots) {
+        const inExtraRoot = extraRoots.some((r) => {
           const rel = relative(r, target);
-          if (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)) {
-            matchedExtraRel = rel;
-            break;
-          }
-        }
-        if (!inRepo && matchedExtraRel === null) {
+          return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+        });
+        if (!inRepo && !inExtraRoot) {
           throw new Error("File outside the permitted workspace or operator-granted roots (worktree.extraReadRoots / extraWriteRoots in the global config)");
         }
         if (inRepo) {
@@ -2888,8 +2884,9 @@ export class DirectorRuntime {
           if (parts.includes(".git") || (parts[0] === ".harness" && !["artifacts", "goals", "notes"].includes(parts[1] ?? ""))) {
             throw new Error("File outside the permitted workspace");
           }
-        } else if (matchedExtraRel !== null) {
-          const parts = matchedExtraRel.split(sep).map((p) => p.toLowerCase());
+        } else {
+          // Check the whole canonical path so the veto holds regardless of which grant matched or how grants nest.
+          const parts = target.split(sep).map((p) => p.toLowerCase());
           if (parts.includes(".git") || parts.some((p, i) => p === ".harness" && parts[i + 1] === "worktrees")) {
             throw new Error("File outside the permitted workspace");
           }
@@ -2909,6 +2906,13 @@ export class DirectorRuntime {
           }
           const buf = Buffer.alloc(pageBytes);
           const count = readSync(fd, buf, 0, pageBytes, reqOffset);
+          // A short read means the file ended (or was truncated) after fstat; treat where it stopped as end of file.
+          const effectiveSize = count < pageBytes ? reqOffset + count : stat.size;
+          if (count === 0) {
+            const emptyEvent: ChatControlEvent = { kind: "director.read_file", path, bytes: 0, reason, ...(reqOffset > 0 ? { offset: reqOffset } : {}) };
+            this.chats.appendTurn(chatSessionId, "system_notice", formatChatEventSummary(emptyEvent), undefined, emptyEvent);
+            return { path, offset: reqOffset, nextOffset: null, totalBytes: effectiveSize, truncated: false, hasMore: false, content: "" };
+          }
           // Skip continuation bytes when the caller's offset lands inside a multi-byte character.
           let skip = 0;
           if (reqOffset > 0) {
@@ -2918,7 +2922,7 @@ export class DirectorRuntime {
           const alignedOffset = reqOffset + skip;
           // Hold back a multi-byte character split by the page end; at end of file decode everything so truncation fails.
           let validEnd = count;
-          if (reqOffset + count < stat.size && count > skip) {
+          if (reqOffset + count < effectiveSize && count > skip) {
             for (let i = count - 1; i >= Math.max(skip, count - 3); i--) {
               const b = buf[i]!;
               if ((b & 0xc0) === 0x80) continue;
@@ -2949,11 +2953,11 @@ export class DirectorRuntime {
           }
           const contentBytes = trimmed ? (hasBom ? 3 : 0) + Buffer.byteLength(content, "utf8") : validEnd - skip;
           const next = alignedOffset + contentBytes;
-          const hasMore = next < stat.size;
+          const hasMore = next < effectiveSize && next > reqOffset;
           const nextOffset = hasMore ? next : null;
           const readEvent: ChatControlEvent = { kind: "director.read_file", path, bytes: contentBytes, reason, ...(alignedOffset > 0 ? { offset: alignedOffset } : {}) };
           this.chats.appendTurn(chatSessionId, "system_notice", formatChatEventSummary(readEvent), undefined, readEvent);
-          return { path, offset: alignedOffset, nextOffset, totalBytes: stat.size, truncated: hasMore, hasMore, content };
+          return { path, offset: alignedOffset, nextOffset, totalBytes: effectiveSize, truncated: hasMore, hasMore, content };
         } finally {
           closeSync(fd);
         }
