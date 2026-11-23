@@ -8,7 +8,7 @@ import { loadConfig } from "../src/config.js";
 import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import type { DaemonEventFrame, SessionControlPayload, SessionControlState } from "../src/protocol/daemon-rpc.js";
-import { runDirectorChatTui } from "../src/tui/app.js";
+import { runDirectorChatTui, runNativeScrollbackTui } from "../src/tui/app.js";
 import { stripTerminalSequences } from "../src/tui/core/index.js";
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
 
@@ -614,6 +614,237 @@ describe("Non-destructive session takeover and control reclaim", () => {
     await tick(30);
     assert.equal(calls.filter((c) => c.op === "chat.send").length, 0, "losing TUI must remain read-only after stale reply");
     assert.ok(writes.map(stripTerminalSequences).join("\n").includes("READ-ONLY"));
+
+    sendInput("\x1d");
+    await tuiPromise;
+  });
+
+  it("canonicalizes session aliases on local and peer session.list_messages and reports canonical delivery targets", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-harness-msg-alias-"));
+    const localState = join(root, "local");
+    const peerState = join(root, "peer");
+    const localSock = join(localState, "d.sock");
+    const peerSock = join(peerState, "d.sock");
+    mkdirSync(localState, { recursive: true });
+    mkdirSync(peerState, { recursive: true });
+
+    const localDaemon = new HarnessDaemon(withFixtureCatalog({ ...loadConfig(root), stateDir: localState, socketPath: localSock }), {
+      dbPath: join(localState, "db.sqlite"),
+      hostName: "local-box",
+    });
+    const peerDaemon = new HarnessDaemon(withFixtureCatalog({ ...loadConfig(root), stateDir: peerState, socketPath: peerSock }), {
+      dbPath: join(peerState, "db.sqlite"),
+      hostName: "peer-box",
+    });
+    await peerDaemon.start();
+    await localDaemon.start();
+    const localClient = new DaemonClient(localSock);
+    const peerClient = new DaemonClient(peerSock);
+    await localClient.connect();
+    await peerClient.connect();
+
+    try {
+      const added = await localClient.request<{ status: string }>("remote.add", {
+        name: "peer-box",
+        sshTarget: peerSock,
+        autoConnect: true,
+      });
+      assert.equal(added.status, "connected");
+      const localTarget = await localClient.request<{ session: { id: string } }>("chat.create", {
+        repoRoot: localState,
+        headless: true,
+      });
+      const peerTarget = await peerClient.request<{ session: { id: string } }>("chat.create", {
+        repoRoot: peerState,
+        headless: true,
+      });
+
+      const localAlias = localTarget.session.id.toUpperCase();
+      const localSent = await localClient.request<{ status: string; target: string }>("session.send_message", {
+        fromSessionId: "cli",
+        target: localAlias,
+        body: "hello-local-alias",
+        expectReply: false,
+      });
+      assert.equal(localSent.status, "delivered");
+      assert.equal(localSent.target, `local:${localTarget.session.id}`);
+
+      const localListed = await localClient.request<Array<{ toSessionId: string; body: string }>>("session.list_messages", {
+        sessionId: localAlias,
+      });
+      assert.equal(localListed.length, 1);
+      assert.equal(localListed[0]?.toSessionId, localTarget.session.id);
+      assert.equal(localListed[0]?.body, "hello-local-alias");
+
+      const peerAlias = peerTarget.session.id.toUpperCase();
+      const peerSent = await localClient.request<{ status: string; target: string }>("session.send_message", {
+        fromSessionId: localTarget.session.id,
+        target: `peer-box:${peerAlias}`,
+        body: "hello-peer-alias",
+        expectReply: false,
+      });
+      assert.equal(peerSent.status, "delivered");
+      assert.equal(peerSent.target, `peer-box:${peerTarget.session.id}`);
+
+      const peerListed = await localClient.request<Array<{ toSessionId: string; body: string }>>("session.list_messages", {
+        target: `peer-box:${peerAlias}`,
+      });
+      assert.equal(peerListed.length, 1);
+      assert.equal(peerListed[0]?.toSessionId, peerTarget.session.id);
+      assert.equal(peerListed[0]?.body, "hello-peer-alias");
+    } finally {
+      localClient.close();
+      peerClient.close();
+      await localDaemon.stop();
+      await peerDaemon.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("handles aliased control.sessionId on mixed-version attach and canonicalized --task aliases in run TUI", async () => {
+    let onDataCb: ((data: string) => void) | null = null;
+    const sendInput = (data: string) => onDataCb?.(data);
+    const writes: string[] = [];
+    const terminal: Terminal = {
+      columns: 100,
+      rows: 30,
+      kittyProtocolActive: false,
+      start(onData) {
+        onDataCb = onData;
+      },
+      stop() {
+        onDataCb = null;
+      },
+      async drainInput() {},
+      write(d) {
+        writes.push(d);
+      },
+      moveBy() {},
+      hideCursor() {},
+      showCursor() {},
+      clearLine() {},
+      clearFromCursor() {},
+      clearScreen() {},
+      setTitle() {},
+      setProgress() {},
+      setProgramStatus() {},
+    };
+
+    const eventListeners = new Set<(ev: DaemonEventFrame) => void>();
+    const takeCalls: Array<Record<string, unknown>> = [];
+    const emit = (ev: DaemonEventFrame) => {
+      for (const fn of eventListeners) fn(ev);
+    };
+    const mockClient = {
+      async request<T = unknown>(op: string, params: Record<string, unknown> = {}): Promise<T> {
+        if (op === "attach") {
+          // Simulate a rev-8 daemon where run.id is canonical ("run-1") while control.sessionId keeps alias ("run-01"),
+          // and task alias "T-1" normalizes to canonical "t-1".
+          return {
+            attachmentId: "att-1",
+            attached: true,
+            tookOver: false,
+            control: {
+              sessionId: "run-01",
+              kind: "run",
+              clientId: "cli-a",
+              controllerClientId: "cli-a",
+              hasControl: true,
+              controlSeq: 1,
+            },
+            run: { id: "run-1", repoRoot: "/repo", status: "active" },
+            taskId: "t-1",
+            tasks: [{ id: "t-1" }],
+            replay: [
+              {
+                seq: 1,
+                runId: "run-1",
+                taskId: "t-1",
+                type: "agent.text_delta",
+                payload: { text: "replayed-task-output" },
+                createdAt: Date.now(),
+              },
+            ],
+            throughSeq: 1,
+          } as T;
+        }
+        if (op === "session.take_control") {
+          takeCalls.push(params);
+          assert.equal(params.sessionId, "run-01");
+          return {
+            sessionId: "run-01",
+            kind: "run",
+            clientId: "cli-a",
+            controllerClientId: "cli-a",
+            hasControl: true,
+            controlSeq: 3,
+            tookOver: true,
+          } as T;
+        }
+        if (op === "work.snapshot") {
+          return { generatedAt: Date.now(), latestSeq: 1, goals: [], runs: [], escalations: [], timers: [], merges: [], worktrees: [], messages: [], inbox: [] } as T;
+        }
+        if (op === "session.leave") return { daemonWillQuit: false } as T;
+        return {} as T;
+      },
+      onEvent(fn: (ev: DaemonEventFrame) => void) {
+        eventListeners.add(fn);
+        return () => eventListeners.delete(fn);
+      },
+      onClose() {
+        return () => {};
+      },
+      close() {},
+    } as unknown as DaemonClient;
+
+    const tuiPromise = runNativeScrollbackTui({
+      client: mockClient,
+      runId: "run-01",
+      initialTaskId: "T-1",
+      terminal,
+    });
+    await tick(40);
+
+    // Live task event for canonical t-1 must also render (not be dropped because initialTaskId was T-1)
+    emit({
+      kind: "event",
+      seq: 2,
+      runId: "run-1",
+      taskId: "t-1",
+      type: "agent.text_delta",
+      payload: { text: " live-task-output" },
+      createdAt: Date.now(),
+    });
+    await tick(30);
+    const renderedEvents = writes.map(stripTerminalSequences).join("\n");
+    assert.ok(renderedEvents.includes("replayed-task-output"), "replay event for canonical t-1 should render when attached with T-1");
+    assert.ok(renderedEvents.includes("live-task-output"), "live event for canonical t-1 should render when attached with T-1");
+
+    // Ownership loss event keyed by bound alias control.sessionId ("run-01") must transition TUI to READ-ONLY
+    writes.length = 0;
+    emit({
+      kind: "event",
+      seq: 0,
+      runId: "run-01",
+      taskId: null,
+      type: "session.control_changed",
+      createdAt: Date.now(),
+      payload: {
+        sessionId: "run-01",
+        kind: "run",
+        controllerClientId: "cli-b",
+        reason: "attached",
+        controlSeq: 2,
+      },
+    });
+    await tick(30);
+    assert.ok(writes.map(stripTerminalSequences).join("\n").includes("READ-ONLY"));
+
+    // Ctrl+Y reclaim must send the bound control.sessionId ("run-01"), not run.id ("run-1")
+    sendInput("\x19");
+    await tick(30);
+    assert.equal(takeCalls.length, 1);
+    assert.equal(takeCalls[0]?.sessionId, "run-01");
 
     sendInput("\x1d");
     await tuiPromise;

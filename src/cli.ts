@@ -483,6 +483,29 @@ export async function chooseRemoteProject(
   return picked ? { kind: "chat", projectId: picked.id, repoRoot: picked.rootPath } : null;
 }
 
+export async function probeHostSwitchClient(opts: {
+  connect: () => Promise<DaemonClient>;
+  targetHostLabel: string;
+  expectedNodeId?: string | null;
+}): Promise<DaemonClient> {
+  const nextClient = await opts.connect();
+  try {
+    if (opts.expectedNodeId) {
+      const info = await nextClient.request<{ nodeId?: string }>("ping");
+      if (info.nodeId && info.nodeId !== opts.expectedNodeId) {
+        throw new Error(
+          `Remote "${opts.targetHostLabel}" resolved to node ${info.nodeId}, expected ${opts.expectedNodeId} (alias mismatch)`,
+        );
+      }
+    }
+    return nextClient;
+  } catch (err) {
+    // Never send session.leave on a failed unregistered probe; an idle auto-quit daemon on the wrong host could shut down.
+    nextClient.close();
+    throw err;
+  }
+}
+
 async function runInteractiveSessionLoop(
   initialClient: DaemonClient,
   initial: ChatStart | PickerStart | { kind: "run"; repoRoot?: string; runId: string; initialTaskId?: string | null },
@@ -578,15 +601,11 @@ async function runInteractiveSessionLoop(
         let nextClient: DaemonClient | null = null;
         try {
           if (nextHostLabel !== currentRemoteHost) {
-            nextClient = await connectClient(hostCtx.localSocketPath, nextTarget, nextBridgeCommand);
-            if (action.targetNodeId) {
-              const info = await nextClient.request<{ nodeId?: string }>("ping");
-              if (info.nodeId && info.nodeId !== action.targetNodeId) {
-                throw new Error(
-                  `Remote "${effectiveTargetHost}" resolved to node ${info.nodeId}, expected ${action.targetNodeId} (alias mismatch)`,
-                );
-              }
-            }
+            nextClient = await probeHostSwitchClient({
+              connect: () => connectClient(hostCtx.localSocketPath, nextTarget, nextBridgeCommand),
+              targetHostLabel: effectiveTargetHost,
+              expectedNodeId: action.targetNodeId,
+            });
           }
           // Cancelling the remote project picker keeps the current connection and session
           if (action.targetId === "__host__" && nextHostLabel) {
@@ -608,7 +627,7 @@ async function runInteractiveSessionLoop(
           }
         } catch (err) {
           if (nextClient) {
-            await nextClient.request("session.leave").catch(() => {});
+            // Close without session.leave; daemon disconnect cleanup releases registered sockets without stopping unregistered idle hosts.
             nextClient.close();
           }
           pendingNotice = {

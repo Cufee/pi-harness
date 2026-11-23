@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { matchesKey, type Terminal } from "@earendil-works/pi-tui";
 import type { ProjectRecord } from "../control-plane/projects.js";
 import type { EventRecord, ReplayPage, RunRecord } from "../control-plane/db.js";
+import { friendlyIdCandidates } from "../control-plane/ids.js";
 import type { DaemonClient } from "../daemon/remote.js";
 import type { ChatSessionRecord, ChatTurnRecord } from "../director/session.js";
 import { formatChatEventSummary, parseChatControlEvent, qualifyRemoteCliHints } from "../protocol/chat-events.js";
@@ -104,6 +105,8 @@ interface AttachRunResult extends ReplayPage {
   tookOver: boolean;
   control?: SessionControlState;
   run: RunRecord | null;
+  taskId?: string | null;
+  tasks?: Array<{ id: string }>;
 }
 
 interface DaemonStatusResult {
@@ -161,6 +164,7 @@ function createSharedShell(spec: SharedShellContext) {
   let busy = false;
   let phaseText = "Ready";
   let transientHint: string | null = null;
+  const controlSessionId = spec.initialControl?.sessionId ?? spec.sessionId;
   let hasControl = spec.initialControl?.hasControl ?? true;
   let controllerClientId = spec.initialControl?.controllerClientId ?? null;
   let clientId = spec.initialControl?.clientId ?? null;
@@ -532,7 +536,7 @@ function createSharedShell(spec: SharedShellContext) {
 
   const takeControl = async () => {
     try {
-      const res = await spec.client.request<SessionControlState>("session.take_control", { sessionId: spec.sessionId });
+      const res = await spec.client.request<SessionControlState>("session.take_control", { sessionId: controlSessionId });
       if (!clientId && res.clientId) clientId = res.clientId;
       applyControl(res.controllerClientId, res.controlSeq);
     } catch (err) {
@@ -1493,6 +1497,8 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     shell.setStatus(true, "Director responding...");
   }
 
+  const controlSessionId = opened.control?.sessionId ?? chatSession.id;
+
   const handleChatEvent = (ev: DaemonEventFrame) => {
     if (ev.watchId) return;
     const p = (ev.payload ?? {}) as Record<string, unknown>;
@@ -1500,7 +1506,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
 
     if (ev.type === "session.control_changed") {
       const sid = typeof p.sessionId === "string" ? p.sessionId : ev.runId;
-      if (sid && sid !== chatSession.id) return;
+      if (sid && sid !== controlSessionId && sid !== chatSession.id) return;
       shell.applyControl(
         typeof p.controllerClientId === "string" ? p.controllerClientId : null,
         typeof p.controlSeq === "number" ? p.controlSeq : undefined,
@@ -1730,6 +1736,16 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
   }
 
   const runId = attached.run?.id ?? attached.control?.sessionId ?? opts.runId;
+  const controlSessionId = attached.control?.sessionId ?? runId;
+  const requestedTaskId = opts.initialTaskId?.trim() || null;
+  const boundTaskId =
+    attached.taskId ??
+    (requestedTaskId
+      ? (() => {
+          const candidates = friendlyIdCandidates(requestedTaskId, "t");
+          return attached.tasks?.find((t) => candidates.includes(t.id))?.id ?? requestedTaskId;
+        })()
+      : null);
   const repoRoot = attached.run?.repoRoot ?? process.cwd();
   let shell!: ReturnType<typeof createSharedShell>;
 
@@ -1744,19 +1760,19 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
     runId,
     initialControl: attached.control,
     terminal: opts.terminal,
-    getRightStatus: () => `run ${runId}${opts.initialTaskId ? ` / ${opts.initialTaskId}` : ""}`,
+    getRightStatus: () => `run ${runId}${boundTaskId ? ` / ${boundTaskId}` : ""}`,
     getIdleBanner: () => `${runId} (${attached.run?.status ?? "active"}) · Ctrl+G Work · /resume · /stop`,
     onUserSubmit: async (text) => {
       shell.transcript.appendUserTurn(text);
-      if (opts.initialTaskId) {
+      if (boundTaskId) {
         const res = await opts.client.request<{ steered?: boolean }>("task.steer", {
-          taskId: opts.initialTaskId,
+          taskId: boundTaskId,
           message: text,
         });
         shell.transcript.appendReceipt({
           tone: res?.steered ? "ok" : "warn",
           tag: "steered",
-          text: res?.steered ? `Sent to ${opts.initialTaskId}` : `${opts.initialTaskId} is not actively running`,
+          text: res?.steered ? `Sent to ${boundTaskId}` : `${boundTaskId} is not actively running`,
         });
       } else {
         const res = await opts.client.request<{ resumed?: boolean; outcome?: string; message?: string; noteDelivered?: boolean } | null>(
@@ -1781,7 +1797,7 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
 
   const runRemotePrefix = opts.remoteHost ? `[REMOTE: ${opts.remoteHost}] ` : "";
   shell.transcript.appendBanner(
-    `${runRemotePrefix}Attached Run · ${runId}${opts.initialTaskId ? ` / ${opts.initialTaskId}` : ""}`,
+    `${runRemotePrefix}Attached Run · ${runId}${boundTaskId ? ` / ${boundTaskId}` : ""}`,
     attached.run?.status ?? "active",
     `Ctrl+G Work · Ctrl+T Runs · /remotes · /resume · /stop`,
   );
@@ -1802,7 +1818,7 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
   const renderEventToTranscript = (ev: EventRecord | DaemonEventFrame) => {
     if ("watchId" in ev && ev.watchId) return;
     if (ev.runId !== runId) return;
-    if (opts.initialTaskId && ev.taskId && ev.taskId !== opts.initialTaskId) return;
+    if (boundTaskId && ev.taskId && ev.taskId !== boundTaskId) return;
 
     const p = (ev.payload ?? {}) as Record<string, unknown>;
     const who = ev.taskId ?? ev.runId;
@@ -1968,7 +1984,7 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
         if (ev.type === "session.control_changed") {
           const p = (ev.payload ?? {}) as Record<string, unknown>;
           const sid = typeof p.sessionId === "string" ? p.sessionId : ev.runId;
-          if (sid && sid !== runId) return;
+          if (sid && sid !== controlSessionId && sid !== runId) return;
           shell.applyControl(
             typeof p.controllerClientId === "string" ? p.controllerClientId : null,
             typeof p.controlSeq === "number" ? p.controlSeq : undefined,
