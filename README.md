@@ -55,7 +55,17 @@ bun run src/cli.ts attach <run-id> --remote ssh://devbox
 # Inspect or clean stale worktrees
 bun run src/cli.ts worktrees list
 bun run src/cli.ts worktrees clean
+
+# Inspect the daemon and its effective settings
+bun run src/cli.ts daemon status
+
+# Resume a stopped or paused run
+bun run src/cli.ts resume <run-id> --message "continue with the review fixes"
 ```
+
+## Configuration
+
+`pi-harness` reads global settings from `~/.pi-harness/config.json` (or `$PI_HARNESS_HOME/config.json`) with an optional repository overlay in `.pi-harness.json`. Edits to the global file apply live without restarting the daemon, and `pi-harness daemon status` prints the settings in effect. See [docs/configuration.md](docs/configuration.md) for configuration keys, defaults, extra read and write roots, live reload, CLI commands, and Director tools.
 
 ## Optional Quota Endpoint Configuration (`~/.pi-harness/config.json`)
 
@@ -70,4 +80,4 @@ bun run src/cli.ts worktrees clean
 }
 ```
 
-See [`proto/quota.proto`](./proto/quota.proto) for the complete Protobuf v3 / ProtoJSON schema.
+See [`proto/quota.proto`](./proto/quota.proto) for the complete Protobuf v3 / ProtoJSON schema. Other configuration keys are documented in [docs/configuration.md](docs/configuration.md).
