@@ -164,6 +164,7 @@ function createSharedShell(spec: SharedShellContext) {
   let hasControl = spec.initialControl?.hasControl ?? true;
   let controllerClientId = spec.initialControl?.controllerClientId ?? null;
   let clientId = spec.initialControl?.clientId ?? null;
+  let lastControlSeq = spec.initialControl?.controlSeq ?? 0;
   const READ_ONLY_RECEIPT = "Read-only: take control first (Ctrl+Y or /take).";
   const queuedMessages: string[] = [];
 
@@ -493,7 +494,12 @@ function createSharedShell(spec: SharedShellContext) {
       ? phaseText
       : `READ-ONLY: ${controllerClientId ? "another terminal has control" : "no terminal has control"} · Ctrl+Y take control`;
 
-  const applyControl = (nextControllerId: string | null) => {
+  const applyControl = (nextControllerId: string | null, nextControlSeq?: number) => {
+    if (typeof nextControlSeq === "number" && Number.isFinite(nextControlSeq)) {
+      if (nextControlSeq < lastControlSeq) return;
+      if (nextControlSeq === lastControlSeq && lastControlSeq > 0) return;
+      lastControlSeq = nextControlSeq;
+    }
     const next = clientId !== null && nextControllerId === clientId;
     const changed = next !== hasControl || (!next && nextControllerId !== controllerClientId);
     hasControl = next;
@@ -528,7 +534,7 @@ function createSharedShell(spec: SharedShellContext) {
     try {
       const res = await spec.client.request<SessionControlState>("session.take_control", { sessionId: spec.sessionId });
       if (!clientId && res.clientId) clientId = res.clientId;
-      applyControl(res.controllerClientId);
+      applyControl(res.controllerClientId, res.controlSeq);
     } catch (err) {
       transcript.appendReceipt({
         tone: "danger",
@@ -1099,6 +1105,7 @@ function createSharedShell(spec: SharedShellContext) {
     openEntity,
     openWork,
     hasControl: () => hasControl,
+    clientId: () => clientId,
     applyControl,
     setStatus(nextBusy: boolean, nextPhase: string) {
       busy = nextBusy;
@@ -1494,7 +1501,10 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     if (ev.type === "session.control_changed") {
       const sid = typeof p.sessionId === "string" ? p.sessionId : ev.runId;
       if (sid && sid !== chatSession.id) return;
-      shell.applyControl(typeof p.controllerClientId === "string" ? p.controllerClientId : null);
+      shell.applyControl(
+        typeof p.controllerClientId === "string" ? p.controllerClientId : null,
+        typeof p.controlSeq === "number" ? p.controlSeq : undefined,
+      );
       return;
     }
 
@@ -1547,7 +1557,9 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       if (ev.type === "chat.steered") {
         const msg = typeof p.message === "string" ? firstLine(p.message, 80) : "";
         if (p.role === "user") {
-          if (!shell.hasControl() && typeof p.message === "string") {
+          const origin = typeof p.originClientId === "string" ? p.originClientId : null;
+          const fromOther = origin ? origin !== shell.clientId() : !shell.hasControl();
+          if (fromOther && typeof p.message === "string") {
             if (shell.transcript.freezeLiveText()) {
               turnFrozeSegments = true;
             }
@@ -1717,6 +1729,7 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
     throw err;
   }
 
+  const runId = attached.run?.id ?? attached.control?.sessionId ?? opts.runId;
   const repoRoot = attached.run?.repoRoot ?? process.cwd();
   let shell!: ReturnType<typeof createSharedShell>;
 
@@ -1727,12 +1740,12 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
     remoteSelector: opts.remoteSelector ?? null,
     localRemotes: opts.localRemotes,
     repoRoot,
-    sessionId: opts.runId,
-    runId: opts.runId,
+    sessionId: runId,
+    runId,
     initialControl: attached.control,
     terminal: opts.terminal,
-    getRightStatus: () => `run ${opts.runId}${opts.initialTaskId ? ` / ${opts.initialTaskId}` : ""}`,
-    getIdleBanner: () => `${opts.runId} (${attached.run?.status ?? "active"}) · Ctrl+G Work · /resume · /stop`,
+    getRightStatus: () => `run ${runId}${opts.initialTaskId ? ` / ${opts.initialTaskId}` : ""}`,
+    getIdleBanner: () => `${runId} (${attached.run?.status ?? "active"}) · Ctrl+G Work · /resume · /stop`,
     onUserSubmit: async (text) => {
       shell.transcript.appendUserTurn(text);
       if (opts.initialTaskId) {
@@ -1748,27 +1761,27 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
       } else {
         const res = await opts.client.request<{ resumed?: boolean; outcome?: string; message?: string; noteDelivered?: boolean } | null>(
           "run.resume",
-          { runId: opts.runId, message: text },
+          { runId, message: text },
         );
         // Report what the daemon did: an already-completed or no-op resume does not deliver the guidance.
         if (res?.resumed || res?.outcome === "resumed" || res?.noteDelivered) {
-          shell.transcript.appendReceipt({ tone: "ok", tag: "run", text: `Sent guidance to ${opts.runId}` });
+          shell.transcript.appendReceipt({ tone: "ok", tag: "run", text: `Sent guidance to ${runId}` });
         } else {
-          const receipt = resumeReceipt(res, opts.runId, opts.remoteSelector ?? opts.remoteHost);
+          const receipt = resumeReceipt(res, runId, opts.remoteSelector ?? opts.remoteHost);
           shell.transcript.appendReceipt({ ...receipt, tag: "run", text: `Guidance not delivered: ${receipt.text}` });
         }
       }
       shell.session.tui.requestRender();
     },
     onCancelActiveTurn: async () => {
-      await opts.client.request("run.stop", { runId: opts.runId, reason: "Stopped from TUI" }).catch(() => {});
+      await opts.client.request("run.stop", { runId, reason: "Stopped from TUI" }).catch(() => {});
       return true;
     },
   });
 
   const runRemotePrefix = opts.remoteHost ? `[REMOTE: ${opts.remoteHost}] ` : "";
   shell.transcript.appendBanner(
-    `${runRemotePrefix}Attached Run · ${opts.runId}${opts.initialTaskId ? ` / ${opts.initialTaskId}` : ""}`,
+    `${runRemotePrefix}Attached Run · ${runId}${opts.initialTaskId ? ` / ${opts.initialTaskId}` : ""}`,
     attached.run?.status ?? "active",
     `Ctrl+G Work · Ctrl+T Runs · /remotes · /resume · /stop`,
   );
@@ -1788,7 +1801,7 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
 
   const renderEventToTranscript = (ev: EventRecord | DaemonEventFrame) => {
     if ("watchId" in ev && ev.watchId) return;
-    if (ev.runId !== opts.runId) return;
+    if (ev.runId !== runId) return;
     if (opts.initialTaskId && ev.taskId && ev.taskId !== opts.initialTaskId) return;
 
     const p = (ev.payload ?? {}) as Record<string, unknown>;
@@ -1955,8 +1968,11 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
         if (ev.type === "session.control_changed") {
           const p = (ev.payload ?? {}) as Record<string, unknown>;
           const sid = typeof p.sessionId === "string" ? p.sessionId : ev.runId;
-          if (sid && sid !== opts.runId) return;
-          shell.applyControl(typeof p.controllerClientId === "string" ? p.controllerClientId : null);
+          if (sid && sid !== runId) return;
+          shell.applyControl(
+            typeof p.controllerClientId === "string" ? p.controllerClientId : null,
+            typeof p.controlSeq === "number" ? p.controlSeq : undefined,
+          );
           return;
         }
         renderEventToTranscript(ev);

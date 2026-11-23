@@ -4,6 +4,7 @@ import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readSync, realpa
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Terminal } from "@earendil-works/pi-tui";
 import { ControlPlaneDb, type EscalationRecord } from "./control-plane/db.js";
 import { findProjectContainingPath, type ProjectBrowseResult, type ProjectSummary } from "./control-plane/projects.js";
 import { ensureTempDir, loadConfig, type AcpProfileConfig } from "./config.js";
@@ -462,13 +463,23 @@ export function resolveLocalStartup(input: {
 }
 
 /**
- * Lets the user pick one of the daemon host's own projects. Falls back to the most recent project
- * when none are registered; resolves to `null` when the picker is cancelled.
+ * Lets the user pick one of the daemon host's own projects. Always opens the picker
+ * (even when empty so the user can add or browse); resolves to `null` when cancelled.
  */
-async function chooseRemoteProject(client: DaemonClient, hostLabel: string | null): Promise<ChatStart | null> {
+export async function chooseRemoteProject(
+  client: DaemonClient,
+  hostLabel: string | null,
+  opts?: { terminal?: Terminal },
+): Promise<ChatStart | null> {
+  await client.request("tui.register").catch(() => {});
   const projects = await client.request<FederatedProjectSummary[]>("project.list", { includeRemotes: false });
-  if (projects.length === 0) return { kind: "chat", preferLastProject: true };
-  const picked = await pickProjectTui({ client, currentHost: hostLabel, initialProjects: projects, includeRemotes: false });
+  const picked = await pickProjectTui({
+    client,
+    currentHost: hostLabel,
+    initialProjects: projects,
+    includeRemotes: false,
+    ...(opts?.terminal ? { terminal: opts.terminal } : {}),
+  });
   return picked ? { kind: "chat", projectId: picked.id, repoRoot: picked.rootPath } : null;
 }
 
@@ -496,13 +507,17 @@ async function runInteractiveSessionLoop(
       pendingNotice = null;
       let action: TuiExitAction;
       if (current.kind === "picker") {
+        await client.request("tui.register").catch(() => {});
         const picked = await pickProjectTui({
           client,
           currentHost: currentRemoteHost,
           includeRemotes: !currentRemoteHost,
           initialNotice: noticeForTurn,
         });
-        if (!picked) return;
+        if (!picked) {
+          await client.request("session.leave").catch(() => {});
+          return;
+        }
         const pickedHost = picked.host && picked.host !== "local" ? picked.host : undefined;
         action = {
           kind: "switch",
@@ -577,18 +592,25 @@ async function runInteractiveSessionLoop(
           if (action.targetId === "__host__" && nextHostLabel) {
             hostStart = await chooseRemoteProject(nextClient ?? client, nextHostLabel);
             if (!hostStart) {
-              nextClient?.close();
+              if (nextClient) {
+                await nextClient.request("session.leave").catch(() => {});
+                nextClient.close();
+              }
               continue;
             }
           }
           if (nextClient) {
+            await client.request("session.leave").catch(() => {});
             client.close();
             client = nextClient;
             currentRemoteHost = nextHostLabel;
             currentRemoteSelector = nextHostLabel;
           }
         } catch (err) {
-          nextClient?.close();
+          if (nextClient) {
+            await nextClient.request("session.leave").catch(() => {});
+            nextClient.close();
+          }
           pendingNotice = {
             tone: "danger",
             text: `Failed to connect to "${effectiveTargetHost}": ${err instanceof Error ? err.message : String(err)}`,
@@ -709,10 +731,12 @@ async function main(): Promise<void> {
         try {
           picked = await chooseRemoteProject(client, remoteSpec.hostLabel);
         } catch (err) {
+          await client.request("session.leave").catch(() => {});
           client.close();
           throw err;
         }
         if (!picked) {
+          await client.request("session.leave").catch(() => {});
           client.close();
           return;
         }
