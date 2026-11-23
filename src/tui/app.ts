@@ -201,6 +201,9 @@ function createSharedShell(spec: SharedShellContext) {
   });
 
   const transcript = new ImmutableTranscript(theme);
+  const appendLiveReceipt = (opts: Parameters<ImmutableTranscript["appendReceipt"]>[0]) => {
+    transcript.appendReceipt(spec.mode === "chat" ? { timestampMs: Date.now(), ...opts } : opts);
+  };
   navigator = new Navigator(session.tui, session.terminal, theme, {
     onChange: () => {
       if (!navigator.isOpen) {
@@ -312,7 +315,7 @@ function createSharedShell(spec: SharedShellContext) {
         currentEffort: cur.effort,
         onSelected: (sel) => {
           void spec.onModelUpdated?.(sel).catch((err) => {
-            transcript.appendReceipt({
+            appendLiveReceipt({
               tone: "danger",
               tag: "model",
               text: err instanceof Error ? err.message : String(err),
@@ -334,7 +337,7 @@ function createSharedShell(spec: SharedShellContext) {
         modelLabel: label,
         onSelected: (effort) => {
           void spec.onEffortUpdated?.(effort).catch((err) => {
-            transcript.appendReceipt({
+            appendLiveReceipt({
               tone: "danger",
               tag: "effort",
               text: err instanceof Error ? err.message : String(err),
@@ -404,7 +407,7 @@ function createSharedShell(spec: SharedShellContext) {
       if (chatsCancelled > 0) summaryParts.push(`${chatsCancelled} chat turn(s)`);
       if (reviewsCancelled > 0) summaryParts.push(`${reviewsCancelled} review(s)`);
       if (timersCancelled > 0) summaryParts.push(`${timersCancelled} pending resume timer(s)`);
-      transcript.appendReceipt({
+      appendLiveReceipt({
         glyph: theme.glyphs.cross,
         tone: "warn",
         tag: "stop",
@@ -415,7 +418,7 @@ function createSharedShell(spec: SharedShellContext) {
       });
       await store.refresh();
     } catch (err) {
-      transcript.appendReceipt({
+      appendLiveReceipt({
         glyph: theme.glyphs.cross,
         tone: "danger",
         tag: "stop",
@@ -476,7 +479,7 @@ function createSharedShell(spec: SharedShellContext) {
             name: addMatch[2]?.trim() || undefined,
             createDir: true,
           });
-          transcript.appendReceipt({
+          appendLiveReceipt({
             glyph: theme.glyphs.check,
             tone: "ok",
             tag: "project",
@@ -531,7 +534,7 @@ function createSharedShell(spec: SharedShellContext) {
         const parts = sub.split(/\s+/);
         const verb = parts[0]!.toLowerCase();
         if (spec.remoteHost && ["add", "connect", "disconnect", "rm", "remove"].includes(verb)) {
-          transcript.appendReceipt({
+          appendLiveReceipt({
             tone: "warn",
             tag: "remote",
             text: `Switch to local (/remotes use local) before running /remotes ${verb}`,
@@ -547,7 +550,7 @@ function createSharedShell(spec: SharedShellContext) {
             ...(bridgeRest.length > 0 ? { bridgeCommand: bridgeRest.join(" ") } : {}),
             autoConnect: true,
           });
-          transcript.appendReceipt({
+          appendLiveReceipt({
             tone: added.status === "connected" ? "ok" : "warn",
             tag: "remote",
             text:
@@ -560,13 +563,13 @@ function createSharedShell(spec: SharedShellContext) {
         }
         if ((verb === "connect" || verb === "disconnect") && parts[1]) {
           const st = await spec.client.request<{ name: string; status: string }>(`remote.${verb}`, { name: parts[1] });
-          transcript.appendReceipt({ tone: st.status === "connected" ? "ok" : "info", tag: "remote", text: `${st.name}: ${st.status}` });
+          appendLiveReceipt({ tone: st.status === "connected" ? "ok" : "info", tag: "remote", text: `${st.name}: ${st.status}` });
           session.tui.requestRender();
           return true;
         }
         if ((verb === "rm" || verb === "remove") && parts[1]) {
           await spec.client.request("remote.remove", { name: parts[1] });
-          transcript.appendReceipt({ tone: "warn", tag: "remote", text: `Removed remote "${parts[1]}"` });
+          appendLiveReceipt({ tone: "warn", tag: "remote", text: `Removed remote "${parts[1]}"` });
           session.tui.requestRender();
           return true;
         }
@@ -583,7 +586,7 @@ function createSharedShell(spec: SharedShellContext) {
       case "send": {
         const m = parsed.args.match(/^(\S+)\s+([\s\S]+)$/);
         if (!m) {
-          transcript.appendReceipt({ tone: "warn", tag: "send", text: "Usage: /send <host:chat-id|chat-id> <message>" });
+          appendLiveReceipt({ tone: "warn", tag: "send", text: "Usage: /send <host:chat-id|chat-id> <message>" });
         } else {
           const res = await spec.client.request<{ target: string; status: string; woke?: boolean; note?: string }>(
             "session.send_message",
@@ -594,7 +597,7 @@ function createSharedShell(spec: SharedShellContext) {
               expectReply: true,
             },
           );
-          transcript.appendReceipt({
+          appendLiveReceipt({
             tone: res.status === "delivered" ? "ok" : "warn",
             tag: "peer",
             text:
@@ -642,7 +645,7 @@ function createSharedShell(spec: SharedShellContext) {
           try {
             await spec.onEffortUpdated(parsed.args);
           } catch (err) {
-            transcript.appendReceipt({
+            appendLiveReceipt({
               tone: "danger",
               tag: "effort",
               text: err instanceof Error ? err.message : String(err),
@@ -664,7 +667,7 @@ function createSharedShell(spec: SharedShellContext) {
         if (parsed.args) {
           const targetId = parsed.args.trim();
           if (targetId === spec.sessionId) {
-            transcript.appendReceipt({ tone: "info", tag: "sessions", text: `Already attached to ${targetId}` });
+            appendLiveReceipt({ tone: "info", tag: "sessions", text: `Already attached to ${targetId}` });
             session.tui.requestRender();
             return true;
           }
@@ -710,13 +713,13 @@ function createSharedShell(spec: SharedShellContext) {
         const daemonLine = daemonSt
           ? `daemon PID ${daemonSt.pid} (up ${formatDuration(daemonSt.uptimeMs)}) · CLIs: ${enabledClis.join(", ") || "none"}`
           : "daemon connected";
-        transcript.appendReceipt({
+        appendLiveReceipt({
           glyph: theme.glyphs.diamond,
           tone: "info",
           tag: "daemon",
           text: `${daemonLine} · model: ${modelStr}`,
         });
-        transcript.appendReceipt({
+        appendLiveReceipt({
           glyph: theme.glyphs.bullet,
           tone: unresolvedEsc > 0 ? "warn" : "info",
           tag: "work",
@@ -728,14 +731,14 @@ function createSharedShell(spec: SharedShellContext) {
       case "steer": {
         const m = parsed.args.match(/^(\S+)\s+([\s\S]+)$/);
         if (!m) {
-          transcript.appendReceipt({ tone: "warn", tag: "steer", text: "Usage: /steer <task-id> <message>" });
+          appendLiveReceipt({ tone: "warn", tag: "steer", text: "Usage: /steer <task-id> <message>" });
         } else {
           try {
             const res = await spec.client.request<{ steered?: boolean }>("task.steer", {
               taskId: m[1],
               message: m[2],
             });
-            transcript.appendReceipt({
+            appendLiveReceipt({
               tone: res?.steered ? "ok" : "warn",
               tag: "steer",
               text: res?.steered
@@ -743,7 +746,7 @@ function createSharedShell(spec: SharedShellContext) {
                 : `${m[1]} is not actively running (steer not delivered)`,
             });
           } catch (err) {
-            transcript.appendReceipt({
+            appendLiveReceipt({
               tone: "danger",
               tag: "steer",
               text: err instanceof Error ? err.message : String(err),
@@ -763,20 +766,20 @@ function createSharedShell(spec: SharedShellContext) {
           if (inMatch) {
             const delayMs = parseDurationMs(inMatch[1]!);
             if (!delayMs) {
-              transcript.appendReceipt({ tone: "warn", tag: "resume", text: `Invalid duration: ${inMatch[1]}` });
+              appendLiveReceipt({ tone: "warn", tag: "resume", text: `Invalid duration: ${inMatch[1]}` });
             } else {
               await spec.client.request("run.schedule_resume", { runId: spec.runId, delayMs });
-              transcript.appendReceipt({ tone: "ok", tag: "resume", text: `Scheduled resume in ${formatDuration(delayMs)}` });
+              appendLiveReceipt({ tone: "ok", tag: "resume", text: `Scheduled resume in ${formatDuration(delayMs)}` });
             }
           } else {
             const res = await spec.client.request<{ resumed?: boolean; outcome?: string; message?: string } | null>("run.resume", {
               runId: spec.runId,
               message: parsed.args || undefined,
             });
-            transcript.appendReceipt({ ...resumeReceipt(res, spec.runId, spec.remoteSelector ?? spec.remoteHost), tag: "resume" });
+            appendLiveReceipt({ ...resumeReceipt(res, spec.runId, spec.remoteSelector ?? spec.remoteHost), tag: "resume" });
           }
         } catch (err) {
-          transcript.appendReceipt({
+          appendLiveReceipt({
             tone: "danger",
             tag: "resume",
             text: err instanceof Error ? err.message : String(err),
@@ -799,7 +802,7 @@ function createSharedShell(spec: SharedShellContext) {
         void session.stop();
         return true;
       default:
-        transcript.appendReceipt({ tone: "warn", tag: "cmd", text: `Unknown command /${parsed.name}. Try /help.` });
+        appendLiveReceipt({ tone: "warn", tag: "cmd", text: `Unknown command /${parsed.name}. Try /help.` });
         session.tui.requestRender();
         return true;
     }
@@ -828,7 +831,7 @@ function createSharedShell(spec: SharedShellContext) {
       if (!text) return;
       if (text.startsWith("/")) {
         void handleSlash(text).catch((err) => {
-          transcript.appendReceipt({
+          appendLiveReceipt({
             tone: "danger",
             tag: "cmd",
             text: err instanceof Error ? err.message : String(err),
@@ -838,7 +841,7 @@ function createSharedShell(spec: SharedShellContext) {
         return;
       }
       void spec.onUserSubmit(text).catch((err) => {
-        transcript.appendReceipt({
+        appendLiveReceipt({
           tone: "danger",
           tag: "error",
           text: err instanceof Error ? err.message : String(err),
@@ -942,7 +945,7 @@ function createSharedShell(spec: SharedShellContext) {
         queuedMessages.push(draft);
         dock.editor.setText("");
         dock.editor.clearUndoHistory();
-        transcript.appendReceipt({
+        appendLiveReceipt({
           tone: "info",
           tag: "queued",
           text: `Queued (${queuedMessages.length}): ${firstLine(draft, 80)} — Ctrl+R to recall`,
@@ -1027,6 +1030,10 @@ async function loadAllChatHistory(client: DaemonClient, opened: ChatOpenResult):
   return all;
 }
 
+function sourceTimestampMs(raw: unknown): number | null {
+  return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : null;
+}
+
 export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<TuiExitAction> {
   // Register event listener BEFORE chat.open so zero early frames are missed during handshake/pagination!
   const earlyBuffer: DaemonEventFrame[] = [];
@@ -1069,7 +1076,10 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
 
   let shell!: ReturnType<typeof createSharedShell>;
 
-  const settleTurn = (turnId: string | null, optsSettle: { finalText?: string; error?: string; cancelled?: boolean }) => {
+  const settleTurn = (
+    turnId: string | null,
+    optsSettle: { finalText?: string; error?: string; cancelled?: boolean; timestampMs?: number | null },
+  ) => {
     if (turnId) {
       if (settledTurns.has(turnId)) return;
       settledTurns.add(turnId);
@@ -1097,9 +1107,12 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     frozenSegments = 0;
     void frozenSegments;
 
+    const settleTs = sourceTimestampMs(optsSettle.timestampMs);
+    const assistantTs = snap.textTimestampMs ?? settleTs;
+
     // Append assistant turn BEFORE tool/error receipts so live tail freezes in place with zero scrollback wipe
     if (finalText.trim()) {
-      shell.transcript.appendAssistantTurn(finalText, snap.modelLabel ?? modelBadge());
+      shell.transcript.appendAssistantTurn(finalText, snap.modelLabel ?? modelBadge(), assistantTs);
     }
     if (snap.tools.length > 0) {
       const ref: EntityRef = {
@@ -1115,6 +1128,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         tag: "tools",
         text: `${snap.tools.length} call(s): ${snap.tools.map((t) => t.label).join(", ")}`,
         ref,
+        timestampMs: settleTs,
       });
     }
     if (optsSettle.error) {
@@ -1123,6 +1137,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         tone: "danger",
         tag: "error",
         text: optsSettle.error,
+        timestampMs: settleTs,
       });
     } else if (optsSettle.cancelled) {
       shell.transcript.appendReceipt({
@@ -1130,6 +1145,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         tone: "warn",
         tag: "cancelled",
         text: "Turn cancelled.",
+        timestampMs: settleTs,
       });
     }
 
@@ -1151,11 +1167,17 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
             message: text,
           });
           if (res?.steered) {
-            if (shell.transcript.freezeLiveText()) {
+            const steeredAt = Date.now();
+            if (shell.transcript.freezeLiveText(steeredAt)) {
               turnFrozeSegments = true;
             }
-            shell.transcript.appendUserTurn(text);
-            shell.transcript.appendReceipt({ tone: "info", tag: "steered", text: "Delivered live steering to Director" });
+            shell.transcript.appendUserTurn(text, steeredAt);
+            shell.transcript.appendReceipt({
+              tone: "info",
+              tag: "steered",
+              text: "Delivered live steering to Director",
+              timestampMs: steeredAt,
+            });
             shell.session.tui.requestRender();
             return;
           }
@@ -1168,6 +1190,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         tone: "info",
         tag: "queued",
         text: `Queued (${shell.queuedMessages.length}): ${firstLine(text, 80)}`,
+        timestampMs: Date.now(),
       });
       shell.syncDock();
       // If the active turn ended or cancelled while `chat.steer` was in flight, drain immediately!
@@ -1180,7 +1203,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     frozenTextSet.clear();
     const turnId = `turn-${randomUUID().slice(0, 8)}`;
     activeTurnId = turnId;
-    shell.transcript.appendUserTurn(text);
+    shell.transcript.appendUserTurn(text, Date.now());
     shell.transcript.liveTail.begin(modelBadge());
     shell.setStatus(true, "Director thinking...");
 
@@ -1199,12 +1222,13 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
           tone: "info",
           tag: "queued",
           text: `Director busy with background wake — queued: ${firstLine(text, 80)}`,
+          timestampMs: Date.now(),
         });
         shell.syncDock();
         return;
       }
       // Idempotent settlement: if `chat.turn.end` already settled this turn, this is a safe no-op
-      settleTurn(turnId, { error: msg });
+      settleTurn(turnId, { error: msg, timestampMs: Date.now() });
     }
   };
 
@@ -1240,6 +1264,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         tone: "ok",
         tag: "project",
         text: `Switched ${chatSession.id} → ${project.name} (${project.rootPath})`,
+        timestampMs: Date.now(),
       });
       shell.syncDock();
     },
@@ -1276,6 +1301,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         tone: "ok",
         tag: "model",
         text: `Switched to ${sel.profileId} / ${sel.model ?? "CLI default"}${sel.effort ? ` (${sel.effort})` : ""}`,
+        timestampMs: Date.now(),
       });
       shell.syncDock();
     },
@@ -1291,6 +1317,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         tone: "ok",
         tag: "effort",
         text: `Reasoning effort set to ${effort} (${modelBadge()})`,
+        timestampMs: Date.now(),
       });
       shell.syncDock();
     },
@@ -1308,18 +1335,19 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     shell.transcript.appendReceipt({ tone: opts.initialNotice.tone, tag: "host", text: opts.initialNotice.text });
   }
 
-  // Hydrate ALL paginated chat history cleanly as immutable blocks
+  // Hydrate ALL paginated chat history cleanly as immutable blocks (preserving source timestamps; undated rows never stamped now)
   for (const turn of fullHistory) {
+    const turnTs = sourceTimestampMs(turn.createdAt);
     if (turn.role === "user") {
-      shell.transcript.appendUserTurn(turn.content);
+      shell.transcript.appendUserTurn(turn.content, turnTs);
     } else if (turn.role === "assistant") {
-      shell.transcript.appendAssistantTurn(turn.content);
+      shell.transcript.appendAssistantTurn(turn.content, undefined, turnTs);
     } else if (turn.role === "tool_output") {
       const display = parseToolDisplay(turn.display);
       if (display) {
-        shell.transcript.appendToolOutput(display);
+        shell.transcript.appendToolOutput(display, turnTs);
       } else {
-        shell.transcript.appendToolOutputNote(turn.content || turn.toolName || "tool output");
+        shell.transcript.appendToolOutputNote(turn.content || turn.toolName || "tool output", turnTs);
       }
     } else if (turn.role === "system_notice") {
       const parsed = turn.event ? parseChatControlEvent(turn.event) : null;
@@ -1334,6 +1362,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         tag: parsed?.kind ?? "notice",
         text: summary,
         ref,
+        timestampMs: turnTs,
       });
     }
   }
@@ -1350,6 +1379,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   const handleChatEvent = (ev: DaemonEventFrame) => {
     if (ev.watchId) return;
     const p = (ev.payload ?? {}) as Record<string, unknown>;
+    const evTs = sourceTimestampMs(ev.createdAt);
 
     if (ev.type === "session.taken_over") {
       const sid = typeof p.sessionId === "string" ? p.sessionId : ev.runId;
@@ -1358,6 +1388,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         tone: "warn",
         tag: "session",
         text: "Another client took over this session — detaching.",
+        timestampMs: evTs,
       });
       void shell.session.stop();
       return;
@@ -1373,6 +1404,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         tone: tripped ? "warn" : "info",
         tag: tripped ? "peer-paused" : "peer",
         text: `${fromHost}:${fromSid}${fromProj}: ${bodyText}${tripped ? " (auto-wakeup paused by hop breaker)" : ""}`,
+        timestampMs: evTs,
       });
       shell.session.tui.requestRender();
       return;
@@ -1399,7 +1431,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       if (ev.type === "chat.delta") {
         const delta = String(p.delta ?? "");
         if (delta) {
-          shell.transcript.liveTail.appendText(delta);
+          shell.transcript.liveTail.appendText(delta, evTs);
           shell.session.tui.requestRender();
         }
         return;
@@ -1409,11 +1441,11 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         const msg = typeof p.message === "string" ? firstLine(p.message, 80) : "";
         if (p.role !== "user" && msg) {
           const prevSnap = shell.transcript.liveTail.snapshot().text.trim();
-          if (shell.transcript.freezeLiveText()) {
+          if (shell.transcript.freezeLiveText(evTs)) {
             turnFrozeSegments = true;
             if (prevSnap) frozenTextSet.add(prevSnap);
           }
-          shell.transcript.appendReceipt({ tone: "info", tag: "steer", text: msg });
+          shell.transcript.appendReceipt({ tone: "info", tag: "steer", text: msg, timestampMs: evTs });
           shell.session.tui.requestRender();
         }
         return;
@@ -1428,7 +1460,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
             turnFrozeSegments = true;
             frozenTextSet.add(prevSnap);
           }
-          shell.transcript.appendToolOutput(display);
+          shell.transcript.appendToolOutput(display, evTs);
           shell.session.tui.requestRender();
           return;
         }
@@ -1443,7 +1475,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
               ? "error"
               : "running";
         const detail = typeof p.summary === "string" ? p.summary : undefined;
-        shell.transcript.liveTail.upsertTool({ id, label, status, detail });
+        shell.transcript.liveTail.upsertTool({ id, label, status, detail }, evTs);
         if (status !== "running") {
           shell.recordRef({
             kind: "tool_call",
@@ -1462,6 +1494,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
           finalText: assistantTurn?.content,
           error: typeof p.error === "string" && p.error ? p.error : undefined,
           cancelled: Boolean(p.cancelled),
+          timestampMs: sourceTimestampMs(assistantTurn?.createdAt) ?? evTs,
         });
         return;
       }
@@ -1486,6 +1519,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         tag: `${sev} ${escId || "escalation"}`,
         text: title,
         ref: escId ? ref : undefined,
+        timestampMs: evTs,
       });
       shell.session.tui.requestRender();
       return;
@@ -1505,6 +1539,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         tag: goalId || ev.type,
         text: summary,
         ref,
+        timestampMs: evTs,
       });
       shell.session.tui.requestRender();
       return;
@@ -1521,6 +1556,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         tag: ev.type.replace(/^quota\./, "quota:"),
         text: `${ev.runId ? `${ev.runId}: ` : ""}${reason}${wake}`,
         ref,
+        timestampMs: evTs,
       });
       shell.session.tui.requestRender();
     }

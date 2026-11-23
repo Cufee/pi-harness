@@ -42,6 +42,57 @@ export interface LiveToolPill {
   detail?: string;
 }
 
+const TIMESTAMP_GROUP_GAP_MS = 5 * 60_000;
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] as const;
+
+function normalizeTimestampMs(ts: number | null | undefined): number | null {
+  if (typeof ts !== "number" || !Number.isFinite(ts) || ts <= 0) return null;
+  return Math.floor(ts);
+}
+
+function isSameLocalDay(aMs: number, bMs: number): boolean {
+  const a = new Date(aMs);
+  const b = new Date(bMs);
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}
+
+function formatLocalClockMinute(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function formatGroupedTimestampLabel(tsMs: number, prevTsMs: number | null, sep: string): string | null {
+  if (prevTsMs === null || !isSameLocalDay(prevTsMs, tsMs)) {
+    const d = new Date(tsMs);
+    return `${WEEKDAYS[d.getDay()]}, ${MONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()} ${sep} ${formatLocalClockMinute(d)}`;
+  }
+  if (Math.abs(tsMs - prevTsMs) >= TIMESTAMP_GROUP_GAP_MS) {
+    return formatLocalClockMinute(new Date(tsMs));
+  }
+  return null;
+}
+
+function renderTimestampDivider(label: string, width: number, theme: Theme): string {
+  const w = Math.max(1, Math.floor(width));
+  const g = theme.glyphs;
+  const clean = sanitizeLine(label);
+  const text = ` ${clean} `;
+  const textW = visibleWidth(text);
+  if (w < textW + 6) {
+    return clamp(` ${theme.muted(clean)}`, w);
+  }
+  const available = w - 2 - textW;
+  const leftLen = Math.floor(available / 2);
+  const rightLen = available - leftLen;
+  const line = ` ${theme.border(g.barH.repeat(leftLen))}${theme.muted(text)}${theme.border(g.barH.repeat(rightLen))} `;
+  return clamp(line, w);
+}
+
 /**
  * Strictly-bottom-only streaming tail for the active assistant turn.
  * Renders only while a turn is live; when the turn finishes, its final content is frozen into
@@ -53,8 +104,13 @@ export class LiveTurnTail implements Component {
   private tools: LiveToolPill[] = [];
   private active = false;
   private modelLabel: string | undefined;
+  private textTimestampMs: number | null = null;
+  private activityTimestampMs: number | null = null;
 
-  constructor(private readonly theme: Theme) {}
+  constructor(
+    private readonly theme: Theme,
+    private readonly resolveDividerLabel?: (tsMs: number | null) => string | null,
+  ) {}
 
   begin(modelLabel?: string): void {
     this.active = true;
@@ -62,27 +118,43 @@ export class LiveTurnTail implements Component {
     this.thought = "";
     this.tools = [];
     this.modelLabel = modelLabel;
+    this.textTimestampMs = null;
+    this.activityTimestampMs = null;
   }
 
-  appendText(delta: string): void {
+  appendText(delta: string, timestampMs?: number | null): void {
     this.active = true;
     this.text += delta;
+    const ts = normalizeTimestampMs(timestampMs);
+    if (ts !== null && this.textTimestampMs === null && this.text.trim()) {
+      this.textTimestampMs = ts;
+    }
   }
 
-  appendThought(delta: string): void {
+  appendThought(delta: string, timestampMs?: number | null): void {
     this.active = true;
     this.thought += delta;
+    const ts = normalizeTimestampMs(timestampMs);
+    if (ts !== null) this.activityTimestampMs = ts;
   }
 
-  upsertTool(pill: LiveToolPill): void {
+  upsertTool(pill: LiveToolPill, timestampMs?: number | null): void {
     this.active = true;
     const idx = this.tools.findIndex((t) => t.id === pill.id);
     if (idx >= 0) this.tools[idx] = pill;
     else this.tools.push(pill);
+    const ts = normalizeTimestampMs(timestampMs);
+    if (ts !== null) this.activityTimestampMs = ts;
   }
 
-  snapshot(): { text: string; thought: string; tools: LiveToolPill[]; modelLabel?: string } {
-    return { text: this.text, thought: this.thought, tools: [...this.tools], modelLabel: this.modelLabel };
+  snapshot(): { text: string; thought: string; tools: LiveToolPill[]; modelLabel?: string; textTimestampMs: number | null } {
+    return {
+      text: this.text,
+      thought: this.thought,
+      tools: [...this.tools],
+      modelLabel: this.modelLabel,
+      textTimestampMs: this.textTimestampMs,
+    };
   }
 
   clear(): void {
@@ -91,6 +163,8 @@ export class LiveTurnTail implements Component {
     this.thought = "";
     this.tools = [];
     this.modelLabel = undefined;
+    this.textTimestampMs = null;
+    this.activityTimestampMs = null;
   }
 
   get isActive(): boolean {
@@ -131,17 +205,29 @@ export class LiveTurnTail implements Component {
       out.push(clamp(`  ${prefix}${parts.join(this.theme.muted(` ${g.sep} `))}`, w));
     }
 
+    if (out.length === 0) return [];
+
+    const effectiveTs = this.text.trim() ? this.textTimestampMs : this.activityTimestampMs;
+    const label = this.resolveDividerLabel?.(effectiveTs) ?? null;
+    if (label) {
+      out.unshift("", renderTimestampDivider(label, w, this.theme));
+    }
+
     return out;
   }
 
-  /** Consumes and returns accumulated live text (preserving active state/tools/model for continued streaming). */
-  takeText(): { text: string; modelLabel: string } {
+  /** Consumes and returns accumulated live text (preserving active state/tools/model when no text was taken). */
+  takeText(): { text: string; modelLabel: string; timestampMs: number | null } {
     const text = this.text;
-    const modelLabel = this.modelLabel ?? "";
+    const hasText = Boolean(text.trim());
+    const modelLabel = hasText ? (this.modelLabel ?? "") : "";
+    const timestampMs = this.textTimestampMs;
     this.text = "";
     this.thought = "";
-    this.modelLabel = undefined;
-    return { text, modelLabel };
+    if (hasText) this.modelLabel = undefined;
+    this.textTimestampMs = null;
+    this.activityTimestampMs = null;
+    return { text, modelLabel, timestampMs };
   }
 
   invalidate(): void {}
@@ -153,12 +239,31 @@ export class LiveTurnTail implements Component {
 export class ImmutableTranscript extends Container {
   readonly liveTail: LiveTurnTail;
   private readonly frozenContainer = new Container();
+  private lastTimestampMs: number | null = null;
 
   constructor(private readonly theme: Theme) {
     super();
-    this.liveTail = new LiveTurnTail(theme);
+    this.liveTail = new LiveTurnTail(theme, (tsMs) => this.computeTimestampLabel(tsMs));
     this.addChild(this.frozenContainer);
     this.addChild(this.liveTail);
+  }
+
+  private computeTimestampLabel(tsMs: number | null | undefined): string | null {
+    const ts = normalizeTimestampMs(tsMs);
+    if (ts === null) return null;
+    return formatGroupedTimestampLabel(ts, this.lastTimestampMs, this.theme.glyphs.sep);
+  }
+
+  private maybeAppendTimestampDivider(timestampMs?: number | null): void {
+    const ts = normalizeTimestampMs(timestampMs);
+    if (ts === null) return;
+    const label = formatGroupedTimestampLabel(ts, this.lastTimestampMs, this.theme.glyphs.sep);
+    this.lastTimestampMs = ts;
+    if (!label) return;
+    const t = this.theme;
+    this.frozenContainer.addChild(
+      new FrozenBlock((w) => ["", renderTimestampDivider(label, w, t)]),
+    );
   }
 
   appendBlank(): void {
@@ -193,9 +298,10 @@ export class ImmutableTranscript extends Container {
    * Generous immutable UserCard: left accent rail (`▎`), `› ` cue, inset padding,
    * and subtle calibrated `userBg` surface fill.
    */
-  appendUserTurn(text: string): void {
+  appendUserTurn(text: string, timestampMs?: number | null): void {
     const clean = sanitizeText(text).trim();
     if (!clean) return;
+    this.maybeAppendTimestampDivider(timestampMs);
     const t = this.theme;
     const g = t.glyphs;
     this.frozenContainer.addChild(
@@ -216,9 +322,10 @@ export class ImmutableTranscript extends Container {
   /**
    * Immutable AssistantCard: optional `◆ <model>` attribution header + syntax-highlighted Markdown.
    */
-  appendAssistantTurn(markdownText: string, meta?: string): void {
+  appendAssistantTurn(markdownText: string, meta?: string, timestampMs?: number | null): void {
     const clean = sanitizeText(markdownText).replace(/^\n+|\n+$/g, "");
     if (!clean.trim()) return;
+    this.maybeAppendTimestampDivider(timestampMs);
     const t = this.theme;
     const g = t.glyphs;
     const mdTheme = t.toMarkdownTheme();
@@ -240,11 +347,11 @@ export class ImmutableTranscript extends Container {
    * Freezes any streamed live text into an immutable AssistantCard before appending a mid-turn card or receipt,
    * preserving exact chronological order and avoiding scrollback wipes.
    */
-  freezeLiveText(): boolean {
+  freezeLiveText(fallbackTimestampMs?: number | null): boolean {
     if (!this.liveTail.isActive) return false;
-    const { text, modelLabel } = this.liveTail.takeText();
+    const { text, modelLabel, timestampMs } = this.liveTail.takeText();
     if (!text.trim()) return false;
-    this.appendAssistantTurn(text, modelLabel || undefined);
+    this.appendAssistantTurn(text, modelLabel || undefined, timestampMs ?? fallbackTimestampMs);
     return true;
   }
 
@@ -252,8 +359,9 @@ export class ImmutableTranscript extends Container {
    * Immutable structured Tool-Output Card (`goals_table`, `goal_detail`, `run_activity`).
    * Identical layout both live (from `chat.tool`) and replayed (from `turn.role === "tool_output"`).
    */
-  appendToolOutput(display: ToolDisplayPayload): void {
-    this.freezeLiveText();
+  appendToolOutput(display: ToolDisplayPayload, timestampMs?: number | null): void {
+    this.freezeLiveText(timestampMs);
+    this.maybeAppendTimestampDivider(timestampMs);
     const t = this.theme;
     this.frozenContainer.addChild(
       new FrozenBlock((w) => ["", ...renderToolOutput(display, w, t)]),
@@ -261,8 +369,9 @@ export class ImmutableTranscript extends Container {
   }
 
   /** Compact dim note for a persisted `tool_output` turn lacking a valid structured display. */
-  appendToolOutputNote(text: string): void {
+  appendToolOutputNote(text: string, timestampMs?: number | null): void {
     const clean = sanitizeLine(text) || "tool output";
+    this.maybeAppendTimestampDivider(timestampMs);
     const t = this.theme;
     this.frozenContainer.addChild(
       new FrozenBlock((w) => [clamp(`  ${t.ok(t.glyphs.check)} ${t.muted(clean)}`, w)]),
@@ -279,8 +388,10 @@ export class ImmutableTranscript extends Container {
     tag?: string;
     text: string;
     ref?: EntityRef;
+    timestampMs?: number | null;
   }): void {
-    this.freezeLiveText();
+    this.freezeLiveText(opts.timestampMs);
+    this.maybeAppendTimestampDivider(opts.timestampMs);
     const t = this.theme;
     const glyph = opts.glyph ?? t.glyphs.bullet;
     const tone = opts.tone ?? "muted";
@@ -298,6 +409,7 @@ export class ImmutableTranscript extends Container {
   clearAll(): void {
     this.frozenContainer.clear();
     this.liveTail.clear();
+    this.lastTimestampMs = null;
   }
 }
 
