@@ -1052,24 +1052,8 @@ export function buildNewSessionParams(
     }
     const effectiveEffort =
       opts.effort && opts.effort.toLowerCase() !== "default" ? opts.effort : undefined;
-    const hasHarnessMcp = opts.mcpServers.some((s) => s.name === "harness");
-    const allowedTools: string[] = [];
-    if (hasHarnessMcp) {
-      allowedTools.push("ToolSearch", "mcp__harness__*");
-    }
-    if (opts.toolPolicy === "read_only_workspace") {
-      allowedTools.push("Read", "Grep", "Glob");
-      if (opts.allowShellInReadOnly) allowedTools.push("Bash");
-      if (opts.mcpServers.some((s) => s.name.trim().toLowerCase() === "octofs")) {
-        allowedTools.push(...[...OCTOFS_READ_ONLY_TOOLS].map((t) => `mcp__octofs__${t}`));
-      }
-      if (opts.mcpServers.some((s) => s.name === "ast-grep" || s.name === "ast_grep")) {
-        allowedTools.push("mcp__ast-grep__*");
-      }
-    }
     const claudeOptions: Record<string, unknown> = {
       disallowedTools: disallowed,
-      ...(allowedTools.length > 0 ? { allowedTools } : {}),
       ...(opts.toolPolicy !== "read_write_workspace" ? {
         settingSources: [],
         strictMcpConfig: true,

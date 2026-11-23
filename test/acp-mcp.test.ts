@@ -798,7 +798,7 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
     assert.ok(ampDirSettings["amp.permissions"]?.some((r) => r.tool === "mcp__harness__*" && r.action === "allow"));
     ampDir.cleanup();
 
-    // 2. Claude control_plane_only keeps ToolSearch + allowedTools for harness MCP
+    // 2. Claude control_plane_only keeps ToolSearch; no allowedTools, so harness MCP goes through the permission gate
     const claudeDir = buildNewSessionParams("claude", {
       cwd: "/tmp",
       systemPrompt: "Director",
@@ -808,7 +808,7 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
     });
     const claudeOpts = (claudeDir.params._meta as { claudeCode: { options: { tools: string[]; allowedTools?: string[] } } }).claudeCode.options;
     assert.deepEqual(claudeOpts.tools, ["ToolSearch"]);
-    assert.deepEqual(claudeOpts.allowedTools, ["ToolSearch", "mcp__harness__*"]);
+    assert.equal(claudeOpts.allowedTools, undefined);
 
     // 3. Post-session mode auto-selection switches writable sessions into bypassPermissions / yolo
     const modeActions = buildPostSessionActions(
@@ -1165,7 +1165,7 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
     assert.equal(isReadOnlyExternalMcpTool("octofs", "shell"), false);
     assert.equal(isReadOnlyExternalMcpTool("ast-grep", "find_code"), true);
 
-    // 3. Claude read_only_workspace pre-allows Read/Grep/Glob + read-only octofs, blocks mutating octofs
+    // 3. Claude read_only_workspace pre-allows nothing (reads go through the permission gate), blocks mutating octofs
     const claudeRo = buildNewSessionParams("claude", {
       cwd: "/tmp",
       systemPrompt: "Research",
@@ -1177,9 +1177,8 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
         { name: "octofs", command: "octofs", args: ["mcp"], env: [] },
       ],
     });
-    const claudeOpts = (claudeRo.params._meta as { claudeCode: { options: { allowedTools: string[]; disallowedTools: string[] } } }).claudeCode.options;
-    assert.ok(claudeOpts.allowedTools.includes("Read") && claudeOpts.allowedTools.includes("Grep") && claudeOpts.allowedTools.includes("Glob"));
-    assert.ok(claudeOpts.allowedTools.includes("mcp__octofs__view"));
+    const claudeOpts = (claudeRo.params._meta as { claudeCode: { options: { allowedTools?: string[]; disallowedTools: string[] } } }).claudeCode.options;
+    assert.equal(claudeOpts.allowedTools, undefined);
     assert.ok(claudeOpts.disallowedTools.includes("mcp__octofs__text_editor"));
     assert.ok(claudeOpts.disallowedTools.includes("mcp__octofs__shell"));
 

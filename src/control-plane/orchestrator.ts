@@ -1527,7 +1527,9 @@ export class HarnessOrchestrator {
           continue;
         }
         this.pendingRollovers.delete(task.id);
-        this.db.updateTask(task.id, { status: "failed", summary: `Task runner failed before settlement: ${msg.slice(0, 240)}` });
+        const flat = msg.replace(/\s+/g, " ").trim();
+        const clipped = flat.length <= 240 ? flat : `${flat.slice(0, 150)} … ${flat.slice(-87)}`;
+        this.db.updateTask(task.id, { status: "failed", summary: `Task runner failed before settlement: ${clipped}` });
         this.db.emitEvent(run.id, task.id, "agent.error", { error: msg });
         return;
       } finally {
