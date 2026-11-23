@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { closeSync, openSync, readdirSync, realpathSync, rmSync, writeSync } from "node:fs";
+import { join, resolve } from "node:path";
 
 const initializedDbs = new WeakSet<Database>();
 const seededPrefixes = new WeakMap<Database, Set<string>>();
@@ -112,18 +113,75 @@ export function friendlyIdCandidates(raw: string, prefix: string): string[] {
   return out;
 }
 
+// Per-process high-water mark so an index is not reused after its file is deleted.
 const fileNameCounters = new Map<string, number>();
 
-/**
- * Generates a short, sequential, UUID-free filename (`t-3-summary-1.md`, `code-exec-1.json`)
- * that does not collide with existing files in `dir`.
- */
-export function nextUniqueFileName(dir: string | null, stem: string, ext: string): string {
-  const key = `${dir ?? "<mem>"}:${stem}${ext}`;
-  let n = (fileNameCounters.get(key) ?? 0) + 1;
-  while (dir && existsSync(join(dir, `${stem}-${n}${ext}`))) {
-    n++;
+/** Highest N among existing `<stem>-<N><ext>` entries in dir (0 when none or unreadable). */
+function scanMaxFileIndex(dir: string, stem: string, ext: string): number {
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return 0;
   }
-  fileNameCounters.set(key, n);
-  return `${stem}-${n}${ext}`;
+  const prefix = `${stem}-`;
+  let max = 0;
+  for (const entry of entries) {
+    if (entry.length <= prefix.length + ext.length || !entry.startsWith(prefix) || !entry.endsWith(ext)) continue;
+    const mid = entry.slice(prefix.length, entry.length - ext.length);
+    if (!/^[0-9]{1,10}$/.test(mid)) continue;
+    const n = Number.parseInt(mid, 10);
+    if (n < 0x80000000 && n > max) max = n;
+  }
+  return max;
+}
+
+/** Creates path exclusively and writes content. Returns false when the entry already exists. */
+function tryCreateExclusive(path: string, content: string): boolean {
+  let fd: number;
+  try {
+    fd = openSync(path, "wx", 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+  try {
+    const buf = Buffer.from(content, "utf8");
+    let off = 0;
+    while (off < buf.length) off += writeSync(fd, buf, off, buf.length - off);
+  } catch (error) {
+    closeSync(fd);
+    rmSync(path, { force: true });
+    throw error;
+  }
+  closeSync(fd);
+  return true;
+}
+
+/**
+ * Creates a new file `<stem>-<n><ext>` in dir (O_CREAT|O_EXCL, mode 0o600) holding content and returns its basename.
+ * Never overwrites, truncates, or deletes an existing entry. dir must exist.
+ */
+export function writeUniqueFile(dir: string, stem: string, ext: string, content: string): string {
+  let canonDir: string;
+  try {
+    canonDir = realpathSync(dir);
+  } catch {
+    canonDir = resolve(dir);
+  }
+  const key = `${canonDir}\0${stem}\0${ext}`;
+  let n = Math.max(fileNameCounters.get(key) ?? 0, scanMaxFileIndex(dir, stem, ext));
+  for (let attempt = 0; attempt < 64; attempt++) {
+    n++;
+    const name = `${stem}-${n}${ext}`;
+    if (tryCreateExclusive(join(dir, name), content)) {
+      fileNameCounters.set(key, n);
+      return name;
+    }
+  }
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const name = `${stem}-${Date.now()}-${randomBytes(4).toString("hex")}${ext}`;
+    if (tryCreateExclusive(join(dir, name), content)) return name;
+  }
+  throw Object.assign(new Error(`EEXIST: could not allocate a unique file for ${stem}-N${ext} in ${dir}`), { code: "EEXIST" });
 }

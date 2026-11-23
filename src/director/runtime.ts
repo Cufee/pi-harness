@@ -14,9 +14,9 @@ import { createCodeModeExecutor, effectiveCodeMode } from "../code-mode/index.js
 import type { HarnessConfig } from "../config.js";
 import { resolveLaunchRoute } from "../control-plane/launch-route.js";
 import { compactTaskHandoff, toolsForTier } from "../control-plane/tools.js";
-import { writeCodeOutput, writeTaskDossier } from "../control-plane/dossiers.js";
+import { findRunDossier, readRunDossier, writeCodeOutput, writeTaskDossier } from "../control-plane/dossiers.js";
 import type { AdmissionLane, QueuePositionInput } from "../control-plane/admission-queue.js";
-import type { ControlPlaneDb } from "../control-plane/db.js";
+import type { ArtifactRecord, ControlPlaneDb, RunRecord } from "../control-plane/db.js";
 import type { CustomRunnerFactory, HarnessOrchestrator } from "../control-plane/orchestrator.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { recordCostInvocation, summarizeCost } from "../cost/ledger.js";
@@ -2362,6 +2362,60 @@ export class DirectorRuntime {
     };
   }
 
+  /**
+   * Existing runs whose indexed dossiers this chat session may read: its synthetic task run, its goals' linked
+   * runs, and session-less goals' linked and Done-Review runs in the same repository. Creates nothing.
+   */
+  private ownedDossierRuns(chatSessionId: string, repoRoot: string): RunRecord[] {
+    const ids = new Set<string>([`director-tasks-${chatSessionId}`]);
+    for (const goal of this.goals.listGoals({ repoRoot })) {
+      if (goal.chatSessionId === chatSessionId) {
+        if (goal.linkedRunId) ids.add(goal.linkedRunId);
+      } else if (goal.chatSessionId === null) {
+        if (goal.linkedRunId) ids.add(goal.linkedRunId);
+        ids.add(`director-tasks-${goal.id}`);
+      }
+    }
+    let realRepo: string;
+    try {
+      realRepo = realpathSync(repoRoot);
+    } catch {
+      return [];
+    }
+    const runs: RunRecord[] = [];
+    for (const id of ids) {
+      const run = this.db.getRun(id);
+      if (!run) continue;
+      try {
+        if (realpathSync(run.repoRoot) === realRepo) runs.push(run);
+      } catch {
+        // Run root no longer resolves; skip it.
+      }
+    }
+    return runs;
+  }
+
+  private readDirectorArtifact(chatSessionId: string, repoRoot: string, args: Record<string, unknown>, signal?: AbortSignal) {
+    const ownedRuns = this.ownedDossierRuns(chatSessionId, repoRoot);
+    if (typeof args.path === "string" && args.path.trim()) {
+      const path = args.path;
+      const run = ownedRuns.find((r) => findRunDossier(this.db, r, path) !== null);
+      if (run) return readRunDossier(this.db, run, args);
+    } else if (typeof args.task_id === "string" && args.task_id.trim()) {
+      const task = this.db.getTask(args.task_id.trim());
+      const run = task ? ownedRuns.find((r) => r.id === task.runId) : undefined;
+      if (run) return readRunDossier(this.db, run, args);
+    } else if (ownedRuns.length > 0) {
+      const byId = new Map<string, ArtifactRecord>();
+      for (const run of ownedRuns) {
+        for (const artifact of this.db.listArtifacts(run.id, undefined, 50, "dossier")) byId.set(artifact.id, artifact);
+      }
+      const artifacts = [...byId.values()].sort((a, b) => b.createdAt - a.createdAt).slice(0, 50);
+      return { artifacts };
+    }
+    return this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, "artifact_read", args, signal);
+  }
+
   private async executeDirectorTool(
     chatSessionId: string,
     repoRoot: string,
@@ -2412,8 +2466,9 @@ export class DirectorRuntime {
         }
       }
       case "spawn_task":
-      case "artifact_read":
         return this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, name, args, signal);
+      case "artifact_read":
+        return this.readDirectorArtifact(chatSessionId, repoRoot, args, signal);
       case "cancel_task": {
         const targetId = String(args.task_id ?? "").trim();
         if (!targetId) throw new Error("task_id is required");
