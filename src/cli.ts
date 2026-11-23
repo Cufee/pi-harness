@@ -559,7 +559,7 @@ async function main(): Promise<void> {
       process.on("unhandledRejection", (reason) => {
         console.error(`[harnessd ${new Date().toISOString()}] unhandledRejection:`, reason);
       });
-      const daemon = new HarnessDaemon(config, { autoQuitWhenIdle: true });
+      const daemon = new HarnessDaemon(config, { autoQuitWhenIdle: true, repoRoot });
       const sock = await daemon.start();
       try {
         writeFileSync(join(config.stateDir, "daemon.pid"), `${process.pid}\n`, "utf8");
