@@ -45,6 +45,7 @@ it("requires structured sources for read-only handoffs and externalizes only ove
       assert.equal(result.summary, persisted.summary);
       assert.deepEqual(result.sources, sources);
       const paths = [providedPath];
+      let overflowMeta: Record<string, unknown> = {};
       if (kind === "research") {
         const [artifact] = db.listArtifacts(run.id, child.id);
         assert.ok(artifact);
@@ -56,6 +57,16 @@ it("requires structured sources for read-only handoffs and externalizes only ove
         assert.deepEqual(await orch.toolExecutor.execute(run.id, parent.id, "artifact_read", { path: pointer }), {
           path: artifact.path, truncated: false, content: longSummary,
         });
+        const keptChars = persisted.summary!.slice(0, persisted.summary!.indexOf("\n\n[Full summary: ")).length;
+        overflowMeta = {
+          truncated: true,
+          full_summary: {
+            path: artifact.path,
+            next_offset: keptChars,
+            total_chars: longSummary.length,
+            read_with: "artifact_read { path, offset: next_offset, task_id }",
+          },
+        };
       } else {
         assert.equal(persisted.summary, summary);
         assert.deepEqual(db.listArtifacts(run.id, child.id), []);
@@ -63,7 +74,10 @@ it("requires structured sources for read-only handoffs and externalizes only ove
       assert.deepEqual(result.artifact_paths, paths);
       // Older or runner-generated result JSON may also contain free-form transcript/log data.
       db.updateTask(child.id, { resultJson: JSON.stringify({ ...result, transcript: "private transcript", tool_logs: "raw logs" }) });
-      children.push({ id: child.id, title: kind, kind, status: "completed", summary: persisted.summary, sources, artifact_paths: paths, escalations: [] });
+      children.push({
+        id: child.id, title: kind, kind, status: "completed", summary: persisted.summary,
+        ...overflowMeta, sources, artifact_paths: paths, escalations: [],
+      });
     }
 
     const runnerOnly = db.createTask({

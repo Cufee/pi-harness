@@ -54,12 +54,40 @@ export function compactTaskHandoff(task: TaskRecord, escalations: EscalationReco
         ? "Task ended without a structured handoff or a final reply."
         : "Task ended without a structured handoff.";
   }
+  let overflow: { path: string; next_offset: number; total_chars?: number } | null = null;
+  if (!paused) {
+    const meta = result?.summary_overflow;
+    if (meta && typeof meta === "object" && typeof meta.path === "string" && meta.path) {
+      overflow = {
+        path: meta.path,
+        next_offset: typeof meta.next_offset === "number" && Number.isFinite(meta.next_offset) ? meta.next_offset : 0,
+        ...(typeof meta.total_chars === "number" && Number.isFinite(meta.total_chars) ? { total_chars: meta.total_chars } : {}),
+      };
+    } else if (fallback) {
+      const m = /\n\[Full output: ([^\]]+)\]$/.exec(fallback.summary);
+      if (m?.[1]) overflow = { path: m[1], next_offset: 0 };
+    } else if (typeof task.summary === "string") {
+      const m = /\n\n\[Full summary: ([^\]]+)\]$/.exec(task.summary);
+      if (m?.[1]) overflow = { path: m[1], next_offset: 0 };
+    }
+  }
   return {
     id: task.id,
     title: task.title,
     kind: task.kind,
     status: task.status,
     summary,
+    ...(overflow
+      ? {
+          truncated: true as const,
+          full_summary: {
+            path: overflow.path,
+            next_offset: overflow.next_offset,
+            ...(overflow.total_chars !== undefined ? { total_chars: overflow.total_chars } : {}),
+            read_with: "artifact_read { path, offset: next_offset, task_id }",
+          },
+        }
+      : {}),
     sources: paused ? [] : result?.sources ?? [],
     artifact_paths: paused ? [] : result?.artifact_paths ?? result?.artifactPaths ?? fallback?.artifact_paths ?? [],
     escalations: escalations.filter((entry) => entry.fromTaskId === task.id),

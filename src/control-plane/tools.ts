@@ -1,10 +1,13 @@
-import { rmSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { realpathSync, rmSync, statSync } from "node:fs";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { recommendModelsByTaskKind, type ModelCatalogCompiler } from "../catalog/compiler.js";
 import { CODE_EXEC_TOOL_NAME, TOOL_SEARCH_TOOL_NAME, createCodeModeExecutor, effectiveCodeMode, exposedTools } from "../code-mode/index.js";
 import type { HarnessConfig } from "../config.js";
 import { codeExecEventSink } from "../protocol/tool-display.js";
+import { checkReadOnlyArgv } from "../runners/acp-shims.js";
+import { isProtectedWritePath } from "../runners/protected-paths.js";
 import type { ToolDefinition } from "../runners/types.js";
+import { resolveGateEnv, runArgv } from "../tools/gate-env.js";
 import type { KbKind } from "../kb/store.js";
 import type { BisectingMergeQueue } from "../worktree/merge-queue.js";
 import { runGit, type WorktreeManager } from "../worktree/manager.js";
@@ -18,8 +21,9 @@ import type {
   TaskKind,
   TaskRecord,
 } from "./db.js";
-import { findRunDossier, readRunDossier, readWorkspaceArtifact, spillSummaryOverflow, writeCodeOutput, writeTaskDossier } from "./dossiers.js";
+import { findRunDossier, readRunDossier, readWorkspaceArtifact, spillSummaryOverflow, writeCodeOutput, writeTaskDossier, writeUniqueTaskDossier } from "./dossiers.js";
 import { compactTaskHandoff, isReadOnlyKind, SUMMARY_LIMIT, validateTaskHandoff } from "./handoffs.js";
+import { expandHomePath } from "./projects.js";
 import type { AnchoredHandoff } from "./prompts.js";
 import { mergeGoalLiveProgress, type GoalLiveProgress, type GoalProgressSource } from "../goals/live-progress.js";
 
@@ -107,7 +111,7 @@ const MAX_TURNS_DESCRIPTION =
 const waitChildrenTool: ToolDefinition = {
   name: "wait_children",
   description:
-    "Event-driven wait for child tasks (zero polling; wakes immediately on completion or escalation). Optional fallback_interval_s configures a dead-agent watchdog wakeup (defaults to a long interval so you never thrash).",
+    "Event-driven wait for child tasks (zero polling; wakes immediately on completion or escalation). Optional fallback_interval_s configures a dead-agent watchdog wakeup (defaults to a long interval so you never thrash). A handoff with truncated: true carries full_summary.path/next_offset; page it with artifact_read.",
   inputSchema: {
     type: "object",
     properties: {
@@ -434,7 +438,8 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
   {
     name: "artifact_read",
     tiers: [1, 2, 3],
-    description: "Read a dossier by path (Tier 1: indexed dossiers in this run only) or list indexed artifacts for a task.",
+    description:
+      "Read a dossier by path (Tier 1: indexed dossiers in this run only) or list indexed artifacts for a task. Returns totalChars, hasMore and nextOffset for long files; call again with offset=nextOffset until hasMore is false. Pass task_id with path for a Director task from another workspace.",
     inputSchema: {
       type: "object",
       properties: {
@@ -442,6 +447,26 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
         task_id: { type: "string" },
         max_chars: { type: "number" },
         offset: { type: "number", description: "Character offset for paginating large artifacts (default 0)." },
+      },
+    },
+  },
+  {
+    name: "inspect_command",
+    tiers: [3],
+    description:
+      "Run one read-only inspection command in your task workspace without a shell (no pipes, redirection, globbing, or chaining). Allowed: git status|log|diff|show|blame|rev-parse|rev-list|merge-base|ls-files|ls-tree|grep|cat-file|describe|shortlog|show-ref|for-each-ref|branch (list)|tag (list)|remote [-v|get-url]|fetch <remote> [<branch>...]|ls-remote <remote>; rg; ls, cat, head, tail, wc, nl, stat; bun test [files] [-t pattern]; bunx tsc --noEmit [-p tsconfig]. Paths must stay inside the workspace and configured read roots. Note: bun test and tsc execute repository code in the task workspace without an OS sandbox (and tsc --noEmit may write .tsbuildinfo when incremental/composite is enabled). Returns exit_code, stdout and stderr tails, and an artifact path holding the full output when it was cut.",
+    inputSchema: {
+      type: "object",
+      required: ["argv"],
+      properties: {
+        argv: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+          description: 'Command and arguments, e.g. ["git","log","-5","--oneline"].',
+        },
+        cwd: { type: "string", description: "Workspace-relative directory (default: workspace root)." },
+        timeout_s: { type: "number", description: "Default 120; max 900 (bun test / tsc)." },
       },
     },
   },
@@ -1199,11 +1224,19 @@ export class ControlPlaneToolExecutor {
 
         const paths = [...artifactPaths];
         let overflowPath: string | undefined;
+        let summaryOverflow: { path: string; next_offset: number; total_chars: number } | undefined;
         if (summary.length > SUMMARY_LIMIT) {
           const spill = spillSummaryOverflow(this.db, run, taskId, summary);
           summary = spill.summary;
           overflowPath = spill.overflowPath;
-          if (overflowPath) paths.push(overflowPath);
+          if (overflowPath) {
+            paths.push(overflowPath);
+            summaryOverflow = {
+              path: overflowPath,
+              next_offset: spill.keptChars ?? 0,
+              total_chars: spill.totalChars ?? fullSummary.length,
+            };
+          }
         }
         const taskStatus = status === "scope_too_large" ? "returned_for_rescope" : status;
         try {
@@ -1230,7 +1263,15 @@ export class ControlPlaneToolExecutor {
             this.db.updateTask(taskId, {
               status: taskStatus,
               summary,
-              resultJson: JSON.stringify({ status, summary, sources, artifact_paths: paths, escalationId, suggestedSplits }),
+              resultJson: JSON.stringify({
+                status,
+                summary,
+                sources,
+                artifact_paths: paths,
+                ...(summaryOverflow ? { summary_overflow: summaryOverflow } : {}),
+                escalationId,
+                suggestedSplits,
+              }),
             });
             // Automatically reflect verify task outcomes onto any linked Goal without requiring extra model calls.
             // An intermediate verify (a Tier 3 probe, or a failed verify while other work is live) only updates the
@@ -1347,6 +1388,148 @@ export class ControlPlaneToolExecutor {
         const root = task.worktreeId ? this.db.getWorktree(task.worktreeId)?.path : run.repoRoot;
         if (!root) throw new Error("Task worktree unavailable");
         return readWorkspaceArtifact(root, args.path, args.max_chars, args.offset);
+      }
+
+      case "inspect_command": {
+        if (!(task.readOnly || isReadOnlyKind(task.kind))) {
+          throw new Error("inspect_command is for read-only tasks; use your shell");
+        }
+        if (!Array.isArray(args.argv) || args.argv.length === 0 || !args.argv.every((a) => typeof a === "string")) {
+          throw new Error("inspect_command requires argv as a non-empty array of strings");
+        }
+        if (args.cwd !== undefined && typeof args.cwd !== "string") {
+          throw new Error("inspect_command cwd must be a string");
+        }
+        const argv = args.argv as string[];
+        const root = task.worktreeId ? this.db.getWorktree(task.worktreeId)?.path : run.repoRoot;
+        if (!root) throw new Error("Task workspace unavailable");
+        const realRoot = realpathSync(root);
+        const requestedCwd = typeof args.cwd === "string" && args.cwd.trim() ? args.cwd.trim() : ".";
+        let cwd: string;
+        try {
+          cwd = realpathSync(resolve(realRoot, requestedCwd));
+        } catch {
+          throw new Error(`inspect_command cwd does not exist: ${requestedCwd}`);
+        }
+        const relCwd = relative(realRoot, cwd);
+        if (
+          isAbsolute(relCwd) ||
+          relCwd === ".." ||
+          relCwd.startsWith(`..${sep}`) ||
+          isProtectedWritePath(realRoot, cwd) ||
+          !statSync(cwd).isDirectory()
+        ) {
+          throw new Error(`inspect_command cwd must be a non-protected directory inside the task workspace: ${requestedCwd}`);
+        }
+        const rawExtraRoots = [
+          join(run.repoRoot, ".harness", "goals"),
+          join(run.repoRoot, ".harness", "artifacts"),
+          resolve(run.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts"),
+          ...(this.config.worktree.extraReadRoots ?? []),
+        ];
+        const resolvedExtraReadRoots: string[] = [];
+        for (const raw of rawExtraRoots) {
+          const trimmed = raw.trim();
+          if (!trimmed) continue;
+          const expanded = resolve(expandHomePath(trimmed));
+          let canonical = expanded;
+          try {
+            canonical = realpathSync(expanded);
+          } catch {
+            // Non-existent root stays at expanded path.
+          }
+          if (!resolvedExtraReadRoots.includes(canonical)) resolvedExtraReadRoots.push(canonical);
+        }
+        const readRoots = [realRoot, ...resolvedExtraReadRoots.filter((r) => r !== realRoot)];
+        const verdict = checkReadOnlyArgv(argv, { cwd, readRoots, protectedRoots: readRoots });
+        if (!verdict.ok) {
+          throw new Error(`inspect_command rejected: ${verdict.reason}`);
+        }
+        const rawTimeout = args.timeout_s === undefined ? 120 : Number(args.timeout_s);
+        if (!Number.isFinite(rawTimeout) || rawTimeout <= 0) {
+          throw new Error("inspect_command timeout_s must be a positive number");
+        }
+        const timeoutMs = Math.min(900, rawTimeout) * 1000;
+        const signal = callerSignal ?? scriptSignal ?? this.hooks.getTaskSignal(taskId);
+        const resolved = await resolveGateEnv({
+          cwd,
+          config: {
+            gateShell: this.config.goals.gateShell,
+            gateEnv: this.config.goals.gateEnv,
+            stateDir: this.config.stateDir,
+          },
+          signal,
+        });
+        const env: NodeJS.ProcessEnv = {
+          ...resolved.env,
+          GIT_PAGER: "cat",
+          PAGER: "cat",
+          GIT_TERMINAL_PROMPT: "0",
+          GIT_OPTIONAL_LOCKS: "0",
+          NO_COLOR: "1",
+          CI: "1",
+        };
+        delete env.GIT_EXTERNAL_DIFF;
+        const bin = argv[0]!;
+        const execArgs =
+          bin === "git"
+            ? [
+                "--no-pager",
+                "-c", "core.fsmonitor=false",
+                "-c", "diff.external=",
+                "-c", "core.hooksPath=/dev/null",
+                "-c", "protocol.ext.allow=never",
+                "-c", "protocol.file.allow=user",
+                ...argv.slice(1),
+              ]
+            : argv.slice(1);
+        const r = await runArgv(bin, execArgs, {
+          cwd,
+          env,
+          timeoutMs,
+          maxOutputBytes: 8 * 1024 * 1024,
+          signal,
+        });
+        const MAX_STREAM_CHARS = 20_000;
+        const keepTail = bin === "bun" || bin === "bunx";
+        const truncated = r.stdout.length > MAX_STREAM_CHARS || r.stderr.length > MAX_STREAM_CHARS;
+        const clip = (s: string) =>
+          s.length <= MAX_STREAM_CHARS
+            ? s
+            : keepTail
+              ? s.slice(s.length - MAX_STREAM_CHARS)
+              : s.slice(0, MAX_STREAM_CHARS);
+        let outputPath: string | undefined;
+        if (truncated) {
+          const fullOutput = [
+            `$ ${argv.join(" ")}`,
+            `cwd: ${relCwd || "."}`,
+            `exit_code: ${r.exitCode ?? "null"}${r.stopped ? ` (stopped: ${r.stopped})` : ""}`,
+            "",
+            "=== STDOUT ===",
+            r.stdout,
+            ...(r.stderr ? ["", "=== STDERR ===", r.stderr] : []),
+          ].join("\n");
+          outputPath = writeUniqueTaskDossier(
+            this.db,
+            run,
+            taskId,
+            "inspect-output",
+            ".txt",
+            fullOutput,
+            "inspect_command output",
+          ).path;
+        }
+        return {
+          argv,
+          cwd: relCwd || ".",
+          exit_code: r.exitCode,
+          ...(r.stopped ? { stopped: r.stopped } : {}),
+          stdout: clip(r.stdout),
+          stderr: clip(r.stderr),
+          truncated,
+          ...(outputPath ? { output_path: outputPath } : {}),
+        };
       }
 
       case "blackboard_set": {

@@ -63,7 +63,7 @@ export function spillSummaryOverflow(
   run: RunRecord,
   taskId: string,
   fullText: string,
-): { summary: string; overflowPath?: string } {
+): { summary: string; overflowPath?: string; keptChars?: number; totalChars?: number } {
   if (fullText.length <= SUMMARY_LIMIT) return { summary: fullText };
   const artifactsDir = dossierDirectory(run.repoRoot);
   const stem = `${taskId}-summary`;
@@ -81,9 +81,12 @@ export function spillSummaryOverflow(
   const fileName = writeUniqueFile(artifactsDir, stem, ".md", fullText, allocateIndex);
   const artifactPath = `.harness/artifacts/${fileName}`;
   const pointer = `\n\n[Full summary: ${artifactPath}]`;
+  const kept = fullText.slice(0, SUMMARY_LIMIT - pointer.length).trimEnd();
   return {
-    summary: fullText.slice(0, SUMMARY_LIMIT - pointer.length).trimEnd() + pointer,
+    summary: kept + pointer,
     overflowPath: resolve(run.repoRoot, artifactPath),
+    keptChars: kept.length,
+    totalChars: fullText.length,
   };
 }
 
@@ -237,13 +240,21 @@ function readArtifact(
       if (!same) throw new Error(opts.nonSymlinkError ?? `Dossier must be a non-symlink path under .harness/artifacts: ${label}`);
     }
     const raw = readFileSync(fd, "utf8");
-    const max = typeof maxChars === "number" && Number.isFinite(maxChars) ? Math.max(0, Math.floor(maxChars)) : 8000;
+    const max = typeof maxChars === "number" && Number.isFinite(maxChars) ? Math.max(0, Math.floor(maxChars)) : 32000;
     const hasOffset = typeof offset === "number" && Number.isFinite(offset);
     const start = hasOffset ? Math.max(0, Math.floor(offset)) : 0;
     const content = raw.slice(start, start + max);
     const hasMore = start + max < raw.length;
     if (hasOffset || hasMore) {
-      return { path: label, offset: start, totalChars: raw.length, truncated: hasMore, hasMore, content };
+      return {
+        path: label,
+        offset: start,
+        totalChars: raw.length,
+        truncated: hasMore,
+        hasMore,
+        nextOffset: hasMore ? start + content.length : null,
+        content,
+      };
     }
     return { path: label, truncated: false, content };
   } finally {

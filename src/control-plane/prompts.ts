@@ -61,7 +61,7 @@ function tierInstructions(tier: 1 | 2 | 3, kind: TaskRecord["kind"]): string {
     "",
     "CORE RULES:",
     isReadOnlyKind(kind)
-      ? `1. Your ${kind} assignment is read-only. NEVER edit workspace files, run mutating commands, or implement changes. Inspect only the evidence needed for your assigned question.${kind === "verify" ? " You may run non-mutating verification commands (tests, linters, git diff, rg, sg, tmux); put any temporary scratch files in OS temp directories rather than inside the workspace." : ""}`
+      ? `1. Your ${kind} assignment is read-only. NEVER edit workspace files, run mutating commands, or implement changes. Inspect only the evidence needed for your assigned question.${kind === "verify" ? " You may run non-mutating verification commands (tests, linters, git diff, rg, sg, tmux); put any temporary scratch files in OS temp directories rather than inside the workspace." : " For git history/state, searches, and tests use the `inspect_command` tool (argv, no shell)."}`
       : "1. Execute only the assigned change inside the task workspace and respect any read-only restriction.",
     "2. Call `return_task` with a summary of at most 2,000 characters and structured `sources` (`path` and optional `lines`, `symbol`, `note`); research, plan, and verify tasks must include at least one source. Save details with `artifact_write` and pass their paths as `artifact_paths` rather than returning transcripts or tool logs.",
     "3. SCOPE SEND-BACK: If the task will not fit your context window or assigned scope, use status `scope_too_large` in your handoff with evidence paths and concrete options (splits, budget/model change, or clarification).",
