@@ -110,9 +110,6 @@ function optionalProfile(value: unknown): string | undefined {
   return value;
 }
 
-const MAX_TURNS_DESCRIPTION =
-  "Optional advisory progress-reminder threshold in tool-call turns (default: config rollover.taskMaxTurns). After this many turns the task may receive one progress reminder and keeps working; it never stops or fails the task. The task decides when its work is ready and hands it back with return_task.";
-
 const waitChildrenTool: ToolDefinition = {
   name: "wait_children",
   description:
@@ -213,7 +210,8 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
   {
     name: "spawn_task",
     tiers: [1],
-    description: "Spawn a read-only Tier 3 research, plan, or verify task. Read its handoff with wait_children.",
+    description:
+      "Spawn a read-only Tier 3 research, plan, or verify task. Read its handoff with wait_children. Tasks have no turn limit; a task whose scope keeps widening is nudged to return a partial handoff (partial: true or scope_too_large with suggested_splits).",
     inputSchema: {
       type: "object",
       required: ["kind", "title", "objective", "model"],
@@ -224,7 +222,6 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
         objective: { type: "string" },
         model: { type: "string" },
         effort: { type: "string" },
-        max_turns: { type: "number", description: MAX_TURNS_DESCRIPTION },
       },
     },
   },
@@ -245,7 +242,6 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
         profile_id: { type: "string" },
         model: { type: "string" },
         effort: { type: "string" },
-        max_turns: { type: "number", description: MAX_TURNS_DESCRIPTION },
         depends_on: { type: "array", items: { type: "string" } },
       },
     },
@@ -329,6 +325,11 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
       properties: {
         status: { type: "string", enum: ["completed", "scope_too_large", "blocked"] },
         summary: { type: "string", description: "Compact handoff (up to 2,000 characters; longer summaries are saved as artifacts)." },
+        partial: {
+          type: "boolean",
+          description:
+            "Set true when handing back incomplete work, for example after a harness scope check. Summarize what is done, cite what you verified, list what remains.",
+        },
         sources: {
           type: "array",
           description: "Evidence references. Required and non-empty for research, plan, and verify tasks.",
@@ -1095,7 +1096,6 @@ export class ControlPlaneToolExecutor {
           profileId: optionalProfile(args.profile_id),
           model: requiredModel(args),
           effort: typeof args.effort === "string" ? args.effort : undefined,
-          maxTurns: typeof args.max_turns === "number" ? args.max_turns : undefined,
           dependsOn: Array.isArray(args.depends_on) ? (args.depends_on as string[]) : [],
           signal: callerSignal ?? scriptSignal ?? this.hooks.getTaskCancelSignal?.(taskId),
         });
@@ -1196,8 +1196,8 @@ export class ControlPlaneToolExecutor {
         if (status !== "completed" && status !== "blocked" && status !== "scope_too_large") {
           throw new Error("return_task requires status completed, blocked, or scope_too_large");
         }
-        const { summary: fullSummary, sources, artifactPaths } = validateTaskHandoff(task.kind, args);
-        let summary = fullSummary;
+        const { summary: fullSummary, sources, artifactPaths, partial } = validateTaskHandoff(task.kind, args);
+        let summary = partial && !fullSummary.startsWith("[Partial]") ? `[Partial] ${fullSummary}` : fullSummary;
 
         if (status === "completed") {
           const activeKids = this.db
@@ -1284,6 +1284,7 @@ export class ControlPlaneToolExecutor {
               resultJson: JSON.stringify({
                 status,
                 summary,
+                ...(partial ? { partial: true } : {}),
                 sources,
                 artifact_paths: paths,
                 ...(summaryOverflow ? { summary_overflow: summaryOverflow } : {}),
@@ -1292,12 +1293,12 @@ export class ControlPlaneToolExecutor {
               }),
             });
             // Automatically reflect verify task outcomes onto any linked Goal without requiring extra model calls.
-            // An intermediate verify (a Tier 3 probe, or a failed verify while other work is live) only updates the
-            // summary: its pass/fail is not the run's final verification and must not gate settlement.
+            // An intermediate verify (a partial handoff, a Tier 3 probe, or a failed verify while other work is live)
+            // only updates the summary: its pass/fail is not the run's final verification and must not gate settlement.
             if (task.kind === "verify") {
               const liveStatuses = ["running", "waiting_children", "ready", "pending", "draining", "merging"];
               const otherLive = this.db.listTasks(runId).some((t) => t.id !== taskId && liveStatuses.includes(t.status));
-              const intermediate = (task.tier === 3 && otherLive) || (taskStatus !== "completed" && otherLive);
+              const intermediate = partial || (task.tier === 3 && otherLive) || (taskStatus !== "completed" && otherLive);
               this.updateLinkedGoalProgress(
                 runId,
                 taskId,

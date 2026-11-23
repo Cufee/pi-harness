@@ -109,38 +109,56 @@ export type ChatControlEvent =
       circuitBreakerTripped?: boolean;
     }
   | {
+      kind: "task.settled";
+      taskId: string;
+      generation: number;
+      runId: string;
+      title: string;
+      status: "completed" | "failed" | "blocked" | "returned_for_rescope";
+      summary: string;
+      partial?: boolean;
+    }
+  | {
       /** Goal lifecycle events queued during a busy Director turn, coalesced and delivered in one turn (oldest first). */
       kind: "goal.events_batch";
       events: GoalLifecycleChatEvent[];
     };
 
-/** Goal lifecycle events that may be coalesced into one `goal.events_batch` wake. */
+/** Goal and delegated-task lifecycle events that may be coalesced into one `goal.events_batch` wake. */
 export type GoalLifecycleChatEvent = Extract<
   ChatControlEvent,
-  { kind: "goal.settled" | "goal.committed" | "goal.amended" | "goal.reviewed" }
+  { kind: "goal.settled" | "goal.committed" | "goal.amended" | "goal.reviewed" | "task.settled" }
 >;
 
-const GOAL_LIFECYCLE_KINDS = new Set<string>(["goal.settled", "goal.committed", "goal.amended", "goal.reviewed"]);
+const GOAL_LIFECYCLE_KINDS = new Set<string>([
+  "goal.settled",
+  "goal.committed",
+  "goal.amended",
+  "goal.reviewed",
+  "task.settled",
+]);
 
 export function isGoalLifecycleEvent(e: ChatControlEvent): e is GoalLifecycleChatEvent {
   return GOAL_LIFECYCLE_KINDS.has(e.kind);
 }
 
 /**
- * One event per (goalId, kind): the last occurrence wins and keeps its position. Coalesced amendments keep the
- * earliest fromVersion so the delivered event spans every version change.
+ * One event per (goalId, kind) or taskId: the last occurrence wins and keeps its position. Coalesced amendments keep
+ * the earliest fromVersion so the delivered event spans every version change.
  */
 export function coalesceGoalEvents(events: GoalLifecycleChatEvent[]): GoalLifecycleChatEvent[] {
+  const keyOf = (e: GoalLifecycleChatEvent) =>
+    e.kind === "task.settled" ? `task:${e.taskId}` : `${e.goalId}\u0000${e.kind}`;
   const last = new Map<string, number>();
   const firstFrom = new Map<string, number>();
   events.forEach((e, i) => {
-    const key = `${e.goalId}\u0000${e.kind}`;
+    const key = keyOf(e);
     last.set(key, i);
     if (e.kind === "goal.amended" && !firstFrom.has(key)) firstFrom.set(key, e.fromVersion);
   });
   const out: GoalLifecycleChatEvent[] = [];
   events.forEach((e, i) => {
-    const key = `${e.goalId}\u0000${e.kind}`;
+    const key = keyOf(e);
     if (last.get(key) !== i) return;
     out.push(e.kind === "goal.amended" ? { ...e, fromVersion: Math.min(e.fromVersion, firstFrom.get(key) ?? e.fromVersion) } : e);
   });
@@ -334,6 +352,29 @@ export function parseChatControlEvent(raw: unknown): ChatControlEvent | null {
         ...(typeof r.circuitBreakerTripped === "boolean" ? { circuitBreakerTripped: r.circuitBreakerTripped } : {}),
       };
     }
+    case "task.settled": {
+      const status = r.status;
+      if (
+        typeof r.taskId !== "string" ||
+        typeof r.generation !== "number" ||
+        typeof r.runId !== "string" ||
+        typeof r.title !== "string" ||
+        (status !== "completed" && status !== "failed" && status !== "blocked" && status !== "returned_for_rescope")
+      ) {
+        return null;
+      }
+      const summary = typeof r.summary === "string" ? r.summary.replace(/\s+/g, " ").trim().slice(0, 300) : "";
+      return {
+        kind: "task.settled",
+        taskId: r.taskId,
+        generation: r.generation,
+        runId: r.runId,
+        title: r.title,
+        status,
+        summary,
+        ...(r.partial === true ? { partial: true } : {}),
+      };
+    }
     case "goal.events_batch": {
       if (!Array.isArray(r.events)) return null;
       const events = r.events
@@ -421,6 +462,12 @@ export function formatChatEventSummary(event: ChatControlEvent, opts?: { remoteH
       return `Scheduled timer ${event.timerId} for ${new Date(event.wakeAt).toISOString()}${event.goalId ? ` (${event.goalId})` : ""}: ${event.reason}`;
     case "timer.fired":
       return `Timer ${event.timerId} fired (${event.wakeReason})${event.goalId ? ` for ${event.goalId}` : ""}: ${event.reason}`;
+    case "task.settled": {
+      const title = event.title.replace(/\s+/g, " ").trim();
+      const partial = event.partial ? " (partial)" : "";
+      const detail = event.summary.replace(/\s+/g, " ").trim();
+      return `Delegated task ${event.taskId} ("${title}") ${event.status}${partial}${detail ? `: ${detail}` : ""}.`;
+    }
     case "goal.events_batch":
       return `${event.events.length} goal updates: ${event.events.map((e) => formatChatEventSummary(e, opts)).join("; ")}`;
     case "session.message_received": {
@@ -524,6 +571,11 @@ export function formatChatEventForModel(event: ChatControlEvent): string {
         event.goalId
           ? `Your scheduled timer (${event.timerId}) for Goal ${event.goalId} has fired (${event.wakeReason}). Check live quota/models via \`list_models\` if needed and continue or resume the planned work.`
           : `Your scheduled timer (${event.timerId}) has fired (${event.wakeReason}). Continue the planned action or update the user concisely.`,
+      ].join("\n");
+    case "task.settled":
+      return [
+        summary,
+        `Read its handoff with wait_tasks({ ids: ["${event.taskId}"] }) (returns immediately), open artifacts with artifact_read if needed, then answer the user or continue.`,
       ].join("\n");
     case "goal.events_batch":
       return ["Handle these goal updates together in one turn:", ...event.events.map((e) => formatChatEventForModel(e))].join("\n\n");

@@ -413,3 +413,141 @@ it("drives unattended auto-verification -> remediation relaunch -> achieved, pro
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+it("wakes an idle Director chat when a Director-spawned Tier 3 task settles, skips already-waited tasks, and respects wakeDirectorOnGoalSettle", async () => {
+  const repoRoot = await makeTempRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-task-wake-"));
+  const sockPath = join(stateDir, "d.sock");
+
+  try {
+    const baseCfg = loadConfig(repoRoot);
+    const config = withFixtureCatalog({
+      ...baseCfg,
+      codeMode: "off",
+      events: { ...baseCfg.events, wakeDirectorOnGoalSettle: true },
+      stateDir,
+      socketPath: sockPath,
+    });
+
+    const releaseAsyncTask = Promise.withResolvers<void>();
+    const releaseNoWakeTask = Promise.withResolvers<void>();
+    const chatPrompts: string[] = [];
+    let spawnedAsyncId = "";
+    let spawnedWaitId = "";
+    let spawnedNoWakeId = "";
+    let sawToolDescriptions = false;
+
+    const daemon = new HarnessDaemon(config, {
+      dbPath: ":memory:",
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          if (req.taskId.startsWith("chat-")) {
+            chatPrompts.push(req.initialPrompt);
+            if (!sawToolDescriptions) {
+              const spawn = req.tools.find((t) => t.name === "spawn_task");
+              const waitT = req.tools.find((t) => t.name === "wait_tasks");
+              const waitC = req.tools.find((t) => t.name === "wait_children");
+              const resume = req.tools.find((t) => t.name === "resume_task");
+              assert.ok(spawn?.description.includes("No turn limit"));
+              assert.ok(spawn?.description.includes("daemon wakes this chat"));
+              assert.ok(waitT?.description.includes("Waits only within this turn"));
+              assert.ok(waitC?.description.includes("Waits only within this turn"));
+              assert.ok(resume?.description.includes("does not reset or impose any turn limit"));
+              sawToolDescriptions = true;
+            }
+            if (req.initialPrompt.includes("SPAWN_AND_END") && !spawnedAsyncId) {
+              const res = (await req.executeTool("spawn_task", {
+                kind: "research",
+                title: "Async lookup",
+                objective: "WAIT_RELEASE_ASYNC",
+                model: "fixture/fixture",
+              })) as { spawned: string };
+              spawnedAsyncId = res.spawned;
+              return { text: `Spawned ${res.spawned} and ending turn.`, stopReason: "completed" };
+            }
+            if (req.initialPrompt.includes("SPAWN_AND_WAIT") && !spawnedWaitId) {
+              const res = (await req.executeTool("spawn_task", {
+                kind: "research",
+                title: "In-turn lookup",
+                objective: "COMPLETE_IMMEDIATELY",
+                model: "fixture/fixture",
+              })) as { spawned: string };
+              spawnedWaitId = res.spawned;
+              await req.executeTool("wait_tasks", { ids: [res.spawned], timeout_s: 5 });
+              return { text: `Consumed ${res.spawned} in-turn.`, stopReason: "completed" };
+            }
+            if (req.initialPrompt.includes("SPAWN_NO_WAKE") && !spawnedNoWakeId) {
+              const res = (await req.executeTool("spawn_task", {
+                kind: "research",
+                title: "Disabled wake lookup",
+                objective: "WAIT_RELEASE_NOWAKE",
+                model: "fixture/fixture",
+              })) as { spawned: string };
+              spawnedNoWakeId = res.spawned;
+              return { text: `Spawned ${res.spawned} with wake off.`, stopReason: "completed" };
+            }
+            return { text: "Handled delegated task settlement.", stopReason: "completed" };
+          }
+          if (req.initialPrompt.includes("WAIT_RELEASE_ASYNC")) {
+            await releaseAsyncTask.promise;
+          } else if (req.initialPrompt.includes("WAIT_RELEASE_NOWAKE")) {
+            await releaseNoWakeTask.promise;
+          }
+          await req.executeTool("return_task", {
+            status: "completed",
+            summary: "Found answer in status.txt",
+            sources: [{ path: "status.txt", lines: "1", note: "checked" }],
+          });
+          return { text: "done", stopReason: "completed" };
+        },
+      }),
+    });
+
+    await daemon.start();
+    try {
+      const chat = await daemon.director.createChat({ repoRoot });
+
+      // 1. Spawn and end turn -> settling wakes the idle Director chat with "Delegated task <id>"
+      await daemon.director.sendChatMessage(chat.id, "SPAWN_AND_END");
+      assert.ok(spawnedAsyncId);
+      assert.equal(sawToolDescriptions, true);
+      const promptsBeforeRelease = chatPrompts.length;
+      releaseAsyncTask.resolve();
+
+      const wakeDeadline = Date.now() + 5_000;
+      while (Date.now() < wakeDeadline && chatPrompts.length === promptsBeforeRelease) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      assert.equal(chatPrompts.length, promptsBeforeRelease + 1, "Settling delegated task must wake Director");
+      const wakePrompt = chatPrompts[chatPrompts.length - 1]!;
+      assert.ok(wakePrompt.includes(`Delegated task ${spawnedAsyncId}`), `Expected Delegated task ${spawnedAsyncId} in wake prompt, got: ${wakePrompt}`);
+      assert.ok(wakePrompt.includes(`wait_tasks({ ids: ["${spawnedAsyncId}"] })`));
+
+      // 2. Control: wait_tasks consumed the settled task in-turn -> NO follow-up wake turn
+      const beforeInTurn = chatPrompts.length;
+      await daemon.director.sendChatMessage(chat.id, "SPAWN_AND_WAIT");
+      assert.equal(chatPrompts.length, beforeInTurn + 1);
+      await new Promise((r) => setTimeout(r, 150));
+      assert.equal(chatPrompts.length, beforeInTurn + 1, "Task already consumed via wait_tasks must not trigger a wake");
+
+      // 3. Control: wakeDirectorOnGoalSettle: false -> NO wake turn when task settles after turn ends
+      daemon.director.updateConfig({
+        ...config,
+        events: { ...config.events, wakeDirectorOnGoalSettle: false },
+      });
+      const beforeNoWake = chatPrompts.length;
+      await daemon.director.sendChatMessage(chat.id, "SPAWN_NO_WAKE");
+      assert.equal(chatPrompts.length, beforeNoWake + 1);
+      releaseNoWakeTask.resolve();
+      await new Promise((r) => setTimeout(r, 200));
+      assert.equal(chatPrompts.length, beforeNoWake + 1, "wakeDirectorOnGoalSettle=false must suppress delegated-task wake");
+    } finally {
+      releaseAsyncTask.resolve();
+      releaseNoWakeTask.resolve();
+      await daemon.stop();
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
