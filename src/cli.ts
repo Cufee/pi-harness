@@ -85,14 +85,17 @@ function requireStringFlag(flags: Record<string, string | boolean>, name: string
   return v.trim();
 }
 
-const RUN_LEGACY_HEX_ID_RE = /^run[-_]([0-9a-f]{8})$/i;
+// Canonical legacy IDs match verbatim (even all-digit ones); other 8-hex spellings need a hex letter so they cannot shadow friendly numeric IDs.
+const RUN_CANONICAL_LEGACY_HEX_ID_RE = /^run-[0-9a-f]{8}$/;
+const RUN_ALPHA_LEGACY_HEX_ID_RE = /^run[-_](?=[0-9a-f]*[a-f])([0-9a-f]{8})$/i;
 const RUN_NUMERIC_ID_RE = /^run[_\s-]+(\d+)$/i;
 
 /** Canonical run ID for a token that names a run (legacy 8-hex or friendly numeric form), else null. */
 function matchRunIdToken(raw: string): string | null {
   const trimmed = raw.trim();
-  const legacyHex = RUN_LEGACY_HEX_ID_RE.exec(trimmed);
-  if (legacyHex) return `run-${legacyHex[1]!.toLowerCase()}`;
+  if (RUN_CANONICAL_LEGACY_HEX_ID_RE.test(trimmed)) return trimmed;
+  const alphaLegacy = RUN_ALPHA_LEGACY_HEX_ID_RE.exec(trimmed);
+  if (alphaLegacy) return `run-${alphaLegacy[1]!.toLowerCase()}`;
   const numeric = RUN_NUMERIC_ID_RE.exec(trimmed);
   if (numeric) return `run-${numeric[1]!.replace(/^0+(?=\d)/, "")}`;
   return null;
