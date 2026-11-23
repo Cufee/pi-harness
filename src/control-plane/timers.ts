@@ -21,6 +21,21 @@ export interface TimerRecord {
   firedAt: number | null;
 }
 
+/**
+ * Whether a pending chat timer's early-cancel subscription covers `goal` settling.
+ * A timer bound to a Goal matches only that Goal. Only an unbound `any` timer matches every
+ * Goal owned by its chat session. An unbound `goal_settled` timer matches nothing and fires
+ * at `wakeAt` (the Director refuses to schedule one; rows from older versions may exist).
+ */
+export function timerMatchesGoalSettlement(
+  timer: Pick<TimerRecord, "ownerKind" | "ownerId" | "goalId" | "wakeOnEvent">,
+  goal: { id: string; chatSessionId: string | null },
+): boolean {
+  if (timer.ownerKind !== "chat" || timer.ownerId !== goal.chatSessionId) return false;
+  if (timer.wakeOnEvent === "any") return !timer.goalId || timer.goalId === goal.id;
+  return timer.wakeOnEvent === "goal_settled" && Boolean(timer.goalId) && timer.goalId === goal.id;
+}
+
 const TIMER_SCHEMA = `
 CREATE TABLE IF NOT EXISTS timers (
   id TEXT PRIMARY KEY,
