@@ -23,7 +23,7 @@ import { ControlPlaneToolExecutor, compactTaskHandoff, isReadOnlyKind, validateT
 import { SUMMARY_LIMIT } from "./handoffs.js";
 import { directorTaskRunId, directorTaskRunOwner, isDirectorTaskContainer } from "./ids.js";
 import { canonicalProjectPath } from "./projects.js";
-import { ensureGoalEvidenceDir, goalEvidenceDir } from "../goals/engine.js";
+import { ensureGoalEvidenceDir } from "../goals/engine.js";
 
 interface ActiveTaskExecution {
   taskId: string;
@@ -2052,9 +2052,10 @@ export class HarnessOrchestrator {
       const scopedKbHints = task.tier === 2 ? this.db.kb.getScopedAmbientIndex(run.repoRoot, writeScopes, 5) : [];
 
       const linkedGoal = this.resolveLinkedGoalForRun(run.id);
-      const goalEvDir = linkedGoal
-        ? (ensureGoalEvidenceDir(run.repoRoot, linkedGoal.id) ?? goalEvidenceDir(run.repoRoot, linkedGoal.id))
-        : null;
+      // Fail closed: a goal evidence dir that fails validation (e.g. a symlinked segment) is never advertised or granted.
+      const goalEvDir = linkedGoal ? ensureGoalEvidenceDir(run.repoRoot, linkedGoal.id) : null;
+      const goalsRoot = join(run.repoRoot, ".harness", "goals");
+      const artifactsRoot = resolve(run.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts");
 
       const initialPrompt = buildHydrationTurn({
         task,
@@ -2070,7 +2071,7 @@ export class HarnessOrchestrator {
         worktreePath: wt?.path ?? null,
         worktreeBranch: wt?.branch ?? null,
         quotaResumeNote,
-        goalEvidenceDir: goalEvDir,
+        goalEvidenceDir: goalEvDir ?? undefined,
       });
 
       const rolloverThreshold =
@@ -2118,23 +2119,25 @@ export class HarnessOrchestrator {
         mcpBridgeEntrypoint,
         externalMcpServers: resolveExternalMcpServers(this.config.stateDir, this.config.externalMcpServers),
         extraPathDirs: nativeToolsPathDirs(this.config.stateDir),
-        extraReadRoots: [
-          join(run.repoRoot, ".harness", "goals"),
+        extraReadRoots: [...new Set([
+          goalsRoot,
           join(run.repoRoot, ".harness", "artifacts"),
+          artifactsRoot,
           ...(this.config.worktree.extraReadRoots ?? []),
-        ],
-        // A goal-linked run may write only its own goal's evidence directory (plus operator roots), not every goal's.
-        extraWriteRoots: goalEvDir
+        ])],
+        // A goal-linked run may write only its own verified goal evidence directory (plus operator roots), never
+        // every goal's and never an unverified path.
+        extraWriteRoots: linkedGoal
           ? toolPolicy === "read_write_workspace"
-            ? [goalEvDir, ...(this.config.worktree.extraWriteRoots ?? [])]
+            ? [...(goalEvDir ? [goalEvDir] : []), ...(this.config.worktree.extraWriteRoots ?? [])]
             : undefined
-          : [join(run.repoRoot, ".harness", "goals"), ...(this.config.worktree.extraWriteRoots ?? [])],
-        extraEnv: linkedGoal && goalEvDir
+          : [goalsRoot, ...(this.config.worktree.extraWriteRoots ?? [])],
+        extraEnv: linkedGoal
           ? {
-              HARNESS_GOAL_EVIDENCE_DIR: goalEvDir,
+              ...(goalEvDir ? { HARNESS_GOAL_EVIDENCE_DIR: goalEvDir } : {}),
               HARNESS_GOAL_ID: linkedGoal.id,
-              HARNESS_GOALS_DIR: join(run.repoRoot, ".harness", "goals"),
-              HARNESS_ARTIFACTS_DIR: resolve(run.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts"),
+              HARNESS_GOALS_DIR: goalsRoot,
+              HARNESS_ARTIFACTS_DIR: artifactsRoot,
             }
           : undefined,
         allowShellInReadOnly: task.kind === "verify",
