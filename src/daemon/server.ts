@@ -3314,11 +3314,18 @@ export class HarnessDaemon {
             throw new Error(`Worktree ${p.worktreeId} belongs to ${run.repoRoot}, not ${repoRoot}`);
           }
           const task = this.db.getTask(wt.taskId);
-          const settled = !task || ["completed", "failed", "cancelled"].includes(task.status);
+          const settled = Boolean(task && ["completed", "failed", "cancelled"].includes(task.status));
           if (!settled && !Boolean(p.force)) {
-            throw new Error(`Cannot remove worktree ${p.worktreeId}: task ${task.id} is still ${task.status}`);
+            throw new Error(
+              task
+                ? `Cannot remove worktree ${p.worktreeId}: task ${task.id} is still ${task.status}`
+                : `Cannot remove worktree ${p.worktreeId}: owning task ${wt.taskId} record is missing`,
+            );
           }
           const wasCleaned = wt.cleanedAt != null;
+          if (!settled && !wasCleaned && !existsSync(wt.path)) {
+            throw new Error(`Cannot remove offline active worktree ${p.worktreeId}: checkout directory is missing; left in place`);
+          }
           const ref = await mgr.teardown(p.worktreeId, {
             archiveBeforeRemove: true,
             requireArchive: true,
