@@ -954,17 +954,18 @@ export class HarnessOrchestrator {
       userMessage: opts?.note?.trim() || "Continue from preserved worktree/artifacts without redoing completed steps.",
     });
 
-    if (run.status !== "active") {
-      this.db.updateRunStatus(run.id, "active");
-    }
-
-    // If a Goal is linked to this run and was paused/stopped, flip it back to executing
+    // If a Goal is linked to this run and was paused/stopped, flip it back to executing.
+    // Done before reactivating the run so run.status listeners see the goal's live status.
     try {
       this.db.db
         .prepare("UPDATE goals SET status = 'executing', updated_at = ? WHERE linked_run_id = ? AND status NOT IN ('achieved','cancelled')")
         .run(Date.now(), run.id);
     } catch {
       // goals table may not exist in unit tests using ControlPlaneDb alone
+    }
+
+    if (run.status !== "active") {
+      this.db.updateRunStatus(run.id, "active");
     }
 
     const nextGen = task.generation + 1;
