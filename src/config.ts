@@ -284,113 +284,431 @@ export function normalizeWorktreeRoots(worktree: unknown) {
   return { roots: normalized, warning: invalid.length ? `Invalid worktree roots in ${invalid.join(", ")}` : undefined };
 }
 
+/** Reads the repository overlay `<repoRoot>/.pi-harness.json`, or `{}` when absent. */
+export function readRepoConfig(repoRoot?: string): Record<string, unknown> {
+  return (repoRoot ? readJsonIfExists(join(repoRoot, ".pi-harness.json")) : undefined) ?? {};
+}
+
 export function loadConfig(repoRoot?: string): HarnessConfig {
   const stateDir = resolve(defaultStateDir());
   mkdirSync(stateDir, { recursive: true });
+  return resolveConfig(readJsonIfExists(join(stateDir, "config.json")) ?? {}, readRepoConfig(repoRoot), { stateDir });
+}
 
-  const globalCfg = readJsonIfExists(join(stateDir, "config.json")) ?? {};
-  const repoCfg = repoRoot ? readJsonIfExists(join(repoRoot, ".pi-harness.json")) ?? {} : {};
-
+/**
+ * Builds the effective config from layers: `base` (or built-in defaults) < global `config.json` < repo `.pi-harness.json`.
+ * Nested sections merge per key; arrays and scalars replace whole. `remotes` and worktree access roots never come
+ * from the repo layer. When `base` is given it replaces the built-in defaults, so a removed global key falls back
+ * to the base value.
+ */
+export function resolveConfig(
+  globalCfg: Record<string, unknown>,
+  repoCfg: Record<string, unknown>,
+  runtime: { stateDir: string; socketPath?: string },
+  base?: HarnessConfig,
+): HarnessConfig {
+  const stateDir = runtime.stateDir;
   const merged = { ...globalCfg, ...repoCfg } as Partial<HarnessConfig>;
   const rollover: RolloverConfig = {
-    orchestratorThreshold: 0.72,
-    workerThreshold: 0.78,
-    orchestratorMaxTurns: 200,
-    workerMaxTurns: 120,
-    taskMaxTurns: 40,
-    reviewerMaxTurns: 30,
-    externalizeBytes: 2048,
-    maxGenerations: 12,
+    ...(base
+      ? base.rollover
+      : {
+          orchestratorThreshold: 0.72,
+          workerThreshold: 0.78,
+          orchestratorMaxTurns: 200,
+          workerMaxTurns: 120,
+          taskMaxTurns: 40,
+          reviewerMaxTurns: 30,
+          externalizeBytes: 2048,
+          maxGenerations: 12,
+        }),
     ...(globalCfg.rollover as Partial<RolloverConfig> | undefined),
     ...(repoCfg.rollover as Partial<RolloverConfig> | undefined),
   };
 
   // Only the operator's config may grant access to additional host directories.
-  const { roots, warning } = normalizeWorktreeRoots(globalCfg.worktree);
+  const globalWorktree = globalCfg.worktree as Partial<WorktreeConfig> | undefined;
+  const { extraReadRoots: _repoRead, extraWriteRoots: _repoWrite, ...repoWorktree } =
+    (repoCfg.worktree as Partial<WorktreeConfig> | undefined) ?? {};
+  const { roots, warning } = normalizeWorktreeRoots(globalWorktree);
   if (warning) console.error(`[harness] ${warning}; ignoring invalid entries`);
-  const worktree: WorktreeConfig = {
-    dir: ".harness/worktrees",
-    artifactsDir: ".harness/artifacts",
-    ciTimeoutMs: 300_000,
-    gitAuthorName: "pi-harness",
-    gitAuthorEmail: "harness@local",
-    archiveRetentionDays: 7,
-    maxConcurrentWorkers: 4,
-    ...(globalCfg.worktree as Partial<WorktreeConfig> | undefined),
-    ...(repoCfg.worktree as Partial<WorktreeConfig> | undefined),
-    ...roots,
-  };
+  const worktree: WorktreeConfig = base
+    ? {
+        ...base.worktree,
+        ...globalWorktree,
+        ...repoWorktree,
+        extraReadRoots:
+          globalWorktree && "extraReadRoots" in globalWorktree ? roots.extraReadRoots : base.worktree.extraReadRoots,
+        extraWriteRoots:
+          globalWorktree && "extraWriteRoots" in globalWorktree ? roots.extraWriteRoots : base.worktree.extraWriteRoots,
+      }
+    : {
+        dir: ".harness/worktrees",
+        artifactsDir: ".harness/artifacts",
+        ciTimeoutMs: 300_000,
+        gitAuthorName: "pi-harness",
+        gitAuthorEmail: "harness@local",
+        archiveRetentionDays: 7,
+        maxConcurrentWorkers: 4,
+        ...globalWorktree,
+        ...repoWorktree,
+        ...roots,
+      };
 
   const goals: GoalsConfig = {
-    defaultMaxReviewCycles: 4,
-    defaultMaxNoProgressCycles: 2,
-    gateTimeoutMs: 180_000,
-    autoVerifyOnSettle: true,
-    maxConcurrentGoals: 4,
+    ...(base
+      ? base.goals
+      : {
+          defaultMaxReviewCycles: 4,
+          defaultMaxNoProgressCycles: 2,
+          gateTimeoutMs: 180_000,
+          autoVerifyOnSettle: true,
+          maxConcurrentGoals: 4,
+        }),
     ...(globalCfg.goals as Partial<GoalsConfig> | undefined),
     ...(repoCfg.goals as Partial<GoalsConfig> | undefined),
   };
 
   const events: EventsConfig = {
-    fallbackWakeupIntervalSec: 600,
-    wakeDirectorOnGoalSettle: true,
+    ...(base ? base.events : { fallbackWakeupIntervalSec: 600, wakeDirectorOnGoalSettle: true }),
     ...(globalCfg.events as Partial<EventsConfig> | undefined),
     ...(repoCfg.events as Partial<EventsConfig> | undefined),
   };
 
   const catalog: CatalogConfig = {
-    ttlHours: 24,
-    artificialAnalysisKeyEnv: "ARTIFICIAL_ANALYSIS_API_KEY",
-    allowPreview: true,
-    preferSubscription: true,
-    modelFilterMode: "all",
-    disabledModels: [],
-    enabledModels: [],
+    ...(base
+      ? base.catalog
+      : {
+          ttlHours: 24,
+          artificialAnalysisKeyEnv: "ARTIFICIAL_ANALYSIS_API_KEY",
+          allowPreview: true,
+          preferSubscription: true,
+          modelFilterMode: "all" as const,
+          disabledModels: [],
+          enabledModels: [],
+        }),
     ...(globalCfg.catalog as Partial<CatalogConfig> | undefined),
     ...(repoCfg.catalog as Partial<CatalogConfig> | undefined),
   };
 
   const quotaRetry: QuotaRetryConfig = {
-    nativeRetryTimeoutMs: 45_000,
-    fallbackCooldownSec: 60,
-    maxCooldownSec: 900,
-    autoResumeEnabled: true,
-    earlyWakePollMs: 30_000,
+    ...(base
+      ? base.quotaRetry
+      : {
+          nativeRetryTimeoutMs: 45_000,
+          fallbackCooldownSec: 60,
+          maxCooldownSec: 900,
+          autoResumeEnabled: true,
+          earlyWakePollMs: 30_000,
+        }),
     ...(globalCfg.quotaRetry as Partial<QuotaRetryConfig> | undefined),
     ...(repoCfg.quotaRetry as Partial<QuotaRetryConfig> | undefined),
   };
 
-  const profiles = (merged.profiles && merged.profiles.length > 0 ? merged.profiles : defaultProfiles());
+  const profiles =
+    Array.isArray(merged.profiles) && merged.profiles.length > 0 ? merged.profiles : (base?.profiles ?? defaultProfiles());
 
   // Security: `remotes` (SSH peer trust & auto-connect targets) MUST only come from trusted user global config,
   // never from untrusted repository `.pi-harness.json`.
-  const globalRemotes = Array.isArray(globalCfg.remotes) ? (globalCfg.remotes as RemoteHostConfig[]) : undefined;
+  const rawRemotes = "remotes" in globalCfg ? globalCfg.remotes : base?.remotes;
+  const remotes = Array.isArray(rawRemotes) ? (rawRemotes as RemoteHostConfig[]) : undefined;
+  // An explicit `[]` clears servers inherited from `base`.
+  const rawExternalMcp = "externalMcpServers" in merged ? merged.externalMcpServers : base?.externalMcpServers;
+  const externalMcpServers = Array.isArray(rawExternalMcp) ? rawExternalMcp : undefined;
 
-  const codeMode = merged.codeMode ?? "collapsed";
+  const codeMode = merged.codeMode ?? base?.codeMode ?? "collapsed";
   if (!["collapsed", "hybrid", "off"].includes(codeMode)) throw new Error(`Unknown codeMode: ${codeMode}`);
+  const firstEnabledProfileId = profiles.find((p) => p.enabled !== false)?.id;
   return {
     stateDir,
-    socketPath: merged.socketPath ? resolve(merged.socketPath) : defaultSocketPath(stateDir),
+    socketPath: runtime.socketPath ?? (merged.socketPath ? resolve(merged.socketPath) : defaultSocketPath(stateDir)),
     profiles,
-    ...(globalRemotes?.length ? { remotes: globalRemotes } : {}),
-    ...(merged.externalMcpServers?.length ? { externalMcpServers: merged.externalMcpServers } : {}),
+    ...(remotes?.length ? { remotes } : {}),
+    ...(externalMcpServers?.length ? { externalMcpServers } : {}),
     codeMode,
     codeExec: {
-      defaultTimeoutMs: 300_000, maxTimeoutMs: 1_800_000,
+      ...(base ? base.codeExec : { defaultTimeoutMs: 300_000, maxTimeoutMs: 1_800_000 }),
       ...(globalCfg.codeExec as HarnessConfig["codeExec"]),
       ...(repoCfg.codeExec as HarnessConfig["codeExec"]),
     },
-    defaultOrchestratorProfile: merged.defaultOrchestratorProfile ?? profiles.find((p) => p.enabled !== false)?.id,
-    defaultWorkerProfile: merged.defaultWorkerProfile ?? profiles.find((p) => p.enabled !== false)?.id,
-    defaultTaskProfile: merged.defaultTaskProfile ?? profiles.find((p) => p.enabled !== false)?.id,
+    defaultOrchestratorProfile: merged.defaultOrchestratorProfile ?? base?.defaultOrchestratorProfile ?? firstEnabledProfileId,
+    defaultWorkerProfile: merged.defaultWorkerProfile ?? base?.defaultWorkerProfile ?? firstEnabledProfileId,
+    defaultTaskProfile: merged.defaultTaskProfile ?? base?.defaultTaskProfile ?? firstEnabledProfileId,
     rollover,
     worktree,
     goals,
     events,
     catalog,
     quotaRetry,
-    quotaEndpoint: merged.quotaEndpoint,
+    quotaEndpoint:
+      "quotaEndpoint" in merged
+        ? ((merged.quotaEndpoint as QuotaEndpointConfig | null | undefined) ?? undefined)
+        : base?.quotaEndpoint,
   };
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Validates the shape of a global `config.json` document or a `config.update` patch. Unknown keys are ignored.
+ * Returns one message per problem, naming the path and expectation; values are never echoed (they may be secrets).
+ */
+export function validateConfigRaw(raw: unknown): string[] {
+  const errors: string[] = [];
+  if (!isPlainObject(raw)) return ["config must be a JSON object"];
+
+  const isString = (v: unknown) => typeof v === "string";
+  const isNonEmptyString = (v: unknown) => typeof v === "string" && v.trim().length > 0;
+  const isBoolean = (v: unknown) => typeof v === "boolean";
+  const isStringArray = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === "string");
+  const isStringRecord = (v: unknown) => isPlainObject(v) && Object.values(v).every((x) => typeof x === "string");
+  const isPositiveInt = (v: unknown) => typeof v === "number" && Number.isInteger(v) && v > 0;
+  const isFiniteNonNegative = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v >= 0;
+  const isFinitePositive = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v > 0;
+  const oneOf = (...values: string[]) => (v: unknown) => typeof v === "string" && values.includes(v);
+
+  type Rule = [check: (v: unknown) => boolean, expectation: string];
+  const STRING: Rule = [isString, "a string"];
+  const NON_EMPTY: Rule = [isNonEmptyString, "a non-empty string"];
+  const BOOLEAN: Rule = [isBoolean, "a boolean"];
+  const STRINGS: Rule = [isStringArray, "an array of strings"];
+  const STRING_MAP: Rule = [isStringRecord, "an object of string values"];
+  const POS_INT: Rule = [isPositiveInt, "a positive integer"];
+  const NON_NEG: Rule = [isFiniteNonNegative, "a finite number >= 0"];
+  const POSITIVE: Rule = [isFinitePositive, "a finite number > 0"];
+
+  const checkFields = (obj: Record<string, unknown>, path: string, rules: Record<string, Rule>) => {
+    for (const [key, [check, expectation]] of Object.entries(rules)) {
+      if (!(key in obj)) continue;
+      if (!check(obj[key])) errors.push(`${path}.${key} must be ${expectation}`);
+    }
+  };
+  const section = (key: string, rules: Record<string, Rule>): Record<string, unknown> | undefined => {
+    if (!(key in raw)) return undefined;
+    const value = raw[key];
+    if (!isPlainObject(value)) {
+      errors.push(`${key} must be an object`);
+      return undefined;
+    }
+    checkFields(value, key, rules);
+    return value;
+  };
+  const list = (key: string): unknown[] | undefined => {
+    if (!(key in raw)) return undefined;
+    if (!Array.isArray(raw[key])) {
+      errors.push(`${key} must be an array`);
+      return undefined;
+    }
+    return raw[key] as unknown[];
+  };
+
+  checkFields(raw, "config", { stateDir: NON_EMPTY, socketPath: NON_EMPTY });
+
+  const profileIds = new Set<string>();
+  list("profiles")?.forEach((profile, i) => {
+    const path = `profiles[${i}]`;
+    if (!isPlainObject(profile)) {
+      errors.push(`${path} must be an object`);
+      return;
+    }
+    if (!isNonEmptyString(profile.id)) errors.push(`${path}.id must be a non-empty string`);
+    else if (profileIds.has(profile.id as string)) errors.push(`${path}.id must be unique`);
+    else profileIds.add(profile.id as string);
+    checkFields(profile, path, {
+      billing: [oneOf("subscription", "api", "local"), '"subscription", "api", or "local"'],
+      enabled: BOOLEAN,
+      models: STRINGS,
+    });
+    if (profile.kind === "acp") {
+      if (!isNonEmptyString(profile.command)) errors.push(`${path}.command must be a non-empty string`);
+      checkFields(profile, path, {
+        adapter: [oneOf("claude", "codex", "gemini", "generic"), '"claude", "codex", "gemini", or "generic"'],
+        args: STRINGS,
+        readOnlyArgs: STRINGS,
+        env: STRING_MAP,
+      });
+    } else if (profile.kind === "pi") {
+      if (!isNonEmptyString(profile.provider)) errors.push(`${path}.provider must be a non-empty string`);
+      checkFields(profile, path, {
+        api: [
+          oneOf("openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"),
+          "a supported pi api",
+        ],
+        baseUrl: STRING,
+        apiKeyEnv: STRING,
+      });
+    } else {
+      errors.push(`${path}.kind must be "acp" or "pi"`);
+    }
+  });
+
+  const remoteNames = new Set<string>();
+  list("remotes")?.forEach((remote, i) => {
+    const path = `remotes[${i}]`;
+    if (!isPlainObject(remote)) {
+      errors.push(`${path} must be an object`);
+      return;
+    }
+    const name = remote.name;
+    if (typeof name !== "string" || !/^[A-Za-z0-9._-]+$/.test(name)) {
+      errors.push(`${path}.name must contain only letters, digits, '.', '_', or '-'`);
+    } else if (name.toLowerCase() === "local") {
+      errors.push(`${path}.name must not be "local"`);
+    } else if (remoteNames.has(name.toLowerCase())) {
+      errors.push(`${path}.name must be unique (case-insensitive)`);
+    } else {
+      remoteNames.add(name.toLowerCase());
+    }
+    if (!isNonEmptyString(remote.sshTarget)) errors.push(`${path}.sshTarget must be a non-empty string`);
+    checkFields(remote, path, {
+      bridgeCommand: STRING,
+      autoConnect: BOOLEAN,
+      reverseAccess: [oneOf("messages", "full"), '"messages" or "full"'],
+    });
+  });
+
+  list("externalMcpServers")?.forEach((server, i) => {
+    const path = `externalMcpServers[${i}]`;
+    if (!isPlainObject(server)) {
+      errors.push(`${path} must be an object`);
+      return;
+    }
+    if (!isNonEmptyString(server.name)) errors.push(`${path}.name must be a non-empty string`);
+    checkFields(server, path, { enabled: BOOLEAN, args: STRINGS, env: STRING_MAP });
+    if (server.enabled === false) checkFields(server, path, { command: STRING });
+    else if (!isNonEmptyString(server.command)) errors.push(`${path}.command must be a non-empty string`);
+  });
+
+  checkFields(raw, "config", {
+    codeMode: [oneOf("collapsed", "hybrid", "off"), '"collapsed", "hybrid", or "off"'],
+    defaultOrchestratorProfile: NON_EMPTY,
+    defaultWorkerProfile: NON_EMPTY,
+    defaultTaskProfile: NON_EMPTY,
+  });
+  section("codeExec", { defaultTimeoutMs: POS_INT, maxTimeoutMs: POS_INT, maxOutputChars: POS_INT });
+  const ratio: Rule = [(v) => typeof v === "number" && v > 0 && v <= 1, "a number in (0, 1]"];
+  section("rollover", {
+    orchestratorThreshold: ratio,
+    workerThreshold: ratio,
+    orchestratorMaxTurns: POS_INT,
+    workerMaxTurns: POS_INT,
+    taskMaxTurns: POS_INT,
+    reviewerMaxTurns: POS_INT,
+    externalizeBytes: POS_INT,
+    maxGenerations: POS_INT,
+  });
+  const worktree = section("worktree", {
+    dir: NON_EMPTY,
+    artifactsDir: NON_EMPTY,
+    gitAuthorName: NON_EMPTY,
+    gitAuthorEmail: NON_EMPTY,
+    setupCommand: STRING,
+    ciCommands: STRINGS,
+    ciTimeoutMs: POS_INT,
+    maxConcurrentWorkers: POS_INT,
+    archiveRetentionDays: NON_NEG,
+  });
+  if (worktree) {
+    const { warning } = normalizeWorktreeRoots(worktree);
+    if (warning) errors.push(warning);
+  }
+  section("goals", {
+    defaultMaxReviewCycles: POS_INT,
+    defaultMaxNoProgressCycles: POS_INT,
+    gateTimeoutMs: POS_INT,
+    maxConcurrentGoals: POS_INT,
+    autoVerifyOnSettle: BOOLEAN,
+  });
+  section("events", { fallbackWakeupIntervalSec: POSITIVE, wakeDirectorOnGoalSettle: BOOLEAN });
+  section("catalog", {
+    ttlHours: NON_NEG,
+    artificialAnalysisKeyEnv: STRING,
+    allowPreview: BOOLEAN,
+    preferSubscription: BOOLEAN,
+    modelFilterMode: [oneOf("all", "allowlist"), '"all" or "allowlist"'],
+    disabledModels: STRINGS,
+    enabledModels: STRINGS,
+  });
+  section("quotaRetry", {
+    nativeRetryTimeoutMs: NON_NEG,
+    fallbackCooldownSec: NON_NEG,
+    maxCooldownSec: NON_NEG,
+    earlyWakePollMs: POSITIVE,
+    autoResumeEnabled: BOOLEAN,
+  });
+  if ("quotaEndpoint" in raw && raw.quotaEndpoint !== null) {
+    const endpoint = raw.quotaEndpoint;
+    if (!isPlainObject(endpoint)) {
+      errors.push("quotaEndpoint must be an object or null");
+    } else {
+      if (!isNonEmptyString(endpoint.url)) errors.push("quotaEndpoint.url must be a non-empty string");
+      checkFields(endpoint, "quotaEndpoint", {
+        headers: STRING_MAP,
+        pollIntervalSec: POSITIVE,
+        timeoutMs: POSITIVE,
+        format: [oneOf("protojson", "protobuf"), '"protojson" or "protobuf"'],
+      });
+    }
+  }
+  return errors;
+}
+
+/** One secret-safe difference between two effective configs. List entries carry ids/names only, never values. */
+export interface ConfigChange {
+  path: string;
+  from?: unknown;
+  to?: unknown;
+  added?: string[];
+  removed?: string[];
+  changed?: string[];
+}
+
+/** Reports what changed between two configs without exposing secret-bearing values (env, args, commands, URLs, headers). */
+export function diffHarnessConfig(prev: HarnessConfig, next: HarnessConfig): ConfigChange[] {
+  const changes: ConfigChange[] = [];
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+  const isPrintable = (v: unknown) => v === undefined || typeof v === "number" || typeof v === "boolean";
+
+  for (const key of ["codeMode", "defaultOrchestratorProfile", "defaultWorkerProfile", "defaultTaskProfile"] as const) {
+    if (prev[key] !== next[key]) changes.push({ path: key, from: prev[key], to: next[key] });
+  }
+
+  for (const key of ["codeExec", "rollover", "worktree", "goals", "events", "catalog", "quotaRetry"] as const) {
+    const a = (prev[key] ?? {}) as Record<string, unknown>;
+    const b = (next[key] ?? {}) as Record<string, unknown>;
+    for (const sub of new Set([...Object.keys(a), ...Object.keys(b)])) {
+      if (same(a[sub], b[sub])) continue;
+      const path = `${key}.${sub}`;
+      const showValues = (isPrintable(a[sub]) && isPrintable(b[sub])) || path === "catalog.modelFilterMode";
+      changes.push(showValues ? { path, from: a[sub], to: b[sub] } : { path });
+    }
+  }
+
+  const diffList = <T>(path: string, a: T[] | undefined, b: T[] | undefined, keyOf: (item: T) => string) => {
+    const before = new Map((a ?? []).map((item) => [keyOf(item), item]));
+    const after = new Map((b ?? []).map((item) => [keyOf(item), item]));
+    const added = [...after.keys()].filter((k) => !before.has(k));
+    const removed = [...before.keys()].filter((k) => !after.has(k));
+    const changed = [...after.keys()].filter((k) => before.has(k) && !same(before.get(k), after.get(k)));
+    if (added.length || removed.length || changed.length) changes.push({ path, added, removed, changed });
+    else if (!same(a ?? [], b ?? [])) changes.push({ path, changed: [] }); // order or duplicate entries only
+  };
+  diffList("profiles", prev.profiles, next.profiles, (p) => p.id);
+  diffList("remotes", prev.remotes, next.remotes, (r) => r.name);
+  diffList("externalMcpServers", prev.externalMcpServers, next.externalMcpServers, (s) => s.name);
+
+  const pe = prev.quotaEndpoint;
+  const ne = next.quotaEndpoint;
+  if (!pe !== !ne) {
+    changes.push({ path: "quotaEndpoint", from: pe ? "set" : "unset", to: ne ? "set" : "unset" });
+  } else if (pe && ne && !same(pe, ne)) {
+    const keys = new Set([...Object.keys(pe), ...Object.keys(ne)]);
+    const changed = [...keys].filter((k) => !same((pe as unknown as Record<string, unknown>)[k], (ne as unknown as Record<string, unknown>)[k]));
+    changes.push({ path: "quotaEndpoint", changed });
+  }
+  return changes;
 }
 
 /**

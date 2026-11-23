@@ -180,6 +180,10 @@ export class HarnessOrchestrator {
 
   /** Applies live configuration updates across all cached WorktreeManagers & MergeQueues and wakes queued workers immediately. */
   updateConfig(next: HarnessConfig, catalog = this.catalog, quota = this.quota): void {
+    // The config object is shared with the tool executor, so clear optional keys the new config omits.
+    for (const key of Object.keys(this.config)) {
+      if (!(key in next)) delete (this.config as unknown as Record<string, unknown>)[key];
+    }
     Object.assign(this.config, next);
     this.catalog = catalog;
     this.quota = quota;
