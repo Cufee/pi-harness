@@ -4,7 +4,7 @@ import type { ProjectRecord } from "../control-plane/projects.js";
 import type { EventRecord, ReplayPage, RunRecord } from "../control-plane/db.js";
 import type { DaemonClient } from "../daemon/remote.js";
 import type { ChatSessionRecord, ChatTurnRecord } from "../director/session.js";
-import { formatChatEventSummary, parseChatControlEvent } from "../protocol/chat-events.js";
+import { formatChatEventSummary, parseChatControlEvent, qualifyRemoteCliHints } from "../protocol/chat-events.js";
 import type { DaemonEventFrame } from "../protocol/daemon-rpc.js";
 import { createCommandAutocomplete, parseSlashCommand, renderHelp, type TuiMode } from "./commands.js";
 import {
@@ -60,6 +60,8 @@ export type TuiExitAction =
 export interface DirectorChatTuiOptions {
   client: DaemonClient;
   remoteHost?: string | null;
+  /** Reconnectable `--remote` selector for CLI hints (saved alias or full ssh:// URL); defaults to `remoteHost`. */
+  remoteSelector?: string | null;
   localRemotes?: ReadonlyArray<{ name: string; sshTarget: string }>;
   initialNotice?: { tone: "info" | "warn" | "danger" | "ok"; text: string } | null;
   repoRoot?: string;
@@ -73,6 +75,8 @@ export interface DirectorChatTuiOptions {
 export interface NativeScrollbackTuiOptions {
   client: DaemonClient;
   remoteHost?: string | null;
+  /** Reconnectable `--remote` selector for CLI hints (saved alias or full ssh:// URL); defaults to `remoteHost`. */
+  remoteSelector?: string | null;
   localRemotes?: ReadonlyArray<{ name: string; sshTarget: string }>;
   initialNotice?: { tone: "info" | "warn" | "danger" | "ok"; text: string } | null;
   runId: string;
@@ -110,6 +114,8 @@ interface SharedShellContext {
   mode: TuiMode;
   client: DaemonClient;
   remoteHost?: string | null;
+  /** Reconnectable `--remote` selector for CLI hints (saved alias or full ssh:// URL); defaults to `remoteHost`. */
+  remoteSelector?: string | null;
   localRemotes?: ReadonlyArray<{ name: string; sshTarget: string }>;
   repoRoot: string;
   projectId?: string | null;
@@ -404,7 +410,7 @@ function createSharedShell(spec: SharedShellContext) {
         tag: "stop",
         text:
           summaryParts.length > 0
-            ? `Stopped ${summaryParts.join(", ")}. Nothing restarts by itself; resume with \`pi-harness resume <run-id>${remoteFlag(spec.remoteHost)}\` or ask the Director to continue.`
+            ? `Stopped ${summaryParts.join(", ")}. Nothing restarts by itself; resume with \`pi-harness resume <run-id>${remoteFlag(spec.remoteSelector ?? spec.remoteHost)}\` or ask the Director to continue.`
             : "No active runs, chats, or reviews were running.",
       });
       await store.refresh();
@@ -767,7 +773,7 @@ function createSharedShell(spec: SharedShellContext) {
               runId: spec.runId,
               message: parsed.args || undefined,
             });
-            transcript.appendReceipt({ ...resumeReceipt(res, spec.runId), tag: "resume" });
+            transcript.appendReceipt({ ...resumeReceipt(res, spec.runId, spec.remoteSelector ?? spec.remoteHost), tag: "resume" });
           }
         } catch (err) {
           transcript.appendReceipt({
@@ -1213,6 +1219,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     mode: "chat",
     client: opts.client,
     remoteHost: opts.remoteHost ?? null,
+    remoteSelector: opts.remoteSelector ?? null,
     localRemotes: opts.localRemotes,
     repoRoot: chatSession.repoRoot || opts.repoRoot || process.cwd(),
     projectId: activeProject?.id ?? chatSession.projectId,
@@ -1316,7 +1323,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       }
     } else if (turn.role === "system_notice") {
       const parsed = turn.event ? parseChatControlEvent(turn.event) : null;
-      const summary = parsed ? settledReceiptText(parsed, opts.remoteHost) : turn.content;
+      const summary = parsed ? settledReceiptText(parsed, opts.remoteSelector ?? opts.remoteHost) : turn.content;
       const ref: EntityRef | undefined =
         parsed && "goalId" in parsed && parsed.goalId
           ? { kind: "goal", id: parsed.goalId, label: `${parsed.goalId}` }
@@ -1490,7 +1497,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       const ref: EntityRef | undefined = goalId ? { kind: "goal", id: goalId, runId: ev.runId || undefined, label: goalId } : undefined;
       if (ref) shell.recordRef(ref);
       const summary = parsed
-        ? settledReceiptText(parsed, opts.remoteHost)
+        ? settledReceiptText(parsed, opts.remoteSelector ?? opts.remoteHost)
         : sanitizeLine(String(p.summary ?? p.title ?? p.status ?? ev.type));
       shell.transcript.appendReceipt({
         glyph: shell.theme.glyphs.diamond,
@@ -1566,6 +1573,7 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
     mode: "run",
     client: opts.client,
     remoteHost: opts.remoteHost ?? null,
+    remoteSelector: opts.remoteSelector ?? null,
     localRemotes: opts.localRemotes,
     repoRoot,
     sessionId: opts.runId,
@@ -1586,8 +1594,17 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
           text: res?.steered ? `Sent to ${opts.initialTaskId}` : `${opts.initialTaskId} is not actively running`,
         });
       } else {
-        await opts.client.request("run.resume", { runId: opts.runId, message: text });
-        shell.transcript.appendReceipt({ tone: "ok", tag: "run", text: `Sent guidance to ${opts.runId}` });
+        const res = await opts.client.request<{ resumed?: boolean; outcome?: string; message?: string; noteDelivered?: boolean } | null>(
+          "run.resume",
+          { runId: opts.runId, message: text },
+        );
+        // Report what the daemon did: an already-completed or no-op resume does not deliver the guidance.
+        if (res?.resumed || res?.outcome === "resumed" || res?.noteDelivered) {
+          shell.transcript.appendReceipt({ tone: "ok", tag: "run", text: `Sent guidance to ${opts.runId}` });
+        } else {
+          const receipt = resumeReceipt(res, opts.runId, opts.remoteSelector ?? opts.remoteHost);
+          shell.transcript.appendReceipt({ ...receipt, tag: "run", text: `Guidance not delivered: ${receipt.text}` });
+        }
       }
       shell.session.tui.requestRender();
     },
@@ -1755,7 +1772,7 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
         text:
           `${ev.type}: ${status}${p.summary ? ` — ${sanitizeLine(String(p.summary))}` : ""}` +
           (ev.type === "run.status" && p.reason ? ` — ${sanitizeLine(String(p.reason))}` : "") +
-          (ev.type === "run.status" && status === "stopped" ? ` (resume: pi-harness resume ${ev.runId}${remoteFlag(opts.remoteHost)})` : ""),
+          (ev.type === "run.status" && status === "stopped" ? ` (resume: pi-harness resume ${ev.runId}${remoteFlag(opts.remoteSelector ?? opts.remoteHost)})` : ""),
         ref,
       });
       shell.session.tui.requestRender();
@@ -1823,9 +1840,10 @@ function remoteFlag(remoteHost?: string | null): string {
 function resumeReceipt(
   res: { resumed?: boolean; outcome?: string; message?: string } | null | undefined,
   runId: string,
+  remoteSelector?: string | null,
 ): { tone: "ok" | "info" | "warn"; text: string } {
   const outcome = res?.outcome ?? (res?.resumed ? "resumed" : undefined);
-  const message = res?.message?.trim();
+  const message = res?.message ? qualifyRemoteCliHints(res.message.trim(), remoteSelector) : undefined;
   if (outcome === "resumed") return { tone: "ok", text: message || `Resumed ${runId}` };
   if (outcome === "already_active" || outcome === "already_queued" || outcome === "already_completed" || outcome === "waiting") {
     return { tone: "info", text: message || `${runId}: ${outcome.replace(/_/g, " ")}` };

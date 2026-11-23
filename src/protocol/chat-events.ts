@@ -366,7 +366,7 @@ export function formatChatEventForModel(event: ChatControlEvent): string {
       if (settledVerificationError(event) !== null) {
         return [
           summary,
-          `Run ${event.runId} for Goal ${event.goalId} ended '${event.runStatus}' but automatic goal verification could not run, so Goal ${event.goalId} is awaiting_human. The run itself did not fail; do not resume or restart the run for it. ` +
+          `Run ${event.runId} for Goal ${event.goalId} completed; goal verification failed to run, so Goal ${event.goalId} is awaiting_human. Do not resume or restart the run for it. ` +
             `Fix the cause above (for example select an enabled reviewer profile), inspect the goal with goal_get({ goal_id: "${event.goalId}" }), then re-run verification with goal_trigger_review, or report the verification error to the user.${escNote}`,
         ].join("\n");
       }
@@ -462,6 +462,14 @@ function isExplicitStop(event: Extract<ChatControlEvent, { kind: "goal.settled" 
 /** A cited CLI command, qualified with `--remote <host>` when the reader is attached to a remote daemon. */
 function cliCommand(verb: "resume" | "tree", runId: string, remoteHost?: string | null): string {
   return `\`pi-harness ${verb} ${runId}${remoteHost ? ` --remote ${remoteHost}` : ""}\``;
+}
+
+/** Appends `--remote <selector>` to each `pi-harness tree|resume <run-id>` hint in `text` that lacks one. */
+export function qualifyRemoteCliHints(text: string, selector: string | null | undefined): string {
+  if (!selector) return text;
+  return text.replace(/pi-harness (?:tree|resume) [\w-]+/g, (cmd, offset: number, all: string) =>
+    all.startsWith(" --remote", offset + cmd.length) ? cmd : `${cmd} --remote ${selector}`,
+  );
 }
 
 /** The recorded cause, or an explicit notice that none was recorded naming the inspect command. */
