@@ -25,7 +25,7 @@ import {
 } from "./acp-shims.js";
 import { isProtectedWritePath } from "./protected-paths.js";
 import { detectQuotaErrorText } from "./quota-detect.js";
-import { turnReminderText, validateRunPolicy } from "./types.js";
+import { MAX_RUNNER_STEER_CONTINUATIONS, turnReminderText, validateRunPolicy } from "./types.js";
 import type { ProbedModelInfo, QuotaPauseInfo, RunAgentRequest, RunAgentResult, RunnerCost, RunnerUsage, ToolPolicy } from "./types.js";
 
 /** Returns an accurate, human-readable description of the active tool policy and permissions. */
@@ -270,6 +270,11 @@ async function openWorkspaceFile(
 
 /** Flattens JSON-RPC RequestError.data (the ACP SDK wraps thrown agent errors as -32603 `{ details }`, or as the parsed object when the message was JSON). Walks `cause` so re-wrapped errors keep their detail. */
 function acpErrorDetail(err: unknown): string {
+  return acpErrorParts(err).join(" | ").slice(0, 1000);
+}
+
+/** The individual diagnostic strings acpErrorDetail joins, in walk order. */
+function acpErrorParts(err: unknown): string[] {
   const parts: string[] = [];
   // True when `v` carries detail, even if an earlier hop already recorded the same text.
   const push = (v: unknown): boolean => {
@@ -299,7 +304,30 @@ function acpErrorDetail(err: unknown): string {
       break;
     }
   }
-  return parts.join(" | ").slice(0, 1000);
+  return parts;
+}
+
+/**
+ * The specific JSON-RPC code an outer error wraps (data.code, data.error.code, or a `cause` chain), skipping the
+ * generic internal-error -32603 that SDK wrappers add. Structured codes are authoritative; diagnostic prose never is.
+ */
+function nestedRpcCode(err: unknown): number | undefined {
+  let cur: unknown = err;
+  for (let depth = 0; cur && typeof cur === "object" && depth < 4; depth++) {
+    try {
+      const candidates: unknown[] = [];
+      if (depth > 0) candidates.push((cur as { code?: unknown }).code);
+      const data = (cur as { data?: unknown }).data;
+      if (data && typeof data === "object") {
+        candidates.push((data as { code?: unknown }).code, ((data as { error?: unknown }).error as { code?: unknown } | undefined)?.code);
+      }
+      for (const c of candidates) if (typeof c === "number" && c !== -32603) return c;
+      cur = (cur as { cause?: unknown }).cause;
+    } catch {
+      break;
+    }
+  }
+  return undefined;
 }
 
 /** Last whole stderr lines that fit in `max` chars, without Node process warnings (never the failure reason). */
@@ -1480,6 +1508,7 @@ export class AcpRunner {
       let upstreamLimitStalled = false;
       // One bounded wrap-up turn when the agent ends naturally without settling its task (no return_task).
       let wrapUpTimedOut = false;
+      let steerContinuations = 0;
 
       for (let recoveryAttempt = 0; recoveryAttempt <= MAX_TOTAL_RECOVERY_CONTINUATIONS; recoveryAttempt++) {
         turnsUsed += 1;
@@ -1505,7 +1534,22 @@ export class AcpRunner {
             if (wrapUpTimedOut && !req.signal.aborted && !rolloverTriggered && !idleTimedOut && !(childGoneError && err === childGoneError)) {
               const detail = `${err instanceof Error ? err.message : String(err)} ${acpErrorDetail(err)}`;
               const code = (err as { code?: unknown } | null)?.code;
-              if ((code === -32800 || /cancel/i.test(detail)) && !detectQuotaErrorText(detail).isQuota) {
+              const name = err instanceof Error ? err.name : "";
+              // Only a complete diagnostic field counts: a cancellation phrase quoted inside a longer error is prose.
+              const wholeCancel = /^(?:(?:request|operation|prompt|turn)\s+)?(?:cancell?ed|aborted)(?:\s+by\s+(?:user|client))?\.?$/i;
+              const explicitCancel = [err instanceof Error ? err.message : String(err), ...acpErrorParts(err)].some((f) =>
+                wholeCancel.test(f.trim()),
+              );
+              // Structured codes decide first: -32800 (plain or wrapped by an internal error) is a cancellation and any
+              // other specific code, however its prose reads, is a genuine RPC error. Only a wrapper with no specific
+              // code falls back to a whole-phrase "request cancelled", or a code-less abort.
+              const nested = code === undefined || code === -32603 || typeof code !== "number" ? nestedRpcCode(err) : undefined;
+              const isCancelled =
+                code === -32800 ||
+                (typeof nested === "number" && nested === -32800) ||
+                (nested === undefined && code === -32603 && explicitCancel) ||
+                (nested === undefined && typeof code !== "number" && (name === "AbortError" || explicitCancel));
+              if (isCancelled && !detectQuotaErrorText(detail).isQuota) {
                 resolvePrompt({ stopReason: "end_turn" });
                 return;
               }
@@ -1684,6 +1728,18 @@ export class AcpRunner {
           ].join("\n");
           if (accumulatedText.length > 0) needsParagraphBreak = true;
           continue;
+        }
+        // Steering queued while the agent could not take it natively opens the next turn (before any wrap-up).
+        if (rawStop !== "cancelled" && !req.isTaskSettled?.() && steerContinuations < MAX_RUNNER_STEER_CONTINUATIONS) {
+          const steers = req.drainPendingSteers?.() ?? [];
+          if (steers.length > 0) {
+            steerContinuations += 1;
+            nextPromptText = `[Steering Update]\n${steers.join("\n\n")}`;
+            if (accumulatedText.length > 0) needsParagraphBreak = true;
+            // Does not consume the failure-recovery budget.
+            recoveryAttempt -= 1;
+            continue;
+          }
         }
         if (
           rawStop !== "cancelled" &&

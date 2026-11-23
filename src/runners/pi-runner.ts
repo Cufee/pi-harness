@@ -17,7 +17,7 @@ import { googleProvider } from "@earendil-works/pi-ai/providers/google";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import type { PiProfileConfig } from "../config.js";
 import { detectQuotaErrorText } from "./quota-detect.js";
-import { turnReminderText, validateRunPolicy } from "./types.js";
+import { MAX_RUNNER_STEER_CONTINUATIONS, turnReminderText, validateRunPolicy } from "./types.js";
 import type { ProbedModelInfo, RunAgentRequest, RunAgentResult, RunnerUsage } from "./types.js";
 
 const BUILTIN_PROVIDERS = new Map<string, [() => Provider<Api>, string]>([
@@ -147,8 +147,21 @@ export class PiRunner {
     const cancelledStopReason = (): RunAgentResult["stopReason"] =>
       cancelReason === "clean_rollover" ? "rollover_requested" : "cancelled";
 
+    // One missing-return wrap-up prompt when the agent stops without settling its task, then at most 3 more turns.
+    let wrapUpAttempted = false;
+    let wrapUpTurnsLeft = 0;
+    // Set once the run can take no more turns: a steer arriving then is refused instead of being acknowledged and dropped.
+    let runEnded = false;
+    // Loop guard for turns opened only to deliver queued steering (runner-wide budget).
+    let steerContinuations = 0;
+    // Both budgets bound a steering turn: the runner-wide continuation cap and the three-turn wrap-up window.
+    const canScheduleSteeringTurn = () =>
+      steerContinuations < MAX_RUNNER_STEER_CONTINUATIONS && (!wrapUpAttempted || wrapUpTurnsLeft > 1);
+
     req.onHandle?.({
       steer: async (msg: string) => {
+        // No later turn can deliver this message (final wrap-up turn running, or the steering budget spent).
+        if (runEnded || !canScheduleSteeringTurn()) return false;
         steeringQueue.push(msg);
         return true;
       },
@@ -170,10 +183,9 @@ export class PiRunner {
     try {
       // maxTurns is an advisory reminder threshold; the loop ends only when the agent stops calling tools.
       let turnReminderSent = false;
-      // One missing-return wrap-up prompt when the agent stops without settling its task, then at most 3 more turns.
-      let wrapUpAttempted = false;
-      let wrapUpTurnsLeft = 0;
       let preWrapUpText = "";
+      // Distinct substantive text of each wrap-up turn, in order, so intermediate findings survive a closing "ok".
+      const wrapUpTexts: string[] = [];
       for (let turn = 0; ; turn++) {
         req.callbacks.onTurn?.(turn + 1);
         if (cancelled || runAbort.signal.aborted) {
@@ -369,8 +381,12 @@ export class PiRunner {
         if (textParts.length > 0) {
           const turnText = textParts.join("\n");
           // Wrap-up turns add to the answer that triggered the wrap-up; an acknowledgement never replaces it.
-          if (!wrapUpAttempted || !preWrapUpText.trim()) lastText = turnText;
-          else if (turnText.trim() && turnText.trim() !== preWrapUpText.trim()) lastText = `${preWrapUpText}\n\n${turnText}`;
+          if (!wrapUpAttempted) lastText = turnText;
+          else {
+            const t = turnText.trim();
+            if (t && t !== preWrapUpText.trim() && !wrapUpTexts.some((w) => w.trim() === t)) wrapUpTexts.push(turnText);
+            lastText = [preWrapUpText, ...wrapUpTexts].filter((x) => x.trim()).join("\n\n");
+          }
         }
 
         const toolCalls = finalMsg.content.filter((c) => c.type === "toolCall");
@@ -433,6 +449,18 @@ export class PiRunner {
         }
 
         if (toolCalls.length === 0) {
+          // Every wrap-up turn counts against the three-turn bound, steering continuations included; once the
+          // current turn is the last one allowed, nothing is drained that could not run.
+          if (canScheduleSteeringTurn()) {
+            const late = req.drainPendingSteers?.() ?? [];
+            if (late.length > 0) steeringQueue.push(...late);
+            if (steeringQueue.length > 0) {
+              // Steering that arrived during the turn opens the next one instead of being dropped.
+              steerContinuations += 1;
+              if (wrapUpAttempted) wrapUpTurnsLeft -= 1;
+              continue;
+            }
+          }
           if (!wrapUpAttempted && req.missingReturnWrapUpPrompt && !req.isTaskSettled?.()) {
             wrapUpAttempted = true;
             wrapUpTurnsLeft = 3;
@@ -470,6 +498,7 @@ export class PiRunner {
         }
       }
     } finally {
+      runEnded = true;
       req.signal.removeEventListener("abort", onReqAbort);
     }
   }
