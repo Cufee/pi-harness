@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import type { Terminal } from "@earendil-works/pi-tui";
+import { getCapabilities, setCapabilities, type Terminal } from "@earendil-works/pi-tui";
 import { parseSlashCommand, renderHelp } from "../src/tui/commands.js";
 import {
   clamp,
@@ -587,5 +587,57 @@ describe("TUI v2 Core Primitives", () => {
     assert.ok(idx1 >= 0 && idx2 > idx1, "Line 1 and Line 2 must render on separate lines");
     assert.ok(idxA >= 0 && idxB > idxA, "Markdown list items must render on separate lines");
     assert.ok(idxCode1 >= 0 && idxCode2 > idxCode1, "Fenced code block lines must render on separate lines");
+
+    // Truecolor fenced code blocks must emit clean SGR sequences without raw ANSI fragments
+    // across frozen, streaming, and repeated highlightCode invocations at widths 40/80/120.
+    const goCode = [
+      "var Plan = fct.Plan{",
+      '\tName: "hv-functional",',
+      '\tSteps: []fct.Step{{Name: "boot"}},',
+      "}",
+    ].join("\n");
+    const goMd = `\`\`\`go\n${goCode}\n\`\`\``;
+    const prevCaps = getCapabilities();
+    setCapabilities({ ...prevCaps, trueColor: true });
+    try {
+      const tcTheme = createTheme({ color: true, ascii: false });
+      const rawFragmentRe = /38;2;|\d+;\d+;\d+m/;
+
+      for (const width of [40, 80, 120]) {
+        const frozen = new ImmutableTranscript(tcTheme);
+        frozen.appendAssistantTurn(goMd);
+        const lines = frozen.render(width);
+        const joined = lines.join("\n");
+        assert.ok(joined.includes("\x1b[38;2;166;154;255m"), `expected info truecolor SGR at width ${width}`);
+        assert.ok(joined.includes("\x1b[38;2;110;224;145m"), `expected ok truecolor SGR at width ${width}`);
+        for (const line of lines) {
+          const stripped = line.replace(/\x1b\[[0-9;]*m/g, "");
+          assert.ok(!rawFragmentRe.test(stripped), `unexpected raw ANSI fragment at width ${width}: ${JSON.stringify(line)}`);
+        }
+
+        // Streaming LiveTurnTail path
+        const streaming = new ImmutableTranscript(tcTheme);
+        streaming.liveTail.begin("test-model");
+        for (const chunk of ["```go\nvar Plan = ", 'fct.Plan{\n\tName: "hv-functional",\n', '\tSteps: []fct.Step{{Name: "boot"}},\n}\n```']) {
+          streaming.liveTail.appendText(chunk);
+          for (const line of streaming.liveTail.render(width)) {
+            const stripped = line.replace(/\x1b\[[0-9;]*m/g, "");
+            assert.ok(!rawFragmentRe.test(stripped), `unexpected raw ANSI fragment while streaming at width ${width}: ${JSON.stringify(line)}`);
+          }
+        }
+      }
+
+      // highlightCode must be idempotent / ANSI-safe if invoked on already-highlighted lines
+      const highlight = tcTheme.toMarkdownTheme().highlightCode!;
+      const once = highlight(goCode, "go");
+      const twice = highlight(once.join("\n"), "go");
+      assert.deepEqual(twice, once, "highlightCode must be idempotent on already-highlighted lines");
+      for (const line of twice) {
+        const stripped = line.replace(/\x1b\[[0-9;]*m/g, "");
+        assert.ok(!rawFragmentRe.test(stripped), `unexpected raw ANSI fragment on double highlight: ${JSON.stringify(line)}`);
+      }
+    } finally {
+      setCapabilities(prevCaps);
+    }
   });
 });
