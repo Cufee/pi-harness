@@ -25,7 +25,7 @@ import {
   formatClock,
   formatCountdown,
   formatDuration,
-  formatToolLabel,
+  fillLineBg,
   Frame,
   handleTabKeys,
   type Hint,
@@ -43,10 +43,13 @@ import {
   TableListView,
   tag,
   type Theme,
+  type Tone,
   Viewport,
+  visibleWidth,
   wrap,
   yankText,
 } from "./core/index.js";
+import { LiveTranscriptModel, type TranscriptLine } from "./live-transcript.js";
 import { QuotaWaitPickerScreen } from "./quota-wait-picker.js";
 import { consumeReplay } from "./replay.js";
 import type { WorkStore } from "./store.js";
@@ -1677,11 +1680,27 @@ class MergeInspectorScreen implements Screen {
 
 /* ─────────────────────────── Live Transcript Viewer ───────────────────────── */
 
+interface LiveRowLayout {
+  lines: TranscriptLine[];
+  indexByKey: Map<string, number>;
+  /** First wrapped row of each logical line. */
+  rowStart: number[];
+  rowCount: number[];
+  /** Logical line index of each wrapped row. */
+  rowLine: number[];
+}
+
+const EMPTY_LAYOUT: LiveRowLayout = { lines: [], indexByKey: new Map(), rowStart: [], rowCount: [], rowLine: [] };
+
 /**
  * Read-only live transcript viewer backed by `watch.start` (`scope: "task"` or `"run"`) + `replay.page`.
  * Buffers early watch frames until `watchId` settles, drains paginated replay + fragments, handles
  * `agent.tool`, `agent.thought_delta`, `agent.rollover`, `agent.error`, and `quota.*`, and guards
  * `onClose()` so late-resolving watches are stopped immediately without leaking.
+ *
+ * Reading: a logical-line cursor (`↑↓`), range selection (`v` / `Shift+↑↓`), exact copy (`y`), and
+ * per-tool expand/collapse (`Enter`). While paused, the top visible line is pinned by its stable key
+ * so streaming output, re-wrapping, and expansion never move what is being read; `End`/`G`/`f` resumes follow.
  */
 export class LiveTranscriptScreen implements Screen {
   readonly variant = "sheet" as const;
@@ -1693,9 +1712,15 @@ export class LiveTranscriptScreen implements Screen {
   private closed = false;
   private detach: (() => void) | null = null;
   private earlyBuffer: DaemonEventFrame[] = [];
-  private rawLines: string[] = [];
-  private textBufByTask = new Map<string, string>();
-  private thoughtBufByTask = new Map<string, string>();
+  private readonly model: LiveTranscriptModel;
+  private layout: LiveRowLayout = EMPTY_LAYOUT;
+  private readonly rowCache = new Map<string, { sig: string; rows: string[] }>();
+  private cursorKey: string | null = null;
+  private selectAnchorKey: string | null = null;
+  private readAnchor: { key: string; delta: number } | null = null;
+  private pausedAtLines = 0;
+  /** Tool block just expanded: its rows are scrolled into view after the next layout. */
+  private revealBlockId: number | null = null;
 
   constructor(
     private readonly runId: string,
@@ -1703,6 +1728,7 @@ export class LiveTranscriptScreen implements Screen {
     private readonly deps: InspectorDeps,
   ) {
     this.title = taskId ? `Live ${taskId}` : `Live ${runId}`;
+    this.model = new LiveTranscriptModel(Boolean(taskId));
   }
 
   onShow(ctx: ScreenContext): void {
@@ -1751,7 +1777,7 @@ export class LiveTranscriptScreen implements Screen {
       })
       .catch((err) => {
         if (this.closed) return;
-        this.rawLines.push(`Failed to start live watch: ${err instanceof Error ? err.message : String(err)}`);
+        this.model.pushNotice(`Failed to start live watch: ${err instanceof Error ? err.message : String(err)}`);
         ctx.requestRender();
       });
   }
@@ -1768,145 +1794,339 @@ export class LiveTranscriptScreen implements Screen {
     }
   }
 
-  private flushPendingBuffers(taskKey?: string): void {
-    const keys = taskKey !== undefined ? [taskKey] : [...new Set([...this.thoughtBufByTask.keys(), ...this.textBufByTask.keys()])];
-    for (const k of keys) {
-      const prefix = !this.taskId && k !== "__run__" ? `[${k}] ` : "";
-      const th = this.thoughtBufByTask.get(k);
-      if (th && th.trim()) {
-        this.rawLines.push(`${prefix}… ${sanitizeLine(th)}`);
+  private ingestEvent(ev: EventRecord | DaemonEventFrame): void {
+    this.model.ingest(ev);
+  }
+
+  /* ── layout ── */
+
+  /** Index of `key` in the current layout, falling back to its block header when the slot vanished (collapse/trim). */
+  private resolveIndex(key: string | null): number {
+    if (!key) return -1;
+    const idx = this.layout.indexByKey.get(key);
+    if (idx !== undefined) return idx;
+    const header = this.layout.indexByKey.get(`${key.slice(0, key.indexOf(":"))}:h`);
+    return header ?? -1;
+  }
+
+  private keyAt(idx: number): string | null {
+    return idx >= 0 ? (this.layout.lines[idx]?.key ?? null) : null;
+  }
+
+  private selectionBounds(): [number, number] | null {
+    if (this.selectAnchorKey === null) return null;
+    const a = this.resolveIndex(this.selectAnchorKey);
+    const c = this.resolveIndex(this.cursorKey);
+    if (a < 0 || c < 0) return null;
+    return [Math.min(a, c), Math.max(a, c)];
+  }
+
+  private styleLine(line: TranscriptLine, width: number, theme: Theme): string[] {
+    const g = theme.glyphs;
+    const indented = (first: string, rest: string, styled: string): string[] => {
+      const avail = Math.max(1, width - visibleWidth(first));
+      return wrap(styled, avail).map((r, i) => `${i === 0 ? first : rest}${r}`);
+    };
+    switch (line.role) {
+      case "spacer":
+        return [""];
+      case "assistant-header":
+        return indented(`${theme.accent(g.diamond)} `, "  ", theme.bold(line.text));
+      case "thought-header":
+        return indented(theme.dim("… "), "  ", theme.dim(theme.italic(line.text)));
+      case "heading":
+        return indented("  ", "  ", theme.accentBold(line.text));
+      case "list":
+        return indented("  ", "    ", line.text);
+      case "fence":
+        return [`  ${theme.muted(line.text ? `${g.boxTL}${g.barH} ${line.text}` : `${g.boxBL}${g.barH}`)}`];
+      case "code": {
+        const bar = `  ${theme.muted(g.barV)} `;
+        return indented(bar, bar, theme.code(line.text));
       }
-      this.thoughtBufByTask.delete(k);
-      const tx = this.textBufByTask.get(k);
-      if (tx) {
-        this.rawLines.push(`${prefix}${sanitizeLine(tx)}`);
+      case "thought":
+        return indented("  ", "  ", theme.dim(theme.italic(line.text)));
+      case "tool-header": {
+        const st = line.tool?.status ?? "running";
+        const tone: Tone = st === "ok" ? "ok" : st === "error" ? "danger" : "accent";
+        const fold = theme.muted(`${line.tool?.expanded ? g.foldOpen : g.foldClosed} `);
+        return indented(fold, "  ", theme.paint(tone, line.text));
       }
-      this.textBufByTask.delete(k);
+      case "tool-label":
+        return indented("    ", "    ", theme.muted(line.text));
+      case "tool-body":
+      case "tool-error": {
+        const bar = `    ${theme.muted(g.barV)} `;
+        return indented(bar, bar, line.role === "tool-error" ? theme.danger(line.text) : line.text);
+      }
+      case "event":
+        return indented("", "  ", theme.paint(line.tone ?? "muted", line.text));
+      default:
+        return indented("  ", "  ", line.text);
     }
   }
 
-  private ingestEvent(ev: EventRecord | DaemonEventFrame): void {
-    const p = (ev.payload ?? {}) as Record<string, unknown>;
-    const taskKey = ev.taskId ?? "__run__";
-    const who = !this.taskId && ev.taskId ? `[${ev.taskId}] ` : "";
+  /** Rebuilds wrapped rows for `rowW` columns: 2-col gutter (cursor / selection rail) + styled line. */
+  private layoutRows(rowW: number, theme: Theme): string[] {
+    const lines = this.model.lines();
+    const indexByKey = new Map<string, number>();
+    lines.forEach((l, i) => indexByKey.set(l.key, i));
+    this.layout = { lines, indexByKey, rowStart: [], rowCount: [], rowLine: [] };
+    // Re-key cursor/anchor to surviving lines (a collapsed tool's sub-line falls back to its header).
+    this.cursorKey = this.keyAt(this.resolveIndex(this.cursorKey));
+    this.selectAnchorKey = this.keyAt(this.resolveIndex(this.selectAnchorKey));
+    if (this.cursorKey === null) this.selectAnchorKey = null;
 
-    if (ev.type === "agent.text_delta") {
-      const th = this.thoughtBufByTask.get(taskKey);
-      if (th && th.trim()) {
-        this.rawLines.push(`${who}… ${sanitizeLine(th)}`);
-        this.thoughtBufByTask.delete(taskKey);
+    if (this.rowCache.size > lines.length * 2 + 256) this.rowCache.clear();
+    const sel = this.selectionBounds();
+    const cursorIdx = this.resolveIndex(this.cursorKey);
+    const bodyW = Math.max(1, rowW - 2);
+    const rows: string[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!;
+      const sig = `${bodyW}\u0000${theme.color}\u0000${line.role}\u0000${line.tone ?? ""}\u0000${line.tool?.status ?? ""}\u0000${line.tool?.expanded ?? ""}\u0000${line.text}`;
+      let cached = this.rowCache.get(line.key);
+      if (!cached || cached.sig !== sig) {
+        cached = { sig, rows: this.styleLine(line, bodyW, theme) };
+        this.rowCache.set(line.key, cached);
       }
-      const delta = String(p.text ?? p.delta ?? "");
-      const combined = (this.textBufByTask.get(taskKey) ?? "") + delta;
-      const parts = combined.split(/\r?\n/);
-      const tail = parts.pop() ?? "";
-      if (tail) this.textBufByTask.set(taskKey, tail);
-      else this.textBufByTask.delete(taskKey);
-      for (const line of parts) this.rawLines.push(`${who}${sanitizeLine(line)}`);
-    } else if (ev.type === "agent.thought_delta") {
-      const delta = String(p.text ?? p.delta ?? "");
-      const combined = (this.thoughtBufByTask.get(taskKey) ?? "") + delta;
-      const parts = combined.split(/\r?\n/);
-      const tail = parts.pop() ?? "";
-      if (tail) this.thoughtBufByTask.set(taskKey, tail);
-      else this.thoughtBufByTask.delete(taskKey);
-      for (const line of parts) {
-        if (line.trim()) this.rawLines.push(`${who}… ${sanitizeLine(line)}`);
-      }
-    } else if (ev.type === "agent.tool") {
-      this.flushPendingBuffers(taskKey);
-      const name = formatToolLabel(String(p.title ?? p.name ?? p.toolName ?? "tool"));
-      const st = String(p.status ?? "running");
-      const icon = st === "completed" || st === "ok" ? "✓" : st === "failed" || st === "error" ? "✗" : "▶";
-      const detail = p.error ?? p.result ?? p.args ?? "";
-      const detailStr = detail ? ` — ${firstLine(typeof detail === "string" ? detail : JSON.stringify(detail), 90)}` : "";
-      this.rawLines.push(`[${formatClock(ev.createdAt)}] ${who}${icon} ${name}${detailStr}`);
-    } else if (ev.type === "agent.tool_start" || ev.type === "agent.tool_end") {
-      this.flushPendingBuffers();
-      const name = formatToolLabel(String(p.toolName ?? p.name ?? p.title ?? "tool"));
-      this.rawLines.push(`[${formatClock(ev.createdAt)}] ${who}${ev.type === "agent.tool_start" ? "▶" : "✓"} ${name}`);
-    } else if (ev.type === "agent.rollover") {
-      this.flushPendingBuffers();
-      const gen = p.generation ?? p.nextGeneration ?? "";
-      const reason = p.reason ? ` (${sanitizeLine(String(p.reason))})` : "";
-      this.rawLines.push(`[${formatClock(ev.createdAt)}] ${who}↻ rollover${gen ? ` → gen ${gen}` : ""}${reason}`);
-    } else if (ev.type === "agent.error") {
-      this.flushPendingBuffers();
-      const msg = sanitizeLine(String(p.message ?? p.error ?? "agent error"));
-      this.rawLines.push(`[${formatClock(ev.createdAt)}] ${who}✗ ERROR: ${msg}`);
-    } else if (ev.type.startsWith("quota.")) {
-      this.flushPendingBuffers();
-      const reason = sanitizeLine(String(p.reason ?? p.mode ?? ""));
-      const wake = p.resumeAt ? ` · resume ${formatCountdown(p.resumeAt as number | string)}` : "";
-      this.rawLines.push(`[${formatClock(ev.createdAt)}] ⏸ ${ev.type}${reason ? ` · ${reason}` : ""}${wake}`);
-    } else {
-      this.flushPendingBuffers();
-      const summary = p.summary ?? p.status ?? p.to ?? p.title ?? p.message ?? "";
-      this.rawLines.push(`[${formatClock(ev.createdAt)}] ${who}${ev.type}${summary ? ` · ${sanitizeLine(String(summary))}` : ""}`);
+      const inSel = sel !== null && i >= sel[0] && i <= sel[1];
+      const isCursor = i === cursorIdx;
+      this.layout.rowStart.push(rows.length);
+      this.layout.rowCount.push(cached.rows.length);
+      cached.rows.forEach((r, j) => {
+        const gutter = isCursor && j === 0 ? `${theme.accent(theme.glyphs.pointer)} ` : inSel ? `${theme.accent(theme.glyphs.rail)} ` : "  ";
+        const row = gutter + r;
+        rows.push(inSel || isCursor ? fillLineBg(row, rowW, theme.badgeBg) : row);
+        this.layout.rowLine.push(i);
+      });
     }
+    return rows;
+  }
 
-    if (this.rawLines.length > 2000) this.rawLines.splice(0, this.rawLines.length - 1500);
+  /* ── reading anchor / follow ── */
+
+  private captureAnchor(): void {
+    const idx = this.layout.rowLine[this.viewport.offset];
+    if (idx === undefined) return;
+    this.readAnchor = { key: this.layout.lines[idx]!.key, delta: this.viewport.offset - this.layout.rowStart[idx]! };
+  }
+
+  private restoreAnchor(): void {
+    if (!this.readAnchor) return;
+    const exact = this.layout.indexByKey.get(this.readAnchor.key);
+    const idx = exact ?? this.resolveIndex(this.readAnchor.key);
+    if (idx < 0) return;
+    const delta = exact === undefined ? 0 : Math.min(this.readAnchor.delta, this.layout.rowCount[idx]! - 1);
+    this.viewport.offset = this.layout.rowStart[idx]! + delta;
+  }
+
+  private pause(): void {
+    if (!this.viewport.follow) return;
+    this.viewport.follow = false;
+    this.pausedAtLines = this.layout.lines.length;
+  }
+
+  private resume(): void {
+    this.viewport.follow = true;
+    this.viewport.scrollToBottom(true);
+    this.readAnchor = null;
+    if (this.selectAnchorKey === null) this.cursorKey = null;
+  }
+
+  private visibleLineRange(): [number, number] {
+    const rowLine = this.layout.rowLine;
+    const top = Math.min(this.viewport.offset, rowLine.length - 1);
+    const bottom = Math.min(rowLine.length - 1, this.viewport.offset + this.viewport.lastHeight - 1);
+    return [rowLine[Math.max(0, top)] ?? 0, rowLine[Math.max(0, bottom)] ?? 0];
+  }
+
+  private moveCursor(delta: number, extend: boolean): void {
+    const lines = this.layout.lines;
+    if (lines.length === 0) return;
+    let idx = this.resolveIndex(this.cursorKey);
+    const fresh = idx < 0;
+    if (fresh) idx = this.visibleLineRange()[1];
+    if (extend && this.selectAnchorKey === null) this.selectAnchorKey = lines[idx]!.key;
+    if (!fresh) idx = Math.max(0, Math.min(lines.length - 1, idx + delta));
+    const dir = delta < 0 ? -1 : 1;
+    while (lines[idx]?.role === "spacer" && idx + dir >= 0 && idx + dir < lines.length) idx += dir;
+    while (lines[idx]?.role === "spacer" && idx - dir >= 0 && idx - dir < lines.length) idx -= dir;
+    this.cursorKey = lines[idx]!.key;
+    if (this.selectAnchorKey === null && extend) this.selectAnchorKey = this.cursorKey;
+    this.pause();
+    this.revealLines(idx, idx);
+    this.captureAnchor();
+  }
+
+  /** Scrolls the minimum needed to show logical lines `from..to`, keeping `from` visible when they do not fit. */
+  private revealLines(from: number, to: number): void {
+    const start = this.layout.rowStart[from]!;
+    const end = this.layout.rowStart[to]! + this.layout.rowCount[to]! - 1;
+    const h = Math.max(1, this.viewport.lastHeight);
+    if (start < this.viewport.offset) this.viewport.offset = start;
+    else if (end >= this.viewport.offset + h) this.viewport.offset = Math.min(start, end - h + 1);
+  }
+
+  private copyLines(from: number, to: number): string {
+    let lo = from;
+    let hi = to;
+    const lines = this.layout.lines;
+    while (lo < hi && lines[lo]?.role === "spacer") lo++;
+    while (hi > lo && lines[hi]?.role === "spacer") hi--;
+    return lines.slice(lo, hi + 1).map((l) => l.copy).join("\n");
   }
 
   render(width: number, maxHeight: number, theme: Theme): string[] {
     const hints: Hint[] = [
-      { key: "f", label: this.viewport.follow ? "follow:on" : "follow:off" },
+      { key: "↑↓", label: "cursor" },
+      { key: "v/⇧↑↓", label: this.selectAnchorKey ? "selecting" : "select" },
       { key: "y", label: "copy" },
-      { key: "↑↓/PgUp/PgDn/wheel", label: "scroll" },
-      { key: "Esc", label: "close" },
+      { key: "⏎", label: "tool" },
+      { key: "f/End", label: this.viewport.follow ? "follow:on" : "follow:off" },
+      { key: "PgUp/PgDn/wheel", label: "scroll" },
+      { key: "Y", label: "copy all" },
+      { key: "Esc", label: this.selectAnchorKey ? "clear" : "close" },
     ];
+    const header = (): string => {
+      if (this.viewport.follow) return theme.ok(`${theme.glyphs.running} live`);
+      const newLines = Math.max(0, this.layout.lines.length - this.pausedAtLines);
+      const lead = newLines > 0 ? theme.warn(`+${newLines} new · End resumes `) : theme.muted("paused ");
+      return `${lead}${theme.muted(this.viewport.statusText())}`;
+    };
+    // The header reflects the layout the body pass computes, so re-render once when that pass changed it.
+    const before = header();
+    const out = this.renderFrame(width, maxHeight, theme, hints, before);
+    const after = header();
+    return after === before ? out : this.renderFrame(width, maxHeight, theme, hints, after);
+  }
+
+  private renderFrame(width: number, maxHeight: number, theme: Theme, hints: Hint[], rightHeader: string): string[] {
     return this.frame.render({
       width,
       maxHeight,
       theme,
       breadcrumbs: this.nav?.breadcrumbs ?? [this.title],
-      rightHeader: this.viewport.follow ? theme.ok(`${theme.glyphs.running} live`) : theme.muted(this.viewport.statusText()),
+      rightHeader,
       hints,
       renderBody: (innerW, bodyH) => {
-        const trailing: string[] = [];
-        for (const [k, th] of this.thoughtBufByTask) {
-          if (th.trim()) {
-            const pfx = !this.taskId && k !== "__run__" ? `[${k}] ` : "";
-            trailing.push(theme.dim(`${pfx}… ${sanitizeLine(th)}`));
+        if (this.model.isEmpty) {
+          this.layout = EMPTY_LAYOUT;
+          return [theme.muted("Waiting for live events...")];
+        }
+        // Reserve the scrollbar gutter up front so rows never get truncated when it appears.
+        const rows = this.layoutRows(Math.max(4, innerW - 2), theme);
+        if (!this.viewport.follow) {
+          this.restoreAnchor();
+          if (this.revealBlockId !== null) {
+            const idxs = this.layout.lines.flatMap((l, i) => (l.blockId === this.revealBlockId ? [i] : []));
+            if (idxs.length > 0) this.revealLines(idxs[0]!, idxs[idxs.length - 1]!);
           }
         }
-        for (const [k, tx] of this.textBufByTask) {
-          if (tx) {
-            const pfx = !this.taskId && k !== "__run__" ? `[${k}] ` : "";
-            trailing.push(`${pfx}${sanitizeLine(tx)}`);
-          }
-        }
-        const all = [...this.rawLines, ...trailing];
-        if (all.length === 0) return [theme.muted("Waiting for live events...")];
-        const wrapped = all.flatMap((l) => wrap(l, innerW));
-        return this.viewport.render(wrapped, innerW, bodyH, theme);
+        this.revealBlockId = null;
+        const out = this.viewport.render(rows, innerW, bodyH, theme);
+        if (!this.viewport.follow) this.captureAnchor();
+        return out;
       },
     });
   }
 
   handleInput(data: string, ctx: ScreenContext): void {
+    const done = () => ctx.requestRender();
+    if (matchesKey(data, "escape") && this.selectAnchorKey !== null) {
+      this.selectAnchorKey = null;
+      return done();
+    }
     if (isPopKey(data, ctx)) {
       ctx.navigator.pop();
       return;
     }
+
+    const wheel = parseMouseWheel(data);
+    if (wheel.hadMouse) {
+      if (wheel.delta < 0) this.pause();
+      if (wheel.delta !== 0 && !this.viewport.follow) {
+        this.viewport.scrollBy(wheel.delta);
+        this.captureAnchor();
+      }
+      return done();
+    }
+
+    const extend = matchesKey(data, "shift+up") || matchesKey(data, "shift+down") || data === "K" || data === "J";
+    const up = extend ? matchesKey(data, "shift+up") || data === "K" : matchesKey(data, "up") || data === "k";
+    if (extend || up || matchesKey(data, "down") || data === "j") {
+      this.moveCursor(up ? -1 : 1, extend);
+      return done();
+    }
+
+    if (data === "v") {
+      if (this.selectAnchorKey !== null) this.selectAnchorKey = null;
+      else {
+        if (this.resolveIndex(this.cursorKey) < 0) this.moveCursor(0, false);
+        this.selectAnchorKey = this.cursorKey;
+      }
+      return done();
+    }
+
+    if (matchesKey(data, "pageUp") || matchesKey(data, "ctrl+u")) {
+      this.pause();
+      this.viewport.pageUp();
+      this.captureAnchor();
+      return done();
+    }
+    if (matchesKey(data, "pageDown") || matchesKey(data, "ctrl+d")) {
+      if (!this.viewport.follow) {
+        this.viewport.pageDown();
+        this.captureAnchor();
+      }
+      return done();
+    }
+    if (matchesKey(data, "home") || data === "g") {
+      this.pause();
+      this.viewport.scrollToTop();
+      this.captureAnchor();
+      return done();
+    }
+    if (matchesKey(data, "end") || data === "G") {
+      this.resume();
+      return done();
+    }
     if (data === "f") {
-      this.viewport.follow = !this.viewport.follow;
-      if (this.viewport.follow) this.viewport.scrollToBottom(true);
-      ctx.requestRender();
-      return;
+      if (this.viewport.follow) {
+        this.pause();
+        this.captureAnchor();
+      } else this.resume();
+      return done();
     }
+
+    if (matchesKey(data, "enter") || matchesKey(data, "return") || data === " ") {
+      const idx = this.resolveIndex(this.cursorKey);
+      const line = this.layout.lines[idx];
+      if (!line || !this.model.toggleTool(line.blockId)) {
+        this.frame.setNotice("Move the cursor (↑↓) onto a tool call to expand or collapse it", "info");
+      } else {
+        this.revealBlockId = line.blockId;
+      }
+      return done();
+    }
+
     if (data === "y") {
-      const copyLines = [
-        ...this.rawLines,
-        ...[...this.textBufByTask.entries()].filter(([, tx]) => tx).map(([k, tx]) => `${!this.taskId && k !== "__run__" ? `[${k}] ` : ""}${sanitizeLine(tx)}`),
-      ];
-      yankText(copyLines.join("\n"), ctx.writeTerminal);
-      this.frame.setNotice("Copied transcript lines", "ok");
-      ctx.requestRender();
-      return;
+      const sel = this.selectionBounds();
+      const cur = this.resolveIndex(this.cursorKey);
+      if (sel || cur >= 0) {
+        const [lo, hi] = sel ?? [cur, cur];
+        const text = this.copyLines(lo, hi);
+        yankText(text, ctx.writeTerminal);
+        const n = hi - lo + 1;
+        this.frame.setNotice(`Copied ${n} line${n === 1 ? "" : "s"}`, "ok");
+        return done();
+      }
     }
-    if (handleViewportScrollKeys(data, this.viewport)) {
-      ctx.requestRender();
+    if (data === "y" || data === "Y") {
+      const lines = this.model.lines();
+      yankText(lines.map((l) => l.copy).join("\n"), ctx.writeTerminal);
+      this.frame.setNotice("Copied transcript", "ok");
+      return done();
     }
   }
 }
