@@ -162,6 +162,9 @@ function makeBg(color: boolean, r: number, g: number, b: number, fallback256: nu
   return (s: string) => `${code}${s}\x1b[49m`;
 }
 
+const CODE_TOKEN_RE =
+  /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|\b(import|export|from|const|let|var|function|async|await|return|if|else|for|while|switch|case|break|continue|class|interface|type|enum|extends|implements|new|try|catch|finally|throw|def|fn|pub|struct|impl|match|use|mod|package|func|go|defer|SELECT|FROM|WHERE|INSERT|UPDATE|CREATE|TABLE)\b|\b\d+(?:\.\d+)?\b/g;
+
 /** Fast, zero-dependency syntax highlighter for fenced code blocks inside Markdown. */
 function highlightCodeLines(
   code: string,
@@ -174,20 +177,17 @@ function highlightCodeLines(
   },
 ): string[] {
   if (!color) return code.split("\n");
-  const KEYWORDS =
-    /\b(import|export|from|const|let|var|function|async|await|return|if|else|for|while|switch|case|break|continue|class|interface|type|enum|extends|implements|new|try|catch|finally|throw|def|fn|pub|struct|impl|match|use|mod|package|func|go|defer|SELECT|FROM|WHERE|INSERT|UPDATE|CREATE|TABLE)\b/g;
 
   return code.split("\n").map((line) => {
     const trimmed = line.trimStart();
     if (trimmed.startsWith("//") || trimmed.startsWith("#") || trimmed.startsWith("--")) {
       return c.dim(line);
     }
-    return (
-      line
-        .replace(/(["'`])(?:\\.|(?!\1).)*\1/g, (m) => c.ok(m))
-        .replace(KEYWORDS, (m) => c.info(m))
-        .replace(/\b(\d+(?:\.\d+)?)\b/g, (m) => c.warn(m)) + "\x1b[39m"
-    );
+    return line.replace(CODE_TOKEN_RE, (match, str: string | undefined, kw: string | undefined) => {
+      if (str !== undefined) return c.ok(match);
+      if (kw !== undefined) return c.info(match);
+      return c.warn(match);
+    });
   });
 }
 
