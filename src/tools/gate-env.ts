@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
-import { access, stat } from "node:fs/promises";
+import { access, realpath, stat } from "node:fs/promises";
 import { homedir, userInfo } from "node:os";
-import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { normalizeGateConfig } from "../config.js";
 import { nativeToolsPathDirs } from "./native-tools.js";
 
@@ -524,6 +524,76 @@ export async function resolveGateEnv(o: {
     env: { ...process.env, ...miseVars, ...gateVars, ...o.extraEnv, PATH: finalPath.join(delimiter) },
     provenance: `shell=${shell} ${login.desc} mise=${miseDesc} dirs=${finalPath.length}`,
   };
+}
+
+function isInsideDir(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return !isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`);
+}
+
+async function expandForbiddenRoots(roots: string[] | undefined): Promise<string[]> {
+  const out = new Set<string>();
+  for (const r of roots ?? []) {
+    if (!r) continue;
+    out.add(resolve(r));
+    try {
+      out.add(await realpath(r));
+    } catch {
+      // Ignore if root cannot be canonicalized; lexical root still applies.
+    }
+  }
+  return [...out];
+}
+
+/**
+ * Resolves a bare command name strictly from `rawPath` (default `process.env.PATH`, absolute entries only)
+ * and rejects if either the matched path or its canonical target lies inside any disallowed workspace root.
+ * Returns the original matched path so multicall binaries (e.g. NixOS coreutils) preserve `argv[0]`.
+ */
+export async function resolveTrustedBinary(
+  name: string,
+  opts?: { rawPath?: string; disallowInsideRoots?: string[] },
+): Promise<string> {
+  if (!name || isAbsolute(name) || name.includes("/")) {
+    throw new Error(`trusted binary lookup requires a bare command name (got '${name}')`);
+  }
+  const dirs = pathSegments(opts?.rawPath ?? process.env.PATH);
+  const found = await findExecutable(name, dirs);
+  if (!found) {
+    throw new Error(`executable '${name}' not found on harness PATH`);
+  }
+  const canonicalFound = await realpath(found);
+  const forbidden = await expandForbiddenRoots(opts?.disallowInsideRoots);
+  for (const root of forbidden) {
+    if (isInsideDir(root, found) || isInsideDir(root, canonicalFound)) {
+      throw new Error(`executable '${name}' resolves inside workspace: ${canonicalFound}`);
+    }
+  }
+  return found;
+}
+
+/**
+ * Keeps only absolute PATH entries from `rawPath` whose path and canonical target lie outside `disallowInsideRoots`.
+ */
+export async function filterTrustedPath(
+  rawPath: string | undefined,
+  disallowInsideRoots?: string[],
+): Promise<string> {
+  const dirs = pathSegments(rawPath);
+  const forbidden = await expandForbiddenRoots(disallowInsideRoots);
+  if (forbidden.length === 0) return dirs.join(delimiter);
+  const kept: string[] = [];
+  for (const dir of dirs) {
+    let canonical = dir;
+    try {
+      canonical = await realpath(dir);
+    } catch {
+      // Non-existent dir checked lexically.
+    }
+    if (forbidden.some((root) => isInsideDir(root, dir) || isInsideDir(root, canonical))) continue;
+    kept.push(dir);
+  }
+  return kept.join(delimiter);
 }
 
 /**

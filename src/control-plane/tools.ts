@@ -4,10 +4,10 @@ import { recommendModelsByTaskKind, type ModelCatalogCompiler } from "../catalog
 import { CODE_EXEC_TOOL_NAME, TOOL_SEARCH_TOOL_NAME, createCodeModeExecutor, effectiveCodeMode, exposedTools } from "../code-mode/index.js";
 import type { HarnessConfig } from "../config.js";
 import { codeExecEventSink } from "../protocol/tool-display.js";
-import { checkReadOnlyArgv } from "../runners/acp-shims.js";
+import { checkReadOnlyArgv, isSafeGitRemoteUrl, parseReadOnlyGitNetworkCommand } from "../runners/acp-shims.js";
 import { isProtectedWritePath } from "../runners/protected-paths.js";
 import type { ToolDefinition } from "../runners/types.js";
-import { resolveGateEnv, runArgv } from "../tools/gate-env.js";
+import { filterTrustedPath, resolveGateEnv, resolveTrustedBinary, runArgv } from "../tools/gate-env.js";
 import type { KbKind } from "../kb/store.js";
 import type { BisectingMergeQueue } from "../worktree/merge-queue.js";
 import { runGit, type WorktreeManager } from "../worktree/manager.js";
@@ -1439,14 +1439,10 @@ export class ControlPlaneToolExecutor {
         ) {
           throw new Error(`inspect_command cwd must be a non-protected directory inside the task workspace: ${requestedCwd}`);
         }
-        const rawExtraRoots = [
-          join(run.repoRoot, ".harness", "goals"),
-          join(run.repoRoot, ".harness", "artifacts"),
-          resolve(run.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts"),
-          ...(this.config.worktree.extraReadRoots ?? []),
-        ];
+        // Only operator global config (config.worktree.extraReadRoots) may authorize external read roots;
+        // repository-configurable artifactsDir and dossier symlinks outside realRoot are never promoted.
         const resolvedExtraReadRoots: string[] = [];
-        for (const raw of rawExtraRoots) {
+        for (const raw of this.config.worktree.extraReadRoots ?? []) {
           const trimmed = raw.trim();
           if (!trimmed) continue;
           const expanded = resolve(expandHomePath(trimmed));
@@ -1469,39 +1465,120 @@ export class ControlPlaneToolExecutor {
         }
         const timeoutMs = Math.min(900, rawTimeout) * 1000;
         const signal = callerSignal ?? scriptSignal ?? this.hooks.getTaskSignal(taskId);
-        const resolved = await resolveGateEnv({
-          cwd,
-          config: {
-            gateShell: this.config.goals.gateShell,
-            gateEnv: this.config.goals.gateEnv,
-            stateDir: this.config.stateDir,
-          },
-          signal,
-        });
-        const env: NodeJS.ProcessEnv = {
-          ...resolved.env,
-          GIT_PAGER: "cat",
-          PAGER: "cat",
-          GIT_TERMINAL_PROMPT: "0",
-          GIT_OPTIONAL_LOCKS: "0",
-          NO_COLOR: "1",
-          CI: "1",
-        };
-        delete env.GIT_EXTERNAL_DIFF;
         const bin = argv[0]!;
-        const execArgs =
-          bin === "git"
-            ? [
-                "--no-pager",
-                "-c", "core.fsmonitor=false",
-                "-c", "diff.external=",
-                "-c", "core.hooksPath=/dev/null",
-                "-c", "protocol.ext.allow=never",
-                "-c", "protocol.file.allow=user",
-                ...argv.slice(1),
-              ]
-            : argv.slice(1);
-        const r = await runArgv(bin, execArgs, {
+        const isGateRunner = bin === "bun" || bin === "bunx";
+        let executable: string;
+        let env: NodeJS.ProcessEnv;
+        if (isGateRunner) {
+          const resolved = await resolveGateEnv({
+            cwd,
+            config: {
+              gateShell: this.config.goals.gateShell,
+              gateEnv: this.config.goals.gateEnv,
+              stateDir: this.config.stateDir,
+            },
+            signal,
+          });
+          env = {
+            ...resolved.env,
+            GIT_PAGER: "cat",
+            PAGER: "cat",
+            GIT_TERMINAL_PROMPT: "0",
+            GIT_OPTIONAL_LOCKS: "0",
+            NO_COLOR: "1",
+            CI: "1",
+          };
+          delete env.GIT_EXTERNAL_DIFF;
+          executable = bin;
+        } else {
+          const workspaceRoots = [root, realRoot, run.repoRoot];
+          try {
+            executable = await resolveTrustedBinary(bin, { disallowInsideRoots: workspaceRoots });
+          } catch (err) {
+            throw new Error(`inspect_command rejected: ${err instanceof Error ? err.message : String(err)}`);
+          }
+          const trustedPath = await filterTrustedPath(process.env.PATH, workspaceRoots);
+          env = {
+            ...(trustedPath ? { PATH: trustedPath } : {}),
+            ...(process.env.HOME !== undefined ? { HOME: process.env.HOME } : {}),
+            ...(process.env.LANG !== undefined ? { LANG: process.env.LANG } : {}),
+            ...(process.env.LC_ALL !== undefined ? { LC_ALL: process.env.LC_ALL } : {}),
+            GIT_PAGER: "cat",
+            PAGER: "cat",
+            GIT_TERMINAL_PROMPT: "0",
+            GIT_OPTIONAL_LOCKS: "0",
+            NO_COLOR: "1",
+            CI: "1",
+          };
+        }
+        const gitSafePrefix = [
+          "--no-pager",
+          "-c", "core.fsmonitor=false",
+          "-c", "diff.external=",
+          "-c", "core.hooksPath=/dev/null",
+          "-c", "protocol.ext.allow=never",
+          "-c", "protocol.file.allow=never",
+        ];
+        if (bin === "git") {
+          let g = 1;
+          while (g < argv.length && (argv[g] === "--no-pager" || argv[g] === "-P" || argv[g] === "--no-optional-locks")) {
+            g++;
+          }
+          const gitSub = argv[g];
+          if (gitSub === "fetch" || gitSub === "ls-remote") {
+            const parsed = parseReadOnlyGitNetworkCommand(gitSub, argv.slice(g + 1));
+            if (!parsed) {
+              throw new Error(`inspect_command rejected: git ${gitSub} arguments are not allowed in read-only mode`);
+            }
+            const probeTimeoutMs = Math.min(timeoutMs, 15_000);
+            const remotesRes = await runArgv(executable, [...gitSafePrefix, "remote"], {
+              cwd,
+              env,
+              timeoutMs: probeTimeoutMs,
+              maxOutputBytes: 256 * 1024,
+              signal,
+            });
+            if (remotesRes.stopped || remotesRes.exitCode !== 0) {
+              throw new Error("inspect_command rejected: failed to list configured git remotes");
+            }
+            const configuredRemotes = remotesRes.stdout
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter(Boolean);
+            let remotesToCheck: string[];
+            if (parsed.allRemotes) {
+              remotesToCheck = configuredRemotes;
+            } else {
+              if (!configuredRemotes.includes(parsed.remote)) {
+                throw new Error(`inspect_command rejected: git remote '${parsed.remote}' is not a configured remote`);
+              }
+              remotesToCheck = [parsed.remote];
+            }
+            for (const remoteName of remotesToCheck) {
+              const urlRes = await runArgv(executable, [...gitSafePrefix, "remote", "get-url", "--all", "--", remoteName], {
+                cwd,
+                env,
+                timeoutMs: probeTimeoutMs,
+                maxOutputBytes: 256 * 1024,
+                signal,
+              });
+              if (urlRes.stopped || urlRes.exitCode !== 0) {
+                throw new Error(`inspect_command rejected: failed to resolve URL for git remote '${remoteName}'`);
+              }
+              const urls = urlRes.stdout
+                .split(/\r?\n/)
+                .map((line) => line.trim())
+                .filter(Boolean);
+              if (urls.length === 0 || urls.some((u) => !isSafeGitRemoteUrl(u))) {
+                throw new Error(
+                  `inspect_command rejected: git remote '${remoteName}' URL must use https://, ssh://, git@host:, or git://`,
+                );
+              }
+            }
+          }
+        }
+        const execArgs = bin === "git" ? [...gitSafePrefix, ...argv.slice(1)] : argv.slice(1);
+        const r = await runArgv(executable, execArgs, {
           cwd,
           env,
           timeoutMs,

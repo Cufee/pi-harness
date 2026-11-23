@@ -240,7 +240,7 @@ function readArtifact(
       if (!same) throw new Error(opts.nonSymlinkError ?? `Dossier must be a non-symlink path under .harness/artifacts: ${label}`);
     }
     const raw = readFileSync(fd, "utf8");
-    const max = typeof maxChars === "number" && Number.isFinite(maxChars) ? Math.max(0, Math.floor(maxChars)) : 32000;
+    const max = typeof maxChars === "number" && Number.isFinite(maxChars) ? Math.max(1, Math.floor(maxChars)) : 32000;
     const hasOffset = typeof offset === "number" && Number.isFinite(offset);
     const start = hasOffset ? Math.max(0, Math.floor(offset)) : 0;
     const content = raw.slice(start, start + max);
