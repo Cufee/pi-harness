@@ -718,6 +718,8 @@ export class DirectorRuntime {
   private launchingGoals = new Map<string, Promise<GoalCommitResult>>();
   /** Bumped by every explicit goal pause or cancel, so a pause issued during a launch wins over it. */
   private goalPauseEpoch = new Map<string, number>();
+  /** Amendments whose steer has not been acknowledged by the run's Tier 1; recovered once the run settles. */
+  private readonly undeliveredAmendments = new Map<string, { version: number; steerMsg: string; reason: string }>();
   private pendingDrainRepos = new Set<string>();
   private pendingDrainAll = false;
 
@@ -967,6 +969,7 @@ export class DirectorRuntime {
     if (!row) return;
     const goal = this.goals.getGoal(row.id);
     if (!goal) return;
+    if (["achieved", "cancelled", "paused"].includes(goal.status)) this.undeliveredAmendments.delete(goal.id);
     if (["achieved", "cancelled", "paused", "verifying", "reviewing"].includes(goal.status)) return;
 
     // Cancel this chat's timers whose settlement subscription covers this goal (we're handling settlement now).
@@ -991,6 +994,19 @@ export class DirectorRuntime {
         ? this.detectExplicitBlocker(goal, ev.runId)
         : null;
     if (blocker && firstNotice) this.parkBlockedGoal(goal, ev.runId, blocker);
+
+    // The run settled on a contract its Tier 1 never acknowledged: relaunch it on the amendment instead of verifying stale work.
+    const pendingAmend = this.undeliveredAmendments.get(goal.id);
+    if (
+      pendingAmend &&
+      pendingAmend.version === goal.version &&
+      goal.status === "executing" &&
+      !blocker &&
+      (status === "completed" || status === "failed")
+    ) {
+      queueMicrotask(() => void this.recoverUndeliveredAmendment(goal.id, goal.version).catch(() => {}));
+      return;
+    }
 
     // Control-plane-driven automatic verification on run completion (removes LLM single point of failure)
     if (
@@ -1561,22 +1577,30 @@ export class DirectorRuntime {
           updatedObjective,
           `Full current contract: blackboard_get({ key: "${latestKey}" }); launch baseline: goal_contract_v${launchedGoal.version}.`,
         ].join("\n");
-        let { delivered } = await this.orchestrator
-          .deliverOrQueueLiveSteer(orchestratorTaskId, steerMsg)
-          .catch(() => ({ delivered: false }));
+        const tracker = this.trackAmendmentDelivery(goal.id, latestAfterLaunch.version, run.id, orchestratorTaskId, steerMsg);
+        const res = await this.orchestrator
+          .deliverOrQueueLiveSteer(orchestratorTaskId, steerMsg, { onOutcome: tracker.onOutcome })
+          .catch(() => ({ delivered: false, mode: "none" as const }));
+        let delivered = res.delivered;
         const isStillLatestExecuting = () => {
           const g = this.goals.getGoal(goal.id);
           return g !== null && g.version === latestAfterLaunch.version && g.status === "executing";
         };
-        if (!delivered && isStillLatestExecuting()) {
+        if (delivered) {
+          this.undeliveredAmendments.delete(goal.id);
+        } else if (res.mode === "queued_before_handle") {
+          tracker.armQueued();
+        } else if (isStillLatestExecuting()) {
           const orch = this.db.getTask(orchestratorTaskId);
           if (orch && ["completed", "failed", "cancelled", "blocked", "returned_for_rescope"].includes(orch.status)) {
             delivered = await this.orchestrator
               .resumeTaskDetailed(orchestratorTaskId, { allowCompleted: true, note: steerMsg, validateBeforeActivate: isStillLatestExecuting })
               .then((r) => r.outcome === "resumed" || r.noteDelivered === true, () => false);
           }
+          if (delivered) this.undeliveredAmendments.delete(goal.id);
         }
-        if (!delivered) {
+        if (!delivered && res.mode !== "queued_before_handle") {
+          tracker.markUndelivered("mid-launch amendment could not be delivered to its run");
           started = this.handOffStrandedGoal(latestAfterLaunch, "mid-launch amendment could not be delivered to its run");
         } else {
           started = this.goals.getGoal(goal.id) ?? started;
@@ -1794,6 +1818,7 @@ export class DirectorRuntime {
    */
   async pauseGoal(goalId: string, reason: string, status: "paused" | "cancelled" = "paused"): Promise<GoalRecord> {
     this.noteGoalPaused(goalId, reason);
+    this.undeliveredAmendments.delete(goalId);
     this.db.admissionQueue.remove("goal", goalId);
     const g = this.goals.setStatus(goalId, status, reason);
     if (g.linkedRunId) {
@@ -2057,19 +2082,35 @@ export class DirectorRuntime {
           const latest = this.goals.getGoal(goal.id);
           return latest !== null && latest.version === goal.version && latest.status === "executing";
         };
-        // A Tier 1 still launching reads the updated row in its initial prompt; one spawning gets the steer queued.
-        let { delivered } = await this.orchestrator
-          .deliverOrQueueLiveSteer(orch.id, steerMsg)
+        // A Tier 1 still launching reads the updated row in its initial prompt; one spawning gets the steer queued and
+        // reports its acknowledgement later, so it is not counted as delivered here.
+        const tracker = this.trackAmendmentDelivery(goal.id, goal.version, goal.linkedRunId, orch.id, steerMsg);
+        const res = await this.orchestrator
+          .deliverOrQueueLiveSteer(orch.id, steerMsg, { onOutcome: tracker.onOutcome })
           .catch(() => ({ delivered: false, mode: "none" as const }));
-        if (delivered) delivery = { delivered: true, via: "steer" };
-        if (!delivered && goal.status === "executing" && isStillAmendedExecuting()) {
-          delivered = await this.orchestrator
-            .resumeTaskDetailed(orch.id, { allowCompleted: true, note: steerMsg, validateBeforeActivate: isStillAmendedExecuting })
-            // An idempotent "already active" return delivers the note only when it was steered in.
-            .then((r) => r.outcome === "resumed" || r.noteDelivered === true, () => false);
-          if (delivered) delivery = { delivered: true, via: "resume" };
+        if (res.delivered) {
+          this.undeliveredAmendments.delete(goal.id);
+          delivery = { delivered: true, via: "steer" };
+        } else if (res.mode === "queued_before_handle") {
+          const reason = "queued for runner handle; awaiting acknowledgement";
+          tracker.armQueued();
+          delivery = { delivered: false, via: "none", reason };
+        } else {
+          let delivered = false;
+          if (goal.status === "executing" && isStillAmendedExecuting()) {
+            delivered = await this.orchestrator
+              .resumeTaskDetailed(orch.id, { allowCompleted: true, note: steerMsg, validateBeforeActivate: isStillAmendedExecuting })
+              // An idempotent "already active" return delivers the note only when it was steered in.
+              .then((r) => r.outcome === "resumed" || r.noteDelivered === true, () => false);
+          }
+          if (delivered) {
+            this.undeliveredAmendments.delete(goal.id);
+            delivery = { delivered: true, via: "resume" };
+          } else {
+            tracker.markUndelivered("amendment could not be delivered to its run");
+            strand("amendment could not be delivered to its run");
+          }
         }
-        if (!delivered) strand("amendment could not be delivered to its run");
       } else {
         strand("linked run has no orchestrator to apply the amendment");
       }
@@ -2105,6 +2146,71 @@ export class DirectorRuntime {
       }
     }
     return { goal: amendedGoal, delta, delivery, supersededEscalationIds, openEscalations };
+  }
+
+  /**
+   * Tracks one amendment steer of `version`: an acknowledged (or rolled-over, hence re-hydrated) steer clears the
+   * pending record; a refused or never-delivered one records it, emits `goal.amendment_undelivered` and schedules
+   * recovery, which relaunches Tier 1 on the amended contract once the run settles.
+   */
+  private trackAmendmentDelivery(goalId: string, version: number, runId: string, orchId: string, steerMsg: string) {
+    let reported = false;
+    const record = (reason: string, eventReason: string): boolean => {
+      const current = this.goals.getGoal(goalId);
+      if (!current || current.version !== version) return false;
+      this.undeliveredAmendments.set(goalId, { version, steerMsg, reason });
+      this.db.emitEvent(runId, orchId, "goal.amendment_undelivered", { goalId, version, reason: eventReason });
+      return true;
+    };
+    return {
+      onOutcome: (accepted: boolean, reason: string) => {
+        reported = true;
+        if (accepted || reason === "rolled_over") {
+          if (this.undeliveredAmendments.get(goalId)?.version === version) this.undeliveredAmendments.delete(goalId);
+          return;
+        }
+        if (record(reason, reason)) {
+          queueMicrotask(() => void this.recoverUndeliveredAmendment(goalId, version).catch(() => {}));
+        }
+      },
+      /** A steer queued for the runner handle: pending until its outcome arrives (unless it already did). */
+      armQueued: () => {
+        if (reported) return;
+        this.undeliveredAmendments.set(goalId, { version, steerMsg, reason: "queued for runner handle; awaiting acknowledgement" });
+      },
+      /** No live steer or resume reached the run; a still-live run recovers it when it settles. */
+      markUndelivered: (reason: string) => {
+        record(reason, "steer_rejected");
+      },
+    };
+  }
+
+  /** Relaunches a settled run's Tier 1 with an amendment it never acknowledged, or hands the goal to a human. */
+  private async recoverUndeliveredAmendment(goalId: string, version: number): Promise<void> {
+    const pending = this.undeliveredAmendments.get(goalId);
+    if (!pending || pending.version !== version) return;
+    const current = this.goals.getGoal(goalId);
+    if (!current || current.version !== version || current.status !== "executing") {
+      this.undeliveredAmendments.delete(goalId);
+      return;
+    }
+    // Still live: its settlement runs recovery again if the amendment is still unacknowledged.
+    if (this.isRunOccupyingGoalSlot(current.linkedRunId)) return;
+    this.undeliveredAmendments.delete(goalId);
+    const orch = current.linkedRunId ? this.db.listTasks(current.linkedRunId).find((t) => t.tier === 1) : undefined;
+    const resumed = orch
+      ? await this.orchestrator
+          .resumeTaskDetailed(orch.id, {
+            allowCompleted: true,
+            note: pending.steerMsg,
+            validateBeforeActivate: () => {
+              const g = this.goals.getGoal(goalId);
+              return g !== null && g.version === version && g.status === "executing";
+            },
+          })
+          .then((r) => r.outcome === "resumed" || r.noteDelivered === true, () => false)
+      : false;
+    if (!resumed) this.handOffStrandedGoal(current, pending.reason);
   }
 
   /** Moves an `executing` goal whose run is not live to `awaiting_human` and releases its slot to the queue. */

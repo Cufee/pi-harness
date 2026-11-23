@@ -35,8 +35,10 @@ interface ActiveTaskExecution {
   runnerGeneration?: number;
   /** True once the current generation's initial prompt was built from the task row (later row edits miss it). */
   promptBuilt?: boolean;
-  /** Steers accepted after the initial prompt was built but before the runner exposed its handle. */
-  pendingSteers?: string[];
+  /** Steers accepted after the initial prompt was built but before the runner exposed its handle, per generation. */
+  pendingSteers?: Array<{ generation: number; message: string; onOutcome?: (accepted: boolean, reason: string) => void }>;
+  /** Serializes every steer to the current handle so live steers never overtake queued ones still draining. */
+  steerChain?: Promise<void>;
 }
 
 /** Stop/cancel epochs captured when a resume was requested. */
@@ -1064,6 +1066,7 @@ export class HarnessOrchestrator {
         this.active.delete(taskId);
         this.pendingRollovers.delete(taskId);
       }
+      for (const item of entry.pendingSteers?.splice(0) ?? []) item.onOutcome?.(false, "generation_ended_without_handle");
       const t = this.db.getTask(taskId);
       if (t) this.afterTaskInactiveInRun(t.runId);
     });
@@ -2064,6 +2067,8 @@ export class HarnessOrchestrator {
   private async runTaskWithRollovers(taskId: string, exec: ActiveTaskExecution): Promise<void> {
     while (!exec.abort.signal.aborted) {
       exec.promptBuilt = false;
+      exec.handle = undefined;
+      exec.steerChain = undefined;
       const task = this.db.getTask(taskId);
       if (!task) return;
       if (["completed", "cancelled", "failed", "returned_for_rescope", "paused_quota"].includes(task.status)) return;
@@ -2155,6 +2160,11 @@ export class HarnessOrchestrator {
       const quotaResumeNote = this.taskResumeNotes.get(task.id) ?? null;
       if (quotaResumeNote) this.taskResumeNotes.delete(task.id);
 
+      // Every write a runner callback or tool call makes is fenced to this execution and generation, so a runner
+      // evicted after a cancel-unwind timeout (or superseded by a rollover or resume) never touches its successor.
+      // Set before the prompt is built so a steer queued right after knows the generation it targets.
+      const runnerGen = task.generation;
+      exec.runnerGeneration = runnerGen;
       const systemPrompt = buildImmutableSystemPrompt(task.tier, task.kind, this.config.codeMode, this.config.codeExec);
       const writeScopes = task.tier === 2 ? this.db.listActiveWriteScopes(run.id, task.id)
         : task.tier === 3 && task.parentId ? this.db.listActiveWriteScopes(run.id, task.parentId) : [];
@@ -2183,6 +2193,8 @@ export class HarnessOrchestrator {
         goalEvidenceDir: goalEvDir ?? undefined,
       });
       exec.promptBuilt = true;
+      // Steers queued for an earlier iteration of this execution are already in the task row this prompt was built from.
+      for (const item of exec.pendingSteers?.splice(0) ?? []) item.onOutcome?.(false, "rolled_over");
 
       const rolloverThreshold =
         task.tier === 1
@@ -2197,10 +2209,6 @@ export class HarnessOrchestrator {
       const maxGenerations = this.config.rollover.maxGenerations ?? 12;
 
       let genToolEvents = 0;
-      // Every write a runner callback or tool call makes is fenced to this execution and generation, so a runner
-      // evicted after a cancel-unwind timeout (or superseded by a rollover or resume) never touches its successor.
-      const runnerGen = task.generation;
-      exec.runnerGeneration = runnerGen;
       const isCurrent = () => this.isCurrentExecution(task.id, exec, runnerGen);
       const generation = new AbortController();
       exec.generationSignal = AbortSignal.any([generation.signal, exec.abort.signal]);
@@ -2272,16 +2280,19 @@ export class HarnessOrchestrator {
         missingReturnWrapUpPrompt: task.tier !== 1 ? buildMissingReturnWrapUpPrompt(task.tier, task.kind) : undefined,
         signal: exec.generationSignal,
         onHandle: (h) => {
+          if (!isCurrent()) return;
           exec.handle = h;
-          const queued = exec.pendingSteers?.splice(0) ?? [];
-          if (queued.length) {
-            void (async () => {
-              for (const message of queued) {
-                if (!isCurrent()) return;
-                const accepted = await h.steer(message).catch(() => false);
-                this.db.emitEvent(run.id, task.id, "agent.steered", { message, accepted });
+          // Queued steers go onto the chain synchronously, so any live steer issued after the handle appears waits behind them.
+          for (const item of exec.pendingSteers?.splice(0) ?? []) {
+            exec.steerChain = (exec.steerChain ?? Promise.resolve()).then(async () => {
+              if (!isCurrent() || item.generation !== runnerGen || exec.handle !== h) {
+                item.onOutcome?.(false, "generation_superseded");
+                return;
               }
-            })();
+              const accepted = await h.steer(item.message).catch(() => false);
+              this.db.emitEvent(run.id, task.id, "agent.steered", { message: item.message, accepted });
+              item.onOutcome?.(accepted, accepted ? "delivered" : "steer_rejected");
+            }).catch(() => {});
           }
         },
         callbacks: {
@@ -2675,6 +2686,13 @@ export class HarnessOrchestrator {
         generation.abort(); // Outstanding MCP scripts must not survive their runner (including a rollover).
         exec.generationSignal = undefined;
         exec.handle = undefined;
+        exec.steerChain = undefined;
+        // A queued steer never crosses into the next generation: its prompt is rebuilt from the amended task row.
+        if ((this.db.getTask(task.id)?.generation ?? runnerGen) > runnerGen && exec.pendingSteers?.length) {
+          const stale = exec.pendingSteers.filter((item) => item.generation <= runnerGen);
+          exec.pendingSteers = exec.pendingSteers.filter((item) => item.generation > runnerGen);
+          for (const item of stale) item.onOutcome?.(false, "rolled_over");
+        }
       }
     }
   }
@@ -3080,21 +3098,31 @@ export class HarnessOrchestrator {
     const exec = this.active.get(taskId);
     // A cancelled session that is still winding down is never steered.
     if (!exec?.handle || exec.abort.signal.aborted) return false;
-    const ok = await exec.handle.steer(message);
-    const task = this.db.getTask(taskId);
-    if (task) {
-      this.db.emitEvent(task.runId, taskId, "agent.steered", { message, accepted: ok });
-    }
-    return ok;
+    const handle = exec.handle;
+    const expectedGen = exec.runnerGeneration;
+    // Chained behind queued steers still draining for this handle, so delivery order matches request order.
+    const step = (exec.steerChain ?? Promise.resolve()).then(async () => {
+      if (exec.handle !== handle || exec.runnerGeneration !== expectedGen || exec.abort.signal.aborted) return false;
+      const ok = await handle.steer(message);
+      const task = this.db.getTask(taskId);
+      if (task) {
+        this.db.emitEvent(task.runId, taskId, "agent.steered", { message, accepted: ok });
+      }
+      return ok;
+    });
+    exec.steerChain = step.then(() => {}, () => {});
+    return step;
   }
 
   /**
    * Delivers guidance to a live task wherever its execution is: before the initial prompt is built the updated task
    * row already carries it, while the runner spawns it is queued for the handle, and once live it is steered.
+   * A queued steer is not delivered yet: `onOutcome` reports whether the handle accepted it or why it never reached one.
    */
   async deliverOrQueueLiveSteer(
     taskId: string,
     message: string,
+    opts?: { onOutcome?: (accepted: boolean, reason: string) => void },
   ): Promise<{ delivered: boolean; mode: "initial_prompt" | "steer" | "queued_before_handle" | "none" }> {
     if (this.describeSteerRefusal(taskId) !== null) return { delivered: false, mode: "none" };
     const exec = this.active.get(taskId);
@@ -3104,8 +3132,12 @@ export class HarnessOrchestrator {
       const ok = await this.steerTask(taskId, message).catch(() => false);
       return { delivered: ok, mode: ok ? "steer" : "none" };
     }
-    (exec.pendingSteers ??= []).push(message);
-    return { delivered: true, mode: "queued_before_handle" };
+    (exec.pendingSteers ??= []).push({
+      generation: exec.runnerGeneration ?? this.db.getTask(taskId)?.generation ?? 1,
+      message,
+      onOutcome: opts?.onOutcome,
+    });
+    return { delivered: false, mode: "queued_before_handle" };
   }
 
   /** Why steering cannot reach this task (settled, cancelled, quota-paused, or stopped run), or null when it may. */
