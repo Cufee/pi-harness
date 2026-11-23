@@ -194,9 +194,7 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
     }
     ampCtrlSpawn.cleanup();
 
-    // Regression for esc-19 / esc-20: Amp read_only_workspace (allowShellInReadOnly=false) must NOT disable
-    // `shell_command` (Amp has no built-in Read/Grep/glob tools), and must instead disable write/subagent tools
-    // while enforcing a strict read-only `amp.permissions` allowlist with `amp.dangerouslyAllowAll: false`.
+    // Restricted Amp sessions disable shell tools and reject them regardless of command or arguments.
     const ampRoSpawn = prepareAcpSpawn(ampProfile, {
       systemPrompt: "Research",
       toolPolicy: "read_only_workspace",
@@ -206,24 +204,14 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
     const ampRoCfg = JSON.parse(readFileSync(ampRoSpawn.env.AMP_SETTINGS_FILE!, "utf8")) as Record<string, unknown>;
     assert.equal(ampRoCfg["amp.dangerouslyAllowAll"], false);
     const roDisabled = ampRoCfg["amp.tools.disable"] as string[];
-    assert.ok(!roDisabled.includes("shell_command"), "read_only_workspace must keep shell_command enabled for Amp");
-    assert.ok(!roDisabled.includes("Bash"), "read_only_workspace must keep Bash enabled for Amp");
     for (const t of ["edit_file", "create_file", "delete_file", "apply_patch", "Task", "create_thread"]) {
       assert.ok(roDisabled.includes(t), `read_only_workspace must disable ${t}`);
     }
-    const roPerms = ampRoCfg["amp.permissions"] as Array<{ tool: string; action: string; matches?: Record<string, string[]> }>;
-    assert.ok(Array.isArray(roPerms) && roPerms.length >= 6);
-    const shellRules = roPerms.filter((r) => r.tool === "shell_command");
-    assert.equal(shellRules.length, 3);
-    assert.equal(shellRules[0]?.action, "reject");
-    assert.ok(shellRules[0]?.matches?.command?.includes("*>*"));
-    assert.ok(shellRules[0]?.matches?.command?.includes("*&&*"));
-    assert.equal(shellRules[1]?.action, "allow");
-    assert.ok(shellRules[1]?.matches?.command?.includes("rg *"));
-    assert.ok(shellRules[1]?.matches?.command?.includes("cat *"));
-    assert.ok(shellRules[1]?.matches?.command?.includes("git status *"));
-    assert.equal(shellRules[2]?.action, "reject");
-    assert.equal(shellRules[2]?.matches, undefined);
+    const roPerms = ampRoCfg["amp.permissions"] as Array<{ tool: string; action: string }>;
+    for (const tool of ["Bash", "shell_command", "shell_command_status", "shell_command_kill"]) {
+      assert.ok(roDisabled.includes(tool), `read_only_workspace must disable ${tool}`);
+      assert.deepEqual(roPerms.filter((r) => r.tool === tool), [{ tool, action: "reject" }]);
+    }
     ampRoSpawn.cleanup();
 
     // Amp read_only_workspace with allowShellInReadOnly=true (verify / Done-Review) disables/rejects write tools without restricting shell
