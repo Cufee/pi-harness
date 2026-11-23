@@ -242,8 +242,22 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
   { ...waitChildrenTool, name: "wait_tasks", tiers: [1, 2] },
   {
     name: "steer_child",
-    tiers: [1, 2],
+    tiers: [1],
     description: "Send mid-turn steering guidance to a running child agent. Steering never restarts a settled child; use resume_task with a note for that.",
+    inputSchema: {
+      type: "object",
+      required: ["task_id", "message"],
+      properties: {
+        task_id: { type: "string" },
+        message: { type: "string" },
+      },
+    },
+  },
+  {
+    // Tier 2 has no resume_task: a settled child is replaced by delegating a fresh task.
+    name: "steer_child",
+    tiers: [2],
+    description: "Send mid-turn steering guidance to a running child agent. Steering never restarts a settled child; spawn a new task for further work.",
     inputSchema: {
       type: "object",
       required: ["task_id", "message"],
@@ -798,7 +812,17 @@ export class ControlPlaneToolExecutor {
     if (scriptSignal || (name === CODE_EXEC_TOOL_NAME && mode !== "off")) {
       const signal = scriptSignal ?? this.hooks.getTaskSignal(taskId);
       if (!signal || signal.aborted || ["completed", "cancelled", "failed", "returned_for_rescope", "paused_quota"].includes(task.status)) {
-        throw new Error(`code_exec requires an active task generation for ${taskId}`);
+        // Name the actual cause (whole-run stop first, then this task's cancellation) instead of a bare refusal.
+        const runStatus = this.db.getRun(runId)?.status;
+        const why =
+          runStatus === "stopped" && !isDirectorTaskContainer(runId)
+            ? `run ${runId} is stopped`
+            : task.status === "cancelled"
+              ? `task ${taskId} was cancelled (${task.summary?.trim() || "no reason recorded"})`
+              : signal?.aborted
+                ? `the calling turn of ${taskId} was cancelled`
+                : `task ${taskId} is ${task.status}`;
+        throw new Error(`code_exec requires an active task generation for ${taskId}: ${why}. Nothing was executed.`);
       }
     }
     const run = this.db.getRun(runId);

@@ -30,6 +30,15 @@ interface ActiveTaskExecution {
   promise: Promise<void>;
 }
 
+/** Stop/cancel epochs captured when a resume was requested. */
+interface StopSnapshot {
+  run: number;
+  repo: number;
+  global: number;
+  /** Per-task cancel epochs (task id -> epoch). */
+  tasks: Map<string, number>;
+}
+
 interface TaskQuotaPauseMeta {
   wireModel: string;
   profileId: string;
@@ -69,6 +78,14 @@ const IN_FLIGHT_TASK_STATUSES = new Set<TaskRecord["status"]>([
 ]);
 
 export { isDirectorTaskContainer };
+
+/** startRun was refused because /stop (all runs or this repo) was issued while the launch was resolving. */
+export class RunStartStoppedError extends Error {
+  constructor(readonly repoRoot: string) {
+    super(`No run was started in ${repoRoot}: a stop was issued while the run was starting. Nothing is running; start it again to continue.`);
+    this.name = "RunStartStoppedError";
+  }
+}
 
 /**
  * Computes the authoritative dynamic status of a Run from its live in-memory execution state
@@ -181,11 +198,19 @@ export class HarnessOrchestrator {
   private quiescenceCheckPending = new Set<string>();
   /** Runs with a stopRun in progress (a resume issued after a stop waits for it). */
   private stoppingRuns = new Map<string, Promise<void>>();
-  /** Bumped by stopRun (key: run id) and cancelTask (key: task id) so an older in-flight resume never undoes a stop. */
+  /**
+   * Bumped by stopRun (key: run id) and cancelTask (key: task id, also for an already-settled task) so an
+   * older in-flight resume, rollover or launch never undoes a stop or cancel.
+   */
   private stopEpoch = new Map<string, number>();
+  /** Bumped by a repo-scoped runs.stop_all (key: canonical repo root). */
+  private repoStopEpoch = new Map<string, number>();
   private globalStopEpoch = 0;
-  private resumingTasks = new Map<string, Promise<ResumeTaskResult>>();
-  private resumingRuns = new Map<string, Promise<ResumeRunResult>>();
+  /** In-flight single-flight resumes, tagged with the stop/cancel epochs they were requested under. */
+  private resumingTasks = new Map<string, { key: string; promise: Promise<ResumeTaskResult>; note?: string }>();
+  private resumingRuns = new Map<string, { key: string; promise: Promise<ResumeRunResult> }>();
+  /** Per-task worktree allocation/teardown chain, so cancel, resume and allocation never interleave. */
+  private worktreeOps = new Map<string, Promise<void>>();
   readonly toolExecutor: ControlPlaneToolExecutor;
 
   constructor(
@@ -323,12 +348,67 @@ export class HarnessOrchestrator {
     return this.globalStopEpoch;
   }
 
-  getGlobalStopEpoch(): number {
-    return this.globalStopEpoch;
+  /** Bumps the stop epoch of one repo (repo-filtered runs.stop_all); other repos' resumes and launches are unaffected. */
+  bumpRepoStopEpoch(repoRoot: string): number {
+    const key = canonicalProjectPath(repoRoot);
+    const next = (this.repoStopEpoch.get(key) ?? 0) + 1;
+    this.repoStopEpoch.set(key, next);
+    return next;
+  }
+
+  getRepoStopEpoch(repoRoot: string): number {
+    return this.repoStopEpoch.get(canonicalProjectPath(repoRoot)) ?? 0;
+  }
+
+  /** Global + repo stop epochs for a launch in `repoRoot`; pass to startRun so a stop issued meanwhile wins. */
+  launchStopFence(repoRoot: string): { global: number; repo: number } {
+    return { global: this.globalStopEpoch, repo: this.getRepoStopEpoch(repoRoot) };
+  }
+
+  launchFenceBroken(repoRoot: string, fence: { global: number; repo: number }): boolean {
+    return this.globalStopEpoch !== fence.global || this.getRepoStopEpoch(repoRoot) !== fence.repo;
   }
 
   private bumpStopEpoch(key: string): void {
     this.stopEpoch.set(key, (this.stopEpoch.get(key) ?? 0) + 1);
+  }
+
+  /** Runs one worktree allocation/teardown for a task after every earlier one for that task has finished. */
+  private runWorktreeOp<T>(taskId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.worktreeOps.get(taskId) ?? Promise.resolve();
+    const p = prev.then(fn);
+    const tail = p.then(
+      () => {},
+      () => {},
+    );
+    this.worktreeOps.set(taskId, tail);
+    void tail.then(() => {
+      if (this.worktreeOps.get(taskId) === tail) this.worktreeOps.delete(taskId);
+    });
+    return p;
+  }
+
+  /** Waits until a cancelled runner (or allocation) for this task has fully exited and its teardown has run. */
+  private async awaitTaskWindDown(taskId: string): Promise<void> {
+    for (;;) {
+      const exec = this.active.get(taskId);
+      if (exec?.abort.signal.aborted) {
+        await exec.promise.catch(() => {});
+        continue;
+      }
+      const op = this.worktreeOps.get(taskId);
+      if (op && (!exec || this.allocatingWorktrees.has(taskId))) {
+        await op;
+        continue;
+      }
+      return;
+    }
+  }
+
+  /** True while a runner for this task is live and not cancelled. */
+  private isLiveExecution(taskId: string): boolean {
+    const exec = this.active.get(taskId);
+    return Boolean(exec && !exec.abort.signal.aborted);
   }
 
   /**
@@ -347,6 +427,16 @@ export class HarnessOrchestrator {
 
   private causeOrHint(runId: string, cause: string | null | undefined): string {
     return cause?.trim() || `no cause was recorded; inspect with \`pi-harness tree ${runId}\``;
+  }
+
+  /** Runs that have a task live (or allocating its worktree) in memory, whatever their stored status. */
+  liveRunIds(): string[] {
+    const ids = new Set<string>();
+    for (const taskId of [...this.active.keys(), ...this.allocatingWorktrees]) {
+      const t = this.db.getTask(taskId);
+      if (t) ids.add(t.runId);
+    }
+    return [...ids];
   }
 
   isRunActiveInMemory(runId: string): boolean {
@@ -554,7 +644,8 @@ export class HarnessOrchestrator {
       if (typeof args.path === "string" && args.path) throw new Error(`No indexed dossier in this run: ${resolve(root, args.path)}`);
       return { artifacts: [] };
     }
-    signal?.throwIfAborted();
+    // spawn_task reports an aborted turn itself, with the delegation context, instead of a bare AbortError.
+    if (name !== "spawn_task") signal?.throwIfAborted();
     // The caller's turn signal travels separately from code_exec's scriptSignal (the synthetic owner is completed).
     return this.toolExecutor.execute(run.id, ownerTask(run.id).id, name, args, undefined, signal);
   }
@@ -565,12 +656,17 @@ export class HarnessOrchestrator {
     profileId?: string;
     model?: string;
     effort?: string;
+    /** Stop epochs captured when the launch was requested (default: now); a stop issued since then wins. */
+    stopFence?: { global: number; repo: number };
   }): Promise<{ run: RunRecord; orchestratorTask: TaskRecord }> {
+    const fence = input.stopFence ?? this.launchStopFence(input.repoRoot);
     const { profile, model } = await resolveLaunchRoute(this.config, {
       ...input, tier: 1, catalog: this.catalog, quota: this.quota, cwd: input.repoRoot,
     });
     const wtMgr = this.getWorktreeManager(input.repoRoot);
     const { baseBranch, baseSha } = await wtMgr.resolveRepoInfo();
+    // Checked after the last await and before the run exists, so a stop issued meanwhile leaves nothing running.
+    if (this.launchFenceBroken(input.repoRoot, fence)) throw new RunStartStoppedError(input.repoRoot);
     const run = this.db.createRun({ goal: input.goal, repoRoot: input.repoRoot, baseBranch, baseSha });
 
     const orchestratorTask = this.db.createTask({
@@ -621,25 +717,33 @@ export class HarnessOrchestrator {
 
     const parent = this.db.getTask(input.parentId);
     if (!parent || parent.runId !== run.id) throw new Error(`Unknown parent task ${input.parentId} in ${run.id}`);
-    // Synchronous stop checks after the last await and before createTask, each with its own cause.
-    if (input.signal?.aborted) {
-      const why = input.signal.reason instanceof Error ? input.signal.reason.message : input.signal.reason ? String(input.signal.reason) : "";
+    // Synchronous stop checks after the last await and before createTask, each with its own cause. When causes
+    // overlap, the broadest one is reported first: whole-run stop, then the caller's cancellation, then the turn.
+    const container = isDirectorTaskContainer(run.id);
+    if (!container && (this.stoppingRuns.has(run.id) || this.db.getRun(run.id)?.status === "stopped")) {
       throw new Error(
-        `Delegation was not started: the calling turn in ${isDirectorTaskContainer(run.id) ? `chat ${directorTaskRunOwner(run.id)}` : `run ${run.id}`} ` +
-          `was cancelled before the task was created${why ? ` (${why})` : ""}. No task was created. A fresh request can delegate again.`,
+        `Cannot delegate from run ${run.id}: the run is stopped (${this.causeOrHint(run.id, this.describeRunCause(run.id))}). No task was created. ` +
+          "This is an explicit stop, not a turn or budget limit. Nothing restarts automatically. Agents in this run should stop and return; " +
+          `the Director (resume_run) or the operator (\`pi-harness resume ${run.id}\`) can resume the run.`,
       );
     }
     if (parent.status === "cancelled") {
+      const who = parent.tier === 1
+        ? `The Director can resume it with resume_task ${parent.id}, or the operator with \`pi-harness resume ${run.id}\`.`
+        : container || parent.parentId === null
+          ? `The Director can resume it with resume_task ${parent.id} or delegate the work again.`
+          : `Its parent orchestrator can resume it with resume_task ${parent.id} or delegate the work again.`;
       throw new Error(
         `Cannot delegate from task ${parent.id}: it was cancelled (${this.causeOrHint(run.id, parent.summary)}). No task was created. ` +
-          "This is an explicit cancellation, not a turn or budget limit. Its parent or the operator can continue it with resume_task " +
-          `${parent.id} (or \`pi-harness resume ${run.id}\`).`,
+          `This is an explicit cancellation, not a turn or budget limit; this task should stop and return. ${who}`,
       );
     }
-    if (!isDirectorTaskContainer(run.id) && (this.stoppingRuns.has(run.id) || this.db.getRun(run.id)?.status === "stopped")) {
+    if (input.signal?.aborted) {
+      const why = input.signal.reason instanceof Error ? input.signal.reason.message : input.signal.reason ? String(input.signal.reason) : "";
       throw new Error(
-        `Cannot delegate from run ${run.id}: the run is stopped (${this.causeOrHint(run.id, this.describeRunCause(run.id))}). No task was created. ` +
-          `This is an explicit stop, not a turn or budget limit. Nothing restarts automatically; continue with resume_run or \`pi-harness resume ${run.id}\`.`,
+        `Delegation was not started: the calling turn in ${container ? `chat ${directorTaskRunOwner(run.id)}` : `run ${run.id}`} ` +
+          `was cancelled before the task was created (${why || `no cause was recorded; inspect with \`pi-harness tree ${run.id}\``}). ` +
+          "No task was created. A fresh request can delegate again.",
       );
     }
     const task = this.db.createTask({
@@ -679,9 +783,12 @@ export class HarnessOrchestrator {
         } else {
           this.allocatingWorktrees.add(task.id);
           try {
-            await wtMgr.createForWorker(run.id, task.id, undefined, { force: Boolean(input.forceStart) });
+            // Serialized with cancelTask's teardown: a cancel during allocation tears the new worktree down after it exists.
+            await this.runWorktreeOp(task.id, () => wtMgr.createForWorker(run.id, task.id, undefined, { force: Boolean(input.forceStart) }));
           } catch (error) {
-            if (error instanceof WorktreeConcurrencyLimitError || String(error).includes("concurrency cap reached")) {
+            if (this.db.getTask(task.id)?.status === "cancelled") {
+              // Cancelled while allocating: never queue or fail over the recorded cancellation.
+            } else if (error instanceof WorktreeConcurrencyLimitError || String(error).includes("concurrency cap reached")) {
               const qEntry = this.db.admissionQueue.enqueue({
                 lane: "worker",
                 repoRoot: run.repoRoot,
@@ -741,7 +848,10 @@ export class HarnessOrchestrator {
       // Kick any newly unblocked dependent tasks in the same run
       const t = this.db.getTask(taskId);
       if (t) {
-        const readyTasks = this.db.listTasks(t.runId, { status: "ready" });
+        // A stopped (or stopping) run never relaunches its ready tasks: that would overwrite the stop with "active".
+        const runHalted =
+          !isDirectorTaskContainer(t.runId) && (this.stoppingRuns.has(t.runId) || this.db.getRun(t.runId)?.status === "stopped");
+        const readyTasks = runHalted ? [] : this.db.listTasks(t.runId, { status: "ready" });
         let launchedAny = false;
         for (const rt of readyTasks) {
           if (!this.active.has(rt.id)) {
@@ -1030,14 +1140,39 @@ export class HarnessOrchestrator {
     return this.resumeTaskInternal(taskId, opts);
   }
 
-  private stopEpochSnapshot(runId: string): { run: number; global: number } {
-    return { run: this.stopEpoch.get(runId) ?? 0, global: this.globalStopEpoch };
+  /** Stop/cancel epochs at request time: this run, its repo, all runs, and each listed task's cancel epoch. */
+  private stopEpochSnapshot(runId: string, taskIds: string[]): StopSnapshot {
+    const repoRoot = this.db.getRun(runId)?.repoRoot;
+    return {
+      run: this.stopEpoch.get(runId) ?? 0,
+      repo: repoRoot ? this.getRepoStopEpoch(repoRoot) : 0,
+      global: this.globalStopEpoch,
+      tasks: new Map(taskIds.map((id) => [id, this.stopEpoch.get(id) ?? 0])),
+    };
+  }
+
+  private snapshotKey(snap: StopSnapshot, taskIds: string[]): string {
+    return [snap.run, snap.repo, snap.global, ...taskIds.map((id) => `${id}=${snap.tasks.get(id) ?? 0}`)].join(":");
+  }
+
+  /** Which newer stop (if any) beat a resume requested under `snap`: the whole run / repo / all runs, or this task alone. */
+  private stopWonSince(task: TaskRecord, snap: StopSnapshot): "run" | "task" | null {
+    const repoRoot = this.db.getRun(task.runId)?.repoRoot;
+    if (
+      (this.stopEpoch.get(task.runId) ?? 0) !== snap.run ||
+      this.globalStopEpoch !== snap.global ||
+      (repoRoot ? this.getRepoStopEpoch(repoRoot) : 0) !== snap.repo ||
+      this.stoppingRuns.has(task.runId)
+    ) {
+      return "run";
+    }
+    return (this.stopEpoch.get(task.id) ?? 0) !== (snap.tasks.get(task.id) ?? 0) ? "task" : null;
   }
 
   private async resumeTaskInternal(
     taskId: string,
     opts: ResumeTaskOptions | undefined,
-    runSnapshot?: { run: number; global: number },
+    runSnapshot?: StopSnapshot,
   ): Promise<ResumeTaskResult> {
     const initial = this.db.getTask(taskId);
     if (!initial) throw new Error(`Unknown task ${taskId}`);
@@ -1046,18 +1181,85 @@ export class HarnessOrchestrator {
         `Task ${initial.id} is the Director's delegation container, not a runnable task. Resume the delegated task itself with resume_task, or delegate again with spawn_task.`,
       );
     }
-    // A resume issued while a stop is in progress waits for it and then applies; otherwise the stop
-    // epochs are captured now, at request time, so any stop issued after this call wins.
-    const pendingStop = runSnapshot ? undefined : this.stoppingRuns.get(initial.runId);
-    const requestSnapshot = runSnapshot ?? (pendingStop ? null : this.stopEpochSnapshot(initial.runId));
-    const requestTaskEpoch = pendingStop ? null : this.stopEpoch.get(initial.id) ?? 0;
-    if (pendingStop) await pendingStop.catch(() => {});
-    const inflight = this.resumingTasks.get(taskId);
-    if (inflight) return inflight;
+    // Stop epochs are captured at request time, so any stop or cancel issued after this call wins. A stop already
+    // in progress was issued first: wait for it, then capture (its own cancels must not refuse this resume).
+    let snap = runSnapshot;
+    if (!snap) {
+      const pendingStop = this.stoppingRuns.get(initial.runId);
+      if (pendingStop) {
+        const entry = this.stopEpochSnapshot(initial.runId, []);
+        await pendingStop.catch(() => {});
+        snap = { ...entry, tasks: new Map([[initial.id, this.stopEpoch.get(initial.id) ?? 0]]) };
+      } else {
+        snap = this.stopEpochSnapshot(initial.runId, [initial.id]);
+      }
+    }
+    const key = this.snapshotKey(snap, [initial.id]);
+    // Join only a resume requested under the same epochs; one from before a newer stop or cancel is never joined.
+    for (;;) {
+      const inflight = this.resumingTasks.get(taskId);
+      if (!inflight) break;
+      if (inflight.key === key) return this.joinTaskResume(taskId, inflight, opts);
+      await inflight.promise.catch(() => {});
+    }
+    const p = this.resumeTaskBody(taskId, opts, snap);
+    const entry = { key, promise: p, note: opts?.note?.trim() || undefined };
+    this.resumingTasks.set(taskId, entry);
+    try {
+      return await p;
+    } finally {
+      if (this.resumingTasks.get(taskId) === entry) this.resumingTasks.delete(taskId);
+    }
+  }
 
+  /** A concurrent caller shares the first caller's result; its own different note is still delivered or reported. */
+  private async joinTaskResume(
+    taskId: string,
+    inflight: { promise: Promise<ResumeTaskResult>; note?: string },
+    opts: ResumeTaskOptions | undefined,
+  ): Promise<ResumeTaskResult> {
+    const res = await inflight.promise;
+    const note = opts?.note?.trim();
+    if (!note || note === inflight.note) return res;
+    const pending = this.taskResumeNotes.get(taskId);
+    let delivered: boolean;
+    if (pending?.kind === "resume") {
+      // Not consumed by the new generation's first turn yet: it reads both notes.
+      pending.userMessage = [pending.userMessage, note].filter(Boolean).join("\n");
+      delivered = true;
+    } else {
+      delivered = this.isLiveExecution(taskId) ? await this.steerTask(taskId, note).catch(() => false) : false;
+    }
+    return {
+      ...res,
+      noteDelivered: delivered,
+      message: `${res.message} ${delivered ? "Your note was also delivered to the task." : "Your note could not be delivered: the task is not live."}`,
+    };
+  }
+
+  private async resumeTaskBody(taskId: string, opts: ResumeTaskOptions | undefined, snap: StopSnapshot): Promise<ResumeTaskResult> {
+    // A cancelled runner (or its allocation / teardown) still winding down is waited for, never reported as active.
+    await this.awaitTaskWindDown(taskId);
     const task = this.db.getTask(taskId)!;
     const where = `run ${task.runId}`;
-    if (this.active.has(task.id) || this.allocatingWorktrees.has(task.id)) {
+    const settled = ["completed", "cancelled", "failed"].includes(task.status);
+    // Queued workers have a live admission loop in the active map, so the queue is checked first.
+    const queued = settled ? null : this.db.admissionQueue.get("worker", task.id);
+    if (queued) {
+      if (opts?.position !== undefined) this.db.admissionQueue.reorder("worker", task.id, opts.position);
+      if (opts?.forceStart) this.db.admissionQueue.markForceStart("worker", task.id);
+      const entry = this.db.admissionQueue.get("worker", task.id) ?? queued;
+      const note = opts?.note?.trim();
+      return {
+        task,
+        outcome: "already_queued",
+        queuePosition: entry.position,
+        message: `Task ${task.id} in ${where} is already queued for a worker slot (#${entry.position}${entry.forceStart ? ", force-start" : ""}); nothing was restarted.` +
+          (note ? " The note was not delivered: the task has no live session yet." : ""),
+        ...(note ? { noteDelivered: false } : {}),
+      };
+    }
+    if (this.isLiveExecution(task.id) || this.allocatingWorktrees.has(task.id)) {
       const noteDelivered = opts?.note?.trim() ? await this.steerTask(task.id, opts.note.trim()).catch(() => false) : undefined;
       return {
         task: this.db.getTask(task.id)!,
@@ -1068,18 +1270,8 @@ export class HarnessOrchestrator {
       };
     }
     if (task.status === "ready") {
-      const queued = this.db.admissionQueue.get("worker", task.id);
-      if (queued) {
-        if (opts?.position !== undefined) this.db.admissionQueue.reorder("worker", task.id, opts.position);
-        if (opts?.forceStart) this.db.admissionQueue.markForceStart("worker", task.id);
-        const entry = this.db.admissionQueue.get("worker", task.id) ?? queued;
-        return {
-          task,
-          outcome: "already_queued",
-          queuePosition: entry.position,
-          message: `Task ${task.id} in ${where} is already queued for a worker slot (#${entry.position}); nothing was restarted.`,
-        };
-      }
+      const won = this.stopWonSince(task, snap);
+      if (won) throw new Error(this.resumeNotAppliedMessage(task, won));
       this.launchTaskLoop(task.id);
       return {
         task: this.db.getTask(task.id)!,
@@ -1102,28 +1294,14 @@ export class HarnessOrchestrator {
       };
     }
 
-    const snapshot = requestSnapshot ?? this.stopEpochSnapshot(task.runId);
-    const taskEpoch = requestTaskEpoch ?? this.stopEpoch.get(task.id) ?? 0;
-    // Which newer stop (if any) beat this resume: the whole run / all runs, or this task alone.
-    const stopWon = (): "run" | "task" | null =>
-      (this.stopEpoch.get(task.runId) ?? 0) !== snapshot.run || this.globalStopEpoch !== snapshot.global || this.stoppingRuns.has(task.runId)
-        ? "run"
-        : (this.stopEpoch.get(task.id) ?? 0) !== taskEpoch
-          ? "task"
-          : null;
+    const stopWon = () => this.stopWonSince(task, snap);
     const won = stopWon();
     if (won) {
       // Report the newest stop's recorded cause once it has been written.
       await this.stoppingRuns.get(task.runId)?.catch(() => {});
       throw new Error(this.resumeNotAppliedMessage(task, won));
     }
-    const p = this.performTaskResume(task, opts, stopWon);
-    this.resumingTasks.set(task.id, p);
-    try {
-      return await p;
-    } finally {
-      if (this.resumingTasks.get(task.id) === p) this.resumingTasks.delete(task.id);
-    }
+    return this.performTaskResume(task, opts, stopWon);
   }
 
   private resumeNotAppliedMessage(task: TaskRecord, by: "run" | "task"): string {
@@ -1141,8 +1319,13 @@ export class HarnessOrchestrator {
     if (!run) throw new Error(`Unknown run ${task.runId}`);
 
     const toolPolicy = toolPolicyForTask(task.tier, task.kind, task.readOnly);
-    let wt = task.worktreeId ? this.db.getWorktree(task.worktreeId) : null;
+    // An earlier cancel's teardown (or allocation) finishes before the worktree is inspected or recreated.
+    await this.worktreeOps.get(task.id);
+    const currentWtId = this.db.getTask(task.id)?.worktreeId ?? task.worktreeId;
+    let wt = currentWtId ? this.db.getWorktree(currentWtId) : null;
     let createdWorktreeId: string | null = null;
+    /** Set when the previous worktree was archived and this generation starts on a fresh one from base. */
+    let archivedFrom: { worktreeId: string; ref: string | null } | null = null;
     let reacquiredLeases = false;
     let profile: RunnerProfileConfig;
     let model: string;
@@ -1155,9 +1338,10 @@ export class HarnessOrchestrator {
     const abandon = (err: Error): never => {
       releaseLeases();
       if (createdWorktreeId) {
-        void this.getWorktreeManager(run.repoRoot)
-          .teardown(createdWorktreeId, { archiveBeforeRemove: true, finalStatus: "archived" })
-          .catch(() => {});
+        const id = createdWorktreeId;
+        void this.runWorktreeOp(task.id, () =>
+          this.getWorktreeManager(run.repoRoot).teardown(id, { archiveBeforeRemove: true, finalStatus: "archived" }),
+        ).catch(() => {});
       }
       throw err;
     };
@@ -1177,8 +1361,11 @@ export class HarnessOrchestrator {
         const wtMgr = this.getWorktreeManager(run.repoRoot);
         if (wtMgr.isGitRepo()) {
           if (!wt || wt.runId !== run.id || !existsSync(wt.path)) {
+            if (wt && wt.runId === run.id) archivedFrom = { worktreeId: wt.id, ref: wt.archiveRef };
             try {
-              wt = await wtMgr.createForWorker(run.id, task.id, undefined, { force: Boolean(opts?.forceStart) });
+              wt = await this.runWorktreeOp(task.id, () =>
+                wtMgr.createForWorker(run.id, task.id, undefined, { force: Boolean(opts?.forceStart) }),
+              );
               createdWorktreeId = wt.id;
             } catch (err) {
               if (err instanceof WorktreeConcurrencyLimitError || String(err).includes("concurrency cap reached")) {
@@ -1223,6 +1410,11 @@ export class HarnessOrchestrator {
       worktreePath: wt?.path ?? null,
       result: { text: priorReason, stopReason: "error" },
     });
+    const archiveNote = archivedFrom
+      ? `The previous worktree ${archivedFrom.worktreeId} was archived when the task was cancelled; this generation starts on a fresh worktree from base branch ${run.baseBranch || "HEAD"}` +
+        (archivedFrom.ref ? ` and the archived work is at ${archivedFrom.ref} (inspect it with \`git log ${archivedFrom.ref}\` and cherry-pick what is still needed).` : " (nothing unmerged was archived).")
+      : null;
+    if (archiveNote) handoff.nextActions.unshift(archiveNote);
     if (opts?.note?.trim()) {
       handoff.nextActions.unshift(`Resume guidance: ${opts.note.trim()}`);
     }
@@ -1289,7 +1481,8 @@ export class HarnessOrchestrator {
     return {
       task: this.db.getTask(task.id)!,
       outcome: "resumed",
-      message: `Task ${task.id} resumed in place in run ${run.id} (generation ${nextGen}, was ${task.status}${runBefore === "stopped" ? "; run was stopped and is active again" : ""}).`,
+      message: `Task ${task.id} resumed in place in run ${run.id} (generation ${nextGen}, was ${task.status}${runBefore === "stopped" ? "; run was stopped and is active again" : ""}).` +
+        (archiveNote ? ` ${archiveNote}` : ""),
     };
   }
 
@@ -1304,15 +1497,32 @@ export class HarnessOrchestrator {
     opts?: { trigger?: "manual" | "auto_timer" | "quota_recovered" | "user_timer"; userMessage?: string; note?: string },
   ): Promise<ResumeRunResult> {
     if (!this.db.getRun(runId)) throw new Error(`Unknown run ${runId}`);
-    await this.stoppingRuns.get(runId)?.catch(() => {});
-    const inflight = this.resumingRuns.get(runId);
-    if (inflight) return inflight;
-    const p = this.resumeRunInternal(runId, opts, this.stopEpochSnapshot(runId));
-    this.resumingRuns.set(runId, p);
+    // Epochs (run, repo, all runs, and every task's cancel epoch) are captured at request time, without yielding
+    // unless a stop issued earlier is still in progress; each candidate's resume is then fenced by this snapshot.
+    const pendingStop = this.stoppingRuns.get(runId);
+    let snap: StopSnapshot;
+    if (pendingStop) {
+      const entry = this.stopEpochSnapshot(runId, []);
+      await pendingStop.catch(() => {});
+      snap = { ...entry, tasks: this.stopEpochSnapshot(runId, this.db.listTasks(runId).map((t) => t.id)).tasks };
+    } else {
+      snap = this.stopEpochSnapshot(runId, this.db.listTasks(runId).map((t) => t.id));
+    }
+    const key = this.snapshotKey(snap, [...snap.tasks.keys()].sort());
+    for (;;) {
+      const inflight = this.resumingRuns.get(runId);
+      if (!inflight) break;
+      if (inflight.key === key) return inflight.promise;
+      // Requested before a newer stop or cancel: never joined; let it fail its own fence first.
+      await inflight.promise.catch(() => {});
+    }
+    const p = this.resumeRunInternal(runId, opts, snap);
+    const entry = { key, promise: p };
+    this.resumingRuns.set(runId, entry);
     try {
       return await p;
     } finally {
-      if (this.resumingRuns.get(runId) === p) this.resumingRuns.delete(runId);
+      if (this.resumingRuns.get(runId) === entry) this.resumingRuns.delete(runId);
     }
   }
 
@@ -1337,11 +1547,14 @@ export class HarnessOrchestrator {
   private async resumeRunInternal(
     runId: string,
     opts: { trigger?: "manual" | "auto_timer" | "quota_recovered" | "user_timer"; userMessage?: string; note?: string } | undefined,
-    snapshot: { run: number; global: number },
+    snapshot: StopSnapshot,
   ): Promise<ResumeRunResult> {
+    // Runners cancelled by an earlier stop are waited for, so they are never reported as already active.
+    await Promise.all(this.db.listTasks(runId).map((t) => this.awaitTaskWindDown(t.id)));
     const run = this.db.getRun(runId)!;
     const tasks = this.db.listTasks(run.id);
-    if (run.status === "paused_quota" || tasks.some((t) => t.status === "paused_quota")) {
+    // An explicit stop is checked before the quota pause: a stopped run resumes its orchestrator in place below.
+    if (run.status !== "stopped" && (run.status === "paused_quota" || tasks.some((t) => t.status === "paused_quota"))) {
       const res = await this.resumeRunFromQuota(run.id, opts);
       return {
         ...this.runResult(run.id, res.resumed ? "resumed" : "nothing_to_resume",
@@ -1354,7 +1567,7 @@ export class HarnessOrchestrator {
     }
 
     const liveIds = tasks
-      .filter((t) => t.profileId !== "director" && (this.active.has(t.id) || this.allocatingWorktrees.has(t.id) || LIVE_TASK_STATUSES.has(t.status)))
+      .filter((t) => t.profileId !== "director" && (this.isLiveExecution(t.id) || this.allocatingWorktrees.has(t.id) || LIVE_TASK_STATUSES.has(t.status)))
       .map((t) => t.id);
     const container = isDirectorTaskContainer(run.id);
     if (container) {
@@ -1374,7 +1587,7 @@ export class HarnessOrchestrator {
     const RESUMABLE_ORCH = new Set(["failed", "blocked", "returned_for_rescope", "cancelled"]);
     const RESUMABLE_ORPHAN = new Set(["failed", "blocked", "returned_for_rescope"]);
     const candidates = tasks.filter((t) => {
-      if (t.profileId === "director" || this.active.has(t.id) || this.allocatingWorktrees.has(t.id)) return false;
+      if (t.profileId === "director" || this.isLiveExecution(t.id) || this.allocatingWorktrees.has(t.id)) return false;
       if (orch && t.id === orch.id) return RESUMABLE_ORCH.has(t.status);
       if (t.status === "cancelled" || t.status === "completed") return false;
       if (t.status === "failed" && t.summary === "Interrupted by daemon restart") return true;
@@ -1392,7 +1605,7 @@ export class HarnessOrchestrator {
       }
       const cause = this.describeRunCause(run.id);
       const next = cancelledChildren.length > 0
-        ? `Resume a specific task with resume_task (e.g. ${cancelledChildren[0]!.id}) or \`pi-harness resume ${run.id}\` after fixing the cause.`
+        ? `A run resume never revives cancelled tasks; resume a specific one with resume_task (e.g. ${cancelledChildren[0]!.id}) from the Director or its parent orchestrator, or delegate the work again.`
         : `Inspect with \`pi-harness tree ${run.id}\`.`;
       return this.runResult(
         run.id,
@@ -1479,7 +1692,8 @@ export class HarnessOrchestrator {
             }
             this.allocatingWorktrees.add(task.id);
             try {
-              wt = await wtMgr.createForWorker(run.id, task.id, undefined, { force: qEntry.forceStart });
+              const force = qEntry.forceStart;
+              wt = await this.runWorktreeOp(task.id, () => wtMgr.createForWorker(run.id, task.id, undefined, { force }));
               this.db.admissionQueue.remove("worker", task.id);
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
@@ -1679,9 +1893,12 @@ export class HarnessOrchestrator {
         if (explicitRollover || res.stopReason === "rollover_requested") {
           this.pendingRollovers.delete(task.id);
           const nextGen = latest.generation + 1;
+          // A stop or cancel during the awaits below wins: the stale continuation writes nothing and launches nothing.
+          const fence = this.rolloverFence(latest);
           // Fail fast after 2 consecutive zero-progress automatic context-threshold rollovers
           if (!explicitRollover && res.stopReason === "rollover_requested") {
             const fp = await this.computeAutoRolloverFingerprint(run.id, task.id, wt?.path ?? null);
+            if (this.rolloverFenceBroken(exec, task.id, fence)) return;
             const prev = this.taskAutoRolloverProgress.get(task.id);
             const streak = prev && prev.fp === fp ? prev.streak + 1 : 1;
             this.taskAutoRolloverProgress.set(task.id, { fp, streak });
@@ -1730,6 +1947,7 @@ export class HarnessOrchestrator {
             worktreePath: wt?.path ?? null,
             result: res,
           });
+          if (this.rolloverFenceBroken(exec, task.id, fence)) return;
           this.db.updateTask(task.id, {
             status: "ready",
             generation: nextGen,
@@ -1752,6 +1970,7 @@ export class HarnessOrchestrator {
         if (res.stopReason === "quota_paused") {
           const qp = res.quotaPause;
           const reason = qp?.reason ?? "Quota / rate limit reached";
+          const fence = this.rolloverFence(latest);
           const pauseHandoff = await this.buildCleanRolloverHandoff({
             runId: run.id,
             task: latest,
@@ -1760,6 +1979,7 @@ export class HarnessOrchestrator {
             worktreePath: wt?.path ?? null,
             result: res,
           });
+          if (this.rolloverFenceBroken(exec, task.id, fence)) return;
           this.taskQuotaHints.set(task.id, {
             wireModel,
             profileId: latest.profileId,
@@ -1889,6 +2109,7 @@ export class HarnessOrchestrator {
         if (explicitRollover && latest && latest.generation + 1 <= maxGenerations) {
           this.pendingRollovers.delete(task.id);
           const nextGen = latest.generation + 1;
+          const fence = this.rolloverFence(latest);
           const nextHandoff = await this.buildCleanRolloverHandoff({
             runId: run.id,
             task: latest,
@@ -1897,6 +2118,7 @@ export class HarnessOrchestrator {
             worktreePath: wt?.path ?? null,
             result: { text: "", stopReason: "rollover_requested" },
           });
+          if (this.rolloverFenceBroken(exec, task.id, fence)) return;
           this.db.updateTask(task.id, {
             status: "ready",
             generation: nextGen,
@@ -1927,6 +2149,20 @@ export class HarnessOrchestrator {
         exec.handle = undefined;
       }
     }
+  }
+
+  /** Generation and stop/cancel epochs before a rollover or quota-pause handoff is awaited. */
+  private rolloverFence(task: TaskRecord): { gen: number; snap: StopSnapshot } {
+    return { gen: task.generation, snap: this.stopEpochSnapshot(task.runId, [task.id]) };
+  }
+
+  /** True when the task was cancelled, its run stopped, or its generation moved on while a handoff was built. */
+  private rolloverFenceBroken(exec: ActiveTaskExecution, taskId: string, fence: { gen: number; snap: StopSnapshot }): boolean {
+    if (exec.abort.signal.aborted) return true;
+    const t = this.db.getTask(taskId);
+    if (!t || t.status === "cancelled" || t.generation !== fence.gen) return true;
+    if (!isDirectorTaskContainer(t.runId) && this.db.getRun(t.runId)?.status === "stopped") return true;
+    return this.stopWonSince(t, fence.snap) !== null;
   }
 
   /**
@@ -2209,7 +2445,8 @@ export class HarnessOrchestrator {
     const refusal = this.describeSteerRefusal(taskId);
     if (refusal) throw new Error(refusal);
     const exec = this.active.get(taskId);
-    if (!exec?.handle) return false;
+    // A cancelled session that is still winding down is never steered.
+    if (!exec?.handle || exec.abort.signal.aborted) return false;
     const ok = await exec.handle.steer(message);
     const task = this.db.getTask(taskId);
     if (task) {
@@ -2218,49 +2455,79 @@ export class HarnessOrchestrator {
     return ok;
   }
 
-  /** Why steering cannot reach this task (settled task or stopped run), or null when it may. */
+  /** Why steering cannot reach this task (settled, cancelled, quota-paused, or stopped run), or null when it may. */
   describeSteerRefusal(taskId: string): string | null {
     const task = this.db.getTask(taskId);
-    if (!task || this.active.has(taskId)) return null;
+    if (!task || this.isLiveExecution(taskId)) return null;
     const run = this.db.getRun(task.runId);
+    const container = isDirectorTaskContainer(task.runId);
+    const runStopped = Boolean(run && run.status === "stopped" && !container);
+    if (task.status === "paused_quota" && !runStopped) {
+      const quota = this.getRunQuotaStatus(task.runId);
+      const when = quota?.mode === "manual" || !quota
+        ? `it resumes when the operator runs \`pi-harness resume ${task.runId}\` (or the Director calls resume_run)`
+        : `it resumes automatically${quota.resumeAt ? ` at ${quota.resumeAt}` : " when quota recovers"}`;
+      return `Steering was not delivered: task ${task.id} is paused on provider quota (${this.causeOrHint(task.runId, task.summary)}); ${when}. ` +
+        "Nothing was changed; send the guidance again once it is running, or pass it as the note when resuming.";
+    }
     const settled = ["cancelled", "failed", "completed", "blocked", "returned_for_rescope"].includes(task.status);
-    const runStopped = Boolean(run && run.status === "stopped" && !isDirectorTaskContainer(run.id));
-    if (!settled && !runStopped) return null;
-    const cause = settled
-      ? this.causeOrHint(task.runId, task.summary)
-      : this.causeOrHint(task.runId, this.describeRunCause(task.runId));
-    const state = settled ? `task ${task.id} is ${task.status}` : `run ${task.runId} is stopped`;
-    const recovery = task.status === "completed"
-      ? "Its result is final; read it with wait_children, or delegate follow-up work as a new task."
-      : `To continue it with this guidance use resume_task({ task_id: "${task.id}", note }) (operator: \`pi-harness resume ${task.runId}\`).`;
+    // A cancelled runner still winding down counts as cancelled, never as live.
+    const aborting = this.active.get(taskId)?.abort.signal.aborted === true;
+    if (!settled && !runStopped && !aborting) return null;
+    // A whole-run stop is the broader cause and is reported first.
+    const cause = runStopped || !settled
+      ? this.causeOrHint(task.runId, this.describeRunCause(task.runId) ?? task.summary)
+      : this.causeOrHint(task.runId, task.summary);
+    const state = runStopped ? `run ${task.runId} is stopped` : settled ? `task ${task.id} is ${task.status}` : `task ${task.id} is being cancelled`;
+    let recovery: string;
+    if (task.status === "completed") {
+      recovery = "Its result is final; read it with wait_children, or delegate follow-up work as a new task.";
+    } else if (runStopped && task.tier === 1) {
+      recovery = `To continue the run use resume_run (Director) or \`pi-harness resume ${task.runId}\` (operator).`;
+    } else if (runStopped) {
+      recovery = `The run must be resumed first (Director resume_run or operator \`pi-harness resume ${task.runId}\`); that never revives cancelled tasks, so then resume this one with resume_task({ task_id: "${task.id}", note }).`;
+    } else if (container || task.parentId === null || task.tier === 1) {
+      recovery = `The Director can continue it with this guidance using resume_task({ task_id: "${task.id}", note }), or delegate again.`;
+    } else {
+      recovery = `Its parent orchestrator (or the Director) can continue it with this guidance using resume_task({ task_id: "${task.id}", note }), or delegate again.`;
+    }
     return `Steering was not delivered: ${state} (${cause}); steering only reaches a running task and never undoes a stop. ${recovery}`;
   }
 
   async cancelTask(taskId: string, reason: string): Promise<void> {
+    // Bumped even for an already-settled task, so a resume requested before this cancel never applies.
     this.bumpStopEpoch(taskId);
     this.db.admissionQueue.remove("worker", taskId);
     const exec = this.active.get(taskId);
-    if (exec) {
-      exec.abort.abort(new Error(reason));
-      await exec.handle?.cancel(reason).catch(() => {});
+    if (exec) exec.abort.abort(new Error(reason));
+    const before = this.db.getTask(taskId);
+    const cancelled = exec?.handle ? exec.handle.cancel(reason).catch(() => {}) : Promise.resolve();
+    // Queued on the task's worktree chain now (synchronously), after any in-flight allocation: a worktree allocated
+    // mid-cancel is torn down once it exists, and a later resume waits for this teardown before touching the worktree.
+    if (before?.tier === 2) {
+      void this.runWorktreeOp(taskId, async () => {
+        await cancelled;
+        const task = this.db.getTask(taskId);
+        // A resume that already started a newer generation owns the worktree now.
+        if (!task?.worktreeId || task.generation !== before.generation || task.status === "merging") return;
+        // NEVER tear down a parent's worktree when cancelling an inherited Tier 3 child (tier 2 only here), and
+        // never while a merge is actively draining it.
+        const run = this.db.getRun(task.runId);
+        const wt = this.db.getWorktree(task.worktreeId);
+        if (run && wt && !wt.cleanedAt && wt.status !== "merged" && wt.status !== "queued") {
+          await this.getWorktreeManager(run.repoRoot)
+            .teardown(wt.id, { archiveBeforeRemove: true, finalStatus: "archived" })
+            .catch(() => {});
+        }
+      }).catch(() => {});
     }
+    await cancelled;
     this.taskQuotaHints.delete(taskId);
     this.taskResumeNotes.delete(taskId);
     this.pendingRollovers.delete(taskId);
     const task = this.db.getTask(taskId);
     if (task && !["completed", "cancelled", "failed"].includes(task.status)) {
       this.db.updateTask(taskId, { status: "cancelled", summary: `Cancelled: ${reason}` });
-    }
-    // Archive & tear down a cancelled Tier 2 worker's worktree immediately — NEVER tear down a parent's worktree
-    // when cancelling an inherited Tier 3 child, and never tear down while a merge is actively draining it!
-    if (task?.tier === 2 && task.worktreeId) {
-      const run = this.db.getRun(task.runId);
-      const wt = this.db.getWorktree(task.worktreeId);
-      if (run && wt && !wt.cleanedAt && wt.status !== "merged" && wt.status !== "queued" && task.status !== "merging") {
-        void this.getWorktreeManager(run.repoRoot)
-          .teardown(wt.id, { archiveBeforeRemove: true, finalStatus: "archived" })
-          .catch(() => {});
-      }
     }
   }
 

@@ -32,11 +32,11 @@ import {
   type RemoteHostConfig,
   type RunnerProfileConfig,
 } from "../config.js";
-import { ControlPlaneDb, type ReplayCursor, type EventRecord } from "../control-plane/db.js";
+import { ControlPlaneDb, type ReplayCursor, type EventRecord, type RunRecord } from "../control-plane/db.js";
 import { readRunDossier, readWorkspaceArtifact } from "../control-plane/dossiers.js";
 import { compactTaskHandoff } from "../control-plane/handoffs.js";
 import { directorTaskRunOwner } from "../control-plane/ids.js";
-import type { ProjectRecord } from "../control-plane/projects.js";
+import { canonicalProjectPath, type ProjectRecord } from "../control-plane/projects.js";
 import type { ChatSessionRecord } from "../director/session.js";
 import { HarnessOrchestrator, isDirectorTaskContainer, type CustomRunnerFactory } from "../control-plane/orchestrator.js";
 import { loadOrCreateNodeId, parseSessionAddress, type SessionMessageRecord } from "../control-plane/session-messages.js";
@@ -2452,39 +2452,19 @@ export class HarnessDaemon {
         });
 
       case "goal.commit": {
-        const g = this.director.goals.getGoal(String(p.goalId));
-        if (!g) throw new Error(`Unknown goal ${p.goalId}`);
-        if (g.status === "achieved" || g.status === "cancelled") {
-          throw new Error(`Goal ${g.id} is ${g.status} and cannot be started again. Create a new goal for follow-up work.`);
-        }
-        if (["executing", "verifying", "reviewing"].includes(g.status)) {
-          return {
-            ...g,
-            outcome: "already_active",
-            message: `Goal ${g.id} is already ${g.status}${g.linkedRunId ? ` on run ${g.linkedRunId}` : ""}; nothing was started again.`,
-          };
-        }
-        // A paused or stopped goal with an unfinished linked run continues in place instead of starting a second run.
-        const linked = g.linkedRunId ? this.orchestrator.getEffectiveRun(g.linkedRunId) : null;
-        if (linked && linked.status !== "completed") {
-          const res = await this.orchestrator.resumeRun(linked.id, { trigger: "manual" });
-          if (res.outcome === "resumed" || res.outcome === "already_active") {
-            const goal = this.director.goals.getGoal(g.id)!;
-            const updated = goal.status === "executing" ? goal : this.director.goals.setStatus(g.id, "executing", "Resumed in place");
-            return { ...updated, outcome: res.outcome, message: `Goal ${g.id}: ${res.message}` };
-          }
-        }
-        const committed = await this.director.commitGoal(g.id, {
+        // One shared start-or-resume contract: the Director's detailed result is returned as is.
+        const res = await this.director.commitGoalDetailed(String(p.goalId), {
           profileId: typeof p.profileId === "string" ? p.profileId : undefined,
           model: typeof p.model === "string" ? p.model : undefined,
           effort: typeof p.effort === "string" ? p.effort : undefined,
         });
         return {
-          ...committed,
-          outcome: committed.linkedRunId && committed.linkedRunId !== g.linkedRunId ? "started" : committed.status,
-          message: committed.linkedRunId && committed.linkedRunId !== g.linkedRunId
-            ? `Goal ${g.id} started on run ${committed.linkedRunId}.`
-            : `Goal ${g.id} is ${committed.status}${committed.linkedRunId ? ` (run ${committed.linkedRunId})` : ""}.`,
+          ...res.goal,
+          outcome: res.outcome,
+          message: res.message,
+          ...(res.runStatus ? { runStatus: res.runStatus } : {}),
+          ...(res.resumedTaskIds ? { resumedTaskIds: res.resumedTaskIds } : {}),
+          ...(res.queuePosition !== undefined ? { queuePosition: res.queuePosition } : {}),
         };
       }
 
@@ -2552,50 +2532,21 @@ export class HarnessDaemon {
         return this.director.goals.listRevisions(String(p.goalId));
 
       case "goal.resume": {
-        const g = this.director.goals.getGoal(String(p.goalId));
-        if (!g) throw new Error(`Unknown goal ${p.goalId}`);
-        if (g.status === "achieved" || g.status === "cancelled") {
-          throw new Error(`Cannot resume ${g.id}: goal is already ${g.status}`);
-        }
-        if (g.linkedRunId) {
-          const res = await this.orchestrator.resumeRun(g.linkedRunId, {
-            trigger: "manual",
-            note: typeof p.note === "string" ? p.note : undefined,
-          });
-          if (res.resumed || res.outcome === "already_active") {
-            const fresh = this.director.goals.getGoal(g.id)!;
-            if (fresh.status !== "executing") this.director.goals.setStatus(g.id, "executing", "Resumed by user");
-            return {
-              resumed: res.resumed,
-              goal: this.director.goals.getGoal(g.id)!,
-              resumedTaskIds: res.resumedTaskIds,
-              outcome: res.outcome,
-              runStatus: res.runStatus,
-              message: `Goal ${g.id}: ${res.message}`,
-              ...(res.resumed ? {} : { reason: res.message }),
-            };
-          }
-          return {
-            resumed: false,
-            goal: g,
-            resumedTaskIds: [],
-            outcome: res.outcome,
-            runStatus: res.runStatus,
-            ...(res.cause ? { cause: res.cause } : {}),
-            reason: `Goal ${g.id}: ${res.message}`,
-            message: `Goal ${g.id}: ${res.message}`,
-          };
-        }
-        if (g.status !== "draft" && g.status !== "paused" && g.status !== "awaiting_human") {
-          throw new Error(`Cannot resume ${g.id} in status ${g.status}`);
-        }
-        const committed = await this.director.commitGoal(g.id);
+        if (!this.director.goals.getGoal(String(p.goalId))) throw new Error(`Unknown goal ${p.goalId}`);
+        // Delegated once to the shared contract; never re-derives or overwrites a newer pause after the await.
+        const res = await this.director.resumeGoalDetailed(String(p.goalId), {
+          note: typeof p.note === "string" ? p.note : undefined,
+        });
+        const resumed = res.outcome === "resumed" || res.outcome === "started";
         return {
-          resumed: true,
-          goal: committed,
-          resumedTaskIds: [],
-          outcome: "started",
-          message: `Goal ${g.id} is ${committed.status}${committed.linkedRunId ? ` on run ${committed.linkedRunId}` : ""}.`,
+          resumed,
+          goal: res.goal,
+          resumedTaskIds: res.resumedTaskIds ?? [],
+          outcome: res.outcome,
+          ...(res.runStatus ? { runStatus: res.runStatus } : {}),
+          ...(res.queuePosition !== undefined ? { queuePosition: res.queuePosition } : {}),
+          message: res.message,
+          ...(resumed ? {} : { reason: res.message }),
         };
       }
 
@@ -2609,26 +2560,12 @@ export class HarnessDaemon {
           summary: typeof p.summary === "string" ? p.summary : undefined,
         });
 
-      case "goal.pause": {
-        const gid = String(p.goalId);
-        this.db.admissionQueue.remove("goal", gid);
-        const g = this.director.goals.setStatus(gid, "paused", "Paused by user");
-        if (g.linkedRunId) await this.orchestrator.stopRun(g.linkedRunId, "Goal paused");
-        void this.director.drainGoalQueue(g.repoRoot).catch(() => {});
-        return g;
-      }
+      case "goal.pause":
+        // Also cancels earlier resume_goal timers and wins over a launch or resume already in flight.
+        return await this.director.pauseGoal(String(p.goalId), "Paused by user");
 
-      case "goal.cancel": {
-        const gid = String(p.goalId);
-        this.db.admissionQueue.remove("goal", gid);
-        const g = this.director.goals.setStatus(gid, "cancelled", "Cancelled by user");
-        if (g.linkedRunId) {
-          await this.orchestrator.stopRun(g.linkedRunId, "Goal cancelled");
-          this.director.autoResolveGoalEscalations(g.linkedRunId, `Auto-resolved: goal ${g.id} cancelled`);
-        }
-        void this.director.drainGoalQueue(g.repoRoot).catch(() => {});
-        return g;
-      }
+      case "goal.cancel":
+        return await this.director.pauseGoal(String(p.goalId), "Cancelled by user", "cancelled");
 
       case "run.create":
         return await this.orchestrator.startRun({
@@ -2676,22 +2613,37 @@ export class HarnessDaemon {
 
       case "runs.stop_all": {
         const reason = typeof p.reason === "string" && p.reason.trim() ? p.reason.trim() : "Stopped by user (/stop)";
-        const repoFilter = typeof p.repoRoot === "string" && p.repoRoot.trim() ? p.repoRoot.trim() : undefined;
-        // An explicit stop wins over every older in-flight resume or launch.
-        this.orchestrator.bumpGlobalStopEpoch();
-        // Abort live Director turns and reviews FIRST so none of them can delegate or resume after the stop.
-        const { cancelledChats, cancelledReviews } = await this.director.cancelAllActive(reason);
-        // Pending chat timers that would resume a goal must not undo the stop.
-        let cancelledTimers = 0;
-        for (const t of this.db.timers.list({ ownerKind: "chat", status: "pending" })) {
-          if (!t.resumeGoal) continue;
-          if (repoFilter && t.goalId && this.director.goals.getGoal(t.goalId)?.repoRoot !== repoFilter) continue;
-          if (this.db.timers.cancel(t.id, reason)) cancelledTimers++;
+        const repoFilter = typeof p.repoRoot === "string" && p.repoRoot.trim() ? canonicalProjectPath(p.repoRoot.trim()) : undefined;
+        const inScope = (repoRoot: string | null | undefined) =>
+          !repoFilter || (repoRoot ? canonicalProjectPath(repoRoot) === repoFilter : false);
+        // An explicit stop wins over every older in-flight resume or launch, in this repo only when filtered.
+        if (repoFilter) this.orchestrator.bumpRepoStopEpoch(repoFilter);
+        else this.orchestrator.bumpGlobalStopEpoch();
+        // Abort live Director turns, reviews and goal-resume timers FIRST (scoped to the repo) so none can delegate
+        // or resume after the stop; the Director counts what it actually cancelled.
+        const { cancelledChats, cancelledReviews, cancelledTimers } = await this.director.cancelAllActive(
+          reason,
+          repoFilter ? { repoRoot: repoFilter } : undefined,
+        );
+        // Pending wakeups of chats outside the filter stay queued.
+        for (const chatId of [...this.pendingWakeups.keys()]) {
+          if (inScope(this.director.chatRepoRoot(chatId))) this.pendingWakeups.delete(chatId);
         }
-        // Also cancel any pending wakeups so stopped runs don't immediately re-wake the Director
-        this.pendingWakeups.clear();
-        const runs = this.db.listRuns(200).filter((r) => {
-          if (repoFilter && r.repoRoot !== repoFilter) return false;
+        // Queued goals leave the queue, so stopping a linked run below cannot drain it and start new work.
+        let dequeuedGoals = 0;
+        for (const entry of this.db.admissionQueue.list({ lane: "goal" })) {
+          if (inScope(entry.repoRoot) && this.db.admissionQueue.remove("goal", entry.targetId)) dequeuedGoals++;
+        }
+        if (dequeuedGoals > 0) this.director.syncQueuedGoalProgress();
+        // Every active or quota-paused run (no row cap), plus runs whose tasks are live in memory.
+        const candidates = new Map<string, RunRecord>();
+        for (const r of this.db.listActiveOrQuotaPausedRuns()) candidates.set(r.id, r);
+        for (const id of this.orchestrator.liveRunIds()) {
+          const r = this.db.getRun(id);
+          if (r) candidates.set(r.id, r);
+        }
+        const runs = [...candidates.values()].filter((r) => {
+          if (!inScope(r.repoRoot)) return false;
           const eff = this.orchestrator.getEffectiveRun(r.id);
           return eff?.status === "active" || eff?.status === "paused_quota";
         });
@@ -2707,6 +2659,7 @@ export class HarnessDaemon {
           cancelledChats,
           cancelledReviews,
           cancelledTimers,
+          dequeuedGoals,
         };
       }
 
