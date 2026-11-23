@@ -50,7 +50,7 @@ export async function resolveLaunchRoute(config: HarnessConfig, selection: Launc
         if (profile.kind !== "acp" || profile.adapter !== "claude" || !claudeAlias.test(route.wireModelId)) continue;
         const requested = model.startsWith("claude-") ? `anthropic/${model}` : model;
         if (!snapshot.models.some(entry => entry.id === requested)) continue;
-        const resolved = compiler.resolveForProfile(profile.id, requested);
+        const resolved = compiler.resolveForProfile(profile.id, requested, undefined, snapshot);
         if (!resolved || resolved.canonicalId !== requested || resolved.wireModelId !== route.wireModelId) continue;
         canonicalId = requested;
       }
