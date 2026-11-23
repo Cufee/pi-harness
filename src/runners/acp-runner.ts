@@ -313,13 +313,25 @@ export class AcpRunner {
     const hasHarnessBridge = Boolean(req.daemonSocketPath && req.mcpBridgeEntrypoint);
     const harnessToolNames = new Set(req.tools.map(({ name }) => name));
     const claudeToolNames = new Set(req.tools.map(({ name }) => `mcp__harness__${name}`));
-    const externalMcpNames = new Set(
-      !controlOnly
-        ? (req.externalMcpServers ?? [])
-            .filter((s) => s?.enabled !== false && typeof s?.name === "string" && s.name.trim())
-            .map((s) => s.name.trim())
-        : [],
-    );
+    const externalMcpEntries: AcpMcpServerEntry[] = [];
+    if (!controlOnly && req.externalMcpServers?.length) {
+      const seen = new Set<string>(["harness"]);
+      for (const ext of req.externalMcpServers) {
+        const name = typeof ext?.name === "string" ? ext.name.trim() : "";
+        const normalized = name.toLowerCase();
+        if (!normalized || seen.has(normalized)) continue;
+        seen.add(normalized);
+        if (ext.enabled === false || typeof ext.command !== "string" || !ext.command.trim()) continue;
+        const mountName = normalized === "octofs" ? "octofs" : name;
+        externalMcpEntries.push({
+          name: mountName,
+          command: ext.command.trim(),
+          args: ext.args ?? [],
+          env: Object.entries(ext.env ?? {}).map(([envName, val]) => ({ name: envName, value: interpolateEnv(val) })),
+        });
+      }
+    }
+    const externalMcpNames = new Set(externalMcpEntries.map((s) => s.name));
     const codexHarnessCalls = new Set<string>();
     const codexExternalCalls = new Set<string>();
     const quotaTimeoutMs = Math.max(0, req.quotaRetryTimeoutMs ?? DEFAULT_QUOTA_RETRY_TIMEOUT_MS);
@@ -1107,22 +1119,7 @@ export class AcpRunner {
           ],
         });
       }
-      if (!controlOnly && req.externalMcpServers?.length) {
-        const seen = new Set(mcpServers.map((s) => s.name.trim().toLowerCase()));
-        for (const ext of req.externalMcpServers) {
-          const name = typeof ext?.name === "string" ? ext.name.trim() : "";
-          const normalized = name.toLowerCase();
-          if (!normalized || normalized === "harness" || seen.has(normalized)) continue;
-          seen.add(normalized);
-          if (ext.enabled === false || typeof ext.command !== "string" || !ext.command.trim()) continue;
-          mcpServers.push({
-            name,
-            command: ext.command.trim(),
-            args: ext.args ?? [],
-            env: Object.entries(ext.env ?? {}).map(([envName, val]) => ({ name: envName, value: interpolateEnv(val) })),
-          });
-        }
-      }
+      mcpServers.push(...externalMcpEntries);
 
       const { params: newSessionParams, needsTurn1SystemPrompt } = buildNewSessionParams(this.profile.adapter, {
         cwd: req.cwd,

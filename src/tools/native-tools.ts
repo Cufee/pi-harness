@@ -87,6 +87,7 @@ export function resolveOctofsBin(stateDir: string): string | null {
       ...(installDir
         ? [join(resolve(installDir), "tools", "octofs", `${OCTOFS_VERSION}-${target.triple}`, "bin", "octofs")]
         : []),
+      join(resolve(packageRoot, "..", ".."), "tools", "octofs", `${OCTOFS_VERSION}-${target.triple}`, "bin", "octofs"),
       join(stateDir, "install", "tools", "octofs", `${OCTOFS_VERSION}-${target.triple}`, "bin", "octofs"),
       join(stateDir, "tools", "octofs", `${OCTOFS_VERSION}-${target.triple}`, "bin", "octofs"),
     ];
