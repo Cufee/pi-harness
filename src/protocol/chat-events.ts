@@ -23,10 +23,23 @@ export type ChatControlEvent =
       openEscalations: number;
       /** Recorded cause text (stop reason, quota reason, escalation title, verification error). */
       detail?: string;
-      /** Cause category: "explicit_stop", "run_failed", "quota_paused", "escalation", or "verification_error". */
+      /** Cause category: "explicit_stop", "run_failed", "quota_paused", "escalation", "verification_error", or "gates_failed". */
       cause?: string;
       /** Who caused the settlement; director-originated events do not wake the Director. */
       source?: ChatEventSource;
+    }
+  | {
+      kind: "goal.escalated";
+      goalId: string;
+      goalVersion: number;
+      goalTitle: string;
+      runId: string;
+      /** Informational DB run status at the time of the escalation (active, paused_quota, completed, ...). */
+      runStatus: string;
+      escalationId: string;
+      severity: "P0";
+      title: string;
+      openEscalations: number;
     }
   | {
       kind: "goal.committed";
@@ -107,6 +120,7 @@ export function parseChatControlEvent(raw: unknown): ChatControlEvent | null {
       ) {
         return null;
       }
+      const detail = typeof r.detail === "string" ? r.detail.trim().slice(0, 500) : "";
       return {
         kind: "goal.settled",
         goalId: r.goalId,
@@ -115,9 +129,34 @@ export function parseChatControlEvent(raw: unknown): ChatControlEvent | null {
         runId: r.runId,
         runStatus,
         openEscalations: typeof r.openEscalations === "number" ? r.openEscalations : 0,
-        ...(typeof r.detail === "string" && r.detail ? { detail: r.detail } : {}),
+        ...(detail ? { detail } : {}),
         ...(typeof r.cause === "string" && r.cause ? { cause: r.cause } : {}),
         ...parseEventSource(r.source),
+      };
+    }
+    case "goal.escalated": {
+      if (
+        typeof r.goalId !== "string" ||
+        typeof r.goalVersion !== "number" ||
+        typeof r.goalTitle !== "string" ||
+        typeof r.runId !== "string" ||
+        typeof r.escalationId !== "string" ||
+        typeof r.title !== "string" ||
+        r.severity !== "P0"
+      ) {
+        return null;
+      }
+      return {
+        kind: "goal.escalated",
+        goalId: r.goalId,
+        goalVersion: r.goalVersion,
+        goalTitle: r.goalTitle,
+        runId: r.runId,
+        runStatus: typeof r.runStatus === "string" && r.runStatus.trim() ? r.runStatus.trim() : "unknown",
+        escalationId: r.escalationId,
+        severity: "P0",
+        title: r.title,
+        openEscalations: typeof r.openEscalations === "number" ? r.openEscalations : 0,
       };
     }
     case "goal.committed": {
@@ -252,12 +291,19 @@ export function formatChatEventSummary(event: ChatControlEvent, opts?: { remoteH
     case "goal.settled": {
       const head = `Goal ${event.goalId} v${event.goalVersion} ("${event.goalTitle}")`;
       const esc = event.openEscalations ? ` (${event.openEscalations} open escalation(s))` : "";
+      const treeCmd = cliCommand("tree", event.runId, opts?.remoteHost);
+      const verificationError = settledVerificationError(event);
+      if (verificationError !== null) {
+        return (
+          `${head}: run ${event.runId} completed, but goal verification failed to run: ${verificationError}${esc}. The run itself did not fail. ` +
+          `Re-run verification (Director: goal_trigger_review) or inspect the goal (goal_get); inspect the run with ${treeCmd}.`
+        );
+      }
       if (event.runStatus === "completed") {
-        const detail = event.detail?.trim();
+        const detail = event.detail?.replace(/\s+/g, " ").trim();
         return `${head} run ${event.runId} completed${esc}${detail ? `: ${detail}` : ""}.`;
       }
       const resumeCmd = cliCommand("resume", event.runId, opts?.remoteHost);
-      const treeCmd = cliCommand("tree", event.runId, opts?.remoteHost);
       const recovery = `Nothing restarts automatically. Continue it in place with ${resumeCmd}, inspect it with ${treeCmd}, or send a new request.`;
       const quotaReason = settledQuotaReason(event);
       if (quotaReason !== null) {
@@ -269,18 +315,19 @@ export function formatChatEventSummary(event: ChatControlEvent, opts?: { remoteH
       if (event.cause === "escalation") {
         return `${head}: run ${event.runId} needs human input: ${settledCauseText(event, treeCmd)}${esc}. Inspect it with ${treeCmd} and answer the escalation, or send a new request.`;
       }
-      const verificationError = settledVerificationError(event);
-      if (verificationError !== null) {
-        return (
-          `${head}: run ${event.runId} completed, but goal verification failed to run: ${verificationError}${esc}. The run itself did not fail. ` +
-          `Re-run verification (Director: goal_trigger_review) or inspect the goal (goal_get); inspect the run with ${treeCmd}.`
-        );
+      if (event.cause === "gates_failed") {
+        return `${head}: run ${event.runId} failed and required deterministic gates still fail: ${settledCauseText(event, treeCmd)}${esc}. ${recovery}`;
       }
       if (event.runStatus === "stopped") {
         if (isExplicitStop(event)) return `${head}: run ${event.runId} was stopped: ${event.detail!.trim()}${esc}. ${recovery}`;
         return `${head}: run ${event.runId} is stopped: ${settledCauseText(event, treeCmd, "no explicit stop was recorded")}${esc}. ${recovery}`;
       }
       return `${head}: run ${event.runId} failed: ${settledCauseText(event, treeCmd)}${esc}. ${recovery}`;
+    }
+    case "goal.escalated": {
+      const esc = event.openEscalations ? ` (${event.openEscalations} open escalation(s))` : "";
+      const title = event.title.replace(/\s+/g, " ").trim();
+      return `Goal ${event.goalId} v${event.goalVersion} ("${event.goalTitle}") run ${event.runId} (${event.runStatus}): ${event.severity} escalation ${event.escalationId} raised — ${title}${esc}.`;
     }
     case "goal.committed":
       return `Goal ${event.goalId} v${event.goalVersion} started autonomous run ${event.runId} (${event.criteriaCount} criteria).`;
@@ -312,10 +359,21 @@ export function formatChatEventForModel(event: ChatControlEvent): string {
   const summary = formatChatEventSummary(event);
   switch (event.kind) {
     case "goal.settled": {
+      const escNote =
+        event.openEscalations > 0
+          ? " Open escalations stay open until disposed; close any handled finding with `resolve_escalation({ escalation_id, reason })`."
+          : "";
+      if (settledVerificationError(event) !== null) {
+        return [
+          summary,
+          `Run ${event.runId} for Goal ${event.goalId} ended '${event.runStatus}' but automatic goal verification could not run, so Goal ${event.goalId} is awaiting_human. The run itself did not fail; do not resume or restart the run for it. ` +
+            `Fix the cause above (for example select an enabled reviewer profile), inspect the goal with goal_get({ goal_id: "${event.goalId}" }), then re-run verification with goal_trigger_review, or report the verification error to the user.${escNote}`,
+        ].join("\n");
+      }
       if (event.runStatus === "completed") {
         return [
           summary,
-          `The autonomous run (${event.runId}) for Goal ${event.goalId} finished. Inspect/settle the goal with \`goal_trigger_review\` (using the appropriate \`verification_mode\` for this task) or report the outcome concisely to the user.`,
+          `The autonomous run (${event.runId}) for Goal ${event.goalId} finished. Inspect/settle the goal with \`goal_trigger_review\` (using the appropriate \`verification_mode\` for this task) or report the outcome concisely to the user.${escNote}`,
         ].join("\n");
       }
       const resume = `resume_run({ goal_id: "${event.goalId}" })`;
@@ -331,10 +389,8 @@ export function formatChatEventForModel(event: ChatControlEvent): string {
         guidance =
           `Run ${event.runId} for Goal ${event.goalId} raised an escalation that needs human input. Surface it to the user with actionable options; ` +
           `once it is resolved, ${resume} continues the same run in place.`;
-      } else if (settledVerificationError(event) !== null) {
-        guidance =
-          `Run ${event.runId} for Goal ${event.goalId} completed; the failure is in goal verification after completion, not in the run. Do not resume or restart the run for it. ` +
-          `Inspect the goal with goal_get({ goal_id: "${event.goalId}" }) and re-run verification with goal_trigger_review once the cause is fixed, or report the verification error to the user.`;
+      } else if (event.cause === "gates_failed") {
+        guidance = `Run ${event.runId} for Goal ${event.goalId} failed and required deterministic gates still fail; Goal ${event.goalId} is awaiting_human and nothing was retried automatically. Inspect via goal_get({ goal_id: "${event.goalId}" }), then call ${resume}, goal_amend, or report to the user.`;
       } else if (event.runStatus === "stopped" && isExplicitStop(event)) {
         guidance =
           `Run ${event.runId} for Goal ${event.goalId} was explicitly stopped; this is not a failure and not a turn or budget limit. Do not restart it yourself. ` +
@@ -348,8 +404,13 @@ export function formatChatEventForModel(event: ChatControlEvent): string {
           `Run ${event.runId} for Goal ${event.goalId} failed. Inspect it with run_status({ goal_id: "${event.goalId}" }). ` +
           `If it is recoverable, ${resume} or resume_task for one task continues it in place; otherwise report the cause and options to the user.${noCause}`;
       }
-      return [summary, guidance].join("\n");
+      return [summary, guidance + escNote].join("\n");
     }
+    case "goal.escalated":
+      return [
+        summary,
+        `The run (${event.runId}) is '${event.runStatus}'; this is an escalation, not a run failure. Inspect with goal_get({ goal_id: "${event.goalId}" }). Answer it by steering or amending, resume a blocked task with resume_task, call resolve_escalation({ escalation_id: "${event.escalationId}", reason }) once handled, or ask the user if a human decision is needed.`,
+      ].join("\n");
     case "timer.fired":
       return [
         summary,
