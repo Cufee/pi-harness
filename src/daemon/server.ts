@@ -393,6 +393,16 @@ export class HarnessDaemon {
         console.error(`[harnessd] Ignored invalid config.json at ${cfgFile} (keeping previous settings): ${err instanceof Error ? err.message : String(err)}`);
         return; // Reject invalid file and keep old settings cleanly
       }
+      let prevHadExternalMcp = false;
+      if (this.lastConfigRaw.trim()) {
+        try {
+          const prevParsed = JSON.parse(this.lastConfigRaw) as Record<string, unknown>;
+          prevHadExternalMcp =
+            typeof prevParsed === "object" && prevParsed !== null && "externalMcpServers" in prevParsed;
+        } catch {
+          // ignore unparseable previous snapshot
+        }
+      }
       this.lastConfigRaw = raw;
       const prevProfiles = JSON.stringify(this.config.profiles);
       const next: HarnessConfig = {
@@ -401,10 +411,14 @@ export class HarnessDaemon {
           ? { profiles: parsed.profiles as RunnerProfileConfig[] }
           : {}),
         ...(Array.isArray(parsed.remotes) ? { remotes: parsed.remotes as RemoteHostConfig[] } : {}),
-        externalMcpServers:
-          Array.isArray(parsed.externalMcpServers) && parsed.externalMcpServers.length > 0
-            ? (parsed.externalMcpServers as HarnessConfig["externalMcpServers"])
-            : undefined,
+        ...("externalMcpServers" in parsed || prevHadExternalMcp
+          ? {
+              externalMcpServers:
+                Array.isArray(parsed.externalMcpServers) && parsed.externalMcpServers.length > 0
+                  ? (parsed.externalMcpServers as HarnessConfig["externalMcpServers"])
+                  : undefined,
+            }
+          : {}),
         ...(typeof parsed.defaultOrchestratorProfile === "string"
           ? { defaultOrchestratorProfile: parsed.defaultOrchestratorProfile }
           : {}),
