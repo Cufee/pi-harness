@@ -1694,22 +1694,24 @@ export class ControlPlaneDb {
     resolve = true,
     auditExtra?: Record<string, unknown>,
   ): EscalationRecord {
-    const esc = this.getEscalation(id);
-    if (!esc) throw new Error(`Unknown escalation ${id}`);
-    const now = Date.now();
-    const status = resolve ? "resolved" : "acked";
-    this.db
-      .prepare("UPDATE escalations SET status = ?, resolution = ?, acked_at = ? WHERE id = ?")
-      .run(status, resolution, now, esc.id);
-    const updated = this.getEscalation(esc.id)!;
-    this.emitEvent(esc.runId, esc.fromTaskId, "escalation.updated", {
-      ...(auditExtra ?? {}),
-      id: esc.id,
-      status,
-      resolution,
-      previousStatus: esc.status,
+    if (resolve) return this.tryResolveEscalation(id, resolution, auditExtra).escalation;
+    return this.transaction(() => {
+      const esc = this.getEscalation(id);
+      if (!esc) throw new Error(`Unknown escalation ${id}`);
+      const status = "acked";
+      this.db
+        .prepare("UPDATE escalations SET status = ?, resolution = ?, acked_at = ? WHERE id = ?")
+        .run(status, resolution, Date.now(), esc.id);
+      const updated = this.getEscalation(esc.id)!;
+      this.emitEvent(esc.runId, esc.fromTaskId, "escalation.updated", {
+        ...(auditExtra ?? {}),
+        id: esc.id,
+        status,
+        resolution,
+        previousStatus: esc.status,
+      });
+      return updated;
     });
-    return updated;
   }
 
   /**
