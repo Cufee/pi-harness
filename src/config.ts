@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import type { CodeMode } from "./code-mode/sdk.js";
 
 export type AcpAdapterKind = "claude" | "codex" | "gemini" | "generic";
@@ -263,6 +263,27 @@ export function interpolateEnv(value: string): string {
   return value.replace(/\$\{([A-Z0-9_]+)\}/g, (_, name: string) => process.env[name] ?? "");
 }
 
+export function normalizeWorktreeRoots(worktree: unknown) {
+  const fields = worktree as Record<string, unknown> | undefined;
+  const invalid: string[] = [];
+  function roots(key: "extraReadRoots" | "extraWriteRoots"): string[] | undefined {
+    const value = fields?.[key];
+    if (value === undefined) return undefined;
+    if (!Array.isArray(value)) {
+      invalid.push(key);
+      return undefined;
+    }
+    const valid = value.filter((root): root is string =>
+      typeof root === "string" && root === root.trim() && !root.includes("\0") &&
+      (isAbsolute(root) || root === "~" || root.startsWith("~/")),
+    );
+    if (valid.length !== value.length) invalid.push(key);
+    return valid;
+  }
+  const normalized = { extraReadRoots: roots("extraReadRoots"), extraWriteRoots: roots("extraWriteRoots") };
+  return { roots: normalized, warning: invalid.length ? `Invalid worktree roots in ${invalid.join(", ")}` : undefined };
+}
+
 export function loadConfig(repoRoot?: string): HarnessConfig {
   const stateDir = resolve(defaultStateDir());
   mkdirSync(stateDir, { recursive: true });
@@ -284,6 +305,9 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
     ...(repoCfg.rollover as Partial<RolloverConfig> | undefined),
   };
 
+  // Only the operator's config may grant access to additional host directories.
+  const { roots, warning } = normalizeWorktreeRoots(globalCfg.worktree);
+  if (warning) console.error(`[harness] ${warning}; ignoring invalid entries`);
   const worktree: WorktreeConfig = {
     dir: ".harness/worktrees",
     artifactsDir: ".harness/artifacts",
@@ -294,6 +318,7 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
     maxConcurrentWorkers: 4,
     ...(globalCfg.worktree as Partial<WorktreeConfig> | undefined),
     ...(repoCfg.worktree as Partial<WorktreeConfig> | undefined),
+    ...roots,
   };
 
   const goals: GoalsConfig = {

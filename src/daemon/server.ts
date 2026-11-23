@@ -15,7 +15,7 @@ export function currentDaemonBuildId(): string {
   }
 }
 import { ModelCatalogCompiler } from "../catalog/compiler.js";
-import { saveGlobalConfig, type HarnessConfig, type RemoteHostConfig, type RunnerProfileConfig } from "../config.js";
+import { normalizeWorktreeRoots, saveGlobalConfig, type HarnessConfig, type RemoteHostConfig, type RunnerProfileConfig } from "../config.js";
 import { ControlPlaneDb, type ReplayCursor, type EventRecord } from "../control-plane/db.js";
 import { readRunDossier, readWorkspaceArtifact } from "../control-plane/dossiers.js";
 import { compactTaskHandoff } from "../control-plane/handoffs.js";
@@ -388,7 +388,9 @@ export class HarnessDaemon {
       if (!raw.trim() || raw === this.lastConfigRaw) return;
       let parsed: Record<string, unknown>;
       try {
-        parsed = JSON.parse(raw) as Record<string, unknown>;
+        const snapshot = JSON.parse(raw);
+        // A scalar contains no root grants, but is not a settings object for the other sections.
+        parsed = snapshot !== null && typeof snapshot === "object" ? snapshot : { externalMcpServers: this.config.externalMcpServers };
       } catch (err) {
         console.error(`[harnessd] Ignored invalid config.json at ${cfgFile} (keeping previous settings): ${err instanceof Error ? err.message : String(err)}`);
         return; // Reject invalid file and keep old settings cleanly
@@ -405,6 +407,8 @@ export class HarnessDaemon {
       }
       this.lastConfigRaw = raw;
       const prevProfiles = JSON.stringify(this.config.profiles);
+      const { roots, warning } = normalizeWorktreeRoots(parsed.worktree);
+      if (warning) console.error(`[harnessd] ${warning}; ignoring invalid entries`);
       const next: HarnessConfig = {
         ...this.config,
         ...(Array.isArray(parsed.profiles) && parsed.profiles.length > 0
@@ -429,7 +433,7 @@ export class HarnessDaemon {
           : {}),
         ...(parsed.codeExec ? { codeExec: { ...this.config.codeExec, ...(parsed.codeExec as HarnessConfig["codeExec"]) } } : {}),
         ...(parsed.rollover ? { rollover: { ...this.config.rollover, ...(parsed.rollover as HarnessConfig["rollover"]) } } : {}),
-        ...(parsed.worktree ? { worktree: { ...this.config.worktree, ...(parsed.worktree as HarnessConfig["worktree"]) } } : {}),
+        worktree: { ...this.config.worktree, ...(parsed.worktree as HarnessConfig["worktree"]), ...roots },
         ...(parsed.goals ? { goals: { ...this.config.goals, ...(parsed.goals as HarnessConfig["goals"]) } } : {}),
         ...(parsed.events ? { events: { ...this.config.events, ...(parsed.events as HarnessConfig["events"]) } } : {}),
         ...(parsed.catalog ? { catalog: { ...this.config.catalog, ...(parsed.catalog as HarnessConfig["catalog"]) } } : {}),
@@ -1870,6 +1874,8 @@ export class HarnessDaemon {
 
       case "config.update": {
         const patch = (p.patch ?? {}) as Record<string, unknown>;
+        const { roots, warning } = normalizeWorktreeRoots(patch.worktree);
+        if (warning) throw new Error(warning);
         const next: HarnessConfig = {
           ...this.config,
           ...(typeof patch.defaultOrchestratorProfile === "string"
@@ -1881,7 +1887,12 @@ export class HarnessDaemon {
             ? { codeMode: patch.codeMode }
             : {}),
           ...(patch.rollover ? { rollover: { ...this.config.rollover, ...(patch.rollover as HarnessConfig["rollover"]) } } : {}),
-          ...(patch.worktree ? { worktree: { ...this.config.worktree, ...(patch.worktree as HarnessConfig["worktree"]) } } : {}),
+          ...(patch.worktree ? { worktree: {
+            ...this.config.worktree,
+            ...(patch.worktree as HarnessConfig["worktree"]),
+            ...(roots.extraReadRoots !== undefined ? { extraReadRoots: roots.extraReadRoots } : {}),
+            ...(roots.extraWriteRoots !== undefined ? { extraWriteRoots: roots.extraWriteRoots } : {}),
+          } } : {}),
           ...(patch.goals ? { goals: { ...this.config.goals, ...(patch.goals as HarnessConfig["goals"]) } } : {}),
           ...(patch.events ? { events: { ...this.config.events, ...(patch.events as HarnessConfig["events"]) } } : {}),
           ...(patch.catalog ? { catalog: { ...this.config.catalog, ...(patch.catalog as HarnessConfig["catalog"]) } } : {}),
