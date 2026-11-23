@@ -65,7 +65,7 @@ bun run src/cli.ts resume <run-id> --message "continue with the review fixes"
 
 ## Configuration
 
-`pi-harness` reads global settings from `~/.pi-harness/config.json` (or `$PI_HARNESS_HOME/config.json`) with an optional repository overlay in `.pi-harness.json`. Edits to the global file apply live without restarting the daemon, and `pi-harness daemon status` prints the settings in effect. See [docs/configuration.md](docs/configuration.md) for configuration keys, defaults, extra read and write roots, live reload, CLI commands, and Director tools.
+`pi-harness` reads global settings from `~/.pi-harness/config.json` (or `$PI_HARNESS_HOME/config.json`) with an optional repository overlay in `.pi-harness.json`. Most edits to the global file apply live without restarting the daemon, and `pi-harness daemon status` reports effective limits, external MCP servers, and config warnings. See [docs/configuration.md](docs/configuration.md) for configuration keys, defaults, extra read and write roots, live reload, CLI commands, and Director tools.
 
 ## Optional Quota Endpoint Configuration (`~/.pi-harness/config.json`)
 

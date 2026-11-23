@@ -1,6 +1,6 @@
 # Runtime install
 
-`install.sh` turns a source checkout into a self-contained, per-user install. It needs no global Node, Bun, Python or package manager, writes nothing outside two directories, and is safe to re-run. The same command updates an existing install.
+`install.sh` turns a source checkout into a self-contained, per-user install. It needs no global Node, Bun, Python or package manager, writes only to the install and launcher directories plus a best-effort audit log under `$PI_HARNESS_HOME`, and is safe to re-run. The same command updates an existing install.
 
 ```sh
 sh install.sh
@@ -14,7 +14,7 @@ From a checkout with Bun on `PATH`, `bun run install` runs the same script. A pl
 | `PI_HARNESS_INSTALL_DIR` | `~/.pi-harness/install` | Staged Bun, releases and caches |
 | `PI_HARNESS_BIN_DIR` | `~/.local/bin` | Where `pi-harness` and `harness` are written |
 
-State (`~/.pi-harness/config.json`, the SQLite database, daemon socket) is untouched and stays one level above the install directory. Every successful run appends one line (UTC time, user, pid, release id, source path) to `$PI_HARNESS_HOME/install-audit.log` (default `~/.pi-harness/install-audit.log`), including unchanged re-runs. `pi-harness` has no `--version` flag; `--help` is the smoke test.
+State (`config.json`, the SQLite database, daemon socket) is untouched. Its locations are configured independently of the install: the state directory is `$PI_HARNESS_HOME` (default `~/.pi-harness`, one level above the default install directory), and the daemon socket can live elsewhere (see `socketPath` in [configuration.md](./configuration.md)). Each run that reaches activation, including unchanged re-runs, attempts to append one line (UTC time, user, pid, release id, source path) to `$PI_HARNESS_HOME/install-audit.log`; the append is best-effort and write errors are ignored, so exit status 0 does not guarantee an audit line was written. `pi-harness` has no `--version` flag; `--help` is the smoke test.
 
 ## Layout
 
@@ -24,12 +24,12 @@ $PI_HARNESS_INSTALL_DIR/
   tools/octofs/<version>-<triple>/bin/octofs   staged octofs (file tools for agents over MCP)
   releases/<id>/                   src, proto, package.json, bun.lock, tsconfig.json, node_modules, .bun -> staged Bun
   current -> releases/<id>         active release (symlink swapped atomically)
-  cache/downloads/                 verified Bun archives
+  cache/downloads/                 verified Bun and octofs archives
   cache/bun/                       Bun package cache (BUN_INSTALL_CACHE_DIR, not ~/.bun)
 $PI_HARNESS_BIN_DIR/pi-harness     launcher; harness -> pi-harness
 ```
 
-`<id>` is the first 12 hex digits of a hash of the runtime files, so the same source always maps to the same release and an unchanged re-run does no work. A release is built in a staging directory and moved into place only after `bun install` succeeds; an interrupted install leaves the previous `current` and launcher working. Old releases are kept (running daemons keep executing from theirs); delete unwanted directories under `releases/` by hand.
+`<id>` is the first 12 hex digits of a hash of the runtime files, so the same source always maps to the same release and an unchanged re-run reuses the existing release and its dependencies (it still swaps `current`, rewrites the launcher, and attempts the audit append). A release is built in a staging directory and moved into place only after `bun install` succeeds; an interrupted install leaves the previous `current` and launcher working. Old releases are kept (running daemons keep executing from theirs); delete unwanted directories under `releases/` by hand.
 
 The launcher is `exec "$release/.bun" "$release/src/cli.ts" "$@"`: the staged Bun by default. `BUN_BIN=/path/to/bun` overrides it for debugging only. Code Mode uses `process.execPath`, so it runs under whichever Bun started the CLI.
 
@@ -53,6 +53,7 @@ Actual inventory, verified by running the installer with `PATH` limited to symli
 | `curl`, `unzip` | fetching and unpacking Bun | the OS |
 | `sha256sum` or `shasum` | checksum verification | the OS |
 | `sysctl` (macOS) | Rosetta and AVX2 detection | the OS |
+| `date` | UTC timestamp in the audit line | the OS |
 | HTTPS to `github.com` | Bun and octofs release downloads | n/a |
 | HTTPS to `registry.npmjs.org` | locked JS dependencies (cold cache) | `bun.lock` |
 | `/usr/bin/sandbox-exec` (macOS) | Code Mode sandbox | the OS |
