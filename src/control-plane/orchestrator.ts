@@ -19,6 +19,8 @@ import type { QueuePositionInput } from "./admission-queue.js";
 import type { AgentTier, ControlPlaneDb, RunRecord, TaskKind, TaskRecord } from "./db.js";
 import { buildHydrationTurn, buildImmutableSystemPrompt, type AnchoredHandoff } from "./prompts.js";
 import { ControlPlaneToolExecutor, compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./tools.js";
+import { directorTaskRunId, directorTaskRunOwner, isDirectorTaskContainer } from "./ids.js";
+import { canonicalProjectPath } from "./projects.js";
 
 interface ActiveTaskExecution {
   taskId: string;
@@ -66,10 +68,7 @@ const IN_FLIGHT_TASK_STATUSES = new Set<TaskRecord["status"]>([
   "merging",
 ]);
 
-/** True for a Director chat's delegation bucket (`director-tasks-<chatId>`), which is not an autonomous run. */
-export function isDirectorTaskContainer(runId: string): boolean {
-  return runId.startsWith("director-tasks-");
-}
+export { isDirectorTaskContainer };
 
 /**
  * Computes the authoritative dynamic status of a Run from its live in-memory execution state
@@ -472,21 +471,34 @@ export class HarnessOrchestrator {
     });
   }
 
+  /** Every delegation bucket owned by exactly `ownerId` (one per workspace it delegated in), oldest first. */
+  listDirectorTaskRuns(ownerId: string): RunRecord[] {
+    const base = directorTaskRunId(ownerId, null);
+    const rows = this.db.db
+      .prepare("SELECT id FROM runs WHERE id = ? OR substr(id, 1, ?) = ? ORDER BY created_at, id")
+      .all(base, base.length + 4, `${base}.ws-`) as { id: string }[];
+    return rows
+      .filter((r) => directorTaskRunOwner(r.id) === ownerId)
+      .map((r) => this.db.getRun(r.id))
+      .filter((r): r is RunRecord => r !== null);
+  }
+
+  /** The owner's bucket for this workspace, created on first use. A bucket never changes its workspace. */
   async ensureDirectorTaskRun(ownerId: string, repoRoot: string): Promise<RunRecord> {
-    const id = `director-tasks-${ownerId}`;
-    const found = this.db.getRun(id);
-    if (found && found.repoRoot === repoRoot) return found;
+    const root = canonicalProjectPath(repoRoot);
+    const match = () => this.listDirectorTaskRuns(ownerId).find((r) => canonicalProjectPath(r.repoRoot) === root);
+    const found = match();
+    if (found) return found;
     // Director chat also works in directories without a git checkout.
-    const base = await this.getWorktreeManager(repoRoot).resolveRepoInfo().catch(() => ({ baseBranch: "", baseSha: "" }));
-    if (found) {
-      // The chat switched projects: keep the container pointed at the chat's current repository.
-      this.db.updateRunRepoInfo(id, repoRoot, base.baseBranch, base.baseSha);
-      return this.db.getRun(id)!;
-    }
+    const base = await this.getWorktreeManager(root).resolveRepoInfo().catch(() => ({ baseBranch: "", baseSha: "" }));
     return this.db.transaction(() => {
-      const existing = this.db.getRun(id);
+      const existing = match();
       if (existing) return existing;
-      const run = this.db.createRun({ id, goal: `Director tasks for ${ownerId}`, repoRoot, ...base });
+      const baseId = directorTaskRunId(ownerId, null);
+      const id = this.db.getRun(baseId) ? directorTaskRunId(ownerId, root) : baseId;
+      const clash = this.db.getRun(id);
+      if (clash) throw new Error(`Director task run ${id} already belongs to ${clash.repoRoot}; cannot reuse it for ${root}`);
+      const run = this.db.createRun({ id, goal: `Director tasks for ${ownerId}`, repoRoot: root, ...base });
       const owner = this.db.createTask({
         runId: id, tier: 1, kind: "orchestrator", title: "Director delegation", objective: "Track this Director's delegated tasks and artifacts.",
         profileId: "director", readOnly: true,
@@ -499,10 +511,12 @@ export class HarnessOrchestrator {
 
   async executeDirectorTaskTool(ownerId: string, repoRoot: string, name: string, args: Record<string, unknown>, signal?: AbortSignal) {
     if (!["spawn_task", "wait_tasks", "wait_children", "cancel_task", "artifact_read"].includes(name)) throw new Error(`Unknown Director task tool ${name}`);
-    const run = await this.ensureDirectorTaskRun(ownerId, repoRoot);
-    signal?.throwIfAborted();
-    const owner = this.db.listTasks(run.id, { parentId: null })[0]!;
+    const ownerTask = (runId: string) => this.db.listTasks(runId, { parentId: null })[0]!;
     if (name === "wait_tasks" || name === "wait_children") {
+      // One wait over the synthetic owners of all this owner's buckets, so tasks delegated in earlier workspaces stay waitable.
+      const runs = this.listDirectorTaskRuns(ownerId);
+      if (runs.length === 0) return { children: [] };
+      const [primary, ...others] = runs.map((r) => ownerTask(r.id).id);
       const ids = Array.isArray(args.ids) ? args.ids.map(String) : undefined;
       const fallbackSec =
         typeof args.fallback_interval_s === "number"
@@ -511,18 +525,31 @@ export class HarnessOrchestrator {
             ? args.timeout_s
             : this.config.events.fallbackWakeupIntervalSec;
       const timeout = Math.max(1, fallbackSec) * 1000;
-      const res = await this.waitForChildrenEventDriven(owner.id, ids, args.mode === "any" ? "any" : "all", timeout, signal);
-      const escalations = this.db.listEscalations(run.id);
+      const res = await this.waitForChildrenEventDriven(primary!, ids, args.mode === "any" ? "any" : "all", timeout, signal, others);
+      const escalationsByRun = new Map<string, ReturnType<ControlPlaneDb["listEscalations"]>>();
+      const escalationsFor = (runId: string) => {
+        if (!escalationsByRun.has(runId)) escalationsByRun.set(runId, this.db.listEscalations(runId));
+        return escalationsByRun.get(runId)!;
+      };
       return {
-        children: res.children.map((task) => compactTaskHandoff(task, escalations)),
+        children: res.children.map((task) => compactTaskHandoff(task, escalationsFor(task.runId))),
         ...(res.wakeReason === "fallback_interval" || res.wakeReason === "child_inactive"
           ? { wakeReason: res.wakeReason }
           : {}),
         ...(res.inactiveTaskIds.length > 0 ? { inactiveTaskIds: res.inactiveTaskIds } : {}),
       };
     }
+    // A task delegated in an earlier workspace is handled in its own bucket; reads never create a bucket that already exists elsewhere.
+    const taskId = name === "spawn_task" || typeof args.task_id !== "string" ? "" : args.task_id.trim();
+    const taskRunId = taskId ? this.db.getTask(taskId)?.runId : undefined;
+    const root = canonicalProjectPath(repoRoot);
+    const run =
+      (taskRunId && directorTaskRunOwner(taskRunId) === ownerId ? this.db.getRun(taskRunId) : null) ??
+      (name === "spawn_task" ? null : this.listDirectorTaskRuns(ownerId).find((r) => canonicalProjectPath(r.repoRoot) === root)) ??
+      (await this.ensureDirectorTaskRun(ownerId, repoRoot));
+    signal?.throwIfAborted();
     // The caller's turn signal travels separately from code_exec's scriptSignal (the synthetic owner is completed).
-    return this.toolExecutor.execute(run.id, owner.id, name, args, undefined, signal);
+    return this.toolExecutor.execute(run.id, ownerTask(run.id).id, name, args, undefined, signal);
   }
 
   async startRun(input: {
@@ -591,7 +618,7 @@ export class HarnessOrchestrator {
     if (input.signal?.aborted) {
       const why = input.signal.reason instanceof Error ? input.signal.reason.message : input.signal.reason ? String(input.signal.reason) : "";
       throw new Error(
-        `Delegation was not started: the calling turn in ${isDirectorTaskContainer(run.id) ? `chat ${run.id.slice("director-tasks-".length)}` : `run ${run.id}`} ` +
+        `Delegation was not started: the calling turn in ${isDirectorTaskContainer(run.id) ? `chat ${directorTaskRunOwner(run.id)}` : `run ${run.id}`} ` +
           `was cancelled before the task was created${why ? ` (${why})` : ""}. No task was created. A fresh request can delegate again.`,
       );
     }
@@ -2287,6 +2314,8 @@ export class HarnessOrchestrator {
     mode: "any" | "all",
     fallbackIntervalMs = this.config.events.fallbackWakeupIntervalSec * 1000,
     signal = this.active.get(parentId)?.generationSignal,
+    /** Further parents whose children join this wait (a Director's buckets in other workspaces); they never run. */
+    extraParentIds: string[] = [],
   ): Promise<{
     children: TaskRecord[];
     wakeReason: "already_settled" | "event" | "escalation" | "steered" | "fallback_interval" | "child_inactive";
@@ -2295,12 +2324,21 @@ export class HarnessOrchestrator {
     signal?.throwIfAborted();
     const parent = this.db.getTask(parentId);
     if (!parent) throw new Error(`Unknown parent task ${parentId}`);
+    const parents = [parent];
+    for (const id of new Set(extraParentIds)) {
+      if (id === parentId) continue;
+      const extra = this.db.getTask(id);
+      if (!extra) throw new Error(`Unknown parent task ${id}`);
+      parents.push(extra);
+    }
+    const parentIds = new Set(parents.map((p) => p.id));
+    const runIds = new Set(parents.map((p) => p.runId));
 
     const terminal = new Set(["completed", "failed", "cancelled", "returned_for_rescope", "blocked", "paused_quota"]);
     const deadline = Date.now() + Math.max(50, fallbackIntervalMs);
 
     const getTargets = () => {
-      const kids = this.db.listTasks(parent.runId, { parentId });
+      const kids = parents.flatMap((p) => this.db.listTasks(p.runId, { parentId: p.id }));
       return ids?.length ? kids.filter((k) => ids.includes(k.id)) : kids;
     };
 
@@ -2353,7 +2391,7 @@ export class HarnessOrchestrator {
         finish(inactive.length > 0 ? "child_inactive" : "fallback_interval", inactive);
       };
       const unsub = this.db.onEvent((ev) => {
-        if (ev.runId !== parent.runId) return;
+        if (!runIds.has(ev.runId)) return;
         if (ev.type === "escalation.created") {
           const p = ev.payload as { fromTaskId?: string; severity?: string } | null;
           if ((p?.fromTaskId && targetIdSet.has(p.fromTaskId)) || p?.severity === "P0" || p?.severity === "P1") {
@@ -2362,7 +2400,7 @@ export class HarnessOrchestrator {
             return;
           }
         }
-        if (ev.type === "goal.amended" || (ev.type === "agent.steered" && ev.taskId === parentId)) {
+        if (ev.type === "goal.amended" || (ev.type === "agent.steered" && ev.taskId !== null && parentIds.has(ev.taskId))) {
           targets = getTargets();
           finish("steered");
           return;

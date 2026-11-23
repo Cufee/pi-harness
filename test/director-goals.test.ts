@@ -253,8 +253,10 @@ it("logs Director reads and delegates sourced research", async () => {
       assert.ok(events.some(event => event.type === "agent.text_delta" && (event.payload as { text: string }).text === "Inspecting status.txt"));
       assert.ok(events.some(event => event.type === "task.status" && (event.payload as { to: string }).to === "completed"));
       const notices = daemon.director.chats.getHistory(chat.id).filter(turn => turn.role === "system_notice");
-      assert.equal(notices.length, 2);
-      assert.match(notices[1]!.content, /large\.txt \(5000 bytes\).*Check encoding/);
+      assert.match(notices[0]!.content, /^Registered project /);
+      const reads = notices.slice(1);
+      assert.equal(reads.length, 2);
+      assert.match(reads[1]!.content, /large\.txt \(5000 bytes\).*Check encoding/);
     } finally {
       await daemon.stop();
     }

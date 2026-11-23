@@ -9,7 +9,7 @@ import type { KbKind } from "../kb/store.js";
 import type { BisectingMergeQueue } from "../worktree/merge-queue.js";
 import { runGit, type WorktreeManager } from "../worktree/manager.js";
 import type { AdmissionLane, QueuePositionInput } from "./admission-queue.js";
-import { scanMaxFileIndex, writeUniqueFile } from "./ids.js";
+import { directorTaskRunOwner, isDirectorTaskContainer, scanMaxFileIndex, writeUniqueFile } from "./ids.js";
 import type {
   AgentTier,
   ControlPlaneDb,
@@ -1686,8 +1686,8 @@ export class ControlPlaneToolExecutor {
   private resolveSessionModelContext(runId: string): string | null {
     try {
       let chatSessionId: string | null = null;
-      if (runId.startsWith("director-tasks-")) {
-        chatSessionId = runId.slice("director-tasks-".length) || null;
+      if (isDirectorTaskContainer(runId)) {
+        chatSessionId = directorTaskRunOwner(runId);
       } else {
         const row = this.db.db
           .prepare(

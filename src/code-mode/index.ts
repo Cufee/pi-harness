@@ -45,7 +45,8 @@ export interface CodeModeExecutorOptions {
   mode: CodeMode;
   allowedTools: () => ToolDefinition[];
   execute: CodeExecOptions["callTool"];
-  artifactsDir: string;
+  /** A function is read again for every code_exec call, so the directory can follow the caller's current workspace. */
+  artifactsDir: string | (() => string);
   pythonCacheDir?: string;
   saveOutput?: CodeExecOptions["saveOutput"];
   signal?: AbortSignal;
@@ -61,7 +62,8 @@ export function createCodeModeExecutor(opts: CodeModeExecutorOptions) {
     async execute(name: string, args: Record<string, unknown>): Promise<unknown> {
       if (opts.mode !== "off" && (name === CODE_EXEC_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME)) {
         return dispatch(name, args, {
-          tools: opts.allowedTools(), callTool: opts.execute, artifactsDir: opts.artifactsDir,
+          tools: opts.allowedTools(), callTool: opts.execute,
+          artifactsDir: typeof opts.artifactsDir === "function" ? opts.artifactsDir() : opts.artifactsDir,
           pythonCacheDir: opts.pythonCacheDir, saveOutput: opts.saveOutput, signal: opts.signal,
           maxOutputChars: opts.maxOutputChars, onToolEvent: opts.onToolEvent,
         }, opts.defaultTimeoutMs, opts.maxTimeoutMs);
