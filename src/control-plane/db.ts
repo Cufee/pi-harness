@@ -173,6 +173,8 @@ export interface WorktreeRecord {
   archiveRef: string | null;
   createdAt: number;
   cleanedAt: number | null;
+  /** Serialized identity of the Git registration created for this row; null for rows recorded before it was kept. */
+  creationIdentityJson?: string | null;
 }
 
 export interface MergeQueueRecord {
@@ -449,7 +451,8 @@ CREATE TABLE IF NOT EXISTS worktrees (
   status TEXT NOT NULL DEFAULT 'active',
   archive_ref TEXT,
   created_at INTEGER NOT NULL,
-  cleaned_at INTEGER
+  cleaned_at INTEGER,
+  creation_identity_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_worktrees_run ON worktrees(run_id, status);
 
@@ -531,6 +534,12 @@ export class ControlPlaneDb {
     this.db = new Database(dbPath);
     this.db.exec("PRAGMA busy_timeout = 5000;");
     this.db.exec(SCHEMA);
+    const worktreeColumns = new Set(
+      (this.db.prepare("PRAGMA table_info(worktrees)").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    if (!worktreeColumns.has("creation_identity_json")) {
+      this.db.exec("ALTER TABLE worktrees ADD COLUMN creation_identity_json TEXT;");
+    }
     this.kb = new KnowledgeBaseStore(this.db);
     this.timers = new TimerManager(this.db);
     this.projects = new ProjectStore(this.db);
@@ -1950,14 +1959,21 @@ export class ControlPlaneDb {
   }
 
   // ---- Worktrees & Merge Queue ----
-  recordWorktree(input: { runId: string; taskId: string; path: string; branch: string; baseSha: string }): WorktreeRecord {
+  recordWorktree(input: {
+    runId: string;
+    taskId: string;
+    path: string;
+    branch: string;
+    baseSha: string;
+    creationIdentityJson?: string | null;
+  }): WorktreeRecord {
     const id = nextFriendlyId(this.db, "wt", "worktrees");
     const now = Date.now();
     this.db
       .prepare(
-        "INSERT INTO worktrees(id, run_id, task_id, path, branch, base_sha, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'active', ?)",
+        "INSERT INTO worktrees(id, run_id, task_id, path, branch, base_sha, status, created_at, creation_identity_json) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)",
       )
-      .run(id, input.runId, input.taskId, input.path, input.branch, input.baseSha, now);
+      .run(id, input.runId, input.taskId, input.path, input.branch, input.baseSha, now, input.creationIdentityJson ?? null);
     this.updateTask(input.taskId, { worktreeId: id });
     const wt = this.getWorktree(id)!;
     this.emitEvent(input.runId, input.taskId, "worktree.created", wt);
@@ -1978,6 +1994,7 @@ export class ControlPlaneDb {
       archiveRef: r.archive_ref ? String(r.archive_ref) : null,
       createdAt: Number(r.created_at),
       cleanedAt: r.cleaned_at == null ? null : Number(r.cleaned_at),
+      creationIdentityJson: r.creation_identity_json == null ? null : String(r.creation_identity_json),
     };
   }
 
