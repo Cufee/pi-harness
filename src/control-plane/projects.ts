@@ -288,11 +288,16 @@ export class ProjectStore {
 
   /** Ensures a path has a registered ProjectRecord (used transparently when opening local workspaces). */
   ensureProjectForPath(rawPath: string): ProjectRecord {
+    return this.ensureProjectForPathWithStatus(rawPath).project;
+  }
+
+  /** Like ensureProjectForPath; `created` is true only when this call inserted the project row. */
+  ensureProjectForPathWithStatus(rawPath: string): { project: ProjectRecord; created: boolean } {
     const canon = canonicalProjectPath(rawPath);
     const existing = this.getByPath(canon);
     if (existing) {
       this.touchProject(existing.id);
-      return this.getById(existing.id)!;
+      return { project: this.getById(existing.id)!, created: false };
     }
     const name = this.pickUniqueName(basename(canon));
     const id = nextFriendlyId(this.db, "proj", "projects");
@@ -303,7 +308,7 @@ export class ProjectStore {
          VALUES (?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`,
       )
       .run(id, name, canon, now, now, now);
-    return this.getById(id)!;
+    return { project: this.getById(id)!, created: true };
   }
 
   updateProject(

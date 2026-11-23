@@ -9,7 +9,7 @@ import type { KbKind } from "../kb/store.js";
 import type { BisectingMergeQueue } from "../worktree/merge-queue.js";
 import { runGit, type WorktreeManager } from "../worktree/manager.js";
 import type { AdmissionLane, QueuePositionInput } from "./admission-queue.js";
-import { scanMaxFileIndex, writeUniqueFile } from "./ids.js";
+import { directorTaskRunOwner, isDirectorTaskContainer, scanMaxFileIndex, writeUniqueFile } from "./ids.js";
 import type {
   AgentTier,
   ControlPlaneDb,
@@ -1085,9 +1085,9 @@ export class ControlPlaneToolExecutor {
         const childId = String(args.task_id);
         const child = this.db.getTask(childId);
         if (!child || child.runId !== runId || child.parentId !== taskId) throw new Error(`Unknown child task ${childId}`);
-        if (name === "steer_child") return { steered: await this.hooks.steerTask(childId, String(args.message)) };
-        await this.hooks.cancelTask(childId, String(args.reason));
-        return { cancelled: childId };
+        if (name === "steer_child") return { steered: await this.hooks.steerTask(child.id, String(args.message)) };
+        await this.hooks.cancelTask(child.id, String(args.reason));
+        return { cancelled: child.id };
       }
 
       case "report_goal_progress": {
@@ -1686,8 +1686,8 @@ export class ControlPlaneToolExecutor {
   private resolveSessionModelContext(runId: string): string | null {
     try {
       let chatSessionId: string | null = null;
-      if (runId.startsWith("director-tasks-")) {
-        chatSessionId = runId.slice("director-tasks-".length) || null;
+      if (isDirectorTaskContainer(runId)) {
+        chatSessionId = directorTaskRunOwner(runId);
       } else {
         const row = this.db.db
           .prepare(

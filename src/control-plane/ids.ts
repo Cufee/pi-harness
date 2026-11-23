@@ -1,7 +1,32 @@
 import type { Database } from "bun:sqlite";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { closeSync, openSync, readdirSync, realpathSync, rmSync, writeSync } from "node:fs";
 import { join, resolve } from "node:path";
+
+/** Prefix of a Director owner's delegation bucket runs (`director-tasks-<ownerId>`). */
+export const DIRECTOR_TASK_RUN_PREFIX = "director-tasks-";
+const DIRECTOR_TASK_WORKSPACE_SUFFIX_RE = /\.ws-[0-9a-f]{12}$/;
+
+/** True for a Director chat's delegation bucket (`director-tasks-<chatId>`), which is not an autonomous run. */
+export function isDirectorTaskContainer(runId: string): boolean {
+  return runId.startsWith(DIRECTOR_TASK_RUN_PREFIX);
+}
+
+/** The chat or goal id that owns a delegation bucket, or null for any other run. */
+export function directorTaskRunOwner(runId: string): string | null {
+  if (!isDirectorTaskContainer(runId)) return null;
+  return runId.slice(DIRECTOR_TASK_RUN_PREFIX.length).replace(DIRECTOR_TASK_WORKSPACE_SUFFIX_RE, "") || null;
+}
+
+/**
+ * Id of an owner's delegation bucket: the base id for the first workspace it delegates in (`canonicalRoot` null),
+ * `<base>.ws-<12 hex sha256(canonicalRoot)>` for each further workspace.
+ */
+export function directorTaskRunId(ownerId: string, canonicalRoot: string | null): string {
+  const base = `${DIRECTOR_TASK_RUN_PREFIX}${ownerId}`;
+  if (canonicalRoot === null) return base;
+  return `${base}.ws-${createHash("sha256").update(canonicalRoot).digest("hex").slice(0, 12)}`;
+}
 
 const initializedDbs = new WeakSet<Database>();
 const seededPrefixes = new WeakMap<Database, Set<string>>();

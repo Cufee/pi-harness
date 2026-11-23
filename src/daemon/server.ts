@@ -35,6 +35,9 @@ import {
 import { ControlPlaneDb, type ReplayCursor, type EventRecord } from "../control-plane/db.js";
 import { readRunDossier, readWorkspaceArtifact } from "../control-plane/dossiers.js";
 import { compactTaskHandoff } from "../control-plane/handoffs.js";
+import { directorTaskRunOwner } from "../control-plane/ids.js";
+import type { ProjectRecord } from "../control-plane/projects.js";
+import type { ChatSessionRecord } from "../director/session.js";
 import { HarnessOrchestrator, isDirectorTaskContainer, type CustomRunnerFactory } from "../control-plane/orchestrator.js";
 import { loadOrCreateNodeId, parseSessionAddress, type SessionMessageRecord } from "../control-plane/session-messages.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
@@ -714,15 +717,12 @@ export class HarnessDaemon {
     for (const g of this.director.goals.listGoals({ chatSessionId })) {
       if (g.linkedRunId) ids.add(g.linkedRunId);
     }
-    const dirRunId = `director-tasks-${chatSessionId}`;
-    if (this.db.getRun(dirRunId)) ids.add(dirRunId);
+    for (const run of this.orchestrator.listDirectorTaskRuns(chatSessionId)) ids.add(run.id);
     return [...ids];
   }
 
   private getChatSessionIdForRun(runId: string): string | null {
-    if (runId.startsWith("director-tasks-")) {
-      return runId.slice("director-tasks-".length) || null;
-    }
+    if (isDirectorTaskContainer(runId)) return directorTaskRunOwner(runId);
     const row = this.db.db
       .prepare("SELECT chat_session_id FROM goals WHERE linked_run_id = ? AND chat_session_id IS NOT NULL ORDER BY updated_at DESC LIMIT 1")
       .get(runId) as { chat_session_id?: string | null } | undefined;
@@ -1300,10 +1300,19 @@ export class HarnessDaemon {
     );
   }
 
-  private async createSessionOnHost(input: { host?: string; project?: string; title?: string }): Promise<Record<string, unknown>> {
+  private async createSessionOnHost(input: {
+    host?: string;
+    project?: string;
+    title?: string;
+    localFallbackRepoRoot?: string;
+  }): Promise<Record<string, unknown>> {
     const targetHost = input.host?.trim();
     if (targetHost && !this.isLocalHostTarget(targetHost)) {
-      const res = await this.peers.callRemote<{ session: { id: string; repoRoot: string; title: string }; project?: unknown }>(
+      const res = await this.peers.callRemote<{
+        session: { id: string; repoRoot: string; title: string };
+        project?: unknown;
+        projectRegistered?: boolean;
+      }>(
         targetHost,
         "chat.create",
         { projectId: input.project, title: input.title, headless: true },
@@ -1314,6 +1323,7 @@ export class HarnessDaemon {
         address: `${targetHost}:${res.session.id}`,
         session: res.session,
         project: res.project ?? null,
+        ...(res.projectRegistered ? { projectRegistered: true } : {}),
       };
     }
 
@@ -1321,20 +1331,32 @@ export class HarnessDaemon {
     if (input.project && !explicitProject) {
       throw new Error(`Unknown project "${input.project}"`);
     }
-    const session = await this.director.createChat({
-      repoRoot: explicitProject?.rootPath ?? process.cwd(),
+    const created = await this.director.createChatDetailed({
+      repoRoot: explicitProject?.rootPath ?? input.localFallbackRepoRoot ?? process.cwd(),
       projectId: explicitProject?.id ?? undefined,
       title: input.title,
     });
-    const boundProject =
-      (session.projectId ? this.db.projects.getById(session.projectId) : null) ??
-      this.db.projects.ensureProjectForPath(session.repoRoot);
+    const { session } = created;
+    const { project: boundProject, registered } = this.ensureChatProject(session);
     return {
       host: "local",
       address: `local:${session.id}`,
       session,
       project: boundProject,
+      ...(created.projectRegistered || registered ? { projectRegistered: true } : {}),
     };
+  }
+
+  /**
+   * The chat's project, registering its path when the chat has none (e.g. its project was removed earlier).
+   * `registered` is true only when this call inserted the project, which is then noted once in the chat.
+   */
+  private ensureChatProject(session: ChatSessionRecord): { project: ProjectRecord; registered: boolean } {
+    const bound = session.projectId ? this.db.projects.getById(session.projectId) : null;
+    if (bound) return { project: bound, registered: false };
+    const { project, created } = this.db.projects.ensureProjectForPathWithStatus(session.repoRoot);
+    if (created) this.director.noteProjectRegistered(session.id, project);
+    return { project, registered: created };
   }
 
   private readLocalSession(sessionId: string, limit = 12): Record<string, unknown> {
@@ -2160,6 +2182,7 @@ export class HarnessDaemon {
         }
 
         let targetProject = explicitProject;
+        let projectRegistered = false;
         if (!session) {
           if (!targetProject && p.preferLastProject) {
             targetProject = this.db.projects.getMostRecent();
@@ -2168,14 +2191,16 @@ export class HarnessDaemon {
             ...p,
             repoRoot: targetProject?.rootPath ?? (typeof p.repoRoot === "string" && p.repoRoot ? p.repoRoot : process.cwd()),
           });
-          session = await this.director.openDefaultChat({
+          const opened = await this.director.openDefaultChatDetailed({
             ...sel,
             projectId: targetProject?.id ?? undefined,
           });
+          session = opened.session;
+          projectRegistered = opened.projectRegistered;
         }
-        const boundProject =
-          (session.projectId ? this.db.projects.getById(session.projectId) : null) ??
-          this.db.projects.ensureProjectForPath(session.repoRoot);
+        const ensured = this.ensureChatProject(session);
+        const boundProject = ensured.project;
+        if (ensured.registered) projectRegistered = true;
         if (boundProject && session.projectId !== boundProject.id) {
           session = this.director.chats.updateSession(session.id, { projectId: boundProject.id });
         }
@@ -2190,6 +2215,7 @@ export class HarnessDaemon {
         return {
           session,
           project: boundProject,
+          ...(projectRegistered ? { projectRegistered: true } : {}),
           ...this.chatHistoryPage(session.id, 0, historyThrough),
           activeTurnId: turn?.id ?? null,
           activeText: turn?.text ?? "",
@@ -2207,7 +2233,7 @@ export class HarnessDaemon {
         if (requestedProjectRef && !explicitProject) {
           throw new Error(`Unknown project "${requestedProjectRef}"`);
         }
-        const session = await this.director.createChat({
+        const created = await this.director.createChatDetailed({
           ...chatSelection({
             ...p,
             repoRoot: explicitProject?.rootPath ?? (typeof p.repoRoot === "string" && p.repoRoot ? p.repoRoot : process.cwd()),
@@ -2215,18 +2241,19 @@ export class HarnessDaemon {
           projectId: explicitProject?.id ?? undefined,
           title: typeof p.title === "string" ? p.title : undefined,
         });
-        const boundProject =
-          (session.projectId ? this.db.projects.getById(session.projectId) : null) ??
-          this.db.projects.ensureProjectForPath(session.repoRoot);
+        const { session } = created;
+        const { project: boundProject, registered } = this.ensureChatProject(session);
         if (!p.headless) {
           this.bindChatSocket(socket, session.id);
         }
+        const { historyThrough } = this.db.db.prepare(
+          "SELECT COALESCE(MAX(seq), 0) AS historyThrough FROM chat_turns WHERE chat_session_id = ?",
+        ).get(session.id) as { historyThrough: number };
         return {
           session,
           project: boundProject,
-          history: [],
-          historyThrough: 0,
-          historyNext: null,
+          ...(created.projectRegistered || registered ? { projectRegistered: true } : {}),
+          ...this.chatHistoryPage(session.id, 0, historyThrough),
           activeTurnId: null,
           activeText: "",
           activePartial: "",
@@ -2641,7 +2668,7 @@ export class HarnessDaemon {
         let cancelledChat = false;
         if (isDirectorTaskContainer(runId)) {
           // Stop the chat's live turn first so it cannot delegate again, then cancel the container's children.
-          cancelledChat = await this.director.cancelChat(runId.slice("director-tasks-".length));
+          cancelledChat = await this.director.cancelChat(directorTaskRunOwner(runId) ?? "");
         }
         await this.orchestrator.stopRun(runId, reason);
         return { stopped: true, ...(cancelledChat ? { cancelledChat } : {}) };

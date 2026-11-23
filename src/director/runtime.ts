@@ -19,6 +19,7 @@ import { findRunDossier, readRunDossier, writeCodeOutput, writeTaskDossier } fro
 import type { AdmissionLane, QueuePositionInput } from "../control-plane/admission-queue.js";
 import type { ArtifactRecord, ControlPlaneDb, RunRecord } from "../control-plane/db.js";
 import type { CustomRunnerFactory, HarnessOrchestrator } from "../control-plane/orchestrator.js";
+import { canonicalProjectPath, type ProjectRecord } from "../control-plane/projects.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { recordCostInvocation, summarizeCost } from "../cost/ledger.js";
 import { timerMatchesGoalSettlement, type TimerRecord } from "../control-plane/timers.js";
@@ -239,7 +240,23 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   },
   {
     name: "project_switch",
-    description: "Rebind this chat session to another registered project (by project ID, name, or path), preserving conversation history while switching workspace cwd.",
+    description:
+      "Rebind this chat session to another registered project (by project ID, name, or path), preserving conversation history while switching workspace cwd. " +
+      "Takes effect immediately for later tool calls in the same turn. Goals and delegated tasks created earlier stay with the project they were created in.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project: { type: "string", description: "Project ID (e.g. proj-1), name, or path on the daemon host." },
+      },
+      required: ["project"],
+    },
+  },
+  {
+    name: "project_remove",
+    description:
+      "Unregister a project from this daemon host's local project registry (by project ID, name, or path). Only the registry entry is removed: " +
+      "files, chat history, goals, runs and tasks are untouched and stay tied to the path. The project's name, description and default profile/model/effort are lost. " +
+      "The path is registered again (with a new ID) the next time a chat is opened or created there. Removing this chat's own project keeps the chat working in the same path.",
     inputSchema: {
       type: "object",
       properties: {
@@ -513,7 +530,10 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
       type: "object",
       properties: {
         host: { type: "string", description: "Target host ('local' or a connected remote host alias; defaults to local)." },
-        project: { type: "string", description: "Optional project ID, name, or path on the target host." },
+        project: {
+          type: "string",
+          description: "Optional project ID, name, or path on the target host. A local session without one opens in this chat's current workspace.",
+        },
         title: { type: "string", description: "Optional session title." },
       },
     },
@@ -549,7 +569,8 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
 export interface DirectorPeerBridge {
   listRemotes(): unknown[];
   listSessions(host?: string): Promise<unknown[]>;
-  createSession(input: { host?: string; project?: string; title?: string }): Promise<unknown>;
+  /** `localFallbackRepoRoot` is used only for a local session without a project; it is never sent to a peer. */
+  createSession(input: { host?: string; project?: string; title?: string; localFallbackRepoRoot?: string }): Promise<unknown>;
   sendMessage(input: {
     fromSessionId: string;
     target: string;
@@ -922,21 +943,39 @@ export class DirectorRuntime {
   }
 
   async createChat(input: ChatSelection) {
-    const project = input.projectId
-      ? this.db.projects.resolveProject(input.projectId)
-      : this.db.projects.ensureProjectForPath(input.repoRoot);
-    const repoRoot = project?.rootPath ?? input.repoRoot;
-    const projectId = project?.id ?? input.projectId ?? null;
+    return (await this.createChatDetailed(input)).session;
+  }
+
+  /** createChat that also reports whether it registered the workspace as a new project (and noted it in the chat). */
+  async createChatDetailed(input: ChatSelection): Promise<{ session: ChatSessionRecord; projectRegistered: boolean }> {
+    const known = input.projectId ? this.db.projects.resolveProject(input.projectId) : this.db.projects.getByPath(input.repoRoot);
+    const selection = await this.resolveChatSelection({
+      ...input,
+      repoRoot: known?.rootPath ?? canonicalProjectPath(input.repoRoot),
+      projectId: known?.id ?? input.projectId ?? null,
+      profileId: input.profileId ?? known?.defaultProfileId ?? undefined,
+      model: input.model !== undefined ? input.model : known?.defaultModel ?? undefined,
+      effort: input.effort !== undefined ? input.effort : known?.defaultEffort ?? undefined,
+    });
+    // Register an unknown path only after its launch route resolved, so a failed create registers nothing.
+    const ensured = input.projectId ? null : this.db.projects.ensureProjectForPathWithStatus(input.repoRoot);
+    const project = ensured?.project ?? known;
     if (project) this.db.projects.touchProject(project.id);
-    return this.chats.createSession(
-      await this.resolveChatSelection({
-        ...input,
-        repoRoot,
-        projectId,
-        profileId: input.profileId ?? project?.defaultProfileId ?? undefined,
-        model: input.model !== undefined ? input.model : project?.defaultModel ?? undefined,
-        effort: input.effort !== undefined ? input.effort : project?.defaultEffort ?? undefined,
-      }),
+    const session = this.chats.createSession({
+      ...selection,
+      repoRoot: project?.rootPath ?? selection.repoRoot,
+      projectId: project?.id ?? selection.projectId,
+    });
+    if (ensured?.created) this.noteProjectRegistered(session.id, ensured.project);
+    return { session, projectRegistered: Boolean(ensured?.created) };
+  }
+
+  /** Appends the one-time receipt for a workspace that was just registered as a project. */
+  noteProjectRegistered(chatSessionId: string, project: ProjectRecord): void {
+    this.chats.appendTurn(
+      chatSessionId,
+      "system_notice",
+      `Registered project ${project.name} (${project.id}) for ${project.rootPath}. Files are untouched; remove it with /projects, 'pi-harness project rm ${project.name}' or the project_remove tool.`,
     );
   }
 
@@ -1040,30 +1079,43 @@ export class DirectorRuntime {
   }
 
   async openDefaultChat(input: ChatSelection) {
-    const project = input.projectId
-      ? this.db.projects.resolveProject(input.projectId)
-      : this.db.projects.ensureProjectForPath(input.repoRoot);
-    const repoRoot = project?.rootPath ?? input.repoRoot;
+    return (await this.openDefaultChatDetailed(input)).session;
+  }
+
+  /** openDefaultChat that also reports whether it registered the workspace as a new project (and noted it in the chat). */
+  async openDefaultChatDetailed(input: ChatSelection): Promise<{ session: ChatSessionRecord; projectRegistered: boolean }> {
+    const known = input.projectId ? this.db.projects.resolveProject(input.projectId) : this.db.projects.getByPath(input.repoRoot);
+    const repoRoot = known?.rootPath ?? canonicalProjectPath(input.repoRoot);
+    const knownId = known?.id ?? input.projectId ?? null;
+    const existing = (knownId ? this.chats.getProjectSession(knownId) : null) ?? this.chats.getWorkspaceSession(repoRoot);
+    const selection = existing
+      ? null
+      : await this.resolveChatSelection({
+          ...input,
+          repoRoot,
+          projectId: knownId,
+          profileId: input.profileId ?? known?.defaultProfileId ?? undefined,
+          model: input.model !== undefined ? input.model : known?.defaultModel ?? undefined,
+          effort: input.effort !== undefined ? input.effort : known?.defaultEffort ?? undefined,
+        });
+    // Register an unknown path only after its launch route resolved, so a failed open registers nothing.
+    const ensured = input.projectId ? null : this.db.projects.ensureProjectForPathWithStatus(input.repoRoot);
+    const project = ensured?.project ?? known;
     const projectId = project?.id ?? input.projectId ?? null;
     if (project) this.db.projects.touchProject(project.id);
-    const existing = (projectId ? this.chats.getProjectSession(projectId) : null) ?? this.chats.getWorkspaceSession(repoRoot);
+    const projectRegistered = Boolean(ensured?.created);
     if (existing) {
       const bound =
         projectId && existing.projectId !== projectId
-          ? this.chats.updateSession(existing.id, { projectId, repoRoot })
+          ? this.chats.updateSession(existing.id, { projectId, repoRoot: project?.rootPath ?? repoRoot })
           : existing;
-      return this.resolveOrMigrateSessionModel(bound);
+      // Note the registration before the model reconciliation await, so a failed reconciliation cannot lose it.
+      if (projectRegistered) this.noteProjectRegistered(bound.id, ensured!.project);
+      return { session: await this.resolveOrMigrateSessionModel(bound), projectRegistered };
     }
-    return this.chats.getOrCreateDefault(
-      await this.resolveChatSelection({
-        ...input,
-        repoRoot,
-        projectId,
-        profileId: input.profileId ?? project?.defaultProfileId ?? undefined,
-        model: input.model !== undefined ? input.model : project?.defaultModel ?? undefined,
-        effort: input.effort !== undefined ? input.effort : project?.defaultEffort ?? undefined,
-      }),
-    );
+    const session = this.chats.getOrCreateDefault({ ...selection!, repoRoot: project?.rootPath ?? repoRoot, projectId });
+    if (projectRegistered) this.noteProjectRegistered(session.id, ensured!.project);
+    return { session, projectRegistered };
   }
 
   switchChatProject(chatSessionId: string, projectRef: string): { session: ChatSessionRecord; project: ReturnType<ControlPlaneDb["projects"]["resolveProject"]> } {
@@ -2313,6 +2365,8 @@ export class DirectorRuntime {
 
   private directorExecutor(session: { id: string; repoRoot: string }, signal: AbortSignal, onToolEvent?: RunnerCallbacks["onToolEvent"]) {
     const presentations = new Map<string, { toolName: string; build: () => ToolDisplayPayload }>();
+    // project_switch takes effect for every later inner tool call, including later calls in the same script.
+    const currentRepoRoot = () => this.chats.getSession(session.id)?.repoRoot ?? session.repoRoot;
     return createCodeModeExecutor({
       ...this.config.codeExec,
       mode: effectiveCodeMode(this.config.codeMode),
@@ -2329,17 +2383,17 @@ export class DirectorRuntime {
           presentations.delete(id);
           return { presented: true };
         }
-        return this.executeDirectorTool(session.id, session.repoRoot, name, args, effectiveSignal, (build) => {
+        return this.executeDirectorTool(session.id, currentRepoRoot(), name, args, effectiveSignal, (build) => {
           const id = randomUUID();
           presentations.set(id, { toolName: name, build });
           return id;
         });
       },
-      artifactsDir: resolve(session.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts"),
+      artifactsDir: () => resolve(currentRepoRoot(), this.config.worktree.artifactsDir ?? ".harness/artifacts"),
       pythonCacheDir: join(this.config.stateDir, "code-mode", "python"),
       saveOutput: async (name, json) => {
         signal.throwIfAborted();
-        const run = await this.orchestrator.ensureDirectorTaskRun(session.id, session.repoRoot);
+        const run = await this.orchestrator.ensureDirectorTaskRun(session.id, currentRepoRoot());
         signal.throwIfAborted();
         const [coordinator] = this.db.listTasks(run.id, { parentId: null });
         return writeCodeOutput(this.db, run, coordinator!.id, name, json);
@@ -2572,27 +2626,29 @@ export class DirectorRuntime {
   }
 
   /**
-   * Existing runs whose indexed dossiers this chat session may read: its synthetic task run, its goals' linked
-   * runs, and session-less goals' linked and Done-Review runs in the same repository. Creates nothing.
+   * Existing runs whose indexed dossiers this chat session may read: its synthetic task runs, its goals' linked
+   * runs, and session-less goals' linked and Done-Review runs in the same repository. With `ownBucketsAnywhere`,
+   * also this chat's own buckets in other workspaces (after the current workspace's runs). Creates nothing.
    */
-  private ownedDossierRuns(chatSessionId: string, repoRoot: string): RunRecord[] {
-    const ids = new Set<string>([`director-tasks-${chatSessionId}`]);
+  private ownedDossierRuns(chatSessionId: string, repoRoot: string, ownBucketsAnywhere = false): RunRecord[] {
+    const ownBuckets = this.orchestrator.listDirectorTaskRuns(chatSessionId);
+    const ids = new Set<string>(ownBuckets.map((r) => r.id));
     for (const goal of this.goals.listGoals({ repoRoot })) {
       if (goal.chatSessionId === chatSessionId) {
         if (goal.linkedRunId) ids.add(goal.linkedRunId);
       } else if (goal.chatSessionId === null) {
         if (goal.linkedRunId) ids.add(goal.linkedRunId);
-        ids.add(`director-tasks-${goal.id}`);
+        for (const run of this.orchestrator.listDirectorTaskRuns(goal.id)) ids.add(run.id);
       }
     }
-    let realRepo: string;
+    const runs: RunRecord[] = [];
+    let realRepo: string | null = null;
     try {
       realRepo = realpathSync(repoRoot);
     } catch {
-      return [];
+      // The current workspace no longer resolves; only this chat's own buckets can still be reached.
     }
-    const runs: RunRecord[] = [];
-    for (const id of ids) {
+    for (const id of realRepo === null ? [] : ids) {
       const run = this.db.getRun(id);
       if (!run) continue;
       try {
@@ -2601,26 +2657,29 @@ export class DirectorRuntime {
         // Run root no longer resolves; skip it.
       }
     }
+    if (ownBucketsAnywhere) for (const run of ownBuckets) if (!runs.some((r) => r.id === run.id)) runs.push(run);
     return runs;
   }
 
   private readDirectorArtifact(chatSessionId: string, repoRoot: string, args: Record<string, unknown>, signal?: AbortSignal) {
-    const ownedRuns = this.ownedDossierRuns(chatSessionId, repoRoot);
     if (typeof args.path === "string" && args.path.trim()) {
       const path = args.path;
-      const run = ownedRuns.find((r) => findRunDossier(this.db, r, path) !== null);
+      const run = this.ownedDossierRuns(chatSessionId, repoRoot, true).find((r) => findRunDossier(this.db, r, path) !== null);
       if (run) return readRunDossier(this.db, run, args);
     } else if (typeof args.task_id === "string" && args.task_id.trim()) {
       const task = this.db.getTask(args.task_id.trim());
-      const run = task ? ownedRuns.find((r) => r.id === task.runId) : undefined;
+      const run = task ? this.ownedDossierRuns(chatSessionId, repoRoot, true).find((r) => r.id === task.runId) : undefined;
       if (run) return readRunDossier(this.db, run, args);
-    } else if (ownedRuns.length > 0) {
-      const byId = new Map<string, ArtifactRecord>();
-      for (const run of ownedRuns) {
-        for (const artifact of this.db.listArtifacts(run.id, undefined, 50, "dossier")) byId.set(artifact.id, artifact);
+    } else {
+      const ownedRuns = this.ownedDossierRuns(chatSessionId, repoRoot);
+      if (ownedRuns.length > 0) {
+        const byId = new Map<string, ArtifactRecord>();
+        for (const run of ownedRuns) {
+          for (const artifact of this.db.listArtifacts(run.id, undefined, 50, "dossier")) byId.set(artifact.id, artifact);
+        }
+        const artifacts = [...byId.values()].sort((a, b) => b.createdAt - a.createdAt).slice(0, 50);
+        return { artifacts };
       }
-      const artifacts = [...byId.values()].sort((a, b) => b.createdAt - a.createdAt).slice(0, 50);
-      return { artifacts };
     }
     return this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, "artifact_read", args, signal);
   }
@@ -2636,7 +2695,13 @@ export class DirectorRuntime {
     const presentGoal = (goal: GoalRecord) => offerPresentation(() => buildGoalDetailDisplay(this.goalDisplayData(goal)));
     if (args.goal_id !== undefined) {
       const goal = this.goals.getGoal(String(args.goal_id));
-      if (!goal || realpathSync(goal.repoRoot) !== realpathSync(repoRoot)) throw new Error("Unknown goal in this workspace");
+      if (!goal) throw new Error("Unknown goal in this workspace");
+      if (canonicalProjectPath(goal.repoRoot) !== canonicalProjectPath(repoRoot)) {
+        throw new Error(
+          `Unknown goal in this workspace: ${goal.id} belongs to ${goal.repoRoot}. Call project_switch to that project to manage it ` +
+            "(register the path first if it is no longer listed by project_list).",
+        );
+      }
     }
     if (name === "goal_commit" || (name === "goal_create" && args.commit_immediately)) {
       if (typeof args.model !== "string" || !args.model.trim()) throw new Error("Select a model from list_models to commit this goal");
@@ -2685,7 +2750,7 @@ export class DirectorRuntime {
         if (targetTask) {
           const targetRun = this.db.getRun(targetTask.runId);
           // Allow cancelling ANY task in this workspace/goal run, not just synthetic Director tasks!
-          if (targetRun && targetRun.repoRoot === repoRoot) {
+          if (targetRun && canonicalProjectPath(targetRun.repoRoot) === canonicalProjectPath(repoRoot)) {
             await this.orchestrator.cancelTask(targetTask.id, typeof args.reason === "string" ? args.reason : "Cancelled by Director");
             return { cancelled: targetTask.id, runId: targetTask.runId };
           }
@@ -2911,7 +2976,7 @@ export class DirectorRuntime {
       case "project_list": {
         const projects = await this.db.projects.listProjects();
         const curSess = this.chats.getSession(chatSessionId);
-        return { currentProjectId: curSess?.projectId ?? null, currentPath: repoRoot, projects };
+        return { currentProjectId: curSess?.projectId ?? null, currentPath: curSess?.repoRoot ?? repoRoot, projects };
       }
 
       case "project_switch": {
@@ -2923,6 +2988,24 @@ export class DirectorRuntime {
           project: switched.project,
           sessionId: switched.session.id,
           repoRoot: switched.session.repoRoot,
+        };
+      }
+
+      case "project_remove": {
+        const ref = String(args.project ?? "").trim();
+        if (!ref) throw new Error("project is required");
+        // Read the binding first: removeProject clears project_id on every chat bound to it.
+        const currentProjectId = this.chats.getSession(chatSessionId)?.projectId ?? null;
+        const { removed, project } = this.db.projects.removeProject(ref);
+        const wasCurrentProject = currentProjectId === project.id;
+        return {
+          removed,
+          project,
+          wasCurrentProject,
+          note:
+            `Only the registry entry was removed; files, chat history, goals, runs and tasks under ${project.rootPath} are untouched. ` +
+            "The project's name, description and default profile/model/effort are gone. The path is registered again (new ID) the next time a chat is opened or created there." +
+            (wasCurrentProject ? " This chat keeps working in the same path." : ""),
         };
       }
 
@@ -2950,13 +3033,19 @@ export class DirectorRuntime {
 
       case "session_create": {
         if (!this.peerBridge) {
-          const created = await this.createChat({
+          const { session: created, projectRegistered } = await this.createChatDetailed({
             repoRoot,
             title: typeof args.title === "string" ? args.title : undefined,
           });
-          return { host: "local", address: `local:${created.id}`, session: created };
+          return {
+            host: "local",
+            address: `local:${created.id}`,
+            session: created,
+            ...(projectRegistered ? { projectRegistered: true } : {}),
+          };
         }
         return await this.peerBridge.createSession({
+          localFallbackRepoRoot: repoRoot,
           host: typeof args.host === "string" && args.host.trim() ? args.host.trim() : undefined,
           project: typeof args.project === "string" && args.project.trim() ? args.project.trim() : undefined,
           title: typeof args.title === "string" && args.title.trim() ? args.title.trim() : undefined,
