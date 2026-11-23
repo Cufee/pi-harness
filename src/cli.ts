@@ -85,11 +85,23 @@ function requireStringFlag(flags: Record<string, string | boolean>, name: string
   return v.trim();
 }
 
-const RUN_ID_TOKEN_RE = /^run[-_](\d+|[0-9a-f]{8})$/i;
+const RUN_LEGACY_HEX_ID_RE = /^run[-_]([0-9a-f]{8})$/i;
+const RUN_NUMERIC_ID_RE = /^run[_\s-]+(\d+)$/i;
+
+/** Canonical run ID for a token that names a run (legacy 8-hex or friendly numeric form), else null. */
+function matchRunIdToken(raw: string): string | null {
+  const trimmed = raw.trim();
+  const legacyHex = RUN_LEGACY_HEX_ID_RE.exec(trimmed);
+  if (legacyHex) return `run-${legacyHex[1]!.toLowerCase()}`;
+  const numeric = RUN_NUMERIC_ID_RE.exec(trimmed);
+  if (numeric) return `run-${numeric[1]!.replace(/^0+(?=\d)/, "")}`;
+  return null;
+}
+
 const RUN_CREATE_ONLY_FLAGS = ["profile", "model", "effort"] as const;
 const RUN_RESUME_USAGE = [
-  'Usage: pi-harness run resume <run-id> [--in 15m] [--message "<msg>"]',
-  'To start a new run whose goal begins with "resume", quote the goal or use: pi-harness run -- resume ...',
+  'Usage: pi-harness run resume <run-id> [--in 15m | --message "<msg>"]',
+  'To start a new run whose goal begins with "resume", quote a multi-word goal or use: pi-harness run -- resume ...',
 ].join("\n");
 
 /**
@@ -102,11 +114,22 @@ export function resolveRunResumeAlias(parsed: ParsedArgs): string | null {
   if (positional[0] !== "run" || positional[1] !== "resume") return null;
   if (doubleDashAt !== null && doubleDashAt <= 1) return null;
   const rest = positional.slice(2);
-  const idMatch = rest.length > 0 ? RUN_ID_TOKEN_RE.exec(rest[0]!) : null;
+  const first = rest[0]?.trim() ?? "";
+  const matchedRunId = rest.length > 0 ? matchRunIdToken(first) : null;
   const hasResumeFlag = flags.in !== undefined || flags.message !== undefined;
-  if (!idMatch || rest.length !== 1) {
-    const evident = rest.length === 0 || hasResumeFlag || idMatch !== null || (rest.length === 1 && /^#?\d+$/.test(rest[0]!));
-    if (evident) throw new Error(RUN_RESUME_USAGE);
+  if (!matchedRunId || rest.length !== 1) {
+    const allBlank = rest.every((t) => !t.trim());
+    const isBareNumber = rest.length === 1 && /^#?\d+$/.test(first);
+    const hasDoubleDashThenId =
+      rest.length > 1 &&
+      rest[0] === "--" &&
+      rest.slice(1).some((t) => {
+        const trimmed = t.trim();
+        return matchRunIdToken(trimmed) !== null || /^#?\d+$/.test(trimmed);
+      });
+    if (allBlank || hasResumeFlag || matchedRunId !== null || isBareNumber || hasDoubleDashThenId) {
+      throw new Error(RUN_RESUME_USAGE);
+    }
     return null;
   }
   const conflicting = RUN_CREATE_ONLY_FLAGS.filter((k) => flags[k] !== undefined);
@@ -115,7 +138,7 @@ export function resolveRunResumeAlias(parsed: ParsedArgs): string | null {
       `${conflicting.map((k) => `--${k}`).join(", ")} cannot be used with \`pi-harness run resume\`: ${conflicting.length > 1 ? "they apply" : "it applies"} only when creating a new run.`,
     );
   }
-  return `run-${idMatch[1]!.toLowerCase()}`;
+  return matchedRunId;
 }
 
 async function handleResumeCommand(
@@ -123,7 +146,8 @@ async function handleResumeCommand(
   runId: string | undefined,
   flags: Record<string, string | boolean>,
 ): Promise<void> {
-  if (!runId) throw new Error('Usage: pi-harness resume <run-id> [--in 15m] [--message "<msg>"]');
+  const trimmedRunId = runId?.trim();
+  if (!trimmedRunId) throw new Error('Usage: pi-harness resume <run-id> [--in 15m | --message "<msg>"]');
   const delaySpec = requireStringFlag(flags, "in");
   const message = requireStringFlag(flags, "message");
   if (delaySpec && message) {
@@ -132,10 +156,10 @@ async function handleResumeCommand(
   if (delaySpec) {
     const delayMs = parseDurationMs(delaySpec);
     if (!delayMs) throw new Error(`Invalid duration for --in: ${delaySpec} (examples: 30s, 15m, 1h30m)`);
-    console.log(JSON.stringify(await client.request("run.schedule_resume", { runId, delayMs }), null, 2));
+    console.log(JSON.stringify(await client.request("run.schedule_resume", { runId: trimmedRunId, delayMs }), null, 2));
     return;
   }
-  console.log(JSON.stringify(await client.request("run.resume", { runId, message }), null, 2));
+  console.log(JSON.stringify(await client.request("run.resume", { runId: trimmedRunId, message }), null, 2));
 }
 
 async function stopLocalDaemon(socketPath: string): Promise<boolean> {
@@ -301,13 +325,13 @@ Usage:
   pi-harness profiles [list | add <id> <cmd> [args...] | remove <id> | probe <id>]
   pi-harness daemon serve | status | stop | restart [--remote <alias|ssh://host>]
   pi-harness run "<goal>" [-p <project>] [--profile id] [--model id] [--effort level] [--detach] [--remote <alias|ssh://host>]
-  pi-harness run resume <run-id> [--in 15m] [--message "<msg>"] [--remote <alias|ssh://host>]
+  pi-harness run resume <run-id> [--in 15m | --message "<msg>"] [--remote <alias|ssh://host>]
                                                     Alias for \`pi-harness resume\`; to start a new run whose goal begins
-                                                    with "resume", quote the goal or use \`pi-harness run -- resume ...\`
+                                                    with "resume", quote a multi-word goal or use \`pi-harness run -- resume ...\`
   pi-harness runs [--json] [--remote <alias|ssh://host>]
   pi-harness tree <run-id> [--remote <alias|ssh://host>]
   pi-harness steer <task-id> "<message>" [--remote <alias|ssh://host>]
-  pi-harness resume <run-id> [--in 15m] [--message "<msg>"] [--remote <alias|ssh://host>]
+  pi-harness resume <run-id> [--in 15m | --message "<msg>"] [--remote <alias|ssh://host>]
   pi-harness stop <run-id> [--remote <alias|ssh://host>]
   pi-harness models [list | sync] [--role name] [--remote <alias|ssh://host>]
   pi-harness quota [show | sync] [--remote <alias|ssh://host>]
