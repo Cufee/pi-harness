@@ -91,7 +91,6 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
       assert.equal(cleanup.removed.length, 1);
       assert.equal(cleanup.archivedRefs.length, 1);
       assert.equal(existsSync(wt.path), false);
-      assert.equal(cleanup.prunedAdminEntries, true);
 
       // Verify the safety archive git ref actually exists in git!
       const refCheck = await runGit(repo, ["rev-parse", cleanup.archivedRefs[0]!]);

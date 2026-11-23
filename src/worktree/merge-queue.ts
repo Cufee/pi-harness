@@ -1,5 +1,3 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
 import type { WorktreeConfig } from "../config.js";
 import type { ControlPlaneDb, MergeQueueRecord } from "../control-plane/db.js";
 import { KnowledgeMaintainer } from "../kb/maintainer.js";
@@ -272,8 +270,7 @@ export class BisectingMergeQueue {
     targetBranch: string,
     opts?: MergeProcessOptions,
   ): Promise<MergeOutcome> {
-    const intPath = join(this.worktrees.baseDir, "_integration", `${next.runId}-${next.id}`);
-
+    let integration: { path: string; remove: () => Promise<void> } | undefined;
     try {
       const { stdout: targetSha } = await runGit(this.repoRoot, ["rev-parse", targetBranch]);
 
@@ -318,8 +315,8 @@ export class BisectingMergeQueue {
       }
 
       // Create detached ephemeral integration worktree on latest targetSha
-      mkdirSync(join(this.worktrees.baseDir, "_integration"), { recursive: true });
-      await runGit(this.repoRoot, ["worktree", "add", "--detach", intPath, targetSha]);
+      integration = await this.worktrees.addScratchWorktree("_integration", `${next.runId}-${next.id}`, targetSha);
+      const intPath = integration.path;
       try {
         await this.worktrees.bootstrapWorktree(intPath);
       } catch (bootErr) {
@@ -449,7 +446,10 @@ export class BisectingMergeQueue {
         if (!alreadyTerminal) {
           this.db.updateTask(next.taskId, { status: "completed", summary: `Merged ${next.branch} at ${mergedSha.slice(0, 8)}` });
         }
-        await this.worktrees.teardown(next.worktreeId, { archiveBeforeRemove: false, finalStatus: "merged" });
+        // A refused teardown must not reject a landed merge; the tree stays for the next sweep.
+        await this.worktrees.teardown(next.worktreeId, { archiveBeforeRemove: false, finalStatus: "merged" }).catch(() => {
+          this.db.updateWorktree(next.worktreeId, { status: "merged" });
+        });
       }
 
       // Lightweight $0-token KB staleness check after targetBranch advances; never breaks merges.
@@ -461,12 +461,7 @@ export class BisectingMergeQueue {
 
       return { item: finished, mergedSha };
     } finally {
-      if (existsSync(intPath)) {
-        await runGit(this.repoRoot, ["worktree", "remove", "--force", intPath]).catch(() => {
-          rmSync(intPath, { recursive: true, force: true });
-        });
-      }
-      await runGit(this.repoRoot, ["worktree", "prune"]).catch(() => {});
+      await integration?.remove();
     }
   }
 
