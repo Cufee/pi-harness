@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { delimiter, isAbsolute, join, resolve } from "node:path";
 import type { CodeMode } from "./code-mode/sdk.js";
 
 export type AcpAdapterKind = "claude" | "codex" | "gemini" | "generic";
@@ -83,6 +83,17 @@ export interface GoalsConfig {
   autoVerifyOnSettle?: boolean;
   /** Max concurrent in-progress goals per repository (default 4; additional committed goals wait in the admission queue). */
   maxConcurrentGoals?: number;
+  /**
+   * Absolute path of the shell that runs verification gates with `-c` (default `/bin/sh`).
+   * Global `config.json` / `config.update` only; ignored in repo `.pi-harness.json`. Invalid values fail gates closed.
+   */
+  gateShell?: string;
+  /**
+   * Extra environment for verification gates (goal criteria, merge-queue CI, worktree setup).
+   * Global `config.json` / `config.update` only; ignored in repo `.pi-harness.json`. `PATH` is prepended to the
+   * resolved PATH, never a replacement. `HARNESS_*` names are reserved. Invalid values fail gates closed.
+   */
+  gateEnv?: Record<string, string>;
 }
 
 export interface EventsConfig {
@@ -284,6 +295,63 @@ export function normalizeWorktreeRoots(worktree: unknown) {
   return { roots: normalized, warning: invalid.length ? `Invalid worktree roots in ${invalid.join(", ")}` : undefined };
 }
 
+const GATE_ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const GATE_CONTROL_RE = /[\u0000-\u001f\u007f]/;
+const MAX_GATE_ENV_VALUE_BYTES = 32 * 1024;
+
+/**
+ * Pure validation of `goals.gateShell` / `goals.gateEnv` (contract pi-harness/goals-gate-config-v1).
+ * `null` / missing (and `""` for gateShell) mean unset. Issues name offending keys only, never values.
+ */
+export function normalizeGateConfig(goals: unknown): {
+  gateShell?: string;
+  gateEnv?: Record<string, string>;
+  issues: string[];
+} {
+  const issues: string[] = [];
+  const out: { gateShell?: string; gateEnv?: Record<string, string>; issues: string[] } = { issues };
+  if (!goals || typeof goals !== "object") return out;
+  const { gateShell, gateEnv } = goals as Record<string, unknown>;
+
+  if (gateShell !== undefined && gateShell !== null && gateShell !== "") {
+    if (
+      typeof gateShell === "string" &&
+      gateShell.trim() === gateShell &&
+      !GATE_CONTROL_RE.test(gateShell) &&
+      isAbsolute(gateShell)
+    ) {
+      out.gateShell = gateShell;
+    } else {
+      issues.push("goals.gateShell must be an absolute path string");
+    }
+  }
+
+  if (gateEnv !== undefined && gateEnv !== null) {
+    if (typeof gateEnv !== "object" || Array.isArray(gateEnv)) {
+      issues.push("goals.gateEnv must be an object of string values");
+    } else {
+      const clean: Record<string, string> = {};
+      const bad: string[] = [];
+      for (const [key, val] of Object.entries(gateEnv as Record<string, unknown>)) {
+        const name = GATE_ENV_NAME_RE.test(key) ? key : JSON.stringify(key.slice(0, 64));
+        if (!GATE_ENV_NAME_RE.test(key)) bad.push(`${name} (invalid name)`);
+        else if (key.startsWith("HARNESS_")) bad.push(`${name} (HARNESS_* names are reserved)`);
+        else if (typeof val !== "string" || val.includes("\0")) bad.push(`${name} (value must be a string without NUL)`);
+        else if (Buffer.byteLength(val, "utf8") > MAX_GATE_ENV_VALUE_BYTES) bad.push(`${name} (value exceeds 32 KiB)`);
+        else if (
+          key === "PATH" &&
+          (val === "" || val.split(delimiter).some((seg) => !seg || !isAbsolute(seg) || GATE_CONTROL_RE.test(seg)))
+        ) {
+          bad.push(`${name} (must be absolute directories joined by '${delimiter}')`);
+        } else clean[key] = val;
+      }
+      if (bad.length > 0) issues.push(`goals.gateEnv has invalid entries: ${bad.join(", ")}`);
+      else out.gateEnv = clean;
+    }
+  }
+  return out;
+}
+
 /** Reads the repository overlay `<repoRoot>/.pi-harness.json`, or `{}` when absent. */
 export function readRepoConfig(repoRoot?: string): Record<string, unknown> {
   return (repoRoot ? readJsonIfExists(join(repoRoot, ".pi-harness.json")) : undefined) ?? {};
@@ -355,9 +423,18 @@ export function resolveConfig(
         ...roots,
       };
 
+  // Security: gate shell/env run commands with operator credentials, so they MUST only come from trusted user
+  // global config, never from untrusted repository `.pi-harness.json`. They are file-authoritative: `base` never
+  // supplies them, so removing them from `config.json` clears them on reload. Invalid values are kept here and fail
+  // gates closed at run time (no throw: loadConfig runs for every CLI command).
+  const globalGoals = globalCfg.goals as Record<string, unknown> | undefined;
+  const { gateShell: globalShell, gateEnv: globalEnv, ...globalGoalsRest } = globalGoals ?? {};
+  const { gateShell: _repoShell, gateEnv: _repoEnv, ...repoGoals } =
+    (repoCfg.goals as Record<string, unknown> | undefined) ?? {};
+  const { gateShell: _baseShell, gateEnv: _baseEnv, ...baseGoals } = base?.goals ?? ({} as Partial<GoalsConfig>);
   const goals: GoalsConfig = {
     ...(base
-      ? base.goals
+      ? (baseGoals as GoalsConfig)
       : {
           defaultMaxReviewCycles: 4,
           defaultMaxNoProgressCycles: 2,
@@ -365,9 +442,11 @@ export function resolveConfig(
           autoVerifyOnSettle: true,
           maxConcurrentGoals: 4,
         }),
-    ...(globalCfg.goals as Partial<GoalsConfig> | undefined),
-    ...(repoCfg.goals as Partial<GoalsConfig> | undefined),
+    ...(globalGoalsRest as Partial<GoalsConfig>),
+    ...(repoGoals as Partial<GoalsConfig>),
   };
+  if (globalShell !== undefined && globalShell !== null && globalShell !== "") goals.gateShell = globalShell as string;
+  if (globalEnv !== undefined && globalEnv !== null) goals.gateEnv = globalEnv as Record<string, string>;
 
   const events: EventsConfig = {
     ...(base ? base.events : { fallbackWakeupIntervalSec: 600, wakeDirectorOnGoalSettle: true }),
@@ -614,13 +693,14 @@ export function validateConfigRaw(raw: unknown): string[] {
     const { warning } = normalizeWorktreeRoots(worktree);
     if (warning) errors.push(warning);
   }
-  section("goals", {
+  const goalsSection = section("goals", {
     defaultMaxReviewCycles: POS_INT,
     defaultMaxNoProgressCycles: POS_INT,
     gateTimeoutMs: POS_INT,
     maxConcurrentGoals: POS_INT,
     autoVerifyOnSettle: BOOLEAN,
   });
+  if (goalsSection) errors.push(...normalizeGateConfig(goalsSection).issues);
   section("events", { fallbackWakeupIntervalSec: POSITIVE, wakeDirectorOnGoalSettle: BOOLEAN });
   section("catalog", {
     ttlHours: NON_NEG,
