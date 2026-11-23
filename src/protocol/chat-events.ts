@@ -47,6 +47,7 @@ export type ChatControlEvent =
       path: string;
       bytes: number;
       reason: string;
+      offset?: number;
     }
   | {
       kind: "timer.scheduled";
@@ -169,6 +170,7 @@ export function parseChatControlEvent(raw: unknown): ChatControlEvent | null {
         path: r.path,
         bytes: r.bytes,
         reason: r.reason,
+        ...(typeof r.offset === "number" && Number.isFinite(r.offset) && r.offset > 0 ? { offset: r.offset } : {}),
       };
     }
     case "timer.scheduled": {
@@ -236,7 +238,7 @@ export function formatChatEventSummary(event: ChatControlEvent): string {
     case "goal.reviewed":
       return `Goal ${event.goalId} v${event.goalVersion} review #${event.cycle} (${event.status}): ${event.summary}`;
     case "director.read_file":
-      return `Director read_file: ${event.path} (${event.bytes} bytes). Reason: ${event.reason}`;
+      return `Director read_file: ${event.path} (${event.bytes} bytes${event.offset && event.offset > 0 ? ` at offset ${event.offset}` : ""}). Reason: ${event.reason}`;
     case "timer.scheduled":
       return `Scheduled timer ${event.timerId} for ${new Date(event.wakeAt).toISOString()}${event.goalId ? ` (${event.goalId})` : ""}: ${event.reason}`;
     case "timer.fired":

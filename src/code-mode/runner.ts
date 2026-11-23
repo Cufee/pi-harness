@@ -64,6 +64,16 @@ globalThis.output = output;
 }
 
 const message = (err: unknown) => err instanceof Error ? err.message : String(err);
+const SANDBOX_DENIAL = /\b(EPERM|EACCES)\b|operation not permitted|PermissionError|Blocked by Code Mode sandbox/i;
+function formatScriptError(raw: string, toolNames: Iterable<string>): string {
+  if (!SANDBOX_DENIAL.test(raw)) return raw;
+  const available = new Set(toolNames);
+  const readers = (["read_file", "artifact_read"] as const).filter((name) => available.has(name));
+  const guidance = readers.length > 0
+    ? `Read files with ${readers.join(" or ")} from "harness" and pass the data into the script.`
+    : "Read files with your own file tools outside code_exec and pass the data into the script.";
+  return `${raw}\n\nHint: code_exec scripts run in an OS sandbox with no filesystem access outside their scratch directory, no subprocesses, and no network. ${guidance}`;
+}
 const IPC_BYTES = 16 * 1024 * 1024;
 
 export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult> {
@@ -193,7 +203,7 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     child = undefined;
     if (stopped) return result;
     clearTimeout(timer); opts.signal?.removeEventListener("abort", abort);
-    if (status !== 0) throw new Error(tail.trim() || `${python ? "Python" : "Bun"} exited with status ${status}`);
+    if (status !== 0) throw new Error(formatScriptError(tail.trim() || `${python ? "Python" : "Bun"} exited with status ${status}`, names));
     const json = JSON.stringify(output) ?? "";
     const limit = Math.max(0, opts.maxOutputChars ?? 20_000);
     result.preview = json.slice(0, limit);
