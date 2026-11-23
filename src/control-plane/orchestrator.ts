@@ -12,6 +12,7 @@ import { recordCostInvocation } from "../cost/ledger.js";
 import { resolveLaunchRoute } from "./launch-route.js";
 import type { RunAgentRequest, RunAgentResult, RunnerExecutionHandle } from "../runners/types.js";
 import { BisectingMergeQueue } from "../worktree/merge-queue.js";
+import { invalidateGateEnvCache, type GateRuntimeConfig } from "../tools/gate-env.js";
 import { nativeToolsPathDirs, resolveExternalMcpServers } from "../tools/native-tools.js";
 import { canonicalPath, runGit, WorktreeConcurrencyLimitError, WorktreeManager } from "../worktree/manager.js";
 import type { QueuePositionInput } from "./admission-queue.js";
@@ -185,13 +186,15 @@ export class HarnessOrchestrator {
       if (!(key in next)) delete (this.config as unknown as Record<string, unknown>)[key];
     }
     Object.assign(this.config, next);
+    invalidateGateEnvCache();
     this.catalog = catalog;
     this.quota = quota;
+    const gate = this.gateRuntimeConfig();
     for (const mgr of this.worktreeManagers.values()) {
-      mgr.updateConfig(next.worktree);
+      mgr.updateConfig(next.worktree, gate);
     }
     for (const mq of this.mergeQueues.values()) {
-      mq.updateConfig(next.worktree);
+      mq.updateConfig(next.worktree, gate);
     }
     this.db.admissionQueue.notify("worker");
   }
@@ -349,10 +352,18 @@ export class HarnessOrchestrator {
     this.db.purgeStaleWriteLeasesOnStartup();
   }
 
+  private gateRuntimeConfig(): GateRuntimeConfig {
+    return {
+      gateShell: this.config.goals.gateShell,
+      gateEnv: this.config.goals.gateEnv,
+      stateDir: this.config.stateDir,
+    };
+  }
+
   getWorktreeManager(repoRoot: string): WorktreeManager {
     let mgr = this.worktreeManagers.get(repoRoot);
     if (!mgr) {
-      mgr = new WorktreeManager(this.db, repoRoot, this.config.worktree);
+      mgr = new WorktreeManager(this.db, repoRoot, this.config.worktree, this.gateRuntimeConfig());
       this.worktreeManagers.set(repoRoot, mgr);
     }
     return mgr;
@@ -361,7 +372,7 @@ export class HarnessOrchestrator {
   getMergeQueue(repoRoot: string): BisectingMergeQueue {
     let mq = this.mergeQueues.get(repoRoot);
     if (!mq) {
-      mq = new BisectingMergeQueue(this.db, this.getWorktreeManager(repoRoot), repoRoot, this.config.worktree);
+      mq = new BisectingMergeQueue(this.db, this.getWorktreeManager(repoRoot), repoRoot, this.config.worktree, this.gateRuntimeConfig());
       this.mergeQueues.set(repoRoot, mq);
     }
     return mq;
