@@ -186,7 +186,9 @@ An empty `extraReadRoots` after you set roots can mean the key is misplaced, it 
 - `pi-harness daemon serve | status | stop | restart [--remote <alias|ssh://host>]`: `serve` runs in the foreground on the local host. `restart` updates a running daemon after an install (a fresh install needs no restart, and an idle daemon from an older build is replaced automatically) and applies startup-fixed settings.
 - `pi-harness resume <run-id> [--in 15m | --message "<msg>"]`: resumes a run immediately; `--in <dur>` instead schedules a delayed resume of a quota-paused run (clamped to 1 s to 24 h). `--in` and `--message` cannot be combined.
 - `pi-harness run resume <run-id> ...` is an alias for `pi-harness resume` and rejects `--profile`, `--model`, and `--effort`. To start a new run whose goal begins with `resume`, quote a multi-word goal, or use `pi-harness run -- resume ...`, which works for any such goal, including the single word.
-- `pi-harness --remote <alias|ssh://host>` on a TTY, without `-p`, `--project`, or `--repo`, opens a picker of that host's registered projects when it has at least one.
+- `pi-harness [--resume] [-p <project>] [--repo <path>]` on a TTY opens the project picker instead of the last-used project. `--resume` opens the registered local project containing the current directory, choosing the innermost project when nested. With no matching project, it opens the picker with a warning. `-p`, `--project`, and `--repo` open that target directly and take precedence over `--resume`.
+- `pi-harness --remote <alias|ssh://host>` on a TTY, without `-p`, `--project`, or `--repo`, always opens a picker of that host's registered projects, including when the host has no registered projects.
+- Session control: when a second TUI attaches to an open session, the first stays connected in read-only mode and keeps its draft. Pressing `Ctrl+Y` or running `/take` reclaims control and makes the other terminal read-only.
 - `pi-harness --help` lists the primary commands.
 
 ## Director tools
