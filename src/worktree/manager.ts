@@ -237,8 +237,7 @@ export class WorktreeManager {
         if (reg && isRemovableLock(reg.locked) && reg.branch === branch) {
           verifyCreationIdentity(reg, identity);
           assertNoNestedCheckouts(canonicalPath(reg.path), entries);
-          await runGit(this.repoRoot, ["worktree", "remove", "--force", "--force", reg.path]);
-          removed = true;
+          removed = await this.removeRegistration(reg.path, reg.path);
         }
       } catch {
         // Leave the tree for inspection.
@@ -283,7 +282,7 @@ export class WorktreeManager {
           if (!reg || !isRemovableLock(reg.locked) || reg.branch !== null) return;
           verifyCreationIdentity(reg, identity);
           assertNoNestedCheckouts(canonicalPath(reg.path), entries);
-          await runGit(this.repoRoot, ["worktree", "remove", "--force", "--force", reg.path]);
+          await this.removeRegistration(reg.path, reg.path);
         } catch {
           // Removal is best effort; a refused tree stays registered.
         }
@@ -305,6 +304,22 @@ export class WorktreeManager {
       maxBuffer: 16 * 1024 * 1024,
     });
     return parsePorcelainWorktrees(stdout);
+  }
+
+  /**
+   * Re-reads the registration's lock state immediately before removing so a foreign lock acquired
+   * after the initial checks is never overridden. Uses `--force --force` only for HARNESS_LOCK_REASON
+   * and a single `--force` when unlocked.
+   */
+  private async removeRegistration(targetPath: string, label: string): Promise<boolean> {
+    const current = matchRegistration(await this.listRegistrations(), targetPath);
+    if (!current) return false;
+    if (!isRemovableLock(current.locked)) {
+      throw new Error(`Worktree ${label} is locked${current.locked ? ` (${current.locked})` : ""}; left in place`);
+    }
+    const forceArgs = current.locked === HARNESS_LOCK_REASON ? ["--force", "--force"] : ["--force"];
+    await runGit(this.repoRoot, ["worktree", "remove", ...forceArgs, current.path]);
+    return true;
   }
 
   /** An owned row is retired when its task settled, or it merged and its task is no longer live. */
@@ -462,8 +477,11 @@ export class WorktreeManager {
     // Path-targeted: Git's printed path matches its stored entry even when the checkout is missing.
     // The branch is deleted only when the removed registration still had it checked out; otherwise it may be a later one.
     if (reg) {
-      await runGit(this.repoRoot, ["worktree", "remove", "--force", "--force", reg.path]);
-      if (reg.branch === wt.branch && wt.branch !== run.baseBranch) {
+      const removed = await this.removeRegistration(reg.path, worktreeId);
+      if (!removed && existsSync(wt.path)) {
+        throw new Error(`Worktree ${worktreeId} at ${wt.path} is not registered with Git; left in place`);
+      }
+      if (removed && reg.branch === wt.branch && wt.branch !== run.baseBranch) {
         await runGit(this.repoRoot, ["branch", "-D", wt.branch]).catch(() => {});
       }
     }
