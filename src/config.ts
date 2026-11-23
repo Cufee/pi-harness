@@ -407,12 +407,23 @@ export function defaultSocketPath(stateDir: string): string {
 
 /** Resolves this host's writable temp directory and exports it as TMPDIR so child processes inherit it. */
 export function ensureTempDir(): string {
-  const requested = process.env.TMPDIR?.trim() ? process.env.TMPDIR : undefined;
-  // Bun's tmpdir() returns a whitespace-only TMPDIR verbatim, so blank must be removed to get the platform default.
-  delete process.env.TMPDIR;
-  const fallback = tmpdir();
+  const names = ["TMPDIR", "TMP", "TEMP"] as const;
+  const saved = names.map((name) => process.env[name]);
+  const restore = (name: (typeof names)[number], value: string | undefined) => {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  };
+  const candidates = saved.filter((value): value is string => !!value?.trim());
+  // Bun's tmpdir() reads TMPDIR, TMP and TEMP and returns blank values verbatim, so all three are cleared to get the platform default.
+  for (const name of names) delete process.env[name];
+  try {
+    candidates.push(tmpdir());
+  } finally {
+    restore("TMP", saved[1]);
+    restore("TEMP", saved[2]);
+  }
   const failures: string[] = [];
-  for (const dir of requested ? [requested, fallback] : [fallback]) {
+  for (const dir of new Set(candidates)) {
     try {
       mkdirSync(dir, { recursive: true, mode: 0o700 });
       accessSync(dir, constants.W_OK | constants.X_OK);
@@ -420,11 +431,11 @@ export function ensureTempDir(): string {
       failures.push(`${dir}: ${err instanceof Error ? err.message : String(err)}`);
       continue;
     }
-    if (failures.length) console.error(`[pi-harness] TMPDIR ${failures[0]}; using ${dir} instead.`);
     process.env.TMPDIR = dir;
+    if (failures.length) console.error(`[pi-harness] TMPDIR ${failures.join("; ")}; using ${dir} instead.`);
     return dir;
   }
-  if (requested) process.env.TMPDIR = requested;
+  restore("TMPDIR", saved[0]);
   throw new Error(`No usable temp directory (${failures.join("; ")}). Set TMPDIR to a writable directory.`);
 }
 

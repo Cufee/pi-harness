@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -277,12 +277,29 @@ export async function ensureLocalDaemon(socketPath: string): Promise<DaemonClien
         check.close();
       }
     }
-    if (exitStatus !== null) {
-      const logged = readFileSync(logPath).subarray(logStart).toString("utf8").trim().slice(-2000);
-      throw new Error(`harnessd exited (${exitStatus}) before listening on ${socketPath}: ${logged || `no output in ${logPath}`}`);
-    }
+    // A socket file means another daemon may still be coming up, so keep polling after our spawn exits.
+    if (exitStatus !== null && !existsSync(socketPath)) throw exitError(exitStatus);
   }
+  if (exitStatus !== null) throw exitError(exitStatus);
   throw new Error(`Timed out waiting for harnessd to listen on ${socketPath}`);
+
+  function exitError(status: string): Error {
+    let logged = "";
+    try {
+      const fd = openSync(logPath, "r");
+      try {
+        const end = fstatSync(fd).size;
+        const start = Math.max(logStart, end - 16384);
+        const buf = Buffer.alloc(Math.max(0, end - start));
+        logged = buf.subarray(0, readSync(fd, buf, 0, buf.length, start)).toString("utf8").trim().slice(-2000);
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      // An unreadable log must not hide the exit status.
+    }
+    return new Error(`harnessd exited (${status}) before listening on ${socketPath}: ${logged || `no output in ${logPath}`}`);
+  }
 }
 
 function resolveRemoteSpec(
