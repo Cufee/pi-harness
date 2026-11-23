@@ -88,13 +88,50 @@ function detailText(v: unknown): string | undefined {
   return typeof v === "string" ? v : JSON.stringify(v);
 }
 
+/** Re-indents valid JSON text without parsing values, so number tokens (e.g. 9007199254740993) stay exact. */
+function indentJson(text: string): string {
+  let out = "";
+  let depth = 0;
+  let inString = false;
+  const nl = () => "\n" + "  ".repeat(depth);
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (inString) {
+      out += c;
+      if (c === "\\") out += text[++i] ?? "";
+      else if (c === '"') inString = false;
+    } else if (c === '"') {
+      inString = true;
+      out += c;
+    } else if (c === "{" || c === "[") {
+      const close = c === "{" ? "}" : "]";
+      let j = i + 1;
+      while (/\s/.test(text[j] ?? "")) j++;
+      if (text[j] === close) {
+        out += c + close;
+        i = j;
+      } else {
+        depth++;
+        out += c + nl();
+      }
+    } else if (c === "}" || c === "]") {
+      depth--;
+      out += nl() + c;
+    } else if (c === ",") out += c + nl();
+    else if (c === ":") out += ": ";
+    else if (!/\s/.test(c)) out += c;
+  }
+  return out;
+}
+
 /** Pretty-prints JSON payloads for reading; non-JSON (including truncated previews) stays verbatim. */
 function bodyLines(raw: string): string[] {
   let text = raw;
   const trimmed = raw.trim();
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
     try {
-      text = JSON.stringify(JSON.parse(trimmed), null, 2);
+      JSON.parse(trimmed);
+      text = indentJson(trimmed);
     } catch {
       // keep raw
     }
@@ -106,6 +143,8 @@ export class LiveTranscriptModel {
   private blocks: Block[] = [];
   private nextId = 1;
   private readonly openText = new Map<string, TextBlock>();
+  /** Whitespace-only deltas that arrived before any text; prepended to the block's first visible delta. */
+  private readonly pendingLead = new Map<string, { kind: "assistant" | "thought"; text: string }>();
   private readonly toolsById = new Map<string, ToolBlock>();
   private readonly lineCache = new Map<number, { sig: string; lines: TranscriptLine[] }>();
 
@@ -140,11 +179,13 @@ export class LiveTranscriptModel {
     if (taskKey === undefined) {
       for (const b of this.openText.values()) b.open = false;
       this.openText.clear();
+      this.pendingLead.clear();
       return;
     }
     const b = this.openText.get(taskKey);
     if (b) b.open = false;
     this.openText.delete(taskKey);
+    this.pendingLead.delete(taskKey);
   }
 
   private appendText(kind: "assistant" | "thought", ev: EventRecord | DaemonEventFrame, taskKey: string, delta: string): void {
@@ -154,8 +195,14 @@ export class LiveTranscriptModel {
       b = undefined;
     }
     if (!b) {
-      if (!delta.trim()) return;
-      b = { id: this.nextId++, kind, taskKey, taskId: ev.taskId ?? null, createdAt: ev.createdAt, text: "", open: true };
+      const lead = this.pendingLead.get(taskKey);
+      if (lead && lead.kind !== kind) this.pendingLead.delete(taskKey);
+      if (!delta.trim()) {
+        this.pendingLead.set(taskKey, { kind, text: (lead?.kind === kind ? lead.text : "") + delta });
+        return;
+      }
+      this.pendingLead.delete(taskKey);
+      b = { id: this.nextId++, kind, taskKey, taskId: ev.taskId ?? null, createdAt: ev.createdAt, text: lead?.kind === kind ? lead.text : "", open: true };
       this.openText.set(taskKey, b);
       this.push(b);
     }
