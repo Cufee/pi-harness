@@ -57,6 +57,9 @@ import type {
   InboxItem,
   RpcRequest,
   RpcResponse,
+  SessionControlPayload,
+  SessionControlReason,
+  SessionControlState,
   SnapshotWorktreeEntry,
 } from "../protocol/daemon-rpc.js";
 import { attachDaemonReader, writeDaemonMessage } from "../protocol/frames.js";
@@ -68,6 +71,9 @@ import { PiRunner } from "../runners/pi-runner.js";
 import { canonicalPath, runGit } from "../worktree/manager.js";
 import { parseValidatedSshTarget, PeerManager, type PeerIdentity, type PeerLink, type RemoteHostStatus } from "./peer.js";
 import { PtyHost } from "./pty-host.js";
+
+const SESSION_READ_ONLY_ERROR =
+  "Session is read-only here: another terminal has control. Take control first (Ctrl+Y or /take).";
 
 interface ClientAttachment {
   id: string;
@@ -219,8 +225,11 @@ export class HarnessDaemon {
 
   private server: Server | null = null;
   private allSockets = new Set<Socket>();
+  private clientIds = new WeakMap<Socket, string>();
   private attachments = new Map<Socket, ClientAttachment>();
+  /** Per-run controller socket (at most one controller per run; viewers live in `attachments`). */
   private runBindings = new Map<string, Socket>();
+  /** Per-chat controller socket (at most one controller per chat; viewers live in `socketToChatId`). */
   private chatBindings = new Map<string, Socket>();
   private chatTurns = new Map<string, { id: string; text: string; cancelling: boolean }>();
   private pendingWakeups = new Map<string, ChatControlEvent[]>();
@@ -231,7 +240,6 @@ export class HarnessDaemon {
   private socketToChatId = new Map<Socket, string>();
   private chatSubscribers = new Set<Socket>();
   private tuiSockets = new Set<Socket>();
-  private takenOverSockets = new WeakSet<Socket>();
   private ptyDetachFns = new Map<Socket, Map<string, () => void>>();
   private watches = new Map<Socket, Map<string, ClientWatch>>();
   private flushingPeers = new Set<string>();
@@ -1053,68 +1061,128 @@ export class HarnessDaemon {
     };
   }
 
-  private evictSocket(prevSock: Socket, sessionId: string): void {
-    this.takenOverSockets.add(prevSock);
-    this.tuiSockets.delete(prevSock);
-    this.chatSubscribers.delete(prevSock);
-    this.attachments.delete(prevSock);
-    const prevChat = this.socketToChatId.get(prevSock);
-    if (prevChat) {
-      if (this.chatBindings.get(prevChat) === prevSock) this.chatBindings.delete(prevChat);
-      this.socketToChatId.delete(prevSock);
+  private clientId(socket: Socket): string {
+    let id = this.clientIds.get(socket);
+    if (!id) {
+      id = `cli-${randomBytes(4).toString("hex")}`;
+      this.clientIds.set(socket, id);
     }
-    for (const [rid, s] of this.runBindings.entries()) {
-      if (s === prevSock) this.runBindings.delete(rid);
+    return id;
+  }
+
+  private chatViewers(chatSessionId: string): Socket[] {
+    const out: Socket[] = [];
+    for (const [sock, cid] of this.socketToChatId.entries()) {
+      if (cid === chatSessionId) out.push(sock);
     }
-    writeDaemonMessage(prevSock, {
+    return out;
+  }
+
+  private runViewers(runId: string): Socket[] {
+    const out: Socket[] = [];
+    for (const att of this.attachments.values()) {
+      if (att.runId === runId) out.push(att.socket);
+    }
+    return out;
+  }
+
+  private controlState(socket: Socket, kind: "chat" | "run", sessionId: string): SessionControlState {
+    const myId = this.clientId(socket);
+    const controller = kind === "chat" ? this.chatBindings.get(sessionId) : this.runBindings.get(sessionId);
+    return {
+      sessionId,
+      kind,
+      clientId: myId,
+      controllerClientId: controller ? this.clientId(controller) : null,
+      hasControl: controller === socket,
+    };
+  }
+
+  private broadcastControl(
+    kind: "chat" | "run",
+    sessionId: string,
+    reason: SessionControlReason,
+    except?: Socket,
+  ): void {
+    const controller = kind === "chat" ? this.chatBindings.get(sessionId) : this.runBindings.get(sessionId);
+    const payload: SessionControlPayload = {
+      sessionId,
+      kind,
+      controllerClientId: controller ? this.clientId(controller) : null,
+      reason,
+    };
+    const frame: DaemonEventFrame = {
       kind: "event",
       seq: 0,
       runId: sessionId,
       taskId: sessionId,
-      type: "session.taken_over",
-      payload: { sessionId, reason: "Attached from another terminal" },
+      type: "session.control_changed",
+      payload,
       createdAt: Date.now(),
-    } satisfies DaemonEventFrame);
-    setTimeout(() => {
-      try {
-        prevSock.end();
-      } catch {
-        // ignore
-      }
-    }, 60).unref();
-    setTimeout(() => {
-      try {
-        if (!prevSock.destroyed) prevSock.destroy();
-      } catch {
-        // ignore
-      }
-    }, 200).unref();
+    };
+    const viewers = kind === "chat" ? this.chatViewers(sessionId) : this.runViewers(sessionId);
+    for (const viewer of viewers) {
+      if (viewer !== except) writeDaemonMessage(viewer, frame);
+    }
   }
 
-  private unbindSocketSession(socket: Socket): void {
+  private requireChatControlIfViewer(socket: Socket, chatSessionId: string): void {
+    if (this.socketToChatId.get(socket) === chatSessionId && this.chatBindings.get(chatSessionId) !== socket) {
+      throw new Error(SESSION_READ_ONLY_ERROR);
+    }
+  }
+
+  private requireRunControlIfViewer(socket: Socket, runId: string): void {
+    if (this.attachments.get(socket)?.runId === runId && this.runBindings.get(runId) !== socket) {
+      throw new Error(SESSION_READ_ONLY_ERROR);
+    }
+  }
+
+  private unbindSocketSession(socket: Socket, reason: "released" | "disconnected" = "released"): void {
     const oldChat = this.socketToChatId.get(socket);
     if (oldChat) {
-      if (this.chatBindings.get(oldChat) === socket) this.chatBindings.delete(oldChat);
       this.socketToChatId.delete(socket);
+      if (this.chatBindings.get(oldChat) === socket) {
+        this.chatBindings.delete(oldChat);
+        this.broadcastControl("chat", oldChat, reason);
+      }
     }
     const oldAtt = this.attachments.get(socket);
     if (oldAtt) {
-      if (this.runBindings.get(oldAtt.runId) === socket) this.runBindings.delete(oldAtt.runId);
       this.attachments.delete(socket);
+      if (this.runBindings.get(oldAtt.runId) === socket) {
+        this.runBindings.delete(oldAtt.runId);
+        this.broadcastControl("run", oldAtt.runId, reason);
+      }
     }
   }
 
   private requireChatOwner(socket: Socket, chatSessionId: string): void {
-    if (this.chatBindings.get(chatSessionId) !== socket) throw new Error("Chat is attached to another terminal or detached");
+    if (this.chatBindings.get(chatSessionId) !== socket) throw new Error(SESSION_READ_ONLY_ERROR);
   }
 
-  private sendChatEvent(chatSessionId: string, turnId: string, type: string, payload: Record<string, unknown>): void {
-    const target = this.chatBindings.get(chatSessionId);
-    if (!target || this.chatTurns.get(chatSessionId)?.id !== turnId) return;
-    writeDaemonMessage(target, {
-      kind: "event", seq: 0, runId: chatSessionId, taskId: chatSessionId, type,
-      payload: { ...payload, chatSessionId, turnId }, createdAt: Date.now(),
-    } satisfies DaemonEventFrame);
+  private sendChatEvent(
+    chatSessionId: string,
+    turnId: string,
+    type: string,
+    payload: Record<string, unknown>,
+    except?: Socket,
+  ): void {
+    if (this.chatTurns.get(chatSessionId)?.id !== turnId) return;
+    const viewers = this.chatViewers(chatSessionId);
+    if (viewers.length === 0) return;
+    const frame: DaemonEventFrame = {
+      kind: "event",
+      seq: 0,
+      runId: chatSessionId,
+      taskId: chatSessionId,
+      type,
+      payload: { ...payload, chatSessionId, turnId },
+      createdAt: Date.now(),
+    };
+    for (const target of viewers) {
+      if (target !== except) writeDaemonMessage(target, frame);
+    }
   }
 
   private chatHistoryPage(chatSessionId: string, afterSeq: number, historyThrough: number) {
@@ -1135,47 +1203,47 @@ export class HarnessDaemon {
   }
 
   private bindChatSocket(socket: Socket, chatSessionId: string): { tookOver: boolean } {
-    if (socket.destroyed || this.takenOverSockets.has(socket)) throw new Error("Chat connection closed or taken over");
+    if (socket.destroyed) throw new Error("Chat connection closed");
     this.cancelIdleShutdown();
     const curChat = this.socketToChatId.get(socket);
     if (curChat !== chatSessionId) {
       this.unbindSocketSession(socket);
     }
-    let tookOver = false;
     const prev = this.chatBindings.get(chatSessionId);
-    if (prev && prev !== socket) {
-      this.evictSocket(prev, chatSessionId);
-      tookOver = true;
-    }
+    const tookOver = Boolean(prev && prev !== socket);
     this.chatBindings.set(chatSessionId, socket);
     this.socketToChatId.set(socket, chatSessionId);
     this.chatSubscribers.add(socket);
     this.tuiSockets.add(socket);
     this.director.chats.touchSession(chatSessionId);
+    if (prev !== socket) {
+      this.broadcastControl("chat", chatSessionId, "attached", socket);
+    }
     return { tookOver };
   }
 
   private bindRunSocket(socket: Socket, runId: string, taskId: string | null): { tookOver: boolean } {
+    if (socket.destroyed) throw new Error("Run connection closed");
     this.cancelIdleShutdown();
     const curAtt = this.attachments.get(socket);
     if (!curAtt || curAtt.runId !== runId) {
       this.unbindSocketSession(socket);
     }
-    let tookOver = false;
     const prev = this.runBindings.get(runId);
-    if (prev && prev !== socket) {
-      this.evictSocket(prev, runId);
-      tookOver = true;
-    }
+    const tookOver = Boolean(prev && prev !== socket);
     this.runBindings.set(runId, socket);
     const boundAtSeq = this.db.getLatestEventSeq();
     this.attachments.set(socket, { id: randomBytes(8).toString("hex"), boundAtSeq, throughSeq: boundAtSeq, socket, runId, taskId });
     this.tuiSockets.add(socket);
+    if (prev !== socket) {
+      this.broadcastControl("run", runId, "attached", socket);
+    }
     return { tookOver };
   }
 
   private handleConnection(socket: Socket): void {
     this.allSockets.add(socket);
+    this.clientIds.set(socket, `cli-${randomBytes(4).toString("hex")}`);
     this.cancelIdleShutdown();
     const detach = attachDaemonReader(socket, {
       onMessage: (raw) => {
@@ -1230,8 +1298,7 @@ export class HarnessDaemon {
   private cleanupSocket(socket: Socket): void {
     this.allSockets.delete(socket);
     const wasTui = this.tuiSockets.delete(socket);
-    const wasTakenOver = this.takenOverSockets.has(socket);
-    this.unbindSocketSession(socket);
+    this.unbindSocketSession(socket, "disconnected");
     this.chatSubscribers.delete(socket);
     this.watches.delete(socket);
     const ptyMap = this.ptyDetachFns.get(socket);
@@ -1241,7 +1308,7 @@ export class HarnessDaemon {
     }
 
     // If the last interactive TUI disconnected abruptly (e.g. terminal window closed) and nothing is running, quit cleanly
-    if (this.autoQuitWhenIdle && wasTui && !wasTakenOver) {
+    if (this.autoQuitWhenIdle && wasTui) {
       const work = this.getLiveWorkSummary();
       if (!work.running) {
         this.cancelIdleShutdown();
@@ -1573,10 +1640,10 @@ export class HarnessDaemon {
     const hopCount = Math.max(record.hopCount, inboundInWindow);
     const circuitBreakerTripped = hopCount > MAX_PEER_MESSAGE_HOPS;
 
-    // Emit live event to attached TUI socket (if any) so the user immediately sees peer traffic
-    const bound = this.chatBindings.get(input.toSessionId);
-    if (bound) {
-      writeDaemonMessage(bound, {
+    // Emit live event to all attached TUI viewers so users immediately see peer traffic
+    const viewers = this.chatViewers(input.toSessionId);
+    if (viewers.length > 0) {
+      const msgFrame: DaemonEventFrame = {
         kind: "event",
         seq: 0,
         runId: input.toSessionId,
@@ -1594,7 +1661,8 @@ export class HarnessDaemon {
           circuitBreakerTripped,
         },
         createdAt: Date.now(),
-      } satisfies DaemonEventFrame);
+      };
+      for (const viewer of viewers) writeDaemonMessage(viewer, msgFrame);
     }
 
     if (circuitBreakerTripped) {
@@ -1944,7 +2012,6 @@ export class HarnessDaemon {
   }
 
   private async dispatch(socket: Socket, req: RpcRequest): Promise<unknown> {
-    if (this.takenOverSockets.has(socket)) throw new Error("Session taken over by another terminal");
     const p = req.params ?? {};
 
     switch (req.op) {
@@ -2274,6 +2341,7 @@ export class HarnessDaemon {
 
       case "chat.set_project": {
         const chatSessionId = String(p.chatSessionId);
+        this.requireChatControlIfViewer(socket, chatSessionId);
         const projectRef = String(p.projectId ?? p.project ?? "");
         const { session, project } = this.director.switchChatProject(chatSessionId, projectRef);
         return { session, project };
@@ -2342,6 +2410,7 @@ export class HarnessDaemon {
           goals: this.director.goals.listGoals({ chatSessionId: session.id }),
           config: this.config,
           tookOver,
+          control: this.controlState(socket, "chat", session.id),
           busy: Boolean(turn),
         };
       }
@@ -2379,6 +2448,7 @@ export class HarnessDaemon {
           goals: this.director.goals.listGoals({ chatSessionId: session.id }),
           config: this.config,
           tookOver: false,
+          ...(!p.headless ? { control: this.controlState(socket, "chat", session.id) } : {}),
           busy: false,
         };
       }
@@ -2462,6 +2532,27 @@ export class HarnessDaemon {
         };
       }
 
+      case "session.take_control": {
+        const chatId = this.socketToChatId.get(socket);
+        const att = this.attachments.get(socket);
+        const kind: "chat" | "run" | null = chatId ? "chat" : att ? "run" : null;
+        const sessionId = chatId ?? att?.runId ?? null;
+        if (!kind || !sessionId) throw new Error("Not attached to a session");
+        const requestedId = typeof p.sessionId === "string" && p.sessionId.trim() ? p.sessionId.trim() : null;
+        if (requestedId && requestedId !== sessionId) {
+          throw new Error(`Not attached to ${requestedId}`);
+        }
+        const bindings = kind === "chat" ? this.chatBindings : this.runBindings;
+        const prev = bindings.get(sessionId);
+        const tookOver = prev !== socket;
+        if (tookOver) {
+          bindings.set(sessionId, socket);
+          if (kind === "chat") this.director.chats.touchSession(sessionId);
+          this.broadcastControl(kind, sessionId, "taken", socket);
+        }
+        return { ...this.controlState(socket, kind, sessionId), tookOver };
+      }
+
       case "chat.send": {
         const chatSessionId = String(p.chatSessionId);
         this.requireChatOwner(socket, chatSessionId);
@@ -2469,6 +2560,7 @@ export class HarnessDaemon {
         const id = typeof p.turnId === "string" && p.turnId ? p.turnId : req.id;
         const turn = { id, text: "", cancelling: false };
         this.chatTurns.set(chatSessionId, turn);
+        this.sendChatEvent(chatSessionId, id, "chat.turn.start", { reason: "user", text: String(p.text) }, socket);
         try {
           const result = await this.director.sendChatMessage(
             chatSessionId, String(p.text),
@@ -2526,8 +2618,10 @@ export class HarnessDaemon {
           Math.min(100, Math.max(1, Number(p.limit) || 100)),
         );
 
-      case "chat.update":
-        return this.director.chats.updateSession(String(p.chatSessionId), {
+      case "chat.update": {
+        const chatSessionId = String(p.chatSessionId);
+        this.requireChatControlIfViewer(socket, chatSessionId);
+        return this.director.chats.updateSession(chatSessionId, {
           profileId: typeof p.profileId === "string" ? p.profileId : undefined,
           model: p.model === null ? null : typeof p.model === "string" ? p.model : undefined,
           effort: p.effort === null ? null : typeof p.effort === "string" ? p.effort : undefined,
@@ -2539,6 +2633,7 @@ export class HarnessDaemon {
                 ? p.modelSelectionContext
                 : undefined,
         });
+      }
 
       case "chat.list":
         return this.director.chats.listSessions();
@@ -2740,6 +2835,7 @@ export class HarnessDaemon {
 
       case "run.stop": {
         const runId = String(p.runId);
+        this.requireRunControlIfViewer(socket, runId);
         const reason = typeof p.reason === "string" ? p.reason : "Stopped by user";
         let cancelledChat = false;
         if (isDirectorTaskContainer(runId)) {
@@ -2804,6 +2900,7 @@ export class HarnessDaemon {
 
       case "run.resume": {
         const runId = String(p.runId);
+        this.requireRunControlIfViewer(socket, runId);
         this.director.assertRunGoalNotTerminal(runId);
         const priorRunStatus = this.orchestrator.getEffectiveRun(runId)?.status;
         const res = await this.orchestrator.resumeRun(runId, {
@@ -2840,6 +2937,7 @@ export class HarnessDaemon {
 
       case "run.schedule_resume": {
         const runId = String(p.runId);
+        this.requireRunControlIfViewer(socket, runId);
         const delayMs = Number(p.delayMs);
         if (!Number.isFinite(delayMs) || delayMs <= 0) {
           throw new Error("delayMs must be a positive number of milliseconds");
@@ -2859,6 +2957,7 @@ export class HarnessDaemon {
           attachmentId: attachment.id,
           attached: true,
           tookOver,
+          control: this.controlState(socket, "run", runId),
           run: this.db.getRun(runId),
           tasks: this.db.listTasks(runId),
           escalations: this.db.listEscalations(runId, "open"),
@@ -3191,12 +3290,20 @@ export class HarnessDaemon {
         };
       }
 
-      case "task.steer":
-        return await this.orchestrator.steerTaskDetailed(String(p.taskId), String(p.message));
+      case "task.steer": {
+        const taskId = String(p.taskId);
+        const task = this.db.getTask(taskId);
+        if (task) this.requireRunControlIfViewer(socket, task.runId);
+        return await this.orchestrator.steerTaskDetailed(taskId, String(p.message));
+      }
 
-      case "task.cancel":
-        await this.orchestrator.cancelTask(String(p.taskId), String(p.reason ?? "Cancelled by user"));
+      case "task.cancel": {
+        const taskId = String(p.taskId);
+        const task = this.db.getTask(taskId);
+        if (task) this.requireRunControlIfViewer(socket, task.runId);
+        await this.orchestrator.cancelTask(taskId, String(p.reason ?? "Cancelled by user"));
         return { cancelled: true };
+      }
 
       case "escalation.list": {
         const chatSessionId = typeof p.chatSessionId === "string" && p.chatSessionId ? p.chatSessionId : undefined;
