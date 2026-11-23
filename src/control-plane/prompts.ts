@@ -94,6 +94,7 @@ export function buildHydrationTurn(input: {
   writeScopes?: string[];
   worktreePath?: string | null;
   worktreeBranch?: string | null;
+  goalEvidenceDir?: string | null;
   quotaResumeNote?: { kind?: "quota" | "resume"; reason?: string; userMessage?: string | null } | null;
 }): string {
   const lines: string[] = [
@@ -104,6 +105,10 @@ export function buildHydrationTurn(input: {
   if (input.task.criteria) lines.push(`Acceptance Criteria: ${input.task.criteria}`);
   if (input.worktreePath) lines.push(`Worktree: ${input.worktreePath} (branch: ${input.worktreeBranch ?? "unknown"})`);
   if (input.writeScopes?.length && !input.task.readOnly) lines.push(`Assigned write scopes: ${JSON.stringify(input.writeScopes)}`);
+  if (input.goalEvidenceDir) {
+    const writable = !input.task.readOnly && input.task.tier === 2;
+    lines.push(`Goal evidence directory${writable ? " (writable)" : ""}: ${input.goalEvidenceDir} (env HARNESS_GOAL_EVIDENCE_DIR)`);
+  }
   if (input.task.tier === 3 && input.task.maxTurns > 0) {
     lines.push(`Progress reminders: the harness does not stop tasks by turn count; you may receive one advisory progress check-in around ${input.task.maxTurns} tool-call turns. Call return_task when your work is ready.`);
   }

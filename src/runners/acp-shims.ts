@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { ensureTempDir, type AcpAdapterKind, type AcpProfileConfig } from "../config.js";
 import type { ArtifactRecord } from "../control-plane/db.js";
+import { isProtectedWritePath } from "./protected-paths.js";
 import type { ToolPolicy } from "./types.js";
 
 export interface PreparedAcpSpawn {
@@ -542,6 +543,8 @@ const READ_ONLY_ARG_CHECKS: Record<string, (args: string[]) => boolean> = {
 export interface ReadOnlyShellScope {
   cwd: string;
   readRoots: string[];
+  /** Read roots that refuse `.git` and `.harness/worktrees` when they are the first root admitting a path. */
+  protectedRoots?: string[];
 }
 
 function isInsideRoot(root: string, path: string): boolean {
@@ -589,7 +592,9 @@ function pathOperandsInsideRoots(args: string[], scope: ReadOnlyShellScope): boo
       } catch {
         return false;
       }
-      if (!scope.readRoots.some((root) => isInsideRoot(root, canonical))) return false;
+      const admitting = scope.readRoots.find((root) => isInsideRoot(root, canonical));
+      if (!admitting) return false;
+      if (scope.protectedRoots?.includes(admitting) && isProtectedWritePath(admitting, canonical)) return false;
     }
   }
   return true;
@@ -875,6 +880,8 @@ export function buildNewSessionParams(
     effort?: string | null;
     mcpServers: AcpMcpServerEntry[];
     agentCapabilities?: Record<string, unknown>;
+    /** Resolved absolute directories outside `cwd` the agent may access (extra read and write roots). */
+    additionalDirectories?: string[];
   },
 ): { params: Record<string, unknown>; needsTurn1SystemPrompt: boolean } {
   const params: Record<string, unknown> = {
@@ -936,6 +943,10 @@ export function buildNewSessionParams(
     };
     claudeOptions.model = opts.model;
     if (effectiveEffort) claudeOptions.effort = effectiveEffort;
+    // claude-agent-acp merges this SDK pass-through with ACP `additionalDirectories` into the SDK options.
+    if (opts.toolPolicy !== "control_plane_only" && opts.additionalDirectories?.length) {
+      claudeOptions.additionalDirectories = [...new Set(opts.additionalDirectories)];
+    }
 
     params._meta = {
       claudeCode: {

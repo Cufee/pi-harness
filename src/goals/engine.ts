@@ -1,17 +1,63 @@
 import { createHash } from "node:crypto";
-import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { lstatSync, mkdirSync, realpathSync } from "node:fs";
+import { join, resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { GoalsConfig } from "../config.js";
 import { friendlyIdCandidates, nextFriendlyId } from "../control-plane/ids.js";
 import { type ResolvedGateEnv, resolveGateEnv, runGateCommand } from "../tools/gate-env.js";
 import { runGit } from "../worktree/manager.js";
+import {
+  type GoalLiveProgress,
+  type GoalProgressSource,
+  mergeGoalLiveProgress,
+  stripStaleLiveProgress,
+} from "./live-progress.js";
+
+export {
+  type GoalLiveProgress,
+  type GoalLiveProgressPatch,
+  type GoalProgressSource,
+  isBlockedPhase,
+  isCurrentClaim,
+  mergeGoalLiveProgress,
+  stripStaleLiveProgress,
+} from "./live-progress.js";
 
 function canonicalRepoPath(p: string): string {
   try {
     return realpathSync(p);
   } catch {
     return resolve(p);
+  }
+}
+
+const GOAL_ID_SEGMENT = /^[a-zA-Z0-9._-]+$/;
+
+/** Per-goal evidence directory `<repo>/.harness/goals/<goalId>`; rejects ids that are not a single safe path segment. */
+export function goalEvidenceDir(repoRoot: string, goalId: string): string {
+  if (!GOAL_ID_SEGMENT.test(goalId) || goalId === "." || goalId === "..") {
+    throw new Error(`Invalid goal id for evidence directory: ${JSON.stringify(goalId)}`);
+  }
+  return join(canonicalRepoPath(repoRoot), ".harness", "goals", goalId);
+}
+
+/** Creates the goal evidence directory segment by segment, refusing symlinks or files; returns null on failure. */
+export function ensureGoalEvidenceDir(repoRoot: string, goalId: string): string | null {
+  try {
+    const target = goalEvidenceDir(repoRoot, goalId);
+    let p = canonicalRepoPath(repoRoot);
+    for (const segment of [".harness", "goals", goalId]) {
+      p = join(p, segment);
+      try {
+        mkdirSync(p);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      }
+      if (!lstatSync(p).isDirectory()) return null;
+    }
+    return target;
+  } catch {
+    return null;
   }
 }
 
@@ -91,15 +137,6 @@ export interface GoalBudgets {
   maxApiEquivUsd?: number;
 }
 
-export interface GoalLiveProgress {
-  phase?: string;
-  summary?: string;
-  verificationStatus?: "not_needed" | "in_progress" | "passed" | "failed";
-  criteriaResults?: CriterionEvaluation[];
-  reportedByTaskId?: string | null;
-  updatedAt: number;
-}
-
 export interface GoalRecord {
   id: string;
   chatSessionId: string | null;
@@ -157,6 +194,23 @@ export interface CriterionEvaluation {
   remediation?: string;
 }
 
+/** What produced a goal_reviews row. Legacy rows read as "review". */
+export type GoalReviewSource = "review" | "deterministic" | "none" | "coordinator_failed" | "director_accept_override";
+
+/** Audit record stored with a `director_accept_override` review. */
+export interface GoalAcceptOverrideAudit {
+  acceptedBy: "director" | "user";
+  chatSessionId: string | null;
+  reason: string;
+  evidence: Array<{ input: string; canonicalPath: string; kind: "file" | "directory"; sizeBytes?: number; mtimeMs: number }>;
+  overrideDeterministic: boolean;
+  failedDeterministicCriteria: string[];
+  prevStatus: GoalStatus;
+  goalVersion: number;
+  verifyRef: string | null;
+  acceptedAt: number;
+}
+
 export interface GoalReviewVerdict {
   id: string;
   goalId: string;
@@ -168,6 +222,8 @@ export interface GoalReviewVerdict {
   summary: string;
   progressFingerprint: string;
   createdAt: number;
+  source?: GoalReviewSource;
+  audit?: GoalAcceptOverrideAudit | null;
 }
 
 export interface DeterministicGateResult {
@@ -223,7 +279,9 @@ CREATE TABLE IF NOT EXISTS goal_reviews (
   blocking_issues_json TEXT NOT NULL,
   summary TEXT NOT NULL,
   progress_fingerprint TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  source TEXT NOT NULL DEFAULT 'review',
+  audit_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_goal_reviews_goal ON goal_reviews(goal_id, cycle);
 `;
@@ -314,6 +372,15 @@ export class GoalEngine {
     }
     if (!cols.has("live_progress_json")) {
       this.db.exec("ALTER TABLE goals ADD COLUMN live_progress_json TEXT");
+    }
+    const reviewCols = new Set(
+      (this.db.prepare("PRAGMA table_info(goal_reviews)").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    if (!reviewCols.has("source")) {
+      this.db.exec("ALTER TABLE goal_reviews ADD COLUMN source TEXT NOT NULL DEFAULT 'review'");
+    }
+    if (!reviewCols.has("audit_json")) {
+      this.db.exec("ALTER TABLE goal_reviews ADD COLUMN audit_json TEXT");
     }
   }
 
@@ -420,7 +487,9 @@ export class GoalEngine {
       )
       .run(id, input.title.trim(), input.description.trim(), JSON.stringify(criteria), JSON.stringify(nonGoals), now);
 
-    return this.getGoal(id)!;
+    const created = this.getGoal(id)!;
+    ensureGoalEvidenceDir(created.repoRoot, created.id);
+    return created;
   }
 
   getGoal(id: string): GoalRecord | null {
@@ -457,7 +526,33 @@ export class GoalEngine {
       .prepare("UPDATE goals SET linked_run_id = ?, status = 'executing', updated_at = ? WHERE id = ?")
       .run(runId, Date.now(), g.id);
     this.clearQueuedProgress(g.id);
+    this.clearStaleVerificationStatus(g.id, { clearBlockedPhase: true });
+    ensureGoalEvidenceDir(g.repoRoot, g.id);
     return this.getGoal(g.id)!;
+  }
+
+  /**
+   * Removes verification claims (and, with `clearBlockedPhase`, a blocked phase) from live progress.
+   * Writes only when something changed and never touches `status`.
+   */
+  clearStaleVerificationStatus(goalIdStr: string, opts?: { clearBlockedPhase?: boolean }): GoalRecord {
+    const g = this.getGoal(goalIdStr);
+    if (!g) throw new Error(`Unknown goal ${goalIdStr}`);
+    const { next, changed } = stripStaleLiveProgress(g.liveProgress, opts);
+    if (!changed) return g;
+    this.db
+      .prepare("UPDATE goals SET live_progress_json = ?, updated_at = ? WHERE id = ?")
+      .run(next ? JSON.stringify(next) : null, Date.now(), g.id);
+    return this.getGoal(g.id)!;
+  }
+
+  /** `created_at` of the given goal revision, or null when it does not exist. */
+  getLatestRevisionCreatedAt(goalIdStr: string, version: number): number | null {
+    const resolvedId = this.getGoal(goalIdStr)?.id ?? goalIdStr;
+    const row = this.db
+      .prepare("SELECT created_at FROM goal_revisions WHERE goal_id = ? AND version = ?")
+      .get(resolvedId, version) as { created_at: number } | undefined;
+    return row ? Number(row.created_at) : null;
   }
 
   /** Drops admission-queue progress (`queued`/`queue_launch_error`) once a goal is no longer waiting for a slot. */
@@ -471,23 +566,21 @@ export class GoalEngine {
   }
 
   /** Persists live model-reported progress, verification status, and criterion checks onto the Goal. */
-  reportProgress(goalIdStr: string, input: Omit<GoalLiveProgress, "updatedAt">): GoalRecord {
+  reportProgress(
+    goalIdStr: string,
+    input: Omit<GoalLiveProgress, "updatedAt" | "goalVersion" | "runId" | "reviewCycle" | "source" | "claimedAt">,
+    source?: GoalProgressSource,
+  ): GoalRecord {
     const g = this.getGoal(goalIdStr);
     if (!g) throw new Error(`Unknown goal ${goalIdStr}`);
     const now = Date.now();
-    const prev = g.liveProgress;
-    const mergedById = new Map<string, CriterionEvaluation>();
-    for (const c of prev?.criteriaResults ?? []) mergedById.set(c.criterionId, c);
-    for (const c of input.criteriaResults ?? []) mergedById.set(c.criterionId, c);
-
-    const next: GoalLiveProgress = {
-      phase: input.phase ?? prev?.phase,
-      summary: input.summary ?? prev?.summary,
-      verificationStatus: input.verificationStatus ?? prev?.verificationStatus,
-      criteriaResults: mergedById.size > 0 ? [...mergedById.values()] : undefined,
-      reportedByTaskId: input.reportedByTaskId ?? prev?.reportedByTaskId ?? null,
-      updatedAt: now,
-    };
+    const next = mergeGoalLiveProgress(g.liveProgress, input, {
+      goalVersion: g.version,
+      runId: g.linkedRunId,
+      reviewCycle: g.reviewCycle,
+      source: source ?? "director",
+      now,
+    });
     this.db
       .prepare("UPDATE goals SET live_progress_json = ?, updated_at = ? WHERE id = ?")
       .run(JSON.stringify(next), now, g.id);
@@ -669,11 +762,20 @@ export class GoalEngine {
     }
 
     const now = Date.now();
+    const clearedProgress = stripStaleLiveProgress(cur.liveProgress, { clearBlockedPhase: true });
+    const nextLiveProgressJson = clearedProgress.changed
+      ? clearedProgress.next
+        ? JSON.stringify(clearedProgress.next)
+        : null
+      : cur.liveProgress
+        ? JSON.stringify(cur.liveProgress)
+        : null;
     this.db
       .prepare(
         `UPDATE goals
          SET version = ?, title = ?, description = ?, criteria_json = ?, non_goals_json = ?,
-             status = ?, review_cycle = 0, no_progress_streak = 0, last_progress_fingerprint = NULL, updated_at = ?
+             status = ?, review_cycle = 0, no_progress_streak = 0, last_progress_fingerprint = NULL,
+             live_progress_json = ?, updated_at = ?
          WHERE id = ?`,
       )
       .run(
@@ -683,6 +785,7 @@ export class GoalEngine {
         JSON.stringify(nextCriteria),
         JSON.stringify(nextNonGoals),
         nextStatus,
+        nextLiveProgressJson,
         now,
         cur.id,
       );
@@ -785,6 +888,7 @@ export class GoalEngine {
     const goal = this.getGoal(goalIdStr);
     if (!goal) throw new Error(`Unknown goal ${goalIdStr}`);
     this.setStatus(goal.id, "verifying");
+    const evidenceDir = ensureGoalEvidenceDir(goal.repoRoot, goal.id) ?? goalEvidenceDir(goal.repoRoot, goal.id);
 
     const gateCwd = opts?.cwd ?? goal.repoRoot;
     const targetRef = opts?.targetRef ?? "HEAD";
@@ -808,6 +912,7 @@ export class GoalEngine {
         resolved ??= await resolveGateEnv({
           cwd: gateCwd,
           config: { gateShell: this.cfg.gateShell, gateEnv: this.cfg.gateEnv, stateDir: this.stateDir },
+          extraEnv: { HARNESS_GOAL_EVIDENCE_DIR: evidenceDir, HARNESS_GOAL_ID: goal.id },
           signal,
         });
         const { stdout, stderr } = await runGateCommand(c.command, {
@@ -865,6 +970,9 @@ export class GoalEngine {
       summary: string;
       diffHash: string;
       spentUsd?: number;
+      /** What produced this verdict; defaults to "review". */
+      source?: GoalReviewSource;
+      audit?: GoalAcceptOverrideAudit | null;
     },
   ): { goal: GoalRecord; review: GoalReviewVerdict; circuitBreakerTripped?: string } {
     const goal = this.getGoal(goalIdStr);
@@ -948,31 +1056,35 @@ export class GoalEngine {
 
     const revId = reviewId(this.db);
     const now = Date.now();
-    this.db
-      .prepare(
-        `INSERT INTO goal_reviews(
-          id, goal_id, goal_version, cycle, verdict, criteria_results_json,
-          blocking_issues_json, summary, progress_fingerprint, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        revId,
-        goal.id,
-        goal.version,
-        nextCycle,
-        effectiveVerdict,
-        JSON.stringify(input.criteriaResults),
-        JSON.stringify(blockingIssues),
-        input.summary,
-        fingerprint,
-        now,
-      );
+    const source: GoalReviewSource = input.source ?? "review";
+    const audit = input.audit ?? null;
+    this.insertReviewRow({
+      id: revId,
+      goalId: goal.id,
+      goalVersion: goal.version,
+      cycle: nextCycle,
+      verdict: effectiveVerdict,
+      criteriaResults: input.criteriaResults,
+      blockingIssues,
+      summary: input.summary,
+      progressFingerprint: fingerprint,
+      createdAt: now,
+      source,
+      audit,
+    });
 
+    // A bounce back to executing starts a new verification epoch: drop the old claim in the same write.
+    // Achieved and awaiting_human keep the evidence on screen.
+    let liveProgressJson: string | null = goal.liveProgress ? JSON.stringify(goal.liveProgress) : null;
+    if (nextStatus === "executing") {
+      const cleared = stripStaleLiveProgress(goal.liveProgress, { clearBlockedPhase: false });
+      if (cleared.changed) liveProgressJson = cleared.next ? JSON.stringify(cleared.next) : null;
+    }
     this.db
       .prepare(
         `UPDATE goals
          SET status = ?, review_cycle = ?, no_progress_streak = ?,
-             last_progress_fingerprint = ?, last_review_summary = ?, updated_at = ?
+             last_progress_fingerprint = ?, last_review_summary = ?, live_progress_json = ?, updated_at = ?
          WHERE id = ?`,
       )
       .run(
@@ -981,6 +1093,7 @@ export class GoalEngine {
         nextNoProgress,
         fingerprint,
         circuitBreakerTripped ? `${circuitBreakerTripped} — ${input.summary}` : input.summary,
+        liveProgressJson,
         now,
         goal.id,
       );
@@ -996,11 +1109,98 @@ export class GoalEngine {
       summary: input.summary,
       progressFingerprint: fingerprint,
       createdAt: now,
+      source,
+      audit,
     };
 
     const updatedGoal = this.getGoal(goal.id)!;
     if (nextStatus === "achieved") this.settleEscalations(updatedGoal, "achieved");
     return { goal: updatedGoal, review, circuitBreakerTripped };
+  }
+
+  private insertReviewRow(r: GoalReviewVerdict & { source: GoalReviewSource; audit: GoalAcceptOverrideAudit | null }): void {
+    this.db
+      .prepare(
+        `INSERT INTO goal_reviews(
+          id, goal_id, goal_version, cycle, verdict, criteria_results_json,
+          blocking_issues_json, summary, progress_fingerprint, created_at, source, audit_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        r.id,
+        r.goalId,
+        r.goalVersion,
+        r.cycle,
+        r.verdict,
+        JSON.stringify(r.criteriaResults),
+        JSON.stringify(r.blockingIssues),
+        r.summary,
+        r.progressFingerprint,
+        r.createdAt,
+        r.source,
+        r.audit ? JSON.stringify(r.audit) : null,
+      );
+  }
+
+  /**
+   * Audited override: marks the goal achieved with an approved review tagged `director_accept_override`.
+   * Bypasses the mechanical gate in `recordReviewVerdict` on purpose so honest failed gate results can be stored.
+   * The caller owns evidence validation and deterministic gates; this only re-checks version and status atomically.
+   */
+  acceptGoalOverride(
+    goalIdStr: string,
+    input: {
+      expectedVersion: number;
+      criteriaResults: CriterionEvaluation[];
+      summary: string;
+      diffHash: string;
+      audit: GoalAcceptOverrideAudit;
+    },
+  ): { goal: GoalRecord; review: GoalReviewVerdict } {
+    const review = this.db.transaction((): GoalReviewVerdict => {
+      const goal = this.getGoal(goalIdStr);
+      if (!goal) throw new Error(`Unknown goal ${goalIdStr}`);
+      if (goal.version !== input.expectedVersion) {
+        throw new Error(`Goal ${goal.id} changed to v${goal.version} (expected v${input.expectedVersion}); not accepting.`);
+      }
+      if (goal.status === "draft" || goal.status === "achieved" || goal.status === "cancelled") {
+        throw new Error(`Goal ${goal.id} is ${goal.status}; cannot accept.`);
+      }
+      const nextCycle = goal.reviewCycle + 1;
+      const failedIds = input.criteriaResults.filter((r) => !r.passed).map((r) => r.criterionId).sort();
+      const fingerprint = createHash("sha256")
+        .update(`${goal.version}|${input.diffHash}|${[...new Set(failedIds)].join(",")}`)
+        .digest("hex")
+        .slice(0, 16);
+      const now = Date.now();
+      const row: GoalReviewVerdict & { source: GoalReviewSource; audit: GoalAcceptOverrideAudit | null } = {
+        id: reviewId(this.db),
+        goalId: goal.id,
+        goalVersion: goal.version,
+        cycle: nextCycle,
+        verdict: "approved",
+        criteriaResults: input.criteriaResults,
+        blockingIssues: [],
+        summary: input.summary,
+        progressFingerprint: fingerprint,
+        createdAt: now,
+        source: "director_accept_override",
+        audit: input.audit,
+      };
+      this.insertReviewRow(row);
+      this.db
+        .prepare(
+          `UPDATE goals
+           SET status = 'achieved', review_cycle = ?, no_progress_streak = 0,
+               last_progress_fingerprint = ?, last_review_summary = ?, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(nextCycle, fingerprint, input.summary, now, goal.id);
+      return row;
+    })();
+    const achieved = this.getGoal(review.goalId)!;
+    this.settleEscalations(achieved, "achieved");
+    return { goal: achieved, review };
   }
 
   listRevisions(goalIdStr: string): GoalRevisionRecord[] {
@@ -1037,10 +1237,27 @@ export class GoalEngine {
       summary: String(r.summary),
       progressFingerprint: String(r.progress_fingerprint),
       createdAt: Number(r.created_at),
+      source: (typeof r.source === "string" && r.source ? r.source : "review") as GoalReviewSource,
+      audit: parseAudit(r.audit_json),
     }));
   }
 
-  buildReviewerPrompt(goal: GoalRecord, gateResult: DeterministicGateResult, diffStat: string, diffPatch?: string): string {
+  buildReviewerPrompt(
+    goal: GoalRecord,
+    gateResult: DeterministicGateResult,
+    diffStat: string,
+    diffPatch?: string,
+    ctx?: {
+      reviewerMaxTurns?: number;
+      evidence?: { goalEvidenceDir: string; goalsDir: string; artifactsDir: string; runArtifactsDir?: string };
+      coordinatorFailure?: {
+        source: GoalProgressSource;
+        summary?: string;
+        criteriaResults: CriterionEvaluation[];
+        claimedAt?: number;
+      };
+    },
+  ): string {
     const lines = [
       `# Independent Skeptical Done-Review (Goal ${goal.id} v${goal.version}, Cycle ${goal.reviewCycle + 1}/${goal.budgets.maxReviewCycles})`,
       `Title: ${goal.title}`,
@@ -1061,9 +1278,41 @@ export class GoalEngine {
     for (const r of gateResult.results) {
       lines.push(`- [${r.criterionId}] ${r.passed ? "PASS" : "FAIL"}: ${r.evidence}`);
     }
+    const failure = ctx?.coordinatorFailure;
+    if (failure) {
+      lines.push(
+        "",
+        "## Coordinator-Reported Verification Failure (current revision)",
+        `Reported by: ${failure.source}${failure.claimedAt ? ` at ${new Date(failure.claimedAt).toISOString()}` : ""}`,
+        `Summary: ${failure.summary?.trim() || "(no summary)"}`,
+      );
+      for (const c of failure.criteriaResults.filter((r) => !r.passed)) {
+        lines.push(`- [${c.criterionId}] FAILED: ${c.evidence}${c.remediation ? ` (remediation: ${c.remediation})` : ""}`);
+      }
+      lines.push(
+        "Confirm or refute each reported failure with your own evidence. Do not approve unless every reported failure is refuted or fixed; say which in the summary.",
+      );
+    }
+    const ev = ctx?.evidence;
+    if (ev) {
+      lines.push(
+        "",
+        "## Evidence Locations (Read-Only)",
+        `- Goal Evidence Directory: ${ev.goalEvidenceDir} (env HARNESS_GOAL_EVIDENCE_DIR)`,
+        `- Goals Root: ${ev.goalsDir} (env HARNESS_GOALS_DIR)`,
+        `- Artifacts Root: ${ev.artifactsDir} (env HARNESS_ARTIFACTS_DIR)`,
+      );
+      if (ev.runArtifactsDir) lines.push(`- Run Artifacts Directory: ${ev.runArtifactsDir}`);
+    }
     lines.push("", "## Git Diff Summary", diffStat || "(no diff)");
     if (diffPatch?.trim()) {
       lines.push("", "## Git Diff Patch (truncated if large)", "```diff", diffPatch.trim(), "```");
+    }
+    if (ctx?.reviewerMaxTurns !== undefined) {
+      lines.push(
+        "",
+        `You may get one advisory progress check-in around ${ctx.reviewerMaxTurns} tool-call turns; the harness does not stop you by turn count. The review has a hard 10-minute wall-clock limit. Submit as soon as every required criterion has evidence; a changes_requested verdict with partial evidence is better than none.`,
+      );
     }
     lines.push(
       "",
@@ -1071,5 +1320,14 @@ export class GoalEngine {
       `{ "verdict": "approved" | "changes_requested" | "escalate_human", "criteriaResults": [{ "criterionId": "...", "passed": true|false, "evidence": "...", "remediation": "..." }], "blockingIssues": [], "summary": "..." }`,
     );
     return lines.join("\n");
+  }
+}
+
+function parseAudit(raw: unknown): GoalAcceptOverrideAudit | null {
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  try {
+    return JSON.parse(raw) as GoalAcceptOverrideAudit;
+  } catch {
+    return null;
   }
 }
