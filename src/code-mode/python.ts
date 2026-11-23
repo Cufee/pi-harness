@@ -254,6 +254,10 @@ def call(name, args=None, /, **fields):
     return _send({'name': name, 'args': {**(args or {}), **fields}})
 def output(value):
     _send({'kind': 'output', 'value': value})
+def report_error(error):
+    # Whether the script's terminal exception came from the sandbox itself; harness tool failures never do.
+    is_denial = not isinstance(error, ToolError) and (isinstance(error, PermissionError) or getattr(error, 'errno', None) in (1, 13))
+    _send({'kind': 'error', 'value': is_denial})
 `;
 
 // Defence in depth only: the OS sandbox profile is the real boundary and applies to every child process.
@@ -296,6 +300,10 @@ try:
 except SystemExit:
     raise
 except BaseException as _error:
+    try:
+        _cm_bridge.report_error(_error)
+    except Exception:
+        pass
     traceback.print_exception(type(_error), _error, _error.__traceback__.tb_next)
     sys.exit(1)
 `;

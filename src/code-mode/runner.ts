@@ -61,26 +61,15 @@ function send(msg) {
 export const call = (name,args={}) => send({name,args});
 export const output = value => { void send({kind:'output',value}) };
 globalThis.output = output;
+// Reports whether the script's terminal exception came from the sandbox itself; harness tool failures never do.
+export const reportError = e => send({kind:'error',value: !!e && !(e instanceof ToolError) &&
+  (e.code === 'EPERM' || e.code === 'EACCES' || e.message === 'Blocked by Code Mode sandbox')});
 `;
 }
 
 const message = (err: unknown) => err instanceof Error ? err.message : String(err);
-const SANDBOX_DENIAL = /\b(EPERM|EACCES)\b|operation not permitted|PermissionError|Blocked by Code Mode sandbox/i;
-// Harness tool rejections surface as ToolError (Bun "ToolError:", Python "_cm_bridge.ToolError:"); their text is not a sandbox denial.
-const TOOL_ERROR = /^\s*(?:[\w.]+\.)?ToolError:/;
-const BLOCK_END = /^\s+at |^Traceback \(most recent call last\):|^(?:During handling of the above exception|The above exception was the direct cause)|^\s*\d+ \| |^[A-Za-z_][\w.]*(?:Error|Exception):/;
-function formatScriptError(raw: string, stderrTail: string, toolNames: Iterable<string>): string {
-  // Ignore echoed script source (Bun code frames, indented Python source excerpts) so tokens in the code itself do not match.
-  const lines = stderrTail.split("\n");
-  let inToolError = false;
-  const diagnostics = lines.filter((line, i) => {
-    if (TOOL_ERROR.test(line)) { inToolError = true; return false; }
-    if (inToolError && !BLOCK_END.test(line)) return false;
-    inToolError = false;
-    if (/^\s*\d+ \| /.test(line)) return false;
-    return !(/^\s+/.test(line) && /^\s*File ".*", line \d+/.test(lines[i - 1] ?? ""));
-  }).join("\n");
-  if (!SANDBOX_DENIAL.test(diagnostics)) return raw;
+function formatScriptError(raw: string, sandboxDenial: boolean, toolNames: Iterable<string>): string {
+  if (!sandboxDenial) return raw;
   const available = new Set(toolNames);
   const readers = (["read_file", "artifact_read"] as const).filter((name) => available.has(name));
   const guidance = readers.length > 0
@@ -106,7 +95,7 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
   const sockets = new Set<Socket>();
   const execAbort = new AbortController();
   let pending = 0, pendingBytes = 0;
-  let child: ChildProcess | undefined, dir: string | undefined, output: unknown, stopped = false;
+  let child: ChildProcess | undefined, dir: string | undefined, output: unknown, sandboxDenial = false, stopped = false;
   function kill() {
     if (child?.pid) try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
   }
@@ -156,6 +145,7 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
       }
       if (!Number.isSafeInteger(id)) throw new Error("Invalid IPC request id");
       if (kind === "output") { output = value; reply({ ok: true }); return; }
+      if (kind === "error") { sandboxDenial = Boolean(value); reply({ ok: true }); return; }
       if (typeof name !== "string" || !args || Array.isArray(args) || typeof args !== "object") throw new Error("Invalid tool call");
       const event = { name, args, via: "code_exec" as const };
       result.toolCalls++;
@@ -199,7 +189,8 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
         .map((n, i) => `const t${i} = args => call(${JSON.stringify(n)}, args); export { t${i} as ${JSON.stringify(n)} };`);
       await Promise.all([
         writeFile(join(dir, "bridge.mjs"), bridge(socket)), writeFile(join(dir, "guard.mjs"), guard),
-        writeFile(join(dir, "script.ts"), opts.code),
+        writeFile(join(dir, "_user.ts"), opts.code),
+        writeFile(join(dir, "script.ts"), "import { reportError } from './bridge.mjs';\ntry { await import('./_user.ts'); } catch (e) { try { await reportError(e); } catch {} throw e; }\n"),
         writeFile(join(pkg, "package.json"), '{"name":"harness","type":"module","main":"index.mjs","types":"index.d.ts"}'),
         writeFile(join(pkg, "index.d.ts"), generateSdkDeclarations(opts.tools)),
         writeFile(join(pkg, "index.mjs"), `import {call,output} from '../../bridge.mjs'; export {output};\n${exports.join("\n")}`),
@@ -208,21 +199,16 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socket, resolve); });
     if (stopped) return result;
     child = spawn(cmd!, args, { cwd: dir, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
-    let tail = "", stderrTail = "";
+    let tail = "";
     for (const stream of [child.stdout!, child.stderr!]) {
       stream.setEncoding("utf8");
       stream.on("data", (s: string) => { result.logs += s.slice(0, Math.max(0, 8192 - result.logs.length)); tail = (tail + s).slice(-2048); });
     }
-    child.stderr!.on("data", (s: string) => {
-      stderrTail += s;
-      // Keep whole lines only, so a truncated leading fragment cannot break frame-header detection.
-      if (stderrTail.length > 4096) { stderrTail = stderrTail.slice(-4096); stderrTail = stderrTail.slice(stderrTail.indexOf("\n") + 1); }
-    });
     const status = await new Promise<number | null>((resolve, reject) => { child!.once("error", reject); child!.once("close", resolve); });
     child = undefined;
     if (stopped) return result;
     clearTimeout(timer); opts.signal?.removeEventListener("abort", abort);
-    if (status !== 0) throw new Error(formatScriptError(tail.trim() || `${python ? "Python" : "Bun"} exited with status ${status}`, stderrTail, names));
+    if (status !== 0) throw new Error(formatScriptError(tail.trim() || `${python ? "Python" : "Bun"} exited with status ${status}`, sandboxDenial, names));
     const json = JSON.stringify(output) ?? "";
     const limit = Math.max(0, opts.maxOutputChars ?? 20_000);
     result.preview = json.slice(0, limit);
