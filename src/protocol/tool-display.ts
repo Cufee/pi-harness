@@ -4,6 +4,7 @@ import type { EscalationRecord, TaskRecord } from "../control-plane/db.js";
 import type { RunActivitySummary } from "../control-plane/telemetry.js";
 import type { RunnerCallbacks } from "../runners/types.js";
 import type { GoalRecord, GoalReviewVerdict } from "../goals/engine.js";
+import { isCurrentClaim } from "../goals/live-progress.js";
 
 export function toolEventPreview(value: unknown): string | undefined {
   if (value === undefined || value === null) return undefined;
@@ -123,6 +124,32 @@ function criterionResults(goal: GoalRecord, review: GoalReviewVerdict | null): M
   return results;
 }
 
+/**
+ * Read-path projection: hides verification claims made for an earlier goal version, run, or review cycle.
+ * Pure (never writes) and never changes `status`. Legacy progress without provenance is shown as stored.
+ */
+export function reconcileGoalWithLiveRun(goal: GoalRecord): GoalRecord {
+  if (goal.status === "draft" || goal.status === "paused" || goal.status === "achieved" || goal.status === "cancelled") {
+    return goal;
+  }
+  const lp = goal.liveProgress;
+  if (!lp) return goal;
+  const hasProvenance = lp.goalVersion !== undefined || lp.runId !== undefined || lp.reviewCycle !== undefined;
+  if (!hasProvenance || isCurrentClaim(goal, lp)) return goal;
+  const {
+    verificationStatus: _v,
+    criteriaResults: _c,
+    goalVersion: _gv,
+    runId: _r,
+    reviewCycle: _rc,
+    source: _s,
+    claimedAt: _ca,
+    ...rest
+  } = lp;
+  const liveProgress = rest.phase === undefined && rest.summary === undefined ? null : rest;
+  return { ...goal, liveProgress };
+}
+
 /** Derives a dynamic verification/review label from actual review records, live `verify` tasks, and model-reported progress. */
 export function deriveGoalVerificationLabel(
   goal: GoalRecord,
@@ -139,6 +166,15 @@ export function deriveGoalVerificationLabel(
   }
   if (runningVerify > 0 || goal.status === "verifying" || goal.status === "reviewing" || goal.liveProgress?.verificationStatus === "in_progress") {
     return runningVerify > 1 ? `verifying (${runningVerify})` : "verifying";
+  }
+  // Live execution outranks labels from earlier cycles (a previous review or a stale failed self-check).
+  if (
+    goal.status === "executing" &&
+    activity &&
+    activity.counts.running > 0 &&
+    ["researching", "planning", "implementing", "merging", "paused_quota"].includes(activity.phase)
+  ) {
+    return `${activity.phase} (${activity.counts.running})`;
   }
   if (goal.reviewCycle > 0) {
     return `${goal.reviewCycle} rev`;

@@ -6,6 +6,12 @@
  * and `formatChatEventSummary`.
  */
 
+export type ChatEventSource = "director" | "user" | "system";
+
+function parseEventSource(v: unknown): { source?: ChatEventSource } {
+  return v === "director" || v === "user" || v === "system" ? { source: v } : {};
+}
+
 export type ChatControlEvent =
   | {
       kind: "goal.settled";
@@ -19,6 +25,8 @@ export type ChatControlEvent =
       detail?: string;
       /** Cause category: "explicit_stop", "run_failed", "quota_paused", "escalation", or "verification_error". */
       cause?: string;
+      /** Who caused the settlement; director-originated events do not wake the Director. */
+      source?: ChatEventSource;
     }
   | {
       kind: "goal.committed";
@@ -44,6 +52,8 @@ export type ChatControlEvent =
       status: string;
       summary: string;
       circuitBreakerTripped?: string;
+      /** Who caused the review (e.g. a director or user accept override). */
+      source?: ChatEventSource;
     }
   | {
       kind: "director.read_file";
@@ -107,6 +117,7 @@ export function parseChatControlEvent(raw: unknown): ChatControlEvent | null {
         openEscalations: typeof r.openEscalations === "number" ? r.openEscalations : 0,
         ...(typeof r.detail === "string" && r.detail ? { detail: r.detail } : {}),
         ...(typeof r.cause === "string" && r.cause ? { cause: r.cause } : {}),
+        ...parseEventSource(r.source),
       };
     }
     case "goal.committed": {
@@ -164,6 +175,7 @@ export function parseChatControlEvent(raw: unknown): ChatControlEvent | null {
         status: r.status,
         summary: r.summary,
         ...(typeof r.circuitBreakerTripped === "string" ? { circuitBreakerTripped: r.circuitBreakerTripped } : {}),
+        ...parseEventSource(r.source),
       };
     }
     case "director.read_file": {
@@ -237,7 +249,10 @@ export function formatChatEventSummary(event: ChatControlEvent): string {
     case "goal.settled": {
       const head = `Goal ${event.goalId} v${event.goalVersion} ("${event.goalTitle}")`;
       const esc = event.openEscalations ? ` (${event.openEscalations} open escalation(s))` : "";
-      if (event.runStatus === "completed") return `${head} run ${event.runId} completed${esc}.`;
+      if (event.runStatus === "completed") {
+        const detail = event.detail?.trim();
+        return `${head} run ${event.runId} completed${esc}${detail ? `: ${detail}` : ""}.`;
+      }
       const recovery =
         `Nothing restarts automatically. Continue it in place with \`pi-harness resume ${event.runId}\`, ` +
         `inspect it with \`pi-harness tree ${event.runId}\`, or send a new request.`;
@@ -258,8 +273,11 @@ export function formatChatEventSummary(event: ChatControlEvent): string {
       return `Goal ${event.goalId} v${event.goalVersion} started autonomous run ${event.runId} (${event.criteriaCount} criteria).`;
     case "goal.amended":
       return `Goal ${event.goalId} v${event.fromVersion}->v${event.toVersion} amended (${event.rationale}); stale reviews invalidated.`;
-    case "goal.reviewed":
-      return `Goal ${event.goalId} v${event.goalVersion} review #${event.cycle} (${event.status}): ${event.summary}`;
+    case "goal.reviewed": {
+      const by = event.source === "director" || event.source === "user" ? event.source : null;
+      const override = by ? (/override/i.test(event.summary) ? ` [${by} override]` : ` [by ${by}]`) : "";
+      return `Goal ${event.goalId} v${event.goalVersion} review #${event.cycle} (${event.status})${override}: ${event.summary}`;
+    }
     case "director.read_file":
       return `Director read_file: ${event.path} (${event.bytes} bytes${event.offset && event.offset > 0 ? ` at offset ${event.offset}` : ""})${event.reason ? `. Reason: ${event.reason}` : "."}`;
     case "timer.scheduled":
