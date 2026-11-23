@@ -543,6 +543,7 @@ export class GoalInspectorScreen implements Screen {
           return this.subList.render(innerW, bodyH, theme);
         }
 
+        const proseW = innerW >= 6 ? innerW - 2 : innerW;
         const lines: string[] = [
           kvRow("Goal", `${g.id} (v${g.version})`, innerW, theme),
           kvRow("Status", statusBadge(g.status, theme), innerW, theme),
@@ -556,7 +557,7 @@ export class GoalInspectorScreen implements Screen {
             : []),
           "",
           divider(innerW, theme, "Description"),
-          ...renderTranscriptBlock({ kind: "text", format: "markdown", text: g.description || g.title }, innerW, theme),
+          ...renderTranscriptBlock({ kind: "text", format: "markdown", text: g.description || g.title }, proseW, theme),
         ];
 
         if (g.criteria.length > 0) {
@@ -577,7 +578,7 @@ export class GoalInspectorScreen implements Screen {
           lines.push(
             "",
             divider(innerW, theme, "Latest Review Summary"),
-            ...renderTranscriptBlock({ kind: "text", format: "markdown", text: g.lastReviewSummary }, innerW, theme),
+            ...renderTranscriptBlock({ kind: "text", format: "markdown", text: g.lastReviewSummary }, proseW, theme),
           );
         }
 
@@ -1157,11 +1158,12 @@ export class TaskInspectorScreen implements Screen {
           kvRow("Updated", `${formatClock(t.updatedAt)} (${formatAge(t.updatedAt)})`, innerW, theme),
         ];
 
+        const proseW = innerW >= 6 ? innerW - 2 : innerW;
         if (t.summary) {
           lines.push(
             "",
             divider(innerW, theme, "Summary"),
-            ...renderTranscriptBlock({ kind: "text", format: "markdown", text: t.summary }, innerW, theme),
+            ...renderTranscriptBlock({ kind: "text", format: "markdown", text: t.summary }, proseW, theme),
           );
         }
 
@@ -1174,7 +1176,7 @@ export class TaskInspectorScreen implements Screen {
             lines.push(
               "",
               divider(innerW, theme, "Handoff"),
-              ...renderTranscriptBlock({ kind: "text", format: "markdown", text: handoffText }, innerW, theme),
+              ...renderTranscriptBlock({ kind: "text", format: "markdown", text: handoffText }, proseW, theme),
             );
           }
         }
@@ -1224,14 +1226,14 @@ export class TaskInspectorScreen implements Screen {
           lines.push(
             "",
             divider(innerW, theme, "Objective"),
-            ...renderTranscriptBlock({ kind: "text", format: "markdown", text: t.objective }, innerW, theme),
+            ...renderTranscriptBlock({ kind: "text", format: "markdown", text: t.objective }, proseW, theme),
           );
         }
         if (t.criteria) {
           lines.push(
             "",
             divider(innerW, theme, "Criteria"),
-            ...renderTranscriptBlock({ kind: "text", format: "markdown", text: t.criteria }, innerW, theme),
+            ...renderTranscriptBlock({ kind: "text", format: "markdown", text: t.criteria }, proseW, theme),
           );
         }
 
@@ -1410,6 +1412,10 @@ class ArtifactInspectorScreen implements Screen {
     }
   }
 
+  private get showingView(): boolean {
+    return !(this.loading && !this.result) && !this.error;
+  }
+
   render(width: number, maxHeight: number, theme: Theme): string[] {
     const hasMore = Boolean(this.result?.hasMore ?? this.result?.truncated);
     const hints: Hint[] = [
@@ -1433,7 +1439,7 @@ class ArtifactInspectorScreen implements Screen {
       hints,
       renderBody: (innerW, bodyH) => {
         if (this.loading && !this.result) return [theme.muted("Loading artifact...")];
-        if (this.error) return [theme.danger(this.error)];
+        if (this.error) return [theme.danger(sanitizeLine(this.error))];
         return this.view.render(innerW, bodyH, theme);
       },
     });
@@ -1441,8 +1447,11 @@ class ArtifactInspectorScreen implements Screen {
 
   handleMouse(ev: OverlayMouseEvent, ctx: ScreenContext): void {
     const rect = this.frame.bodyRect;
-    if (!rect || this.frame.hasInlineModal) return;
-    this.view.handleMouse({ ...ev, x: ev.x - rect.col, y: ev.y - rect.row }, ctx);
+    if (!rect || this.frame.hasInlineModal || !this.showingView) return;
+    const localX = ev.x - rect.col;
+    const localY = ev.y - rect.row;
+    if (ev.type === "press" && (localX < 0 || localX >= rect.width || localY < 0 || localY >= rect.height)) return;
+    this.view.handleMouse({ ...ev, x: localX, y: localY }, ctx);
   }
 
   handleInput(data: string, ctx: ScreenContext): void {
@@ -1457,7 +1466,7 @@ class ArtifactInspectorScreen implements Screen {
       void this.load(ctx);
       return;
     }
-    if (this.view.handleKey(data, ctx)) {
+    if (this.showingView && this.view.handleKey(data, ctx)) {
       ctx.requestRender();
       return;
     }
@@ -1861,7 +1870,10 @@ export class LiveTranscriptScreen implements Screen {
     this.lastCtx = ctx;
     const rect = this.frame.bodyRect;
     if (!rect) return;
-    this.view.handleMouse({ ...ev, x: ev.x - rect.col, y: ev.y - rect.row }, ctx);
+    const localX = ev.x - rect.col;
+    const localY = ev.y - rect.row;
+    if (ev.type === "press" && (localX < 0 || localX >= rect.width || localY < 0 || localY >= rect.height)) return;
+    this.view.handleMouse({ ...ev, x: localX, y: localY }, ctx);
   }
 
   handleInput(data: string, ctx: ScreenContext): void {
@@ -1900,7 +1912,18 @@ function genericDetailBlocks(ref: EntityRef): ViewBlock[] {
       },
     ];
   }
-  return [{ id: 1, rev: 1, block: { kind: "text", format: "plain", text: `${ref.kind}: ${ref.id}\n${ref.label}` } }];
+  const fallbackText = `${ref.kind}: ${ref.id}\n${ref.label}`;
+  return [
+    {
+      id: 1,
+      rev: 1,
+      block: {
+        kind: "rows",
+        render: (w, theme) => renderTranscriptBlock({ kind: "text", format: "plain", text: fallbackText }, w, theme),
+        copy: JSON.stringify(ref, null, 2),
+      },
+    },
+  ];
 }
 
 class GenericDetailScreen implements Screen {
@@ -1940,7 +1963,10 @@ class GenericDetailScreen implements Screen {
   handleMouse(ev: OverlayMouseEvent, ctx: ScreenContext): void {
     const rect = this.frame.bodyRect;
     if (!rect) return;
-    this.view.handleMouse({ ...ev, x: ev.x - rect.col, y: ev.y - rect.row }, ctx);
+    const localX = ev.x - rect.col;
+    const localY = ev.y - rect.row;
+    if (ev.type === "press" && (localX < 0 || localX >= rect.width || localY < 0 || localY >= rect.height)) return;
+    this.view.handleMouse({ ...ev, x: localX, y: localY }, ctx);
   }
 
   handleInput(data: string, ctx: ScreenContext): void {

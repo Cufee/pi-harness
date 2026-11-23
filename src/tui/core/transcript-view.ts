@@ -59,6 +59,41 @@ interface ReadAnchor {
   blockId: number;
   row: number;
   rowsAtCapture: number;
+  widthAtCapture: number;
+}
+
+interface NormalizedSelection {
+  mode: "row" | "cell";
+  startRow: number;
+  endRow: number;
+  startCol: number;
+  endCol: number;
+}
+
+const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/** Snaps inclusive cell range `[c0, c1]` outward to whole grapheme boundaries on `row`. */
+function snapCellRange(row: string, c0: number, c1: number, contentW: number): { c0: number; c1: number } {
+  const maxCol = Math.max(0, contentW - 1);
+  let start = Math.max(0, Math.min(maxCol, c0));
+  let end = Math.max(start, Math.min(maxCol, c1));
+  const plain = stripTerminalSequences(row);
+  if (!plain || !/[^\x20-\x7e]/.test(plain)) {
+    return { c0: start, c1: end };
+  }
+  let col = 0;
+  for (const { segment } of GRAPHEME_SEGMENTER.segment(plain)) {
+    const w = visibleWidth(segment);
+    if (w > 0) {
+      const gStart = col;
+      const gEnd = col + w - 1;
+      if (start >= gStart && start <= gEnd) start = gStart;
+      if (end >= gStart && end <= gEnd) end = Math.min(maxCol, gEnd);
+    }
+    col += w;
+    if (col > end) break;
+  }
+  return { c0: start, c1: end };
 }
 
 export class TranscriptView {
@@ -78,6 +113,7 @@ export class TranscriptView {
   private lastInnerWidth = 0;
   private lastContentWidth = 0;
   private lastBodyHeight = 10;
+  private lastDrawnRows = 0;
 
   private cursor: BlockPos | null = null;
   private selMode: "none" | "row" | "cell" = "none";
@@ -98,10 +134,6 @@ export class TranscriptView {
     this.emptyText = opts?.emptyText ?? "Empty";
     this.notify = opts?.notify;
     this.onInspect = opts?.onInspect;
-  }
-
-  get following(): boolean {
-    return this.viewport.follow;
   }
 
   get hasSelection(): boolean {
@@ -139,17 +171,18 @@ export class TranscriptView {
   hints(): Hint[] {
     const hasFoldable = this.entries.some((e) => isFoldable(e.block.block));
     return [
-      { key: "↑↓", label: "cursor" },
-      { key: "v/⇧↑↓", label: this.hasSelection ? "selecting" : "select" },
+      { key: "Esc", label: this.hasSelection ? "clear" : "close" },
+      { key: "drag", label: "copy" },
       { key: "y", label: "copy" },
       ...(hasFoldable || this.followCapable ? [{ key: "⏎", label: "fold" }] : []),
+      { key: "↑↓", label: "cursor" },
       ...(this.onInspect ? [{ key: "Ctrl+X", label: "inspect" }] : []),
       ...(this.followCapable
         ? [{ key: "f/End", label: this.viewport.follow ? "follow:on" : "follow:off" }]
         : []),
+      { key: "v/⇧↑↓", label: this.hasSelection ? "selecting" : "select" },
       { key: "PgUp/PgDn/wheel", label: "scroll" },
       { key: "Y", label: "copy all" },
-      { key: "Esc", label: this.hasSelection ? "clear" : "close" },
     ];
   }
 
@@ -196,13 +229,7 @@ export class TranscriptView {
     this.selHead = null;
   }
 
-  private normalizedSelection(): {
-    mode: "row" | "cell";
-    startRow: number;
-    endRow: number;
-    startCol: number;
-    endCol: number;
-  } | null {
+  private normalizedSelection(): NormalizedSelection | null {
     if (this.selMode === "none" || !this.selAnchor || !this.selHead) return null;
     const aRow = this.posToGlobalRow(this.selAnchor);
     const hRow = this.posToGlobalRow(this.selHead);
@@ -225,6 +252,31 @@ export class TranscriptView {
     };
   }
 
+  private rowSelectionCols(
+    row: string,
+    globalRow: number,
+    sel: NormalizedSelection,
+    contentW: number,
+  ): { c0: number; c1: number } {
+    const maxCol = Math.max(0, contentW - 1);
+    if (sel.mode !== "cell") return { c0: 0, c1: maxCol };
+    let rawStart = 0;
+    let rawEnd = maxCol;
+    if (sel.startRow === sel.endRow) {
+      rawStart = Math.min(sel.startCol, maxCol);
+      rawEnd = Math.min(sel.endCol, maxCol);
+    } else if (globalRow === sel.startRow) {
+      rawStart = Math.min(sel.startCol, maxCol);
+      rawEnd = maxCol;
+    } else if (globalRow === sel.endRow) {
+      rawStart = 0;
+      rawEnd = Math.min(sel.endCol, maxCol);
+    } else {
+      return { c0: 0, c1: maxCol };
+    }
+    return snapCellRange(row, rawStart, rawEnd, contentW);
+  }
+
   /* ── read anchor & follow ── */
 
   private captureAnchor(): void {
@@ -236,6 +288,7 @@ export class TranscriptView {
       blockId: pos.blockId,
       row: pos.row,
       rowsAtCapture: entry.rows.length,
+      widthAtCapture: this.lastContentWidth,
     };
   }
 
@@ -246,7 +299,7 @@ export class TranscriptView {
     if (entry) {
       const count = entry.rows.length;
       const mapped =
-        count === anchor.rowsAtCapture
+        this.lastContentWidth === anchor.widthAtCapture || count === anchor.rowsAtCapture
           ? Math.min(count - 1, anchor.row)
           : Math.min(count - 1, Math.floor((anchor.row * count) / Math.max(1, anchor.rowsAtCapture)));
       this.viewport.offset = entry.start + Math.max(0, mapped);
@@ -303,7 +356,12 @@ export class TranscriptView {
       this.cursor = { blockId: vb.id, row: 0 };
     }
     if (!this.viewport.follow && this.readAnchor?.blockId === vb.id) {
-      this.readAnchor = { blockId: vb.id, row: 0, rowsAtCapture: 1 };
+      this.readAnchor = {
+        blockId: vb.id,
+        row: 0,
+        rowsAtCapture: 1,
+        widthAtCapture: this.lastContentWidth,
+      };
     }
     this.revealBlockId = vb.id;
   }
@@ -316,21 +374,8 @@ export class TranscriptView {
 
     for (let g = sel.startRow; g <= sel.endRow; g++) {
       const row = this.rawRowAt(g);
-      let c0 = 0;
-      let len = contentW;
-      if (sel.mode === "cell") {
-        if (sel.startRow === sel.endRow) {
-          c0 = sel.startCol;
-          len = Math.max(0, sel.endCol - sel.startCol + 1);
-        } else if (g === sel.startRow) {
-          c0 = sel.startCol;
-          len = Math.max(0, contentW - sel.startCol);
-        } else if (g === sel.endRow) {
-          c0 = 0;
-          len = Math.max(0, sel.endCol + 1);
-        }
-      }
-      const text = stripTerminalSequences(sliceByColumn(row, c0, len, false)).trimEnd();
+      const { c0, c1 } = this.rowSelectionCols(row, g, sel, contentW);
+      const text = stripTerminalSequences(sliceByColumn(row, c0, Math.max(0, c1 - c0 + 1), true)).trimEnd();
       pieces.push({ text, fromCol0: c0 === 0 });
     }
 
@@ -377,8 +422,11 @@ export class TranscriptView {
     const contentW = Math.max(1, rowW - 2);
 
     const widthChanged = this.lastContentWidth > 0 && this.lastContentWidth !== contentW;
-    if (widthChanged && this.selMode === "cell") {
-      this.clearSelection();
+    if (widthChanged) {
+      if (this.selMode === "cell" || this.dragging) {
+        this.clearSelection();
+      }
+      this.dragging = false;
     }
     this.lastInnerWidth = innerW;
     this.lastContentWidth = contentW;
@@ -389,6 +437,7 @@ export class TranscriptView {
       this.entries = [];
       this.indexById.clear();
       this.totalRows = 0;
+      this.lastDrawnRows = 0;
       this.rowCache.clear();
       this.folds.clear();
       return [clamp(theme.muted(this.emptyText), innerW)];
@@ -398,11 +447,13 @@ export class TranscriptView {
     const entries: LayoutEntry[] = [];
     const indexById = new Map<number, number>();
     let totalRows = 0;
+    let foldRowDelta = 0;
 
     for (const vb of blocks) {
       seenIds.add(vb.id);
       const fold = this.folds.get(vb.id) ?? defaultFold(vb.block);
-      let cached = this.rowCache.get(vb.id);
+      const prev = this.rowCache.get(vb.id);
+      let cached = prev;
       if (
         !cached ||
         cached.rev !== vb.rev ||
@@ -411,6 +462,13 @@ export class TranscriptView {
         cached.color !== theme.color
       ) {
         const rows = renderTranscriptBlock(vb.block, contentW, theme, fold);
+        if (prev && prev.width === contentW && prev.fold !== fold) {
+          const prevLen =
+            prev.rev === vb.rev
+              ? prev.rows.length
+              : renderTranscriptBlock(vb.block, contentW, theme, prev.fold).length;
+          foldRowDelta += rows.length - prevLen;
+        }
         cached = { rev: vb.rev, width: contentW, fold, color: theme.color, rows };
         this.rowCache.set(vb.id, cached);
       }
@@ -432,11 +490,16 @@ export class TranscriptView {
     this.totalRows = totalRows;
 
     if (totalRows === 0) {
+      this.lastDrawnRows = 0;
       return [clamp(theme.muted(this.emptyText), innerW)];
     }
 
-    if (widthChanged && !this.viewport.follow) {
-      this.pausedAtRows = totalRows;
+    if (!this.viewport.follow) {
+      if (widthChanged) {
+        this.pausedAtRows = totalRows;
+      } else if (foldRowDelta !== 0) {
+        this.pausedAtRows += foldRowDelta;
+      }
     }
 
     // Clamp cursor / selection endpoints if blocks shrunk or vanished.
@@ -488,18 +551,7 @@ export class TranscriptView {
           if (!theme.color) {
             displayRows.push(clamp(gutter + raw, rowW));
           } else {
-            let c0 = 0;
-            let c1 = contentW - 1;
-            if (sel.startRow === sel.endRow) {
-              c0 = Math.min(sel.startCol, contentW - 1);
-              c1 = Math.min(sel.endCol, contentW - 1);
-            } else if (globalRow === sel.startRow) {
-              c0 = Math.min(sel.startCol, contentW - 1);
-              c1 = contentW - 1;
-            } else if (globalRow === sel.endRow) {
-              c0 = 0;
-              c1 = Math.min(sel.endCol, contentW - 1);
-            }
+            const { c0, c1 } = this.rowSelectionCols(raw, globalRow, sel, contentW);
             const padded = fit(raw, contentW);
             const before = c0 > 0 ? sliceByColumn(padded, 0, c0, true) : "";
             const selected = sliceByColumn(padded, c0, Math.max(0, c1 - c0 + 1), true);
@@ -515,7 +567,9 @@ export class TranscriptView {
       }
     }
 
-    return this.viewport.render(displayRows, innerW, bodyH, theme);
+    const rendered = this.viewport.render(displayRows, innerW, bodyH, theme);
+    this.lastDrawnRows = rendered.length;
+    return rendered;
   }
 
   /* ── keyboard input ── */
@@ -736,10 +790,12 @@ export class TranscriptView {
 
     if (ev.type === "press") {
       if (ev.button !== "left") return;
-      if (ev.y < 0 || ev.y >= this.lastBodyHeight || ev.x < 0 || ev.x >= this.lastInnerWidth) return;
-      this.clearSelection();
-      const pos = this.bodyRowToPos(ev.y);
+      if (ev.y < 0 || ev.y >= this.lastDrawnRows || ev.x < 0 || ev.x >= this.lastInnerWidth) return;
+      const globalRow = this.viewport.offset + ev.y;
+      if (globalRow < 0 || globalRow >= this.totalRows) return;
+      const pos = this.globalRowToPos(globalRow);
       if (!pos) return;
+      this.clearSelection();
       const col = this.toContentCol(ev.x);
       this.dragging = true;
       this.cursor = { blockId: pos.blockId, row: pos.row };
@@ -750,6 +806,10 @@ export class TranscriptView {
 
     if (ev.type === "drag") {
       if (!this.dragging || !this.selAnchor) return;
+      if (this.viewport.follow) {
+        this.pause();
+        this.captureAnchor();
+      }
       if (ev.y < 0) {
         this.pause();
         this.viewport.scrollBy(-1);
@@ -799,12 +859,12 @@ export class TranscriptView {
         return;
       }
 
-      // Click (press and release on the same cell): toggle fold on a foldable block's first visible row.
+      // Click (press and release on the same cell): toggle fold on a foldable block's header row only.
       this.clearSelection();
       const entry = this.entryById(head.blockId);
       if (entry && isFoldable(entry.block.block)) {
         const headerRow = entry.rows[0] === "" && entry.rows.length > 1 ? 1 : 0;
-        if (head.row === 0 || head.row === headerRow) {
+        if (head.row === headerRow) {
           this.toggleBlockFold(entry.block);
           return;
         }

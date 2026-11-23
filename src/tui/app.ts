@@ -27,6 +27,7 @@ import {
   TerminalSession,
 } from "./core/index.js";
 import { type InspectorDeps, openEntityInspector } from "./inspectors.js";
+import { foldAgentEvent } from "./live-transcript.js";
 import {
   EffortPickerScreen,
   GoToPaletteScreen,
@@ -1823,105 +1824,71 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
     const p = (ev.payload ?? {}) as Record<string, unknown>;
     const who = ev.taskId ?? ev.runId;
 
-    if (ev.type === "agent.text_delta") {
-      const txt = String(p.text ?? p.delta ?? "");
-      if (txt) {
-        if (liveTaskId && liveTaskId !== who) {
+    const f = foldAgentEvent(ev);
+    if (f) {
+      switch (f.kind) {
+        case "text":
+          if (f.delta) {
+            if (liveTaskId && liveTaskId !== who) {
+              flushRunTail();
+            }
+            if (!shell.transcript.liveTail.isActive) {
+              shell.transcript.liveTail.begin(who);
+            }
+            liveTaskId = who;
+            shell.transcript.liveTail.appendText(f.delta);
+            shell.session.tui.requestRender();
+          }
+          return;
+
+        case "thought":
+          if (f.delta) {
+            shell.transcript.liveTail.appendThought(f.delta);
+            shell.session.tui.requestRender();
+          }
+          return;
+
+        case "turn_end":
           flushRunTail();
+          shell.session.tui.requestRender();
+          return;
+
+        case "tool": {
+          if (f.legacy) return;
+          const id = f.id ?? `${who}:${String(f.payload.name ?? f.payload.title ?? "tool")}`;
+          const detail =
+            typeof f.payload.error === "string"
+              ? f.payload.error
+              : typeof f.payload.result === "string"
+                ? firstLine(f.payload.result, 60)
+                : typeof f.payload.args === "string"
+                  ? firstLine(f.payload.args, 60)
+                  : undefined;
+          shell.transcript.liveTail.upsertTool({ id, label: `${who}: ${f.label}`, status: f.status, detail });
+          if (f.status !== "running") {
+            shell.recordRef({
+              kind: "tool_call",
+              id,
+              runId: ev.runId,
+              label: `${who} ${f.label}${detail ? `: ${detail}` : ""}`,
+              payload: f.payload,
+            });
+          }
+          shell.session.tui.requestRender();
+          return;
         }
-        if (!shell.transcript.liveTail.isActive) {
-          shell.transcript.liveTail.begin(who);
-        }
-        liveTaskId = who;
-        shell.transcript.liveTail.appendText(txt);
-        shell.session.tui.requestRender();
+
+        case "notice":
+          flushRunTail();
+          shell.transcript.appendReceipt({
+            tone: f.tone,
+            glyph: f.glyph ? shell.theme.glyphs[f.glyph] : undefined,
+            tag: f.tag.startsWith("quota:") ? f.tag : `${who} ${f.tag}`,
+            text: f.text,
+          });
+          shell.session.tui.requestRender();
+          return;
       }
-      return;
-    }
-
-    if (ev.type === "agent.thought_delta") {
-      const txt = String(p.text ?? p.delta ?? "");
-      if (txt) {
-        shell.transcript.liveTail.appendThought(txt);
-        shell.session.tui.requestRender();
-      }
-      return;
-    }
-
-    if (ev.type === "agent.tool") {
-      const id = String(p.id ?? p.toolCallId ?? `${who}:${String(p.name ?? p.title ?? "tool")}`);
-      const label = formatToolLabel(String(p.title ?? p.name ?? "tool"));
-      const rawSt = String(p.status ?? "running");
-      const status =
-        rawSt === "completed" || rawSt === "ok"
-          ? "ok"
-          : rawSt === "failed" || rawSt === "error"
-            ? "error"
-            : "running";
-      const detail =
-        typeof p.error === "string"
-          ? p.error
-          : typeof p.result === "string"
-            ? firstLine(p.result, 60)
-            : typeof p.args === "string"
-              ? firstLine(p.args, 60)
-              : undefined;
-      shell.transcript.liveTail.upsertTool({ id, label: `${who}: ${label}`, status, detail });
-      if (status !== "running") {
-        shell.recordRef({
-          kind: "tool_call",
-          id,
-          runId: ev.runId,
-          label: `${who} ${label}${detail ? `: ${detail}` : ""}`,
-          payload: p,
-        });
-      }
-      shell.session.tui.requestRender();
-      return;
-    }
-
-    if (ev.type === "agent.turn_end") {
-      flushRunTail();
-      shell.session.tui.requestRender();
-      return;
-    }
-
-    if (ev.type === "agent.rollover") {
-      flushRunTail();
-      const gen = p.generation ?? p.nextGeneration ?? "";
-      shell.transcript.appendReceipt({
-        tone: "info",
-        tag: `${who} rollover`,
-        text: `Clean rollover${gen ? ` → gen ${gen}` : ""}${p.reason ? ` (${sanitizeLine(String(p.reason))})` : ""}`,
-      });
-      shell.session.tui.requestRender();
-      return;
-    }
-
-    if (ev.type === "agent.error") {
-      flushRunTail();
-      shell.transcript.appendReceipt({
-        glyph: shell.theme.glyphs.cross,
-        tone: "danger",
-        tag: `${who} error`,
-        text: sanitizeLine(String(p.message ?? p.error ?? "Agent error")),
-      });
-      shell.session.tui.requestRender();
-      return;
-    }
-
-    if (ev.type.startsWith("quota.")) {
-      flushRunTail();
-      const reason = sanitizeLine(String(p.reason ?? p.mode ?? ev.type));
-      const wake = p.resumeAt ? ` · resume ${formatCountdown(p.resumeAt as number | string)}` : "";
-      shell.transcript.appendReceipt({
-        glyph: shell.theme.glyphs.pause,
-        tone: ev.type === "quota.run_resumed" ? "ok" : "warn",
-        tag: ev.type.replace(/^quota\./, "quota:"),
-        text: `${reason}${wake}`,
-      });
-      shell.session.tui.requestRender();
-      return;
     }
 
     if (ev.type === "escalation.created") {

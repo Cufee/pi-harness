@@ -256,7 +256,7 @@ export class Frame {
       row: bodyRow,
       col: 1 + padX,
       width: innerW,
-      height: Math.min(Math.max(1, bodyLines.length), Math.max(0, maxH - bodyRow)),
+      height: Math.min(bodyLines.length, Math.max(0, maxH - bodyRow)),
     };
 
     if (padY) out.push(boxRow(""));

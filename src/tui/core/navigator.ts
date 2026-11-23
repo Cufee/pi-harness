@@ -171,21 +171,22 @@ export class Navigator {
         if (isKeyRelease(data)) return;
         const top = this.current;
         if (!top) return;
-        const mouseEvents = parseMouseEvents(data);
-        if (mouseEvents.length > 0) {
-          if (top.handleMouse) {
-            const bounds = this.handle?.getBounds();
-            const offX = bounds?.col ?? 0;
-            const offY = bounds?.row ?? 0;
-            const ctx = this.makeContext();
-            for (const ev of mouseEvents) {
-              top.handleMouse({ ...ev, x: ev.x - offX, y: ev.y - offY }, ctx);
+        if (!data.includes("\x1b[200~")) {
+          const mouseEvents = parseMouseEvents(data);
+          if (mouseEvents.length > 0) {
+            if (top.handleMouse) {
+              const bounds = this.handle?.getBounds();
+              if (!bounds) return;
+              const ctx = this.makeContext();
+              for (const ev of mouseEvents) {
+                top.handleMouse({ ...ev, x: ev.x - bounds.col, y: ev.y - bounds.row }, ctx);
+              }
+              this.requestRender();
+              return;
             }
-            this.requestRender();
-            return;
-          }
-          if (!mouseEvents.some((e) => e.type === "wheel")) {
-            return;
+            if (!mouseEvents.some((e) => e.type === "wheel")) {
+              return;
+            }
           }
         }
         top.handleInput(data, this.makeContext());
