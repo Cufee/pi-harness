@@ -490,9 +490,12 @@ export class AcpRunner {
     let rejectActivePromptOnChildExit: ((err: Error) => void) | null = null;
     let childExitFlushTimer: ReturnType<typeof setTimeout> | null = null;
     let childGoneError: Error | null = null;
+    // Recorded even after the prompt settled, so a transport EOF that wins the race can still report the exit status.
+    let childExitInfo: { code: number | null; signal: NodeJS.Signals | null } | null = null;
     const childExitMessage = (code: number | null, signal: NodeJS.Signals | null) =>
       `ACP agent process exited during an active turn (code=${code ?? "null"}, signal=${signal ?? "null"})`;
     const onChildGone = (code: number | null, signal: NodeJS.Signals | null, fromClose: boolean) => {
+      if (!childExitInfo && (code !== null || signal !== null)) childExitInfo = { code, signal };
       // Abort, rollover, idle timeout, and cancel grace terminate the child on purpose.
       if (req.signal.aborted || rolloverTriggered || idleTimedOut || cancelGraceTimer) return;
       if (!rejectActivePromptOnChildExit) return;
@@ -1767,7 +1770,30 @@ export class AcpRunner {
       if (idleTimedOut && !quotaWatchdogTriggered) {
         throw new Error(`ACP runner (${this.profile.id}) timed out after ${idleTimeoutMs}ms of inactivity`);
       }
-      const primary = spawnErr ?? err;
+      let primary = spawnErr ?? err;
+      const childDied = Boolean(childGoneError && primary === childGoneError);
+      // Normal pipe closure rejects the prompt with a transport EOF before the exit flush timer fires. Reconcile it
+      // with the child's exit (bounded wait) so the outcome does not depend on which event arrived first. A JSON-RPC
+      // error response from the agent carries a numeric code and is never treated as transport closure.
+      if (!childDied && child && sessionId && !spawnErr && !req.signal.aborted && typeof (primary as { code?: unknown } | null)?.code !== "number") {
+        if (!childExitInfo && child.exitCode === null && child.signalCode === null) {
+          await new Promise<void>((resolveWait) => {
+            const done = () => {
+              clearTimeout(waitTimer);
+              child.off("exit", done);
+              resolveWait();
+            };
+            const waitTimer = setTimeout(done, 250);
+            child.once("exit", done);
+          });
+        }
+        const info = childExitInfo as { code: number | null; signal: NodeJS.Signals | null } | null;
+        const code = info?.code ?? child.exitCode;
+        const signal = info?.signal ?? child.signalCode;
+        if (code !== null || signal !== null) {
+          primary = childGoneError = new Error(childExitMessage(code, signal));
+        }
+      }
       const baseMsg = primary instanceof Error ? primary.message : String(primary);
       const errDetail = acpErrorDetail(primary);
       const errMsg = errDetail && !baseMsg.includes(errDetail) ? `${baseMsg}: ${errDetail}` : baseMsg;
@@ -1791,12 +1817,14 @@ export class AcpRunner {
         }
       }
       const combined = `${errMsg}\n${stderrBuf}`;
-      const detected = detectQuotaErrorText(combined);
+      // For a child death the stderr tail is history (live stderr quota lines already drive quotaRetrying), so only
+      // the error itself is scanned.
+      const detected = detectQuotaErrorText(childGoneError && primary === childGoneError ? errMsg : combined);
 
-      // A sudden child exit is a crash, not a quota pause, unless live quota signals fired during the run.
-      const quotaSignal = childGoneError && primary === childGoneError
-        ? quotaWatchdogTriggered || quotaRejected || quotaRetryHits > 0
-        : quotaWatchdogTriggered || detected.isQuota || errData?.errorKind === "rate_limit" || Boolean(errRateLimit);
+      // Classify from quota state that is still unresolved now (quotaRetrying clears on forward progress), never
+      // from lifetime retry history: a recovered worker that later crashes fails instead of pausing.
+      const quotaSignal =
+        quotaWatchdogTriggered || quotaRetrying || detected.isQuota || errData?.errorKind === "rate_limit" || Boolean(errRateLimit);
       if (quotaSignal) {
         const reason = lastQuotaReason || detected.summary || errMsg;
         const resetAt = lastQuotaResetAt ?? detected.resetAtIso ?? null;
