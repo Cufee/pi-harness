@@ -237,12 +237,16 @@ export class ProjectsScreen implements Screen {
       onOpenRemotes?: () => void;
       includeRemotes?: boolean;
       initialProjects?: FederatedProjectSummary[];
+      initialNotice?: { tone: "info" | "warn" | "danger" | "ok"; text: string } | null;
       cancelLabel?: string;
     },
   ) {}
 
   onShow(ctx: ScreenContext): void {
     this.nav = ctx.navigator;
+    if (this.opts.initialNotice) {
+      this.frame.setNotice(this.opts.initialNotice.text, this.opts.initialNotice.tone);
+    }
     if (this.opts.initialProjects) {
       this.projects = this.opts.initialProjects;
       this.loading = false;
@@ -518,6 +522,7 @@ export async function pickProjectTui(opts: {
   client: DaemonClient;
   currentHost?: string | null;
   initialProjects?: FederatedProjectSummary[];
+  initialNotice?: { tone: "info" | "warn" | "danger" | "ok"; text: string } | null;
   includeRemotes?: boolean;
   terminal?: Terminal;
 }): Promise<FederatedProjectSummary | null> {
@@ -547,6 +552,7 @@ export async function pickProjectTui(opts: {
       currentHost: opts.currentHost,
       includeRemotes: opts.includeRemotes,
       initialProjects: opts.initialProjects,
+      initialNotice: opts.initialNotice,
       cancelLabel: "cancel",
       onOpenProject: (project) => {
         picked = project;
