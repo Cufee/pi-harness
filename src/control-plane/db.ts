@@ -1,9 +1,9 @@
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { basename, dirname } from "node:path";
 import { Database } from "bun:sqlite";
 import { AdmissionQueue } from "./admission-queue.js";
-import { friendlyIdCandidates, nextFriendlyId, nextSequenceValue } from "./ids.js";
+import { advanceSequenceFloor, friendlyIdCandidates, nextFriendlyId, nextSequenceValue } from "./ids.js";
 import { ProjectStore } from "./projects.js";
 import { SessionMessageStore } from "./session-messages.js";
 import { TimerManager } from "./timers.js";
@@ -1358,13 +1358,44 @@ export class ControlPlaneDb {
     return nextSequenceValue(this.db, `artseq:${scopeKey}`);
   }
 
-  /** Dossier paths (any run) ending with suffix, for matching other spellings of the same repo root. */
+  /** Raises the spill sequence for scopeKey so the next value is above floor (e.g. the highest index on disk). */
+  advanceArtifactSeqFloor(scopeKey: string, floor: number): void {
+    advanceSequenceFloor(this.db, `artseq:${scopeKey}`, floor);
+  }
+
+  /** Highest N among indexed dossier paths named `<stem>-<N><ext>` (optionally for one task); 0 when none. */
+  maxIndexedArtifactSeq(stem: string, ext: string, taskId?: string): number {
+    const rows = (
+      taskId
+        ? this.db.prepare("SELECT path FROM artifacts WHERE kind = 'dossier' AND task_id = ?").all(taskId)
+        : this.db.prepare("SELECT path FROM artifacts WHERE kind = 'dossier'").all()
+    ) as Array<{ path: string }>;
+    const prefix = `${stem}-`;
+    let max = 0;
+    for (const row of rows) {
+      const name = basename(String(row.path));
+      if (name.length <= prefix.length + ext.length || !name.startsWith(prefix) || !name.endsWith(ext)) continue;
+      const mid = name.slice(prefix.length, name.length - ext.length);
+      if (!/^[1-9][0-9]{0,9}$/.test(mid)) continue;
+      const n = Number.parseInt(mid, 10);
+      if (n < 0x80000000 && n > max) max = n;
+    }
+    return max;
+  }
+
+  /**
+   * Dossier paths (any run) ending with suffix, compared case-insensitively so spellings that alias the same file on
+   * a case-insensitive filesystem are found too. Lengths are in code points, matching SQLite's length()/substr().
+   */
   listDossierPathsWithSuffix(suffix: string): string[] {
-    if (!suffix) return [];
+    const codePoints = [...suffix].length;
+    if (codePoints === 0) return [];
     const rows = this.db
-      .prepare("SELECT DISTINCT path FROM artifacts WHERE kind = 'dossier' AND length(path) > ? AND substr(path, -?) = ?")
-      .all(suffix.length, suffix.length, suffix) as Array<{ path: string }>;
-    return rows.map(r => r.path);
+      .prepare(
+        "SELECT DISTINCT path FROM artifacts WHERE kind = 'dossier' AND length(path) >= ? AND lower(substr(path, length(path) - ? + 1)) = lower(?)",
+      )
+      .all(codePoints, codePoints, suffix) as Array<{ path: string }>;
+    return rows.map(r => String(r.path));
   }
 
   /** Number of distinct runs that index any of paths as a dossier. */

@@ -9,7 +9,7 @@ import type { KbKind } from "../kb/store.js";
 import type { BisectingMergeQueue } from "../worktree/merge-queue.js";
 import { runGit, type WorktreeManager } from "../worktree/manager.js";
 import type { AdmissionLane, QueuePositionInput } from "./admission-queue.js";
-import { writeUniqueFile } from "./ids.js";
+import { scanMaxFileIndex, writeUniqueFile } from "./ids.js";
 import type {
   AgentTier,
   ControlPlaneDb,
@@ -1144,8 +1144,20 @@ export class ControlPlaneToolExecutor {
         let overflowPath: string | undefined;
         if (summary.length > SUMMARY_LIMIT) {
           const artifactsDir = dossierDirectory(run.repoRoot);
-          const minIndex = typeof this.db.nextArtifactSeq === "function" ? this.db.nextArtifactSeq(`${taskId}-summary.md`) : 0;
-          const fileName = writeUniqueFile(artifactsDir, `${taskId}-summary`, ".md", summary, minIndex);
+          const stem = `${taskId}-summary`;
+          const seqKey = `summary:${taskId}`;
+          let allocateIndex: (() => number) | undefined;
+          if (typeof this.db.nextArtifactSeq === "function") {
+            if (typeof this.db.advanceArtifactSeqFloor === "function") {
+              // Seed above indices already on disk or recorded in the index (including deleted files).
+              const diskMax = scanMaxFileIndex(artifactsDir, stem, ".md");
+              const dbMax =
+                typeof this.db.maxIndexedArtifactSeq === "function" ? this.db.maxIndexedArtifactSeq(stem, ".md", taskId) : 0;
+              this.db.advanceArtifactSeqFloor(seqKey, Math.max(diskMax, dbMax));
+            }
+            allocateIndex = () => this.db.nextArtifactSeq(seqKey);
+          }
+          const fileName = writeUniqueFile(artifactsDir, stem, ".md", summary, allocateIndex);
           const artifactPath = `.harness/artifacts/${fileName}`;
           overflowPath = resolve(run.repoRoot, artifactPath);
           paths.push(overflowPath);

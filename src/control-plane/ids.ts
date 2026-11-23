@@ -99,6 +99,16 @@ export function nextSequenceValue(db: Database, prefix: string): number {
   return row.next_value;
 }
 
+/** Raises the durable sequence for prefix so the next value is above floor; never lowers it. */
+export function advanceSequenceFloor(db: Database, prefix: string, floor: number): void {
+  if (!Number.isSafeInteger(floor) || floor <= 0) return;
+  ensureSequenceTable(db);
+  db.prepare(
+    `INSERT INTO id_sequences(prefix, next_value) VALUES (?, ?)
+     ON CONFLICT(prefix) DO UPDATE SET next_value = MAX(next_value, excluded.next_value)`,
+  ).run(prefix, floor);
+}
+
 /**
  * Produces ordered lookup candidates for a model-supplied ID:
  *   1. Exact trimmed string (always matches first — preserves legacy hex IDs like `goal-95d485df`)
@@ -130,7 +140,7 @@ export function friendlyIdCandidates(raw: string, prefix: string): string[] {
 const fileNameCounters = new Map<string, number>();
 
 /** Highest N among existing `<stem>-<N><ext>` entries in dir (0 when none or unreadable). */
-function scanMaxFileIndex(dir: string, stem: string, ext: string): number {
+export function scanMaxFileIndex(dir: string, stem: string, ext: string): number {
   let entries: string[];
   try {
     entries = readdirSync(dir);
@@ -179,7 +189,11 @@ function tryCreateExclusive(path: string, content: string): boolean {
     } catch {
       // The write error is the one to report; still remove the partial file below.
     }
-    rmSync(path, { force: true });
+    try {
+      rmSync(path, { force: true });
+    } catch {
+      // An unlink failure must not mask the write error.
+    }
     throw error;
   }
   try {
@@ -198,10 +212,16 @@ function tryCreateExclusive(path: string, content: string): boolean {
 /**
  * Creates a new file `<stem>-<n><ext>` in dir (O_CREAT|O_EXCL, mode 0o600) holding content and returns its basename.
  * Never overwrites, truncates, or deletes an existing entry. dir must exist. stem and ext must be plain name parts
- * (no separators or NUL). When minIndex is a positive integer, n is at least minIndex, so a durable sequence can
- * keep indices of deleted files from being reused.
+ * (no separators or NUL). When allocateIndex is given, every attempted n comes from it before the file is created,
+ * so a durable allocator reserves each published index (and each skipped one) and never reissues it.
  */
-export function writeUniqueFile(dir: string, stem: string, ext: string, content: string, minIndex = 0): string {
+export function writeUniqueFile(
+  dir: string,
+  stem: string,
+  ext: string,
+  content: string,
+  allocateIndex?: () => number,
+): string {
   if (!stem || stem === "." || stem === ".." || /[\/\\\0]/.test(stem) || /[\/\\\0]/.test(ext)) {
     throw new Error("Invalid unique filename stem or extension");
   }
@@ -212,18 +232,28 @@ export function writeUniqueFile(dir: string, stem: string, ext: string, content:
     canonDir = resolve(dir);
   }
   const key = `${canonDir}\0${stem}\0${ext}`;
-  const floor = Number.isSafeInteger(minIndex) && minIndex > 0 ? minIndex - 1 : 0;
-  let n = Math.max(fileNameCounters.get(key) ?? 0, scanMaxFileIndex(dir, stem, ext), floor);
-  for (let attempt = 0; attempt < 64; attempt++) {
-    n++;
-    const name = `${stem}-${n}${ext}`;
-    if (tryCreateExclusive(join(dir, name), content)) {
-      fileNameCounters.set(key, n);
-      return name;
+  if (allocateIndex) {
+    for (let attempt = 0; attempt < 64; attempt++) {
+      const n = allocateIndex();
+      const name = `${stem}-${n}${ext}`;
+      if (tryCreateExclusive(join(dir, name), content)) {
+        fileNameCounters.set(key, Math.max(fileNameCounters.get(key) ?? 0, n));
+        return name;
+      }
+    }
+  } else {
+    let n = Math.max(fileNameCounters.get(key) ?? 0, scanMaxFileIndex(dir, stem, ext));
+    for (let attempt = 0; attempt < 64; attempt++) {
+      n++;
+      const name = `${stem}-${n}${ext}`;
+      if (tryCreateExclusive(join(dir, name), content)) {
+        fileNameCounters.set(key, n);
+        return name;
+      }
     }
   }
   for (let attempt = 0; attempt < 8; attempt++) {
-    const name = `${stem}-${Date.now()}-${randomBytes(4).toString("hex")}${ext}`;
+    const name = `${stem}-${Date.now()}-${randomBytes(8).toString("hex")}${ext}`;
     if (tryCreateExclusive(join(dir, name), content)) return name;
   }
   throw Object.assign(new Error(`EEXIST: could not allocate a unique file for ${stem}-N${ext} in ${dir}`), { code: "EEXIST" });
