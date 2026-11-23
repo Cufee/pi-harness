@@ -7,18 +7,21 @@ sh install.sh
 ~/.local/bin/pi-harness --help
 ```
 
+From a checkout with Bun on `PATH`, `bun run install` runs the same script. A plain `bun install` does not.
+
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `PI_HARNESS_INSTALL_DIR` | `~/.pi-harness/install` | Staged Bun, releases and caches |
 | `PI_HARNESS_BIN_DIR` | `~/.local/bin` | Where `pi-harness` and `harness` are written |
 
-State (`~/.pi-harness/config.json`, the SQLite database, daemon socket) is untouched and stays one level above the install directory. `pi-harness` has no `--version` flag; `--help` is the smoke test.
+State (`~/.pi-harness/config.json`, the SQLite database, daemon socket) is untouched and stays one level above the install directory. Every successful run appends one line (UTC time, user, pid, release id, source path) to `$PI_HARNESS_HOME/install-audit.log` (default `~/.pi-harness/install-audit.log`), including unchanged re-runs. `pi-harness` has no `--version` flag; `--help` is the smoke test.
 
 ## Layout
 
 ```
 $PI_HARNESS_INSTALL_DIR/
   bun/<version>-<target>/bin/bun   staged upstream Bun
+  tools/octofs/<version>-<triple>/bin/octofs   staged octofs (file tools for agents over MCP)
   releases/<id>/                   src, proto, package.json, bun.lock, tsconfig.json, node_modules, .bun -> staged Bun
   current -> releases/<id>         active release (symlink swapped atomically)
   cache/downloads/                 verified Bun archives
@@ -34,8 +37,9 @@ The launcher is `exec "$release/.bun" "$release/src/cli.ts" "$@"`: the staged Bu
 
 1. Maps `uname` to a Bun target (`darwin-{aarch64,x64}`, `linux-{aarch64,x64}`, `-musl` where `/lib/ld-musl-*` exists, `-baseline` for x64 CPUs without AVX2; a shell under Rosetta is treated as arm64).
 2. Downloads `https://github.com/oven-sh/bun/releases/download/bun-v$BUN_VERSION/bun-$target.zip` and checks it against the SHA-256 pinned in `install.sh`, before unzipping. A cached archive that fails the check is deleted and fetched again.
-3. Copies the runtime files into a release directory and runs `bun install --frozen-lockfile --production`. The frozen lockfile fails on any drift from `bun.lock` instead of re-resolving; `bun.lock` carries integrity hashes. Dev dependencies (`tsc`, `protoc-gen-es`) are not installed; `src/gen` is committed.
-4. Swaps `current`, then rewrites the launcher.
+3. On the four targets with a pin (macOS and Linux, arm64 and x64), downloads `octofs` `0.26.0` from its GitHub release and checks the pinned SHA-256 before unpacking; the daemon offers it to agents as an MCP server (opt-out and the on-demand fallback are in [configuration.md](./configuration.md)).
+4. Copies the runtime files into a release directory and runs `bun install --frozen-lockfile --production`. The frozen lockfile fails on any drift from `bun.lock` instead of re-resolving; `bun.lock` carries integrity hashes. Dev dependencies (`tsc`, `protoc-gen-es`) are not installed; `src/gen` is committed.
+5. Swaps `current`, then rewrites the launcher.
 
 A `.lock` directory prevents concurrent installs; remove it if a killed install left it behind.
 
@@ -49,7 +53,7 @@ Actual inventory, verified by running the installer with `PATH` limited to symli
 | `curl`, `unzip` | fetching and unpacking Bun | the OS |
 | `sha256sum` or `shasum` | checksum verification | the OS |
 | `sysctl` (macOS) | Rosetta and AVX2 detection | the OS |
-| HTTPS to `github.com` | Bun release download | n/a |
+| HTTPS to `github.com` | Bun and octofs release downloads | n/a |
 | HTTPS to `registry.npmjs.org` | locked JS dependencies (cold cache) | `bun.lock` |
 | `/usr/bin/sandbox-exec` (macOS) | Code Mode sandbox | the OS |
 | `git` | harness worktrees and agent runs, not the install | the OS |
