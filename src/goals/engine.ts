@@ -8,6 +8,7 @@ import { type ResolvedGateEnv, resolveGateEnv, runGateCommand } from "../tools/g
 import { runGit } from "../worktree/manager.js";
 import {
   type GoalLiveProgress,
+  type GoalLiveProgressPatch,
   type GoalProgressSource,
   mergeGoalLiveProgress,
   stripStaleLiveProgress,
@@ -17,6 +18,7 @@ export {
   type GoalLiveProgress,
   type GoalLiveProgressPatch,
   type GoalProgressSource,
+  isAuthoritativeSource,
   isBlockedPhase,
   isCurrentClaim,
   mergeGoalLiveProgress,
@@ -568,7 +570,7 @@ export class GoalEngine {
   /** Persists live model-reported progress, verification status, and criterion checks onto the Goal. */
   reportProgress(
     goalIdStr: string,
-    input: Omit<GoalLiveProgress, "updatedAt" | "goalVersion" | "runId" | "reviewCycle" | "source" | "claimedAt">,
+    input: GoalLiveProgressPatch,
     source?: GoalProgressSource,
   ): GoalRecord {
     const g = this.getGoal(goalIdStr);
@@ -888,7 +890,8 @@ export class GoalEngine {
     const goal = this.getGoal(goalIdStr);
     if (!goal) throw new Error(`Unknown goal ${goalIdStr}`);
     this.setStatus(goal.id, "verifying");
-    const evidenceDir = ensureGoalEvidenceDir(goal.repoRoot, goal.id) ?? goalEvidenceDir(goal.repoRoot, goal.id);
+    // A rejected (e.g. symlinked) evidence directory is never advertised to gate commands.
+    const verifiedEvDir = ensureGoalEvidenceDir(goal.repoRoot, goal.id);
 
     const gateCwd = opts?.cwd ?? goal.repoRoot;
     const targetRef = opts?.targetRef ?? "HEAD";
@@ -912,7 +915,10 @@ export class GoalEngine {
         resolved ??= await resolveGateEnv({
           cwd: gateCwd,
           config: { gateShell: this.cfg.gateShell, gateEnv: this.cfg.gateEnv, stateDir: this.stateDir },
-          extraEnv: { HARNESS_GOAL_EVIDENCE_DIR: evidenceDir, HARNESS_GOAL_ID: goal.id },
+          extraEnv: {
+            ...(verifiedEvDir !== null ? { HARNESS_GOAL_EVIDENCE_DIR: verifiedEvDir } : {}),
+            HARNESS_GOAL_ID: goal.id,
+          },
           signal,
         });
         const { stdout, stderr } = await runGateCommand(c.command, {
@@ -1165,6 +1171,9 @@ export class GoalEngine {
       }
       if (goal.status === "draft" || goal.status === "achieved" || goal.status === "cancelled") {
         throw new Error(`Goal ${goal.id} is ${goal.status}; cannot accept.`);
+      }
+      if (goal.status === "paused" && input.audit.acceptedBy === "director") {
+        throw new Error(`Goal ${goal.id} was paused by the user; the Director cannot accept a paused goal.`);
       }
       const nextCycle = goal.reviewCycle + 1;
       const failedIds = input.criteriaResults.filter((r) => !r.passed).map((r) => r.criterionId).sort();

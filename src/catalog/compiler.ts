@@ -599,17 +599,23 @@ export class ModelCatalogCompiler {
     excludeExhausted?: boolean;
     includeDisabled?: boolean;
   }): Promise<CompiledModelCatalog> {
-    const cached = this.loadCached();
-    const catalog: CompiledModelCatalog =
-      opts?.forceSync || !cached || !this.isCacheFresh(cached)
-        ? await this.sync(opts?.cwd ?? process.cwd())
-        : cached;
-
-    this.quotaClient?.harvestLocal(this.config.profiles);
-    await this.quotaClient?.sync(false).catch(() => {});
     const enabledProfileIds = new Set(
       this.config.profiles.filter((p) => p.enabled !== false).map((p) => p.id),
     );
+    const hasEnabledRoute = (m: CompiledModelCatalog["models"][number]) =>
+      [m.preferredRoute, ...m.alternateRoutes].some((route) => route && enabledProfileIds.has(route.profileId));
+    const cached = this.loadCached();
+    // A fresh cache whose models are all on disabled or unknown profiles was compiled for another profile set:
+    // resync once from the enabled profiles instead of returning an empty catalog (a live empty result is final).
+    const cacheUsable =
+      !!cached &&
+      this.isCacheFresh(cached) &&
+      !(enabledProfileIds.size > 0 && cached.models.length > 0 && !cached.models.some(hasEnabledRoute));
+    const catalog: CompiledModelCatalog =
+      opts?.forceSync || !cacheUsable ? await this.sync(opts?.cwd ?? process.cwd()) : cached!;
+
+    this.quotaClient?.harvestLocal(this.config.profiles);
+    await this.quotaClient?.sync(false).catch(() => {});
     const enrichedModels = catalog.models
       .flatMap((m) => {
         // Never return a route on a disabled or unknown profile; drop models left without a route.

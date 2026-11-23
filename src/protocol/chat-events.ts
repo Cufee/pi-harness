@@ -370,6 +370,14 @@ export function formatChatEventForModel(event: ChatControlEvent): string {
             `Fix the cause above (for example select an enabled reviewer profile), inspect the goal with goal_get({ goal_id: "${event.goalId}" }), then re-run verification with goal_trigger_review, or report the verification error to the user.${escNote}`,
         ].join("\n");
       }
+      if (event.runStatus === "completed" && event.detail?.trim().toLowerCase().startsWith("blocked:")) {
+        return [
+          summary,
+          `The autonomous run (${event.runId}) for Goal ${event.goalId} finished blocked and needs human input; do not call \`goal_trigger_review\` for it. ` +
+            `Inspect the blocker and any open escalation (goal_get({ goal_id: "${event.goalId}" })), surface it to the user with actionable options, then resolve it, ` +
+            `amend the goal with \`goal_amend\` if the blocker shows the goal is wrong, or call resume_run({ goal_id: "${event.goalId}" }) once it is unblocked.${escNote}`,
+        ].join("\n");
+      }
       if (event.runStatus === "completed") {
         return [
           summary,
