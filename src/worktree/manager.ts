@@ -36,6 +36,24 @@ function isWithin(parent: string, child: string): boolean {
 const ACTIVE_TASK_STATUSES = new Set(["running", "draining", "waiting_children", "merging", "paused_quota"]);
 const SCRATCH_KINDS = new Set(["_verify", "_integration"]);
 
+/** Lock reason on every worktree the harness creates; only this reason marks a lock the harness may override on removal. */
+export const HARNESS_LOCK_REASON = "pi-harness";
+
+/** True when the harness may remove a registration with this lock: unlocked (pre-lock rows) or locked by the harness. */
+function isRemovableLock(locked: string | null): boolean {
+  return locked === null || locked === HARNESS_LOCK_REASON;
+}
+
+/** Reads <adminDir>/locked: null when absent, else the reason without Git's trailing newline ("" for a bare lock). */
+function readLockReason(adminDir: string): string | null {
+  try {
+    return readFileSync(join(adminDir, "locked"), "utf8").replace(/\r?\n$/, "");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+}
+
 const execFileAsync = promisify(execFile);
 
 export interface GitResult {
@@ -205,7 +223,7 @@ export class WorktreeManager {
     const wtPath = join(this.baseDir, runId, suffix === 1 ? taskId : `${taskId}-${suffix}`);
 
     mkdirSync(join(this.baseDir, runId), { recursive: true });
-    await runGit(this.repoRoot, ["worktree", "add", "-b", branch, wtPath, sha]);
+    await runGit(this.repoRoot, ["worktree", "add", "--lock", "--reason", HARNESS_LOCK_REASON, "-b", branch, wtPath, sha]);
     const identity = captureCreationIdentity(wtPath, await this.commonDir());
 
     try {
@@ -216,10 +234,10 @@ export class WorktreeManager {
       try {
         const entries = await this.listRegistrations();
         const reg = matchRegistration(entries, wtPath);
-        if (reg && reg.locked === null && reg.branch === branch) {
+        if (reg && isRemovableLock(reg.locked) && reg.branch === branch) {
           verifyCreationIdentity(reg, identity);
           assertNoNestedCheckouts(canonicalPath(reg.path), entries);
-          await runGit(this.repoRoot, ["worktree", "remove", "--force", reg.path]);
+          await runGit(this.repoRoot, ["worktree", "remove", "--force", "--force", reg.path]);
           removed = true;
         }
       } catch {
@@ -240,8 +258,9 @@ export class WorktreeManager {
   }
 
   /**
-   * Adds a detached scratch worktree at <baseDir>/<kind>/<name>. remove() runs at most once, targets only the
-   * registration this call created (by admin-entry and .git file identity, not path), and never rejects.
+   * Adds a detached scratch worktree at <baseDir>/<kind>/<name>, locked with HARNESS_LOCK_REASON. remove() runs at
+   * most once, targets only the registration this call created (by admin-entry and .git file identity, not path), and
+   * never rejects.
    */
   async addScratchWorktree(
     kind: "_verify" | "_integration",
@@ -250,7 +269,7 @@ export class WorktreeManager {
   ): Promise<{ path: string; remove: () => Promise<void> }> {
     const path = join(this.baseDir, kind, name);
     mkdirSync(join(this.baseDir, kind), { recursive: true });
-    await runGit(this.repoRoot, ["worktree", "add", "--detach", path, sha]);
+    await runGit(this.repoRoot, ["worktree", "add", "--lock", "--reason", HARNESS_LOCK_REASON, "--detach", path, sha]);
     const identity = captureCreationIdentity(path, await this.commonDir());
     let consumed = false;
     return {
@@ -261,10 +280,10 @@ export class WorktreeManager {
         try {
           const entries = await this.listRegistrations();
           const reg = matchRegistration(entries, path);
-          if (!reg || reg.locked !== null || reg.branch !== null) return;
+          if (!reg || !isRemovableLock(reg.locked) || reg.branch !== null) return;
           verifyCreationIdentity(reg, identity);
           assertNoNestedCheckouts(canonicalPath(reg.path), entries);
-          await runGit(this.repoRoot, ["worktree", "remove", "--force", reg.path]);
+          await runGit(this.repoRoot, ["worktree", "remove", "--force", "--force", reg.path]);
         } catch {
           // Removal is best effort; a refused tree stays registered.
         }
@@ -404,7 +423,7 @@ export class WorktreeManager {
     const entries = await this.listRegistrations();
     const reg = matchRegistration(entries, wt.path);
     if (reg) {
-      if (reg.locked !== null) {
+      if (!isRemovableLock(reg.locked)) {
         throw new Error(`Worktree ${worktreeId} is locked${reg.locked ? ` (${reg.locked})` : ""}; left in place`);
       }
       if (reg.branch !== null && reg.branch !== wt.branch) {
@@ -443,7 +462,7 @@ export class WorktreeManager {
     // Path-targeted: Git's printed path matches its stored entry even when the checkout is missing.
     // The branch is deleted only when the removed registration still had it checked out; otherwise it may be a later one.
     if (reg) {
-      await runGit(this.repoRoot, ["worktree", "remove", "--force", reg.path]);
+      await runGit(this.repoRoot, ["worktree", "remove", "--force", "--force", reg.path]);
       if (reg.branch === wt.branch && wt.branch !== run.baseBranch) {
         await runGit(this.repoRoot, ["branch", "-D", wt.branch]).catch(() => {});
       }
@@ -655,7 +674,7 @@ function verifyCheckoutBacklink(reg: PorcelainWorktree, expectedCommonDir: strin
   } catch (err) {
     throw new Error(`Checkout at ${reg.path} does not link back to its registration (${err instanceof Error ? err.message : err}); left in place`);
   }
-  if (existsSync(join(adminDir, "locked"))) throw new Error(`Worktree at ${reg.path} is locked; left in place`);
+  if (!isRemovableLock(readLockReason(adminDir))) throw new Error(`Worktree at ${reg.path} is locked; left in place`);
 }
 
 interface FileIdentity {
@@ -717,7 +736,7 @@ function captureCreationIdentity(wtPath: string, expectedCommonDir: string): Cre
   };
 }
 
-/** Throws unless reg is still the exact, unlocked registration and checkout recorded by captureCreationIdentity. */
+/** Throws unless reg is still the exact registration, unlocked or harness-locked, and checkout recorded by captureCreationIdentity. */
 function verifyCreationIdentity(reg: PorcelainWorktree, identity: CreationIdentity): void {
   const { adminDir } = identity;
   if (!existsSync(adminDir) || !sameIdentity(fileIdentity(statSync(adminDir, { bigint: true })), identity.adminStat)) {
@@ -727,7 +746,7 @@ function verifyCreationIdentity(reg: PorcelainWorktree, identity: CreationIdenti
   if (readPathFile(join(adminDir, "gitdir")) !== canonicalPath(dotGit)) {
     throw new Error(`Admin entry ${adminDir} no longer points at ${reg.path}`);
   }
-  if (existsSync(join(adminDir, "locked"))) throw new Error(`Worktree at ${reg.path} is locked`);
+  if (!isRemovableLock(readLockReason(adminDir))) throw new Error(`Worktree at ${reg.path} is locked`);
   if (!existsSync(reg.path)) return;
   const st = lstatSync(dotGit, { bigint: true });
   if (!st.isFile() || !sameIdentity(fileIdentity(st), identity.dotGitStat)) throw new Error(`${dotGit} was replaced`);
