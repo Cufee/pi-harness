@@ -946,7 +946,6 @@ export class HarnessOrchestrator {
       }
       throw err;
     }
-    this.quota.clearPassiveExhaustion(profile.id);
 
     const priorReason = task.summary?.trim() || `previous status was '${task.status}'`;
     const priorHandoff = task.handoffJson ? (JSON.parse(task.handoffJson) as AnchoredHandoff) : null;
@@ -968,6 +967,7 @@ export class HarnessOrchestrator {
       throw preconditionFailed();
     }
 
+    this.quota.clearPassiveExhaustion(profile.id);
     this.clearRunQuotaTimers(run.id);
     this.runQuotaStates.delete(run.id);
     this.runConsecutiveQuotaPauses.delete(run.id);
