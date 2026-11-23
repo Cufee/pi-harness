@@ -42,7 +42,7 @@ export interface ParsedArgs {
 
 export function parseArgs(argv: string[]): ParsedArgs {
   const positional: string[] = [];
-  const flags: Record<string, string | boolean> = {};
+  const flags: Record<string, string | boolean> = Object.create(null) as Record<string, string | boolean>;
   let doubleDashAt: number | null = null;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
@@ -584,7 +584,9 @@ async function main(): Promise<void> {
 
   const rawRemote = requireStringFlag(flags, "remote");
   const hostFlag = requireStringFlag(flags, "host");
-  if (flags.p === true) throw new Error("Flag -p requires a project name/id/path");
+  if (Object.prototype.hasOwnProperty.call(flags, "p") && (typeof flags.p !== "string" || !flags.p.trim())) {
+    throw new Error("Flag -p requires a project name/id/path");
+  }
   const projectFlag = requireStringFlag(flags, "project") ?? (typeof flags.p === "string" ? flags.p.trim() : undefined);
   const explicitRepoFlag = requireStringFlag(flags, "repo");
   const rawRepoRoot = explicitRepoFlag ?? process.cwd();
