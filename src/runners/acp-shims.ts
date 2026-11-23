@@ -1,6 +1,6 @@
-import { accessSync, constants, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, constants, lstatSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { AcpAdapterKind, AcpProfileConfig } from "../config.js";
 import type { ArtifactRecord } from "../control-plane/db.js";
 import type { ToolPolicy } from "./types.js";
@@ -76,6 +76,7 @@ export function isReadOnlyExternalMcpTool(serverName: string, toolName: string):
   return /^(?:read|get|list|search|find|view|dump|inspect|describe|query)(?:_|$)/.test(tool);
 }
 
+/** Git subcommands that only inspect (subject to the option checks in `isReadOnlyGitCommand`). */
 const READ_ONLY_GIT_SUBCOMMANDS = new Set([
   "status",
   "log",
@@ -95,54 +96,53 @@ const READ_ONLY_GIT_SUBCOMMANDS = new Set([
   "for-each-ref",
   "name-rev",
   "check-ignore",
-  "ls-remote",
   "whatchanged",
   "count-objects",
 ]);
 
-const READ_ONLY_SIMPLE_BINS = new Set([
-  "rg",
-  "grep",
-  "egrep",
-  "fgrep",
+/** Readers with no option that executes, writes, or follows anything beyond their operands. */
+const PLAIN_READ_ONLY_BINS = new Set([
   "cat",
   "head",
   "tail",
   "nl",
-  "wc",
   "ls",
-  "tree",
   "stat",
-  "file",
-  "pwd",
-  "which",
-  "type",
   "readlink",
   "realpath",
   "basename",
   "dirname",
-  "diff",
   "cmp",
   "comm",
-  "sort",
-  "uniq",
   "cut",
   "tr",
-  "jq",
-  "shasum",
-  "sha256sum",
-  "md5",
-  "md5sum",
+  "echo",
+  "printf",
   "test",
   "[",
   "true",
   "false",
-  "printf",
-  "echo",
-  "cd",
+  "pwd",
+  "which",
+  "type",
 ]);
 
+/** Leading assignments a read-only command may carry; values must not name paths. */
+const SAFE_ENV_ASSIGNMENT = /^(?:LANG|LC_[A-Z]+|TZ|NO_COLOR|COLUMNS|TERM)=[^/]*$/;
+
+const CONTROL_CHARS = /[\u0000-\u0008\u000b-\u001f\u007f]/;
+/** Whitespace other than space, tab, and newline (which the shell does not treat as a word separator). */
+const NON_SHELL_WHITESPACE = /[^\S \t\n]/;
+
+/**
+ * Splits a command line into simple-command segments, or returns null when the line uses any shell
+ * feature whose effect the validator cannot see in the token list: redirections (except stderr to
+ * /dev/null or stdout), command/process substitution, parameter/arithmetic/ANSI expansion, tilde and
+ * brace expansion, subshells and zsh glob qualifiers, unquoted glob characters, zsh `=cmd`
+ * expansion, line continuations, background jobs, and control characters.
+ */
 function splitShellSegments(cmd: string): string[] | null {
+  if (CONTROL_CHARS.test(cmd)) return null;
   const segments: string[] = [];
   let cur = "";
   let inSingle = false;
@@ -157,16 +157,20 @@ function splitShellSegments(cmd: string): string[] | null {
     }
     if (inDouble) {
       if (ch === "\\" && next !== undefined) {
+        if (next === "\n") return null;
         cur += ch + next;
         i++;
         continue;
       }
-      if (ch === "`" || (ch === "$" && next === "(")) return null; // command substitution inside double quotes
+      if (ch === "`") return null;
+      if (ch === "$" && next !== undefined && next !== '"' && !/\s/.test(next)) return null;
       cur += ch;
       if (ch === '"') inDouble = false;
       continue;
     }
+    const wordStart = cur.length === 0 || /\s/.test(cur[cur.length - 1]!);
     if (ch === "\\" && next !== undefined) {
+      if (next === "\n") return null;
       cur += ch + next;
       i++;
       continue;
@@ -181,8 +185,9 @@ function splitShellSegments(cmd: string): string[] | null {
       cur += ch;
       continue;
     }
-    // Permit ONLY stderr-to-null (`2>/dev/null`) and stderr-to-stdout (`2>&1`); reject all other redirections
+    // Permit ONLY stderr-to-null (`2>/dev/null`) and stderr-to-stdout (`2>&1`) as whole words; reject all other redirections
     if (ch === "2" && next === ">") {
+      if (!wordStart) return null;
       if (cmd.slice(i).startsWith("2>/dev/null") && (i + 11 === cmd.length || /[\s|;&\n]/.test(cmd[i + 11]!))) {
         i += 10;
         continue;
@@ -193,21 +198,24 @@ function splitShellSegments(cmd: string): string[] | null {
       }
       return null;
     }
-    // Reject unquoted redirections, command substitutions, and process substitutions
-    if (ch === ">" || ch === "`") return null;
-    if (ch === "$" && next === "(") return null;
-    if (ch === "<" && (next === "(" || next === ">")) return null;
+    if (ch === ">" || ch === "<" || ch === "`") return null;
+    if (ch === "$" && next !== undefined && !/\s/.test(next)) return null;
+    if ("{}()".includes(ch)) return null;
+    if (ch === "~" && (wordStart || cur.endsWith("=") || cur.endsWith(":"))) return null;
+    if (wordStart && (ch === "=" || ch === "#")) return null; // zsh `=cmd` expansion; comments hide words
+    // Unquoted glob characters expand to names the validator cannot see; only a lone `[` (the test command) is literal.
+    if (ch === "*" || ch === "?" || (ch === "[" && !(wordStart && (next === undefined || /\s/.test(next))))) return null;
     if (ch === "&" && next === ">") return null;
 
     // Segment separators outside quotes: |, ||, &&, ;, \n
     if (ch === "|" || ch === ";" || ch === "\n") {
-      if (cur.trim()) segments.push(cur.trim());
+      if (cur.trim()) segments.push(cur);
       cur = "";
       if (ch === "|" && next === "|") i++;
       continue;
     }
     if (ch === "&" && next === "&") {
-      if (cur.trim()) segments.push(cur.trim());
+      if (cur.trim()) segments.push(cur);
       cur = "";
       i++;
       continue;
@@ -216,16 +224,33 @@ function splitShellSegments(cmd: string): string[] | null {
     cur += ch;
   }
   if (inSingle || inDouble) return null;
-  if (cur.trim()) segments.push(cur.trim());
+  if (cur.trim()) segments.push(cur);
   return segments;
 }
 
-function tokenizeSegment(seg: string): string[] {
-  const tokens: string[] = [];
+/**
+ * Splits one segment into the argument vector the shell passes, applying POSIX quote removal. A word is
+ * an `assignment` only when its name and `=` are unquoted, as the shell requires.
+ */
+function tokenizeSegment(seg: string): Array<{ text: string; assignment: boolean }> {
+  const words: Array<{ text: string; assignment: boolean }> = [];
   let cur = "";
   let inSingle = false;
   let inDouble = false;
   let hasToken = false;
+  let quotedAt = -1; // length of `cur` when the first quote or escape in this word began
+  const quote = () => {
+    hasToken = true;
+    if (quotedAt < 0) quotedAt = cur.length;
+  };
+  const push = () => {
+    const eq = cur.indexOf("=");
+    const assignment = /^[A-Za-z_][A-Za-z0-9_]*=/.test(cur) && (quotedAt < 0 || quotedAt > eq);
+    words.push({ text: cur, assignment });
+    cur = "";
+    hasToken = false;
+    quotedAt = -1;
+  };
   for (let i = 0; i < seg.length; i++) {
     const ch = seg[i]!;
     const next = seg[i + 1];
@@ -236,7 +261,8 @@ function tokenizeSegment(seg: string): string[] {
     }
     if (inDouble) {
       if (ch === "\\" && next !== undefined) {
-        cur += next;
+        // Inside double quotes a backslash only escapes $, `, ", and \; otherwise it stays literal.
+        cur += "$`\"\\".includes(next) ? next : ch + next;
         i++;
       } else if (ch === '"') {
         inDouble = false;
@@ -246,256 +272,449 @@ function tokenizeSegment(seg: string): string[] {
       continue;
     }
     if (ch === "\\" && next !== undefined) {
+      quote();
       cur += next;
-      hasToken = true;
       i++;
       continue;
     }
     if (ch === "'") {
+      quote();
       inSingle = true;
-      hasToken = true;
       continue;
     }
     if (ch === '"') {
+      quote();
       inDouble = true;
-      hasToken = true;
       continue;
     }
-    if (/\s/.test(ch)) {
-      if (hasToken) {
-        tokens.push(cur);
-        cur = "";
-        hasToken = false;
-      }
+    if (ch === " " || ch === "\t") {
+      if (hasToken) push();
       continue;
     }
     cur += ch;
     hasToken = true;
   }
-  if (hasToken) tokens.push(cur);
-  return tokens;
+  if (hasToken) push();
+  return words;
+}
+
+/** Long option name of `--name[=value]`, or undefined for anything else. */
+function longOptionName(arg: string): string | undefined {
+  return arg.startsWith("--") && arg.length > 2 ? arg.slice(2).split("=")[0]! : undefined;
 }
 
 /**
- * Quote-aware validator for read-only shell inspection commands executed by `read_only_workspace`
- * ACP agents (Codex, Gemini, Antigravity, OpenCode, Claude). Safely permits pipes/chains of
- * inspection tools (`git status/log/diff`, `rg "=>" src/`, `sg`, `ls`, `cat`, `sed -n`, `find`)
- * while rejecting unquoted redirections, command substitutions, and mutating flags/subcommands.
+ * True when `arg` names a blocked long option exactly or by abbreviation (git and getopt_long accept
+ * unique prefixes). Names in `exact` are distinct options that happen to prefix a blocked one.
  */
-export function isSafeReadOnlyShellCommand(rawCommand: string): boolean {
-  const trimmed = rawCommand.trim();
-  if (!trimmed) return false;
-  const segments = splitShellSegments(trimmed);
-  if (!segments || segments.length === 0) return false;
+function isBlockedLongOption(arg: string, blocked: string[], exact: string[] = []): boolean {
+  const name = longOptionName(arg);
+  if (name === undefined || exact.includes(name)) return false;
+  return blocked.some((b) => b.startsWith(name));
+}
 
-  for (const seg of segments) {
-    const tokens = tokenizeSegment(seg);
-    let idx = 0;
-    // Skip harmless leading VAR=val env prefixes (block PATH/LD_*/DYLD_* hijacking)
-    while (idx < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[idx]!)) {
-      const varName = tokens[idx]!.split("=")[0]!.toUpperCase();
-      if (varName === "PATH" || varName.startsWith("LD_") || varName.startsWith("DYLD_") || varName === "IFS") {
-        return false;
-      }
-      idx++;
-    }
-    if (idx >= tokens.length) return false;
-    const rawBin = tokens[idx]!;
-    const bin = rawBin.includes("/") ? rawBin.split("/").pop()! : rawBin;
-    const args = tokens.slice(idx + 1);
+/** True when `arg` is a short-option cluster containing any of `letters` (attached values included). */
+function hasShortFlag(arg: string, letters: string): boolean {
+  return /^-[^-]/.test(arg) && [...arg.slice(1)].some((c) => letters.includes(c));
+}
 
-    if (READ_ONLY_SIMPLE_BINS.has(bin)) {
-      if (bin === "sort" && args.some((a) => a === "-o" || a.startsWith("--output"))) return false;
+const TREE_SHORT_FLAGS = "adfxqNQpugshDFvtcUriASnCXJ";
+const TREE_LONG_FLAGS = new Set(["gitignore", "ignore-case", "matchdirs", "prune", "noreport", "charset", "filelimit", "si", "du", "timefmt", "inodes", "device", "dirsfirst", "filesfirst", "sort"]);
+const TREE_LONG_WITH_VALUE = new Set(["charset", "filelimit", "timefmt", "sort"]);
+
+/** tree: allowlisted flags only (no output file, HTML rerun, base HREF, or symlink following). */
+function isSafeTreeArgs(args: string[]): boolean {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    const name = longOptionName(arg);
+    if (name !== undefined) {
+      if (!TREE_LONG_FLAGS.has(name)) return false;
+      if (!arg.includes("=") && TREE_LONG_WITH_VALUE.has(name)) i++;
       continue;
     }
-    if (bin === "sg" || bin === "ast-grep") {
-      if (args.some((a) => a === "-U" || a === "--update-all" || a === "--rewrite" || a === "-i" || a === "--interactive" || a.startsWith("--rewrite="))) {
-        return false;
-      }
+    if (!arg.startsWith("-") || arg === "-") continue;
+    const withValue = /^-[LPI](.*)$/.exec(arg);
+    if (withValue) {
+      if (!withValue[1]) i++;
       continue;
     }
-    if (bin === "sed") {
-      if (args.some((a) => a === "-i" || a.startsWith("-i") || a.startsWith("--in-place"))) return false;
-      if (!args.some((a) => a === "-n" || a === "--quiet" || a === "--silent" || /^-[a-zA-Z]*n[a-zA-Z]*$/.test(a))) return false;
-      continue;
-    }
-    if (bin === "find") {
-      if (args.some((a) => ["-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"].includes(a))) {
-        return false;
-      }
-      continue;
-    }
-    if (bin === "sqlite3") {
-      if (!args.includes("-readonly")) return false;
-      if (args.some((a) => /\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|VACUUM|ATTACH|PRAGMA\s+\w+\s*=)\b/i.test(a))) {
-        return false;
-      }
-      continue;
-    }
-    if (bin === "git") {
-      let g = 0;
-      while (g < args.length && args[g]!.startsWith("-")) {
-        const flag = args[g]!;
-        if (flag === "-C" || flag === "--git-dir" || flag === "--work-tree") {
-          g += 2;
-          continue;
-        }
-        if (flag === "-c") {
-          const kv = (args[g + 1] ?? "").toLowerCase();
-          if (/^(?:core\.|credential\.|alias\.|filter\.|diff\.external)/.test(kv)) return false;
-          g += 2;
-          continue;
-        }
-        if (flag === "--no-pager" || flag === "-P" || flag === "--bare" || flag === "--no-optional-locks") {
-          g += 1;
-          continue;
-        }
-        return false;
-      }
-      const sub = args[g];
-      if (!sub) return false;
-      const subArgs = args.slice(g + 1);
-      if (READ_ONLY_GIT_SUBCOMMANDS.has(sub)) {
-        // Hardening: block command-executing / file-writing git subcommand options (including attached/clustered short flags)
-        if (sub === "diff" || sub === "log" || sub === "show") {
-          if (
-            subArgs.some(
-              (a) =>
-                a === "--output" ||
-                a.startsWith("--output=") ||
-                a === "--ext-diff" ||
-                a.startsWith("--ext-diff=") ||
-                a === "--textconv",
-            )
-          ) {
-            return false;
-          }
-        }
-        if (sub === "grep") {
-          if (
-            subArgs.some(
-              (a) =>
-                a === "-O" ||
-                a.startsWith("-O") ||
-                a === "--open-files-in-pager" ||
-                a.startsWith("--open-files-in-pager=") ||
-                (/^-[a-zA-Z]*O/.test(a)),
-            )
-          ) {
-            return false;
-          }
-        }
-        continue;
-      }
-      if (sub === "branch") {
-        const badBranch = subArgs.some((a) =>
-          ["-d", "-D", "-m", "-M", "-c", "-C", "-u", "--delete", "--move", "--copy", "--edit-description", "--unset-upstream"].includes(a) ||
-          a.startsWith("--set-upstream"),
-        );
-        if (badBranch) return false;
-        // Only allow listing/current-branch flags (reject positional branch creation like `git branch new-name`)
-        const hasPositional = subArgs.some((a) => !a.startsWith("-"));
-        const isListQuery = subArgs.some((a) => a === "-l" || a === "--list" || a === "--contains" || a === "--merged" || a === "--no-merged");
-        if (hasPositional && !isListQuery) return false;
-        continue;
-      }
-      if (sub === "tag") {
-        if (subArgs.length === 0 || subArgs.some((a) => a === "-l" || a === "--list")) continue;
-        return false;
-      }
-      if (sub === "remote") {
-        if (subArgs.length === 0 || subArgs[0] === "-v" || subArgs[0] === "show" || subArgs[0] === "get-url") continue;
-        return false;
-      }
-      return false;
-    }
-    return false;
+    if (![...arg.slice(1)].every((c) => TREE_SHORT_FLAGS.includes(c))) return false;
   }
   return true;
 }
 
+/** uniq: a second operand is an output file. */
+function isSafeUniqArgs(args: string[]): boolean {
+  let operands = 0;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--") return false;
+    if (/^-[fsw]$/.test(arg) || /^--(?:skip-fields|skip-chars|check-chars)$/.test(arg)) {
+      i++;
+      continue;
+    }
+    if (!arg.startsWith("-") || arg === "-") operands++;
+  }
+  return operands <= 1;
+}
+
+const SED_ADDRESS = String.raw`(?:\d+|\$|/(?:[^/\\\n]|\\.)*/I?)`;
+const SED_PRINT_CLAUSE = String.raw`\s*${SED_ADDRESS}(?:\s*,\s*${SED_ADDRESS})?\s*p\s*`;
+const SED_PRINT_SCRIPT = new RegExp(String.raw`^${SED_PRINT_CLAUSE}(?:;${SED_PRINT_CLAUSE})*;?\s*$`);
+
+/** sed: `-n` with scripts made only of address-print clauses (no in-place, w/r/e verbs, or script files). */
+function isSafeSedArgs(args: string[]): boolean {
+  const scripts: string[] = [];
+  const files: string[] = [];
+  let quiet = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--quiet" || arg === "--silent") {
+      quiet = true;
+      continue;
+    }
+    if (arg === "--regexp-extended") continue;
+    if (arg.startsWith("--expression=")) {
+      scripts.push(arg.slice("--expression=".length));
+      continue;
+    }
+    if (arg === "--expression") {
+      if (i + 1 >= args.length) return false;
+      scripts.push(args[++i]!);
+      continue;
+    }
+    if (arg.startsWith("--")) return false;
+    if (arg.startsWith("-") && arg !== "-") {
+      const m = /^-([nEr]*)(e?)([\s\S]*)$/.exec(arg);
+      if (!m) return false;
+      if (m[1]!.includes("n")) quiet = true;
+      if (m[2]) {
+        const script = m[3] || args[++i];
+        if (script === undefined) return false;
+        scripts.push(script);
+      } else if (m[3]) {
+        return false;
+      }
+      continue;
+    }
+    files.push(arg);
+  }
+  if (!quiet) return false;
+  if (scripts.length === 0) {
+    const first = files.shift();
+    if (first === undefined) return false;
+    scripts.push(first);
+  }
+  return scripts.every((s) => SED_PRINT_SCRIPT.test(s));
+}
+
+const SQLITE_FLAGS = new Set(["-readonly", "-safe", "-header", "-noheader", "-csv", "-json", "-line", "-list", "-column", "-box", "-table", "-markdown", "-html", "-quote", "-tabs", "-ascii", "-bail", "-batch"]);
+const SQLITE_FLAGS_WITH_VALUE = new Set(["-separator", "-newline", "-nullvalue"]);
+
+/** sqlite3: `-readonly`, output switches, one plain database path, and one SELECT/WITH/EXPLAIN statement. */
+function isSafeSqliteArgs(args: string[]): boolean {
+  const positional: string[] = [];
+  let readonly = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (!arg.startsWith("-")) {
+      positional.push(arg);
+      continue;
+    }
+    const flag = arg.replace(/^--/, "-");
+    if (flag === "-readonly") readonly = true;
+    if (SQLITE_FLAGS.has(flag)) continue;
+    if (SQLITE_FLAGS_WITH_VALUE.has(flag) && i + 1 < args.length) {
+      i++;
+      continue;
+    }
+    return false;
+  }
+  if (!readonly || positional.length !== 2) return false;
+  const [db, sql] = positional as [string, string];
+  if (db.includes(":")) return false; // URI filenames and :memory: carry their own options
+  return (
+    /^\s*(?:SELECT|WITH|EXPLAIN)\b/i.test(sql) &&
+    !/^\s*\./m.test(sql) &&
+    !/;\s*\S/.test(sql) &&
+    !/\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|VACUUM|ATTACH|DETACH|PRAGMA)\b/i.test(sql) &&
+    !/\b(?:readfile|writefile|edit|fsdir|lsdir|load_extension|zipfile|sqlar_\w+|fts3_tokenizer)\s*\(/i.test(sql)
+  );
+}
+
+/** ast-grep: default/run/scan only, never applying rewrites or prompting. */
+function isSafeAstGrepArgs(args: string[]): boolean {
+  const sub = args[0];
+  if (sub !== undefined && !sub.startsWith("-") && sub !== "run" && sub !== "scan") return false;
+  return !args.some((a) => hasShortFlag(a, "Uic") || isBlockedLongOption(a, ["update-all", "interactive", "rewrite", "config", "follow"]));
+}
+
+const GIT_BRANCH_FLAGS = new Set(["-l", "--list", "-a", "--all", "-r", "--remotes", "-v", "--verbose", "--show-current", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--format", "--sort", "--color", "--no-color", "--column", "--no-column", "-i", "--ignore-case"]);
+const GIT_TAG_FLAGS = new Set(["-l", "--list", "-n", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--format", "--sort", "--color", "--no-color", "--column", "--no-column", "-i", "--ignore-case"]);
+const GIT_LIST_FLAGS = new Set(["-l", "--list", "-n", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at"]);
+
+/** git branch / git tag: listing flags only; positional words only alongside a list-mode flag. */
+function isGitListQuery(args: string[], flags: Set<string>): boolean {
+  let positional = false;
+  let list = false;
+  for (const arg of args) {
+    if (!arg.startsWith("-")) {
+      positional = true;
+      continue;
+    }
+    const names = arg.startsWith("--") ? [arg.split("=")[0]!] : /^-n\d*$/.test(arg) ? ["-n"] : [...arg.slice(1)].map((c) => `-${c}`);
+    for (const name of names) {
+      if (!flags.has(name)) return false;
+      if (GIT_LIST_FLAGS.has(name)) list = true;
+    }
+  }
+  return !positional || list;
+}
+
+function isReadOnlyGitCommand(args: string[]): boolean {
+  let g = 0;
+  while (g < args.length && args[g]!.startsWith("-")) {
+    const flag = args[g]!;
+    if (flag === "--no-pager" || flag === "-P" || flag === "--no-optional-locks") {
+      g += 1;
+      continue;
+    }
+    // -C (relative operands would resolve elsewhere), -c, --git-dir, --work-tree, --bare, --exec-path, ...
+    return false;
+  }
+  const sub = args[g];
+  if (!sub) return false;
+  const subArgs = args.slice(g + 1);
+  if (subArgs.some((a) => isBlockedLongOption(a, ["output", "ext-diff", "textconv", "no-index"], ["text"]))) return false;
+  if (sub === "grep" && subArgs.some((a) => /^-[a-zA-Z]*O/.test(a) || isBlockedLongOption(a, ["open-files-in-pager"]))) return false;
+  if (sub === "cat-file" && subArgs.some((a) => isBlockedLongOption(a, ["filters"]))) return false;
+  if (READ_ONLY_GIT_SUBCOMMANDS.has(sub)) return true;
+  if (sub === "branch") return isGitListQuery(subArgs, GIT_BRANCH_FLAGS);
+  if (sub === "tag") return isGitListQuery(subArgs, GIT_TAG_FLAGS);
+  if (sub === "remote") {
+    if (subArgs.length === 0 || (subArgs.length === 1 && (subArgs[0] === "-v" || subArgs[0] === "--verbose"))) return true;
+    if (subArgs[0] !== "get-url") return false;
+    const rest = subArgs.slice(1);
+    return rest.every((a) => !a.startsWith("-") || a === "--push" || a === "--all") && rest.filter((a) => !a.startsWith("-")).length === 1;
+  }
+  return false;
+}
+
+/** Per-command argument policy for commands that are readers only with restricted options. */
+const READ_ONLY_ARG_CHECKS: Record<string, (args: string[]) => boolean> = {
+  grep: (args) => !args.some((a) => hasShortFlag(a, "R") || isBlockedLongOption(a, ["dereference-recursive"])),
+  egrep: (args) => READ_ONLY_ARG_CHECKS.grep!(args),
+  fgrep: (args) => READ_ONLY_ARG_CHECKS.grep!(args),
+  rg: (args) =>
+    !args.some((a) => hasShortFlag(a, "zL") || ["pre", "pre-glob", "hostname-bin", "search-zip", "follow"].includes(longOptionName(a) ?? "")),
+  sort: (args) =>
+    !args.some((a) => hasShortFlag(a, "oT") || isBlockedLongOption(a, ["output", "compress-program", "temporary-directory", "files0-from"])),
+  uniq: isSafeUniqArgs,
+  tree: isSafeTreeArgs,
+  // Modes that read a list of file names from a file (manifests) or follow links inside operand directories
+  // reach paths the operand check never sees.
+  wc: (args) => !args.some((a) => isBlockedLongOption(a, ["files0-from"])),
+  diff: (args) => !args.some((a) => hasShortFlag(a, "r") || isBlockedLongOption(a, ["recursive"])),
+  shasum: (args) => !args.some((a) => hasShortFlag(a, "c") || isBlockedLongOption(a, ["check"])),
+  sha256sum: (args) => READ_ONLY_ARG_CHECKS.shasum!(args),
+  md5sum: (args) => READ_ONLY_ARG_CHECKS.shasum!(args),
+  md5: (args) => READ_ONLY_ARG_CHECKS.shasum!(args),
+  file: (args) => !args.some((a) => hasShortFlag(a, "Cf") || isBlockedLongOption(a, ["compile", "files-from"])),
+  find: (args) =>
+    !args.some((a) =>
+      ["-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls", "-L", "-H", "-follow", "-files0-from"].includes(a),
+    ),
+  sed: isSafeSedArgs,
+  sqlite3: isSafeSqliteArgs,
+  jq: (args) =>
+    !args.some(
+      (a) =>
+        hasShortFlag(a, "Lf") ||
+        isBlockedLongOption(a, ["library-path", "from-file"]) ||
+        /\$ENV\b|\benv\b|\bimport\b|\binclude\b/.test(a),
+    ),
+  sg: isSafeAstGrepArgs,
+  "ast-grep": isSafeAstGrepArgs,
+  git: isReadOnlyGitCommand,
+};
+
+/** Filesystem scope for path operands: the shell's working directory and the canonical allowed read roots. */
+export interface ReadOnlyShellScope {
+  cwd: string;
+  readRoots: string[];
+}
+
+function isInsideRoot(root: string, path: string): boolean {
+  const rel = relative(root, path);
+  return !isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`);
+}
+
+/**
+ * Every token is treated as a possible path: the whole token, the text after its first `=`, for options
+ * the text from the first `/`, every attached short-option value, and for (quoted) glob characters
+ * also the directory before the first glob. A `..` segment denies (the shell resolves it physically,
+ * after symlinks). An existing candidate must
+ * canonicalise inside a read root; a missing one reads nothing and is allowed.
+ */
+function pathOperandsInsideRoots(args: string[], scope: ReadOnlyShellScope): boolean {
+  for (const arg of args) {
+    if (arg.startsWith("-") && /\.\.(?:\/|$)/.test(arg)) return false;
+    const candidates = [arg];
+    const eq = arg.indexOf("=");
+    if (eq >= 0) candidates.push(arg.slice(eq + 1));
+    const slash = arg.indexOf("/");
+    if (arg.startsWith("-") && slash >= 0) candidates.push(arg.slice(slash));
+    // A short-option cluster may end in an attached value at any position (`-nfFILE`).
+    if (/^-[^-]/.test(arg)) for (let k = 2; k < arg.length; k++) candidates.push(arg.slice(k));
+    // A word with glob characters reaching here was quoted: a tool may treat it as a pattern (check the
+    // directory before the glob) or as a literal name (check the whole word).
+    for (const word of [...candidates]) {
+      const glob = word.search(/[*?[]/);
+      if (glob >= 0) candidates.push(word.slice(0, word.lastIndexOf("/", glob) + 1) || ".");
+    }
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      if (candidate.split("/").includes("..")) return false;
+      const absolute = resolve(scope.cwd, candidate);
+      try {
+        lstatSync(absolute);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "ENOTDIR") continue;
+        return false;
+      }
+      let canonical: string;
+      try {
+        canonical = realpathSync(absolute);
+      } catch {
+        return false;
+      }
+      if (!scope.readRoots.some((root) => isInsideRoot(root, canonical))) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Validator for read-only shell inspection commands run by `read_only_workspace` ACP agents that send
+ * permission callbacks (Codex, Gemini, Antigravity, OpenCode, Claude). Approves only when the token list
+ * is exactly the argument vector the shell will run, every command word is a bare, known reader, and no
+ * option that executes, writes, or redirects identity is present. With `scope`, every path operand must
+ * also stay inside the allowed read roots. Unknown means deny. This gates harness approval only; it is
+ * not an OS sandbox.
+ */
+export function isSafeReadOnlyShellCommand(rawCommand: string, scope?: ReadOnlyShellScope): boolean {
+  // The shell splits words only on space, tab, and newline; JavaScript's \s and trim() also match other
+  // whitespace, so any other whitespace or control character would make the token list differ from argv.
+  if (CONTROL_CHARS.test(rawCommand) || NON_SHELL_WHITESPACE.test(rawCommand)) return false;
+  if (!rawCommand.trim()) return false;
+  const segments = splitShellSegments(rawCommand);
+  if (!segments || segments.length === 0) return false;
+
+  for (const seg of segments) {
+    const words = tokenizeSegment(seg);
+    let idx = 0;
+    // Only a word whose name and `=` are unquoted is an assignment; a quoted one is the command word.
+    while (idx < words.length && words[idx]!.assignment) {
+      if (!SAFE_ENV_ASSIGNMENT.test(words[idx]!.text)) return false;
+      idx++;
+    }
+    const tokens = words.map((w) => w.text);
+    const bin = tokens[idx];
+    if (bin === undefined || bin.includes("/") || /^[A-Za-z_][A-Za-z0-9_]*=/.test(bin)) return false;
+    const args = tokens.slice(idx + 1);
+    if (!PLAIN_READ_ONLY_BINS.has(bin)) {
+      const check = Object.hasOwn(READ_ONLY_ARG_CHECKS, bin) ? READ_ONLY_ARG_CHECKS[bin] : undefined;
+      if (!check?.(args)) return false;
+    }
+    if (scope && !pathOperandsInsideRoots(args, scope)) return false;
+  }
+  return true;
+}
+
+/** Wraps a regex body so it behaves the same whether Amp matches regex patterns anchored or unanchored. */
+const ampRegex = (body: string): string => `/^[\\s\\S]*${body}[\\s\\S]*$/`;
+const ampToolRegex = (tool: string, body: string): string => `/^${tool}\\s(?:[\\s\\S]*\\s)?${body}[\\s\\S]*$/`;
+
+/**
+ * Amp never sends permission callbacks, so read-only Amp agents get a static `amp.permissions` list.
+ * Allow patterns anchor only the first command word, so the reject list must make every allowed line a
+ * single simple command whose words are literal: no separators, redirections, expansions, or quote,
+ * escape, or glob characters inside an option name. Path containment is not expressible here.
+ * Patterns that start and end with `/` are regexes in Amp's matcher.
+ */
 const AMP_READ_ONLY_SHELL_REJECT_PATTERNS = [
   "*>*",
+  "*<*",
   "*;*",
   "*&&*",
   "*||*",
-  "*$(*",
+  "*&*",
+  "*|*",
+  "*$*",
   "*`*",
   "*\n*",
-  "*--output*",
+  "*\r*",
+  "*{*",
+  "*}*",
+  ampRegex(String.raw`(?:^|[\s=:])~`),
+  ampRegex(String.raw`(?:^|\s)-[^\s=]*['"\\*?[]`),
+  ampRegex(String.raw`['"\\]-`),
+  ampRegex(String.raw`(?:^|\s)[*?[]`),
+  ampRegex(String.raw`[*?\]]\S*\(`),
+  "*--ou*",
+  "*--ext*",
+  "*--textc*",
+  "*--no-i*",
+  "*--filt*",
+  "*--op*",
+  "*--pre*",
+  "*--hostname-bin*",
+  "*--search-zip*",
+  "*--comp*",
+  "*--temporary-directory*",
+  "*--update-all*",
+  "*--rewrite*",
+  "*--interactive*",
+  "*--in-place*",
+  "*--library-path*",
+  "*--from-file*",
   "*-exec*",
   "*-ok*",
   "*-delete*",
   "*-fprint*",
   "*-fls*",
   "*sed *-i*",
-  "*sed *--in-place*",
-  "*sg *-U*",
-  "*ast-grep *-U*",
-  "*--update-all*",
-  "*--rewrite*",
-  "*--interactive*",
-  "*branch -d*",
-  "*branch -D*",
-  "*branch -m*",
-  "*branch -M*",
-  "*branch -c*",
-  "*branch -C*",
-  "*branch --delete*",
-  "*branch --move*",
-  "*branch --copy*",
-  "*branch --edit*",
-  "*branch --set-*",
-  "*| *sh *",
-  "*| *sh",
-  "*|sh *",
-  "*|sh",
-  "*| *bash*",
-  "*|bash*",
-  "*| *zsh*",
-  "*|zsh*",
-  "*| *tee *",
-  "*|tee *",
-  "*| *xargs*",
-  "*|xargs*",
-  "*| *dd *",
-  "*|dd *",
-  "*| *rm *",
-  "*|rm *",
-  "*| *mv *",
-  "*|mv *",
-  "*| *cp *",
-  "*|cp *",
-  "*| *chmod*",
-  "*|chmod*",
-  "*| *chown*",
-  "*|chown*",
-  "*| *python*",
-  "*|python*",
-  "*| *node*",
-  "*|node*",
-  "*| *bun*",
-  "*|bun*",
-  "*| *perl*",
-  "*|perl*",
-  "*| *ruby*",
-  "*|ruby*",
-  "*| *awk*",
-  "*|awk*",
-  "*| *sqlite3*",
-  "*|sqlite3*",
+  ampToolRegex(String.raw`git\s+grep`, "-[A-Za-z]*O"),
+  ampToolRegex("rg", "-[A-Za-z0-9]*z"),
+  ampToolRegex("sort", "(?:-[A-Za-z0-9]*[oT]|--(?:o|co|t))"),
+  ampToolRegex("(?:sg|ast-grep)", "-[A-Za-z]*[Ui]"),
+  ampToolRegex("tree", "-[A-Za-z0-9]*[oRHl]"),
+  ampToolRegex("file", "-[A-Za-z]*C"),
+  ampToolRegex("jq", "-[A-Za-z]*[fL]"),
+  ampRegex(String.raw`^jq\s[\s\S]*\b(?:env|import|include)\b`),
 ];
+
+const AMP_SED_ADDRESS = String.raw`(?:\d+|/[^/'"\\\n]*/)`;
+const AMP_SED_SCRIPT = String.raw`${AMP_SED_ADDRESS}(?:,${AMP_SED_ADDRESS})?p`;
 
 const AMP_READ_ONLY_SHELL_ALLOW_PATTERNS = [
   "rg",
   "rg *",
-  "sg *",
-  "ast-grep *",
+  "sg -*",
+  "sg run *",
+  "sg scan",
+  "sg scan *",
+  "ast-grep -*",
+  "ast-grep run *",
+  "ast-grep scan",
+  "ast-grep scan *",
   "cat *",
   "head *",
   "tail *",
   "nl *",
-  "sed -n *",
+  // sed -n with one address-print script and plain file operands
+  String.raw`/^sed -n (?:'${AMP_SED_SCRIPT}'|"${AMP_SED_SCRIPT}"|\d+(?:,\d+)?p)(?: [^\s'"\\-][^\s'"\\]*)*$/`,
   "wc *",
   "ls",
   "ls *",
@@ -518,7 +737,6 @@ const AMP_READ_ONLY_SHELL_ALLOW_PATTERNS = [
   "sha256sum *",
   "jq *",
   "sort *",
-  "uniq *",
   "cut *",
   "tr *",
   "git status",
@@ -536,22 +754,15 @@ const AMP_READ_ONLY_SHELL_ALLOW_PATTERNS = [
   "git grep *",
   "git blame *",
   "git describe *",
-  "git tag",
-  "git tag -l*",
-  "git tag --list*",
-  "git branch",
-  "git branch -l*",
-  "git branch --list*",
-  "git branch -a*",
-  "git branch -r*",
-  "git branch -v*",
-  "git branch --show-current*",
-  "git remote -v*",
   "git cat-file *",
   "git merge-base *",
-  "git shortlog*",
+  "git shortlog",
+  "git shortlog *",
   "git rev-list *",
-  "sqlite3 -readonly *",
+  String.raw`/^git tag(?: (?:-l|--list)(?: [^\s'"\\-][^\s'"\\]*)?)?$/`,
+  String.raw`/^git branch(?: (?:-a|-r|-v|-vv|-av|-avv|-l|--list|--all|--remotes|--verbose|--show-current))*$/`,
+  "git remote",
+  "git remote -v",
 ];
 
 function isExecutableBinary(filePath: string): boolean {
