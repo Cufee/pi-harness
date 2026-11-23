@@ -163,7 +163,10 @@ async function handleResumeCommand(
     console.log(JSON.stringify(await client.request("run.schedule_resume", { runId: trimmedRunId, delayMs }), null, 2));
     return;
   }
-  console.log(JSON.stringify(await client.request("run.resume", { runId: trimmedRunId, message }), null, 2));
+  const res = await client.request<Record<string, unknown>>("run.resume", { runId: trimmedRunId, message });
+  // Lead with the idempotent outcome and its message (resumed, already_active, already_completed, nothing_to_resume).
+  const { outcome, message: resultMessage, ...rest } = res ?? {};
+  console.log(JSON.stringify({ ...(outcome !== undefined ? { outcome, message: resultMessage } : {}), ...rest }, null, 2));
 }
 
 async function stopLocalDaemon(socketPath: string): Promise<boolean> {
@@ -316,7 +319,7 @@ Usage:
   pi-harness project list [--host <name>] [--json]  List registered projects
   pi-harness project add <path> [--name n] [--host <name>] [--init] [--clone <url>]
                                                     Register or create a project folder/repo (~ expands on target host)
-  pi-harness project use <name|id|path> [--host <name>]
+  pi-harness project use <[host:]name|id|path> [--host <name>]
                                                     Open Director Chat bound to a project
   pi-harness project rm <name|id> [--host <name>]   Unregister a project (never deletes files on disk)
   pi-harness project browse [path] [--host <name>]  Browse directories on local or remote host
@@ -767,14 +770,25 @@ async function main(): Promise<void> {
           break;
         }
         if (sub === "use" || sub === "open") {
-          const ref = positional[2];
-          if (!ref) throw new Error("Usage: pi-harness project use <name|id|path> [--host <name>]");
-          if (hostFlag && remoteSpec.target && hostFlag.toLowerCase() !== (remoteSpec.hostLabel ?? "").toLowerCase()) {
-            throw new Error(`Cannot combine --remote ${rawRemote} with --host ${hostFlag} on \`project use\`; specify one target host.`);
+          let ref = positional[2];
+          if (!ref) throw new Error("Usage: pi-harness project use <[host:]name|id|path> [--host <name>]");
+          // `<host>:<ref>` selects a project on a configured remote when --host is not given explicitly.
+          let useHost = hostFlag;
+          const colon = ref.indexOf(":");
+          if (!useHost && colon > 0) {
+            const prefix = ref.slice(0, colon);
+            const alias = config.remotes?.find((r) => r.name.toLowerCase() === prefix.toLowerCase());
+            if (alias && ref.slice(colon + 1).trim()) {
+              useHost = alias.name;
+              ref = ref.slice(colon + 1).trim();
+            }
+          }
+          if (useHost && remoteSpec.target && useHost.toLowerCase() !== (remoteSpec.hostLabel ?? "").toLowerCase()) {
+            throw new Error(`Cannot combine --remote ${rawRemote} with --host ${useHost} on \`project use\`; specify one target host.`);
           }
           const proj = await client.request<ProjectSummary & { host?: string }>("project.get", {
             projectId: ref,
-            ...(hostFlag ? { host: hostFlag } : {}),
+            ...(useHost ? { host: useHost } : {}),
           });
           if (!process.stdout.isTTY) {
             console.log(JSON.stringify(proj, null, 2));
@@ -782,8 +796,8 @@ async function main(): Promise<void> {
           }
           let targetClient = client;
           let targetHostLabel = remoteSpec.hostLabel;
-          if (hostFlag && hostFlag.toLowerCase() !== "local" && !remoteSpec.target) {
-            const spec = resolveRemoteSpec(hostFlag, config.remotes);
+          if (useHost && useHost.toLowerCase() !== "local" && !remoteSpec.target) {
+            const spec = resolveRemoteSpec(useHost, config.remotes);
             client.close();
             targetClient = await connectClient(config.socketPath, spec.target, spec.bridgeCommand);
             targetHostLabel = spec.hostLabel;

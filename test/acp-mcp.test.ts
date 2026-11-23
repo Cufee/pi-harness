@@ -577,7 +577,7 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
     assert.equal(detectQuotaErrorText("error code: 429").isQuota, true);
   });
 
-  it("enforces maxTurns, avoids duplicating generic systemPrompt, evaluates PromptResponse.usage rollover, and allows nested new workspace directories while blocking symlink escapes", async () => {
+  it("does not stop at maxTurns, avoids duplicating generic systemPrompt, evaluates PromptResponse.usage rollover, and allows nested new workspace directories while blocking symlink escapes", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "acp-hardening-"));
     const outside = mkdtempSync(join(tmpdir(), "acp-outside-"));
     try {
@@ -642,7 +642,7 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
       assert.equal(genRes.usage?.used, 80_000);
       assert.equal(genRes.usage?.size, 100_000);
 
-      // maxTurns enforcement across tool-call waves
+      // maxTurns is advisory: the runner keeps going across tool-call waves past the threshold
       let cancelOnMaxTurns = false;
       const loopAgent = agent()
         .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
@@ -690,8 +690,9 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
         },
         loopAgent,
       );
-      assert.equal(cancelOnMaxTurns, true);
-      assert.equal(mtRes.stopReason, "max_turns");
+      assert.equal(cancelOnMaxTurns, false);
+      assert.equal(mtRes.stopReason, "completed");
+      assert.match(mtRes.text, /wave 3/);
 
       // Ordinary assistant prose mentioning "rate limiting" without any observed rejection signal MUST NOT trigger quota_paused
       const proseAgent = agent()

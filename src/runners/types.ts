@@ -103,6 +103,10 @@ export interface RunAgentRequest {
   initialPrompt: string;
   model: string;
   effort?: string | null;
+  /**
+   * Advisory progress-reminder threshold (tool-call turns). When reached the runner sends ONE
+   * progress reminder and keeps working; 0 disables the reminder. Never stops the run.
+   */
   maxTurns: number;
   rolloverThreshold?: number;
   /** Soft timeout (ms) allowing native 429/rate-limit retries across subscription pools before pausing early. */
@@ -148,6 +152,8 @@ export function validateRunPolicy(req: RunAgentRequest): void {
 
 export interface RunAgentResult {
   text: string;
+  // "max_turns" stays in the union only for compatibility with an existing Director comparison;
+  // no runner ever returns it (turn counts are advisory reminders, never stops).
   stopReason: "completed" | "cancelled" | "rollover_requested" | "quota_paused" | "max_turns" | "error";
   usage?: RunnerUsage;
   sessionId?: string;
@@ -161,4 +167,25 @@ export interface ProbedModelInfo {
   description?: string;
   explicitModelId?: string;
   supportedEfforts?: string[];
+}
+
+/**
+ * Text of the single advisory progress reminder a runner sends when a task reaches its maxTurns
+ * threshold. Chosen by tier (and reviewer role), never by inspecting req.tools: code mode hides
+ * return_task behind code_exec.
+ */
+export function turnReminderText(tier: AgentTier, isReviewer = false): string {
+  const prefix =
+    "Progress check: you have reached this task's progress-reminder threshold of tool-call turns. " +
+    "This is advisory only: the harness will not stop you and nothing has been cancelled. Keep working while the work is productive.";
+  if (isReviewer) {
+    return `${prefix} When you have evidence for every required criterion, call submit_review_verdict (or return the requested JSON verdict).`;
+  }
+  if (tier === 1) {
+    return `${prefix} Check that delegated work is still progressing with wait_children, and if your context is getting heavy call request_rollover with an anchored handoff. You finish by ending your turn once the goal is integrated and verified.`;
+  }
+  if (tier === 2) {
+    return `${prefix} When your slice is ready: commit, submit_for_merge if you changed the repo, then return_task. If your context is getting heavy, commit clean WIP and call request_rollover. If the slice is larger than assigned, return_task with scope_too_large and evidence.`;
+  }
+  return `${prefix} When your result is ready, hand it back with return_task. If the assignment is larger than expected, return_task with scope_too_large, evidence paths and suggested splits instead of cutting the work short.`;
 }

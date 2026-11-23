@@ -884,7 +884,7 @@ export class ControlPlaneDb {
     }));
   }
 
-  updateRunStatus(id: string, status: RunRecord["status"]): void {
+  updateRunStatus(id: string, status: RunRecord["status"], reason?: string): void {
     const now = Date.now();
     const prev = this.db.prepare("SELECT status FROM runs WHERE id = ?").get(id) as { status: string } | undefined;
     this.db.prepare("UPDATE runs SET status = ?, updated_at = ? WHERE id = ?").run(status, now, id);
@@ -904,7 +904,30 @@ export class ControlPlaneDb {
         )
         .run(id);
     }
-    this.emitEvent(id, null, "run.status", { status });
+    this.emitEvent(id, null, "run.status", reason ? { status, reason } : { status });
+  }
+
+  /** Reason recorded on the latest run.status / quota.run_paused event for a run, or null when none was recorded. */
+  getLastRunStatusReason(runId: string): string | null {
+    const row = this.db
+      .prepare(
+        "SELECT payload_json FROM events WHERE run_id = ? AND type IN ('run.status', 'quota.run_paused') ORDER BY seq DESC LIMIT 1",
+      )
+      .get(runId) as { payload_json: string } | undefined;
+    if (!row) return null;
+    try {
+      const reason = (JSON.parse(row.payload_json) as { reason?: unknown } | null)?.reason;
+      return typeof reason === "string" && reason.trim() ? reason.trim() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Re-points a run at another repository (used when a Director chat switches projects). */
+  updateRunRepoInfo(runId: string, repoRoot: string, baseBranch: string, baseSha: string): void {
+    this.db
+      .prepare("UPDATE runs SET repo_root = ?, base_branch = ?, base_sha = ?, updated_at = ? WHERE id = ?")
+      .run(repoRoot, baseBranch, baseSha, Date.now(), runId);
   }
 
   // ---- Tasks & Write-Scope Leases ----

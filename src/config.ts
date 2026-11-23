@@ -112,13 +112,13 @@ export interface RolloverConfig {
   orchestratorThreshold: number;
   /** Context ratio triggering Tier 2 Worker clean worktree rollover (default 0.78) */
   workerThreshold: number;
-  /** Hard turn cap for Tier 1 Orchestrators (default 200) */
+  /** Advisory progress-reminder threshold in tool-call turns for Tier 1 Orchestrators (default 200); never stops the agent */
   orchestratorMaxTurns: number;
-  /** Hard turn cap for Tier 2 Workers (default 120) */
+  /** Advisory progress-reminder threshold in tool-call turns for Tier 2 Workers (default 120); never stops the agent */
   workerMaxTurns: number;
-  /** Hard turn cap for Tier 3 Task Agents (default 40) */
+  /** Advisory progress-reminder threshold in tool-call turns for Tier 3 Task Agents (default 40); never stops the agent */
   taskMaxTurns: number;
-  /** Hard turn cap for Goal Done-Review agents (default 12) */
+  /** Advisory progress-reminder threshold in tool-call turns for Goal Done-Review agents (default 30); never stops the agent */
   reviewerMaxTurns: number;
   /** Tool output byte threshold above which output is externalized to artifact file (default 2048) */
   externalizeBytes: number;

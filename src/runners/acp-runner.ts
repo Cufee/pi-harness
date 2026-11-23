@@ -25,7 +25,7 @@ import {
 } from "./acp-shims.js";
 import { isProtectedWritePath } from "./protected-paths.js";
 import { detectQuotaErrorText } from "./quota-detect.js";
-import { validateRunPolicy } from "./types.js";
+import { turnReminderText, validateRunPolicy } from "./types.js";
 import type { ProbedModelInfo, QuotaPauseInfo, RunAgentRequest, RunAgentResult, RunnerCost, RunnerUsage, ToolPolicy } from "./types.js";
 
 /** Returns an accurate, human-readable description of the active tool policy and permissions. */
@@ -415,7 +415,8 @@ export class AcpRunner {
     };
     let rolloverTriggered = false;
     let rolloverWarningSent = false;
-    let maxTurnsTriggered = false;
+    // maxTurns is an advisory progress-reminder threshold: one reminder, never a stop.
+    let turnReminderSent = false;
     let turnsUsed = 0;
     let completedToolInWave = false;
     const inFlightToolCalls = new Set<string>();
@@ -463,7 +464,7 @@ export class AcpRunner {
       const effectiveMs = inFlightToolCalls.size > 0 ? Math.max(idleTimeoutMs, 1_800_000) : idleTimeoutMs;
       idleTimer = setTimeout(() => {
         idleTimer = null;
-        if (quotaWatchdogTriggered || rolloverTriggered || maxTurnsTriggered || req.signal.aborted) return;
+        if (quotaWatchdogTriggered || rolloverTriggered || req.signal.aborted) return;
         idleTimedOut = true;
         const cb = rejectActivePromptOnIdle;
         clearIdleWatchdog();
@@ -476,16 +477,27 @@ export class AcpRunner {
       idleTimer.unref?.();
     };
 
+    // Fire-and-forget steering into the live session; adapters without a steering channel get nothing.
+    const sendSteeringText = (text: string) => {
+      if (!sessionId || !activeConnection) return;
+      if (steeringSupported) {
+        void activeConnection.agent
+          .request("_session/steering", { sessionId, prompt: [{ type: "text", text }] })
+          .catch(() => {});
+      } else if (isAmpProfile) {
+        void activeConnection.agent
+          .request("_amp/session/steer", { sessionId, steerId: randomUUID(), prompt: [{ type: "text", text }] })
+          .catch(() => {});
+      }
+    };
+    const isReviewer = req.tools.some((t) => t.name === "submit_review_verdict");
     const advanceTurnWaveIfNeeded = () => {
-      if (!completedToolInWave || inFlightToolCalls.size > 0 || maxTurnsTriggered) return;
+      if (!completedToolInWave || inFlightToolCalls.size > 0) return;
       completedToolInWave = false;
-      if (req.maxTurns > 0 && turnsUsed >= req.maxTurns) {
-        maxTurnsTriggered = true;
-        if (sessionId && activeConnection) {
-          void activeConnection.agent.notify("session/cancel", { sessionId }).catch(() => {});
-        }
-        armCancelGraceTimer("max_turn_requests");
-        return;
+      // A new tool call after a completed wave means work is continuing: remind once, never cancel.
+      if (!turnReminderSent && req.maxTurns > 0 && turnsUsed >= req.maxTurns) {
+        turnReminderSent = true;
+        sendSteeringText(turnReminderText(req.tier, isReviewer));
       }
       turnsUsed += 1;
       req.callbacks.onTurn?.(turnsUsed);
@@ -718,21 +730,9 @@ export class AcpRunner {
             rolloverWarningSent = true;
             const pct = Math.round(ratio * 100);
             const limitPct = Math.round(req.rolloverThreshold * 100);
-            const warnMsg =
-              `Context usage is at ${pct}% (hard rollover at ${limitPct}%). Finish your current atomic step and call \`request_rollover\` with a thorough anchored handoff (goal_invariants, architectural_decisions, active_risks, next_actions) so no context is lost.`;
-            if (steeringSupported) {
-              void activeConnection.agent
-                .request("_session/steering", { sessionId, prompt: [{ type: "text", text: warnMsg }] })
-                .catch(() => {});
-            } else if (isAmpProfile) {
-              void activeConnection.agent
-                .request("_amp/session/steer", {
-                  sessionId,
-                  steerId: randomUUID(),
-                  prompt: [{ type: "text", text: warnMsg }],
-                })
-                .catch(() => {});
-            }
+            sendSteeringText(
+              `Context usage is at ${pct}% (hard rollover at ${limitPct}%). Finish your current atomic step and call \`request_rollover\` with a thorough anchored handoff (goal_invariants, architectural_decisions, active_risks, next_actions) so no context is lost.`,
+            );
           }
 
           if (
@@ -1369,12 +1369,11 @@ export class AcpRunner {
       let airFailureCode = "";
       let consecutiveSilentRecoveries = 0;
       let breakerExplainedOnce = false;
+      // Upstream adapter request limit (rawStop "max_turn_requests"): the harness has no turn limit, so a
+      // productive turn is re-prompted on the same session; a limit hit with zero progress ends with an error.
+      let upstreamLimitStalled = false;
 
       for (let recoveryAttempt = 0; recoveryAttempt <= MAX_TOTAL_RECOVERY_CONTINUATIONS; recoveryAttempt++) {
-        if (recoveryAttempt > 0 && req.maxTurns > 0 && turnsUsed >= req.maxTurns) {
-          maxTurnsTriggered = true;
-          break;
-        }
         turnsUsed += 1;
         req.callbacks.onTurn?.(turnsUsed);
         completedToolInWave = false;
@@ -1472,17 +1471,28 @@ export class AcpRunner {
           (quotaRetryHits > 0 && turnSucceededTools === 0 && turnQuotaDetected.isQuota) ||
           shortHardQuotaText;
 
-        // Never continue if rollover, maxTurns, quota watchdog, quota rejection, user abort, or quota failure occurred
+        // Never continue if rollover, quota watchdog, quota rejection, user abort, or quota failure occurred
         if (
           rolloverTriggered ||
-          maxTurnsTriggered ||
-          rawStop === "max_turn_requests" ||
           quotaWatchdogTriggered ||
           turnQuotaFalseCompletion ||
           req.signal.aborted ||
           ["quota_exhausted", "rate_limited", "budget_exhausted"].includes(airFailureCode)
         ) {
           break;
+        }
+
+        if (rawStop === "max_turn_requests") {
+          if (turnSucceededTools === 0) {
+            upstreamLimitStalled = true;
+            break;
+          }
+          nextPromptText =
+            "The agent runtime ended that turn at its own request limit; the harness has no turn limit. Continue from where you left off.";
+          if (accumulatedText.length > 0) needsParagraphBreak = true;
+          // Productive continuation: does not consume the failure-recovery budget.
+          recoveryAttempt -= 1;
+          continue;
         }
 
         // If the identical-failure circuit breaker tripped (6+ consecutive identical failures with zero
@@ -1599,13 +1609,24 @@ export class AcpRunner {
         }
       }
 
+      if (upstreamLimitStalled && !rolloverTriggered && !req.signal.aborted) {
+        const msg =
+          `ACP runner (${this.profile.id}): the upstream agent adapter ended a turn at its own request limit (max_turn_requests) ` +
+          "without any successful tool call. This is an adapter limit, not a harness turn limit; the harness stopped re-prompting to avoid a hot loop.";
+        return {
+          text: accumulatedText ? `${accumulatedText}\n\n${msg}` : msg,
+          stopReason: "error",
+          usage: lastUsage,
+          sessionId,
+          toolFailures: allToolFailures.length > 0 ? allToolFailures : undefined,
+        };
+      }
+
       const stopReason: RunAgentResult["stopReason"] = rolloverTriggered
         ? "rollover_requested"
-        : maxTurnsTriggered || rawStop === "max_turn_requests"
-          ? "max_turns"
-          : rawStop === "cancelled" || req.signal.aborted
-            ? "cancelled"
-            : "completed";
+        : rawStop === "cancelled" || req.signal.aborted
+          ? "cancelled"
+          : "completed";
 
       return {
         text: accumulatedText,
@@ -1629,15 +1650,6 @@ export class AcpRunner {
         return {
           text: accumulatedText,
           stopReason: "rollover_requested",
-          usage: lastUsage,
-          sessionId,
-          toolFailures: allToolFailures.length > 0 ? allToolFailures : undefined,
-        };
-      }
-      if (maxTurnsTriggered) {
-        return {
-          text: accumulatedText,
-          stopReason: "max_turns",
           usage: lastUsage,
           sessionId,
           toolFailures: allToolFailures.length > 0 ? allToolFailures : undefined,

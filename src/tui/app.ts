@@ -382,23 +382,29 @@ function createSharedShell(spec: SharedShellContext) {
         stoppedRunIds?: string[];
         cancelledChats?: number;
         cancelledReviews?: number;
+        cancelledTimers?: number;
       }>("runs.stop_all", {
         reason: reason || "Stopped by user (/stop)",
       });
       const runsStopped = res.stoppedRunIds?.length ?? 0;
       const chatsCancelled = res.cancelledChats ?? 0;
       const reviewsCancelled = res.cancelledReviews ?? 0;
+      const timersCancelled = res.cancelledTimers ?? 0;
       const summaryParts: string[] = [];
-      if (runsStopped > 0) summaryParts.push(`${runsStopped} run(s)`);
-      if (chatsCancelled > 0) summaryParts.push(`${chatsCancelled} chat(s)`);
+      if (runsStopped > 0) {
+        const ids = res.stoppedRunIds!.slice(0, 3).join(", ");
+        summaryParts.push(runsStopped > 3 ? `${ids} and ${runsStopped - 3} more run(s)` : ids);
+      }
+      if (chatsCancelled > 0) summaryParts.push(`${chatsCancelled} chat turn(s)`);
       if (reviewsCancelled > 0) summaryParts.push(`${reviewsCancelled} review(s)`);
+      if (timersCancelled > 0) summaryParts.push(`${timersCancelled} pending resume timer(s)`);
       transcript.appendReceipt({
         glyph: theme.glyphs.cross,
         tone: "warn",
         tag: "stop",
         text:
           summaryParts.length > 0
-            ? `Stopped ${summaryParts.join(", ")}.`
+            ? `Stopped ${summaryParts.join(", ")}. Nothing restarts by itself; resume with \`pi-harness resume <run-id>\` or ask the Director to continue.`
             : "No active runs, chats, or reviews were running.",
       });
       await store.refresh();
@@ -482,6 +488,29 @@ function createSharedShell(spec: SharedShellContext) {
           void store.refresh();
           syncDock();
           return true;
+        }
+        // `<host>:<project>` opens a project on a configured remote or connected peer host.
+        const hostMatch = arg.match(/^([^:\s/]+):(.+)$/);
+        if (hostMatch) {
+          const wanted = hostMatch[1]!.toLowerCase();
+          let host = spec.localRemotes?.find((r) => r.name.toLowerCase() === wanted)?.name;
+          if (!host) {
+            const peers = await spec.client.request<Array<{ name: string }>>("remote.list").catch(() => []);
+            host = peers.find((r) => r.name.toLowerCase() === wanted)?.name;
+          }
+          if (host) {
+            const remote = await spec.client.request<ProjectRecord & { nodeId?: string | null }>("project.get", {
+              projectId: hostMatch[2]!.trim(),
+              host,
+            });
+            switchTo("chat", "__project__", {
+              projectId: remote.id,
+              repoRoot: remote.rootPath,
+              targetHost: host,
+              ...(remote.nodeId ? { targetNodeId: remote.nodeId } : {}),
+            });
+            return true;
+          }
         }
         const target = await spec.client.request<ProjectRecord>("project.get", { projectId: arg });
         switchTo("chat", "__project__", { projectId: target.id, repoRoot: target.rootPath });
@@ -1284,7 +1313,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       }
     } else if (turn.role === "system_notice") {
       const parsed = turn.event ? parseChatControlEvent(turn.event) : null;
-      const summary = parsed ? formatChatEventSummary(parsed) : turn.content;
+      const summary = parsed ? settledReceiptText(parsed, turn.event) : turn.content;
       const ref: EntityRef | undefined =
         parsed && "goalId" in parsed && parsed.goalId
           ? { kind: "goal", id: parsed.goalId, label: `${parsed.goalId}` }
@@ -1458,7 +1487,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       const ref: EntityRef | undefined = goalId ? { kind: "goal", id: goalId, runId: ev.runId || undefined, label: goalId } : undefined;
       if (ref) shell.recordRef(ref);
       const summary = parsed
-        ? formatChatEventSummary(parsed)
+        ? settledReceiptText(parsed, p)
         : sanitizeLine(String(p.summary ?? p.title ?? p.status ?? ev.type));
       shell.transcript.appendReceipt({
         glyph: shell.theme.glyphs.diamond,
@@ -1720,7 +1749,10 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
       shell.transcript.appendReceipt({
         tone: status === "failed" || status === "blocked" ? "danger" : status === "completed" ? "ok" : "info",
         tag: who,
-        text: `${ev.type}: ${status}${p.summary ? ` — ${sanitizeLine(String(p.summary))}` : ""}`,
+        text:
+          `${ev.type}: ${status}${p.summary ? ` — ${sanitizeLine(String(p.summary))}` : ""}` +
+          (ev.type === "run.status" && p.reason ? ` — ${sanitizeLine(String(p.reason))}` : "") +
+          (ev.type === "run.status" && status === "stopped" ? ` (resume: pi-harness resume ${ev.runId})` : ""),
         ref,
       });
       shell.session.tui.requestRender();
@@ -1773,4 +1805,16 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
     detachEvents();
     detachClose();
   }
+}
+
+/**
+ * Receipt text for a chat control event. A goal.settled that did not complete also shows the recorded
+ * cause from the raw event (when present) and the concrete resume command for its run.
+ */
+function settledReceiptText(parsed: NonNullable<ReturnType<typeof parseChatControlEvent>>, raw: unknown): string {
+  const base = formatChatEventSummary(parsed);
+  if (parsed.kind !== "goal.settled" || parsed.runStatus === "completed") return base;
+  const detail = raw && typeof raw === "object" ? (raw as { detail?: unknown }).detail : undefined;
+  const cause = typeof detail === "string" && detail.trim() ? sanitizeLine(detail.trim()) : `no cause recorded; inspect with pi-harness tree ${parsed.runId}`;
+  return `${base} — ${cause} (resume: pi-harness resume ${parsed.runId})`;
 }

@@ -17,7 +17,7 @@ import { googleProvider } from "@earendil-works/pi-ai/providers/google";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import type { PiProfileConfig } from "../config.js";
 import { detectQuotaErrorText } from "./quota-detect.js";
-import { validateRunPolicy } from "./types.js";
+import { turnReminderText, validateRunPolicy } from "./types.js";
 import type { ProbedModelInfo, RunAgentRequest, RunAgentResult, RunnerUsage } from "./types.js";
 
 const BUILTIN_PROVIDERS = new Map<string, [() => Provider<Api>, string]>([
@@ -168,8 +168,9 @@ export class PiRunner {
     }));
 
     try {
-      const maxTurnsLimit = req.maxTurns > 0 ? req.maxTurns : Number.POSITIVE_INFINITY;
-      for (let turn = 0; turn < maxTurnsLimit; turn++) {
+      // maxTurns is an advisory reminder threshold; the loop ends only when the agent stops calling tools.
+      let turnReminderSent = false;
+      for (let turn = 0; ; turn++) {
         req.callbacks.onTurn?.(turn + 1);
         if (cancelled || runAbort.signal.aborted) {
           return { text: lastText, stopReason: cancelledStopReason(), usage: lastUsage };
@@ -428,6 +429,12 @@ export class PiRunner {
           return { text: lastText, stopReason: "completed", usage: lastUsage };
         }
 
+        // Work continues (tool calls pending): send ONE advisory progress reminder at the threshold.
+        if (!turnReminderSent && req.maxTurns > 0 && turn + 1 >= req.maxTurns) {
+          turnReminderSent = true;
+          steeringQueue.push(turnReminderText(req.tier, req.tools.some((t) => t.name === "submit_review_verdict")));
+        }
+
         // Inject soft rollover warning once when approaching rolloverThreshold
         const softWarnThreshold = req.rolloverThreshold ? Math.max(0.5, req.rolloverThreshold - 0.12) : undefined;
         if (
@@ -445,8 +452,6 @@ export class PiRunner {
           );
         }
       }
-
-      return { text: lastText, stopReason: "max_turns", usage: lastUsage };
     } finally {
       req.signal.removeEventListener("abort", onReqAbort);
     }
