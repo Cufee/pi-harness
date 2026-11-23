@@ -4,7 +4,7 @@ import { closeSync, existsSync, mkdirSync, openSync, realpathSync, writeFileSync
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ProjectBrowseResult, ProjectSummary } from "./control-plane/projects.js";
-import { loadConfig, type AcpProfileConfig } from "./config.js";
+import { ensureTempDir, loadConfig, type AcpProfileConfig } from "./config.js";
 import { loadOrCreateNodeId } from "./control-plane/session-messages.js";
 import type { RemoteHostStatus } from "./daemon/peer.js";
 import { DaemonClient, runStdioSocketBridge } from "./daemon/remote.js";
@@ -602,6 +602,7 @@ async function main(): Promise<void> {
       process.on("unhandledRejection", (reason) => {
         console.error(`[harnessd ${new Date().toISOString()}] unhandledRejection:`, reason);
       });
+      ensureTempDir();
       const daemon = new HarnessDaemon(config, { autoQuitWhenIdle: true, repoRoot });
       const sock = await daemon.start();
       try {
