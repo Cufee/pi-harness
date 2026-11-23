@@ -579,6 +579,9 @@ export class DirectorRuntime {
   private wakeHandler: ((chatSessionId: string, event: ChatControlEvent) => void) | null = null;
   private peerBridge: DirectorPeerBridge | null = null;
   private notifiedSettledGoals = new Set<string>();
+  private launchingGoals = new Set<string>();
+  private pendingDrainRepos = new Set<string>();
+  private pendingDrainAll = false;
 
   constructor(
     private readonly db: ControlPlaneDb,
@@ -757,6 +760,10 @@ export class DirectorRuntime {
     if (ev.type !== "run.status") return;
     const status = String((ev.payload as { status?: string } | null)?.status ?? "");
     if (status === "active" || status === "paused_quota") {
+      // A resumed run can settle again with the same goal version; let that settlement through.
+      if (status === "active") {
+        for (const key of this.notifiedSettledGoals) if (key.includes(`:${ev.runId}:`)) this.notifiedSettledGoals.delete(key);
+      }
       this.syncQueuedGoalProgress();
       return;
     }
@@ -782,7 +789,8 @@ export class DirectorRuntime {
     }
 
     const dedupeKey = `${goal.id}:v${goal.version}:c${goal.reviewCycle}:${ev.runId}:${status}`;
-    if (this.notifiedSettledGoals.has(dedupeKey)) return;
+    // Deduplicates verification launches and wakeups only; slot hand-off and queue admission always run.
+    const firstNotice = !this.notifiedSettledGoals.has(dedupeKey);
     this.notifiedSettledGoals.add(dedupeKey);
 
     // Control-plane-driven automatic verification on run completion (removes LLM single point of failure)
@@ -792,7 +800,7 @@ export class DirectorRuntime {
       goal.verificationMode !== "none" &&
       !this.activeReviews.has(goal.id)
     ) {
-      if (!this.unsubRunEvents) return; // daemon disposed
+      if (!this.unsubRunEvents || !firstNotice) return; // daemon disposed or already launched
       void this.verifyAndReviewGoal(goal.id, undefined, { autoTriggered: true }).catch((err) => {
         if (!this.unsubRunEvents || !goal.chatSessionId || !this.config.events?.wakeDirectorOnGoalSettle) return;
         const msg = err instanceof Error ? err.message : String(err);
@@ -832,7 +840,7 @@ export class DirectorRuntime {
     void this.drainGoalQueue(goal.repoRoot).catch(() => {});
     this.syncQueuedGoalProgress();
 
-    if (!wakeOnSettle || !goal.chatSessionId) return;
+    if (!firstNotice || !wakeOnSettle || !goal.chatSessionId) return;
 
     const event: ChatControlEvent = {
       kind: "goal.settled",
@@ -1043,9 +1051,9 @@ export class DirectorRuntime {
     return run !== null && (run.status === "active" || run.status === "paused_quota");
   }
 
-  /** A goal holds a concurrency slot only while its run is live or an in-process review is running for it. */
+  /** A goal holds a concurrency slot while it is launching, its run is live, or an in-process review is running for it. */
   private isGoalOccupyingSlot(goal: GoalRecord): boolean {
-    if (goal.status === "verifying" || goal.status === "reviewing") return this.activeReviews.has(goal.id);
+    if (this.launchingGoals.has(goal.id) || this.activeReviews.has(goal.id)) return true;
     if (goal.status !== "executing") return false;
     return this.isRunOccupyingGoalSlot(goal.linkedRunId);
   }
@@ -1079,8 +1087,11 @@ export class DirectorRuntime {
         }
       }
       const queuedIds = new Set(entries.map((e) => e.targetId));
-      for (const g of this.goals.listGoals({ status: "draft" })) {
-        if (g.liveProgress?.phase === "queued" && !queuedIds.has(g.id)) this.goals.clearQueuedProgress(g.id);
+      for (const g of this.goals.listGoals()) {
+        const phase = g.liveProgress?.phase;
+        // A draft keeps its launch error so the user sees why it left the queue.
+        const stale = phase === "queued" || (phase === "queue_launch_error" && g.status !== "draft");
+        if (stale && !queuedIds.has(g.id)) this.goals.clearQueuedProgress(g.id);
       }
     } finally {
       this.syncingQueuedProgress = false;
@@ -1091,28 +1102,38 @@ export class DirectorRuntime {
     goal: GoalRecord,
     opts?: { profileId?: string; model?: string; effort?: string },
   ): Promise<GoalRecord> {
-    this.db.admissionQueue.remove("goal", goal.id);
-    const criteriaSummary = goal.criteria
-      .map((c) => `- [${c.id}] (${c.kind}${c.required ? "*" : ""}) ${c.description}${c.command ? ` [cmd: ${c.command}]` : ""}`)
-      .join("\n");
-    const runObjective = [
-      `Goal ${goal.id} v${goal.version}: ${goal.title}`,
-      goal.description,
-      "",
-      "Acceptance Criteria:",
-      criteriaSummary,
-      ...(goal.nonGoals.length ? ["", "Non-Goals:", ...goal.nonGoals.map((n) => `- ${n}`)] : []),
-    ].join("\n");
+    if (this.launchingGoals.has(goal.id)) return this.goals.getGoal(goal.id) ?? goal;
+    // Claim the slot before the first await so concurrent admission decisions see it.
+    this.launchingGoals.add(goal.id);
+    let started: GoalRecord;
+    let runId: string;
+    try {
+      this.db.admissionQueue.remove("goal", goal.id);
+      const criteriaSummary = goal.criteria
+        .map((c) => `- [${c.id}] (${c.kind}${c.required ? "*" : ""}) ${c.description}${c.command ? ` [cmd: ${c.command}]` : ""}`)
+        .join("\n");
+      const runObjective = [
+        `Goal ${goal.id} v${goal.version}: ${goal.title}`,
+        goal.description,
+        "",
+        "Acceptance Criteria:",
+        criteriaSummary,
+        ...(goal.nonGoals.length ? ["", "Non-Goals:", ...goal.nonGoals.map((n) => `- ${n}`)] : []),
+      ].join("\n");
 
-    const { run } = await this.orchestrator.startRun({
-      goal: runObjective,
-      repoRoot: goal.repoRoot,
-      profileId: opts?.profileId,
-      model: opts?.model,
-      effort: opts?.effort,
-    });
+      const { run } = await this.orchestrator.startRun({
+        goal: runObjective,
+        repoRoot: goal.repoRoot,
+        profileId: opts?.profileId,
+        model: opts?.model,
+        effort: opts?.effort,
+      });
 
-    const started = this.goals.linkRunAndStart(goal.id, run.id);
+      started = this.goals.linkRunAndStart(goal.id, run.id);
+      runId = run.id;
+    } finally {
+      this.launchingGoals.delete(goal.id);
+    }
     this.syncQueuedGoalProgress();
     if (started.chatSessionId) {
       const committedEvent: ChatControlEvent = {
@@ -1120,7 +1141,7 @@ export class DirectorRuntime {
         goalId: started.id,
         goalVersion: started.version,
         goalTitle: started.title,
-        runId: run.id,
+        runId,
         criteriaCount: started.criteria.length,
       };
       this.chats.appendTurn(
@@ -1131,7 +1152,7 @@ export class DirectorRuntime {
         committedEvent,
       );
     }
-    this.db.emitEvent(run.id, null, "goal.committed", { goalId: started.id, version: started.version, title: started.title });
+    this.db.emitEvent(runId, null, "goal.committed", { goalId: started.id, version: started.version, title: started.title });
     return started;
   }
 
@@ -1141,6 +1162,7 @@ export class DirectorRuntime {
   ): Promise<GoalRecord> {
     const goal = this.goals.getGoal(goalId);
     if (!goal) throw new Error(`Unknown goal ${goalId}`);
+    if (this.launchingGoals.has(goal.id)) return goal;
 
     const limit = Math.max(1, this.config.goals.maxConcurrentGoals ?? 4);
     let activeCount = this.countActiveGoals(goal.repoRoot);
@@ -1150,6 +1172,10 @@ export class DirectorRuntime {
     if (!opts?.forceStart && activeCount < limit && queuedAhead.length > 0) {
       // Free slots go to goals already waiting (FIFO) before this goal decides whether to queue.
       await this.drainGoalQueue(goal.repoRoot);
+      const fresh = this.goals.getGoal(goal.id);
+      if (!fresh) throw new Error(`Unknown goal ${goalId}`);
+      // The drain may have admitted this goal itself.
+      if (this.launchingGoals.has(fresh.id) || ["executing", "verifying", "reviewing"].includes(fresh.status)) return fresh;
       activeCount = this.countActiveGoals(goal.repoRoot);
       queuedAhead = listQueuedAhead();
     }
@@ -1179,7 +1205,13 @@ export class DirectorRuntime {
 
   /** Admits queued goals in strict queue order whenever capacity opens or `maxConcurrentGoals` increases. */
   async drainGoalQueue(repoRoot?: string): Promise<string[]> {
-    if (this.disposed || this.drainingGoals) return [];
+    if (this.disposed) return [];
+    if (this.drainingGoals) {
+      // Rerun once the current drain finishes so capacity freed meanwhile is not missed.
+      if (repoRoot) this.pendingDrainRepos.add(repoRoot);
+      else this.pendingDrainAll = true;
+      return [];
+    }
     this.drainingGoals = true;
     const startedIds: string[] = [];
     try {
@@ -1192,7 +1224,11 @@ export class DirectorRuntime {
           const next = this.db.admissionQueue.peekNext("goal", repo);
           if (!next) break;
           const goal = this.goals.getGoal(next.targetId);
-          if (!goal || ["achieved", "cancelled", "executing", "verifying", "reviewing"].includes(goal.status)) {
+          if (
+            !goal ||
+            this.launchingGoals.has(goal.id) ||
+            ["achieved", "cancelled", "executing", "verifying", "reviewing"].includes(goal.status)
+          ) {
             this.db.admissionQueue.remove("goal", next.targetId);
             continue;
           }
@@ -1214,6 +1250,13 @@ export class DirectorRuntime {
       }
     } finally {
       this.drainingGoals = false;
+      if (!this.disposed && (this.pendingDrainAll || this.pendingDrainRepos.size > 0)) {
+        const repos = [...this.pendingDrainRepos];
+        const drainAll = this.pendingDrainAll || repos.length > 1;
+        this.pendingDrainAll = false;
+        this.pendingDrainRepos.clear();
+        void this.drainGoalQueue(drainAll ? undefined : repos[0]).catch(() => {});
+      }
     }
     return startedIds;
   }
@@ -1373,7 +1416,10 @@ export class DirectorRuntime {
 
   /** Moves an `executing` goal whose run is not live to `awaiting_human` and releases its slot to the queue. */
   private handOffStrandedGoal(goal: GoalRecord, reason: string): GoalRecord {
-    if (goal.status !== "executing" || this.isRunOccupyingGoalSlot(goal.linkedRunId)) return goal;
+    // Re-read so a concurrent pause, cancel, or amendment is never overwritten.
+    const current = this.goals.getGoal(goal.id);
+    if (!current || current.version !== goal.version || current.status !== "executing") return current ?? goal;
+    if (this.isRunOccupyingGoalSlot(current.linkedRunId)) return current;
     const updated = this.goals.setStatus(goal.id, "awaiting_human", `Goal ${goal.id} needs attention: ${reason}; resume or review.`);
     void this.drainGoalQueue(goal.repoRoot).catch(() => {});
     return updated;
@@ -1426,6 +1472,7 @@ export class DirectorRuntime {
       unsubscribe();
       this.activeReviews.delete(goal.id);
       if (!this.disposed) {
+        this.syncQueuedGoalProgress();
         const latest = this.goals.getGoal(goal.id);
         if (latest && !this.isGoalOccupyingSlot(latest)) void this.drainGoalQueue(latest.repoRoot).catch(() => {});
       }
@@ -1827,7 +1874,38 @@ export class DirectorRuntime {
     },
     opts?: { autoTriggered?: boolean },
   ): Promise<void> {
-    const { goal, review, circuitBreakerTripped } = outcome;
+    const { review, circuitBreakerTripped } = outcome;
+    let goal = outcome.goal;
+    if (goal.status === "executing") {
+      // Wake / steer Tier 1 Orchestrator — or relaunch in-place if Tier 1 already settled!
+      const orch = goal.linkedRunId ? this.db.listTasks(goal.linkedRunId).find((t) => t.tier === 1) : undefined;
+      let delivered = false;
+      if (orch) {
+        const unmet = review.criteriaResults.filter((c) => !c.passed);
+        const msg = [
+          `[INDEPENDENT REVIEW #${review.cycle}: CHANGES REQUESTED for ${goal.id} v${goal.version}]`,
+          `Summary: ${review.summary}`,
+          ...unmet.map((u) => `- ${u.criterionId}: ${u.evidence}${u.remediation ? ` | Fix: ${u.remediation}` : ""}`),
+          ...review.blockingIssues.map((b) => `- Blocker: ${b}`),
+        ].join("\n");
+        delivered = await this.orchestrator.steerTask(orch.id, msg).catch(() => false);
+        if (!delivered) {
+          delivered = await this.orchestrator
+            .resumeTask(orch.id, { allowCompleted: true, note: msg })
+            .then(() => true, () => false);
+        }
+      }
+      if (!delivered) {
+        const reason = !goal.linkedRunId
+          ? "no linked run to apply requested changes"
+          : orch
+            ? "requested changes could not be delivered to its run"
+            : "linked run has no orchestrator to apply requested changes";
+        goal = this.handOffStrandedGoal(goal, reason);
+        outcome.goal = goal;
+      }
+    }
+
     if (goal.linkedRunId) {
       this.db.emitEvent(goal.linkedRunId, null, "goal.reviewed", {
         goalId: goal.id,
@@ -1858,27 +1936,6 @@ export class DirectorRuntime {
             blocking: true,
           });
         }
-      } else if (goal.status === "executing") {
-        // Wake / steer Tier 1 Orchestrator — or relaunch in-place if Tier 1 already settled!
-        const orch = this.db.listTasks(goal.linkedRunId).find((t) => t.tier === 1);
-        if (orch) {
-          const unmet = review.criteriaResults.filter((c) => !c.passed);
-          const msg = [
-            `[INDEPENDENT REVIEW #${review.cycle}: CHANGES REQUESTED for ${goal.id} v${goal.version}]`,
-            `Summary: ${review.summary}`,
-            ...unmet.map((u) => `- ${u.criterionId}: ${u.evidence}${u.remediation ? ` | Fix: ${u.remediation}` : ""}`),
-            ...review.blockingIssues.map((b) => `- Blocker: ${b}`),
-          ].join("\n");
-          let delivered = await this.orchestrator.steerTask(orch.id, msg).catch(() => false);
-          if (!delivered) {
-            delivered = await this.orchestrator
-              .resumeTask(orch.id, { allowCompleted: true, note: msg })
-              .then(() => true, () => false);
-          }
-          if (!delivered) this.handOffStrandedGoal(goal, "requested changes could not be delivered to its run");
-        } else {
-          this.handOffStrandedGoal(goal, "linked run has no orchestrator to apply requested changes");
-        }
       }
     }
 
@@ -1894,7 +1951,9 @@ export class DirectorRuntime {
         ...(circuitBreakerTripped ? { circuitBreakerTripped } : {}),
       };
       const willWakeDirector = Boolean(
-        opts?.autoTriggered && (goal.status === "achieved" || goal.status === "awaiting_human"),
+        opts?.autoTriggered &&
+          this.config.events?.wakeDirectorOnGoalSettle !== false &&
+          (goal.status === "achieved" || goal.status === "awaiting_human"),
       );
       if (willWakeDirector && this.wakeHandler) {
         // Let the wakeup turn record the single canonical `system_notice` turn so `goal.reviewed` is never delivered twice!
