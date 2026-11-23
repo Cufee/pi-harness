@@ -78,29 +78,37 @@ export const reportError = e => send({kind:'error',value: !!e && !(e instanceof 
 const fatalHook = `
 import { reportError } from './bridge.mjs';
 const fatalEvents = ['uncaughtException', 'unhandledRejection'], onceRan = {};
+// Bun's process emitter keeps one registration per callback: the first one wins and off removes it.
+// A callback here is registered either as itself or as one prepended once-wrapper, never both.
 const prepended = { uncaughtException: new Map(), unhandledRejection: new Map() };
-const origPrependOnce = process.prependOnceListener, origRemove = process.removeListener;
+const orig = {};
+for (const m of ['on', 'addListener', 'once', 'prependListener', 'prependOnceListener', 'removeListener', 'removeAllListeners']) orig[m] = process[m];
 let fatalHandled = false;
+for (const m of ['on', 'addListener', 'once', 'prependListener']) process[m] = function (event, fn) {
+  if (fatalEvents.includes(event) && prepended[event].has(fn)) return this;
+  return orig[m].call(this, event, fn);
+};
 process.prependOnceListener = function (event, fn) {
-  if (!fatalEvents.includes(event) || typeof fn !== 'function') return origPrependOnce.call(this, event, fn);
+  if (!fatalEvents.includes(event) || typeof fn !== 'function') return orig.prependOnceListener.call(this, event, fn);
+  if (prepended[event].has(fn) || process.rawListeners(event).includes(fn)) return this;
   function wrapped(...args) {
-    const list = prepended[event].get(fn), i = list ? list.indexOf(wrapped) : -1;
-    if (i >= 0) { list.splice(i, 1); if (!list.length) prepended[event].delete(fn); }
-    origRemove.call(process, event, wrapped);
+    if (prepended[event].get(fn) === wrapped) prepended[event].delete(fn);
+    orig.removeListener.call(process, event, wrapped);
     onceRan[event] = true; queueMicrotask(() => { onceRan[event] = false; });
     return fn.apply(this, args);
   }
-  const list = prepended[event].get(fn) ?? [];
-  list.push(wrapped); prepended[event].set(fn, list);
-  return process.prependListener(event, wrapped);
+  prepended[event].set(fn, wrapped);
+  return orig.prependListener.call(this, event, wrapped);
 };
 process.removeListener = process.off = function (event, fn) {
-  const list = fatalEvents.includes(event) ? prepended[event].get(fn) : undefined;
-  if (!list) return origRemove.call(this, event, fn);
-  const wrapped = list.pop();
-  if (!list.length) prepended[event].delete(fn);
-  origRemove.call(this, event, wrapped);
-  return this;
+  const wrapped = fatalEvents.includes(event) ? prepended[event].get(fn) : undefined;
+  if (!wrapped) return orig.removeListener.call(this, event, fn);
+  prepended[event].delete(fn);
+  return orig.removeListener.call(this, event, wrapped);
+};
+process.removeAllListeners = function (...args) {
+  for (const event of fatalEvents) if (!args.length || args[0] === event) prepended[event].clear();
+  return orig.removeAllListeners.apply(this, args);
 };
 for (const event of fatalEvents) process.on(event, async e => {
   const handled = onceRan[event] || process.listenerCount(event) > 1;
