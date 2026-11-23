@@ -9,7 +9,14 @@ import { withFixtureCatalog } from "./fixtures/launch-config.js";
 import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import { AcpRunner, describeToolPolicyMode, detectCodexCodeModeMisconfig } from "../src/runners/acp-runner.js";
-import { buildNewSessionParams, buildPostSessionActions, hasCodexCodeModeHost, prepareAcpSpawn } from "../src/runners/acp-shims.js";
+import {
+  buildNewSessionParams,
+  buildPostSessionActions,
+  hasCodexCodeModeHost,
+  isReadOnlyExternalMcpTool,
+  isSafeReadOnlyShellCommand,
+  prepareAcpSpawn,
+} from "../src/runners/acp-shims.js";
 import { detectQuotaErrorText } from "../src/runners/quota-detect.js";
 import type { PassiveQuotaSignal, RunAgentRequest, RunnerExecutionHandle, RunnerUsage } from "../src/runners/types.js";
 
@@ -1115,6 +1122,195 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
         false,
         "Must never claim 'strictly read-only' when verification shell is enabled",
       );
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces quote-aware read-only shell validation, external MCP read-only filtering, and full read_only_workspace permission matrix across adapters", async () => {
+    // 1. Quote-aware read-only shell validator
+    for (const okCmd of [
+      `rg "=>" src/ | head -n 20`,
+      `git status && git log -n 5 --oneline`,
+      `git diff -U3 HEAD~1 2>/dev/null`,
+      `find src -name "*.ts" 2>&1 | sort`,
+      `sed -n '1,40p' src/cli.ts`,
+      `sg -p 'fn $A()' src/`,
+      `sqlite3 -readonly db.sqlite "SELECT 1"`,
+    ]) {
+      assert.equal(isSafeReadOnlyShellCommand(okCmd), true, `Expected safe read-only command to pass: ${okCmd}`);
+    }
+    for (const badCmd of [
+      `echo hi > out.txt`,
+      `rm -rf /tmp/x`,
+      `sed -i 's/a/b/' foo.ts`,
+      `sg -U -p 'a' -r 'b' src/`,
+      `find . -delete`,
+      `git checkout main`,
+      `git branch new-branch`,
+      `git commit -m x`,
+      `PATH=/evil rg foo`,
+      `rg $(whoami) src/`,
+      `python3 -c 'print(1)'`,
+    ]) {
+      assert.equal(isSafeReadOnlyShellCommand(badCmd), false, `Expected mutating command to be rejected: ${badCmd}`);
+    }
+
+    // 2. External MCP read-only filter (`octofs` & `ast-grep`)
+    assert.equal(isReadOnlyExternalMcpTool("octofs", "view"), true);
+    assert.equal(isReadOnlyExternalMcpTool("octofs", "view_signatures"), true);
+    assert.equal(isReadOnlyExternalMcpTool("octofs", "ast_grep"), true);
+    assert.equal(isReadOnlyExternalMcpTool("octofs", "text_editor"), false);
+    assert.equal(isReadOnlyExternalMcpTool("octofs", "batch_edit"), false);
+    assert.equal(isReadOnlyExternalMcpTool("octofs", "shell"), false);
+    assert.equal(isReadOnlyExternalMcpTool("ast-grep", "find_code"), true);
+
+    // 3. Claude read_only_workspace pre-allows Read/Grep/Glob + read-only octofs, blocks mutating octofs
+    const claudeRo = buildNewSessionParams("claude", {
+      cwd: "/tmp",
+      systemPrompt: "Research",
+      toolPolicy: "read_only_workspace",
+      allowShellInReadOnly: false,
+      model: "claude-sonnet-5-5",
+      mcpServers: [
+        { name: "harness", command: "bun", args: ["bridge"], env: [] },
+        { name: "octofs", command: "octofs", args: ["mcp"], env: [] },
+      ],
+    });
+    const claudeOpts = (claudeRo.params._meta as { claudeCode: { options: { allowedTools: string[]; disallowedTools: string[] } } }).claudeCode.options;
+    assert.ok(claudeOpts.allowedTools.includes("Read") && claudeOpts.allowedTools.includes("Grep") && claudeOpts.allowedTools.includes("Glob"));
+    assert.ok(claudeOpts.allowedTools.includes("mcp__octofs__view"));
+    assert.ok(claudeOpts.disallowedTools.includes("mcp__octofs__text_editor"));
+    assert.ok(claudeOpts.disallowedTools.includes("mcp__octofs__shell"));
+
+    // 4. Codex allowShellInReadOnly=true (verify/Done-Review) does NOT set INITIAL_AGENT_MODE=read-only,
+    //    whereas allowShellInReadOnly=false (research/plan) DOES set INITIAL_AGENT_MODE=read-only.
+    const codexProfile = profile("codex");
+    const codexResearch = prepareAcpSpawn(codexProfile, { systemPrompt: "R", toolPolicy: "read_only_workspace", allowShellInReadOnly: false });
+    const codexVerify = prepareAcpSpawn(codexProfile, { systemPrompt: "V", toolPolicy: "read_only_workspace", allowShellInReadOnly: true });
+    assert.equal(codexResearch.env.INITIAL_AGENT_MODE, "read-only");
+    assert.equal(codexVerify.env.INITIAL_AGENT_MODE, undefined);
+    codexResearch.cleanup();
+    codexVerify.cleanup();
+
+    // 5. Real AcpRunner permission matrix for read_only_workspace (allowShellInReadOnly=false)
+    const cwd = mkdtempSync(join(tmpdir(), "pi-ro-matrix-"));
+    try {
+      writeFileSync(join(cwd, "index.ts"), "export const x = () => 1;\n", "utf8");
+      const decisions: Record<string, string> = {};
+      const seenMcpNames: string[] = [];
+
+      const fixture = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {}, agentInfo: { name: "codex-acp", version: "1.0" } }))
+        .onRequest("session/new", async ({ params }) => {
+          const srvs = (params as { mcpServers?: Array<{ name: string }> }).mcpServers ?? [];
+          seenMcpNames.push(...srvs.map((s) => s.name));
+          return {
+            sessionId: "ro-s1",
+            configOptions: [
+              {
+                id: "model",
+                name: "Model",
+                type: "select" as const,
+                category: "model",
+                currentValue: "gpt-6.2-sol",
+                options: [{ value: "gpt-6.2-sol", name: "GPT-6.2 Sol" }],
+              },
+            ],
+          };
+        })
+        .onRequest("session/prompt", async ({ client: c }) => {
+          const ask = async (label: string, req: Record<string, unknown>) => {
+            const resp = (await c.request("session/request_permission", {
+              sessionId: "ro-s1",
+              options: [
+                { optionId: "allow", kind: "allow_once", name: "Allow" },
+                { optionId: "deny", kind: "reject_once", name: "Deny" },
+              ],
+              ...req,
+            } as never)) as { outcome?: { optionId?: string } };
+            decisions[label] = resp?.outcome?.optionId ?? "cancelled";
+          };
+
+          // Grep/Glob with empty locations & glob pattern inside workspace -> ALLOW
+          await ask("grep_empty_loc", { toolCall: { toolCallId: "1", title: "Grep", kind: "search", locations: [] } });
+          await ask("glob_pattern", { toolCall: { toolCallId: "2", title: "Glob", kind: "search", locations: [{ path: "**/*.ts" }] } });
+          // Read outside workspace -> DENY
+          await ask("read_escape", { toolCall: { toolCallId: "3", title: "Read", kind: "read", locations: [{ path: "/etc/passwd" }] } });
+          // Write inside workspace -> DENY
+          await ask("write_local", { toolCall: { toolCallId: "4", title: "Edit", kind: "edit", locations: [{ path: "index.ts" }] } });
+          // Read-only shell wrapped in ["/bin/zsh", "-lc", ...] -> ALLOW
+          await ask("shell_ro_zsh", {
+            toolCall: {
+              toolCallId: "5",
+              title: "shell",
+              kind: "execute",
+              rawInput: { command: ["/bin/zsh", "-lc", `git status && rg "=>" index.ts 2>/dev/null`] },
+            },
+          });
+          // Mutating shell -> DENY
+          await ask("shell_mutating", {
+            toolCall: { toolCallId: "6", title: "shell", kind: "execute", rawInput: { command: "rm -rf index.ts" } },
+          });
+          // `think` & read-only `other` (`list_dir`) -> ALLOW
+          await ask("think_tool", { toolCall: { toolCallId: "7", title: "Thinking", kind: "think" } });
+          await ask("list_dir_other", { toolCall: { toolCallId: "8", title: "list_dir", kind: "other", rawInput: { path: "." } } });
+          // Dot-separated harness MCP (`mcp.harness.return_task`) -> ALLOW
+          await ask("harness_dot", { toolCall: { toolCallId: "9", title: "mcp.harness.return_task", kind: "execute" } });
+          // External `octofs` read tool -> ALLOW; mutating `octofs.text_editor` -> DENY
+          await ask("octofs_view", {
+            _meta: { is_mcp_tool_approval: true },
+            toolCall: { toolCallId: "10", title: "mcp.octofs.view", kind: "execute", rawInput: { server: "octofs", tool: "view" } },
+          });
+          await ask("octofs_edit", {
+            _meta: { is_mcp_tool_approval: true },
+            toolCall: { toolCallId: "11", title: "mcp.octofs.text_editor", kind: "execute", rawInput: { server: "octofs", tool: "text_editor" } },
+          });
+
+          await c.notify("session/update", {
+            sessionId: "ro-s1",
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "matrix done" } },
+          });
+          return { stopReason: "end_turn" };
+        });
+
+      const runner = new AcpRunner(codexProfile);
+      await runner.run(
+        {
+          runId: "r-ro",
+          taskId: "t-ro",
+          tier: 3,
+          kind: "research",
+          cwd,
+          toolPolicy: "read_only_workspace",
+          allowShellInReadOnly: false,
+          systemPrompt: "Research",
+          initialPrompt: "Inspect",
+          model: "gpt-6.2-sol",
+          maxTurns: 10,
+          daemonSocketPath: "/tmp/fake.sock",
+          mcpBridgeEntrypoint: "/tmp/fake-bridge.ts",
+          externalMcpServers: [{ name: "octofs", command: "octofs", args: ["mcp"], enabled: true }],
+          tools: [{ name: "return_task", description: "Return", inputSchema: { type: "object" } }],
+          executeTool: async () => ({}),
+          signal: new AbortController().signal,
+          callbacks: {},
+        },
+        fixture,
+      );
+
+      assert.ok(seenMcpNames.includes("octofs"), "octofs external MCP must be attached for read_only_workspace agents");
+      assert.equal(decisions.grep_empty_loc, "allow");
+      assert.equal(decisions.glob_pattern, "allow");
+      assert.equal(decisions.read_escape, "deny");
+      assert.equal(decisions.write_local, "deny");
+      assert.equal(decisions.shell_ro_zsh, "allow");
+      assert.equal(decisions.shell_mutating, "deny");
+      assert.equal(decisions.think_tool, "allow");
+      assert.equal(decisions.list_dir_other, "allow");
+      assert.equal(decisions.harness_dot, "allow");
+      assert.equal(decisions.octofs_view, "allow");
+      assert.equal(decisions.octofs_edit, "deny");
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }

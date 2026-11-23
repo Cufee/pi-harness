@@ -26,6 +26,9 @@ const AMP_READ_ONLY_DISABLED_TOOLS = [
   "create_file",
   "delete_file",
   "apply_patch",
+  "mcp__octofs__text_editor",
+  "mcp__octofs__batch_edit",
+  "mcp__octofs__shell",
   "Task",
   "create_thread",
   "send_thread_message",
@@ -34,6 +37,358 @@ const AMP_READ_ONLY_DISABLED_TOOLS = [
   "oracle",
   "librarian",
 ];
+
+export const OCTOFS_READ_ONLY_TOOLS = new Set([
+  "view",
+  "view_signatures",
+  "list_files",
+  "extract_lines",
+  "ast_grep",
+]);
+
+export const OCTOFS_MUTATING_TOOLS = new Set([
+  "text_editor",
+  "batch_edit",
+  "shell",
+]);
+
+const AST_GREP_READ_ONLY_TOOLS = new Set([
+  "find_code",
+  "find_code_by_rule",
+  "dump_syntax_tree",
+  "test_match_code_rule",
+]);
+
+/**
+ * Checks whether an external MCP server tool is safe to invoke in `read_only_workspace` mode.
+ * `octofs` exposes both read-only (`view`, `view_signatures`, `list_files`, `extract_lines`, `ast_grep`)
+ * and mutating (`text_editor`, `batch_edit`, `shell`) tools — only the read-only subset is permitted.
+ */
+export function isReadOnlyExternalMcpTool(serverName: string, toolName: string): boolean {
+  const srv = serverName.trim().toLowerCase();
+  const tool = toolName.trim().toLowerCase();
+  if (!tool) return false;
+  if (srv === "octofs") return OCTOFS_READ_ONLY_TOOLS.has(tool);
+  if (srv === "ast-grep" || srv === "ast_grep") return AST_GREP_READ_ONLY_TOOLS.has(tool);
+  if (/(?:write|edit|delete|remove|create|update|patch|apply|exec|shell|run|kill|set_|put_|post_|rewrite)/.test(tool)) {
+    return false;
+  }
+  return /^(?:read|get|list|search|find|view|dump|inspect|describe|query)(?:_|$)/.test(tool);
+}
+
+const READ_ONLY_GIT_SUBCOMMANDS = new Set([
+  "status",
+  "log",
+  "show",
+  "diff",
+  "rev-parse",
+  "ls-files",
+  "ls-tree",
+  "grep",
+  "blame",
+  "describe",
+  "cat-file",
+  "merge-base",
+  "shortlog",
+  "rev-list",
+  "show-ref",
+  "for-each-ref",
+  "name-rev",
+  "check-ignore",
+  "ls-remote",
+  "whatchanged",
+  "count-objects",
+]);
+
+const READ_ONLY_SIMPLE_BINS = new Set([
+  "rg",
+  "grep",
+  "egrep",
+  "fgrep",
+  "cat",
+  "head",
+  "tail",
+  "nl",
+  "wc",
+  "ls",
+  "tree",
+  "stat",
+  "file",
+  "pwd",
+  "which",
+  "type",
+  "readlink",
+  "realpath",
+  "basename",
+  "dirname",
+  "diff",
+  "cmp",
+  "comm",
+  "sort",
+  "uniq",
+  "cut",
+  "tr",
+  "jq",
+  "shasum",
+  "sha256sum",
+  "md5",
+  "md5sum",
+  "test",
+  "[",
+  "true",
+  "false",
+  "printf",
+  "echo",
+  "cd",
+]);
+
+function splitShellSegments(cmd: string): string[] | null {
+  const segments: string[] = [];
+  let cur = "";
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i]!;
+    const next = cmd[i + 1];
+    if (inSingle) {
+      cur += ch;
+      if (ch === "'") inSingle = false;
+      continue;
+    }
+    if (inDouble) {
+      if (ch === "\\" && next !== undefined) {
+        cur += ch + next;
+        i++;
+        continue;
+      }
+      if (ch === "`" || (ch === "$" && next === "(")) return null; // command substitution inside double quotes
+      cur += ch;
+      if (ch === '"') inDouble = false;
+      continue;
+    }
+    if (ch === "\\" && next !== undefined) {
+      cur += ch + next;
+      i++;
+      continue;
+    }
+    if (ch === "'") {
+      inSingle = true;
+      cur += ch;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+      cur += ch;
+      continue;
+    }
+    // Permit ONLY stderr-to-null (`2>/dev/null`) and stderr-to-stdout (`2>&1`); reject all other redirections
+    if (ch === "2" && next === ">") {
+      if (cmd.slice(i).startsWith("2>/dev/null") && (i + 11 === cmd.length || /[\s|;&\n]/.test(cmd[i + 11]!))) {
+        i += 10;
+        continue;
+      }
+      if (cmd.slice(i).startsWith("2>&1") && (i + 4 === cmd.length || /[\s|;&\n]/.test(cmd[i + 4]!))) {
+        i += 3;
+        continue;
+      }
+      return null;
+    }
+    // Reject unquoted redirections, command substitutions, and process substitutions
+    if (ch === ">" || ch === "`") return null;
+    if (ch === "$" && next === "(") return null;
+    if (ch === "<" && (next === "(" || next === ">")) return null;
+    if (ch === "&" && next === ">") return null;
+
+    // Segment separators outside quotes: |, ||, &&, ;, \n
+    if (ch === "|" || ch === ";" || ch === "\n") {
+      if (cur.trim()) segments.push(cur.trim());
+      cur = "";
+      if (ch === "|" && next === "|") i++;
+      continue;
+    }
+    if (ch === "&" && next === "&") {
+      if (cur.trim()) segments.push(cur.trim());
+      cur = "";
+      i++;
+      continue;
+    }
+    if (ch === "&") return null; // background execution
+    cur += ch;
+  }
+  if (inSingle || inDouble) return null;
+  if (cur.trim()) segments.push(cur.trim());
+  return segments;
+}
+
+function tokenizeSegment(seg: string): string[] {
+  const tokens: string[] = [];
+  let cur = "";
+  let inSingle = false;
+  let inDouble = false;
+  let hasToken = false;
+  for (let i = 0; i < seg.length; i++) {
+    const ch = seg[i]!;
+    const next = seg[i + 1];
+    if (inSingle) {
+      if (ch === "'") inSingle = false;
+      else cur += ch;
+      continue;
+    }
+    if (inDouble) {
+      if (ch === "\\" && next !== undefined) {
+        cur += next;
+        i++;
+      } else if (ch === '"') {
+        inDouble = false;
+      } else {
+        cur += ch;
+      }
+      continue;
+    }
+    if (ch === "\\" && next !== undefined) {
+      cur += next;
+      hasToken = true;
+      i++;
+      continue;
+    }
+    if (ch === "'") {
+      inSingle = true;
+      hasToken = true;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+      hasToken = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (hasToken) {
+        tokens.push(cur);
+        cur = "";
+        hasToken = false;
+      }
+      continue;
+    }
+    cur += ch;
+    hasToken = true;
+  }
+  if (hasToken) tokens.push(cur);
+  return tokens;
+}
+
+/**
+ * Quote-aware validator for read-only shell inspection commands executed by `read_only_workspace`
+ * ACP agents (Codex, Gemini, Antigravity, OpenCode, Claude). Safely permits pipes/chains of
+ * inspection tools (`git status/log/diff`, `rg "=>" src/`, `sg`, `ls`, `cat`, `sed -n`, `find`)
+ * while rejecting unquoted redirections, command substitutions, and mutating flags/subcommands.
+ */
+export function isSafeReadOnlyShellCommand(rawCommand: string): boolean {
+  const trimmed = rawCommand.trim();
+  if (!trimmed) return false;
+  const segments = splitShellSegments(trimmed);
+  if (!segments || segments.length === 0) return false;
+
+  for (const seg of segments) {
+    const tokens = tokenizeSegment(seg);
+    let idx = 0;
+    // Skip harmless leading VAR=val env prefixes (block PATH/LD_*/DYLD_* hijacking)
+    while (idx < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[idx]!)) {
+      const varName = tokens[idx]!.split("=")[0]!.toUpperCase();
+      if (varName === "PATH" || varName.startsWith("LD_") || varName.startsWith("DYLD_") || varName === "IFS") {
+        return false;
+      }
+      idx++;
+    }
+    if (idx >= tokens.length) return false;
+    const rawBin = tokens[idx]!;
+    const bin = rawBin.includes("/") ? rawBin.split("/").pop()! : rawBin;
+    const args = tokens.slice(idx + 1);
+
+    if (READ_ONLY_SIMPLE_BINS.has(bin)) {
+      if (bin === "sort" && args.some((a) => a === "-o" || a.startsWith("--output"))) return false;
+      continue;
+    }
+    if (bin === "sg" || bin === "ast-grep") {
+      if (args.some((a) => a === "-U" || a === "--update-all" || a === "--rewrite" || a === "-i" || a === "--interactive" || a.startsWith("--rewrite="))) {
+        return false;
+      }
+      continue;
+    }
+    if (bin === "sed") {
+      if (args.some((a) => a === "-i" || a.startsWith("-i") || a.startsWith("--in-place"))) return false;
+      if (!args.some((a) => a === "-n" || a === "--quiet" || a === "--silent" || /^-[a-zA-Z]*n[a-zA-Z]*$/.test(a))) return false;
+      continue;
+    }
+    if (bin === "find") {
+      if (args.some((a) => ["-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"].includes(a))) {
+        return false;
+      }
+      continue;
+    }
+    if (bin === "sqlite3") {
+      if (!args.includes("-readonly")) return false;
+      if (args.some((a) => /\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|VACUUM|ATTACH|PRAGMA\s+\w+\s*=)\b/i.test(a))) {
+        return false;
+      }
+      continue;
+    }
+    if (bin === "git") {
+      let g = 0;
+      while (g < args.length && args[g]!.startsWith("-")) {
+        const flag = args[g]!;
+        if (flag === "-C" || flag === "--git-dir" || flag === "--work-tree") {
+          g += 2;
+          continue;
+        }
+        if (flag === "-c") {
+          const kv = (args[g + 1] ?? "").toLowerCase();
+          if (/^(?:core\.|credential\.|alias\.|filter\.|diff\.external)/.test(kv)) return false;
+          g += 2;
+          continue;
+        }
+        if (flag === "--no-pager" || flag === "-P" || flag === "--bare" || flag === "--no-optional-locks") {
+          g += 1;
+          continue;
+        }
+        return false;
+      }
+      const sub = args[g];
+      if (!sub) return false;
+      const subArgs = args.slice(g + 1);
+      if (READ_ONLY_GIT_SUBCOMMANDS.has(sub)) {
+        if (sub === "diff" && subArgs.some((a) => a === "--output" || a.startsWith("--output="))) return false;
+        continue;
+      }
+      if (sub === "branch") {
+        const badBranch = subArgs.some((a) =>
+          ["-d", "-D", "-m", "-M", "-c", "-C", "-u", "--delete", "--move", "--copy", "--edit-description", "--unset-upstream"].includes(a) ||
+          a.startsWith("--set-upstream"),
+        );
+        if (badBranch) return false;
+        // Only allow listing/current-branch flags (reject positional branch creation like `git branch new-name`)
+        const hasPositional = subArgs.some((a) => !a.startsWith("-"));
+        const isListQuery = subArgs.some((a) => a === "-l" || a === "--list" || a === "--contains" || a === "--merged" || a === "--no-merged");
+        if (hasPositional && !isListQuery) return false;
+        continue;
+      }
+      if (sub === "tag") {
+        if (subArgs.length === 0 || subArgs.some((a) => a === "-l" || a === "--list")) continue;
+        return false;
+      }
+      if (sub === "remote") {
+        if (subArgs.length === 0 || subArgs[0] === "-v" || subArgs[0] === "show" || subArgs[0] === "get-url") continue;
+        return false;
+      }
+      if (sub === "config") {
+        if (subArgs.some((a) => a === "--get" || a === "--get-all" || a === "--list" || a === "-l")) continue;
+        return false;
+      }
+      return false;
+    }
+    return false;
+  }
+  return true;
+}
 
 const AMP_READ_ONLY_SHELL_REJECT_PATTERNS = [
   "*>*",
@@ -51,7 +406,8 @@ const AMP_READ_ONLY_SHELL_REJECT_PATTERNS = [
   "*-fls*",
   "*sed *-i*",
   "*sed *--in-place*",
-  "*-U*",
+  "*sg *-U*",
+  "*ast-grep *-U*",
   "*--update-all*",
   "*--rewrite*",
   "*--interactive*",
@@ -297,7 +653,11 @@ export function prepareAcpSpawn(
       },
     });
     env.DISABLE_MCP_CONFIG_FILTERING = "true";
-    if (opts.toolPolicy !== "read_write_workspace") env.INITIAL_AGENT_MODE = "read-only";
+    // Only lock Codex into OS Seatbelt read-only sandbox when shell verification is NOT requested;
+    // disposable verification checkouts (`allowShellInReadOnly: true`) need `/tmp` and test runners to work.
+    if (opts.toolPolicy !== "read_write_workspace" && !opts.allowShellInReadOnly) {
+      env.INITIAL_AGENT_MODE = "read-only";
+    }
   } else if (profile.adapter === "gemini") {
     // Shim 1: gemini --acp ignores NewSessionRequest.systemPrompt; use GEMINI_SYSTEM_MD
     const dir = mkdtempSync(join(tmpdir(), "pi-harness-gemini-"));
@@ -348,6 +708,8 @@ export function prepareAcpSpawn(
                   "amp.tools.disable": AMP_READ_ONLY_DISABLED_TOOLS,
                   "amp.permissions": [
                     { tool: "mcp__harness__*", action: "allow" },
+                    ...[...OCTOFS_READ_ONLY_TOOLS].map((t) => ({ tool: `mcp__octofs__${t}`, action: "allow" })),
+                    { tool: "mcp__ast-grep__*", action: "allow" },
                     ...AMP_READ_ONLY_DISABLED_TOOLS.map((tool) => ({ tool, action: "reject" })),
                     { tool: "shell_command", action: "allow" },
                     { tool: "Bash", action: "allow" },
@@ -361,6 +723,8 @@ export function prepareAcpSpawn(
                   "amp.tools.disable": AMP_READ_ONLY_DISABLED_TOOLS,
                   "amp.permissions": [
                     { tool: "mcp__harness__*", action: "allow" },
+                    ...[...OCTOFS_READ_ONLY_TOOLS].map((t) => ({ tool: `mcp__octofs__${t}`, action: "allow" })),
+                    { tool: "mcp__ast-grep__*", action: "allow" },
                     ...AMP_READ_ONLY_DISABLED_TOOLS.map((tool) => ({ tool, action: "reject" })),
                     { tool: "shell_command", action: "reject", matches: { command: AMP_READ_ONLY_SHELL_REJECT_PATTERNS } },
                     { tool: "shell_command", action: "allow", matches: { command: AMP_READ_ONLY_SHELL_ALLOW_PATTERNS } },
@@ -438,7 +802,13 @@ export function buildNewSessionParams(
   if (adapter === "claude") {
     const disallowed = ["Agent", "Task"];
     if (opts.toolPolicy !== "read_write_workspace") {
-      disallowed.push("Write", "Edit", "MultiEdit", "NotebookEdit");
+      disallowed.push(
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "NotebookEdit",
+        ...[...OCTOFS_MUTATING_TOOLS].map((t) => `mcp__octofs__${t}`),
+      );
       if (!opts.allowShellInReadOnly) disallowed.push("Bash");
     }
     if (opts.toolPolicy === "control_plane_only") {
@@ -448,9 +818,23 @@ export function buildNewSessionParams(
     const effectiveEffort =
       opts.effort && opts.effort.toLowerCase() !== "default" ? opts.effort : undefined;
     const hasHarnessMcp = opts.mcpServers.some((s) => s.name === "harness");
+    const allowedTools: string[] = [];
+    if (hasHarnessMcp) {
+      allowedTools.push("ToolSearch", "mcp__harness__*");
+    }
+    if (opts.toolPolicy === "read_only_workspace") {
+      allowedTools.push("Read", "Grep", "Glob");
+      if (opts.allowShellInReadOnly) allowedTools.push("Bash");
+      if (opts.mcpServers.some((s) => s.name === "octofs")) {
+        allowedTools.push(...[...OCTOFS_READ_ONLY_TOOLS].map((t) => `mcp__octofs__${t}`));
+      }
+      if (opts.mcpServers.some((s) => s.name === "ast-grep" || s.name === "ast_grep")) {
+        allowedTools.push("mcp__ast-grep__*");
+      }
+    }
     const claudeOptions: Record<string, unknown> = {
       disallowedTools: disallowed,
-      ...(hasHarnessMcp ? { allowedTools: ["ToolSearch", "mcp__harness__*"] } : {}),
+      ...(allowedTools.length > 0 ? { allowedTools } : {}),
       ...(opts.toolPolicy !== "read_write_workspace" ? {
         settingSources: [],
         strictMcpConfig: true,

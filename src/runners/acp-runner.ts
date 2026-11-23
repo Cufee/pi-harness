@@ -12,6 +12,8 @@ import {
   buildPostSessionActions,
   extractArtifactsFromToolUpdate,
   isAmpAcpProfile,
+  isReadOnlyExternalMcpTool,
+  isSafeReadOnlyShellCommand,
   prepareAcpSpawn,
   reportedModels,
   reportedModelSatisfies,
@@ -274,7 +276,13 @@ export class AcpRunner {
     const hasHarnessBridge = Boolean(req.daemonSocketPath && req.mcpBridgeEntrypoint);
     const harnessToolNames = new Set(req.tools.map(({ name }) => name));
     const claudeToolNames = new Set(req.tools.map(({ name }) => `mcp__harness__${name}`));
+    const externalMcpNames = new Set(
+      !controlOnly
+        ? (req.externalMcpServers ?? []).filter((s) => s.enabled !== false && s.name.trim()).map((s) => s.name.trim())
+        : [],
+    );
     const codexHarnessCalls = new Set<string>();
+    const codexExternalCalls = new Set<string>();
     const quotaTimeoutMs = Math.max(0, req.quotaRetryTimeoutMs ?? DEFAULT_QUOTA_RETRY_TIMEOUT_MS);
     const startupTimeoutMs = Math.max(0, req.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS);
     const idleTimeoutMs = Math.max(0, req.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS);
@@ -646,12 +654,19 @@ export class AcpRunner {
             const input = update.rawInput as { server?: string; tool?: string } | undefined;
             if (kind === "tool_call") {
               codexHarnessCalls.delete(callId);
-              if (update.kind === "execute" && meta?.is_mcp_tool_call === true &&
-                  input?.server === "harness" && input.tool && harnessToolNames.has(input.tool)) {
-                codexHarnessCalls.add(callId);
+              codexExternalCalls.delete(callId);
+              if (update.kind === "execute" && meta?.is_mcp_tool_call === true && input?.server && input.tool) {
+                if (input.server === "harness" && harnessToolNames.has(input.tool)) {
+                  codexHarnessCalls.add(callId);
+                } else if (externalMcpNames.has(input.server) && (canWrite || isReadOnlyExternalMcpTool(input.server, input.tool))) {
+                  codexExternalCalls.add(callId);
+                }
               }
             }
-            if (update.status === "completed" || update.status === "failed") codexHarnessCalls.delete(callId);
+            if (update.status === "completed" || update.status === "failed") {
+              codexHarnessCalls.delete(callId);
+              codexExternalCalls.delete(callId);
+            }
           }
           const rawTitle = update.title ? String(update.title) : update.name ? String(update.name) : undefined;
           if (callId && rawTitle) {
@@ -708,6 +723,7 @@ export class AcpRunner {
           _meta?: { is_mcp_tool_approval?: boolean };
           toolCall?: {
             toolCallId?: string; title?: string; name?: string; kind?: string;
+            rawInput?: Record<string, unknown>;
             locations?: Array<{ path: string }>;
             _meta?: {
               claudeCode?: { toolName?: string; mcpServer?: { name?: string; source?: string } };
@@ -719,51 +735,38 @@ export class AcpRunner {
         const callId = p.toolCall?.toolCallId ? String(p.toolCall.toolCallId) : undefined;
         const title = String(p.toolCall?.title ?? p.toolCall?.name ?? (callId ? toolTitlesById.get(callId) : "") ?? "");
         const toolKind = p.toolCall?.kind;
+        const rawInput = (p.toolCall?.rawInput && typeof p.toolCall.rawInput === "object" ? p.toolCall.rawInput : undefined) as
+          | Record<string, unknown>
+          | undefined;
         const options = p.options ?? [];
 
         const allowOpt =
           options.find((o) => o.kind === "allow_once") ??
           options.find((o) => o.kind === "allow_always");
         const denyOpt = options.find((o) => o.kind === "reject_once") ?? options.find((o) => o.kind === "reject_always");
-        const externalMcpNames = new Set(
-          allowShell
-            ? (req.externalMcpServers ?? []).filter((s) => s.enabled !== false && s.name.trim()).map((s) => s.name.trim())
-            : [],
-        );
-        const claude = p.toolCall?._meta?.claudeCode;
-        const claudeUntrustedSource =
-          claude?.mcpServer?.source === "project" ||
-          claude?.mcpServer?.source === "user" ||
-          claude?.mcpServer?.source === "local";
-        const claudeExternalMcp =
-          this.profile.adapter === "claude" &&
-          claude?.mcpServer?.name !== undefined &&
-          !claudeUntrustedSource &&
-          externalMcpNames.has(claude.mcpServer.name);
-        // Allow Claude's built-in ToolSearch (required to load deferred MCP tools) and harness MCP calls across
-        // any non-user/project/local MCP server source (`dynamic`, `sdk`, `acp`, `inline`, etc.) and any toolKind.
-        const claudeToolSearch =
-          this.profile.adapter === "claude" && claude?.toolName === "ToolSearch";
-        const claudeHarnessMcp =
-          this.profile.adapter === "claude" &&
-          !claudeUntrustedSource &&
-          claude?.toolName !== undefined &&
-          claudeToolNames.has(claude.toolName) &&
-          (claude.mcpServer === undefined || claude.mcpServer.name === "harness");
-        const claudeCall = claudeToolSearch || claudeHarnessMcp || claudeExternalMcp;
 
-        const codexCall = this.profile.adapter === "codex" && toolKind === "execute" &&
-          p._meta?.is_mcp_tool_approval === true && callId !== undefined && codexHarnessCalls.has(callId);
+        const extractExternalMcp = (
+          rawName: string,
+        ): { server: string; tool: string } | null => {
+          const firstToken = rawName.trim().split(/\s+/)[0] ?? "";
+          if (!firstToken) return null;
+          for (const srv of externalMcpNames) {
+            const escaped = srv.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const re = new RegExp(`^(?:mcp(?:__|_|\\.|/|:))?${escaped}(?:__|_|\\.|/|:)(.+)$`);
+            const m = firstToken.match(re);
+            if (m?.[1]) return { server: srv, tool: m[1] };
+          }
+          return null;
+        };
 
-        // Normalize MCP tool names emitted by Gemini / Antigravity / generic ACP adapters:
-        // e.g. `mcp__harness__code_exec`, `mcp_harness_goal_list` (agy), `harness__code_exec`, `harness:code_exec`, `harness/code_exec`, or bare `code_exec`
-        const rawCandidateName = p.toolCall?.name ?? p.toolCall?.title ?? "";
+        // Normalize MCP tool names emitted by Gemini / Antigravity / Codex / generic ACP adapters across ALL separators:
+        // e.g. `mcp__harness__code_exec`, `mcp_harness_goal_list`, `mcp.harness.tool_search`, `harness:code_exec`, `harness/code_exec`, `harness.code_exec`
+        const rawCandidateName = p.toolCall?.name ?? p.toolCall?.title ?? title;
         const normalizedHarnessTool = rawCandidateName
           .trim()
           .split(/\s+/)[0]
-          ?.replace(/^mcp__harness__/, "")
-          .replace(/^mcp_harness_/, "")
-          .replace(/^harness(?:__|:|\/)/, "") ?? "";
+          ?.replace(/^mcp(?:__|_|\/|\.|:)harness(?:__|_|\/|\.|:)/, "")
+          .replace(/^harness(?:__|_|\/|\.|:)/, "") ?? "";
         const nonFileToolKind =
           toolKind !== "read" && toolKind !== "edit" && toolKind !== "delete" && toolKind !== "move";
         const noFileLocations = !p.toolCall?.locations?.length;
@@ -772,53 +775,177 @@ export class AcpRunner {
           noFileLocations &&
           normalizedHarnessTool.length > 0 &&
           harnessToolNames.has(normalizedHarnessTool);
+        const normalizedExt = nonFileToolKind ? extractExternalMcp(rawCandidateName) : null;
         const matchesNormalizedExternal =
-          nonFileToolKind &&
-          [...externalMcpNames].some((srv) =>
-            rawCandidateName.startsWith(`mcp__${srv}__`) ||
-            rawCandidateName.startsWith(`mcp_${srv}_`) ||
-            rawCandidateName.startsWith(`${srv}__`) ||
-            rawCandidateName.startsWith(`${srv}:`) ||
-            rawCandidateName.startsWith(`${srv}/`),
-          );
+          normalizedExt !== null &&
+          (canWrite || isReadOnlyExternalMcpTool(normalizedExt.server, normalizedExt.tool));
+
+        const claude = p.toolCall?._meta?.claudeCode;
+        const claudeUntrustedSource =
+          claude?.mcpServer?.source === "project" ||
+          claude?.mcpServer?.source === "user" ||
+          claude?.mcpServer?.source === "local";
+        const claudeExtParsed = claude?.toolName ? extractExternalMcp(claude.toolName) : null;
+        const claudeExternalMcp =
+          this.profile.adapter === "claude" &&
+          claude?.mcpServer?.name !== undefined &&
+          !claudeUntrustedSource &&
+          externalMcpNames.has(claude.mcpServer.name) &&
+          (canWrite ||
+            isReadOnlyExternalMcpTool(
+              claude.mcpServer.name,
+              claudeExtParsed?.tool ?? claude.toolName ?? "",
+            ));
+        // Allow Claude's built-in ToolSearch (required to load deferred MCP tools) and harness MCP calls across
+        // any non-user/project/local MCP server source (`dynamic`, `sdk`, `acp`, `inline`, etc.) and any toolKind.
+        const claudeToolSearch =
+          this.profile.adapter === "claude" &&
+          claude?.toolName === "ToolSearch" &&
+          (hasHarnessBridge || externalMcpNames.size > 0);
+        const claudeHarnessMcp =
+          this.profile.adapter === "claude" &&
+          !claudeUntrustedSource &&
+          claude?.toolName !== undefined &&
+          claudeToolNames.has(claude.toolName) &&
+          (claude.mcpServer === undefined || claude.mcpServer.name === "harness");
+
+        const codexRawServer = typeof rawInput?.server === "string" ? rawInput.server : undefined;
+        const codexRawTool = typeof rawInput?.tool === "string" ? rawInput.tool : undefined;
+        const codexDirectHarness = Boolean(codexRawServer === "harness" && codexRawTool && harnessToolNames.has(codexRawTool));
+        const codexDirectExternal = Boolean(
+          codexRawServer &&
+            codexRawTool &&
+            externalMcpNames.has(codexRawServer) &&
+            (canWrite || isReadOnlyExternalMcpTool(codexRawServer, codexRawTool)),
+        );
+        const codexTrackedHarness =
+          toolKind === "execute" &&
+          p._meta?.is_mcp_tool_approval === true &&
+          callId !== undefined &&
+          codexHarnessCalls.has(callId);
+        const codexTrackedExternal =
+          toolKind === "execute" &&
+          p._meta?.is_mcp_tool_approval === true &&
+          callId !== undefined &&
+          codexExternalCalls.has(callId);
+        const codexHarnessMcp =
+          this.profile.adapter === "codex" &&
+          ((toolKind === "execute" && p._meta?.is_mcp_tool_approval === true && codexDirectHarness) ||
+            codexTrackedHarness ||
+            matchesNormalizedHarness);
+        const codexExternalMcp =
+          this.profile.adapter === "codex" &&
+          ((toolKind === "execute" && p._meta?.is_mcp_tool_approval === true && codexDirectExternal) ||
+            codexTrackedExternal ||
+            matchesNormalizedExternal);
 
         const geminiMcp = p.toolCall?._meta?.["gemini-cli"]?.mcp;
         const geminiExternalMcp =
           this.profile.adapter === "gemini" &&
-          ((geminiMcp?.server_name !== undefined && externalMcpNames.has(geminiMcp.server_name)) ||
+          ((geminiMcp?.server_name !== undefined &&
+            externalMcpNames.has(geminiMcp.server_name) &&
+            (canWrite || isReadOnlyExternalMcpTool(geminiMcp.server_name, geminiMcp.tool_name ?? ""))) ||
             matchesNormalizedExternal);
-        const geminiCall = this.profile.adapter === "gemini" &&
+        const geminiHarnessMcp =
+          this.profile.adapter === "gemini" &&
           ((geminiMcp?.server_name === "harness" &&
-            geminiMcp.tool_name !== undefined && harnessToolNames.has(geminiMcp.tool_name)) ||
-            matchesNormalizedHarness ||
-            geminiExternalMcp);
+            geminiMcp.tool_name !== undefined &&
+            harnessToolNames.has(geminiMcp.tool_name)) ||
+            matchesNormalizedHarness);
 
-        const genericCall = this.profile.adapter === "generic" &&
-          (matchesNormalizedHarness || matchesNormalizedExternal);
+        const genericHarnessMcp = this.profile.adapter === "generic" && matchesNormalizedHarness;
+        const genericExternalMcp = this.profile.adapter === "generic" && matchesNormalizedExternal;
+
+        const harnessMcpAllowed =
+          hasHarnessBridge && (claudeHarnessMcp || codexHarnessMcp || geminiHarnessMcp || genericHarnessMcp);
+        const externalMcpAllowed =
+          !controlOnly && (claudeExternalMcp || codexExternalMcp || geminiExternalMcp || genericExternalMcp);
+
+        const validateReadLocations = async (): Promise<boolean> => {
+          const paths: string[] = [];
+          for (const loc of p.toolCall?.locations ?? []) {
+            if (loc?.path) paths.push(loc.path);
+          }
+          if (rawInput) {
+            for (const key of ["path", "file_path", "filePath", "directory", "dir", "cwd", "target_file", "SearchPath"]) {
+              const val = rawInput[key];
+              if (typeof val === "string" && val.trim()) paths.push(val.trim());
+            }
+          }
+          for (const rawPath of paths) {
+            // Strip trailing glob segment (e.g. `src/**/*.ts` -> `src`) so search globs validate cleanly inside workspace
+            const cleaned = rawPath.includes("*") || rawPath.includes("?") || rawPath.includes("[")
+              ? (rawPath.split(/[*?[]/)[0]?.replace(/\/+$/, "") || ".")
+              : rawPath;
+            try {
+              await workspaceTarget(workspace, cleaned, true);
+            } catch {
+              return false;
+            }
+          }
+          return true;
+        };
+
+        const unwrapShellArgv = (argv: string[]): string => {
+          if (argv.length >= 3) {
+            const firstBin = argv[0]!.includes("/") ? argv[0]!.split("/").pop()! : argv[0]!;
+            if ((firstBin === "sh" || firstBin === "bash" || firstBin === "zsh") && /^-[a-zA-Z]*c$/.test(argv[1]!)) {
+              return argv[2]!;
+            }
+          }
+          return argv.join(" ");
+        };
+
+        const extractShellCommand = (): string => {
+          if (rawInput) {
+            if (typeof rawInput.command === "string") return rawInput.command;
+            if (typeof rawInput.cmd === "string") return rawInput.cmd;
+            if (Array.isArray(rawInput.command)) return unwrapShellArgv(rawInput.command.map(String));
+            if (Array.isArray(rawInput.argv)) return unwrapShellArgv(rawInput.argv.map(String));
+          }
+          // Strip common adapter prefixes from title like `shell_command: git status` or `Run command: rg foo`
+          const stripped = title.replace(/^(?:shell_command|bash|run_command|execute|terminal)\s*:\s*/i, "").trim();
+          return stripped;
+        };
+
+        const READ_ONLY_OTHER_TOOL_RE =
+          /^(?:read|read_file|view_file|view_file_outline|view_code_item|list_dir|list_directory|list_files|find_by_name|find_files|glob|grep|grep_search|search|search_files|codebase_search|ast_grep|view_signatures|extract_lines)\b/i;
+
         const isRead = toolKind === "read" || toolKind === "search";
         const isWrite = toolKind === "edit" || toolKind === "delete" || toolKind === "move";
         const isExecute = toolKind === "execute";
         let workspaceCall = false;
-        // Allow native workspace reads/searches, writes (when canWrite), and shell commands (e.g. tests, git diff, rg, sg, tmux)
-        // for non-control-plane agents so verification and coding are not blocked by overly strict sandboxes.
+        // Allow native workspace reads/searches, read-only shell inspection commands, writes (when canWrite),
+        // and full shell commands (when allowShell) for non-control-plane agents.
         if (!controlOnly && !claude?.mcpServer && !p._meta?.is_mcp_tool_approval && !geminiMcp) {
-          if (isRead || (canWrite && isWrite)) {
+          if (isRead) {
+            workspaceCall = await validateReadLocations();
+          } else if (canWrite && isWrite) {
             try {
               const locations = p.toolCall?.locations ?? [];
               for (const location of locations) {
                 await workspaceTarget(workspace, location.path, toolKind === "edit" || toolKind === "move");
               }
-              workspaceCall = locations.length > 0 || (canWrite && isRead);
+              workspaceCall = locations.length > 0;
             } catch {
               workspaceCall = false;
             }
-          } else if (isExecute && allowShell) {
+          } else if (isExecute) {
+            if (allowShell) {
+              workspaceCall = true;
+            } else {
+              const cmd = extractShellCommand();
+              workspaceCall = cmd.length > 0 && isSafeReadOnlyShellCommand(cmd);
+            }
+          } else if (toolKind === "think") {
             workspaceCall = true;
-          } else if (canWrite && (toolKind === "fetch" || toolKind === "other" || toolKind === "think" || toolKind === undefined)) {
+          } else if (canWrite && (toolKind === "fetch" || toolKind === "other" || toolKind === undefined)) {
             workspaceCall = true;
+          } else if ((toolKind === "other" || toolKind === undefined) && READ_ONLY_OTHER_TOOL_RE.test(rawCandidateName.trim())) {
+            workspaceCall = await validateReadLocations();
           }
         }
-        if (!sessionId || params.sessionId !== sessionId || !(workspaceCall || (hasHarnessBridge && (claudeCall || codexCall || geminiCall || genericCall)))) {
+        if (!sessionId || params.sessionId !== sessionId || !(workspaceCall || claudeToolSearch || harnessMcpAllowed || externalMcpAllowed)) {
           const deniedLabel = title || toolKind || "native tool";
           turnDeniedTools.push(deniedLabel);
           allToolFailures.push(`${deniedLabel} (blocked by ${policyModeDesc})`);
@@ -941,7 +1068,7 @@ export class AcpRunner {
           ],
         });
       }
-      if (allowShell && req.externalMcpServers?.length) {
+      if (!controlOnly && req.externalMcpServers?.length) {
         for (const ext of req.externalMcpServers) {
           if (ext.enabled === false || !ext.name?.trim() || !ext.command?.trim() || ext.name.trim() === "harness") continue;
           mcpServers.push({
