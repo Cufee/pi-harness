@@ -67,6 +67,23 @@ export const reportError = e => send({kind:'error',value: !!e && !(e instanceof 
 `;
 }
 
+// Appended to the preload guard so script.ts stays the entrypoint while its terminal exception, from module
+// evaluation, a timer, or an unhandled rejection, still reports provenance before Bun exits nonzero.
+// A script that installs its own handler for the event keeps control of it. Bun dispatches a rejection left by the
+// last timer only after beforeExit and then exits without awaiting its handler, so one extra turn lets the report finish.
+const fatalHook = `
+import { reportError } from './bridge.mjs';
+let fatalHandled = false, extraTurn = false;
+process.on('beforeExit', () => { if (!extraTurn) { extraTurn = true; setImmediate(() => {}); } });
+for (const event of ['uncaughtException', 'unhandledRejection']) process.on(event, async e => {
+  if (fatalHandled || process.listenerCount(event) > 1) return;
+  fatalHandled = true; process.exitCode = 1;
+  console.error(e);
+  await reportError(e).catch(() => {});
+  process.exit(1);
+});
+`;
+
 const message = (err: unknown) => err instanceof Error ? err.message : String(err);
 function formatScriptError(raw: string, sandboxDenial: boolean, toolNames: Iterable<string>): string {
   if (!sandboxDenial) return raw;
@@ -188,9 +205,8 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
       const exports = [...new Set([...names, "code_exec", "tool_search"])].filter(n => n !== "output")
         .map((n, i) => `const t${i} = args => call(${JSON.stringify(n)}, args); export { t${i} as ${JSON.stringify(n)} };`);
       await Promise.all([
-        writeFile(join(dir, "bridge.mjs"), bridge(socket)), writeFile(join(dir, "guard.mjs"), guard),
-        writeFile(join(dir, "_user.ts"), opts.code),
-        writeFile(join(dir, "script.ts"), "import { reportError } from './bridge.mjs';\ntry { await import('./_user.ts'); } catch (e) { try { await reportError(e); } catch {} throw e; }\n"),
+        writeFile(join(dir, "bridge.mjs"), bridge(socket)), writeFile(join(dir, "guard.mjs"), guard + fatalHook),
+        writeFile(join(dir, "script.ts"), opts.code),
         writeFile(join(pkg, "package.json"), '{"name":"harness","type":"module","main":"index.mjs","types":"index.d.ts"}'),
         writeFile(join(pkg, "index.d.ts"), generateSdkDeclarations(opts.tools)),
         writeFile(join(pkg, "index.mjs"), `import {call,output} from '../../bridge.mjs'; export {output};\n${exports.join("\n")}`),
