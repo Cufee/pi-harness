@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { WorktreeConfig } from "../config.js";
 import type { ControlPlaneDb, WorktreeRecord } from "../control-plane/db.js";
@@ -11,9 +11,19 @@ export function canonicalPath(p: string): string {
   try {
     return realpathSync(abs);
   } catch {
-    return abs;
+    // Resolve the deepest existing ancestor so a deleted leaf keeps the identity Git recorded.
+    const parent = dirname(abs);
+    return parent === abs ? abs : join(canonicalPath(parent), basename(abs));
   }
 }
+
+function isWithin(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+
+const ACTIVE_TASK_STATUSES = new Set(["running", "draining", "waiting_children", "merging", "paused_quota"]);
+const SCRATCH_KINDS = new Set(["_verify", "_integration"]);
 
 const execFileAsync = promisify(execFile);
 
@@ -44,8 +54,9 @@ export interface LiveWorktreeInfo {
 export interface CleanupReport {
   removed: string[];
   archivedRefs: string[];
-  prunedAdminEntries: boolean;
   expiredArchiveRefs: string[];
+  /** Registrations under the managed root that cleanup left untouched, and why. */
+  skipped: Array<{ target: string; reason: string }>;
   errors: Array<{ target: string; error: string }>;
 }
 
@@ -188,17 +199,70 @@ export class WorktreeManager {
     try {
       await this.bootstrapWorktree(wtPath);
     } catch (err) {
+      // Roll back only what this call created; a locked tree and its branch are left in place.
+      let removed = false;
       try {
-        await runGit(this.repoRoot, ["worktree", "remove", "--force", wtPath]);
+        const reg = await this.findRegistration(wtPath);
+        if (reg?.locked == null) {
+          await runGit(this.repoRoot, ["worktree", "remove", "--force", reg?.path ?? wtPath]);
+          removed = true;
+        }
       } catch {
-        rmSync(wtPath, { recursive: true, force: true });
+        // Leave the tree for inspection.
       }
-      await runGit(this.repoRoot, ["branch", "-D", branch]).catch(() => {});
-      await runGit(this.repoRoot, ["worktree", "prune"]).catch(() => {});
+      if (removed) await runGit(this.repoRoot, ["branch", "-D", branch]).catch(() => {});
       throw err;
     }
 
     return this.db.recordWorktree({ runId, taskId, path: wtPath, branch, baseSha: sha });
+  }
+
+  /** Adds a detached scratch worktree at <baseDir>/<kind>/<name>. remove() targets exactly that registration and never rejects. */
+  async addScratchWorktree(
+    kind: "_verify" | "_integration",
+    name: string,
+    sha: string,
+  ): Promise<{ path: string; remove: () => Promise<void> }> {
+    const path = join(this.baseDir, kind, name);
+    mkdirSync(join(this.baseDir, kind), { recursive: true });
+    await runGit(this.repoRoot, ["worktree", "add", "--detach", path, sha]);
+    return {
+      path,
+      remove: async () => {
+        try {
+          const reg = await this.findRegistration(path);
+          if (reg && reg.locked === null) await runGit(this.repoRoot, ["worktree", "remove", "--force", reg.path]);
+        } catch {
+          // Removal is best effort; a refused tree stays registered.
+        }
+      },
+    };
+  }
+
+  /** Returns the single Git registration whose canonical path equals targetPath, or null. Throws when ambiguous. */
+  private async findRegistration(targetPath: string): Promise<PorcelainWorktree | null> {
+    const target = canonicalPath(targetPath);
+    const { stdout } = await runGit(this.repoRoot, ["worktree", "list", "--porcelain"]);
+    const matches = parsePorcelainWorktrees(stdout).filter((e) => canonicalPath(e.path) === target);
+    if (matches.length > 1) throw new Error(`Multiple Git worktree registrations match ${targetPath}`);
+    return matches[0] ?? null;
+  }
+
+  /** An owned row is retired when its task settled, or it merged and its task is no longer live. */
+  private isRetired(row: WorktreeRecord): boolean {
+    const task = this.db.getTask(row.taskId);
+    if (task && ["completed", "failed", "cancelled"].includes(task.status)) return true;
+    return row.status === "merged" && (!task || !ACTIVE_TASK_STATUSES.has(task.status));
+  }
+
+  /** Un-cleaned rows whose run belongs to this repo. Cleaned rows never authorise removal: paths and branch names are reused. */
+  private ownedRows(runId?: string): WorktreeRecord[] {
+    const repoCanon = canonicalPath(this.repoRoot);
+    return this.db.listWorktrees(runId).filter((r) => {
+      if (r.cleanedAt != null) return false;
+      const run = this.db.getRun(r.runId);
+      return Boolean(run && canonicalPath(run.repoRoot) === repoCanon);
+    });
   }
 
   /**
@@ -281,8 +345,24 @@ export class WorktreeManager {
   ): Promise<string | null> {
     const wt = this.db.getWorktree(worktreeId);
     if (!wt) return null;
-    // Idempotent: a repeated teardown (e.g. cancel and an abandoned resume) never clears the recorded archive ref.
-    if (wt.cleanedAt && !existsSync(wt.path)) return wt.archiveRef;
+    // Idempotent, and a cleaned row never touches a reused path or branch.
+    if (wt.cleanedAt != null) return wt.archiveRef;
+    const run = this.db.getRun(wt.runId);
+    if (!run || canonicalPath(run.repoRoot) !== canonicalPath(this.repoRoot)) {
+      throw new Error(`Worktree ${worktreeId} does not belong to a run in ${this.repoRoot}`);
+    }
+    // Ownership and lock checks precede the archive snapshot, which stages files in the tree.
+    const reg = await this.findRegistration(wt.path);
+    if (reg) {
+      if (reg.locked !== null) {
+        throw new Error(`Worktree ${worktreeId} is locked${reg.locked ? ` (${reg.locked})` : ""}; left in place`);
+      }
+      if (reg.branch !== null && reg.branch !== wt.branch) {
+        throw new Error(`Worktree ${worktreeId} is on branch ${reg.branch}, not ${wt.branch}; left in place`);
+      }
+    } else if (existsSync(wt.path)) {
+      throw new Error(`Worktree ${worktreeId} at ${wt.path} is not registered with Git; left in place`);
+    }
 
     let archiveRef: string | null = wt.archiveRef;
     if (opts?.archiveBeforeRemove) {
@@ -300,22 +380,10 @@ export class WorktreeManager {
       }
     }
 
-    if (existsSync(wt.path)) {
-      try {
-        await runGit(this.repoRoot, ["worktree", "remove", "--force", wt.path]);
-      } catch {
-        rmSync(wt.path, { recursive: true, force: true });
-      }
-    }
+    // Path-targeted: Git's printed path matches its stored entry even when the checkout is missing.
+    if (reg) await runGit(this.repoRoot, ["worktree", "remove", "--force", reg.path]);
+    if (wt.branch !== run.baseBranch) await runGit(this.repoRoot, ["branch", "-D", wt.branch]).catch(() => {});
 
-    // Delete temporary working branch (best-effort)
-    try {
-      await runGit(this.repoRoot, ["branch", "-D", wt.branch]);
-    } catch {
-      // Branch may already be deleted
-    }
-
-    await runGit(this.repoRoot, ["worktree", "prune"]);
     this.db.updateWorktree(wt.id, {
       status: opts?.finalStatus ?? "removed",
       archiveRef,
@@ -325,153 +393,141 @@ export class WorktreeManager {
     return archiveRef;
   }
 
+  /**
+   * Lists registrations under the managed root, excluding scratch trees. `orphaned` means owned and retired.
+   * With runId, only that run's owned trees are returned.
+   */
   async listLive(runId?: string): Promise<LiveWorktreeInfo[]> {
-    const dbRecords = this.db.listWorktrees(runId);
-    const byPath = new Map(dbRecords.map((r) => [canonicalPath(r.path), r]));
+    // Rows are newest first; on a reused path the newest un-cleaned row owns it.
+    const byPath = new Map<string, WorktreeRecord>();
+    for (const r of this.ownedRows()) {
+      const key = canonicalPath(r.path);
+      if (!byPath.has(key)) byPath.set(key, r);
+    }
     const base = canonicalPath(this.baseDir);
 
     const { stdout } = await runGit(this.repoRoot, ["worktree", "list", "--porcelain"]);
-    const entries = parsePorcelainWorktrees(stdout);
     const results: LiveWorktreeInfo[] = [];
-
-    const verifyPrefix = canonicalPath(join(this.baseDir, "_verify"));
-    const intPrefix = canonicalPath(join(this.baseDir, "_integration"));
-    for (const entry of entries) {
+    for (const entry of parsePorcelainWorktrees(stdout)) {
       const abs = canonicalPath(entry.path);
-      if (!abs.startsWith(base)) continue;
-      // Never treat active ephemeral verification or merge integration worktrees as orphans during sweep
-      if (abs.startsWith(verifyPrefix) || abs.startsWith(intPrefix)) continue;
+      if (!isWithin(base, abs)) continue;
+      if (SCRATCH_KINDS.has(relative(base, abs).split(sep)[0] ?? "")) continue;
       const rec = byPath.get(abs) ?? null;
+      if (runId && (!rec || rec.runId !== runId)) continue;
       const existsOnDisk = existsSync(abs);
-      const dirty = existsOnDisk ? await this.isDirty(abs) : false;
-      const task = rec ? this.db.getTask(rec.taskId) : null;
-      const orphaned =
-        !rec ||
-        rec.status === "removed" ||
-        rec.status === "merged" ||
-        (task != null && ["completed", "failed", "cancelled"].includes(task.status));
-
       results.push({
         record: rec,
         path: abs,
         branch: entry.branch,
         head: entry.head,
         existsOnDisk,
-        dirty,
-        orphaned,
+        // A tree Git cannot read counts as dirty so it is archived, never skipped silently.
+        dirty: existsOnDisk ? await this.isDirty(abs).catch(() => true) : false,
+        orphaned: rec ? this.isRetired(rec) : false,
       });
     }
     return results;
   }
 
   /**
-   * Sweeps orphaned/settled worktrees, removes stale git admin metadata,
-   * and expires old safety archive refs past retention window.
+   * Retires owned worktrees whose tasks settled, finalises retired rows whose checkout is gone,
+   * deletes branches of cleaned rows, and expires old safety archive refs. Never prunes or deletes unowned trees.
    */
   async sweep(opts?: { runId?: string; forceAll?: boolean }): Promise<CleanupReport> {
     const report: CleanupReport = {
       removed: [],
       archivedRefs: [],
-      prunedAdminEntries: false,
       expiredArchiveRefs: [],
+      skipped: [],
       errors: [],
     };
+    const errMsg = (err: unknown) => (err instanceof Error ? err.message : String(err));
+    const attempted = new Set<string>();
 
-    const live = await this.listLive(opts?.runId);
-    for (const item of live) {
-      if (!opts?.forceAll && !item.orphaned) continue;
+    for (const item of await this.listLive(opts?.runId)) {
+      const rec = item.record;
+      if (!rec) {
+        report.skipped.push({ target: item.path, reason: "unmanaged worktree" });
+        continue;
+      }
+      if (!item.orphaned && !(opts?.forceAll && item.existsOnDisk)) {
+        if (opts?.forceAll) report.skipped.push({ target: item.path, reason: "offline active worktree" });
+        continue;
+      }
+      attempted.add(rec.id);
       try {
-        if (item.record) {
-          const ref = await this.teardown(item.record.id, {
-            archiveBeforeRemove: item.dirty || item.record.status !== "merged",
-            finalStatus: item.record.status === "merged" ? "merged" : "archived",
-          });
-          if (ref) report.archivedRefs.push(ref);
-          report.removed.push(item.path);
-        } else {
-          try {
-            await runGit(this.repoRoot, ["worktree", "remove", "--force", item.path]);
-          } catch {
-            rmSync(item.path, { recursive: true, force: true });
-          }
-          if (item.branch) {
-            await runGit(this.repoRoot, ["branch", "-D", item.branch]).catch(() => {});
-          }
-          report.removed.push(item.path);
-        }
-      } catch (err) {
-        report.errors.push({ target: item.path, error: err instanceof Error ? err.message : String(err) });
-      }
-    }
-
-    // Reconcile DB worktree rows whose directory no longer exists on disk (existing orphaned dirs were torn down above)
-    const repoCanon = canonicalPath(this.repoRoot);
-    for (const rec of this.db.listWorktrees(opts?.runId)) {
-      if (rec.status !== "active" && rec.status !== "queued" && rec.status !== "bounced") continue;
-      const run = this.db.getRun(rec.runId);
-      if (run && canonicalPath(run.repoRoot) !== repoCanon) continue;
-      if (!existsSync(rec.path)) {
-        this.db.updateWorktree(rec.id, {
-          status: "removed",
-          cleanedAt: Date.now(),
+        const ref = await this.teardown(rec.id, {
+          archiveBeforeRemove: item.dirty || rec.status !== "merged",
+          finalStatus: rec.status === "merged" ? "merged" : "archived",
         });
+        if (ref) report.archivedRefs.push(ref);
+        report.removed.push(item.path);
+      } catch (err) {
+        report.errors.push({ target: item.path, error: errMsg(err) });
       }
     }
 
-    try {
-      await runGit(this.repoRoot, ["worktree", "prune"]);
-      report.prunedAdminEntries = true;
-    } catch (err) {
-      report.errors.push({ target: "git worktree prune", error: err instanceof Error ? err.message : String(err) });
+    // Finalise retired rows whose checkout is already gone; active rows with a missing checkout stay untouched.
+    for (const rec of this.ownedRows(opts?.runId)) {
+      if (attempted.has(rec.id) || !this.isRetired(rec)) continue;
+      if (existsSync(rec.path)) {
+        report.errors.push({ target: rec.path, error: "Retired worktree is not a Git worktree under the managed root; left in place" });
+        continue;
+      }
+      try {
+        await this.teardown(rec.id, {
+          archiveBeforeRemove: false,
+          finalStatus: rec.status === "merged" ? "merged" : "removed",
+        });
+      } catch (err) {
+        report.errors.push({ target: rec.path, error: errMsg(err) });
+      }
     }
 
-    // Delete stale local `harness/*` branches with no active/queued/bounced DB record and not checked out
+    // Delete only exact branches of cleaned rows that nothing else uses.
     try {
       const [{ stdout: branchesOut }, { stdout: wtListOut }] = await Promise.all([
         runGit(this.repoRoot, ["for-each-ref", "--format=%(refname:short)", "refs/heads/harness"]),
         runGit(this.repoRoot, ["worktree", "list", "--porcelain"]),
       ]);
-      const checkedOutBranches = new Set(
-        parsePorcelainWorktrees(wtListOut)
-          .map((e) => e.branch)
-          .filter((b): b is string => Boolean(b)),
-      );
-      const activeDbBranches = new Set(
-        this.db
-          .listWorktrees()
-          .filter((w) => w.status === "active" || w.status === "queued" || w.status === "bounced")
-          .map((w) => w.branch),
-      );
-      const runPrefix = opts?.runId ? `harness/${opts.runId}/` : null;
-
+      const repoCanon = canonicalPath(this.repoRoot);
+      const inUse = new Set(this.ownedRows().map((w) => w.branch));
+      for (const e of parsePorcelainWorktrees(wtListOut)) if (e.branch) inUse.add(e.branch);
+      const cleanedBranches = new Set<string>();
+      for (const w of this.db.listWorktrees(opts?.runId)) {
+        if (w.cleanedAt == null) continue;
+        const run = this.db.getRun(w.runId);
+        if (!run || canonicalPath(run.repoRoot) !== repoCanon || w.branch === run.baseBranch) continue;
+        cleanedBranches.add(w.branch);
+      }
       for (const raw of branchesOut.split("\n")) {
         const branch = raw.trim();
-        if (!branch) continue;
-        if (runPrefix && !branch.startsWith(runPrefix)) continue;
-        if (activeDbBranches.has(branch) || checkedOutBranches.has(branch)) continue;
+        if (!branch || !cleanedBranches.has(branch) || inUse.has(branch)) continue;
         try {
           await runGit(this.repoRoot, ["branch", "-D", branch]);
         } catch (err) {
-          report.errors.push({ target: branch, error: err instanceof Error ? err.message : String(err) });
+          report.errors.push({ target: branch, error: errMsg(err) });
         }
       }
     } catch (err) {
-      report.errors.push({ target: "refs/heads/harness", error: err instanceof Error ? err.message : String(err) });
+      report.errors.push({ target: "refs/heads/harness", error: errMsg(err) });
     }
 
-    // Expire old safety archive refs past retentionDays
+    // Expire old safety archive refs past retentionDays; never the snapshots this sweep just took.
     const retentionMs = (this.config.archiveRetentionDays ?? 7) * 86_400_000;
     const cutoffSec = Math.floor((Date.now() - retentionMs) / 1000);
+    const runPrefix = opts?.runId ? `refs/harness/archive/${opts.runId}/` : "refs/harness/archive/";
+    const justArchived = new Set(report.archivedRefs);
     try {
       const { stdout } = await runGit(this.repoRoot, [
         "for-each-ref",
         "--format=%(refname) %(committerdate:unix)",
-        "refs/harness/archive",
+        opts?.runId ? `refs/harness/archive/${opts.runId}` : "refs/harness/archive",
       ]);
       for (const line of stdout.split("\n")) {
         if (!line.trim()) continue;
         const [ref, tsStr] = line.trim().split(/\s+/);
-        if (!ref) continue;
+        if (!ref || !ref.startsWith(runPrefix) || justArchived.has(ref)) continue;
         const ts = Number(tsStr ?? 0);
         if (opts?.forceAll || (ts > 0 && ts < cutoffSec)) {
           await runGit(this.repoRoot, ["update-ref", "-d", ref]);
@@ -486,17 +542,28 @@ export class WorktreeManager {
   }
 }
 
-function parsePorcelainWorktrees(stdout: string): Array<{ path: string; head: string | null; branch: string | null }> {
+interface PorcelainWorktree {
+  path: string;
+  head: string | null;
+  branch: string | null;
+  /** null when unlocked, "" for a bare lock, otherwise the lock reason. */
+  locked: string | null;
+}
+
+function parsePorcelainWorktrees(stdout: string): PorcelainWorktree[] {
   const blocks = stdout.split(/\n\n+/).filter((b) => b.trim().length > 0);
   return blocks.map((block) => {
     let path = "";
     let head: string | null = null;
     let branch: string | null = null;
+    let locked: string | null = null;
     for (const line of block.split("\n")) {
       if (line.startsWith("worktree ")) path = line.slice("worktree ".length).trim();
       else if (line.startsWith("HEAD ")) head = line.slice("HEAD ".length).trim();
       else if (line.startsWith("branch ")) branch = line.slice("branch ".length).trim().replace(/^refs\/heads\//, "");
+      else if (line === "locked") locked = "";
+      else if (line.startsWith("locked ")) locked = line.slice("locked ".length);
     }
-    return { path, head, branch };
+    return { path, head, branch, locked };
   });
 }
