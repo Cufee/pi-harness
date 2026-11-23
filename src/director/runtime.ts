@@ -2331,6 +2331,12 @@ export class DirectorRuntime {
       if (goal.criteria.some((c) => c.kind === "deterministic")) {
         const checkout = await this.prepareVerifyCheckout(goal, run);
         try {
+          // A pause, amend or cancel during checkout must stop before the gates write "verifying" over it.
+          if (slot.signal.aborted) {
+            throw slot.signal.reason instanceof Error ? slot.signal.reason : new Error(`goal_accept for ${goal.id} was interrupted`);
+          }
+          const fresh = checkAcceptable(this.goals.getGoal(goal.id));
+          if (fresh.version !== goal.version) throw new Error(`Goal ${goal.id} changed during goal_accept`);
           verifyRef = checkout.verifyRef;
           const gate = await this.goals.runDeterministicGates(goal.id, run?.baseSha, slot.signal, {
             cwd: checkout.verifyCwd,
@@ -2571,8 +2577,8 @@ export class DirectorRuntime {
       const openP0 = goal.linkedRunId ? this.db.listEscalations(goal.linkedRunId, "open").find((e) => e.severity === "P0") : undefined;
       if (openP0) throw new Error(`Cannot auto-approve failed run while P0 escalation ${openP0.id} (${openP0.title}) is open`);
     };
-    // Read once, before gates move the goal's status: a current failed claim by the coordinator blocks approval.
-    const coordinatorFailure = this.detectCoordinatorFailure(goal);
+    // A current failed claim by the coordinator blocks approval; re-read after gates and after the reviewer.
+    let coordinatorFailure = this.detectCoordinatorFailure(goal);
 
     const committedMode: VerificationMode = goal.verificationMode ?? "auto";
     if (opts?.verificationMode === "none" && committedMode !== "none") {
@@ -2616,6 +2622,9 @@ export class DirectorRuntime {
         targetRef: verifyRef,
       });
       assertCurrent();
+      // The coordinator may have reported (or confirmed) while gates ran: settle on its latest claim.
+      const latestGoal = this.goals.getGoal(goal.id) ?? goal;
+      coordinatorFailure = this.detectCoordinatorFailure(latestGoal);
 
       // If deterministic gates failed, record immediately without burning LLM review tokens!
       if (!gateResult.allPassed) {
@@ -2648,7 +2657,7 @@ export class DirectorRuntime {
           .listReviews(goal.id)
           .filter((r) => r.goalVersion === goal.version)
           .at(-1);
-        const lp = goal.liveProgress;
+        const lp = latestGoal.liveProgress;
         const confirmedAfterBounce =
           lp != null &&
           isCurrentClaim(goal, lp) &&
@@ -2992,15 +3001,35 @@ export class DirectorRuntime {
           `Incomplete review output (stopReason=${stopReason}, turns=${turnsUsed}, reminder threshold=${reviewerMaxTurns})`;
 
         if (submittedVerdict?.verdict === "approved") assertNoOpenP0ForFailedRunApproval();
+        // A coordinator failure reported after the reviewer's prompt was built was never seen: it blocks approval.
+        const postReviewGoal = this.goals.getGoal(goal.id);
+        const lateFailure = postReviewGoal ? this.detectCoordinatorFailure(postReviewGoal) : null;
+        const unseenFailure =
+          submittedVerdict?.verdict === "approved" &&
+          lateFailure &&
+          (!coordinatorFailure || (lateFailure.claimedAt ?? 0) > (coordinatorFailure.claimedAt ?? 0))
+            ? lateFailure
+            : null;
+        const blockingIssues = submittedVerdict?.blockingIssues ?? (submittedVerdict ? [] : [noVerdictIssue]);
         outcome = this.db.transaction(() => {
           const recorded = this.goals.recordReviewVerdict(goal.id, {
-            verdict: submittedVerdict?.verdict ?? "changes_requested",
+            verdict: unseenFailure ? "changes_requested" : (submittedVerdict?.verdict ?? "changes_requested"),
             criteriaResults: mergedResults,
-            blockingIssues: submittedVerdict?.blockingIssues ?? (submittedVerdict ? [] : [noVerdictIssue]),
-            summary: notes.length ? `${baseSummary} ${notes.join(" ")}` : baseSummary,
+            blockingIssues: unseenFailure
+              ? [
+                  `Coordinator reported verification failed after the reviewer started: ${(unseenFailure.summary ?? "no summary").slice(0, 400)}`,
+                  ...unseenFailure.criteriaResults.map(
+                    (c) => `${c.criterionId}: ${c.evidence}${c.remediation ? ` | Fix: ${c.remediation}` : ""}`,
+                  ),
+                  ...blockingIssues,
+                ]
+              : blockingIssues,
+            summary: unseenFailure
+              ? `Reviewer approved, but the coordinator reported verification failed during review; not approving. ${baseSummary}`
+              : notes.length ? `${baseSummary} ${notes.join(" ")}` : baseSummary,
             diffHash: gateResult.diffHash,
             spentUsd: this.sumRunCostUsd(goal.linkedRunId),
-            source: "review",
+            source: unseenFailure ? "coordinator_failed" : "review",
           });
           const summary = `${recorded.review.verdict}: ${recorded.review.summary}`.slice(0, 2000);
           const dossier = writeTaskDossier(this.db, reviewRun, reviewerTask.id, "review.json",
@@ -3937,7 +3966,7 @@ export class DirectorRuntime {
 
       case "queue_list": {
         const lane = args.lane === "goal" || args.lane === "worker" ? (args.lane as AdmissionLane) : undefined;
-        this.syncQueuedGoalProgress();
+        // Read-only: queue progress is kept current by admission-queue changes, not by reads.
         const entries = this.db.admissionQueue.list({ lane, repoRoot });
         return {
           repoRoot,

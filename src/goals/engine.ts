@@ -889,6 +889,10 @@ export class GoalEngine {
   ): Promise<DeterministicGateResult> {
     const goal = this.getGoal(goalIdStr);
     if (!goal) throw new Error(`Unknown goal ${goalIdStr}`);
+    // An already-stopped review or acceptance never writes "verifying" over a newer pause or cancel.
+    if (signal?.aborted) {
+      throw signal.reason instanceof Error ? signal.reason : new Error(`Verification of ${goal.id} was interrupted`);
+    }
     this.setStatus(goal.id, "verifying");
     // A rejected (e.g. symlinked) evidence directory is never advertised to gate commands.
     const verifiedEvDir = ensureGoalEvidenceDir(goal.repoRoot, goal.id);

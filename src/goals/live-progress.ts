@@ -79,11 +79,21 @@ export function mergeGoalLiveProgress(
 
   const baseVerificationSource =
     base?.verificationStatus !== undefined ? (base.verificationSource ?? base.source) : undefined;
-  const authoritativeBlocked = sameEpoch && isBlockedPhase(base?.phase) && isAuthoritativeSource(base?.source);
+  // A legacy claim (no provenance) stays legacy, validated by its reporter and time, until a non-worker
+  // verification status or blocked phase replaces it; a worker can neither replace nor migrate it.
+  const legacyClaim =
+    !!prev && !hasProvenance(prev) && (prev.verificationStatus !== undefined || isBlockedPhase(prev.phase));
+  const migratesLegacy =
+    ctx.source !== "worker" && (patch.verificationStatus !== undefined || isBlockedPhase(patch.phase));
+  const legacyLocked = legacyClaim && ctx.source === "worker";
+  const authoritativeBlocked =
+    (sameEpoch && isBlockedPhase(base?.phase) && isAuthoritativeSource(base?.source)) ||
+    (legacyLocked && isBlockedPhase(base?.phase));
   const workerLocked =
-    ctx.source === "worker" &&
-    sameEpoch &&
-    ((base?.verificationStatus !== undefined && isAuthoritativeSource(baseVerificationSource)) || authoritativeBlocked);
+    legacyLocked ||
+    (ctx.source === "worker" &&
+      sameEpoch &&
+      ((base?.verificationStatus !== undefined && isAuthoritativeSource(baseVerificationSource)) || authoritativeBlocked));
   const setsVerification = patch.verificationStatus !== undefined && !workerLocked;
 
   const mergedById = new Map<string, CriterionEvaluation>();
@@ -101,7 +111,7 @@ export function mergeGoalLiveProgress(
       : (patch.reportedByTaskId ?? base?.reportedByTaskId ?? null),
     updatedAt: ctx.now,
   };
-  if (isClaim && !workerLocked) {
+  if (isClaim && !workerLocked && (!legacyClaim || migratesLegacy)) {
     next.goalVersion = ctx.goalVersion;
     next.runId = ctx.runId;
     next.reviewCycle = ctx.reviewCycle;
