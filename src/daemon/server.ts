@@ -15,7 +15,17 @@ export function currentDaemonBuildId(): string {
   }
 }
 import { ModelCatalogCompiler } from "../catalog/compiler.js";
-import { normalizeWorktreeRoots, saveGlobalConfig, type HarnessConfig, type RemoteHostConfig, type RunnerProfileConfig } from "../config.js";
+import {
+  diffHarnessConfig,
+  normalizeWorktreeRoots,
+  readRepoConfig,
+  resolveConfig,
+  saveGlobalConfig,
+  validateConfigRaw,
+  type HarnessConfig,
+  type RemoteHostConfig,
+  type RunnerProfileConfig,
+} from "../config.js";
 import { ControlPlaneDb, type ReplayCursor, type EventRecord } from "../control-plane/db.js";
 import { readRunDossier, readWorkspaceArtifact } from "../control-plane/dossiers.js";
 import { compactTaskHandoff } from "../control-plane/handoffs.js";
@@ -37,7 +47,7 @@ import type {
 import { attachDaemonReader, writeDaemonMessage } from "../protocol/frames.js";
 import { buildGoalDetailDisplay, buildGoalsTableDisplay, summarizeToolDisplay } from "../protocol/tool-display.js";
 import { QuotaClient } from "../quota/client.js";
-import { ensureOctofs, shouldStageOctofs } from "../tools/native-tools.js";
+import { ensureOctofs, resolveExternalMcpServers, shouldStageOctofs } from "../tools/native-tools.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
 import { runGit } from "../worktree/manager.js";
@@ -183,14 +193,27 @@ export class HarnessDaemon {
   private configWatcher: FSWatcher | null = null;
   private configReloadTimer: ReturnType<typeof setTimeout> | null = null;
   private lastConfigRaw = "";
+  /** Repository overlay snapshotted at startup; reloads layer `config.json` beneath it. */
+  private readonly repoOverlay: Record<string, unknown>;
+  /** Without a repo root, the constructor config is the layer beneath `config.json` on reload. */
+  private readonly reloadBase: HarnessConfig | undefined;
   private autoQuitWhenIdle = false;
   private hasCustomRunner = false;
   private startedAt = Date.now();
 
   constructor(
     public config: HarnessConfig,
-    opts?: { dbPath?: string; customRunnerFactory?: CustomRunnerFactory; autoQuitWhenIdle?: boolean; hostName?: string },
+    opts?: {
+      dbPath?: string;
+      customRunnerFactory?: CustomRunnerFactory;
+      autoQuitWhenIdle?: boolean;
+      hostName?: string;
+      repoRoot?: string;
+    },
   ) {
+    this.repoOverlay = readRepoConfig(opts?.repoRoot);
+    // Cloned because the orchestrator mutates the constructor config in place.
+    this.reloadBase = opts?.repoRoot ? undefined : structuredClone(config);
     this.autoQuitWhenIdle = Boolean(opts?.autoQuitWhenIdle);
     this.hasCustomRunner = Boolean(opts?.customRunnerFactory);
     const dbPath = opts?.dbPath ?? join(config.stateDir, "control-plane.sqlite");
@@ -346,15 +369,7 @@ export class HarnessDaemon {
       void ensureOctofs(next.stateDir).catch(() => {});
     }
 
-    if (!opts?.skipSave) {
-      saveGlobalConfig(next);
-      try {
-        const cfgFile = join(next.stateDir, "config.json");
-        if (existsSync(cfgFile)) this.lastConfigRaw = readFileSync(cfgFile, "utf8");
-      } catch {
-        // ignore
-      }
-    }
+    if (!opts?.skipSave) this.persistConfig();
 
     if (opts?.profilesChanged) {
       this.catalog.invalidateCache();
@@ -362,6 +377,79 @@ export class HarnessDaemon {
       void this.catalog.sync(process.cwd()).catch(() => {});
     }
     return next;
+  }
+
+  /** Saves the effective config and records the written text so the watcher ignores the daemon's own write. */
+  private persistConfig(): void {
+    saveGlobalConfig(this.config);
+    try {
+      const cfgFile = join(this.config.stateDir, "config.json");
+      if (existsSync(cfgFile)) this.lastConfigRaw = readFileSync(cfgFile, "utf8");
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * Rebuilds the config from `config.json` + the startup repo overlay (or the constructor config) and applies it.
+   * Missing, empty, or unchanged files are ignored; invalid files are rejected and the previous settings kept.
+   */
+  private reloadConfigFromDisk(): void {
+    const cfgFile = join(this.config.stateDir, "config.json");
+    let raw: string;
+    try {
+      raw = readFileSync(cfgFile, "utf8");
+    } catch {
+      return;
+    }
+    if (!raw.trim() || raw === this.lastConfigRaw) return;
+    this.lastConfigRaw = raw;
+    let parsed: unknown;
+    let errors: string[];
+    try {
+      parsed = JSON.parse(raw);
+      errors = validateConfigRaw(parsed);
+    } catch (err) {
+      errors = [err instanceof Error ? err.message : String(err)];
+    }
+    if (errors.length > 0) {
+      console.error(
+        `[harnessd ${new Date().toISOString()}] config reload rejected ${cfgFile} (keeping previous settings): ${errors.join("; ")}`,
+      );
+      return;
+    }
+    // Snapshot: until the first mutation, this.config is the object the orchestrator updates in place.
+    const prev = structuredClone(this.config);
+    const next = resolveConfig(
+      parsed as Record<string, unknown>,
+      this.repoOverlay,
+      { stateDir: prev.stateDir, socketPath: prev.socketPath },
+      this.reloadBase,
+    );
+    if (diffHarnessConfig(prev, next).length === 0) return;
+    const applied = this.applyConfigMutation(next, {
+      profilesChanged: JSON.stringify(next.profiles) !== JSON.stringify(prev.profiles),
+      skipSave: true,
+    });
+    const changes = diffHarnessConfig(prev, applied);
+    if (changes.length > 0) {
+      console.error(`[harnessd ${new Date().toISOString()}] config reload applied ${cfgFile} changes=${JSON.stringify(changes)}`);
+    }
+  }
+
+  private stopConfigWatcher(): void {
+    if (this.configReloadTimer) {
+      clearTimeout(this.configReloadTimer);
+      this.configReloadTimer = null;
+    }
+    if (this.configWatcher) {
+      try {
+        this.configWatcher.close();
+      } catch {
+        // ignore
+      }
+      this.configWatcher = null;
+    }
   }
 
   /** Watches `<stateDir>/config.json` so edits on disk apply live without restarting `harnessd`. */
@@ -377,89 +465,21 @@ export class HarnessDaemon {
       return;
     }
 
-    const reloadFromDisk = () => {
-      if (!existsSync(cfgFile)) return;
-      let raw: string;
-      try {
-        raw = readFileSync(cfgFile, "utf8");
-      } catch {
-        return;
-      }
-      if (!raw.trim() || raw === this.lastConfigRaw) return;
-      let parsed: Record<string, unknown>;
-      try {
-        const snapshot = JSON.parse(raw);
-        // A scalar contains no root grants, but is not a settings object for the other sections.
-        parsed = snapshot !== null && typeof snapshot === "object" ? snapshot : { externalMcpServers: this.config.externalMcpServers };
-      } catch (err) {
-        console.error(`[harnessd] Ignored invalid config.json at ${cfgFile} (keeping previous settings): ${err instanceof Error ? err.message : String(err)}`);
-        return; // Reject invalid file and keep old settings cleanly
-      }
-      let prevHadExternalMcp = false;
-      if (this.lastConfigRaw.trim()) {
-        try {
-          const prevParsed = JSON.parse(this.lastConfigRaw) as Record<string, unknown>;
-          prevHadExternalMcp =
-            typeof prevParsed === "object" && prevParsed !== null && "externalMcpServers" in prevParsed;
-        } catch {
-          // ignore unparseable previous snapshot
-        }
-      }
-      this.lastConfigRaw = raw;
-      const prevProfiles = JSON.stringify(this.config.profiles);
-      const { roots, warning } = normalizeWorktreeRoots(parsed.worktree);
-      if (warning) console.error(`[harnessd] ${warning}; ignoring invalid entries`);
-      const next: HarnessConfig = {
-        ...this.config,
-        ...(Array.isArray(parsed.profiles) && parsed.profiles.length > 0
-          ? { profiles: parsed.profiles as RunnerProfileConfig[] }
-          : {}),
-        ...(Array.isArray(parsed.remotes) ? { remotes: parsed.remotes as RemoteHostConfig[] } : {}),
-        ...("externalMcpServers" in parsed || prevHadExternalMcp
-          ? {
-              externalMcpServers:
-                Array.isArray(parsed.externalMcpServers) && parsed.externalMcpServers.length > 0
-                  ? (parsed.externalMcpServers as HarnessConfig["externalMcpServers"])
-                  : undefined,
-            }
-          : {}),
-        ...(typeof parsed.defaultOrchestratorProfile === "string"
-          ? { defaultOrchestratorProfile: parsed.defaultOrchestratorProfile }
-          : {}),
-        ...(typeof parsed.defaultWorkerProfile === "string" ? { defaultWorkerProfile: parsed.defaultWorkerProfile } : {}),
-        ...(typeof parsed.defaultTaskProfile === "string" ? { defaultTaskProfile: parsed.defaultTaskProfile } : {}),
-        ...(parsed.codeMode === "collapsed" || parsed.codeMode === "hybrid" || parsed.codeMode === "off"
-          ? { codeMode: parsed.codeMode }
-          : {}),
-        ...(parsed.codeExec ? { codeExec: { ...this.config.codeExec, ...(parsed.codeExec as HarnessConfig["codeExec"]) } } : {}),
-        ...(parsed.rollover ? { rollover: { ...this.config.rollover, ...(parsed.rollover as HarnessConfig["rollover"]) } } : {}),
-        worktree: { ...this.config.worktree, ...(parsed.worktree as HarnessConfig["worktree"]), ...roots },
-        ...(parsed.goals ? { goals: { ...this.config.goals, ...(parsed.goals as HarnessConfig["goals"]) } } : {}),
-        ...(parsed.events ? { events: { ...this.config.events, ...(parsed.events as HarnessConfig["events"]) } } : {}),
-        ...(parsed.catalog ? { catalog: { ...this.config.catalog, ...(parsed.catalog as HarnessConfig["catalog"]) } } : {}),
-        ...(parsed.quotaRetry
-          ? { quotaRetry: { ...this.config.quotaRetry, ...(parsed.quotaRetry as HarnessConfig["quotaRetry"]) } }
-          : {}),
-        ...("quotaEndpoint" in parsed
-          ? { quotaEndpoint: (parsed.quotaEndpoint as HarnessConfig["quotaEndpoint"] | null) ?? undefined }
-          : {}),
-      };
-      const profilesChanged = JSON.stringify(next.profiles) !== prevProfiles;
-      this.applyConfigMutation(next, { profilesChanged, skipSave: true });
-      console.error(
-        `[harnessd] Live-reloaded ${cfgFile} (maxConcurrentGoals=${next.goals.maxConcurrentGoals ?? 4}, maxConcurrentWorkers=${next.worktree.maxConcurrentWorkers ?? 4}, reviewerMaxTurns=${next.rollover.reviewerMaxTurns})`,
-      );
-    };
-
     try {
       this.configWatcher = watch(stateDir, (_eventType, filename) => {
         if (filename && filename !== "config.json") return;
         if (this.configReloadTimer) clearTimeout(this.configReloadTimer);
         this.configReloadTimer = setTimeout(() => {
           this.configReloadTimer = null;
-          reloadFromDisk();
+          this.reloadConfigFromDisk();
         }, 120);
         this.configReloadTimer.unref?.();
+      });
+      this.configWatcher.on("error", (err) => {
+        console.error(
+          `[harnessd ${new Date().toISOString()}] config watcher stopped for ${cfgFile}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        this.stopConfigWatcher();
       });
       this.configWatcher.unref?.();
     } catch {
@@ -563,18 +583,7 @@ export class HarnessDaemon {
       clearInterval(this.sweepTimer);
       this.sweepTimer = null;
     }
-    if (this.configReloadTimer) {
-      clearTimeout(this.configReloadTimer);
-      this.configReloadTimer = null;
-    }
-    if (this.configWatcher) {
-      try {
-        this.configWatcher.close();
-      } catch {
-        // ignore
-      }
-      this.configWatcher = null;
-    }
+    this.stopConfigWatcher();
     for (const t of this.flushRetryTimers.values()) clearTimeout(t);
     this.flushRetryTimers.clear();
     this.flushingPeers.clear();
@@ -1752,6 +1761,10 @@ export class HarnessDaemon {
             extraReadRoots: this.config.worktree.extraReadRoots ?? [],
             extraWriteRoots: this.config.worktree.extraWriteRoots ?? [],
           },
+          effectiveExternalMcpServers: resolveExternalMcpServers(
+            this.config.stateDir,
+            this.orchestrator.config.externalMcpServers,
+          ).map((s) => ({ name: s.name, enabled: s.enabled !== false })),
           hasLibghosttyVt: this.ptyHost.hasLibghosttyVt,
           runs: this.db.listRuns(20),
           goals: this.director.goals.listGoals(),
@@ -1791,7 +1804,7 @@ export class HarnessDaemon {
         const existing = (this.config.remotes ?? []).filter((r) => r.name.toLowerCase() !== name.toLowerCase());
         const nextRemotes = [...existing, entry];
         this.config = { ...this.config, remotes: nextRemotes };
-        saveGlobalConfig(this.config);
+        this.persistConfig();
         this.peers.syncRemotes(nextRemotes, p.connectNow === false ? { skipConnectNames: new Set([name.toLowerCase()]) } : undefined);
         if (p.connectNow !== false) {
           try {
@@ -1811,7 +1824,7 @@ export class HarnessDaemon {
         if (nextRemotes.length === before.length) throw new Error(`Unknown remote host: ${name}`);
         const knownNodeId = this.peers.getKnownNodeId(name);
         this.config = { ...this.config, remotes: nextRemotes };
-        saveGlobalConfig(this.config);
+        this.persistConfig();
         this.peers.syncRemotes(nextRemotes);
         const failedQueued = this.db.sessionMessages.failQueuedForHost(name, knownNodeId, `Remote host "${name}" was removed`);
         return { removed: name, failedQueued };
@@ -1874,8 +1887,9 @@ export class HarnessDaemon {
 
       case "config.update": {
         const patch = (p.patch ?? {}) as Record<string, unknown>;
-        const { roots, warning } = normalizeWorktreeRoots(patch.worktree);
-        if (warning) throw new Error(warning);
+        const patchErrors = validateConfigRaw(patch);
+        if (patchErrors.length > 0) throw new Error(`Invalid config patch: ${patchErrors.join("; ")}`);
+        const { roots } = normalizeWorktreeRoots(patch.worktree);
         const next: HarnessConfig = {
           ...this.config,
           ...(typeof patch.defaultOrchestratorProfile === "string"
