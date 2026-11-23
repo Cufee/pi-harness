@@ -306,6 +306,9 @@ const GLOBAL_ONLY_CONFIG_KEYS: ReadonlySet<string> = new Set([
 ]);
 
 const CONFIG_SECTIONS = Object.keys(CONFIG_SECTION_KEYS) as ConfigSection[];
+const SECTION_KEY_SETS: Record<ConfigSection, ReadonlySet<string>> = Object.fromEntries(
+  CONFIG_SECTIONS.map((section) => [section, new Set(Object.keys(CONFIG_SECTION_KEYS[section]))]),
+) as unknown as Record<ConfigSection, ReadonlySet<string>>;
 const TOP_LEVEL_KEYS: ReadonlySet<string> = new Set(Object.keys(CONFIG_TOP_LEVEL_KEYS));
 /** Each nested key mapped to its one section; keys with two homes or equal to a top-level key are left out. */
 const SECTION_OF_KEY: ReadonlyMap<string, ConfigSection> = (() => {
@@ -329,6 +332,7 @@ export interface MisplacedConfigKey {
 }
 
 function isMisplacedIn(section: ConfigSection, key: string): boolean {
+  if (SECTION_KEY_SETS[section].has(key)) return false;
   const home = SECTION_OF_KEY.get(key);
   return home !== undefined ? home !== section : TOP_LEVEL_KEYS.has(key);
 }
@@ -351,11 +355,14 @@ export function findMisplacedConfigKeys(raw: unknown, layer: "global" | "repo"):
     const value = raw[section];
     if (!Object.hasOwn(raw, section) || !isPlainObject(value)) continue;
     for (const key of Object.keys(value)) {
-      const home = SECTION_OF_KEY.get(key);
       const path = `${section}.${key}`;
+      if (SECTION_KEY_SETS[section].has(key)) {
+        if (layer === "repo" && GLOBAL_ONLY_CONFIG_KEYS.has(path)) out.push({ path, supported: supported(path) });
+        continue;
+      }
+      const home = SECTION_OF_KEY.get(key);
       if (home !== undefined) {
-        if (home !== section) out.push({ path, supported: supported(`${home}.${key}`) });
-        else if (layer === "repo" && GLOBAL_ONLY_CONFIG_KEYS.has(path)) out.push({ path, supported: supported(path) });
+        out.push({ path, supported: supported(`${home}.${key}`) });
       } else if (TOP_LEVEL_KEYS.has(key)) {
         out.push({ path, supported: supported(key) });
       }
@@ -364,15 +371,19 @@ export function findMisplacedConfigKeys(raw: unknown, layer: "global" | "repo"):
   return out;
 }
 
-/** Copy of a raw layer whose sections hold no keys that belong elsewhere, so those keys never reach the effective config. */
+/** Copy of a raw layer whose sections hold no keys that belong elsewhere; omits `quotaEndpoint` when stripping empties it. */
 function dropMisplacedSectionKeys(raw: Record<string, unknown>): Record<string, unknown> {
   let out = raw;
   for (const section of CONFIG_SECTIONS) {
     const sec = raw[section];
     if (!Object.hasOwn(raw, section) || !isPlainObject(sec)) continue;
     if (!Object.keys(sec).some((key) => isMisplacedIn(section, key))) continue;
-    const clean = Object.fromEntries(Object.entries(sec).filter(([key]) => !isMisplacedIn(section, key)));
-    out = { ...out, [section]: clean };
+    const remaining = Object.entries(sec).filter(([key]) => !isMisplacedIn(section, key));
+    if (section === "quotaEndpoint" && remaining.length === 0) {
+      out = Object.fromEntries(Object.entries(out).filter(([k]) => k !== section));
+    } else {
+      out = { ...out, [section]: Object.fromEntries(remaining) };
+    }
   }
   return out;
 }
@@ -747,12 +758,14 @@ export function stableEqual(a: unknown, b: unknown): boolean {
 }
 
 /**
- * Validates the shape of a global `config.json` document or a `config.update` patch. Unknown keys are ignored.
+ * Validates the shape of a global `config.json` document or a `config.update` patch. Unknown keys are ignored,
+ * and sections emptied only by misplaced keys are omitted before validation.
  * Returns one message per problem, naming the path and expectation; values are never echoed (they may be secrets).
  */
 export function validateConfigRaw(raw: unknown): string[] {
   const errors: string[] = [];
   if (!isPlainObject(raw)) return ["config must be a JSON object"];
+  const doc = dropMisplacedSectionKeys(raw);
 
   const isString = (v: unknown) => typeof v === "string";
   const isNonEmptyString = (v: unknown) => typeof v === "string" && v.trim().length > 0;
@@ -781,8 +794,8 @@ export function validateConfigRaw(raw: unknown): string[] {
     }
   };
   const section = (key: string, rules: Record<string, Rule>): Record<string, unknown> | undefined => {
-    if (!(key in raw)) return undefined;
-    const value = raw[key];
+    if (!(key in doc)) return undefined;
+    const value = doc[key];
     if (!isPlainObject(value)) {
       errors.push(`${key} must be an object`);
       return undefined;
@@ -791,15 +804,15 @@ export function validateConfigRaw(raw: unknown): string[] {
     return value;
   };
   const list = (key: string): unknown[] | undefined => {
-    if (!(key in raw)) return undefined;
-    if (!Array.isArray(raw[key])) {
+    if (!(key in doc)) return undefined;
+    if (!Array.isArray(doc[key])) {
       errors.push(`${key} must be an array`);
       return undefined;
     }
-    return raw[key] as unknown[];
+    return doc[key] as unknown[];
   };
 
-  checkFields(raw, "config", { stateDir: NON_EMPTY, socketPath: NON_EMPTY });
+  checkFields(doc, "config", { stateDir: NON_EMPTY, socketPath: NON_EMPTY });
 
   const profileIds = new Set<string>();
   list("profiles")?.forEach((profile, i) => {
@@ -880,7 +893,7 @@ export function validateConfigRaw(raw: unknown): string[] {
     else if (!isNonEmptyString(server.command)) errors.push(`${path}.command must be a non-empty string`);
   });
 
-  checkFields(raw, "config", {
+  checkFields(doc, "config", {
     codeMode: [oneOf("collapsed", "hybrid", "off"), '"collapsed", "hybrid", or "off"'],
     defaultOrchestratorProfile: NON_EMPTY,
     defaultWorkerProfile: NON_EMPTY,
@@ -938,8 +951,8 @@ export function validateConfigRaw(raw: unknown): string[] {
     earlyWakePollMs: POSITIVE,
     autoResumeEnabled: BOOLEAN,
   });
-  if ("quotaEndpoint" in raw && raw.quotaEndpoint !== null) {
-    const endpoint = raw.quotaEndpoint;
+  if ("quotaEndpoint" in doc && doc.quotaEndpoint !== null) {
+    const endpoint = doc.quotaEndpoint;
     if (!isPlainObject(endpoint)) {
       errors.push("quotaEndpoint must be an object or null");
     } else {
