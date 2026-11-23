@@ -3298,13 +3298,17 @@ export class DirectorRuntime {
     if (esc.status === "resolved") {
       return { escalation: esc, alreadyResolved: true, goalId, goalStatus: goal?.status ?? null, runStatus, remainingOpen: remaining() };
     }
-    const updated = this.db.ackEscalation(esc.id, reason, true, {
+    // Guarded transition: a concurrent or repeated resolve loses the race without a second event or notice.
+    const { escalation: updated, transitioned } = this.db.tryResolveEscalation(esc.id, reason, {
       resolvedBy: input.resolvedBy,
       chatSessionId: input.chatSessionId ?? null,
       goalId,
       goalVersion: goal?.version ?? null,
       runStatus,
     });
+    if (!transitioned) {
+      return { escalation: updated, alreadyResolved: true, goalId, goalStatus: goal?.status ?? null, runStatus, remainingOpen: remaining() };
+    }
     const noticeSession = goal?.chatSessionId ?? input.chatSessionId;
     if (noticeSession) {
       this.chats.appendTurn(

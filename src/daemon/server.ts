@@ -3109,13 +3109,13 @@ export class HarnessDaemon {
         const chatSessionId = typeof p.chatSessionId === "string" && p.chatSessionId ? p.chatSessionId : undefined;
         const runId = typeof p.runId === "string" && p.runId ? p.runId : undefined;
         const status =
-          p.status === "open" || p.status === "acked" || p.status === "resolved" ? p.status : undefined;
+          p.status === "open" || p.status === "acked" || p.status === "resolved" || p.status === "unresolved"
+            ? p.status
+            : undefined;
+        const limit =
+          typeof p.limit === "number" && Number.isFinite(p.limit) ? Math.max(1, Math.min(1000, Math.floor(p.limit))) : 100;
         const runIds = runId ? [runId] : chatSessionId ? this.getRunIdsForChatSession(chatSessionId) : undefined;
-        return this.db.listAllEscalations({
-          runIds,
-          status,
-          limit: typeof p.limit === "number" ? p.limit : 100,
-        });
+        return this.db.listAllEscalations({ runIds, status, limit });
       }
 
       case "escalation.get": {
@@ -3135,10 +3135,29 @@ export class HarnessDaemon {
 
       case "escalation.resolve": {
         const escalationId = String(p.escalationId ?? "");
-        const reason = String(p.reason ?? p.resolution ?? "");
-        const chatSessionId = typeof p.chatSessionId === "string" ? p.chatSessionId : undefined;
-        const repoRoot = chatSessionId ? this.director.chats.getSession(chatSessionId)?.repoRoot : undefined;
-        return this.director.resolveEscalation({ escalationId, reason, chatSessionId, repoRoot, resolvedBy: "operator" });
+        const rawReason = p.reason !== undefined ? p.reason : p.resolution;
+        if (typeof rawReason !== "string" || rawReason.trim().length === 0) {
+          throw new Error("reason must be a non-empty string");
+        }
+        let chatSessionId: string | undefined;
+        let repoRoot: string | undefined;
+        if (p.chatSessionId !== undefined) {
+          // A provided session must be real, so a blank or unknown ID never bypasses workspace scoping.
+          if (typeof p.chatSessionId !== "string" || p.chatSessionId.trim().length === 0) {
+            throw new Error("chatSessionId must be a non-empty string when provided");
+          }
+          chatSessionId = p.chatSessionId;
+          const sess = this.director.chats.getSession(chatSessionId);
+          if (!sess) throw new Error(`Unknown chat session ${chatSessionId}`);
+          repoRoot = sess.repoRoot;
+        }
+        return this.director.resolveEscalation({
+          escalationId,
+          reason: rawReason,
+          chatSessionId,
+          repoRoot,
+          resolvedBy: "operator",
+        });
       }
 
       case "escalation.reconcile":
