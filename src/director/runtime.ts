@@ -1018,7 +1018,7 @@ export class DirectorRuntime {
       goal.criteria.some((c) => c.required && c.kind === "deterministic") &&
       goal.liveProgress?.phase !== "blocked" &&
       !this.activeReviews.has(goal.id) &&
-      !this.db.listEscalations(ev.runId, "open").some((e) => e.severity === "P0")
+      !this.db.listEscalations(ev.runId, "unresolved").some((e) => e.severity === "P0")
     ) {
       if (!this.unsubRunEvents || !firstNotice) return;
       void this.verifyAndReviewGoal(goal.id, undefined, { autoTriggered: true, settledRunStatus: "failed" }).catch((err) =>
@@ -1029,7 +1029,7 @@ export class DirectorRuntime {
 
     // A settled run no longer occupies a goal slot: hand the goal to a human and admit queued goals.
     // Open escalations stay open here; they are counted in the hand-off and disposed of explicitly.
-    const openEscalations = this.db.listEscalations(ev.runId, "open").length;
+    const openEscalations = this.db.listEscalations(ev.runId, "unresolved").length;
     // The recorded stop/failure cause travels with the hand-off note and the Director wake.
     const recordedCause = status === "completed" ? null : this.orchestrator.describeRunCause(ev.runId);
     const explicitStopReason = status === "stopped" ? ((ev.payload as { reason?: string } | null)?.reason?.trim() || null) : null;
@@ -1097,7 +1097,7 @@ export class DirectorRuntime {
     if (!latest || latest.version !== goal.version || ["achieved", "cancelled", "paused"].includes(latest.status)) return;
     let openEscCount = 0;
     try {
-      openEscCount = this.db.listEscalations(runId, "open").length;
+      openEscCount = this.db.listEscalations(runId, "unresolved").length;
     } catch {
       return; // DB may be closing
     }
@@ -1443,21 +1443,10 @@ export class DirectorRuntime {
       if (current.status === "achieved" || current.status === "cancelled") {
         return { goal: current, outcome: "already_settled", message: `Goal ${current.id} is ${current.status}; nothing was started.` };
       }
-      // Tier 1 launches with the latest revision; its exact text becomes the blackboard baseline below.
-      const launchedGoal = this.goals.getGoal(goal.id) ?? goal;
-      const criteriaSummary = launchedGoal.criteria
-        .map((c) => `- [${c.id}] (${c.kind}${c.required ? "*" : ""}) ${c.description}${c.command ? ` [cmd: ${c.command}]` : ""}`)
-        .join("\n");
-      const runObjective = [
-        `Goal ${launchedGoal.id} v${launchedGoal.version}: ${launchedGoal.title}`,
-        launchedGoal.description,
-        "",
-        "Acceptance Criteria:",
-        criteriaSummary,
-        ...(launchedGoal.nonGoals.length ? ["", "Non-Goals:", ...launchedGoal.nonGoals.map((n) => `- ${n}`)] : []),
-        ...evidenceDirLines(launchedGoal),
-      ].join("\n");
-
+      // Tier 1 launches with the revision current when its rows are created; its exact text becomes the blackboard
+      // baseline below. An amendment during the launch's awaits is read by resolveGoal instead of being steered later.
+      const initialVersion = current.version;
+      let launchedGoal = current;
       let run: RunRecord;
       let orchestratorTaskId: string;
       const prevLinkedRunId = current.linkedRunId ?? null;
@@ -1465,7 +1454,7 @@ export class DirectorRuntime {
       try {
         let orchestratorTask: { id: string };
         ({ run, orchestratorTask } = await this.orchestrator.startRun({
-          goal: runObjective,
+          goal: goalRunObjective(launchedGoal).objective,
           repoRoot: goal.repoRoot,
           profileId: opts?.profileId,
           model: opts?.model,
@@ -1476,6 +1465,11 @@ export class DirectorRuntime {
           onRunCreated: (created) => {
             this.db.db.prepare("UPDATE goals SET linked_run_id = ?, updated_at = ? WHERE id = ?").run(created.id, Date.now(), goal.id);
             linkedEarly = created.id;
+          },
+          resolveGoal: () => {
+            launchedGoal = this.goals.getGoal(goal.id) ?? launchedGoal;
+            const { title, objective } = goalRunObjective(launchedGoal);
+            return { goal: objective, taskTitle: title };
           },
         }));
         orchestratorTaskId = orchestratorTask.id;
@@ -1527,74 +1521,66 @@ export class DirectorRuntime {
       started = this.goals.linkRunAndStart(goal.id, run.id);
       runId = run.id;
       launched = true;
+      const contractValue = (g: Pick<GoalRecord, "version" | "title" | "description" | "criteria" | "nonGoals">, delta: unknown) => ({
+        version: g.version,
+        title: g.title,
+        description: g.description,
+        criteria: g.criteria,
+        nonGoals: g.nonGoals,
+        delta,
+      });
       try {
-        // The launched contract is the baseline later amendments point back to: exactly what Tier 1 received.
-        this.db.blackboardSet(
-          run.id,
-          `goal_contract_v${launchedGoal.version}`,
-          {
-            version: launchedGoal.version,
-            title: launchedGoal.title,
-            description: launchedGoal.description,
-            criteria: launchedGoal.criteria,
-            nonGoals: launchedGoal.nonGoals,
-            delta: null,
-          },
-          orchestratorTaskId,
-        );
+        // The launched contract is what Tier 1 received. When it was amended during the launch, earlier revisions
+        // since the committed version are backfilled so the amendment's baseline stays readable.
+        const revisions = launchedGoal.version > initialVersion ? this.goals.listRevisions(goal.id) : [];
+        for (const rev of revisions) {
+          if (rev.version < initialVersion || rev.version >= launchedGoal.version) continue;
+          this.db.blackboardSet(run.id, `goal_contract_v${rev.version}`, contractValue(rev, rev.delta), orchestratorTaskId);
+        }
+        const launchedDelta = revisions.find((r) => r.version === launchedGoal.version)?.delta ?? null;
+        this.db.blackboardSet(run.id, `goal_contract_v${launchedGoal.version}`, contractValue(launchedGoal, launchedDelta), orchestratorTaskId);
       } catch {
         // Blackboard is advisory; the run is already launched.
       }
-      // An amendment that landed while startRun was awaiting had no run to steer; deliver it now.
+      // An amendment that landed after the run's rows were created: deliver it to the live run, or hand the goal off.
       const latestAfterLaunch = this.goals.getGoal(goal.id);
       if (latestAfterLaunch && latestAfterLaunch.version > launchedGoal.version) {
-        const latestCriteria = latestAfterLaunch.criteria
-          .map((c) => `- [${c.id}] (${c.kind}${c.required ? ", required" : ""}): ${c.description}${c.command ? ` [cmd: ${c.command}]` : ""}`)
-          .join("\n");
-        const updatedObjective = [
-          `GOAL ${latestAfterLaunch.id} (v${latestAfterLaunch.version}): ${latestAfterLaunch.title}`,
-          latestAfterLaunch.description,
-          "",
-          "Acceptance Criteria:",
-          latestCriteria,
-          ...(latestAfterLaunch.nonGoals.length ? ["", "Non-Goals:", ...latestAfterLaunch.nonGoals.map((n) => `- ${n}`)] : []),
-          ...evidenceDirLines(latestAfterLaunch),
-        ].join("\n");
+        const { title: updatedTitle, objective: updatedObjective } = goalRunObjective(latestAfterLaunch);
         this.db.updateRunGoal(run.id, updatedObjective);
-        this.db.updateTask(orchestratorTaskId, {
-          title: `Goal ${latestAfterLaunch.id} v${latestAfterLaunch.version}: ${latestAfterLaunch.title}`,
-          objective: updatedObjective,
-        });
+        this.db.updateTask(orchestratorTaskId, { title: updatedTitle, objective: updatedObjective });
         const latestKey = `goal_contract_v${latestAfterLaunch.version}`;
         try {
           const revisionDelta = this.goals.listRevisions(goal.id).find((r) => r.version === latestAfterLaunch.version)?.delta ?? null;
-          this.db.blackboardSet(
-            run.id,
-            latestKey,
-            {
-              version: latestAfterLaunch.version,
-              title: latestAfterLaunch.title,
-              description: latestAfterLaunch.description,
-              criteria: latestAfterLaunch.criteria,
-              nonGoals: latestAfterLaunch.nonGoals,
-              delta: revisionDelta,
-            },
-            orchestratorTaskId,
-          );
+          this.db.blackboardSet(run.id, latestKey, contractValue(latestAfterLaunch, revisionDelta), orchestratorTaskId);
         } catch {
           // Blackboard is advisory; the steer below still carries the full objective.
         }
-        void this.orchestrator
-          .steerTask(
-            orchestratorTaskId,
-            [
-              `[GOAL AMENDED: ${goal.id} v${launchedGoal.version} -> v${latestAfterLaunch.version}]`,
-              "The goal was amended while this run was starting; your launch objective is outdated. Current contract:",
-              updatedObjective,
-              `Full current contract: blackboard_get({ key: "${latestKey}" }); launch baseline: goal_contract_v${launchedGoal.version}.`,
-            ].join("\n"),
-          )
-          .catch(() => false);
+        const steerMsg = [
+          `[GOAL AMENDED: ${goal.id} v${launchedGoal.version} -> v${latestAfterLaunch.version}]`,
+          "The goal was amended while this run was starting; your launch objective is outdated. Current contract:",
+          updatedObjective,
+          `Full current contract: blackboard_get({ key: "${latestKey}" }); launch baseline: goal_contract_v${launchedGoal.version}.`,
+        ].join("\n");
+        let { delivered } = await this.orchestrator
+          .deliverOrQueueLiveSteer(orchestratorTaskId, steerMsg)
+          .catch(() => ({ delivered: false }));
+        const isStillLatestExecuting = () => {
+          const g = this.goals.getGoal(goal.id);
+          return g !== null && g.version === latestAfterLaunch.version && g.status === "executing";
+        };
+        if (!delivered && isStillLatestExecuting()) {
+          const orch = this.db.getTask(orchestratorTaskId);
+          if (orch && ["completed", "failed", "cancelled", "blocked", "returned_for_rescope"].includes(orch.status)) {
+            delivered = await this.orchestrator
+              .resumeTaskDetailed(orchestratorTaskId, { allowCompleted: true, note: steerMsg, validateBeforeActivate: isStillLatestExecuting })
+              .then((r) => r.outcome === "resumed" || r.noteDelivered === true, () => false);
+          }
+        }
+        if (!delivered) {
+          started = this.handOffStrandedGoal(latestAfterLaunch, "mid-launch amendment could not be delivered to its run");
+        } else {
+          started = this.goals.getGoal(goal.id) ?? started;
+        }
       }
     } finally {
       if (this.launchingGoals.get(goal.id) === slot) this.launchingGoals.delete(goal.id);
@@ -2071,7 +2057,10 @@ export class DirectorRuntime {
           const latest = this.goals.getGoal(goal.id);
           return latest !== null && latest.version === goal.version && latest.status === "executing";
         };
-        let delivered = await this.orchestrator.steerTask(orch.id, steerMsg).catch(() => false);
+        // A Tier 1 still launching reads the updated row in its initial prompt; one spawning gets the steer queued.
+        let { delivered } = await this.orchestrator
+          .deliverOrQueueLiveSteer(orch.id, steerMsg)
+          .catch(() => ({ delivered: false, mode: "none" as const }));
         if (delivered) delivery = { delivered: true, via: "steer" };
         if (!delivered && goal.status === "executing" && isStillAmendedExecuting()) {
           delivered = await this.orchestrator
@@ -2109,7 +2098,7 @@ export class DirectorRuntime {
     if (goal.linkedRunId) {
       try {
         openEscalations = this.db
-          .listEscalations(goal.linkedRunId, "open")
+          .listEscalations(goal.linkedRunId, "unresolved")
           .map((e) => ({ id: e.id, severity: e.severity, category: e.category, title: e.title }));
       } catch {
         // Escalations table may be absent.
@@ -2509,9 +2498,12 @@ export class DirectorRuntime {
       if (runStatus === "stopped") abort.abort(new Error("Run stopped during review"));
       // Only a genuine resume aborts: the Done-Reviewer running on this run, or a snapshot deriving
       // "active" from it, must never cancel the review it belongs to.
+      // A real execution activating (registered in the orchestrator, which the Done-Reviewer never is) also counts.
+      const taskTo = ev.type === "task.status" ? (ev.payload as { to?: string } | null)?.to : undefined;
       if (
         opts?.settledRunStatus === "failed" &&
-        (ev.type === "task.resumed" || (runStatus === "active" && this.orchestrator.isRunActiveInMemory(ev.runId)))
+        (ev.type === "task.resumed" ||
+          ((runStatus === "active" || taskTo === "running") && this.orchestrator.isRunActiveInMemory(ev.runId)))
       ) {
         abort.abort(new Error("Run resumed during failed-run verification"));
       }
@@ -2569,13 +2561,21 @@ export class DirectorRuntime {
           (run && this.db.getRun(run.id)?.status === "stopped")) {
         throw new Error(`Goal ${goal.id} changed or stopped during review`);
       }
+      if (opts?.settledRunStatus === "failed" && run && this.orchestrator.isRunActiveInMemory(run.id)) {
+        throw new Error("Run resumed during failed-run verification");
+      }
     };
     assertCurrent();
     // Approving a failed run resolves its escalations; an outstanding P0 (possibly reopened mid-verification) needs a human.
     const assertNoOpenP0ForFailedRunApproval = () => {
       if (opts?.settledRunStatus !== "failed") return;
-      const openP0 = goal.linkedRunId ? this.db.listEscalations(goal.linkedRunId, "open").find((e) => e.severity === "P0") : undefined;
-      if (openP0) throw new Error(`Cannot auto-approve failed run while P0 escalation ${openP0.id} (${openP0.title}) is open`);
+      // Unresolved includes a P0 reopened (acked) after an earlier resolution.
+      const pendingP0 = goal.linkedRunId
+        ? this.db.listEscalations(goal.linkedRunId, "unresolved").find((e) => e.severity === "P0")
+        : undefined;
+      if (pendingP0) {
+        throw new Error(`Cannot auto-approve failed run while P0 escalation ${pendingP0.id} (${pendingP0.title}) is ${pendingP0.status}`);
+      }
     };
     // A current failed claim by the coordinator blocks approval; re-read after gates and after the reviewer.
     let coordinatorFailure = this.detectCoordinatorFailure(goal);
@@ -2599,13 +2599,16 @@ export class DirectorRuntime {
         passed: true,
         evidence: opts?.summary?.trim() || "Marked complete without separate verification pass (verification_mode=none).",
       }));
-      const outcome = this.goals.recordReviewVerdict(goal.id, {
-        verdict: "approved",
-        criteriaResults: directResults,
-        blockingIssues: [],
-        summary: opts?.summary?.trim() || "Goal completed directly (verification_mode=none).",
-        diffHash: `direct-${Date.now()}`,
-        source: "none",
+      const outcome = this.db.transaction(() => {
+        assertNoOpenP0ForFailedRunApproval();
+        return this.goals.recordReviewVerdict(goal.id, {
+          verdict: "approved",
+          criteriaResults: directResults,
+          blockingIssues: [],
+          summary: opts?.summary?.trim() || "Goal completed directly (verification_mode=none).",
+          diffHash: `direct-${Date.now()}`,
+          source: "none",
+        });
       });
       await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
       return outcome;
@@ -2633,8 +2636,9 @@ export class DirectorRuntime {
           const failed = gateResult.results.filter((r) => !r.passed);
           const requiredIds = new Set(goal.criteria.filter((c) => c.required).map((c) => c.id));
           const failedRequired = failed.filter((r) => requiredIds.has(r.criterionId));
-          const evidenceTail = failed.map((r) => `${r.criterionId}: ${r.evidence}`).join(" | ").slice(-500);
-          throw new FailedRunGatesError((failedRequired.length ? failedRequired : failed).map((r) => r.criterionId), evidenceTail);
+          const reportFailed = failedRequired.length ? failedRequired : failed;
+          const evidenceTail = reportFailed.map((r) => `${r.criterionId}: ${r.evidence}`).join(" | ").slice(-500);
+          throw new FailedRunGatesError(reportFailed.map((r) => r.criterionId), evidenceTail);
         }
         const outcome = this.goals.recordReviewVerdict(goal.id, {
           verdict: "changes_requested",
@@ -2704,18 +2708,22 @@ export class DirectorRuntime {
               evidence: opts?.summary?.trim() || `Verified without separate LLM review (${effectiveMode}).`,
             })),
         ];
-        assertNoOpenP0ForFailedRunApproval();
-        const outcome = this.goals.recordReviewVerdict(goal.id, {
-          verdict: "approved",
-          criteriaResults: allResults,
-          blockingIssues: [],
-          summary:
-            opts?.summary?.trim() ||
-            (gateResult.results.length > 0
-              ? `All ${gateResult.results.length} deterministic check(s) passed; approved without redundant LLM review.`
-              : "Approved cleanly without redundant LLM review."),
-          diffHash: gateResult.diffHash,
-          source: "deterministic",
+        // Re-checked in the verdict's transaction so a resume or reopened P0 cannot slip in before it is recorded.
+        const outcome = this.db.transaction(() => {
+          assertCurrent();
+          assertNoOpenP0ForFailedRunApproval();
+          return this.goals.recordReviewVerdict(goal.id, {
+            verdict: "approved",
+            criteriaResults: allResults,
+            blockingIssues: [],
+            summary:
+              opts?.summary?.trim() ||
+              (gateResult.results.length > 0
+                ? `All ${gateResult.results.length} deterministic check(s) passed; approved without redundant LLM review.`
+                : "Approved cleanly without redundant LLM review."),
+            diffHash: gateResult.diffHash,
+            source: "deterministic",
+          });
         });
         await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
         return outcome;
@@ -3000,7 +3008,6 @@ export class DirectorRuntime {
           submittedVerdict?.summary ??
           `Incomplete review output (stopReason=${stopReason}, turns=${turnsUsed}, reminder threshold=${reviewerMaxTurns})`;
 
-        if (submittedVerdict?.verdict === "approved") assertNoOpenP0ForFailedRunApproval();
         // A coordinator failure reported after the reviewer's prompt was built was never seen: it blocks approval.
         const postReviewGoal = this.goals.getGoal(goal.id);
         const lateFailure = postReviewGoal ? this.detectCoordinatorFailure(postReviewGoal) : null;
@@ -3012,6 +3019,10 @@ export class DirectorRuntime {
             : null;
         const blockingIssues = submittedVerdict?.blockingIssues ?? (submittedVerdict ? [] : [noVerdictIssue]);
         outcome = this.db.transaction(() => {
+          if (submittedVerdict?.verdict === "approved" && !unseenFailure) {
+            assertCurrent();
+            assertNoOpenP0ForFailedRunApproval();
+          }
           const recorded = this.goals.recordReviewVerdict(goal.id, {
             verdict: unseenFailure ? "changes_requested" : (submittedVerdict?.verdict ?? "changes_requested"),
             criteriaResults: mergedResults,
@@ -4683,6 +4694,24 @@ function hasClaimProvenance(lp: GoalLiveProgress): boolean {
  */
 function goalEvidenceDirOrNull(goal: GoalRecord): string | null {
   return ensureGoalEvidenceDir(goal.repoRoot, goal.id);
+}
+
+/** The Tier 1 assignment for a goal revision: its title line and full objective (criteria, non-goals, evidence dir). */
+function goalRunObjective(g: GoalRecord): { title: string; objective: string } {
+  const title = `Goal ${g.id} v${g.version}: ${g.title}`;
+  const criteriaSummary = g.criteria
+    .map((c) => `- [${c.id}] (${c.kind}${c.required ? "*" : ""}) ${c.description}${c.command ? ` [cmd: ${c.command}]` : ""}`)
+    .join("\n");
+  const objective = [
+    title,
+    g.description,
+    "",
+    "Acceptance Criteria:",
+    criteriaSummary,
+    ...(g.nonGoals.length ? ["", "Non-Goals:", ...g.nonGoals.map((n) => `- ${n}`)] : []),
+    ...evidenceDirLines(g),
+  ].join("\n");
+  return { title, objective };
 }
 
 function evidenceDirLines(goal: GoalRecord): string[] {

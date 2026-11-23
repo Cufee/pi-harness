@@ -33,6 +33,10 @@ interface ActiveTaskExecution {
   promise: Promise<void>;
   /** Task generation the current runner of this execution was started for. */
   runnerGeneration?: number;
+  /** True once the current generation's initial prompt was built from the task row (later row edits miss it). */
+  promptBuilt?: boolean;
+  /** Steers accepted after the initial prompt was built but before the runner exposed its handle. */
+  pendingSteers?: string[];
 }
 
 /** Stop/cancel epochs captured when a resume was requested. */
@@ -120,6 +124,9 @@ export function deriveRunStatus(
   const execTasks = tasks.filter((t) => !isDoneReviewTask(t));
   if (execTasks.some((t) => LIVE_TASK_STATUSES.has(t.status))) return "active";
   if (execTasks.length === 0) return run.status;
+  // An explicit completion (e.g. accepted failed-run verification) is authoritative until an explicit resume,
+  // even when orphaned queued rows remain beside the settled coordinator.
+  if (run.status === "completed") return "completed";
 
   if (execTasks.some((t) => t.status === "paused_quota")) return "paused_quota";
 
@@ -130,9 +137,6 @@ export function deriveRunStatus(
     }
     return run.status === "active" ? "active" : run.status;
   }
-
-  // An explicit completion (e.g. accepted failed-run verification) is authoritative until an explicit resume.
-  if (run.status === "completed") return "completed";
 
   const realOrch = execTasks.find((t) => t.tier === 1 && t.profileId !== "director");
   if (realOrch) {
@@ -579,15 +583,15 @@ export class HarnessOrchestrator {
 
   /**
    * Human-readable recorded cause for a run's current state: live quota pause, persisted run.status /
-   * quota reason, or an open P0 escalation. Null when no cause was recorded.
+   * quota reason, or an unresolved (open or reopened) P0 escalation. Null when no cause was recorded.
    */
   describeRunCause(runId: string): string | null {
     const quota = this.getRunQuotaStatus(runId);
     if (quota) return `paused on provider quota: ${quota.reason}`;
     const reason = this.db.getLastRunStatusReason(runId);
     if (reason) return reason;
-    const p0 = this.db.listEscalations(runId, "open").find((e) => e.severity === "P0");
-    if (p0) return `open P0 escalation ${p0.id}: ${p0.title}`;
+    const p0 = this.db.listEscalations(runId, "unresolved").find((e) => e.severity === "P0");
+    if (p0) return `${p0.status} P0 escalation ${p0.id}: ${p0.title}`;
     return null;
   }
 
@@ -844,6 +848,11 @@ export class HarnessOrchestrator {
     stopFence?: { global: number; repo: number };
     /** Called synchronously right after the run row exists and before Tier 1 launches (e.g. to link a goal). */
     onRunCreated?: (run: RunRecord) => void;
+    /**
+     * Called synchronously after the last await, right before the run and Tier 1 rows exist, to read the latest
+     * goal text (e.g. an amendment that arrived while the launch was resolving its route or repository).
+     */
+    resolveGoal?: () => { goal: string; taskTitle?: string };
   }): Promise<{ run: RunRecord; orchestratorTask: TaskRecord }> {
     const fence = input.stopFence ?? this.launchStopFence(input.repoRoot);
     const { profile, model } = await resolveLaunchRoute(this.config, {
@@ -853,7 +862,9 @@ export class HarnessOrchestrator {
     const { baseBranch, baseSha } = await wtMgr.resolveRepoInfo();
     // Checked after the last await and before the run exists, so a stop issued meanwhile leaves nothing running.
     if (this.launchFenceBroken(input.repoRoot, fence)) throw new RunStartStoppedError(input.repoRoot);
-    const run = this.db.createRun({ goal: input.goal, repoRoot: input.repoRoot, baseBranch, baseSha });
+    const resolved = input.resolveGoal ? input.resolveGoal() : { goal: input.goal };
+    const goal = resolved.goal;
+    const run = this.db.createRun({ goal, repoRoot: input.repoRoot, baseBranch, baseSha });
     if (input.onRunCreated) {
       try {
         input.onRunCreated(run);
@@ -868,8 +879,8 @@ export class HarnessOrchestrator {
       parentId: null,
       tier: 1,
       kind: "orchestrator",
-      title: `Orchestrator: ${(input.goal.split("\n")[0] ?? input.goal).slice(0, 72)}`,
-      objective: input.goal,
+      title: `Orchestrator: ${(resolved.taskTitle ?? goal.split("\n")[0] ?? goal).slice(0, 72)}`,
+      objective: goal,
       criteria: "Decompose into disjoint Tier 2 Workers, resolve escalations, verify integration on base branch.",
       readOnly: true,
       profileId: profile.id,
@@ -1022,20 +1033,26 @@ export class HarnessOrchestrator {
 
   launchTaskLoop(taskId: string): void {
     if (this.active.has(taskId) || this.allocatingWorktrees.has(taskId)) return;
-    const initialTask = this.db.getTask(taskId);
-    if (initialTask) {
-      const owningRun = this.db.getRun(initialTask.runId);
-      if (owningRun && owningRun.status !== "active") {
-        this.db.updateRunStatus(owningRun.id, "active");
-      }
-    }
     const abort = new AbortController();
     const entry: ActiveTaskExecution = {
       taskId,
       abort,
       promise: Promise.resolve(),
     };
+    // Register the execution before the run turns active so synchronous run.status listeners see it live.
     this.active.set(taskId, entry);
+    const initialTask = this.db.getTask(taskId);
+    if (initialTask) {
+      const owningRun = this.db.getRun(initialTask.runId);
+      if (owningRun && owningRun.status !== "active") {
+        try {
+          this.db.updateRunStatus(owningRun.id, "active");
+        } catch (error) {
+          this.active.delete(taskId);
+          throw error;
+        }
+      }
+    }
     entry.promise = this.runTaskWithRollovers(taskId, entry).catch((err) => {
       const task = this.db.getTask(taskId);
       if (!task || entry.abort.signal.aborted) return;
@@ -2046,6 +2063,7 @@ export class HarnessOrchestrator {
 
   private async runTaskWithRollovers(taskId: string, exec: ActiveTaskExecution): Promise<void> {
     while (!exec.abort.signal.aborted) {
+      exec.promptBuilt = false;
       const task = this.db.getTask(taskId);
       if (!task) return;
       if (["completed", "cancelled", "failed", "returned_for_rescope", "paused_quota"].includes(task.status)) return;
@@ -2124,11 +2142,16 @@ export class HarnessOrchestrator {
       const cwd = wt?.path ?? run.repoRoot;
       const { profile, model, wireModel } = await this.taskRoute(task, cwd);
       if (exec.abort.signal.aborted) return;
+      // Re-read after the route await so an edit made meanwhile (e.g. a mid-launch goal amendment) is in the
+      // runner's initial assignment rather than lost behind a steer that has no runner to reach yet.
+      const latestTask = this.db.getTask(task.id);
+      if (!latestTask || ["completed", "cancelled", "failed", "returned_for_rescope", "paused_quota"].includes(latestTask.status)) return;
       task.model = model;
 
-      this.db.updateTask(task.id, { status: "running", model, profileId: profile.id });
+      this.db.updateTask(latestTask.id, { status: "running", model, profileId: profile.id });
+      const hydratedTask: TaskRecord = { ...latestTask, status: "running", model, profileId: profile.id };
 
-      const handoff = task.handoffJson ? (JSON.parse(task.handoffJson) as AnchoredHandoff) : null;
+      const handoff = hydratedTask.handoffJson ? (JSON.parse(hydratedTask.handoffJson) as AnchoredHandoff) : null;
       const quotaResumeNote = this.taskResumeNotes.get(task.id) ?? null;
       if (quotaResumeNote) this.taskResumeNotes.delete(task.id);
 
@@ -2144,7 +2167,7 @@ export class HarnessOrchestrator {
       const artifactsRoot = resolve(run.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts");
 
       const initialPrompt = buildHydrationTurn({
-        task,
+        task: hydratedTask,
         handoff,
         tasksSnapshot: this.db.listTasks(run.id),
         artifacts: task.tier === 1 ? this.db.listArtifacts(run.id, undefined, 30, "dossier") : this.db.listArtifacts(run.id, task.id, 30),
@@ -2159,6 +2182,7 @@ export class HarnessOrchestrator {
         quotaResumeNote,
         goalEvidenceDir: goalEvDir ?? undefined,
       });
+      exec.promptBuilt = true;
 
       const rolloverThreshold =
         task.tier === 1
@@ -2249,6 +2273,16 @@ export class HarnessOrchestrator {
         signal: exec.generationSignal,
         onHandle: (h) => {
           exec.handle = h;
+          const queued = exec.pendingSteers?.splice(0) ?? [];
+          if (queued.length) {
+            void (async () => {
+              for (const message of queued) {
+                if (!isCurrent()) return;
+                const accepted = await h.steer(message).catch(() => false);
+                this.db.emitEvent(run.id, task.id, "agent.steered", { message, accepted });
+              }
+            })();
+          }
         },
         callbacks: {
           // Cost is still recorded on this invocation's own record: the spend happened even for a stale runner.
@@ -3052,6 +3086,26 @@ export class HarnessOrchestrator {
       this.db.emitEvent(task.runId, taskId, "agent.steered", { message, accepted: ok });
     }
     return ok;
+  }
+
+  /**
+   * Delivers guidance to a live task wherever its execution is: before the initial prompt is built the updated task
+   * row already carries it, while the runner spawns it is queued for the handle, and once live it is steered.
+   */
+  async deliverOrQueueLiveSteer(
+    taskId: string,
+    message: string,
+  ): Promise<{ delivered: boolean; mode: "initial_prompt" | "steer" | "queued_before_handle" | "none" }> {
+    if (this.describeSteerRefusal(taskId) !== null) return { delivered: false, mode: "none" };
+    const exec = this.active.get(taskId);
+    if (!exec || exec.abort.signal.aborted) return { delivered: false, mode: "none" };
+    if (exec.promptBuilt !== true) return { delivered: true, mode: "initial_prompt" };
+    if (exec.handle) {
+      const ok = await this.steerTask(taskId, message).catch(() => false);
+      return { delivered: ok, mode: ok ? "steer" : "none" };
+    }
+    (exec.pendingSteers ??= []).push(message);
+    return { delivered: true, mode: "queued_before_handle" };
   }
 
   /** Why steering cannot reach this task (settled, cancelled, quota-paused, or stopped run), or null when it may. */
