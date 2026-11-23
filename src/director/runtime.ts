@@ -445,7 +445,24 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
       },
     },
   },
-  ...toolsForTier(1).filter(tool => ["spawn_task", "wait_tasks", "wait_children", "cancel_task", "artifact_read"].includes(tool.name)),
+  ...toolsForTier(1)
+    .filter((tool) => ["spawn_task", "wait_tasks", "wait_children", "cancel_task", "artifact_read"].includes(tool.name))
+    .map((tool) => {
+      if (tool.name === "spawn_task") {
+        return {
+          ...tool,
+          description:
+            "Spawn a read-only Tier 3 research, plan, or verify task. No turn limit. When your turn ends, the daemon wakes this chat when a task you spawned completes, fails, blocks, or returns for re-scope (config events.wakeDirectorOnGoalSettle); results you already read with wait_tasks do not wake you again. A task may return early with partial: true or scope_too_large and suggested splits after a harness scope check.",
+        };
+      }
+      if (tool.name === "wait_tasks" || tool.name === "wait_children") {
+        return {
+          ...tool,
+          description: `${tool.description} Waits only within this turn; if you end your turn instead, this chat is woken when each delegated task settles.`,
+        };
+      }
+      return tool;
+    }),
   {
     name: "read_file",
     description: "Read a UTF-8 text file: any workspace file, harness goals, notes, and artifacts, or any other file on this machine that the operator's account can read (absolute or ~/ path). Returns one page (default 32768 bytes, up to 2097152 with max_bytes) that ends on a line boundary when possible. Select lines with start_line and end_line, or page by bytes with offset. When hasMore is true, call again with offset set to nextOffset to continue to end of file. .git internals, task worktrees, and harness-internal state are refused. Binary files and directories are not supported.",
@@ -516,7 +533,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
     name: "resume_task",
     description:
-      "Resume a failed, crashed, cancelled, or stopped task in-place (same task ID, artifacts, and a deterministic recovery handoff) instead of spawning a new duplicate task. A Worker keeps its worktree and WIP commits while that worktree still exists; a cancelled Worker's worktree was archived, so it restarts on a fresh worktree from the base branch and the result message names the archived ref. Safe to repeat: a task that is already running, queued or completed returns its current state (`outcome`) and nothing is restarted.",
+      "Resume a failed, crashed, cancelled, or stopped task in-place (same task ID, artifacts, and a deterministic recovery handoff) instead of spawning a new duplicate task. A Worker keeps its worktree and WIP commits while that worktree still exists; a cancelled Worker's worktree was archived, so it restarts on a fresh worktree from the base branch and the result message names the archived ref. Safe to repeat: a task that is already running, queued or completed returns its current state (`outcome`) and nothing is restarted. Resuming does not reset or impose any turn limit.",
     inputSchema: {
       type: "object",
       required: ["task_id"],
@@ -759,6 +776,8 @@ export class DirectorRuntime {
   private nextAmendmentAttemptId = 1;
   private pendingDrainRepos = new Set<string>();
   private pendingDrainAll = false;
+  /** Director-spawned task settlements (`id:generation`) already read via wait_tasks/wait_children so they do not wake again. */
+  private seenTaskSettlements = new Set<string>();
 
   constructor(
     private readonly db: ControlPlaneDb,
@@ -906,7 +925,11 @@ export class DirectorRuntime {
   }
 
   private handleControlPlaneEvent(ev: EventRecord): void {
-    // Wake any subagent task timers waiting early on a child settlement
+    // Goal settlement and queue admission always run; only Director wakeups are gated by this setting.
+    const wakeOnSettle = Boolean(this.config.events?.wakeDirectorOnGoalSettle);
+
+    // Wake any subagent task timers waiting early on a child settlement, and wake the owning Director chat
+    // when a Director-spawned Tier 3 task settles.
     if (ev.type === "task.status" && ev.taskId) {
       const payload = ev.payload as { to?: string; status?: string } | null;
       const st = String(payload?.to ?? payload?.status ?? "");
@@ -921,11 +944,30 @@ export class DirectorRuntime {
             `child_settled:${child.id}`,
           );
         }
+        if (
+          wakeOnSettle &&
+          child &&
+          child.tier === 3 &&
+          (st === "completed" || st === "failed" || st === "blocked" || st === "returned_for_rescope")
+        ) {
+          const owner = directorTaskRunOwner(ev.runId);
+          if (owner && !this.seenTaskSettlements.has(`${child.id}:${child.generation}`)) {
+            const handoff = compactTaskHandoff(child);
+            const summary = (handoff.summary ?? child.summary ?? "").replace(/\s+/g, " ").trim().slice(0, 300);
+            this.wakeHandler?.(owner, {
+              kind: "task.settled",
+              taskId: child.id,
+              generation: child.generation,
+              runId: ev.runId,
+              title: child.title,
+              status: st,
+              summary,
+              ...("partial" in handoff && handoff.partial ? { partial: true } : {}),
+            });
+          }
+        }
       }
     }
-
-    // Goal settlement and queue admission always run; only Director wakeups are gated by this setting.
-    const wakeOnSettle = Boolean(this.config.events?.wakeDirectorOnGoalSettle);
 
     // Wake Director immediately on P0 escalations or manual quota pauses for any linked Goal
     if (ev.type === "escalation.created") {
@@ -3905,6 +3947,44 @@ export class DirectorRuntime {
     return name === "__list_tools" ? executor.tools() : executor.execute(name, args);
   }
 
+  private isStaleTaskSettlement(event: Extract<ChatControlEvent, { kind: "task.settled" }>): boolean {
+    if (this.seenTaskSettlements.has(`${event.taskId}:${event.generation}`)) return true;
+    const row = this.db.getTask(event.taskId);
+    if (!row || row.generation !== event.generation || row.status !== event.status) return true;
+    return false;
+  }
+
+  private dropStaleTaskSettlements(event: ChatControlEvent): ChatControlEvent | null {
+    if (event.kind === "task.settled") {
+      return this.isStaleTaskSettlement(event) ? null : event;
+    }
+    if (event.kind === "goal.events_batch") {
+      const live = event.events.filter((e) => e.kind !== "task.settled" || !this.isStaleTaskSettlement(e));
+      if (live.length === 0) return null;
+      return live.length === 1 ? live[0]! : { kind: "goal.events_batch", events: live };
+    }
+    return event;
+  }
+
+  private recordSeenTaskSettlements(result: unknown): void {
+    const children = (result as { children?: Array<{ id?: string; status?: string }> } | null)?.children;
+    if (!Array.isArray(children)) return;
+    for (const child of children) {
+      if (
+        typeof child?.id === "string" &&
+        (child.status === "completed" ||
+          child.status === "failed" ||
+          child.status === "blocked" ||
+          child.status === "returned_for_rescope")
+      ) {
+        const row = this.db.getTask(child.id);
+        if (row && row.status === child.status) {
+          this.seenTaskSettlements.add(`${row.id}:${row.generation}`);
+        }
+      }
+    }
+  }
+
   /** Executes a single interactive Tier 0 conversational turn and persists both user & assistant messages. */
   async sendChatMessage(
     chatSessionId: string,
@@ -3955,6 +4035,8 @@ export class DirectorRuntime {
           typedEvent = opts.revalidateEvent(typedEvent);
           if (!typedEvent) throw new StaleWakeEventError();
         }
+        typedEvent = this.dropStaleTaskSettlements(typedEvent);
+        if (!typedEvent) throw new StaleWakeEventError();
       } else {
         // A fresh user message naturally supersedes any pending timer subscribed to `user_message` / `any`.
         for (const t of this.db.timers.list({ ownerKind: "chat", ownerId: chatSessionId, status: "pending" })) {
@@ -4251,7 +4333,9 @@ export class DirectorRuntime {
       case "wait_tasks": {
         const active = this.activeChats.get(chatSessionId);
         if (!active) {
-          return this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, "wait_tasks", args, signal);
+          const res = await this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, "wait_tasks", args, signal);
+          this.recordSeenTaskSettlements(res);
+          return res;
         }
         const waitAbort = new AbortController();
         const combinedSignal = signal ? AbortSignal.any([signal, waitAbort.signal]) : waitAbort.signal;
@@ -4262,7 +4346,9 @@ export class DirectorRuntime {
         };
         active.waitInterrupts.add(onInterrupt);
         try {
-          return await this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, "wait_tasks", args, combinedSignal);
+          const res = await this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, "wait_tasks", args, combinedSignal);
+          this.recordSeenTaskSettlements(res);
+          return res;
         } catch (err) {
           if (userInterruption) {
             const inter = userInterruption as { message: string; role: "user" | "system_notice" };

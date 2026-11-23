@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, it } from "bun:test";
 import { loadConfig } from "../src/config.js";
 import { writeCodeOutput } from "../src/control-plane/dossiers.js";
+import { compactTaskHandoff } from "../src/control-plane/handoffs.js";
 import type { CustomRunnerFactory } from "../src/control-plane/orchestrator.js";
 import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
@@ -252,6 +253,256 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
       assert.ok(existsSync(join(repoRoot, ".harness", "notes", "report.md")));
     } finally {
       client.close();
+      await daemon.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("writes partial fallbacks on error/cancel, accepts return_task partial:true with artifacts, and nudges only Tier 3 on widening scope", async () => {
+    const root = realpathSync(mkdtempSync("/tmp/pi-goal13-handoff-"));
+    const repoRoot = join(root, "repo");
+    const stateDir = join(root, "state");
+    const sockPath = join(stateDir, "d.sock");
+
+    await runGit(root, ["init", "-b", "main", repoRoot]);
+    writeFileSync(join(repoRoot, "README.md"), "# repo\n", "utf8");
+    await runGit(repoRoot, ["add", "README.md"]);
+    await runGit(repoRoot, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "init"]);
+
+    const baseCfg = loadConfig(repoRoot);
+    const config = withFixtureCatalog({ ...baseCfg, stateDir, socketPath: sockPath });
+
+    const cancelStarted = Promise.withResolvers<void>();
+    const cancelGate = Promise.withResolvers<void>();
+    const emitWidening = (onToolEvent?: NonNullable<Parameters<ReturnType<CustomRunnerFactory>["run"]>[0]["callbacks"]["onToolEvent"]>) => {
+      const topics = ["cortexsdk", "nats", "listdevices", "commissioning"];
+      for (let i = 0; i < 4; i++) {
+        onToolEvent?.({
+          id: `g-${i}`,
+          name: "grep",
+          kind: "search",
+          status: "completed",
+          args: JSON.stringify({ pattern: topics[i], path: `cloud/mod${i}/handler.go` }),
+        });
+      }
+      for (let i = 4; i < 9; i++) {
+        onToolEvent?.({
+          id: `r-${i}`,
+          name: "read",
+          kind: "read",
+          status: "completed",
+          args: JSON.stringify({ path: `cloud/mod${i}/service.go` }),
+        });
+      }
+    };
+
+    const customRunnerFactory: CustomRunnerFactory = () => ({
+      run: async (req) => {
+        if (req.initialPrompt.includes("CASE_ERROR")) {
+          await req.executeTool("artifact_write", {
+            name: "err-notes.md",
+            content: "Findings before error",
+            summary: "Error dossier",
+          });
+          return { text: "Adapter crashed mid-stream", stopReason: "error" };
+        }
+        if (req.initialPrompt.includes("CASE_CANCEL")) {
+          await req.executeTool("artifact_write", {
+            name: "cancel-notes.md",
+            content: "Findings before cancel",
+            summary: "Cancel dossier",
+          });
+          req.onHandle?.({
+            steer: async () => true,
+            cancel: async () => {
+              cancelGate.resolve();
+            },
+          });
+          cancelStarted.resolve();
+          await cancelGate.promise;
+          return { text: "Partial work before cancel", stopReason: "cancelled" };
+        }
+        if (req.initialPrompt.includes("CASE_PARTIAL_RETURN")) {
+          const dossier = (await req.executeTool("artifact_write", {
+            name: "partial-dossier.md",
+            content: "Partial survey",
+            summary: "Partial dossier",
+          })) as { path: string };
+          await req.executeTool("return_task", {
+            status: "completed",
+            partial: true,
+            summary: "Verified area A; area B remains",
+            artifact_paths: [dossier.path],
+          });
+          return { text: "done", stopReason: "completed" };
+        }
+        if (req.initialPrompt.includes("CASE_WIDEN")) {
+          emitWidening(req.callbacks.onToolEvent);
+          const dossier = (await req.executeTool("artifact_write", {
+            name: "widen.md",
+            content: "Survey",
+            summary: "Survey",
+          })) as { path: string };
+          await req.executeTool("return_task", {
+            status: "completed",
+            partial: true,
+            summary: "Done after check",
+            artifact_paths: [dossier.path],
+          });
+          return { text: "done", stopReason: "completed" };
+        }
+        return { text: "ok", stopReason: "completed" };
+      },
+    });
+
+    const daemon = new HarnessDaemon(config, { dbPath: ":memory:", customRunnerFactory });
+    await daemon.start();
+    try {
+      const baseSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout.trim();
+      const run = daemon.db.createRun({ goal: "goal-13 handoffs", repoRoot, baseBranch: "main", baseSha });
+      const parent = daemon.db.createTask({
+        runId: run.id,
+        tier: 1,
+        kind: "orchestrator",
+        title: "Orch",
+        objective: "Coordinate",
+        readOnly: true,
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      daemon.db.updateTask(parent.id, { status: "running" });
+
+      const waitSettled = async (taskId: string) => {
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline) {
+          const t = daemon.db.getTask(taskId);
+          if (t && ["completed", "failed", "cancelled", "returned_for_rescope", "blocked"].includes(t.status)) return t;
+          await new Promise((r) => setTimeout(r, 15));
+        }
+        throw new Error(`Timed out waiting for ${taskId}`);
+      };
+
+      // 1. stopReason "error" -> partial fallback with artifact_paths from earlier artifact_write
+      const errTask = await daemon.orchestrator.spawnAndStartTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 3,
+        kind: "research",
+        title: "Error scout",
+        objective: "CASE_ERROR",
+        readOnly: true,
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      const errSettled = await waitSettled(errTask.id);
+      const errHandoff = compactTaskHandoff(errSettled);
+      assert.equal(errHandoff.status, "failed");
+      assert.equal((errHandoff as { partial?: boolean }).partial, true);
+      assert.ok(errHandoff.summary?.startsWith("[Partial handoff: task ended without return_task (runner_error:"));
+      assert.ok(errHandoff.artifact_paths.some((p: string) => p.endsWith("err-notes.md")));
+
+      // 2. Harness cancel -> status cancelled and partial fallback with earlier artifact_write
+      const cancelTask = await daemon.orchestrator.spawnAndStartTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 3,
+        kind: "research",
+        title: "Cancel scout",
+        objective: "CASE_CANCEL",
+        readOnly: true,
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      await cancelStarted.promise;
+      await daemon.orchestrator.cancelTask(cancelTask.id, "user abort");
+      const cancelDeadline = Date.now() + 5_000;
+      while (Date.now() < cancelDeadline && daemon.orchestrator.activeTaskCount() > 0) {
+        await new Promise((r) => setTimeout(r, 15));
+      }
+      const cancelRow = daemon.db.getTask(cancelTask.id)!;
+      const cancelHandoff = compactTaskHandoff(cancelRow);
+      assert.equal(cancelHandoff.status, "cancelled");
+      assert.equal((cancelHandoff as { partial?: boolean }).partial, true);
+      assert.ok(cancelHandoff.summary?.startsWith("[Partial handoff: task ended without return_task (cancelled: user abort)"));
+      assert.ok(cancelHandoff.artifact_paths.some((p: string) => p.endsWith("cancel-notes.md")));
+
+      // 3. return_task partial: true with only artifact_paths (no sources) -> accepted, partial: true, "[Partial] " prefix
+      const partialTask = await daemon.orchestrator.spawnAndStartTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 3,
+        kind: "research",
+        title: "Partial scout",
+        objective: "CASE_PARTIAL_RETURN",
+        readOnly: true,
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      const partialSettled = await waitSettled(partialTask.id);
+      const partialHandoff = compactTaskHandoff(partialSettled);
+      assert.equal(partialHandoff.status, "completed");
+      assert.equal((partialHandoff as { partial?: boolean }).partial, true);
+      assert.ok(partialHandoff.summary?.startsWith("[Partial] Verified area A"));
+      assert.ok(partialHandoff.artifact_paths.some((p: string) => p.endsWith("partial-dossier.md")));
+
+      // 4. Tier 3 widening onToolEvent -> emits agent.scope_nudge and agent.steered with "[Harness scope check]"
+      const widenT3 = await daemon.orchestrator.spawnAndStartTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 3,
+        kind: "research",
+        title: "Widening T3",
+        objective: "CASE_WIDEN",
+        readOnly: true,
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      await waitSettled(widenT3.id);
+      const t3Events = daemon.db.getEventsSince(run.id, 0, widenT3.id);
+      assert.ok(
+        t3Events.some((e) => e.type === "agent.scope_nudge"),
+        "Tier 3 widening sequence must emit agent.scope_nudge",
+      );
+      assert.ok(
+        t3Events.some(
+          (e) =>
+            e.type === "agent.steered" &&
+            String((e.payload as { message?: string } | null)?.message ?? "").includes("[Harness scope check]"),
+        ),
+        "Tier 3 widening sequence must emit agent.steered with [Harness scope check]",
+      );
+
+      // 5. Same widening sequence on Tier 2 -> no scope nudge and no steer
+      const widenT2 = await daemon.orchestrator.spawnAndStartTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 2,
+        kind: "worker",
+        title: "Widening T2",
+        objective: "CASE_WIDEN",
+        readOnly: false,
+        writeScopes: ["README.md"],
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      await waitSettled(widenT2.id);
+      const t2Events = daemon.db.getEventsSince(run.id, 0, widenT2.id);
+      assert.equal(
+        t2Events.some((e) => e.type === "agent.scope_nudge"),
+        false,
+        "Tier 2 worker must not receive Tier 3 scope nudges",
+      );
+      assert.equal(
+        t2Events.some(
+          (e) =>
+            e.type === "agent.steered" &&
+            String((e.payload as { message?: string } | null)?.message ?? "").includes("[Harness scope check]"),
+        ),
+        false,
+        "Tier 2 worker must not be steered by scope check",
+      );
+    } finally {
+      cancelGate.resolve();
       await daemon.stop();
       rmSync(root, { recursive: true, force: true });
     }

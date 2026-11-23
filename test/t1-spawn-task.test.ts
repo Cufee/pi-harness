@@ -82,7 +82,7 @@ it.each(["research", "plan", "verify"] as const)("lets Tier 1 spawn and await a 
     const spawnTool = orch.toolExecutor.tools(1).find(tool => tool.name === "spawn_task")!;
     const properties = spawnTool.inputSchema.properties as Record<string, { enum?: string[] }>;
     assert.deepEqual(properties.kind?.enum?.toSorted(), ["plan", "research", "verify"]);
-    assert.deepEqual(Object.keys(properties).toSorted(), ["effort", "kind", "max_turns", "model", "objective", "profile_id", "title"]);
+    assert.deepEqual(Object.keys(properties).toSorted(), ["effort", "kind", "model", "objective", "profile_id", "title"]);
     const assignment = { title: "Read deployment notes", objective: "Find how deployment starts" };
     await assert.rejects(() => execute("spawn_task", { ...assignment, kind: "execute" }), /Tier 1.*only permits research, plan, and verify/);
     assert.equal(catalogCalls, 0);
@@ -154,10 +154,28 @@ it.each(["research", "plan", "verify"] as const)("lets Tier 1 spawn and await a 
     const { spawned: unsourced } = await execute("spawn_task", {
       title: "Read notes", objective: "Exit without submitting", kind, model: scout.id, effort: "medium",
     }) as { spawned: string };
-    assert.deepEqual(await execute("wait_tasks", { ids: [unsourced], timeout_s: 1 }), { children: [{
-      id: unsourced, title: "Read notes", kind, status: "failed", summary: "Task ended without a valid sourced handoff.",
-      sources: [], artifact_paths: [], escalations: [],
-    }] });
+    const unsourcedWait = await execute("wait_tasks", { ids: [unsourced], timeout_s: 1 }) as {
+      children: Array<{ id: string; title: string; kind: string; status: string; partial?: boolean; summary: string; sources: unknown[]; artifact_paths: string[]; escalations: unknown[] }>;
+    };
+    assert.equal(unsourcedWait.children.length, 1);
+    const [unsourcedHandoff] = unsourcedWait.children;
+    assert.ok(unsourcedHandoff);
+    assert.equal(unsourcedHandoff.id, unsourced);
+    assert.equal(unsourcedHandoff.title, "Read notes");
+    assert.equal(unsourcedHandoff.kind, kind);
+    assert.equal(unsourcedHandoff.status, "failed");
+    assert.equal(unsourcedHandoff.partial, true);
+    assert.ok(unsourcedHandoff.summary.startsWith("[Partial handoff: task ended without return_task (missing_return_task)"));
+    assert.ok(unsourcedHandoff.summary.includes("Unstructured runner output"));
+    assert.deepEqual(unsourcedHandoff.sources, []);
+    assert.equal(unsourcedHandoff.artifact_paths.length, 1);
+    assert.match(unsourcedHandoff.artifact_paths[0]!, /output-gen1(?:-\d+)?\.md$/);
+    assert.deepEqual(await execute("artifact_read", { path: unsourcedHandoff.artifact_paths[0]! }), {
+      path: unsourcedHandoff.artifact_paths[0]!,
+      content: "Unstructured runner output",
+      truncated: false,
+    });
+    assert.deepEqual(unsourcedHandoff.escalations, []);
 
     const pending = db.createTask({
       runId: run.id, parentId: parent.id, tier: 3, kind: "plan", title: "Queued plan", objective: "Plan", profileId, dependsOn: [parent.id],

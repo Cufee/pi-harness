@@ -83,14 +83,16 @@ Every other key can come from `.pi-harness.json`, including `profiles`, `externa
 | --- | --- | --- |
 | `rollover.orchestratorThreshold` | `0.72` | Context utilization ratio in `(0, 1]` triggering Tier 1 rollover. |
 | `rollover.workerThreshold` | `0.78` | Context utilization ratio in `(0, 1]` triggering Tier 2 rollover. |
-| `rollover.orchestratorMaxTurns` | `200` | Tool-call turns before an advisory progress reminder on continuing work (once per runner session when supported; never stops an agent; positive integer). |
-| `rollover.workerMaxTurns` | `120` | Tool-call turns before an advisory progress reminder on continuing work (once per runner session when supported; never stops an agent; positive integer). |
-| `rollover.taskMaxTurns` | `40` | Tool-call turns before an advisory progress reminder on continuing work (once per runner session when supported; never stops an agent; positive integer). |
-| `rollover.reviewerMaxTurns` | `30` | Tool-call turns before an advisory progress reminder on continuing work (once per runner session when supported; never stops an agent; positive integer). |
+| `rollover.orchestratorMaxTurns` | `200` | Deprecated, no effect: tasks are never stopped or reminded by turn count. |
+| `rollover.workerMaxTurns` | `120` | Deprecated, no effect: tasks are never stopped or reminded by turn count. |
+| `rollover.taskMaxTurns` | `40` | Deprecated, no effect: tasks are never stopped or reminded by turn count. |
+| `rollover.reviewerMaxTurns` | `30` | Deprecated, no effect: tasks are never stopped or reminded by turn count. |
 | `rollover.externalizeBytes` | `2048` | Validated (positive integer) but read by no runtime component; Code Mode spilling uses `codeExec.maxOutputChars`. |
 | `rollover.maxGenerations` | `12` | Generation cap per task to stop unbounded rollover loops (positive integer). |
 
-A value in your config file overrides the default; an older file that sets `reviewerMaxTurns` (for example to `12`) keeps that value until you remove the key.
+#### Scope checks
+
+Instead of turn caps, the harness runs an advisory scope check on Tier 3 tasks (`src/runners/scope-nudge.ts`). It observes completed tool calls for widening across unrelated workspace areas and search topics, or repeated/stale reads (never raw turn or token counts), and steers the task to return a partial handoff (`partial: true` or `scope_too_large` with proposed splits) when scope keeps expanding. Long bounded reads for a single question continue uninterrupted and rely on compaction.
 
 ### `worktree`
 
@@ -125,7 +127,7 @@ A value in your config file overrides the default; an older file that sets `revi
 | Key | Default | Notes |
 | --- | --- | --- |
 | `events.fallbackWakeupIntervalSec` | `600` | Fallback wakeup interval in seconds for event-driven waits (`> 0`). |
-| `events.wakeDirectorOnGoalSettle` | `true` | Wake an idle Director chat when one of its goal runs settles. |
+| `events.wakeDirectorOnGoalSettle` | `true` | Wake an idle Director chat when one of its goal runs or Director-spawned tasks settles. |
 | `catalog.ttlHours` | `24` | Model catalog cache TTL in hours (`>= 0`). |
 | `catalog.artificialAnalysisKeyEnv` | `ARTIFICIAL_ANALYSIS_API_KEY` | Validated (string) but read by no runtime component; setting it selects no credential. |
 | `catalog.allowPreview` | `true` | Allow preview models to outrank older GA releases in the same family. |
@@ -162,8 +164,8 @@ When neither a reset time nor confirmed current capacity provides a schedule (or
 | Takes effect | Settings |
 | --- | --- |
 | Immediately | `worktree` keys other than the roots (raising `maxConcurrentWorkers` starts queued workers); `goals.gateTimeoutMs`, `gateShell`, `gateEnv`, `autoVerifyOnSettle`, and `maxConcurrentGoals` (raising it starts queued goals); `remotes`; `quotaEndpoint`; `catalog`; `profiles`; `worktree.extraWriteRoots` for Director `write_note`; `events` for Director settlement and wait handlers (a wait already in progress keeps the value read when it started); `codeMode` and `codeExec` for an existing task's next MCP tool discovery (`tools/list`) and Code Mode dispatch; `externalMcpServers` for daemon config, `daemon status`, and background `octofs` staging; `quotaRetry.fallbackCooldownSec`, `maxCooldownSec`, `autoResumeEnabled`, and `earlyWakePollMs` when the next quota pause is handled (timers already armed are not reconfigured) |
-| When a task or goal is created | `rollover.orchestratorMaxTurns`, `workerMaxTurns`, and `taskMaxTurns` (copied into the task record and kept for its later generations); `goals.defaultMaxReviewCycles` and `defaultMaxNoProgressCycles` (copied into the new goal contract; existing goals keep theirs) |
-| At agent launch or generation (running sessions keep theirs) | `worktree.extraReadRoots`, `worktree.extraWriteRoots`; `externalMcpServers` entries for newly started ACP sessions; `codeMode` and `codeExec` initial prompt and runner tool list (later MCP tool discovery and Code Mode dispatches read the current mode and limits); `quotaRetry.nativeRetryTimeoutMs`; `rollover.reviewerMaxTurns`, `orchestratorThreshold`, `workerThreshold`, and `maxGenerations`; default profiles |
+| When a task or goal is created | `goals.defaultMaxReviewCycles` and `defaultMaxNoProgressCycles` (copied into the new goal contract; existing goals keep theirs) |
+| At agent launch or generation (running sessions keep theirs) | `worktree.extraReadRoots`, `worktree.extraWriteRoots`; `externalMcpServers` entries for newly started ACP sessions; `codeMode` and `codeExec` initial prompt and runner tool list (later MCP tool discovery and Code Mode dispatches read the current mode and limits); `quotaRetry.nativeRetryTimeoutMs`; `rollover.orchestratorThreshold`, `workerThreshold`, and `maxGenerations`; default profiles |
 | Only after a daemon restart | state directory (`PI_HARNESS_HOME`), `socketPath`, the repository overlay |
 
 To change `socketPath` or `PI_HARNESS_HOME`, run `pi-harness daemon stop` while the old setting is still in effect, change the setting, then start the daemon at the new address: `pi-harness daemon restart` targets the newly configured address and leaves the old daemon running if the effective socket path changes. Start or restart from the intended overlay directory.

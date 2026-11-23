@@ -7,6 +7,7 @@ import type { ModelCatalogCompiler } from "../catalog/compiler.js";
 import type { QuotaClient } from "../quota/client.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
+import { ScopeNudgeMonitor } from "../runners/scope-nudge.js";
 import { toolPolicyForTask } from "../runners/types.js";
 import { recordCostInvocation } from "../cost/ledger.js";
 import { resolveLaunchRoute } from "./launch-route.js";
@@ -293,6 +294,7 @@ export class HarnessOrchestrator {
   /** Deferred activations waiting for a write lease, keyed by canonical repo root. */
   private leaseWaitQueue = new Map<string, Set<() => void>>();
   private unsubLeaseEvents: () => void;
+  private disposed = false;
   /** Accepted steering not yet delivered (FIFO per task, at most MAX_PENDING_STEERS). */
   private pendingSteers = new Map<string, string[]>();
   /** In-flight waitForChildrenEventDriven calls per waiting task. */
@@ -421,6 +423,7 @@ export class HarnessOrchestrator {
   }
 
   dispose(): void {
+    this.disposed = true;
     for (const runId of [...this.runQuotaStates.keys()]) {
       this.clearRunQuotaTimers(runId);
     }
@@ -1110,6 +1113,7 @@ export class HarnessOrchestrator {
       }
     }
     entry.promise = this.runTaskWithRollovers(taskId, entry).catch((err) => {
+      if (this.disposed) return;
       const task = this.db.getTask(taskId);
       if (!task || entry.abort.signal.aborted) return;
       this.db.updateTask(taskId, { status: "failed", summary: `Task launch failed: ${String(err instanceof Error ? err.message : err).slice(0, 240)}` });
@@ -1119,9 +1123,10 @@ export class HarnessOrchestrator {
       if (this.active.get(taskId) === entry) {
         this.active.delete(taskId);
         this.pendingRollovers.delete(taskId);
-        this.disposeSteeringState(taskId);
+        if (!this.disposed) this.disposeSteeringState(taskId);
       }
       for (const item of entry.pendingSteers?.splice(0) ?? []) item.onOutcome?.(false, "generation_ended_without_handle");
+      if (this.disposed) return;
       const t = this.db.getTask(taskId);
       if (t) this.afterTaskInactiveInRun(t.runId);
     });
@@ -2291,6 +2296,7 @@ export class HarnessOrchestrator {
       const maxGenerations = this.config.rollover.maxGenerations ?? 12;
 
       let genToolEvents = 0;
+      const scopeMonitor = task.tier === 3 ? new ScopeNudgeMonitor({ workspaceRoot: cwd }) : null;
       const isCurrent = () => this.isCurrentExecution(task.id, exec, runnerGen);
       const generation = new AbortController();
       exec.generationSignal = AbortSignal.any([generation.signal, exec.abort.signal]);
@@ -2429,6 +2435,25 @@ export class HarnessOrchestrator {
             if (!isCurrent()) return;
             genToolEvents += 1;
             this.db.emitEvent(run.id, task.id, "agent.tool", ev);
+            if (scopeMonitor && !runnerReq.isTaskSettled?.()) {
+              const status = ev.status === "pending" ? "in_progress" : ev.status;
+              if (status === "in_progress" || status === "completed" || status === "failed") {
+                const nudge = scopeMonitor.observe({
+                  id: ev.id,
+                  name: ev.name,
+                  kind: ev.kind,
+                  status,
+                  args: ev.args,
+                });
+                if (nudge) {
+                  this.db.emitEvent(run.id, task.id, "agent.scope_nudge", {
+                    signals: scopeMonitor.signals(),
+                    message: nudge,
+                  });
+                  void this.steerTaskDetailed(task.id, nudge);
+                }
+              }
+            }
           },
         },
       };
@@ -2444,11 +2469,23 @@ export class HarnessOrchestrator {
         const res = await runner.run(runnerReq).finally(() => {
           exec.phase = "settling";
         });
+        if (this.disposed) return;
         const latest = this.db.getTask(task.id)!;
-        if (exec.abort.signal.aborted || latest.status === "cancelled") return;
+        if (exec.abort.signal.aborted || latest.status === "cancelled") {
+          if (latest.tier !== 1 && !["completed", "returned_for_rescope", "blocked"].includes(latest.status)) {
+            const why = exec.abort.signal.reason instanceof Error ? exec.abort.signal.reason.message : "";
+            const baseSummary = why ? `Cancelled: ${why}` : (latest.summary || "Cancelled");
+            await this.writeFallbackHandoff(
+              latest, run, wt, res, "cancelled", baseSummary,
+              why ? `cancelled: ${why}` : "cancelled",
+              { allowAborted: true },
+            );
+          }
+          return;
+        }
 
-        // Honor terminal/settled status from `return_task` or `report_issue` BEFORE rollover/maxTurns/quota
-        // so a task that already completed on its final/threshold turn is NEVER reopened into generation N+1!
+        // Honor terminal/settled status from `return_task` or `report_issue` BEFORE rollover/quota
+        // so a task that already completed on its final turn is NEVER reopened into generation N+1!
         if (["completed", "returned_for_rescope", "blocked", "cancelled"].includes(latest.status)) {
           this.pendingRollovers.delete(task.id);
           this.runConsecutiveQuotaPauses.delete(run.id);
@@ -2457,7 +2494,12 @@ export class HarnessOrchestrator {
             try {
               validateTaskHandoff(latest.kind, JSON.parse(latest.resultJson ?? "{}"));
             } catch {
-              this.db.updateTask(task.id, { status: "failed", resultJson: null, summary: "Task ended without a valid sourced handoff." });
+              await this.writeFallbackHandoff(
+                latest, run, wt, res, "failed",
+                "Task ended without a valid sourced handoff.",
+                "invalid_handoff",
+                { allowStatus: "completed" },
+              );
             }
           }
           if ((latest.tier === 1 || latest.tier === 2) && latest.status === "completed") {
@@ -2475,7 +2517,7 @@ export class HarnessOrchestrator {
         }
 
         // Clean rollover requested either via explicit `request_rollover` or the context threshold.
-        // Turn counts never force a rollover: maxTurns is only an advisory reminder inside the runner.
+        // Turn counts never force a rollover or stop a task.
         const explicitRollover = this.pendingRollovers.get(task.id);
         if (explicitRollover || res.stopReason === "rollover_requested") {
           this.pendingRollovers.delete(task.id);
@@ -2490,10 +2532,12 @@ export class HarnessOrchestrator {
             const streak = prev && prev.fp === fp ? prev.streak + 1 : 1;
             this.taskAutoRolloverProgress.set(task.id, { fp, streak });
             if (streak >= 2) {
-              this.db.updateTask(task.id, {
-                status: "failed",
-                summary: `Aborted after ${streak} consecutive zero-progress automatic rollovers (no commits, worktree edits, artifacts, or child tasks).`,
-              });
+              const summary = `Aborted after ${streak} consecutive zero-progress automatic rollovers (no commits, worktree edits, artifacts, or child tasks).`;
+              if (task.tier === 1) {
+                this.db.updateTask(task.id, { status: "failed", summary });
+              } else {
+                await this.settleWithoutReturn(exec, latest, run, wt, res, "failed", summary, "zero_progress_rollover");
+              }
               this.db.createEscalation({
                 runId: run.id,
                 fromTaskId: task.id,
@@ -2510,10 +2554,12 @@ export class HarnessOrchestrator {
             this.taskAutoRolloverProgress.delete(task.id);
           }
           if (nextGen > maxGenerations) {
-            this.db.updateTask(task.id, {
-              status: "failed",
-              summary: `Exceeded max rollover generations (${maxGenerations}); escalating to prevent infinite rollover loop.`,
-            });
+            const summary = `Exceeded max rollover generations (${maxGenerations}); escalating to prevent infinite rollover loop.`;
+            if (task.tier === 1) {
+              this.db.updateTask(task.id, { status: "failed", summary });
+            } else {
+              await this.settleWithoutReturn(exec, latest, run, wt, res, "failed", summary, "max_generations");
+            }
             this.db.createEscalation({
               runId: run.id,
               fromTaskId: task.id,
@@ -2597,16 +2643,27 @@ export class HarnessOrchestrator {
 
         if (exec.abort.signal.aborted) {
           const why = exec.abort.signal.reason instanceof Error ? exec.abort.signal.reason.message : "";
-          this.db.updateTask(task.id, { status: "cancelled", summary: why ? `Cancelled: ${why}` : "Cancelled" });
+          const baseSummary = why ? `Cancelled: ${why}` : "Cancelled";
+          if (latest.tier === 1) {
+            this.db.updateTask(task.id, { status: "cancelled", summary: baseSummary });
+          } else {
+            await this.writeFallbackHandoff(
+              latest, run, wt, res, "cancelled", baseSummary,
+              why ? `cancelled: ${why}` : "cancelled",
+              { allowAborted: true },
+            );
+          }
           return;
         }
         if (res.stopReason === "cancelled") {
           // Nobody cancelled this task (the harness abort was not signalled): the runner ended the session itself.
           const failures = res.toolFailures?.length ? ` Last tool failure: ${res.toolFailures[res.toolFailures.length - 1]!.slice(0, 200)}` : "";
-          this.db.updateTask(task.id, {
-            status: "failed",
-            summary: `Runner ended the session as cancelled without a harness cancellation.${failures}`,
-          });
+          const baseSummary = `Runner ended the session as cancelled without a harness cancellation.${failures}`;
+          if (latest.tier === 1) {
+            this.db.updateTask(task.id, { status: "failed", summary: baseSummary });
+          } else {
+            await this.settleWithoutReturn(exec, latest, run, wt, res, "failed", baseSummary, "runner_cancelled");
+          }
           return;
         }
 
@@ -2626,14 +2683,19 @@ export class HarnessOrchestrator {
 
         if (res.stopReason === "error") {
           const detail = res.text.trim().slice(-240);
-          this.db.updateTask(task.id, {
-            status: "failed",
-            summary: detail ? `Task runner reported an error: ${detail}` : "Task runner reported an error.",
-          });
+          const baseSummary = detail ? `Task runner reported an error: ${detail}` : "Task runner reported an error.";
+          if (latest.tier === 1) {
+            this.db.updateTask(task.id, { status: "failed", summary: baseSummary });
+          } else {
+            await this.settleWithoutReturn(
+              exec, latest, run, wt, res, "failed", baseSummary,
+              detail ? `runner_error: ${detail}` : "runner_error",
+            );
+          }
           return;
         }
         if (isReadOnlyKind(latest.kind)) {
-          await this.settleWithoutReturn(exec, latest, run, wt, res, "failed", "Task ended without a valid sourced handoff.");
+          await this.settleWithoutReturn(exec, latest, run, wt, res, "failed", "Task ended without a valid sourced handoff.", "missing_return_task");
           return;
         }
 
@@ -2739,8 +2801,25 @@ export class HarnessOrchestrator {
         });
         return;
       } catch (err) {
+        if (this.disposed) return;
         const msg = err instanceof Error ? err.message : String(err);
-        if (exec.abort.signal.aborted) return;
+        if (exec.abort.signal.aborted) {
+          const latestAborted = this.db.getTask(task.id);
+          if (
+            latestAborted &&
+            latestAborted.tier !== 1 &&
+            !["completed", "returned_for_rescope", "blocked"].includes(latestAborted.status)
+          ) {
+            const why = exec.abort.signal.reason instanceof Error ? exec.abort.signal.reason.message : "";
+            const baseSummary = why ? `Cancelled: ${why}` : (latestAborted.summary || "Cancelled");
+            await this.writeFallbackHandoff(
+              latestAborted, run, wt, null, "cancelled", baseSummary,
+              why ? `cancelled: ${why}` : "cancelled",
+              { allowAborted: true },
+            );
+          }
+          return;
+        }
         // If an explicit clean rollover was scheduled right before the runner rejected on cancel, proceed with rollover!
         const explicitRollover = this.pendingRollovers.get(task.id);
         const latest = this.db.getTask(task.id);
@@ -2777,7 +2856,13 @@ export class HarnessOrchestrator {
         this.pendingRollovers.delete(task.id);
         const flat = msg.replace(/\s+/g, " ").trim();
         const clipped = flat.length <= 240 ? flat : `${flat.slice(0, 150)} … ${flat.slice(-87)}`;
-        this.db.updateTask(task.id, { status: "failed", summary: `Task runner failed before settlement: ${clipped}` });
+        const baseSummary = `Task runner failed before settlement: ${clipped}`;
+        const target = latest ?? task;
+        if (target.tier === 1) {
+          this.db.updateTask(task.id, { status: "failed", summary: baseSummary });
+        } else {
+          await this.settleWithoutReturn(exec, target, run, wt, null, "failed", baseSummary, `runner_error: ${clipped}`);
+        }
         this.db.emitEvent(run.id, task.id, "agent.error", { error: msg });
         return;
       } finally {
@@ -2787,7 +2872,7 @@ export class HarnessOrchestrator {
         exec.handle = undefined;
         exec.steerChain = undefined;
         // A queued steer never crosses into the next generation: its prompt is rebuilt from the amended task row.
-        if ((this.db.getTask(task.id)?.generation ?? runnerGen) > runnerGen && exec.pendingSteers?.length) {
+        if (!this.disposed && (this.db.getTask(task.id)?.generation ?? runnerGen) > runnerGen && exec.pendingSteers?.length) {
           const stale = exec.pendingSteers.filter((item) => item.generation <= runnerGen);
           exec.pendingSteers = exec.pendingSteers.filter((item) => item.generation > runnerGen);
           for (const item of stale) item.onOutcome?.(false, "rolled_over");
@@ -2797,23 +2882,39 @@ export class HarnessOrchestrator {
   }
 
   /**
-   * Settles a non-Tier-1 task that ended naturally without return_task. Status and summary stay exactly as the
-   * caller decided; resultJson gains a harness-synthesized, labelled fallback (git state, indexed artifacts, a bounded
-   * excerpt of the final output). Read-only kinds keep their generic failed handoff and only get their output saved
-   * as a dossier the parent can list with artifact_read({ task_id }). Writes nothing when the task was cancelled,
-   * settled or resumed while the evidence was gathered.
+   * Race-gated wrapper for settling a non-Tier-1 task that ended without return_task.
+   * Writes nothing if the task was cancelled, settled, or resumed while git/artifact evidence was gathered.
    */
   private async settleWithoutReturn(
     exec: ActiveTaskExecution,
     task: TaskRecord,
     run: RunRecord,
     wt: WorktreeRecord | null,
-    res: RunAgentResult,
+    res: RunAgentResult | null,
     status: "completed" | "failed",
     baseSummary: string,
+    reason = "missing_return_task",
   ): Promise<void> {
+    await this.writeFallbackHandoff(task, run, wt, res, status, baseSummary, reason, { exec });
+  }
+
+  /**
+   * Writes a non-empty partial fallback handoff (`resultJson.fallback` with `partial: true`, inline
+   * artifact list, git summary, and output excerpt/dossier) for any non-Tier-1 task ending without
+   * `return_task` (read-only natural end, error, cancel, throw, zero-progress abort, maxGenerations).
+   */
+  private async writeFallbackHandoff(
+    task: TaskRecord,
+    run: RunRecord,
+    wt: WorktreeRecord | null,
+    res: RunAgentResult | null,
+    status: "completed" | "failed" | "cancelled",
+    baseSummary: string,
+    reason: string,
+    opts?: { exec?: ActiveTaskExecution; allowAborted?: boolean; allowStatus?: TaskStatus },
+  ): Promise<void> {
+    if (this.disposed) return;
     const gen = task.generation;
-    const readOnly = isReadOnlyKind(task.kind);
     const git: { head?: string; branch?: string; committed?: string; uncommitted?: string; status?: string[] } = {};
     const wtPath = wt && !wt.cleanedAt && existsSync(wt.path) ? wt.path : null;
     if (wtPath) {
@@ -2837,20 +2938,28 @@ export class HarnessOrchestrator {
     } catch {
       artifactPaths = [];
     }
-    const text = res.text.trim();
-    const EXCERPT = 1200;
 
-    // Race gate (synchronous up to the transaction): someone else cancelled, settled or resumed this task meanwhile.
+    // Generation-guarded race gate (synchronous up to the transaction).
+    if (this.disposed) return;
     const row = this.db.getTask(task.id);
-    if (
-      this.active.get(task.id) !== exec ||
-      exec.abort.signal.aborted ||
-      !row ||
-      row.generation !== gen ||
-      !["running", "waiting_children", "draining"].includes(row.status)
-    ) {
-      return;
+    if (!row || row.generation !== gen) return;
+    if (opts?.allowAborted) {
+      if (["completed", "returned_for_rescope", "blocked"].includes(row.status)) return;
+    } else if (opts?.allowStatus) {
+      if (row.status !== opts.allowStatus) return;
+    } else if (opts?.exec) {
+      if (
+        this.active.get(task.id) !== opts.exec ||
+        opts.exec.abort.signal.aborted ||
+        !["running", "waiting_children", "draining"].includes(row.status)
+      ) {
+        return;
+      }
     }
+
+    const readOnly = isReadOnlyKind(task.kind);
+    const text = res?.text?.trim() ?? "";
+    const EXCERPT = 1200;
     // The full output is saved only past the gate, so a superseded generation never leaves stray files or rows.
     const saveOutput = readOnly ? text.length > 0 : text.length > EXCERPT;
     let outputPath: string | null = null;
@@ -2867,38 +2976,65 @@ export class HarnessOrchestrator {
         }
       }
       const paths = outputPath && !artifactPaths.includes(outputPath) ? [...artifactPaths, outputPath] : artifactPaths;
-      const fallbackBase = { reason: "missing_return_task", wrap_up_attempted: Boolean(res.wrapUpAttempted) };
-      if (readOnly) {
-        this.db.updateTask(task.id, {
-          status: "failed",
-          summary: baseSummary,
-          resultJson: JSON.stringify({ status: "failed", fallback: { ...fallbackBase, artifact_paths: paths } }),
-        });
-        return;
-      }
-      const header =
-        `[Fallback handoff: task ended without return_task; wrap-up turn ${res.wrapUpAttempted ? "attempted" : "not available"}; ` +
-        "unverified, synthesized by the harness]";
-      const gitLine = wtPath
-        ? `Git: ${git.branch ?? "?"} @ ${git.head?.slice(0, 12) ?? "?"}; committed since base: ${git.committed ?? "unknown"}; ` +
-          `uncommitted: ${git.uncommitted ?? "unknown"}${git.status?.length ? ` (${git.status.length} changed path(s))` : ""}`
-        : "Git: no worktree";
-      const artLine = `Artifacts: ${paths.length} indexed${paths.length ? " (see artifact_paths)" : ""}`;
-      const pointer = outputPath ? `\n[Full output: ${relative(run.repoRoot, outputPath)}]` : "";
-      const fixed = `${header}\n${gitLine}\n${artLine}\nFinal worker output (unstructured excerpt):\n`;
-      const budget = Math.max(0, Math.min(EXCERPT, SUMMARY_LIMIT - fixed.length - pointer.length));
-      const excerpt = !text ? "(no output)" : text.length <= budget ? text : `…${text.slice(-(budget - 1))}`;
-      const summary = `${fixed}${excerpt}${pointer}`.slice(0, SUMMARY_LIMIT);
+      const summary = this.formatFallbackSummary({
+        repoRoot: run.repoRoot,
+        reason,
+        wtPath,
+        git,
+        paths,
+        outputPath,
+        text,
+        excerptLimit: EXCERPT,
+      });
       this.db.updateTask(task.id, {
         status,
         summary: baseSummary,
         resultJson: JSON.stringify({
           status,
-          text: res.text,
-          fallback: { ...fallbackBase, stop_reason: res.stopReason, summary, artifact_paths: paths, git },
+          ...(res ? { text: res.text } : {}),
+          fallback: {
+            reason,
+            wrap_up_attempted: Boolean(res?.wrapUpAttempted),
+            ...(res ? { stop_reason: res.stopReason } : {}),
+            partial: true,
+            summary,
+            artifact_paths: paths,
+            ...(wtPath ? { git } : {}),
+          },
         }),
       });
     });
+  }
+
+  private formatFallbackSummary(input: {
+    repoRoot: string;
+    reason: string;
+    wtPath: string | null;
+    git: { head?: string; branch?: string; committed?: string; uncommitted?: string; status?: string[] };
+    paths: string[];
+    outputPath: string | null;
+    text: string;
+    excerptLimit: number;
+  }): string {
+    const { repoRoot, reason, wtPath, git, paths, outputPath, text, excerptLimit } = input;
+    const header = `[Partial handoff: task ended without return_task (${reason}); unverified, synthesized by the harness]`;
+    const gitLine = wtPath
+      ? `Git: ${git.branch ?? "?"} @ ${git.head?.slice(0, 12) ?? "?"}; committed since base: ${git.committed ?? "unknown"}; ` +
+        `uncommitted: ${git.uncommitted ?? "unknown"}${git.status?.length ? ` (${git.status.length} changed path(s))` : ""}`
+      : "Git: no worktree";
+    const displayPaths = paths.slice(0, 5).map((p) => {
+      const rel = relative(repoRoot, p);
+      return rel && !rel.startsWith("..") ? rel : p;
+    });
+    const more = paths.length > 5 ? `, +${paths.length - 5} more` : "";
+    const artLine = paths.length
+      ? `Artifacts: ${paths.length} indexed: ${displayPaths.join(", ")}${more}`
+      : "Artifacts: 0 indexed";
+    const pointer = outputPath ? `\n[Full output: ${relative(repoRoot, outputPath)}]` : "";
+    const fixed = `${header}\n${gitLine}\n${artLine}\nFinal output (unstructured excerpt):\n`;
+    const budget = Math.max(0, Math.min(excerptLimit, SUMMARY_LIMIT - fixed.length - pointer.length));
+    const excerpt = !text ? "(no final output)" : text.length <= budget ? text : `…${text.slice(-(budget - 1))}`;
+    return `${fixed}${excerpt}${pointer}`.slice(0, SUMMARY_LIMIT);
   }
 
   /** Generation and stop/cancel epochs before a rollover or quota-pause handoff is awaited. */
@@ -3448,7 +3584,43 @@ export class HarnessOrchestrator {
     this.pendingRollovers.delete(taskId);
     const task = this.db.getTask(taskId);
     if (task && !["completed", "cancelled", "failed"].includes(task.status)) {
-      this.db.updateTask(taskId, { status: "cancelled", summary: `Cancelled: ${reason}` });
+      const baseSummary = `Cancelled: ${reason}`;
+      const run = task.tier !== 1 ? this.db.getRun(task.runId) : null;
+      if (run && task.tier !== 1) {
+        let artifactPaths: string[] = [];
+        try {
+          artifactPaths = this.db.listArtifacts(run.id, task.id, 50).map((a) => a.path).slice(0, 20);
+        } catch {
+          artifactPaths = [];
+        }
+        const cancelReason = reason ? `cancelled: ${reason}` : "cancelled";
+        const fallbackSummary = this.formatFallbackSummary({
+          repoRoot: run.repoRoot,
+          reason: cancelReason,
+          wtPath: null,
+          git: {},
+          paths: artifactPaths,
+          outputPath: null,
+          text: "",
+          excerptLimit: 1200,
+        });
+        this.db.updateTask(taskId, {
+          status: "cancelled",
+          summary: baseSummary,
+          resultJson: JSON.stringify({
+            status: "cancelled",
+            fallback: {
+              reason: cancelReason,
+              wrap_up_attempted: false,
+              partial: true,
+              summary: fallbackSummary,
+              artifact_paths: artifactPaths,
+            },
+          }),
+        });
+      } else {
+        this.db.updateTask(taskId, { status: "cancelled", summary: baseSummary });
+      }
       // No runner loop will exit for a queued or never-launched task, so settle its run here (a stop sweep does that itself).
       if (!exec && !opts?.bulk) this.afterTaskInactiveInRun(task.runId);
     }

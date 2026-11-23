@@ -10,12 +10,16 @@ type TaskSource = { path: string; lines?: string; symbol?: string; note?: string
 export function validateTaskHandoff(kind: TaskKind, args: Record<string, unknown>) {
   const fullSummary = args.summary;
   if (typeof fullSummary !== "string") throw new Error("return_task requires a summary string");
+  const partial = args.partial === true;
   const artifactPaths = args.artifact_paths === undefined ? [] : args.artifact_paths;
   if (!Array.isArray(artifactPaths) || !artifactPaths.every((path) => typeof path === "string")) {
     throw new Error("return_task artifact_paths must be an array of strings");
   }
   const rawSources = args.sources === undefined ? [] : args.sources;
-  if (!Array.isArray(rawSources) || (isReadOnlyKind(kind) && rawSources.length === 0)) {
+  if (
+    !Array.isArray(rawSources) ||
+    (isReadOnlyKind(kind) && rawSources.length === 0 && !(partial && artifactPaths.length > 0))
+  ) {
     throw new Error(`return_task requires a non-empty sources array for ${kind} tasks (each source needs a path)`);
   }
   const sources: TaskSource[] = rawSources.map((source) => {
@@ -25,7 +29,7 @@ export function validateTaskHandoff(kind: TaskKind, args: Record<string, unknown
     }
     return { path, lines, symbol, note };
   });
-  return { summary: fullSummary, sources, artifactPaths };
+  return { summary: fullSummary, sources, artifactPaths, partial };
 }
 
 function matchRecordedArtifactPath(pointerPath: string, artifactPaths: unknown): string | null {
@@ -96,6 +100,7 @@ export function compactTaskHandoff(task: TaskRecord, escalations: EscalationReco
     kind: task.kind,
     status: task.status,
     summary,
+    ...(!paused && (result?.partial === true || result?.fallback?.partial === true) ? { partial: true as const } : {}),
     ...(overflow
       ? {
           truncated: true as const,

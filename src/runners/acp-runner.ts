@@ -25,7 +25,7 @@ import {
 } from "./acp-shims.js";
 import { isProtectedWritePath } from "./protected-paths.js";
 import { detectQuotaErrorText } from "./quota-detect.js";
-import { MAX_RUNNER_STEER_CONTINUATIONS, turnReminderText, validateRunPolicy } from "./types.js";
+import { MAX_RUNNER_STEER_CONTINUATIONS, validateRunPolicy } from "./types.js";
 import type { ProbedModelInfo, QuotaPauseInfo, RunAgentRequest, RunAgentResult, RunnerCost, RunnerUsage, ToolPolicy } from "./types.js";
 
 /** Returns an accurate, human-readable description of the active tool policy and permissions. */
@@ -482,8 +482,6 @@ export class AcpRunner {
     let rolloverWarningSent = false;
     let wrapUpAttempted = false;
     let wrapUpTimer: ReturnType<typeof setTimeout> | null = null;
-    // maxTurns is an advisory progress-reminder threshold: one reminder, never a stop.
-    let turnReminderSent = false;
     let turnsUsed = 0;
     let completedToolInWave = false;
     const inFlightToolCalls = new Set<string>();
@@ -614,15 +612,9 @@ export class AcpRunner {
           .catch(() => {});
       }
     };
-    const isReviewer = req.tools.some((t) => t.name === "submit_review_verdict");
     const advanceTurnWaveIfNeeded = () => {
       if (!completedToolInWave || inFlightToolCalls.size > 0) return;
       completedToolInWave = false;
-      // A new tool call after a completed wave means work is continuing: remind once, never cancel.
-      if (!turnReminderSent && req.maxTurns > 0 && turnsUsed >= req.maxTurns) {
-        turnReminderSent = true;
-        sendSteeringText(turnReminderText(req.tier, isReviewer));
-      }
       turnsUsed += 1;
       req.callbacks.onTurn?.(turnsUsed);
     };
