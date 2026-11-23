@@ -103,7 +103,7 @@ export interface EventsConfig {
    * Default is intentionally long (600s = 10m) so agents rely on events and never thrash/token-poll.
    */
   fallbackWakeupIntervalSec: number;
-  /** Automatically wake an idle Director chat session when one of its Goal runs settles (default true). */
+  /** Automatically wake an idle Director chat session when one of its Goal runs or Director-spawned tasks settles (default true). */
   wakeDirectorOnGoalSettle: boolean;
 }
 
@@ -112,13 +112,13 @@ export interface RolloverConfig {
   orchestratorThreshold: number;
   /** Context ratio triggering Tier 2 Worker clean worktree rollover (default 0.78) */
   workerThreshold: number;
-  /** Advisory progress-reminder threshold in tool-call turns for Tier 1 Orchestrators (default 200); never stops the agent */
+  /** Deprecated; no effect: tasks are never stopped or reminded by turn count. */
   orchestratorMaxTurns: number;
-  /** Advisory progress-reminder threshold in tool-call turns for Tier 2 Workers (default 120); never stops the agent */
+  /** Deprecated; no effect: tasks are never stopped or reminded by turn count. */
   workerMaxTurns: number;
-  /** Advisory progress-reminder threshold in tool-call turns for Tier 3 Task Agents (default 40); never stops the agent */
+  /** Deprecated; no effect: tasks are never stopped or reminded by turn count. */
   taskMaxTurns: number;
-  /** Advisory progress-reminder threshold in tool-call turns for Goal Done-Review agents (default 30); never stops the agent */
+  /** Deprecated; no effect: tasks are never stopped or reminded by turn count. */
   reviewerMaxTurns: number;
   /** Tool output byte threshold above which output is externalized to artifact file (default 2048) */
   externalizeBytes: number;
