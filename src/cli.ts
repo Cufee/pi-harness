@@ -1,8 +1,10 @@
 #!/usr/bin/env bun
 import { spawn } from "node:child_process";
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ControlPlaneDb, type EscalationRecord } from "./control-plane/db.js";
 import type { ProjectBrowseResult, ProjectSummary } from "./control-plane/projects.js";
 import { ensureTempDir, loadConfig, type AcpProfileConfig } from "./config.js";
 import { loadOrCreateNodeId } from "./control-plane/session-messages.js";
@@ -27,6 +29,7 @@ const BOOLEAN_LONG_FLAGS = new Set([
   "no-auto-connect",
   "no-create",
   "exclude-exhausted",
+  "direct",
 ]);
 
 export interface ParsedArgs {
@@ -308,6 +311,31 @@ function resolveRemoteSpec(
   return { target: `ssh://${trimmed}`, hostLabel: trimmed.includes("@") ? trimmed.split("@")[1]! : trimmed };
 }
 
+type ReconcileResult = ReturnType<ControlPlaneDb["reconcileSettledGoalEscalations"]>;
+
+/** Reconciles settled-goal escalations straight against a control-plane SQLite file, without a daemon. */
+function reconcileEscalationsDirect(dbPath: string): ReconcileResult {
+  // ControlPlaneDb creates missing files, so check first.
+  if (!existsSync(dbPath)) throw new Error(`Control-plane database not found at ${dbPath}`);
+  const db = new ControlPlaneDb(dbPath);
+  try {
+    return db.reconcileSettledGoalEscalations();
+  } finally {
+    db.close();
+  }
+}
+
+function printReconcileResult(out: { mode: string } & ReconcileResult, json: boolean): void {
+  if (json) {
+    console.log(JSON.stringify(out, null, 2));
+    return;
+  }
+  console.log(`Reconciled ${out.resolved} escalation(s) across ${out.goals} goal(s) and ${out.runs} run(s) [mode: ${out.mode}].`);
+  for (const item of out.items) {
+    console.log(`  ${item.escalationId}  run=${item.runId}  goal=${item.goalId} (${item.goalStatus})  was ${item.previousStatus}`);
+  }
+}
+
 async function connectClient(configSocketPath: string, remoteTarget?: string, bridgeCommand?: string): Promise<DaemonClient> {
   if (!remoteTarget) {
     return await ensureLocalDaemon(configSocketPath);
@@ -339,6 +367,9 @@ Usage:
   pi-harness chat send <target> "<message>" [--from <chat-id>] [--no-reply]
                                                     Send a message to any local (chat-1) or remote (gpu-box:chat-4) chat
   pi-harness goals [list | review <id> | pause <id> | cancel <id>]
+  pi-harness escalations [list] [--status open|acked|resolved|all] [--run <run-id>] [--json] [--remote <alias|ssh://host>]
+  pi-harness escalations reconcile [--direct [--db <path>]] [--json] [--remote <alias|ssh://host>]
+  pi-harness escalations resolve <escalation-id> --reason "<text>" [--json] [--remote <alias|ssh://host>]
   pi-harness profiles [list | add <id> <cmd> [args...] | remove <id> | probe <id>]
   pi-harness daemon serve | status | stop | restart [--remote <alias|ssh://host>]
   pi-harness run "<goal>" [-p <project>] [--profile id] [--model id] [--effort level] [--detach] [--remote <alias|ssh://host>]
@@ -682,6 +713,16 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (cmd === "escalations" && positional[1] === "reconcile" && flags.direct) {
+    if (remoteSpec.target) throw new Error("--direct uses the local SQLite file and cannot be combined with --remote");
+    const rawDb = typeof flags.db === "string" ? flags.db.trim() : "";
+    const dbPath = rawDb
+      ? resolve(rawDb === "~" || rawDb.startsWith("~/") ? join(homedir(), rawDb.slice(1)) : rawDb)
+      : join(config.stateDir, "control-plane.sqlite");
+    printReconcileResult({ mode: "direct", ...reconcileEscalationsDirect(dbPath) }, Boolean(flags.json));
+    return;
+  }
+
   const client = await connectClient(config.socketPath, remoteSpec.target, remoteSpec.bridgeCommand);
   let handoffClientToTui = false;
   try {
@@ -972,6 +1013,60 @@ async function main(): Promise<void> {
           console.log(JSON.stringify(await client.request("goal.cancel", { goalId: positional[2] }), null, 2));
         } else {
           console.log(JSON.stringify(await client.request("goal.list", { repoRoot }), null, 2));
+        }
+        break;
+      }
+
+      case "escalations": {
+        const sub = positional[1] ?? "list";
+        if (sub === "list") {
+          const status = flags.status;
+          if (status !== undefined && !(typeof status === "string" && ["open", "acked", "resolved", "all"].includes(status))) {
+            throw new Error("Usage: pi-harness escalations [list] [--status open|acked|resolved|all] [--run <run-id>] [--json]");
+          }
+          const params: Record<string, unknown> = {};
+          if (typeof flags.run === "string" && flags.run.trim()) params.runId = flags.run.trim();
+          if (status === "open" || status === "acked" || status === "resolved") params.status = status;
+          let items = await client.request<EscalationRecord[]>("escalation.list", params);
+          if (status === undefined) items = items.filter((e) => e.status === "open" || e.status === "acked");
+          if (flags.json) {
+            console.log(JSON.stringify(items, null, 2));
+          } else if (items.length === 0) {
+            console.log("No escalations found.");
+          } else {
+            for (const e of items) {
+              console.log(`${e.id}  ${e.severity}  ${e.category}  ${e.status}  ${e.runId}  ${e.title}`);
+            }
+          }
+        } else if (sub === "reconcile") {
+          if (flags.db !== undefined) throw new Error("--db can only be used with --direct");
+          let out: { mode: string } & ReconcileResult;
+          try {
+            out = { mode: "daemon", ...(await client.request<ReconcileResult>("escalation.reconcile")) };
+          } catch (err) {
+            if (!/Unknown daemon op/.test(err instanceof Error ? err.message : String(err))) throw err;
+            if (remoteSpec.target) throw new Error("remote daemon predates escalation.reconcile");
+            out = { mode: "direct_fallback", ...reconcileEscalationsDirect(join(config.stateDir, "control-plane.sqlite")) };
+          }
+          printReconcileResult(out, Boolean(flags.json));
+        } else if (sub === "resolve") {
+          const escalationId = positional[2]?.trim();
+          const reason = typeof flags.reason === "string" ? flags.reason.trim() : "";
+          if (!escalationId || !reason) {
+            throw new Error('Usage: pi-harness escalations resolve <escalation-id> --reason "<text>" [--json]');
+          }
+          const res = await client.request<{ alreadyResolved?: boolean; remainingOpen?: number }>("escalation.resolve", {
+            escalationId,
+            reason,
+          });
+          if (flags.json) {
+            console.log(JSON.stringify(res, null, 2));
+          } else {
+            const head = res.alreadyResolved ? `Escalation ${escalationId} was already resolved.` : `Resolved escalation ${escalationId}.`;
+            console.log(typeof res.remainingOpen === "number" ? `${head} ${res.remainingOpen} open escalation(s) remain.` : head);
+          }
+        } else {
+          throw new Error(`Unknown escalations subcommand: ${sub}. Expected list, reconcile, or resolve.`);
         }
         break;
       }
