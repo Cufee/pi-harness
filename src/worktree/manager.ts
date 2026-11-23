@@ -124,19 +124,20 @@ export class WorktreeManager {
     opts?: { force?: boolean },
   ): Promise<WorktreeRecord> {
     const repoCanon = canonicalPath(this.repoRoot);
+    const TERMINAL_RUN_STATUSES = new Set(["completed", "failed", "stopped"]);
+    const LIVE_OR_PAUSED_TASK_STATUSES = new Set(["running", "draining", "waiting_children", "merging", "paused_quota"]);
+    const INACTIVE_OWNER_TASK_STATUSES = new Set(["failed", "cancelled", "completed", "blocked", "returned_for_rescope"]);
     const active = this.db.listWorktrees().filter((w) => {
       if (w.status !== "active" && w.status !== "queued" && w.status !== "bounced") return false;
       const run = this.db.getRun(w.runId);
-      if (run && canonicalPath(run.repoRoot) !== repoCanon) return false;
+      // A worktree whose run row is gone cannot be attributed to any repo, so it must not hold a slot.
+      if (!run) return false;
+      if (canonicalPath(run.repoRoot) !== repoCanon) return false;
       const ownerTask = this.db.getTask(w.taskId);
-      if (
-        ownerTask &&
-        (ownerTask.status === "failed" ||
-          ownerTask.status === "cancelled" ||
-          ownerTask.status === "completed" ||
-          ownerTask.status === "blocked" ||
-          ownerTask.status === "returned_for_rescope")
-      ) {
+      if (ownerTask && INACTIVE_OWNER_TASK_STATUSES.has(ownerTask.status)) return false;
+      // Terminal runs free their slots unless the owner task is still live or quota-paused
+      // (a resumed task can run before its run's stored status flips back to active).
+      if (TERMINAL_RUN_STATUSES.has(run.status) && (!ownerTask || !LIVE_OR_PAUSED_TASK_STATUSES.has(ownerTask.status))) {
         return false;
       }
       return existsSync(w.path);

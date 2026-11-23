@@ -13,7 +13,7 @@ import { resolveLaunchRoute } from "./launch-route.js";
 import type { RunAgentRequest, RunAgentResult, RunnerExecutionHandle } from "../runners/types.js";
 import { BisectingMergeQueue } from "../worktree/merge-queue.js";
 import { nativeToolsPathDirs, resolveExternalMcpServers } from "../tools/native-tools.js";
-import { runGit, WorktreeConcurrencyLimitError, WorktreeManager } from "../worktree/manager.js";
+import { canonicalPath, runGit, WorktreeConcurrencyLimitError, WorktreeManager } from "../worktree/manager.js";
 import type { QueuePositionInput } from "./admission-queue.js";
 import type { AgentTier, ControlPlaneDb, RunRecord, TaskKind, TaskRecord } from "./db.js";
 import { buildHydrationTurn, buildImmutableSystemPrompt, type AnchoredHandoff } from "./prompts.js";
@@ -341,6 +341,8 @@ export class HarnessOrchestrator {
         void this.checkRunQuotaQuiescence(run.id).catch(() => {});
       }
     }
+    // Covers runs beyond the listRuns window; quota-paused task leases survive for resume.
+    this.db.purgeStaleWriteLeasesOnStartup();
   }
 
   getWorktreeManager(repoRoot: string): WorktreeManager {
@@ -1698,6 +1700,7 @@ export class HarnessOrchestrator {
 
   private waitForWorktreeSlot(repoRoot: string, signal: AbortSignal): Promise<void> {
     if (signal.aborted) return Promise.resolve();
+    const targetRepo = canonicalPath(repoRoot);
     return new Promise<void>((resolve) => {
       let done = false;
       const finish = () => {
@@ -1710,9 +1713,13 @@ export class HarnessOrchestrator {
         resolve();
       };
       const unsubEvents = this.db.onEvent((ev) => {
-        if (ev.type === "worktree.removed" || ev.type === "merge.finished" || ev.type === "task.status") {
+        // A run turning terminal frees the slots of its non-live worktrees.
+        const runEnded =
+          ev.type === "run.status" &&
+          ["completed", "failed", "stopped"].includes((ev.payload as { status?: string } | null)?.status ?? "");
+        if (runEnded || ev.type === "worktree.removed" || ev.type === "merge.finished" || ev.type === "task.status") {
           const evRun = this.db.getRun(ev.runId);
-          if (!evRun || evRun.repoRoot === repoRoot) finish();
+          if (!evRun || canonicalPath(evRun.repoRoot) === targetRepo) finish();
         }
       });
       const unsubQueue = this.db.admissionQueue.onChange((lane) => {
