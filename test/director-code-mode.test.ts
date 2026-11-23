@@ -52,7 +52,7 @@ for (const mode of ["collapsed", "hybrid", "off"] as const) {
       const tools = await callBridge(bridge, req, "__list_tools", {}) as ToolDefinition[];
       assert.deepEqual(tools, req.tools);
       const names = tools.map((tool) => tool.name);
-      if (effectiveCodeMode(mode) === "collapsed") assert.deepEqual(names, ["tool_search", "code_exec"]);
+      if (effectiveCodeMode(mode) === "collapsed") assert.deepEqual(names, ["read_file", "tool_search", "code_exec"]);
       else assert.ok(names.includes("goal_list"));
       if (effectiveCodeMode(mode) === "off") {
         assert.ok(!names.includes("tool_search") && !names.includes("code_exec"));

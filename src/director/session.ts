@@ -6,6 +6,13 @@ import { friendlyIdCandidates, nextFriendlyId } from "../control-plane/ids.js";
 import { parseChatControlEvent, type ChatControlEvent } from "../protocol/chat-events.js";
 import type { ToolDisplayPayload } from "../protocol/tool-display.js";
 
+/** Director tools that stay directly callable in collapsed Code Mode. */
+export const DIRECTOR_DIRECT_TOOLS = ["read_file"] as const;
+
+/** Leaves Director read receipts out of the prompt window's system turns. */
+const EXCLUDE_READ_RECEIPTS_SQL =
+  "AND (event_json IS NULL OR NOT json_valid(event_json) OR json_extract(event_json, '$.kind') IS NOT 'director.read_file')";
+
 function canonicalRepoPath(p: string): string {
   try {
     return realpathSync(p);
@@ -75,15 +82,20 @@ export function buildDirectorSystemPrompt(
   mode: CodeMode = "off",
   codeExecOpts?: { defaultTimeoutMs?: number; maxTimeoutMs?: number },
 ): string {
-  const codeMode = codeModePromptSection(mode, codeExecOpts);
+  const codeMode = codeModePromptSection(mode, { ...codeExecOpts, directTools: DIRECTOR_DIRECT_TOOLS });
+  const largeFiles = codeMode
+    ? 'For a large file, find the relevant part first: in a code_exec script, loop read_file from "harness" over the file and output only the matching lines. Direct node:fs or open() calls inside code_exec fail with EPERM.'
+    : "For a large file, read the range you need, not the whole file.";
   return [
     "You are the Tier 0 INTERACTIVE DIRECTOR of pi-harness — the user's persistent engineering partner.",
     "You sit ABOVE the autonomous Tier 1 Run Orchestrators so the user always has an instant, responsive chat.",
     "",
     "YOUR RESPONSIBILITIES:",
     "1. Brainstorm designs, discuss tradeoffs, explore requirements, and answer progress questions immediately using `goal_list`, `goal_get`, `list_models`, and `kb_search`.",
-    "Never edit code, run shell commands, or inspect repository files directly in normal operation. Delegate lookups to a narrow read-only research, plan, or verify worker via spawn_task. Select a concrete model from list_models. Read its summary and sources via wait_tasks; open authorized artifacts on demand. Use read_file only as a rare logged exception with an exception_reason. read_file returns UTF-8 text in logged pages (default 4096 bytes; set max_bytes up to 65536 and continue from nextOffset) from the workspace, .harness/goals, .harness/notes, .harness/artifacts, and operator-granted roots. write_note saves notes and reports under .harness/goals/ or .harness/notes/. In code_exec scripts, direct reads of workspace files fail with EPERM; call read_file or artifact_read from \"harness\" instead.",
-    "Treat credentials, private keys, tokens, and .env-style files as sensitive: read them only when the user's request requires it, and never copy their contents into chat, notes, goals, or task prompts.",
+    "Read files directly with read_file whenever their contents help you answer, plan, or check work. It reads workspace files, harness goals, notes, and artifacts, and any other file on this machine that the operator's account can read (use an absolute or ~/ path). No reason or approval is needed. .git internals, task worktrees, and harness-internal state are refused, and the OS may refuse other files; report a refusal instead of working around it.",
+    "Read what the request needs, not everything nearby. read_file returns UTF-8 text one page at a time (default 32768 bytes, ending on a line boundary): select lines with start_line and end_line, or continue with offset set to nextOffset until hasMore is false. Size the output to the question, and raise max_bytes only when you need more in a single result. " + largeFiles,
+    "Never edit code or run shell commands yourself; code changes go through goals. Delegate lookups that span many files, need codebase search, or need shell commands or tests to a narrow read-only research, plan, or verify worker via spawn_task. Select a concrete model from list_models. Read its summary and sources via wait_tasks; open authorized artifacts on demand. Delegation adds value when you do not know where to look, when the reading would flood your context, or when a conclusion needs independent verification; for one or a few known files a direct read is faster. write_note saves notes and reports under .harness/goals/ or .harness/notes/.",
+    "Treat credentials, private keys, tokens, and .env-style files as sensitive: read them only when the user's request requires it, and never copy their contents into chat, notes, goals, or task prompts. If a file you opened for another reason contains secrets, do not repeat them.",
     "2. When the user is ready to execute work, draft a structured **Goal Contract** via `goal_create` (with `criteria`, optional `non_goals`, and `verification_mode`: `auto` | `deterministic` | `none` | `independent_review`), commit it immediately via `goal_commit` for a clear action request so an autonomous Tier 1 Orchestrator executes it cleanly. Scale criteria and verification depth proportionally to task risk: for straightforward operational or low-risk tasks, use lean deterministic checks (or `verification_mode: 'none'` / `'deterministic'`) instead of inventing heavy behavioral/architectural review layers; reserve `independent_review` and multi-layer criteria for non-trivial code or architectural changes.",
     "Use sensible defaults. Ask only when a genuinely ambiguous or irreversible decision blocks action. Create separate goals for distinct requests or amend the relevant active goal — prefer cohesive vertical goals and avoid spawning many overlapping concurrent goals that edit the same files.",
     "3. When the user changes requirements mid-flight, call `goal_amend` so a clean `vN -> vN+1` amendment delta propagates to the running Tier 1 Orchestrator without losing unaffected work.",
@@ -353,7 +365,8 @@ export class DirectorSessionStore {
    * Builds a balanced prompt-context history window: up to `conversationLimit` most-recent
    * `user`/`assistant` turns PLUS up to `systemLimit` most-recent `system_notice`/`tool_output`
    * turns, interleaved in chronological `seq` order so heavy tool/event bursts never evict
-   * user requirements or earlier steering.
+   * user requirements or earlier steering. Director read receipts are operator-facing audit
+   * records and are left out of the system window so they cannot displace goal or timer events.
    */
   getPromptHistory(
     chatSessionId: string,
@@ -379,12 +392,12 @@ export class DirectorSessionStore {
       excludeSeq !== undefined
         ? this.db
             .prepare(
-              "SELECT * FROM chat_turns WHERE chat_session_id = ? AND role IN ('system_notice', 'tool_output') AND seq != ? ORDER BY seq DESC LIMIT ?",
+              `SELECT * FROM chat_turns WHERE chat_session_id = ? AND role IN ('system_notice', 'tool_output') AND seq != ? ${EXCLUDE_READ_RECEIPTS_SQL} ORDER BY seq DESC LIMIT ?`,
             )
             .all(chatSessionId, excludeSeq, sysLimit)
         : this.db
             .prepare(
-              "SELECT * FROM chat_turns WHERE chat_session_id = ? AND role IN ('system_notice', 'tool_output') ORDER BY seq DESC LIMIT ?",
+              `SELECT * FROM chat_turns WHERE chat_session_id = ? AND role IN ('system_notice', 'tool_output') ${EXCLUDE_READ_RECEIPTS_SQL} ORDER BY seq DESC LIMIT ?`,
             )
             .all(chatSessionId, sysLimit)
     ) as Record<string, unknown>[];

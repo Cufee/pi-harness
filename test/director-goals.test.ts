@@ -200,7 +200,7 @@ describe("Tier 0 Director, Run-Until-Done Goal Engine, Independent Done-Review &
   });
 });
 
-it("limits Director reads to a logged workspace snippet and delegates sourced research", async () => {
+it("logs Director reads and delegates sourced research", async () => {
   const repoRoot = await makeTempRepo();
   const stateDir = mkdtempSync(join(tmpdir(), "director-isolation-"));
   let childId = "";
@@ -222,13 +222,13 @@ it("limits Director reads to a logged workspace snippet and delegates sourced re
             return { stopReason: "completed", text: "raw child transcript" };
           }
           assert.equal(req.toolPolicy, "control_plane_only");
-          await assert.rejects(req.executeTool("read_file", { path: "large.txt" }), /exception_reason/);
-          await assert.rejects(req.executeTool("read_file", { path: "link.txt", exception_reason: "Inspect link" }), /outside/);
+          const linked = await req.executeTool("read_file", { path: "link.txt", exception_reason: "Inspect link" }) as { content: string };
+          assert.equal(linked.content, "private");
           const snippet = await req.executeTool("read_file", {
             path: "large.txt", max_chars: 10000, exception_reason: "Check encoding",
           }) as { content: string; truncated: boolean };
-          assert.equal(Buffer.byteLength(snippet.content), 4096);
-          assert.equal(snippet.truncated, true);
+          assert.equal(Buffer.byteLength(snippet.content), 5000);
+          assert.equal(snippet.truncated, false);
           const assignment = { title: "Locate status", objective: "Read status.txt", model: req.model };
           await assert.rejects(req.executeTool("spawn_task", { ...assignment, kind: "execute" }), /only permits/);
           const child = await req.executeTool("spawn_task", { ...assignment, kind: "research" }) as { spawned: string };
@@ -253,8 +253,8 @@ it("limits Director reads to a logged workspace snippet and delegates sourced re
       assert.ok(events.some(event => event.type === "agent.text_delta" && (event.payload as { text: string }).text === "Inspecting status.txt"));
       assert.ok(events.some(event => event.type === "task.status" && (event.payload as { to: string }).to === "completed"));
       const notices = daemon.director.chats.getHistory(chat.id).filter(turn => turn.role === "system_notice");
-      assert.equal(notices.length, 1);
-      assert.match(notices[0]!.content, /large\.txt \(4096 bytes\).*Check encoding/);
+      assert.equal(notices.length, 2);
+      assert.match(notices[1]!.content, /large\.txt \(5000 bytes\).*Check encoding/);
     } finally {
       await daemon.stop();
     }
