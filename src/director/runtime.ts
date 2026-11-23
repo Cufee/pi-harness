@@ -802,7 +802,8 @@ export class DirectorRuntime {
 
     // Cancel this chat's timers whose settlement subscription covers this goal (we're handling settlement now).
     // A timer bound to a Goal matches only that Goal; only an unbound `any` timer matches every Goal of the chat.
-    if (goal.chatSessionId) {
+    // Timers are cancelled only when settlement wakes are enabled; otherwise the timer remains the chat's wake.
+    if (wakeOnSettle && goal.chatSessionId) {
       for (const t of this.db.timers.list({ ownerKind: "chat", ownerId: goal.chatSessionId, status: "pending" })) {
         if (timerMatchesGoalSettlement(t, goal)) {
           this.db.timers.cancel(t.id, `goal_settled:${goal.id}`);
