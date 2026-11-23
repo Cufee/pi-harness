@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ControlPlaneDb, RunRecord } from "./db.js";
+import { nextUniqueFileName } from "./ids.js";
 
 export function dossierDirectory(repoRoot: string, ...parts: string[]): string {
   let path = realpathSync(repoRoot);
@@ -29,7 +30,16 @@ export function writeTaskDossier(db: ControlPlaneDb, run: RunRecord, taskId: str
 }
 
 export function writeCodeOutput(db: ControlPlaneDb, run: RunRecord, taskId: string, name: string, json: string) {
-  const path = join(dossierDirectory(run.repoRoot), basename(name));
+  const dir = dossierDirectory(run.repoRoot);
+  const rawBase = basename(name);
+  let path = join(dir, rawBase);
+  if (existsSync(path)) {
+    // Restart-safe collision avoidance: never fail with EEXIST when an in-memory counter resets after restart
+    const dot = rawBase.lastIndexOf(".");
+    const stem = (dot > 0 ? rawBase.slice(0, dot) : rawBase).replace(/-\d+$/, "");
+    const ext = dot > 0 ? rawBase.slice(dot) : ".json";
+    path = join(dir, nextUniqueFileName(dir, stem, ext));
+  }
   writeFileSync(path, json, { flag: "wx", mode: 0o600 });
   try {
     return db.recordArtifact({ runId: run.id, taskId, kind: "dossier", path, summary: "Code Mode output" }).path;

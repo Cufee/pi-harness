@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readSync, realpathSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -150,6 +151,46 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
         target_id: { type: "string", description: "Goal ID (e.g. goal-3) or worker task ID (e.g. t-4)." },
         bypass_quota: { type: "boolean", description: "If true, also force-resume a quota-paused goal/worker despite quota exhaustion (use sparingly!)." },
         reason: { type: "string", description: "Brief justification for bypassing the concurrency or quota limit." },
+      },
+    },
+  },
+  {
+    name: "goal_accept",
+    description:
+      "Explicit Director acceptance/override for a Goal based on verified evidence (e.g. when a review was obstructed or human approved). Requires a clear reason and concrete evidence_paths; recorded permanently in goal review history and auto-resolves open escalations.",
+    inputSchema: {
+      type: "object",
+      required: ["goal_id", "reason", "evidence_paths"],
+      properties: {
+        goal_id: { type: "string" },
+        reason: { type: "string", description: "Explicit rationale for accepting the goal." },
+        evidence_paths: { type: "array", items: { type: "string" }, description: "Concrete file/artifact paths proving completion." },
+      },
+    },
+  },
+  {
+    name: "steer_task",
+    description: "Deliver a live steering message to any running Tier 1/2/3 task across active Goal runs in this workspace.",
+    inputSchema: {
+      type: "object",
+      required: ["task_id", "message"],
+      properties: {
+        task_id: { type: "string" },
+        message: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "write_note",
+    description:
+      "Logged Director note/report writer scoped strictly to `.harness/goals/`, `.harness/notes/`, or configured `extraWriteRoots` (never writes tracked repository source code).",
+    inputSchema: {
+      type: "object",
+      required: ["path", "content", "reason"],
+      properties: {
+        path: { type: "string", description: "Destination file under .harness/goals/, .harness/notes/, or extraWriteRoots." },
+        content: { type: "string", description: "Markdown/text content to write." },
+        reason: { type: "string", description: "Concise logged reason for writing this note." },
       },
     },
   },
@@ -1580,6 +1621,11 @@ export class DirectorRuntime {
             mcpBridgeEntrypoint,
             externalMcpServers: resolveExternalMcpServers(this.config.stateDir, this.config.externalMcpServers),
             extraPathDirs: nativeToolsPathDirs(this.config.stateDir),
+            extraReadRoots: [
+              join(goal.repoRoot, ".harness", "goals"),
+              join(goal.repoRoot, ".harness", "artifacts"),
+              ...(this.config.worktree.extraReadRoots ?? []),
+            ],
             signal: reviewerSignal,
             callbacks: {
               onSessionId: (sid) => {
@@ -1682,6 +1728,7 @@ export class DirectorRuntime {
 
       if (goal.status === "achieved") {
         this.db.updateRunStatus(goal.linkedRunId, "completed");
+        this.autoResolveGoalEscalations(goal.linkedRunId, `Auto-resolved: goal ${goal.id} achieved`);
         void this.drainGoalQueue(goal.repoRoot).catch(() => {});
       } else if (goal.status === "awaiting_human") {
         void this.drainGoalQueue(goal.repoRoot).catch(() => {});
@@ -1728,17 +1775,32 @@ export class DirectorRuntime {
         summary: review.summary,
         ...(circuitBreakerTripped ? { circuitBreakerTripped } : {}),
       };
-      this.chats.appendTurn(
-        goal.chatSessionId,
-        "system_notice",
-        formatChatEventSummary(reviewedEvent),
-        undefined,
-        reviewedEvent,
+      const willWakeDirector = Boolean(
+        opts?.autoTriggered && (goal.status === "achieved" || goal.status === "awaiting_human"),
       );
-      if (opts?.autoTriggered && (goal.status === "achieved" || goal.status === "awaiting_human")) {
-        this.wakeHandler?.(goal.chatSessionId, reviewedEvent);
+      if (willWakeDirector && this.wakeHandler) {
+        // Let the wakeup turn record the single canonical `system_notice` turn so `goal.reviewed` is never delivered twice!
+        this.wakeHandler(goal.chatSessionId, reviewedEvent);
+      } else {
+        this.chats.appendTurn(
+          goal.chatSessionId,
+          "system_notice",
+          formatChatEventSummary(reviewedEvent),
+          undefined,
+          reviewedEvent,
+        );
       }
     }
+  }
+
+  /** Resolves all open/acked escalations on a settled goal's run so stale escalations never linger. */
+  autoResolveGoalEscalations(runId: string | null | undefined, resolution: string): number {
+    if (!runId) return 0;
+    const open = this.db.listEscalations(runId).filter((e) => e.status === "open" || e.status === "acked");
+    for (const esc of open) {
+      this.db.ackEscalation(esc.id, resolution, true);
+    }
+    return open.length;
   }
 
   /** Cancels all active Director turns and in-flight Done-Reviews (used by `/stop`). */
@@ -2128,9 +2190,95 @@ export class DirectorRuntime {
         }
       }
       case "spawn_task":
-      case "cancel_task":
       case "artifact_read":
         return this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, name, args, signal);
+      case "cancel_task": {
+        const targetId = String(args.task_id ?? "").trim();
+        if (!targetId) throw new Error("task_id is required");
+        const targetTask = this.db.getTask(targetId);
+        if (targetTask) {
+          const targetRun = this.db.getRun(targetTask.runId);
+          // Allow cancelling ANY task in this workspace/goal run, not just synthetic Director tasks!
+          if (targetRun && targetRun.repoRoot === repoRoot) {
+            await this.orchestrator.cancelTask(targetTask.id, typeof args.reason === "string" ? args.reason : "Cancelled by Director");
+            return { cancelled: targetTask.id, runId: targetTask.runId };
+          }
+        }
+        return this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, name, args, signal);
+      }
+      case "steer_task": {
+        const targetId = String(args.task_id ?? "").trim();
+        const message = String(args.message ?? "").trim();
+        if (!targetId || !message) throw new Error("task_id and message are required");
+        const targetTask = this.db.getTask(targetId);
+        if (!targetTask) throw new Error(`Unknown task ${targetId}`);
+        const steered = await this.orchestrator.steerTask(targetTask.id, message);
+        return { steered, taskId: targetTask.id, runId: targetTask.runId };
+      }
+      case "goal_accept": {
+        const goalId = String(args.goal_id ?? "").trim();
+        const reason = String(args.reason ?? "").trim();
+        const evidencePaths = Array.isArray(args.evidence_paths)
+          ? (args.evidence_paths as unknown[]).map((p) => String(p).trim()).filter(Boolean)
+          : [];
+        if (!goalId || !reason) throw new Error("goal_accept requires goal_id and reason");
+        if (evidencePaths.length === 0) throw new Error("goal_accept requires non-empty evidence_paths");
+        const goal = this.goals.getGoal(goalId);
+        if (!goal) throw new Error(`Unknown goal ${goalId}`);
+        const evidenceSummary = `Evidence: ${evidencePaths.join(", ")}`;
+        const outcome = this.goals.recordReviewVerdict(goal.id, {
+          verdict: "approved",
+          criteriaResults: goal.criteria.map((c) => ({
+            criterionId: c.id,
+            passed: true,
+            evidence: `[DIRECTOR ACCEPTED] ${reason} (${evidenceSummary})`,
+          })),
+          blockingIssues: [],
+          summary: `[DIRECTOR ACCEPTED OVERRIDE] ${reason} (${evidenceSummary})`,
+          diffHash: `director-accept-${Date.now()}`,
+          spentUsd: this.sumRunCostUsd(goal.linkedRunId),
+        });
+        await this.handlePostReviewTransition(outcome, { autoTriggered: false });
+        return { ...outcome, presentation_id: presentGoal(outcome.goal) };
+      }
+      case "write_note": {
+        const rawPath = String(args.path ?? "").trim();
+        const content = String(args.content ?? "");
+        const reason = String(args.reason ?? "").trim();
+        if (!rawPath || !reason) throw new Error("write_note requires path and reason");
+        const root = realpathSync(repoRoot);
+        const expandRoot = (r: string) => {
+          const t = r.trim();
+          const exp = t === "~" ? homedir() : t.startsWith("~/") ? resolve(homedir(), t.slice(2)) : resolve(t);
+          return existsSync(exp) ? realpathSync(exp) : exp;
+        };
+        const allowedWriteRoots = [
+          join(root, ".harness", "goals"),
+          join(root, ".harness", "notes"),
+          ...(this.config.worktree.extraWriteRoots ?? []).map(expandRoot),
+        ];
+        const expandedTarget = rawPath.startsWith("~/") ? resolve(homedir(), rawPath.slice(2)) : resolve(root, rawPath);
+        const matchedRoot = allowedWriteRoots.find((allowed) => {
+          const rel = relative(allowed, expandedTarget);
+          return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+        });
+        if (!matchedRoot) {
+          throw new Error("write_note path must be inside .harness/goals/, .harness/notes/, or a configured extraWriteRoots directory");
+        }
+        mkdirSync(dirname(expandedTarget), { recursive: true });
+        const realParent = realpathSync(dirname(expandedTarget));
+        const parentRel = relative(existsSync(matchedRoot) ? realpathSync(matchedRoot) : matchedRoot, realParent);
+        if (parentRel === ".." || parentRel.startsWith(`..${sep}`) || isAbsolute(parentRel)) {
+          throw new Error("write_note parent symlink escapes allowed write root");
+        }
+        writeFileSync(expandedTarget, content, "utf8");
+        this.chats.appendTurn(
+          chatSessionId,
+          "system_notice",
+          `Director write_note: ${rawPath} (${Buffer.byteLength(content, "utf8")} bytes). Reason: ${reason}`,
+        );
+        return { written: true, path: expandedTarget, bytes: Buffer.byteLength(content, "utf8") };
+      }
       case "goal_create": {
         const criteria = (Array.isArray(args.criteria) ? args.criteria : []) as Array<
           Omit<GoalCriterion, "id" | "required"> & { id?: string; required?: boolean }
@@ -2392,7 +2540,10 @@ export class DirectorRuntime {
         const gid = String(args.goal_id);
         this.db.admissionQueue.remove("goal", gid);
         const g = this.goals.setStatus(gid, "cancelled", "Cancelled by Director");
-        if (g.linkedRunId) await this.orchestrator.stopRun(g.linkedRunId, "Goal cancelled");
+        if (g.linkedRunId) {
+          await this.orchestrator.stopRun(g.linkedRunId, "Goal cancelled");
+          this.autoResolveGoalEscalations(g.linkedRunId, `Auto-resolved: goal ${g.id} cancelled`);
+        }
         void this.drainGoalQueue(g.repoRoot).catch(() => {});
         return { ...g, presentation_id: presentGoal(g) };
       }
@@ -2400,12 +2551,35 @@ export class DirectorRuntime {
       case "read_file": {
         const reason = typeof args.exception_reason === "string" ? args.exception_reason.trim() : "";
         if (!reason) throw new Error("read_file requires exception_reason");
+        const rawPath = String(args.path ?? "").trim();
         const root = realpathSync(repoRoot);
-        const target = realpathSync(resolve(root, String(args.path)));
-        const path = relative(root, target);
-        if (path === ".." || path.startsWith(`..${sep}`) || isAbsolute(path) ||
-            path.split(sep).some(part => [".git", ".harness"].includes(part.toLowerCase()))) {
-          throw new Error("File outside the permitted workspace");
+        const expandRoot = (r: string) => {
+          const t = r.trim();
+          const exp = t === "~" ? homedir() : t.startsWith("~/") ? resolve(homedir(), t.slice(2)) : resolve(t);
+          return existsSync(exp) ? realpathSync(exp) : exp;
+        };
+        const candidate = rawPath.startsWith("~/") ? resolve(homedir(), rawPath.slice(2)) : resolve(root, rawPath);
+        const target = realpathSync(candidate);
+        const extraReadRoots = (this.config.worktree.extraReadRoots ?? []).map(expandRoot);
+        const relToRepo = relative(root, target);
+        const inRepo = relToRepo !== ".." && !relToRepo.startsWith(`..${sep}`) && !isAbsolute(relToRepo);
+        const path = inRepo ? relToRepo : target;
+        const inExtraRoot = extraReadRoots.some((r) => {
+          const rel = relative(r, target);
+          return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+        });
+        if (!inRepo && !inExtraRoot) {
+          throw new Error("File outside the permitted workspace or extraReadRoots");
+        }
+        if (inRepo) {
+          const parts = relToRepo.split(sep).map((p) => p.toLowerCase());
+          // Block .git and .harness/worktrees, while permitting .harness/goals, .harness/artifacts, and .harness/notes!
+          if (parts.includes(".git")) {
+            throw new Error("File outside the permitted workspace");
+          }
+          if (parts[0] === ".harness" && !["artifacts", "goals", "notes"].includes(parts[1] ?? "")) {
+            throw new Error("File outside the permitted workspace");
+          }
         }
         const fd = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
         try {

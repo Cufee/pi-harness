@@ -229,32 +229,10 @@ export class HarnessDaemon {
   private scheduleDirectorWakeup(chatSessionId: string, event: ChatControlEvent): void {
     const activeTurn = this.chatTurns.get(chatSessionId);
     if (activeTurn) {
-      const summary = formatChatEventSummary(event);
-      void this.director
-        .steerChat(chatSessionId, summary, { role: "system_notice", event })
-        .then((accepted) => {
-          if (accepted) {
-            if (event.kind === "session.message_received") {
-              this.db.sessionMessages.markWakeStatus(event.messageId, "done");
-            }
-            this.sendChatEvent(chatSessionId, activeTurn.id, "chat.steered", {
-              message: summary,
-              role: "system_notice",
-              event,
-            });
-          } else {
-            const q = this.pendingWakeups.get(chatSessionId) ?? [];
-            q.push(event);
-            this.pendingWakeups.set(chatSessionId, q);
-            this.drainPendingWakeup(chatSessionId);
-          }
-        })
-        .catch(() => {
-          const q = this.pendingWakeups.get(chatSessionId) ?? [];
-          q.push(event);
-          this.pendingWakeups.set(chatSessionId, q);
-          this.drainPendingWakeup(chatSessionId);
-        });
+      // Queue background goal/timer/peer events until the active Director turn finishes instead of interrupting mid-turn!
+      const q = this.pendingWakeups.get(chatSessionId) ?? [];
+      q.push(event);
+      this.pendingWakeups.set(chatSessionId, q);
       return;
     }
     void this.runDirectorWakeupTurn(chatSessionId, event);
@@ -406,8 +384,9 @@ export class HarnessDaemon {
       let parsed: Record<string, unknown>;
       try {
         parsed = JSON.parse(raw) as Record<string, unknown>;
-      } catch {
-        return; // Ignore transient partial writes while editor saves
+      } catch (err) {
+        console.error(`[harnessd] Ignored invalid config.json at ${cfgFile} (keeping previous settings): ${err instanceof Error ? err.message : String(err)}`);
+        return; // Reject invalid file and keep old settings cleanly
       }
       this.lastConfigRaw = raw;
       const prevProfiles = JSON.stringify(this.config.profiles);
@@ -443,6 +422,9 @@ export class HarnessDaemon {
       };
       const profilesChanged = JSON.stringify(next.profiles) !== prevProfiles;
       this.applyConfigMutation(next, { profilesChanged, skipSave: true });
+      console.error(
+        `[harnessd] Live-reloaded ${cfgFile} (maxConcurrentGoals=${next.goals.maxConcurrentGoals ?? 4}, maxConcurrentWorkers=${next.worktree.maxConcurrentWorkers ?? 4}, reviewerMaxTurns=${next.rollover.reviewerMaxTurns})`,
+      );
     };
 
     try {
@@ -1738,6 +1720,14 @@ export class HarnessDaemon {
           hostName: this.peers.localHostName,
           uptimeMs: Date.now() - this.startedAt,
           socketPath: this.config.socketPath,
+          configPath: join(this.config.stateDir, "config.json"),
+          effectiveLimits: {
+            maxConcurrentGoals: this.config.goals.maxConcurrentGoals ?? 4,
+            maxConcurrentWorkers: this.config.worktree.maxConcurrentWorkers ?? 4,
+            reviewerMaxTurns: this.config.rollover.reviewerMaxTurns,
+            extraReadRoots: this.config.worktree.extraReadRoots ?? [],
+            extraWriteRoots: this.config.worktree.extraWriteRoots ?? [],
+          },
           hasLibghosttyVt: this.ptyHost.hasLibghosttyVt,
           runs: this.db.listRuns(20),
           goals: this.director.goals.listGoals(),
@@ -2406,7 +2396,10 @@ export class HarnessDaemon {
         const gid = String(p.goalId);
         this.db.admissionQueue.remove("goal", gid);
         const g = this.director.goals.setStatus(gid, "cancelled", "Cancelled by user");
-        if (g.linkedRunId) await this.orchestrator.stopRun(g.linkedRunId, "Goal cancelled");
+        if (g.linkedRunId) {
+          await this.orchestrator.stopRun(g.linkedRunId, "Goal cancelled");
+          this.director.autoResolveGoalEscalations(g.linkedRunId, `Auto-resolved: goal ${g.id} cancelled`);
+        }
         void this.director.drainGoalQueue(g.repoRoot).catch(() => {});
         return g;
       }

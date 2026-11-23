@@ -356,7 +356,35 @@ export function isSafeReadOnlyShellCommand(rawCommand: string): boolean {
       if (!sub) return false;
       const subArgs = args.slice(g + 1);
       if (READ_ONLY_GIT_SUBCOMMANDS.has(sub)) {
-        if (sub === "diff" && subArgs.some((a) => a === "--output" || a.startsWith("--output="))) return false;
+        // Hardening: block command-executing / file-writing git subcommand options (including attached/clustered short flags)
+        if (sub === "diff" || sub === "log" || sub === "show") {
+          if (
+            subArgs.some(
+              (a) =>
+                a === "--output" ||
+                a.startsWith("--output=") ||
+                a === "--ext-diff" ||
+                a.startsWith("--ext-diff=") ||
+                a === "--textconv",
+            )
+          ) {
+            return false;
+          }
+        }
+        if (sub === "grep") {
+          if (
+            subArgs.some(
+              (a) =>
+                a === "-O" ||
+                a.startsWith("-O") ||
+                a === "--open-files-in-pager" ||
+                a.startsWith("--open-files-in-pager=") ||
+                (/^-[a-zA-Z]*O/.test(a)),
+            )
+          ) {
+            return false;
+          }
+        }
         continue;
       }
       if (sub === "branch") {
@@ -377,10 +405,6 @@ export function isSafeReadOnlyShellCommand(rawCommand: string): boolean {
       }
       if (sub === "remote") {
         if (subArgs.length === 0 || subArgs[0] === "-v" || subArgs[0] === "show" || subArgs[0] === "get-url") continue;
-        return false;
-      }
-      if (sub === "config") {
-        if (subArgs.some((a) => a === "--get" || a === "--get-all" || a === "--list" || a === "-l")) continue;
         return false;
       }
       return false;

@@ -165,4 +165,8 @@ ln -sf pi-harness "$BIN_DIR/harness"
 
 log "installed release $ID with Bun $BUN_VERSION ($target)"
 log "launcher: $BIN_DIR/pi-harness"
+# Audit trail of release activations (who, when, commit/source, release ID)
+AUDIT_LOG="$HOME_DIR/install-audit.log"
+mkdir -p "$HOME_DIR"
+printf '%s user=%s pid=%s release=%s src=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${USER:-unknown}" "$$" "$ID" "${SRC:-unknown}" >> "$AUDIT_LOG" 2>/dev/null || true
 case ":$PATH:" in *":$BIN_DIR:"*) ;; *) log "add $BIN_DIR to PATH to run pi-harness by name" ;; esac

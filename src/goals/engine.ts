@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { delimiter, dirname, join, resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { GoalsConfig } from "../config.js";
 import { friendlyIdCandidates, nextFriendlyId } from "../control-plane/ids.js";
@@ -15,6 +16,22 @@ function canonicalRepoPath(p: string): string {
   }
 }
 
+function buildGateEnv(): NodeJS.ProcessEnv {
+  const home = homedir();
+  const candidates = [
+    join(home, ".local", "share", "mise", "shims"),
+    join(home, ".mise", "shims"),
+    join(home, ".local", "bin"),
+    dirname(process.execPath),
+    "/opt/homebrew/bin",
+  ];
+  const existing = (process.env.PATH ?? "").split(delimiter).filter(Boolean);
+  const existingSet = new Set(existing);
+  const prepend = candidates.filter((dir) => dir && !existingSet.has(dir) && existsSync(dir));
+  if (prepend.length === 0) return process.env;
+  return { ...process.env, PATH: [...prepend, ...existing].join(delimiter) };
+}
+
 async function runGate(
   command: string,
   cwd: string,
@@ -22,7 +39,7 @@ async function runGate(
   timeoutMs = 180_000,
 ): Promise<{ stdout: string; stderr: string }> {
   signal?.throwIfAborted();
-  const child = spawn("/bin/sh", ["-lc", command], { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn("/bin/sh", ["-lc", command], { cwd, env: buildGateEnv(), detached: true, stdio: ["ignore", "pipe", "pipe"] });
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
   let stopped: Error | undefined;
@@ -357,6 +374,13 @@ export class GoalEngine {
       command: c.command,
       required: c.required !== false,
     }));
+    for (const c of criteria) {
+      if (c.kind === "deterministic" && !c.command?.trim()) {
+        throw new Error(
+          `Deterministic criterion '${c.id}' requires a non-empty shell 'command' (or use kind 'behavioral'/'architectural').`,
+        );
+      }
+    }
     const nonGoals = input.nonGoals ?? [];
     const budgets: GoalBudgets = {
       maxReviewCycles: input.budgets?.maxReviewCycles ?? this.cfg.defaultMaxReviewCycles,
@@ -480,7 +504,7 @@ export class GoalEngine {
       description?: string;
       addCriteria?: Array<Omit<GoalCriterion, "id" | "required"> & { id?: string; required?: boolean }>;
       removeCriteriaIds?: string[];
-      updateCriteria?: GoalCriterion[];
+      updateCriteria?: Array<Partial<GoalCriterion> & { id: string }>;
       nonGoals?: string[];
       rationale: string;
     },
@@ -496,8 +520,17 @@ export class GoalEngine {
     for (const upd of patch.updateCriteria ?? []) {
       const idx = nextCriteria.findIndex((c) => c.id === upd.id);
       if (idx >= 0) {
-        nextCriteria[idx] = upd;
-        modifiedCriteria.push(upd);
+        const existing = nextCriteria[idx]!;
+        // Partial merge: omitted fields preserve existing values so updating `command` never wipes `kind`/`description`/`required`!
+        const merged: GoalCriterion = {
+          id: existing.id,
+          description: upd.description !== undefined ? upd.description : existing.description,
+          kind: upd.kind !== undefined ? upd.kind : existing.kind,
+          command: upd.command !== undefined ? upd.command : existing.command,
+          required: upd.required !== undefined ? upd.required : existing.required,
+        };
+        nextCriteria[idx] = merged;
+        modifiedCriteria.push(merged);
       }
     }
 
@@ -512,6 +545,13 @@ export class GoalEngine {
 
     if (nextCriteria.length === 0) {
       throw new Error("Goal amendment cannot remove all acceptance criteria");
+    }
+    for (const c of nextCriteria) {
+      if (c.kind === "deterministic" && !c.command?.trim()) {
+        throw new Error(
+          `Deterministic criterion '${c.id}' requires a non-empty shell 'command' (or change kind to 'behavioral'/'architectural').`,
+        );
+      }
     }
 
     const nextVersion = cur.version + 1;

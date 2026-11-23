@@ -129,7 +129,14 @@ export class WorktreeManager {
       const run = this.db.getRun(w.runId);
       if (run && canonicalPath(run.repoRoot) !== repoCanon) return false;
       const ownerTask = this.db.getTask(w.taskId);
-      if (ownerTask && (ownerTask.status === "failed" || ownerTask.status === "cancelled" || ownerTask.status === "completed")) {
+      if (
+        ownerTask &&
+        (ownerTask.status === "failed" ||
+          ownerTask.status === "cancelled" ||
+          ownerTask.status === "completed" ||
+          ownerTask.status === "blocked" ||
+          ownerTask.status === "returned_for_rescope")
+      ) {
         return false;
       }
       return existsSync(w.path);

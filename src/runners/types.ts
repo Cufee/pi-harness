@@ -123,6 +123,10 @@ export interface RunAgentRequest {
   externalMcpServers?: ExternalMcpServerConfig[];
   /** Extra directories prepended to PATH for shell-enabled ACP agents (bundled ast-grep / octofs). */
   extraPathDirs?: string[];
+  /** Additional allowed read-only directories outside `cwd` (e.g. main `.harness/goals`, `.harness/artifacts`, `extraReadRoots`). */
+  extraReadRoots?: string[];
+  /** Additional allowed writable directories outside `cwd` (e.g. main `.harness/goals`, `extraWriteRoots`). */
+  extraWriteRoots?: string[];
   /** Permit shell execution (`Bash`/`shell_command`/`execute`) in `read_only_workspace` (used for verify/Done-Review in isolated checkouts). */
   allowShellInReadOnly?: boolean;
   signal: AbortSignal;

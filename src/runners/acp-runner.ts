@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, realpath, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { client, ndJsonStream, PROTOCOL_VERSION, type AgentApp, type ClientConnection } from "@agentclientprotocol/sdk/unstable";
@@ -166,8 +167,42 @@ async function workspaceTarget(root: string, requested: string, allowNew: boolea
   return { path, exists: false };
 }
 
-async function openWorkspaceFile(root: string, requested: string, write: boolean) {
-  const { path: target, exists } = await workspaceTarget(root, requested, write);
+async function resolveExtraRoots(rawRoots: string[] | undefined): Promise<string[]> {
+  if (!rawRoots?.length) return [];
+  const out: string[] = [];
+  for (const raw of rawRoots) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    const expanded = trimmed === "~" ? homedir() : trimmed.startsWith("~/") ? resolve(homedir(), trimmed.slice(2)) : resolve(trimmed);
+    try {
+      out.push(await realpath(expanded));
+    } catch {
+      out.push(expanded);
+    }
+  }
+  return out;
+}
+
+async function resolveAllowedTarget(
+  primaryRoot: string,
+  extraRoots: string[],
+  requested: string,
+  allowNew: boolean,
+): Promise<{ path: string; exists: boolean; root: string }> {
+  let firstErr: unknown;
+  for (const root of [primaryRoot, ...extraRoots]) {
+    try {
+      const target = await workspaceTarget(root, requested, allowNew);
+      return { ...target, root };
+    } catch (err) {
+      if (!firstErr) firstErr = err;
+    }
+  }
+  throw firstErr ?? new Error("ACP filesystem path is outside allowed roots");
+}
+
+async function openWorkspaceFile(primaryRoot: string, extraRoots: string[], requested: string, write: boolean) {
+  const { path: target, exists, root } = await resolveAllowedTarget(primaryRoot, extraRoots, requested, write);
   if (write && !exists) {
     await mkdir(dirname(target), { recursive: true });
     const actualParent = await realpath(dirname(target));
@@ -239,6 +274,8 @@ export class AcpRunner {
       throw new Error(`Model ${req.model} is unavailable on ACP profile ${this.profile.id}`);
     }
     const workspace = await realpath(req.cwd);
+    const extraWriteRoots = await resolveExtraRoots(req.extraWriteRoots);
+    const extraReadRoots = await resolveExtraRoots([...(req.extraReadRoots ?? []), ...(req.extraWriteRoots ?? [])]);
     const controlOnly = req.toolPolicy === "control_plane_only";
     const canWrite = req.toolPolicy === "read_write_workspace";
     const allowShell = canWrite || (req.toolPolicy === "read_only_workspace" && Boolean(req.allowShellInReadOnly));
@@ -878,7 +915,7 @@ export class AcpRunner {
               ? (rawPath.split(/[*?[]/)[0]?.replace(/\/+$/, "") || ".")
               : rawPath;
             try {
-              await workspaceTarget(workspace, cleaned, true);
+              await resolveAllowedTarget(workspace, extraReadRoots, cleaned, true);
             } catch {
               return false;
             }
@@ -924,7 +961,7 @@ export class AcpRunner {
             try {
               const locations = p.toolCall?.locations ?? [];
               for (const location of locations) {
-                await workspaceTarget(workspace, location.path, toolKind === "edit" || toolKind === "move");
+                await resolveAllowedTarget(workspace, extraWriteRoots, location.path, toolKind === "edit" || toolKind === "move");
               }
               workspaceCall = locations.length > 0;
             } catch {
@@ -967,7 +1004,7 @@ export class AcpRunner {
           throw new Error(`Read denied: agent is running in ${policyModeDesc} mode`);
         }
         const p = params as unknown as { path: string; line?: number; limit?: number };
-        const file = await openWorkspaceFile(workspace, p.path, false);
+        const file = await openWorkspaceFile(workspace, extraReadRoots, p.path, false);
         let raw: string;
         try {
           raw = await file.readFile("utf8");
@@ -995,7 +1032,7 @@ export class AcpRunner {
           throw new Error(`Write denied: agent is running in ${policyModeDesc} mode`);
         }
         const p = params as unknown as { path: string; content: string };
-        const file = await openWorkspaceFile(workspace, p.path, true);
+        const file = await openWorkspaceFile(workspace, extraWriteRoots, p.path, true);
         try {
           await file.truncate(0);
           await file.writeFile(p.content, "utf8");

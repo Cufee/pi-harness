@@ -66,6 +66,10 @@ export interface WorktreeConfig {
   archiveRetentionDays?: number;
   /** Max concurrent active Tier 2 worker worktrees (default 4) */
   maxConcurrentWorkers?: number;
+  /** Additional host directories readable by read-only agents, reviewers, and workers (e.g. `~/vanolyze-work`). */
+  extraReadRoots?: string[];
+  /** Additional host directories writable by workers and Director notes (e.g. `~/vanolyze-work`). */
+  extraWriteRoots?: string[];
 }
 
 export interface GoalsConfig {
@@ -273,7 +277,7 @@ export function loadConfig(repoRoot?: string): HarnessConfig {
     orchestratorMaxTurns: 200,
     workerMaxTurns: 120,
     taskMaxTurns: 40,
-    reviewerMaxTurns: 12,
+    reviewerMaxTurns: 30,
     externalizeBytes: 2048,
     maxGenerations: 12,
     ...(globalCfg.rollover as Partial<RolloverConfig> | undefined),

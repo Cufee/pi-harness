@@ -323,6 +323,15 @@ export class HarnessOrchestrator {
       const hasQuotaPaused = updatedTasks.some((t) => t.status === "paused_quota");
       if (!hasQuotaPaused) {
         this.db.releaseWriteLeasesForRun(run.id);
+      } else {
+        // Even when a sibling task is cleanly quota-paused, ALWAYS release leases owned by dead/terminal tasks!
+        this.db.db
+          .prepare(
+            `UPDATE write_leases SET active = 0
+             WHERE run_id = ? AND active = 1
+               AND task_id IN (SELECT id FROM tasks WHERE run_id = ? AND status IN ('failed','cancelled','completed'))`,
+          )
+          .run(run.id, run.id);
       }
 
       if (mutated || run.status === "active") {
@@ -998,10 +1007,19 @@ export class HarnessOrchestrator {
       return this.resumeRunFromQuota(run.id, opts);
     }
 
-    const RESUMABLE = new Set(["failed", "cancelled", "blocked", "returned_for_rescope"]);
-    const candidates = tasks.filter(
-      (t) => t.profileId !== "director" && RESUMABLE.has(t.status) && !this.active.has(t.id),
-    );
+    // NEVER revive `cancelled` or `completed` tasks on `resumeRun`!
+    // Resume the Tier 1 orchestrator (if failed/blocked/returned) plus any workers specifically interrupted by a daemon restart;
+    // Tier 1 then inspects the task tree and decides whether to resume any older failed workers.
+    const orch = tasks.find((t) => t.tier === 1 && t.profileId !== "director");
+    const RESUMABLE_ORCH = new Set(["failed", "blocked", "returned_for_rescope"]);
+    const candidates = tasks.filter((t) => {
+      if (t.profileId === "director" || this.active.has(t.id)) return false;
+      if (t.status === "cancelled" || t.status === "completed") return false;
+      if (orch && t.id === orch.id && RESUMABLE_ORCH.has(t.status)) return true;
+      if (t.status === "failed" && t.summary === "Interrupted by daemon restart") return true;
+      if (!orch && RESUMABLE_ORCH.has(t.status)) return true;
+      return false;
+    });
     if (candidates.length === 0) {
       return { resumed: false, resumedTaskIds: [], run: this.getEffectiveRun(run.id) ?? run };
     }
@@ -1157,6 +1175,15 @@ export class HarnessOrchestrator {
         mcpBridgeEntrypoint,
         externalMcpServers: resolveExternalMcpServers(this.config.stateDir, this.config.externalMcpServers),
         extraPathDirs: nativeToolsPathDirs(this.config.stateDir),
+        extraReadRoots: [
+          join(run.repoRoot, ".harness", "goals"),
+          join(run.repoRoot, ".harness", "artifacts"),
+          ...(this.config.worktree.extraReadRoots ?? []),
+        ],
+        extraWriteRoots: [
+          join(run.repoRoot, ".harness", "goals"),
+          ...(this.config.worktree.extraWriteRoots ?? []),
+        ],
         allowShellInReadOnly: task.kind === "verify",
         signal: exec.generationSignal,
         onHandle: (h) => {
