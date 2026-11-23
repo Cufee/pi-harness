@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import type { HarnessConfig, RunnerProfileConfig } from "../config.js";
 import type { ModelCatalogCompiler } from "../catalog/compiler.js";
 import type { QuotaClient } from "../quota/client.js";
@@ -16,9 +16,11 @@ import { invalidateGateEnvCache, type GateRuntimeConfig } from "../tools/gate-en
 import { nativeToolsPathDirs, resolveExternalMcpServers } from "../tools/native-tools.js";
 import { canonicalPath, runGit, WorktreeConcurrencyLimitError, WorktreeManager } from "../worktree/manager.js";
 import type { QueuePositionInput } from "./admission-queue.js";
-import type { AgentTier, ControlPlaneDb, RunRecord, TaskKind, TaskRecord } from "./db.js";
-import { buildHydrationTurn, buildImmutableSystemPrompt, type AnchoredHandoff } from "./prompts.js";
+import { WriteScopeConflictError, type AgentTier, type ControlPlaneDb, type RunRecord, type TaskKind, type TaskRecord, type WorktreeRecord } from "./db.js";
+import { buildHydrationTurn, buildImmutableSystemPrompt, buildMissingReturnWrapUpPrompt, type AnchoredHandoff } from "./prompts.js";
+import { spillSummaryOverflow, writeTaskDossier } from "./dossiers.js";
 import { ControlPlaneToolExecutor, compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./tools.js";
+import { SUMMARY_LIMIT } from "./handoffs.js";
 import { directorTaskRunId, directorTaskRunOwner, isDirectorTaskContainer } from "./ids.js";
 import { canonicalProjectPath } from "./projects.js";
 import { ensureGoalEvidenceDir, goalEvidenceDir } from "../goals/engine.js";
@@ -125,7 +127,7 @@ export function deriveRunStatus(
     if (realOrch.status === "failed") return "failed";
     if (realOrch.status === "cancelled") return "stopped";
     // A blocked coordinator never settled its work: report failed (there is no blocked run status), never completed.
-    if (realOrch.status === "blocked") return "failed";
+    if (realOrch.status === "blocked" || realOrch.status === "returned_for_rescope") return "failed";
     if (realOrch.status === "completed") {
       // Do not falsely declare a run completed if non-orchestrator workers are blocked with unresolved work
       const realChildren = tasks.filter((t) => t.id !== realOrch.id && t.profileId !== "director");
@@ -139,6 +141,23 @@ export function deriveRunStatus(
   if (realTasks.some((t) => t.status === "failed")) return "failed";
   if (realTasks.every((t) => t.status === "cancelled")) return "stopped";
   return "completed";
+}
+
+/**
+ * Machine cause for a derived run status: a run that derives "failed" while no real task failed is blocked on an
+ * escalation (blocked or returned-for-rescope tasks), which is recoverable rather than a failure.
+ */
+export function deriveRunCause(
+  tasks: TaskRecord[],
+  derived: RunRecord["status"],
+): { cause: "blocked_escalation"; reason: string } | null {
+  if (derived !== "failed") return null;
+  const real = tasks.filter((t) => t.profileId !== "director");
+  if (real.some((t) => t.status === "failed")) return null;
+  const blocked = real.filter((t) => t.status === "blocked" || t.status === "returned_for_rescope");
+  if (blocked.length === 0) return null;
+  const summaries = blocked.map((t) => `${t.id} ${t.status}: ${(t.summary ?? t.title).replace(/\s+/g, " ").slice(0, 160)}`);
+  return { cause: "blocked_escalation", reason: `Blocked: ${summaries.join("; ")}`.slice(0, 600) };
 }
 
 /**
@@ -189,6 +208,10 @@ export interface ResumeRunResult {
   failed?: Array<{ taskId: string; error: string }>;
   /** Set when this caller passed a note: whether it reached the run's orchestrator. */
   noteDelivered?: boolean;
+  /** True when the run was already running (outcome "already_active"). */
+  alreadyRunning?: boolean;
+  /** Machine-readable reason for a resume that restarted nothing. */
+  reason?: "already_running" | "no_resumable_tasks" | "blocked_on_escalation" | "already_completed";
 }
 
 export class HarnessOrchestrator {
@@ -223,6 +246,11 @@ export class HarnessOrchestrator {
   private resumingRuns = new Map<string, { key: string; promise: Promise<ResumeRunResult>; note?: string }>();
   /** Per-task worktree allocation/teardown chain, so cancel, resume and allocation never interleave. */
   private worktreeOps = new Map<string, Promise<void>>();
+  /** Worktree teardowns started by cancelTask, removed by identity when they settle. */
+  private taskTeardowns = new Map<string, Promise<void>>();
+  /** Deferred activations waiting for a write lease, keyed by canonical repo root. */
+  private leaseWaitQueue = new Map<string, Set<() => void>>();
+  private unsubLeaseEvents: () => void;
   readonly toolExecutor: ControlPlaneToolExecutor;
 
   constructor(
@@ -266,6 +294,17 @@ export class HarnessOrchestrator {
       resumeTaskDetailed: (taskId, opts) => this.resumeTaskDetailed(taskId, opts),
       forceStartWorker: (taskId, opts) => this.forceStartWorker(taskId, opts),
     }, config);
+    // Wakes deferred activations waiting on a write lease whenever a holder can no longer write.
+    this.unsubLeaseEvents = db.onEvent((ev) => {
+      if (this.leaseWaitQueue.size === 0) return;
+      const p = ev.payload as { to?: string; status?: string } | null;
+      const released =
+        (ev.type === "task.status" && ["completed", "failed", "cancelled", "returned_for_rescope", "blocked"].includes(p?.to ?? "")) ||
+        (ev.type === "run.status" && ["completed", "failed", "stopped"].includes(p?.status ?? ""));
+      if (!released) return;
+      const run = this.db.getRun(ev.runId);
+      if (run) this.onWriteLeaseReleased(run.repoRoot);
+    });
   }
 
   /** Applies live configuration updates across all cached WorktreeManagers & MergeQueues and wakes queued workers immediately. */
@@ -340,6 +379,8 @@ export class HarnessOrchestrator {
     this.taskQuotaHints.clear();
     this.taskResumeNotes.clear();
     this.pendingRollovers.clear();
+    this.unsubLeaseEvents();
+    for (const key of [...this.leaseWaitQueue.keys()]) this.onWriteLeaseReleased(key);
   }
 
   private clearRunQuotaTimers(runId: string): void {
@@ -418,6 +459,69 @@ export class HarnessOrchestrator {
     }
   }
 
+  /**
+   * Bounded wait for cancelled runners and cancel-started worktree teardowns of these tasks. A cancelled entry still
+   * registered after `timeoutMs` is evicted (its loop writes nothing after an abort, and its finally is
+   * identity-guarded) and reported as task.cancel_unwind_timeout.
+   */
+  private async awaitCancelUnwind(taskIds: string[], timeoutMs = 15_000): Promise<void> {
+    await Promise.all(
+      taskIds.map(async (id) => {
+        const entry = this.active.get(id);
+        const aborted = entry?.abort.signal.aborted ? entry : undefined;
+        const teardown = this.taskTeardowns.get(id);
+        if (!aborted && !teardown) return;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timedOut = await Promise.race([
+          Promise.allSettled([aborted?.promise, teardown].filter(Boolean)).then(() => false),
+          new Promise<boolean>((resolveTimeout) => {
+            timer = setTimeout(() => resolveTimeout(true), timeoutMs);
+            timer.unref?.();
+          }),
+        ]);
+        clearTimeout(timer);
+        if (timedOut && aborted && this.active.get(id) === aborted) {
+          this.active.delete(id);
+          this.pendingRollovers.delete(id);
+          const task = this.db.getTask(id);
+          if (task) this.db.emitEvent(task.runId, id, "task.cancel_unwind_timeout", { taskId: id });
+        }
+      }),
+    );
+  }
+
+  /** Resolves when a write lease in `repoRoot` is released, on abort, or after a 15 s safety interval. */
+  private waitForWriteLease(repoRoot: string, signal: AbortSignal): Promise<void> {
+    if (signal.aborted) return Promise.resolve();
+    const key = canonicalPath(repoRoot);
+    return new Promise<void>((resolveWait) => {
+      let waiters = this.leaseWaitQueue.get(key);
+      if (!waiters) {
+        waiters = new Set();
+        this.leaseWaitQueue.set(key, waiters);
+      }
+      const finish = () => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", finish);
+        const set = this.leaseWaitQueue.get(key);
+        set?.delete(finish);
+        if (set && set.size === 0) this.leaseWaitQueue.delete(key);
+        resolveWait();
+      };
+      waiters.add(finish);
+      const timer = setTimeout(finish, 15_000);
+      timer.unref?.();
+      signal.addEventListener("abort", finish, { once: true });
+    });
+  }
+
+  /** Wakes every activation waiting for a write lease in `repoRoot`; each retries its all-or-nothing reacquire. */
+  private onWriteLeaseReleased(repoRoot: string): void {
+    const waiters = this.leaseWaitQueue.get(canonicalPath(repoRoot));
+    if (!waiters) return;
+    for (const wake of [...waiters]) wake();
+  }
+
   /** True while a runner for this task is live and not cancelled. */
   private isLiveExecution(taskId: string): boolean {
     const exec = this.active.get(taskId);
@@ -465,14 +569,15 @@ export class HarnessOrchestrator {
   }
 
   /** Recomputes and persists the dynamic status for a single run based on live tasks + SQLite state. */
-  reconcileRunStatus(runId: string): RunRecord | null {
+  reconcileRunStatus(runId: string, failedCause?: { reason: string; cause: string }): RunRecord | null {
     const run = this.db.getRun(runId);
     if (!run) return null;
     const tasks = this.db.listTasks(runId);
     const live = this.isRunActiveInMemory(runId);
     const derived = deriveRunStatus(run, tasks, live);
     if (derived !== run.status) {
-      this.db.updateRunStatus(runId, derived);
+      const why = (derived === "failed" ? failedCause : undefined) ?? deriveRunCause(tasks, derived);
+      this.db.updateRunStatus(runId, derived, why?.reason, why?.cause);
       return this.db.getRun(runId);
     }
     return run;
@@ -486,7 +591,8 @@ export class HarnessOrchestrator {
     const live = this.isRunActiveInMemory(runId);
     const derived = deriveRunStatus(run, tasks, live);
     if (derived !== run.status && tasks.length > 0) {
-      this.db.updateRunStatus(runId, derived);
+      const why = deriveRunCause(tasks, derived);
+      this.db.updateRunStatus(runId, derived, why?.reason, why?.cause);
       return this.db.getRun(runId);
     }
     return derived === run.status ? run : { ...run, status: derived };
@@ -503,10 +609,12 @@ export class HarnessOrchestrator {
     for (const run of runs) {
       const tasks = this.db.listTasks(run.id);
       let mutated = false;
+      let interrupted = false;
       for (const t of tasks) {
         if (LIVE_TASK_STATUSES.has(t.status) || t.status === "ready" || t.status === "pending") {
           this.db.updateTask(t.id, { status: "failed", summary: "Interrupted by daemon restart" });
           mutated = true;
+          interrupted = true;
         }
       }
       const failedMerges = this.db.failStaleMergesForRun(run.id, "Interrupted by daemon restart");
@@ -528,7 +636,11 @@ export class HarnessOrchestrator {
       }
 
       if (mutated || run.status === "active") {
-        this.reconcileRunStatus(run.id);
+        // Statuses stay "failed"; the cause tells consumers the run was interrupted and resumes in place.
+        this.reconcileRunStatus(
+          run.id,
+          interrupted ? { reason: "Interrupted by daemon restart; resume continues it in place", cause: "daemon_restart" } : undefined,
+        );
       }
       if (hasQuotaPaused || run.status === "paused_quota") {
         void this.checkRunQuotaQuiescence(run.id).catch(() => {});
@@ -881,34 +993,40 @@ export class HarnessOrchestrator {
       this.db.updateTask(taskId, { status: "failed", summary: `Task launch failed: ${String(err instanceof Error ? err.message : err).slice(0, 240)}` });
       this.db.emitEvent(task.runId, taskId, "agent.error", { error: String(err) });
     }).finally(() => {
-      this.pendingRollovers.delete(taskId);
-      this.active.delete(taskId);
-      // Kick any newly unblocked dependent tasks in the same run
-      const t = this.db.getTask(taskId);
-      if (t) {
-        // A stopped (or stopping) run never relaunches its ready tasks: that would overwrite the stop with "active".
-        const runHalted =
-          !isDirectorTaskContainer(t.runId) && (this.stoppingRuns.has(t.runId) || this.db.getRun(t.runId)?.status === "stopped");
-        const readyTasks = runHalted ? [] : this.db.listTasks(t.runId, { status: "ready" });
-        let launchedAny = false;
-        for (const rt of readyTasks) {
-          if (!this.active.has(rt.id)) {
-            this.launchTaskLoop(rt.id);
-            launchedAny = true;
-          }
-        }
-        // Quiescence barrier: once ALL active tasks in this run have exited, either arm quota pause
-        // OR dynamically reconcile the run's true terminal status!
-        if (!launchedAny && !this.isRunActiveInMemory(t.runId)) {
-          const paused = this.db.listTasks(t.runId).some((x) => x.status === "paused_quota");
-          if (paused) {
-            void this.checkRunQuotaQuiescence(t.runId).catch(() => {});
-          } else {
-            this.reconcileRunStatus(t.runId);
-          }
-        }
+      // An entry evicted after a cancel-unwind timeout must never remove the newer generation's entry.
+      if (this.active.get(taskId) === entry) {
+        this.active.delete(taskId);
+        this.pendingRollovers.delete(taskId);
       }
+      const t = this.db.getTask(taskId);
+      if (t) this.afterTaskInactiveInRun(t.runId);
     });
+  }
+
+  /**
+   * After a task of `runId` stops being live: launches newly ready tasks (never in a stopped or stopping run, which
+   * would overwrite the stop with "active"), and once nothing in the run is live arms the quota pause or reconciles
+   * the run's terminal status.
+   */
+  private afterTaskInactiveInRun(runId: string): void {
+    const runHalted =
+      !isDirectorTaskContainer(runId) && (this.stoppingRuns.has(runId) || this.db.getRun(runId)?.status === "stopped");
+    const readyTasks = runHalted ? [] : this.db.listTasks(runId, { status: "ready" });
+    let launchedAny = false;
+    for (const rt of readyTasks) {
+      if (!this.active.has(rt.id)) {
+        this.launchTaskLoop(rt.id);
+        launchedAny = true;
+      }
+    }
+    if (!launchedAny && !this.isRunActiveInMemory(runId)) {
+      const paused = this.db.listTasks(runId).some((x) => x.status === "paused_quota");
+      if (paused) {
+        void this.checkRunQuotaQuiescence(runId).catch(() => {});
+      } else {
+        this.reconcileRunStatus(runId);
+      }
+    }
   }
 
   /**
@@ -1281,6 +1399,11 @@ export class HarnessOrchestrator {
         snap = this.stopEpochSnapshot(initial.runId, [initial.id]);
       }
     }
+    // A cancelled runner or its worktree teardown still unwinding is waited for (bounded), never reported as active.
+    await this.awaitCancelUnwind([initial.id]);
+    if (this.taskTeardowns.has(initial.id)) {
+      throw new Error(`Worktree of task ${initial.id} is still being archived; retry the resume in a few seconds.`);
+    }
     const key = this.snapshotKey(snap, [initial.id]);
     // Join only a resume requested under the same epochs; one from before a newer stop or cancel is never joined.
     for (;;) {
@@ -1441,6 +1564,7 @@ export class HarnessOrchestrator {
     const releaseLeases = () => {
       if (reacquiredLeases) {
         this.db.db.prepare("UPDATE write_leases SET active = 0 WHERE task_id = ?").run(task.id);
+        this.onWriteLeaseReleased(run.repoRoot);
       }
     };
     const abandon = (err: Error): never => {
@@ -1652,6 +1776,21 @@ export class HarnessOrchestrator {
     extra: Partial<ResumeRunResult> = {},
   ): ResumeRunResult {
     const run = this.getEffectiveRun(runId) ?? this.db.getRun(runId)!;
+    let reason: ResumeRunResult["reason"];
+    if (outcome === "already_active") reason = "already_running";
+    else if (outcome === "already_completed") reason = "already_completed";
+    else if (outcome === "nothing_to_resume") {
+      const blocked = this.db.listTasks(runId).filter((t) => t.status === "blocked" && t.profileId !== "director");
+      const open = blocked.length > 0 ? this.db.listEscalations(runId, "open") : [];
+      if (open.length > 0) {
+        reason = "blocked_on_escalation";
+        message +=
+          ` Blocked on open escalation(s): ${open.slice(0, 8).map((e) => `${e.id} (${e.title.slice(0, 120)})`).join("; ")}. ` +
+          `Resolve or answer them, then resume_task ${blocked[0]!.id} continues the blocked task in place.`;
+      } else {
+        reason = "no_resumable_tasks";
+      }
+    }
     return {
       resumed: outcome === "resumed",
       resumedTaskIds: [],
@@ -1659,6 +1798,8 @@ export class HarnessOrchestrator {
       outcome,
       runStatus: run.status,
       message,
+      ...(outcome === "already_active" ? { alreadyRunning: true } : {}),
+      ...(reason ? { reason } : {}),
       ...extra,
     };
   }
@@ -1683,6 +1824,7 @@ export class HarnessOrchestrator {
     snapshot: StopSnapshot,
   ): Promise<ResumeRunResult> {
     // Runners cancelled by an earlier stop are waited for, so they are never reported as already active.
+    await this.awaitCancelUnwind(this.db.listTasks(runId).map((t) => t.id));
     await Promise.all(this.db.listTasks(runId).map((t) => this.awaitTaskWindDown(t.id)));
     const run = this.db.getRun(runId)!;
     const tasks = this.db.listTasks(run.id);
@@ -1711,6 +1853,13 @@ export class HarnessOrchestrator {
     const callerNote = (opts?.note ?? opts?.userMessage)?.trim() || undefined;
     const alreadyActive = async (message: string, extra: Partial<ResumeRunResult> = {}): Promise<ResumeRunResult> => {
       const res = this.runResult(run.id, "already_active", message, extra);
+      if (callerNote && container) {
+        return {
+          ...res,
+          noteDelivered: false,
+          message: `${res.message} Your note was not delivered: a Director delegation container has no orchestrator to steer; steer a delegated task directly with steer_task.`,
+        };
+      }
       return callerNote ? this.withRunNote(res, await this.deliverNoteToRun(run.id, callerNote)) : res;
     };
     if (container) {
@@ -1823,7 +1972,24 @@ export class HarnessOrchestrator {
       // Deferred worktree & write-lease activation for Tier 2 Workers that started `pending` on `depends_on`
       if (task.tier === 2 && toolPolicy === "read_write_workspace") {
         if (!this.db.listActiveWriteScopes(run.id, task.id).length && this.db.listAssignedWriteScopes(run.id, task.id).length) {
-          this.db.reacquireWriteLeasesForTask(run.id, task.id);
+          // An overlapping lease still held by another task: wait for its release instead of failing the activation.
+          let waitingOn: string | null = null;
+          for (;;) {
+            try {
+              this.db.reacquireWriteLeasesForTask(run.id, task.id);
+              break;
+            } catch (err) {
+              if (!(err instanceof WriteScopeConflictError)) throw err;
+              const holder = err.holders[0]?.taskId ?? "another task";
+              if (holder !== waitingOn) {
+                waitingOn = holder;
+                this.db.updateTask(task.id, { summary: `Waiting for write lease held by ${holder}` });
+              }
+              await this.waitForWriteLease(run.repoRoot, exec.abort.signal);
+              if (exec.abort.signal.aborted || this.db.getTask(task.id)?.status !== task.status) return;
+            }
+          }
+          if (waitingOn) this.db.updateTask(task.id, { summary: null });
         }
         if (!wt || wt.runId !== task.runId) {
           const wtMgr = this.getWorktreeManager(run.repoRoot);
@@ -1972,6 +2138,12 @@ export class HarnessOrchestrator {
             }
           : undefined,
         allowShellInReadOnly: task.kind === "verify",
+        isTaskSettled: () => {
+          const t = this.db.getTask(task.id);
+          return !t || t.generation !== task.generation ||
+            ["completed", "returned_for_rescope", "blocked", "cancelled", "failed"].includes(t.status);
+        },
+        missingReturnWrapUpPrompt: task.tier !== 1 ? buildMissingReturnWrapUpPrompt(task.tier, task.kind) : undefined,
         signal: exec.generationSignal,
         onHandle: (h) => {
           exec.handle = h;
@@ -2214,7 +2386,7 @@ export class HarnessOrchestrator {
           return;
         }
         if (isReadOnlyKind(latest.kind)) {
-          this.db.updateTask(task.id, { status: "failed", summary: "Task ended without a valid sourced handoff." });
+          await this.settleWithoutReturn(exec, latest, run, wt, res, "failed", "Task ended without a valid sourced handoff.");
           return;
         }
 
@@ -2247,10 +2419,10 @@ export class HarnessOrchestrator {
                 () => false,
               ));
             if (dirty || hasUnmergedCommits || latestWt.status === "bounced" || latestWt.status === "queued") {
-              this.db.updateTask(task.id, {
-                status: "failed",
-                summary: `Worker exited with unmerged/dirty worktree (status: ${latestWt.status}, dirty: ${dirty}, unmergedCommits: ${hasUnmergedCommits}).`,
-              });
+              await this.settleWithoutReturn(
+                exec, latest, run, latestWt, res, "failed",
+                `Worker exited with unmerged/dirty worktree (status: ${latestWt.status}, dirty: ${dirty}, unmergedCommits: ${hasUnmergedCommits}).`,
+              );
               return;
             }
             if (latestWt.status === "merged") {
@@ -2262,6 +2434,46 @@ export class HarnessOrchestrator {
         this.runConsecutiveQuotaPauses.delete(run.id);
         this.taskAutoRolloverProgress.delete(task.id);
         // Agent finished its turn naturally without calling `return_task`
+        if (latest.tier !== 1) {
+          await this.settleWithoutReturn(exec, latest, run, wt, res, "completed", res.text.slice(0, 1000) || "Completed");
+          return;
+        }
+        const finalReply = res.text.trim();
+        if (finalReply.length > SUMMARY_LIMIT) {
+          // Tier 1's natural reply is its handoff: keep the full text readable from a dossier, bound the summary.
+          let spill: { summary: string; overflowPath?: string } | null = null;
+          let spillError = "";
+          try {
+            spill = spillSummaryOverflow(this.db, run, task.id, finalReply);
+          } catch (err) {
+            spillError = err instanceof Error ? err.message : String(err);
+          }
+          if (spill) {
+            const saved = spill;
+            this.db.transaction(() => {
+              if (saved.overflowPath) {
+                this.db.recordArtifact({ runId: run.id, taskId: task.id, kind: "dossier", path: saved.overflowPath, summary: "Full task summary" });
+              }
+              this.db.updateTask(task.id, {
+                status: "completed",
+                summary: saved.summary,
+                resultJson: JSON.stringify({
+                  status: "completed",
+                  text: res.text,
+                  summary: saved.summary,
+                  artifact_paths: saved.overflowPath ? [saved.overflowPath] : [],
+                }),
+              });
+            });
+            return;
+          }
+          this.db.updateTask(task.id, {
+            status: "completed",
+            summary: `${res.text.slice(0, 1000)} [Full summary could not be saved: ${spillError.slice(0, 200)}]`,
+            resultJson: JSON.stringify({ status: "completed", text: res.text }),
+          });
+          return;
+        }
         this.db.updateTask(task.id, {
           status: "completed",
           summary: res.text.slice(0, 1000) || "Completed",
@@ -2317,6 +2529,110 @@ export class HarnessOrchestrator {
         exec.handle = undefined;
       }
     }
+  }
+
+  /**
+   * Settles a non-Tier-1 task that ended naturally without return_task. Status and summary stay exactly as the
+   * caller decided; resultJson gains a harness-synthesized, labelled fallback (git state, indexed artifacts, a bounded
+   * excerpt of the final output). Read-only kinds keep their generic failed handoff and only get their output saved
+   * as a dossier the parent can list with artifact_read({ task_id }). Writes nothing when the task was cancelled,
+   * settled or resumed while the evidence was gathered.
+   */
+  private async settleWithoutReturn(
+    exec: ActiveTaskExecution,
+    task: TaskRecord,
+    run: RunRecord,
+    wt: WorktreeRecord | null,
+    res: RunAgentResult,
+    status: "completed" | "failed",
+    baseSummary: string,
+  ): Promise<void> {
+    const gen = task.generation;
+    const readOnly = isReadOnlyKind(task.kind);
+    const git: { head?: string; branch?: string; committed?: string; uncommitted?: string; status?: string[] } = {};
+    const wtPath = wt && !wt.cleanedAt && existsSync(wt.path) ? wt.path : null;
+    if (wtPath) {
+      const out = (args: string[]) => runGit(wtPath, args, 5_000).then((r) => r.stdout, () => null);
+      const [head, branch, committed, uncommitted, statusShort] = await Promise.all([
+        out(["rev-parse", "HEAD"]),
+        out(["rev-parse", "--abbrev-ref", "HEAD"]),
+        wt?.baseSha ? out(["diff", "--shortstat", `${wt.baseSha}..HEAD`]) : Promise.resolve(null),
+        out(["diff", "--shortstat"]),
+        out(["status", "--short"]),
+      ]);
+      if (head) git.head = head;
+      if (branch) git.branch = branch;
+      if (committed !== null) git.committed = committed || "no commits since base";
+      if (uncommitted !== null) git.uncommitted = uncommitted || "none";
+      if (statusShort !== null) git.status = statusShort.split("\n").filter(Boolean).slice(0, 40);
+    }
+    let artifactPaths: string[] = [];
+    try {
+      artifactPaths = this.db.listArtifacts(run.id, task.id, 50).map((a) => a.path).slice(0, 20);
+    } catch {
+      artifactPaths = [];
+    }
+    const text = res.text.trim();
+    const EXCERPT = 1200;
+
+    // Race gate (synchronous up to the transaction): someone else cancelled, settled or resumed this task meanwhile.
+    const row = this.db.getTask(task.id);
+    if (
+      this.active.get(task.id) !== exec ||
+      exec.abort.signal.aborted ||
+      !row ||
+      row.generation !== gen ||
+      !["running", "waiting_children", "draining"].includes(row.status)
+    ) {
+      return;
+    }
+    // The full output is saved only past the gate, so a superseded generation never leaves stray files or rows.
+    const saveOutput = readOnly ? text.length > 0 : text.length > EXCERPT;
+    let outputPath: string | null = null;
+    this.db.transaction(() => {
+      if (saveOutput) {
+        try {
+          outputPath = writeTaskDossier(
+            this.db, run, task.id, `output-gen${gen}.md`, text,
+            readOnly ? "Unstructured task output" : "Full final output (no return_task)",
+          ).path;
+        } catch {
+          outputPath = null;
+        }
+      }
+      const paths = outputPath && !artifactPaths.includes(outputPath) ? [...artifactPaths, outputPath] : artifactPaths;
+      const fallbackBase = { reason: "missing_return_task", wrap_up_attempted: Boolean(res.wrapUpAttempted) };
+      if (readOnly) {
+        this.db.updateTask(task.id, {
+          status: "failed",
+          summary: baseSummary,
+          resultJson: JSON.stringify({ status: "failed", fallback: { ...fallbackBase, artifact_paths: paths } }),
+        });
+        return;
+      }
+      const header =
+        `[Fallback handoff: task ended without return_task; wrap-up turn ${res.wrapUpAttempted ? "attempted" : "not available"}; ` +
+        "unverified, synthesized by the harness]";
+      const gitLine = wtPath
+        ? `Git: ${git.branch ?? "?"} @ ${git.head?.slice(0, 12) ?? "?"}; committed since base: ${git.committed ?? "unknown"}; ` +
+          `uncommitted: ${git.uncommitted ?? "unknown"}${git.status?.length ? ` (${git.status.length} changed path(s))` : ""}`
+        : "Git: no worktree";
+      const artLine = `Artifacts: ${paths.length} indexed${paths.length ? " (see artifact_paths)" : ""}`;
+      const pointer = outputPath ? `\n[Full output: ${relative(run.repoRoot, outputPath)}]` : "";
+      const fixed = `${header}\n${gitLine}\n${artLine}\nFinal worker output (unstructured excerpt):\n`;
+      const budget = Math.max(0, Math.min(EXCERPT, SUMMARY_LIMIT - fixed.length - pointer.length));
+      const excerpt = !text ? "(no output)" : text.length <= budget ? text : `…${text.slice(-(budget - 1))}`;
+      const summary = `${fixed}${excerpt}${pointer}`.slice(0, SUMMARY_LIMIT);
+      this.db.updateTask(task.id, {
+        status,
+        summary: baseSummary,
+        resultJson: JSON.stringify({
+          status,
+          text: res.text,
+          fallback: { ...fallbackBase, stop_reason: res.stopReason, summary, artifact_paths: paths, git },
+        }),
+      });
+    });
   }
 
   /** Generation and stop/cancel epochs before a rollover or quota-pause handoff is awaited. */
@@ -2662,7 +2978,7 @@ export class HarnessOrchestrator {
     return `Steering was not delivered: ${state} (${cause}); steering only reaches a running task and never undoes a stop. ${recovery}`;
   }
 
-  async cancelTask(taskId: string, reason: string, opts?: { internalStopSweep?: boolean }): Promise<void> {
+  async cancelTask(taskId: string, reason: string, opts?: { internalStopSweep?: boolean; bulk?: boolean }): Promise<void> {
     // Bumped even for an already-settled task, so a resume requested before this cancel never applies.
     this.bumpStopEpoch(taskId);
     // Only an explicit cancel (not a stopRun sweep) fences resumes that were waiting on that earlier stop.
@@ -2675,7 +2991,7 @@ export class HarnessOrchestrator {
     // Queued on the task's worktree chain now (synchronously), after any in-flight allocation: a worktree allocated
     // mid-cancel is torn down once it exists, and a later resume waits for this teardown before touching the worktree.
     if (before?.tier === 2) {
-      void this.runWorktreeOp(taskId, async () => {
+      const teardown = this.runWorktreeOp(taskId, async () => {
         await cancelled;
         const task = this.db.getTask(taskId);
         // A resume that already started a newer generation owns the worktree now.
@@ -2690,6 +3006,11 @@ export class HarnessOrchestrator {
             .catch(() => {});
         }
       }).catch(() => {});
+      // Not awaited here (cancel stays non-blocking); a resume waits for it in awaitCancelUnwind.
+      this.taskTeardowns.set(taskId, teardown);
+      void teardown.finally(() => {
+        if (this.taskTeardowns.get(taskId) === teardown) this.taskTeardowns.delete(taskId);
+      });
     }
     await cancelled;
     this.taskQuotaHints.delete(taskId);
@@ -2698,6 +3019,8 @@ export class HarnessOrchestrator {
     const task = this.db.getTask(taskId);
     if (task && !["completed", "cancelled", "failed"].includes(task.status)) {
       this.db.updateTask(taskId, { status: "cancelled", summary: `Cancelled: ${reason}` });
+      // No runner loop will exit for a queued or never-launched task, so settle its run here (a stop sweep does that itself).
+      if (!exec && !opts?.bulk) this.afterTaskInactiveInRun(task.runId);
     }
   }
 
@@ -2715,13 +3038,15 @@ export class HarnessOrchestrator {
       this.clearRunQuotaTimers(runId);
       this.runQuotaStates.delete(runId);
       const first = this.db.listTasks(runId);
-      await Promise.all(first.map((t) => this.cancelTask(t.id, reason, { internalStopSweep: true })));
+      await Promise.all(first.map((t) => this.cancelTask(t.id, reason, { internalStopSweep: true, bulk: true })));
       if (!container) this.db.updateRunStatus(runId, "stopped", reason);
       // Second sweep: catches tasks that raced createTask while the first sweep was cancelling.
       const seen = new Set(first.map((t) => t.id));
       const raced = this.db.listTasks(runId).filter((t) => !seen.has(t.id));
-      await Promise.all(raced.map((t) => this.cancelTask(t.id, reason, { internalStopSweep: true })));
+      await Promise.all(raced.map((t) => this.cancelTask(t.id, reason, { internalStopSweep: true, bulk: true })));
       this.db.releaseWriteLeasesForRun(runId);
+      const stoppedRun = this.db.getRun(runId);
+      if (stoppedRun) this.onWriteLeaseReleased(stoppedRun.repoRoot);
       if (!container) {
         if (this.db.getRun(runId)?.status !== "stopped") this.db.updateRunStatus(runId, "stopped", reason);
       } else {

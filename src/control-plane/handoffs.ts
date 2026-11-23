@@ -32,6 +32,8 @@ export function compactTaskHandoff(task: TaskRecord, escalations: EscalationReco
   const result = task.resultJson ? JSON.parse(task.resultJson) : null;
   const paused = task.status === "paused_quota" || task.summary?.startsWith("Paused (quota):");
   const unstructured = typeof result?.text === "string" && typeof result?.summary !== "string";
+  // Harness-synthesized handoff for a non-orchestrator task that ended without return_task.
+  const fallback = typeof result?.fallback?.summary === "string" && task.kind !== "orchestrator" ? result.fallback : null;
   let summary = task.summary?.slice(0, SUMMARY_LIMIT) ?? null;
   if (paused) {
     const reason = task.summary?.startsWith("Paused (quota):") ? task.summary.slice("Paused (quota):".length).trim() : task.summary?.trim() ?? "";
@@ -42,6 +44,7 @@ export function compactTaskHandoff(task: TaskRecord, escalations: EscalationReco
       `(resume_run) or the operator (\`pi-harness resume ${task.runId}\`) resumes it, so escalate if you need it sooner. ` +
       "Do not respawn or cancel it.";
   }
+  else if (fallback) summary = fallback.summary.slice(0, SUMMARY_LIMIT);
   else if (unstructured) {
     // Tier 1 orchestrators have no return_task; their natural final reply is the handoff.
     const reply = task.kind === "orchestrator" ? result.text.trim() : "";
@@ -58,7 +61,7 @@ export function compactTaskHandoff(task: TaskRecord, escalations: EscalationReco
     status: task.status,
     summary,
     sources: paused ? [] : result?.sources ?? [],
-    artifact_paths: paused ? [] : result?.artifact_paths ?? result?.artifactPaths ?? [],
+    artifact_paths: paused ? [] : result?.artifact_paths ?? result?.artifactPaths ?? fallback?.artifact_paths ?? [],
     escalations: escalations.filter((entry) => entry.fromTaskId === task.id),
   };
 }

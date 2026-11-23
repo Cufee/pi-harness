@@ -9,7 +9,7 @@ import type { KbKind } from "../kb/store.js";
 import type { BisectingMergeQueue } from "../worktree/merge-queue.js";
 import { runGit, type WorktreeManager } from "../worktree/manager.js";
 import type { AdmissionLane, QueuePositionInput } from "./admission-queue.js";
-import { directorTaskRunOwner, isDirectorTaskContainer, scanMaxFileIndex, writeUniqueFile } from "./ids.js";
+import { directorTaskRunOwner, isDirectorTaskContainer } from "./ids.js";
 import type {
   AgentTier,
   ControlPlaneDb,
@@ -18,7 +18,7 @@ import type {
   TaskKind,
   TaskRecord,
 } from "./db.js";
-import { dossierDirectory, findRunDossier, readRunDossier, readWorkspaceArtifact, writeCodeOutput, writeTaskDossier } from "./dossiers.js";
+import { findRunDossier, readRunDossier, readWorkspaceArtifact, spillSummaryOverflow, writeCodeOutput, writeTaskDossier } from "./dossiers.js";
 import { compactTaskHandoff, isReadOnlyKind, SUMMARY_LIMIT, validateTaskHandoff } from "./handoffs.js";
 import type { AnchoredHandoff } from "./prompts.js";
 import { mergeGoalLiveProgress, type GoalLiveProgress, type GoalProgressSource } from "../goals/live-progress.js";
@@ -1200,26 +1200,10 @@ export class ControlPlaneToolExecutor {
         const paths = [...artifactPaths];
         let overflowPath: string | undefined;
         if (summary.length > SUMMARY_LIMIT) {
-          const artifactsDir = dossierDirectory(run.repoRoot);
-          const stem = `${taskId}-summary`;
-          const seqKey = `summary:${taskId}`;
-          let allocateIndex: (() => number) | undefined;
-          if (typeof this.db.nextArtifactSeq === "function") {
-            if (typeof this.db.advanceArtifactSeqFloor === "function") {
-              // Seed above indices already on disk or recorded in the index (including deleted files).
-              const diskMax = scanMaxFileIndex(artifactsDir, stem, ".md");
-              const dbMax =
-                typeof this.db.maxIndexedArtifactSeq === "function" ? this.db.maxIndexedArtifactSeq(stem, ".md", taskId) : 0;
-              this.db.advanceArtifactSeqFloor(seqKey, Math.max(diskMax, dbMax));
-            }
-            allocateIndex = () => this.db.nextArtifactSeq(seqKey);
-          }
-          const fileName = writeUniqueFile(artifactsDir, stem, ".md", summary, allocateIndex);
-          const artifactPath = `.harness/artifacts/${fileName}`;
-          overflowPath = resolve(run.repoRoot, artifactPath);
-          paths.push(overflowPath);
-          const pointer = `\n\n[Full summary: ${artifactPath}]`;
-          summary = summary.slice(0, SUMMARY_LIMIT - pointer.length).trimEnd() + pointer;
+          const spill = spillSummaryOverflow(this.db, run, taskId, summary);
+          summary = spill.summary;
+          overflowPath = spill.overflowPath;
+          if (overflowPath) paths.push(overflowPath);
         }
         const taskStatus = status === "scope_too_large" ? "returned_for_rescope" : status;
         try {
