@@ -59,7 +59,7 @@ import { QuotaClient } from "../quota/client.js";
 import { ensureOctofs, resolveExternalMcpServers, shouldStageOctofs } from "../tools/native-tools.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
-import { runGit } from "../worktree/manager.js";
+import { canonicalPath, runGit } from "../worktree/manager.js";
 import { parseValidatedSshTarget, PeerManager, type PeerIdentity, type PeerLink, type RemoteHostStatus } from "./peer.js";
 import { PtyHost } from "./pty-host.js";
 
@@ -728,9 +728,13 @@ export class HarnessDaemon {
   }
 
   private async sweepAllKnownRepos(): Promise<void> {
-    const repos = new Set(this.db.listRuns(100).map((r) => r.repoRoot));
+    const repos = new Set(this.db.listRuns(100).map((r) => canonicalPath(r.repoRoot)));
     for (const repo of repos) {
-      await this.orchestrator.getWorktreeManager(repo).sweep();
+      try {
+        await this.orchestrator.getWorktreeManager(repo).sweep();
+      } catch {
+        // One missing or failing repo must not stop the sweep of the others.
+      }
     }
   }
 
@@ -3305,24 +3309,26 @@ export class HarnessDaemon {
           const wt = this.db.getWorktree(p.worktreeId);
           if (!wt) throw new Error(`Unknown worktree ${p.worktreeId}`);
           const run = this.db.getRun(wt.runId);
-          if (run && run.repoRoot !== repoRoot) {
+          if (!run) throw new Error(`Worktree ${p.worktreeId} has no owning run`);
+          if (canonicalPath(run.repoRoot) !== canonicalPath(repoRoot)) {
             throw new Error(`Worktree ${p.worktreeId} belongs to ${run.repoRoot}, not ${repoRoot}`);
           }
           const task = this.db.getTask(wt.taskId);
-          const activeStatuses = new Set(["running", "waiting_children", "pending", "ready"]);
-          if (task && activeStatuses.has(task.status) && !Boolean(p.force)) {
+          const settled = !task || ["completed", "failed", "cancelled"].includes(task.status);
+          if (!settled && !Boolean(p.force)) {
             throw new Error(`Cannot remove worktree ${p.worktreeId}: task ${task.id} is still ${task.status}`);
           }
+          const wasCleaned = wt.cleanedAt != null;
           const ref = await mgr.teardown(p.worktreeId, {
             archiveBeforeRemove: true,
             requireArchive: true,
             finalStatus: "archived",
           });
           return {
-            removed: [p.worktreeId],
+            removed: wasCleaned ? [] : [p.worktreeId],
             archivedRefs: ref ? [ref] : [],
-            prunedAdminEntries: true,
             expiredArchiveRefs: [],
+            skipped: [],
             errors: [],
           };
         }
