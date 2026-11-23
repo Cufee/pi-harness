@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { getCapabilities, setCapabilities, type Terminal } from "@earendil-works/pi-tui";
+import { getCapabilities, type OverlayHandle, setCapabilities, type Terminal } from "@earendil-works/pi-tui";
+import type { EventRecord } from "../src/control-plane/db.js";
+import type { DaemonClient } from "../src/daemon/remote.js";
+import type { DaemonEventFrame } from "../src/protocol/daemon-rpc.js";
 import { parseSlashCommand, renderHelp } from "../src/tui/commands.js";
 import {
   clamp,
   createTheme,
   dimLine,
-  DISABLE_MOUSE_WHEEL_SEQ,
-  ENABLE_MOUSE_WHEEL_SEQ,
+  DISABLE_MOUSE_SEQ,
+  ENABLE_MOUSE_SEQ,
   fillLineBg,
   fit,
   FixedDock,
@@ -33,6 +36,8 @@ import {
   visibleWidth,
   wrap,
 } from "../src/tui/core/index.js";
+import { type InspectorDeps, LiveTranscriptScreen } from "../src/tui/inspectors.js";
+import type { WorkStore } from "../src/tui/store.js";
 import { renderToolOutput, type ToolDisplayPayload } from "../src/tui/tool-output/index.js";
 
 function makeFakeTerminal(cols = 100, rows = 30) {
@@ -264,7 +269,7 @@ describe("TUI v2 Core Primitives", () => {
     const { terminal, writes } = makeFakeTerminal();
     const tui = new ModalScreen(terminal);
     tui.start();
-    assert.equal(writes.some((w) => w.includes(ENABLE_MOUSE_WHEEL_SEQ)), false);
+    assert.equal(writes.some((w) => w.includes(ENABLE_MOUSE_SEQ)), false);
 
     const nav = new Navigator(tui, terminal, theme);
     const dummyScreen: Screen = {
@@ -276,20 +281,20 @@ describe("TUI v2 Core Primitives", () => {
     nav.push(dummyScreen);
     assert.equal(nav.isOpen, true);
     assert.deepEqual(nav.breadcrumbs, ["TestSheet"]);
-    assert.ok(writes.includes(ENABLE_MOUSE_WHEEL_SEQ));
+    assert.ok(writes.includes(ENABLE_MOUSE_SEQ));
 
     const prevWrites = writes.length;
     nav.push({ ...dummyScreen, title: "Child" });
     assert.deepEqual(nav.breadcrumbs, ["TestSheet", "Child"]);
-    assert.equal(writes.slice(prevWrites).includes(ENABLE_MOUSE_WHEEL_SEQ), false);
+    assert.equal(writes.slice(prevWrites).includes(ENABLE_MOUSE_SEQ), false);
 
     nav.pop();
     assert.equal(nav.isOpen, true);
-    assert.equal(writes.includes(DISABLE_MOUSE_WHEEL_SEQ), false);
+    assert.equal(writes.includes(DISABLE_MOUSE_SEQ), false);
 
     nav.pop();
     assert.equal(nav.isOpen, false);
-    assert.ok(writes.includes(DISABLE_MOUSE_WHEEL_SEQ));
+    assert.ok(writes.includes(DISABLE_MOUSE_SEQ));
     tui.stop();
   });
 
@@ -639,5 +644,317 @@ describe("TUI v2 Core Primitives", () => {
     } finally {
       setCapabilities(prevCaps);
     }
+  });
+});
+
+function makeStubLiveDeps(initialReplay: EventRecord[] = []) {
+  const listeners = new Set<(ev: DaemonEventFrame) => void>();
+  const client = {
+    onEvent(cb: (ev: DaemonEventFrame) => void) {
+      listeners.add(cb);
+      return () => {
+        listeners.delete(cb);
+      };
+    },
+    async request(op: string) {
+      if (op === "watch.start") {
+        return { watchId: "watch-test", throughSeq: initialReplay.length, replay: initialReplay };
+      }
+      if (op === "replay.page") {
+        return { throughSeq: initialReplay.length, replay: [] };
+      }
+      if (op === "watch.stop") {
+        return { stopped: true };
+      }
+      return {};
+    },
+  } as unknown as DaemonClient;
+  const deps: InspectorDeps = {
+    client,
+    store: {} as WorkStore,
+    repoRoot: "/repo",
+  };
+  let nextSeq = initialReplay.length + 1;
+  const emit = (ev: Omit<DaemonEventFrame, "kind" | "watchId" | "seq">) => {
+    const frame: DaemonEventFrame = { ...ev, kind: "event", seq: nextSeq++, watchId: "watch-test" };
+    for (const cb of listeners) cb(frame);
+  };
+  return { deps, emit };
+}
+
+describe("Transcript Unification Regressions", () => {
+  it("renders LiveTranscriptScreen fenced code via the same Markdown truecolor path as ImmutableTranscript with zero raw SGR fragments at widths 100 and 60", async () => {
+    const goCode = [
+      "var Plan = fct.Plan{",
+      '\tName: "hv-functional",',
+      "\tCount: 42,",
+      '\tSteps: []fct.Step{{Name: "boot"}},',
+      "}",
+    ].join("\n");
+    const goMd = `\`\`\`go\n${goCode}\n\`\`\``;
+    const prevCaps = getCapabilities();
+    setCapabilities({ ...prevCaps, trueColor: true });
+    try {
+      const tcTheme = createTheme({ color: true, ascii: false });
+      const rawFragmentRe = /38;2;|\d+;\d+;\d+m/;
+
+      const mainChat = new ImmutableTranscript(tcTheme);
+      mainChat.appendAssistantTurn(goMd);
+      const mainChatOutput = mainChat.render(100).join("\n");
+      const mainSgrCodes = new Set(mainChatOutput.match(/\x1b\[38;2;\d+;\d+;\d+m/g) ?? []);
+      assert.ok(mainSgrCodes.size >= 3, "expected keyword, string, and number truecolor SGR codes");
+
+      const { deps, emit } = makeStubLiveDeps();
+      const { terminal } = makeFakeTerminal(100, 24);
+      const tui = new ModalScreen(terminal);
+      const nav = new Navigator(tui, terminal, tcTheme);
+      const screen = new LiveTranscriptScreen("run-1", "task-1", deps);
+      nav.push(screen);
+      await new Promise((r) => setTimeout(r, 15));
+
+      emit({
+        runId: "run-1",
+        taskId: "task-1",
+        type: "agent.text_delta",
+        createdAt: Date.now(),
+        payload: { delta: goMd },
+      });
+
+      for (const width of [100, 60]) {
+        const rows = screen.render(width, 24, tcTheme);
+        const joined = rows.join("\n");
+        for (const sgr of mainSgrCodes) {
+          assert.ok(joined.includes(sgr), `LiveTranscriptScreen at width ${width} missing SGR ${JSON.stringify(sgr)}`);
+        }
+        for (const row of rows) {
+          assert.equal(visibleWidth(row), width, `row width mismatch at width ${width}`);
+          const stripped = row.replace(/\x1b\[[0-9;]*m/g, "");
+          assert.ok(!rawFragmentRe.test(stripped), `raw ANSI fragment at width ${width}: ${JSON.stringify(row)}`);
+        }
+      }
+      nav.closeAll();
+    } finally {
+      setCapabilities(prevCaps);
+    }
+  });
+
+  it("copies plain text via OSC 52 on SGR mouse press/drag/release through Navigator with 0-based overlay bounds and no chrome glyphs", async () => {
+    const theme = createTheme({ color: true, ascii: false });
+    const { terminal, writes, sendInput } = makeFakeTerminal(100, 24);
+    const tui = new ModalScreen(terminal);
+    const nav = new Navigator(tui, terminal, theme);
+    const now = Date.now();
+    const { deps } = makeStubLiveDeps([
+      {
+        seq: 1,
+        runId: "run-1",
+        taskId: "task-1",
+        type: "agent.text_delta",
+        createdAt: now,
+        payload: { delta: "Alpha bravo charlie delta\nSecond line echo foxtrot" },
+      },
+    ]);
+    const screen = new LiveTranscriptScreen("run-1", "task-1", deps);
+    tui.start();
+    nav.push(screen);
+    await new Promise((r) => setTimeout(r, 15));
+
+    const composited = (
+      tui as unknown as { compositeOverlays(l: string[], w: number, h: number): string[] }
+    ).compositeOverlays(tui.render(100), 100, 24);
+    const viewportTop = Math.max(0, composited.length - terminal.rows);
+    const visible = composited.slice(viewportTop);
+
+    // Assert pi-tui OverlayHandle.getBounds() uses 0-based terminal coordinates matching the rendered frame top-left corner.
+    const handle = (nav as unknown as { handle: OverlayHandle | null }).handle;
+    const bounds = handle?.getBounds();
+    assert.ok(bounds, "overlay bounds must be populated after TUI render");
+    assert.equal(
+      stripTerminalSequences(visible[bounds.row]!)[bounds.col],
+      "╭",
+      "getBounds() must return 0-based terminal coordinates",
+    );
+
+    const row1 = visible.findIndex((l) => stripTerminalSequences(l).includes("Alpha bravo charlie delta"));
+    const row2 = visible.findIndex((l) => stripTerminalSequences(l).includes("Second line echo foxtrot"));
+    assert.ok(row1 >= 0 && row2 > row1, "both transcript lines must be visible inside overlay");
+
+    const plain1 = stripTerminalSequences(visible[row1]!);
+    const plain2 = stripTerminalSequences(visible[row2]!);
+    const startX0 = plain1.indexOf("Alpha");
+    const endX0 = plain2.indexOf("echo") + "echo".length - 1;
+    assert.ok(startX0 >= 0 && endX0 > 0);
+
+    // SGR mouse coordinates are 1-based.
+    const x1 = startX0 + 1;
+    const y1 = row1 + 1;
+    const x2 = endX0 + 1;
+    const y2 = row2 + 1;
+
+    writes.length = 0;
+    sendInput(`\x1b[<0;${x1};${y1}M`);
+    sendInput(`\x1b[<32;${x2};${y2}M`);
+    sendInput(`\x1b[<0;${x2};${y2}m`);
+
+    const oscWrite = writes.find((w) => w.includes("\x1b]52;c;"));
+    assert.ok(oscWrite, "mouse release after drag must emit OSC 52 clipboard sequence");
+    const m = oscWrite.match(/\x1b\]52;c;([A-Za-z0-9+/=]+)\x07/);
+    assert.ok(m, "OSC 52 sequence must contain valid base64 payload");
+    const decoded = Buffer.from(m[1]!, "base64").toString("utf8");
+    assert.equal(decoded, "Alpha bravo charlie delta\nSecond line echo");
+    assert.equal(/[╭╮╰╯│┃┆▸▎]/.test(decoded), false, "copied text must exclude frame borders, gutter, and scrollbar");
+
+    nav.closeAll();
+    tui.stop();
+  });
+
+  it("folds and unfolds tool blocks via Enter while keeping the top visible row stable when paused", async () => {
+    const theme = createTheme({ color: false, ascii: false });
+    const now = Date.now();
+    const { deps } = makeStubLiveDeps([
+      {
+        seq: 1,
+        runId: "run-1",
+        taskId: "task-1",
+        type: "agent.text_delta",
+        createdAt: now,
+        payload: { delta: "TOP_ANCHOR_LINE_ONE\n\nSecond intro line" },
+      },
+      {
+        seq: 2,
+        runId: "run-1",
+        taskId: "task-1",
+        type: "agent.tool",
+        createdAt: now + 1000,
+        payload: {
+          id: "call-1",
+          name: "read_file",
+          status: "completed",
+          args: '{"path":"ARG_SECRET_PATH.ts"}',
+          result: "first line summary\nEXPANDED_RESULT_LINE_TWO",
+        },
+      },
+      {
+        seq: 3,
+        runId: "run-1",
+        taskId: "task-1",
+        type: "agent.text_delta",
+        createdAt: now + 2000,
+        payload: { delta: Array.from({ length: 24 }, (_, i) => `Trailing line ${i + 1}`).join("\n\n") },
+      },
+    ]);
+
+    const { terminal } = makeFakeTerminal(100, 30);
+    const tui = new ModalScreen(terminal);
+    const nav = new Navigator(tui, terminal, theme);
+    const ctx = { navigator: nav, theme, requestRender: () => {}, writeTerminal: () => {} };
+    const screen = new LiveTranscriptScreen("run-1", "task-1", deps);
+    nav.push(screen);
+    await new Promise((r) => setTimeout(r, 15));
+
+    // Initial render in follow mode, then jump to top (paused) so Block 1 is pinned above the tool.
+    screen.render(100, 30, theme);
+    screen.handleInput("g", ctx);
+    const beforeRows = screen.render(100, 30, theme);
+    const beforeJoined = beforeRows.join("\n");
+    assert.ok(beforeJoined.includes("read_file"), "collapsed tool header must be visible");
+    assert.equal(beforeJoined.includes("EXPANDED_RESULT_LINE_TWO"), false, "tool body must be hidden when collapsed");
+    assert.equal(beforeJoined.includes("ARG_SECRET_PATH.ts"), false, "tool args must be hidden when collapsed");
+
+    const bodyRow = (rows: string[]) => {
+      const rect = (screen as unknown as { frame: Frame }).frame.bodyRect!;
+      return stripTerminalSequences(rows[rect.row]!);
+    };
+
+    // Move cursor down until the gutter pointer sits on the read_file tool header row.
+    const cursorOnTool = (rows: string[]) =>
+      rows.some((r) => {
+        const plain = stripTerminalSequences(r);
+        return plain.includes("read_file") && plain.indexOf("▸") !== plain.lastIndexOf("▸");
+      });
+    for (let step = 0; step < 12; step++) {
+      screen.handleInput("j", ctx);
+      const curRows = screen.render(100, 30, theme);
+      if (cursorOnTool(curRows)) break;
+    }
+    const preToggleRows = screen.render(100, 30, theme);
+    const topBeforeToggle = bodyRow(preToggleRows);
+    assert.ok(cursorOnTool(preToggleRows), "cursor must reach the tool block");
+
+    // Expand tool via Enter
+    screen.handleInput("\r", ctx);
+    const expandedRows = screen.render(100, 30, theme);
+    const expandedJoined = expandedRows.join("\n");
+    assert.ok(expandedJoined.includes("EXPANDED_RESULT_LINE_TWO"), "tool result must appear after Enter");
+    assert.ok(expandedJoined.includes("ARG_SECRET_PATH.ts"), "tool args must appear after Enter");
+    assert.equal(bodyRow(expandedRows), topBeforeToggle, "top visible row must stay unchanged when expanding below it");
+
+    // Collapse tool via Enter
+    screen.handleInput("\r", ctx);
+    const collapsedRows = screen.render(100, 30, theme);
+    const collapsedJoined = collapsedRows.join("\n");
+    assert.equal(collapsedJoined.includes("EXPANDED_RESULT_LINE_TWO"), false, "tool result must hide after second Enter");
+    assert.equal(bodyRow(collapsedRows), topBeforeToggle, "top visible row must stay unchanged when collapsing below it");
+
+    nav.closeAll();
+  });
+
+  it("restores the exact top visible row across a 100 -> 60 -> 100 width resize while paused", async () => {
+    const theme = createTheme({ color: false, ascii: false });
+    const now = Date.now();
+    const makePara = (tag: string) =>
+      `${tag} ` +
+      Array.from({ length: 10 }, (_, i) => `${tag}_word_${i}_with_enough_length_to_wrap_differently`).join(" ");
+
+    const { deps } = makeStubLiveDeps([
+      { seq: 1, runId: "run-1", taskId: "task-1", type: "agent.text_delta", createdAt: now, payload: { delta: makePara("BLK_ONE") } },
+      { seq: 2, runId: "run-1", taskId: "task-1", type: "agent.turn_end", createdAt: now + 100, payload: {} },
+      { seq: 3, runId: "run-1", taskId: "task-1", type: "agent.text_delta", createdAt: now + 200, payload: { delta: makePara("BLK_TWO") } },
+      { seq: 4, runId: "run-1", taskId: "task-1", type: "agent.turn_end", createdAt: now + 300, payload: {} },
+      { seq: 5, runId: "run-1", taskId: "task-1", type: "agent.text_delta", createdAt: now + 400, payload: { delta: makePara("BLK_THREE") } },
+      { seq: 6, runId: "run-1", taskId: "task-1", type: "agent.turn_end", createdAt: now + 500, payload: {} },
+      { seq: 7, runId: "run-1", taskId: "task-1", type: "agent.text_delta", createdAt: now + 600, payload: { delta: makePara("BLK_FOUR") } },
+    ]);
+
+    const { terminal } = makeFakeTerminal(100, 20);
+    const tui = new ModalScreen(terminal);
+    const nav = new Navigator(tui, terminal, theme);
+    const ctx = { navigator: nav, theme, requestRender: () => {}, writeTerminal: () => {} };
+    const screen = new LiveTranscriptScreen("run-1", "task-1", deps);
+    nav.push(screen);
+    await new Promise((r) => setTimeout(r, 15));
+
+    const topBodyRow = (width: number) => {
+      const rows = screen.render(width, 20, theme);
+      const rect = (screen as unknown as { frame: Frame }).frame.bodyRect!;
+      return stripTerminalSequences(rows[rect.row]!);
+    };
+
+    // Start at bottom, then pause and scroll up into BLK_TWO.
+    topBodyRow(100);
+    screen.handleInput("\x1b[5~", ctx); // PageUp
+    let topAt100 = topBodyRow(100);
+    for (let i = 0; i < 20 && !topAt100.includes("BLK_TWO"); i++) {
+      screen.handleInput("\x1b[<64;10;5M", ctx); // wheel up 3 rows
+      topAt100 = topBodyRow(100);
+      if (topAt100.includes("BLK_ONE")) {
+        // Overshot into BLK_ONE; nudge down 1 row at a time via wheel/down? Just step down with wheel down / cursor
+        break;
+      }
+    }
+    // Pin squarely inside BLK_TWO (or whichever block has its tag on the top visible row).
+    const blockTag = ["BLK_ONE", "BLK_TWO", "BLK_THREE", "BLK_FOUR"].find((t) => topAt100.includes(t));
+    assert.ok(blockTag, `expected top visible row to carry a block tag, got: ${JSON.stringify(topAt100)}`);
+
+    const topAt60 = topBodyRow(60);
+    assert.ok(
+      topAt60.includes(blockTag),
+      `at width 60 top row must belong to ${blockTag}, got: ${JSON.stringify(topAt60)}`,
+    );
+
+    const topBackAt100 = topBodyRow(100);
+    assert.equal(topBackAt100, topAt100, "returning to width 100 must restore the exact top visible row");
+
+    nav.closeAll();
   });
 });

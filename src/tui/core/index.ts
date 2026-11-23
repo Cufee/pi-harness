@@ -8,4 +8,6 @@ export * from "./frame.js";
 export { type Hint, renderHintBar, yankText, RecentRefsRing } from "./keymap.js";
 export type { EntityRef as TuiEntityRef } from "./keymap.js";
 export * from "./navigator.js";
+export * from "./transcript-blocks.js";
+export * from "./transcript-view.js";
 export * from "./dock.js";

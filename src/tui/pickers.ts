@@ -29,6 +29,7 @@ import {
   layoutColumns,
   middleEllipsis,
   type Navigator,
+  type OverlayMouseEvent,
   parseMouseWheel,
   type RecentRefsRing,
   renderProgressBar,
@@ -41,6 +42,8 @@ import {
   TableListView,
   tag,
   type Theme,
+  TranscriptView,
+  type ViewBlock,
   Viewport,
   wrap,
 } from "./core/index.js";
@@ -1505,16 +1508,23 @@ export class KbDetailScreen implements Screen {
   readonly title: string;
   private readonly frame = new Frame();
   private nav: Navigator | null = null;
-  private readonly viewport = new Viewport();
+  private readonly view: TranscriptView;
   private entry: KbEntry | null = null;
   private loading = true;
   private error: string | null = null;
+  private dataRev = 1;
+  private blocks: ViewBlock[] = [];
 
   constructor(
     private readonly client: DaemonClient,
     private readonly card: KbCard,
   ) {
     this.title = card.id;
+    this.blocks = this.buildBlocks();
+    this.view = new TranscriptView(() => this.blocks, {
+      follow: false,
+      notify: (text, tone) => this.frame.setNotice(text, tone),
+    });
   }
 
   onShow(ctx: ScreenContext): void {
@@ -1522,9 +1532,98 @@ export class KbDetailScreen implements Screen {
     void this.load(ctx);
   }
 
+  private buildBlocks(): ViewBlock[] {
+    const item = this.entry ?? this.card;
+    const entry = this.entry;
+    const rev = this.dataRev;
+    const copyMeta = [
+      `ID: ${item.id}`,
+      `Kind: ${item.kind}`,
+      `Status: ${item.status} (${item.confidence})`,
+      `Tags: ${(item.tags ?? []).join(", ") || "—"}`,
+      `Path Globs: ${(item.pathGlobs ?? []).join(", ") || "—"}`,
+      `Hits: ${item.hitCount ?? 0}`,
+      ...(item.verifiedSha ? [`Verified SHA: ${item.verifiedSha}`] : []),
+      ...(entry?.evidencePaths?.length ? ["Evidence Paths:", ...entry.evidencePaths.map((p) => `  - ${p}`)] : []),
+    ].join("\n");
+
+    const out: ViewBlock[] = [
+      {
+        id: 1,
+        rev,
+        block: {
+          kind: "rows",
+          copy: copyMeta,
+          render: (innerW, theme) => {
+            const lines: string[] = [
+              kvRow("ID", item.id, innerW, theme),
+              kvRow("Kind", item.kind, innerW, theme),
+              kvRow("Status", `${statusBadge(item.status, theme)} (${item.confidence})`, innerW, theme),
+              kvRow("Tags", (item.tags ?? []).join(", ") || "—", innerW, theme),
+              kvRow("Path Globs", (item.pathGlobs ?? []).join(", ") || "—", innerW, theme),
+              kvRow("Hits", String(item.hitCount ?? 0), innerW, theme),
+              ...(item.verifiedSha ? [kvRow("Verified SHA", item.verifiedSha, innerW, theme)] : []),
+              ...(entry?.updatedAt ? [kvRow("Updated", formatAge(entry.updatedAt), innerW, theme)] : []),
+            ];
+            if (entry?.evidencePaths && entry.evidencePaths.length > 0) {
+              lines.push("", divider(innerW, theme, "Evidence Paths"));
+              for (const p of entry.evidencePaths) lines.push(clamp(`  - ${sanitizeLine(p)}`, innerW));
+            }
+            lines.push("", divider(innerW, theme, "Context"));
+            return lines;
+          },
+        },
+      },
+    ];
+
+    if (this.loading && !entry) {
+      out.push({
+        id: 2,
+        rev,
+        block: {
+          kind: "rows",
+          copy: "",
+          render: (innerW, theme) => [clamp(theme.muted("Loading full entry via kb.get..."), innerW)],
+        },
+      });
+    } else if (this.error && !entry) {
+      const errText = this.error;
+      out.push({
+        id: 2,
+        rev,
+        block: {
+          kind: "rows",
+          copy: `Failed to load full entry: ${errText}`,
+          render: (innerW, theme) => [clamp(theme.danger(`Failed to load full entry: ${errText}`), innerW)],
+        },
+      });
+      if (this.card.summary) {
+        out.push({
+          id: 3,
+          rev,
+          block: { kind: "text", format: "markdown", text: this.card.summary },
+        });
+      }
+    } else {
+      out.push({
+        id: 2,
+        rev,
+        block: {
+          kind: "text",
+          format: "markdown",
+          text: entry?.contextMd || this.card.summary || "(empty)",
+        },
+      });
+    }
+
+    return out;
+  }
+
   private async load(ctx: ScreenContext): Promise<void> {
     this.loading = true;
     this.error = null;
+    this.dataRev += 1;
+    this.blocks = this.buildBlocks();
     ctx.requestRender();
     try {
       const entries = await this.client.request<KbEntry[]>("kb.get", { ids: [this.card.id] });
@@ -1533,6 +1632,8 @@ export class KbDetailScreen implements Screen {
       this.error = err instanceof Error ? err.message : String(err);
     } finally {
       this.loading = false;
+      this.dataRev += 1;
+      this.blocks = this.buildBlocks();
       ctx.requestRender();
     }
   }
@@ -1546,60 +1647,25 @@ export class KbDetailScreen implements Screen {
       breadcrumbs: this.nav?.breadcrumbs ?? ["Knowledge Base", this.card.id],
       rightHeader: statusBadge(item.status, theme),
       subtitle: sanitizeLine(item.title),
-      hints: [
-        { key: "↑↓/PgUp/PgDn/wheel", label: "scroll" },
-        { key: "Esc", label: "back" },
-      ],
-      renderBody: (innerW, bodyH) => {
-        const lines: string[] = [
-          kvRow("ID", item.id, innerW, theme),
-          kvRow("Kind", item.kind, innerW, theme),
-          kvRow("Status", `${statusBadge(item.status, theme)} (${item.confidence})`, innerW, theme),
-          kvRow("Tags", (item.tags ?? []).join(", ") || "—", innerW, theme),
-          kvRow("Path Globs", (item.pathGlobs ?? []).join(", ") || "—", innerW, theme),
-          kvRow("Hits", String(item.hitCount ?? 0), innerW, theme),
-          ...(item.verifiedSha ? [kvRow("Verified SHA", item.verifiedSha, innerW, theme)] : []),
-          ...(this.entry?.updatedAt ? [kvRow("Updated", formatAge(this.entry.updatedAt), innerW, theme)] : []),
-        ];
-        if (this.entry?.evidencePaths && this.entry.evidencePaths.length > 0) {
-          lines.push("", divider(innerW, theme, "Evidence Paths"));
-          for (const p of this.entry.evidencePaths) lines.push(clamp(`  - ${sanitizeLine(p)}`, innerW));
-        }
-        lines.push("", divider(innerW, theme, "Context"));
-        if (this.loading && !this.entry) {
-          lines.push(theme.muted("Loading full entry via kb.get..."));
-        } else if (this.error && !this.entry) {
-          lines.push(theme.danger(`Failed to load full entry: ${this.error}`));
-          if (this.card.summary) lines.push(...wrap(sanitizeText(this.card.summary), innerW));
-        } else {
-          lines.push(...wrap(sanitizeText(this.entry?.contextMd || this.card.summary || "(empty)"), innerW));
-        }
-        return this.viewport.render(lines, innerW, bodyH, theme);
-      },
+      hints: this.view.hints(),
+      renderBody: (innerW, bodyH) => this.view.render(innerW, bodyH, theme),
     });
   }
 
+  handleMouse(ev: OverlayMouseEvent, ctx: ScreenContext): void {
+    const rect = this.frame.bodyRect;
+    if (!rect) return;
+    this.view.handleMouse({ ...ev, x: ev.x - rect.col, y: ev.y - rect.row }, ctx);
+  }
+
   handleInput(data: string, ctx: ScreenContext): void {
-    const wheel = parseMouseWheel(data);
-    if (wheel.hadMouse) {
-      if (wheel.delta !== 0) {
-        this.viewport.scrollBy(wheel.delta);
-        ctx.requestRender();
-      }
+    if (this.view.handleKey(data, ctx)) {
+      ctx.requestRender();
       return;
     }
     if (isPopKey(data, ctx)) {
       ctx.navigator.pop();
-      return;
     }
-    if (matchesKey(data, "up") || data === "k") this.viewport.scrollBy(-1);
-    else if (matchesKey(data, "down") || data === "j") this.viewport.scrollBy(1);
-    else if (matchesKey(data, "pageUp") || matchesKey(data, "ctrl+u")) this.viewport.pageUp();
-    else if (matchesKey(data, "pageDown") || matchesKey(data, "ctrl+d")) this.viewport.pageDown();
-    else if (matchesKey(data, "home") || data === "g") this.viewport.scrollToTop();
-    else if (matchesKey(data, "end") || data === "G") this.viewport.scrollToBottom();
-    else return;
-    ctx.requestRender();
   }
 }
 

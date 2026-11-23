@@ -8,7 +8,7 @@ import {
   TuiMainScreen,
 } from "@earendil-works/pi-tui";
 import type { Theme } from "./tokens.js";
-import { DISABLE_MOUSE_WHEEL_SEQ, ENABLE_MOUSE_WHEEL_SEQ } from "./viewport.js";
+import { DISABLE_MOUSE_SEQ, ENABLE_MOUSE_SEQ, parseMouseEvents, type ScreenMouseEvent } from "./viewport.js";
 
 const FAINT = "\x1b[2m";
 const RESET = "\x1b[0m";
@@ -88,7 +88,7 @@ export class ModalScreen extends TuiMainScreen {
   }
 
   protected override getExitRestorePrefix(): string {
-    return DISABLE_MOUSE_WHEEL_SEQ + super.getExitRestorePrefix();
+    return DISABLE_MOUSE_SEQ + super.getExitRestorePrefix();
   }
 
   /** Public helper used by `TerminalSession.stop()` to restore terminal state cleanly. */
@@ -114,6 +114,8 @@ export interface ScreenContext {
   writeTerminal: (seq: string) => void;
 }
 
+export type OverlayMouseEvent = ScreenMouseEvent;
+
 export interface Screen {
   readonly id?: string;
   readonly title: string;
@@ -121,6 +123,7 @@ export interface Screen {
   readonly variant?: "sheet" | "dialog";
   render(width: number, maxHeight: number, theme: Theme): string[];
   handleInput(data: string, ctx: ScreenContext): void;
+  handleMouse?(ev: OverlayMouseEvent, ctx: ScreenContext): void;
   onShow?(ctx: ScreenContext): void;
   onClose?(): void;
 }
@@ -168,6 +171,23 @@ export class Navigator {
         if (isKeyRelease(data)) return;
         const top = this.current;
         if (!top) return;
+        const mouseEvents = parseMouseEvents(data);
+        if (mouseEvents.length > 0) {
+          if (top.handleMouse) {
+            const bounds = this.handle?.getBounds();
+            const offX = bounds?.col ?? 0;
+            const offY = bounds?.row ?? 0;
+            const ctx = this.makeContext();
+            for (const ev of mouseEvents) {
+              top.handleMouse({ ...ev, x: ev.x - offX, y: ev.y - offY }, ctx);
+            }
+            this.requestRender();
+            return;
+          }
+          if (!mouseEvents.some((e) => e.type === "wheel")) {
+            return;
+          }
+        }
         top.handleInput(data, this.makeContext());
       },
     };
@@ -218,7 +238,7 @@ export class Navigator {
       if (this.mouseEnabled) {
         this.mouseEnabled = false;
         try {
-          this.terminal.write(DISABLE_MOUSE_WHEEL_SEQ);
+          this.terminal.write(DISABLE_MOUSE_SEQ);
         } catch {
           // ignore
         }
@@ -231,7 +251,7 @@ export class Navigator {
     if (!this.mouseEnabled) {
       this.mouseEnabled = true;
       try {
-        this.terminal.write(ENABLE_MOUSE_WHEEL_SEQ);
+        this.terminal.write(ENABLE_MOUSE_SEQ);
       } catch {
         // ignore
       }

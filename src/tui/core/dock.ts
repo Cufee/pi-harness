@@ -3,14 +3,14 @@ import {
   type Component,
   Container,
   Editor,
-  Markdown,
   matchesKey,
   type TUI,
 } from "@earendil-works/pi-tui";
-import { renderToolOutput, type ToolDisplayPayload } from "../tool-output/index.js";
+import type { ToolDisplayPayload } from "../tool-output/index.js";
 import { type EntityRef, type Hint, renderHintBar } from "./keymap.js";
 import { clamp, fillLineBg, fit, middleEllipsis, sanitizeLine, sanitizeText, splitRow, visibleWidth, wrap } from "./text.js";
 import { statusGlyph, statusTone, type Theme, type Tone } from "./tokens.js";
+import { renderTranscriptBlock, type TranscriptBlock } from "./transcript-blocks.js";
 
 /**
  * Immutable transcript block: once rendered at `width`, its lines NEVER mutate.
@@ -178,12 +178,14 @@ export class LiveTurnTail implements Component {
     const g = this.theme.glyphs;
 
     if (this.text.trim()) {
-      out.push("");
-      if (this.modelLabel) {
-        out.push(clamp(` ${this.theme.accent(g.diamond)} ${this.theme.muted(sanitizeLine(this.modelLabel))}`, w));
-      }
-      const md = new Markdown(sanitizeText(this.text).replace(/^\n+|\n+$/g, ""), 1, 0, this.theme.toMarkdownTheme());
-      out.push(...md.render(w).map((l) => clamp(l, w)));
+      out.push(
+        ...renderTranscriptBlock(
+          { kind: "assistant", text: this.text, meta: this.modelLabel },
+          w,
+          this.theme,
+          "expanded",
+        ),
+      );
     } else if (this.thought.trim()) {
       const last = sanitizeLine(this.thought.trim().split("\n").slice(-1)[0] ?? "");
       if (last) {
@@ -299,48 +301,22 @@ export class ImmutableTranscript extends Container {
    * and subtle calibrated `userBg` surface fill.
    */
   appendUserTurn(text: string, timestampMs?: number | null): void {
-    const clean = sanitizeText(text).trim();
-    if (!clean) return;
+    if (!sanitizeText(text).trim()) return;
     this.maybeAppendTimestampDivider(timestampMs);
     const t = this.theme;
-    const g = t.glyphs;
-    this.frozenContainer.addChild(
-      new FrozenBlock((w) => {
-        const inner = Math.max(4, w - 5);
-        const wrapped = wrap(clean, inner);
-        const bar = t.accent(g.rail);
-        const out: string[] = [""];
-        for (let i = 0; i < wrapped.length; i++) {
-          const prefix = i === 0 ? `${bar} ${t.accentBold(g.prompt)} ` : `${bar}   `;
-          out.push(fillLineBg(`${prefix}${t.bold(wrapped[i]!)}`, w, t.userBg));
-        }
-        return out;
-      }),
-    );
+    const block: TranscriptBlock = { kind: "user", text };
+    this.frozenContainer.addChild(new FrozenBlock((w) => renderTranscriptBlock(block, w, t)));
   }
 
   /**
    * Immutable AssistantCard: optional `◆ <model>` attribution header + syntax-highlighted Markdown.
    */
   appendAssistantTurn(markdownText: string, meta?: string, timestampMs?: number | null): void {
-    const clean = sanitizeText(markdownText).replace(/^\n+|\n+$/g, "");
-    if (!clean.trim()) return;
+    if (!sanitizeText(markdownText).replace(/^\n+|\n+$/g, "").trim()) return;
     this.maybeAppendTimestampDivider(timestampMs);
     const t = this.theme;
-    const g = t.glyphs;
-    const mdTheme = t.toMarkdownTheme();
-    const cleanMeta = meta ? sanitizeLine(meta) : "";
-    this.frozenContainer.addChild(
-      new FrozenBlock((w) => {
-        const md = new Markdown(clean, 1, 0, mdTheme);
-        const out: string[] = [""];
-        if (cleanMeta) {
-          out.push(clamp(` ${t.accent(g.diamond)} ${t.muted(cleanMeta)}`, w));
-        }
-        out.push(...md.render(w));
-        return out;
-      }),
-    );
+    const block: TranscriptBlock = { kind: "assistant", text: markdownText, meta };
+    this.frozenContainer.addChild(new FrozenBlock((w) => renderTranscriptBlock(block, w, t, "expanded")));
   }
 
   /**
@@ -363,19 +339,16 @@ export class ImmutableTranscript extends Container {
     this.freezeLiveText(timestampMs);
     this.maybeAppendTimestampDivider(timestampMs);
     const t = this.theme;
-    this.frozenContainer.addChild(
-      new FrozenBlock((w) => ["", ...renderToolOutput(display, w, t)]),
-    );
+    const block: TranscriptBlock = { kind: "tool_output", display };
+    this.frozenContainer.addChild(new FrozenBlock((w) => renderTranscriptBlock(block, w, t)));
   }
 
   /** Compact dim note for a persisted `tool_output` turn lacking a valid structured display. */
   appendToolOutputNote(text: string, timestampMs?: number | null): void {
-    const clean = sanitizeLine(text) || "tool output";
     this.maybeAppendTimestampDivider(timestampMs);
     const t = this.theme;
-    this.frozenContainer.addChild(
-      new FrozenBlock((w) => [clamp(`  ${t.ok(t.glyphs.check)} ${t.muted(clean)}`, w)]),
-    );
+    const block: TranscriptBlock = { kind: "tool_note", text };
+    this.frozenContainer.addChild(new FrozenBlock((w) => renderTranscriptBlock(block, w, t)));
   }
 
   /**
@@ -393,17 +366,15 @@ export class ImmutableTranscript extends Container {
     this.freezeLiveText(opts.timestampMs);
     this.maybeAppendTimestampDivider(opts.timestampMs);
     const t = this.theme;
-    const glyph = opts.glyph ?? t.glyphs.bullet;
-    const tone = opts.tone ?? "muted";
-    const cleanText = sanitizeLine(opts.text);
-    const tagPart = opts.tag ? `${t.paint(tone, `[${sanitizeLine(opts.tag)}]`)} ` : "";
-    const inspectHint = opts.ref ? t.dim("  (Ctrl+X inspect)") : "";
-    this.frozenContainer.addChild(
-      new FrozenBlock((w) => {
-        const left = `  ${t.paint(tone, glyph)} ${tagPart}${cleanText}`;
-        return [splitRow(left, inspectHint, w)];
-      }),
-    );
+    const block: TranscriptBlock = {
+      kind: "receipt",
+      glyph: opts.glyph,
+      tone: opts.tone,
+      tag: opts.tag,
+      text: opts.text,
+      hint: opts.ref ? "(Ctrl+X inspect)" : undefined,
+    };
+    this.frozenContainer.addChild(new FrozenBlock((w) => renderTranscriptBlock(block, w, t)));
   }
 
   clearAll(): void {

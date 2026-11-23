@@ -15,6 +15,7 @@ import type { DaemonClient } from "../daemon/remote.js";
 import type { GoalRecord, GoalReviewVerdict, GoalRevisionRecord } from "../goals/engine.js";
 import type { DaemonEventFrame } from "../protocol/daemon-rpc.js";
 import {
+  blockSourceText,
   clamp,
   type ColumnSpec,
   divider,
@@ -25,7 +26,6 @@ import {
   formatClock,
   formatCountdown,
   formatDuration,
-  fillLineBg,
   Frame,
   handleTabKeys,
   type Hint,
@@ -33,8 +33,10 @@ import {
   kvRow,
   middleEllipsis,
   type Navigator,
+  type OverlayMouseEvent,
   parseDurationMs,
   parseMouseWheel,
+  renderTranscriptBlock,
   sanitizeLine,
   sanitizeText,
   type Screen,
@@ -43,13 +45,13 @@ import {
   TableListView,
   tag,
   type Theme,
-  type Tone,
+  TranscriptView,
+  type ViewBlock,
   Viewport,
-  visibleWidth,
   wrap,
   yankText,
 } from "./core/index.js";
-import { LiveTranscriptModel, type TranscriptLine } from "./live-transcript.js";
+import { LiveTranscriptModel } from "./live-transcript.js";
 import { QuotaWaitPickerScreen } from "./quota-wait-picker.js";
 import { consumeReplay } from "./replay.js";
 import type { WorkStore } from "./store.js";
@@ -554,7 +556,7 @@ export class GoalInspectorScreen implements Screen {
             : []),
           "",
           divider(innerW, theme, "Description"),
-          ...wrap(sanitizeText(g.description || g.title), innerW),
+          ...renderTranscriptBlock({ kind: "text", format: "markdown", text: g.description || g.title }, innerW, theme),
         ];
 
         if (g.criteria.length > 0) {
@@ -572,7 +574,11 @@ export class GoalInspectorScreen implements Screen {
         }
 
         if (g.lastReviewSummary) {
-          lines.push("", divider(innerW, theme, "Latest Review Summary"), ...wrap(sanitizeText(g.lastReviewSummary), innerW));
+          lines.push(
+            "",
+            divider(innerW, theme, "Latest Review Summary"),
+            ...renderTranscriptBlock({ kind: "text", format: "markdown", text: g.lastReviewSummary }, innerW, theme),
+          );
         }
 
         return this.viewport.render(lines, innerW, bodyH, theme);
@@ -1152,7 +1158,11 @@ export class TaskInspectorScreen implements Screen {
         ];
 
         if (t.summary) {
-          lines.push("", divider(innerW, theme, "Summary"), ...wrap(sanitizeText(t.summary), innerW));
+          lines.push(
+            "",
+            divider(innerW, theme, "Summary"),
+            ...renderTranscriptBlock({ kind: "text", format: "markdown", text: t.summary }, innerW, theme),
+          );
         }
 
         if (this.data.handoff) {
@@ -1161,7 +1171,11 @@ export class TaskInspectorScreen implements Screen {
               ? this.data.handoff
               : this.data.handoff.summary || JSON.stringify(this.data.handoff);
           if (handoffText && handoffText !== t.summary) {
-            lines.push("", divider(innerW, theme, "Handoff"), ...wrap(sanitizeText(handoffText), innerW));
+            lines.push(
+              "",
+              divider(innerW, theme, "Handoff"),
+              ...renderTranscriptBlock({ kind: "text", format: "markdown", text: handoffText }, innerW, theme),
+            );
           }
         }
 
@@ -1207,10 +1221,18 @@ export class TaskInspectorScreen implements Screen {
         }
 
         if (t.objective) {
-          lines.push("", divider(innerW, theme, "Objective"), ...wrap(sanitizeText(t.objective), innerW));
+          lines.push(
+            "",
+            divider(innerW, theme, "Objective"),
+            ...renderTranscriptBlock({ kind: "text", format: "markdown", text: t.objective }, innerW, theme),
+          );
         }
         if (t.criteria) {
-          lines.push("", divider(innerW, theme, "Criteria"), ...wrap(sanitizeText(t.criteria), innerW));
+          lines.push(
+            "",
+            divider(innerW, theme, "Criteria"),
+            ...renderTranscriptBlock({ kind: "text", format: "markdown", text: t.criteria }, innerW, theme),
+          );
         }
 
         return this.viewport.render(lines, innerW, bodyH, theme);
@@ -1324,8 +1346,10 @@ class ArtifactInspectorScreen implements Screen {
   readonly title: string;
   private readonly frame = new Frame();
   private nav: Navigator | null = null;
-  private readonly viewport = new Viewport();
+  private readonly view: TranscriptView;
   private result: ArtifactReadResult | null = null;
+  private contentRev = 0;
+  private blocks: ViewBlock[] = [];
   private offset = 0;
   private loading = true;
   private error: string | null = null;
@@ -1337,11 +1361,32 @@ class ArtifactInspectorScreen implements Screen {
     private readonly deps: InspectorDeps,
   ) {
     this.title = middleEllipsis(artifactPath, 28);
+    this.view = new TranscriptView(() => this.blocks, {
+      follow: false,
+      emptyText: "(empty)",
+      notify: (text, tone) => this.frame.setNotice(text, tone),
+    });
   }
 
   onShow(ctx: ScreenContext): void {
     this.nav = ctx.navigator;
     void this.load(ctx);
+  }
+
+  private rebuildBlocks(): void {
+    this.contentRev += 1;
+    const content = this.result?.content ?? "";
+    if (!content) {
+      this.blocks = [];
+      return;
+    }
+    const lower = this.artifactPath.toLowerCase();
+    const block = lower.endsWith(".md")
+      ? { kind: "text" as const, format: "markdown" as const, text: content }
+      : lower.endsWith(".json")
+        ? { kind: "text" as const, format: "code" as const, lang: "json", text: content }
+        : { kind: "text" as const, format: "plain" as const, text: content };
+    this.blocks = [{ id: 1, rev: this.contentRev, block }];
   }
 
   private async load(ctx: ScreenContext): Promise<void> {
@@ -1355,7 +1400,8 @@ class ArtifactInspectorScreen implements Screen {
         maxChars: this.pageSize,
         offset: this.offset,
       });
-      this.viewport.scrollToTop();
+      this.rebuildBlocks();
+      this.view.scrollToTop();
     } catch (err) {
       this.error = err instanceof Error ? err.message : String(err);
     } finally {
@@ -1369,8 +1415,7 @@ class ArtifactInspectorScreen implements Screen {
     const hints: Hint[] = [
       ...(this.offset > 0 ? [{ key: "p", label: "prev page" }] : []),
       ...(hasMore ? [{ key: "n", label: "next page" }] : []),
-      { key: "y", label: "copy" },
-      { key: "Esc", label: "back" },
+      ...this.view.hints(),
     ];
     const total = this.result?.totalChars;
     const right =
@@ -1389,22 +1434,19 @@ class ArtifactInspectorScreen implements Screen {
       renderBody: (innerW, bodyH) => {
         if (this.loading && !this.result) return [theme.muted("Loading artifact...")];
         if (this.error) return [theme.danger(this.error)];
-        const lines = wrap(sanitizeText(this.result?.content ?? "(empty)"), innerW);
-        return this.viewport.render(lines, innerW, bodyH, theme);
+        return this.view.render(innerW, bodyH, theme);
       },
     });
   }
 
+  handleMouse(ev: OverlayMouseEvent, ctx: ScreenContext): void {
+    const rect = this.frame.bodyRect;
+    if (!rect || this.frame.hasInlineModal) return;
+    this.view.handleMouse({ ...ev, x: ev.x - rect.col, y: ev.y - rect.row }, ctx);
+  }
+
   handleInput(data: string, ctx: ScreenContext): void {
     if (this.frame.handleInlineInput(data, ctx.requestRender)) return;
-    if (isPopKey(data, ctx)) {
-      ctx.navigator.pop();
-      return;
-    }
-    if (handleViewportScrollKeys(data, this.viewport)) {
-      ctx.requestRender();
-      return;
-    }
     if (data === "n" && !this.loading && (this.result?.hasMore || this.result?.truncated)) {
       this.offset += this.pageSize;
       void this.load(ctx);
@@ -1415,10 +1457,12 @@ class ArtifactInspectorScreen implements Screen {
       void this.load(ctx);
       return;
     }
-    if (data === "y" && this.result?.content) {
-      const ok = yankText(this.result.content, ctx.writeTerminal);
-      this.frame.setNotice(ok ? "Copied artifact content" : "Clipboard unavailable", ok ? "ok" : "warn");
+    if (this.view.handleKey(data, ctx)) {
       ctx.requestRender();
+      return;
+    }
+    if (isPopKey(data, ctx)) {
+      ctx.navigator.pop();
     }
   }
 }
@@ -1680,56 +1724,24 @@ class MergeInspectorScreen implements Screen {
 
 /* ─────────────────────────── Live Transcript Viewer ───────────────────────── */
 
-interface StyledLine {
-  rows: string[];
-  /** Character offset in the logical line's text where each row starts. */
-  offs: number[];
-}
-
-interface LiveRowLayout {
-  lines: TranscriptLine[];
-  indexByKey: Map<string, number>;
-  /** First wrapped row of each logical line. */
-  rowStart: number[];
-  rowCount: number[];
-  /** Logical line index of each wrapped row. */
-  rowLine: number[];
-  /** Source character offset (within its logical line) at which each wrapped row starts. */
-  rowOffset: number[];
-}
-
-const EMPTY_LAYOUT: LiveRowLayout = { lines: [], indexByKey: new Map(), rowStart: [], rowCount: [], rowLine: [], rowOffset: [] };
-
 /**
  * Read-only live transcript viewer backed by `watch.start` (`scope: "task"` or `"run"`) + `replay.page`.
- * Buffers early watch frames until `watchId` settles, drains paginated replay + fragments, handles
- * `agent.tool`, `agent.thought_delta`, `agent.rollover`, `agent.error`, and `quota.*`, and guards
+ * Buffers early watch frames until `watchId` settles, drains paginated replay + fragments, and guards
  * `onClose()` so late-resolving watches are stopped immediately without leaking.
- *
- * Reading: a logical-line cursor (`↑↓`), range selection (`v` / `Shift+↑↓`), exact copy (`y`), and
- * per-tool expand/collapse (`Enter`). While paused, the top visible line is pinned by its stable key
- * so streaming output, re-wrapping, and expansion never move what is being read; `End`/`G`/`f` resumes follow.
+ * Delegates rendering, folding, cursor/mouse selection, copy, and read anchoring to `TranscriptView`.
  */
 export class LiveTranscriptScreen implements Screen {
   readonly variant = "sheet" as const;
   readonly title: string;
   private readonly frame = new Frame();
   private nav: Navigator | null = null;
-  private readonly viewport = new Viewport({ follow: true });
+  private lastCtx: ScreenContext | null = null;
   private watchId: string | null = null;
   private closed = false;
   private detach: (() => void) | null = null;
   private earlyBuffer: DaemonEventFrame[] = [];
   private readonly model: LiveTranscriptModel;
-  private layout: LiveRowLayout = EMPTY_LAYOUT;
-  private readonly rowCache = new Map<string, { sig: string } & StyledLine>();
-  private cursorKey: string | null = null;
-  private selectAnchorKey: string | null = null;
-  /** Top visible source position: logical line + character offset, so it survives any re-wrap width. */
-  private readAnchor: { key: string; offset: number } | null = null;
-  private pausedAtLines = 0;
-  /** Tool block just expanded: its rows are scrolled into view after the next layout. */
-  private revealBlockId: number | null = null;
+  private readonly view: TranscriptView;
 
   constructor(
     private readonly runId: string,
@@ -1738,10 +1750,32 @@ export class LiveTranscriptScreen implements Screen {
   ) {
     this.title = taskId ? `Live ${taskId}` : `Live ${runId}`;
     this.model = new LiveTranscriptModel(Boolean(taskId));
+    this.view = new TranscriptView(() => this.model.blocks(), {
+      follow: true,
+      emptyText: "Waiting for live events...",
+      notify: (text, tone) => this.frame.setNotice(text, tone),
+      onInspect: (vb) => {
+        if (!this.lastCtx) return;
+        const b = vb.block;
+        const label = b.kind === "tool" ? b.label : `${b.kind} #${vb.id}`;
+        openEntityInspector(
+          {
+            kind: "tool_call",
+            id: `${this.taskId ?? this.runId}:${vb.id}`,
+            runId: this.runId,
+            label,
+            payload: vb.payload ?? blockSourceText(b),
+          },
+          this.deps,
+          this.lastCtx,
+        );
+      },
+    });
   }
 
   onShow(ctx: ScreenContext): void {
     this.nav = ctx.navigator;
+    this.lastCtx = ctx;
     this.closed = false;
     this.earlyBuffer = [];
 
@@ -1753,7 +1787,7 @@ export class LiveTranscriptScreen implements Screen {
         return;
       }
       if (ev.watchId !== this.watchId) return;
-      this.ingestEvent(ev);
+      this.model.ingest(ev);
       ctx.requestRender();
     });
 
@@ -1774,13 +1808,13 @@ export class LiveTranscriptScreen implements Screen {
           this.deps.client,
           res,
           { watchId: res.watchId },
-          (ev) => this.ingestEvent(ev),
+          (ev) => this.model.ingest(ev),
           () => this.closed,
         );
         if (this.closed) return;
         const buffered = this.earlyBuffer.splice(0);
         for (const ev of buffered) {
-          if (ev.watchId === this.watchId) this.ingestEvent(ev);
+          if (ev.watchId === this.watchId) this.model.ingest(ev);
         }
         ctx.requestRender();
       })
@@ -1803,388 +1837,87 @@ export class LiveTranscriptScreen implements Screen {
     }
   }
 
-  private ingestEvent(ev: EventRecord | DaemonEventFrame): void {
-    this.model.ingest(ev);
-  }
-
-  /* ── layout ── */
-
-  /** Index of `key` in the current layout, falling back to its block header when the slot vanished (collapse/trim). */
-  private resolveIndex(key: string | null): number {
-    if (!key) return -1;
-    const idx = this.layout.indexByKey.get(key);
-    if (idx !== undefined) return idx;
-    const header = this.layout.indexByKey.get(`${key.slice(0, key.indexOf(":"))}:h`);
-    return header ?? -1;
-  }
-
-  private keyAt(idx: number): string | null {
-    return idx >= 0 ? (this.layout.lines[idx]?.key ?? null) : null;
-  }
-
-  private selectionBounds(): [number, number] | null {
-    if (this.selectAnchorKey === null) return null;
-    const a = this.resolveIndex(this.selectAnchorKey);
-    const c = this.resolveIndex(this.cursorKey);
-    if (a < 0 || c < 0) return null;
-    return [Math.min(a, c), Math.max(a, c)];
-  }
-
-  /**
-   * Styled display rows for one logical line plus the character offset of each row inside `line.text`
-   * (the stable source position that survives re-wrapping). `width` is the full row budget: wrapping
-   * reserves the widest of the first/continuation prefixes so no wrapped row is ever clipped.
-   */
-  private styleLine(line: TranscriptLine, width: number, theme: Theme): StyledLine {
-    const g = theme.glyphs;
-    const plain = (s: string): string => s;
-    const indented = (first: string, rest: string, style: (s: string) => string = plain, text = line.text): StyledLine => {
-      const avail = Math.max(1, width - Math.max(visibleWidth(first), visibleWidth(rest)));
-      const parts = wrap(text, avail);
-      const offs: number[] = [];
-      let pos = 0;
-      for (const part of parts) {
-        const at = part ? text.indexOf(part, pos) : -1;
-        offs.push(at >= 0 ? at : pos);
-        if (at >= 0) pos = at + part.length;
-      }
-      return { rows: parts.map((r, i) => `${i === 0 ? first : rest}${style(r)}`), offs };
-    };
-    switch (line.role) {
-      case "spacer":
-        return { rows: [""], offs: [0] };
-      case "assistant-header":
-        return indented(`${theme.accent(g.diamond)} `, "  ", (s) => theme.bold(s));
-      case "thought-header":
-        return indented(theme.dim("… "), "  ", (s) => theme.dim(theme.italic(s)));
-      case "heading":
-        return indented("  ", "  ", (s) => theme.accentBold(s));
-      case "list":
-        return indented("  ", "    ");
-      case "fence":
-        return line.text
-          ? indented(`  ${theme.muted(`${g.boxTL}${g.barH} `)}`, "     ", (s) => theme.muted(s))
-          : { rows: [`  ${theme.muted(`${g.boxBL}${g.barH}`)}`], offs: [0] };
-      case "code": {
-        const bar = `  ${theme.muted(g.barV)} `;
-        return indented(bar, bar, (s) => theme.code(s));
-      }
-      case "thought":
-        return indented("  ", "  ", (s) => theme.dim(theme.italic(s)));
-      case "tool-header": {
-        const st = line.tool?.status ?? "running";
-        const tone: Tone = st === "ok" ? "ok" : st === "error" ? "danger" : "accent";
-        const fold = theme.muted(`${line.tool?.expanded ? g.foldOpen : g.foldClosed} `);
-        return indented(fold, "  ", (s) => theme.paint(tone, s));
-      }
-      case "tool-label":
-        return indented("    ", "    ", (s) => theme.muted(s));
-      case "tool-body":
-      case "tool-error": {
-        const bar = `    ${theme.muted(g.barV)} `;
-        return indented(bar, bar, line.role === "tool-error" ? (s) => theme.danger(s) : plain);
-      }
-      case "event":
-        return indented("", "  ", (s) => theme.paint(line.tone ?? "muted", s));
-      default:
-        return indented("  ", "  ");
-    }
-  }
-
-  /** Rebuilds wrapped rows for `rowW` columns: 2-col gutter (cursor / selection rail) + styled line. */
-  private layoutRows(rowW: number, theme: Theme): string[] {
-    const lines = this.model.lines();
-    const indexByKey = new Map<string, number>();
-    lines.forEach((l, i) => indexByKey.set(l.key, i));
-    this.layout = { lines, indexByKey, rowStart: [], rowCount: [], rowLine: [], rowOffset: [] };
-    // Re-key cursor/anchor to surviving lines (a collapsed tool's sub-line falls back to its header).
-    this.cursorKey = this.keyAt(this.resolveIndex(this.cursorKey));
-    this.selectAnchorKey = this.keyAt(this.resolveIndex(this.selectAnchorKey));
-    if (this.cursorKey === null) this.selectAnchorKey = null;
-
-    if (this.rowCache.size > lines.length * 2 + 256) this.rowCache.clear();
-    const sel = this.selectionBounds();
-    const cursorIdx = this.resolveIndex(this.cursorKey);
-    const bodyW = Math.max(1, rowW - 2);
-    const rows: string[] = [];
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i]!;
-      const sig = `${bodyW}\u0000${theme.color}\u0000${line.role}\u0000${line.tone ?? ""}\u0000${line.tool?.status ?? ""}\u0000${line.tool?.expanded ?? ""}\u0000${line.text}`;
-      let cached = this.rowCache.get(line.key);
-      if (!cached || cached.sig !== sig) {
-        cached = { sig, ...this.styleLine(line, bodyW, theme) };
-        this.rowCache.set(line.key, cached);
-      }
-      const inSel = sel !== null && i >= sel[0] && i <= sel[1];
-      const isCursor = i === cursorIdx;
-      this.layout.rowStart.push(rows.length);
-      this.layout.rowCount.push(cached.rows.length);
-      cached.rows.forEach((r, j) => {
-        const gutter = isCursor && j === 0 ? `${theme.accent(theme.glyphs.pointer)} ` : inSel ? `${theme.accent(theme.glyphs.rail)} ` : "  ";
-        const row = gutter + r;
-        rows.push(inSel || isCursor ? fillLineBg(row, rowW, theme.badgeBg) : row);
-        this.layout.rowLine.push(i);
-        this.layout.rowOffset.push(cached.offs[j] ?? 0);
-      });
-    }
-    return rows;
-  }
-
-  /* ── reading anchor / follow ── */
-
-  private captureAnchor(): void {
-    const idx = this.layout.rowLine[this.viewport.offset];
-    if (idx === undefined) return;
-    this.readAnchor = { key: this.layout.lines[idx]!.key, offset: this.layout.rowOffset[this.viewport.offset] ?? 0 };
-  }
-
-  private restoreAnchor(): void {
-    if (!this.readAnchor) return;
-    const exact = this.layout.indexByKey.get(this.readAnchor.key);
-    const idx = exact ?? this.resolveIndex(this.readAnchor.key);
-    if (idx < 0) return;
-    // Land on the wrapped row that contains the remembered character, whatever the current width.
-    let delta = 0;
-    if (exact !== undefined) {
-      const start = this.layout.rowStart[idx]!;
-      while (delta + 1 < this.layout.rowCount[idx]! && (this.layout.rowOffset[start + delta + 1] ?? 0) <= this.readAnchor.offset) delta++;
-    }
-    this.viewport.offset = this.layout.rowStart[idx]! + delta;
-  }
-
-  private pause(): void {
-    if (!this.viewport.follow) return;
-    this.viewport.follow = false;
-    this.pausedAtLines = this.layout.lines.length;
-  }
-
-  private resume(): void {
-    this.viewport.follow = true;
-    this.viewport.scrollToBottom(true);
-    this.readAnchor = null;
-    if (this.selectAnchorKey === null) this.cursorKey = null;
-  }
-
-  private visibleLineRange(): [number, number] {
-    const rowLine = this.layout.rowLine;
-    const top = Math.min(this.viewport.offset, rowLine.length - 1);
-    const bottom = Math.min(rowLine.length - 1, this.viewport.offset + this.viewport.lastHeight - 1);
-    return [rowLine[Math.max(0, top)] ?? 0, rowLine[Math.max(0, bottom)] ?? 0];
-  }
-
-  private moveCursor(delta: number, extend: boolean): void {
-    const lines = this.layout.lines;
-    if (lines.length === 0) return;
-    let idx = this.resolveIndex(this.cursorKey);
-    const fresh = idx < 0;
-    if (fresh) idx = this.visibleLineRange()[1];
-    if (extend && this.selectAnchorKey === null) this.selectAnchorKey = lines[idx]!.key;
-    if (!fresh) idx = Math.max(0, Math.min(lines.length - 1, idx + delta));
-    const dir = delta < 0 ? -1 : 1;
-    while (lines[idx]?.role === "spacer" && idx + dir >= 0 && idx + dir < lines.length) idx += dir;
-    while (lines[idx]?.role === "spacer" && idx - dir >= 0 && idx - dir < lines.length) idx -= dir;
-    this.cursorKey = lines[idx]!.key;
-    if (this.selectAnchorKey === null && extend) this.selectAnchorKey = this.cursorKey;
-    this.pause();
-    this.revealLines(idx, idx);
-    this.captureAnchor();
-  }
-
-  /** Scrolls the minimum needed to show logical lines `from..to`, keeping `from` visible when they do not fit. */
-  private revealLines(from: number, to: number): void {
-    const start = this.layout.rowStart[from]!;
-    const end = this.layout.rowStart[to]! + this.layout.rowCount[to]! - 1;
-    const h = Math.max(1, this.viewport.lastHeight);
-    if (start < this.viewport.offset) this.viewport.offset = start;
-    else if (end >= this.viewport.offset + h) this.viewport.offset = Math.min(start, end - h + 1);
-  }
-
-  private copyLines(from: number, to: number): string {
-    let lo = from;
-    let hi = to;
-    const lines = this.layout.lines;
-    while (lo < hi && lines[lo]?.role === "spacer") lo++;
-    while (hi > lo && lines[hi]?.role === "spacer") hi--;
-    return lines.slice(lo, hi + 1).map((l) => l.copy).join("\n");
-  }
-
   render(width: number, maxHeight: number, theme: Theme): string[] {
-    const hints: Hint[] = [
-      { key: "↑↓", label: "cursor" },
-      { key: "v/⇧↑↓", label: this.selectAnchorKey ? "selecting" : "select" },
-      { key: "y", label: "copy" },
-      { key: "⏎", label: "tool" },
-      { key: "f/End", label: this.viewport.follow ? "follow:on" : "follow:off" },
-      { key: "PgUp/PgDn/wheel", label: "scroll" },
-      { key: "Y", label: "copy all" },
-      { key: "Esc", label: this.selectAnchorKey ? "clear" : "close" },
-    ];
-    // Narrow terminals shed detail instead of letting the frame drop the whole header.
     const room = Math.max(8, Math.max(4, width - 2 - (width >= 20 ? 4 : 2)) - 6);
-    const header = (): string => {
-      if (this.viewport.follow) return theme.ok(`${theme.glyphs.running} live`);
-      const newLines = Math.max(0, this.layout.lines.length - this.pausedAtLines);
-      const status = this.viewport.statusText();
-      const variants = [
-        newLines > 0 ? `+${newLines} new · End resumes ${status}` : `paused ${status}`,
-        newLines > 0 ? `+${newLines} new · End` : `paused ${status}`,
-        newLines > 0 ? `+${newLines} new` : "paused",
-      ].map((v) => v.trimEnd());
-      const text = variants.find((v) => visibleWidth(v) <= room) ?? variants[variants.length - 1]!;
-      return newLines > 0 ? theme.warn(text) : theme.muted(text);
-    };
-    // The header reflects the layout the body pass computes, so re-render once when that pass changed it.
-    const before = header();
-    const out = this.renderFrame(width, maxHeight, theme, hints, before);
-    const after = header();
-    return after === before ? out : this.renderFrame(width, maxHeight, theme, hints, after);
+    const before = this.view.status(theme, room);
+    const out = this.renderFrame(width, maxHeight, theme, before);
+    const after = this.view.status(theme, room);
+    return after === before ? out : this.renderFrame(width, maxHeight, theme, after);
   }
 
-  private renderFrame(width: number, maxHeight: number, theme: Theme, hints: Hint[], rightHeader: string): string[] {
+  private renderFrame(width: number, maxHeight: number, theme: Theme, rightHeader: string): string[] {
     return this.frame.render({
       width,
       maxHeight,
       theme,
       breadcrumbs: this.nav?.breadcrumbs ?? [this.title],
       rightHeader,
-      hints,
-      renderBody: (innerW, bodyH) => {
-        if (this.model.isEmpty) {
-          this.layout = EMPTY_LAYOUT;
-          return [theme.muted("Waiting for live events...")];
-        }
-        // Reserve the scrollbar gutter up front so rows never get truncated when it appears.
-        const rows = this.layoutRows(Math.max(4, innerW - 2), theme);
-        let restoredAt = -1;
-        if (!this.viewport.follow) {
-          this.restoreAnchor();
-          restoredAt = this.viewport.offset;
-          if (this.revealBlockId !== null) {
-            const idxs = this.layout.lines.flatMap((l, i) => (l.blockId === this.revealBlockId ? [i] : []));
-            if (idxs.length > 0) this.revealLines(idxs[0]!, idxs[idxs.length - 1]!);
-          }
-        }
-        this.revealBlockId = null;
-        const out = this.viewport.render(rows, innerW, bodyH, theme);
-        // Keep the remembered source position while the viewport still shows it; re-capturing the
-        // restored row would round the anchor down to a row start and drift on every resize.
-        if (!this.viewport.follow && (restoredAt !== this.viewport.offset || this.readAnchor === null)) this.captureAnchor();
-        return out;
-      },
+      hints: this.view.hints(),
+      renderBody: (innerW, bodyH) => this.view.render(innerW, bodyH, theme),
     });
   }
 
+  handleMouse(ev: OverlayMouseEvent, ctx: ScreenContext): void {
+    this.lastCtx = ctx;
+    const rect = this.frame.bodyRect;
+    if (!rect) return;
+    this.view.handleMouse({ ...ev, x: ev.x - rect.col, y: ev.y - rect.row }, ctx);
+  }
+
   handleInput(data: string, ctx: ScreenContext): void {
-    const done = () => ctx.requestRender();
-    if (matchesKey(data, "escape") && this.selectAnchorKey !== null) {
-      this.selectAnchorKey = null;
-      return done();
+    this.lastCtx = ctx;
+    if (this.view.handleKey(data, ctx)) {
+      ctx.requestRender();
+      return;
     }
     if (isPopKey(data, ctx)) {
       ctx.navigator.pop();
-      return;
-    }
-
-    const wheel = parseMouseWheel(data);
-    if (wheel.hadMouse) {
-      if (wheel.delta < 0) this.pause();
-      if (wheel.delta !== 0 && !this.viewport.follow) {
-        this.viewport.scrollBy(wheel.delta);
-        this.captureAnchor();
-      }
-      return done();
-    }
-
-    const extend = matchesKey(data, "shift+up") || matchesKey(data, "shift+down") || data === "K" || data === "J";
-    const up = extend ? matchesKey(data, "shift+up") || data === "K" : matchesKey(data, "up") || data === "k";
-    if (extend || up || matchesKey(data, "down") || data === "j") {
-      this.moveCursor(up ? -1 : 1, extend);
-      return done();
-    }
-
-    if (data === "v") {
-      if (this.selectAnchorKey !== null) this.selectAnchorKey = null;
-      else {
-        if (this.resolveIndex(this.cursorKey) < 0) this.moveCursor(0, false);
-        this.selectAnchorKey = this.cursorKey;
-      }
-      return done();
-    }
-
-    if (matchesKey(data, "pageUp") || matchesKey(data, "ctrl+u")) {
-      this.pause();
-      this.viewport.pageUp();
-      this.captureAnchor();
-      return done();
-    }
-    if (matchesKey(data, "pageDown") || matchesKey(data, "ctrl+d")) {
-      if (!this.viewport.follow) {
-        this.viewport.pageDown();
-        this.captureAnchor();
-      }
-      return done();
-    }
-    if (matchesKey(data, "home") || data === "g") {
-      this.pause();
-      this.viewport.scrollToTop();
-      this.captureAnchor();
-      return done();
-    }
-    if (matchesKey(data, "end") || data === "G") {
-      this.resume();
-      return done();
-    }
-    if (data === "f") {
-      if (this.viewport.follow) {
-        this.pause();
-        this.captureAnchor();
-      } else this.resume();
-      return done();
-    }
-
-    if (matchesKey(data, "enter") || matchesKey(data, "return") || data === " ") {
-      const idx = this.resolveIndex(this.cursorKey);
-      const line = this.layout.lines[idx];
-      if (!line || !this.model.toggleTool(line.blockId)) {
-        this.frame.setNotice("Move the cursor (↑↓) onto a tool call to expand or collapse it", "info");
-      } else {
-        this.revealBlockId = line.blockId;
-      }
-      return done();
-    }
-
-    if (data === "y") {
-      const sel = this.selectionBounds();
-      const cur = this.resolveIndex(this.cursorKey);
-      if (sel || cur >= 0) {
-        const [lo, hi] = sel ?? [cur, cur];
-        const text = this.copyLines(lo, hi);
-        yankText(text, ctx.writeTerminal);
-        const n = hi - lo + 1;
-        this.frame.setNotice(`Copied ${n} line${n === 1 ? "" : "s"}`, "ok");
-        return done();
-      }
-    }
-    if (data === "y" || data === "Y") {
-      const lines = this.model.lines();
-      yankText(lines.map((l) => l.copy).join("\n"), ctx.writeTerminal);
-      this.frame.setNotice("Copied transcript", "ok");
-      return done();
     }
   }
 }
 
 /* ──────────────────────── Generic / ToolCall Inspector ────────────────────── */
 
+function genericDetailBlocks(ref: EntityRef): ViewBlock[] {
+  if (typeof ref.payload === "string") {
+    const trimmed = ref.payload.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        JSON.parse(trimmed);
+        return [{ id: 1, rev: 1, block: { kind: "text", format: "code", lang: "json", text: ref.payload } }];
+      } catch {
+        // render as markdown below
+      }
+    }
+    return [{ id: 1, rev: 1, block: { kind: "text", format: "markdown", text: ref.payload } }];
+  }
+  if (ref.payload != null) {
+    return [
+      {
+        id: 1,
+        rev: 1,
+        block: { kind: "text", format: "code", lang: "json", text: JSON.stringify(ref.payload, null, 2) },
+      },
+    ];
+  }
+  return [{ id: 1, rev: 1, block: { kind: "text", format: "plain", text: `${ref.kind}: ${ref.id}\n${ref.label}` } }];
+}
+
 class GenericDetailScreen implements Screen {
   readonly variant = "sheet" as const;
   readonly title: string;
   private readonly frame = new Frame();
   private nav: Navigator | null = null;
-  private readonly viewport = new Viewport();
+  private readonly blocks: ViewBlock[];
+  private readonly view: TranscriptView;
 
   constructor(private readonly ref: EntityRef) {
     this.title = middleEllipsis(ref.label || ref.id, 30);
+    this.blocks = genericDetailBlocks(ref);
+    this.view = new TranscriptView(() => this.blocks, {
+      follow: false,
+      notify: (text, tone) => this.frame.setNotice(text, tone),
+    });
   }
 
   onShow(ctx: ScreenContext): void {
@@ -2192,45 +1925,31 @@ class GenericDetailScreen implements Screen {
   }
 
   render(width: number, maxHeight: number, theme: Theme): string[] {
+    const room = Math.max(8, Math.max(4, width - 2 - (width >= 20 ? 4 : 2)) - 6);
     return this.frame.render({
       width,
       maxHeight,
       theme,
       breadcrumbs: this.nav?.breadcrumbs ?? ["Inspect", this.ref.kind, this.title],
-      hints: [
-        { key: "y", label: "copy" },
-        { key: "Esc", label: "back" },
-      ],
-      renderBody: (innerW, bodyH) => {
-        const bodyText =
-          typeof this.ref.payload === "string"
-            ? this.ref.payload
-            : this.ref.payload != null
-              ? JSON.stringify(this.ref.payload, null, 2)
-              : `${this.ref.kind}: ${this.ref.id}\n${this.ref.label}`;
-        const lines = wrap(sanitizeText(bodyText), innerW);
-        return this.viewport.render(lines, innerW, bodyH, theme);
-      },
+      rightHeader: this.view.status(theme, room) || undefined,
+      hints: this.view.hints(),
+      renderBody: (innerW, bodyH) => this.view.render(innerW, bodyH, theme),
     });
   }
 
+  handleMouse(ev: OverlayMouseEvent, ctx: ScreenContext): void {
+    const rect = this.frame.bodyRect;
+    if (!rect) return;
+    this.view.handleMouse({ ...ev, x: ev.x - rect.col, y: ev.y - rect.row }, ctx);
+  }
+
   handleInput(data: string, ctx: ScreenContext): void {
+    if (this.view.handleKey(data, ctx)) {
+      ctx.requestRender();
+      return;
+    }
     if (isPopKey(data, ctx)) {
       ctx.navigator.pop();
-      return;
-    }
-    if (data === "y") {
-      const txt =
-        typeof this.ref.payload === "string"
-          ? this.ref.payload
-          : JSON.stringify(this.ref.payload ?? this.ref, null, 2);
-      yankText(txt, ctx.writeTerminal);
-      this.frame.setNotice("Copied details", "ok");
-      ctx.requestRender();
-      return;
-    }
-    if (handleViewportScrollKeys(data, this.viewport)) {
-      ctx.requestRender();
     }
   }
 }
