@@ -4,7 +4,7 @@ import type { EscalationRecord, TaskRecord } from "../control-plane/db.js";
 import type { RunActivitySummary } from "../control-plane/telemetry.js";
 import type { RunnerCallbacks } from "../runners/types.js";
 import type { GoalRecord, GoalReviewVerdict } from "../goals/engine.js";
-import { isCurrentClaim } from "../goals/live-progress.js";
+import { isCurrentClaim, stripStaleLiveProgress } from "../goals/live-progress.js";
 
 export function toolEventPreview(value: unknown): string | undefined {
   if (value === undefined || value === null) return undefined;
@@ -136,17 +136,8 @@ export function reconcileGoalWithLiveRun(goal: GoalRecord): GoalRecord {
   if (!lp) return goal;
   const hasProvenance = lp.goalVersion !== undefined || lp.runId !== undefined || lp.reviewCycle !== undefined;
   if (!hasProvenance || isCurrentClaim(goal, lp)) return goal;
-  const {
-    verificationStatus: _v,
-    criteriaResults: _c,
-    goalVersion: _gv,
-    runId: _r,
-    reviewCycle: _rc,
-    source: _s,
-    claimedAt: _ca,
-    ...rest
-  } = lp;
-  const liveProgress = rest.phase === undefined && rest.summary === undefined ? null : rest;
+  // A stale blocked phase (and its summary) belongs to the stale claim, so it is hidden too.
+  const liveProgress = stripStaleLiveProgress(lp, { clearBlockedPhase: true }).next;
   return { ...goal, liveProgress };
 }
 

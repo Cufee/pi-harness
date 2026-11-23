@@ -8,19 +8,23 @@ export interface GoalLiveProgress {
   summary?: string;
   verificationStatus?: "not_needed" | "in_progress" | "passed" | "failed";
   criteriaResults?: CriterionEvaluation[];
+  /** Task that reported the current verification claim (frozen by later updates that do not set a status). */
   reportedByTaskId?: string | null;
   updatedAt: number;
   /** Provenance of the last CLAIM (verificationStatus, criteriaResults, or phase "blocked"). Absent on legacy rows. */
   goalVersion?: number;
   runId?: string | null;
   reviewCycle?: number;
+  /** Author of the claim; follows `verificationSource` while a verification status is stored. */
   source?: GoalProgressSource;
+  /** Author of `verificationStatus`; criterion-only or summary updates never relabel it. */
+  verificationSource?: GoalProgressSource;
   claimedAt?: number;
 }
 
 export type GoalLiveProgressPatch = Omit<
   GoalLiveProgress,
-  "updatedAt" | "goalVersion" | "runId" | "reviewCycle" | "source" | "claimedAt"
+  "updatedAt" | "goalVersion" | "runId" | "reviewCycle" | "source" | "verificationSource" | "claimedAt"
 >;
 
 export interface GoalProgressContext {
@@ -35,6 +39,11 @@ export function isBlockedPhase(phase?: string | null): boolean {
   return phase?.trim().toLowerCase() === "blocked";
 }
 
+/** Sources whose verification claims gate settlement; worker claims are display-only. */
+export function isAuthoritativeSource(s?: GoalProgressSource): boolean {
+  return s === "coordinator" || s === "director" || s === "verify_task";
+}
+
 function hasProvenance(lp: GoalLiveProgress): boolean {
   return lp.goalVersion !== undefined || lp.runId !== undefined || lp.reviewCycle !== undefined;
 }
@@ -42,7 +51,10 @@ function hasProvenance(lp: GoalLiveProgress): boolean {
 /**
  * Merges a progress patch into the stored live progress. Claims (verification status, criterion results, or a
  * blocked phase) are stamped with the goal epoch they were made in; a claim from a different epoch drops the
- * previous claim first. Summary or ordinary phase updates never refresh a claim's provenance.
+ * previous claim first. Summary or ordinary phase updates never refresh a claim's provenance, and only a patch
+ * that sets `verificationStatus` changes who authored it. Within the same epoch, a worker cannot overwrite an
+ * authoritative verification status or clear an authoritative blocked phase; it may still add summary, ordinary
+ * phase and criterion results.
  */
 export function mergeGoalLiveProgress(
   prev: GoalLiveProgress | null | undefined,
@@ -51,44 +63,72 @@ export function mergeGoalLiveProgress(
 ): GoalLiveProgress {
   const isClaim =
     patch.verificationStatus !== undefined || patch.criteriaResults !== undefined || isBlockedPhase(patch.phase);
+  const sameEpoch =
+    !!prev &&
+    prev.goalVersion === ctx.goalVersion &&
+    prev.runId === ctx.runId &&
+    prev.reviewCycle === ctx.reviewCycle;
   let base: GoalLiveProgress | null | undefined = prev;
-  if (
-    isClaim &&
-    prev &&
-    hasProvenance(prev) &&
-    (prev.goalVersion !== ctx.goalVersion || prev.runId !== ctx.runId || prev.reviewCycle !== ctx.reviewCycle)
-  ) {
-    const { verificationStatus: _v, criteriaResults: _c, ...rest } = prev;
+  if (isClaim && prev && hasProvenance(prev) && !sameEpoch) {
+    const { verificationStatus: _v, verificationSource: _vs, criteriaResults: _c, ...rest } = prev;
     base = rest;
     if (isBlockedPhase(prev.phase) && patch.phase === undefined) {
       delete base.phase;
     }
   }
 
+  const baseVerificationSource =
+    base?.verificationStatus !== undefined ? (base.verificationSource ?? base.source) : undefined;
+  const authoritativeBlocked = sameEpoch && isBlockedPhase(base?.phase) && isAuthoritativeSource(base?.source);
+  const workerLocked =
+    ctx.source === "worker" &&
+    sameEpoch &&
+    ((base?.verificationStatus !== undefined && isAuthoritativeSource(baseVerificationSource)) || authoritativeBlocked);
+  const setsVerification = patch.verificationStatus !== undefined && !workerLocked;
+
   const mergedById = new Map<string, CriterionEvaluation>();
   for (const c of base?.criteriaResults ?? []) mergedById.set(c.criterionId, c);
   for (const c of patch.criteriaResults ?? []) mergedById.set(c.criterionId, c);
 
+  const keepClaimAuthor = !setsVerification && (workerLocked || base?.verificationStatus !== undefined);
   const next: GoalLiveProgress = {
-    phase: patch.phase ?? base?.phase,
+    phase: authoritativeBlocked && ctx.source === "worker" ? base?.phase : (patch.phase ?? base?.phase),
     summary: patch.summary ?? base?.summary,
-    verificationStatus: patch.verificationStatus ?? base?.verificationStatus,
+    verificationStatus: setsVerification ? patch.verificationStatus : base?.verificationStatus,
     criteriaResults: mergedById.size > 0 ? [...mergedById.values()] : undefined,
-    reportedByTaskId: patch.reportedByTaskId ?? base?.reportedByTaskId ?? null,
+    reportedByTaskId: keepClaimAuthor
+      ? (base?.reportedByTaskId ?? null)
+      : (patch.reportedByTaskId ?? base?.reportedByTaskId ?? null),
     updatedAt: ctx.now,
   };
-  if (isClaim) {
+  if (isClaim && !workerLocked) {
     next.goalVersion = ctx.goalVersion;
     next.runId = ctx.runId;
     next.reviewCycle = ctx.reviewCycle;
-    next.source = ctx.source;
-    next.claimedAt = ctx.now;
+    if (setsVerification) {
+      next.source = ctx.source;
+      next.verificationSource = ctx.source;
+      next.claimedAt = ctx.now;
+    } else if (base?.verificationStatus !== undefined) {
+      // Criterion-only (or blocked-phase) claim on an existing status: the status keeps its author and time.
+      if (baseVerificationSource !== undefined) {
+        next.source = baseVerificationSource;
+        next.verificationSource = baseVerificationSource;
+      }
+      next.claimedAt = base.claimedAt ?? base.updatedAt;
+    } else {
+      next.source = ctx.source;
+      next.claimedAt = ctx.now;
+    }
   } else if (base) {
     if (base.goalVersion !== undefined) next.goalVersion = base.goalVersion;
     if (base.runId !== undefined) next.runId = base.runId;
     if (base.reviewCycle !== undefined) next.reviewCycle = base.reviewCycle;
     if (base.source !== undefined) next.source = base.source;
-    if (base.claimedAt !== undefined) next.claimedAt = base.claimedAt;
+    if (base.verificationSource !== undefined) next.verificationSource = base.verificationSource;
+    // Legacy rows have no claim time: remember when the stored status was reported before refreshing updatedAt.
+    const claimedAt = base.claimedAt ?? (base.verificationStatus !== undefined ? base.updatedAt : undefined);
+    if (claimedAt !== undefined) next.claimedAt = claimedAt;
   }
   return next;
 }
@@ -116,10 +156,20 @@ export function stripStaleLiveProgress(
     runId,
     reviewCycle,
     source,
+    verificationSource,
     claimedAt,
     ...rest
   } = lp;
-  let changed = [verificationStatus, criteriaResults, goalVersion, runId, reviewCycle, source, claimedAt].some(
+  let changed = [
+    verificationStatus,
+    criteriaResults,
+    goalVersion,
+    runId,
+    reviewCycle,
+    source,
+    verificationSource,
+    claimedAt,
+  ].some(
     (v) => v !== undefined,
   );
   const next: GoalLiveProgress = { ...rest };
