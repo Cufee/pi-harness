@@ -1019,4 +1019,126 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
       assert.equal(exitAction.kind, "exit");
     }
   });
+
+  it("handles non-destructive read-only takeover, draft preservation, Ctrl+Y and /take reclaim in runDirectorChatTui", async () => {
+    const { terminal, writes, sendInput } = makeFakeTerminal(120, 30);
+    const chatSession: ChatSessionRecord = {
+      id: "chat-42",
+      projectId: null,
+      repoRoot: "/repo",
+      title: "Takeover Test",
+      profileId: "acp:codex",
+      model: "openai/gpt-6.2-sol",
+      effort: "high",
+      acpSessionId: null,
+      modelSelectionContext: null,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+
+    const mock = makeMockClient(async (op) => {
+      if (op === "chat.open") {
+        return {
+          session: chatSession,
+          history: [],
+          historyNext: null,
+          historyThrough: 0,
+          activeTurnId: null,
+          activeText: "",
+          activePartial: "",
+          tookOver: false,
+          control: {
+            sessionId: "chat-42",
+            kind: "chat",
+            clientId: "cli-a",
+            controllerClientId: "cli-a",
+            hasControl: true,
+          },
+          busy: false,
+        };
+      }
+      if (op === "session.take_control") {
+        return {
+          sessionId: "chat-42",
+          kind: "chat",
+          clientId: "cli-a",
+          controllerClientId: "cli-a",
+          hasControl: true,
+          tookOver: true,
+        };
+      }
+      if (op === "chat.send") return { ok: true };
+      if (op === "work.snapshot") {
+        return { generatedAt: Date.now(), latestSeq: 0, goals: [], runs: [], escalations: [], timers: [], merges: [], worktrees: [], messages: [], inbox: [] };
+      }
+      if (op === "session.leave") return { daemonWillQuit: false };
+      return {};
+    });
+
+    const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+    await new Promise((r) => setTimeout(r, 40));
+
+    // 1. Lose control to cli-b -> stays open in READ-ONLY mode
+    writes.length = 0;
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: "chat-42",
+      taskId: "chat-42",
+      type: "session.control_changed",
+      createdAt: Date.now(),
+      payload: { sessionId: "chat-42", kind: "chat", controllerClientId: "cli-b", reason: "attached" },
+    });
+    const raceResult = await Promise.race([
+      runPromise.then(() => "exited"),
+      new Promise<string>((r) => setTimeout(() => r("alive"), 50)),
+    ]);
+    assert.equal(raceResult, "alive", "TUI must stay open when losing control");
+    const roOutput = writes.map(stripTerminalSequences).join("\n");
+    assert.ok(roOutput.includes("READ-ONLY"), "Read-only status row must render");
+    assert.ok(roOutput.includes("Ctrl+Y"), "Read-only indicator must mention Ctrl+Y");
+
+    // 2. Typing and submitting while read-only blocks chat.send and preserves draft
+    for (const ch of "Hello") sendInput(ch);
+    sendInput("\r");
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(mock.calls.filter((c) => c.op === "chat.send").length, 0, "chat.send must be blocked while read-only");
+
+    // 3. Ctrl+Y reclaims control; pressing Enter submits the preserved draft
+    sendInput("\x19");
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(mock.calls.filter((c) => c.op === "session.take_control").length, 1);
+
+    sendInput("\r");
+    await new Promise((r) => setTimeout(r, 30));
+    const sendCalls = mock.calls.filter((c) => c.op === "chat.send");
+    assert.equal(sendCalls.length, 1);
+    assert.equal(sendCalls[0]?.params.text, "Hello");
+
+    // 4. Controller disconnects -> uncontrolled read-only state
+    writes.length = 0;
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: "chat-42",
+      taskId: "chat-42",
+      type: "session.control_changed",
+      createdAt: Date.now(),
+      payload: { sessionId: "chat-42", kind: "chat", controllerClientId: null, reason: "disconnected" },
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.ok(writes.map(stripTerminalSequences).join("\n").includes("no terminal has control"));
+
+    // 5. While read-only, /take reclaims control a second time
+    for (const ch of "/take") sendInput(ch);
+    sendInput("\r");
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(mock.calls.filter((c) => c.op === "session.take_control").length, 2);
+
+    // 6. Ctrl+] exits cleanly and calls session.leave
+    sendInput("\x1d");
+    const exitAction = await runPromise;
+    assert.equal(exitAction.kind, "exit");
+    assert.ok(mock.calls.some((c) => c.op === "session.leave"));
+  });
 });

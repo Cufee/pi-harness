@@ -27,6 +27,26 @@ export interface DaemonEventFrame {
 
 export type WireFrame = RpcRequest | RpcResponse | DaemonEventFrame;
 
+export type SessionControlReason = "attached" | "taken" | "released" | "disconnected";
+
+/** Payload of the `session.control_changed` event, sent to every viewer of the session except the socket that caused it. */
+export interface SessionControlPayload {
+  sessionId: string;
+  kind: "chat" | "run";
+  /** null: no terminal has input control. */
+  controllerClientId: string | null;
+  reason: SessionControlReason;
+}
+
+/** Returned as `control` by chat.open, chat.create and attach, and as the result of session.take_control. */
+export interface SessionControlState {
+  sessionId: string;
+  kind: "chat" | "run";
+  clientId: string;
+  controllerClientId: string | null;
+  hasControl: boolean;
+}
+
 export type DaemonOp =
   | "ping"
   | "status"
@@ -65,6 +85,7 @@ export type DaemonOp =
   | "session.read"
   | "sessions.list"
   | "session.leave"
+  | "session.take_control"
   | "kb.search"
   | "kb.get"
   | "goal.create"

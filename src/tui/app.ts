@@ -5,7 +5,7 @@ import type { EventRecord, ReplayPage, RunRecord } from "../control-plane/db.js"
 import type { DaemonClient } from "../daemon/remote.js";
 import type { ChatSessionRecord, ChatTurnRecord } from "../director/session.js";
 import { formatChatEventSummary, parseChatControlEvent, qualifyRemoteCliHints } from "../protocol/chat-events.js";
-import type { DaemonEventFrame } from "../protocol/daemon-rpc.js";
+import type { DaemonEventFrame, SessionControlState } from "../protocol/daemon-rpc.js";
 import { createCommandAutocomplete, parseSlashCommand, renderHelp, type TuiMode } from "./commands.js";
 import {
   createTheme,
@@ -94,6 +94,7 @@ interface ChatOpenResult {
   activeText: string;
   activePartial: string;
   tookOver: boolean;
+  control?: SessionControlState;
   busy: boolean;
 }
 
@@ -101,6 +102,7 @@ interface AttachRunResult extends ReplayPage {
   attachmentId: string;
   attached: boolean;
   tookOver: boolean;
+  control?: SessionControlState;
   run: RunRecord | null;
 }
 
@@ -124,6 +126,8 @@ interface SharedShellContext {
   sessionId: string;
   chatSessionId?: string;
   runId?: string;
+  initialControl?: SessionControlState;
+  onControlChanged?: (hasControl: boolean) => void;
   terminal?: Terminal;
   getRightStatus: () => string;
   getIdleBanner: () => string;
@@ -157,6 +161,10 @@ function createSharedShell(spec: SharedShellContext) {
   let busy = false;
   let phaseText = "Ready";
   let transientHint: string | null = null;
+  let hasControl = spec.initialControl?.hasControl ?? true;
+  let controllerClientId = spec.initialControl?.controllerClientId ?? null;
+  let clientId = spec.initialControl?.clientId ?? null;
+  const READ_ONLY_RECEIPT = "Read-only: take control first (Ctrl+Y or /take).";
   const queuedMessages: string[] = [];
 
   let dock!: FixedDock;
@@ -171,13 +179,13 @@ function createSharedShell(spec: SharedShellContext) {
       session.tui.requestRender();
     },
     isOverlayOpen: () => navigator?.isOpen ?? false,
-    isBusy: () => busy,
+    isBusy: () => busy && hasControl,
     onInterrupt: () => {
       if (navigator.isOpen) {
         navigator.pop();
         return "consumed";
       }
-      if (busy) {
+      if (busy && hasControl) {
         void spec.onCancelActiveTurn();
         return "consumed";
       }
@@ -259,7 +267,7 @@ function createSharedShell(spec: SharedShellContext) {
         currentHost: spec.remoteHost ?? null,
         currentProjectId: cur.id,
         currentRepoRoot: cur.repoRoot,
-        canSwitchCurrentSession: Boolean(spec.onSwitchCurrentSessionProject),
+        canSwitchCurrentSession: Boolean(spec.onSwitchCurrentSessionProject) && hasControl,
         onOpenProject: (project) => {
           const targetHost = project.host && project.host !== "local" ? project.host : undefined;
           switchTo("chat", "__project__", {
@@ -305,6 +313,11 @@ function createSharedShell(spec: SharedShellContext) {
 
   const openModels = () => {
     if (!spec.onModelUpdated) return;
+    if (!hasControl) {
+      transcript.appendReceipt({ tone: "warn", tag: "control", text: READ_ONLY_RECEIPT });
+      session.tui.requestRender();
+      return;
+    }
     const cur = spec.getCurrentModel?.() ?? {};
     navigator.push(
       new ModelPickerScreen(spec.client, {
@@ -329,6 +342,11 @@ function createSharedShell(spec: SharedShellContext) {
 
   const openEffort = () => {
     if (!spec.onEffortUpdated) return;
+    if (!hasControl) {
+      transcript.appendReceipt({ tone: "warn", tag: "control", text: READ_ONLY_RECEIPT });
+      session.tui.requestRender();
+      return;
+    }
     const cur = spec.getCurrentModel?.() ?? {};
     const label = `${cur.profileId ?? "auto"} · ${cur.model ?? "CLI default"}`;
     navigator.push(
@@ -462,10 +480,83 @@ function createSharedShell(spec: SharedShellContext) {
     { key: "/help", label: "Help" },
   ];
 
+  const readOnlyHints: Hint[] = [
+    { key: "Ctrl+Y", label: "Take control" },
+    { key: "Ctrl+P", label: "Projects" },
+    { key: "Ctrl+O", label: "Go" },
+    { key: "/sessions", label: "Switch" },
+    { key: "/quit", label: "Detach" },
+  ];
+
+  const effectivePhaseText = () =>
+    hasControl
+      ? phaseText
+      : `READ-ONLY: ${controllerClientId ? "another terminal has control" : "no terminal has control"} · Ctrl+Y take control`;
+
+  const applyControl = (nextControllerId: string | null) => {
+    const next = clientId !== null && nextControllerId === clientId;
+    const changed = next !== hasControl || (!next && nextControllerId !== controllerClientId);
+    hasControl = next;
+    controllerClientId = nextControllerId;
+    if (changed) {
+      if (hasControl) {
+        transcript.appendReceipt({
+          glyph: theme.glyphs.check,
+          tone: "ok",
+          tag: "control",
+          text: "You have control of this session.",
+        });
+      } else if (controllerClientId) {
+        transcript.appendReceipt({
+          tone: "warn",
+          tag: "control",
+          text: "Control moved to another terminal. This terminal is read-only. Ctrl+Y or /take takes control back. Ctrl+P or /sessions switches to another project or session.",
+        });
+      } else {
+        transcript.appendReceipt({
+          tone: "warn",
+          tag: "control",
+          text: "The controlling terminal disconnected. No terminal has control. Ctrl+Y or /take takes control.",
+        });
+      }
+    }
+    syncDock();
+    spec.onControlChanged?.(hasControl);
+  };
+
+  const takeControl = async () => {
+    try {
+      const res = await spec.client.request<SessionControlState>("session.take_control", { sessionId: spec.sessionId });
+      if (!clientId && res.clientId) clientId = res.clientId;
+      applyControl(res.controllerClientId);
+    } catch (err) {
+      transcript.appendReceipt({
+        tone: "danger",
+        tag: "control",
+        text: err instanceof Error ? err.message : String(err),
+      });
+      session.tui.requestRender();
+    }
+  };
+
   const handleSlash = async (raw: string): Promise<boolean> => {
     const parsed = parseSlashCommand(raw);
     if (!parsed) return false;
+    if (!hasControl && ["model", "effort", "resume", "steer", "send"].includes(parsed.name)) {
+      transcript.appendReceipt({ tone: "warn", tag: "control", text: READ_ONLY_RECEIPT });
+      session.tui.requestRender();
+      return true;
+    }
     switch (parsed.name) {
+      case "take": {
+        if (hasControl) {
+          transcript.appendReceipt({ tone: "info", tag: "control", text: "This terminal already has control." });
+          session.tui.requestRender();
+          return true;
+        }
+        await takeControl();
+        return true;
+      }
       case "projects": {
         const arg = parsed.args.trim();
         if (!arg) {
@@ -819,12 +910,12 @@ function createSharedShell(spec: SharedShellContext) {
       activeGoalsCount: initialHud.activeGoalsCount,
       idleBanner: spec.getIdleBanner(),
       busy: false,
-      phaseText: "Ready",
+      phaseText: effectivePhaseText(),
       remoteHost: spec.remoteHost ?? null,
       transientHint: null,
       rightStatus: spec.getRightStatus(),
       queuedCount: 0,
-      hints: dockHints,
+      hints: hasControl ? dockHints : readOnlyHints,
     },
     onSubmit: (raw) => {
       const text = raw.trim();
@@ -838,6 +929,12 @@ function createSharedShell(spec: SharedShellContext) {
           });
           session.tui.requestRender();
         });
+        return;
+      }
+      if (!hasControl) {
+        dock.editor.setText(raw);
+        transcript.appendReceipt({ tone: "warn", tag: "control", text: READ_ONLY_RECEIPT });
+        session.tui.requestRender();
         return;
       }
       void spec.onUserSubmit(text).catch((err) => {
@@ -861,11 +958,12 @@ function createSharedShell(spec: SharedShellContext) {
       activeGoalsCount: hud.activeGoalsCount,
       idleBanner: spec.getIdleBanner(),
       busy,
-      phaseText,
+      phaseText: effectivePhaseText(),
       remoteHost: spec.remoteHost ?? null,
       transientHint,
       rightStatus: spec.getRightStatus(),
       queuedCount: queuedMessages.length,
+      hints: hasControl ? dockHints : readOnlyHints,
     });
     session.tui.requestRender();
   };
@@ -935,8 +1033,14 @@ function createSharedShell(spec: SharedShellContext) {
       return { consume: true };
     }
 
+    if (matchesKey(data, "ctrl+y") && !hasControl) {
+      void takeControl();
+      return { consume: true };
+    }
+
     // Queue follow-up draft while busy (`Ctrl+Q` or `Alt+Enter`)
     if (
+      hasControl &&
       busy &&
       (data === "\x11" || data === "\x1b\r" || matchesKey(data, "ctrl+q") || matchesKey(data, "alt+enter"))
     ) {
@@ -994,6 +1098,8 @@ function createSharedShell(spec: SharedShellContext) {
     recordRef,
     openEntity,
     openWork,
+    hasControl: () => hasControl,
+    applyControl,
     setStatus(nextBusy: boolean, nextPhase: string) {
       busy = nextBusy;
       phaseText = nextPhase;
@@ -1233,7 +1339,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   };
 
   const drainQueue = () => {
-    if (sending || shell.queuedMessages.length === 0) return;
+    if (!shell.hasControl() || sending || shell.queuedMessages.length === 0) return;
     const next = shell.queuedMessages.shift()!;
     shell.syncDock();
     void dispatchPrompt(next);
@@ -1247,6 +1353,10 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     localRemotes: opts.localRemotes,
     repoRoot: chatSession.repoRoot || opts.repoRoot || process.cwd(),
     projectId: activeProject?.id ?? chatSession.projectId,
+    initialControl: opened.control,
+    onControlChanged: (has) => {
+      if (has) drainQueue();
+    },
     getProject: () => ({
       id: activeProject?.id ?? chatSession.projectId,
       name: activeProject?.name ?? null,
@@ -1381,16 +1491,10 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     const p = (ev.payload ?? {}) as Record<string, unknown>;
     const evTs = sourceTimestampMs(ev.createdAt);
 
-    if (ev.type === "session.taken_over") {
+    if (ev.type === "session.control_changed") {
       const sid = typeof p.sessionId === "string" ? p.sessionId : ev.runId;
       if (sid && sid !== chatSession.id) return;
-      shell.transcript.appendReceipt({
-        tone: "warn",
-        tag: "session",
-        text: "Another client took over this session — detaching.",
-        timestampMs: evTs,
-      });
-      void shell.session.stop();
+      shell.applyControl(typeof p.controllerClientId === "string" ? p.controllerClientId : null);
       return;
     }
 
@@ -1421,6 +1525,9 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         turnFrozeSegments = false;
         frozenTextSet.clear();
         activeTurnId = evTurnId ?? activeTurnId;
+        if (p.reason === "user" && typeof p.text === "string") {
+          shell.transcript.appendUserTurn(p.text);
+        }
         shell.transcript.liveTail.begin(modelBadge());
         shell.setStatus(true, "Director responding...");
         return;
@@ -1439,7 +1546,15 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
 
       if (ev.type === "chat.steered") {
         const msg = typeof p.message === "string" ? firstLine(p.message, 80) : "";
-        if (p.role !== "user" && msg) {
+        if (p.role === "user") {
+          if (!shell.hasControl() && typeof p.message === "string") {
+            if (shell.transcript.freezeLiveText()) {
+              turnFrozeSegments = true;
+            }
+            shell.transcript.appendUserTurn(p.message);
+            shell.session.tui.requestRender();
+          }
+        } else if (msg) {
           const prevSnap = shell.transcript.liveTail.snapshot().text.trim();
           if (shell.transcript.freezeLiveText(evTs)) {
             turnFrozeSegments = true;
@@ -1614,6 +1729,7 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
     repoRoot,
     sessionId: opts.runId,
     runId: opts.runId,
+    initialControl: attached.control,
     terminal: opts.terminal,
     getRightStatus: () => `run ${opts.runId}${opts.initialTaskId ? ` / ${opts.initialTaskId}` : ""}`,
     getIdleBanner: () => `${opts.runId} (${attached.run?.status ?? "active"}) · Ctrl+G Work · /resume · /stop`,
@@ -1836,12 +1952,11 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
 
     if (!closed) {
       liveHandler = (ev) => {
-        if (ev.type === "session.taken_over") {
-          const sid = typeof (ev.payload as Record<string, unknown> | undefined)?.sessionId === "string"
-            ? String((ev.payload as Record<string, unknown>).sessionId)
-            : ev.runId;
+        if (ev.type === "session.control_changed") {
+          const p = (ev.payload ?? {}) as Record<string, unknown>;
+          const sid = typeof p.sessionId === "string" ? p.sessionId : ev.runId;
           if (sid && sid !== opts.runId) return;
-          void shell.session.stop();
+          shell.applyControl(typeof p.controllerClientId === "string" ? p.controllerClientId : null);
           return;
         }
         renderEventToTranscript(ev);
