@@ -1,5 +1,16 @@
 import { execFile } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync } from "node:fs";
+import {
+  type BigIntStats,
+  appendFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  symlinkSync,
+} from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { WorktreeConfig } from "../config.js";
@@ -195,16 +206,20 @@ export class WorktreeManager {
 
     mkdirSync(join(this.baseDir, runId), { recursive: true });
     await runGit(this.repoRoot, ["worktree", "add", "-b", branch, wtPath, sha]);
+    const identity = captureCreationIdentity(wtPath, await this.commonDir());
 
     try {
       await this.bootstrapWorktree(wtPath);
     } catch (err) {
-      // Roll back only what this call created; a locked tree and its branch are left in place.
+      // Roll back only the exact registration this call created; anything else is left in place.
       let removed = false;
       try {
-        const reg = await this.findRegistration(wtPath);
-        if (reg?.locked == null) {
-          await runGit(this.repoRoot, ["worktree", "remove", "--force", reg?.path ?? wtPath]);
+        const entries = await this.listRegistrations();
+        const reg = matchRegistration(entries, wtPath);
+        if (reg && reg.locked === null && reg.branch === branch) {
+          verifyCreationIdentity(reg, identity);
+          assertNoNestedCheckouts(canonicalPath(reg.path), entries);
+          await runGit(this.repoRoot, ["worktree", "remove", "--force", reg.path]);
           removed = true;
         }
       } catch {
@@ -217,7 +232,10 @@ export class WorktreeManager {
     return this.db.recordWorktree({ runId, taskId, path: wtPath, branch, baseSha: sha });
   }
 
-  /** Adds a detached scratch worktree at <baseDir>/<kind>/<name>. remove() targets exactly that registration and never rejects. */
+  /**
+   * Adds a detached scratch worktree at <baseDir>/<kind>/<name>. remove() runs at most once, targets only the
+   * registration this call created (by admin-entry and .git file identity, not path), and never rejects.
+   */
   async addScratchWorktree(
     kind: "_verify" | "_integration",
     name: string,
@@ -226,12 +244,20 @@ export class WorktreeManager {
     const path = join(this.baseDir, kind, name);
     mkdirSync(join(this.baseDir, kind), { recursive: true });
     await runGit(this.repoRoot, ["worktree", "add", "--detach", path, sha]);
+    const identity = captureCreationIdentity(path, await this.commonDir());
+    let consumed = false;
     return {
       path,
       remove: async () => {
+        if (consumed) return;
+        consumed = true;
         try {
-          const reg = await this.findRegistration(path);
-          if (reg && reg.locked === null) await runGit(this.repoRoot, ["worktree", "remove", "--force", reg.path]);
+          const entries = await this.listRegistrations();
+          const reg = matchRegistration(entries, path);
+          if (!reg || reg.locked !== null || reg.branch !== null) return;
+          verifyCreationIdentity(reg, identity);
+          assertNoNestedCheckouts(canonicalPath(reg.path), entries);
+          await runGit(this.repoRoot, ["worktree", "remove", "--force", reg.path]);
         } catch {
           // Removal is best effort; a refused tree stays registered.
         }
@@ -239,13 +265,20 @@ export class WorktreeManager {
     };
   }
 
-  /** Returns the single Git registration whose canonical path equals targetPath, or null. Throws when ambiguous. */
-  private async findRegistration(targetPath: string): Promise<PorcelainWorktree | null> {
-    const target = canonicalPath(targetPath);
-    const { stdout } = await runGit(this.repoRoot, ["worktree", "list", "--porcelain"]);
-    const matches = parsePorcelainWorktrees(stdout).filter((e) => canonicalPath(e.path) === target);
-    if (matches.length > 1) throw new Error(`Multiple Git worktree registrations match ${targetPath}`);
-    return matches[0] ?? null;
+  /** Canonical absolute path of this repository's common Git directory. */
+  private async commonDir(): Promise<string> {
+    const { stdout } = await runGit(this.repoRoot, ["rev-parse", "--git-common-dir"]);
+    return canonicalPath(resolve(this.repoRoot, stdout));
+  }
+
+  /** All Git worktree registrations, parsed from NUL-delimited porcelain output so any path bytes survive. */
+  private async listRegistrations(): Promise<PorcelainWorktree[]> {
+    const { stdout } = await execFileAsync("git", ["worktree", "list", "--porcelain", "-z"], {
+      cwd: this.repoRoot,
+      timeout: 30_000,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return parsePorcelainWorktrees(stdout);
   }
 
   /** An owned row is retired when its task settled, or it merged and its task is no longer live. */
@@ -300,7 +333,8 @@ export class WorktreeManager {
 
   async isDirty(wtPath: string, opts?: { ignoreHarnessDir?: boolean }): Promise<boolean> {
     if (!existsSync(wtPath)) return false;
-    const args = opts?.ignoreHarnessDir ? ["status", "--porcelain", "--", ".", ":!.harness"] : ["status", "--porcelain"];
+    const status = ["--no-optional-locks", "status", "--porcelain"];
+    const args = opts?.ignoreHarnessDir ? [...status, "--", ".", ":!.harness"] : status;
     const { stdout } = await runGit(wtPath, args);
     return stdout.length > 0;
   }
@@ -351,8 +385,17 @@ export class WorktreeManager {
     if (!run || canonicalPath(run.repoRoot) !== canonicalPath(this.repoRoot)) {
       throw new Error(`Worktree ${worktreeId} does not belong to a run in ${this.repoRoot}`);
     }
-    // Ownership and lock checks precede the archive snapshot, which stages files in the tree.
-    const reg = await this.findRegistration(wt.path);
+    // Ownership, lock, and containment checks precede the archive snapshot, which stages files in the tree.
+    if (!this.isRetired(wt) && !existsSync(wt.path)) {
+      throw new Error(`Worktree ${worktreeId} is active and offline (checkout missing); left in place`);
+    }
+    const targetCanon = canonicalPath(wt.path);
+    const owner = this.ownedRows().find((r) => canonicalPath(r.path) === targetCanon);
+    if (owner && owner.id !== wt.id) {
+      throw new Error(`Worktree ${worktreeId} is superseded by newer worktree ${owner.id} at ${wt.path}; left in place`);
+    }
+    const entries = await this.listRegistrations();
+    const reg = matchRegistration(entries, wt.path);
     if (reg) {
       if (reg.locked !== null) {
         throw new Error(`Worktree ${worktreeId} is locked${reg.locked ? ` (${reg.locked})` : ""}; left in place`);
@@ -360,9 +403,11 @@ export class WorktreeManager {
       if (reg.branch !== null && reg.branch !== wt.branch) {
         throw new Error(`Worktree ${worktreeId} is on branch ${reg.branch}, not ${wt.branch}; left in place`);
       }
+      verifyCheckoutBacklink(reg, await this.commonDir());
     } else if (existsSync(wt.path)) {
       throw new Error(`Worktree ${worktreeId} at ${wt.path} is not registered with Git; left in place`);
     }
+    assertNoNestedCheckouts(targetCanon, entries);
 
     let archiveRef: string | null = wt.archiveRef;
     if (opts?.archiveBeforeRemove) {
@@ -383,8 +428,13 @@ export class WorktreeManager {
     }
 
     // Path-targeted: Git's printed path matches its stored entry even when the checkout is missing.
-    if (reg) await runGit(this.repoRoot, ["worktree", "remove", "--force", reg.path]);
-    if (wt.branch !== run.baseBranch) await runGit(this.repoRoot, ["branch", "-D", wt.branch]).catch(() => {});
+    // The branch is deleted only when the removed registration still had it checked out; otherwise it may be a later one.
+    if (reg) {
+      await runGit(this.repoRoot, ["worktree", "remove", "--force", reg.path]);
+      if (reg.branch === wt.branch && wt.branch !== run.baseBranch) {
+        await runGit(this.repoRoot, ["branch", "-D", wt.branch]).catch(() => {});
+      }
+    }
 
     this.db.updateWorktree(wt.id, {
       status: opts?.finalStatus ?? "removed",
@@ -408,9 +458,8 @@ export class WorktreeManager {
     }
     const base = canonicalPath(this.baseDir);
 
-    const { stdout } = await runGit(this.repoRoot, ["worktree", "list", "--porcelain"]);
     const results: LiveWorktreeInfo[] = [];
-    for (const entry of parsePorcelainWorktrees(stdout)) {
+    for (const entry of await this.listRegistrations()) {
       const abs = canonicalPath(entry.path);
       if (!isWithin(base, abs)) continue;
       if (SCRATCH_KINDS.has(relative(base, abs).split(sep)[0] ?? "")) continue;
@@ -423,8 +472,8 @@ export class WorktreeManager {
         branch: entry.branch,
         head: entry.head,
         existsOnDisk,
-        // A tree Git cannot read counts as dirty so it is archived, never skipped silently.
-        dirty: existsOnDisk ? await this.isDirty(abs).catch(() => true) : false,
+        // A tree Git cannot read counts as dirty so it is archived, never skipped silently. Unmanaged trees are not probed.
+        dirty: rec && existsOnDisk ? await this.isDirty(abs).catch(() => true) : false,
         orphaned: rec ? this.isRetired(rec) : false,
       });
     }
@@ -433,7 +482,7 @@ export class WorktreeManager {
 
   /**
    * Retires owned worktrees whose tasks settled, finalises retired rows whose checkout is gone,
-   * deletes branches of cleaned rows, and expires old safety archive refs. Never prunes or deletes unowned trees.
+   * and expires old safety archive refs. Never prunes, deletes unowned trees, or deletes branches of cleaned rows.
    */
   async sweep(opts?: { runId?: string; forceAll?: boolean }): Promise<CleanupReport> {
     const report: CleanupReport = {
@@ -486,36 +535,8 @@ export class WorktreeManager {
       }
     }
 
-    // Delete only exact branches of cleaned rows that nothing else uses.
-    try {
-      const [{ stdout: branchesOut }, { stdout: wtListOut }] = await Promise.all([
-        runGit(this.repoRoot, ["for-each-ref", "--format=%(refname:short)", "refs/heads/harness"]),
-        runGit(this.repoRoot, ["worktree", "list", "--porcelain"]),
-      ]);
-      const repoCanon = canonicalPath(this.repoRoot);
-      const inUse = new Set(this.ownedRows().map((w) => w.branch));
-      for (const e of parsePorcelainWorktrees(wtListOut)) if (e.branch) inUse.add(e.branch);
-      const cleanedBranches = new Set<string>();
-      for (const w of this.db.listWorktrees(opts?.runId)) {
-        if (w.cleanedAt == null) continue;
-        const run = this.db.getRun(w.runId);
-        if (!run || canonicalPath(run.repoRoot) !== repoCanon || w.branch === run.baseBranch) continue;
-        cleanedBranches.add(w.branch);
-      }
-      for (const raw of branchesOut.split("\n")) {
-        const branch = raw.trim();
-        if (!branch || !cleanedBranches.has(branch) || inUse.has(branch)) continue;
-        try {
-          await runGit(this.repoRoot, ["branch", "-D", branch]);
-        } catch (err) {
-          report.errors.push({ target: branch, error: errMsg(err) });
-        }
-      }
-    } catch (err) {
-      report.errors.push({ target: "refs/heads/harness", error: errMsg(err) });
-    }
-
     // Expire old safety archive refs past retentionDays; never the snapshots this sweep just took.
+    // Deletion is guarded by the OID read here, so a concurrently refreshed ref survives.
     const retentionMs = (this.config.archiveRetentionDays ?? 7) * 86_400_000;
     const cutoffSec = Math.floor((Date.now() - retentionMs) / 1000);
     const runPrefix = opts?.runId ? `refs/harness/archive/${opts.runId}/` : "refs/harness/archive/";
@@ -523,17 +544,21 @@ export class WorktreeManager {
     try {
       const { stdout } = await runGit(this.repoRoot, [
         "for-each-ref",
-        "--format=%(refname) %(committerdate:unix)",
+        "--format=%(refname) %(objectname) %(committerdate:unix)",
         opts?.runId ? `refs/harness/archive/${opts.runId}` : "refs/harness/archive",
       ]);
       for (const line of stdout.split("\n")) {
         if (!line.trim()) continue;
-        const [ref, tsStr] = line.trim().split(/\s+/);
-        if (!ref || !ref.startsWith(runPrefix) || justArchived.has(ref)) continue;
+        const [ref, oid, tsStr] = line.trim().split(/\s+/);
+        if (!ref || !oid || !ref.startsWith(runPrefix) || justArchived.has(ref)) continue;
         const ts = Number(tsStr ?? 0);
         if (opts?.forceAll || (ts > 0 && ts < cutoffSec)) {
-          await runGit(this.repoRoot, ["update-ref", "-d", ref]);
-          report.expiredArchiveRefs.push(ref);
+          try {
+            await runGit(this.repoRoot, ["update-ref", "-d", ref, oid]);
+            report.expiredArchiveRefs.push(ref);
+          } catch (err) {
+            report.errors.push({ target: ref, error: errMsg(err) });
+          }
         }
       }
     } catch {
@@ -552,20 +577,141 @@ interface PorcelainWorktree {
   locked: string | null;
 }
 
+/** Parses `git worktree list --porcelain -z`: NUL-terminated attributes, with an empty field ending each entry. */
 function parsePorcelainWorktrees(stdout: string): PorcelainWorktree[] {
-  const blocks = stdout.split(/\n\n+/).filter((b) => b.trim().length > 0);
-  return blocks.map((block) => {
-    let path = "";
-    let head: string | null = null;
-    let branch: string | null = null;
-    let locked: string | null = null;
-    for (const line of block.split("\n")) {
-      if (line.startsWith("worktree ")) path = line.slice("worktree ".length).trim();
-      else if (line.startsWith("HEAD ")) head = line.slice("HEAD ".length).trim();
-      else if (line.startsWith("branch ")) branch = line.slice("branch ".length).trim().replace(/^refs\/heads\//, "");
-      else if (line === "locked") locked = "";
-      else if (line.startsWith("locked ")) locked = line.slice("locked ".length);
+  const entries: PorcelainWorktree[] = [];
+  let cur: PorcelainWorktree | null = null;
+  for (const field of stdout.split("\0")) {
+    if (field === "") {
+      if (cur) entries.push(cur);
+      cur = null;
+      continue;
     }
-    return { path, head, branch, locked };
-  });
+    cur ??= { path: "", head: null, branch: null, locked: null };
+    if (field.startsWith("worktree ")) cur.path = field.slice("worktree ".length);
+    else if (field.startsWith("HEAD ")) cur.head = field.slice("HEAD ".length);
+    else if (field.startsWith("branch ")) cur.branch = field.slice("branch ".length).replace(/^refs\/heads\//, "");
+    else if (field === "locked") cur.locked = "";
+    else if (field.startsWith("locked ")) cur.locked = field.slice("locked ".length);
+  }
+  if (cur) entries.push(cur);
+  return entries;
+}
+
+/** Returns the single registration whose canonical path equals targetPath, or null. Throws when ambiguous. */
+function matchRegistration(entries: PorcelainWorktree[], targetPath: string): PorcelainWorktree | null {
+  const target = canonicalPath(targetPath);
+  const matches = entries.filter((e) => canonicalPath(e.path) === target);
+  if (matches.length > 1) throw new Error(`Multiple Git worktree registrations match ${targetPath}`);
+  return matches[0] ?? null;
+}
+
+/** Reads a one-line path file Git wrote (`.git` link, `commondir`, `gitdir`) and resolves it relative to its directory. */
+function readPathFile(file: string, prefix = ""): string {
+  const raw = readFileSync(file, "utf8").replace(/\r?\n$/, "");
+  if (!raw.startsWith(prefix) || raw.length === prefix.length) throw new Error(`Malformed ${file}`);
+  return canonicalPath(resolve(dirname(file), raw.slice(prefix.length)));
+}
+
+/**
+ * Resolves the admin entry a checkout's `.git` file points at and proves it is a linked worktree of
+ * expectedCommonDir whose backlink names this checkout. Throws on any mismatch.
+ */
+function resolveAdminDir(wtPath: string, expectedCommonDir: string): string {
+  const dotGit = join(wtPath, ".git");
+  if (!lstatSync(dotGit).isFile()) throw new Error(`${dotGit} is not a linked-worktree .git file`);
+  const adminDir = readPathFile(dotGit, "gitdir: ");
+  if (dirname(adminDir) !== join(expectedCommonDir, "worktrees")) {
+    throw new Error(`${wtPath} belongs to ${adminDir}, not a worktree of ${expectedCommonDir}`);
+  }
+  if (readPathFile(join(adminDir, "commondir")) !== expectedCommonDir) {
+    throw new Error(`${adminDir} does not share common directory ${expectedCommonDir}`);
+  }
+  if (readPathFile(join(adminDir, "gitdir")) !== canonicalPath(dotGit)) {
+    throw new Error(`${adminDir} does not point back to ${wtPath}`);
+  }
+  return adminDir;
+}
+
+/** Refuses before any read or staging when an on-disk checkout is not this registration of this repository. */
+function verifyCheckoutBacklink(reg: PorcelainWorktree, expectedCommonDir: string): void {
+  if (!existsSync(reg.path)) return;
+  let adminDir: string;
+  try {
+    adminDir = resolveAdminDir(reg.path, expectedCommonDir);
+  } catch (err) {
+    throw new Error(`Checkout at ${reg.path} does not link back to its registration (${err instanceof Error ? err.message : err}); left in place`);
+  }
+  if (existsSync(join(adminDir, "locked"))) throw new Error(`Worktree at ${reg.path} is locked; left in place`);
+}
+
+interface FileIdentity {
+  dev: bigint;
+  ino: bigint;
+  birthtimeNs: bigint;
+}
+
+interface CreationIdentity {
+  adminDir: string;
+  adminStat: FileIdentity;
+  dotGitStat: FileIdentity;
+}
+
+function fileIdentity(s: BigIntStats): FileIdentity {
+  return { dev: s.dev, ino: s.ino, birthtimeNs: s.birthtimeNs };
+}
+
+function sameIdentity(a: FileIdentity, b: FileIdentity): boolean {
+  return a.dev === b.dev && a.ino === b.ino && a.birthtimeNs === b.birthtimeNs;
+}
+
+/** Records the admin entry and `.git` file a just-added worktree got, so later removal targets only that creation. */
+function captureCreationIdentity(wtPath: string, expectedCommonDir: string): CreationIdentity {
+  const adminDir = resolveAdminDir(wtPath, expectedCommonDir);
+  return {
+    adminDir,
+    adminStat: fileIdentity(statSync(adminDir, { bigint: true })),
+    dotGitStat: fileIdentity(lstatSync(join(wtPath, ".git"), { bigint: true })),
+  };
+}
+
+/** Throws unless reg is still the exact, unlocked registration and checkout recorded by captureCreationIdentity. */
+function verifyCreationIdentity(reg: PorcelainWorktree, identity: CreationIdentity): void {
+  const { adminDir } = identity;
+  if (!existsSync(adminDir) || !sameIdentity(fileIdentity(statSync(adminDir, { bigint: true })), identity.adminStat)) {
+    throw new Error(`Admin entry ${adminDir} was replaced`);
+  }
+  const dotGit = join(reg.path, ".git");
+  if (readPathFile(join(adminDir, "gitdir")) !== canonicalPath(dotGit)) {
+    throw new Error(`Admin entry ${adminDir} no longer points at ${reg.path}`);
+  }
+  if (existsSync(join(adminDir, "locked"))) throw new Error(`Worktree at ${reg.path} is locked`);
+  if (!existsSync(reg.path)) return;
+  const st = lstatSync(dotGit, { bigint: true });
+  if (!st.isFile() || !sameIdentity(fileIdentity(st), identity.dotGitStat)) throw new Error(`${dotGit} was replaced`);
+  if (readPathFile(dotGit, "gitdir: ") !== adminDir) throw new Error(`${dotGit} no longer points at ${adminDir}`);
+}
+
+/**
+ * Refuses when removing targetCanon would also destroy another checkout: a registered worktree below it,
+ * or any `.git` file or directory below it on disk (foreign repositories, submodules). Symlinks are not followed.
+ */
+function assertNoNestedCheckouts(targetCanon: string, entries: PorcelainWorktree[]): void {
+  for (const e of entries) {
+    if (isWithin(targetCanon, canonicalPath(e.path))) {
+      throw new Error(`${targetCanon} contains nested registered worktree ${e.path}; left in place`);
+    }
+  }
+  if (!existsSync(targetCanon)) return;
+  const stack = [targetCanon];
+  while (stack.length > 0) {
+    const dir = stack.pop()!;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === ".git") {
+        if (dir !== targetCanon) throw new Error(`${targetCanon} contains nested git checkout ${dir}; left in place`);
+        continue;
+      }
+      if (entry.isDirectory() && !entry.isSymbolicLink()) stack.push(join(dir, entry.name));
+    }
+  }
 }
