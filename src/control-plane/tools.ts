@@ -1,4 +1,4 @@
-import { rmSync, writeFileSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { recommendModelsByTaskKind, type ModelCatalogCompiler } from "../catalog/compiler.js";
 import { CODE_EXEC_TOOL_NAME, TOOL_SEARCH_TOOL_NAME, createCodeModeExecutor, effectiveCodeMode, exposedTools } from "../code-mode/index.js";
@@ -9,7 +9,7 @@ import type { KbKind } from "../kb/store.js";
 import type { BisectingMergeQueue } from "../worktree/merge-queue.js";
 import { runGit, type WorktreeManager } from "../worktree/manager.js";
 import type { AdmissionLane, QueuePositionInput } from "./admission-queue.js";
-import { nextUniqueFileName } from "./ids.js";
+import { writeUniqueFile } from "./ids.js";
 import type {
   AgentTier,
   ControlPlaneDb,
@@ -18,7 +18,7 @@ import type {
   TaskKind,
   TaskRecord,
 } from "./db.js";
-import { dossierDirectory, readRunDossier, readWorkspaceArtifact, writeCodeOutput, writeTaskDossier } from "./dossiers.js";
+import { dossierDirectory, findRunDossier, readRunDossier, readWorkspaceArtifact, writeCodeOutput, writeTaskDossier } from "./dossiers.js";
 import { compactTaskHandoff, isReadOnlyKind, SUMMARY_LIMIT, validateTaskHandoff } from "./handoffs.js";
 import type { AnchoredHandoff } from "./prompts.js";
 
@@ -1144,10 +1144,9 @@ export class ControlPlaneToolExecutor {
         let overflowPath: string | undefined;
         if (summary.length > SUMMARY_LIMIT) {
           const artifactsDir = dossierDirectory(run.repoRoot);
-          const fileName = nextUniqueFileName(artifactsDir, `${taskId}-summary`, ".md");
+          const fileName = writeUniqueFile(artifactsDir, `${taskId}-summary`, ".md", summary);
           const artifactPath = `.harness/artifacts/${fileName}`;
           overflowPath = resolve(run.repoRoot, artifactPath);
-          writeFileSync(overflowPath, summary, { encoding: "utf8", flag: "wx" });
           paths.push(overflowPath);
           const pointer = `\n\n[Full summary: ${artifactPath}]`;
           summary = summary.slice(0, SUMMARY_LIMIT - pointer.length).trimEnd() + pointer;
@@ -1279,7 +1278,7 @@ export class ControlPlaneToolExecutor {
       }
 
       case "artifact_read": {
-        if (task.tier === 1 || typeof args.path !== "string" || !args.path || this.db.hasDossier(runId, resolve(run.repoRoot, args.path))) {
+        if (task.tier === 1 || typeof args.path !== "string" || !args.path || findRunDossier(this.db, run, args.path) !== null) {
           return readRunDossier(this.db, run, args);
         }
         const root = task.worktreeId ? this.db.getWorktree(task.worktreeId)?.path : run.repoRoot;

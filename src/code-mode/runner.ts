@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { nextUniqueFileName } from "../control-plane/ids.js";
+import { writeUniqueFile } from "../control-plane/ids.js";
 import { toolEventPreview } from "../protocol/tool-display.js";
 import type { ToolDefinition } from "../runners/types.js";
 import { providePython, pythonBridge, pythonEntry, pythonGuard, pythonModule, type PythonRuntime } from "./python.js";
@@ -25,6 +25,7 @@ export interface CodeExecOptions {
   callTool: (name: string, args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>;
   signal?: AbortSignal; timeoutMs?: number; maxOutputChars?: number;
   artifactsDir: string; scratchRoot?: string;
+  /** Persists oversized output. `name` is a suggested base name; the callback owns collision-free uniqueness. */
   saveOutput?: (name: string, json: string) => string | Promise<string>;
   onToolEvent?: (event: CodeExecToolEvent) => void;
 }
@@ -197,14 +198,11 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     const limit = Math.max(0, opts.maxOutputChars ?? 20_000);
     result.preview = json.slice(0, limit);
     if (json.length > limit) {
-      const name = nextUniqueFileName(opts.saveOutput ? null : opts.artifactsDir, "code-exec", ".json");
       if (opts.saveOutput) {
-        result.artifactPath = await opts.saveOutput(name, json);
+        result.artifactPath = await opts.saveOutput("code-exec.json", json);
       } else {
         await mkdir(opts.artifactsDir, { recursive: true });
-        const path = join(opts.artifactsDir, name);
-        await writeFile(path, json, { flag: "wx", mode: 0o600 });
-        result.artifactPath = path;
+        result.artifactPath = join(opts.artifactsDir, writeUniqueFile(opts.artifactsDir, "code-exec", ".json", json));
       }
     } else if (output !== undefined) result.output = output;
     result.ok = true;
