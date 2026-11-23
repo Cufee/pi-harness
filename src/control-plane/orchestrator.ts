@@ -21,6 +21,7 @@ import { buildHydrationTurn, buildImmutableSystemPrompt, type AnchoredHandoff } 
 import { ControlPlaneToolExecutor, compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./tools.js";
 import { directorTaskRunId, directorTaskRunOwner, isDirectorTaskContainer } from "./ids.js";
 import { canonicalProjectPath } from "./projects.js";
+import { ensureGoalEvidenceDir, goalEvidenceDir } from "../goals/engine.js";
 
 interface ActiveTaskExecution {
   taskId: string;
@@ -118,6 +119,8 @@ export function deriveRunStatus(
   if (realOrch) {
     if (realOrch.status === "failed") return "failed";
     if (realOrch.status === "cancelled") return "stopped";
+    // A blocked coordinator never settled its work: report failed (there is no blocked run status), never completed.
+    if (realOrch.status === "blocked") return "failed";
     if (realOrch.status === "completed") {
       // Do not falsely declare a run completed if non-orchestrator workers are blocked with unresolved work
       const realChildren = tasks.filter((t) => t.id !== realOrch.id && t.profileId !== "director");
@@ -551,6 +554,16 @@ export class HarnessOrchestrator {
     return mq;
   }
 
+  /** The goal linked to this run, if any (the goals table is absent in standalone control-plane databases). */
+  private resolveLinkedGoalForRun(runId: string): { id: string } | null {
+    try {
+      const row = this.db.db.prepare("SELECT id FROM goals WHERE linked_run_id = ? LIMIT 1").get(runId) as { id: string } | null;
+      return row ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   private taskRoute(task: TaskRecord, cwd: string, target?: { profileId?: string; model?: string }) {
     return resolveLaunchRoute(this.config, {
       profileId: target?.profileId ?? task.profileId,
@@ -658,6 +671,8 @@ export class HarnessOrchestrator {
     effort?: string;
     /** Stop epochs captured when the launch was requested (default: now); a stop issued since then wins. */
     stopFence?: { global: number; repo: number };
+    /** Called synchronously right after the run row exists and before Tier 1 launches (e.g. to link a goal). */
+    onRunCreated?: (run: RunRecord) => void;
   }): Promise<{ run: RunRecord; orchestratorTask: TaskRecord }> {
     const fence = input.stopFence ?? this.launchStopFence(input.repoRoot);
     const { profile, model } = await resolveLaunchRoute(this.config, {
@@ -668,6 +683,14 @@ export class HarnessOrchestrator {
     // Checked after the last await and before the run exists, so a stop issued meanwhile leaves nothing running.
     if (this.launchFenceBroken(input.repoRoot, fence)) throw new RunStartStoppedError(input.repoRoot);
     const run = this.db.createRun({ goal: input.goal, repoRoot: input.repoRoot, baseBranch, baseSha });
+    if (input.onRunCreated) {
+      try {
+        input.onRunCreated(run);
+      } catch (err) {
+        this.db.updateRunStatus(run.id, "failed", `Run setup failed: ${err instanceof Error ? err.message : String(err)}`);
+        throw err;
+      }
+    }
 
     const orchestratorTask = this.db.createTask({
       runId: run.id,
@@ -1733,6 +1756,11 @@ export class HarnessOrchestrator {
         : task.tier === 3 && task.parentId ? this.db.listActiveWriteScopes(run.id, task.parentId) : [];
       const scopedKbHints = task.tier === 2 ? this.db.kb.getScopedAmbientIndex(run.repoRoot, writeScopes, 5) : [];
 
+      const linkedGoal = this.resolveLinkedGoalForRun(run.id);
+      const goalEvDir = linkedGoal
+        ? (ensureGoalEvidenceDir(run.repoRoot, linkedGoal.id) ?? goalEvidenceDir(run.repoRoot, linkedGoal.id))
+        : null;
+
       const initialPrompt = buildHydrationTurn({
         task,
         handoff,
@@ -1747,6 +1775,7 @@ export class HarnessOrchestrator {
         worktreePath: wt?.path ?? null,
         worktreeBranch: wt?.branch ?? null,
         quotaResumeNote,
+        goalEvidenceDir: goalEvDir,
       });
 
       const rolloverThreshold =
@@ -1799,10 +1828,20 @@ export class HarnessOrchestrator {
           join(run.repoRoot, ".harness", "artifacts"),
           ...(this.config.worktree.extraReadRoots ?? []),
         ],
-        extraWriteRoots: [
-          join(run.repoRoot, ".harness", "goals"),
-          ...(this.config.worktree.extraWriteRoots ?? []),
-        ],
+        // A goal-linked run may write only its own goal's evidence directory (plus operator roots), not every goal's.
+        extraWriteRoots: goalEvDir
+          ? toolPolicy === "read_write_workspace"
+            ? [goalEvDir, ...(this.config.worktree.extraWriteRoots ?? [])]
+            : undefined
+          : [join(run.repoRoot, ".harness", "goals"), ...(this.config.worktree.extraWriteRoots ?? [])],
+        extraEnv: linkedGoal && goalEvDir
+          ? {
+              HARNESS_GOAL_EVIDENCE_DIR: goalEvDir,
+              HARNESS_GOAL_ID: linkedGoal.id,
+              HARNESS_GOALS_DIR: join(run.repoRoot, ".harness", "goals"),
+              HARNESS_ARTIFACTS_DIR: resolve(run.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts"),
+            }
+          : undefined,
         allowShellInReadOnly: task.kind === "verify",
         signal: exec.generationSignal,
         onHandle: (h) => {

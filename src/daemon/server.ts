@@ -54,7 +54,7 @@ import type {
   SnapshotWorktreeEntry,
 } from "../protocol/daemon-rpc.js";
 import { attachDaemonReader, writeDaemonMessage } from "../protocol/frames.js";
-import { buildGoalDetailDisplay, buildGoalsTableDisplay, summarizeToolDisplay } from "../protocol/tool-display.js";
+import { buildGoalDetailDisplay, buildGoalsTableDisplay, reconcileGoalWithLiveRun, summarizeToolDisplay } from "../protocol/tool-display.js";
 import { QuotaClient } from "../quota/client.js";
 import { ensureOctofs, resolveExternalMcpServers, shouldStageOctofs } from "../tools/native-tools.js";
 import { AcpRunner } from "../runners/acp-runner.js";
@@ -298,6 +298,8 @@ export class HarnessDaemon {
    * (e.g. `goal.settled`, `timer.fired`) — zero polling, zero string-prefix parsing.
    */
   private scheduleDirectorWakeup(chatSessionId: string, event: ChatControlEvent): void {
+    // The Director caused this goal event itself (e.g. its own goal_accept); waking it would be a self-wake.
+    if (isDirectorSourcedGoalEvent(event)) return;
     const activeTurn = this.chatTurns.get(chatSessionId);
     if (activeTurn) {
       // Queue background goal/timer/peer events until the active Director turn finishes instead of interrupting mid-turn!
@@ -324,6 +326,13 @@ export class HarnessDaemon {
         const curGoal = this.director.goals.getGoal(next.goalId);
         if (curRun?.status === "active") continue;
         if (curGoal && ["achieved", "cancelled", "reviewing", "verifying"].includes(curGoal.status)) continue;
+      }
+      if (isDirectorSourcedGoalEvent(next)) continue;
+      // Drop queued review notices the goal has since moved past (amended, cancelled, or resumed after escalation).
+      if (next.kind === "goal.reviewed") {
+        const curGoal = this.director.goals.getGoal(next.goalId);
+        if (!curGoal || curGoal.version > next.goalVersion || curGoal.status === "cancelled") continue;
+        if (next.status === "awaiting_human" && ["executing", "verifying", "reviewing"].includes(curGoal.status)) continue;
       }
       void this.runDirectorWakeupTurn(chatSessionId, next);
       return;
@@ -2453,11 +2462,16 @@ export class HarnessDaemon {
 
       case "goal.commit": {
         // One shared start-or-resume contract: the Director's detailed result is returned as is.
+        const priorRunId = this.director.goals.getGoal(String(p.goalId))?.linkedRunId ?? null;
+        const priorRunStatus = priorRunId ? this.orchestrator.getEffectiveRun(priorRunId)?.status : undefined;
         const res = await this.director.commitGoalDetailed(String(p.goalId), {
           profileId: typeof p.profileId === "string" ? p.profileId : undefined,
           model: typeof p.model === "string" ? p.model : undefined,
           effort: typeof p.effort === "string" ? p.effort : undefined,
         });
+        if (priorRunId && res.goal.linkedRunId === priorRunId) {
+          this.director.onRunResumed(priorRunId, priorRunStatus, res.outcome === "resumed");
+        }
         return {
           ...res.goal,
           outcome: res.outcome,
@@ -2479,14 +2493,17 @@ export class HarnessDaemon {
         });
 
       case "goal.list":
-        return this.director.goals.listGoals({
-          repoRoot: typeof p.repoRoot === "string" ? p.repoRoot : undefined,
-          chatSessionId: typeof p.chatSessionId === "string" && p.chatSessionId ? p.chatSessionId : undefined,
-        });
+        return this.director.goals
+          .listGoals({
+            repoRoot: typeof p.repoRoot === "string" ? p.repoRoot : undefined,
+            chatSessionId: typeof p.chatSessionId === "string" && p.chatSessionId ? p.chatSessionId : undefined,
+          })
+          .map(reconcileGoalWithLiveRun);
 
       case "goal.get": {
-        const g = this.director.goals.getGoal(String(p.goalId));
-        if (!g) throw new Error(`Unknown goal ${p.goalId}`);
+        const stored = this.director.goals.getGoal(String(p.goalId));
+        if (!stored) throw new Error(`Unknown goal ${p.goalId}`);
+        const g = reconcileGoalWithLiveRun(stored);
         const reviews = this.director.goals.listReviews(g.id);
         const tasks = g.linkedRunId ? this.db.listTasks(g.linkedRunId) : [];
         const escalations = g.linkedRunId ? this.db.listEscalations(g.linkedRunId, "open") : [];
@@ -2500,14 +2517,17 @@ export class HarnessDaemon {
             { toolName: "goal_get", display },
           );
         }
-        return { goal: g, reviews, tasks, escalations, activity, display };
+        const acceptOverrides = reviews.filter((r) => r.source === "director_accept_override");
+        return { goal: g, reviews, acceptOverrides, tasks, escalations, activity, display };
       }
 
       case "goal.table_display": {
-        const goals = this.director.goals.listGoals({
-          repoRoot: typeof p.repoRoot === "string" ? p.repoRoot : undefined,
-          chatSessionId: typeof p.chatSessionId === "string" && p.chatSessionId ? p.chatSessionId : undefined,
-        });
+        const goals = this.director.goals
+          .listGoals({
+            repoRoot: typeof p.repoRoot === "string" ? p.repoRoot : undefined,
+            chatSessionId: typeof p.chatSessionId === "string" && p.chatSessionId ? p.chatSessionId : undefined,
+          })
+          .map(reconcileGoalWithLiveRun);
         const display = buildGoalsTableDisplay(
           goals.map((goal) => ({
             goal,
@@ -2532,12 +2552,17 @@ export class HarnessDaemon {
         return this.director.goals.listRevisions(String(p.goalId));
 
       case "goal.resume": {
-        if (!this.director.goals.getGoal(String(p.goalId))) throw new Error(`Unknown goal ${p.goalId}`);
+        const before = this.director.goals.getGoal(String(p.goalId));
+        if (!before) throw new Error(`Unknown goal ${p.goalId}`);
+        const priorRunStatus = before.linkedRunId ? this.orchestrator.getEffectiveRun(before.linkedRunId)?.status : undefined;
         // Delegated once to the shared contract; never re-derives or overwrites a newer pause after the await.
         const res = await this.director.resumeGoalDetailed(String(p.goalId), {
           note: typeof p.note === "string" ? p.note : undefined,
         });
         const resumed = res.outcome === "resumed" || res.outcome === "started";
+        if (before.linkedRunId && res.goal.linkedRunId === before.linkedRunId) {
+          this.director.onRunResumed(before.linkedRunId, priorRunStatus, res.outcome === "resumed");
+        }
         return {
           resumed,
           goal: res.goal,
@@ -2548,6 +2573,16 @@ export class HarnessDaemon {
           message: res.message,
           ...(resumed ? {} : { reason: res.message }),
         };
+      }
+
+      case "goal.accept": {
+        const evidencePaths = Array.isArray(p.evidencePaths) ? p.evidencePaths.map(String) : [];
+        return await this.director.acceptGoalOverride(String(p.goalId), {
+          reason: String(p.reason ?? ""),
+          evidencePaths,
+          overrideDeterministic: p.overrideDeterministic === true,
+          source: "user",
+        });
       }
 
       case "goal.review":
@@ -2665,20 +2700,26 @@ export class HarnessDaemon {
 
       case "run.resume": {
         const runId = String(p.runId);
-        return await this.orchestrator.resumeRun(runId, {
+        const priorRunStatus = this.orchestrator.getEffectiveRun(runId)?.status;
+        const res = await this.orchestrator.resumeRun(runId, {
           trigger: "manual",
           userMessage: typeof p.message === "string" && p.message.trim() ? p.message.trim() : undefined,
           note: typeof p.note === "string" && p.note.trim() ? p.note.trim() : undefined,
         });
+        this.director.onRunResumed(runId, priorRunStatus, res.outcome === "resumed");
+        return res;
       }
 
       case "task.resume": {
+        const taskBefore = this.db.getTask(String(p.taskId));
+        const priorRunStatus = taskBefore ? this.orchestrator.getEffectiveRun(taskBefore.runId)?.status : undefined;
         const res = await this.orchestrator.resumeTaskDetailed(String(p.taskId), {
           note: typeof p.note === "string" ? p.note : undefined,
           model: typeof p.model === "string" ? p.model : undefined,
           effort: typeof p.effort === "string" ? p.effort : undefined,
           profileId: typeof p.profileId === "string" ? p.profileId : undefined,
         });
+        this.director.onRunResumed(res.task.runId, priorRunStatus, res.outcome === "resumed");
         return {
           resumed: res.outcome === "resumed",
           task: res.task,
@@ -2792,7 +2833,7 @@ export class HarnessDaemon {
         const chatSessionId = typeof p.chatSessionId === "string" && p.chatSessionId ? p.chatSessionId : undefined;
         const repoRoot = typeof p.repoRoot === "string" && p.repoRoot ? p.repoRoot : undefined;
         const filterRunId = typeof p.runId === "string" && p.runId ? p.runId : undefined;
-        const goals = this.director.goals.listGoals({ repoRoot, chatSessionId });
+        const goals = this.director.goals.listGoals({ repoRoot, chatSessionId }).map(reconcileGoalWithLiveRun);
         const goalByRunId = new Map(goals.filter((g) => g.linkedRunId).map((g) => [g.linkedRunId!, g]));
         const runIds = filterRunId
           ? [filterRunId]
@@ -3322,4 +3363,9 @@ export class HarnessDaemon {
         throw new Error(`Unknown daemon op: ${req.op}`);
     }
   }
+}
+
+/** Goal lifecycle events the Director itself caused; they never wake (or re-wake) the Director. */
+function isDirectorSourcedGoalEvent(event: ChatControlEvent): boolean {
+  return (event.kind === "goal.settled" || event.kind === "goal.reviewed") && event.source === "director";
 }

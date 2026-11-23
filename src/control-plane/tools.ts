@@ -21,6 +21,7 @@ import type {
 import { dossierDirectory, findRunDossier, readRunDossier, readWorkspaceArtifact, writeCodeOutput, writeTaskDossier } from "./dossiers.js";
 import { compactTaskHandoff, isReadOnlyKind, SUMMARY_LIMIT, validateTaskHandoff } from "./handoffs.js";
 import type { AnchoredHandoff } from "./prompts.js";
+import { mergeGoalLiveProgress, type GoalLiveProgress, type GoalProgressSource } from "../goals/live-progress.js";
 
 export { readRunDossier } from "./dossiers.js";
 export { compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./handoffs.js";
@@ -279,11 +280,16 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
       required: ["summary"],
       properties: {
         summary: { type: "string", description: "Concise live progress or verification update." },
-        phase: { type: "string", description: "Short current phase label (e.g. 'planning', 'implementing', 'verifying')." },
+        phase: {
+          type: "string",
+          description:
+            "Short current phase label (e.g. 'planning', 'implementing', 'verifying'). Phase 'blocked' means you cannot proceed without a human: automatic verification is skipped when the run settles and the Director is woken with your summary and remediation. Use it only for genuine blockers.",
+        },
         verification_status: {
           type: "string",
           enum: ["not_needed", "in_progress", "passed", "failed"],
-          description: "Current verification state as decided/observed by the agent.",
+          description:
+            "Current verification state as decided/observed by the agent. 'failed' prevents automatic approval of this goal revision until you report again (passed, failed, or phase 'blocked').",
         },
         criteria_results: {
           type: "array",
@@ -1238,11 +1244,20 @@ export class ControlPlaneToolExecutor {
               resultJson: JSON.stringify({ status, summary, sources, artifact_paths: paths, escalationId, suggestedSplits }),
             });
             // Automatically reflect verify task outcomes onto any linked Goal without requiring extra model calls.
+            // An intermediate verify (a Tier 3 probe, or a failed verify while other work is live) only updates the
+            // summary: its pass/fail is not the run's final verification and must not gate settlement.
             if (task.kind === "verify") {
-              this.updateLinkedGoalProgress(runId, taskId, {
-                verificationStatus: taskStatus === "completed" ? "passed" : "failed",
-                summary: summary.slice(0, 300),
-              });
+              const liveStatuses = ["running", "waiting_children", "ready", "pending", "draining", "merging"];
+              const otherLive = this.db.listTasks(runId).some((t) => t.id !== taskId && liveStatuses.includes(t.status));
+              const intermediate = (task.tier === 3 && otherLive) || (taskStatus !== "completed" && otherLive);
+              this.updateLinkedGoalProgress(
+                runId,
+                taskId,
+                intermediate
+                  ? { summary: summary.slice(0, 300) }
+                  : { verificationStatus: taskStatus === "completed" ? "passed" : "failed", summary: summary.slice(0, 300) },
+                "verify_task",
+              );
             }
             return { returned: true, status: taskStatus, ...(escalationId ? { escalationId } : {}) };
           });
@@ -1663,40 +1678,33 @@ export class ControlPlaneToolExecutor {
       verificationStatus?: "not_needed" | "in_progress" | "passed" | "failed";
       criteriaResults?: Array<{ criterionId: string; passed: boolean; evidence: string; remediation?: string }>;
     },
+    source?: GoalProgressSource,
   ): { recorded: boolean; goalId: string | null } {
     try {
       const row = this.db.db
-        .prepare("SELECT id, live_progress_json FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1")
-        .get(runId) as { id: string; live_progress_json?: string | null } | undefined;
+        .prepare(
+          "SELECT id, version, review_cycle, live_progress_json FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1",
+        )
+        .get(runId) as { id: string; version: number; review_cycle: number | null; live_progress_json?: string | null } | undefined;
       if (!row) return { recorded: false, goalId: null };
 
-      let prev: {
-        phase?: string;
-        summary?: string;
-        verificationStatus?: string;
-        criteriaResults?: Array<{ criterionId: string; passed: boolean; evidence: string; remediation?: string }>;
-        reportedByTaskId?: string | null;
-      } = {};
+      let prev: GoalLiveProgress | null = null;
       if (typeof row.live_progress_json === "string" && row.live_progress_json.trim()) {
         try {
-          prev = JSON.parse(row.live_progress_json) as typeof prev;
+          prev = JSON.parse(row.live_progress_json) as GoalLiveProgress;
         } catch {
-          prev = {};
+          prev = null;
         }
       }
-      const byId = new Map<string, { criterionId: string; passed: boolean; evidence: string; remediation?: string }>();
-      for (const c of prev.criteriaResults ?? []) byId.set(c.criterionId, c);
-      for (const c of patch.criteriaResults ?? []) byId.set(c.criterionId, c);
-
       const now = Date.now();
-      const next = {
-        phase: patch.phase ?? prev.phase,
-        summary: patch.summary ?? prev.summary,
-        verificationStatus: patch.verificationStatus ?? prev.verificationStatus,
-        criteriaResults: byId.size > 0 ? [...byId.values()] : undefined,
-        reportedByTaskId: taskId,
-        updatedAt: now,
-      };
+      const claimSource: GoalProgressSource = source ?? (this.db.getTask(taskId)?.tier === 1 ? "coordinator" : "worker");
+      const next = mergeGoalLiveProgress(prev, { ...patch, reportedByTaskId: taskId }, {
+        goalVersion: Number(row.version),
+        runId,
+        reviewCycle: Number(row.review_cycle ?? 0),
+        source: claimSource,
+        now,
+      });
       this.db.db
         .prepare("UPDATE goals SET live_progress_json = ?, updated_at = ? WHERE id = ?")
         .run(JSON.stringify(next), now, row.id);

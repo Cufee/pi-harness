@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { open as openFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -8,6 +8,7 @@ import {
   compareSemanticVersions,
   parseClaudeFamilyVersion,
   recommendModelsByTaskKind,
+  type CompiledModelEntry,
   type ModelCatalogCompiler,
 } from "../catalog/compiler.js";
 import { vendorSuccessors } from "../catalog/lifecycle.js";
@@ -24,14 +25,18 @@ import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { recordCostInvocation, summarizeCost } from "../cost/ledger.js";
 import { timerMatchesGoalSettlement, type TimerRecord } from "../control-plane/timers.js";
 import {
+  ensureGoalEvidenceDir,
   GoalEngine,
+  goalEvidenceDir,
   shouldRunIndependentReview,
   type CriterionEvaluation,
+  type GoalAcceptOverrideAudit,
   type GoalCriterion,
   type GoalRecord,
   type GoalReviewVerdict,
   type VerificationMode,
 } from "../goals/engine.js";
+import { isBlockedPhase, isCurrentClaim, type GoalLiveProgress, type GoalProgressSource } from "../goals/live-progress.js";
 import {
   formatChatEventForModel,
   formatChatEventSummary,
@@ -42,6 +47,8 @@ import {
   buildGoalsTableDisplay,
   buildRunActivityDisplay,
   codeExecEventSink,
+  deriveGoalVerificationLabel,
+  reconcileGoalWithLiveRun,
   summarizeToolDisplay,
   type ToolDisplayPayload,
 } from "../protocol/tool-display.js";
@@ -166,14 +173,23 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
     name: "goal_accept",
     description:
-      "Explicit Director acceptance/override for a Goal based on verified evidence (e.g. when a review was obstructed or human approved). Requires a clear reason and concrete evidence_paths; recorded permanently in goal review history and auto-resolves open escalations.",
+      "Explicit Director acceptance/override for a Goal based on verified evidence (e.g. when a review was obstructed or human approved). Requires a clear reason and concrete, readable evidence_paths (files or directories, e.g. under the goal's evidenceDir; .git, task worktrees and harness-internal state are refused). Required deterministic gates are re-run first and a failure rejects the accept unless override_deterministic is true. Recorded permanently with an audit trail in goal review history; auto-resolves open escalations.",
     inputSchema: {
       type: "object",
       required: ["goal_id", "reason", "evidence_paths"],
       properties: {
         goal_id: { type: "string" },
-        reason: { type: "string", description: "Explicit rationale for accepting the goal." },
-        evidence_paths: { type: "array", items: { type: "string" }, description: "Concrete file/artifact paths proving completion." },
+        reason: { type: "string", minLength: 1, description: "Explicit rationale for accepting the goal." },
+        evidence_paths: {
+          type: "array",
+          minItems: 1,
+          items: { type: "string" },
+          description: "Concrete readable file/directory paths proving completion (repo-relative, absolute, or ~/).",
+        },
+        override_deterministic: {
+          type: "boolean",
+          description: "Accept even if required deterministic gates still fail (default false). The failing ids are recorded in the audit.",
+        },
       },
     },
   },
@@ -288,7 +304,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
     name: "report_goal_progress",
     description:
-      "Record live progress, verification status, or checked criterion results on a Goal so the Goals table and detail cards dynamically reflect actual work.",
+      "Record live progress, verification status, or checked criterion results on a Goal so the Goals table and detail cards dynamically reflect actual work. Phase 'blocked' means the goal cannot proceed without a human: automatic verification is skipped when its run settles and the Director is woken with the summary and remediation; use it only for genuine blockers. verification_status 'failed' prevents automatic approval of this revision until progress is reported again.",
     inputSchema: {
       type: "object",
       required: ["goal_id", "summary"],
@@ -640,6 +656,8 @@ export class DirectorRuntime {
   private wakeHandler: ((chatSessionId: string, event: ChatControlEvent) => void) | null = null;
   private peerBridge: DirectorPeerBridge | null = null;
   private notifiedSettledGoals = new Set<string>();
+  /** Runs whose escalation is being created by a path that wakes the Director itself; skips the P0 wake. */
+  private suppressEscalationWakeRuns = new Set<string>();
   /** In-flight launches; joiners receive the launch's actual outcome (started, stopped, already_active ...). */
   private launchingGoals = new Map<string, Promise<GoalCommitResult>>();
   /** Bumped by every explicit goal pause or cancel, so a pause issued during a launch wins over it. */
@@ -777,6 +795,8 @@ export class DirectorRuntime {
     // Wake Director immediately on P0 escalations or manual quota pauses for any linked Goal
     if (ev.type === "escalation.created") {
       if (!wakeOnSettle) return;
+      // The caller creating this escalation wakes the Director itself (blocked settle or review transition).
+      if (this.suppressEscalationWakeRuns.has(ev.runId)) return;
       const p = ev.payload as { severity?: string; title?: string } | null;
       if (p?.severity !== "P0") return;
       const row = this.db.db
@@ -870,8 +890,16 @@ export class DirectorRuntime {
     const firstNotice = !this.notifiedSettledGoals.has(dedupeKey);
     this.notifiedSettledGoals.add(dedupeKey);
 
+    // An explicit blocker (blocked phase or blocked task) goes to a human without running verification gates.
+    const blocker =
+      (status === "completed" || status === "failed") && goal.status === "executing"
+        ? this.detectExplicitBlocker(goal, ev.runId)
+        : null;
+    if (blocker && firstNotice) this.parkBlockedGoal(goal, ev.runId, blocker);
+
     // Control-plane-driven automatic verification on run completion (removes LLM single point of failure)
     if (
+      !blocker &&
       status === "completed" &&
       this.config.goals?.autoVerifyOnSettle !== false &&
       goal.verificationMode !== "none" &&
@@ -908,7 +936,9 @@ export class DirectorRuntime {
     // The recorded stop/failure cause travels with the hand-off note and the Director wake.
     const recordedCause = status === "completed" ? null : this.orchestrator.describeRunCause(ev.runId);
     const explicitStopReason = status === "stopped" ? ((ev.payload as { reason?: string } | null)?.reason?.trim() || null) : null;
-    if ((status === "failed" || status === "stopped") && goal.status === "executing" && openEscalations === 0) {
+    if (blocker) {
+      // Parked above: awaiting_human with the blocker's escalation.
+    } else if ((status === "failed" || status === "stopped") && goal.status === "executing" && openEscalations === 0) {
       this.goals.setStatus(
         goal.id,
         "awaiting_human",
@@ -937,11 +967,15 @@ export class DirectorRuntime {
       runId: ev.runId,
       runStatus: status,
       openEscalations,
-      ...(recordedCause ? { detail: recordedCause } : {}),
-      // Only a stop with a recorded operator reason is explicit; a stop derived from settled tasks is not.
-      ...(status !== "completed"
-        ? { cause: status === "failed" ? "run_failed" : explicitStopReason ? "explicit_stop" : "derived_stopped" }
-        : {}),
+      ...(blocker
+        ? { detail: blockerDetail(blocker), cause: "escalation" }
+        : {
+            ...(recordedCause ? { detail: recordedCause } : {}),
+            // Only a stop with a recorded operator reason is explicit; a stop derived from settled tasks is not.
+            ...(status !== "completed"
+              ? { cause: status === "failed" ? "run_failed" : explicitStopReason ? "explicit_stop" : "derived_stopped" }
+              : {}),
+          }),
     };
     this.wakeHandler?.(goal.chatSessionId, event);
   }
@@ -1211,7 +1245,7 @@ export class DirectorRuntime {
         }
         const summary = `Queued at #${entry.position} (${activeCount}/${limit} concurrent goals active)`;
         if (goal.liveProgress?.phase !== "queued" || goal.liveProgress?.summary !== summary) {
-          this.goals.reportProgress(goal.id, { phase: "queued", summary });
+          this.goals.reportProgress(goal.id, { phase: "queued", summary }, "system");
         }
       }
       const queuedIds = new Set(entries.map((e) => e.targetId));
@@ -1281,9 +1315,12 @@ export class DirectorRuntime {
         "Acceptance Criteria:",
         criteriaSummary,
         ...(goal.nonGoals.length ? ["", "Non-Goals:", ...goal.nonGoals.map((n) => `- ${n}`)] : []),
+        ...evidenceDirLines(goal),
       ].join("\n");
 
       let run: RunRecord;
+      const prevLinkedRunId = current.linkedRunId ?? null;
+      let linkedEarly: string | null = null;
       try {
         ({ run } = await this.orchestrator.startRun({
           goal: runObjective,
@@ -1292,8 +1329,19 @@ export class DirectorRuntime {
           model: opts?.model,
           effort: opts?.effort,
           stopFence,
+          // Link before Tier 1 launches so its workers see the goal (evidence dir, write scope, env) from turn one.
+          // Status stays untouched here: the checks below still decide between executing, paused and cancelled.
+          onRunCreated: (created) => {
+            this.db.db.prepare("UPDATE goals SET linked_run_id = ?, updated_at = ? WHERE id = ?").run(created.id, Date.now(), goal.id);
+            linkedEarly = created.id;
+          },
         }));
       } catch (err) {
+        if (linkedEarly) {
+          this.db.db
+            .prepare("UPDATE goals SET linked_run_id = ? WHERE id = ? AND linked_run_id = ?")
+            .run(prevLinkedRunId, goal.id, linkedEarly);
+        }
         if (!(err instanceof RunStartStoppedError)) throw err;
         // /stop arrived before the run existed: nothing was created and the goal keeps its status.
         return {
@@ -1553,6 +1601,7 @@ export class DirectorRuntime {
     return {
       ...res.goal,
       ...(qEntry ? { queued: true, queuePosition: qEntry.position } : {}),
+      evidenceDir: goalEvidenceDirOrNull(res.goal),
       runId: res.goal.linkedRunId,
       goalStatus: res.goal.status,
       outcome: res.outcome,
@@ -1603,7 +1652,7 @@ export class DirectorRuntime {
             this.goals.reportProgress(goal.id, {
               phase: "queue_launch_error",
               summary: `Failed to launch from queue: ${err instanceof Error ? err.message : String(err)}`,
-            });
+            }, "system");
           }
         }
         this.syncQueuedGoalProgress();
@@ -1692,6 +1741,7 @@ export class DirectorRuntime {
         "Acceptance Criteria:",
         criteriaSummary,
         ...(goal.nonGoals.length ? ["", "Non-Goals:", ...goal.nonGoals.map((n) => `- ${n}`)] : []),
+        ...evidenceDirLines(goal),
       ].join("\n");
       this.db.updateRunGoal(goal.linkedRunId, updatedObjective);
 
@@ -1791,6 +1841,354 @@ export class DirectorRuntime {
   }
 
   /**
+   * A run resumed from a settled epoch (completed, failed or stopped) starts a fresh attempt: verification
+   * claims and a blocked phase from the previous epoch no longer describe it. An already-active run or a
+   * quota auto-resume keeps its claims, since Tier 1 is still live and its reports are current.
+   */
+  onRunResumed(runId: string, priorRunStatus: RunRecord["status"] | null | undefined, resumed: boolean): void {
+    if (!resumed || !priorRunStatus || !["completed", "failed", "stopped"].includes(priorRunStatus)) return;
+    try {
+      const rows = this.db.db.prepare("SELECT id FROM goals WHERE linked_run_id = ?").all(runId) as Array<{ id: string }>;
+      for (const row of rows) this.goals.clearStaleVerificationStatus(row.id, { clearBlockedPhase: true });
+    } catch {
+      // Goals table may be absent or closing.
+    }
+  }
+
+  /**
+   * A current failed verification claim from the coordinator, Director or final verify task (worker claims
+   * are display-only). Legacy rows without provenance count only when reported by the run's Tier 1 (or this
+   * goal's chat) after the newest review and the current revision.
+   */
+  private detectCoordinatorFailure(goal: GoalRecord): CoordinatorFailure | null {
+    const lp = goal.liveProgress;
+    if (!lp || lp.verificationStatus !== "failed") return null;
+    if (hasClaimProvenance(lp)) {
+      if (!isCurrentClaim(goal, lp)) return null;
+      if (lp.source !== "coordinator" && lp.source !== "director" && lp.source !== "verify_task") return null;
+    } else {
+      const tier1 = goal.linkedRunId
+        ? this.db.listTasks(goal.linkedRunId).find((t) => t.tier === 1 && t.profileId !== "director")
+        : undefined;
+      const by = lp.reportedByTaskId ?? null;
+      if (!by || (by !== tier1?.id && by !== goal.chatSessionId)) return null;
+      const newestReview = Math.max(
+        0,
+        ...this.goals.listReviews(goal.id).filter((r) => r.goalVersion === goal.version).map((r) => r.createdAt),
+      );
+      const revisionAt = this.goals.getLatestRevisionCreatedAt(goal.id, goal.version) ?? 0;
+      if (lp.updatedAt <= newestReview || lp.updatedAt <= revisionAt) return null;
+    }
+    return {
+      source: lp.source ?? "coordinator",
+      summary: lp.summary,
+      criteriaResults: (lp.criteriaResults ?? []).filter((c) => !c.passed),
+      claimedAt: lp.claimedAt ?? lp.updatedAt,
+    };
+  }
+
+  /**
+   * An explicit blocker on a settled run: a current (or legacy) blocked phase, or a blocked non-director task.
+   * A bare open escalation is not a blocker: an earlier breaker's P0 stays open across a manual resume.
+   */
+  private detectExplicitBlocker(goal: GoalRecord, runId: string): ExplicitBlocker | null {
+    const lp = goal.liveProgress;
+    const phaseBlocked = Boolean(lp && isBlockedPhase(lp.phase) && (!hasClaimProvenance(lp) || isCurrentClaim(goal, lp)));
+    const tasks = this.db.listTasks(runId);
+    const blockedTasks = tasks.filter((t) => t.profileId !== "director" && t.status === "blocked");
+    if (!phaseBlocked && blockedTasks.length === 0) return null;
+    const blockedIds = new Set(blockedTasks.map((t) => t.id));
+    const escalation = this.db
+      .listEscalations(runId, "open")
+      .find((e) => e.blocking && blockedIds.has(e.fromTaskId));
+    const tier1 = tasks.find((t) => t.tier === 1 && t.profileId !== "director");
+    const summary =
+      (phaseBlocked ? lp?.summary?.trim() : undefined) ||
+      escalation?.title ||
+      blockedTasks[0]?.summary?.trim() ||
+      (blockedTasks[0] ? `task ${blockedTasks[0].id} is blocked` : "blocked without a summary");
+    const remediation = (lp?.criteriaResults ?? [])
+      .filter((c) => !c.passed && c.remediation)
+      .map((c) => `${c.criterionId}: ${c.remediation}`);
+    return { summary, remediation, escalationId: escalation?.id ?? null, tier1Id: tier1?.id ?? null };
+  }
+
+  /** Hands a blocked goal to a human: no gates, awaiting_human, and one blocking escalation (reused when present). */
+  private parkBlockedGoal(goal: GoalRecord, runId: string, blocker: ExplicitBlocker): void {
+    this.goals.setStatus(goal.id, "awaiting_human", `Blocked: ${blocker.summary.slice(0, 240)}`);
+    if (blocker.escalationId || !blocker.tier1Id) return;
+    const evidenceDir = goalEvidenceDirOrNull(goal);
+    this.suppressEscalationWakeRuns.add(runId);
+    try {
+      this.db.createEscalation({
+        runId,
+        fromTaskId: blocker.tier1Id,
+        toTaskId: null,
+        severity: "P0",
+        category: "blocked_dependency",
+        title: `Goal ${goal.id} blocked: ${blocker.summary.slice(0, 160)}`,
+        attempted: blocker.remediation,
+        evidencePaths: [evidenceDir && existsSync(evidenceDir) ? evidenceDir : goal.repoRoot],
+        blocking: true,
+      });
+    } finally {
+      this.suppressEscalationWakeRuns.delete(runId);
+    }
+  }
+
+  /**
+   * Creates the detached `_verify` worktree at the run's base branch tip (gates and reviewers test the real
+   * target branch without touching the host checkout). Without a base branch, verification runs in the repo.
+   */
+  private async prepareVerifyCheckout(
+    goal: GoalRecord,
+    run: RunRecord | null,
+  ): Promise<{ verifyCwd: string; verifyRef: string; isolated: boolean; cleanup: () => Promise<void> }> {
+    let verifyCwd = goal.repoRoot;
+    let verifyRef = run?.baseBranch || "HEAD";
+    let worktreePath: string | null = null;
+    const cleanup = async () => {
+      if (!worktreePath) return;
+      const p = worktreePath;
+      worktreePath = null;
+      await runGit(goal.repoRoot, ["worktree", "remove", "--force", p]).catch(async () => {
+        const { rmSync } = await import("node:fs");
+        rmSync(p, { recursive: true, force: true });
+      });
+      await runGit(goal.repoRoot, ["worktree", "prune"]).catch(() => {});
+    };
+    if (run?.baseBranch) {
+      const targetSha = await runGit(goal.repoRoot, ["rev-parse", "--verify", `${run.baseBranch}^{commit}`])
+        .then((r) => r.stdout)
+        .catch(() => null);
+      if (targetSha) {
+        const wtMgr = this.orchestrator.getWorktreeManager(goal.repoRoot);
+        const candidatePath = join(wtMgr.baseDir, "_verify", `${goal.id}-${randomUUID().slice(0, 8)}`);
+        mkdirSync(join(wtMgr.baseDir, "_verify"), { recursive: true });
+        await runGit(goal.repoRoot, ["worktree", "add", "--detach", candidatePath, targetSha]);
+        worktreePath = candidatePath;
+        verifyCwd = candidatePath;
+        verifyRef = targetSha;
+        try {
+          // Do NOT silently swallow bootstrap failures — fail verification cleanly if setupCommand fails
+          await wtMgr.bootstrapWorktree(candidatePath);
+        } catch (err) {
+          await cleanup();
+          throw err;
+        }
+      } else {
+        // Fail closed when targetBranch cannot be resolved and host checkout is on a different branch
+        const headBranch = await runGit(goal.repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])
+          .then((r) => r.stdout)
+          .catch(() => null);
+        if (headBranch && headBranch !== run.baseBranch) {
+          throw new Error(
+            `Cannot verify goal ${goal.id}: target branch '${run.baseBranch}' does not resolve (host checkout is '${headBranch}').`,
+          );
+        }
+      }
+    }
+    return { verifyCwd, verifyRef, isolated: worktreePath !== null, cleanup };
+  }
+
+  /**
+   * Audited acceptance override (Director goal_accept or user `goal.accept`). Validates readable evidence,
+   * stops an active review, re-runs required deterministic gates (a failure rejects unless overridden), then
+   * records an approved `director_accept_override` review with its audit. Before the commit every failure
+   * restores the goal's previous status; queue removal, run completion and wakes happen only after it.
+   */
+  async acceptGoalOverride(
+    goalId: string,
+    input: {
+      reason: string;
+      evidencePaths: string[];
+      overrideDeterministic?: boolean;
+      source: "director" | "user";
+      chatSessionId?: string | null;
+    },
+  ): Promise<{ goal: GoalRecord; review: GoalReviewVerdict }> {
+    const reason = String(input.reason ?? "").trim();
+    const rawPaths = (input.evidencePaths ?? []).map((p) => String(p).trim()).filter(Boolean);
+    if (!reason) throw new Error("goal_accept requires a non-empty reason");
+    if (rawPaths.length === 0) throw new Error("goal_accept requires non-empty evidence_paths");
+    const checkAcceptable = (g: GoalRecord | null): GoalRecord => {
+      if (!g) throw new Error(`Unknown goal ${goalId}`);
+      if (g.status === "draft" || g.status === "achieved" || g.status === "cancelled") {
+        throw new Error(`Goal ${g.id} is ${g.status}; nothing to accept.`);
+      }
+      if (g.status === "paused" && input.source === "director") {
+        throw new Error(`Goal ${g.id} is paused by the user; ask the user before accepting it.`);
+      }
+      return g;
+    };
+    const initial = checkAcceptable(this.goals.getGoal(goalId));
+    const evidence = rawPaths.map((p) => resolveDirectorEvidencePath(initial.repoRoot, p));
+
+    const running = this.activeReviews.get(initial.id);
+    if (running) {
+      running.abort(new Error(`Review superseded by goal_accept for ${initial.id}`));
+      const deadline = Date.now() + 5_000;
+      while (this.activeReviews.has(initial.id) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+      if (this.activeReviews.has(initial.id)) throw new Error(`Review of ${initial.id} is still stopping; retry goal_accept shortly.`);
+    }
+    // Re-read after a stopped review: it may have moved the goal (its status is what a failure restores).
+    const goal = checkAcceptable(this.goals.getGoal(initial.id));
+    const slot = new AbortController();
+    this.activeReviews.set(goal.id, slot);
+    const prevStatus = goal.status;
+    let committed = false;
+    try {
+      const run = goal.linkedRunId ? this.db.getRun(goal.linkedRunId) : null;
+      let gateResults: CriterionEvaluation[] = [];
+      let diffHash = `director-accept-${Date.now()}`;
+      let verifyRef: string | null = null;
+      let failedDeterministic: string[] = [];
+      if (goal.criteria.some((c) => c.kind === "deterministic")) {
+        const checkout = await this.prepareVerifyCheckout(goal, run);
+        try {
+          verifyRef = checkout.verifyRef;
+          const gate = await this.goals.runDeterministicGates(goal.id, run?.baseSha, slot.signal, {
+            cwd: checkout.verifyCwd,
+            targetRef: checkout.verifyRef,
+          });
+          gateResults = gate.results;
+          diffHash = gate.diffHash;
+        } finally {
+          await checkout.cleanup();
+        }
+        const required = new Set(goal.criteria.filter((c) => c.required).map((c) => c.id));
+        failedDeterministic = gateResults.filter((r) => !r.passed && required.has(r.criterionId)).map((r) => r.criterionId);
+        if (failedDeterministic.length > 0 && !input.overrideDeterministic) {
+          if (goal.linkedRunId) {
+            this.db.emitEvent(goal.linkedRunId, null, "goal.accept_rejected", {
+              goalId: goal.id,
+              version: goal.version,
+              failedCriteria: failedDeterministic,
+              source: input.source,
+            });
+          }
+          throw new Error(
+            `goal_accept rejected for ${goal.id}: required deterministic gate(s) still fail (${failedDeterministic.join(", ")}). ` +
+              "Fix them, or pass override_deterministic: true to accept anyway (recorded in the audit).",
+          );
+        }
+      }
+
+      const by = input.source === "user" ? "USER" : "DIRECTOR";
+      const evidenceSummary = `Evidence: ${evidence.map((e) => e.canonicalPath).join(", ")}`;
+      const covered = new Set(gateResults.map((r) => r.criterionId));
+      const criteriaResults: CriterionEvaluation[] = [
+        ...gateResults,
+        ...goal.criteria
+          .filter((c) => !covered.has(c.id))
+          .map((c) => ({ criterionId: c.id, passed: true, evidence: `[${by} ACCEPTED] ${reason} (${evidenceSummary})` })),
+      ];
+      const audit: GoalAcceptOverrideAudit = {
+        acceptedBy: input.source,
+        chatSessionId: input.chatSessionId ?? goal.chatSessionId ?? null,
+        reason,
+        evidence,
+        overrideDeterministic: input.overrideDeterministic === true,
+        failedDeterministicCriteria: failedDeterministic,
+        prevStatus,
+        goalVersion: goal.version,
+        verifyRef,
+        acceptedAt: Date.now(),
+      };
+      const summary =
+        `[${by} ACCEPTED OVERRIDE] ${reason} (${evidenceSummary})` +
+        (failedDeterministic.length ? ` [deterministic override: ${failedDeterministic.join(", ")}]` : "");
+      const outcome = this.goals.acceptGoalOverride(goal.id, {
+        expectedVersion: goal.version,
+        criteriaResults,
+        summary,
+        diffHash,
+        audit,
+      });
+      committed = true;
+      this.finishAcceptedGoal(outcome.goal, outcome.review, input.source);
+      return outcome;
+    } catch (err) {
+      if (!committed) {
+        try {
+          const current = this.goals.getGoal(goal.id);
+          if (current && current.version === goal.version && current.status !== prevStatus && current.status !== "achieved" &&
+              current.status !== "cancelled") {
+            this.goals.setStatus(goal.id, prevStatus);
+          }
+        } catch {
+          // DB may be closing during shutdown
+        }
+      }
+      throw err;
+    } finally {
+      if (this.activeReviews.get(goal.id) === slot) this.activeReviews.delete(goal.id);
+    }
+  }
+
+  /** Post-commit side effects of an accepted override; each step is best-effort (the goal is already achieved). */
+  private finishAcceptedGoal(goal: GoalRecord, review: GoalReviewVerdict, source: "director" | "user"): void {
+    const attempt = (fn: () => unknown) => {
+      try {
+        const r = fn();
+        if (r instanceof Promise) r.catch(() => {});
+      } catch {
+        // best-effort
+      }
+    };
+    attempt(() => this.db.admissionQueue.remove("goal", goal.id));
+    const runId = goal.linkedRunId;
+    if (runId) {
+      attempt(async () => {
+        const st = this.orchestrator.getEffectiveRun(runId)?.status;
+        if (st === "active" || st === "paused_quota") await this.orchestrator.stopRun(runId, `Goal ${goal.id} accepted by ${source}`);
+        this.db.updateRunStatus(runId, "completed");
+      });
+      attempt(() => this.autoResolveGoalEscalations(runId, `Auto-resolved: goal ${goal.id} accepted by ${source}`));
+      attempt(() =>
+        this.db.emitEvent(runId, null, "goal.reviewed", {
+          goalId: goal.id,
+          version: review.goalVersion,
+          cycle: review.cycle,
+          verdict: review.verdict,
+          status: goal.status,
+          summary: review.summary,
+          source,
+        }),
+      );
+    }
+    if (goal.chatSessionId) {
+      attempt(() => {
+        for (const t of this.db.timers.list({ ownerKind: "chat", ownerId: goal.chatSessionId!, status: "pending" })) {
+          if (timerMatchesGoalSettlement(t, goal)) this.db.timers.cancel(t.id, `goal_settled:${goal.id}`);
+        }
+      });
+    }
+    attempt(() => this.drainGoalQueue(goal.repoRoot));
+    attempt(() => this.syncQueuedGoalProgress());
+    if (goal.chatSessionId) {
+      const event: ChatControlEvent = {
+        kind: "goal.reviewed",
+        goalId: goal.id,
+        goalVersion: review.goalVersion,
+        cycle: review.cycle,
+        verdict: review.verdict,
+        status: goal.status,
+        summary: review.summary,
+        source,
+      };
+      attempt(() => {
+        // The Director's own accept never wakes it; a user accept wakes the owning Director.
+        if (source === "user" && this.wakeHandler && this.config.events?.wakeDirectorOnGoalSettle !== false) {
+          this.wakeHandler(goal.chatSessionId!, event);
+        } else {
+          this.chats.appendTurn(goal.chatSessionId!, "system_notice", formatChatEventSummary(event), undefined, event);
+        }
+      });
+    }
+  }
+
+  /**
    * Executes the full deterministic Verification Gates -> Independent Skeptical Done-Review pipeline.
    * Never lets the generator self-approve: invokes a fresh read-only Reviewer session (or fails fast at $0 LLM cost on deterministic gates).
    */
@@ -1863,6 +2261,8 @@ export class DirectorRuntime {
       }
     };
     assertCurrent();
+    // Read once, before gates move the goal's status: a current failed claim by the coordinator blocks approval.
+    const coordinatorFailure = this.detectCoordinatorFailure(goal);
 
     const committedMode: VerificationMode = goal.verificationMode ?? "auto";
     if (opts?.verificationMode === "none" && committedMode !== "none") {
@@ -1872,6 +2272,12 @@ export class DirectorRuntime {
     }
     const effectiveMode: VerificationMode = opts?.verificationMode ?? committedMode;
     if (effectiveMode === "none") {
+      if (coordinatorFailure) {
+        throw new Error(
+          `Goal ${goal.id}: coordinator reported verification failed for the current revision (${(coordinatorFailure.summary ?? "no summary").slice(0, 300)}). ` +
+            "Resume the run, amend the goal, or use goal_accept with evidence.",
+        );
+      }
       const directResults: CriterionEvaluation[] = goal.criteria.map((c) => ({
         criterionId: c.id,
         passed: true,
@@ -1883,57 +2289,15 @@ export class DirectorRuntime {
         blockingIssues: [],
         summary: opts?.summary?.trim() || "Goal completed directly (verification_mode=none).",
         diffHash: `direct-${Date.now()}`,
+        source: "none",
       });
       await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
       return outcome;
     }
 
-    const targetRef = run?.baseBranch || "HEAD";
-    // Prepare an isolated detached verification worktree at exact targetSha whenever verifying a git branch,
-    // so gates and Done-Reviewers (which can run `bun test`, `tmux`, etc.) always test the real target branch
-    // without colliding with dirty edits or a different checked-out branch in `goal.repoRoot`.
-    let verifyCwd = goal.repoRoot;
-    let verifyRef = targetRef;
-    let verifyWorktreePath: string | null = null;
-    if (run?.baseBranch) {
-      const targetSha = await runGit(goal.repoRoot, ["rev-parse", "--verify", `${run.baseBranch}^{commit}`])
-        .then((r) => r.stdout)
-        .catch(() => null);
-      if (targetSha) {
-        const wtMgr = this.orchestrator.getWorktreeManager(goal.repoRoot);
-        const candidatePath = join(wtMgr.baseDir, "_verify", `${goal.id}-${randomUUID().slice(0, 8)}`);
-        const { mkdirSync } = await import("node:fs");
-        mkdirSync(join(wtMgr.baseDir, "_verify"), { recursive: true });
-        await runGit(goal.repoRoot, ["worktree", "add", "--detach", candidatePath, targetSha]);
-        verifyWorktreePath = candidatePath;
-        verifyCwd = candidatePath;
-        verifyRef = targetSha;
-        // Do NOT silently swallow bootstrap failures — fail verification cleanly if setupCommand fails
-        await wtMgr.bootstrapWorktree(candidatePath);
-      } else {
-        // Fail closed when targetBranch cannot be resolved and host checkout is on a different branch
-        const headBranch = await runGit(goal.repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])
-          .then((r) => r.stdout)
-          .catch(() => null);
-        if (headBranch && headBranch !== run.baseBranch) {
-          throw new Error(
-            `Cannot verify goal ${goal.id}: target branch '${run.baseBranch}' does not resolve (host checkout is '${headBranch}').`,
-          );
-        }
-      }
-    }
-
-    const cleanupVerifyWorktree = async () => {
-      if (!verifyWorktreePath) return;
-      const p = verifyWorktreePath;
-      verifyWorktreePath = null;
-      await runGit(goal.repoRoot, ["worktree", "remove", "--force", p]).catch(async () => {
-        const { rmSync } = await import("node:fs");
-        rmSync(p, { recursive: true, force: true });
-      });
-      await runGit(goal.repoRoot, ["worktree", "prune"]).catch(() => {});
-    };
-
+    const checkout = await this.prepareVerifyCheckout(goal, run);
+    const verifyCwd = checkout.verifyCwd;
+    const verifyRef = checkout.verifyRef;
     try {
       const gateResult = await this.goals.runDeterministicGates(goal.id, run?.baseSha, signal, {
         cwd: verifyCwd,
@@ -1950,6 +2314,7 @@ export class DirectorRuntime {
           summary: "Deterministic verification gates failed; bouncing back to Tier 1 before LLM review.",
           diffHash: gateResult.diffHash,
           spentUsd: this.sumRunCostUsd(goal.linkedRunId),
+          source: "deterministic",
         });
         await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
         return outcome;
@@ -1958,6 +2323,44 @@ export class DirectorRuntime {
       // Agent-chosen verification depth: when deterministic checks already cover the goal (or mode='deterministic'),
       // approve cleanly at $0 LLM cost without spawning a redundant independent reviewer session!
       if (!shouldRunIndependentReview(goal, effectiveMode)) {
+        // A coordinator-reported failure, or a silent settle after one bounced, is never approved at $0.
+        const lastReview = this.goals
+          .listReviews(goal.id)
+          .filter((r) => r.goalVersion === goal.version)
+          .at(-1);
+        const lp = goal.liveProgress;
+        const confirmedAfterBounce =
+          lp != null && isCurrentClaim(goal, lp) && (lp.verificationStatus === "passed" || lp.verificationStatus === "not_needed");
+        const unconfirmedBounce = !coordinatorFailure && lastReview?.source === "coordinator_failed" && !confirmedAfterBounce;
+        if (coordinatorFailure || unconfirmedBounce) {
+          const coveredIds = new Set(gateResult.results.map((r) => r.criterionId));
+          const reported = coordinatorFailure?.criteriaResults ?? [];
+          const criteriaResults: CriterionEvaluation[] = [
+            ...gateResult.results,
+            ...reported.filter((c) => !coveredIds.has(c.criterionId)),
+          ];
+          const head = coordinatorFailure
+            ? `Coordinator reported verification failed for v${goal.version} cycle ${goal.reviewCycle}: ${(coordinatorFailure.summary ?? "no summary").slice(0, 400)}`
+            : `Coordinator has not confirmed verification after its failed report in cycle ${lastReview!.cycle}.`;
+          const outcome = this.goals.recordReviewVerdict(goal.id, {
+            verdict: "changes_requested",
+            criteriaResults,
+            blockingIssues: [
+              head,
+              ...reported.map((c) => `${c.criterionId}: ${c.evidence}${c.remediation ? ` | Fix: ${c.remediation}` : ""}`),
+            ],
+            summary:
+              (coordinatorFailure
+                ? "Deterministic checks passed but the coordinator reported verification failed; not approving."
+                : "Deterministic checks passed but the coordinator has not confirmed verification after its failed report; not approving.") +
+              " Re-verify, then call report_goal_progress with verification_status passed or failed, or phase blocked.",
+            diffHash: gateResult.diffHash,
+            spentUsd: this.sumRunCostUsd(goal.linkedRunId),
+            source: "coordinator_failed",
+          });
+          await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
+          return outcome;
+        }
         const coveredIds = new Set(gateResult.results.map((r) => r.criterionId));
         const allResults: CriterionEvaluation[] = [
           ...gateResult.results,
@@ -1979,6 +2382,7 @@ export class DirectorRuntime {
               ? `All ${gateResult.results.length} deterministic check(s) passed; approved without redundant LLM review.`
               : "Approved cleanly without redundant LLM review."),
           diffHash: gateResult.diffHash,
+          source: "deterministic",
         });
         await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
         return outcome;
@@ -2000,26 +2404,27 @@ export class DirectorRuntime {
         diffPatch = "";
       }
 
-      const reviewerPrompt = this.goals.buildReviewerPrompt(goal, gateResult, diffStat, diffPatch);
+      const reviewerMaxTurns = this.config.rollover.reviewerMaxTurns;
+      const goalsDir = join(goal.repoRoot, ".harness", "goals");
+      const artifactsDir = resolve(goal.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts");
+      const evidenceDir = ensureGoalEvidenceDir(goal.repoRoot, goal.id) ?? goalEvidenceDir(goal.repoRoot, goal.id);
+      const reviewerPrompt = this.goals.buildReviewerPrompt(goal, gateResult, diffStat, diffPatch, {
+        reviewerMaxTurns,
+        evidence: {
+          goalEvidenceDir: evidenceDir,
+          goalsDir,
+          artifactsDir,
+          ...(run ? { runArtifactsDir: join(artifactsDir, run.id) } : {}),
+        },
+        ...(coordinatorFailure ? { coordinatorFailure } : {}),
+      });
       // Prefer an independent model family different from the authoring run's Tier 1/Tier 2 model
       const runTasks = run ? this.db.listTasks(run.id) : [];
       const authorModel =
         runTasks.find((t) => t.tier === 2 && t.model)?.model ??
         runTasks.find((t) => t.tier === 1 && t.model)?.model ??
         undefined;
-      const cachedCat = this.catalog.loadCached();
-      const recVerify = cachedCat
-        ? recommendModelsByTaskKind(cachedCat.models, { avoidModelId: authorModel }).verify
-        : null;
-      const { profile, model, wireModel } = await resolveLaunchRoute(this.config, {
-        tier: 3,
-        cwd: verifyCwd,
-        profileId: recVerify?.profile,
-        model: recVerify?.model,
-        catalog: this.catalog,
-        quota: this.quota,
-      });
-      const reviewerEffort = recVerify?.effort && recVerify.effort !== "default" ? recVerify.effort : undefined;
+      const { profile, model, wireModel, effort: reviewerEffort } = await this.resolveReviewerRoute(verifyCwd, authorModel);
       const runner = this.customRunnerFactory
         ? this.customRunnerFactory(profile)
         : profile.kind === "acp"
@@ -2036,13 +2441,26 @@ export class DirectorRuntime {
 
       const submitTool: ToolDefinition = {
         name: "submit_review_verdict",
-        description: "Submit the structured Independent Done-Review verdict.",
+        description:
+          "Submit the structured Independent Done-Review verdict. criteriaResults items are {criterionId, passed (boolean true only when verified), evidence, remediation?}; an invalid verdict is rejected with an error you can fix and resubmit.",
         inputSchema: {
           type: "object",
           required: ["verdict", "criteriaResults", "summary"],
           properties: {
             verdict: { type: "string", enum: ["approved", "changes_requested", "escalate_human"] },
-            criteriaResults: { type: "array", items: { type: "object" } },
+            criteriaResults: {
+              type: "array",
+              items: {
+                type: "object",
+                required: ["criterionId", "passed", "evidence"],
+                properties: {
+                  criterionId: { type: "string" },
+                  passed: { type: "boolean" },
+                  evidence: { type: "string" },
+                  remediation: { type: "string" },
+                },
+              },
+            },
             blockingIssues: { type: "array", items: { type: "string" } },
             summary: { type: "string" },
           },
@@ -2065,7 +2483,7 @@ export class DirectorRuntime {
         readOnly: true,
         profileId: profile.id,
         model,
-        maxTurns: this.config.rollover.reviewerMaxTurns,
+        maxTurns: reviewerMaxTurns,
       });
       const abort = new AbortController();
       const reviewerSignal = AbortSignal.any([signal, abort.signal]);
@@ -2092,15 +2510,25 @@ export class DirectorRuntime {
       };
 
       let outcome: ReturnType<GoalEngine["recordReviewVerdict"]>;
+      let turnsUsed = 0;
+      let timedOut = false;
+      // O1: the wall-clock limit fired after a valid verdict was submitted: record that verdict.
+      const submittedBeforeTimeout = () => timedOut && verdictBox.value !== null && !signal.aborted;
       const bridgeExt = import.meta.url.endsWith(".js") ? "mcp-bridge.js" : "mcp-bridge.ts";
       const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", bridgeExt);
       const reviewerExecuteTool = async (name: string, args: Record<string, unknown>) => {
         if (name === "submit_review_verdict") {
+          const v = normalizeReviewerVerdict<Partial<SubmittedVerdict>>(args);
+          if (!v) {
+            throw new Error(
+              "submit_review_verdict: verdict must be approved | changes_requested | escalate_human, with criteriaResults[{criterionId, passed, evidence}]",
+            );
+          }
           verdictBox.value = {
-            verdict: String(args.verdict) as SubmittedVerdict["verdict"],
-            criteriaResults: Array.isArray(args.criteriaResults) ? (args.criteriaResults as CriterionEvaluation[]) : [],
-            blockingIssues: Array.isArray(args.blockingIssues) ? (args.blockingIssues as string[]) : [],
-            summary: String(args.summary ?? ""),
+            verdict: v.verdict as SubmittedVerdict["verdict"],
+            criteriaResults: v.criteriaResults ?? [],
+            blockingIssues: v.blockingIssues ?? [],
+            summary: typeof v.summary === "string" ? v.summary : "",
           };
           return { recorded: true };
         }
@@ -2108,6 +2536,7 @@ export class DirectorRuntime {
       };
       this.activeReviewerTools.set(reviewerTask.id, { tools: [submitTool], execute: reviewerExecuteTool });
       const reviewerTimeout = setTimeout(() => {
+        timedOut = true;
         abort.abort(new Error("Independent Done-Reviewer timed out after 10 minutes"));
       }, 600_000);
       reviewerTimeout.unref?.();
@@ -2124,7 +2553,7 @@ export class DirectorRuntime {
           model,
           wireModel,
         });
-        let res;
+        let res: Awaited<ReturnType<typeof runner.run>> | null = null;
         try {
           res = await runner.run({
             runId: reviewRun.id,
@@ -2133,13 +2562,14 @@ export class DirectorRuntime {
             kind: "verify",
             cwd: verifyCwd,
             toolPolicy: "read_only_workspace",
-            allowShellInReadOnly: Boolean(verifyWorktreePath),
+            allowShellInReadOnly: checkout.isolated,
             model: wireModel,
             effort: reviewerEffort,
             systemPrompt:
-              "You are an independent read-only Done-Reviewer operating in a disposable verification checkout of the target branch. Inspect the implementation, diffs, and verification evidence for each required criterion — you may run tests, linters, git diff, rg, sg, or tmux checks freely to verify behavior, but never edit tracked repository code or delegate. Call submit_review_verdict if available, or return the requested JSON verdict with concrete sources for every required criterion.",
+              "You are an independent read-only Done-Reviewer operating in a disposable verification checkout of the target branch. Inspect the implementation, diffs, and verification evidence for each required criterion — you may run tests, linters, git diff, rg, sg, or tmux checks freely to verify behavior, but never edit tracked repository code or delegate. Call submit_review_verdict if available, or return the requested JSON verdict with concrete sources for every required criterion. " +
+              `You may get one advisory progress check-in around ${reviewerMaxTurns} tool-call turns; the harness does not stop you by turn count. The review has a hard 10-minute wall-clock limit. Submit as soon as every required criterion has evidence; a changes_requested verdict with partial evidence is better than none.`,
             initialPrompt: reviewerPrompt,
-            maxTurns: this.config.rollover.reviewerMaxTurns,
+            maxTurns: reviewerMaxTurns,
             tools: [submitTool],
             executeTool: reviewerExecuteTool,
             daemonSocketPath: this.config.socketPath,
@@ -2147,10 +2577,16 @@ export class DirectorRuntime {
             externalMcpServers: resolveExternalMcpServers(this.config.stateDir, this.config.externalMcpServers),
             extraPathDirs: nativeToolsPathDirs(this.config.stateDir),
             extraReadRoots: [
-              join(goal.repoRoot, ".harness", "goals"),
+              goalsDir,
               join(goal.repoRoot, ".harness", "artifacts"),
               ...(this.config.worktree.extraReadRoots ?? []),
             ],
+            extraEnv: {
+              HARNESS_GOAL_EVIDENCE_DIR: evidenceDir,
+              HARNESS_GOAL_ID: goal.id,
+              HARNESS_GOALS_DIR: goalsDir,
+              HARNESS_ARTIFACTS_DIR: artifactsDir,
+            },
             signal: reviewerSignal,
             callbacks: {
               onSessionId: (sid) => {
@@ -2165,24 +2601,33 @@ export class DirectorRuntime {
                 emit("agent.usage", usage);
                 cost.onUsage(usage);
               },
+              onTurn: (n) => {
+                turnsUsed = n;
+              },
               onPassiveQuota: (sig) => this.quota.ingestPassiveSignal(sig),
             },
           });
+        } catch (err) {
+          if (!submittedBeforeTimeout()) throw err;
         } finally {
           cost.finish();
         }
-        reviewerSignal.throwIfAborted();
-        assertCurrent();
-        if (res.stopReason !== "completed") {
-          throw new Error(`Reviewer stopped: ${res.stopReason}. ${res.text}`);
+        const keepSubmitted = submittedBeforeTimeout();
+        if (!keepSubmitted) {
+          reviewerSignal.throwIfAborted();
+          if (res && res.stopReason !== "completed") {
+            throw new Error(`Reviewer stopped: ${res.stopReason}. ${res.text}`);
+          }
         }
+        assertCurrent();
 
         // Fallback JSON parse if reviewer returned JSON text instead of calling submit_review_verdict
-        if (!verdictBox.value) {
+        if (!verdictBox.value && res) {
           verdictBox.value = parseReviewerVerdictJson<SubmittedVerdict>(res.text);
         }
 
         const submittedVerdict = verdictBox.value;
+        const stopReason = keepSubmitted ? "timeout_after_verdict" : (res?.stopReason ?? "unknown");
 
         // Merge deterministic gate pass results with reviewer evaluations so deterministic criteria stay evidenced
         const mergedResults: CriterionEvaluation[] = [...gateResult.results];
@@ -2191,16 +2636,39 @@ export class DirectorRuntime {
             mergedResults.push(r);
           }
         }
+        // Coordinator-failed criteria that neither the gates nor the reviewer evaluated stay failed.
+        for (const c of coordinatorFailure?.criteriaResults ?? []) {
+          if (!mergedResults.some((m) => m.criterionId === c.criterionId)) {
+            mergedResults.push({
+              criterionId: c.criterionId,
+              passed: false,
+              evidence: `Coordinator reported this criterion failed and the reviewer did not evaluate it: ${c.evidence}`,
+              ...(c.remediation ? { remediation: c.remediation } : {}),
+            });
+          }
+        }
+        const noVerdictIssue =
+          `Reviewer did not return a structured verdict (stopReason=${stopReason}, turnsUsed=${turnsUsed}, reviewerMaxTurns=${reviewerMaxTurns} advisory). ` +
+          `Output tail: ${(res?.text ?? "").slice(-300)}`;
+        const notes = [
+          coordinatorFailure && coordinatorFailure.criteriaResults.length === 0
+            ? "(coordinator-reported failure was shown to the reviewer)"
+            : null,
+          authorModel && model === authorModel ? "(reviewer model equals author model: no independent route available)" : null,
+        ].filter(Boolean);
+        const baseSummary =
+          submittedVerdict?.summary ??
+          `Incomplete review output (stopReason=${stopReason}, turns=${turnsUsed}, reminder threshold=${reviewerMaxTurns})`;
 
         outcome = this.db.transaction(() => {
           const recorded = this.goals.recordReviewVerdict(goal.id, {
             verdict: submittedVerdict?.verdict ?? "changes_requested",
             criteriaResults: mergedResults,
-            blockingIssues:
-              submittedVerdict?.blockingIssues ?? (submittedVerdict ? [] : ["Reviewer did not return a structured verdict"]),
-            summary: submittedVerdict?.summary ?? "Incomplete review output",
+            blockingIssues: submittedVerdict?.blockingIssues ?? (submittedVerdict ? [] : [noVerdictIssue]),
+            summary: notes.length ? `${baseSummary} ${notes.join(" ")}` : baseSummary,
             diffHash: gateResult.diffHash,
             spentUsd: this.sumRunCostUsd(goal.linkedRunId),
+            source: "review",
           });
           const summary = `${recorded.review.verdict}: ${recorded.review.summary}`.slice(0, 2000);
           const dossier = writeTaskDossier(this.db, reviewRun, reviewerTask.id, "review.json",
@@ -2217,7 +2685,7 @@ export class DirectorRuntime {
         const detail = err instanceof Error ? err.message : String(err);
         failReviewer(detail);
         reviewerSignal.throwIfAborted();
-        throw new Error(`${failedSummary} (${detail})`);
+        throw new Error(`${failedSummary} (${detail}; turns=${turnsUsed})`);
       } finally {
         clearTimeout(reviewerTimeout);
         this.activeReviewerTools.delete(reviewerTask.id);
@@ -2227,8 +2695,51 @@ export class DirectorRuntime {
       await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered });
       return outcome;
     } finally {
-      await cleanupVerifyWorktree();
+      await checkout.cleanup();
     }
+  }
+
+  /**
+   * Done-Reviewer route: the fresh enabled catalog's verify recommendation (independent of the author model,
+   * ACP preferred), falling back to the same model on any enabled profile, then any enabled route.
+   */
+  private async resolveReviewerRoute(
+    verifyCwd: string,
+    authorModel: string | undefined,
+  ): Promise<{ profile: Awaited<ReturnType<typeof resolveLaunchRoute>>["profile"]; model: string; wireModel: string; effort: string | undefined }> {
+    let models: CompiledModelEntry[] = [];
+    try {
+      let cat = await this.catalog.getCatalog({ cwd: verifyCwd, excludeExhausted: true });
+      if (cat.models.length === 0) cat = await this.catalog.getCatalog({ cwd: verifyCwd, excludeExhausted: false });
+      models = cat.models;
+    } catch {
+      models = this.catalog.loadCached()?.models ?? [];
+    }
+    const enabledProfiles = this.config.profiles.filter((p) => p.enabled !== false);
+    const rec = recommendModelsByTaskKind(models, { avoidModelId: authorModel, enabledProfiles, preferAcp: true }).verify;
+    const rungs: Array<{ profileId?: string; model?: string }> = [];
+    if (rec?.profile && enabledProfiles.some((p) => p.id === rec.profile)) rungs.push({ profileId: rec.profile, model: rec.model });
+    if (rec?.model) rungs.push({ model: rec.model });
+    rungs.push({});
+    let lastError: unknown;
+    for (const rung of rungs) {
+      try {
+        const route = await resolveLaunchRoute(this.config, {
+          tier: 3,
+          cwd: verifyCwd,
+          profileId: rung.profileId,
+          model: rung.model,
+          catalog: this.catalog,
+          quota: this.quota,
+        });
+        const matchesRec = rec != null && route.profile.id === rec.profile && route.model === rec.model;
+        const effort = matchesRec && rec.effort && rec.effort !== "default" ? rec.effort : undefined;
+        return { ...route, effort };
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    throw lastError;
   }
 
   private async handlePostReviewTransition(
@@ -2288,6 +2799,14 @@ export class DirectorRuntime {
       goal = current;
       outcome.goal = current;
     }
+    // Decided before the escalation below so its P0 wake can be suppressed in favour of the single review wake.
+    const willWakeDirector = Boolean(
+      goal.chatSessionId &&
+        !invalidated &&
+        opts?.autoTriggered &&
+        this.config.events?.wakeDirectorOnGoalSettle !== false &&
+        (goal.status === "achieved" || goal.status === "awaiting_human"),
+    );
 
     if (goal.linkedRunId) {
       this.db.emitEvent(goal.linkedRunId, null, "goal.reviewed", {
@@ -2310,16 +2829,32 @@ export class DirectorRuntime {
         void this.drainGoalQueue(goal.repoRoot).catch(() => {});
         const orch = this.db.listTasks(goal.linkedRunId).find((t) => t.tier === 1);
         if (orch) {
-          this.db.createEscalation({
-            runId: goal.linkedRunId,
-            fromTaskId: orch.id,
-            toTaskId: null,
-            severity: "P0",
-            category: "verification_failed",
-            title: circuitBreakerTripped ?? `Goal ${goal.id} needs human review`,
-            evidencePaths: [goal.repoRoot],
-            blocking: true,
-          });
+          const failedIds = review.criteriaResults.filter((c) => !c.passed).map((c) => c.criterionId);
+          const attempted = circuitBreakerTripped
+            ? [
+                ...review.blockingIssues.slice(0, 5),
+                ...review.criteriaResults.filter((c) => !c.passed && c.remediation).map((c) => `${c.criterionId}: ${c.remediation}`),
+              ]
+            : undefined;
+          const runId = goal.linkedRunId;
+          if (willWakeDirector) this.suppressEscalationWakeRuns.add(runId);
+          try {
+            this.db.createEscalation({
+              runId,
+              fromTaskId: orch.id,
+              toTaskId: null,
+              severity: "P0",
+              category: "verification_failed",
+              title: circuitBreakerTripped
+                ? `${circuitBreakerTripped}${failedIds.length ? ` (failed: ${failedIds.join(", ")})` : ""}`
+                : `Goal ${goal.id} needs human review`,
+              evidencePaths: [goal.repoRoot],
+              ...(attempted ? { attempted } : {}),
+              blocking: true,
+            });
+          } finally {
+            if (willWakeDirector) this.suppressEscalationWakeRuns.delete(runId);
+          }
         }
       }
     }
@@ -2335,12 +2870,6 @@ export class DirectorRuntime {
         summary: review.summary,
         ...(circuitBreakerTripped ? { circuitBreakerTripped } : {}),
       };
-      const willWakeDirector = Boolean(
-        !invalidated &&
-          opts?.autoTriggered &&
-          this.config.events?.wakeDirectorOnGoalSettle !== false &&
-          (goal.status === "achieved" || goal.status === "awaiting_human"),
-      );
       if (willWakeDirector && this.wakeHandler) {
         // Let the wakeup turn record the single canonical `system_notice` turn so `goal.reviewed` is never delivered twice!
         this.wakeHandler(goal.chatSessionId, reviewedEvent);
@@ -2601,9 +3130,10 @@ export class DirectorRuntime {
       const goalBanner =
         bannerGoals.length > 0
           ? `\n\nActive/Recent Goals:\n${bannerGoals
-              .map((g) => {
+              .map((stored) => {
+                const g = reconcileGoalWithLiveRun(stored);
                 const queued = g.status === "draft" && g.liveProgress?.phase === "queued" ? g.liveProgress.summary : undefined;
-                const ver = queued ?? (g.reviewCycle > 0 ? `${g.reviewCycle} rev` : g.liveProgress?.verificationStatus ?? g.status);
+                const ver = queued ?? (g.reviewCycle > 0 ? `${g.reviewCycle} rev` : deriveGoalVerificationLabel(g));
                 return `- ${g.id} v${g.version} [${g.status}] "${g.title}" (${ver})`;
               })
               .join("\n")}${
@@ -2721,7 +3251,9 @@ export class DirectorRuntime {
     this.activeChats.get(chatSessionId)?.onToolEvent?.({ id: `display-${randomUUID()}`, name: toolName, status: "completed", display });
   }
 
-  private goalDisplayData(goal: GoalRecord) {
+  private goalDisplayData(stored: GoalRecord) {
+    // Read-only projection: a stale verification claim is hidden, never rewritten.
+    const goal = reconcileGoalWithLiveRun(stored);
     const runId = goal.linkedRunId;
     return {
       goal,
@@ -2891,28 +3423,14 @@ export class DirectorRuntime {
       }
       case "goal_accept": {
         const goalId = String(args.goal_id ?? "").trim();
-        const reason = String(args.reason ?? "").trim();
-        const evidencePaths = Array.isArray(args.evidence_paths)
-          ? (args.evidence_paths as unknown[]).map((p) => String(p).trim()).filter(Boolean)
-          : [];
-        if (!goalId || !reason) throw new Error("goal_accept requires goal_id and reason");
-        if (evidencePaths.length === 0) throw new Error("goal_accept requires non-empty evidence_paths");
-        const goal = this.goals.getGoal(goalId);
-        if (!goal) throw new Error(`Unknown goal ${goalId}`);
-        const evidenceSummary = `Evidence: ${evidencePaths.join(", ")}`;
-        const outcome = this.goals.recordReviewVerdict(goal.id, {
-          verdict: "approved",
-          criteriaResults: goal.criteria.map((c) => ({
-            criterionId: c.id,
-            passed: true,
-            evidence: `[DIRECTOR ACCEPTED] ${reason} (${evidenceSummary})`,
-          })),
-          blockingIssues: [],
-          summary: `[DIRECTOR ACCEPTED OVERRIDE] ${reason} (${evidenceSummary})`,
-          diffHash: `director-accept-${Date.now()}`,
-          spentUsd: this.sumRunCostUsd(goal.linkedRunId),
+        if (!goalId) throw new Error("goal_accept requires goal_id");
+        const outcome = await this.acceptGoalOverride(goalId, {
+          reason: String(args.reason ?? ""),
+          evidencePaths: Array.isArray(args.evidence_paths) ? (args.evidence_paths as unknown[]).map(String) : [],
+          overrideDeterministic: args.override_deterministic === true,
+          source: "director",
+          chatSessionId,
         });
-        await this.handlePostReviewTransition(outcome, { autoTriggered: false });
         return { ...outcome, presentation_id: presentGoal(outcome.goal) };
       }
       case "write_note": {
@@ -3010,7 +3528,7 @@ export class DirectorRuntime {
           });
           return this.goalCommitToolResult(res, presentGoal(res.goal));
         }
-        return { ...created, presentation_id: presentGoal(created) };
+        return { ...created, evidenceDir: goalEvidenceDirOrNull(created), presentation_id: presentGoal(created) };
       }
 
       case "goal_commit": {
@@ -3080,7 +3598,9 @@ export class DirectorRuntime {
       case "goal_list": {
         const allProjects = Boolean(args.all_projects);
         this.syncQueuedGoalProgress();
-        const goals = allProjects ? this.goals.listGoals({}) : this.goals.listGoals({ repoRoot, chatSessionId });
+        const goals = (allProjects ? this.goals.listGoals({}) : this.goals.listGoals({ repoRoot, chatSessionId })).map(
+          reconcileGoalWithLiveRun,
+        );
         const presentation_id = offerPresentation(() => buildGoalsTableDisplay(goals.map((goal) => this.goalDisplayData(goal))));
         return { goals, presentation_id };
       }
@@ -3209,7 +3729,7 @@ export class DirectorRuntime {
                 }))
             : undefined,
           reportedByTaskId: chatSessionId,
-        });
+        }, "director");
         if (g.linkedRunId) {
           this.db.emitEvent(g.linkedRunId, null, "goal.progress", { goalId: g.id, ...g.liveProgress });
         }
@@ -3223,6 +3743,8 @@ export class DirectorRuntime {
         const detail = this.goalDisplayData(g);
         return {
           ...detail,
+          acceptOverrides: detail.reviews.filter((r) => r.source === "director_accept_override"),
+          evidenceDir: goalEvidenceDirOrNull(g),
           tasks: detail.tasks.map((t) => compactTaskHandoff(t, detail.openEscalations)),
           presentation_id: offerPresentation(() => buildGoalDetailDisplay(detail)),
         };
@@ -3278,28 +3800,7 @@ export class DirectorRuntime {
         if (startLine < 1) throw new Error("start_line must be 1 or greater");
         if (endLine !== undefined && endLine < startLine) throw new Error("end_line must not be less than start_line");
 
-        const root = realpathSync(repoRoot);
-        const candidate = rawPath === "~" ? homedir()
-          : rawPath.startsWith("~/") ? resolve(homedir(), rawPath.slice(2))
-          : resolve(root, rawPath);
-        const target = realpathSync(candidate);
-        const relToRepo = relative(root, target);
-        const inRepo = relToRepo !== ".." && !relToRepo.startsWith(`..${sep}`) && !isAbsolute(relToRepo);
-        const path = inRepo ? relToRepo : target;
-        const protectedMessage = "read_file cannot read protected paths (.git, task worktrees, or harness-internal state)";
-        if (inRepo) {
-          const parts = relToRepo.split(sep).map((p) => p.toLowerCase());
-          // Block .git and .harness/worktrees, while permitting .harness/goals, .harness/artifacts, and .harness/notes.
-          if (parts.includes(".git") || (parts[0] === ".harness" && !["artifacts", "goals", "notes"].includes(parts[1] ?? ""))) {
-            throw new Error(protectedMessage);
-          }
-        } else {
-          // Check the whole canonical path so the veto holds wherever the file lives.
-          const parts = target.split(sep).map((p) => p.toLowerCase());
-          if (parts.includes(".git") || parts.some((p, i) => p === ".harness" && parts[i + 1] === "worktrees")) {
-            throw new Error(protectedMessage);
-          }
-        }
+        const { target, display: path } = resolveDirectorReadablePath(repoRoot, rawPath);
 
         const pageBytes = Math.min(READ_FILE_MAX_PAGE_BYTES, Math.max(4, int(args.max_bytes) ?? READ_FILE_DEFAULT_PAGE_BYTES));
         const file = await openFile(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -3497,12 +3998,15 @@ export class DirectorRuntime {
       }
 
       case "resume_task": {
+        const taskBefore = this.db.getTask(String(args.task_id));
+        const priorRunStatus = taskBefore ? this.orchestrator.getEffectiveRun(taskBefore.runId)?.status : undefined;
         const res = await this.orchestrator.resumeTaskDetailed(String(args.task_id), {
           note: typeof args.note === "string" ? args.note : undefined,
           model: typeof args.model === "string" ? args.model : undefined,
           effort: typeof args.effort === "string" ? args.effort : undefined,
           profileId: typeof args.profile_id === "string" && args.profile_id.trim() ? args.profile_id.trim() : undefined,
         });
+        this.onRunResumed(res.task.runId, priorRunStatus, res.outcome === "resumed");
         return {
           resumed: res.outcome === "resumed",
           outcome: res.outcome,
@@ -3522,10 +4026,12 @@ export class DirectorRuntime {
           runId = g.linkedRunId;
         }
         if (!runId) throw new Error("resume_run requires run_id or goal_id");
+        const priorRunStatus = this.orchestrator.getEffectiveRun(runId)?.status;
         const res = await this.orchestrator.resumeRun(runId, {
           trigger: "manual",
           note: typeof args.note === "string" ? args.note : undefined,
         });
+        this.onRunResumed(res.run.id, priorRunStatus, res.outcome === "resumed");
         return {
           ...res,
           presentation_id: offerPresentation(() => buildRunActivityDisplay(buildRunActivitySummary(this.db, res.run.id))),
@@ -3714,38 +4220,160 @@ export class DirectorRuntime {
   }
 }
 
-/**
- * Extracts a structured verdict JSON object from reviewer prose without greedy regex bugs
- * when the reviewer quotes code braces outside the JSON block.
- */
-export function parseReviewerVerdictJson<T extends { verdict?: unknown }>(text: string): T | null {
-  const isValid = (parsed: unknown): parsed is T =>
-    Boolean(
-      parsed &&
-        typeof parsed === "object" &&
-        !Array.isArray(parsed) &&
-        typeof (parsed as { verdict?: unknown }).verdict === "string" &&
-        ["approved", "changes_requested", "escalate_human"].includes(String((parsed as { verdict: string }).verdict)),
-    );
+interface CoordinatorFailure {
+  source: GoalProgressSource;
+  summary?: string;
+  criteriaResults: CriterionEvaluation[];
+  claimedAt?: number;
+}
 
-  // 1. Prefer the last fenced ```json ... ``` (or ``` ... ```) block containing a valid verdict object
-  const fenceMatches = [...text.matchAll(/```(?:json)?\s*\n([\s\S]*?)```/gi)];
-  for (let i = fenceMatches.length - 1; i >= 0; i--) {
-    try {
-      const parsed = JSON.parse(fenceMatches[i]![1]!.trim());
-      if (isValid(parsed)) return parsed;
-    } catch {
-      // keep scanning earlier fences
+interface ExplicitBlocker {
+  summary: string;
+  remediation: string[];
+  /** An open blocking escalation already raised by a blocked task; reused instead of creating another. */
+  escalationId: string | null;
+  tier1Id: string | null;
+}
+
+function hasClaimProvenance(lp: GoalLiveProgress): boolean {
+  return lp.goalVersion !== undefined || lp.runId !== undefined || lp.reviewCycle !== undefined;
+}
+
+/** The goal's canonical evidence directory (created when possible), or null for an id that is not a safe segment. */
+function goalEvidenceDirOrNull(goal: GoalRecord): string | null {
+  try {
+    return ensureGoalEvidenceDir(goal.repoRoot, goal.id) ?? goalEvidenceDir(goal.repoRoot, goal.id);
+  } catch {
+    return null;
+  }
+}
+
+function evidenceDirLines(goal: GoalRecord): string[] {
+  const dir = goalEvidenceDirOrNull(goal);
+  return dir
+    ? ["", `Goal Evidence Directory: ${dir} (env HARNESS_GOAL_EVIDENCE_DIR). Write verification evidence for this goal there.`]
+    : [];
+}
+
+function blockerDetail(blocker: ExplicitBlocker): string {
+  const remediation = blocker.remediation.length ? `; remediation: ${blocker.remediation.join("; ")}` : "";
+  return `blocked: ${blocker.summary}${remediation}`.slice(0, 300);
+}
+
+/**
+ * Resolves a Director read path (repo-relative, absolute, or ~/) to its canonical target. Refuses `.git`,
+ * task worktrees, and harness-internal state (repo `.harness/*` other than artifacts, goals and notes).
+ */
+export function resolveDirectorReadablePath(repoRoot: string, rawPath: string): { target: string; inRepo: boolean; display: string } {
+  const root = realpathSync(repoRoot);
+  const candidate = rawPath === "~" ? homedir()
+    : rawPath.startsWith("~/") ? resolve(homedir(), rawPath.slice(2))
+    : resolve(root, rawPath);
+  const target = realpathSync(candidate);
+  const relToRepo = relative(root, target);
+  const inRepo = relToRepo !== ".." && !relToRepo.startsWith(`..${sep}`) && !isAbsolute(relToRepo);
+  const protectedMessage = "read_file cannot read protected paths (.git, task worktrees, or harness-internal state)";
+  if (inRepo) {
+    const parts = relToRepo.split(sep).map((p) => p.toLowerCase());
+    // Block .git and .harness/worktrees, while permitting .harness/goals, .harness/artifacts, and .harness/notes.
+    if (parts.includes(".git") || (parts[0] === ".harness" && !["artifacts", "goals", "notes"].includes(parts[1] ?? ""))) {
+      throw new Error(protectedMessage);
+    }
+  } else {
+    // Check the whole canonical path so the veto holds wherever the file lives.
+    const parts = target.split(sep).map((p) => p.toLowerCase());
+    if (parts.includes(".git") || parts.some((p, i) => p === ".harness" && parts[i + 1] === "worktrees")) {
+      throw new Error(protectedMessage);
     }
   }
+  return { target, inRepo, display: inRepo ? relToRepo : target };
+}
 
-  // 2. Fall back to scanning balanced top-level `{ ... }` objects from the end of the text
-  const candidates: string[] = [];
+/** goal_accept evidence: a readable regular file or directory under the same policy as read_file. */
+export function resolveDirectorEvidencePath(repoRoot: string, rawPath: string): GoalAcceptOverrideAudit["evidence"][number] {
+  let target: string;
+  try {
+    ({ target } = resolveDirectorReadablePath(repoRoot, rawPath));
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") throw new Error(`goal_accept evidence path does not exist: ${rawPath}`);
+    throw new Error(`goal_accept evidence path refused: ${rawPath} (${err instanceof Error ? err.message : String(err)})`);
+  }
+  try {
+    accessSync(target, constants.R_OK);
+  } catch {
+    throw new Error(`goal_accept evidence path is not readable: ${rawPath}`);
+  }
+  const st = statSync(target);
+  if (!st.isFile() && !st.isDirectory()) throw new Error(`goal_accept evidence path must be a regular file or directory: ${rawPath}`);
+  return {
+    input: rawPath,
+    canonicalPath: target,
+    kind: st.isFile() ? "file" : "directory",
+    ...(st.isFile() ? { sizeBytes: st.size } : {}),
+    mtimeMs: st.mtimeMs,
+  };
+}
+
+const REVIEWER_VERDICTS = ["approved", "changes_requested", "escalate_human"];
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+/** Normalizes one reviewer criterion result (snake_case aliases, strict `passed === true`); null without an id. */
+export function normalizeCriterionEvaluation(raw: unknown): CriterionEvaluation | null {
+  if (!isPlainObject(raw)) return null;
+  const id = raw.criterionId ?? raw.criterion_id;
+  if (typeof id !== "string" || !id.trim()) return null;
+  return {
+    criterionId: id.trim(),
+    passed: raw.passed === true,
+    evidence: typeof raw.evidence === "string" ? raw.evidence : "",
+    ...(typeof raw.remediation === "string" ? { remediation: raw.remediation } : {}),
+  };
+}
+
+/**
+ * Normalizes a reviewer verdict: unwraps one `{ review }` / `{ result }` level, accepts snake_case aliases,
+ * requires a known verdict, and coerces criteria and blocking issues. Never adds a key the input lacked.
+ */
+export function normalizeReviewerVerdict<T extends { verdict?: unknown }>(raw: unknown): T | null {
+  if (!isPlainObject(raw)) return null;
+  let obj = raw;
+  if (typeof obj.verdict !== "string") {
+    const inner = isPlainObject(obj.review) ? obj.review : isPlainObject(obj.result) ? obj.result : null;
+    if (!inner) return null;
+    obj = inner;
+  }
+  const verdict = typeof obj.verdict === "string" ? obj.verdict.trim() : "";
+  if (!REVIEWER_VERDICTS.includes(verdict)) return null;
+  const { criteria_results, blocking_issues, ...rest } = obj;
+  const out: Record<string, unknown> = { ...rest, verdict };
+  const criteria = rest.criteriaResults ?? criteria_results;
+  if (criteria !== undefined) {
+    out.criteriaResults = Array.isArray(criteria)
+      ? criteria.map(normalizeCriterionEvaluation).filter((c): c is CriterionEvaluation => c !== null)
+      : [];
+  }
+  const issues = rest.blockingIssues ?? blocking_issues;
+  if (issues !== undefined) {
+    out.blockingIssues =
+      typeof issues === "string" ? [issues] : Array.isArray(issues) ? issues.filter((i): i is string => typeof i === "string") : [];
+  }
+  if (rest.summary !== undefined && typeof rest.summary !== "string") out.summary = String(rest.summary);
+  return out as T;
+}
+
+const VERDICT_SCAN_BYTES = 256 * 1024;
+const VERDICT_SCAN_MAX_STARTS = 512;
+
+/** End index of the balanced `{...}` object starting at `start` (string-aware), or -1. */
+function balancedObjectEnd(text: string, start: number): number {
   let depth = 0;
-  let start = -1;
   let inString = false;
   let escaped = false;
-  for (let i = 0; i < text.length; i++) {
+  for (let i = start; i < text.length; i++) {
     const ch = text[i]!;
     if (inString) {
       if (escaped) escaped = false;
@@ -3753,27 +4381,45 @@ export function parseReviewerVerdictJson<T extends { verdict?: unknown }>(text: 
       else if (ch === '"') inString = false;
       continue;
     }
-    if (ch === '"') {
-      inString = true;
-      continue;
-    }
-    if (ch === "{") {
-      if (depth === 0) start = i;
-      depth++;
-    } else if (ch === "}" && depth > 0) {
+    if (ch === '"') inString = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") {
       depth--;
-      if (depth === 0 && start >= 0) {
-        candidates.push(text.slice(start, i + 1));
-        start = -1;
-      }
+      if (depth === 0) return i;
     }
   }
-  for (let i = candidates.length - 1; i >= 0; i--) {
+  return -1;
+}
+
+/**
+ * Extracts a structured verdict from reviewer prose: the last fenced block holding a valid verdict, else a
+ * right-to-left scan of `{` starts in the output tail. Each start begins its own string state, so a stray
+ * quote or brace in earlier prose cannot hide the verdict object.
+ */
+export function parseReviewerVerdictJson<T extends { verdict?: unknown }>(text: string): T | null {
+  const fences = [...text.matchAll(/```(?:json)?[ \t]*\r?\n?([\s\S]*?)```/gi)];
+  for (let i = fences.length - 1; i >= 0; i--) {
     try {
-      const parsed = JSON.parse(candidates[i]!);
-      if (isValid(parsed)) return parsed;
+      const parsed = normalizeReviewerVerdict<T>(JSON.parse(fences[i]![1]!.trim()));
+      if (parsed) return parsed;
     } catch {
-      // ignore non-JSON brace blocks (e.g. code snippets)
+      // keep scanning earlier fences
+    }
+  }
+
+  const tail = text.length > VERDICT_SCAN_BYTES ? text.slice(-VERDICT_SCAN_BYTES) : text;
+  const lastVerdict = tail.lastIndexOf('"verdict"');
+  if (lastVerdict === -1) return null;
+  let visited = 0;
+  for (let start = tail.lastIndexOf("{", lastVerdict); start >= 0 && visited < VERDICT_SCAN_MAX_STARTS; start = start > 0 ? tail.lastIndexOf("{", start - 1) : -1) {
+    visited++;
+    const end = balancedObjectEnd(tail, start);
+    if (end < 0) continue;
+    try {
+      const parsed = normalizeReviewerVerdict<T>(JSON.parse(tail.slice(start, end + 1)));
+      if (parsed) return parsed;
+    } catch {
+      // not JSON (e.g. a code snippet); keep scanning left
     }
   }
   return null;
