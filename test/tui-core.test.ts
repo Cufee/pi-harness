@@ -688,7 +688,7 @@ describe("Transcript Unification Regressions", () => {
       "var Plan = fct.Plan{",
       '\tName: "hv-functional",',
       "\tCount: 42,",
-      '\tSteps: []fct.Step{{Name: "boot"}},',
+      '\tSteps: []fct.Step{{Name: "boot_long_wrapped_segment_for_narrow_width_check_final_token"}},',
       "}",
     ].join("\n");
     const goMd = `\`\`\`go\n${goCode}\n\`\`\``;
@@ -698,11 +698,43 @@ describe("Transcript Unification Regressions", () => {
       const tcTheme = createTheme({ color: true, ascii: false });
       const rawFragmentRe = /38;2;|\d+;\d+;\d+m/;
 
+      const tokenFgSgr = (lines: readonly string[], token: string): string | null => {
+        for (const line of lines) {
+          let activeFg = "";
+          let plain = "";
+          const fgAtPlainIdx: string[] = [];
+          let i = 0;
+          while (i < line.length) {
+            if (line[i] === "\x1b" && line[i + 1] === "[") {
+              const end = line.indexOf("m", i + 2);
+              if (end !== -1) {
+                const seq = line.slice(i, end + 1);
+                if (seq === "\x1b[0m" || seq === "\x1b[m" || seq === "\x1b[39m") activeFg = "";
+                else if (/^\x1b\[38;2;\d+;\d+;\d+m$/.test(seq)) activeFg = seq;
+                i = end + 1;
+                continue;
+              }
+            }
+            plain += line[i]!;
+            fgAtPlainIdx.push(activeFg);
+            i++;
+          }
+          const pos = plain.indexOf(token);
+          if (pos >= 0) return fgAtPlainIdx[pos] ?? "";
+        }
+        return null;
+      };
+
       const mainChat = new ImmutableTranscript(tcTheme);
       mainChat.appendAssistantTurn(goMd);
-      const mainChatOutput = mainChat.render(100).join("\n");
-      const mainSgrCodes = new Set(mainChatOutput.match(/\x1b\[38;2;\d+;\d+;\d+m/g) ?? []);
-      assert.ok(mainSgrCodes.size >= 3, "expected keyword, string, and number truecolor SGR codes");
+      const mainRows100 = mainChat.render(100);
+      const tokens = ["var", '"hv-functional"', "42"];
+      const mainTokenStyles = new Map<string, string>();
+      for (const tok of tokens) {
+        const sgr = tokenFgSgr(mainRows100, tok);
+        assert.ok(sgr && sgr.startsWith("\x1b[38;2;"), `expected truecolor SGR on token ${tok} in ImmutableTranscript`);
+        mainTokenStyles.set(tok, sgr);
+      }
 
       const { deps, emit } = makeStubLiveDeps();
       const { terminal } = makeFakeTerminal(100, 24);
@@ -720,11 +752,18 @@ describe("Transcript Unification Regressions", () => {
         payload: { delta: goMd },
       });
 
+      const renderedByWidth = new Map<number, string[]>();
       for (const width of [100, 60]) {
         const rows = screen.render(width, 24, tcTheme);
-        const joined = rows.join("\n");
-        for (const sgr of mainSgrCodes) {
-          assert.ok(joined.includes(sgr), `LiveTranscriptScreen at width ${width} missing SGR ${JSON.stringify(sgr)}`);
+        renderedByWidth.set(width, rows);
+        const plainJoined = rows.map((r) => stripTerminalSequences(r)).join("\n");
+        assert.ok(plainJoined.includes("final_token"), `wrapped long code line must retain final_token at width ${width}`);
+        for (const tok of tokens) {
+          assert.equal(
+            tokenFgSgr(rows, tok),
+            mainTokenStyles.get(tok),
+            `token ${tok} truecolor SGR must match ImmutableTranscript at width ${width}`,
+          );
         }
         for (const row of rows) {
           assert.equal(visibleWidth(row), width, `row width mismatch at width ${width}`);
@@ -732,6 +771,10 @@ describe("Transcript Unification Regressions", () => {
           assert.ok(!rawFragmentRe.test(stripped), `raw ANSI fragment at width ${width}: ${JSON.stringify(row)}`);
         }
       }
+      assert.ok(
+        renderedByWidth.get(60)!.length > renderedByWidth.get(100)!.length,
+        "long code line must wrap into additional rows at width 60",
+      );
       nav.closeAll();
     } finally {
       setCapabilities(prevCaps);
@@ -751,7 +794,7 @@ describe("Transcript Unification Regressions", () => {
         taskId: "task-1",
         type: "agent.text_delta",
         createdAt: now,
-        payload: { delta: "Alpha bravo charlie delta\nSecond line echo foxtrot" },
+        payload: { delta: "Alpha bravo charlie delta\nSecond A界B 🚀 echo foxtrot" },
       },
     ]);
     const screen = new LiveTranscriptScreen("run-1", "task-1", deps);
@@ -759,11 +802,15 @@ describe("Transcript Unification Regressions", () => {
     nav.push(screen);
     await new Promise((r) => setTimeout(r, 15));
 
-    const composited = (
-      tui as unknown as { compositeOverlays(l: string[], w: number, h: number): string[] }
-    ).compositeOverlays(tui.render(100), 100, 24);
-    const viewportTop = Math.max(0, composited.length - terminal.rows);
-    const visible = composited.slice(viewportTop);
+    const compositeVisible = () => {
+      const composited = (
+        tui as unknown as { compositeOverlays(l: string[], w: number, h: number): string[] }
+      ).compositeOverlays(tui.render(100), 100, 24);
+      const viewportTop = Math.max(0, composited.length - terminal.rows);
+      return composited.slice(viewportTop);
+    };
+
+    const visible = compositeVisible();
 
     // Assert pi-tui OverlayHandle.getBounds() uses 0-based terminal coordinates matching the rendered frame top-left corner.
     const handle = (nav as unknown as { handle: OverlayHandle | null }).handle;
@@ -776,33 +823,92 @@ describe("Transcript Unification Regressions", () => {
     );
 
     const row1 = visible.findIndex((l) => stripTerminalSequences(l).includes("Alpha bravo charlie delta"));
-    const row2 = visible.findIndex((l) => stripTerminalSequences(l).includes("Second line echo foxtrot"));
+    const row2 = visible.findIndex((l) => stripTerminalSequences(l).includes("Second A界B"));
     assert.ok(row1 >= 0 && row2 > row1, "both transcript lines must be visible inside overlay");
 
     const plain1 = stripTerminalSequences(visible[row1]!);
     const plain2 = stripTerminalSequences(visible[row2]!);
-    const startX0 = plain1.indexOf("Alpha");
-    const endX0 = plain2.indexOf("echo") + "echo".length - 1;
-    assert.ok(startX0 >= 0 && endX0 > 0);
+    const startX0 = visibleWidth(plain1.slice(0, plain1.indexOf("Alpha")));
+    const rocketCol0 = visibleWidth(plain2.slice(0, plain2.indexOf("🚀")));
+    assert.ok(startX0 >= 0 && rocketCol0 > 0);
 
-    // SGR mouse coordinates are 1-based.
-    const x1 = startX0 + 1;
-    const y1 = row1 + 1;
-    const x2 = endX0 + 1;
-    const y2 = row2 + 1;
-
+    // Cross-row drag ending on the first cell of wide emoji 🚀 must snap outward to include the full emoji.
     writes.length = 0;
-    sendInput(`\x1b[<0;${x1};${y1}M`);
-    sendInput(`\x1b[<32;${x2};${y2}M`);
-    sendInput(`\x1b[<0;${x2};${y2}m`);
+    sendInput(`\x1b[<0;${startX0 + 1};${row1 + 1}M`);
+    sendInput(`\x1b[<32;${rocketCol0 + 1};${row2 + 1}M`);
+    sendInput(`\x1b[<0;${rocketCol0 + 1};${row2 + 1}m`);
 
-    const oscWrite = writes.find((w) => w.includes("\x1b]52;c;"));
-    assert.ok(oscWrite, "mouse release after drag must emit OSC 52 clipboard sequence");
-    const m = oscWrite.match(/\x1b\]52;c;([A-Za-z0-9+/=]+)\x07/);
-    assert.ok(m, "OSC 52 sequence must contain valid base64 payload");
-    const decoded = Buffer.from(m[1]!, "base64").toString("utf8");
-    assert.equal(decoded, "Alpha bravo charlie delta\nSecond line echo");
-    assert.equal(/[╭╮╰╯│┃┆▸▎]/.test(decoded), false, "copied text must exclude frame borders, gutter, and scrollbar");
+    const oscWrites1 = writes.filter((w) => w.includes("\x1b]52;c;"));
+    assert.equal(oscWrites1.length, 1, "mouse release must emit exactly one OSC 52 clipboard write");
+    const m1 = oscWrites1[0]!.match(/\x1b\]52;c;([A-Za-z0-9+/=]+)\x07/);
+    assert.ok(m1, "OSC 52 sequence must contain valid base64 payload");
+    const decoded1 = Buffer.from(m1[1]!, "base64").toString("utf8");
+    assert.equal(decoded1, "Alpha bravo charlie delta\nSecond A界B 🚀");
+    assert.equal(/[╭╮╰╯│┃┆▸▎]/.test(decoded1), false, "copied text must exclude frame borders, gutter, and scrollbar");
+
+    // Partial-cell drag starting on the second cell of wide glyph 界 through B must copy "界B" and paint "A界B".
+    const jieCol0 = visibleWidth(plain2.slice(0, plain2.indexOf("界")));
+    const bCol0 = visibleWidth(plain2.slice(0, plain2.indexOf("B")));
+    writes.length = 0;
+    sendInput(`\x1b[<0;${jieCol0 + 2};${row2 + 1}M`);
+    sendInput(`\x1b[<32;${bCol0 + 1};${row2 + 1}M`);
+    sendInput(`\x1b[<0;${bCol0 + 1};${row2 + 1}m`);
+
+    const oscWrites2 = writes.filter((w) => w.includes("\x1b]52;c;"));
+    assert.equal(oscWrites2.length, 1, "partial wide-glyph drag must emit exactly one OSC 52 write");
+    const m2 = oscWrites2[0]!.match(/\x1b\]52;c;([A-Za-z0-9+/=]+)\x07/);
+    assert.ok(m2);
+    assert.equal(Buffer.from(m2[1]!, "base64").toString("utf8"), "界B");
+    const highlightedVisible = compositeVisible();
+    const highlightedRow = highlightedVisible.find((l) => stripTerminalSequences(l).includes("Second "));
+    assert.ok(highlightedRow, "highlighted row must still be visible after drag copy");
+    assert.ok(
+      stripTerminalSequences(highlightedRow).includes("A界B"),
+      "highlighted row must preserve the full wide glyph without dropping it",
+    );
+    assert.ok(
+      highlightedRow.includes(theme.badgeBg("界B")),
+      "highlight background must wrap the snapped wide glyph and B together",
+    );
+
+    // Short transcript: clicking below the last drawn content row must not fold the last tool.
+    nav.closeAll();
+    const { deps: shortDeps } = makeStubLiveDeps([
+      {
+        seq: 1,
+        runId: "run-1",
+        taskId: "task-1",
+        type: "agent.tool",
+        createdAt: now,
+        payload: {
+          id: "call-short",
+          name: "read_file",
+          status: "completed",
+          result: "SHORT_FIRST\nSHOULD_STAY_COLLAPSED",
+        },
+      },
+    ]);
+    const shortScreen = new LiveTranscriptScreen("run-1", "task-1", shortDeps);
+    nav.push(shortScreen);
+    await new Promise((r) => setTimeout(r, 15));
+    const shortVisible = compositeVisible();
+    assert.equal(
+      shortVisible.map((l) => stripTerminalSequences(l)).join("\n").includes("SHOULD_STAY_COLLAPSED"),
+      false,
+      "short tool starts collapsed",
+    );
+    const shortBounds = (nav as unknown as { handle: OverlayHandle | null }).handle?.getBounds()!;
+    const shortRect = (shortScreen as unknown as { frame: Frame }).frame.bodyRect!;
+    const belowY1 = shortBounds.row + shortRect.row + shortRect.height + 2 + 1;
+    const insideX1 = shortBounds.col + shortRect.col + 4 + 1;
+    sendInput(`\x1b[<0;${insideX1};${belowY1}M`);
+    sendInput(`\x1b[<0;${insideX1};${belowY1}m`);
+    const afterClickVisible = compositeVisible();
+    assert.equal(
+      afterClickVisible.map((l) => stripTerminalSequences(l)).join("\n").includes("SHOULD_STAY_COLLAPSED"),
+      false,
+      "clicking below the last content row of a short transcript must leave the tool collapsed",
+    );
 
     nav.closeAll();
     tui.stop();
@@ -811,6 +917,7 @@ describe("Transcript Unification Regressions", () => {
   it("folds and unfolds tool blocks via Enter while keeping the top visible row stable when paused", async () => {
     const theme = createTheme({ color: false, ascii: false });
     const now = Date.now();
+    const longResult = Array.from({ length: 55 }, (_, i) => `RESULT_LINE_${String(i + 1).padStart(2, "0")}`).join("\n");
     const { deps } = makeStubLiveDeps([
       {
         seq: 1,
@@ -818,7 +925,7 @@ describe("Transcript Unification Regressions", () => {
         taskId: "task-1",
         type: "agent.text_delta",
         createdAt: now,
-        payload: { delta: "TOP_ANCHOR_LINE_ONE\n\nSecond intro line" },
+        payload: { delta: "INTRO_ONE\n\nINTRO_TWO\n\nUNIQUE_ANCHOR_ROW_ALPHA\n\nIntro trailing line" },
       },
       {
         seq: 2,
@@ -831,7 +938,7 @@ describe("Transcript Unification Regressions", () => {
           name: "read_file",
           status: "completed",
           args: '{"path":"ARG_SECRET_PATH.ts"}',
-          result: "first line summary\nEXPANDED_RESULT_LINE_TWO",
+          result: longResult,
         },
       },
       {
@@ -840,11 +947,11 @@ describe("Transcript Unification Regressions", () => {
         taskId: "task-1",
         type: "agent.text_delta",
         createdAt: now + 2000,
-        payload: { delta: Array.from({ length: 24 }, (_, i) => `Trailing line ${i + 1}`).join("\n\n") },
+        payload: { delta: Array.from({ length: 50 }, (_, i) => `Trailing line ${i + 1}`).join("\n\n") },
       },
     ]);
 
-    const { terminal } = makeFakeTerminal(100, 30);
+    const { terminal } = makeFakeTerminal(100, 82);
     const tui = new ModalScreen(terminal);
     const nav = new Navigator(tui, terminal, theme);
     const ctx = { navigator: nav, theme, requestRender: () => {}, writeTerminal: () => {} };
@@ -852,19 +959,22 @@ describe("Transcript Unification Regressions", () => {
     nav.push(screen);
     await new Promise((r) => setTimeout(r, 15));
 
-    // Initial render in follow mode, then jump to top (paused) so Block 1 is pinned above the tool.
-    screen.render(100, 30, theme);
-    screen.handleInput("g", ctx);
-    const beforeRows = screen.render(100, 30, theme);
-    const beforeJoined = beforeRows.join("\n");
-    assert.ok(beforeJoined.includes("read_file"), "collapsed tool header must be visible");
-    assert.equal(beforeJoined.includes("EXPANDED_RESULT_LINE_TWO"), false, "tool body must be hidden when collapsed");
-    assert.equal(beforeJoined.includes("ARG_SECRET_PATH.ts"), false, "tool args must be hidden when collapsed");
-
     const bodyRow = (rows: string[]) => {
       const rect = (screen as unknown as { frame: Frame }).frame.bodyRect!;
       return stripTerminalSequences(rows[rect.row]!);
     };
+
+    // Pause at top, then scroll down 6 rows (2 wheel steps) to pin the unique non-blank anchor row at the top.
+    screen.render(100, 82, theme);
+    screen.handleInput("g", ctx);
+    screen.render(100, 82, theme);
+    screen.handleInput("\x1b[<65;10;5M", ctx);
+    screen.handleInput("\x1b[<65;10;5M", ctx);
+    const beforeRows = screen.render(100, 82, theme);
+    const beforeJoined = beforeRows.join("\n");
+    assert.ok(beforeJoined.includes("read_file"), "collapsed tool header must be visible");
+    assert.equal(beforeJoined.includes("RESULT_LINE_02"), false, "tool body must be hidden when collapsed");
+    assert.equal(beforeJoined.includes("ARG_SECRET_PATH.ts"), false, "tool args must be hidden when collapsed");
 
     // Move cursor down until the gutter pointer sits on the read_file tool header row.
     const cursorOnTool = (rows: string[]) =>
@@ -874,27 +984,46 @@ describe("Transcript Unification Regressions", () => {
       });
     for (let step = 0; step < 12; step++) {
       screen.handleInput("j", ctx);
-      const curRows = screen.render(100, 30, theme);
+      const curRows = screen.render(100, 82, theme);
       if (cursorOnTool(curRows)) break;
     }
-    const preToggleRows = screen.render(100, 30, theme);
+    const preToggleRows = screen.render(100, 82, theme);
     const topBeforeToggle = bodyRow(preToggleRows);
+    assert.ok(
+      topBeforeToggle.includes("UNIQUE_ANCHOR_ROW_ALPHA"),
+      `top row before toggle must be the unique non-blank anchor, got: ${JSON.stringify(topBeforeToggle)}`,
+    );
     assert.ok(cursorOnTool(preToggleRows), "cursor must reach the tool block");
 
-    // Expand tool via Enter
+    // 1st Enter: collapsed -> expanded (clipped at 40 source lines).
     screen.handleInput("\r", ctx);
-    const expandedRows = screen.render(100, 30, theme);
+    const expandedRows = screen.render(100, 82, theme);
     const expandedJoined = expandedRows.join("\n");
-    assert.ok(expandedJoined.includes("EXPANDED_RESULT_LINE_TWO"), "tool result must appear after Enter");
-    assert.ok(expandedJoined.includes("ARG_SECRET_PATH.ts"), "tool args must appear after Enter");
+    assert.ok(expandedJoined.includes("ARG_SECRET_PATH.ts"), "tool args must appear after first Enter");
+    assert.ok(expandedJoined.includes("RESULT_LINE_02"), "clipped result lines must appear after first Enter");
+    assert.ok(expandedJoined.includes("more lines"), "clip marker row must appear for >40-line section");
+    assert.equal(expandedJoined.includes("RESULT_LINE_55"), false, "last result line must be absent while clipped");
     assert.equal(bodyRow(expandedRows), topBeforeToggle, "top visible row must stay unchanged when expanding below it");
+    assert.equal(/\+\d+ new/.test(expandedJoined), false, "expanding a fold must not report '+N new'");
 
-    // Collapse tool via Enter
+    // 2nd Enter: expanded (clipped) -> full.
     screen.handleInput("\r", ctx);
-    const collapsedRows = screen.render(100, 30, theme);
+    const fullRows = screen.render(100, 82, theme);
+    const fullJoined = fullRows.join("\n");
+    assert.ok(fullJoined.includes("RESULT_LINE_55"), "last result line must appear in full fold state");
+    assert.equal(fullJoined.includes("more lines"), false, "clip marker must disappear in full fold state");
+    assert.equal(bodyRow(fullRows), topBeforeToggle, "top visible row must stay unchanged when switching to full");
+    assert.equal(/\+\d+ new/.test(fullJoined), false, "showing full fold must not report '+N new'");
+
+    // 3rd Enter: full -> collapsed.
+    screen.handleInput("\r", ctx);
+    const collapsedRows = screen.render(100, 82, theme);
     const collapsedJoined = collapsedRows.join("\n");
-    assert.equal(collapsedJoined.includes("EXPANDED_RESULT_LINE_TWO"), false, "tool result must hide after second Enter");
+    assert.equal(collapsedJoined.includes("RESULT_LINE_02"), false, "tool body must hide after third Enter");
+    assert.equal(collapsedJoined.includes("RESULT_LINE_55"), false, "last result line must hide after third Enter");
+    assert.equal(collapsedJoined.includes("ARG_SECRET_PATH.ts"), false, "tool args must hide after third Enter");
     assert.equal(bodyRow(collapsedRows), topBeforeToggle, "top visible row must stay unchanged when collapsing below it");
+    assert.equal(/\+\d+ new/.test(collapsedJoined), false, "collapsing a fold must not report '+N new'");
 
     nav.closeAll();
   });
@@ -902,25 +1031,22 @@ describe("Transcript Unification Regressions", () => {
   it("restores the exact top visible row across a 100 -> 60 -> 100 width resize while paused", async () => {
     const theme = createTheme({ color: false, ascii: false });
     const now = Date.now();
-    const makePara = (tag: string) =>
-      `${tag} ` +
-      Array.from({ length: 10 }, (_, i) => `${tag}_word_${i}_with_enough_length_to_wrap_differently`).join(" ");
+    const makeMultiRow = (tag: string, count: number) =>
+      Array.from({ length: count }, (_, i) => `${tag}_ROW_${String(i + 1).padStart(2, "0")} long_token_for_wrapping_between_widths`).join(
+        "\n\n",
+      );
 
-    const { deps } = makeStubLiveDeps([
-      { seq: 1, runId: "run-1", taskId: "task-1", type: "agent.text_delta", createdAt: now, payload: { delta: makePara("BLK_ONE") } },
-      { seq: 2, runId: "run-1", taskId: "task-1", type: "agent.turn_end", createdAt: now + 100, payload: {} },
-      { seq: 3, runId: "run-1", taskId: "task-1", type: "agent.text_delta", createdAt: now + 200, payload: { delta: makePara("BLK_TWO") } },
-      { seq: 4, runId: "run-1", taskId: "task-1", type: "agent.turn_end", createdAt: now + 300, payload: {} },
-      { seq: 5, runId: "run-1", taskId: "task-1", type: "agent.text_delta", createdAt: now + 400, payload: { delta: makePara("BLK_THREE") } },
-      { seq: 6, runId: "run-1", taskId: "task-1", type: "agent.turn_end", createdAt: now + 500, payload: {} },
-      { seq: 7, runId: "run-1", taskId: "task-1", type: "agent.text_delta", createdAt: now + 600, payload: { delta: makePara("BLK_FOUR") } },
+    const { deps, emit } = makeStubLiveDeps([
+      { seq: 1, runId: "run-1", taskId: "task-a", type: "agent.text_delta", createdAt: now, payload: { delta: makeMultiRow("BLK_A", 8) } },
+      { seq: 2, runId: "run-1", taskId: "task-b", type: "agent.text_delta", createdAt: now + 100, payload: { delta: makeMultiRow("BLK_B", 16) } },
+      { seq: 3, runId: "run-1", taskId: "task-c", type: "agent.text_delta", createdAt: now + 200, payload: { delta: makeMultiRow("BLK_C", 16) } },
     ]);
 
     const { terminal } = makeFakeTerminal(100, 20);
     const tui = new ModalScreen(terminal);
     const nav = new Navigator(tui, terminal, theme);
     const ctx = { navigator: nav, theme, requestRender: () => {}, writeTerminal: () => {} };
-    const screen = new LiveTranscriptScreen("run-1", "task-1", deps);
+    const screen = new LiveTranscriptScreen("run-1", undefined, deps);
     nav.push(screen);
     await new Promise((r) => setTimeout(r, 15));
 
@@ -930,30 +1056,55 @@ describe("Transcript Unification Regressions", () => {
       return stripTerminalSequences(rows[rect.row]!);
     };
 
-    // Start at bottom, then pause and scroll up into BLK_TWO.
+    // Start at top (paused), then scroll down to pin a specific interior row of BLK_B.
     topBodyRow(100);
-    screen.handleInput("\x1b[5~", ctx); // PageUp
+    screen.handleInput("g", ctx);
     let topAt100 = topBodyRow(100);
-    for (let i = 0; i < 20 && !topAt100.includes("BLK_TWO"); i++) {
-      screen.handleInput("\x1b[<64;10;5M", ctx); // wheel up 3 rows
+    for (let i = 0; i < 40 && !topAt100.includes("BLK_B_ROW_06"); i++) {
+      screen.handleInput("\x1b[<65;10;5M", ctx); // wheel down 3 rows
       topAt100 = topBodyRow(100);
-      if (topAt100.includes("BLK_ONE")) {
-        // Overshot into BLK_ONE; nudge down 1 row at a time via wheel/down? Just step down with wheel down / cursor
+      if (topAt100.includes("BLK_B_ROW_07") || topAt100.includes("BLK_B_ROW_08")) {
         break;
       }
     }
-    // Pin squarely inside BLK_TWO (or whichever block has its tag on the top visible row).
-    const blockTag = ["BLK_ONE", "BLK_TWO", "BLK_THREE", "BLK_FOUR"].find((t) => topAt100.includes(t));
-    assert.ok(blockTag, `expected top visible row to carry a block tag, got: ${JSON.stringify(topAt100)}`);
+    assert.ok(
+      /BLK_B_ROW_0[5-8]/.test(topAt100),
+      `expected top row to be an interior row of BLK_B, got: ${JSON.stringify(topAt100)}`,
+    );
 
     const topAt60 = topBodyRow(60);
-    assert.ok(
-      topAt60.includes(blockTag),
-      `at width 60 top row must belong to ${blockTag}, got: ${JSON.stringify(topAt60)}`,
-    );
+    assert.ok(topAt60.includes("BLK_B"), `at width 60 top row must remain inside BLK_B, got: ${JSON.stringify(topAt60)}`);
 
     const topBackAt100 = topBodyRow(100);
     assert.equal(topBackAt100, topAt100, "returning to width 100 must restore the exact top visible row");
+
+    // Stream more text into the anchored block (task-b) at the same width: top row must not drift.
+    emit({
+      runId: "run-1",
+      taskId: "task-b",
+      type: "agent.text_delta",
+      createdAt: now + 300,
+      payload: { delta: "\n\n" + makeMultiRow("BLK_B_STREAM", 20) },
+    });
+    assert.equal(
+      topBodyRow(100),
+      topAt100,
+      "streaming more text into the anchored block must not shift the paused top row",
+    );
+
+    // Stream more text into a block above the anchored block (task-a): top row must still not drift.
+    emit({
+      runId: "run-1",
+      taskId: "task-a",
+      type: "agent.text_delta",
+      createdAt: now + 400,
+      payload: { delta: "\n\n" + makeMultiRow("BLK_A_STREAM", 20) },
+    });
+    assert.equal(
+      topBodyRow(100),
+      topAt100,
+      "streaming more text into a block above the anchored block must not shift the paused top row",
+    );
 
     nav.closeAll();
   });

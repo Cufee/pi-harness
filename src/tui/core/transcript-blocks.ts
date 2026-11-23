@@ -128,32 +128,30 @@ export function nextFold(block: TranscriptBlock, fold: FoldState): FoldState {
   return "collapsed";
 }
 
-/** Exact clipboard text for a whole block: markdown source, raw tool sections, or receipt text. */
+/** Exact clipboard text for a whole block: raw source text without pretty-printing or sanitization. */
 export function blockSourceText(block: TranscriptBlock): string {
   switch (block.kind) {
     case "user":
-      return sanitizeText(block.text).trim();
     case "assistant":
     case "thought":
-      return sanitizeText(block.text).replace(/^\n+|\n+$/g, "");
+    case "text":
+      return block.text;
     case "tool": {
-      const meta = block.meta ? `[${sanitizeLine(block.meta)}] ` : "";
-      const parts = [`${meta}${sanitizeLine(block.label)} (${block.status})`];
+      const meta = block.meta ? `[${block.meta}] ` : "";
+      const parts = [`${meta}${block.label} (${block.status})`];
       for (const sec of toolSections(block)) {
-        parts.push(`${sec.label}:\n${prepareToolSection(sec.value).text}`);
+        parts.push(`${sec.label}:\n${sec.value}`);
       }
       return parts.join("\n");
     }
     case "tool_output":
       return JSON.stringify(block.display, null, 2);
     case "tool_note":
-      return sanitizeLine(block.text) || "tool output";
+      return block.text || "tool output";
     case "receipt": {
-      const tag = block.tag ? `[${sanitizeLine(block.tag)}] ` : "";
-      return `${tag}${sanitizeLine(block.text)}`.trim();
+      const tag = block.tag ? `[${block.tag}] ` : "";
+      return `${tag}${block.text}`.trim();
     }
-    case "text":
-      return sanitizeText(block.text);
     case "rows":
       return block.copy;
   }

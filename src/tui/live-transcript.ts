@@ -136,17 +136,8 @@ export class LiveTranscriptModel {
   private readonly pendingLead = new Map<string, { kind: "assistant" | "thought"; text: string }>();
   private readonly toolsById = new Map<string, ModelBlock>();
   private nextId = 1;
-  private _rev = 0;
 
   constructor(private readonly taskScoped: boolean) {}
-
-  get isEmpty(): boolean {
-    return this.items.length === 0;
-  }
-
-  get rev(): number {
-    return this._rev;
-  }
 
   blocks(): readonly ModelBlock[] {
     return this.items;
@@ -181,7 +172,6 @@ export class LiveTranscriptModel {
   private push(item: ModelBlock, taskKey: string, toolId?: string): void {
     this.items.push(item);
     this.metaById.set(item.id, { taskKey, toolId });
-    this._rev += 1;
     if (this.items.length > MAX_BLOCKS) {
       const dropped = this.items.splice(0, this.items.length - TRIM_TO_BLOCKS);
       for (const d of dropped) {
@@ -199,13 +189,21 @@ export class LiveTranscriptModel {
 
   private closeText(taskKey?: string): void {
     if (taskKey === undefined) {
-      for (const b of this.openText.values()) b.open = false;
+      for (const b of this.openText.values()) {
+        if (b.open) {
+          b.open = false;
+          b.rev += 1;
+        }
+      }
       this.openText.clear();
       this.pendingLead.clear();
       return;
     }
     const b = this.openText.get(taskKey);
-    if (b) b.open = false;
+    if (b && b.open) {
+      b.open = false;
+      b.rev += 1;
+    }
     this.openText.delete(taskKey);
     this.pendingLead.delete(taskKey);
   }
@@ -249,7 +247,6 @@ export class LiveTranscriptModel {
     const textBlock = item.block as Extract<TranscriptBlock, { kind: "assistant" | "thought" }>;
     textBlock.text += delta;
     item.rev += 1;
-    this._rev += 1;
   }
 
   ingest(ev: EventRecord | DaemonEventFrame): void {
@@ -310,9 +307,12 @@ export class LiveTranscriptModel {
               ) {
                 item.block = { ...item.block, status: "ok" };
                 item.open = false;
-                item.payload = folded.payload;
+                const prevPayload =
+                  item.payload && typeof item.payload === "object" && !Array.isArray(item.payload)
+                    ? (item.payload as Record<string, unknown>)
+                    : {};
+                item.payload = { ...prevPayload, ...folded.payload };
                 item.rev += 1;
-                this._rev += 1;
                 return;
               }
             }
@@ -375,9 +375,12 @@ export class LiveTranscriptModel {
           error: folded.error ?? prev.error,
         };
         existing.open = folded.status === "running";
-        existing.payload = folded.payload;
+        const prevPayload =
+          existing.payload && typeof existing.payload === "object" && !Array.isArray(existing.payload)
+            ? (existing.payload as Record<string, unknown>)
+            : {};
+        existing.payload = { ...prevPayload, ...folded.payload };
         existing.rev += 1;
-        this._rev += 1;
         return;
       }
 

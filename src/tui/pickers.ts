@@ -1555,14 +1555,15 @@ export class KbDetailScreen implements Screen {
           kind: "rows",
           copy: copyMeta,
           render: (innerW, theme) => {
+            const cleanStatus = sanitizeLine(item.status);
             const lines: string[] = [
-              kvRow("ID", item.id, innerW, theme),
-              kvRow("Kind", item.kind, innerW, theme),
-              kvRow("Status", `${statusBadge(item.status, theme)} (${item.confidence})`, innerW, theme),
-              kvRow("Tags", (item.tags ?? []).join(", ") || "—", innerW, theme),
-              kvRow("Path Globs", (item.pathGlobs ?? []).join(", ") || "—", innerW, theme),
+              kvRow("ID", sanitizeLine(item.id), innerW, theme),
+              kvRow("Kind", sanitizeLine(item.kind), innerW, theme),
+              kvRow("Status", `${statusBadge(cleanStatus, theme)} (${sanitizeLine(String(item.confidence))})`, innerW, theme),
+              kvRow("Tags", sanitizeLine((item.tags ?? []).join(", ")) || "—", innerW, theme),
+              kvRow("Path Globs", sanitizeLine((item.pathGlobs ?? []).join(", ")) || "—", innerW, theme),
               kvRow("Hits", String(item.hitCount ?? 0), innerW, theme),
-              ...(item.verifiedSha ? [kvRow("Verified SHA", item.verifiedSha, innerW, theme)] : []),
+              ...(item.verifiedSha ? [kvRow("Verified SHA", sanitizeLine(item.verifiedSha), innerW, theme)] : []),
               ...(entry?.updatedAt ? [kvRow("Updated", formatAge(entry.updatedAt), innerW, theme)] : []),
             ];
             if (entry?.evidencePaths && entry.evidencePaths.length > 0) {
@@ -1594,7 +1595,7 @@ export class KbDetailScreen implements Screen {
         block: {
           kind: "rows",
           copy: `Failed to load full entry: ${errText}`,
-          render: (innerW, theme) => [clamp(theme.danger(`Failed to load full entry: ${errText}`), innerW)],
+          render: (innerW, theme) => [clamp(theme.danger(`Failed to load full entry: ${sanitizeLine(errText)}`), innerW)],
         },
       });
       if (this.card.summary) {
@@ -1655,7 +1656,10 @@ export class KbDetailScreen implements Screen {
   handleMouse(ev: OverlayMouseEvent, ctx: ScreenContext): void {
     const rect = this.frame.bodyRect;
     if (!rect) return;
-    this.view.handleMouse({ ...ev, x: ev.x - rect.col, y: ev.y - rect.row }, ctx);
+    const localX = ev.x - rect.col;
+    const localY = ev.y - rect.row;
+    if (ev.type === "press" && (localX < 0 || localX >= rect.width || localY < 0 || localY >= rect.height)) return;
+    this.view.handleMouse({ ...ev, x: localX, y: localY }, ctx);
   }
 
   handleInput(data: string, ctx: ScreenContext): void {
