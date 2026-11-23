@@ -38,6 +38,11 @@ interface StopSnapshot {
   global: number;
   /** Per-task cancel epochs (task id -> epoch). */
   tasks: Map<string, number>;
+  /**
+   * Per-task explicit-cancel epochs taken at request entry, before waiting on any pending stop. Only explicit
+   * cancelTask calls bump them (never a stopRun sweep), so a cancel issued during that wait still fences the resume.
+   */
+  explicit?: Map<string, number>;
 }
 
 interface TaskQuotaPauseMeta {
@@ -182,6 +187,8 @@ export interface ResumeRunResult {
   cause?: string;
   activeTaskIds?: string[];
   failed?: Array<{ taskId: string; error: string }>;
+  /** Set when this caller passed a note: whether it reached the run's orchestrator. */
+  noteDelivered?: boolean;
 }
 
 export class HarnessOrchestrator {
@@ -206,12 +213,14 @@ export class HarnessOrchestrator {
    * older in-flight resume, rollover or launch never undoes a stop or cancel.
    */
   private stopEpoch = new Map<string, number>();
+  /** Bumped (key: task id) only by explicit cancelTask calls, never by a stopRun sweep's own cancellations. */
+  private explicitCancelEpoch = new Map<string, number>();
   /** Bumped by a repo-scoped runs.stop_all (key: canonical repo root). */
   private repoStopEpoch = new Map<string, number>();
   private globalStopEpoch = 0;
   /** In-flight single-flight resumes, tagged with the stop/cancel epochs they were requested under. */
   private resumingTasks = new Map<string, { key: string; promise: Promise<ResumeTaskResult>; note?: string }>();
-  private resumingRuns = new Map<string, { key: string; promise: Promise<ResumeRunResult> }>();
+  private resumingRuns = new Map<string, { key: string; promise: Promise<ResumeRunResult>; note?: string }>();
   /** Per-task worktree allocation/teardown chain, so cancel, resume and allocation never interleave. */
   private worktreeOps = new Map<string, Promise<void>>();
   readonly toolExecutor: ControlPlaneToolExecutor;
@@ -251,6 +260,7 @@ export class HarnessOrchestrator {
       getWorktreeManager: (repoRoot) => this.getWorktreeManager(repoRoot),
       getMergeQueue: (repoRoot) => this.getMergeQueue(repoRoot),
       getTaskSignal: (taskId) => this.active.get(taskId)?.generationSignal,
+      describeRunCause: (runId) => this.describeRunCause(runId),
       getTaskCancelSignal: (taskId) => this.active.get(taskId)?.abort.signal,
       resumeTask: (taskId, opts) => this.resumeTask(taskId, opts),
       resumeTaskDetailed: (taskId, opts) => this.resumeTaskDetailed(taskId, opts),
@@ -744,9 +754,14 @@ export class HarnessOrchestrator {
     // overlap, the broadest one is reported first: whole-run stop, then the caller's cancellation, then the turn.
     const container = isDirectorTaskContainer(run.id);
     if (!container && (this.stoppingRuns.has(run.id) || this.db.getRun(run.id)?.status === "stopped")) {
+      // Only a stop in progress or one with a recorded reason is called explicit; a bare derived status is not.
+      const explicitStop = this.stoppingRuns.has(run.id) || Boolean(this.db.getLastRunStatusReason(run.id));
       throw new Error(
         `Cannot delegate from run ${run.id}: the run is stopped (${this.causeOrHint(run.id, this.describeRunCause(run.id))}). No task was created. ` +
-          "This is an explicit stop, not a turn or budget limit. Nothing restarts automatically. Agents in this run should stop and return; " +
+          (explicitStop
+            ? "This is an explicit stop, not a turn or budget limit. "
+            : "No stop reason was recorded, so this status may be derived rather than an explicit stop; it is not a turn or budget limit. ") +
+          "Nothing restarts automatically. Agents in this run should stop and return; " +
           `the Director (resume_run) or the operator (\`pi-harness resume ${run.id}\`) can resume the run.`,
       );
     }
@@ -902,7 +917,7 @@ export class HarnessOrchestrator {
    *  - Transitions the run to `paused_quota`.
    *  - If a Quota Endpoint is wired OR passive ACP rate-limit data provided a concrete reset time
    *    (and `autoResumeEnabled` is true): arms an automatic daemon timer (+ early-wakeup poller).
-   *  - Otherwise (no Quota Endpoint & no reset time): stops cleanly and waits for the user to
+   *  - Otherwise (no Quota Endpoint & no reset time, or automatic resume disabled): stops cleanly and waits for the user to
    *    resume manually or pick a wait duration!
    */
   private async checkRunQuotaQuiescence(runId: string): Promise<void> {
@@ -1021,7 +1036,11 @@ export class HarnessOrchestrator {
         hasQuotaEndpoint: this.quota.isConfigured(),
         detail: canAutoSchedule
           ? schedule.detail
-          : "No Quota Endpoint or reset time available — paused cleanly. Resume anytime or choose a wait duration.",
+          : !autoEnabled
+            ? `Automatic quota resume is disabled (quotaRetry.autoResumeEnabled is false)${
+                effectiveResumeAtMs !== null ? `; quota is expected to reset at ${new Date(effectiveResumeAtMs).toISOString()}` : ""
+              } — paused cleanly. Resume manually or choose a wait duration.`
+            : "No Quota Endpoint or reset time available — paused cleanly. Resume anytime or choose a wait duration.",
       });
     } finally {
       this.quiescenceCheckPending.delete(runId);
@@ -1086,15 +1105,46 @@ export class HarnessOrchestrator {
     runId: string,
     opts?: { trigger?: "manual" | "auto_timer" | "quota_recovered" | "user_timer"; userMessage?: string },
   ): Promise<{ resumed: boolean; resumedTaskIds: string[]; run: RunRecord }> {
+    const { fenced: _none, ...res } = this.resumeRunFromQuotaInternal(runId, opts);
+    return res;
+  }
+
+  /**
+   * Synchronous body of `resumeRunFromQuota`. With `fence` (the stop/cancel snapshot taken when a run resume was
+   * requested), a run stop issued since then refuses the whole resume and an explicitly cancelled task is skipped.
+   */
+  private resumeRunFromQuotaInternal(
+    runId: string,
+    opts: { trigger?: "manual" | "auto_timer" | "quota_recovered" | "user_timer"; userMessage?: string } | undefined,
+    fence?: StopSnapshot,
+  ): { resumed: boolean; resumedTaskIds: string[]; run: RunRecord; fenced?: string } {
     const run = this.db.getRun(runId);
     if (!run) throw new Error(`Unknown run ${runId}`);
+
+    if (fence) {
+      const repoRoot = run.repoRoot;
+      const stoppedSince =
+        (this.stopEpoch.get(runId) ?? 0) !== fence.run ||
+        this.globalStopEpoch !== fence.global ||
+        (repoRoot ? this.getRepoStopEpoch(repoRoot) : 0) !== fence.repo ||
+        this.stoppingRuns.has(runId) ||
+        run.status === "stopped";
+      if (stoppedSince) {
+        return {
+          resumed: false,
+          resumedTaskIds: [],
+          run,
+          fenced: `Resume of run ${runId} was not applied: it was stopped after the resume was requested (${this.causeOrHint(runId, this.describeRunCause(runId))}). Nothing was started. Resume it again to continue.`,
+        };
+      }
+    }
 
     const trigger = opts?.trigger ?? "manual";
     this.clearRunQuotaTimers(runId);
     this.runQuotaStates.delete(runId);
 
     const tasks = this.db.listTasks(runId);
-    const pausedTasks = tasks.filter((t) => t.status === "paused_quota");
+    const pausedTasks = tasks.filter((t) => t.status === "paused_quota" && (!fence || this.stopWonSince(t, fence) === null));
     if (pausedTasks.length === 0) {
       if (run.status === "paused_quota") {
         this.db.updateRunStatus(runId, "active");
@@ -1171,11 +1221,21 @@ export class HarnessOrchestrator {
       repo: repoRoot ? this.getRepoStopEpoch(repoRoot) : 0,
       global: this.globalStopEpoch,
       tasks: new Map(taskIds.map((id) => [id, this.stopEpoch.get(id) ?? 0])),
+      explicit: this.explicitCancelSnapshot(taskIds),
     };
   }
 
+  private explicitCancelSnapshot(taskIds: string[]): Map<string, number> {
+    return new Map(taskIds.map((id) => [id, this.explicitCancelEpoch.get(id) ?? 0]));
+  }
+
   private snapshotKey(snap: StopSnapshot, taskIds: string[]): string {
-    return [snap.run, snap.repo, snap.global, ...taskIds.map((id) => `${id}=${snap.tasks.get(id) ?? 0}`)].join(":");
+    return [
+      snap.run,
+      snap.repo,
+      snap.global,
+      ...taskIds.map((id) => `${id}=${snap.tasks.get(id) ?? 0}/${snap.explicit?.get(id) ?? 0}`),
+    ].join(":");
   }
 
   /** Which newer stop (if any) beat a resume requested under `snap`: the whole run / repo / all runs, or this task alone. */
@@ -1189,7 +1249,10 @@ export class HarnessOrchestrator {
     ) {
       return "run";
     }
-    return (this.stopEpoch.get(task.id) ?? 0) !== (snap.tasks.get(task.id) ?? 0) ? "task" : null;
+    if ((this.stopEpoch.get(task.id) ?? 0) !== (snap.tasks.get(task.id) ?? 0)) return "task";
+    // An explicit cancel issued after request entry (also while waiting on an earlier stop) always wins.
+    if (snap.explicit && (this.explicitCancelEpoch.get(task.id) ?? 0) !== (snap.explicit.get(task.id) ?? 0)) return "task";
+    return null;
   }
 
   private async resumeTaskInternal(
@@ -1205,12 +1268,13 @@ export class HarnessOrchestrator {
       );
     }
     // Stop epochs are captured at request time, so any stop or cancel issued after this call wins. A stop already
-    // in progress was issued first: wait for it, then capture (its own cancels must not refuse this resume).
+    // in progress was issued first: wait for it, then capture (its own cancels must not refuse this resume). Explicit
+    // cancels are snapshotted at entry, before that wait, so one issued during the wait still fences this resume.
     let snap = runSnapshot;
     if (!snap) {
       const pendingStop = this.stoppingRuns.get(initial.runId);
       if (pendingStop) {
-        const entry = this.stopEpochSnapshot(initial.runId, []);
+        const entry = this.stopEpochSnapshot(initial.runId, [initial.id]);
         await pendingStop.catch(() => {});
         snap = { ...entry, tasks: new Map([[initial.id, this.stopEpoch.get(initial.id) ?? 0]]) };
       } else {
@@ -1243,21 +1307,42 @@ export class HarnessOrchestrator {
   ): Promise<ResumeTaskResult> {
     const res = await inflight.promise;
     const note = opts?.note?.trim();
-    if (!note || note === inflight.note) return res;
-    const pending = this.taskResumeNotes.get(taskId);
-    let delivered: boolean;
-    if (pending?.kind === "resume") {
-      // Not consumed by the new generation's first turn yet: it reads both notes.
-      pending.userMessage = [pending.userMessage, note].filter(Boolean).join("\n");
-      delivered = true;
-    } else {
-      delivered = this.isLiveExecution(taskId) ? await this.steerTask(taskId, note).catch(() => false) : false;
+    if (!note) {
+      // The first caller's note delivery is not this caller's.
+      const { noteDelivered: _first, ...shared } = res;
+      return shared;
     }
+    if (note === inflight.note) return res;
+    // This caller's own precondition guards its note: a failed guard never forwards it.
+    let valid: boolean;
+    try {
+      valid = opts?.validateBeforeActivate ? Boolean(await opts.validateBeforeActivate()) : true;
+    } catch {
+      valid = false;
+    }
+    if (!valid) {
+      throw new Error(`Task ${taskId} resume cancelled: precondition no longer holds. Your note was not delivered.`);
+    }
+    const delivered = await this.deliverNoteToTask(taskId, note);
     return {
       ...res,
       noteDelivered: delivered,
       message: `${res.message} ${delivered ? "Your note was also delivered to the task." : "Your note could not be delivered: the task is not live."}`,
     };
+  }
+
+  /**
+   * Delivers a note to a task that was just resumed or is running: appended to a resume note its new generation
+   * has not read yet, otherwise steered into the live session. False when neither is possible.
+   */
+  private async deliverNoteToTask(taskId: string, note: string): Promise<boolean> {
+    const pending = this.taskResumeNotes.get(taskId);
+    if (pending?.kind === "resume" || pending?.kind === "quota") {
+      // Not consumed by the new generation's first turn yet: it reads both notes.
+      pending.userMessage = [pending.userMessage, note].filter(Boolean).join("\n");
+      return true;
+    }
+    return this.isLiveExecution(taskId) ? await this.steerTask(taskId, note).catch(() => false) : false;
   }
 
   private async resumeTaskBody(taskId: string, opts: ResumeTaskOptions | undefined, snap: StopSnapshot): Promise<ResumeTaskResult> {
@@ -1522,25 +1607,36 @@ export class HarnessOrchestrator {
     if (!this.db.getRun(runId)) throw new Error(`Unknown run ${runId}`);
     // Epochs (run, repo, all runs, and every task's cancel epoch) are captured at request time, without yielding
     // unless a stop issued earlier is still in progress; each candidate's resume is then fenced by this snapshot.
+    // Explicit task cancels are snapshotted at entry, before any wait, so one issued during that wait still fences.
     const pendingStop = this.stoppingRuns.get(runId);
     let snap: StopSnapshot;
     if (pendingStop) {
-      const entry = this.stopEpochSnapshot(runId, []);
+      const entry = this.stopEpochSnapshot(runId, this.db.listTasks(runId).map((t) => t.id));
       await pendingStop.catch(() => {});
       snap = { ...entry, tasks: this.stopEpochSnapshot(runId, this.db.listTasks(runId).map((t) => t.id)).tasks };
     } else {
       snap = this.stopEpochSnapshot(runId, this.db.listTasks(runId).map((t) => t.id));
     }
     const key = this.snapshotKey(snap, [...snap.tasks.keys()].sort());
+    const note = (opts?.note ?? opts?.userMessage)?.trim() || undefined;
     for (;;) {
       const inflight = this.resumingRuns.get(runId);
       if (!inflight) break;
-      if (inflight.key === key) return inflight.promise;
+      if (inflight.key === key) {
+        // A concurrent caller shares the first caller's result; its own different note is delivered or reported.
+        const res = await inflight.promise;
+        if (!note) {
+          const { noteDelivered: _first, ...shared } = res;
+          return shared;
+        }
+        if (note === inflight.note) return res;
+        return this.withRunNote(res, await this.deliverNoteToRun(runId, note));
+      }
       // Requested before a newer stop or cancel: never joined; let it fail its own fence first.
       await inflight.promise.catch(() => {});
     }
     const p = this.resumeRunInternal(runId, opts, snap);
-    const entry = { key, promise: p };
+    const entry = { key, promise: p, note };
     this.resumingRuns.set(runId, entry);
     try {
       return await p;
@@ -1567,6 +1663,20 @@ export class HarnessOrchestrator {
     };
   }
 
+  /** Delivers a caller's note to the run's Tier 1 orchestrator (pending resume note or live steering). */
+  private async deliverNoteToRun(runId: string, note: string): Promise<boolean> {
+    const orch = this.db.listTasks(runId).find((t) => t.tier === 1 && t.profileId !== "director");
+    return orch ? this.deliverNoteToTask(orch.id, note) : false;
+  }
+
+  private withRunNote(res: ResumeRunResult, delivered: boolean): ResumeRunResult {
+    return {
+      ...res,
+      noteDelivered: delivered,
+      message: `${res.message} ${delivered ? "Your note was delivered to the run's orchestrator." : "Your note could not be delivered: the run's orchestrator is not live."}`,
+    };
+  }
+
   private async resumeRunInternal(
     runId: string,
     opts: { trigger?: "manual" | "auto_timer" | "quota_recovered" | "user_timer"; userMessage?: string; note?: string } | undefined,
@@ -1578,12 +1688,16 @@ export class HarnessOrchestrator {
     const tasks = this.db.listTasks(run.id);
     // An explicit stop is checked before the quota pause: a stopped run resumes its orchestrator in place below.
     if (run.status !== "stopped" && (run.status === "paused_quota" || tasks.some((t) => t.status === "paused_quota"))) {
-      const res = await this.resumeRunFromQuota(run.id, opts);
+      const note = (opts?.note ?? opts?.userMessage)?.trim() || undefined;
+      // Fenced by the request-time snapshot: a stop or cancel issued after this resume was requested wins.
+      const res = this.resumeRunFromQuotaInternal(run.id, { trigger: opts?.trigger, userMessage: note }, snapshot);
+      const base = res.fenced ?? (res.resumed
+        ? `Run ${run.id} resumed from its quota pause: ${res.resumedTaskIds.join(", ")}.`
+        : `Run ${run.id} had no quota-paused tasks left to resume.`);
+      const noteText = note ? (res.resumed ? " Your note was passed to the resumed tasks." : " Your note was not delivered.") : "";
       return {
-        ...this.runResult(run.id, res.resumed ? "resumed" : "nothing_to_resume",
-          res.resumed
-            ? `Run ${run.id} resumed from its quota pause: ${res.resumedTaskIds.join(", ")}.`
-            : `Run ${run.id} had no quota-paused tasks left to resume.`),
+        ...this.runResult(run.id, res.resumed ? "resumed" : "nothing_to_resume", base + noteText,
+          note ? { noteDelivered: res.resumed } : {}),
         resumed: res.resumed,
         resumedTaskIds: res.resumedTaskIds,
       };
@@ -1593,9 +1707,15 @@ export class HarnessOrchestrator {
       .filter((t) => t.profileId !== "director" && (this.isLiveExecution(t.id) || this.allocatingWorktrees.has(t.id) || LIVE_TASK_STATUSES.has(t.status)))
       .map((t) => t.id);
     const container = isDirectorTaskContainer(run.id);
+    // A caller's note on a run that is already active is delivered to its live orchestrator, never dropped silently.
+    const callerNote = (opts?.note ?? opts?.userMessage)?.trim() || undefined;
+    const alreadyActive = async (message: string, extra: Partial<ResumeRunResult> = {}): Promise<ResumeRunResult> => {
+      const res = this.runResult(run.id, "already_active", message, extra);
+      return callerNote ? this.withRunNote(res, await this.deliverNoteToRun(run.id, callerNote)) : res;
+    };
     if (container) {
       if (liveIds.length > 0) {
-        return this.runResult(run.id, "already_active", `Run ${run.id} already has live delegated tasks (${liveIds.join(", ")}); nothing was restarted.`, { activeTaskIds: liveIds });
+        return alreadyActive(`Run ${run.id} already has live delegated tasks (${liveIds.join(", ")}); nothing was restarted.`, { activeTaskIds: liveIds });
       }
       return this.runResult(
         run.id,
@@ -1620,7 +1740,7 @@ export class HarnessOrchestrator {
     const cancelledChildren = tasks.filter((t) => t.status === "cancelled" && t.id !== orch?.id && t.profileId !== "director");
     if (candidates.length === 0) {
       if (liveIds.length > 0) {
-        return this.runResult(run.id, "already_active", `Run ${run.id} is already running (${liveIds.slice(0, 12).join(", ")}); nothing was restarted.`, { activeTaskIds: liveIds });
+        return alreadyActive(`Run ${run.id} is already running (${liveIds.slice(0, 12).join(", ")}); nothing was restarted.`, { activeTaskIds: liveIds });
       }
       const eff = this.getEffectiveRun(run.id) ?? run;
       if (eff.status === "completed") {
@@ -1651,10 +1771,12 @@ export class HarnessOrchestrator {
     }
     const resumedTaskIds: string[] = [];
     const failed: Array<{ taskId: string; error: string }> = [];
+    let noteSteered = false;
     for (const t of candidates) {
       try {
         const res = await this.resumeTaskInternal(t.id, note ? { note } : undefined, snapshot);
         if (res.outcome === "resumed") resumedTaskIds.push(res.task.id);
+        if (res.noteDelivered) noteSteered = true;
       } catch (err) {
         failed.push({ taskId: t.id, error: err instanceof Error ? err.message : String(err) });
       }
@@ -1669,13 +1791,20 @@ export class HarnessOrchestrator {
     }
     if (resumedTaskIds.length === 0) {
       if (failed.length === 0) {
-        return this.runResult(run.id, "already_active", `Run ${run.id} is already running; nothing was restarted.`);
+        const res = this.runResult(run.id, "already_active", `Run ${run.id} is already running; nothing was restarted.`);
+        return callerNote ? this.withRunNote(res, noteSteered) : res;
       }
-      return this.runResult(run.id, "nothing_to_resume", `Run ${run.id} was not resumed: ${failed.map((f) => f.error).join(" ")}`, { failed });
+      return this.runResult(run.id, "nothing_to_resume", `Run ${run.id} was not resumed: ${failed.map((f) => f.error).join(" ")}`, {
+        failed,
+        ...(callerNote ? { noteDelivered: noteSteered } : {}),
+      });
     }
     const notRestarted = cancelledChildren.length > 0 ? ` Cancelled tasks were not restarted: ${cancelledChildren.slice(0, 12).map((t) => t.id).join(", ")}.` : "";
     return {
-      ...this.runResult(run.id, "resumed", `Run ${run.id} resumed in place: ${resumedTaskIds.join(", ")}.${notRestarted}`, failed.length > 0 ? { failed } : {}),
+      ...this.runResult(run.id, "resumed", `Run ${run.id} resumed in place: ${resumedTaskIds.join(", ")}.${notRestarted}`, {
+        ...(failed.length > 0 ? { failed } : {}),
+        ...(callerNote ? { noteDelivered: true } : {}),
+      }),
       resumedTaskIds,
     };
   }
@@ -2533,9 +2662,11 @@ export class HarnessOrchestrator {
     return `Steering was not delivered: ${state} (${cause}); steering only reaches a running task and never undoes a stop. ${recovery}`;
   }
 
-  async cancelTask(taskId: string, reason: string): Promise<void> {
+  async cancelTask(taskId: string, reason: string, opts?: { internalStopSweep?: boolean }): Promise<void> {
     // Bumped even for an already-settled task, so a resume requested before this cancel never applies.
     this.bumpStopEpoch(taskId);
+    // Only an explicit cancel (not a stopRun sweep) fences resumes that were waiting on that earlier stop.
+    if (!opts?.internalStopSweep) this.explicitCancelEpoch.set(taskId, (this.explicitCancelEpoch.get(taskId) ?? 0) + 1);
     this.db.admissionQueue.remove("worker", taskId);
     const exec = this.active.get(taskId);
     if (exec) exec.abort.abort(new Error(reason));
@@ -2584,12 +2715,12 @@ export class HarnessOrchestrator {
       this.clearRunQuotaTimers(runId);
       this.runQuotaStates.delete(runId);
       const first = this.db.listTasks(runId);
-      await Promise.all(first.map((t) => this.cancelTask(t.id, reason)));
+      await Promise.all(first.map((t) => this.cancelTask(t.id, reason, { internalStopSweep: true })));
       if (!container) this.db.updateRunStatus(runId, "stopped", reason);
       // Second sweep: catches tasks that raced createTask while the first sweep was cancelling.
       const seen = new Set(first.map((t) => t.id));
       const raced = this.db.listTasks(runId).filter((t) => !seen.has(t.id));
-      await Promise.all(raced.map((t) => this.cancelTask(t.id, reason)));
+      await Promise.all(raced.map((t) => this.cancelTask(t.id, reason, { internalStopSweep: true })));
       this.db.releaseWriteLeasesForRun(runId);
       if (!container) {
         if (this.db.getRun(runId)?.status !== "stopped") this.db.updateRunStatus(runId, "stopped", reason);
