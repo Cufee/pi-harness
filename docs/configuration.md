@@ -33,7 +33,8 @@ Every other key can come from `.pi-harness.json`, including `profiles`, `externa
 ```
 
 - A key takes effect only at the path shown in the reference below. `extraReadRoots` and `extraWriteRoots` belong under `worktree`; at the top level they are not read.
-- Unrecognized keys are ignored and have no effect. After editing, confirm the result with `pi-harness daemon status` (see [Inspecting effective settings](#inspecting-effective-settings)).
+- Known keys at an unsupported location (such as top-level `extraReadRoots` or `extraWriteRoots`, a key in the wrong section, or a global-only key in `.pi-harness.json`) are ignored without taking effect. `harnessd` logs a value-free `config warning:` naming the file, key path, and supported location at startup and on live reload (and `config warnings cleared:` when global warnings clear), and lists active warnings in `configWarnings` from `pi-harness daemon status`.
+- Unrecognized keys outside the schema are ignored without warning. After editing, confirm active settings with `pi-harness daemon status` (see [Inspecting effective settings](#inspecting-effective-settings)).
 
 ## Extra read and write roots
 
@@ -149,8 +150,8 @@ A value in your config file overrides the default; an older file that sets `revi
 - A missing, empty, or unchanged file changes nothing. Deleting `config.json` keeps the previous settings; write `{}` to return to defaults plus the startup overlay.
 - Invalid JSON or any value that fails validation is rejected as a whole and previous settings stay active. The daemon log line names the failing keys, never values.
 - An applied reload logs the changed keys; values of roots, gate shell and environment, commands, URLs, and headers are not printed.
-- Reload log entries use the prefixes `config reload applied` and `config reload rejected` on the daemon's stderr (redirected to `daemon.log` next to the socket, `$PI_HARNESS_HOME/daemon.log` with the default state-dir socket, when auto-spawned).
-- `/settings` in the TUI writes the same `config.json` through the daemon; the rewritten file holds recognized keys only.
+- Reload log entries use the prefixes `config reload applied`, `config reload rejected`, `config warning:`, and `config warnings cleared:` on the daemon's stderr (redirected to `daemon.log` next to the socket, `$PI_HARNESS_HOME/daemon.log` with the default state-dir socket, when auto-spawned).
+- `/settings` in the TUI writes the same `config.json` through the daemon, omitting unrecognized top-level keys and misplaced known section keys.
 
 | Takes effect | Settings |
 | --- | --- |
@@ -163,10 +164,11 @@ A value in your config file overrides the default; an older file that sets `revi
 `pi-harness daemon status` (or plain `pi-harness daemon`) prints the daemon's `status` response as JSON. Alongside `pid`, `socketPath`, and `uptimeMs`, check:
 
 - `configPath`: path to the global `config.json` the daemon watches.
+- `configWarnings`: array of value-free warnings for known keys at unsupported locations in `config.json` or the startup `.pi-harness.json` overlay (including global-only keys in the overlay).
 - `effectiveLimits`: `maxConcurrentGoals`, `maxConcurrentWorkers`, `reviewerMaxTurns`, `extraReadRoots`, and `extraWriteRoots`.
 - `effectiveExternalMcpServers`: array of `{ name, enabled }` entries, including the default `octofs` unless disabled.
 
-An empty `extraReadRoots` after you set roots means the key is misplaced, set as a global-only key in a repository overlay, or the reload was rejected.
+An empty `extraReadRoots` after you set roots means the key is misplaced or set as a global-only key in a repository overlay (check `configWarnings`), or the reload was rejected.
 
 ## CLI
 
