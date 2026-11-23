@@ -13,7 +13,7 @@ export const TOOL_SEARCH_TOOL_NAME = "tool_search";
 
 export const CODE_EXEC_TOOL: ToolDefinition = {
   name: CODE_EXEC_TOOL_NAME,
-  description: 'Chain allowed tools in a Bun TypeScript script with top-level await. Use import { ... } from "harness" and output(value) to return JSON. Find signatures with tool_search. Each serialized IPC message must fit in 16 MiB. Cancellation stops the script, not tool actions already started. Set language: "python" to run Python instead: use `from harness import name, output` (find Python signatures with tool_search language "python") and list third-party wheels in packages as "name==version".',
+  description: 'Chain allowed tools in a Bun TypeScript script with top-level await. Use import { ... } from "harness" and output(value) to return JSON. Find signatures with tool_search. Each serialized IPC message must fit in 16 MiB. Cancellation stops the script, not tool actions already started. Set language: "python" to run Python instead: use `from harness import name, output` (find Python signatures with tool_search language "python") and list third-party wheels in packages as "name==version". Scripts run in an OS sandbox: no filesystem access outside the script\'s scratch directory, no subprocesses, no network. Direct node:fs or open() reads of workspace files fail with EPERM; read files with harness functions listed by tool_search (artifact_read, or read_file where available) or with your own file tools outside code_exec.',
   inputSchema: {
     type: "object",
     required: ["code"],
@@ -214,6 +214,7 @@ export function codeModePromptSection(mode: CodeMode, opts?: { defaultTimeoutMs?
     'Your client may prefix tool names (for example mcp__harness__code_exec) or wrap this server behind its own tool_search and code_exec. Then `harness` in the client\'s own script exports only code_exec and tool_search, so importing return_task or any other harness function there fails. Call the harness code_exec with `{ code }` and put the `import { ... } from "harness"` line inside that code string.',
     'In the Amp native wrapper, use `text(result)` to display the result of the nested call. Use `output(value)` inside the harness code_exec script to return a value to Amp.',
     'code_exec also accepts language: "python" (default TypeScript): `from harness import name, output`; tool_search with language "python" lists Python signatures; packages: ["name==version"] installs pinned wheels.',
+    "Scripts run in an OS sandbox with no filesystem access outside their scratch directory, no subprocesses, and no network. Direct node:fs or Python open() reads of workspace files fail with EPERM; read files with harness functions listed by tool_search (artifact_read, or read_file where available) or with your own file tools outside code_exec.",
     `Set timeout_s for long waits (default ${defaultSec}s, maximum ${maxSec}s unless configured lower). Results over the inline limit (default 20,000 characters) return a preview and artifact path.`,
   ].join("\n\n");
 }

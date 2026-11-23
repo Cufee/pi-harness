@@ -339,11 +339,17 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   ...toolsForTier(1).filter(tool => ["spawn_task", "wait_tasks", "wait_children", "cancel_task", "artifact_read"].includes(tool.name)),
   {
     name: "read_file",
-    description: "Read up to 4096 bytes of workspace text as a logged exception. Delegate normal inspection to spawn_task.",
+    description: "Read UTF-8 text from the workspace, .harness/goals, .harness/notes, .harness/artifacts, or operator-granted roots, one logged page at a time (default 4096 bytes; set max_bytes up to 65536). When hasMore is true, call again with offset set to nextOffset. Delegate broad or multi-file inspection to spawn_task.",
     inputSchema: {
       type: "object",
       required: ["path", "exception_reason"],
-      properties: { path: { type: "string" }, exception_reason: { type: "string", minLength: 1 }, max_chars: { type: "number" } },
+      properties: {
+        path: { type: "string" },
+        exception_reason: { type: "string", minLength: 1, description: "Short purpose, recorded in the session log." },
+        offset: { type: "number", description: "Byte offset to start from (default 0). Pass the previous result's nextOffset." },
+        max_bytes: { type: "number", description: "Page size in bytes (default 4096, maximum 65536)." },
+        max_chars: { type: "number", description: "Optional: trim the page to at most this many characters." },
+      },
     },
   },
   {
@@ -2851,24 +2857,32 @@ export class DirectorRuntime {
         };
         const candidate = rawPath.startsWith("~/") ? resolve(homedir(), rawPath.slice(2)) : resolve(root, rawPath);
         const target = realpathSync(candidate);
-        const extraReadRoots = (this.config.worktree.extraReadRoots ?? []).map(expandRoot);
+        const extraRoots = [...(this.config.worktree.extraReadRoots ?? []), ...(this.config.worktree.extraWriteRoots ?? [])]
+          .filter((r) => typeof r === "string" && r.trim().length > 0)
+          .map(expandRoot);
         const relToRepo = relative(root, target);
         const inRepo = relToRepo !== ".." && !relToRepo.startsWith(`..${sep}`) && !isAbsolute(relToRepo);
         const path = inRepo ? relToRepo : target;
-        const inExtraRoot = extraReadRoots.some((r) => {
+        let matchedExtraRel: string | null = null;
+        for (const r of extraRoots) {
           const rel = relative(r, target);
-          return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
-        });
-        if (!inRepo && !inExtraRoot) {
-          throw new Error("File outside the permitted workspace or extraReadRoots");
+          if (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)) {
+            matchedExtraRel = rel;
+            break;
+          }
+        }
+        if (!inRepo && matchedExtraRel === null) {
+          throw new Error("File outside the permitted workspace or operator-granted roots (worktree.extraReadRoots / extraWriteRoots in the global config)");
         }
         if (inRepo) {
           const parts = relToRepo.split(sep).map((p) => p.toLowerCase());
-          // Block .git and .harness/worktrees, while permitting .harness/goals, .harness/artifacts, and .harness/notes!
-          if (parts.includes(".git")) {
+          // Block .git and .harness/worktrees, while permitting .harness/goals, .harness/artifacts, and .harness/notes.
+          if (parts.includes(".git") || (parts[0] === ".harness" && !["artifacts", "goals", "notes"].includes(parts[1] ?? ""))) {
             throw new Error("File outside the permitted workspace");
           }
-          if (parts[0] === ".harness" && !["artifacts", "goals", "notes"].includes(parts[1] ?? "")) {
+        } else if (matchedExtraRel !== null) {
+          const parts = matchedExtraRel.split(sep).map((p) => p.toLowerCase());
+          if (parts.includes(".git") || parts.some((p, i) => p === ".harness" && parts[i + 1] === "worktrees")) {
             throw new Error("File outside the permitted workspace");
           }
         }
@@ -2876,14 +2890,62 @@ export class DirectorRuntime {
         try {
           const stat = fstatSync(fd);
           if (!stat.isFile()) throw new Error("Expected a regular file");
-          const bytes = Buffer.alloc(4096);
-          const count = readSync(fd, bytes, 0, bytes.length, 0);
-          const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, count), { stream: stat.size > count });
-          const limit = typeof args.max_chars === "number" ? Math.min(4096, Math.max(0, args.max_chars)) : 4096;
-          const content = text.slice(0, limit);
-          const readEvent: ChatControlEvent = { kind: "director.read_file", path, bytes: count, reason };
+          const pageBytes = typeof args.max_bytes === "number" && Number.isFinite(args.max_bytes)
+            ? Math.min(65536, Math.max(4, Math.floor(args.max_bytes)))
+            : 4096;
+          const reqOffset = typeof args.offset === "number" && Number.isFinite(args.offset) ? Math.max(0, Math.floor(args.offset)) : 0;
+          if (reqOffset >= stat.size) {
+            const emptyEvent: ChatControlEvent = { kind: "director.read_file", path, bytes: 0, reason, ...(reqOffset > 0 ? { offset: reqOffset } : {}) };
+            this.chats.appendTurn(chatSessionId, "system_notice", formatChatEventSummary(emptyEvent), undefined, emptyEvent);
+            return { path, offset: reqOffset, nextOffset: null, totalBytes: stat.size, truncated: false, hasMore: false, content: "" };
+          }
+          const buf = Buffer.alloc(pageBytes);
+          const count = readSync(fd, buf, 0, pageBytes, reqOffset);
+          // Skip continuation bytes when the caller's offset lands inside a multi-byte character.
+          let skip = 0;
+          if (reqOffset > 0) {
+            const maxSkip = Math.min(3, count);
+            while (skip < maxSkip && (buf[skip]! & 0xc0) === 0x80) skip++;
+          }
+          const alignedOffset = reqOffset + skip;
+          // Hold back a multi-byte character split by the page end; at end of file decode everything so truncation fails.
+          let validEnd = count;
+          if (reqOffset + count < stat.size && count > skip) {
+            for (let i = count - 1; i >= Math.max(skip, count - 3); i--) {
+              const b = buf[i]!;
+              if ((b & 0xc0) === 0x80) continue;
+              const seqLen = (b & 0xe0) === 0xc0 ? 2 : (b & 0xf0) === 0xe0 ? 3 : (b & 0xf8) === 0xf0 ? 4 : 1;
+              if (count - i < seqLen) validEnd = i;
+              break;
+            }
+          }
+          const slice = buf.subarray(skip, validEnd);
+          let decoded: string;
+          try {
+            decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: alignedOffset > 0 }).decode(slice);
+          } catch {
+            throw new Error("read_file supports UTF-8 text files only");
+          }
+          const hasBom = alignedOffset === 0 && slice.length >= 3 && slice[0] === 0xef && slice[1] === 0xbb && slice[2] === 0xbf;
+          let content = decoded;
+          let trimmed = false;
+          if (typeof args.max_chars === "number" && Number.isFinite(args.max_chars)) {
+            let charLimit = Math.max(1, Math.floor(args.max_chars));
+            if (charLimit < decoded.length) {
+              const hi = decoded.charCodeAt(charLimit - 1);
+              const lo = decoded.charCodeAt(charLimit);
+              if (hi >= 0xd800 && hi <= 0xdbff && lo >= 0xdc00 && lo <= 0xdfff) charLimit = charLimit > 1 ? charLimit - 1 : 2;
+              content = decoded.slice(0, charLimit);
+              trimmed = content.length < decoded.length;
+            }
+          }
+          const contentBytes = trimmed ? (hasBom ? 3 : 0) + Buffer.byteLength(content, "utf8") : validEnd - skip;
+          const next = alignedOffset + contentBytes;
+          const hasMore = next < stat.size;
+          const nextOffset = hasMore ? next : null;
+          const readEvent: ChatControlEvent = { kind: "director.read_file", path, bytes: contentBytes, reason, ...(alignedOffset > 0 ? { offset: alignedOffset } : {}) };
           this.chats.appendTurn(chatSessionId, "system_notice", formatChatEventSummary(readEvent), undefined, readEvent);
-          return { path, truncated: stat.size > count || content.length < text.length, content };
+          return { path, offset: alignedOffset, nextOffset, totalBytes: stat.size, truncated: hasMore, hasMore, content };
         } finally {
           closeSync(fd);
         }
