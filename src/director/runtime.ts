@@ -74,6 +74,14 @@ import { nativeToolsPathDirs, resolveExternalMcpServers } from "../tools/native-
 import { runGit } from "../worktree/manager.js";
 import { runMergedRef } from "../worktree/merge-queue.js";
 import {
+  buildGateActivityEvent,
+  detectGitPush,
+  goalGateState,
+  looksLikeGitPush,
+  type GoalGate,
+} from "./gate-activity.js";
+import { buildGoalGetResult, GOAL_GET_TOOL, parseGoalGetOptions } from "./goal-get.js";
+import {
   buildDirectorSystemPrompt,
   DIRECTOR_DIRECT_TOOLS,
   DirectorSessionStore,
@@ -491,16 +499,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
       required: ["project"],
     },
   },
-  {
-    name: "goal_get",
-    description:
-      "Inspect a Goal's criteria, latest review, linked run tree, and open escalations. Pass the returned presentation_id to present_result to show the Goal detail card.",
-    inputSchema: {
-      type: "object",
-      required: ["goal_id"],
-      properties: { goal_id: { type: "string" } },
-    },
-  },
+  GOAL_GET_TOOL,
   {
     name: "present_result",
     description:
@@ -940,6 +939,10 @@ export class DirectorRuntime {
   private pendingDrainAll = false;
   /** Director-spawned task settlements (`id:generation`) already read via wait_tasks/wait_children so they do not wake again. */
   private seenTaskSettlements = new Set<string>();
+  /** Pending shell tool calls whose title/args look like `git push`, keyed by `${taskId}:${toolCallId}` (cap 256). */
+  private pendingPushCommands = new Map<string, string>();
+  /** Gate-activity dedupe keys already delivered (cap 2000). */
+  private notifiedGateActivity = new Set<string>();
 
   constructor(
     private readonly db: ControlPlaneDb,
@@ -1101,6 +1104,42 @@ export class DirectorRuntime {
     this.wakeHandler?.(timer.ownerId, event);
   }
 
+  private goalForRun(runId: string): GoalRecord | null {
+    const row = this.db.db
+      .prepare("SELECT id FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1")
+      .get(runId) as { id: string } | undefined;
+    return row ? this.goals.getGoal(row.id) : null;
+  }
+
+  private notifyGateActivity(
+    runId: string,
+    dedupeKey: string,
+    buildEvent: (goal: GoalRecord, gate: GoalGate) => ChatControlEvent,
+  ): void {
+    if (this.notifiedGateActivity.has(dedupeKey)) return;
+    const goal = this.goalForRun(runId);
+    if (!goal?.chatSessionId) return;
+    const gate = goalGateState(goal, this.db.listEscalations(runId, "unresolved"));
+    if (!gate) return;
+    if (this.notifiedGateActivity.size >= 2000) {
+      const oldest = this.notifiedGateActivity.values().next().value;
+      if (oldest !== undefined) this.notifiedGateActivity.delete(oldest);
+    }
+    this.notifiedGateActivity.add(dedupeKey);
+    const event = buildEvent(goal, gate);
+    if (this.wakeHandler && this.config.events?.wakeDirectorOnGoalSettle) {
+      this.wakeHandler(goal.chatSessionId, event);
+    } else {
+      this.chats.appendTurn(
+        goal.chatSessionId,
+        "system_notice",
+        formatChatEventSummary(event),
+        undefined,
+        event,
+      );
+    }
+  }
+
   private handleControlPlaneEvent(ev: EventRecord): void {
     // Goal settlement and queue admission always run; only Director wakeups are gated by this setting.
     const wakeOnSettle = Boolean(this.config.events?.wakeDirectorOnGoalSettle);
@@ -1144,6 +1183,91 @@ export class DirectorRuntime {
           }
         }
       }
+    }
+
+    // Gate-activity: notify the Director when a gated goal's run spawns a Tier 2 worker or pushes to a remote.
+    // Tier 3 spawn_task calls are intentionally not counted as worker_spawned (read-only scouts / worker sub-steps).
+    // Paths deliberately not covered (design 1.3): deterministic gate commands run by the Director in a `_verify`
+    // worktree (Director-configured, not orchestrator activity) and remote pushes made outside the harness.
+    if (ev.type === "task.created" && ev.taskId) {
+      if (directorTaskRunOwner(ev.runId) !== null) return;
+      const p = ev.payload as { tier?: number; kind?: string; title?: string } | null;
+      if (p?.tier === 2 && p?.kind === "worker") {
+        this.notifyGateActivity(ev.runId, `spawn:${ev.taskId}`, (goal, gate) =>
+          buildGateActivityEvent(goal, gate, "worker_spawned", {
+            runId: ev.runId,
+            taskId: ev.taskId!,
+            taskTier: 2,
+            ...(typeof p.title === "string" && p.title ? { title: p.title } : {}),
+          }),
+        );
+      }
+      return;
+    }
+
+    if (ev.type === "agent.tool" && ev.taskId) {
+      if (directorTaskRunOwner(ev.runId) !== null) return;
+      const p = ev.payload as {
+        id?: string;
+        status?: string;
+        title?: string;
+        args?: unknown;
+        result?: unknown;
+      } | null;
+      if (!p || typeof p.status !== "string") return;
+      const callId = typeof p.id === "string" && p.id ? p.id : null;
+      const cacheKey = callId ? `${ev.taskId}:${callId}` : null;
+      const titleText = typeof p.title === "string" ? p.title : "";
+      const argsText =
+        typeof p.args === "string" ? p.args : p.args && typeof p.args === "object" ? JSON.stringify(p.args) : "";
+      const ownText = [titleText, argsText].filter(Boolean).join("\n");
+
+      if (p.status === "pending" || p.status === "in_progress") {
+        if (cacheKey && ownText && looksLikeGitPush(ownText)) {
+          if (this.pendingPushCommands.has(cacheKey)) {
+            this.pendingPushCommands.delete(cacheKey);
+          } else if (this.pendingPushCommands.size >= 256) {
+            const oldest = this.pendingPushCommands.keys().next().value;
+            if (oldest !== undefined) this.pendingPushCommands.delete(oldest);
+          }
+          this.pendingPushCommands.set(cacheKey, ownText);
+        }
+        return;
+      }
+
+      if (p.status === "failed" || p.status === "error" || p.status === "cancelled") {
+        if (cacheKey) this.pendingPushCommands.delete(cacheKey);
+        return;
+      }
+
+      if (p.status === "completed") {
+        const cachedText = cacheKey ? this.pendingPushCommands.get(cacheKey) : undefined;
+        if (cacheKey) this.pendingPushCommands.delete(cacheKey);
+        const commandText = ownText && looksLikeGitPush(ownText) ? ownText : cachedText ?? ownText;
+        if (!commandText || !looksLikeGitPush(commandText)) return;
+        const resultText =
+          typeof p.result === "string"
+            ? p.result
+            : p.result && typeof p.result === "object"
+              ? JSON.stringify(p.result)
+              : undefined;
+        const push = detectGitPush(commandText, resultText);
+        if (!push) return;
+        const taskTier = this.db.getTask(ev.taskId)?.tier ?? 2;
+        const dedupeKey = `push:${ev.taskId}:${callId ?? ev.seq}`;
+        this.notifyGateActivity(ev.runId, dedupeKey, (goal, gate) =>
+          buildGateActivityEvent(goal, gate, "remote_push", {
+            runId: ev.runId,
+            taskId: ev.taskId!,
+            taskTier,
+            command: push.command,
+            remote: push.remote,
+            refs: push.refs,
+            confirmed: push.confirmed,
+          }),
+        );
+      }
+      return;
     }
 
     // Wake Director immediately on P0 escalations or manual quota pauses for any linked Goal
@@ -5681,15 +5805,25 @@ export class DirectorRuntime {
         const g = this.goals.getGoal(String(args.goal_id));
         if (!g) throw new Error(`Unknown goal ${args.goal_id}`);
         const detail = this.goalDisplayData(g);
+        const opts = parseGoalGetOptions(args);
+        const evidenceDir = goalEvidenceDirOrNull(g);
+        const result = buildGoalGetResult(detail, opts, { evidenceDir, repoRoot: g.repoRoot });
+        // Preserve goal-18 v5 reviewer diagnostics fields (added on main after goal-20 Part A).
+        if (opts.sections.includes("goal") && result.goal && typeof result.goal === "object") {
+          (result.goal as Record<string, unknown>).lastReviewerFailure = detail.goal.lastReviewerFailure ?? null;
+        }
+        if (opts.sections.includes("reviews") && Array.isArray(result.reviews) && result.reviews.length > 0) {
+          const newestOut = result.reviews[0] as Record<string, unknown> | undefined;
+          const newestSrc =
+            newestOut && typeof newestOut.id === "string"
+              ? detail.reviews.find((r) => r.id === newestOut.id)
+              : undefined;
+          if (newestOut && newestSrc && newestSrc.diagnostics !== undefined) {
+            newestOut.diagnostics = newestSrc.diagnostics;
+          }
+        }
         return {
-          ...detail,
-          acceptOverrides: detail.reviews.filter((r) => r.source === "director_accept_override"),
-          evidenceDir: goalEvidenceDirOrNull(g),
-          tasks: detail.tasks.map((t) => ({
-            ...compactTaskHandoff(t, detail.openEscalations),
-            goalVersion: t.goalVersion ?? null,
-            staleGoalVersion: t.goalVersion != null ? t.goalVersion < detail.goal.version : detail.goal.version > 1,
-          })),
+          ...result,
           presentation_id: offerPresentation(() => buildGoalDetailDisplay(detail)),
         };
       }
