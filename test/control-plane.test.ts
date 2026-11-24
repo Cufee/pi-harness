@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "bun:test";
@@ -15,7 +15,7 @@ import {
   type RecentlyResolvedEscalation,
   type TaskRecord,
 } from "../src/control-plane/db.js";
-import { compactTaskHandoff } from "../src/control-plane/handoffs.js";
+import { compactTaskHandoff, validateTaskHandoff } from "../src/control-plane/handoffs.js";
 import { HarnessOrchestrator } from "../src/control-plane/orchestrator.js";
 import { buildHydrationTurn, buildImmutableSystemPrompt } from "../src/control-plane/prompts.js";
 import { buildRunActivitySummary } from "../src/control-plane/telemetry.js";
@@ -967,6 +967,46 @@ describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () =>
           /only supported with status 'completed'/,
         );
       }
+      assert.throws(
+        () =>
+          validateTaskHandoff("worker", {
+            summary: "Missing status with external deliverable",
+            external_deliverable: { ref: "origin-ext/feature-x" },
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof HarnessRejection, `expected HarnessRejection, got ${String(err)}`);
+          assert.equal(err.notice.rule, "handoff-external-deliverable");
+          assert.ok(
+            countWords(err.notice) <= WORD_BUDGET,
+            `missing-status rejection exceeded ${WORD_BUDGET}-word budget: ${countWords(err.notice)}`,
+          );
+          assert.match(err.message, /only supported with status 'completed'/);
+          assert.match(err.message, /missing/);
+          return true;
+        },
+      );
+      assert.throws(
+        () =>
+          validateTaskHandoff("worker", {
+            status: "blocked",
+            summary: "Blocked with external deliverable",
+            external_deliverable: { ref: "origin-ext/feature-x" },
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof HarnessRejection);
+          assert.equal(err.notice.rule, "handoff-external-deliverable");
+          assert.match(err.message, /only supported with status 'completed'/);
+          return true;
+        },
+      );
+      assert.deepEqual(
+        validateTaskHandoff("worker", {
+          status: "completed",
+          summary: "Completed with external deliverable",
+          external_deliverable: { ref: "origin-ext/feature-x" },
+        }).externalDeliverable,
+        { ref: "origin-ext/feature-x" },
+      );
       assert.equal(db.getTask(worker.id)?.status, "running");
       const t3 = db.createTask({
         runId: run.id,
@@ -1129,18 +1169,86 @@ describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () =>
       const mergedWt = await wtMgr.createForWorker(run.id, mergedWorker.id, baseSha);
       db.updateTask(mergedWorker.id, { worktreeId: mergedWt.id });
 
-      // Simulate an initial commit merged into main (leaving worktree status = 'merged').
+      // Merge an initial commit into main via submit_for_merge (leaving live worker running and worktree status = 'merged').
       writeFileSync(join(mergedWt.path, "merged-part.md"), "# Merged change\n", "utf8");
       await runGit(mergedWt.path, ["add", "merged-part.md"]);
       await runGit(mergedWt.path, ["-c", "user.name=test", "-c", "user.email=test@local", "commit", "-m", "Merged change"]);
-      await runGit(repoRoot, ["merge", "--ff-only", mergedWt.branch]);
-      db.updateWorktree(mergedWt.id, { status: "merged" });
+      const mergeRes = (await orch.toolExecutor.execute(run.id, mergedWorker.id, "submit_for_merge", {
+        summary: "Merged change",
+      })) as { status: string; mergedSha?: string };
+      assert.equal(mergeRes.status, "merged");
+      assert.equal(db.getWorktree(mergedWt.id)?.status, "merged");
+      assert.equal(db.getTask(mergedWorker.id)?.status, "running");
 
       // Worker commits additional work after merge and settles via external_deliverable.
       writeFileSync(join(mergedWt.path, "post-merge-report.md"), "# Post-merge report\n", "utf8");
       await runGit(mergedWt.path, ["add", "post-merge-report.md"]);
       await runGit(mergedWt.path, ["-c", "user.name=test", "-c", "user.email=test@local", "commit", "-m", "Post-merge report"]);
       const postMergeHead = (await runGit(mergedWt.path, ["rev-parse", "HEAD"])).stdout;
+      const mainBeforeArchiveFailure = (await runGit(repoRoot, ["rev-parse", "main"])).stdout;
+
+      // 6a. If the required archive ref update fails, return_task must reject before committing anything:
+      // task stays running, worktree stays merged (not torn down), and base branch is unchanged.
+      const hooksDir = join(repoRoot, ".git", "hooks");
+      mkdirSync(hooksDir, { recursive: true });
+      await runGit(repoRoot, ["config", "core.hooksPath", hooksDir]);
+      const refTxHook = join(hooksDir, "reference-transaction");
+      writeFileSync(
+        refTxHook,
+        [
+          "#!/bin/sh",
+          "while IFS= read -r line; do",
+          '  case "$line" in',
+          '    *"refs/harness/archive/"*) exit 1 ;;',
+          "  esac",
+          "done",
+          "exit 0",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      chmodSync(refTxHook, 0o755);
+
+      await assert.rejects(
+        () =>
+          orch.toolExecutor.execute(run.id, mergedWorker.id, "return_task", {
+            status: "completed",
+            summary: "Merged base fix and archived post-merge report externally",
+            external_deliverable: {
+              ref: "origin-ext/post-merge-report",
+              sha: postMergeHead,
+            },
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof HarnessRejection, `expected HarnessRejection, got ${String(err)}`);
+          assert.equal(err.notice.rule, "settlement-archive-failed");
+          assert.ok(
+            countWords(err.notice) <= WORD_BUDGET,
+            `archive-failed rejection exceeded ${WORD_BUDGET}-word budget: ${countWords(err.notice)}`,
+          );
+          assert.match(err.message, /^\[harness blocked: settlement-archive-failed\] .+ Why: .+ Allowed: .+$/);
+          assert.match(err.message, /archive ref/i);
+          assert.ok(err.message.includes("return_task"), `expected return_task retry guidance: ${err.message}`);
+          assert.ok(err.message.includes("submit_for_merge"), `expected submit_for_merge guidance: ${err.message}`);
+          assert.ok(err.message.includes("blocked"), `expected blocked guidance: ${err.message}`);
+          return true;
+        },
+      );
+      // Yield to ensure no background teardown ran after the rejected settlement.
+      await new Promise((r) => setTimeout(r, 150));
+
+      const taskAfterArchiveFailure = db.getTask(mergedWorker.id)!;
+      assert.equal(taskAfterArchiveFailure.status, "running");
+      assert.equal(taskAfterArchiveFailure.resultJson, null);
+      const wtAfterArchiveFailure = db.getWorktree(mergedWt.id)!;
+      assert.equal(wtAfterArchiveFailure.status, "merged");
+      assert.equal(wtAfterArchiveFailure.cleanedAt, null);
+      assert.equal(wtAfterArchiveFailure.archiveRef, null);
+      assert.equal(existsSync(mergedWt.path), true);
+      assert.equal((await runGit(repoRoot, ["rev-parse", "main"])).stdout, mainBeforeArchiveFailure);
+
+      // Remove the injected archive-ref failure hook and verify retrying return_task now succeeds cleanly.
+      rmSync(refTxHook, { force: true });
 
       const mergedExtRes = (await orch.toolExecutor.execute(run.id, mergedWorker.id, "return_task", {
         status: "completed",

@@ -1,4 +1,4 @@
-import { REJECTIONS } from "../advisories/rejections.js";
+import { REJECTIONS, rejection } from "../advisories/rejections.js";
 import {
   buildMinimalFallbackResultJson,
   formatFallbackSummary,
@@ -97,9 +97,17 @@ export function validateTaskHandoff(kind: TaskKind, args: Record<string, unknown
     if (kind !== "worker") {
       throw new Error("return_task external_deliverable is only supported for Tier 2 workers.");
     }
-    if (args.status !== undefined && args.status !== "completed") {
-      throw new Error(
-        `return_task external_deliverable is only supported with status 'completed' (got '${String(args.status)}'). Use status 'completed' to settle an external deliverable, or omit external_deliverable when returning '${String(args.status)}'.`,
+    if (args.status !== "completed") {
+      const got = args.status === undefined ? "missing" : `'${String(args.status)}'`;
+      const omitGuidance =
+        args.status === undefined
+          ? "omit external_deliverable"
+          : `omit external_deliverable when returning '${String(args.status)}'`;
+      throw rejection(
+        "handoff-external-deliverable",
+        `return_task was rejected: external_deliverable is only supported with status 'completed' (got ${got}).`,
+        "External deliverables only record completed work settled outside the base branch by a Tier 2 worker.",
+        `Use status 'completed' to settle an external deliverable, or ${omitGuidance}.`,
       );
     }
     const raw = args.external_deliverable;

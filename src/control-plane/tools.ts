@@ -44,7 +44,7 @@ import {
   type GoalProgressSource,
 } from "../goals/live-progress.js";
 import type { SteerTaskResult } from "./orchestrator.js";
-import { REJECTIONS } from "../advisories/rejections.js";
+import { REJECTIONS, rejection } from "../advisories/rejections.js";
 import { roleOf } from "../advisories/roles.js";
 import { allowedToolNames, notYourTool, toolsForRole } from "../tool-descriptions/index.js";
 import { allowedToolsForRole } from "../tool-descriptions/registry.js";
@@ -770,7 +770,15 @@ export class ControlPlaneToolExecutor {
         if (preserveMergedWorktree) {
           const archiveRef = await preserveMergedWorktree.wtMgr.snapshotToArchiveRef(preserveMergedWorktree.wt);
           assertReturnStillValid();
-          if (archiveRef && recordedExternalDeliverable) {
+          if (!archiveRef) {
+            throw rejection(
+              "settlement-archive-failed",
+              "return_task completed was rejected: the archive ref for post-merge commits could not be written.",
+              "Completing without archiving would risk losing those commits when the merged worktree is removed.",
+              "Retry return_task, call submit_for_merge to land the commits, or call return_task with status blocked.",
+            );
+          }
+          if (recordedExternalDeliverable) {
             recordedExternalDeliverable = {
               ...recordedExternalDeliverable,
               archive_ref: archiveRef,
