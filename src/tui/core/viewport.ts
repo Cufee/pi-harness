@@ -57,46 +57,45 @@ export function parseMouseWheel(data: string): { delta: number; hadMouse: boolea
   return { delta, hadMouse };
 }
 
-export interface ScrollbarRowRange {
-  /** Exact rendered array whose rows include the scrollbar slice. */
-  lines: readonly string[];
-  /** Start row offset within `lines` where scrollbar-bearing rows begin. */
-  start: number;
-  /** Number of consecutive rows from `start` that have a trailing scrollbar gutter. */
-  count: number;
-  /** Selectable content width for those rows (excluding the trailing scrollbar gutter). */
-  contentWidth: number;
+export interface ScrollbarCapture {
+  consume(line: string): { line: string; contentWidth: number | undefined };
 }
 
-const scrollbarCaptureStack: ScrollbarRowRange[][] = [];
+interface ActiveScrollbarCapture {
+  token: string;
+  prefix: string;
+  rx: RegExp;
+}
 
-/** Begins capturing rendered scrollbar row geometry during a synchronous `Frame` body render. */
+let nextScrollbarCaptureId = 0;
+const scrollbarCaptureStack: ActiveScrollbarCapture[] = [];
+
+/** Begins tagging scrollbar-bearing Viewport rows during a synchronous `Frame` body render. */
 export function beginScrollbarCapture(): void {
-  scrollbarCaptureStack.push([]);
+  const token = `${++nextScrollbarCaptureId}_${Math.random().toString(36).slice(2, 10)}`;
+  scrollbarCaptureStack.push({
+    token,
+    prefix: `\x1b_hsb:${token}:`,
+    rx: new RegExp(`\x1b_hsb:${token}:(\\d+)\x1b\\\\`, "g"),
+  });
 }
 
-/** Ends scrollbar geometry capture and returns the captured ranges for the current render. */
-export function endScrollbarCapture(): ScrollbarRowRange[] {
-  return scrollbarCaptureStack.pop() ?? [];
-}
-
-/** Records a scrollbar-bearing row range during an active capture. */
-export function recordScrollbarRange(range: ScrollbarRowRange): void {
-  const current = scrollbarCaptureStack[scrollbarCaptureStack.length - 1];
-  if (current) current.push(range);
-}
-
-/** Replaces a previously recorded range (by rendered array identity) when wrapped by a container such as `ListView`. */
-export function replaceScrollbarRange(prevLines: readonly string[], nextRange: ScrollbarRowRange): void {
-  const current = scrollbarCaptureStack[scrollbarCaptureStack.length - 1];
-  if (!current) return;
-  for (let i = current.length - 1; i >= 0; i--) {
-    if (current[i]!.lines === prevLines) {
-      current[i] = nextRange;
-      return;
-    }
-  }
-  current.push(nextRange);
+/** Ends scrollbar capture and returns a consumer that strips this render's tags and recovers row widths. */
+export function endScrollbarCapture(): ScrollbarCapture | undefined {
+  const active = scrollbarCaptureStack.pop();
+  if (!active) return undefined;
+  return {
+    consume(line: string) {
+      if (!line.includes(active.prefix)) return { line, contentWidth: undefined };
+      let contentWidth: number | undefined;
+      active.rx.lastIndex = 0;
+      const clean = line.replace(active.rx, (_, rawW: string) => {
+        contentWidth = Number(rawW);
+        return "";
+      });
+      return { line: clean, contentWidth };
+    },
+  };
 }
 
 /**
@@ -190,14 +189,15 @@ export class Viewport {
     const thumbSize = Math.max(1, Math.round((h / lines.length) * h));
     const thumbTop = Math.min(h - thumbSize, Math.round((this.offset / maxOff) * (h - thumbSize)));
 
+    const activeCapture = scrollbarCaptureStack[scrollbarCaptureStack.length - 1];
+    const tag = activeCapture ? `\x1b_hsb:${activeCapture.token}:${bodyWidth}\x1b\\` : "";
     const out: string[] = [];
     for (let i = 0; i < h; i++) {
       const content = fit(slice[i] ?? "", bodyWidth);
       const isThumb = i >= thumbTop && i < thumbTop + thumbSize;
       const bar = isThumb ? theme.accent(theme.glyphs.scrollThumb) : theme.muted(theme.glyphs.scrollTrack);
-      out.push(`${content} ${bar}`);
+      out.push(`${tag}${content} ${bar}`);
     }
-    recordScrollbarRange({ lines: out, start: 0, count: out.length, contentWidth: bodyWidth });
     return out;
   }
 

@@ -1510,6 +1510,10 @@ class ArtifactInspectorScreen implements Screen {
     this.view.handleMouse({ ...ev, x: localX, y: localY }, ctx);
   }
 
+  clearSelection(): void {
+    this.view.clearSelection();
+  }
+
   handleInput(data: string, ctx: ScreenContext): void {
     if (this.frame.handleInlineInput(data, ctx.requestRender)) return;
     if (data === "n" && !this.loading && (this.result?.hasMore || this.result?.truncated)) {
@@ -1934,6 +1938,10 @@ export class LiveTranscriptScreen implements Screen {
     this.view.handleMouse({ ...ev, x: localX, y: localY }, ctx);
   }
 
+  clearSelection(): void {
+    this.view.clearSelection();
+  }
+
   handleInput(data: string, ctx: ScreenContext): void {
     this.lastCtx = ctx;
     if (this.view.handleKey(data, ctx)) {
@@ -2027,6 +2035,10 @@ class GenericDetailScreen implements Screen {
       return false;
     }
     this.view.handleMouse({ ...ev, x: localX, y: localY }, ctx);
+  }
+
+  clearSelection(): void {
+    this.view.clearSelection();
   }
 
   handleInput(data: string, ctx: ScreenContext): void {

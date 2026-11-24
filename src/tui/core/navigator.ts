@@ -13,6 +13,7 @@ import {
   type CellPoint,
   extractSelectionText,
   highlightCells,
+  type NormalizedSelection,
   normalizeSelection,
   rowSelectionCols,
 } from "./selection.js";
@@ -135,6 +136,8 @@ export interface Screen {
   handleInput(data: string, ctx: ScreenContext): void;
   /** Optional custom mouse handler. Return `false` to fall through to default overlay selection. */
   handleMouse?(ev: OverlayMouseEvent, ctx: ScreenContext): void | boolean;
+  /** Clears any screen-managed text selection when default overlay selection takes over. */
+  clearSelection?(): void;
   onShow?(ctx: ScreenContext): void;
   onClose?(): void;
 }
@@ -154,6 +157,8 @@ interface SelectionRowSnapshot {
   row: number;
   lineIdx: number;
   rowWidth: number;
+  c0: number;
+  c1: number;
   plain: string;
 }
 
@@ -161,6 +166,7 @@ interface SelectionSnapshot {
   frame: Frame;
   col: number;
   width: number;
+  sel: NormalizedSelection;
   rows: SelectionRowSnapshot[];
 }
 
@@ -193,6 +199,21 @@ function nearestTextRowIndex(rows: readonly number[], y: number): number {
 function selectableRowWidth(region: FrameTextRegion, lineIdx: number): number {
   const override = region.rowWidths?.get(lineIdx);
   return override !== undefined ? Math.max(1, Math.min(region.width, override)) : region.width;
+}
+
+function selectedRowSpan(
+  line: string,
+  region: FrameTextRegion,
+  lineIdx: number,
+  row: number,
+  sel: NormalizedSelection,
+): { rowWidth: number; c0: number; c1: number; plain: string } {
+  const rowWidth = selectableRowWidth(region, lineIdx);
+  const inner = sliceByColumn(line, region.col, rowWidth, true);
+  const { c0, c1 } = rowSelectionCols(inner, row, sel, region.width);
+  const spanW = c0 < rowWidth ? Math.min(c1, rowWidth - 1) - c0 + 1 : 0;
+  const plain = spanW > 0 ? stripTerminalSequences(sliceByColumn(inner, c0, spanW, true)) : "";
+  return { rowWidth, c0, c1, plain };
 }
 
 function computeOverlayHeight(termRows: number, isDialog: boolean): number {
@@ -332,6 +353,10 @@ export class Navigator {
                   }
                 }
                 this.mouseGestureOwner = "default";
+                if (ev.button === "left" && top.clearSelection) {
+                  top.clearSelection();
+                  needsRender = true;
+                }
                 if (this.handleDefaultMouse(localEv, ctx, bounds)) {
                   needsRender = true;
                 }
@@ -419,14 +444,13 @@ export class Navigator {
     for (let r = sel.startRow; r <= lastRow; r++) {
       const lineIdx = visibleRows[r];
       if (lineIdx === undefined || lineIdx < 0 || lineIdx >= lines.length) continue;
-      const rowWidth = selectableRowWidth(region, lineIdx);
-      const plain = stripTerminalSequences(sliceByColumn(lines[lineIdx]!, region.col, rowWidth, true));
-      rows.push({ row: r, lineIdx, rowWidth, plain });
+      rows.push({ row: r, lineIdx, ...selectedRowSpan(lines[lineIdx]!, region, lineIdx, r, sel) });
     }
     this.overlaySel.snapshot = {
       frame,
       col: region.col,
       width: region.width,
+      sel,
       rows,
     };
   }
@@ -441,10 +465,10 @@ export class Navigator {
       if (entry.row >= region.rows.length) return false;
       const lineIdx = region.rows[entry.row]!;
       if (lineIdx !== entry.lineIdx || lineIdx < 0 || lineIdx >= rawLines.length) return false;
-      const rowWidth = selectableRowWidth(region, lineIdx);
-      if (rowWidth !== entry.rowWidth) return false;
-      const plain = stripTerminalSequences(sliceByColumn(rawLines[lineIdx]!, region.col, rowWidth, true));
-      if (plain !== entry.plain) return false;
+      const cur = selectedRowSpan(rawLines[lineIdx]!, region, lineIdx, entry.row, snap.sel);
+      if (cur.rowWidth !== entry.rowWidth || cur.c0 !== entry.c0 || cur.c1 !== entry.c1 || cur.plain !== entry.plain) {
+        return false;
+      }
     }
     return true;
   }

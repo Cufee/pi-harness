@@ -2,7 +2,7 @@ import { Input, matchesKey } from "@earendil-works/pi-tui";
 import { type Hint, renderHintBar } from "./keymap.js";
 import { clamp, fillLineBg, fit, sanitizeLine, splitRow, visibleWidth } from "./text.js";
 import type { Theme, Tone } from "./tokens.js";
-import { beginScrollbarCapture, endScrollbarCapture, type ScrollbarRowRange } from "./viewport.js";
+import { beginScrollbarCapture, endScrollbarCapture, type ScrollbarCapture } from "./viewport.js";
 
 export interface FrameTab {
   id: string;
@@ -87,18 +87,6 @@ export interface FrameTextRegion {
   bodyRows: number[];
   /** Per-line selectable width overrides derived from rendered Viewport/ListView scrollbar geometry. */
   rowWidths?: ReadonlyMap<number, number>;
-}
-
-function findLastSubsequence(haystack: readonly string[], needle: readonly string[], endExclusive: number): number {
-  const len = needle.length;
-  if (len === 0 || len > endExclusive) return -1;
-  outer: for (let i = endExclusive - len; i >= 0; i--) {
-    for (let j = 0; j < len; j++) {
-      if (haystack[i + j] !== needle[j]) continue outer;
-    }
-    return i;
-  }
-  return -1;
 }
 
 let capturedFrame: Frame | null = null;
@@ -216,7 +204,7 @@ export class Frame {
     if (this.confirmState || this.promptState || this.notice) chrome += 1;
     const usePadY = opts?.padY ?? maxHeight >= chrome + 5;
     if (usePadY) chrome += 2;
-    return Math.max(2, Math.floor(maxHeight) - chrome);
+    return Math.max(1, Math.floor(maxHeight) - chrome);
   }
 
   render(opts: {
@@ -292,38 +280,28 @@ export class Frame {
     const bodyRow = out.length;
     beginScrollbarCapture();
     let rawBodyLines: string[];
-    let scrollbarRanges: ScrollbarRowRange[];
+    let scrollbarCapture: ScrollbarCapture | undefined;
     try {
       rawBodyLines = opts.renderBody(innerW, availBody);
     } finally {
-      scrollbarRanges = endScrollbarCapture();
+      scrollbarCapture = endScrollbarCapture();
     }
     const bodyLines = rawBodyLines.slice(0, availBody);
     const bodyRows: number[] = [];
-    for (const line of bodyLines) {
+    const rowWidths = new Map<number, number>();
+    for (const rawLine of bodyLines) {
+      const { line, contentWidth } = scrollbarCapture
+        ? scrollbarCapture.consume(rawLine)
+        : { line: rawLine, contentWidth: undefined };
       const idx = out.length;
       out.push(boxRow(line));
       textRows.push(idx);
       bodyRows.push(idx);
-    }
-    if (bodyLines.length === 0) out.push(boxRow(""));
-
-    const rowWidths = new Map<number, number>();
-    let searchEnd = rawBodyLines.length;
-    for (let k = scrollbarRanges.length - 1; k >= 0; k--) {
-      const range = scrollbarRanges[k]!;
-      const matchIdx =
-        range.lines === rawBodyLines ? 0 : findLastSubsequence(rawBodyLines, range.lines, searchEnd);
-      if (matchIdx < 0) continue;
-      searchEnd = matchIdx;
-      const clampedW = Math.max(1, Math.min(innerW, range.contentWidth));
-      for (let i = 0; i < range.count; i++) {
-        const bodyIdx = matchIdx + range.start + i;
-        if (bodyIdx >= 0 && bodyIdx < bodyLines.length) {
-          rowWidths.set(bodyRow + bodyIdx, clampedW);
-        }
+      if (contentWidth !== undefined) {
+        rowWidths.set(idx, Math.max(1, Math.min(innerW, contentWidth)));
       }
     }
+    if (bodyLines.length === 0) out.push(boxRow(""));
 
     this.bodyRect = {
       row: bodyRow,
@@ -334,21 +312,31 @@ export class Frame {
 
     if (padY) out.push(boxRow(""));
 
+    const inlineNotice =
+      (this.confirmState || this.promptState) && this.notice
+        ? clamp(theme.paint(this.notice.tone, this.notice.text), Math.max(1, innerW))
+        : "";
+    const noticeOnInline = Boolean(inlineNotice) && out.length + 2 >= maxH;
+
     if (this.confirmState) {
       const label = this.confirmState.confirmLabel ?? "y/Enter confirm · n/Esc cancel";
+      const confirmLine = theme.warn(`${g.warn} ${sanitizeLine(this.confirmState.message)}  [${label}]`);
       textRows.push(out.length);
-      out.push(boxRow(theme.warn(`${g.warn} ${sanitizeLine(this.confirmState.message)}  [${label}]`)));
+      out.push(boxRow(noticeOnInline ? splitRow(confirmLine, inlineNotice, innerW, 2) : confirmLine));
     } else if (this.promptState) {
       const lbl = theme.accentBold(`${this.promptState.spec.label}: `);
       const placeholder =
         !this.promptState.input.getValue() && this.promptState.spec.placeholder
           ? ` ${theme.dim(this.promptState.spec.placeholder)}`
           : "";
+      const noticeReserve = noticeOnInline ? visibleWidth(inlineNotice) + 2 : 0;
+      const promptBudget = Math.max(4, innerW - noticeReserve);
       const reserve = visibleWidth(lbl) + visibleWidth(placeholder);
-      const inpW = Math.max(4, innerW - reserve);
+      const inpW = Math.max(4, promptBudget - reserve);
       const rendered = (this.promptState.input.render(inpW)[0] ?? "").replace(/^>\s?/, "").trimEnd();
+      const promptLine = clamp(`${lbl}${rendered}${placeholder}`, promptBudget);
       textRows.push(out.length);
-      out.push(boxRow(clamp(`${lbl}${rendered}${placeholder}`, innerW)));
+      out.push(boxRow(noticeOnInline ? splitRow(promptLine, inlineNotice, innerW, 2) : promptLine));
     } else if (this.notice) {
       textRows.push(out.length);
       out.push(boxRow(theme.paint(this.notice.tone, this.notice.text)));
@@ -368,11 +356,7 @@ export class Frame {
           ]
         : opts.hints;
 
-    const inlineNotice =
-      (this.confirmState || this.promptState) && this.notice
-        ? clamp(theme.paint(this.notice.tone, this.notice.text), Math.max(1, innerW))
-        : "";
-    if (inlineNotice) {
+    if (inlineNotice && !noticeOnInline) {
       const hintsW = innerW - visibleWidth(inlineNotice) - 2;
       const footerLine =
         hintsW >= 4

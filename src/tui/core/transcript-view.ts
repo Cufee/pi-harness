@@ -197,10 +197,11 @@ export class TranscriptView {
     return this.entryById(pos.blockId)?.rows[pos.row] ?? "";
   }
 
-  private clearSelection(): void {
+  clearSelection(): void {
     this.selMode = "none";
     this.selAnchor = null;
     this.selHead = null;
+    this.dragging = false;
     this.dragStart = null;
   }
 

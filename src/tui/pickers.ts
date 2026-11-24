@@ -1664,6 +1664,10 @@ export class KbDetailScreen implements Screen {
     this.view.handleMouse({ ...ev, x: localX, y: localY }, ctx);
   }
 
+  clearSelection(): void {
+    this.view.clearSelection();
+  }
+
   handleInput(data: string, ctx: ScreenContext): void {
     if (this.view.handleKey(data, ctx)) {
       ctx.requestRender();

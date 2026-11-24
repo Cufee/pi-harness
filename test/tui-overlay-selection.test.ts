@@ -694,6 +694,39 @@ describe("Shared Navigator overlay text selection", () => {
     sendInput("\x1b");
     assert.equal(nav.isOpen, false, "Esc must pop when captured frame disappears");
 
+    // Unrelated change elsewhere on the same row (e.g. updating rightHeader) during drag must NOT cancel the copy.
+    let rightHeader = "updated 1";
+    const liveHeaderScreen: Screen = {
+      title: "Worker t-17",
+      variant: "sheet",
+      render(width, maxHeight, t) {
+        return frame.render({
+          width,
+          maxHeight,
+          theme: t,
+          breadcrumbs: ["Worker t-17"],
+          rightHeader,
+          hints: [{ key: "Esc", label: "close" }],
+          renderBody: () => ["body line"],
+        });
+      },
+      handleInput(data, ctx) {
+        if (isPopKey(data, ctx)) ctx.navigator.pop();
+      },
+    };
+    nav.push(liveHeaderScreen);
+    const hdrVisible = compositeVisible(tui, terminal);
+    const hdrY = hdrVisible.findIndex((l) => stripTerminalSequences(l).includes("Worker t-17"));
+    assert.ok(hdrY >= 0);
+    const hdrX = colOf(stripTerminalSequences(hdrVisible[hdrY]!), "Worker");
+    writes.length = 0;
+    sendInput(`\x1b[<0;${hdrX + 1};${hdrY + 1}M`);
+    sendInput(`\x1b[<32;${hdrX + "Worker".length};${hdrY + 1}M`);
+    rightHeader = "updated 2";
+    compositeVisible(tui, terminal);
+    sendInput(`\x1b[<0;${hdrX + "Worker".length};${hdrY + 1}m`);
+    assert.deepEqual(extractOsc52Payloads(writes), ["Worker"]);
+
     nav.closeAll();
     tui.stop();
   });
@@ -751,6 +784,41 @@ describe("Shared Navigator overlay text selection", () => {
     writes.length = 0;
     dragCells(sendInput, bodyX0 + 7, artBodyY, bodyX0, artSubY);
     assert.deepEqual(extractOsc52Payloads(writes), ["Artifact"]);
+
+    // Subsequent subtitle drag (default owner) must clear TranscriptView's body highlight and prevent 'y' from recopying the stale body selection.
+    const afterBodyDrag = compositeVisible(tui, terminal);
+    const subY2 = afterBodyDrag.findIndex((l) => stripTerminalSequences(l).includes("artifacts/report.md"));
+    const bodyY2 = afterBodyDrag.findIndex((l) => stripTerminalSequences(l).includes("Artifact body first line"));
+    assert.ok(subY2 >= 0 && bodyY2 > subY2);
+    assert.equal(
+      afterBodyDrag[bodyY2]!.includes(theme.badgeBg("Artifact")),
+      true,
+      "body cell selection highlight should be active before subtitle drag",
+    );
+    const subX0 = colOf(stripTerminalSequences(afterBodyDrag[subY2]!), "artifacts/report.md");
+    writes.length = 0;
+    dragCells(sendInput, subX0, subY2, subX0 + "artifacts/report.md".length - 1, subY2);
+    assert.deepEqual(extractOsc52Payloads(writes), ["artifacts/report.md"]);
+    const afterHandoff = compositeVisible(tui, terminal);
+    const bodyRowAfter = afterHandoff.find((l) => stripTerminalSequences(l).includes("Artifact body first line")) ?? "";
+    const subRowAfter = afterHandoff.find((l) => stripTerminalSequences(l).includes("artifacts/report.md")) ?? "";
+    assert.equal(
+      bodyRowAfter.includes(theme.badgeBg("Artifact")),
+      false,
+      "body cell selection highlight must clear when subtitle drag takes ownership",
+    );
+    assert.equal(
+      subRowAfter.includes(theme.badgeBg("artifacts/report.md")),
+      true,
+      "subtitle selection highlight must be active after handoff",
+    );
+    writes.length = 0;
+    sendInput("y");
+    assert.deepEqual(
+      extractOsc52Payloads(writes),
+      ["Artifact body first line\nArtifact body second line"],
+      "'y' must not recopy the stale body cell selection after subtitle drag",
+    );
 
     nav.pop();
 
@@ -893,6 +961,59 @@ describe("Shared Navigator overlay text selection", () => {
     dragCells(sendInput, bStartX, banY, hashX, itemY);
     assert.deepEqual(extractOsc52Payloads(writes), ["Banner header\nitem-one"]);
 
+    nav.pop();
+
+    // 3) Overflowing 1-row ASCII/NO_COLOR Viewport followed by an identical literal row ending in " #":
+    // only the real scrollbar row loses " #"; the identical literal row keeps its " #" suffix.
+    const noColorAscii = createTheme({ color: false, ascii: true });
+    const dupTerm = makeFakeTerminal(40, 14);
+    const dupTui = new ModalScreen(dupTerm.terminal);
+    const dupNav = new Navigator(dupTui, dupTerm.terminal, noColorAscii);
+    const dupFrame = new Frame();
+    const dupViewport = new Viewport();
+    let capturedInnerW = 0;
+    const dupScreen: Screen = {
+      title: "DupRow",
+      variant: "dialog",
+      render(width, maxHeight, t) {
+        return dupFrame.render({
+          width,
+          maxHeight,
+          theme: t,
+          breadcrumbs: ["DupRow"],
+          hints: [{ key: "Esc", label: "close" }],
+          renderBody: (innerW) => {
+            capturedInnerW = innerW;
+            return [
+              ...dupViewport.render(["same-row", "second-row"], innerW, 1, t),
+              `${"same-row".padEnd(innerW - 2)} #`,
+            ];
+          },
+        });
+      },
+      handleInput(data, ctx) {
+        if (isPopKey(data, ctx)) ctx.navigator.pop();
+      },
+    };
+    dupTui.start();
+    dupNav.push(dupScreen);
+    const dupVisible = compositeVisible(dupTui, dupTerm.terminal);
+    const dupRows = dupVisible
+      .map((l, idx) => ({ idx, plain: stripTerminalSequences(l) }))
+      .filter((r) => r.plain.includes("same-row"));
+    assert.equal(dupRows.length, 2);
+    const vpRowY = dupRows[0]!.idx;
+    const litRowY = dupRows[1]!.idx;
+    const dupStartX = colOf(dupRows[0]!.plain, "same-row");
+    const dupEndX = visibleWidth(dupRows[1]!.plain.slice(0, dupRows[1]!.plain.lastIndexOf("#")));
+    dupTerm.writes.length = 0;
+    dragCells(dupTerm.sendInput, dupStartX, vpRowY, dupEndX, litRowY);
+    assert.deepEqual(extractOsc52Payloads(dupTerm.writes), [
+      `same-row\n${"same-row".padEnd(capturedInnerW - 2)} #`,
+    ]);
+    dupNav.closeAll();
+    dupTui.stop();
+
     nav.closeAll();
     tui.stop();
   });
@@ -977,6 +1098,23 @@ describe("Shared Navigator overlay text selection", () => {
     sendInput("\r");
     assert.equal(submitted, "ok", "typing and Enter must still submit prompt after copying");
     assert.equal(frame.hasInlineModal, false);
+
+    // 3) Short dialog (maxHeight 7 with two body rows): both active prompt and copy notice remain visible.
+    const shortFrame = new Frame();
+    shortFrame.askPrompt({ label: "Reason", onSubmit: () => {} });
+    shortFrame.setNotice("Copied 8 chars", "ok");
+    const shortRendered = shortFrame.render({
+      width: 72,
+      maxHeight: 7,
+      theme,
+      breadcrumbs: ["ShortDialog"],
+      hints: [{ key: "Esc", label: "close" }],
+      renderBody: () => ["Body line 1", "Body line 2"],
+    });
+    assert.ok(shortRendered.length <= 7);
+    const shortPlain = shortRendered.map((l) => stripTerminalSequences(l)).join("\n");
+    assert.ok(shortPlain.includes("Reason:"), `Expected prompt visible at maxHeight 7 in:\n${shortPlain}`);
+    assert.ok(shortPlain.includes("Copied 8 chars"), `Expected copy notice visible at maxHeight 7 in:\n${shortPlain}`);
 
     nav.closeAll();
     tui.stop();
