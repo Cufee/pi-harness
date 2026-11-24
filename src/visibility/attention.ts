@@ -104,8 +104,12 @@ function compareInboxItems(a: InboxItem, b: InboxItem): number {
   return SEV_RANK[a.severity] - SEV_RANK[b.severity] || kindRank(a) - kindRank(b) || b.createdAt - a.createdAt;
 }
 
+function isDismissedAt(itemCreatedAt: number, dismissedItemCreatedAt?: number): boolean {
+  return dismissedItemCreatedAt !== undefined && dismissedItemCreatedAt >= itemCreatedAt;
+}
+
 function withDismissal(verdict: AttentionVerdict, itemCreatedAt: number, dismissedItemCreatedAt?: number): AttentionVerdict {
-  if (dismissedItemCreatedAt !== undefined && dismissedItemCreatedAt >= itemCreatedAt) {
+  if (isDismissedAt(itemCreatedAt, dismissedItemCreatedAt)) {
     return { audience: verdict.audience, reason: "dismissed" };
   }
   return verdict;
@@ -199,6 +203,8 @@ export function evaluateAttentionVerdict(candidate: AttentionCandidate): Attenti
       let verdict: AttentionVerdict;
       if (candidate.merge.status !== "conflict" && candidate.merge.status !== "ci_failed") {
         verdict = { audience: "none", reason: "not_bounced" };
+      } else if (isDirectorTaskContainer(candidate.merge.runId)) {
+        verdict = { audience: "director", reason: "director_container" };
       } else if (candidate.run && LIVE_RUN_STATUSES.has(candidate.run.status)) {
         verdict = { audience: "orchestrator", reason: "run_live" };
       } else if (candidate.goalId !== null) {
@@ -282,13 +288,14 @@ export function classifyAttention(input: AttentionInput): AttentionClassificatio
     pushClassified(item, verdict);
   }
 
-  // 2. Escalations: evaluate base eligibility first so only human-eligible escalations can supersede older ones
+  // 2. Escalations: evaluate base eligibility and dismissal first so only shown escalations can supersede older ones
   interface PendingEscalation {
     escalation: EscalationRecord;
     raiserTask: TaskRecord | null;
     owningGoal: GoalRecord | null;
     item: InboxItem;
     baseAudience: AttentionAudience;
+    dismissedItemCreatedAt: number | undefined;
   }
   const pendingEscalations: PendingEscalation[] = [];
   const newestByGoalCategory = new Map<string, EscalationRecord>();
@@ -299,13 +306,6 @@ export function classifyAttention(input: AttentionInput): AttentionClassificatio
     for (const e of re.escalations) {
       const raiserTask = runTaskById.get(e.fromTaskId) ?? taskById.get(e.fromTaskId) ?? null;
       const base = baseEscalationVerdict(e, raiserTask, owningGoal);
-      if (base.audience === "human" && owningGoal) {
-        const key = `${owningGoal.id}:${e.category}`;
-        const prev = newestByGoalCategory.get(key);
-        if (!prev || isNewerEscalation(e, prev)) {
-          newestByGoalCategory.set(key, e);
-        }
-      }
       const item: InboxItem = {
         id: `inbox:esc:${e.id}`,
         severity: e.severity,
@@ -318,12 +318,21 @@ export function classifyAttention(input: AttentionInput): AttentionClassificatio
         taskId: e.fromTaskId,
         createdAt: e.createdAt,
       };
+      const dismissedItemCreatedAt = dismissals?.get(item.id);
+      if (base.audience === "human" && !isDismissedAt(e.createdAt, dismissedItemCreatedAt) && owningGoal) {
+        const key = `${owningGoal.id}:${e.category}`;
+        const prev = newestByGoalCategory.get(key);
+        if (!prev || isNewerEscalation(e, prev)) {
+          newestByGoalCategory.set(key, e);
+        }
+      }
       pendingEscalations.push({
         escalation: e,
         raiserTask,
         owningGoal,
         item,
         baseAudience: base.audience,
+        dismissedItemCreatedAt,
       });
     }
   }
@@ -333,7 +342,7 @@ export function classifyAttention(input: AttentionInput): AttentionClassificatio
     if (entry.baseAudience === "human" && entry.owningGoal) {
       const key = `${entry.owningGoal.id}:${entry.escalation.category}`;
       const newest = newestByGoalCategory.get(key);
-      if (newest && newest.id !== entry.escalation.id) {
+      if (newest && isNewerEscalation(newest, entry.escalation)) {
         superseded = true;
       }
     }
@@ -343,7 +352,7 @@ export function classifyAttention(input: AttentionInput): AttentionClassificatio
       raiserTask: entry.raiserTask,
       owningGoal: entry.owningGoal,
       superseded,
-      dismissedItemCreatedAt: dismissals?.get(entry.item.id),
+      dismissedItemCreatedAt: entry.dismissedItemCreatedAt,
     });
     pushClassified(entry.item, verdict);
   }

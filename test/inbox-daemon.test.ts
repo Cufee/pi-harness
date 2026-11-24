@@ -170,4 +170,31 @@ describe("Inbox daemon RPCs and snapshot integration", () => {
       rmSync(stateDir, { recursive: true, force: true });
     }
   });
+
+  it("keeps max(stored, incoming) item_created_at on out-of-order dismiss upserts and resets on restore", () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-inbox-watermark-"));
+    const db = new ControlPlaneDb(join(stateDir, "control-plane.sqlite"));
+    try {
+      const itemId = "inbox:goal:goal-1";
+      db.dismissInboxItem(itemId, 20, 1_000);
+      assert.equal(db.listInboxDismissals().get(itemId), 20);
+
+      // Late out-of-order dismiss for an older item version must not regress the stored watermark
+      db.dismissInboxItem(itemId, 10, 2_000);
+      assert.equal(db.listInboxDismissals().get(itemId), 20);
+
+      // Newer item version advances the stored watermark
+      db.dismissInboxItem(itemId, 30, 3_000);
+      assert.equal(db.listInboxDismissals().get(itemId), 30);
+
+      // Explicit restore removes the watermark so a later dismiss starts fresh
+      assert.equal(db.restoreInboxItem(itemId), true);
+      assert.equal(db.listInboxDismissals().has(itemId), false);
+      db.dismissInboxItem(itemId, 10, 4_000);
+      assert.equal(db.listInboxDismissals().get(itemId), 10);
+    } finally {
+      db.close();
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
 });

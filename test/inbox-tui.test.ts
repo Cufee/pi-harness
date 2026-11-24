@@ -51,8 +51,28 @@ function makeMockClient(handler: (op: string, params: Record<string, unknown>) =
   return { client, calls };
 }
 
+function parseInboxRender(lines: string[]): { badgeCount: number; rows: string[]; text: string } {
+  const plain = lines.map(stripTerminalSequences);
+  const tabLine = plain.find((l) => l.includes("1:Inbox"));
+  assert.ok(tabLine, "Rendered frame must include the 1:Inbox tab");
+  const badgeMatch = tabLine.match(/1:Inbox(?: \((\d+)\))?/);
+  const badgeCount = badgeMatch?.[1] ? Number(badgeMatch[1]) : 0;
+
+  const headerIdx = plain.findIndex((l) => l.includes("SEV") && l.includes("KIND") && l.includes("TITLE"));
+  assert.ok(headerIdx >= 0, "Rendered Inbox tab must include table header");
+  const rows: string[] = [];
+  for (let i = headerIdx + 2; i < plain.length; i++) {
+    const line = plain[i]!;
+    if (line.startsWith("├") || line.startsWith("└")) break;
+    const inner = line.replace(/^│/, "").replace(/│$/, "").trim();
+    if (!inner || inner.startsWith("Inbox clear")) break;
+    rows.push(inner);
+  }
+  return { badgeCount, rows, text: plain.join("\n") };
+}
+
 describe("WorkNavigatorScreen inbox defaults and actions", () => {
-  it("opens on goals even with a non-empty inbox, keeps Inbox count synced to snap.inbox, toggles internal items with 'i', and sends dismiss/restore/clear_stale", async () => {
+  it("opens on goals even with a non-empty inbox, keeps Inbox count equal to rendered rows across snapshot changes, toggles/persists internal items, and confirms clear_stale", async () => {
     const theme = createTheme({ color: false, ascii: false });
     const { terminal } = makeFakeTerminal(120, 30);
     const tui = new ModalScreen(terminal);
@@ -60,7 +80,18 @@ describe("WorkNavigatorScreen inbox defaults and actions", () => {
     const ctx = { navigator: nav, theme, requestRender: () => {}, writeTerminal: () => {} };
 
     const now = Date.now();
-    const shownItem: InboxItem = {
+    const shownEsc: InboxItem = {
+      id: "inbox:esc:esc-human",
+      severity: "P0",
+      kind: "escalation",
+      title: "[P0/blocked_dependency] Need production sign-off",
+      detail: "from t-1 in run-1 · blocking",
+      ref: { kind: "escalation", id: "esc-human", runId: "run-1", label: "esc-human Need production sign-off" },
+      runId: "run-1",
+      taskId: "t-1",
+      createdAt: now - 2_000,
+    };
+    const shownRun: InboxItem = {
       id: "inbox:run:run-stale",
       severity: "P1",
       kind: "run_failed",
@@ -106,7 +137,7 @@ describe("WorkNavigatorScreen inbox defaults and actions", () => {
       merges: [],
       worktrees: [],
       messages: [],
-      inbox: [shownItem],
+      inbox: [shownEsc, shownRun],
       internalAttention: [internalTask, dismissedItem],
     };
 
@@ -127,35 +158,47 @@ describe("WorkNavigatorScreen inbox defaults and actions", () => {
     nav.push(workNav);
     assert.equal(workNav.currentTab, "goals");
 
-    // 2. Press "1" to switch to Inbox tab; Inbox tab count matches snap.inbox.length (1)
+    // 2. Press "1" to switch to Inbox tab; badge count equals rendered rows (2)
     workNav.handleInput("1", ctx);
     assert.equal(workNav.currentTab, "inbox");
-    const inboxDefaultRender = workNav.render(120, 24, theme).map(stripTerminalSequences).join("\n");
-    assert.ok(inboxDefaultRender.includes("1:Inbox (1)"), "Inbox tab count must equal snap.inbox.length");
-    assert.ok(inboxDefaultRender.includes("run-stale failed"));
-    assert.equal(inboxDefaultRender.includes("Old worker"), false, "Internal rows must be hidden by default");
-    assert.ok(inboxDefaultRender.includes("d dismiss") && inboxDefaultRender.includes("D clear stale") && inboxDefaultRender.includes("i show internal"));
+    const renderTwo = parseInboxRender(workNav.render(120, 24, theme));
+    assert.equal(renderTwo.badgeCount, 2);
+    assert.equal(renderTwo.rows.length, renderTwo.badgeCount);
+    assert.ok(renderTwo.rows[0]!.includes("Need production sign-off"));
+    assert.ok(renderTwo.rows[1]!.includes("run-stale failed"));
+    assert.equal(renderTwo.text.includes("Old worker"), false, "Internal rows must be hidden by default");
+    assert.ok(renderTwo.text.includes("d dismiss") && renderTwo.text.includes("D clear stale") && renderTwo.text.includes("i show internal"));
 
     // 3. Press "d" on the selected shown item -> sends inbox.dismiss
     workNav.handleInput("d", ctx);
     await new Promise((r) => setTimeout(r, 20));
     const dismissCall = mock.calls.find((c) => c.op === "inbox.dismiss");
     assert.deepEqual(dismissCall?.params, {
-      itemId: shownItem.id,
-      itemCreatedAt: shownItem.createdAt,
+      itemId: shownEsc.id,
+      itemCreatedAt: shownEsc.createdAt,
     });
 
-    // 4. Press "i" -> reveals internal rows with hidden reason in DETAIL; tab count stays 1; state lives on WorkStore
+    // 4. Snapshot shrinks to 1 human row -> badge count and rendered row count update together to 1
+    currentSnap = { ...currentSnap, latestSeq: 2, inbox: [shownRun] };
+    await store.refresh();
+    const renderOne = parseInboxRender(workNav.render(120, 24, theme));
+    assert.equal(renderOne.badgeCount, 1);
+    assert.equal(renderOne.rows.length, renderOne.badgeCount);
+    assert.ok(renderOne.rows[0]!.includes("run-stale failed"));
+    assert.equal(renderOne.text.includes("Need production sign-off"), false);
+
+    // 5. Press "i" -> reveals internal rows with hidden reason in DETAIL; tab count stays 1; state lives on WorkStore
     workNav.handleInput("i", ctx);
     assert.equal(store.showInternal, true);
-    const withInternalRender = workNav.render(120, 24, theme).map(stripTerminalSequences).join("\n");
-    assert.ok(withInternalRender.includes("1:Inbox (1)"), "Tab count must remain snap.inbox.length when internal items are shown");
-    assert.ok(withInternalRender.includes("Old worker"));
-    assert.ok(withInternalRender.includes("[run_live"));
-    assert.ok(withInternalRender.includes("[dismissed"));
-    assert.ok(withInternalRender.includes("i hide internal"));
+    const withInternal = parseInboxRender(workNav.render(120, 24, theme));
+    assert.equal(withInternal.badgeCount, 1, "Tab count must remain snap.inbox.length when internal items are shown");
+    assert.equal(withInternal.rows.length, 3);
+    assert.ok(withInternal.rows[0]!.includes("run-stale failed"));
+    assert.ok(withInternal.rows[1]!.includes("Old worker") && withInternal.rows[1]!.includes("[run_live"));
+    assert.ok(withInternal.rows[2]!.includes("run-prev failed") && withInternal.rows[2]!.includes("[dismissed"));
+    assert.ok(withInternal.text.includes("i hide internal"));
 
-    // 5. Move down to the dismissed row and press "d" -> sends inbox.restore
+    // 6. Move down to the dismissed row and press "d" -> sends inbox.restore
     workNav.handleInput("j", ctx); // -> internalTask
     workNav.handleInput("j", ctx); // -> dismissedItem
     workNav.handleInput("d", ctx);
@@ -163,22 +206,40 @@ describe("WorkNavigatorScreen inbox defaults and actions", () => {
     const restoreCall = mock.calls.find((c) => c.op === "inbox.restore");
     assert.deepEqual(restoreCall?.params, { itemId: dismissedItem.id });
 
-    // 6. Press "D" -> confirm with "y" -> sends inbox.clear_stale with store scope
+    // 7. Press "D" -> no RPC before confirmation, none after cancel, sends inbox.clear_stale only after confirm
+    workNav.handleInput("D", ctx);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(mock.calls.filter((c) => c.op === "inbox.clear_stale").length, 0, "D must not clear before confirm");
+    workNav.handleInput("n", ctx);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(mock.calls.filter((c) => c.op === "inbox.clear_stale").length, 0, "Cancelling D must not call inbox.clear_stale");
+
     workNav.handleInput("D", ctx);
     workNav.handleInput("y", ctx);
     await new Promise((r) => setTimeout(r, 20));
-    const clearCall = mock.calls.find((c) => c.op === "inbox.clear_stale");
-    assert.deepEqual(clearCall?.params, { chatSessionId: "chat-1", repoRoot: "/repo" });
+    const clearCalls = mock.calls.filter((c) => c.op === "inbox.clear_stale");
+    assert.equal(clearCalls.length, 1);
+    assert.deepEqual(clearCalls[0]?.params, { chatSessionId: "chat-1", repoRoot: "/repo" });
 
-    // 7. Reopening WorkNavigatorScreen preserves showInternal on WorkStore; empty state mentions "i" when hidden internal items exist
+    // 8. Reopening a new WorkNavigatorScreen on the same store preserves showInternal=true
     nav.pop();
-    store.showInternal = false;
-    currentSnap = { ...currentSnap, inbox: [] };
-    await store.refresh();
     const reopened = new WorkNavigatorScreen(deps, "inbox");
     nav.push(reopened);
-    const emptyRender = reopened.render(120, 24, theme).map(stripTerminalSequences).join("\n");
-    assert.ok(emptyRender.includes("press 'i' to show"), "Empty inbox text must mention 'i' when internal items exist");
+    assert.equal(store.showInternal, true);
+    const reopenedWithInternal = parseInboxRender(reopened.render(120, 24, theme));
+    assert.equal(reopenedWithInternal.rows.length, 3);
+    assert.ok(reopenedWithInternal.text.includes("Old worker"));
+    assert.ok(reopenedWithInternal.text.includes("i hide internal"));
+
+    // 9. Toggling internal off and emptying inbox drops badge and rendered rows to 0 and shows the 'i' hint
+    reopened.handleInput("i", ctx);
+    assert.equal(store.showInternal, false);
+    currentSnap = { ...currentSnap, latestSeq: 3, inbox: [] };
+    await store.refresh();
+    const emptyRender = parseInboxRender(reopened.render(120, 24, theme));
+    assert.equal(emptyRender.badgeCount, 0);
+    assert.equal(emptyRender.rows.length, 0);
+    assert.ok(emptyRender.text.includes("press 'i' to show"), "Empty inbox text must mention 'i' when internal items exist");
 
     store.dispose();
   });

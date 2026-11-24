@@ -400,13 +400,110 @@ describe("classifyAttention policy", () => {
     assert.equal(byId.get("inbox:esc:esc-newest-resolved")?.hiddenReason, "not_open");
   });
 
-  it("hides auto quota pause, goal-linked failed run, container run, task rows, live/goal/remerged bounces, and open messages", () => {
+  it("does not let a dismissed newest escalation supersede an older eligible escalation of the same goal and category", () => {
+    const goal = makeGoal({ id: "goal-1", status: "executing", linkedRunId: "run-1" });
+    const worker = makeTask({ id: "t-1", runId: "run-1", status: "running" });
+
+    const oldest = makeEscalation({
+      id: "esc-oldest",
+      fromTaskId: worker.id,
+      severity: "P0",
+      category: "blocked_dependency",
+      createdAt: 1_000,
+    });
+    const older = makeEscalation({
+      id: "esc-older",
+      fromTaskId: worker.id,
+      severity: "P0",
+      category: "blocked_dependency",
+      createdAt: 2_000,
+    });
+    const newest = makeEscalation({
+      id: "esc-newest",
+      fromTaskId: worker.id,
+      severity: "P0",
+      category: "blocked_dependency",
+      createdAt: 3_000,
+    });
+
+    const res = classifyAttention(
+      makeInput({
+        goals: [goal],
+        runs: [
+          runEntry({
+            run: { id: "run-1", status: "active" },
+            goalId: goal.id,
+            tasks: [worker],
+            escalations: [oldest, older, newest],
+          }),
+        ],
+        dismissals: new Map([["inbox:esc:esc-newest", 3_000]]),
+      }),
+    );
+
+    assert.deepEqual(
+      res.inbox.map((i) => i.id),
+      ["inbox:esc:esc-older"],
+    );
+    const byId = new Map(res.internalAttention.map((i) => [i.id, i]));
+    assert.equal(byId.get("inbox:esc:esc-newest")?.hiddenReason, "dismissed");
+    assert.equal(byId.get("inbox:esc:esc-newest")?.audience, "human");
+    assert.equal(byId.get("inbox:esc:esc-oldest")?.hiddenReason, "superseded");
+    assert.equal(byId.get("inbox:esc:esc-oldest")?.audience, "none");
+  });
+
+  it("shows manual quota pause and hides auto_timer and user_timer pauses with auto_resume", () => {
+    const res = classifyAttention(
+      makeInput({
+        runs: [
+          runEntry({
+            run: { id: "run-manual-q", status: "paused_quota", updatedAt: 3_000 },
+            goalId: null,
+            quotaPause: { mode: "manual", reason: "429 manual intervention", resumeAt: null },
+          }),
+          runEntry({
+            run: { id: "run-auto-timer-q", status: "paused_quota", updatedAt: 2_000 },
+            goalId: null,
+            quotaPause: { mode: "auto_timer", reason: "quota reset timer", resumeAt: 99_999 },
+          }),
+          runEntry({
+            run: { id: "run-user-timer-q", status: "paused_quota", updatedAt: 1_000 },
+            goalId: null,
+            quotaPause: { mode: "user_timer", reason: "user wait timer", resumeAt: 88_888 },
+          }),
+        ],
+      }),
+    );
+
+    assert.deepEqual(
+      res.inbox.map((i) => i.id),
+      ["inbox:quota:run-manual-q"],
+    );
+    const byId = new Map(res.internalAttention.map((i) => [i.id, i]));
+    assert.equal(byId.get("inbox:quota:run-auto-timer-q")?.hiddenReason, "auto_resume");
+    assert.equal(byId.get("inbox:quota:run-auto-timer-q")?.audience, "none");
+    assert.equal(byId.get("inbox:quota:run-user-timer-q")?.hiddenReason, "auto_resume");
+    assert.equal(byId.get("inbox:quota:run-user-timer-q")?.audience, "none");
+  });
+
+  it("hides timer quota pauses, goal-linked failed run, container run/merges, task rows, live/goal/remerged bounces, and open messages", () => {
     const goal = makeGoal({ id: "goal-1", status: "executing", linkedRunId: "run-goal-fail" });
     const goalSettled = makeGoal({ id: "goal-2", status: "paused", linkedRunId: "run-goal-settled" });
 
     const blockedActiveTask = makeTask({ id: "t-blk-active", runId: "run-live", status: "blocked" });
     const failedActiveTask = makeTask({ id: "t-fail-active", runId: "run-live", status: "failed" });
     const blockedSettledTask = makeTask({ id: "t-blk-settled", runId: "run-settled", status: "blocked" });
+    const resumedT1 = makeTask({ id: "t-resumed-t1", runId: "run-resumed", tier: 1, kind: "orchestrator", status: "running", generation: 2 });
+    const failedPriorChild = makeTask({ id: "t-resumed-fail", runId: "run-resumed", parentId: resumedT1.id, status: "failed" });
+    const containerBounce = makeMerge({
+      id: "mq-container",
+      runId: "director-tasks-chat-1",
+      taskId: "t-bucket",
+      branch: "harness/director-tasks-chat-1/t-bucket",
+      status: "conflict",
+      createdAt: 1_500,
+      finishedAt: 1_600,
+    });
 
     const res = classifyAttention(
       makeInput({
@@ -415,21 +512,35 @@ describe("classifyAttention policy", () => {
           runEntry({
             run: { id: "run-auto-q", status: "paused_quota" },
             goalId: null,
-            quotaPause: { mode: "auto", reason: "auto wait", resumeAt: 99_999 },
+            quotaPause: { mode: "auto_timer", reason: "auto wait", resumeAt: 99_999 },
+          }),
+          runEntry({
+            run: { id: "run-user-q", status: "paused_quota" },
+            goalId: null,
+            quotaPause: { mode: "user_timer", reason: "user wait", resumeAt: 88_888 },
           }),
           runEntry({
             run: { id: "run-goal-fail", status: "failed" },
             goalId: goal.id,
           }),
           runEntry({
-            run: { id: "director-tasks-chat-1", status: "failed" },
+            run: { id: "director-tasks-chat-1", status: "completed" },
             goalId: null,
             tasks: [makeTask({ id: "t-bucket", runId: "director-tasks-chat-1", status: "blocked" })],
+          }),
+          runEntry({
+            run: { id: "director-tasks-chat-2", status: "failed" },
+            goalId: null,
           }),
           runEntry({
             run: { id: "run-live", status: "active" },
             goalId: null,
             tasks: [blockedActiveTask, failedActiveTask],
+          }),
+          runEntry({
+            run: { id: "run-resumed", status: "active" },
+            goalId: null,
+            tasks: [resumedT1, failedPriorChild],
           }),
           runEntry({
             run: { id: "run-settled", status: "completed" },
@@ -442,12 +553,16 @@ describe("classifyAttention policy", () => {
           }),
         ],
         merges: [
+          containerBounce,
           makeMerge({ id: "mq-live", runId: "run-live", taskId: "t-live", branch: "harness/run-live/t-live", status: "ci_failed", createdAt: 1_000 }),
+          makeMerge({ id: "mq-paused-quota", runId: "run-auto-q", taskId: "t-pq", branch: "harness/run-auto-q/t-pq", status: "conflict", createdAt: 1_000 }),
           makeMerge({ id: "mq-goal", runId: "run-goal-settled", taskId: "t-g", branch: "harness/run-goal-settled/t-g", status: "conflict", createdAt: 1_000 }),
           makeMerge({ id: "mq-remerged-branch", runId: "run-settled", taskId: "t-r1", branch: "harness/run-settled/shared", status: "ci_failed", createdAt: 1_000, finishedAt: 1_100 }),
           makeMerge({ id: "mq-remerged-branch-ok", runId: "run-settled", taskId: "t-r1-retry", branch: "harness/run-settled/shared", status: "merged", createdAt: 2_000, finishedAt: 2_100 }),
           makeMerge({ id: "mq-remerged-task", runId: "run-settled", taskId: "t-r2", branch: "harness/run-settled/old", status: "conflict", createdAt: 1_000, finishedAt: 1_100 }),
           makeMerge({ id: "mq-remerged-task-queued", runId: "run-settled", taskId: "t-r2", branch: "harness/run-settled/new", status: "queued", createdAt: 2_000, finishedAt: null }),
+          makeMerge({ id: "mq-remerged-running", runId: "run-settled", taskId: "t-r3", branch: "harness/run-settled/run-retry", status: "ci_failed", createdAt: 1_000, finishedAt: 1_100 }),
+          makeMerge({ id: "mq-remerged-running-now", runId: "run-settled", taskId: "t-r3", branch: "harness/run-settled/run-retry", status: "running", createdAt: 2_000, finishedAt: null }),
         ],
         messages: [makeMessage({ id: "msg-open", runId: "run-live", status: "open" })],
       }),
@@ -457,61 +572,135 @@ describe("classifyAttention policy", () => {
     const byId = new Map(res.internalAttention.map((i) => [i.id, i]));
     assert.equal(byId.get("inbox:quota:run-auto-q")?.hiddenReason, "auto_resume");
     assert.equal(byId.get("inbox:quota:run-auto-q")?.audience, "none");
+    assert.equal(byId.get("inbox:quota:run-user-q")?.hiddenReason, "auto_resume");
+    assert.equal(byId.get("inbox:quota:run-user-q")?.audience, "none");
     assert.equal(byId.get("inbox:run:run-goal-fail")?.hiddenReason, "covered_by_goal");
     assert.equal(byId.get("inbox:run:run-goal-fail")?.audience, "director");
-    assert.equal(byId.has("inbox:run:director-tasks-chat-1"), false);
+    assert.equal(byId.has("inbox:run:director-tasks-chat-2"), false);
     assert.equal(byId.has("inbox:task:t-bucket"), false);
+    assert.equal(byId.get("inbox:merge:mq-container")?.hiddenReason, "director_container");
+    assert.equal(byId.get("inbox:merge:mq-container")?.audience, "director");
     assert.equal(byId.get("inbox:task:t-blk-active")?.hiddenReason, "run_live");
     assert.equal(byId.get("inbox:task:t-blk-active")?.audience, "orchestrator");
     assert.equal(byId.get("inbox:task:t-fail-active")?.hiddenReason, "run_live");
+    assert.equal(byId.get("inbox:task:t-resumed-fail")?.hiddenReason, "run_live");
+    assert.equal(byId.get("inbox:task:t-resumed-fail")?.audience, "orchestrator");
     assert.equal(byId.get("inbox:task:t-blk-settled")?.hiddenReason, "covered_by_run_or_goal");
     assert.equal(byId.get("inbox:merge:mq-live")?.hiddenReason, "run_live");
+    assert.equal(byId.get("inbox:merge:mq-paused-quota")?.hiddenReason, "run_live");
+    assert.equal(byId.get("inbox:merge:mq-paused-quota")?.audience, "orchestrator");
     assert.equal(byId.get("inbox:merge:mq-goal")?.hiddenReason, "covered_by_goal");
     assert.equal(byId.get("inbox:merge:mq-remerged-branch")?.hiddenReason, "remerged");
     assert.equal(byId.get("inbox:merge:mq-remerged-task")?.hiddenReason, "remerged");
+    assert.equal(byId.get("inbox:merge:mq-remerged-running")?.hiddenReason, "remerged");
     assert.equal(byId.get("inbox:msg:msg-open")?.hiddenReason, "agent_to_agent");
     assert.equal(byId.get("inbox:msg:msg-open")?.audience, "none");
+
+    assert.deepEqual(
+      evaluateAttentionVerdict({
+        kind: "merge_bounced",
+        merge: containerBounce,
+        run: makeRun({ id: "director-tasks-chat-1", status: "completed" }),
+        goalId: null,
+        remerged: false,
+      }),
+      { audience: "director", reason: "director_container" },
+    );
   });
 
-  it("hides dismissed items while preserving audience, and resurfaces them when createdAt is newer", () => {
-    const failedRunOld = runEntry({
-      run: { id: "run-d1", status: "failed", updatedAt: 5_000 },
+  it("keeps a bounce visible when the only successful merge on that branch/task is older than the bounce", () => {
+    const settledRun = runEntry({
+      run: { id: "run-settled", status: "completed", updatedAt: 4_000 },
       goalId: null,
     });
-    const failedRunNewer = runEntry({
-      run: { id: "run-d2", status: "failed", updatedAt: 6_000 },
+    const olderSuccess = makeMerge({
+      id: "mq-older-ok",
+      runId: "run-settled",
+      taskId: "t-1",
+      branch: "harness/run-settled/t-1",
+      status: "merged",
+      createdAt: 1_000,
+      finishedAt: 1_100,
+    });
+    const laterBounce = makeMerge({
+      id: "mq-later-bounce",
+      runId: "run-settled",
+      taskId: "t-1",
+      branch: "harness/run-settled/t-1",
+      status: "conflict",
+      createdAt: 2_000,
+      finishedAt: 2_100,
+    });
+
+    const res = classifyAttention(
+      makeInput({
+        runs: [settledRun],
+        merges: [olderSuccess, laterBounce],
+      }),
+    );
+
+    assert.deepEqual(
+      res.inbox.map((i) => i.id),
+      ["inbox:merge:mq-later-bounce"],
+    );
+    assert.equal(res.internalAttention.length, 0);
+  });
+
+  it("hides dismissed items when watermark is equal or greater, preserves audience, and resurfaces at createdAt = watermark + 1", () => {
+    const failedRunEqual = runEntry({
+      run: { id: "run-d-eq", status: "failed", updatedAt: 5_000 },
+      goalId: null,
+    });
+    const failedRunOlderThanWatermark = runEntry({
+      run: { id: "run-d-gt", status: "failed", updatedAt: 5_000 },
+      goalId: null,
+    });
+    const failedRunOneNewer = runEntry({
+      run: { id: "run-d-plus1", status: "failed", updatedAt: 5_001 },
       goalId: null,
     });
     const dismissals = new Map<string, number>([
-      ["inbox:run:run-d1", 5_000],
-      ["inbox:run:run-d2", 5_500],
+      ["inbox:run:run-d-eq", 5_000],
+      ["inbox:run:run-d-gt", 5_001],
+      ["inbox:run:run-d-plus1", 5_000],
     ]);
 
     const res = classifyAttention(
       makeInput({
-        runs: [failedRunOld, failedRunNewer],
+        runs: [failedRunEqual, failedRunOlderThanWatermark, failedRunOneNewer],
         dismissals,
       }),
     );
 
     assert.deepEqual(
       res.inbox.map((i) => i.id),
-      ["inbox:run:run-d2"],
+      ["inbox:run:run-d-plus1"],
     );
-    assert.equal(res.internalAttention.length, 1);
-    assert.equal(res.internalAttention[0]!.id, "inbox:run:run-d1");
-    assert.equal(res.internalAttention[0]!.audience, "human");
-    assert.equal(res.internalAttention[0]!.hiddenReason, "dismissed");
+    const byId = new Map(res.internalAttention.map((i) => [i.id, i]));
+    assert.equal(res.internalAttention.length, 2);
+    assert.equal(byId.get("inbox:run:run-d-eq")?.audience, "human");
+    assert.equal(byId.get("inbox:run:run-d-eq")?.hiddenReason, "dismissed");
+    assert.equal(byId.get("inbox:run:run-d-gt")?.audience, "human");
+    assert.equal(byId.get("inbox:run:run-d-gt")?.hiddenReason, "dismissed");
 
     // Per-item verdict function agrees directly
     assert.deepEqual(
       evaluateAttentionVerdict({
         kind: "run_failed",
-        run: failedRunOld.run,
+        run: failedRunEqual.run,
         goalId: null,
         dismissedItemCreatedAt: 5_000,
       }),
       { audience: "human", reason: "dismissed" },
+    );
+    assert.deepEqual(
+      evaluateAttentionVerdict({
+        kind: "run_failed",
+        run: failedRunOneNewer.run,
+        goalId: null,
+        dismissedItemCreatedAt: 5_000,
+      }),
+      { audience: "human" },
     );
   });
 });

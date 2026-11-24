@@ -2710,8 +2710,11 @@ export class ControlPlaneDb {
         `INSERT INTO inbox_dismissals(item_id, item_created_at, dismissed_at)
          VALUES (?, ?, ?)
          ON CONFLICT(item_id) DO UPDATE SET
-           item_created_at = excluded.item_created_at,
-           dismissed_at = excluded.dismissed_at`,
+           item_created_at = MAX(inbox_dismissals.item_created_at, excluded.item_created_at),
+           dismissed_at = CASE
+             WHEN excluded.item_created_at >= inbox_dismissals.item_created_at THEN excluded.dismissed_at
+             ELSE inbox_dismissals.dismissed_at
+           END`,
       )
       .run(itemId, itemCreatedAt, dismissedAt);
   }
