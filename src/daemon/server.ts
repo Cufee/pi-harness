@@ -4276,7 +4276,7 @@ export class HarnessDaemon {
           if (!sess) throw new Error(`Unknown chat session ${chatSessionId}`);
           repoRoot = sess.repoRoot;
         }
-        return this.director.resolveEscalation({
+        return await this.director.resolveEscalation({
           escalationId,
           reason: rawReason,
           chatSessionId,
