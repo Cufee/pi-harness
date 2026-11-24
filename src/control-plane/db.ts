@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import { basename, dirname, relative } from "node:path";
 import { Database } from "bun:sqlite";
 import { AdmissionQueue } from "./admission-queue.js";
 import { advanceSequenceFloor, friendlyIdCandidates, nextFriendlyId, nextSequenceValue } from "./ids.js";
@@ -8,6 +8,80 @@ import { ProjectStore } from "./projects.js";
 import { SessionMessageStore } from "./session-messages.js";
 import { TimerManager } from "./timers.js";
 import { KnowledgeBaseStore } from "../kb/store.js";
+
+export const SUMMARY_LIMIT = 2000;
+
+export interface FallbackGitSummary {
+  head?: string;
+  branch?: string;
+  committed?: string;
+  uncommitted?: string;
+  status?: string[];
+}
+
+export function formatFallbackSummary(input: {
+  repoRoot: string;
+  reason: string;
+  wtPath: string | null;
+  git: FallbackGitSummary;
+  paths: string[];
+  outputPath: string | null;
+  text: string;
+  excerptLimit: number;
+}): { summary: string; outputClipped: boolean } {
+  const { repoRoot, reason, wtPath, git, paths, outputPath, text, excerptLimit } = input;
+  const header = `[Partial handoff: task ended without return_task (${reason}); unverified, synthesized by the harness]`;
+  const gitLine = wtPath
+    ? `Git: ${git.branch ?? "?"} @ ${git.head?.slice(0, 12) ?? "?"}; committed since base: ${git.committed ?? "unknown"}; ` +
+      `uncommitted: ${git.uncommitted ?? "unknown"}${git.status?.length ? ` (${git.status.length} changed path(s))` : ""}`
+    : "Git: no worktree";
+  const displayPaths = paths.slice(0, 5).map((p) => {
+    const rel = relative(repoRoot, p);
+    return rel && !rel.startsWith("..") ? rel : p;
+  });
+  const more = paths.length > 5 ? `, +${paths.length - 5} more` : "";
+  const artLine = paths.length
+    ? `Artifacts: ${paths.length} indexed: ${displayPaths.join(", ")}${more}`
+    : "Artifacts: 0 indexed";
+  const pointer = outputPath ? `\n[Full output: ${relative(repoRoot, outputPath)}]` : "";
+  const fixed = `${header}\n${gitLine}\n${artLine}\nFinal output (unstructured excerpt):\n`;
+  const budget = Math.max(0, Math.min(excerptLimit, SUMMARY_LIMIT - fixed.length - pointer.length));
+  const outputClipped = Boolean(text) && text.length > budget;
+  const excerpt = !text ? "(no final output)" : !outputClipped ? text : `…${text.slice(-(budget - 1))}`;
+  return {
+    summary: `${fixed}${excerpt}${pointer}`.slice(0, SUMMARY_LIMIT),
+    outputClipped,
+  };
+}
+
+export function buildMinimalFallbackResultJson(input: {
+  repoRoot: string;
+  status: "failed" | "cancelled" | "blocked";
+  reason: string;
+  artifactPaths: string[];
+}): string {
+  const { summary: fallbackSummary, outputClipped } = formatFallbackSummary({
+    repoRoot: input.repoRoot,
+    reason: input.reason,
+    wtPath: null,
+    git: {},
+    paths: input.artifactPaths,
+    outputPath: null,
+    text: "",
+    excerptLimit: 1200,
+  });
+  return JSON.stringify({
+    status: input.status,
+    fallback: {
+      reason: input.reason,
+      wrap_up_attempted: false,
+      partial: true,
+      output_truncated: outputClipped,
+      summary: fallbackSummary,
+      artifact_paths: input.artifactPaths,
+    },
+  });
+}
 
 /** A requested write scope overlaps an active lease on the same (repo root, target branch). */
 export class WriteScopeConflictError extends Error {
@@ -1311,6 +1385,7 @@ export class ControlPlaneDb {
     const queue = [failedTaskId];
     const visited = new Set<string>([failedTaskId]);
     const now = Date.now();
+    const run = this.getRun(runId);
     while (queue.length > 0) {
       const depId = queue.shift()!;
       const dependents = this.db
@@ -1322,9 +1397,31 @@ export class ControlPlaneDb {
         const target = this.getTask(task_id);
         if (!target || target.status !== "pending") continue;
         const summary = `Cancelled because dependency ${failedTaskId} ended with status '${reasonStatus}'`;
-        this.db
-          .prepare("UPDATE tasks SET status = 'cancelled', summary = ?, updated_at = ? WHERE id = ? AND status = 'pending'")
-          .run(summary, now, task_id);
+        let resultJson: string | null = null;
+        if (target.tier !== 1 && run) {
+          let artifactPaths: string[] = [];
+          try {
+            artifactPaths = this.listArtifacts(run.id, task_id, 50).map((a) => a.path).slice(0, 20);
+          } catch {
+            artifactPaths = [];
+          }
+          resultJson = buildMinimalFallbackResultJson({
+            repoRoot: run.repoRoot,
+            status: "cancelled",
+            reason: `cancelled: dependency ${failedTaskId} ended with status '${reasonStatus}'`,
+            artifactPaths,
+          });
+        }
+        const update = resultJson !== null
+          ? this.db
+              .prepare(
+                "UPDATE tasks SET status = 'cancelled', summary = ?, result_json = ?, updated_at = ? WHERE id = ? AND status = 'pending'",
+              )
+              .run(summary, resultJson, now, task_id)
+          : this.db
+              .prepare("UPDATE tasks SET status = 'cancelled', summary = ?, updated_at = ? WHERE id = ? AND status = 'pending'")
+              .run(summary, now, task_id);
+        if (update.changes === 0) continue;
         this.db.prepare("UPDATE write_leases SET active = 0 WHERE task_id = ?").run(task_id);
         this.emitEvent(runId, task_id, "task.status", { from: "pending", to: "cancelled", summary });
         queue.push(task_id);

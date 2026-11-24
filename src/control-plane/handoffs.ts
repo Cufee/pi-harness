@@ -1,55 +1,21 @@
-import { relative } from "node:path";
-import type { ControlPlaneDb, EscalationRecord, TaskKind, TaskRecord } from "./db.js";
+import {
+  buildMinimalFallbackResultJson,
+  formatFallbackSummary,
+  SUMMARY_LIMIT,
+  type ControlPlaneDb,
+  type EscalationRecord,
+  type FallbackGitSummary,
+  type TaskKind,
+  type TaskRecord,
+} from "./db.js";
+
+export { formatFallbackSummary, SUMMARY_LIMIT, type FallbackGitSummary };
 
 export function isReadOnlyKind(kind: string): kind is "research" | "plan" | "verify" {
   return kind === "research" || kind === "plan" || kind === "verify";
 }
 
-export const SUMMARY_LIMIT = 2000;
 type TaskSource = { path: string; lines?: string; symbol?: string; note?: string };
-
-export interface FallbackGitSummary {
-  head?: string;
-  branch?: string;
-  committed?: string;
-  uncommitted?: string;
-  status?: string[];
-}
-
-export function formatFallbackSummary(input: {
-  repoRoot: string;
-  reason: string;
-  wtPath: string | null;
-  git: FallbackGitSummary;
-  paths: string[];
-  outputPath: string | null;
-  text: string;
-  excerptLimit: number;
-}): { summary: string; outputClipped: boolean } {
-  const { repoRoot, reason, wtPath, git, paths, outputPath, text, excerptLimit } = input;
-  const header = `[Partial handoff: task ended without return_task (${reason}); unverified, synthesized by the harness]`;
-  const gitLine = wtPath
-    ? `Git: ${git.branch ?? "?"} @ ${git.head?.slice(0, 12) ?? "?"}; committed since base: ${git.committed ?? "unknown"}; ` +
-      `uncommitted: ${git.uncommitted ?? "unknown"}${git.status?.length ? ` (${git.status.length} changed path(s))` : ""}`
-    : "Git: no worktree";
-  const displayPaths = paths.slice(0, 5).map((p) => {
-    const rel = relative(repoRoot, p);
-    return rel && !rel.startsWith("..") ? rel : p;
-  });
-  const more = paths.length > 5 ? `, +${paths.length - 5} more` : "";
-  const artLine = paths.length
-    ? `Artifacts: ${paths.length} indexed: ${displayPaths.join(", ")}${more}`
-    : "Artifacts: 0 indexed";
-  const pointer = outputPath ? `\n[Full output: ${relative(repoRoot, outputPath)}]` : "";
-  const fixed = `${header}\n${gitLine}\n${artLine}\nFinal output (unstructured excerpt):\n`;
-  const budget = Math.max(0, Math.min(excerptLimit, SUMMARY_LIMIT - fixed.length - pointer.length));
-  const outputClipped = Boolean(text) && text.length > budget;
-  const excerpt = !text ? "(no final output)" : !outputClipped ? text : `…${text.slice(-(budget - 1))}`;
-  return {
-    summary: `${fixed}${excerpt}${pointer}`.slice(0, SUMMARY_LIMIT),
-    outputClipped,
-  };
-}
 
 /**
  * Synchronously settles a task to a terminal status. For non-Tier-1 tasks, writes a minimal
@@ -79,29 +45,14 @@ export function settleTaskMinimalFallback(
   } catch {
     artifactPaths = [];
   }
-  const { summary: fallbackSummary, outputClipped } = formatFallbackSummary({
-    repoRoot: run.repoRoot,
-    reason,
-    wtPath: null,
-    git: {},
-    paths: artifactPaths,
-    outputPath: null,
-    text: "",
-    excerptLimit: 1200,
-  });
   db.updateTask(task.id, {
     status,
     summary,
-    resultJson: JSON.stringify({
+    resultJson: buildMinimalFallbackResultJson({
+      repoRoot: run.repoRoot,
       status,
-      fallback: {
-        reason,
-        wrap_up_attempted: false,
-        partial: true,
-        output_truncated: outputClipped,
-        summary: fallbackSummary,
-        artifact_paths: artifactPaths,
-      },
+      reason,
+      artifactPaths,
     }),
   });
 }
