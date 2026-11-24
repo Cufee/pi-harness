@@ -5,6 +5,7 @@ export * from "./layout.js";
 export * from "./viewport.js";
 export * from "./list.js";
 export * from "./frame.js";
+export * from "./selection.js";
 export { type Hint, renderHintBar, yankText, RecentRefsRing } from "./keymap.js";
 export type { EntityRef as TuiEntityRef } from "./keymap.js";
 export * from "./navigator.js";

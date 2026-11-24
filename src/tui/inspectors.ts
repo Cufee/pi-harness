@@ -1499,9 +1499,9 @@ class ArtifactInspectorScreen implements Screen {
     });
   }
 
-  handleMouse(ev: OverlayMouseEvent, ctx: ScreenContext): void {
+  handleMouse(ev: OverlayMouseEvent, ctx: ScreenContext): void | boolean {
     const rect = this.frame.bodyRect;
-    if (!rect || this.frame.hasInlineModal || !this.showingView) return;
+    if (!rect || this.frame.hasInlineModal || !this.showingView) return false;
     const localX = ev.x - rect.col;
     const localY = ev.y - rect.row;
     if (ev.type === "press" && (localX < 0 || localX >= rect.width || localY < 0 || localY >= rect.height)) return;

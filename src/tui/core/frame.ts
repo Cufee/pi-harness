@@ -79,12 +79,38 @@ export interface FrameBodyRect {
   height: number;
 }
 
+export interface FrameTextRegion {
+  col: number;
+  width: number;
+  rows: number[];
+  bodyRows: number[];
+}
+
+let capturedFrame: Frame | null = null;
+let capturingFrame = false;
+
+/** Begins capturing the last `Frame` whose `render()` runs during a synchronous overlay render. */
+export function beginFrameCapture(): void {
+  capturedFrame = null;
+  capturingFrame = true;
+}
+
+/** Ends frame capture and returns the captured `Frame`, if any. */
+export function endFrameCapture(): Frame | null {
+  const frame = capturedFrame;
+  capturedFrame = null;
+  capturingFrame = false;
+  return frame;
+}
+
 export class Frame {
   private confirmState: FrameConfirm | null = null;
   private promptState: { spec: FramePrompt; input: Input } | null = null;
   private notice: { text: string; tone: Tone } | null = null;
   /** Overlay-local bounds of the rendered body area from the most recent `render()`. */
   bodyRect: FrameBodyRect | null = null;
+  /** Overlay-local selectable text rows (header, subtitle, body, inline/notice) from the most recent `render()`. */
+  textRegion: FrameTextRegion | null = null;
 
   get hasInlineModal(): boolean {
     return this.confirmState !== null || this.promptState !== null;
@@ -217,11 +243,13 @@ export class Frame {
     const headerLine = splitRow(crumbText, opts.rightHeader ?? "", innerW);
 
     const out: string[] = [topBorder, boxRow(headerLine)];
+    const textRows: number[] = [1];
 
     const hasSubtitle = Boolean(opts.subtitle);
     const hasTabs = Boolean(opts.tabs && opts.tabs.length > 0);
 
     if (opts.subtitle) {
+      textRows.push(out.length);
       out.push(boxRow(theme.muted(sanitizeLine(opts.subtitle))));
     }
 
@@ -248,8 +276,12 @@ export class Frame {
 
     const bodyRow = out.length;
     const bodyLines = opts.renderBody(innerW, availBody).slice(0, availBody);
+    const bodyRows: number[] = [];
     for (const line of bodyLines) {
+      const idx = out.length;
       out.push(boxRow(line));
+      textRows.push(idx);
+      bodyRows.push(idx);
     }
     if (bodyLines.length === 0) out.push(boxRow(""));
     this.bodyRect = {
@@ -263,6 +295,7 @@ export class Frame {
 
     if (this.confirmState) {
       const label = this.confirmState.confirmLabel ?? "y/Enter confirm · n/Esc cancel";
+      textRows.push(out.length);
       out.push(boxRow(theme.warn(`${g.warn} ${sanitizeLine(this.confirmState.message)}  [${label}]`)));
     } else if (this.promptState) {
       const lbl = theme.accentBold(`${this.promptState.spec.label}: `);
@@ -273,8 +306,10 @@ export class Frame {
       const reserve = visibleWidth(lbl) + visibleWidth(placeholder);
       const inpW = Math.max(4, innerW - reserve);
       const rendered = (this.promptState.input.render(inpW)[0] ?? "").replace(/^>\s?/, "").trimEnd();
+      textRows.push(out.length);
       out.push(boxRow(clamp(`${lbl}${rendered}${placeholder}`, innerW)));
     } else if (this.notice) {
+      textRows.push(out.length);
       out.push(boxRow(theme.paint(this.notice.tone, this.notice.text)));
     }
 
@@ -294,6 +329,16 @@ export class Frame {
 
     out.push(boxRow(renderHintBar(footerHints, innerW, theme)));
     out.push(botBorder);
-    return out.slice(0, maxH);
+    const rendered = out.slice(0, maxH);
+    this.textRegion = {
+      col: 1 + padX,
+      width: innerW,
+      rows: textRows.filter((r) => r < rendered.length),
+      bodyRows: bodyRows.filter((r) => r < rendered.length),
+    };
+    if (capturingFrame) {
+      capturedFrame = this;
+    }
+    return rendered;
   }
 }

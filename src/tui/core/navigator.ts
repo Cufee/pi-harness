@@ -7,6 +7,16 @@ import {
   type Terminal,
   TuiMainScreen,
 } from "@earendil-works/pi-tui";
+import { beginFrameCapture, endFrameCapture, type Frame, type FrameTextRegion } from "./frame.js";
+import { yankText } from "./keymap.js";
+import {
+  type CellPoint,
+  extractSelectionText,
+  highlightCells,
+  normalizeSelection,
+  rowSelectionCols,
+} from "./selection.js";
+import { fillLineBg, sliceByColumn, stripTerminalSequences } from "./text.js";
 import type { Theme } from "./tokens.js";
 import { DISABLE_MOUSE_SEQ, ENABLE_MOUSE_SEQ, parseMouseEvents, type ScreenMouseEvent } from "./viewport.js";
 
@@ -123,7 +133,8 @@ export interface Screen {
   readonly variant?: "sheet" | "dialog";
   render(width: number, maxHeight: number, theme: Theme): string[];
   handleInput(data: string, ctx: ScreenContext): void;
-  handleMouse?(ev: OverlayMouseEvent, ctx: ScreenContext): void;
+  /** Optional custom mouse handler. Return `false` to fall through to default overlay selection. */
+  handleMouse?(ev: OverlayMouseEvent, ctx: ScreenContext): void | boolean;
   onShow?(ctx: ScreenContext): void;
   onClose?(): void;
 }
@@ -139,6 +150,57 @@ export function isPopKey(data: string, ctx: ScreenContext, opts?: { allowQ?: boo
   return false;
 }
 
+interface OverlaySelectionState {
+  anchor: CellPoint | null;
+  head: CellPoint | null;
+  dragging: boolean;
+  moved: boolean;
+  lines: string[];
+  frame: Frame | null;
+  width: number;
+}
+
+function nearestTextRowIndex(rows: readonly number[], y: number): number {
+  let bestIdx = 0;
+  let bestDist = Math.abs(rows[0]! - y);
+  for (let i = 1; i < rows.length; i++) {
+    const dist = Math.abs(rows[i]! - y);
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+
+function hasScrollbarCell(line: string, col: number, width: number, theme: Theme): boolean {
+  if (width < 6) return false;
+  const tail = stripTerminalSequences(sliceByColumn(line, col + width - 2, 2, true));
+  if (tail.length !== 2 || tail[0] !== " ") return false;
+  const ch = tail[1]!;
+  return ch === theme.glyphs.scrollThumb || ch === theme.glyphs.scrollTrack;
+}
+
+function detectScrollbarRows(
+  lines: readonly string[],
+  region: FrameTextRegion,
+  theme: Theme,
+): Set<number> {
+  const out = new Set<number>();
+  if (region.width < 6 || region.bodyRows.length === 0) return out;
+  const suffix: number[] = [];
+  for (let i = region.bodyRows.length - 1; i >= 0; i--) {
+    const lineIdx = region.bodyRows[i]!;
+    const line = lines[lineIdx] ?? "";
+    if (!hasScrollbarCell(line, region.col, region.width, theme)) break;
+    suffix.push(lineIdx);
+  }
+  if (suffix.length >= 2 || (suffix.length === 1 && region.bodyRows.length === 1)) {
+    for (const r of suffix) out.add(r);
+  }
+  return out;
+}
+
 function computeOverlayHeight(termRows: number, isDialog: boolean): number {
   const rows = Math.max(8, Math.floor(termRows || 30));
   const maxByMargin = Math.max(6, rows - 2);
@@ -151,6 +213,15 @@ export class Navigator {
   private mouseEnabled = false;
   private readonly hostComponent: Component;
   private readonly onChange?: () => void;
+  private readonly overlaySel: OverlaySelectionState = {
+    anchor: null,
+    head: null,
+    dragging: false,
+    moved: false,
+    lines: [],
+    frame: null,
+    width: 0,
+  };
 
   constructor(
     private readonly tui: ModalScreen,
@@ -163,8 +234,49 @@ export class Navigator {
       render: (width: number) => {
         const top = this.current;
         if (!top) return [];
+        if (this.overlaySel.width !== 0 && this.overlaySel.width !== width) {
+          this.clearOverlaySelection();
+        }
         const maxH = computeOverlayHeight(this.terminal.rows || 30, top.variant === "dialog");
-        return top.render(width, maxH, this.theme);
+        beginFrameCapture();
+        let rawLines: string[];
+        let capturedFrame: Frame | null = null;
+        try {
+          rawLines = top.render(width, maxH, this.theme);
+        } finally {
+          capturedFrame = endFrameCapture();
+        }
+        this.overlaySel.lines = rawLines;
+        this.overlaySel.frame = capturedFrame;
+        this.overlaySel.width = width;
+
+        if (!this.hasActiveSelection || !this.theme.color) {
+          return rawLines;
+        }
+        const region = capturedFrame?.textRegion;
+        if (!region || region.rows.length === 0 || region.width <= 0) {
+          return rawLines;
+        }
+        const sel = normalizeSelection("cell", this.overlaySel.anchor!, this.overlaySel.head!);
+        if (sel.startRow >= region.rows.length) {
+          return rawLines;
+        }
+        const scrollbarRows = detectScrollbarRows(rawLines, region, this.theme);
+        const out = [...rawLines];
+        const lastRow = Math.min(sel.endRow, region.rows.length - 1);
+        for (let r = sel.startRow; r <= lastRow; r++) {
+          const lineIdx = region.rows[r]!;
+          if (lineIdx < 0 || lineIdx >= out.length) continue;
+          const line = out[lineIdx]!;
+          const rowW = scrollbarRows.has(lineIdx) ? Math.max(1, region.width - 2) : region.width;
+          const inner = sliceByColumn(line, region.col, rowW, true);
+          const { c0, c1 } = rowSelectionCols(inner, r, sel, region.width);
+          if (c0 >= rowW) continue;
+          const hc1 = Math.min(c1, rowW - 1);
+          const highlighted = highlightCells(line, region.col + c0, region.col + hc1, width, this.theme.badgeBg);
+          out[lineIdx] = fillLineBg(highlighted, width, this.theme.surfaceBg);
+        }
+        return out;
       },
       invalidate: () => {},
       handleInput: (data: string) => {
@@ -174,24 +286,148 @@ export class Navigator {
         if (!data.includes("\x1b[200~")) {
           const mouseEvents = parseMouseEvents(data);
           if (mouseEvents.length > 0) {
-            if (top.handleMouse) {
-              const bounds = this.handle?.getBounds();
-              if (!bounds) return;
-              const ctx = this.makeContext();
-              for (const ev of mouseEvents) {
-                top.handleMouse({ ...ev, x: ev.x - bounds.col, y: ev.y - bounds.row }, ctx);
+            const bounds = this.handle?.getBounds();
+            const ctx = this.makeContext();
+            let hasUnhandledWheel = false;
+            let needsRender = false;
+            for (const ev of mouseEvents) {
+              const localEv = bounds ? { ...ev, x: ev.x - bounds.col, y: ev.y - bounds.row } : null;
+              if (top.handleMouse) {
+                if (!localEv) return;
+                const res = top.handleMouse(localEv, ctx);
+                if (res !== false) {
+                  if (this.hasActiveSelection) this.clearOverlaySelection();
+                  needsRender = true;
+                  continue;
+                }
               }
+              if (ev.type === "wheel") {
+                if (this.hasActiveSelection) {
+                  this.clearOverlaySelection();
+                  needsRender = true;
+                }
+                hasUnhandledWheel = true;
+                continue;
+              }
+              if (localEv && this.handleDefaultMouse(localEv, ctx)) {
+                needsRender = true;
+              }
+            }
+            if (hasUnhandledWheel) {
+              top.handleInput(data, ctx);
+              if (needsRender) this.requestRender();
+              return;
+            }
+            if (needsRender) {
               this.requestRender();
-              return;
             }
-            if (!mouseEvents.some((e) => e.type === "wheel")) {
-              return;
-            }
+            return;
           }
+        }
+        if (this.hasActiveSelection) {
+          this.clearOverlaySelection();
+          if (matchesKey(data, "escape")) {
+            this.requestRender();
+            return;
+          }
+          this.requestRender();
+        } else if (this.overlaySel.dragging) {
+          this.clearOverlaySelection();
         }
         top.handleInput(data, this.makeContext());
       },
     };
+  }
+
+  private get hasActiveSelection(): boolean {
+    return this.overlaySel.moved && this.overlaySel.anchor !== null && this.overlaySel.head !== null;
+  }
+
+  private clearOverlaySelection(clearCache = false): void {
+    this.overlaySel.anchor = null;
+    this.overlaySel.head = null;
+    this.overlaySel.dragging = false;
+    this.overlaySel.moved = false;
+    if (clearCache) {
+      this.overlaySel.lines = [];
+      this.overlaySel.frame = null;
+      this.overlaySel.width = 0;
+    }
+  }
+
+  private handleDefaultMouse(ev: OverlayMouseEvent, ctx: ScreenContext): boolean {
+    const frame = this.overlaySel.frame;
+    const region = frame?.textRegion;
+    if (!region || region.rows.length === 0 || region.width <= 0) return false;
+
+    if (ev.type === "press") {
+      if (ev.button !== "left") return false;
+      const rowIdx = region.rows.indexOf(ev.y);
+      const inCols = ev.x >= region.col && ev.x < region.col + region.width;
+      if (rowIdx < 0 || !inCols) {
+        if (this.hasActiveSelection) {
+          this.clearOverlaySelection();
+          return true;
+        }
+        return false;
+      }
+      const hadActive = this.hasActiveSelection;
+      const pt: CellPoint = { row: rowIdx, col: ev.x - region.col };
+      this.overlaySel.anchor = pt;
+      this.overlaySel.head = pt;
+      this.overlaySel.dragging = true;
+      this.overlaySel.moved = false;
+      return hadActive;
+    }
+
+    if (ev.type === "drag") {
+      if (ev.button !== "left" || !this.overlaySel.dragging || !this.overlaySel.anchor) return false;
+      const col = Math.max(0, Math.min(region.width - 1, ev.x - region.col));
+      const rowIdx = nearestTextRowIndex(region.rows, ev.y);
+      const prevHead = this.overlaySel.head;
+      const changed = !prevHead || prevHead.row !== rowIdx || prevHead.col !== col;
+      this.overlaySel.head = { row: rowIdx, col };
+      if (rowIdx !== this.overlaySel.anchor.row || col !== this.overlaySel.anchor.col) {
+        this.overlaySel.moved = true;
+      }
+      return changed;
+    }
+
+    if (ev.type === "release") {
+      if (ev.button !== "left" || !this.overlaySel.dragging || !this.overlaySel.anchor) return false;
+      this.overlaySel.dragging = false;
+      const col = Math.max(0, Math.min(region.width - 1, ev.x - region.col));
+      const rowIdx = nearestTextRowIndex(region.rows, ev.y);
+      this.overlaySel.head = { row: rowIdx, col };
+      if (rowIdx !== this.overlaySel.anchor.row || col !== this.overlaySel.anchor.col) {
+        this.overlaySel.moved = true;
+      }
+      if (!this.overlaySel.moved) {
+        this.clearOverlaySelection();
+        return false;
+      }
+      const sel = normalizeSelection("cell", this.overlaySel.anchor, this.overlaySel.head);
+      const lines = this.overlaySel.lines;
+      const scrollbarRows = detectScrollbarRows(lines, region, this.theme);
+      const text = extractSelectionText(
+        sel,
+        (i) => {
+          const lineIdx = region.rows[i];
+          if (lineIdx === undefined) return "";
+          const line = lines[lineIdx] ?? "";
+          const rowW = scrollbarRows.has(lineIdx) ? Math.max(1, region.width - 2) : region.width;
+          return sliceByColumn(line, region.col, rowW, true);
+        },
+        region.width,
+      );
+      if (text) {
+        yankText(text, ctx.writeTerminal);
+        frame?.setNotice(`Copied ${text.length} char${text.length === 1 ? "" : "s"}`, "ok");
+      }
+      return true;
+    }
+
+    return false;
   }
 
   get isOpen(): boolean {
@@ -276,12 +512,14 @@ export class Navigator {
   }
 
   push(screen: Screen): void {
+    this.clearOverlaySelection(true);
     this.stack.push(screen);
     screen.onShow?.(this.makeContext());
     this.syncOverlay();
   }
 
   replace(screen: Screen): void {
+    this.clearOverlaySelection(true);
     const prev = this.stack.pop();
     prev?.onClose?.();
     this.stack.push(screen);
@@ -290,12 +528,14 @@ export class Navigator {
   }
 
   pop(): void {
+    this.clearOverlaySelection(true);
     const prev = this.stack.pop();
     prev?.onClose?.();
     this.syncOverlay();
   }
 
   closeAll(): void {
+    this.clearOverlaySelection(true);
     while (this.stack.length > 0) {
       this.stack.pop()?.onClose?.();
     }

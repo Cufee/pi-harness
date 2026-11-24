@@ -1,7 +1,14 @@
 import { matchesKey } from "@earendil-works/pi-tui";
 import { type Hint, yankText } from "./keymap.js";
 import type { ScreenContext } from "./navigator.js";
-import { clamp, fillLineBg, fit, sliceByColumn, stripTerminalSequences, visibleWidth } from "./text.js";
+import {
+  extractSelectionText as extractSharedSelectionText,
+  highlightCells,
+  type NormalizedSelection,
+  normalizeSelection,
+  rowSelectionCols,
+} from "./selection.js";
+import { clamp, fillLineBg, stripTerminalSequences, visibleWidth } from "./text.js";
 import type { Theme, Tone } from "./tokens.js";
 import {
   blockSourceText,
@@ -60,40 +67,6 @@ interface ReadAnchor {
   row: number;
   rowsAtCapture: number;
   widthAtCapture: number;
-}
-
-interface NormalizedSelection {
-  mode: "row" | "cell";
-  startRow: number;
-  endRow: number;
-  startCol: number;
-  endCol: number;
-}
-
-const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-
-/** Snaps inclusive cell range `[c0, c1]` outward to whole grapheme boundaries on `row`. */
-function snapCellRange(row: string, c0: number, c1: number, contentW: number): { c0: number; c1: number } {
-  const maxCol = Math.max(0, contentW - 1);
-  let start = Math.max(0, Math.min(maxCol, c0));
-  let end = Math.max(start, Math.min(maxCol, c1));
-  const plain = stripTerminalSequences(row);
-  if (!plain || !/[^\x20-\x7e]/.test(plain)) {
-    return { c0: start, c1: end };
-  }
-  let col = 0;
-  for (const { segment } of GRAPHEME_SEGMENTER.segment(plain)) {
-    const w = visibleWidth(segment);
-    if (w > 0) {
-      const gStart = col;
-      const gEnd = col + w - 1;
-      if (start >= gStart && start <= gEnd) start = gStart;
-      if (end >= gStart && end <= gEnd) end = Math.min(maxCol, gEnd);
-    }
-    col += w;
-    if (col > end) break;
-  }
-  return { c0: start, c1: end };
 }
 
 export class TranscriptView {
@@ -236,47 +209,11 @@ export class TranscriptView {
     const aRow = this.posToGlobalRow(this.selAnchor);
     const hRow = this.posToGlobalRow(this.selHead);
     if (aRow < 0 || hRow < 0) return null;
-    if (aRow < hRow || (aRow === hRow && this.selAnchor.col <= this.selHead.col)) {
-      return {
-        mode: this.selMode,
-        startRow: aRow,
-        endRow: hRow,
-        startCol: this.selAnchor.col,
-        endCol: this.selHead.col,
-      };
-    }
-    return {
-      mode: this.selMode,
-      startRow: hRow,
-      endRow: aRow,
-      startCol: this.selHead.col,
-      endCol: this.selAnchor.col,
-    };
-  }
-
-  private rowSelectionCols(
-    row: string,
-    globalRow: number,
-    sel: NormalizedSelection,
-    contentW: number,
-  ): { c0: number; c1: number } {
-    const maxCol = Math.max(0, contentW - 1);
-    if (sel.mode !== "cell") return { c0: 0, c1: maxCol };
-    let rawStart = 0;
-    let rawEnd = maxCol;
-    if (sel.startRow === sel.endRow) {
-      rawStart = Math.min(sel.startCol, maxCol);
-      rawEnd = Math.min(sel.endCol, maxCol);
-    } else if (globalRow === sel.startRow) {
-      rawStart = Math.min(sel.startCol, maxCol);
-      rawEnd = maxCol;
-    } else if (globalRow === sel.endRow) {
-      rawStart = 0;
-      rawEnd = Math.min(sel.endCol, maxCol);
-    } else {
-      return { c0: 0, c1: maxCol };
-    }
-    return snapCellRange(row, rawStart, rawEnd, contentW);
+    return normalizeSelection(
+      this.selMode,
+      { row: aRow, col: this.selAnchor.col },
+      { row: hRow, col: this.selHead.col },
+    );
   }
 
   /* ── read anchor & follow ── */
@@ -376,39 +313,7 @@ export class TranscriptView {
   private extractSelectionText(): string {
     const sel = this.normalizedSelection();
     if (!sel) return "";
-    const contentW = Math.max(1, this.lastContentWidth);
-    const pieces: Array<{ text: string; fromCol0: boolean }> = [];
-
-    for (let g = sel.startRow; g <= sel.endRow; g++) {
-      const row = this.rawRowAt(g);
-      const { c0, c1 } = this.rowSelectionCols(row, g, sel, contentW);
-      const text = stripTerminalSequences(sliceByColumn(row, c0, Math.max(0, c1 - c0 + 1), true)).trimEnd();
-      pieces.push({ text, fromCol0: c0 === 0 });
-    }
-
-    // Trim trailing/leading blank spacer rows on whole-row selections only.
-    if (sel.mode === "row") {
-      while (pieces.length > 1 && pieces[0]!.text === "") pieces.shift();
-      while (pieces.length > 1 && pieces[pieces.length - 1]!.text === "") pieces.pop();
-    }
-
-    // Remove the common leading indent of rows selected from column 0 (drops Markdown padding, keeps code indent).
-    let minIndent = Infinity;
-    for (const p of pieces) {
-      if (p.fromCol0 && p.text.length > 0) {
-        const indent = p.text.length - p.text.trimStart().length;
-        if (indent < minIndent) minIndent = indent;
-      }
-    }
-    if (minIndent > 0 && Number.isFinite(minIndent)) {
-      for (const p of pieces) {
-        if (p.fromCol0 && p.text.length >= minIndent) {
-          p.text = p.text.slice(minIndent);
-        }
-      }
-    }
-
-    return pieces.map((p) => p.text).join("\n");
+    return extractSharedSelectionText(sel, (g) => this.rawRowAt(g), Math.max(1, this.lastContentWidth));
   }
 
   private allSourceText(): string {
@@ -559,12 +464,8 @@ export class TranscriptView {
           if (!theme.color) {
             displayRows.push(clamp(gutter + raw, rowW));
           } else {
-            const { c0, c1 } = this.rowSelectionCols(raw, globalRow, sel, contentW);
-            const padded = fit(raw, contentW);
-            const before = c0 > 0 ? sliceByColumn(padded, 0, c0, true) : "";
-            const selected = sliceByColumn(padded, c0, Math.max(0, c1 - c0 + 1), true);
-            const after = c1 + 1 < contentW ? sliceByColumn(padded, c1 + 1, contentW - (c1 + 1), true) : "";
-            const styled = `${before}\x1b[0m${theme.badgeBg(stripTerminalSequences(selected))}${after}`;
+            const { c0, c1 } = rowSelectionCols(raw, globalRow, sel, contentW);
+            const styled = highlightCells(raw, c0, c1, contentW, theme.badgeBg);
             displayRows.push(clamp(gutter + styled, rowW));
           }
         } else if (inSel || isCursor) {
