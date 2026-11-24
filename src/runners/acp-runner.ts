@@ -374,9 +374,53 @@ function stderrTail(buf: string, max = 500): string {
 }
 
 const EXECUTOR_LOST_RE = /No executor is connected/i;
+const EXECUTOR_LOST_START_RE =
+  /^\s*(?:Uncaught\s+)?(?:(?:Tool|MCP|RPC)[^:\n]*:\s*)?(?:Error:\s*)?No executor is connected\b/i;
 const EXECUTOR_LOST_LINE_RE =
   /^\s*(?:Uncaught\s+)?(?:(?:Tool|MCP|RPC)[^:\n]*:\s*)?(?:Error:\s*)?No executor is connected\b/im;
+const EXECUTOR_LOST_UNCAUGHT_RE = /^\s*Uncaught\s+Error:\s*No executor is connected\b/im;
 const EXECUTOR_LOST_TEST_NOISE_RE = /\b(?:AssertionError|bun test)\b|^\s*\d+\s*\|/m;
+const MCP_PREFIXED_TOOL_RE = /^mcp(?:__|_|[:/.])/i;
+
+function isMcpOrCodeExecToolUpdate(
+  update: Record<string, unknown>,
+  resolvedTitle: string,
+  isHarnessCall: boolean,
+  externalMcpNames: ReadonlySet<string>,
+): { isEligible: boolean; isCodeExec: boolean } {
+  const firstToken = resolvedTitle.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+  const isCodeExec = firstToken === "code_exec";
+  if (isCodeExec) return { isEligible: true, isCodeExec: true };
+  if (isHarnessCall) return { isEligible: true, isCodeExec: false };
+  if (MCP_PREFIXED_TOOL_RE.test(firstToken)) return { isEligible: true, isCodeExec: false };
+  for (const srv of externalMcpNames) {
+    const escaped = srv.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`^${escaped}(?:__|_|[:/.])`, "i").test(firstToken)) {
+      return { isEligible: true, isCodeExec: false };
+    }
+  }
+  const rawInput = update.rawInput as { server?: unknown } | undefined;
+  if (rawInput && typeof rawInput.server === "string" && rawInput.server.trim().length > 0) {
+    return { isEligible: true, isCodeExec: false };
+  }
+  const meta = update._meta as
+    | {
+        is_mcp_tool_call?: unknown;
+        is_mcp_tool_approval?: unknown;
+        claudeCode?: { mcpServer?: unknown };
+        "gemini-cli"?: { mcp?: unknown };
+      }
+    | undefined;
+  if (
+    meta?.is_mcp_tool_call === true ||
+    meta?.is_mcp_tool_approval === true ||
+    Boolean(meta?.claudeCode?.mcpServer) ||
+    Boolean(meta?.["gemini-cli"]?.mcp)
+  ) {
+    return { isEligible: true, isCodeExec: false };
+  }
+  return { isEligible: false, isCodeExec: false };
+}
 
 function collectToolUpdateOutputText(update: Record<string, unknown>): string {
   const parts: string[] = [];
@@ -402,14 +446,26 @@ function collectToolUpdateOutputText(update: Record<string, unknown>): string {
   return parts.join("\n").trim();
 }
 
-function detectExecutorLostToolUpdate(update: Record<string, unknown>, status: string): string | null {
+function detectExecutorLostToolUpdate(
+  update: Record<string, unknown>,
+  status: string,
+  provenance: {
+    isAmpProfile: boolean;
+    resolvedTitle: string;
+    isHarnessCall: boolean;
+    externalMcpNames: ReadonlySet<string>;
+  },
+): string | null {
+  if (!provenance.isAmpProfile) return null;
+  const { isEligible, isCodeExec } = isMcpOrCodeExecToolUpdate(
+    update,
+    provenance.resolvedTitle,
+    provenance.isHarnessCall,
+    provenance.externalMcpNames,
+  );
+  if (!isEligible) return null;
   const text = collectToolUpdateOutputText(update);
-  if (!text || !EXECUTOR_LOST_RE.test(text)) return null;
-  const lineMatch = text.match(EXECUTOR_LOST_LINE_RE);
-  if (lineMatch) {
-    const start = lineMatch.index ?? 0;
-    return text.slice(start, start + 220).trim();
-  }
+  if (!text || !EXECUTOR_LOST_RE.test(text) || EXECUTOR_LOST_TEST_NOISE_RE.test(text)) return null;
   const rawOut = update.rawOutput;
   const rawOutIsError = Boolean(
     rawOut &&
@@ -418,10 +474,30 @@ function detectExecutorLostToolUpdate(update: Record<string, unknown>, status: s
         typeof (rawOut as { error?: unknown }).error === "string"),
   );
   const isErrorShape = status === "failed" || rawOutIsError;
-  // Require an error-shaped short result without test-runner or code-listing noise so normal
-  // file reads, greps, or failing test logs mentioning this phrase never abort a healthy session.
-  if (isErrorShape && text.length <= 500 && !EXECUTOR_LOST_TEST_NOISE_RE.test(text)) {
-    return text.slice(0, 220);
+  if (isErrorShape) {
+    const lineMatch = text.match(EXECUTOR_LOST_LINE_RE);
+    if (lineMatch) {
+      const start = lineMatch.index ?? 0;
+      return text.slice(start, start + 220).trim();
+    }
+    if (text.length <= 500) {
+      return text.slice(0, 220);
+    }
+    return null;
+  }
+  // Retain Amp's completed-MCP error shape (short error-only output starting with the executor-lost
+  // message) and code_exec uncaught stack traces without matching arbitrary tool output.
+  if (status === "completed") {
+    if (text.length <= 500 && EXECUTOR_LOST_START_RE.test(text)) {
+      return text.slice(0, 220).trim();
+    }
+    if (isCodeExec) {
+      const uncaughtMatch = text.match(EXECUTOR_LOST_UNCAUGHT_RE);
+      if (uncaughtMatch) {
+        const start = uncaughtMatch.index ?? 0;
+        return text.slice(start, start + 220).trim();
+      }
+    }
   }
   return null;
 }
@@ -626,6 +702,7 @@ export class AcpRunner {
     let anonymousInFlightToolCalls = 0;
     const hasInFlightToolCall = () => inFlightToolCalls.size > 0 || anonymousInFlightToolCalls > 0;
     let harnessCancelIssuedForTurn = false;
+    let turnPermissionCancelled = false;
     let steerAckTimedOut = false;
     let brokenSessionCode: RunnerErrorCode | null = null;
     let brokenSessionDetail = "";
@@ -634,6 +711,9 @@ export class AcpRunner {
     let steeringSupported = false;
     let activeConnection: ClientConnection | null = null;
     const toolTitlesById = new Map<string, string>();
+    const toolStatusById = new Map<string, string>();
+    const isTerminalToolStatus = (s: string | undefined): boolean =>
+      s === "completed" || s === "failed" || s === "cancelled";
 
     type SteerHandoffState = {
       turnPromise: Promise<Record<string, unknown>>;
@@ -642,9 +722,13 @@ export class AcpRunner {
       replacementSent: boolean;
       ackSettled: boolean;
       ackLive: boolean;
+      ackTimeoutDeferred: boolean;
+      replacementInFlightToolCalls: Set<string>;
+      replacementAnonymousInFlightToolCalls: number;
       message: string;
       userEchoText: string;
       settleAck: (live: boolean) => void;
+      resumeDeferredAckTimeout?: () => void;
     };
     const steerHandoff: {
       pending: SteerHandoffState | null;
@@ -836,12 +920,16 @@ export class AcpRunner {
         replacementSent: false,
         ackSettled: false,
         ackLive: false,
+        ackTimeoutDeferred: false,
+        replacementInFlightToolCalls: new Set<string>(),
+        replacementAnonymousInFlightToolCalls: 0,
         message,
         userEchoText: "",
         settleAck: (live: boolean) => {
           if (state.ackSettled) return;
           state.ackSettled = true;
           state.ackLive = live;
+          state.ackTimeoutDeferred = false;
           if (ackTimer) {
             clearTimeout(ackTimer);
             ackTimer = null;
@@ -882,19 +970,34 @@ export class AcpRunner {
       if (opts.waitForAck) {
         const ackTimeoutMs = Math.max(0, this.opts?.steerAckTimeoutMs ?? DEFAULT_STEER_ACK_TIMEOUT_MS);
         if (ackTimeoutMs > 0) {
-          ackTimer = setTimeout(() => {
-            ackTimer = null;
-            if (state.ackSettled) return;
-            // Cancel the unacknowledged replacement so it cannot deliver later alongside harness fallback.
-            if (sessionId && activeConnection === conn) {
-              steerAckTimedOut = true;
-              harnessCancelIssuedForTurn = true;
-              void conn.agent.notify("session/cancel", { sessionId }).catch(() => {});
-              armCancelGraceTimer("cancelled");
-            }
-            state.settleAck(false);
-          }, ackTimeoutMs);
-          ackTimer.unref?.();
+          const scheduleAckTimeout = () => {
+            if (state.ackSettled || ackTimer) return;
+            ackTimer = setTimeout(() => {
+              ackTimer = null;
+              if (state.ackSettled) return;
+              // Never send session/cancel or fall back while a tool call is in flight;
+              // defer until all in-flight tools finish and re-arm once idle.
+              if (hasInFlightToolCall()) {
+                state.ackTimeoutDeferred = true;
+                return;
+              }
+              // Cancel the unacknowledged replacement so it cannot deliver later alongside harness fallback.
+              if (sessionId && activeConnection === conn && !stopped && !req.signal.aborted && !rolloverTriggered) {
+                steerAckTimedOut = true;
+                harnessCancelIssuedForTurn = true;
+                void conn.agent.notify("session/cancel", { sessionId }).catch(() => {});
+                armCancelGraceTimer("cancelled");
+              }
+              state.settleAck(false);
+            }, ackTimeoutMs);
+            ackTimer.unref?.();
+          };
+          state.resumeDeferredAckTimeout = () => {
+            if (!state.ackTimeoutDeferred || state.ackSettled || hasInFlightToolCall()) return;
+            state.ackTimeoutDeferred = false;
+            scheduleAckTimeout();
+          };
+          scheduleAckTimeout();
         }
       }
 
@@ -1501,7 +1604,18 @@ export class AcpRunner {
           if (accumulatedText.length > 0) needsParagraphBreak = true;
           textSinceLastTool = "";
           const callId = update.toolCallId ? String(update.toolCallId) : update.id ? String(update.id) : undefined;
-          const status = String(update.status ?? "in_progress");
+          const hasExplicitStatus = typeof update.status === "string" && update.status.trim().length > 0;
+          const prevStatus = callId ? toolStatusById.get(callId) : undefined;
+          const isMetadataOnlyAfterTerminal =
+            kind === "tool_call_update" && !hasExplicitStatus && isTerminalToolStatus(prevStatus);
+          const status = hasExplicitStatus
+            ? String(update.status)
+            : kind === "tool_call_update" && prevStatus
+              ? prevStatus
+              : "in_progress";
+          if (callId && (kind === "tool_call" || hasExplicitStatus || !prevStatus)) {
+            toolStatusById.set(callId, status);
+          }
           const isNewToolCall = kind === "tool_call" && (!callId || !seenToolCallIds.has(callId));
           if (callId) seenToolCallIds.add(callId);
           if (
@@ -1515,12 +1629,26 @@ export class AcpRunner {
           }
           if (kind === "tool_call") {
             advanceTurnWaveIfNeeded();
-            if (status !== "completed" && status !== "failed" && status !== "cancelled") {
-              if (callId) inFlightToolCalls.add(callId);
-              else anonymousInFlightToolCalls += 1;
+            if (!isTerminalToolStatus(status)) {
+              if (callId) {
+                inFlightToolCalls.add(callId);
+                if (steerHandoff.pending?.replacementSent) {
+                  steerHandoff.pending.replacementInFlightToolCalls.add(callId);
+                }
+              } else {
+                anonymousInFlightToolCalls += 1;
+                if (steerHandoff.pending?.replacementSent) {
+                  steerHandoff.pending.replacementAnonymousInFlightToolCalls += 1;
+                }
+              }
             }
-          } else if (status !== "completed" && status !== "failed" && status !== "cancelled") {
-            if (callId) inFlightToolCalls.add(callId);
+          } else if (!isMetadataOnlyAfterTerminal && !isTerminalToolStatus(status)) {
+            if (callId) {
+              inFlightToolCalls.add(callId);
+              if (steerHandoff.pending?.replacementSent) {
+                steerHandoff.pending.replacementInFlightToolCalls.add(callId);
+              }
+            }
           }
           const rawTitle = update.title ? String(update.title) : update.name ? String(update.name) : undefined;
           if (callId && rawTitle) {
@@ -1553,7 +1681,12 @@ export class AcpRunner {
             codexExternalCalls.delete(callId);
           }
           const wasInFlight = Boolean(callId && inFlightToolCalls.has(callId));
-          const executorLostSnippet = detectExecutorLostToolUpdate(update, status);
+          const executorLostSnippet = detectExecutorLostToolUpdate(update, status, {
+            isAmpProfile,
+            resolvedTitle,
+            isHarnessCall,
+            externalMcpNames,
+          });
           if (executorLostSnippet && !brokenSessionCode) {
             brokenSessionCode = ACP_EXECUTOR_LOST_ERROR_CODE;
             brokenSessionDetail = executorLostSnippet;
@@ -1565,62 +1698,67 @@ export class AcpRunner {
               armCancelGraceTimer("cancelled");
             }
           }
-          if (status === "completed") {
+          const finishInFlightToolCall = () => {
             if (callId) {
               inFlightToolCalls.delete(callId);
+              steerHandoff.pending?.replacementInFlightToolCalls.delete(callId);
               harnessToolCallIds.delete(callId);
             } else {
               anonymousInFlightToolCalls = Math.max(0, anonymousInFlightToolCalls - 1);
-            }
-            resetIdleWatchdog();
-            completedToolInWave = true;
-            if (!executorLostSnippet) {
-              quotaRejected = false;
-              textSinceQuotaRejection = "";
-              disarmQuotaWatchdog(true);
-              turnSucceededTools += 1;
-              if (kind === "tool_call" || wasInFlight) {
-                emitAuthOk();
+              if (steerHandoff.pending?.replacementSent) {
+                steerHandoff.pending.replacementAnonymousInFlightToolCalls = Math.max(
+                  0,
+                  steerHandoff.pending.replacementAnonymousInFlightToolCalls - 1,
+                );
               }
-              if (isHarnessCall) {
-                markHarnessToolObserved();
+            }
+            if (!hasInFlightToolCall()) {
+              steerHandoff.ack?.resumeDeferredAckTimeout?.();
+            }
+          };
+          if (!isMetadataOnlyAfterTerminal) {
+            if (status === "completed") {
+              finishInFlightToolCall();
+              resetIdleWatchdog();
+              completedToolInWave = true;
+              if (!executorLostSnippet) {
+                quotaRejected = false;
+                textSinceQuotaRejection = "";
+                disarmQuotaWatchdog(true);
+                turnSucceededTools += 1;
+                if (kind === "tool_call" || wasInFlight) {
+                  emitAuthOk();
+                }
+                if (isHarnessCall) {
+                  markHarnessToolObserved();
+                }
+                // Any successful tool call resets the identical-failure streak so exploratory debugging never trips the breaker
+                identicalFailureStreak = 0;
+                lastIdenticalFailureKey = "";
+              } else {
+                allToolFailures.push(`${resolvedTitle}: ${executorLostSnippet}`);
               }
-              // Any successful tool call resets the identical-failure streak so exploratory debugging never trips the breaker
-              identicalFailureStreak = 0;
-              lastIdenticalFailureKey = "";
-            } else {
-              allToolFailures.push(`${resolvedTitle}: ${executorLostSnippet}`);
-            }
-          } else if (status === "failed") {
-            if (callId) {
-              inFlightToolCalls.delete(callId);
-              harnessToolCallIds.delete(callId);
-            } else {
-              anonymousInFlightToolCalls = Math.max(0, anonymousInFlightToolCalls - 1);
-            }
-            resetIdleWatchdog();
-            completedToolInWave = true;
-            const detail = extractToolErrorSnippet(update);
-            turnFailedTools.push({ title: resolvedTitle, detail });
-            allToolFailures.push(detail ? `${resolvedTitle}: ${detail}` : resolvedTitle);
-            const failKey = `${resolvedTitle.toLowerCase()}::${(detail ?? "").toLowerCase().slice(0, 120)}`;
-            if (failKey === lastIdenticalFailureKey) {
-              identicalFailureStreak += 1;
-            } else {
-              lastIdenticalFailureKey = failKey;
-              identicalFailureStreak = 1;
-            }
-            if (!brokenSessionCode && identicalFailureStreak >= IDENTICAL_FAILURE_BREAKER && !identicalFailureBreakerTripped && sessionId && activeConnection) {
-              identicalFailureBreakerTripped = true;
-              harnessCancelIssuedForTurn = true;
-              void activeConnection.agent.notify("session/cancel", { sessionId }).catch(() => {});
-            }
-          } else if (status === "cancelled") {
-            if (callId) {
-              inFlightToolCalls.delete(callId);
-              harnessToolCallIds.delete(callId);
-            } else {
-              anonymousInFlightToolCalls = Math.max(0, anonymousInFlightToolCalls - 1);
+            } else if (status === "failed") {
+              finishInFlightToolCall();
+              resetIdleWatchdog();
+              completedToolInWave = true;
+              const detail = extractToolErrorSnippet(update);
+              turnFailedTools.push({ title: resolvedTitle, detail });
+              allToolFailures.push(detail ? `${resolvedTitle}: ${detail}` : resolvedTitle);
+              const failKey = `${resolvedTitle.toLowerCase()}::${(detail ?? "").toLowerCase().slice(0, 120)}`;
+              if (failKey === lastIdenticalFailureKey) {
+                identicalFailureStreak += 1;
+              } else {
+                lastIdenticalFailureKey = failKey;
+                identicalFailureStreak = 1;
+              }
+              if (!brokenSessionCode && identicalFailureStreak >= IDENTICAL_FAILURE_BREAKER && !identicalFailureBreakerTripped && sessionId && activeConnection) {
+                identicalFailureBreakerTripped = true;
+                harnessCancelIssuedForTurn = true;
+                void activeConnection.agent.notify("session/cancel", { sessionId }).catch(() => {});
+              }
+            } else if (status === "cancelled") {
+              finishInFlightToolCall();
             }
           }
           const eventPaths = Array.isArray(update.locations)
@@ -2033,6 +2171,7 @@ export class AcpRunner {
             error: deniedText,
             denied: deniedRule,
           });
+          if (!denyOpt) turnPermissionCancelled = true;
           return (
             denyOpt
               ? { outcome: { outcome: "selected", optionId: denyOpt.optionId } }
@@ -2043,6 +2182,7 @@ export class AcpRunner {
         if (allowOpt) {
           return { outcome: { outcome: "selected", optionId: allowOpt.optionId } } as never;
         }
+        turnPermissionCancelled = true;
         return { outcome: { outcome: "cancelled" } } as never;
       })
       .onRequest("fs/read_text_file", async ({ params }) => {
@@ -2275,14 +2415,24 @@ export class AcpRunner {
       // productive turn is re-prompted on the same session; a limit hit with zero progress ends with an error.
       let upstreamLimitStalled = false;
       let steerContinuations = 0;
-      let pendingSteerTurnPromise: Promise<Record<string, unknown>> | null = null;
+      let pendingSteerHandoff: SteerHandoffState | null = null;
 
       for (let recoveryAttempt = 0; recoveryAttempt <= MAX_TOTAL_RECOVERY_CONTINUATIONS; recoveryAttempt++) {
         turnsUsed += 1;
         req.callbacks.onTurn?.(turnsUsed);
+        const resumingSteerHandoff = pendingSteerHandoff;
         completedToolInWave = false;
         inFlightToolCalls.clear();
         anonymousInFlightToolCalls = 0;
+        if (resumingSteerHandoff) {
+          for (const id of resumingSteerHandoff.replacementInFlightToolCalls) {
+            inFlightToolCalls.add(id);
+          }
+          anonymousInFlightToolCalls = resumingSteerHandoff.replacementAnonymousInFlightToolCalls;
+        }
+        if (!hasInFlightToolCall()) {
+          steerHandoff.ack?.resumeDeferredAckTimeout?.();
+        }
         turnFailedTools = [];
         turnDeniedTools = [];
         turnSucceededTools = 0;
@@ -2292,16 +2442,17 @@ export class AcpRunner {
         textSinceLastTool = "";
         steerHandoff.cancelIssuedForTurn = false;
         harnessCancelIssuedForTurn = false;
+        turnPermissionCancelled = false;
 
         promptInFlight = true;
         try {
           const promptPromise =
-            pendingSteerTurnPromise ??
+            pendingSteerHandoff?.turnPromise ??
             (conn.agent.request("session/prompt", {
               sessionId,
               prompt: [{ type: "text", text: nextPromptText }],
             } as never) as unknown as Promise<Record<string, unknown>>);
-          pendingSteerTurnPromise = null;
+          pendingSteerHandoff = null;
           if (turnsUsed === 1) {
             startToolsGraceWatch();
           }
@@ -2503,7 +2654,7 @@ export class AcpRunner {
             break;
           }
           if (!(handoff.ackSettled && !handoff.ackLive && rawStop !== "cancelled")) {
-            pendingSteerTurnPromise = handoff.turnPromise;
+            pendingSteerHandoff = handoff;
             if (accumulatedText.length > 0) needsParagraphBreak = true;
             recoveryAttempt -= 1;
             continue;
@@ -2756,6 +2907,7 @@ export class AcpRunner {
         !rolloverTriggered &&
         !req.signal.aborted &&
         !harnessCancelIssuedForTurn &&
+        !turnPermissionCancelled &&
         !steerAckTimedOut &&
         turnDeniedTools.length === 0;
 
