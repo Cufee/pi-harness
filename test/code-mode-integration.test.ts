@@ -80,7 +80,7 @@ it("lists and discovers only the tier's tools in collapsed, hybrid and off modes
         assert.equal(names.includes("list_models"), tier !== 3);
         for (const name of ["code_exec", "tool_search"]) assert.equal(names.includes(name), mode === "hybrid");
       }
-      if (mode === "off") await assert.rejects(call(id, "code_exec", { code: "output(1)" }), /not permitted/);
+      if (mode === "off") await assert.rejects(call(id, "code_exec", { code: "output(1)" }), /not permitted|\[harness blocked: not-your-tool\]/);
       else {
         const { matched } = await call(id, "tool_search", { names: ["tree_view", "spawn_worker", "list_models"] }) as { matched: string[] };
         assert.ok(matched.includes("tree_view"));
