@@ -9,7 +9,8 @@ import { globsOverlap } from "../src/control-plane/db.js";
 import { parseReviewerVerdictJson } from "../src/director/runtime.js";
 import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
-import type { GoalRecord } from "../src/goals/engine.js";
+import type { GoalRecord, GoalReviewVerdict } from "../src/goals/engine.js";
+import type { ChatControlEvent } from "../src/protocol/chat-events.js";
 import { runGit } from "../src/worktree/manager.js";
 
 async function makeTempRepo(): Promise<string> {
@@ -965,6 +966,330 @@ it("goal_get shows task goalVersion and staleGoalVersion", async () => {
       assert.equal(actWorker?.lastAmendmentAction, "queued");
     } finally {
       releaseAll.resolve();
+      await daemon.stop();
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+it("verifies deterministic gates at verify_ref without touching primary checkout, reports GateLocation, handles remote-only/unknown refs, and supports metadata-only goal_amend verify_ref", async () => {
+  const repoRoot = await makeTempRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-verify-ref-state-"));
+  const sockPath = join(stateDir, "d.sock");
+  try {
+    const mainSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout;
+    await runGit(repoRoot, ["checkout", "-b", "feature"]);
+    writeFileSync(join(repoRoot, "only-on-feature.txt"), "feature work\n", "utf8");
+    await runGit(repoRoot, ["add", "only-on-feature.txt"]);
+    await runGit(repoRoot, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "feat: branch work"]);
+    const featureSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout;
+    await runGit(repoRoot, ["checkout", "main"]);
+
+    const baseCfg = loadConfig(repoRoot);
+    const config = withFixtureCatalog({
+      ...baseCfg,
+      codeMode: "off",
+      goals: { ...baseCfg.goals, autoVerifyOnSettle: false },
+      stateDir,
+      socketPath: sockPath,
+    });
+
+    type ToolAction = (executeTool: (name: string, args: Record<string, unknown>) => Promise<unknown>, tools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }>) => Promise<void>;
+    let nextChatAction: ToolAction | null = null;
+
+    const daemon = new HarnessDaemon(config, {
+      dbPath: ":memory:",
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          if (req.taskId.startsWith("chat-")) {
+            if (nextChatAction) {
+              const fn = nextChatAction;
+              nextChatAction = null;
+              await fn(req.executeTool, req.tools);
+            }
+            return { text: "ok", stopReason: "completed" };
+          }
+          return { text: "idle", stopReason: "completed" };
+        },
+      }),
+    });
+
+    await daemon.start();
+    try {
+      const chat = await daemon.director.createChat({ repoRoot });
+
+      // 1. Gate sees produced branch via verify_ref; primary checkout untouched; _verify worktree removed.
+      let gFeature!: GoalRecord;
+      let gFeatureReview!: { goal: GoalRecord; review: GoalReviewVerdict };
+      nextChatAction = async (executeTool, tools) => {
+        const createTool = tools.find((t) => t.name === "goal_create");
+        assert.ok(createTool?.description.includes("_verify"));
+        assert.ok(createTool?.description.includes("HARNESS_VERIFY_REF"));
+        assert.ok(createTool?.description.includes("HARNESS_VERIFY_SHA"));
+        assert.ok(createTool?.description.includes("criteriaResults[].gate"));
+
+        gFeature = (await executeTool("goal_create", {
+          title: "Verify feature branch",
+          description: "Check only-on-feature.txt at verify_ref",
+          verify_ref: "feature",
+          verification_mode: "deterministic",
+          criteria: [
+            {
+              id: "c1",
+              description: "only-on-feature.txt exists at verified SHA",
+              kind: "deterministic",
+              command: 'test -f only-on-feature.txt && test "$(git rev-parse HEAD)" = "$HARNESS_VERIFY_SHA" && test "$HARNESS_VERIFY_REF" = "feature"',
+              required: true,
+            },
+          ],
+        })) as GoalRecord;
+        gFeatureReview = (await executeTool("goal_trigger_review", { goal_id: gFeature.id })) as {
+          goal: GoalRecord;
+          review: GoalReviewVerdict;
+        };
+      };
+      await daemon.director.sendChatMessage(chat.id, "create and verify feature goal");
+
+      assert.equal(gFeature.verifyRef, "feature");
+      assert.equal(gFeatureReview.review.verdict, "approved");
+      assert.equal(gFeatureReview.goal.status, "achieved");
+      const g1Gate = gFeatureReview.review.criteriaResults[0]?.gate;
+      assert.ok(g1Gate, "expected gate location on criterion result");
+      assert.equal(g1Gate.ref, "feature");
+      assert.equal(g1Gate.sha, featureSha);
+      assert.equal(g1Gate.isolated, true);
+      assert.equal(g1Gate.source, "verify_ref");
+      assert.ok(g1Gate.cwd.includes("/_verify/"), `expected _verify worktree cwd, got ${g1Gate.cwd}`);
+      assert.ok(
+        gFeatureReview.review.criteriaResults[0]!.evidence.startsWith(`[at feature@${featureSha.slice(0, 7)}]`),
+        `expected evidence prefix, got ${gFeatureReview.review.criteriaResults[0]!.evidence}`,
+      );
+
+      // Primary checkout unchanged and _verify worktree removed.
+      assert.equal((await runGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])).stdout, "main");
+      assert.equal(existsSync(join(repoRoot, "only-on-feature.txt")), false);
+      assert.equal((await runGit(repoRoot, ["status", "--porcelain"])).stdout, "");
+      const wtList = (await runGit(repoRoot, ["worktree", "list", "--porcelain"])).stdout;
+      assert.equal(wtList.includes("_verify"), false, `expected _verify cleaned up: ${wtList}`);
+      assert.equal(existsSync(g1Gate.cwd), false, "expected _verify directory removed from disk");
+
+      // 2. Control: without verify_ref, gate runs at run.baseBranch and notes unchanged commit + verify_ref.
+      const gControl = daemon.director.goals.createGoal({
+        chatSessionId: chat.id,
+        repoRoot,
+        title: "Control without verify_ref",
+        description: "Verify on baseBranch with no merged commits",
+        verificationMode: "deterministic",
+        criteria: [
+          {
+            id: "c1",
+            description: "only-on-feature.txt exists",
+            kind: "deterministic",
+            command: "test -f only-on-feature.txt",
+            required: true,
+          },
+        ],
+      });
+      const controlRun = daemon.db.createRun({ goal: gControl.title, repoRoot, baseBranch: "main", baseSha: mainSha });
+      daemon.director.goals.linkRunAndStart(gControl.id, controlRun.id);
+
+      const controlRes = await daemon.director.verifyAndReviewGoal(gControl.id);
+      assert.equal(controlRes.review.verdict, "changes_requested");
+      const controlGate = controlRes.review.criteriaResults[0]?.gate;
+      assert.ok(controlGate);
+      assert.equal(controlGate.source, "run_base_branch");
+      assert.equal(controlGate.ref, "main");
+      assert.equal(controlGate.sha, mainSha);
+      assert.equal(controlGate.isolated, true);
+      assert.ok(controlGate.note?.includes("no work merged"), `expected unchanged-commit note, got ${controlGate.note}`);
+      assert.ok(controlGate.note?.includes("verify_ref"), `expected verify_ref hint, got ${controlGate.note}`);
+      assert.ok(controlRes.review.summary.includes("no work merged"), controlRes.review.summary);
+      assert.ok(controlRes.review.summary.includes("verify_ref"), controlRes.review.summary);
+
+      // 3. Remote-only ref via refs/remotes/origin/feature + metadata-only goal_amend verify_ref.
+      await runGit(repoRoot, ["branch", "-D", "feature"]);
+      await runGit(repoRoot, ["update-ref", "refs/remotes/origin/feature", featureSha]);
+
+      const beforeAmend = daemon.director.goals.getGoal(gControl.id)!;
+      let amendRes!: { goal: GoalRecord; metadataOnly?: boolean; hint?: string };
+      nextChatAction = async (executeTool) => {
+        amendRes = (await executeTool("goal_amend", {
+          goal_id: gControl.id,
+          rationale: "Point verification at remote feature branch",
+          verify_ref: "feature",
+        })) as { goal: GoalRecord; metadataOnly?: boolean; hint?: string };
+      };
+      await daemon.director.sendChatMessage(chat.id, "amend verify_ref only");
+
+      assert.equal(amendRes.metadataOnly, true);
+      assert.equal(amendRes.goal.version, beforeAmend.version, "verify_ref-only amend must not bump version");
+      assert.equal(amendRes.goal.status, beforeAmend.status, "verify_ref-only amend must not change status");
+      assert.equal(amendRes.goal.verifyRef, "feature");
+      assert.ok(amendRes.hint?.includes("goal_trigger_review"), amendRes.hint);
+
+      const remoteRes = await daemon.director.verifyAndReviewGoal(gControl.id);
+      assert.equal(remoteRes.review.verdict, "approved");
+      assert.equal(remoteRes.goal.status, "achieved");
+      const remoteGate = remoteRes.review.criteriaResults[0]?.gate;
+      assert.equal(remoteGate?.ref, "origin/feature");
+      assert.equal(remoteGate?.sha, featureSha);
+      assert.equal(remoteGate?.source, "verify_ref");
+      assert.equal(remoteGate?.isolated, true);
+
+      // Clearing verify_ref via "" also preserves version and status.
+      const beforeClear = daemon.director.goals.getGoal(gControl.id)!;
+      let clearRes!: { goal: GoalRecord; metadataOnly?: boolean };
+      nextChatAction = async (executeTool) => {
+        clearRes = (await executeTool("goal_amend", {
+          goal_id: gControl.id,
+          rationale: "Reset verify_ref to default",
+          verify_ref: "",
+        })) as { goal: GoalRecord; metadataOnly?: boolean };
+      };
+      await daemon.director.sendChatMessage(chat.id, "clear verify_ref");
+      assert.equal(clearRes.metadataOnly, true);
+      assert.equal(clearRes.goal.version, beforeClear.version);
+      assert.equal(clearRes.goal.status, beforeClear.status);
+      assert.equal(clearRes.goal.verifyRef, null);
+
+      // Unknown verify_ref fails closed with "does not resolve" and parks awaiting_human.
+      const gUnknown = daemon.director.goals.createGoal({
+        chatSessionId: chat.id,
+        repoRoot,
+        title: "Unknown verify_ref",
+        description: "Must fail closed",
+        verifyRef: "nope",
+        verificationMode: "deterministic",
+        criteria: [{ id: "c1", description: "Always true", kind: "deterministic", command: "true", required: true }],
+      });
+      daemon.director.goals.setStatus(gUnknown.id, "executing");
+      await assert.rejects(() => daemon.director.verifyAndReviewGoal(gUnknown.id), /does not resolve/);
+      const parked = daemon.director.goals.getGoal(gUnknown.id)!;
+      assert.equal(parked.status, "awaiting_human");
+      assert.ok(parked.lastReviewSummary?.includes("does not resolve"), parked.lastReviewSummary ?? "");
+    } finally {
+      await daemon.stop();
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+it("reports Blocked on verification settlement wording when a failed run's workers all completed and gates fail", async () => {
+  const repoRoot = await makeTempRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-blocked-verify-state-"));
+  const sockPath = join(stateDir, "d.sock");
+  try {
+    const mainSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout;
+    const baseCfg = loadConfig(repoRoot);
+    const config = withFixtureCatalog({
+      ...baseCfg,
+      codeMode: "off",
+      goals: { ...baseCfg.goals, autoVerifyOnSettle: true },
+      events: { ...baseCfg.events, wakeDirectorOnGoalSettle: true },
+      stateDir,
+      socketPath: sockPath,
+    });
+
+    const wakes: ChatControlEvent[] = [];
+    const wakeArrived = Promise.withResolvers<ChatControlEvent>();
+
+    const daemon = new HarnessDaemon(config, {
+      dbPath: ":memory:",
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          if (req.taskId.startsWith("chat-")) {
+            return { text: "noted", stopReason: "completed" };
+          }
+          if (req.tier === 1) {
+            const spawned = (await req.executeTool("spawn_worker", {
+              title: "Worker pushing elsewhere",
+              objective: "Complete work outside merge queue",
+              write_scopes: ["feature.txt"],
+              model: "fixture/fixture",
+            })) as { spawned: string };
+            await req.executeTool("wait_children", { ids: [spawned.spawned], timeout_s: 10 });
+            return { text: "orchestrator failed after worker finished", stopReason: "error" };
+          }
+          await req.executeTool("return_task", {
+            status: "completed",
+            summary: "Committed on separate branch",
+            sources: [],
+          });
+          return { text: "worker completed", stopReason: "completed" };
+        },
+      }),
+    });
+
+    await daemon.start();
+    daemon.director.setWakeHandler((_chatId, event) => {
+      wakes.push(event);
+      if (event.kind === "goal.settled") wakeArrived.resolve(event);
+    });
+    try {
+      const chat = await daemon.director.createChat({ repoRoot });
+      const goal = daemon.director.goals.createGoal({
+        chatSessionId: chat.id,
+        repoRoot,
+        title: "External branch work",
+        description: "Worker completes without merging into main",
+        verificationMode: "deterministic",
+        criteria: [
+          {
+            id: "c1",
+            description: "only-on-feature.txt exists",
+            kind: "deterministic",
+            command: "test -f only-on-feature.txt",
+            required: true,
+          },
+        ],
+      });
+      await daemon.director.commitGoal(goal.id);
+
+      const settledEvent = await Promise.race([
+        wakeArrived.promise,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timed out waiting for goal.settled wake")), 10_000)),
+      ]);
+      const finalGoal = daemon.director.goals.getGoal(goal.id)!;
+      const sha7 = mainSha.slice(0, 7);
+
+      assert.equal(finalGoal.status, "awaiting_human");
+      assert.ok(
+        finalGoal.lastReviewSummary?.startsWith("Blocked on verification:"),
+        `expected Blocked on verification prefix, got: ${finalGoal.lastReviewSummary}`,
+      );
+      assert.ok(
+        finalGoal.lastReviewSummary?.includes(`main@${sha7}`),
+        `expected main@${sha7}, got: ${finalGoal.lastReviewSummary}`,
+      );
+      assert.ok(
+        finalGoal.lastReviewSummary?.includes("All 1 worker task(s) completed"),
+        `expected worker count, got: ${finalGoal.lastReviewSummary}`,
+      );
+      assert.ok(
+        finalGoal.lastReviewSummary?.includes("no work merged") && finalGoal.lastReviewSummary?.includes("verify_ref"),
+        `expected unchanged-commit note, got: ${finalGoal.lastReviewSummary}`,
+      );
+      assert.equal(
+        /Linked run .* failed and/.test(finalGoal.lastReviewSummary ?? ""),
+        false,
+        `must not blame linked run: ${finalGoal.lastReviewSummary}`,
+      );
+
+      assert.equal(settledEvent.kind, "goal.settled");
+      if (settledEvent.kind === "goal.settled") {
+        assert.equal(settledEvent.cause, "gates_failed");
+        assert.ok(
+          settledEvent.detail?.startsWith("blocked_on_verification: "),
+          `expected blocked_on_verification detail prefix, got: ${settledEvent.detail}`,
+        );
+        assert.ok(settledEvent.detail?.includes(`main@${sha7}`), settledEvent.detail);
+      }
+      assert.ok(wakes.length >= 1);
+    } finally {
       await daemon.stop();
     }
   } finally {

@@ -15,7 +15,7 @@ import { vendorSuccessors } from "../catalog/lifecycle.js";
 import { createCodeModeExecutor, effectiveCodeMode } from "../code-mode/index.js";
 import type { HarnessConfig } from "../config.js";
 import { resolveLaunchRoute } from "../control-plane/launch-route.js";
-import { compactTaskHandoff, toolsForTier } from "../control-plane/tools.js";
+import { compactTaskHandoff, isReadOnlyKind, toolsForTier } from "../control-plane/tools.js";
 import { findRunDossier, readRunDossier, writeCodeOutput, writeTaskDossier } from "../control-plane/dossiers.js";
 import type { AdmissionLane, QueuePositionInput } from "../control-plane/admission-queue.js";
 import type { ArtifactRecord, ControlPlaneDb, EscalationRecord, EventRecord, RunRecord } from "../control-plane/db.js";
@@ -36,6 +36,7 @@ import {
   parseGoalCriterionPatches,
   shouldRunIndependentReview,
   type CriterionEvaluation,
+  type GateLocation,
   type GoalAcceptOverrideAudit,
   type GoalAmendmentDelta,
   type GoalCriterion,
@@ -81,13 +82,23 @@ const READ_FILE_DEFAULT_PAGE_BYTES = 32 * 1024;
 const READ_FILE_MAX_PAGE_BYTES = 2 * 1024 * 1024;
 const READ_FILE_SCAN_BYTES = 1024 * 1024;
 
+function formatGateRefSha(location: GateLocation): string {
+  const sha7 = location.sha ? location.sha.slice(0, 7) : "unknown";
+  return `${location.ref}@${sha7}`;
+}
+
 /** Thrown when a failed run's required deterministic gates still fail; the goal goes to a human without a review cycle. */
 class FailedRunGatesError extends Error {
   constructor(
     readonly failedIds: string[],
     readonly evidenceTail: string,
+    readonly location: GateLocation,
+    readonly workersCompleted: boolean,
+    readonly completedWorkerCount = 0,
   ) {
-    super(`required deterministic gate(s) still fail after the run failed (${failedIds.join(", ")})${evidenceTail ? `: ${evidenceTail}` : ""}`);
+    super(
+      `required deterministic gate(s) still fail after the run failed (${failedIds.join(", ")}) at ${formatGateRefSha(location)} in ${location.cwd}${evidenceTail ? `: ${evidenceTail}` : ""}`,
+    );
     this.name = "FailedRunGatesError";
   }
 }
@@ -177,11 +188,19 @@ export function formatAmendmentDelta(
     .join("\n");
 }
 
+const VERIFY_REF_DESC =
+  "Branch, tag, origin/<branch> or SHA whose tree deterministic gates and the Done-Reviewer verify. Set it when the goal's work is pushed to a branch other than the run's base branch, which happens when workers push their own branch instead of merging through the queue. Resolves a local ref first, then origin/<ref>, fetching from origin if needed. Fails if it still does not resolve. Default: the run's base branch.";
+
 const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
     name: "goal_create",
     description:
-      "Draft a structured, versioned Goal Contract with concrete deterministic check commands and behavioral/architectural acceptance criteria.",
+      "Draft a structured, versioned Goal Contract with concrete deterministic check commands and behavioral/architectural acceptance criteria. " +
+      "Deterministic criteria run as shell commands in a detached `_verify` git worktree that the harness creates and removes. " +
+      "It checks out verify_ref when set, otherwise the linked run's base branch (the branch the primary checkout had when the run started). " +
+      "Without a run or base branch, commands run in the primary checkout itself, and results say so. The primary checkout is never modified. " +
+      "Commands get HARNESS_REPO_ROOT (primary checkout path), HARNESS_VERIFY_REF, HARNESS_VERIFY_SHA, HARNESS_GOAL_ID and HARNESS_GOAL_EVIDENCE_DIR. " +
+      "Each gate result records the cwd, ref and SHA it ran at (goal_get reviews[].criteriaResults[].gate).",
     inputSchema: {
       type: "object",
       required: ["title", "description", "criteria"],
@@ -210,6 +229,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
           description:
             "Verification depth chosen by the agent based on risk (default 'auto': runs deterministic checks and only spawns an independent LLM reviewer if required behavioral/architectural criteria exist).",
         },
+        verify_ref: { type: "string", description: VERIFY_REF_DESC },
         commit_immediately: { type: "boolean", description: "Start autonomous Tier 1 execution with the selected model" },
         model: { type: "string", minLength: 1, description: "Required for immediate commit. Select from list_models." },
         profile_id: { type: "string" },
@@ -327,7 +347,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
     name: "goal_amend",
     description:
-      "Amend an active or draft Goal Contract (vN -> vN+1), invalidating stale reviews and notifying the running Tier 1 Orchestrator with the exact delta. description REPLACES the entire description; use append_description to add instructions while keeping the existing text. add_criteria adds, update_criteria merges by id, remove_criteria_ids removes. Amending supersedes this goal's open verification_failed escalations only; other escalations stay open.",
+      "Amend an active or draft Goal Contract (vN -> vN+1), invalidating stale reviews and notifying the running Tier 1 Orchestrator with the exact delta. description REPLACES the entire description; use append_description to add instructions while keeping the existing text. add_criteria adds, update_criteria merges by id, remove_criteria_ids removes. Amending supersedes this goal's open verification_failed escalations only; other escalations stay open. Updating only verify_ref is a metadata change (does not bump version, change status, or steer running tasks); call goal_trigger_review to re-run gates.",
     inputSchema: {
       type: "object",
       required: ["goal_id", "rationale"],
@@ -366,6 +386,10 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
         },
         remove_criteria_ids: { type: "array", items: { type: "string" } },
         non_goals: { type: "array", items: { type: "string" } },
+        verify_ref: {
+          type: "string",
+          description: `${VERIFY_REF_DESC} Pass "" to clear verify_ref and fall back to the run's base branch.`,
+        },
       },
     },
   },
@@ -1358,6 +1382,13 @@ export class DirectorRuntime {
     const gates = err instanceof FailedRunGatesError;
     const reviewerFailed = err instanceof ReviewerFailedError;
     const msg = err instanceof Error ? err.message : String(err);
+    const detailPrefix = gates
+      ? err.workersCompleted
+        ? "blocked_on_verification: "
+        : "deterministic_gates_failed: "
+      : reviewerFailed
+        ? "reviewer_failed: "
+        : "verification_error: ";
     this.wakeHandler?.(goal.chatSessionId, {
       kind: "goal.settled",
       goalId: goal.id,
@@ -1367,7 +1398,7 @@ export class DirectorRuntime {
       runStatus,
       openEscalations: openEscCount,
       cause: gates ? "gates_failed" : "verification_error",
-      detail: (gates ? "deterministic_gates_failed: " : reviewerFailed ? "reviewer_failed: " : "verification_error: ") + msg.slice(0, 240),
+      detail: detailPrefix + msg.slice(0, 240),
     });
   }
 
@@ -2737,46 +2768,72 @@ export class DirectorRuntime {
 
   /**
    * Creates the detached `_verify` worktree for verification gates and Done-Review without touching the host
-   * checkout. Prefers this run's recorded merge commit (`refs/harness/merged/<runId>`) when it exists and is an
-   * ancestor of the base branch tip, falling back to the base branch tip otherwise. Without a base branch,
-   * verification runs in the repo.
-   *
-   * Checking out the local base tip includes sibling goals' unpushed merges, so a shipped gate running
-   * `git merge-base --is-ancestor HEAD origin/main` fails even when this goal's own merge was pushed. Checking
-   * out this run's recorded merge commit evaluates the goal itself without auto-pushing.
+   * checkout. Resolves `goal.verifyRef` when explicitly set (local ref, `origin/<ref>`, then `git fetch --no-tags origin`),
+   * failing closed if unresolved. Otherwise targets `run.baseBranch`, preferring this run's recorded merge commit
+   * (`refs/harness/merged/<runId>`) when it exists and is an ancestor of the base branch tip. Without a verify ref or
+   * resolvable base branch, verification falls back to the primary checkout and records that in `location`.
    */
   private async prepareVerifyCheckout(
     goal: GoalRecord,
     run: RunRecord | null,
-  ): Promise<{ verifyCwd: string; verifyRef: string; isolated: boolean; cleanup: () => Promise<void> }> {
+  ): Promise<{ verifyCwd: string; verifyRef: string; isolated: boolean; location: GateLocation; cleanup: () => Promise<void> }> {
+    const explicitRef = goal.verifyRef?.trim() || "";
+    const explicit = Boolean(explicitRef);
+    const wanted = explicitRef || run?.baseBranch || "";
     let verifyCwd = goal.repoRoot;
-    let verifyRef = run?.baseBranch || "HEAD";
+    let verifyRef = wanted || "HEAD";
+    let refName = wanted || "HEAD";
+    let source: GateLocation["source"] = explicit ? "verify_ref" : run?.baseBranch ? "run_base_branch" : "repo_root";
+    let note: string | undefined;
     let verifyScratch: { path: string; remove: () => Promise<void> } | null = null;
     const cleanup = async () => {
       const scratch = verifyScratch;
       verifyScratch = null;
       await scratch?.remove();
     };
-    if (run?.baseBranch) {
-      const baseTipSha = await runGit(goal.repoRoot, ["rev-parse", "--verify", `${run.baseBranch}^{commit}`])
-        .then((r) => r.stdout)
+    const resolveCommit = (ref: string): Promise<string | null> =>
+      runGit(goal.repoRoot, ["rev-parse", "--verify", `${ref}^{commit}`])
+        .then((r) => r.stdout || null)
         .catch(() => null);
-      if (baseTipSha) {
-        let targetSha = baseTipSha;
-        const mergedRefSha = await runGit(goal.repoRoot, ["rev-parse", "--verify", `${runMergedRef(run.id)}^{commit}`])
-          .then((r) => r.stdout)
-          .catch(() => null);
-        if (mergedRefSha) {
-          const isAncestor = await runGit(goal.repoRoot, ["merge-base", "--is-ancestor", mergedRefSha, baseTipSha])
-            .then(() => true)
-            .catch(() => false);
-          if (isAncestor) targetSha = mergedRefSha;
+
+    if (wanted) {
+      let resolvedSha = await resolveCommit(wanted);
+      let resolvedRefName = wanted;
+      if (!resolvedSha && !wanted.startsWith("origin/") && !wanted.startsWith("refs/")) {
+        resolvedSha = await resolveCommit(`refs/remotes/origin/${wanted}`);
+        if (resolvedSha) resolvedRefName = `origin/${wanted}`;
+      }
+      if (!resolvedSha && explicit) {
+        const fetchRef = wanted.startsWith("origin/") ? wanted.slice("origin/".length) : wanted;
+        if (fetchRef && !fetchRef.startsWith("-")) {
+          await runGit(goal.repoRoot, ["fetch", "--no-tags", "origin", fetchRef]).catch(() => {});
+          resolvedSha = await resolveCommit(`refs/remotes/origin/${fetchRef}`);
+          if (resolvedSha) {
+            resolvedRefName = `origin/${fetchRef}`;
+          } else {
+            resolvedSha = await resolveCommit(wanted);
+            if (resolvedSha) resolvedRefName = wanted;
+          }
+        }
+      }
+
+      if (resolvedSha) {
+        let targetSha = resolvedSha;
+        if (!explicit && run) {
+          const mergedRefSha = await resolveCommit(runMergedRef(run.id));
+          if (mergedRefSha) {
+            const isAncestor = await runGit(goal.repoRoot, ["merge-base", "--is-ancestor", mergedRefSha, resolvedSha])
+              .then(() => true)
+              .catch(() => false);
+            if (isAncestor) targetSha = mergedRefSha;
+          }
         }
         const wtMgr = this.orchestrator.getWorktreeManager(goal.repoRoot);
         const scratch = await wtMgr.addScratchWorktree("_verify", `${goal.id}-${randomUUID().slice(0, 8)}`, targetSha);
         verifyScratch = scratch;
         verifyCwd = scratch.path;
         verifyRef = targetSha;
+        refName = resolvedRefName;
         try {
           // Do NOT silently swallow bootstrap failures — fail verification cleanly if setupCommand fails
           await wtMgr.bootstrapWorktree(scratch.path);
@@ -2785,19 +2842,54 @@ export class DirectorRuntime {
           await scratch.remove();
           throw err;
         }
+      } else if (explicit) {
+        throw new Error(
+          `Cannot verify goal ${goal.id}: verify_ref '${wanted}' does not resolve locally or on origin (fetched).`,
+        );
       } else {
         // Fail closed when targetBranch cannot be resolved and host checkout is on a different branch
         const headBranch = await runGit(goal.repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])
           .then((r) => r.stdout)
           .catch(() => null);
-        if (headBranch && headBranch !== run.baseBranch) {
+        if (headBranch && headBranch !== run!.baseBranch) {
           throw new Error(
-            `Cannot verify goal ${goal.id}: target branch '${run.baseBranch}' does not resolve (host checkout is '${headBranch}').`,
+            `Cannot verify goal ${goal.id}: target branch '${run!.baseBranch}' does not resolve (host checkout is '${headBranch}').`,
           );
         }
+        source = "repo_root";
+        refName = headBranch || run!.baseBranch;
       }
     }
-    return { verifyCwd, verifyRef, isolated: Boolean(verifyScratch), cleanup };
+
+    if (!verifyScratch) {
+      source = "repo_root";
+      if (!wanted) {
+        const headBranch = await runGit(goal.repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])
+          .then((r) => r.stdout)
+          .catch(() => null);
+        refName = headBranch || "HEAD";
+      }
+      note = `ran in the primary checkout (${refName}), not an isolated worktree`;
+    }
+
+    const sha = await runGit(verifyCwd, ["rev-parse", "HEAD"])
+      .then((r) => r.stdout)
+      .catch(() => (verifyScratch ? verifyRef : ""));
+
+    if (!explicit && run?.baseSha && sha && sha === run.baseSha) {
+      const unchangedNote = `verified commit equals the run's starting commit: no work merged into ${run.baseBranch || refName}; if the goal's work is on another branch, set verify_ref`;
+      note = note ? `${note}; ${unchangedNote}` : unchangedNote;
+    }
+
+    const location: GateLocation = {
+      cwd: verifyCwd,
+      ref: refName,
+      sha,
+      isolated: Boolean(verifyScratch),
+      source,
+      ...(note ? { note } : {}),
+    };
+    return { verifyCwd, verifyRef, isolated: Boolean(verifyScratch), location, cleanup };
   }
 
   /**
@@ -2861,10 +2953,13 @@ export class DirectorRuntime {
           }
           const fresh = checkAcceptable(this.goals.getGoal(goal.id));
           if (fresh.version !== goal.version) throw new Error(`Goal ${goal.id} changed during goal_accept`);
-          verifyRef = checkout.verifyRef;
+          verifyRef = checkout.location.sha
+            ? `${checkout.location.ref}@${checkout.location.sha}`
+            : checkout.location.ref;
           const gate = await this.goals.runDeterministicGates(goal.id, run?.baseSha, slot.signal, {
             cwd: checkout.verifyCwd,
             targetRef: checkout.verifyRef,
+            location: checkout.location,
           });
           gateResults = gate.results;
           diffHash = gate.diffHash;
@@ -3075,7 +3170,9 @@ export class DirectorRuntime {
                 goal.id,
                 "awaiting_human",
                 error instanceof FailedRunGatesError
-                  ? `Linked run ${current.linkedRunId ?? "unknown"} failed and required deterministic gate(s) still fail (${error.failedIds.join(", ")}); resume or review.`
+                  ? error.workersCompleted
+                    ? `Blocked on verification: required deterministic gate(s) ${error.failedIds.join(", ")} fail at ${formatGateRefSha(error.location)} (${error.location.isolated ? "_verify worktree, removed" : `primary checkout ${error.location.cwd}`}). All ${error.completedWorkerCount} worker task(s) completed${error.location.note ? `; ${error.location.note}` : ""}. If the work is on another branch, goal_amend verify_ref then goal_trigger_review; otherwise resume ${current.linkedRunId ?? "unknown"} or review.`
+                    : `Linked run ${current.linkedRunId ?? "unknown"} failed and required deterministic gate(s) still fail (${error.failedIds.join(", ")}) at ${formatGateRefSha(error.location)}; resume or review.`
                   : error instanceof ReviewerFailedError
                     ? `Reviewer failed to return a structured verdict after ${error.attempts} ${error.attempts === 1 ? "attempt" : "attempts"}; review cycle not consumed${error.detail ? `: ${error.detail.slice(0, 240)}` : ""}`
                     : `Verification failed: ${msg.slice(0, 240)}`,
@@ -3194,6 +3291,7 @@ export class DirectorRuntime {
       const gateResult = await this.goals.runDeterministicGates(goal.id, run?.baseSha, signal, {
         cwd: verifyCwd,
         targetRef: verifyRef,
+        location: checkout.location,
       });
       assertCurrent();
       // The coordinator may have reported (or confirmed) while gates ran: settle on its latest claim.
@@ -3209,13 +3307,26 @@ export class DirectorRuntime {
           const failedRequired = failed.filter((r) => requiredIds.has(r.criterionId));
           const reportFailed = failedRequired.length ? failedRequired : failed;
           const evidenceTail = reportFailed.map((r) => `${r.criterionId}: ${r.evidence}`).join(" | ").slice(-500);
-          throw new FailedRunGatesError(reportFailed.map((r) => r.criterionId), evidenceTail);
+          const workerTasks = goal.linkedRunId
+            ? this.db
+                .listTasks(goal.linkedRunId)
+                .filter((t) => t.profileId !== "director" && t.tier >= 2 && !isReadOnlyKind(t.kind))
+            : [];
+          const workersCompleted = workerTasks.length > 0 && workerTasks.every((t) => t.status === "completed");
+          throw new FailedRunGatesError(
+            reportFailed.map((r) => r.criterionId),
+            evidenceTail,
+            gateResult.location,
+            workersCompleted,
+            workersCompleted ? workerTasks.length : 0,
+          );
         }
+        const locSummary = `${formatGateRefSha(gateResult.location)}${gateResult.location.note ? `; ${gateResult.location.note}` : ""}`;
         const outcome = this.goals.recordReviewVerdict(goal.id, {
           verdict: "changes_requested",
           criteriaResults: gateResult.results,
           blockingIssues: gateResult.results.filter((r) => !r.passed).map((r) => r.evidence),
-          summary: "Deterministic verification gates failed; bouncing back to Tier 1 before LLM review.",
+          summary: `Deterministic verification gates failed; bouncing back to Tier 1 before LLM review. (gates ran at ${locSummary})`,
           diffHash: gateResult.diffHash,
           spentUsd: this.sumRunCostUsd(goal.linkedRunId),
           source: "deterministic",
@@ -4728,6 +4839,7 @@ export class DirectorRuntime {
             ["auto", "none", "deterministic", "independent_review"].includes(args.verification_mode)
               ? (args.verification_mode as VerificationMode)
               : undefined,
+          verifyRef: typeof args.verify_ref === "string" ? args.verify_ref : undefined,
           budgets:
             typeof args.max_review_cycles === "number" ? { maxReviewCycles: args.max_review_cycles } : undefined,
         });
@@ -4793,17 +4905,49 @@ export class DirectorRuntime {
       }
 
       case "goal_amend": {
-        const amended = await this.amendGoal(String(args.goal_id), {
+        const goalId = String(args.goal_id);
+        const hasVerifyRef = typeof args.verify_ref === "string" || args.verify_ref === null;
+        const verifyRefVal = args.verify_ref === null ? null : typeof args.verify_ref === "string" ? args.verify_ref : null;
+        const updateCriteria = parseGoalCriterionPatches(args.update_criteria, "update_criteria");
+        const hasContractPatch =
+          typeof args.title === "string" ||
+          typeof args.description === "string" ||
+          typeof args.append_description === "string" ||
+          (Array.isArray(args.add_criteria) && args.add_criteria.length > 0) ||
+          (updateCriteria !== undefined && updateCriteria.length > 0) ||
+          (Array.isArray(args.remove_criteria_ids) && args.remove_criteria_ids.length > 0) ||
+          Array.isArray(args.non_goals);
+        if (hasVerifyRef && !hasContractPatch) {
+          const updated = this.goals.setVerifyRef(goalId, verifyRefVal);
+          const targetDesc = updated.verifyRef ?? "the run's base branch";
+          return {
+            goal: updated,
+            metadataOnly: true,
+            hint: `call goal_trigger_review to re-run gates at ${targetDesc}`,
+            presentation_id: presentGoal(updated),
+          };
+        }
+        const amended = await this.amendGoal(goalId, {
           rationale: String(args.rationale),
           title: typeof args.title === "string" ? args.title : undefined,
           description: typeof args.description === "string" ? args.description : undefined,
           appendDescription: typeof args.append_description === "string" ? args.append_description : undefined,
           confirmReplaceDescription: args.confirm_replace_description === true ? true : undefined,
           addCriteria: Array.isArray(args.add_criteria) ? (args.add_criteria as GoalCriterion[]) : undefined,
-          updateCriteria: parseGoalCriterionPatches(args.update_criteria, "update_criteria"),
+          updateCriteria,
           removeCriteriaIds: Array.isArray(args.remove_criteria_ids) ? (args.remove_criteria_ids as string[]) : undefined,
           nonGoals: Array.isArray(args.non_goals) ? (args.non_goals as string[]) : undefined,
         }, { source: "director", actorChatSessionId: chatSessionId });
+        if (hasVerifyRef) {
+          const updated = this.goals.setVerifyRef(amended.goal.id, verifyRefVal);
+          const targetDesc = updated.verifyRef ?? "the run's base branch";
+          return {
+            ...amended,
+            goal: updated,
+            hint: `call goal_trigger_review to re-run gates at ${targetDesc}`,
+            presentation_id: presentGoal(updated),
+          };
+        }
         return { ...amended, presentation_id: presentGoal(amended.goal) };
       }
 
