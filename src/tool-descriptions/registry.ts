@@ -551,7 +551,8 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
         verify: RETURN_TASK_SOURCES_READ_ONLY_FACT,
       },
       verifyVerdict: {
-        default: "For a final verify, completed records a pass and any other status a fail; a handoff with partial: true records neither.",
+        default:
+          "A final verify returns status completed for a PASS. For a FAIL or changes-requested verdict, return status blocked with your findings in summary and sources: the task settles as completed and records a failed verification, and nothing is escalated. Only when verification could not run and no result exists, return blocked with partial: true.",
       },
       scopeSendBack: {
         default:
