@@ -93,9 +93,12 @@ export interface GoalCriterion {
   kind: CriterionKind;
   /**
    * Runnable shell command for `deterministic` criteria (executed at $0 LLM cost).
-   * Runs with `cwd` set to an isolated `_verify` scratch worktree checked out at the goal's target branch when a linked
-   * run resolves one (otherwise `goal.repoRoot`), and receives `HARNESS_REPO_ROOT` (the canonical main checkout),
-   * `HARNESS_GOAL_EVIDENCE_DIR` (when the evidence directory is valid), and `HARNESS_GOAL_ID` in its environment.
+   * Runs in a detached `_verify` git worktree that the harness creates and removes. Checks out `verifyRef` when set,
+   * otherwise the linked run's base branch (preferring the run's recorded merge commit when applicable); without a run
+   * or base branch, runs in the primary checkout (`goal.repoRoot`), and results say so. The primary checkout is never
+   * modified. Receives `HARNESS_REPO_ROOT` (primary checkout path), `HARNESS_VERIFY_REF`, `HARNESS_VERIFY_SHA`,
+   * `HARNESS_GOAL_ID`, and `HARNESS_GOAL_EVIDENCE_DIR` (when the evidence directory is valid). Each gate result records
+   * the `cwd`, `ref`, and `sha` it ran at (`CriterionEvaluation.gate`).
    */
   command?: string;
   required: boolean;
@@ -157,6 +160,7 @@ export interface GoalRecord {
   nonGoals: string[];
   budgets: GoalBudgets;
   verificationMode?: VerificationMode;
+  verifyRef?: string | null;
   liveProgress?: GoalLiveProgress | null;
   status: GoalStatus;
   linkedRunId: string | null;
@@ -196,11 +200,21 @@ export interface GoalRevisionRecord {
   createdAt: number;
 }
 
+export interface GateLocation {
+  cwd: string;
+  ref: string;
+  sha: string;
+  isolated: boolean;
+  source: "verify_ref" | "run_base_branch" | "repo_root";
+  note?: string;
+}
+
 export interface CriterionEvaluation {
   criterionId: string;
   passed: boolean;
   evidence: string;
   remediation?: string;
+  gate?: GateLocation;
 }
 
 /** What produced a goal_reviews row. Legacy rows read as "review". */
@@ -239,6 +253,7 @@ export interface DeterministicGateResult {
   allPassed: boolean;
   results: CriterionEvaluation[];
   diffHash: string;
+  location: GateLocation;
 }
 
 export const GOALS_SCHEMA = `
@@ -253,6 +268,7 @@ CREATE TABLE IF NOT EXISTS goals (
   non_goals_json TEXT NOT NULL DEFAULT '[]',
   budgets_json TEXT NOT NULL,
   verification_mode TEXT NOT NULL DEFAULT 'auto',
+  verify_ref TEXT,
   live_progress_json TEXT,
   status TEXT NOT NULL DEFAULT 'draft',
   linked_run_id TEXT,
@@ -379,6 +395,9 @@ export class GoalEngine {
     if (!cols.has("verification_mode")) {
       this.db.exec("ALTER TABLE goals ADD COLUMN verification_mode TEXT NOT NULL DEFAULT 'auto'");
     }
+    if (!cols.has("verify_ref")) {
+      this.db.exec("ALTER TABLE goals ADD COLUMN verify_ref TEXT");
+    }
     if (!cols.has("live_progress_json")) {
       this.db.exec("ALTER TABLE goals ADD COLUMN live_progress_json TEXT");
     }
@@ -416,6 +435,7 @@ export class GoalEngine {
       nonGoals: JSON.parse(String(r.non_goals_json)) as string[],
       budgets: JSON.parse(String(r.budgets_json)) as GoalBudgets,
       verificationMode,
+      verifyRef: typeof r.verify_ref === "string" && r.verify_ref.trim() ? r.verify_ref.trim() : null,
       liveProgress,
       status: String(r.status) as GoalStatus,
       linkedRunId: r.linked_run_id ? String(r.linked_run_id) : null,
@@ -437,6 +457,7 @@ export class GoalEngine {
     nonGoals?: string[];
     budgets?: Partial<GoalBudgets>;
     verificationMode?: VerificationMode;
+    verifyRef?: string | null;
   }): GoalRecord {
     if (!input.title.trim()) throw new Error("Goal title is required");
     const verificationMode: VerificationMode = input.verificationMode ?? "auto";
@@ -467,13 +488,14 @@ export class GoalEngine {
       maxWallClockMin: input.budgets?.maxWallClockMin,
       maxApiEquivUsd: input.budgets?.maxApiEquivUsd,
     };
+    const verifyRef = typeof input.verifyRef === "string" && input.verifyRef.trim() ? input.verifyRef.trim() : null;
 
     this.db
       .prepare(
         `INSERT INTO goals(
           id, chat_session_id, repo_root, version, title, description,
-          criteria_json, non_goals_json, budgets_json, verification_mode, status, created_at, updated_at
-        ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)`,
+          criteria_json, non_goals_json, budgets_json, verification_mode, verify_ref, status, created_at, updated_at
+        ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)`,
       )
       .run(
         id,
@@ -485,6 +507,7 @@ export class GoalEngine {
         JSON.stringify(nonGoals),
         JSON.stringify(budgets),
         verificationMode,
+        verifyRef,
         now,
         now,
       );
@@ -639,6 +662,18 @@ export class GoalEngine {
     const updated = this.getGoal(g.id)!;
     if (status === "achieved" || status === "cancelled") this.settleEscalations(updated, status);
     return updated;
+  }
+
+  /** Updates verify_ref metadata without bumping version, changing status, or steering active runs. */
+  setVerifyRef(goalIdStr: string, ref: string | null): GoalRecord {
+    const g = this.getGoal(goalIdStr);
+    if (!g) throw new Error(`Unknown goal ${goalIdStr}`);
+    if (g.status === "cancelled") throw new Error("Cannot amend a cancelled goal");
+    const normalized = typeof ref === "string" && ref.trim() ? ref.trim() : null;
+    this.db
+      .prepare("UPDATE goals SET verify_ref = ?, updated_at = ? WHERE id = ?")
+      .run(normalized, Date.now(), g.id);
+    return this.getGoal(g.id)!;
   }
 
   /** Resolves escalations on a settled goal's linked run; a failure here never fails the committed transition. */
@@ -925,7 +960,7 @@ export class GoalEngine {
     goalIdStr: string,
     baseSha?: string,
     signal?: AbortSignal,
-    opts?: { cwd?: string; targetRef?: string },
+    opts?: { cwd?: string; targetRef?: string; location?: GateLocation },
   ): Promise<DeterministicGateResult> {
     const goal = this.getGoal(goalIdStr);
     if (!goal) throw new Error(`Unknown goal ${goalIdStr}`);
@@ -939,6 +974,23 @@ export class GoalEngine {
 
     const gateCwd = opts?.cwd ?? goal.repoRoot;
     const targetRef = opts?.targetRef ?? "HEAD";
+    let location: GateLocation;
+    if (opts?.location) {
+      location = opts.location;
+    } else {
+      const sha = await runGit(gateCwd, ["rev-parse", "HEAD"])
+        .then((r) => r.stdout)
+        .catch(() => "");
+      location = {
+        cwd: gateCwd,
+        ref: targetRef,
+        sha,
+        isolated: false,
+        source: "repo_root",
+      };
+    }
+    const sha7 = location.sha ? location.sha.slice(0, 7) : "unknown";
+    const locPrefix = `[at ${location.ref}@${sha7}]${location.isolated ? "" : " in primary checkout"}`;
     const results: CriterionEvaluation[] = [];
     let allPassed = true;
     let resolved: ResolvedGateEnv | undefined;
@@ -950,8 +1002,9 @@ export class GoalEngine {
         results.push({
           criterionId: c.id,
           passed: false,
-          evidence: `Deterministic criterion '${c.id}' has no shell command configured.`,
+          evidence: `${locPrefix} Deterministic criterion '${c.id}' has no shell command configured.`,
           remediation: "Amend the goal to provide a runnable deterministic command or change criterion kind.",
+          gate: location,
         });
         continue;
       }
@@ -963,6 +1016,8 @@ export class GoalEngine {
             ...(verifiedEvDir !== null ? { HARNESS_GOAL_EVIDENCE_DIR: verifiedEvDir } : {}),
             HARNESS_GOAL_ID: goal.id,
             HARNESS_REPO_ROOT: goal.repoRoot,
+            HARNESS_VERIFY_REF: location.ref,
+            HARNESS_VERIFY_SHA: location.sha,
           },
           signal,
         });
@@ -976,7 +1031,8 @@ export class GoalEngine {
         results.push({
           criterionId: c.id,
           passed: true,
-          evidence: `$ ${c.command} -> exit 0${stdout.trim() ? `: ${stdout.trim().slice(-300)}` : stderr.trim() ? `: ${stderr.trim().slice(-200)}` : ""}`,
+          evidence: `${locPrefix} $ ${c.command} -> exit 0${stdout.trim() ? `: ${stdout.trim().slice(-300)}` : stderr.trim() ? `: ${stderr.trim().slice(-200)}` : ""}`,
+          gate: location,
         });
       } catch (err: unknown) {
         signal?.throwIfAborted();
@@ -985,8 +1041,9 @@ export class GoalEngine {
         results.push({
           criterionId: c.id,
           passed: false,
-          evidence: `$ ${c.command} -> FAILED\n${message.slice(-600)}${resolved ? `\n[gate-env] ${resolved.provenance}` : ""}`,
+          evidence: `${locPrefix} $ ${c.command} -> FAILED\n${message.slice(-600)}${resolved ? `\n[gate-env] ${resolved.provenance}` : ""}`,
           remediation: `Fix failures in deterministic check: ${c.command}`,
+          gate: location,
         });
       }
     }
@@ -1002,7 +1059,7 @@ export class GoalEngine {
     }
     const diffHash = createHash("sha256").update(diffText).digest("hex").slice(0, 16);
 
-    return { allPassed, results, diffHash };
+    return { allPassed, results, diffHash, location };
   }
 
   /**
