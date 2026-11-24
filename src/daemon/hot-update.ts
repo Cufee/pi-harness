@@ -1,9 +1,15 @@
-import { existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
+import { Database } from "bun:sqlite";
 import type { HotUpdateConfig } from "../config.js";
+import { classifyInterruptedTasks, formatRecoveryPlan, type RecoveryPlan } from "../control-plane/restart-recovery.js";
 import type { DaemonReloadParams, DaemonReloadReply, ReloadStatus } from "../protocol/daemon-rpc.js";
+import { ensureLocalDaemon, stopLocalDaemon } from "./launch.js";
 import { currentRelease, installedCurrent, readReleaseAt, releaseTargetForDir, type ReleaseIdentity, type ReleaseTarget } from "./release.js";
 import { DaemonClient } from "./remote.js";
+import { spawnSupervisorDetached } from "./supervise.js";
 
 const DEFAULT_BOOT_TIMEOUT_MS = 20_000;
 const STOP_BUDGET_MS = 45_000;
@@ -325,29 +331,129 @@ async function probePing(socketPath: string, timeoutMs = 2000): Promise<DaemonPi
   }
 }
 
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function waitForPidExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isPidAlive(pid)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return !isPidAlive(pid);
+}
+
+export function formatLegacyBootstrapNotice(info: DaemonPingInfo, targetReleaseId: string): string {
+  const workLabel = info.liveWork || (info.running === false ? "idle" : "active work");
+  return [
+    `harnessd (pid ${info.pid ?? "?"}, ${workLabel}) does not support hot update and was not restarted.`,
+    `Release ${targetReleaseId} is installed and is used on the next daemon start.`,
+    `To restart it now and resume its work in place, run from a terminal (not from an agent):`,
+    `  pi-harness daemon recover --dry-run`,
+    `  pi-harness daemon reload --legacy`,
+  ].join("\n");
+}
+
+function resolveFallbackFromProc(pid: number): ReleaseTarget | null {
+  if (process.platform !== "linux" || !Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const raw = readFileSync(`/proc/${pid}/cmdline`);
+    const argv = raw
+      .toString("utf8")
+      .split("\0")
+      .filter((s) => s.length > 0);
+    if (argv.length < 2) return null;
+    const argv0 = argv[0]!;
+    const argv1 = argv[1]!;
+    const resolvedArgv1 = isAbsolute(argv1)
+      ? argv1
+      : (() => {
+          const procCwd = resolveCwdFromProc(pid);
+          return procCwd ? resolve(procCwd, argv1) : null;
+        })();
+    if (!resolvedArgv1 || (!resolvedArgv1.endsWith("/src/cli.ts") && !resolvedArgv1.endsWith("\\src\\cli.ts"))) return null;
+    const dir = resolve(dirname(resolvedArgv1), "..");
+    if (!existsSync(join(dir, "src", "cli.ts"))) return null;
+    const base = releaseTargetForDir(dir);
+    const bunCandidate = join(base.releaseDir, ".bun");
+    if (!existsSync(bunCandidate) && argv0 && existsSync(argv0)) {
+      return { ...base, bunPath: argv0 };
+    }
+    return base;
+  } catch {
+    return null;
+  }
+}
+
+function resolveCwdFromProc(pid: number): string | null {
+  if (process.platform !== "linux" || !Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const cwd = realpathSync(`/proc/${pid}/cwd`);
+    return existsSync(cwd) ? cwd : null;
+  } catch {
+    return null;
+  }
+}
+
+async function printFallbackFileIfPresent(socketPath: string, waitForFile: boolean): Promise<void> {
+  const fallbackFilePath = join(dirname(socketPath), "reload-fallback.txt");
+  if (waitForFile && !existsSync(fallbackFilePath)) {
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline && !existsSync(fallbackFilePath)) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+  if (!existsSync(fallbackFilePath)) return;
+  try {
+    const text = readFileSync(fallbackFilePath, "utf8").trim();
+    if (text) console.error(text);
+  } catch {
+    // ignore read error
+  }
+}
+
 export async function waitForDaemonReload(opts: {
   socketPath: string;
   targetReleaseId: string;
   oldPid?: number;
   deadlineAt: number;
+  legacy?: boolean;
+  expectFallbackFile?: boolean;
+  hasAffectedRuns?: boolean;
 }): Promise<number> {
   const bootTimeoutMs = parsePositiveEnvMs(process.env.PI_HARNESS_SUPERVISE_BOOT_TIMEOUT_MS) ?? DEFAULT_BOOT_TIMEOUT_MS;
-  const waitDeadline = opts.deadlineAt + STOP_BUDGET_MS + 2 * bootTimeoutMs + WAIT_SLACK_MS;
+  const waitDeadline = opts.deadlineAt + STOP_BUDGET_MS + bootTimeoutMs + DEFAULT_BOOT_TIMEOUT_MS + WAIT_SLACK_MS;
 
   while (Date.now() < waitDeadline) {
     await new Promise((r) => setTimeout(r, 150));
     const ping = await probePing(opts.socketPath, 2000);
     if (!ping) continue;
     if (opts.oldPid !== undefined && ping.pid === opts.oldPid) continue;
+    if (ping.releaseId === opts.targetReleaseId) {
+      console.log(`reloaded harnessd to release ${ping.releaseId} (pid ${ping.pid ?? "?"}).`);
+      return 0;
+    }
+    const waitForFallbackFile =
+      Boolean(opts.expectFallbackFile) || (Boolean(opts.hasAffectedRuns) && ping.restartSafe !== true);
     if (ping.reload?.lastError?.targetReleaseId === opts.targetReleaseId) {
       console.error(
         `reload failed: harnessd could not start release ${opts.targetReleaseId} (${ping.reload.lastError.error}) and is back on release ${ping.releaseId ?? "unknown"} (pid ${ping.pid ?? "?"}).`,
       );
+      await printFallbackFileIfPresent(opts.socketPath, waitForFallbackFile);
       return 3;
     }
-    if (ping.releaseId === opts.targetReleaseId) {
-      console.log(`reloaded harnessd to release ${ping.releaseId} (pid ${ping.pid ?? "?"}).`);
-      return 0;
+    if (opts.legacy) {
+      console.error(
+        `reload failed: harnessd could not start release ${opts.targetReleaseId} and is back on release ${ping.releaseId ?? "pre-feature"} (pid ${ping.pid ?? "?"}).`,
+      );
+      await printFallbackFileIfPresent(opts.socketPath, waitForFallbackFile);
+      return 3;
     }
   }
 
@@ -357,13 +463,190 @@ export async function waitForDaemonReload(opts: {
 
 export interface DaemonReloadCliOptions {
   socketPath: string;
+  stateDir?: string;
   targetDir?: string;
+  previousDir?: string;
+  dbPath?: string;
   explicitTarget?: ReleaseTarget;
   allowCheckout?: boolean;
+  legacy?: boolean;
+  yes?: boolean;
   fromInstall?: boolean;
   now?: boolean;
   wait?: boolean;
   force?: boolean;
+}
+
+async function promptLegacyConfirmation(): Promise<boolean> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await rl.question("Restart harnessd now? [y/N] ")).trim().toLowerCase();
+    return answer === "y" || answer === "yes";
+  } catch {
+    return false;
+  } finally {
+    rl.close();
+  }
+}
+
+async function runLegacyReloadCli(params: {
+  opts: DaemonReloadCliOptions;
+  self: ReleaseIdentity;
+  target: ReleaseTarget;
+  allowCheckout: boolean;
+  info: DaemonPingInfo;
+}): Promise<number> {
+  const { opts, self, target, allowCheckout, info } = params;
+
+  if (info.reload !== undefined) {
+    console.error("This daemon supports hot update. Run pi-harness daemon reload.");
+    return 1;
+  }
+
+  try {
+    validateTarget(target, allowCheckout);
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    return 1;
+  }
+
+  if (typeof info.pid !== "number" || !Number.isInteger(info.pid) || info.pid <= 0) {
+    console.error("Running harnessd did not report a valid PID; cannot run legacy reload.");
+    return 1;
+  }
+
+  // Step 1: read-only dry run against SQLite (same classification as `daemon recover --dry-run`).
+  const rawDb = opts.dbPath?.trim() ?? "";
+  const dbPath = rawDb
+    ? resolve(rawDb === "~" || rawDb.startsWith("~/") ? join(homedir(), rawDb.slice(1)) : rawDb)
+    : join(opts.stateDir ?? dirname(opts.socketPath), "control-plane.sqlite");
+
+  let plan: RecoveryPlan;
+  try {
+    if (!existsSync(dbPath)) {
+      throw new Error(`Database not found: ${dbPath}`);
+    }
+    const raw = new Database(dbPath, { readonly: true });
+    try {
+      plan = classifyInterruptedTasks(raw);
+    } finally {
+      raw.close();
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`dry run failed: ${msg}. Nothing was changed.`);
+    return 1;
+  }
+  console.log(formatRecoveryPlan(plan));
+
+  // Step 2: resolve fallback release (--previous, else ping.releaseDir, else /proc/<pid>/cmdline, else none).
+  let previous: ReleaseTarget | null = null;
+  if (opts.previousDir) {
+    const prevDir = resolve(opts.previousDir);
+    if (!existsSync(prevDir)) {
+      console.error(`Invalid --previous directory: ${prevDir} does not exist.`);
+      return 1;
+    }
+    previous = releaseTargetForDir(prevDir);
+    if (!existsSync(previous.cliPath)) {
+      console.error(`Invalid --previous directory: CLI entrypoint not found at ${previous.cliPath}`);
+      return 1;
+    }
+    if (!existsSync(previous.bunPath)) {
+      console.error(`Invalid --previous directory: bun binary not found at ${previous.bunPath}`);
+      return 1;
+    }
+  } else if (info.releaseDir && existsSync(join(info.releaseDir, "src", "cli.ts"))) {
+    previous = releaseTargetForDir(info.releaseDir);
+  } else {
+    previous = resolveFallbackFromProc(info.pid);
+  }
+
+  const affectedRunIds = [...new Set(plan.relaunch.map((t) => t.runId))];
+  const runningReleaseLabel = info.releaseId
+    ? `${info.releaseId}${info.releaseDir ? ` (${info.releaseDir})` : ""}`
+    : "pre-feature";
+  const fallbackLabel = previous ? `${previous.releaseId} (${previous.releaseDir})` : "no fallback release found";
+  const restartSafeLabel = info.restartSafe === true ? "yes" : "no";
+
+  console.log(
+    [
+      "",
+      "Legacy reload plan:",
+      `  Running daemon: pid ${info.pid}, release ${runningReleaseLabel}, restart-safe: ${restartSafeLabel}`,
+      `  Target release: ${target.releaseId} (${target.releaseDir})`,
+      `  Fallback release: ${fallbackLabel}`,
+      `  Affected runs: ${affectedRunIds.length > 0 ? affectedRunIds.join(", ") : "none"}`,
+      "",
+      "Not preserved on first activation against a pre-feature daemon:",
+      "  - Attached old-release TUIs exit.",
+      "  - An in-flight Director turn is aborted and its unflushed tail is lost (no tool list or continuation turn).",
+      "  - Queued Director wakeups are lost.",
+      "  - Agents write no rollover handoffs; interrupted tasks resume from harness-built recovery handoffs.",
+      "  - In-flight merges, Done-Reviews, and verification gates run again.",
+      "  - Active PTYs, code_exec scripts, and in-memory quota --in timers are lost.",
+      "  - wait_timer rows cancelled by the old daemon during shutdown are revived to pending by the new daemon.",
+    ].join("\n"),
+  );
+
+  // Step 3: confirmation (TTY prompt or --yes; non-TTY without --yes exits 2).
+  if (!opts.yes) {
+    if (!process.stdin.isTTY) {
+      console.error("Not confirmed. Pass --yes to run without a prompt.");
+      return 2;
+    }
+    const confirmed = await promptLegacyConfirmation();
+    if (!confirmed) {
+      console.error("Not confirmed. Nothing was changed.");
+      return 2;
+    }
+  }
+
+  // Step 4: hand off to the detached supervisor.
+  let cwd = dirname(opts.socketPath);
+  const procCwd = resolveCwdFromProc(info.pid);
+  if (procCwd) {
+    cwd = procCwd;
+  } else {
+    try {
+      const curCwd = process.cwd();
+      if (existsSync(curCwd)) cwd = curCwd;
+    } catch {
+      // keep socket dir fallback
+    }
+  }
+
+  spawnSupervisorDetached(
+    self,
+    {
+      socketPath: opts.socketPath,
+      target,
+      previous,
+      stopPid: info.pid,
+      stopRestartSafe: info.restartSafe === true,
+      ...(info.releaseId ? { fromReleaseId: info.releaseId } : {}),
+      ...(affectedRunIds.length > 0 ? { affectedRunIds } : {}),
+    },
+    cwd,
+  );
+
+  const logPath = join(dirname(opts.socketPath), "daemon.log");
+  console.log(`restart handed to supervisor, see ${logPath}`);
+
+  if (!opts.wait) return 0;
+
+  const expectFallbackFile = Boolean(
+    previous && affectedRunIds.length > 0 && (readReleaseAt(previous.releaseDir) === null || info.restartSafe !== true),
+  );
+  return await waitForDaemonReload({
+    socketPath: opts.socketPath,
+    targetReleaseId: target.releaseId,
+    oldPid: info.pid,
+    deadlineAt: Date.now(),
+    legacy: true,
+    expectFallbackFile,
+    hasAffectedRuns: affectedRunIds.length > 0,
+  });
 }
 
 export async function runDaemonReloadCli(opts: DaemonReloadCliOptions): Promise<number> {
@@ -406,21 +689,17 @@ export async function runDaemonReloadCli(opts: DaemonReloadCliOptions): Promise<
   let reply: DaemonReloadReply;
   try {
     info = await client.request<DaemonPingInfo>("ping");
+    if (opts.legacy) {
+      // Close the probe socket before running dry-run / prompt / supervisor stop.
+      client.close();
+      return await runLegacyReloadCli({ opts, self, target, allowCheckout, info });
+    }
     if (info.releaseId === target.releaseId && !opts.force) {
       console.log(`already running release ${target.releaseId}`);
       return 0;
     }
-    // Seam for slice 4a-2: --legacy path plugs in here before the no-reload notice.
     if (info.reload === undefined) {
-      console.log(
-        [
-          `harnessd (pid ${info.pid ?? "?"}, ${info.liveWork || "idle"}) does not support hot update and was not restarted.`,
-          `Release ${target.releaseId} is installed and is used on the next daemon start.`,
-          `To restart it now and resume its work in place, run from a terminal (not from an agent):`,
-          `  pi-harness daemon recover --dry-run`,
-          `  pi-harness daemon reload --legacy`,
-        ].join("\n"),
-      );
+      console.log(formatLegacyBootstrapNotice(info, target.releaseId));
       return 0;
     }
     const source: "install" | "cli" = opts.fromInstall ? "install" : "cli";
@@ -465,21 +744,51 @@ export async function runDaemonReloadCli(opts: DaemonReloadCliOptions): Promise<
 }
 
 /**
- * If a local daemon with `ping.reload` is listening, runs an immediate forced reload with `--wait`
- * and returns its exit code. Returns `null` when no daemon is running or it lacks `ping.reload`,
- * so `daemon restart` falls back to `stopLocalDaemon` + `ensureLocalDaemon`.
+ * Handles `pi-harness daemon restart` against a running local daemon:
+ * - With `ping.reload`: immediate forced reload with `--wait`.
+ * - Without `ping.reload` and busy (`running !== false`): prints the legacy notice and returns 1 without stopping.
+ * - Without `ping.reload` and idle (`running === false`): stops, waits for the old PID to exit, spawns and verifies a new PID.
+ * Returns `null` when no daemon is currently listening so the caller can start a fresh one.
  */
 export async function tryReloadForDaemonRestart(socketPath: string): Promise<number | null> {
   const ping = await probePing(socketPath, 2000);
-  if (!ping || ping.reload === undefined) return null;
+  if (!ping) return null;
   const self = currentRelease();
   const target = installedCurrent(self) ?? self;
-  return await runDaemonReloadCli({
-    socketPath,
-    explicitTarget: target,
-    allowCheckout: true,
-    now: true,
-    force: true,
-    wait: true,
-  });
+  if (ping.reload !== undefined) {
+    return await runDaemonReloadCli({
+      socketPath,
+      explicitTarget: target,
+      allowCheckout: true,
+      now: true,
+      force: true,
+      wait: true,
+    });
+  }
+  if (ping.running !== false) {
+    console.log(formatLegacyBootstrapNotice(ping, target.releaseId));
+    return 1;
+  }
+  const oldPid = typeof ping.pid === "number" && ping.pid > 0 ? ping.pid : undefined;
+  await stopLocalDaemon(socketPath);
+  if (oldPid !== undefined) {
+    const exitTimeoutMs = ping.restartSafe ? 30_000 : 10_000;
+    const exited = await waitForPidExit(oldPid, exitTimeoutMs);
+    if (!exited) {
+      console.error(`Timed out waiting for old harnessd (pid ${oldPid}) to exit; not restarting.`);
+      return 1;
+    }
+  }
+  const c = await ensureLocalDaemon(socketPath);
+  try {
+    const after = await c.request<DaemonPingInfo>("ping");
+    if (oldPid !== undefined && after.pid === oldPid) {
+      console.error(`Old harnessd (pid ${oldPid}) is still serving after stop; restart failed.`);
+      return 1;
+    }
+  } finally {
+    c.close();
+  }
+  console.log("Restarted harnessd.");
+  return 0;
 }

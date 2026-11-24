@@ -42,6 +42,8 @@ const BOOLEAN_LONG_FLAGS = new Set([
   "now",
   "wait",
   "from-install",
+  "legacy",
+  "yes",
   "supervise",
 ]);
 
@@ -294,6 +296,7 @@ Usage:
   pi-harness profiles [list | add <id> <cmd> [args...] | remove <id> | probe <id>]
   pi-harness daemon serve | status | stop | restart [--remote <alias|ssh://host>]
   pi-harness daemon reload [--now] [--wait] [--target <dir>] [--from-install]
+  pi-harness daemon reload --legacy [--yes] [--wait] [--previous <dir>] [--target <dir>] [--db <path>]
   pi-harness daemon recover --dry-run [--db <path>] [--json]
   pi-harness run "<goal>" [-p <project>] [--profile id] [--model id] [--effort level] [--detach] [--remote <alias|ssh://host>]
   pi-harness run resume <run-id> [--in 15m | --message "<msg>"] [--remote <alias|ssh://host>]
@@ -729,9 +732,16 @@ async function main(): Promise<void> {
         throw new Error(`\`daemon reload\` only runs locally; omit --remote (got --remote ${rawRemote}).`);
       }
       const targetDir = requireStringFlag(flags, "target");
+      const previousDir = requireStringFlag(flags, "previous");
+      const dbPath = requireStringFlag(flags, "db");
       const code = await runDaemonReloadCli({
         socketPath: config.socketPath,
+        stateDir: config.stateDir,
         targetDir,
+        previousDir,
+        dbPath,
+        legacy: flags.legacy === true,
+        yes: flags.yes === true,
         fromInstall: flags["from-install"] === true,
         now: flags.now === true,
         wait: flags.wait === true,
