@@ -10,6 +10,7 @@ import { DAEMON_PROTOCOL_REV, HarnessDaemon } from "../src/daemon/server.js";
 import { createTheme, ModalScreen, Navigator, stripTerminalSequences, visibleWidth } from "../src/tui/core/index.js";
 import { ProjectsScreen } from "../src/tui/projects.js";
 import type { AttachableSession } from "../src/tui/store.js";
+import { withFixtureCatalog } from "./fixtures/launch-config.js";
 
 function makeFakeTerminal(): Terminal {
   return {
@@ -42,9 +43,11 @@ describe("SSH-first Projects Registry, Session Switching, Non-Git Folders & TUI 
     const gitProjPath = join(workspacesDir, "backend");
     const folderProjPath = join(workspacesDir, "scratch-notes");
 
-    const cfg = loadConfig(root);
-    cfg.stateDir = stateDir;
-    cfg.socketPath = sockPath;
+    const cfg = withFixtureCatalog({
+      ...loadConfig(root),
+      stateDir,
+      socketPath: sockPath,
+    });
 
     const daemon = new HarnessDaemon(cfg);
     await daemon.start();
