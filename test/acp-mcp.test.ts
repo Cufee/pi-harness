@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "bun:test";
 import { agent } from "@agentclientprotocol/sdk/unstable";
+import { contextWarningText } from "../src/advisories/message.js";
 import { REJECTIONS } from "../src/advisories/rejections.js";
 import { loadConfig, type AcpProfileConfig } from "../src/config.js";
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
@@ -1679,6 +1680,314 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
       assert.equal(rwRes.stopReason, "completed");
       assert.equal(readFileSync(gitConfig, "utf8"), "[core]\n\trepositoryformatversion = 0\n");
       assert.equal(readFileSync(outsideFile, "utf8"), "outside-secret");
+    } finally {
+      rmSync(baseDir, { recursive: true, force: true });
+    }
+  });
+
+  it("T-acp: tool_call locations populate paths, denied permissions emit failed events with rule ids, turnOpen tracks prompt flight, and context warning uses contextWarningText", async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), "acp-t-acp-"));
+    const cwd = join(baseDir, "workspace");
+    const outsideFile = join(baseDir, "outside.txt");
+    mkdirSync(join(cwd, "src"), { recursive: true });
+    mkdirSync(join(cwd, ".git"), { recursive: true });
+    const srcFile = join(cwd, "src", "file.ts");
+    const gitConfig = join(cwd, ".git", "config");
+    writeFileSync(srcFile, "export const v = 1;\n", "utf8");
+    writeFileSync(outsideFile, "outside\n", "utf8");
+    writeFileSync(gitConfig, "[core]\n\trepositoryformatversion = 0\n", "utf8");
+
+    try {
+      // (i) & (ii) Read-only task: tool_call with locations -> paths; denied permissions -> failed events with denied rule ids, denial holds
+      const roEvents: Array<Parameters<NonNullable<RunAgentRequest["callbacks"]["onToolEvent"]>>[0]> = [];
+      const permOutcomes: Record<string, string> = {};
+      const denyOpts = [
+        { kind: "allow_once", optionId: "allow", name: "Allow" },
+        { kind: "reject_once", optionId: "deny", name: "Deny" },
+      ];
+      const outcomeOf = (resp: unknown): string => {
+        const out = (resp as { outcome: { outcome: string; optionId?: string } }).outcome;
+        return out.outcome === "selected" ? (out.optionId ?? "") : out.outcome;
+      };
+
+      const roFixture = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {} }))
+        .onRequest("session/new", async () => ({
+          sessionId: "s-t-acp-ro",
+          models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+        }))
+        .onRequest("session/prompt", async ({ client, params }) => {
+          const sid = params.sessionId;
+          // (i) tool_call and tool_call_update with locations
+          await client.notify("session/update", {
+            sessionId: sid,
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: "loc-1",
+              title: "Read",
+              kind: "read",
+              status: "pending",
+              locations: [{ path: srcFile }],
+            },
+          } as never);
+          await client.notify("session/update", {
+            sessionId: sid,
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: "loc-1",
+              status: "completed",
+              locations: [{ path: srcFile }, { path: join(cwd, "src", "second.ts") }],
+            },
+          } as never);
+          await client.notify("session/update", {
+            sessionId: sid,
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: "no-loc-1",
+              title: "Think",
+              kind: "think",
+              status: "completed",
+            },
+          } as never);
+
+          // (ii) Denied permissions across all 6 rule ids
+          permOutcomes.shell = outcomeOf(
+            await client.request("session/request_permission", {
+              sessionId: sid,
+              toolCall: { toolCallId: "d-shell", title: "Bash", kind: "execute", rawInput: { command: "rm -rf src" } },
+              options: denyOpts,
+            }),
+          );
+          permOutcomes.write = outcomeOf(
+            await client.request("session/request_permission", {
+              sessionId: sid,
+              toolCall: { toolCallId: "d-write", title: "Edit", kind: "edit", locations: [{ path: srcFile }] },
+              options: denyOpts,
+            }),
+          );
+          permOutcomes.outside = outcomeOf(
+            await client.request("session/request_permission", {
+              sessionId: sid,
+              toolCall: { toolCallId: "d-outside", title: "Read", kind: "read", locations: [{ path: outsideFile }] },
+              options: denyOpts,
+            }),
+          );
+          permOutcomes.prot = outcomeOf(
+            await client.request("session/request_permission", {
+              sessionId: sid,
+              toolCall: { toolCallId: "d-prot", title: "Read", kind: "read", locations: [{ path: gitConfig }] },
+              options: denyOpts,
+            }),
+          );
+          permOutcomes.mcp = outcomeOf(
+            await client.request("session/request_permission", {
+              sessionId: sid,
+              toolCall: {
+                toolCallId: "d-mcp",
+                title: "mcp__github__create_issue",
+                kind: "other",
+                _meta: { claudeCode: { toolName: "mcp__github__create_issue", mcpServer: { name: "github", source: "dynamic" } } },
+              },
+              options: denyOpts,
+            }),
+          );
+          permOutcomes.policy = outcomeOf(
+            await client.request("session/request_permission", {
+              sessionId: sid,
+              toolCall: { toolCallId: "d-policy", title: "custom_tool", kind: "other" },
+              options: denyOpts,
+            }),
+          );
+
+          await client.notify("session/update", {
+            sessionId: sid,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Checked." } },
+          } as never);
+          return { stopReason: "end_turn" } as never;
+        });
+
+      const roRes = await new AcpRunner(profile("claude")).run(
+        {
+          runId: "r-t-acp-ro",
+          taskId: "t-t-acp-ro",
+          tier: 3,
+          kind: "research",
+          cwd,
+          model: "opus",
+          systemPrompt: "Research",
+          initialPrompt: "Inspect",
+          toolPolicy: "read_only_workspace",
+          externalMcpServers: [{ name: "github", command: "unused", args: [] }],
+          tools: [],
+          executeTool: async () => ({}),
+          signal: new AbortController().signal,
+          callbacks: {
+            onToolEvent: (ev) => roEvents.push(ev),
+          },
+        },
+        roFixture,
+      );
+      assert.equal(roRes.stopReason, "completed");
+
+      const locPending = roEvents.find((e) => e.id === "loc-1" && e.status === "pending");
+      const locDone = roEvents.find((e) => e.id === "loc-1" && e.status === "completed");
+      const noLoc = roEvents.find((e) => e.id === "no-loc-1");
+      assert.deepEqual(locPending?.paths, [srcFile]);
+      assert.deepEqual(locDone?.paths, [srcFile, join(cwd, "src", "second.ts")]);
+      assert.equal(noLoc?.paths, undefined);
+
+      assert.deepEqual(permOutcomes, {
+        shell: "deny",
+        write: "deny",
+        outside: "deny",
+        prot: "deny",
+        mcp: "deny",
+        policy: "deny",
+      });
+      const expectedDenials: Array<[string, string, string[] | undefined]> = [
+        ["d-shell", "read-only-shell", undefined],
+        ["d-write", "read-only-write", [srcFile]],
+        ["d-outside", "outside-roots", [outsideFile]],
+        ["d-prot", "protected-path", [gitConfig]],
+        ["d-mcp", "read-only-mcp", undefined],
+        ["d-policy", "tool-policy", undefined],
+      ];
+      for (const [id, rule, expectedPaths] of expectedDenials) {
+        const matches = roEvents.filter((e) => e.id === id);
+        assert.equal(matches.length, 1, `expected one failed event for ${id}`);
+        assert.equal(matches[0]!.status, "failed");
+        assert.equal(matches[0]!.denied, rule);
+        assert.deepEqual(matches[0]!.paths, expectedPaths);
+      }
+
+      // (iii) & (iv) handle.turnOpen() tracks prompt flight (including resolve and reject) and context warning uses contextWarningText
+      let handle: RunnerExecutionHandle | undefined;
+      let turnOpenBeforePrompt: boolean | undefined;
+      let turnOpenInsidePrompt: boolean | undefined;
+      let releasePrompt!: () => void;
+      let promptEntered!: () => void;
+      const promptEnteredPromise = new Promise<void>((r) => {
+        promptEntered = r;
+      });
+      const steeredTexts: string[] = [];
+      let steeringReceived!: () => void;
+      const steeringReceivedPromise = new Promise<void>((r) => {
+        steeringReceived = r;
+      });
+
+      const steerFixture = agent()
+        .onRequest("initialize", async () => ({
+          protocolVersion: 1,
+          agentCapabilities: {},
+          _meta: { steering: { supported: true } },
+        } as never))
+        .onRequest("session/new", async () => ({
+          sessionId: "s-t-acp-turn",
+          models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+        } as never))
+        .onRequest("session/prompt", async ({ client, params }) => {
+          turnOpenInsidePrompt = handle?.turnOpen?.();
+          promptEntered();
+          await client.notify("session/update", {
+            sessionId: params.sessionId,
+            update: { sessionUpdate: "usage_update", used: 70_000, size: 100_000 },
+          } as never);
+          await new Promise<void>((r) => {
+            releasePrompt = r;
+          });
+          await client.notify("session/update", {
+            sessionId: params.sessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Done." } },
+          } as never);
+          return { stopReason: "end_turn" } as never;
+        })
+        .onRequest("*", async ({ method, params }) => {
+          if (method === "_session/steering") {
+            const p = params as { prompt?: Array<{ text?: string }> };
+            steeredTexts.push((p.prompt ?? []).map((b) => b.text ?? "").join(""));
+            steeringReceived();
+            return {} as never;
+          }
+          throw new Error(`Unexpected method ${method}`);
+        });
+
+      const runPromise = new AcpRunner(profile("claude")).run(
+        {
+          runId: "r-t-acp-turn",
+          taskId: "t-t-acp-turn",
+          tier: 2,
+          kind: "worker",
+          cwd,
+          model: "opus",
+          systemPrompt: "Worker",
+          initialPrompt: "Work",
+          toolPolicy: "read_write_workspace",
+          contextWindow: 100_000,
+          rolloverThreshold: 0.78,
+          tools: [],
+          executeTool: async () => ({}),
+          signal: new AbortController().signal,
+          onHandle: (h) => {
+            handle = h;
+            turnOpenBeforePrompt = h.turnOpen?.();
+          },
+          callbacks: {},
+        },
+        steerFixture,
+      );
+
+      await promptEnteredPromise;
+      await steeringReceivedPromise;
+      assert.equal(turnOpenBeforePrompt, false, "turnOpen must be false before session/prompt");
+      assert.equal(turnOpenInsidePrompt, true, "turnOpen must be true upon entering session/prompt");
+      assert.equal(handle?.turnOpen?.(), true, "turnOpen must be true while session/prompt is in flight");
+      releasePrompt();
+      const turnRes = await runPromise;
+      assert.equal(turnRes.stopReason, "completed");
+      assert.equal(handle?.turnOpen?.(), false, "turnOpen must be false after session/prompt resolves");
+      assert.deepEqual(steeredTexts, [contextWarningText(2, 70, 78)]);
+
+      // Also verify turnOpen resets to false when session/prompt rejects
+      let errHandle: RunnerExecutionHandle | undefined;
+      let errTurnOpenInside: boolean | undefined;
+      const rejectFixture = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {} }))
+        .onRequest("session/new", async () => ({
+          sessionId: "s-t-acp-err",
+          models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+        }))
+        .onRequest("session/prompt", async () => {
+          errTurnOpenInside = errHandle?.turnOpen?.();
+          throw new Error("prompt exploded");
+        });
+
+      await assert.rejects(
+        () =>
+          new AcpRunner(profile("claude")).run(
+            {
+              runId: "r-t-acp-err",
+              taskId: "t-t-acp-err",
+              tier: 2,
+              kind: "worker",
+              cwd,
+              model: "opus",
+              systemPrompt: "Worker",
+              initialPrompt: "Fail",
+              toolPolicy: "read_write_workspace",
+              tools: [],
+              executeTool: async () => ({}),
+              signal: new AbortController().signal,
+              onHandle: (h) => {
+                errHandle = h;
+              },
+              callbacks: {},
+            },
+            rejectFixture,
+          ),
+        /prompt exploded/,
+      );
+      assert.equal(errTurnOpenInside, true);
+      assert.equal(errHandle?.turnOpen?.(), false, "turnOpen must be false after session/prompt rejects");
     } finally {
       rmSync(baseDir, { recursive: true, force: true });
     }
