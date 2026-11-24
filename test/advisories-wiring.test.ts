@@ -7,7 +7,9 @@ import { loadConfig } from "../src/config.js";
 import { ControlPlaneDb } from "../src/control-plane/db.js";
 import { HarnessOrchestrator, type CustomRunnerFactory } from "../src/control-plane/orchestrator.js";
 import { QuotaClient } from "../src/quota/client.js";
+import type { ToolDefinition } from "../src/runners/types.js";
 import * as scopeNudgeMod from "../src/runners/scope-nudge.js";
+import { toolsForRole } from "../src/tool-descriptions/registry.js";
 import { runGit } from "../src/worktree/manager.js";
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
 
@@ -643,5 +645,112 @@ describe("goal-14 slice B1: orchestrator advisory wiring", () => {
     const monitor = new scopeNudgeMod.ScopeNudgeMonitor({ workspaceRoot: "/repo" });
     const ret = monitor.observe({ name: "read", status: "completed", args: { path: "src/a.ts" } });
     assert.equal(ret, undefined);
+  });
+
+  it("T4-1o: orchestrator launches each role with its registry tool definitions (names and descriptions)", async () => {
+    const { root, repoRoot, stateDir, baseSha } = await makeTempGitRepo("pi-adv-t41o-");
+    const recordedTools = new Map<string, ToolDefinition[]>();
+
+    const { db, orch } = makeOrchestrator(repoRoot, stateDir, () => ({
+      run: async (req) => {
+        recordedTools.set(req.kind, req.tools);
+        await req.executeTool("return_task", {
+          status: "completed",
+          summary: `${req.kind} finished`,
+          sources: [{ path: "README.md", note: "checked" }],
+        });
+        return { text: "done", stopReason: "completed" };
+      },
+    }));
+
+    try {
+      const run = db.createRun({ goal: "T4-1o per-role tool descriptions", repoRoot, baseBranch: "main", baseSha });
+      const parent = db.createTask({
+        runId: run.id,
+        tier: 1,
+        kind: "orchestrator",
+        title: "Orch",
+        objective: "Coordinate",
+        readOnly: true,
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      db.updateTask(parent.id, { status: "running" });
+
+      const specs = [
+        { role: "research" as const, tier: 3 as const, kind: "research" as const, readOnly: true, writeScopes: undefined },
+        { role: "verify" as const, tier: 3 as const, kind: "verify" as const, readOnly: true, writeScopes: undefined },
+        { role: "plan" as const, tier: 3 as const, kind: "plan" as const, readOnly: true, writeScopes: undefined },
+        { role: "worker" as const, tier: 2 as const, kind: "worker" as const, readOnly: false, writeScopes: ["README.md"] },
+      ];
+
+      for (const spec of specs) {
+        const spawned = await orch.spawnAndStartTask({
+          runId: run.id,
+          parentId: parent.id,
+          tier: spec.tier,
+          kind: spec.kind,
+          title: `Task ${spec.role}`,
+          objective: `Run ${spec.role}`,
+          readOnly: spec.readOnly,
+          ...(spec.writeScopes ? { writeScopes: spec.writeScopes } : {}),
+          profileId: "pi:local",
+          model: "fixture/fixture",
+        });
+        await waitUntil(
+          () => TERMINAL_STATUSES.has(db.getTask(spawned.id)?.status ?? "") && orch.activeTaskCount() === 0,
+          5_000,
+          `${spec.role} task`,
+        );
+      }
+
+      for (const spec of specs) {
+        const actual = recordedTools.get(spec.role);
+        assert.ok(actual, `expected recorded req.tools for ${spec.role}`);
+        const expected = toolsForRole(spec.role);
+        assert.deepEqual(
+          actual.map((t) => ({ name: t.name, description: t.description })),
+          expected.map((t) => ({ name: t.name, description: t.description })),
+          `${spec.role} req.tools names/descriptions must equal toolsForRole("${spec.role}")`,
+        );
+        assert.deepEqual(actual, expected, `${spec.role} req.tools must equal toolsForRole("${spec.role}")`);
+      }
+
+      const descOf = (role: string, toolName: string): string => {
+        const found = recordedTools.get(role)?.find((t) => t.name === toolName);
+        assert.ok(found, `expected ${toolName} in ${role} tools`);
+        return found.description;
+      };
+
+      const workerReportIssue = descOf("worker", "report_issue");
+      const workerReturnTask = descOf("worker", "return_task");
+      for (const roRole of ["research", "verify"] as const) {
+        assert.notEqual(
+          descOf(roRole, "report_issue"),
+          workerReportIssue,
+          `${roRole} report_issue description must differ from worker`,
+        );
+        assert.notEqual(
+          descOf(roRole, "return_task"),
+          workerReturnTask,
+          `${roRole} return_task description must differ from worker`,
+        );
+
+        const directorOnlyTools = ["goal_create", "goal_commit", "present_result"];
+        for (const tool of recordedTools.get(roRole)!) {
+          for (const dirTool of directorOnlyTools) {
+            assert.equal(
+              tool.description.includes(dirTool),
+              false,
+              `${roRole} tool ${tool.name} description must not mention Director tool ${dirTool}`,
+            );
+          }
+        }
+      }
+    } finally {
+      orch.dispose();
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

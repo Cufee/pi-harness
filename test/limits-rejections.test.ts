@@ -185,6 +185,109 @@ describe("goal-14 slice C1 limits and rejections", () => {
     }
   });
 
+  it("T3-10e read-only finding advisory end to end through orchestrator advised executor", async () => {
+    const { repoRoot, baseSha, db, orch, cleanup } = await setupHarness();
+    try {
+      const run = db.createRun({ goal: "Read-only finding advisory e2e", repoRoot, baseBranch: "main", baseSha });
+      const parent = db.createTask({
+        runId: run.id,
+        tier: 1,
+        kind: "orchestrator",
+        title: "Orch",
+        objective: "Coordinate",
+        readOnly: true,
+        profileId: "pi:local",
+      });
+      db.updateTask(parent.id, { status: "running" });
+
+      const verify = db.createTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 3,
+        kind: "verify",
+        title: "Verify slice",
+        objective: "Check implementation",
+        readOnly: true,
+        profileId: "pi:local",
+      });
+      db.updateTask(verify.id, { status: "running" });
+
+      const firstRes = (await orch.toolExecutor.execute(run.id, verify.id, "report_issue", {
+        severity: "P1",
+        category: "code_defect",
+        title: "First defect found during verify",
+        evidence_paths: ["README.md"],
+      })) as { escalationId: string; blocking: boolean; routedTo: string; harness_advisory?: string[] };
+
+      assert.equal(firstRes.blocking, false);
+      assert.equal(firstRes.routedTo, parent.id);
+      assert.equal(db.getTask(verify.id)?.status, "running");
+      const firstEsc = db.getEscalation(firstRes.escalationId)!;
+      assert.equal(firstEsc.blocking, false);
+      assert.equal(firstEsc.toTaskId, parent.id);
+
+      assert.ok(Array.isArray(firstRes.harness_advisory), "expected harness_advisory array on first read-only finding");
+      assert.equal(firstRes.harness_advisory.length, 1);
+      const advisoryText = firstRes.harness_advisory[0]!;
+      assert.match(
+        advisoryText,
+        /^\[harness advisory: read-only-finding-escalation\] .+ Why: .+ Instead: .+return_task.+/,
+      );
+      assert.ok(advisoryText.includes(firstRes.escalationId));
+
+      // Second call on the same verify task yields no second advisory (dedupe per subject).
+      const secondRes = (await orch.toolExecutor.execute(run.id, verify.id, "report_issue", {
+        severity: "P1",
+        category: "code_defect",
+        title: "Second defect found during verify",
+        evidence_paths: ["README.md"],
+      })) as { escalationId: string; blocking: boolean; routedTo: string; harness_advisory?: string[] };
+
+      assert.equal(secondRes.blocking, false);
+      assert.equal(secondRes.routedTo, parent.id);
+      assert.equal(db.getTask(verify.id)?.status, "running");
+      assert.equal(secondRes.harness_advisory, undefined);
+
+      const verifyAdvisories = db
+        .getEventsSince(run.id, 0)
+        .filter((e) => e.taskId === verify.id && e.type === "agent.advisory");
+      assert.equal(verifyAdvisories.length, 1);
+      assert.equal((verifyAdvisories[0]!.payload as { rule?: string }).rule, "read-only-finding-escalation");
+
+      // A verify task reporting env_failure at P1 is blocked as before and gets no read-only-finding-escalation advisory.
+      const envVerify = db.createTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 3,
+        kind: "verify",
+        title: "Verify env failure",
+        objective: "Check environment",
+        readOnly: true,
+        profileId: "pi:local",
+      });
+      db.updateTask(envVerify.id, { status: "running" });
+
+      const envRes = (await orch.toolExecutor.execute(run.id, envVerify.id, "report_issue", {
+        severity: "P1",
+        category: "env_failure",
+        title: "Test binary unavailable",
+        evidence_paths: ["README.md"],
+      })) as { escalationId: string; blocking: boolean; harness_advisory?: string[] };
+
+      assert.equal(envRes.blocking, true);
+      assert.equal(db.getTask(envVerify.id)?.status, "blocked");
+      assert.equal(db.getEscalation(envRes.escalationId)?.blocking, true);
+      assert.equal(envRes.harness_advisory, undefined);
+
+      const envAdvisories = db
+        .getEventsSince(run.id, 0)
+        .filter((e) => e.taskId === envVerify.id && e.type === "agent.advisory");
+      assert.equal(envAdvisories.length, 0);
+    } finally {
+      cleanup();
+    }
+  });
+
   it("T5-1 converted limits (L18, L20, L6, L33)", async () => {
     const { repoRoot, baseSha, db, orch, goals, cleanup } = await setupHarness();
     try {

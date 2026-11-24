@@ -30,17 +30,18 @@ import type { QueuePositionInput } from "./admission-queue.js";
 import { WriteScopeConflictError, type AgentTier, type ControlPlaneDb, type RunRecord, type TaskKind, type TaskRecord, type TaskStatus, type WorktreeRecord } from "./db.js";
 import { buildHydrationTurn, buildImmutableSystemPrompt, buildMissingReturnWrapUpPrompt, type AnchoredHandoff } from "./prompts.js";
 import { spillSummaryOverflow, writeUniqueTaskDossier } from "./dossiers.js";
-import { ControlPlaneToolExecutor, compactTaskHandoff, isReadOnlyKind, toolsForTier, validateTaskHandoff } from "./tools.js";
+import { ControlPlaneToolExecutor, compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./tools.js";
+import { allToolNames, allowedToolNames } from "../tool-descriptions/registry.js";
 import { formatFallbackSummary, settleTaskMinimalFallback, SUMMARY_LIMIT } from "./handoffs.js";
 import { applyRecoveryPhaseA, classifyInterruptedTasks, relaunchInterruptedTasks } from "./restart-recovery.js";
 import { directorTaskRunId, directorTaskRunOwner, isDirectorTaskContainer } from "./ids.js";
 import { canonicalProjectPath } from "./projects.js";
 import { ensureGoalEvidenceDir, goalEvidenceDir } from "../goals/engine.js";
 
+const TASK_AGENT_ROLES = ["orchestrator", "worker", "research", "plan", "verify", "execute"] as const;
+// Exclude Director-only tools (notably read_file) so task-agent native read_file events are not misclassified as harness calls.
 const HARNESS_TOOL_NAMES: ReadonlySet<string> = new Set([
-  ...toolsForTier(1).map((t) => t.name),
-  ...toolsForTier(2).map((t) => t.name),
-  ...toolsForTier(3).map((t) => t.name),
+  ...[...allToolNames()].filter((name) => TASK_AGENT_ROLES.some((role) => allowedToolNames(role).has(name))),
   "code_exec",
   "tool_search",
 ]);
@@ -2549,7 +2550,7 @@ export class HarnessOrchestrator {
         rolloverThreshold,
         contextWindow: catalogEntry?.contextK ? catalogEntry.contextK * 1000 : undefined,
         quotaRetryTimeoutMs: this.config.quotaRetry.nativeRetryTimeoutMs,
-        tools: this.toolExecutor.tools(task.tier),
+        tools: this.toolExecutor.tools(hydratedTask),
         executeTool: (name, args) => {
           try {
             this.assertCurrentToolGeneration(task.id, runnerGen);
