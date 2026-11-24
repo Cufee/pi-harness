@@ -127,6 +127,14 @@ class FailedRunGatesError extends Error {
   }
 }
 
+/** Thrown when verification cannot resolve verify_ref or run.baseBranch (and no merged-commit fallback exists). */
+class VerifyCheckoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "VerifyCheckoutError";
+  }
+}
+
 export { StaleReviewError };
 
 /** Thrown when the independent Done-Reviewer exhausts its attempts without a structured verdict; no review cycle is consumed. */
@@ -373,7 +381,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
     name: "goal_accept",
     description:
-      "Explicit Director acceptance/override for a Goal based on verified evidence (e.g. when a review was obstructed or human approved). Requires a clear reason and concrete, readable evidence_paths (files or directories, e.g. under the goal's evidenceDir; .git, task worktrees and harness-internal state are refused). Required deterministic gates are re-run first and a failure rejects the accept unless override_deterministic is true. Recorded permanently with an audit trail in goal review history; auto-resolves open escalations.",
+      "Explicit Director acceptance/override for a Goal based on verified evidence (e.g. when a review was obstructed or human approved). Requires a clear reason and concrete, readable evidence_paths (files or directories, e.g. under the goal's evidenceDir; .git, task worktrees and harness-internal state are refused). Required deterministic gates are re-run first and a failure rejects the accept unless override_deterministic is true. If the gate checkout cannot be prepared (e.g. base branch deleted), the accept proceeds and the audit records gatesNotRun. Recorded permanently with an audit trail in goal review history; auto-resolves open escalations.",
     inputSchema: {
       type: "object",
       required: ["goal_id", "reason", "evidence_paths"],
@@ -559,7 +567,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
     name: "goal_trigger_review",
     description:
-      "Verify and settle a Goal at the chosen verification depth (defaults to the Goal's verification_mode: 'auto' runs deterministic checks and only spawns an independent LLM reviewer when required behavioral/architectural criteria exist; 'deterministic' runs checks only; 'none' approves directly).",
+      "Verify and settle a Goal at the chosen verification depth (defaults to the Goal's verification_mode: 'auto' runs deterministic checks and only spawns an independent LLM reviewer when required behavioral/architectural criteria exist; 'deterministic' runs checks only; 'none' approves directly). If the run's base branch was deleted and verify_ref is unset, gates fall back to the run's last merged commit (refs/harness/merged/<runId>); if neither exists, verification fails with remediation options.",
     inputSchema: {
       type: "object",
       required: ["goal_id"],
@@ -1649,7 +1657,7 @@ export class DirectorRuntime {
       runStatus,
       openEscalations: openEscCount,
       cause: gates ? "gates_failed" : "verification_error",
-      detail: detailPrefix + msg.slice(0, 240),
+      detail: detailPrefix + (err instanceof VerifyCheckoutError ? msg : msg.slice(0, 240)),
     });
   }
 
@@ -3160,11 +3168,13 @@ export class DirectorRuntime {
   /**
    * Creates the detached `_verify` worktree for verification gates and Done-Review without switching the host
    * checkout's branch. Resolves `goal.verifyRef` when explicitly set (local ref, `origin/<ref>`, then source-only
-   * `git fetch --no-tags origin -- <ref>` with `FETCH_HEAD` fallback), failing closed if invalid or unresolved.
-   * Otherwise targets `run.baseBranch`, preferring this run's recorded merge commit (`refs/harness/merged/<runId>`)
-   * when it exists, is an ancestor of the base branch tip, and equals or descends from the run's latest promoted
-   * merge commit. Without a verify ref or resolvable base branch, verification falls back to the primary checkout
-   * and records that in `location`.
+   * `git fetch --no-tags origin -- <ref>` with `FETCH_HEAD` fallback), failing closed with `VerifyCheckoutError`
+   * if invalid or unresolved. Otherwise targets `run.baseBranch`, preferring this run's recorded merge commit
+   * (`refs/harness/merged/<runId>`) when it exists, is an ancestor of the base branch tip, and equals or descends
+   * from the run's latest promoted merge commit. If `run.baseBranch` no longer exists locally or on origin, falls
+   * back to `refs/harness/merged/<runId>` (source `"merged_commit"`); if neither exists (and HEAD is not that
+   * unborn branch), fails with `VerifyCheckoutError` naming remedies. Without a verify ref or run base branch,
+   * verification runs in the primary checkout and records that in `location`.
    */
   private async prepareVerifyCheckout(
     goal: GoalRecord,
@@ -3188,6 +3198,22 @@ export class DirectorRuntime {
       runGit(goal.repoRoot, ["rev-parse", "--verify", `${ref}^{commit}`])
         .then((r) => r.stdout || null)
         .catch(() => null);
+    const addScratch = async (targetSha: string, targetRefName: string) => {
+      const wtMgr = this.orchestrator.getWorktreeManager(goal.repoRoot);
+      const scratch = await wtMgr.addScratchWorktree("_verify", `${goal.id}-${randomUUID().slice(0, 8)}`, targetSha);
+      verifyScratch = scratch;
+      verifyCwd = scratch.path;
+      verifyRef = targetSha;
+      refName = targetRefName;
+      try {
+        // Do NOT silently swallow bootstrap failures — fail verification cleanly if setupCommand fails
+        await wtMgr.bootstrapWorktree(scratch.path);
+      } catch (err) {
+        verifyScratch = null;
+        await scratch.remove();
+        throw err;
+      }
+    };
 
     if (wanted) {
       let resolvedSha = await resolveCommit(wanted);
@@ -3224,36 +3250,32 @@ export class DirectorRuntime {
             if (isAncestor && coversLatestMerge) targetSha = mergedRefSha;
           }
         }
-        const wtMgr = this.orchestrator.getWorktreeManager(goal.repoRoot);
-        const scratch = await wtMgr.addScratchWorktree("_verify", `${goal.id}-${randomUUID().slice(0, 8)}`, targetSha);
-        verifyScratch = scratch;
-        verifyCwd = scratch.path;
-        verifyRef = targetSha;
-        refName = resolvedRefName;
-        try {
-          // Do NOT silently swallow bootstrap failures — fail verification cleanly if setupCommand fails
-          await wtMgr.bootstrapWorktree(scratch.path);
-        } catch (err) {
-          verifyScratch = null;
-          await scratch.remove();
-          throw err;
-        }
+        await addScratch(targetSha, resolvedRefName);
       } else if (explicit) {
-        throw new Error(
-          `Cannot verify goal ${goal.id}: verify_ref '${wanted}' does not resolve locally or on origin (fetched).`,
+        throw new VerifyCheckoutError(
+          `Cannot verify goal ${goal.id}: verify_ref '${wanted}' does not resolve locally or on origin (fetched). goal_amend verify_ref to an existing branch or SHA, then goal_trigger_review; or goal_accept with override_deterministic: true.`,
         );
       } else {
-        // Fail closed when targetBranch cannot be resolved and host checkout is on a different branch
-        const headBranch = await runGit(goal.repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])
-          .then((r) => r.stdout)
-          .catch(() => null);
-        if (headBranch && headBranch !== run!.baseBranch) {
-          throw new Error(
-            `Cannot verify goal ${goal.id}: target branch '${run!.baseBranch}' does not resolve (host checkout is '${headBranch}').`,
-          );
+        const mergedRef = run ? runMergedRef(run.id) : null;
+        const mergedSha = mergedRef ? await resolveCommit(mergedRef) : null;
+        if (mergedSha && mergedRef && run) {
+          await addScratch(mergedSha, mergedRef);
+          source = "merged_commit";
+          note = `base branch '${run.baseBranch}' no longer exists locally or on origin; verified run ${run.id}'s last merged commit ${mergedSha.slice(0, 7)} (${mergedRef}). To verify another ref, goal_amend verify_ref`;
+        } else {
+          // Keep existing unborn-branch behavior when HEAD equals run.baseBranch; fail closed otherwise.
+          const headBranch = await runGit(goal.repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])
+            .then((r) => r.stdout)
+            .catch(() => null);
+          if (headBranch && headBranch === run!.baseBranch) {
+            source = "repo_root";
+            refName = headBranch;
+          } else {
+            throw new VerifyCheckoutError(
+              `Cannot verify goal ${goal.id}: run base branch '${run!.baseBranch}' no longer exists (not local, not on origin) and run ${run!.id} has no merged commit (${runMergedRef(run!.id)}). Set goal_amend verify_ref to a branch or SHA with the work, then goal_trigger_review; or goal_accept with override_deterministic: true.`,
+            );
+          }
         }
-        source = "repo_root";
-        refName = headBranch || run!.baseBranch;
       }
     }
 
@@ -3351,45 +3373,56 @@ export class DirectorRuntime {
       let diffHash = `director-accept-${Date.now()}`;
       let verifyRef: string | null = null;
       let failedDeterministic: string[] = [];
+      let gatesNotRun: string | null = null;
+      let gatesNotRunMsg: string | null = null;
       if (goal.criteria.some((c) => c.kind === "deterministic")) {
-        const checkout = await this.prepareVerifyCheckout(goal, run);
+        let checkout: Awaited<ReturnType<DirectorRuntime["prepareVerifyCheckout"]>> | null = null;
         try {
-          // A pause, amend or cancel during checkout must stop before the gates write "verifying" over it.
-          if (slot.signal.aborted) {
-            throw slot.signal.reason instanceof Error ? slot.signal.reason : new Error(`goal_accept for ${goal.id} was interrupted`);
-          }
-          const fresh = checkAcceptable(this.goals.getGoal(goal.id));
-          if (fresh.version !== goal.version || (fresh.verifyRef ?? null) !== (goal.verifyRef ?? null)) {
-            throw new Error(`Goal ${goal.id} changed during goal_accept`);
-          }
-          verifyRef = checkout.location.sha
-            ? `${checkout.location.ref}@${checkout.location.sha}`
-            : checkout.location.ref;
-          const gate = await this.goals.runDeterministicGates(goal.id, run?.baseSha, slot.signal, {
-            cwd: checkout.verifyCwd,
-            targetRef: checkout.verifyRef,
-            location: checkout.location,
-          });
-          gateResults = gate.results;
-          diffHash = gate.diffHash;
-        } finally {
-          await checkout.cleanup();
+          checkout = await this.prepareVerifyCheckout(goal, run);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          gatesNotRunMsg = msg;
+          gatesNotRun = `gate checkout could not be prepared: ${msg}`;
         }
-        const required = new Set(goal.criteria.filter((c) => c.required).map((c) => c.id));
-        failedDeterministic = gateResults.filter((r) => !r.passed && required.has(r.criterionId)).map((r) => r.criterionId);
-        if (failedDeterministic.length > 0 && !input.overrideDeterministic) {
-          if (goal.linkedRunId) {
-            this.db.emitEvent(goal.linkedRunId, null, "goal.accept_rejected", {
-              goalId: goal.id,
-              version: goal.version,
-              failedCriteria: failedDeterministic,
-              source: input.source,
+        if (checkout) {
+          try {
+            // A pause, amend or cancel during checkout must stop before the gates write "verifying" over it.
+            if (slot.signal.aborted) {
+              throw slot.signal.reason instanceof Error ? slot.signal.reason : new Error(`goal_accept for ${goal.id} was interrupted`);
+            }
+            const fresh = checkAcceptable(this.goals.getGoal(goal.id));
+            if (fresh.version !== goal.version || (fresh.verifyRef ?? null) !== (goal.verifyRef ?? null)) {
+              throw new Error(`Goal ${goal.id} changed during goal_accept`);
+            }
+            verifyRef = checkout.location.sha
+              ? `${checkout.location.ref}@${checkout.location.sha}`
+              : checkout.location.ref;
+            const gate = await this.goals.runDeterministicGates(goal.id, run?.baseSha, slot.signal, {
+              cwd: checkout.verifyCwd,
+              targetRef: checkout.verifyRef,
+              location: checkout.location,
             });
+            gateResults = gate.results;
+            diffHash = gate.diffHash;
+          } finally {
+            await checkout.cleanup();
           }
-          throw new Error(
-            `goal_accept rejected for ${goal.id}: required deterministic gate(s) still fail (${failedDeterministic.join(", ")}). ` +
-              "Fix them, or pass override_deterministic: true to accept anyway (recorded in the audit).",
-          );
+          const required = new Set(goal.criteria.filter((c) => c.required).map((c) => c.id));
+          failedDeterministic = gateResults.filter((r) => !r.passed && required.has(r.criterionId)).map((r) => r.criterionId);
+          if (failedDeterministic.length > 0 && !input.overrideDeterministic) {
+            if (goal.linkedRunId) {
+              this.db.emitEvent(goal.linkedRunId, null, "goal.accept_rejected", {
+                goalId: goal.id,
+                version: goal.version,
+                failedCriteria: failedDeterministic,
+                source: input.source,
+              });
+            }
+            throw new Error(
+              `goal_accept rejected for ${goal.id}: required deterministic gate(s) still fail (${failedDeterministic.join(", ")}). ` +
+                "Fix them, or pass override_deterministic: true to accept anyway (recorded in the audit).",
+            );
+          }
         }
       }
 
@@ -3400,7 +3433,14 @@ export class DirectorRuntime {
         ...gateResults,
         ...goal.criteria
           .filter((c) => !covered.has(c.id))
-          .map((c) => ({ criterionId: c.id, passed: true, evidence: `[${by} ACCEPTED] ${reason} (${evidenceSummary})` })),
+          .map((c) => ({
+            criterionId: c.id,
+            passed: true,
+            evidence:
+              c.kind === "deterministic" && gatesNotRunMsg
+                ? `[${by} ACCEPTED; gates not run: ${gatesNotRunMsg}] ${reason} (${evidenceSummary})`
+                : `[${by} ACCEPTED] ${reason} (${evidenceSummary})`,
+          })),
       ];
       const audit: GoalAcceptOverrideAudit = {
         acceptedBy: input.source,
@@ -3409,6 +3449,7 @@ export class DirectorRuntime {
         evidence,
         overrideDeterministic: input.overrideDeterministic === true,
         failedDeterministicCriteria: failedDeterministic,
+        ...(gatesNotRun ? { gatesNotRun } : {}),
         prevStatus,
         goalVersion: goal.version,
         verifyRef,
@@ -3416,7 +3457,8 @@ export class DirectorRuntime {
       };
       const summary =
         `[${by} ACCEPTED OVERRIDE] ${reason} (${evidenceSummary})` +
-        (failedDeterministic.length ? ` [deterministic override: ${failedDeterministic.join(", ")}]` : "");
+        (failedDeterministic.length ? ` [deterministic override: ${failedDeterministic.join(", ")}]` : "") +
+        (gatesNotRunMsg ? ` [gates not run: ${gatesNotRunMsg.slice(0, 200)}]` : "");
       // A pause, amend, verify_ref change or cancel during the gates aborts this slot: never commit over it.
       if (slot.signal.aborted) {
         throw slot.signal.reason instanceof Error ? slot.signal.reason : new Error(`goal_accept for ${goal.id} was interrupted`);
@@ -3433,6 +3475,18 @@ export class DirectorRuntime {
         audit,
       });
       committed = true;
+      if (gatesNotRun && goal.linkedRunId) {
+        try {
+          this.db.emitEvent(goal.linkedRunId, null, "goal.accept_gates_skipped", {
+            goalId: goal.id,
+            version: goal.version,
+            reason: gatesNotRun,
+            source: input.source,
+          });
+        } catch {
+          // best-effort audit event
+        }
+      }
       this.finishAcceptedGoal(outcome.goal, outcome.review, input.source);
       return outcome;
     } catch (err) {
@@ -3669,8 +3723,15 @@ export class DirectorRuntime {
         abort.abort(new Error("Run resumed during failed-run verification"));
       }
     });
+    let outcome: {
+      goal: GoalRecord;
+      review: GoalReviewVerdict;
+      circuitBreakerTripped?: string;
+    };
+    let succeeded = false;
     try {
-      return await this.verifyAndReviewGoalInner(goal, reviewSignal, opts);
+      outcome = await this.verifyAndReviewGoalInner(goal, reviewSignal, opts);
+      succeeded = true;
     } catch (error) {
       if (!this.disposed) {
         if (error instanceof StaleReviewError && !error.staleEventRecorded && goal.linkedRunId) {
@@ -3719,7 +3780,9 @@ export class DirectorRuntime {
                           : "";
                         return `Reviewer failed to return a structured verdict after ${error.attempts} ${error.attempts === 1 ? "attempt" : "attempts"}; review cycle not consumed${diagBrief}${error.detail ? `: ${error.detail.slice(0, 240)}` : ""}`;
                       })()
-                    : `Verification failed: ${msg.slice(0, 240)}`,
+                    : error instanceof VerifyCheckoutError
+                      ? error.message
+                      : `Verification failed: ${msg.slice(0, 240)}`,
               );
             }
           } else if (
@@ -3759,11 +3822,32 @@ export class DirectorRuntime {
             this.handleControlPlaneEvent(deferredStopEvent);
           }
         }
+        if (!succeeded) {
+          this.syncQueuedGoalProgress();
+          const latest = this.goals.getGoal(goal.id);
+          if (latest && !this.isGoalOccupyingSlot(latest)) void this.drainGoalQueue(latest.repoRoot).catch(() => {});
+        }
+      }
+    }
+
+    // Run post-review transition only after _verify cleanup, unsubscribe, and activeReviews release so a fast
+    // relaunched Tier 1 completion is never swallowed by the settled-goal dedupe while activeReviews is still held.
+    try {
+      if (!this.disposed) {
+        await this.handlePostReviewTransition(outcome, {
+          autoTriggered: opts?.autoTriggered,
+          signal: reviewSignal,
+          reviewEpoch,
+        });
+      }
+    } finally {
+      if (!this.disposed) {
         this.syncQueuedGoalProgress();
         const latest = this.goals.getGoal(goal.id);
         if (latest && !this.isGoalOccupyingSlot(latest)) void this.drainGoalQueue(latest.repoRoot).catch(() => {});
       }
     }
+    return outcome;
   }
 
   private async verifyAndReviewGoalInner(
@@ -3852,7 +3936,6 @@ export class DirectorRuntime {
           expectedVersion: goal.version,
         });
       });
-      await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered, signal });
       return outcome;
     }
 
@@ -3906,7 +3989,6 @@ export class DirectorRuntime {
           source: "deterministic",
           expectedVersion: goal.version,
         });
-        await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered, signal });
         return outcome;
       }
 
@@ -3952,7 +4034,6 @@ export class DirectorRuntime {
             source: "coordinator_failed",
             expectedVersion: goal.version,
           });
-          await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered, signal });
           return outcome;
         }
         const coveredIds = new Set(gateResult.results.map((r) => r.criterionId));
@@ -3984,7 +4065,6 @@ export class DirectorRuntime {
             expectedVersion: goal.version,
           });
         });
-        await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered, signal });
         return outcome;
       }
 
@@ -4650,7 +4730,6 @@ export class DirectorRuntime {
         unsubscribe();
       }
 
-      await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered, signal });
       return outcome;
     } finally {
       await checkout.cleanup();
@@ -4706,12 +4785,12 @@ export class DirectorRuntime {
       review: GoalReviewVerdict;
       circuitBreakerTripped?: string;
     },
-    opts?: { autoTriggered?: boolean; signal?: AbortSignal },
+    opts?: { autoTriggered?: boolean; signal?: AbortSignal; reviewEpoch?: number },
   ): Promise<void> {
     const { review, circuitBreakerTripped } = outcome;
     const reviewedVersion = review.goalVersion;
     let goal = outcome.goal;
-    const reviewEpoch = this.getReviewInvalidationEpoch(goal.id);
+    const reviewEpoch = opts?.reviewEpoch ?? this.getReviewInvalidationEpoch(goal.id);
     const isInvalidated = (g: GoalRecord) =>
       Boolean(opts?.signal?.aborted) ||
       this.getReviewInvalidationEpoch(goal.id) !== reviewEpoch ||

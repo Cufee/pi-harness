@@ -1626,3 +1626,76 @@ it("T3-15: Director self-reading advisory fires once per turn and stays silent o
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+it("releases activeReviews and cleans up _verify worktree before relaunching Tier 1 on changes_requested", async () => {
+  const repoRoot = await makeTempRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-settle-order-state-"));
+  const sockPath = join(stateDir, "d.sock");
+  let orchGenerations = 0;
+  let gen2SawActiveReview: boolean | null = null;
+  let gen2SawVerifyWorktree: boolean | null = null;
+
+  try {
+    const cfg = withFixtureCatalog({
+      ...loadConfig(repoRoot),
+      stateDir,
+      socketPath: sockPath,
+      codeMode: "off",
+      goals: { defaultMaxReviewCycles: 4, defaultMaxNoProgressCycles: 3, gateTimeoutMs: 90_000, autoVerifyOnSettle: true },
+      events: { fallbackWakeupIntervalSec: 900, wakeDirectorOnGoalSettle: false },
+    });
+
+    let goalId = "";
+    const daemon = new HarnessDaemon(cfg, {
+      dbPath: ":memory:",
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          if (req.taskId.startsWith("chat-")) return { text: "ok", stopReason: "completed" };
+          if (req.tier === 1) {
+            orchGenerations++;
+            if (orchGenerations === 1) {
+              return { text: "gen1", stopReason: "completed" };
+            }
+            const activeReviews = (daemon.director as unknown as { activeReviews: Map<string, AbortController> }).activeReviews;
+            gen2SawActiveReview = activeReviews.has(goalId);
+            gen2SawVerifyWorktree = (await runGit(repoRoot, ["worktree", "list", "--porcelain"])).stdout.includes("_verify");
+            writeFileSync(join(repoRoot, "out.txt"), "gen2\n", "utf8");
+            await runGit(repoRoot, ["add", "out.txt"]);
+            await runGit(repoRoot, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "add out.txt"]);
+            return { text: "gen2", stopReason: "completed" };
+          }
+          return { text: "done", stopReason: "completed" };
+        },
+      }),
+    });
+
+    await daemon.start();
+    try {
+      const chat = await daemon.director.createChat({ repoRoot });
+      const goal = daemon.director.goals.createGoal({
+        repoRoot,
+        chatSessionId: chat.id,
+        title: "Verify settle ordering before Tier 1 relaunch",
+        description: "Produce out.txt on remediation gen 2",
+        verificationMode: "deterministic",
+        criteria: [{ id: "c1", kind: "deterministic", description: "out.txt exists", command: "test -f out.txt", required: true }],
+      });
+      goalId = goal.id;
+      await daemon.director.commitGoal(goal.id);
+
+      const deadline = Date.now() + 8_000;
+      while (Date.now() < deadline && daemon.director.goals.getGoal(goal.id)?.status !== "achieved") {
+        await new Promise((r) => setTimeout(r, 30));
+      }
+      assert.equal(daemon.director.goals.getGoal(goal.id)?.status, "achieved");
+      assert.equal(orchGenerations, 2);
+      assert.equal(gen2SawActiveReview, false, "activeReviews must be cleared before Tier 1 remediation relaunch");
+      assert.equal(gen2SawVerifyWorktree, false, "_verify worktree must be cleaned up before Tier 1 remediation relaunch");
+    } finally {
+      await daemon.stop();
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
