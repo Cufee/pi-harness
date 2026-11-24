@@ -33,6 +33,7 @@ export interface CodeExecOptions {
 export interface CodeExecResult {
   ok: boolean; output?: unknown; preview: string; artifactPath?: string; logs: string; toolCalls: number;
   error?: string; timedOut?: boolean; cancelled?: boolean;
+  steeringMessages?: string[]; hint?: string;
 }
 
 export function timeoutMs(ms: number | undefined, max = 1_800_000): number {

@@ -878,9 +878,12 @@ export class ControlPlaneToolExecutor {
     if (!task || task.runId !== runId) {
       throw new Error(`Task ${taskId} not found in run ${runId}`);
     }
+    const inScript = scriptSignal !== undefined;
+    const callerGeneration = task.generation;
+    const callerTaskSignal = this.hooks.getTaskSignal(taskId);
     const mode = effectiveCodeMode(this.config.codeMode);
-    if (scriptSignal || (name === CODE_EXEC_TOOL_NAME && mode !== "off")) {
-      const taskSignal = this.hooks.getTaskSignal(taskId);
+    if (inScript || (name === CODE_EXEC_TOOL_NAME && mode !== "off")) {
+      const taskSignal = callerTaskSignal;
       const signal = scriptSignal ?? taskSignal;
       if (
         !signal ||
@@ -912,8 +915,7 @@ export class ControlPlaneToolExecutor {
       return this.tools(task.tier);
     }
     if (mode !== "off" && (name === CODE_EXEC_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME)) {
-      const signal = this.hooks.getTaskSignal(taskId);
-      const callerGeneration = task.generation;
+      const signal = callerTaskSignal;
       const res = await createCodeModeExecutor({
         ...this.config.codeExec,
         mode,
@@ -936,7 +938,7 @@ export class ControlPlaneToolExecutor {
         signal,
         onToolEvent: this.createCodeExecEventSink(runId, taskId, callerGeneration),
       }).execute(name, args);
-      return this.attachPendingSteers(taskId, res);
+      return inScript ? res : this.attachPendingSteers(taskId, res, callerGeneration, signal);
     }
 
     const allowed = new Set(toolsForTier(task.tier).map((t) => t.name));
@@ -945,12 +947,22 @@ export class ControlPlaneToolExecutor {
     }
 
     const result = await this.executeTool(runId, taskId, task, run, name, args, scriptSignal, callerSignal);
-    return this.attachPendingSteers(taskId, result);
+    return inScript ? result : this.attachPendingSteers(taskId, result, callerGeneration, callerTaskSignal);
   }
 
-  /** Appends any queued steering messages (oldest first) onto a tool result as a universal delivery safety net. */
-  private attachPendingSteers(taskId: string, result: unknown): unknown {
+  /** Appends any queued steering messages (oldest first) onto an outer model-visible tool result. */
+  private attachPendingSteers(
+    taskId: string,
+    result: unknown,
+    expectedGeneration?: number,
+    expectedSignal?: AbortSignal,
+  ): unknown {
     if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+    if (expectedSignal?.aborted) return result;
+    const liveSignal = this.hooks.getTaskSignal(taskId);
+    if (liveSignal?.aborted) return result;
+    if (expectedSignal && liveSignal !== expectedSignal) return result;
+    if (expectedGeneration !== undefined && this.db.getTask(taskId)?.generation !== expectedGeneration) return result;
     const obj = result as Record<string, unknown>;
     if (Array.isArray(obj.steeringMessages) && obj.steeringMessages.length > 0) return result;
     const steeringMessages = this.hooks.drainPendingSteers?.(taskId) ?? [];
@@ -1216,7 +1228,12 @@ export class ControlPlaneToolExecutor {
         const settled = waitRes.children;
         const escalations = this.db.listEscalations(runId);
         const stillRunning = settled.filter((c) => ["running", "ready", "pending", "draining", "waiting_children", "merging"].includes(c.status));
-        const steeringMessages = this.hooks.drainPendingSteers?.(taskId) ?? [];
+        const steeringMessages =
+          scriptSignal ||
+          this.hooks.getTaskSignal(taskId)?.aborted ||
+          this.db.getTask(taskId)?.generation !== task.generation
+            ? []
+            : (this.hooks.drainPendingSteers?.(taskId) ?? []);
         const steering = steeringMessages.length > 0
           ? {
               wakeReason: "steered",
@@ -2192,7 +2209,9 @@ export class ControlPlaneToolExecutor {
       }
 
       const task = this.db.getTask(taskId);
-      const boundVersion = task?.goalVersion ?? null;
+      const claimSource: GoalProgressSource = source ?? (task?.tier === 1 ? "coordinator" : "worker");
+      const boundVersion =
+        claimSource === "director" || claimSource === "system" ? null : (task?.goalVersion ?? 0);
       const currentVersion = Number(row.version);
       const filtered = filterProgressPatch(patch, {
         goalId: row.id,
@@ -2224,7 +2243,6 @@ export class ControlPlaneToolExecutor {
         }
       }
       const now = Date.now();
-      const claimSource: GoalProgressSource = source ?? (task?.tier === 1 ? "coordinator" : "worker");
       const next = mergeGoalLiveProgress(prev, { ...filtered.patch, reportedByTaskId: taskId }, {
         goalVersion: currentVersion,
         reporterGoalVersion: boundVersion,
