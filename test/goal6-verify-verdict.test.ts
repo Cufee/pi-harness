@@ -433,4 +433,106 @@ describe("goal-6: read-only blocked-with-result settles completed without Goal P
       "1 rev",
     );
   });
+
+  it("does not park the goal or create a Goal P0 when a read-only task is left blocked without a result", async () => {
+    const repoRoot = await makeTempRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-goal6-ro-blocked-state-"));
+    try {
+      const baseCfg = loadConfig(repoRoot);
+      const config = withFixtureCatalog({
+        ...baseCfg,
+        codeMode: "off",
+        events: { ...baseCfg.events, wakeDirectorOnGoalSettle: true },
+        goals: { ...baseCfg.goals, autoVerifyOnSettle: true },
+        stateDir,
+        socketPath: join(stateDir, "d.sock"),
+      });
+      const daemon = new HarnessDaemon(config, {
+        dbPath: ":memory:",
+        customRunnerFactory: () => ({
+          run: async () => ({ text: "ok", stopReason: "completed" }),
+        }),
+      });
+      await daemon.start();
+      const baseSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout;
+
+      try {
+        const chat = await daemon.director.createChat({ repoRoot });
+        const goal = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Blocked read-only task without result must not park goal",
+          description: "Defense in depth: detectExplicitBlocker must exclude read-only kinds left in status blocked.",
+          criteria: [{ id: "c1", description: "Deterministic check", kind: "deterministic", command: "true", required: true }],
+          verificationMode: "deterministic",
+        });
+        const run = daemon.db.createRun({
+          goal: goal.title,
+          repoRoot,
+          baseBranch: "main",
+          baseSha,
+        });
+        daemon.director.goals.linkRunAndStart(goal.id, run.id);
+
+        const orch = daemon.db.createTask({
+          runId: run.id,
+          tier: 1,
+          kind: "orchestrator",
+          title: "Tier 1 Orchestrator",
+          objective: "Coordinate goal",
+          readOnly: true,
+          profileId: "pi:local",
+        });
+        daemon.db.updateTask(orch.id, { status: "completed", summary: "Orchestrator finished" });
+
+        // Insert read-only tasks directly via DB in status "blocked" with no resultJson.
+        for (const kind of ["research", "plan", "verify"] as const) {
+          const roTask = daemon.db.createTask({
+            runId: run.id,
+            parentId: orch.id,
+            tier: 3,
+            kind,
+            title: `Blocked ${kind} task`,
+            objective: `Read-only ${kind}`,
+            readOnly: true,
+            profileId: "pi:local",
+          });
+          daemon.db.updateTask(roTask.id, {
+            status: "blocked",
+            summary: `${kind} left blocked without result`,
+          });
+          assert.equal(daemon.db.getTask(roTask.id)?.status, "blocked");
+          assert.equal(daemon.db.getTask(roTask.id)?.resultJson, null);
+        }
+
+        // Settling the run must not park the goal or create a "Goal ... blocked" P0.
+        assert.equal(daemon.orchestrator.getEffectiveRun(run.id)?.status, "completed");
+        daemon.db.updateRunStatus(run.id, "completed");
+        await waitFor(
+          () => daemon.director.goals.listReviews(goal.id).length >= 1,
+          4000,
+          "Director auto-verification after run with blocked read-only tasks settles",
+        );
+
+        const settledGoal = daemon.director.goals.getGoal(goal.id)!;
+        assert.notEqual(settledGoal.status, "awaiting_human");
+        assert.equal(settledGoal.status, "achieved");
+
+        const reviews = daemon.director.goals.listReviews(goal.id);
+        assert.equal(reviews.length, 1);
+        assert.equal(reviews[0]!.verdict, "approved");
+
+        const escalations = daemon.db.listEscalations(run.id);
+        const p0OrGoalBlocked = escalations.filter(
+          (e) => e.severity === "P0" || /^Goal .+ blocked:/i.test(e.title),
+        );
+        assert.deepEqual(p0OrGoalBlocked, []);
+      } finally {
+        await daemon.stop();
+      }
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
 });

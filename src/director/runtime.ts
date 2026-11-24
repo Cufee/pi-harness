@@ -3084,14 +3084,14 @@ export class DirectorRuntime {
   }
 
   /**
-   * An explicit blocker on a settled run: a current (or legacy) blocked phase, or a blocked non-director task.
+   * An explicit blocker on a settled run: a current (or legacy) blocked phase, or a blocked non-director, non-read-only task.
    * A bare open escalation is not a blocker: an earlier breaker's P0 stays open across a manual resume.
    */
   private detectExplicitBlocker(goal: GoalRecord, runId: string): ExplicitBlocker | null {
     const lp = goal.liveProgress;
     const phaseBlocked = Boolean(lp && isBlockedPhase(lp.phase) && (!hasClaimProvenance(lp) || isCurrentClaim(goal, lp)));
     const tasks = this.db.listTasks(runId);
-    const blockedTasks = tasks.filter((t) => t.profileId !== "director" && t.status === "blocked");
+    const blockedTasks = tasks.filter((t) => t.profileId !== "director" && t.status === "blocked" && !isReadOnlyKind(t.kind));
     if (!phaseBlocked && blockedTasks.length === 0) return null;
     const blockedIds = new Set(blockedTasks.map((t) => t.id));
     const escalation = this.db
