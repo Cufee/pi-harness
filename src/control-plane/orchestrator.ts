@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { constants as fsConstants, existsSync } from "node:fs";
+import { lstat, open, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { HarnessConfig, RunnerProfileConfig } from "../config.js";
 import type { ModelCatalogCompiler } from "../catalog/compiler.js";
 import type { QuotaClient } from "../quota/client.js";
@@ -29,7 +30,7 @@ import { canonicalPath, runGit, WorktreeConcurrencyLimitError, WorktreeManager }
 import type { QueuePositionInput } from "./admission-queue.js";
 import { WriteScopeConflictError, type AgentTier, type ControlPlaneDb, type EscalationRecord, type RunRecord, type TaskKind, type TaskRecord, type TaskStatus, type WorktreeRecord } from "./db.js";
 import { buildHydrationTurn, buildImmutableSystemPrompt, buildMissingReturnWrapUpPrompt, type AnchoredHandoff } from "./prompts.js";
-import { spillSummaryOverflow, writeUniqueTaskDossier } from "./dossiers.js";
+import { hashRunDossier, spillSummaryOverflow, writeUniqueTaskDossier } from "./dossiers.js";
 import { ControlPlaneToolExecutor, compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./tools.js";
 import { allToolNames, allowedToolNames } from "../tool-descriptions/registry.js";
 import { formatFallbackSummary, settleTaskMinimalFallback, SUMMARY_LIMIT } from "./handoffs.js";
@@ -289,23 +290,122 @@ interface RolloverProgress {
   routes: string[];
 }
 
-/** Total bytes over distinct contents (sha256) of the files. Missing or unreadable files add nothing. */
-function distinctContentBytes(paths: string[], repoRoot?: string): number {
+const CHILD_ACTIVITY_EVENT_TYPES = [
+  "agent.tool",
+  "agent.text_delta",
+  "agent.thought_delta",
+  "agent.usage",
+  "agent.rollover",
+  "artifact.recorded",
+  "blackboard.updated",
+  "goal.progress",
+  "task.status",
+  "task.created",
+  "escalation.created",
+  "worktree.created",
+  "merge.queued",
+  "merge.promoted",
+  "merge.bounced",
+  "merge.finished",
+  "message.answered",
+] as const;
+
+const MAX_UNTRACKED_HASH_FILES = 256;
+const MAX_UNTRACKED_FILE_BYTES = 4 * 1024 * 1024;
+
+function hasParentTraversalComponent(p: string): boolean {
+  return p.replaceAll("\\", "/").split("/").includes("..");
+}
+
+/** Total bytes over distinct contents (sha256) of safe, pinned run dossiers. Missing, unsafe, or unreadable files add nothing. */
+async function distinctContentBytes(db: ControlPlaneDb, run: RunRecord, paths: string[]): Promise<number> {
   const seen = new Set<string>();
   let total = 0;
   for (const p of paths) {
-    try {
-      const full = repoRoot ? resolve(repoRoot, p) : p;
-      const buf = readFileSync(full);
-      const digest = createHash("sha256").update(buf).digest("hex");
-      if (seen.has(digest)) continue;
-      seen.add(digest);
-      total += buf.byteLength;
-    } catch {
-      // Missing or unreadable file adds nothing.
-    }
+    const hashed = await hashRunDossier(db, run, p);
+    if (!hashed || seen.has(hashed.sha256)) continue;
+    seen.add(hashed.sha256);
+    total += hashed.bytes;
   }
   return total;
+}
+
+/** Hashes paths and regular-file contents of untracked non-ignored worktree files without following symlinks or blocking on FIFOs. */
+async function hashUntrackedFiles(worktreePath: string): Promise<string> {
+  const raw = await runGit(worktreePath, ["ls-files", "--others", "--exclude-standard", "-z"])
+    .then((r) => r.stdout)
+    .catch(() => "");
+  if (!raw) return "";
+  const relPaths = raw
+    .split("\0")
+    .filter((p) => p.length > 0 && p !== ".harness" && !p.startsWith(".harness/"))
+    .sort();
+  if (relPaths.length === 0) return "";
+
+  let realRoot: string;
+  try {
+    realRoot = await realpath(worktreePath);
+  } catch {
+    return "";
+  }
+
+  const totalHash = createHash("sha256");
+  totalHash.update(`count:${relPaths.length}\0`);
+  const chunk = Buffer.allocUnsafe(65_536);
+  let count = 0;
+  for (const rel of relPaths) {
+    if (count >= MAX_UNTRACKED_HASH_FILES) break;
+    count += 1;
+    totalHash.update(rel);
+    totalHash.update("\0");
+    const candidate = resolve(realRoot, rel);
+    const backRel = relative(realRoot, candidate).replaceAll("\\", "/");
+    if (!backRel || backRel === "." || hasParentTraversalComponent(backRel) || isAbsolute(backRel)) continue;
+    try {
+      const preStat = await lstat(candidate, { bigint: true });
+      if (preStat.isSymbolicLink() || !preStat.isFile()) {
+        totalHash.update("nonfile\0");
+        continue;
+      }
+      const realCandidate = await realpath(candidate);
+      if (realCandidate !== candidate) {
+        totalHash.update("outside\0");
+        continue;
+      }
+      const handle = await open(candidate, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+      try {
+        const st = await handle.stat({ bigint: true });
+        if (!st.isFile() || st.dev !== preStat.dev || st.ino !== preStat.ino || (await realpath(candidate)) !== candidate) {
+          totalHash.update("nonfile\0");
+          continue;
+        }
+        if (st.size > BigInt(MAX_UNTRACKED_FILE_BYTES)) {
+          totalHash.update(`oversize:${st.size.toString()}\0`);
+          continue;
+        }
+        let readTotal = 0;
+        let oversized = false;
+        while (true) {
+          const remaining = MAX_UNTRACKED_FILE_BYTES - readTotal;
+          const toRead = Math.min(chunk.length, remaining + 1);
+          const { bytesRead } = await handle.read(chunk, 0, toRead, null);
+          if (bytesRead === 0) break;
+          readTotal += bytesRead;
+          if (readTotal > MAX_UNTRACKED_FILE_BYTES) {
+            oversized = true;
+            break;
+          }
+          totalHash.update(chunk.subarray(0, bytesRead));
+        }
+        totalHash.update(oversized ? `oversize:${st.size.toString()}\0` : "\0");
+      } finally {
+        await handle.close();
+      }
+    } catch {
+      totalHash.update("unreadable\0");
+    }
+  }
+  return totalHash.digest("hex").slice(0, 16);
 }
 
 export class HarnessOrchestrator {
@@ -2639,7 +2739,16 @@ export class HarnessOrchestrator {
           },
           onArtifact: (art) => {
             if (!isCurrent()) return;
-            this.db.recordArtifact({ runId: run.id, taskId: task.id, ...art });
+            // Strip origin at the persistence boundary: only writeTaskDossier marks an agent dossier.
+            this.db.recordArtifact({
+              runId: run.id,
+              taskId: task.id,
+              kind: art.kind,
+              path: art.path,
+              summary: art.summary,
+              gitSha: art.gitSha,
+              exitCode: art.exitCode,
+            });
           },
           onPassiveQuota: (sig) => {
             if (!isCurrent()) return;
@@ -3458,12 +3567,7 @@ export class HarnessOrchestrator {
         "Stopped: 2 context windows in a row with nothing new (no commit, file change, added dossier content, child change, or newly read file). " +
         (latest.tier === 1 ? "resume_run continues it." : "resume_task with a note continues it.");
       let settled = false;
-      if (latest.tier === 1) {
-        if (this.active.get(taskId) === exec && !this.rolloverFenceBroken(exec, taskId, fence)) {
-          this.db.updateTask(taskId, { status: "failed", summary });
-          settled = true;
-        }
-      } else {
+      if (!this.rolloverFenceBroken(exec, taskId, fence)) {
         settled = await this.settleWithoutReturn(exec, runnerGen, latest, run, wt, res, "failed", summary, "zero_progress_rollover");
       }
       if (settled) {
@@ -3489,8 +3593,27 @@ export class HarnessOrchestrator {
             evidencePaths,
             blocking: true,
           });
-        } catch {
-          // Never allow escalation creation failure to escape rollOver.
+        } catch (err) {
+          // Record the failure durably (event plus task summary) without letting it escape rollOver.
+          const errMsg = err instanceof Error ? err.message : String(err);
+          try {
+            this.db.emitEvent(run.id, taskId, "escalation.create_failed", {
+              category: "budget_exhausted",
+              reason: "zero_progress_rollover",
+              error: errMsg,
+            });
+          } catch {
+            // Never allow event emission failure to escape rollOver.
+          }
+          try {
+            const cur = this.db.getTask(taskId);
+            const base = cur?.summary ?? summary;
+            const note = `Escalation creation failed: ${errMsg}`;
+            const updatedSummary = base.includes(note) ? base : `${base} ${note}`.slice(0, SUMMARY_LIMIT);
+            this.db.updateTask(taskId, { summary: updatedSummary });
+          } catch {
+            // Never allow summary update failure to escape rollOver.
+          }
         }
       }
       return false;
@@ -3539,20 +3662,60 @@ export class HarnessOrchestrator {
     const canWrite = !task.readOnly && !isReadOnlyKind(task.kind);
     let gitState = !canWrite ? "ro" : "no-wt";
     if (canWrite && worktreePath && existsSync(worktreePath)) {
-      const [head, status, diff] = await Promise.all([
+      const [head, status, diff, stagedDiff, untrackedHash] = await Promise.all([
         runGit(worktreePath, ["rev-parse", "HEAD"]).then((r) => r.stdout).catch(() => ""),
         runGit(worktreePath, ["status", "--porcelain"]).then((r) => r.stdout).catch(() => ""),
-        runGit(worktreePath, ["diff"]).then((r) => r.stdout).catch(() => ""),
+        runGit(worktreePath, ["diff", "--binary"]).then((r) => r.stdout).catch(() => ""),
+        runGit(worktreePath, ["diff", "--cached", "--binary"]).then((r) => r.stdout).catch(() => ""),
+        hashUntrackedFiles(worktreePath),
       ]);
       const diffHash = createHash("sha256").update(diff).digest("hex").slice(0, 16);
-      gitState = `${head}|${status}|${diffHash}`;
+      const stagedHash = createHash("sha256").update(stagedDiff).digest("hex").slice(0, 16);
+      gitState = `${head}|${status}|${diffHash}|${stagedHash}|${untrackedHash}`;
     }
 
     const agentDossierPaths = this.db.listAgentDossierPaths(run.id, task.id);
-    const artHigh = Math.max(prev?.artHigh ?? 0, distinctContentBytes(agentDossierPaths, run.repoRoot));
+    const artHigh = Math.max(prev?.artHigh ?? 0, await distinctContentBytes(this.db, run, agentDossierPaths));
 
-    const kids = this.db.listTasks(run.id, { parentId: task.id });
-    const kidSig = kids.map((k) => `${k.id}:${k.status}:${k.generation}:${k.updatedAt}`).join(",");
+    const allRunTasks = this.db.listTasks(run.id);
+    const byParent = new Map<string, TaskRecord[]>();
+    for (const t of allRunTasks) {
+      if (!t.parentId) continue;
+      const list = byParent.get(t.parentId);
+      if (list) list.push(t);
+      else byParent.set(t.parentId, [t]);
+    }
+    const descendants: TaskRecord[] = [];
+    const queue = [...(byParent.get(task.id) ?? [])];
+    const seenDesc = new Set<string>();
+    while (queue.length > 0) {
+      const cur = queue.shift()!;
+      if (seenDesc.has(cur.id)) continue;
+      seenDesc.add(cur.id);
+      descendants.push(cur);
+      const next = byParent.get(cur.id);
+      if (next) queue.push(...next);
+    }
+    descendants.sort((a, b) => a.id.localeCompare(b.id));
+    const maxSeqByChild = new Map<string, number>();
+    if (descendants.length > 0) {
+      const idPlaceholders = descendants.map(() => "?").join(", ");
+      const typePlaceholders = CHILD_ACTIVITY_EVENT_TYPES.map(() => "?").join(", ");
+      const rows = this.db.db
+        .prepare(
+          `SELECT task_id, MAX(seq) AS max_seq FROM events WHERE run_id = ? AND task_id IN (${idPlaceholders}) AND type IN (${typePlaceholders}) GROUP BY task_id`,
+        )
+        .all(run.id, ...descendants.map((k) => k.id), ...CHILD_ACTIVITY_EVENT_TYPES) as Array<{
+        task_id: string;
+        max_seq: number | null;
+      }>;
+      for (const row of rows) {
+        if (row.max_seq != null) maxSeqByChild.set(String(row.task_id), Number(row.max_seq));
+      }
+    }
+    const kidSig = descendants
+      .map((k) => `${k.id}:${k.status}:${k.generation}:${maxSeqByChild.get(k.id) ?? 0}`)
+      .join(",");
 
     const allBb = this.db.blackboardGet(run.id);
     const bbSig = Object.entries(allBb)
@@ -3576,6 +3739,7 @@ export class HarnessOrchestrator {
       .join(",");
 
     const act = this.advisories.activityProgress(task.id);
+    const ver = this.advisories.verificationProgress(task.id);
 
     const cachedModels = this.catalog.loadCached()?.models ?? [];
     const routeKey = (r: { profileId: string | null; model: string | null; effort: string | null }): string => {
@@ -3597,7 +3761,7 @@ export class HarnessOrchestrator {
       ]),
     ).sort();
 
-    const fp = `${gitState}::art=${artHigh}::kids=${kidSig}::bb=${bbSig}::esc=${escSig}::act=${act}::rt=${routes.join(",")}`;
+    const fp = `${gitState}::art=${artHigh}::kids=${kidSig}::bb=${bbSig}::esc=${escSig}::act=${act}::ver=${ver}::rt=${routes.join(",")}`;
     return { fp, artHigh, routes };
   }
 

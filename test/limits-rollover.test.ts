@@ -5,6 +5,7 @@ import { describe, it } from "bun:test";
 import { ModelCatalogCompiler } from "../src/catalog/compiler.js";
 import { loadConfig, type HarnessConfig, type PiProfileConfig } from "../src/config.js";
 import { ControlPlaneDb } from "../src/control-plane/db.js";
+import { writeTaskDossier } from "../src/control-plane/dossiers.js";
 import { HarnessOrchestrator, type CustomRunnerFactory } from "../src/control-plane/orchestrator.js";
 import { QuotaClient } from "../src/quota/client.js";
 import { runGit } from "../src/worktree/manager.js";
@@ -795,6 +796,475 @@ describe("goal-14 slice B2o: count-free rollover liveness and overflow rollovers
       // Source check: orchestrator.ts contains no reference to maxGenerations
       const orchSrc = readFileSync(join(REPO_ROOT_DIR, "src", "control-plane", "orchestrator.ts"), "utf8");
       assert.equal(orchSrc.includes("maxGenerations"), false, "orchestrator.ts must not reference maxGenerations");
+    } finally {
+      await orch.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("goal-14 fix FX-ORCH: rollover progress fingerprint and Tier 1 partial handoff", () => {
+  it("FXO-4a: editing an existing untracked file between rollovers advances the fingerprint", async () => {
+    const { root, repoRoot, stateDir, baseSha } = await makeTempGitRepo("pi-fxo-4a-");
+    let runs = 0;
+
+    const { db, orch } = makeOrchestrator(repoRoot, stateDir, () => ({
+      run: async (req) => {
+        runs += 1;
+        // Write same-length updated content to the same untracked file each window so porcelain status is unchanged.
+        writeFileSync(join(req.cwd, "scratch.tmp"), `untracked-rev-${runs}\n`, "utf8");
+        if (runs < 5) {
+          return { text: `edited untracked ${runs}`, stopReason: "rollover_requested" };
+        }
+        await runGit(req.cwd, ["add", "scratch.tmp"]);
+        await runGit(req.cwd, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "final untracked"]);
+        await req.executeTool("submit_for_merge", { summary: "merge scratch.tmp" });
+        await req.executeTool("return_task", {
+          status: "completed",
+          summary: "Completed after editing untracked file across 4 rollovers",
+          sources: [{ path: "README.md", note: "done" }],
+        });
+        return { text: "done", stopReason: "completed" };
+      },
+    }));
+
+    try {
+      const { run, parent } = createRunWithParent(db, repoRoot, baseSha, "FXO-4a untracked file content");
+      const worker = await orch.spawnAndStartTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 2,
+        kind: "worker",
+        title: "Edit untracked file",
+        objective: "Iteratively edit an untracked file",
+        readOnly: false,
+        writeScopes: ["scratch.tmp"],
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      await waitUntil(() => TERMINAL_STATUSES.has(db.getTask(worker.id)?.status ?? ""), 10_000, "FXO-4a terminal");
+      const finalTask = db.getTask(worker.id)!;
+      assert.equal(finalTask.status, "completed");
+      assert.equal(runs, 5);
+      assert.equal(finalTask.generation, 5);
+      assert.equal(db.listEscalations(run.id).length, 0);
+    } finally {
+      await orch.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("FXO-4b: replacing staged content advances the fingerprint", async () => {
+    const { root, repoRoot, stateDir, baseSha } = await makeTempGitRepo("pi-fxo-4b-");
+    let runs = 0;
+
+    const { db, orch } = makeOrchestrator(repoRoot, stateDir, () => ({
+      run: async (req) => {
+        runs += 1;
+        // Replace content and immediately stage it so unstaged diff stays empty and porcelain stays "M  src/a.ts".
+        writeFileSync(join(req.cwd, "src", "a.ts"), `export const a = ${runs + 10};\n`, "utf8");
+        await runGit(req.cwd, ["add", "src/a.ts"]);
+        if (runs < 5) {
+          return { text: `staged rev ${runs}`, stopReason: "rollover_requested" };
+        }
+        await runGit(req.cwd, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "final staged"]);
+        await req.executeTool("submit_for_merge", { summary: "merge staged src/a.ts" });
+        await req.executeTool("return_task", {
+          status: "completed",
+          summary: "Completed after replacing staged content across 4 rollovers",
+          sources: [{ path: "src/a.ts", note: "done" }],
+        });
+        return { text: "done", stopReason: "completed" };
+      },
+    }));
+
+    try {
+      const { run, parent } = createRunWithParent(db, repoRoot, baseSha, "FXO-4b staged content");
+      const worker = await orch.spawnAndStartTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 2,
+        kind: "worker",
+        title: "Replace staged content",
+        objective: "Iteratively stage edits to src/a.ts",
+        readOnly: false,
+        writeScopes: ["src/a.ts"],
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      await waitUntil(() => TERMINAL_STATUSES.has(db.getTask(worker.id)?.status ?? ""), 10_000, "FXO-4b terminal");
+      const finalTask = db.getTask(worker.id)!;
+      assert.equal(finalTask.status, "completed");
+      assert.equal(runs, 5);
+      assert.equal(finalTask.generation, 5);
+      assert.equal(db.listEscalations(run.id).length, 0);
+    } finally {
+      await orch.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("FXO-4c: reading a new child dossier advances the fingerprint while re-reading the same dossier does not", async () => {
+    const { root, repoRoot, stateDir, baseSha } = await makeTempGitRepo("pi-fxo-4c-");
+    const childDossiers: string[] = [];
+    let progressRuns = 0;
+    let repeatRuns = 0;
+
+    const { db, orch } = makeOrchestrator(repoRoot, stateDir, () => ({
+      run: async (req) => {
+        const title = db.getTask(req.taskId)?.title ?? "";
+        if (title === "read-new-child-dossiers") {
+          progressRuns += 1;
+          const target = childDossiers[progressRuns - 1];
+          if (target) {
+            await req.executeTool("artifact_read", { path: target });
+          }
+          if (progressRuns < 5) {
+            return { text: `read child dossier ${progressRuns}`, stopReason: "rollover_requested" };
+          }
+          await req.executeTool("return_task", {
+            status: "completed",
+            summary: "Synthesized 4 distinct child dossiers across rollovers",
+            sources: [{ path: "README.md", note: "done" }],
+          });
+          return { text: "done", stopReason: "completed" };
+        }
+        if (title === "reread-same-child-dossier") {
+          repeatRuns += 1;
+          await req.executeTool("artifact_read", { path: childDossiers[0]! });
+          return { text: `reread ${repeatRuns}`, stopReason: "rollover_requested" };
+        }
+        return { text: "ok", stopReason: "completed" };
+      },
+    }));
+
+    try {
+      const { run, parent } = createRunWithParent(db, repoRoot, baseSha, "FXO-4c child dossier reads");
+      const child = db.createTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 3,
+        kind: "research",
+        title: "Scout child",
+        objective: "Produce dossiers",
+        readOnly: true,
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      for (let i = 1; i <= 4; i += 1) {
+        const rec = writeTaskDossier(db, run, child.id, `finding-${i}.md`, `# Finding ${i}\nDetails ${i}\n`, `finding ${i}`);
+        childDossiers.push(rec.path);
+      }
+
+      const tProgress = await orch.spawnAndStartTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 2,
+        kind: "worker",
+        title: "read-new-child-dossiers",
+        objective: "Read each child dossier",
+        readOnly: false,
+        writeScopes: ["README.md"],
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      await waitUntil(() => TERMINAL_STATUSES.has(db.getTask(tProgress.id)?.status ?? ""), 10_000, "FXO-4c progress");
+      assert.equal(db.getTask(tProgress.id)?.status, "completed");
+      assert.equal(progressRuns, 5);
+      assert.equal(db.listEscalations(run.id).filter((e) => e.fromTaskId === tProgress.id).length, 0);
+
+      const tRepeat = await orch.spawnAndStartTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 2,
+        kind: "worker",
+        title: "reread-same-child-dossier",
+        objective: "Re-read same dossier",
+        readOnly: false,
+        writeScopes: ["src/a.ts"],
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      await waitUntil(() => TERMINAL_STATUSES.has(db.getTask(tRepeat.id)?.status ?? ""), 10_000, "FXO-4c repeat");
+      assert.equal(repeatRuns, 3);
+      assert.equal(db.getTask(tRepeat.id)?.status, "failed");
+    } finally {
+      await orch.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("FXO-4d: a verification run with new output advances the fingerprint and an identical repeated command does not", async () => {
+    const { root, repoRoot, stateDir, baseSha } = await makeTempGitRepo("pi-fxo-4d-");
+    let newOutputRuns = 0;
+    let identicalRuns = 0;
+
+    const { db, orch } = makeOrchestrator(repoRoot, stateDir, () => ({
+      run: async (req) => {
+        const title = db.getTask(req.taskId)?.title ?? "";
+        if (title === "verify-new-output") {
+          newOutputRuns += 1;
+          req.callbacks.onToolEvent?.({
+            id: `verify-new-${newOutputRuns}`,
+            name: "Bash",
+            kind: "execute",
+            status: newOutputRuns < 4 ? "failed" : "completed",
+            args: JSON.stringify({ command: "bun test" }),
+            ...(newOutputRuns < 4
+              ? { error: `${4 - newOutputRuns} failing tests` }
+              : { result: "0 failing tests, 12 passed" }),
+          });
+          if (newOutputRuns < 5) {
+            return { text: `verify pass ${newOutputRuns}`, stopReason: "rollover_requested" };
+          }
+          await req.executeTool("return_task", {
+            status: "completed",
+            summary: "Verification converged across rollovers",
+            sources: [{ path: "README.md", note: "verified" }],
+          });
+          return { text: "done", stopReason: "completed" };
+        }
+        if (title === "verify-identical-output") {
+          identicalRuns += 1;
+          req.callbacks.onToolEvent?.({
+            id: `verify-same-${identicalRuns}`,
+            name: "Bash",
+            kind: "execute",
+            status: "completed",
+            args: JSON.stringify({ command: "bun test" }),
+            result: "2 failing tests (identical)",
+          });
+          return { text: `same verify ${identicalRuns}`, stopReason: "rollover_requested" };
+        }
+        return { text: "ok", stopReason: "completed" };
+      },
+    }));
+
+    try {
+      const { run, parent } = createRunWithParent(db, repoRoot, baseSha, "FXO-4d verification evidence");
+
+      const tNew = await orch.spawnAndStartTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 3,
+        kind: "verify",
+        title: "verify-new-output",
+        objective: "Run verification suite",
+        readOnly: true,
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      await waitUntil(() => TERMINAL_STATUSES.has(db.getTask(tNew.id)?.status ?? ""), 10_000, "FXO-4d new output");
+      assert.equal(db.getTask(tNew.id)?.status, "completed");
+      assert.equal(newOutputRuns, 5);
+      assert.equal(db.listEscalations(run.id).filter((e) => e.fromTaskId === tNew.id).length, 0);
+
+      const tSame = await orch.spawnAndStartTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 3,
+        kind: "verify",
+        title: "verify-identical-output",
+        objective: "Run identical verification",
+        readOnly: true,
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      await waitUntil(() => TERMINAL_STATUSES.has(db.getTask(tSame.id)?.status ?? ""), 10_000, "FXO-4d identical");
+      assert.equal(identicalRuns, 3);
+      assert.equal(db.getTask(tSame.id)?.status, "failed");
+      assert.equal(db.listEscalations(run.id).filter((e) => e.fromTaskId === tSame.id).length, 1);
+    } finally {
+      await orch.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("FXO-4e: three empty windows stop Tier 1 with a structured partial handoff; real child activity advances fingerprint while silent running child does not; escalation errors record durably", async () => {
+    const { root, repoRoot, stateDir, baseSha } = await makeTempGitRepo("pi-fxo-4e-");
+    let tier1Runs = 0;
+    let activeChildParentRuns = 0;
+    let silentChildParentRuns = 0;
+    let escThrowRuns = 0;
+    let activeChildId = "";
+    let silentChildId = "";
+    let activeChildRunId = "";
+
+    const { db, orch } = makeOrchestrator(repoRoot, stateDir, () => ({
+      run: async (req) => {
+        const t = db.getTask(req.taskId);
+        if (t?.tier === 1) {
+          tier1Runs += 1;
+          return { text: `tier1 empty window ${tier1Runs}`, stopReason: "rollover_requested" };
+        }
+        if (t?.title === "parent-with-active-child") {
+          activeChildParentRuns += 1;
+          if (!activeChildId) {
+            const c = db.createTask({
+              runId: req.runId,
+              parentId: req.taskId,
+              tier: 3,
+              kind: "research",
+              title: "Active child",
+              objective: "Emit real tool events",
+              readOnly: true,
+              profileId: "pi:local",
+              model: "fixture/fixture",
+            });
+            db.updateTask(c.id, { status: "running" });
+            activeChildId = c.id;
+            activeChildRunId = req.runId;
+          }
+          if (activeChildParentRuns < 5) {
+            // Simulate real child tool activity while child remains marked running.
+            db.emitEvent(activeChildRunId, activeChildId, "agent.tool", {
+              id: `child-tool-${activeChildParentRuns}`,
+              name: "read_file",
+              status: "completed",
+            });
+            return { text: `waiting on active child ${activeChildParentRuns}`, stopReason: "rollover_requested" };
+          }
+          db.updateTask(activeChildId, { status: "completed", summary: "child finished" });
+          await req.executeTool("return_task", {
+            status: "completed",
+            summary: "Completed after observing real child activity across rollovers",
+            sources: [{ path: "README.md", note: "done" }],
+          });
+          return { text: "done", stopReason: "completed" };
+        }
+        if (t?.title === "parent-with-silent-child") {
+          silentChildParentRuns += 1;
+          if (!silentChildId) {
+            const c = db.createTask({
+              runId: req.runId,
+              parentId: req.taskId,
+              tier: 3,
+              kind: "research",
+              title: "Silent child",
+              objective: "Stuck running",
+              readOnly: true,
+              profileId: "pi:local",
+              model: "fixture/fixture",
+            });
+            db.updateTask(c.id, { status: "running" });
+            silentChildId = c.id;
+          }
+          // Merely touching the child row or emitting an external steer must not count as child progress.
+          db.updateTask(silentChildId, { summary: `touched ${silentChildParentRuns}` });
+          db.emitEvent(req.runId, silentChildId, "agent.steered", { message: "ping", accepted: false });
+          return { text: `waiting on silent child ${silentChildParentRuns}`, stopReason: "rollover_requested" };
+        }
+        if (t?.title === "escalation-throw-worker") {
+          escThrowRuns += 1;
+          return { text: `empty ${escThrowRuns}`, stopReason: "rollover_requested" };
+        }
+        return { text: "ok", stopReason: "completed" };
+      },
+    }));
+
+    try {
+      // 1. Tier 1 empty windows -> stops on 3rd rollover with structured partial handoff and P0 escalation.
+      const started = await orch.startRun({
+        goal: "FXO-4e Tier 1 empty rollover stop",
+        repoRoot,
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      await waitUntil(
+        () => TERMINAL_STATUSES.has(db.getTask(started.orchestratorTask.id)?.status ?? ""),
+        10_000,
+        "FXO-4e Tier 1 terminal",
+      );
+      const t1Final = db.getTask(started.orchestratorTask.id)!;
+      assert.equal(tier1Runs, 3);
+      assert.equal(t1Final.status, "failed");
+      assert.ok((t1Final.summary ?? "").includes("2 context windows in a row with nothing new"));
+      const t1Parsed = JSON.parse(t1Final.resultJson ?? "{}") as {
+        status?: string;
+        fallback?: { partial?: boolean; reason?: string; summary?: string; artifact_paths?: string[] };
+      };
+      assert.equal(t1Parsed.status, "failed");
+      assert.equal(t1Parsed.fallback?.partial, true, "Tier 1 stop must store a structured partial handoff");
+      assert.equal(t1Parsed.fallback?.reason, "zero_progress_rollover");
+      assert.ok(typeof t1Parsed.fallback?.summary === "string" && t1Parsed.fallback.summary.length > 0);
+      assert.ok(Array.isArray(t1Parsed.fallback?.artifact_paths));
+      const t1Escs = db.listEscalations(started.run.id).filter((e) => e.fromTaskId === started.orchestratorTask.id);
+      assert.equal(t1Escs.length, 1);
+      assert.equal(t1Escs[0]!.severity, "P0");
+      assert.equal(t1Escs[0]!.category, "budget_exhausted");
+
+      // 2. Real child activity advances parent fingerprint; silent running child does not.
+      const { run, parent } = createRunWithParent(db, repoRoot, baseSha, "FXO-4e child activity");
+
+      const pActive = await orch.spawnAndStartTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 2,
+        kind: "worker",
+        title: "parent-with-active-child",
+        objective: "Wait for active child",
+        readOnly: false,
+        writeScopes: ["src/a.ts"],
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      await waitUntil(() => TERMINAL_STATUSES.has(db.getTask(pActive.id)?.status ?? ""), 10_000, "FXO-4e active child");
+      assert.equal(db.getTask(pActive.id)?.status, "completed");
+      assert.equal(activeChildParentRuns, 5);
+
+      const pSilent = await orch.spawnAndStartTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 2,
+        kind: "worker",
+        title: "parent-with-silent-child",
+        objective: "Wait for silent child",
+        readOnly: false,
+        writeScopes: ["src/b.ts"],
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      await waitUntil(() => TERMINAL_STATUSES.has(db.getTask(pSilent.id)?.status ?? ""), 10_000, "FXO-4e silent child");
+      assert.equal(silentChildParentRuns, 3);
+      assert.equal(db.getTask(pSilent.id)?.status, "failed");
+
+      // 3. If createEscalation throws on stop, record failure durably (event + task summary).
+      const origCreateEsc = db.createEscalation.bind(db);
+      db.createEscalation = () => {
+        throw new Error("simulated escalation DB failure");
+      };
+      try {
+        const tEscFail = await orch.spawnAndStartTask({
+          runId: run.id,
+          parentId: parent.id,
+          tier: 2,
+          kind: "worker",
+          title: "escalation-throw-worker",
+          objective: "Trigger escalation error",
+          readOnly: false,
+          writeScopes: ["src/c.ts"],
+          profileId: "pi:local",
+          model: "fixture/fixture",
+        });
+        await waitUntil(() => TERMINAL_STATUSES.has(db.getTask(tEscFail.id)?.status ?? ""), 10_000, "FXO-4e esc fail");
+        const finalEscTask = db.getTask(tEscFail.id)!;
+        assert.equal(escThrowRuns, 3);
+        assert.equal(finalEscTask.status, "failed");
+        assert.ok(
+          (finalEscTask.summary ?? "").includes("Escalation creation failed: simulated escalation DB failure"),
+          finalEscTask.summary ?? "",
+        );
+        const failEvents = db
+          .getEventsSince(run.id, 0, tEscFail.id)
+          .filter((e) => e.type === "escalation.create_failed");
+        assert.equal(failEvents.length, 1);
+        assert.equal(
+          (failEvents[0]!.payload as { error?: string }).error,
+          "simulated escalation DB failure",
+        );
+      } finally {
+        db.createEscalation = origCreateEsc;
+      }
     } finally {
       await orch.dispose();
       rmSync(root, { recursive: true, force: true });

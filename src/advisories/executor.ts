@@ -2,6 +2,7 @@ import { existsSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import type { HarnessConfig } from "../config.js";
 import type { ControlPlaneDb, TaskRecord } from "../control-plane/db.js";
+import { findRunDossier } from "../control-plane/dossiers.js";
 import { ControlPlaneToolExecutor, type ToolRuntimeHooks } from "../control-plane/tools.js";
 import type { AdvisoryEngine } from "./engine.js";
 import { attachNotices } from "./message.js";
@@ -32,6 +33,57 @@ export interface AdvisedExecutorOptions {
   engine: AdvisoryEngine;
   subjectFor(task: TaskRecord): Subject | null;
   workspaceRootFor?(task: TaskRecord): string | null;
+}
+
+function hasParentTraversalComponent(p: string): boolean {
+  return p.replaceAll("\\", "/").split("/").includes("..");
+}
+
+function isOtherTaskDossier(
+  db: ControlPlaneDb,
+  runId: string,
+  taskId: string,
+  candidatePaths: string[],
+): boolean {
+  if (candidatePaths.length === 0) return false;
+  if (db.db) {
+    const placeholders = candidatePaths.map(() => "?").join(", ");
+    const rows = db.db
+      .prepare(
+        `SELECT DISTINCT task_id FROM artifacts WHERE run_id = ? AND kind = 'dossier' AND path IN (${placeholders})`,
+      )
+      .all(runId, ...candidatePaths) as Array<{ task_id: string }>;
+    const owners = rows.map((r) => String(r.task_id));
+    return owners.some((id) => id !== taskId) && !owners.includes(taskId);
+  }
+  const pathSet = new Set(candidatePaths);
+  const owners = new Set(
+    db
+      .listArtifacts(runId, undefined, 500, "dossier")
+      .filter((a) => pathSet.has(a.path))
+      .map((a) => a.taskId),
+  );
+  return owners.size > 0 && !owners.has(taskId);
+}
+
+function inspectCommandVerification(
+  args: Record<string, unknown>,
+  result: unknown,
+): { commandKey: string; outcome: string } | null {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return null;
+  const r = result as Record<string, unknown>;
+  const argv = Array.isArray(r.argv) ? r.argv : Array.isArray(args.argv) ? args.argv : null;
+  if (!argv || argv.length === 0) return null;
+  const cwd = typeof r.cwd === "string" ? r.cwd : typeof args.cwd === "string" ? args.cwd : ".";
+  const commandKey = `inspect:${JSON.stringify({ argv, cwd })}`;
+  // Exclude volatile spill path (`output_path`), `hint`, and `harness_advisory` so identical spills deduplicate.
+  const outcome = JSON.stringify({
+    exit_code: r.exit_code ?? null,
+    stopped: r.stopped ?? null,
+    stdout: typeof r.stdout === "string" ? r.stdout : "",
+    stderr: typeof r.stderr === "string" ? r.stderr : "",
+  });
+  return { commandKey, outcome };
 }
 
 function extractInspectCommandPaths(args: Record<string, unknown>, workspaceRoot: string): string[] {
@@ -65,7 +117,7 @@ function extractInspectCommandPaths(args: Record<string, unknown>, workspaceRoot
       realCandidate = candidate;
     }
     const rel = relative(realRoot, realCandidate).replaceAll("\\", "/");
-    if (!rel || rel === "." || rel === ".." || rel.startsWith("../") || isAbsolute(rel)) continue;
+    if (!rel || rel === "." || hasParentTraversalComponent(rel) || isAbsolute(rel)) continue;
     if (rel === ".harness" || rel.startsWith(".harness/")) continue;
     if (!seen.has(rel)) {
       seen.add(rel);
@@ -103,7 +155,7 @@ function extractArtifactReadPaths(args: Record<string, unknown>, workspaceRoot: 
   }
 
   const rel = relative(realRoot, realCandidate).replaceAll("\\", "/");
-  if (!rel || rel === "." || rel === ".." || rel.startsWith("../") || isAbsolute(rel)) return [];
+  if (!rel || rel === "." || hasParentTraversalComponent(rel) || isAbsolute(rel)) return [];
   if (rel === ".harness" || rel.startsWith(".harness/")) return [];
   return [rel];
 }
@@ -247,15 +299,35 @@ export class AdvisedToolExecutor extends ControlPlaneToolExecutor {
       logAdvisoryError("observe_completed", err, runId, taskId, name);
     }
 
-    if (name === "inspect_command" || name === "artifact_read") {
+    if (name === "inspect_command") {
       try {
         const workspaceRoot = this.adv.workspaceRootFor?.(task) ?? subject.workspaceRoot;
-        const paths =
-          name === "inspect_command"
-            ? extractInspectCommandPaths(args, workspaceRoot)
-            : extractArtifactReadPaths(args, workspaceRoot);
+        const paths = extractInspectCommandPaths(args, workspaceRoot);
         if (paths.length > 0) {
           this.adv.engine.noteActivity(subject.id, paths);
+        }
+        const ver = inspectCommandVerification(args, result);
+        if (ver) {
+          this.adv.engine.noteVerification(subject.id, ver.commandKey, ver.outcome);
+        }
+      } catch (err) {
+        logAdvisoryError("note_activity", err, runId, taskId, name);
+      }
+    } else if (name === "artifact_read") {
+      try {
+        const run = typeof this.advDb.getRun === "function" ? this.advDb.getRun(runId) : null;
+        const requested = typeof args.path === "string" ? args.path.trim() : "";
+        const foundDossier = run && requested ? findRunDossier(this.advDb, run, requested) : null;
+        if (foundDossier) {
+          if (isOtherTaskDossier(this.advDb, runId, taskId, foundDossier.candidates)) {
+            this.adv.engine.noteDossierRead(subject.id, foundDossier.rel ?? foundDossier.recordedPath);
+          }
+        } else {
+          const workspaceRoot = this.adv.workspaceRootFor?.(task) ?? subject.workspaceRoot;
+          const paths = extractArtifactReadPaths(args, workspaceRoot);
+          if (paths.length > 0) {
+            this.adv.engine.noteActivity(subject.id, paths);
+          }
         }
       } catch (err) {
         logAdvisoryError("note_activity", err, runId, taskId, name);

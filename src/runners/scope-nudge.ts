@@ -451,6 +451,10 @@ function extractOperationKey(args: Record<string, unknown>): string {
   return entries.length > 0 ? JSON.stringify(entries) : "";
 }
 
+function hasParentTraversalComponent(p: string): boolean {
+  return p.replaceAll("\\", "/").split("/").includes("..");
+}
+
 export class ScopeNudgeMonitor implements ScopeSignalSource {
   private readonly workspaceRoot: string;
   private readonly areaDepth: number;
@@ -655,7 +659,7 @@ export class ScopeNudgeMonitor implements ScopeSignalSource {
     const abs = isAbsolute(slash) ? resolve(slash) : resolve(this.workspaceRoot, slash);
     const rel = relative(this.workspaceRoot, abs).replaceAll("\\", "/");
     if (!rel || rel === ".") return ".";
-    if (rel.startsWith("..") || isAbsolute(rel)) return abs.replaceAll("\\", "/");
+    if (hasParentTraversalComponent(rel) || isAbsolute(rel)) return abs.replaceAll("\\", "/");
     return rel;
   }
 
@@ -666,7 +670,7 @@ export class ScopeNudgeMonitor implements ScopeSignalSource {
 
     if (!rel || rel === ".") return ".";
 
-    if (rel.startsWith("..") || isAbsolute(rel)) {
+    if (hasParentTraversalComponent(rel) || isAbsolute(rel)) {
       const segs = abs.replaceAll("\\", "/").split("/").filter(Boolean);
       const dirSegs = !isDirHint && segs.length > 1 && FILE_EXT_RE.test(segs[segs.length - 1]!)
         ? segs.slice(0, -1)

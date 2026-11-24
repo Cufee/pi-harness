@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { type BigIntStats, constants, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { lstat, open, realpath } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ControlPlaneDb, RunRecord } from "./db.js";
 import { SUMMARY_LIMIT } from "./handoffs.js";
@@ -263,27 +264,13 @@ function readArtifact(
   }
 }
 
-export function readRunDossier(db: ControlPlaneDb, run: RunRecord, args: Record<string, unknown>) {
-  if (typeof args.path !== "string" || !args.path) {
-    const rawTaskId = typeof args.task_id === "string" ? args.task_id.trim() : "";
-    const taskId = rawTaskId
-      ? typeof db.getTask === "function"
-        ? (db.getTask(rawTaskId)?.id ?? rawTaskId)
-        : rawTaskId
-      : undefined;
-    return { artifacts: db.listArtifacts(run.id, taskId, 50, "dossier") };
-  }
-  const found = findRunDossier(db, run, args.path);
-  const shown = found?.recordedPath ?? resolve(run.repoRoot, args.path);
-  if (!found) throw new Error(`No indexed dossier in this run: ${shown}`);
-  const nonSymlink = `Dossier must be a non-symlink path under .harness/artifacts: ${shown}`;
-  if (found.rel === null) throw new Error(nonSymlink);
-  // Built from the requested path, not from realpath(target): equality below holds only when no component
-  // from .harness down to the file is a symlink.
-  const realRoot = realpathSync(run.repoRoot);
-  const expected = join(realRoot, found.rel);
-  // A path indexed by several runs (under any root spelling, or a case alias of the same file) cannot prove which
-  // run's bytes it now holds.
+function hasAmbiguousDossierOwnership(
+  db: ControlPlaneDb,
+  run: RunRecord,
+  found: { rel: string; candidates: string[] },
+  realRoot: string,
+  expected: string,
+): boolean {
   const ownerPaths = new Set(found.candidates);
   if (typeof db.listDistinctDossierPaths === "function") {
     const suffix = sep + found.rel;
@@ -316,7 +303,97 @@ export function readRunDossier(db: ControlPlaneDb, run: RunRecord, args: Record<
       }
     }
   }
-  if (typeof db.countDossierOwners === "function" && db.countDossierOwners([...ownerPaths]) > 1) {
+  return typeof db.countDossierOwners === "function" && db.countDossierOwners([...ownerPaths]) > 1;
+}
+
+export const DEFAULT_MAX_DOSSIER_HASH_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Safely hashes an indexed dossier of `run` using pinned, non-blocking, symlink-free regular-file reads
+ * with incremental chunked hashing and a byte bound. Returns null for missing, unindexed, symlink, FIFO,
+ * non-regular, multi-run ambiguous, or oversized paths without blocking or throwing.
+ */
+export async function hashRunDossier(
+  db: ControlPlaneDb,
+  run: RunRecord,
+  requested: string,
+  opts?: { maxBytes?: number },
+): Promise<{ sha256: string; bytes: number } | null> {
+  try {
+    const found = findRunDossier(db, run, requested);
+    if (!found || found.rel === null) return null;
+    const realRoot = await realpath(run.repoRoot);
+    const expected = join(realRoot, found.rel);
+    if (hasAmbiguousDossierOwnership(db, run, { rel: found.rel, candidates: found.candidates }, realRoot, expected)) {
+      return null;
+    }
+    const preStat = await lstat(expected, { bigint: true });
+    if (preStat.isSymbolicLink() || !preStat.isFile()) return null;
+    if ((await realpath(expected)) !== expected) return null;
+
+    const maxBytes =
+      typeof opts?.maxBytes === "number" && Number.isFinite(opts.maxBytes) && opts.maxBytes >= 0
+        ? Math.floor(opts.maxBytes)
+        : DEFAULT_MAX_DOSSIER_HASH_BYTES;
+
+    const handle = await open(expected, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const fdStat = await handle.stat({ bigint: true });
+      if (!fdStat.isFile()) return null;
+      const pathStat = await lstat(expected, { bigint: true });
+      if (
+        pathStat.isSymbolicLink() ||
+        fdStat.dev !== pathStat.dev ||
+        fdStat.ino !== pathStat.ino ||
+        (await realpath(expected)) !== expected
+      ) {
+        return null;
+      }
+      if (fdStat.size > BigInt(maxBytes)) return null;
+
+      const hash = createHash("sha256");
+      const chunk = Buffer.allocUnsafe(Math.min(65_536, Math.max(1, maxBytes)));
+      let total = 0;
+      while (true) {
+        const remaining = maxBytes - total;
+        const toRead = Math.min(chunk.length, remaining + 1);
+        const { bytesRead } = await handle.read(chunk, 0, toRead, null);
+        if (bytesRead === 0) break;
+        total += bytesRead;
+        if (total > maxBytes) return null;
+        hash.update(chunk.subarray(0, bytesRead));
+      }
+      return { sha256: hash.digest("hex"), bytes: total };
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+export function readRunDossier(db: ControlPlaneDb, run: RunRecord, args: Record<string, unknown>) {
+  if (typeof args.path !== "string" || !args.path) {
+    const rawTaskId = typeof args.task_id === "string" ? args.task_id.trim() : "";
+    const taskId = rawTaskId
+      ? typeof db.getTask === "function"
+        ? (db.getTask(rawTaskId)?.id ?? rawTaskId)
+        : rawTaskId
+      : undefined;
+    return { artifacts: db.listArtifacts(run.id, taskId, 50, "dossier") };
+  }
+  const found = findRunDossier(db, run, args.path);
+  const shown = found?.recordedPath ?? resolve(run.repoRoot, args.path);
+  if (!found) throw new Error(`No indexed dossier in this run: ${shown}`);
+  const nonSymlink = `Dossier must be a non-symlink path under .harness/artifacts: ${shown}`;
+  if (found.rel === null) throw new Error(nonSymlink);
+  // Built from the requested path, not from realpath(target): equality below holds only when no component
+  // from .harness down to the file is a symlink.
+  const realRoot = realpathSync(run.repoRoot);
+  const expected = join(realRoot, found.rel);
+  // A path indexed by several runs (under any root spelling, or a case alias of the same file) cannot prove which
+  // run's bytes it now holds.
+  if (hasAmbiguousDossierOwnership(db, run, { rel: found.rel, candidates: found.candidates }, realRoot, expected)) {
     throw new Error(`Dossier path has ambiguous multi-run ownership: ${shown}`);
   }
   if (lstatSync(expected).isSymbolicLink() || realpathSync(expected) !== expected) throw new Error(nonSymlink);

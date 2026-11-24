@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { isAbsolute, relative, resolve } from "node:path";
 import { NativeEventParser } from "./native.js";
 import { deniedNotice } from "./rejections.js";
@@ -54,10 +55,30 @@ interface SubjectState {
   deniedGenCount: number;
   pending: PendingItem[];
   activityPaths: Set<string>;
+  otherDossierReads: Set<string>;
+  verificationEvidence: Set<string>;
 }
 
 function compositeKey(rule: string, key: string): string {
   return `${rule}\0${key}`;
+}
+
+function hasParentTraversalComponent(p: string): boolean {
+  return p.replaceAll("\\", "/").split("/").includes("..");
+}
+
+function shellCommandKey(name: string, args: Record<string, unknown> | undefined): string {
+  if (args) {
+    for (const key of ["command", "cmd", "script"] as const) {
+      const val = args[key];
+      if (typeof val === "string" && val.trim()) return val.trim();
+    }
+    if (Array.isArray(args.argv) && args.argv.length > 0) {
+      const joined = args.argv.map((item) => String(item)).join(" ").trim();
+      if (joined) return joined;
+    }
+  }
+  return name.trim();
 }
 
 export class AdvisoryEngine {
@@ -115,6 +136,8 @@ export class AdvisoryEngine {
       deniedGenCount: 0,
       pending: [],
       activityPaths: new Set(),
+      otherDossierReads: new Set(),
+      verificationEvidence: new Set(),
     };
     this.subjects.set(subject.id, created);
     return created;
@@ -138,7 +161,7 @@ export class AdvisoryEngine {
       const slashPath = trimmed.replaceAll("\\", "/");
       const absPath = isAbsolute(slashPath) ? resolve(slashPath) : resolve(absRoot, slashPath);
       const rel = relative(absRoot, absPath).replaceAll("\\", "/");
-      if (!rel || rel === "." || rel.startsWith("..") || isAbsolute(rel)) continue;
+      if (!rel || rel === "." || hasParentTraversalComponent(rel) || isAbsolute(rel)) continue;
       if (rel === ".harness" || rel.startsWith(".harness/")) continue;
       st.activityPaths.add(rel);
     }
@@ -278,6 +301,19 @@ export class AdvisoryEngine {
       this.addWorkspaceActivityPaths(st, merged.paths);
     }
 
+    if (
+      merged.harnessTool === null &&
+      !merged.viaCodeExec &&
+      merged.nativeClass === "shell" &&
+      !merged.denied
+    ) {
+      const rawOutput = merged.status === "failed" ? (ev.error ?? ev.result) : (ev.result ?? ev.error);
+      if (typeof rawOutput === "string") {
+        const cmd = shellCommandKey(merged.name, merged.args);
+        this.recordVerification(st, `shell:${cmd}`, `${merged.status}\0${rawOutput}`);
+      }
+    }
+
     const isHarnessEvent = merged.harnessTool !== null || merged.viaCodeExec;
     const observed: ObservedCall = {
       origin: "event",
@@ -288,6 +324,7 @@ export class AdvisoryEngine {
       ...(merged.id !== undefined ? { id: merged.id } : {}),
       args: merged.args,
       paths: merged.paths,
+      ...(ev.result !== undefined ? { result: ev.result } : {}),
       inScript: merged.viaCodeExec,
       ...(merged.denied !== undefined ? { denied: merged.denied } : {}),
     };
@@ -413,6 +450,18 @@ export class AdvisoryEngine {
     }
   }
 
+  private recordVerification(st: SubjectState, commandKey: string, outcome: string): void {
+    const trimmed = commandKey.trim();
+    if (!trimmed) return;
+    const digest = createHash("sha256")
+      .update(trimmed)
+      .update("\0")
+      .update(outcome)
+      .digest("hex")
+      .slice(0, 16);
+    st.verificationEvidence.add(digest);
+  }
+
   /**
    * Workspace paths the executor saw a harness tool read: `inspect_command` operands that exist,
    * and the path of an `artifact_read` of a workspace file.
@@ -424,11 +473,42 @@ export class AdvisoryEngine {
   }
 
   /**
-   * Number of distinct workspace paths the subject read, searched, or edited in all generations.
+   * Canonical key of a distinct indexed dossier belonging to another task in this run read via `artifact_read`.
+   */
+  noteDossierRead(subjectId: string, dossierKey: string): void {
+    const st = this.subjects.get(subjectId);
+    if (!st) return;
+    const normalized = dossierKey.replaceAll("\\", "/").trim();
+    if (!normalized) return;
+    st.otherDossierReads.add(normalized);
+  }
+
+  /**
+   * Records a distinct verification command outcome (command identity + normalized result output).
+   * Identical repeated command outputs deduplicate; new outputs advance `verificationProgress`.
+   */
+  noteVerification(subjectId: string, commandKey: string, outcome: string): void {
+    const st = this.subjects.get(subjectId);
+    if (!st) return;
+    this.recordVerification(st, commandKey, outcome);
+  }
+
+  /**
+   * Number of distinct workspace paths read/searched/edited plus distinct other-task dossiers read in all generations.
    * Compared for equality between two rollovers by the L3 fingerprint. Never compared with a threshold.
    */
   activityProgress(subjectId: string): number {
-    return this.subjects.get(subjectId)?.activityPaths.size ?? 0;
+    const st = this.subjects.get(subjectId);
+    if (!st) return 0;
+    return st.activityPaths.size + st.otherDossierReads.size;
+  }
+
+  /**
+   * Number of distinct verification command outcomes observed across all generations.
+   * Compared for equality between two rollovers by the L3 fingerprint. Never compared with a threshold.
+   */
+  verificationProgress(subjectId: string): number {
+    return this.subjects.get(subjectId)?.verificationEvidence.size ?? 0;
   }
 
   /**

@@ -65,7 +65,7 @@ export interface RunnerCallbacks {
   onThoughtDelta?: (text: string) => void;
   onUsage?: (usage: RunnerUsage) => void;
   onTurn?: (turnsUsed: number) => void;
-  onArtifact?: (artifact: Omit<ArtifactRecord, "id" | "runId" | "taskId" | "createdAt">) => void;
+  onArtifact?: (artifact: Omit<ArtifactRecord, "id" | "runId" | "taskId" | "createdAt" | "origin">) => void;
   onPassiveQuota?: (signal: PassiveQuotaSignal) => void;
   onQuotaRetryState?: (ev: QuotaRetryStateEvent) => void;
   onToolEvent?: (ev: {
