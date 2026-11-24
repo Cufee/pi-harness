@@ -33,6 +33,8 @@ interface ActiveTaskExecution {
   generationSignal?: AbortSignal;
   handle?: RunnerExecutionHandle;
   promise: Promise<void>;
+  /** Task generation of the current launch attempt, captured before setup and fenced separately from runnerGeneration. */
+  launchGeneration?: number;
   /** Task generation the current runner of this execution was started for. */
   runnerGeneration?: number;
   /** True once the current generation's initial prompt was built from the task row (later row edits miss it). */
@@ -742,48 +744,56 @@ export class HarnessOrchestrator {
    */
   reconcileStaleRunsOnStartup(): void {
     if (this.active.size > 0 || this.allocatingWorktrees.size > 0) return;
-    const runs = this.db.listRuns(200);
-    for (const run of runs) {
-      const tasks = this.db.listTasks(run.id);
-      let mutated = false;
-      let interrupted = false;
-      for (const t of tasks) {
-        if (LIVE_TASK_STATUSES.has(t.status) || t.status === "ready" || t.status === "pending") {
-          settleTaskMinimalFallback(this.db, t, "failed", "Interrupted by daemon restart", "daemon_restart");
-          mutated = true;
-          interrupted = true;
+    const pageSize = 200;
+    let cursor: { createdAt: number; id: string } | undefined;
+    for (;;) {
+      const runs = this.db.listRuns(pageSize, cursor);
+      if (runs.length === 0) break;
+      for (const run of runs) {
+        const tasks = this.db.listTasks(run.id);
+        let mutated = false;
+        let interrupted = false;
+        for (const t of tasks) {
+          if (LIVE_TASK_STATUSES.has(t.status) || t.status === "ready" || t.status === "pending") {
+            settleTaskMinimalFallback(this.db, t, "failed", "Interrupted by daemon restart", "daemon_restart");
+            mutated = true;
+            interrupted = true;
+          }
+        }
+        const failedMerges = this.db.failStaleMergesForRun(run.id, "Interrupted by daemon restart");
+        if (failedMerges > 0) mutated = true;
+
+        const updatedTasks = this.db.listTasks(run.id);
+        const hasQuotaPaused = updatedTasks.some((t) => t.status === "paused_quota");
+        if (!hasQuotaPaused) {
+          this.db.releaseWriteLeasesForRun(run.id);
+        } else {
+          // Even when a sibling task is cleanly quota-paused, ALWAYS release leases owned by dead/terminal tasks!
+          this.db.db
+            .prepare(
+              `UPDATE write_leases SET active = 0
+               WHERE run_id = ? AND active = 1
+                 AND task_id IN (SELECT id FROM tasks WHERE run_id = ? AND status IN ('failed','cancelled','completed'))`,
+            )
+            .run(run.id, run.id);
+        }
+
+        if (mutated || run.status === "active") {
+          // Statuses stay "failed"; the cause tells consumers the run was interrupted and resumes in place.
+          this.reconcileRunStatus(
+            run.id,
+            interrupted ? { reason: "Interrupted by daemon restart; resume continues it in place", cause: "daemon_restart" } : undefined,
+          );
+        }
+        if (hasQuotaPaused || run.status === "paused_quota") {
+          void this.checkRunQuotaQuiescence(run.id).catch(() => {});
         }
       }
-      const failedMerges = this.db.failStaleMergesForRun(run.id, "Interrupted by daemon restart");
-      if (failedMerges > 0) mutated = true;
-
-      const updatedTasks = this.db.listTasks(run.id);
-      const hasQuotaPaused = updatedTasks.some((t) => t.status === "paused_quota");
-      if (!hasQuotaPaused) {
-        this.db.releaseWriteLeasesForRun(run.id);
-      } else {
-        // Even when a sibling task is cleanly quota-paused, ALWAYS release leases owned by dead/terminal tasks!
-        this.db.db
-          .prepare(
-            `UPDATE write_leases SET active = 0
-             WHERE run_id = ? AND active = 1
-               AND task_id IN (SELECT id FROM tasks WHERE run_id = ? AND status IN ('failed','cancelled','completed'))`,
-          )
-          .run(run.id, run.id);
-      }
-
-      if (mutated || run.status === "active") {
-        // Statuses stay "failed"; the cause tells consumers the run was interrupted and resumes in place.
-        this.reconcileRunStatus(
-          run.id,
-          interrupted ? { reason: "Interrupted by daemon restart; resume continues it in place", cause: "daemon_restart" } : undefined,
-        );
-      }
-      if (hasQuotaPaused || run.status === "paused_quota") {
-        void this.checkRunQuotaQuiescence(run.id).catch(() => {});
-      }
+      if (runs.length < pageSize) break;
+      const last = runs[runs.length - 1]!;
+      cursor = { createdAt: last.createdAt, id: last.id };
     }
-    // Covers runs beyond the listRuns window; quota-paused task leases survive for resume.
+    // Purge any remaining stale write leases; quota-paused task leases survive for resume.
     this.db.purgeStaleWriteLeasesOnStartup();
   }
 
@@ -1137,6 +1147,7 @@ export class HarnessOrchestrator {
     this.active.set(taskId, entry);
     const initialTask = this.db.getTask(taskId);
     if (initialTask) {
+      entry.launchGeneration = initialTask.generation;
       const owningRun = this.db.getRun(initialTask.runId);
       if (owningRun && owningRun.status !== "active") {
         try {
@@ -1152,7 +1163,8 @@ export class HarnessOrchestrator {
       const task = this.db.getTask(taskId);
       if (!task || entry.abort.signal.aborted) return;
       if (this.active.get(taskId) !== entry) return;
-      if (entry.runnerGeneration !== undefined && task.generation !== entry.runnerGeneration) return;
+      if (entry.launchGeneration !== undefined && task.generation !== entry.launchGeneration) return;
+      if (["completed", "cancelled", "failed", "returned_for_rescope", "blocked", "paused_quota"].includes(task.status)) return;
       const detail = String(err instanceof Error ? err.message : err).replace(/\s+/g, " ").trim().slice(0, 240);
       settleTaskMinimalFallback(
         this.db,
@@ -2201,6 +2213,7 @@ export class HarnessOrchestrator {
       const task = this.db.getTask(taskId);
       if (!task) return;
       if (["completed", "cancelled", "failed", "returned_for_rescope", "paused_quota"].includes(task.status)) return;
+      exec.launchGeneration = task.generation;
 
       const run = this.db.getRun(task.runId);
       if (!run) return;

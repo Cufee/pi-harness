@@ -874,8 +874,15 @@ export class ControlPlaneToolExecutor {
     }
     const mode = effectiveCodeMode(this.config.codeMode);
     if (scriptSignal || (name === CODE_EXEC_TOOL_NAME && mode !== "off")) {
-      const signal = scriptSignal ?? this.hooks.getTaskSignal(taskId);
-      if (!signal || signal.aborted || ["completed", "cancelled", "failed", "returned_for_rescope", "paused_quota"].includes(task.status)) {
+      const taskSignal = this.hooks.getTaskSignal(taskId);
+      const signal = scriptSignal ?? taskSignal;
+      if (
+        !signal ||
+        signal.aborted ||
+        !taskSignal ||
+        taskSignal.aborted ||
+        ["completed", "cancelled", "failed", "returned_for_rescope", "paused_quota"].includes(task.status)
+      ) {
         // Name the actual cause (whole-run stop first, then this task's cancellation) instead of a bare refusal.
         const runStatus = this.db.getRun(runId)?.status;
         const why =
@@ -886,7 +893,7 @@ export class ControlPlaneToolExecutor {
               })`
             : task.status === "cancelled"
               ? `task ${taskId} was cancelled (${task.summary?.trim() || "no reason recorded"})`
-              : signal?.aborted
+              : signal?.aborted || taskSignal?.aborted
                 ? `the calling turn of ${taskId} was cancelled`
                 : `task ${taskId} is ${task.status}`;
         throw new Error(`code_exec requires an active task generation for ${taskId}: ${why}. Nothing was executed.`);
@@ -905,7 +912,18 @@ export class ControlPlaneToolExecutor {
         ...this.config.codeExec,
         mode,
         allowedTools: () => toolsForTier(task.tier),
-        execute: (inner, input, execSignal) => this.execute(runId, taskId, inner, input, execSignal ?? signal),
+        execute: (inner, input, execSignal) => {
+          if (
+            signal?.aborted ||
+            (signal && this.hooks.getTaskSignal(taskId) !== signal) ||
+            this.db.getTask(taskId)?.generation !== callerGeneration
+          ) {
+            throw new Error(
+              `Stale code_exec call for task ${taskId} generation ${callerGeneration}: caller is no longer the active execution.`,
+            );
+          }
+          return this.execute(runId, taskId, inner, input, execSignal ?? signal);
+        },
         artifactsDir: resolve(run.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts"),
         pythonCacheDir: join(this.config.stateDir, "code-mode", "python"),
         saveOutput: (name, json) => writeCodeOutput(this.db, run, taskId, name, json),
@@ -1254,8 +1272,10 @@ export class ControlPlaneToolExecutor {
         if (status !== "completed" && status !== "blocked" && status !== "scope_too_large") {
           throw new Error("return_task requires status completed, blocked, or scope_too_large");
         }
-        const callerSignal = scriptSignal ?? this.hooks.getTaskSignal(taskId);
-        const callerCancelSignal = this.hooks.getTaskCancelSignal?.(taskId);
+        // Capture the task's generation signal separately from Code Mode's per-script abort signal:
+        // only generationSignal identifies the active execution, while all signals are checked for abort.
+        const generationSignal = this.hooks.getTaskSignal(taskId);
+        const cancelSignal = this.hooks.getTaskCancelSignal?.(taskId);
         const assertReturnStillValid = () => {
           const current = this.db.getTask(taskId);
           if (!current || current.generation !== task.generation) {
@@ -1265,13 +1285,13 @@ export class ControlPlaneToolExecutor {
                 ": task generation moved on before settlement.",
             );
           }
-          if (callerSignal?.aborted || callerCancelSignal?.aborted) {
+          if (scriptSignal?.aborted || generationSignal?.aborted || cancelSignal?.aborted || callerSignal?.aborted) {
             throw new Error(`return_task aborted for task ${taskId}: task execution was cancelled or superseded.`);
           }
-          if (callerSignal && this.hooks.getTaskSignal(taskId) !== callerSignal) {
+          if ((generationSignal && this.hooks.getTaskSignal(taskId) !== generationSignal) || (scriptSignal && !generationSignal)) {
             throw new Error(`Stale return_task for task ${taskId}: caller is no longer the active execution.`);
           }
-          const invalidStatus = callerSignal
+          const invalidStatus = generationSignal || scriptSignal
             ? !["running", "waiting_children", "draining"].includes(current.status)
             : ["completed", "cancelled", "failed", "returned_for_rescope", "blocked", "paused_quota"].includes(current.status);
           if (invalidStatus) {
