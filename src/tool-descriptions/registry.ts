@@ -237,9 +237,9 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     inputSchema: {
       default: {
         type: "object",
-        required: ["title", "objective", "write_scopes", "model"],
+        required: ["objective", "write_scopes", "model"],
         properties: {
-          title: { type: "string" },
+          title: { type: "string", description: "Short task title; derived from objective if omitted." },
           objective: { type: "string" },
           criteria: { type: "string" },
           write_scopes: { type: "array", items: { type: "string" }, description: "Disjoint glob patterns owned by this worker (e.g. ['src/auth/**'])" },
@@ -306,11 +306,11 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     inputSchema: {
       default: {
         type: "object",
-        required: ["kind", "title", "objective", "model"],
+        required: ["kind", "objective", "model"],
         properties: {
           kind: { type: "string", enum: ["research", "plan", "verify"] },
           profile_id: { type: "string" },
-          title: { type: "string" },
+          title: { type: "string", description: "Short task title; derived from objective if omitted." },
           objective: { type: "string" },
           model: { type: "string" },
           effort: { type: "string" },
@@ -318,10 +318,10 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
       },
       worker: {
         type: "object",
-        required: ["kind", "title", "objective", "model"],
+        required: ["kind", "objective", "model"],
         properties: {
           kind: { type: "string", enum: ["research", "plan", "execute", "verify"] },
-          title: { type: "string" },
+          title: { type: "string", description: "Short task title; derived from objective if omitted." },
           objective: { type: "string" },
           criteria: { type: "string" },
           read_only: { type: "boolean", description: "Opt an execute task into read-only access. Research, plan, and verify are always read-only." },
@@ -583,7 +583,7 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     inputSchema: {
       default: {
         type: "object",
-        required: ["severity", "category", "title", "evidence_paths"],
+        required: ["severity", "category", "evidence_paths"],
         properties: {
           severity: { type: "string", enum: ["P0", "P1", "P2"] },
           category: {
@@ -601,7 +601,7 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
               "security_risk",
             ],
           },
-          title: { type: "string" },
+          title: { type: "string", description: "Short issue title; derived from attempted, evidence_paths, or category if omitted." },
           evidence_paths: { type: "array", items: { type: "string" } },
           attempted: { type: "array", items: { type: "string" } },
           blocking: { type: "boolean" },
@@ -929,10 +929,10 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     inputSchema: {
       default: {
         type: "object",
-        required: ["kind", "title", "summary", "context_md", "evidence_paths"],
+        required: ["kind", "summary", "context_md", "evidence_paths"],
         properties: {
           kind: { type: "string", enum: ["invariant", "gotcha", "architecture", "decision", "convention"] },
-          title: { type: "string" },
+          title: { type: "string", description: "Short entry title; derived from summary or context_md if omitted." },
           summary: { type: "string" },
           context_md: { type: "string" },
           tags: { type: "array", items: { type: "string" } },

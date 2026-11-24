@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { homedir as bareOsHomedir } from "os";
 import { join, resolve } from "node:path";
+import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
 import { describe, it } from "bun:test";
 import { normalizeAttachRunId } from "../src/cli.js";
+import { generatePythonDeclarations, generateSdkDeclarations } from "../src/code-mode/sdk.js";
 import { defaultStateDir, loadConfig } from "../src/config.js";
 import { ControlPlaneDb, deriveTitle } from "../src/control-plane/db.js";
-import { ControlPlaneToolExecutor, type ToolRuntimeHooks } from "../src/control-plane/tools.js";
+import { ControlPlaneToolExecutor, toolsForTier, type ToolRuntimeHooks } from "../src/control-plane/tools.js";
 import { formatQuotaPauseSummary } from "../src/runners/quota-detect.js";
 
 describe("goal-22 hygiene", () => {
@@ -312,5 +314,140 @@ describe("goal-22 hygiene", () => {
     assert.equal(normalizeAttachRunId("Run_abcdef12"), "run-abcdef12");
     assert.equal(normalizeAttachRunId("RUN-dir-chat-1"), "run-dir-chat-1");
     assert.equal(normalizeAttachRunId("chat-x"), null);
+  });
+
+  it("allows title-less requests in published tool schemas and generated SDK signatures", () => {
+    const validator = new AjvJsonSchemaValidator();
+    const tier1 = toolsForTier(1);
+    const tier2 = toolsForTier(2);
+    const byName = (tools: ReturnType<typeof toolsForTier>, name: string) => {
+      const tool = tools.find((entry) => entry.name === name);
+      assert.ok(tool, `expected tool ${name}`);
+      return tool;
+    };
+
+    const cases: Array<{
+      label: string;
+      tool: ReturnType<typeof byName>;
+      validWithoutTitle: Record<string, unknown>;
+      missingRequired: Record<string, unknown>;
+    }> = [
+      {
+        label: "tier1.spawn_worker",
+        tool: byName(tier1, "spawn_worker"),
+        validWithoutTitle: {
+          objective: "Wire optional title support",
+          write_scopes: ["src/control-plane/tools.ts"],
+          model: "anthropic/claude-opus-5-5",
+        },
+        missingRequired: {
+          write_scopes: ["src/control-plane/tools.ts"],
+          model: "anthropic/claude-opus-5-5",
+        },
+      },
+      {
+        label: "tier1.spawn_task",
+        tool: byName(tier1, "spawn_task"),
+        validWithoutTitle: {
+          kind: "research",
+          objective: "Inspect published schemas",
+          model: "anthropic/claude-opus-5-5",
+        },
+        missingRequired: {
+          kind: "research",
+          model: "anthropic/claude-opus-5-5",
+        },
+      },
+      {
+        label: "tier2.spawn_task",
+        tool: byName(tier2, "spawn_task"),
+        validWithoutTitle: {
+          kind: "execute",
+          objective: "Apply scoped fix",
+          model: "anthropic/claude-opus-5-5",
+        },
+        missingRequired: {
+          kind: "execute",
+          model: "anthropic/claude-opus-5-5",
+        },
+      },
+      {
+        label: "tier1.report_issue",
+        tool: byName(tier1, "report_issue"),
+        validWithoutTitle: {
+          severity: "P2",
+          category: "code_defect",
+          evidence_paths: ["src/control-plane/tools.ts"],
+        },
+        missingRequired: {
+          severity: "P2",
+          category: "code_defect",
+        },
+      },
+      {
+        label: "tier1.kb_propose",
+        tool: byName(tier1, "kb_propose"),
+        validWithoutTitle: {
+          kind: "gotcha",
+          summary: "Keep tools.ts and registry.ts schemas aligned",
+          context_md: "T4-2s compares toolsForRole against toolsForTier.",
+          evidence_paths: ["test/tool-descriptions.test.ts"],
+        },
+        missingRequired: {
+          kind: "gotcha",
+          context_md: "Missing summary",
+          evidence_paths: ["test/tool-descriptions.test.ts"],
+        },
+      },
+    ];
+
+    for (const { label, tool, validWithoutTitle, missingRequired } of cases) {
+      const validate = validator.getValidator(tool.inputSchema as never);
+      const withoutTitleResult = validate(validWithoutTitle);
+      assert.equal(
+        withoutTitleResult.valid,
+        true,
+        `${label} should accept omitted title: ${withoutTitleResult.errorMessage ?? ""}`,
+      );
+      const withTitleResult = validate({ ...validWithoutTitle, title: "Explicit title" });
+      assert.equal(
+        withTitleResult.valid,
+        true,
+        `${label} should still accept explicit string title: ${withTitleResult.errorMessage ?? ""}`,
+      );
+      const badTitleResult = validate({ ...validWithoutTitle, title: 123 });
+      assert.equal(badTitleResult.valid, false, `${label} should reject non-string title`);
+      const missingReqResult = validate(missingRequired);
+      assert.equal(missingReqResult.valid, false, `${label} should still enforce remaining required fields`);
+    }
+
+    const tsTier1 = generateSdkDeclarations(tier1);
+    const tsTier2 = generateSdkDeclarations(tier2);
+    const pyTier1 = generatePythonDeclarations(tier1);
+    const pyTier2 = generatePythonDeclarations(tier2);
+
+    for (const name of ["spawn_worker", "spawn_task", "report_issue", "kb_propose"]) {
+      const tsLine = tsTier1.split("\n").find((line) => line.includes(`export function ${name}(`));
+      assert.ok(tsLine, `expected TS declaration for ${name}`);
+      assert.match(tsLine, /\btitle\?: string;/, `${name} TS declaration should mark title optional`);
+      assert.doesNotMatch(tsLine, /\btitle: string;/, `${name} TS declaration must not mark title required`);
+
+      const pyIdx = pyTier1.split("\n").findIndex((line) => line.startsWith(`def ${name}(`));
+      assert.ok(pyIdx >= 0, `expected Python declaration for ${name}`);
+      const pyDoc = pyTier1.split("\n")[pyIdx + 1] ?? "";
+      assert.match(pyDoc, /'title'\?: str\b/, `${name} Python declaration should mark title optional`);
+      assert.doesNotMatch(pyDoc, /'title': str\b/, `${name} Python declaration must not mark title required`);
+    }
+
+    const tsTier2SpawnTask = tsTier2.split("\n").find((line) => line.includes("export function spawn_task("));
+    assert.ok(tsTier2SpawnTask, "expected Tier 2 TS declaration for spawn_task");
+    assert.match(tsTier2SpawnTask, /\btitle\?: string;/);
+    assert.doesNotMatch(tsTier2SpawnTask, /\btitle: string;/);
+
+    const pyTier2Lines = pyTier2.split("\n");
+    const pyTier2Idx = pyTier2Lines.findIndex((line) => line.startsWith("def spawn_task("));
+    assert.ok(pyTier2Idx >= 0, "expected Tier 2 Python declaration for spawn_task");
+    assert.match(pyTier2Lines[pyTier2Idx + 1] ?? "", /'title'\?: str\b/);
+    assert.doesNotMatch(pyTier2Lines[pyTier2Idx + 1] ?? "", /'title': str\b/);
   });
 });
