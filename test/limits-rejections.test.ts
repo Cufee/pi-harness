@@ -79,17 +79,18 @@ describe("goal-14 slice C1 limits and rejections", () => {
           category: "code_defect",
           title: `Defect found by ${kind}`,
           evidence_paths: ["README.md"],
-        })) as { escalationId: string; blocking: boolean; routedTo: string };
+        })) as { escalationId: string; blocking: boolean; routedTo: string; advisory?: string };
 
         assert.equal(res.blocking, false);
         assert.equal(res.routedTo, parent.id);
+        assert.match(res.advisory ?? "", /non-blocking.*return_task/i);
         assert.equal(db.getTask(t.id)?.status, "running");
         const esc = db.getEscalation(res.escalationId)!;
         assert.equal(esc.blocking, false);
         assert.equal(esc.toTaskId, parent.id);
       }
 
-      // 2. code_defect P0 from research -> non-blocking and addressed to parent, NOT human.
+      // 2. code_defect P0 from research -> non-blocking, task stays running, and human-addressed so it surfaces in the inbox.
       const resP0Task = db.createTask({
         runId: run.id,
         parentId: parent.id,
@@ -106,15 +107,16 @@ describe("goal-14 slice C1 limits and rejections", () => {
         category: "code_defect",
         title: "Critical defect found in research",
         evidence_paths: ["README.md"],
-      })) as { escalationId: string; blocking: boolean; routedTo: string };
+      })) as { escalationId: string; blocking: boolean; routedTo: string; advisory?: string };
       assert.equal(resP0.blocking, false);
-      assert.equal(resP0.routedTo, parent.id);
+      assert.equal(resP0.routedTo, "human");
+      assert.match(resP0.advisory ?? "", /non-blocking.*return_task/i);
       assert.equal(db.getTask(resP0Task.id)?.status, "running");
       const escP0 = db.getEscalation(resP0.escalationId)!;
       assert.equal(escP0.blocking, false);
-      assert.equal(escP0.toTaskId, parent.id);
+      assert.equal(escP0.toTaskId, null);
 
-      // 3. env_failure P1 from verify -> blocked as today.
+      // 3. env_failure P1 from read-only verify -> never blocks; task keeps running with tool-result advisory.
       const envTask = db.createTask({
         runId: run.id,
         parentId: parent.id,
@@ -131,12 +133,37 @@ describe("goal-14 slice C1 limits and rejections", () => {
         category: "env_failure",
         title: "Missing binary",
         evidence_paths: ["README.md"],
-      })) as { escalationId: string; blocking: boolean };
-      assert.equal(envRes.blocking, true);
-      assert.equal(db.getTask(envTask.id)?.status, "blocked");
-      assert.equal(db.getEscalation(envRes.escalationId)?.blocking, true);
+      })) as { escalationId: string; blocking: boolean; routedTo: string; advisory?: string };
+      assert.equal(envRes.blocking, false);
+      assert.equal(envRes.routedTo, parent.id);
+      assert.match(envRes.advisory ?? "", /non-blocking.*return_task/i);
+      assert.equal(db.getTask(envTask.id)?.status, "running");
+      assert.equal(db.getEscalation(envRes.escalationId)?.blocking, false);
 
-      // 4. code_defect P1 with explicit blocking: true from verify -> blocked as today.
+      // 3b. env_failure P1 from writable execute task -> blocks as before.
+      const execEnvTask = db.createTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 3,
+        kind: "execute",
+        title: "Execute env fail",
+        objective: "Run command",
+        readOnly: false,
+        profileId: "pi:local",
+      });
+      db.updateTask(execEnvTask.id, { status: "running" });
+      const execEnvRes = (await orch.toolExecutor.execute(run.id, execEnvTask.id, "report_issue", {
+        severity: "P1",
+        category: "env_failure",
+        title: "Missing binary in execute",
+        evidence_paths: ["README.md"],
+      })) as { escalationId: string; blocking: boolean; advisory?: string };
+      assert.equal(execEnvRes.blocking, true);
+      assert.equal(execEnvRes.advisory, undefined);
+      assert.equal(db.getTask(execEnvTask.id)?.status, "blocked");
+      assert.equal(db.getEscalation(execEnvRes.escalationId)?.blocking, true);
+
+      // 4. code_defect P1 with explicit blocking: true from read-only verify -> still non-blocking; task stays running.
       const explicitBlockTask = db.createTask({
         runId: run.id,
         parentId: parent.id,
@@ -154,10 +181,12 @@ describe("goal-14 slice C1 limits and rejections", () => {
         title: "Must halt",
         evidence_paths: ["README.md"],
         blocking: true,
-      })) as { escalationId: string; blocking: boolean };
-      assert.equal(expRes.blocking, true);
-      assert.equal(db.getTask(explicitBlockTask.id)?.status, "blocked");
-      assert.equal(db.getEscalation(expRes.escalationId)?.blocking, true);
+      })) as { escalationId: string; blocking: boolean; routedTo: string; advisory?: string };
+      assert.equal(expRes.blocking, false);
+      assert.equal(expRes.routedTo, parent.id);
+      assert.match(expRes.advisory ?? "", /non-blocking.*return_task/i);
+      assert.equal(db.getTask(explicitBlockTask.id)?.status, "running");
+      assert.equal(db.getEscalation(expRes.escalationId)?.blocking, false);
 
       // 5. code_defect P1 from a worker -> blocked as today.
       const worker = db.createTask({
@@ -254,7 +283,7 @@ describe("goal-14 slice C1 limits and rejections", () => {
       assert.equal(verifyAdvisories.length, 1);
       assert.equal((verifyAdvisories[0]!.payload as { rule?: string }).rule, "read-only-finding-escalation");
 
-      // A verify task reporting env_failure at P1 is blocked as before and gets no read-only-finding-escalation advisory.
+      // A verify task reporting env_failure at P1 is non-blocking (with tool-result advisory) and gets no read-only-finding-escalation advisory.
       const envVerify = db.createTask({
         runId: run.id,
         parentId: parent.id,
@@ -272,17 +301,49 @@ describe("goal-14 slice C1 limits and rejections", () => {
         category: "env_failure",
         title: "Test binary unavailable",
         evidence_paths: ["README.md"],
-      })) as { escalationId: string; blocking: boolean; harness_advisory?: string[] };
+      })) as { escalationId: string; blocking: boolean; advisory?: string; harness_advisory?: string[] };
 
-      assert.equal(envRes.blocking, true);
-      assert.equal(db.getTask(envVerify.id)?.status, "blocked");
-      assert.equal(db.getEscalation(envRes.escalationId)?.blocking, true);
+      assert.equal(envRes.blocking, false);
+      assert.match(envRes.advisory ?? "", /non-blocking.*return_task/i);
+      assert.equal(db.getTask(envVerify.id)?.status, "running");
+      assert.equal(db.getEscalation(envRes.escalationId)?.blocking, false);
       assert.equal(envRes.harness_advisory, undefined);
 
       const envAdvisories = db
         .getEventsSince(run.id, 0)
         .filter((e) => e.taskId === envVerify.id && e.type === "agent.advisory");
       assert.equal(envAdvisories.length, 0);
+
+      // A writable execute task reporting env_failure at P1 is blocked as before and gets no read-only-finding-escalation advisory.
+      const envExecute = db.createTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 3,
+        kind: "execute",
+        title: "Execute env failure",
+        objective: "Run environment check",
+        readOnly: false,
+        profileId: "pi:local",
+      });
+      db.updateTask(envExecute.id, { status: "running" });
+
+      const envExecRes = (await orch.toolExecutor.execute(run.id, envExecute.id, "report_issue", {
+        severity: "P1",
+        category: "env_failure",
+        title: "Test binary unavailable in execute",
+        evidence_paths: ["README.md"],
+      })) as { escalationId: string; blocking: boolean; advisory?: string; harness_advisory?: string[] };
+
+      assert.equal(envExecRes.blocking, true);
+      assert.equal(envExecRes.advisory, undefined);
+      assert.equal(db.getTask(envExecute.id)?.status, "blocked");
+      assert.equal(db.getEscalation(envExecRes.escalationId)?.blocking, true);
+      assert.equal(envExecRes.harness_advisory, undefined);
+
+      const envExecAdvisories = db
+        .getEventsSince(run.id, 0)
+        .filter((e) => e.taskId === envExecute.id && e.type === "agent.advisory");
+      assert.equal(envExecAdvisories.length, 0);
     } finally {
       cleanup();
     }

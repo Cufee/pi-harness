@@ -136,12 +136,6 @@ function derivedTitleNote(title: string): string {
 
 export type TaskToolSubject = Pick<TaskRecord, "runId" | "tier" | "kind" | "profileId" | "title" | "readOnly">;
 
-const READ_ONLY_FINDING_CATEGORIES = new Set<EscalationCategory>([
-  "verification_failed",
-  "code_defect",
-  "broken_test",
-]);
-
 export function toolsForTask(task: TaskToolSubject): ToolDefinition[] {
   return toolsForRole(roleOf(task), { readOnly: task.readOnly || isReadOnlyKind(task.kind) });
 }
@@ -824,18 +818,14 @@ export class ControlPlaneToolExecutor {
         const category = String(args.category) as EscalationCategory;
         const evidencePaths = Array.isArray(args.evidence_paths) ? (args.evidence_paths as string[]) : [];
         const attempted = Array.isArray(args.attempted) ? (args.attempted as string[]) : [];
-        const role = roleOf(task);
-        const readOnlyFinding =
-          (role === "research" || role === "plan" || role === "verify") &&
-          READ_ONLY_FINDING_CATEGORIES.has(category);
-        const blocking =
-          args.blocking === undefined
-            ? readOnlyFinding
-              ? false
-              : severity !== "P2"
+        const readOnly = isReadOnlyKind(task.kind);
+        const blocking = readOnly
+          ? false
+          : args.blocking === undefined
+            ? severity !== "P2"
             : Boolean(args.blocking);
 
-        const toTaskId = readOnlyFinding && !blocking ? task.parentId : severity === "P0" ? null : task.parentId;
+        const toTaskId = severity === "P0" ? null : task.parentId;
         const { title, derived } = deriveTitle(
           args.title,
           [args.summary, args.body, ...attempted, evidencePaths[0]],
@@ -860,11 +850,15 @@ export class ControlPlaneToolExecutor {
         }
         const directorOwner = toTaskId && this.db.getTask(toTaskId)?.parentId === null ? directorTaskRunOwner(runId) : null;
         const routedTo = toTaskId === null ? "human" : directorOwner ? `director:${directorOwner}` : toTaskId;
+        const advisory = readOnly
+          ? `Read-only ${task.kind} tasks never raise blocking escalations: recorded ${esc.id} as non-blocking (blocking=false). Keep going and include this finding in your return_task handoff, or call return_task with status "blocked" if you truly cannot produce a result.`
+          : undefined;
         return {
           escalationId: esc.id,
           severity: esc.severity,
           routedTo,
           blocking,
+          ...(advisory ? { advisory } : {}),
           ...(derived ? { note: derivedTitleNote(esc.title) } : {}),
         };
       }

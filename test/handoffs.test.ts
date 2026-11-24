@@ -192,12 +192,14 @@ it("keeps read-only report_issue non-blocking and auto-resolves agent-addressed 
       const child = db.createTask({
         runId: run.id, parentId: parent.id, tier: 3, kind, title: kind, objective: "Inspect", profileId: "acp:codex",
       });
+      db.updateTask(child.id, { status: "running" });
       const res = (await orch.toolExecutor.execute(run.id, child.id, "report_issue", {
         severity: "P1", category: "code_defect", title: `${kind} finding`, evidence_paths: ["a.ts"],
-      })) as { escalationId: string; severity: string; routedTo: string; blocking: boolean; harness_advisory?: string[] };
+      })) as { escalationId: string; severity: string; routedTo: string; blocking: boolean; advisory?: string; harness_advisory?: string[] };
       assert.equal(res.severity, "P1");
       assert.equal(res.routedTo, parent.id);
       assert.equal(res.blocking, false);
+      assert.match(res.advisory ?? "", /non-blocking.*return_task/i);
       assert.ok(
         Array.isArray(res.harness_advisory) &&
           res.harness_advisory.some((a) => a.includes("read-only-finding-escalation")),
@@ -207,21 +209,60 @@ it("keeps read-only report_issue non-blocking and auto-resolves agent-addressed 
       assert.equal(esc.blocking, false);
       assert.equal(esc.status, "open");
       assert.equal(esc.toTaskId, parent.id);
-      assert.equal(db.getTask(child.id)?.status, "ready");
-      assert.match(buildImmutableSystemPrompt(3, kind, "off"), /non-blocking and you keep working/);
+      assert.equal(db.getTask(child.id)?.status, "running");
+      const roPrompt = buildImmutableSystemPrompt(3, kind, "off");
+      assert.match(roPrompt, /non-blocking and you keep working/);
+      assert.doesNotMatch(roPrompt, /ends your task/);
 
+      // Explicit blocking: true is forced non-blocking for read-only kinds; task stays running.
+      const forcedRes = (await orch.toolExecutor.execute(run.id, child.id, "report_issue", {
+        severity: "P1", category: "code_defect", title: `${kind} forced block`, evidence_paths: ["a.ts"], blocking: true,
+      })) as { escalationId: string; routedTo: string; blocking: boolean; advisory?: string };
+      assert.equal(forcedRes.routedTo, parent.id);
+      assert.equal(forcedRes.blocking, false);
+      assert.match(forcedRes.advisory ?? "", /non-blocking.*return_task/i);
+      const forcedRow = db.db.prepare("SELECT blocking FROM escalations WHERE id = ?").get(forcedRes.escalationId) as { blocking: number };
+      assert.equal(forcedRow.blocking, 0);
+      assert.equal(db.getEscalation(forcedRes.escalationId)?.blocking, false);
+      assert.equal(db.getTask(child.id)?.status, "running");
+
+      // P1 env_failure is also non-blocking for read-only kinds; task stays running.
+      const envRes = (await orch.toolExecutor.execute(run.id, child.id, "report_issue", {
+        severity: "P1", category: "env_failure", title: `${kind} env failure`, evidence_paths: ["a.ts"],
+      })) as { escalationId: string; routedTo: string; blocking: boolean; advisory?: string };
+      assert.equal(envRes.routedTo, parent.id);
+      assert.equal(envRes.blocking, false);
+      assert.match(envRes.advisory ?? "", /non-blocking.*return_task/i);
+      const envRow = db.db.prepare("SELECT blocking FROM escalations WHERE id = ?").get(envRes.escalationId) as { blocking: number };
+      assert.equal(envRow.blocking, 0);
+      assert.equal(db.getEscalation(envRes.escalationId)?.blocking, false);
+      assert.equal(db.getTask(child.id)?.status, "running");
+
+      // P0 from a read-only task stays human-addressed (toTaskId null) and non-blocking even with blocking: true.
       const p0Res = (await orch.toolExecutor.execute(run.id, child.id, "report_issue", {
-        severity: "P0", category: "security_risk", title: `${kind} P0`, evidence_paths: ["a.ts"], blocking: false,
-      })) as { escalationId: string; routedTo: string; blocking: boolean };
+        severity: "P0", category: "security_risk", title: `${kind} P0`, evidence_paths: ["a.ts"], blocking: true,
+      })) as { escalationId: string; routedTo: string; blocking: boolean; advisory?: string };
       assert.equal(p0Res.routedTo, "human");
       assert.equal(p0Res.blocking, false);
+      assert.match(p0Res.advisory ?? "", /non-blocking.*return_task/i);
+      const p0Row = db.db.prepare("SELECT blocking FROM escalations WHERE id = ?").get(p0Res.escalationId) as { blocking: number };
+      assert.equal(p0Row.blocking, 0);
       assert.equal(db.getEscalation(p0Res.escalationId)?.blocking, false);
-      assert.equal(db.getTask(child.id)?.status, "ready");
+      assert.equal(db.getEscalation(p0Res.escalationId)?.toTaskId, null);
+      assert.equal(db.getTask(child.id)?.status, "running");
 
-      db.updateTask(child.id, { status: "completed" });
-      const resolved = db.getEscalation(res.escalationId)!;
-      assert.equal(resolved.status, "resolved");
-      assert.equal(resolved.resolution, `Auto-resolved: raising task ${child.id} completed`);
+      // Task is still running and can cleanly complete via return_task.
+      await orch.toolExecutor.execute(run.id, child.id, "return_task", {
+        status: "completed",
+        summary: `${kind} completed with findings`,
+        sources: [{ path: "a.ts", note: "inspected" }],
+      });
+      assert.equal(db.getTask(child.id)?.status, "completed");
+      for (const escId of [res.escalationId, forcedRes.escalationId, envRes.escalationId]) {
+        const resolved = db.getEscalation(escId)!;
+        assert.equal(resolved.status, "resolved");
+        assert.equal(resolved.resolution, `Auto-resolved: raising task ${child.id} completed`);
+      }
       assert.equal(db.getEscalation(p0Res.escalationId)?.status, "open");
     }
 
