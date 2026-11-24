@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { loadConfig } from "../src/config.js";
@@ -642,11 +642,10 @@ describe("goal-18 Done-Review reliability", () => {
     }
   });
 
-  it("deletes stale refs/harness/merged/<runId> and logs a warning when update-ref fails on a later merge", async () => {
+  it("succeeds and records merge.promoted when refs/harness/merged/<runId>.lock is held, leaving ref and lock untouched", async () => {
     const repoRoot = await makeTempRepo();
     const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-g18-state-"));
     const sockPath = join(stateDir, "d.sock");
-    let verifyCheckoutHead = "";
     const warnings: string[] = [];
     const origWarn = console.warn;
     console.warn = (...args: unknown[]) => {
@@ -665,17 +664,7 @@ describe("goal-18 Done-Review reliability", () => {
       const daemon = new HarnessDaemon(config, {
         dbPath: ":memory:",
         customRunnerFactory: () => ({
-          run: async (req) => {
-            if (req.kind !== "verify") return { text: "ok", stopReason: "completed" };
-            verifyCheckoutHead = (await runGit(req.cwd, ["rev-parse", "HEAD"])).stdout;
-            await req.executeTool("submit_review_verdict", {
-              verdict: "approved",
-              criteriaResults: [{ criterionId: "behavior", passed: true, evidence: `Verified at ${verifyCheckoutHead}` }],
-              blockingIssues: [],
-              summary: "Verified at base tip after stale ref removal.",
-            });
-            return { text: "approved", stopReason: "completed" };
-          },
+          run: async () => ({ text: "ok", stopReason: "completed" }),
         }),
       });
 
@@ -688,7 +677,7 @@ describe("goal-18 Done-Review reliability", () => {
           stateDir,
         });
 
-        const run = daemon.db.createRun({ goal: "Two-merge run", repoRoot, baseBranch: "main", baseSha });
+        const run = daemon.db.createRun({ goal: "Locked ref run", repoRoot, baseBranch: "main", baseSha });
 
         // Merge 1 lands sha1 and writes refs/harness/merged/<runId>.
         const task1 = daemon.db.createTask({
@@ -712,9 +701,10 @@ describe("goal-18 Done-Review reliability", () => {
         const refAfter1 = (await runGit(repoRoot, ["rev-parse", "--verify", `${mergedRef}^{commit}`])).stdout;
         assert.equal(refAfter1, merged1.mergedSha);
 
-        // Hold a lock file on refs/harness/merged/<runId> so merge 2's update-ref fails.
+        // Pre-create <ref>.lock to simulate another Git writer holding the lock during merge 2.
         const refFilePath = resolve(repoRoot, (await runGit(repoRoot, ["rev-parse", "--git-path", mergedRef])).stdout);
-        writeFileSync(`${refFilePath}.lock`, "locked\n", "utf8");
+        const lockFilePath = `${refFilePath}.lock`;
+        writeFileSync(lockFilePath, "other-writer-lock\n", "utf8");
 
         const task2 = daemon.db.createTask({
           runId: run.id,
@@ -731,151 +721,37 @@ describe("goal-18 Done-Review reliability", () => {
         await runGit(wt2.path, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "feat: merge 2"]);
         daemon.db.enqueueMerge({ runId: run.id, taskId: task2.id, worktreeId: wt2.id, branch: wt2.branch });
         const merged2 = await mq.processNext(run.id);
+        assert.equal(merged2?.item.status, "merged");
         assert.ok(merged2?.mergedSha);
         assert.notEqual(merged2.mergedSha, merged1.mergedSha);
 
-        // Stale ref pointing to sha1 must have been removed, and a warning must have been logged.
-        const refStillExists = await runGit(repoRoot, ["rev-parse", "--verify", `${mergedRef}^{commit}`])
-          .then(() => true)
-          .catch(() => false);
-        assert.equal(refStillExists, false, "stale merge ref must be deleted when update-ref fails");
+        // Target branch advanced, while the pre-existing lock file and ref remain untouched.
+        assert.equal((await runGit(repoRoot, ["rev-parse", "main"])).stdout, merged2.mergedSha);
+        assert.equal(existsSync(lockFilePath), true, "pre-existing lock file must remain untouched");
+        assert.equal(readFileSync(lockFilePath, "utf8"), "other-writer-lock\n");
+        const refAfter2 = (await runGit(repoRoot, ["rev-parse", "--verify", `${mergedRef}^{commit}`])).stdout;
+        assert.equal(refAfter2, merged1.mergedSha, "locked merge ref must remain untouched");
+
+        // Warning logged and merge.ref_warning + merge.promoted events recorded with merge 2's sha.
         assert.ok(
-          warnings.some((w) => w.includes(mergedRef) && w.includes("removed stale merge ref")),
+          warnings.some((w) => w.includes(mergedRef)),
           `expected merge ref warning, got: ${JSON.stringify(warnings)}`,
         );
+        const events = daemon.db.getEventsSince(run.id, 0);
+        const refWarning = events.find((e) => e.type === "merge.ref_warning" && e.taskId === task2.id);
+        assert.ok(refWarning, "expected merge.ref_warning event");
+        const refWarningPayload = refWarning.payload as Record<string, unknown>;
+        assert.equal(refWarningPayload.mergeId, merged2.item.id);
+        assert.equal(refWarningPayload.ref, mergedRef);
+        assert.equal(refWarningPayload.mergedSha, merged2.mergedSha);
 
-        // Verification checkout must fall back to base tip (sha2), NOT stale sha1.
-        const chat = await daemon.director.createChat({ repoRoot });
-        const goal = daemon.director.goals.createGoal({
-          chatSessionId: chat.id,
-          repoRoot,
-          title: "Fallback after stale ref delete",
-          description: "Verify checkout evaluates merge 2 instead of stale merge 1",
-          criteria: [{ id: "behavior", description: "Behavior verified", kind: "behavioral", required: true }],
-        });
-        daemon.director.goals.linkRunAndStart(goal.id, run.id);
-        await daemon.director.verifyAndReviewGoal(goal.id);
-        assert.equal(verifyCheckoutHead, merged2.mergedSha);
-      } finally {
-        await daemon.stop();
-      }
-    } finally {
-      console.warn = origWarn;
-      rmSync(repoRoot, { recursive: true, force: true });
-      rmSync(stateDir, { recursive: true, force: true });
-    }
-  });
-
-  it("removes packed stale refs on update-ref failure so verification checks out merge 2 instead of stale packed merge 1", async () => {
-    const repoRoot = await makeTempRepo();
-    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-g18-packed-state-"));
-    const sockPath = join(stateDir, "d.sock");
-    let verifyCheckoutHead = "";
-    const warnings: string[] = [];
-    const origWarn = console.warn;
-    console.warn = (...args: unknown[]) => {
-      warnings.push(args.map(String).join(" "));
-    };
-
-    try {
-      const baseCfg = loadConfig(repoRoot);
-      const config = withFixtureCatalog({
-        ...baseCfg,
-        goals: { ...baseCfg.goals, autoVerifyOnSettle: false },
-        stateDir,
-        socketPath: sockPath,
-      });
-      const daemon = new HarnessDaemon(config, {
-        dbPath: ":memory:",
-        customRunnerFactory: () => ({
-          run: async (req) => {
-            if (req.kind !== "verify") return { text: "ok", stopReason: "completed" };
-            verifyCheckoutHead = (await runGit(req.cwd, ["rev-parse", "HEAD"])).stdout;
-            await req.executeTool("submit_review_verdict", {
-              verdict: "approved",
-              criteriaResults: [{ criterionId: "behavior", passed: true, evidence: `checked ${verifyCheckoutHead}` }],
-              blockingIssues: [],
-              summary: "Verified latest commit.",
-            });
-            return { text: "done", stopReason: "completed" };
-          },
-        }),
-      });
-
-      await daemon.start();
-      try {
-        const wtMgr = daemon.orchestrator.getWorktreeManager(repoRoot);
-        const mq = new BisectingMergeQueue(daemon.db, wtMgr, repoRoot, config.worktree);
-        const baseSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout;
-
-        // Pack merge 1's ref into packed-refs, then hold loose ref .lock during merge 2 (Astra's reproduction).
-        const runA = daemon.db.createRun({ goal: "Packed ref run A", repoRoot, baseBranch: "main", baseSha });
-        const taskA1 = daemon.db.createTask({
-          runId: runA.id,
-          parentId: null,
-          tier: 2,
-          kind: "execute",
-          title: "Worker A1",
-          objective: "Add a1.txt",
-          profileId: "fixture",
-        });
-        const wtA1 = await wtMgr.createForWorker(runA.id, taskA1.id, "main");
-        writeFileSync(join(wtA1.path, "a1.txt"), "a1\n", "utf8");
-        await runGit(wtA1.path, ["add", "a1.txt"]);
-        await runGit(wtA1.path, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "feat: a1"]);
-        daemon.db.enqueueMerge({ runId: runA.id, taskId: taskA1.id, worktreeId: wtA1.id, branch: wtA1.branch });
-        const mergedA1 = await mq.processNext(runA.id);
-        assert.ok(mergedA1?.mergedSha);
-
-        const refA = runMergedRef(runA.id);
-        await runGit(repoRoot, ["pack-refs", "--all"]);
-        const looseRefPathA = resolve(repoRoot, (await runGit(repoRoot, ["rev-parse", "--git-path", refA])).stdout);
-        assert.equal(existsSync(looseRefPathA), false, "expected packed ref to have no loose file");
-        assert.equal((await runGit(repoRoot, ["rev-parse", "--verify", `${refA}^{commit}`])).stdout, mergedA1.mergedSha);
-
-        // Hold loose ref .lock so both update-ref and update-ref -d fail on merge 2.
-        mkdirSync(dirname(looseRefPathA), { recursive: true });
-        writeFileSync(`${looseRefPathA}.lock`, "locked\n", "utf8");
-
-        const taskA2 = daemon.db.createTask({
-          runId: runA.id,
-          parentId: null,
-          tier: 2,
-          kind: "execute",
-          title: "Worker A2",
-          objective: "Add a2.txt",
-          profileId: "fixture",
-        });
-        const wtA2 = await wtMgr.createForWorker(runA.id, taskA2.id, "main");
-        writeFileSync(join(wtA2.path, "a2.txt"), "a2\n", "utf8");
-        await runGit(wtA2.path, ["add", "a2.txt"]);
-        await runGit(wtA2.path, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "feat: a2"]);
-        daemon.db.enqueueMerge({ runId: runA.id, taskId: taskA2.id, worktreeId: wtA2.id, branch: wtA2.branch });
-        const mergedA2 = await mq.processNext(runA.id);
-        assert.ok(mergedA2?.mergedSha);
-        assert.notEqual(mergedA2.mergedSha, mergedA1.mergedSha);
-
-        // Ref must be gone from both loose and packed-refs.
-        const refAStillResolves = await runGit(repoRoot, ["rev-parse", "--verify", `${refA}^{commit}`])
-          .then(() => true)
-          .catch(() => false);
-        assert.equal(refAStillResolves, false, "packed stale merge ref must be removed on update-ref failure");
-        assert.ok(
-          warnings.some((w) => w.includes(refA) && w.includes("removed stale merge ref")),
-          `expected stale ref warning, got: ${JSON.stringify(warnings)}`,
-        );
-
-        const chat = await daemon.director.createChat({ repoRoot });
-        const goalA = daemon.director.goals.createGoal({
-          chatSessionId: chat.id,
-          repoRoot,
-          title: "Verify after packed ref cleanup",
-          description: "Must verify merge 2, not stale packed merge 1",
-          criteria: [{ id: "behavior", description: "Behavior verified", kind: "behavioral", required: true }],
-        });
-        daemon.director.goals.linkRunAndStart(goalA.id, runA.id);
-        await daemon.director.verifyAndReviewGoal(goalA.id);
-        assert.equal(verifyCheckoutHead, mergedA2.mergedSha);
+        const promoted = events.find((e) => e.type === "merge.promoted" && e.taskId === task2.id);
+        assert.ok(promoted, "expected merge.promoted event");
+        const promotedPayload = promoted.payload as Record<string, unknown>;
+        assert.equal(promotedPayload.mergeId, merged2.item.id);
+        assert.equal(promotedPayload.mergedSha, merged2.mergedSha);
+        assert.equal(promotedPayload.ref, mergedRef);
+        assert.equal(promotedPayload.refUpdated, false);
       } finally {
         await daemon.stop();
       }
