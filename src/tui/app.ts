@@ -140,6 +140,7 @@ interface SharedShellContext {
   getRightStatus: () => string;
   getIdleBanner: () => string;
   onUserSubmit: (text: string) => Promise<void>;
+  onSteerQueued?: (itemId: string) => Promise<void>;
   onCancelActiveTurn: () => Promise<boolean>;
   onBeforeStop?: () => void;
   onModelUpdated?: (sel: { profileId: string; model: string | null; effort: string | null }) => Promise<void>;
@@ -962,6 +963,39 @@ function createSharedShell(spec: SharedShellContext) {
         session.tui.requestRender();
         return true;
       }
+      case "now": {
+        if (!spec.onSteerQueued) {
+          appendLiveReceipt({ tone: "warn", tag: "queue", text: "/now is only available in Director chat mode." });
+          session.tui.requestRender();
+          return true;
+        }
+        if (!hasControl) {
+          appendLiveReceipt({ tone: "warn", tag: "control", text: READ_ONLY_RECEIPT });
+          session.tui.requestRender();
+          return true;
+        }
+        const arg = parsed.args.trim();
+        const items = queue.list();
+        if (items.length === 0) {
+          appendLiveReceipt({ tone: "muted", tag: "queue", text: "No queued messages to send." });
+          session.tui.requestRender();
+          return true;
+        }
+        const idx = arg === "" ? 1 : /^\d+$/.test(arg) ? Number.parseInt(arg, 10) : Number.NaN;
+        if (!Number.isFinite(idx) || idx < 1 || idx > items.length) {
+          appendLiveReceipt({ tone: "warn", tag: "queue", text: `Usage: /now [n] (1..${items.length})` });
+          session.tui.requestRender();
+          return true;
+        }
+        const target = items[idx - 1]!;
+        if (target.state === "sending") {
+          appendLiveReceipt({ tone: "muted", tag: "queue", text: `Message #${idx} is already sending.` });
+          session.tui.requestRender();
+          return true;
+        }
+        await spec.onSteerQueued(target.id);
+        return true;
+      }
       case "drop": {
         const arg = parsed.args.trim().toLowerCase();
         if (!arg) {
@@ -1060,6 +1094,7 @@ function createSharedShell(spec: SharedShellContext) {
       rightStatus: spec.getRightStatus(),
       queuedCount: 0,
       queuedItems: [],
+      canSteerQueued: Boolean(spec.onSteerQueued),
       hints: hasControl ? dockHints : readOnlyHints,
     },
     onSubmit: (raw) => {
@@ -1109,6 +1144,7 @@ function createSharedShell(spec: SharedShellContext) {
       rightStatus: spec.getRightStatus(),
       queuedCount: queue.length,
       queuedItems: queue.list(),
+      canSteerQueued: Boolean(spec.onSteerQueued),
       hints: hasControl ? dockHints : readOnlyHints,
     });
     session.tui.requestRender();
@@ -1216,6 +1252,27 @@ function createSharedShell(spec: SharedShellContext) {
       queue.popLatest();
       syncDock();
       return { consume: true };
+    }
+
+    // Steer first queued message into the live turn now (`Alt+S`)
+    if (
+      hasControl &&
+      spec.onSteerQueued &&
+      (data === "\x1bs" || matchesKey(data, "alt+s")) &&
+      queue.queuedLength > 0
+    ) {
+      const next = queue.peekNextQueued();
+      if (next) {
+        void spec.onSteerQueued(next.id).catch((err) => {
+          appendLiveReceipt({
+            tone: "danger",
+            tag: "error",
+            text: err instanceof Error ? err.message : String(err),
+          });
+          session.tui.requestRender();
+        });
+        return { consume: true };
+      }
     }
 
     // Alt+1..Alt+5 jump straight into numbered dock attention slot (supports legacy ESC+digit, Kitty CSI u, and modifyOtherKeys)
@@ -1495,6 +1552,12 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   const tryDeliverQueuedBySteer = async (itemId: string): Promise<void> => {
     const current = shell.queue.get(itemId);
     if (!current) return;
+    if (reconnect?.offline || reconnect?.expectingRestart || reloadingBlocked) {
+      const reason: ChatQueueReason = reconnect?.offline ? "reconnect" : "restart";
+      shell.queue.markQueued(itemId, reason);
+      shell.syncDock();
+      return;
+    }
     if (!activeTurnId) {
       shell.queue.markQueued(itemId, "after_turn");
       shell.syncDock();
@@ -1590,14 +1653,9 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       return;
     }
 
-    // Busy Enter puts the item into the pinned strip immediately, then attempts live steering.
+    // Busy Enter only queues the message in the pinned strip (no chat.steer or chat.cancel RPC).
     if (sending) {
-      const item = enqueuePrompt(text, { state: activeTurnId ? "sending" : "queued", reason: "after_turn" });
-      if (activeTurnId) {
-        await tryDeliverQueuedBySteer(item.id);
-      } else if (!sending) {
-        drainQueue();
-      }
+      enqueuePrompt(text, { state: "queued", reason: "after_turn" });
       return;
     }
 
@@ -1714,6 +1772,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       return `${pTag}${chatSession.id} · ${sanitizeLine(chatSession.title || "Director Chat")} (Ctrl+P Projects · Ctrl+G Work · Ctrl+O Go)`;
     },
     onUserSubmit: dispatchPrompt,
+    onSteerQueued: tryDeliverQueuedBySteer,
     onCancelActiveTurn: async () => {
       if (!activeTurnId) return false;
       const id = activeTurnId;

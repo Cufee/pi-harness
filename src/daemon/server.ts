@@ -3538,27 +3538,30 @@ export class HarnessDaemon {
         }
       }
 
-      case "chat.steer":
+      case "chat.steer": {
+        const chatSessionId = this.resolveChatSessionId(String(p.chatSessionId));
+        this.requireChatOwner(socket, chatSessionId);
+        const turn = this.chatTurns.get(chatSessionId);
+        if (!turn || turn.id !== p.turnId || turn.cancelling) return { steered: false, cancelled: false };
+        const message = String(p.message);
+        if (await this.director.steerChat(chatSessionId, message, { role: "user" })) {
+          this.sendChatEvent(
+            chatSessionId,
+            turn.id,
+            "chat.steered",
+            { message, role: "user", originClientId: this.clientId(socket) },
+            socket,
+          );
+          return { steered: true };
+        }
+        return { steered: false, cancelled: false };
+      }
+
       case "chat.cancel": {
         const chatSessionId = this.resolveChatSessionId(String(p.chatSessionId));
         this.requireChatOwner(socket, chatSessionId);
         const turn = this.chatTurns.get(chatSessionId);
         if (!turn || turn.id !== p.turnId || turn.cancelling) return { steered: false, cancelled: false };
-        if (req.op === "chat.steer") {
-          const message = String(p.message);
-          if (await this.director.steerChat(chatSessionId, message, { role: "user" })) {
-            this.sendChatEvent(
-              chatSessionId,
-              turn.id,
-              "chat.steered",
-              { message, role: "user", originClientId: this.clientId(socket) },
-              socket,
-            );
-            return { steered: true };
-          }
-          this.requireChatOwner(socket, chatSessionId);
-          if (this.chatTurns.get(chatSessionId) !== turn || turn.cancelling) return { steered: false, cancelled: false };
-        }
         turn.cancelling = true;
         try {
           return { steered: false, cancelled: await this.director.cancelChat(chatSessionId) };

@@ -264,20 +264,20 @@ describe("goal-34 c2: ChatQueueModel pure unit tests", () => {
     assert.ok(joined.includes("4 queued · sends after harnessd restarts"));
     assert.ok(joined.includes("5 queued · sends when you take control"));
     assert.ok(joined.includes("+2 more queued"));
-    assert.ok(joined.includes("Ctrl+R edit · Alt+Q drop"));
+    assert.ok(joined.includes("Alt+S /now · Ctrl+R edit · Alt+Q drop"));
   });
 });
 
 describe("goal-34 c2: runDirectorChatTui pinned queue strip end-to-end", () => {
-  it("shows sending immediately while chat.steer hangs, transitions to queued on {steered:false}, drains on turn end, and renders user turn once", async () => {
+  it("busy Enter queues without RPC, explicit /now shows sending while chat.steer hangs, reverts to queued on {steered:false}, drains on turn end, and renders user turn once", async () => {
     const { terminal, writes, text, since, sendInput, typeText } = makeFakeTerminal(120, 30);
     const session = makeChatSession("chat-q34-e2e");
     const queuedMsg = "I think we can keep IDs scoped to session";
 
     let resolveFirstSend!: () => void;
     const firstSendGate = new Promise<void>((r) => (resolveFirstSend = r));
-    let resolveSteer!: (val: { steered: boolean }) => void;
-    const steerGate = new Promise<{ steered: boolean }>((r) => (resolveSteer = r));
+    let resolveSteer!: (val: { steered: boolean; cancelled?: boolean }) => void;
+    const steerGate = new Promise<{ steered: boolean; cancelled?: boolean }>((r) => (resolveSteer = r));
     let sendCount = 0;
 
     const mock = makeMockClient(async (op) => {
@@ -318,27 +318,42 @@ describe("goal-34 c2: runDirectorChatTui pinned queue strip end-to-end", () => {
     await waitFor(() => mock.calls.some((c) => c.op === "chat.send"), 3000, "first chat.send");
     const turn1Id = String(mock.calls.find((c) => c.op === "chat.send")!.params.turnId);
 
-    // 2. While turn 1 is active and chat.steer will hang, type queuedMsg and press Enter
+    // 2. While turn 1 is active, busy Enter queues in the strip with zero steer/cancel RPCs
     const markBeforeQueue = writes.length;
     typeText(queuedMsg);
     sendInput("\r");
-    await waitFor(() => mock.calls.some((c) => c.op === "chat.steer"), 3000, "chat.steer invoked");
-
-    // Assert the pinned queue strip renders the message as `sending` BEFORE chat.steer resolves
     await waitFor(
-      () => since(markBeforeQueue).includes("1 sending") && since(markBeforeQueue).includes(queuedMsg),
+      () => since(markBeforeQueue).includes("1 queued · sends after this turn") && since(markBeforeQueue).includes(queuedMsg),
+      3000,
+      "busy Enter immediately queues in strip",
+    );
+    assert.equal(mock.calls.some((c) => c.op === "chat.steer"), false, "Busy Enter must not call chat.steer");
+    assert.equal(mock.calls.some((c) => c.op === "chat.cancel"), false, "Busy Enter must not call chat.cancel");
+
+    // 3. Explicit `/now` triggers chat.steer (which hangs) -> strip transitions to `1 sending` before steer resolves
+    const markBeforeNow = writes.length;
+    typeText("/now");
+    sendInput("\r");
+    await waitFor(() => mock.calls.some((c) => c.op === "chat.steer"), 3000, "chat.steer invoked by /now");
+    const steerCall = mock.calls.find((c) => c.op === "chat.steer")!;
+    assert.equal(steerCall.params.message, queuedMsg);
+    assert.equal(steerCall.params.turnId, turn1Id);
+
+    await waitFor(
+      () => since(markBeforeNow).includes("1 sending") && since(markBeforeNow).includes(queuedMsg),
       3000,
       "sending state visible before steer resolves",
     );
 
-    // 3. Resolve chat.steer as { steered: false } -> transitions to `queued · sends after this turn`
+    // 4. Resolve chat.steer as { steered: false, cancelled: false } -> transitions back to `queued · sends after this turn`
     const markBeforeSteerResolve = writes.length;
-    resolveSteer({ steered: false });
+    resolveSteer({ steered: false, cancelled: false });
     await waitFor(
       () => since(markBeforeSteerResolve).includes("queued · sends after this turn"),
       3000,
       "queued · sends after this turn visible",
     );
+    assert.equal(mock.calls.some((c) => c.op === "chat.cancel"), false, "Rejected steer must never trigger chat.cancel");
 
     // Must NOT append legacy `[queued] Queued (` receipt
     assert.equal(text().includes("[queued]"), false, "Must not render removed [queued] transcript receipt");
@@ -440,6 +455,9 @@ describe("goal-34 c2: runDirectorChatTui pinned queue strip end-to-end", () => {
         await sendGate;
         return { ok: true };
       }
+      if (op === "chat.steer") {
+        return { steered: true };
+      }
       if (op === "ping") {
         throw new Error("daemon offline");
       }
@@ -484,6 +502,24 @@ describe("goal-34 c2: runDirectorChatTui pinned queue strip end-to-end", () => {
     sendInput("\r");
     await new Promise((r) => setTimeout(r, 40));
     assert.equal(since(markAfterDrop).includes("keep-first-edited"), false, "/drop all cleared the strip");
+
+    // Queue two more items; steer #2 with `/now 2`, then steer remaining #1 with `Alt+S`
+    typeText("steer-first-by-key");
+    sendInput("\r");
+    await waitFor(() => text().includes("steer-first-by-key"), 3000, "queued first for send-now");
+    typeText("steer-second-by-cmd");
+    sendInput("\r");
+    await waitFor(() => text().includes("steer-second-by-cmd"), 3000, "queued second for send-now");
+    assert.equal(mock.calls.filter((c) => c.op === "chat.steer").length, 0, "Busy Enter must not steer");
+
+    typeText("/now 2");
+    sendInput("\r");
+    await waitFor(() => mock.calls.filter((c) => c.op === "chat.steer").length === 1, 3000, "/now 2 steered second item");
+    assert.equal(mock.calls.filter((c) => c.op === "chat.steer")[0]!.params.message, "steer-second-by-cmd");
+
+    sendInput("\x1bs");
+    await waitFor(() => mock.calls.filter((c) => c.op === "chat.steer").length === 2, 3000, "Alt+S steered first queued item");
+    assert.equal(mock.calls.filter((c) => c.op === "chat.steer")[1]!.params.message, "steer-first-by-key");
 
     // End the active turn so nothing drains
     mock.emit({

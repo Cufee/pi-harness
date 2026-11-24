@@ -1,3 +1,9 @@
+import type {
+  EscalationCategory,
+  EscalationRecord,
+  EscalationSeverity,
+  RunRecord,
+} from "../control-plane/db.js";
 import type { ChatTurnRecord } from "../director/session.js";
 import {
   type ChatControlEvent,
@@ -5,6 +11,11 @@ import {
   parseChatControlEvent,
 } from "../protocol/chat-events.js";
 import type { DaemonEventFrame } from "../protocol/daemon-rpc.js";
+import {
+  type AttentionCandidate,
+  type AttentionQuotaPause,
+  evaluateAttentionVerdict,
+} from "../visibility/index.js";
 import {
   firstLine,
   formatCountdown,
@@ -49,21 +60,124 @@ const RAW_TOKEN_REPLACEMENTS: ReadonlyArray<[RegExp, string]> = [
   [/\bremote_push\b/gi, "remote push"],
 ];
 
-// Interim local policy; replace with goal-33's shared src/visibility/ attention policy once landed.
-export function classifyAttentionAudience(
-  input:
-    | { kind: "escalation"; toTaskId?: unknown; severity?: unknown; blocking?: unknown }
-    | { kind: "quota"; eventType: string; mode?: unknown },
-): "human" | "internal" | "drop" {
+const ESCALATION_CATEGORIES = new Set<EscalationCategory>([
+  "scope_too_large",
+  "code_defect",
+  "broken_test",
+  "interface_conflict",
+  "ambiguous_spec",
+  "blocked_dependency",
+  "verification_failed",
+  "budget_exhausted",
+  "env_failure",
+  "security_risk",
+]);
+
+export type LiveAttentionInput =
+  | {
+      kind: "escalation";
+      runId?: string;
+      id?: unknown;
+      escalationId?: unknown;
+      fromTaskId?: unknown;
+      toTaskId?: unknown;
+      severity?: unknown;
+      category?: unknown;
+      title?: unknown;
+      blocking?: unknown;
+      status?: unknown;
+      createdAt?: unknown;
+    }
+  | {
+      kind: "quota";
+      eventType: string;
+      runId?: string;
+      mode?: unknown;
+      reason?: unknown;
+      resumeAt?: unknown;
+      createdAt?: unknown;
+    };
+
+function parseEscalationSeverity(raw: unknown): EscalationSeverity {
+  const s = typeof raw === "string" ? raw.trim().toUpperCase() : "";
+  if (s === "P0" || s === "P1" || s === "P2") return s;
+  return "P1";
+}
+
+function parseEscalationCategory(raw: unknown): EscalationCategory {
+  const s = typeof raw === "string" ? raw.trim() : "";
+  return ESCALATION_CATEGORIES.has(s as EscalationCategory) ? (s as EscalationCategory) : "blocked_dependency";
+}
+
+function parseEscalationStatus(raw: unknown): EscalationRecord["status"] {
+  if (raw === "acked" || raw === "resolved") return raw;
+  return "open";
+}
+
+/** Builds a typed `AttentionCandidate` from a live `escalation.created` or `quota.*` frame payload. */
+export function toAttentionCandidate(input: LiveAttentionInput): AttentionCandidate {
   if (input.kind === "escalation") {
-    if (input.toTaskId != null) return "drop";
-    const sev = typeof input.severity === "string" ? input.severity.toUpperCase() : "";
-    const isBlocking = input.blocking === true || input.blocking === 1;
-    return sev === "P0" || isBlocking ? "human" : "internal";
+    const rawToTaskId = input.toTaskId;
+    const toTaskId =
+      rawToTaskId == null
+        ? null
+        : typeof rawToTaskId === "string"
+          ? rawToTaskId.trim() || null
+          : String(rawToTaskId);
+    const createdAt = asNumber(input.createdAt) ?? 0;
+    const escalation: EscalationRecord = {
+      id: asString(input.id) || asString(input.escalationId) || "esc-live",
+      runId: input.runId ?? "",
+      fromTaskId: asString(input.fromTaskId),
+      toTaskId,
+      severity: parseEscalationSeverity(input.severity),
+      category: parseEscalationCategory(input.category),
+      title: asString(input.title),
+      evidencePaths: [],
+      attempted: [],
+      suggestedSplits: [],
+      blocking: input.blocking === true || input.blocking === 1,
+      status: parseEscalationStatus(input.status),
+      resolution: null,
+      createdAt,
+      ackedAt: null,
+    };
+    return { kind: "escalation", escalation };
   }
-  if (input.eventType === "quota.run_paused" && input.mode === "manual") {
-    return "human";
-  }
+
+  const isRunPaused = input.eventType === "quota.run_paused";
+  const mode = asString(input.mode);
+  const reason = asString(input.reason);
+  const resumeAt =
+    typeof input.resumeAt === "number" || typeof input.resumeAt === "string" ? input.resumeAt : null;
+  const createdAt = asNumber(input.createdAt) ?? 0;
+  const run: RunRecord = {
+    id: input.runId ?? "",
+    goal: "",
+    repoRoot: "",
+    baseBranch: "",
+    baseSha: "",
+    coordinationGroup: null,
+    isolationMode: "standalone",
+    status: isRunPaused ? "paused_quota" : "active",
+    createdAt,
+    updatedAt: createdAt,
+  };
+  const quotaPause: AttentionQuotaPause | null = isRunPaused && mode ? { mode, reason, resumeAt } : null;
+  return { kind: "quota_paused", run, quotaPause };
+}
+
+/**
+ * Evaluates escalation and quota live-frame visibility through goal-33's shared
+ * `evaluateAttentionVerdict` policy.
+ * - `audience === "human"` (undismissed) -> `"human"`
+ * - agent-addressed escalations (`reason === "agent_addressed"`) -> `"drop"`
+ * - `"orchestrator"`, `"director"`, and `"none"` -> `"internal"`
+ */
+export function classifyAttentionAudience(input: LiveAttentionInput): "human" | "internal" | "drop" {
+  const verdict = evaluateAttentionVerdict(toAttentionCandidate(input));
+  if (verdict.audience === "human" && !verdict.reason) return "human";
+  if (verdict.reason === "agent_addressed") return "drop";
   return "internal";
 }
 
@@ -527,7 +641,15 @@ function classifyLiveGoalEvent(
 }
 
 function classifyLiveQuotaEvent(ev: DaemonEventFrame, p: Record<string, unknown>): ClassifiedChatLine {
-  const audience = classifyAttentionAudience({ kind: "quota", eventType: ev.type, mode: p.mode });
+  const audience = classifyAttentionAudience({
+    kind: "quota",
+    eventType: ev.type,
+    runId: ev.runId || asString(p.runId),
+    mode: p.mode,
+    reason: p.reason,
+    resumeAt: p.resumeAt,
+    createdAt: ev.createdAt,
+  });
   const effectiveAudience: ChatLineAudience = audience === "human" ? "human" : "internal";
   const reason = ensureSafeText(asString(p.reason), "", ev.type);
   const wake =
@@ -581,9 +703,17 @@ function classifyLiveQuotaEvent(ev: DaemonEventFrame, p: Record<string, unknown>
 function classifyLiveEscalationEvent(ev: DaemonEventFrame, p: Record<string, unknown>): ClassifiedChatLine | null {
   const audience = classifyAttentionAudience({
     kind: "escalation",
+    runId: ev.runId || asString(p.runId),
+    id: p.id,
+    escalationId: p.escalationId,
+    fromTaskId: p.fromTaskId ?? ev.taskId,
     toTaskId: p.toTaskId,
     severity: p.severity,
+    category: p.category,
+    title: p.title,
     blocking: p.blocking,
+    status: p.status,
+    createdAt: p.createdAt ?? ev.createdAt,
   });
   if (audience === "drop") return null;
 

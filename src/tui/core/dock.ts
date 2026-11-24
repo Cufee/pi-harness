@@ -611,6 +611,8 @@ export interface DockState {
   queuedCount: number;
   /** Pinned pending/sending user messages rendered directly above the composer. */
   queuedItems?: readonly ChatQueueItem[];
+  /** Whether the queue strip supports explicit send-now steering (default true). */
+  canSteerQueued?: boolean;
   /** Bottom hint strip (always 1 line). */
   hints: Hint[];
 }
@@ -965,7 +967,20 @@ export class FixedDock implements Component {
     const cap = this.queueStripCap();
     const shown = items.slice(0, cap);
     const hidden = Math.max(0, items.length - shown.length);
-    const keyHint = width >= 72 ? `${t.dim("Ctrl+R edit · Alt+Q drop")} ` : width >= 48 ? `${t.dim("Ctrl+R · Alt+Q")} ` : "";
+    const canSteer = this.state.canSteerQueued !== false;
+    const keyHint = canSteer
+      ? width >= 88
+        ? `${t.dim("Alt+S /now · Ctrl+R edit · Alt+Q drop")} `
+        : width >= 72
+          ? `${t.dim("/now · Ctrl+R edit · Alt+Q drop")} `
+          : width >= 48
+            ? `${t.dim("Alt+S · Ctrl+R · Alt+Q")} `
+            : ""
+      : width >= 72
+        ? `${t.dim("Ctrl+R edit · Alt+Q drop")} `
+        : width >= 48
+          ? `${t.dim("Ctrl+R · Alt+Q")} `
+          : "";
     const out: string[] = [];
 
     for (let i = 0; i < shown.length; i += 1) {

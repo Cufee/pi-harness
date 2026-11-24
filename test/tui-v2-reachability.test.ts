@@ -887,7 +887,7 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
     store.dispose();
   });
 
-  it("verifies runDirectorChatTui (chat.history pagination, tool_output replay + live present_result, chat.send text, busy chat.steer, session.leave) and runNativeScrollbackTui (attach replay.page + agent.tool)", async () => {
+  it("verifies runDirectorChatTui (chat.history pagination, tool_output replay + live present_result, chat.send text, busy Enter queueing + /now chat.steer, session.leave) and runNativeScrollbackTui (attach replay.page + agent.tool)", async () => {
     // 1. Director Chat TUI full wiring test
     {
       const { terminal, writes, sendInput } = makeFakeTerminal(100, 30);
@@ -912,6 +912,9 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
 
       let resolveFirstSend!: () => void;
       const firstSendGate = new Promise<void>((r) => (resolveFirstSend = r));
+      let resolveSecondSend!: () => void;
+      const secondSendGate = new Promise<void>((r) => (resolveSecondSend = r));
+      let sendCount = 0;
 
       const mock = makeMockClient(async (op, params) => {
         if (op === "chat.open") {
@@ -951,7 +954,9 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
           return { generatedAt: Date.now(), latestSeq: 0, goals: [], runs: [], escalations: [], timers: [], merges: [], worktrees: [], messages: [], inbox: [] };
         }
         if (op === "chat.send") {
-          await firstSendGate;
+          sendCount += 1;
+          if (sendCount === 1) await firstSendGate;
+          else if (sendCount === 2) await secondSendGate;
           return { ok: true };
         }
         if (op === "chat.steer") {
@@ -979,13 +984,16 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
       assert.equal(sendCall?.params.text, "Hello Director");
       const activeTurnId = String(sendCall?.params.turnId);
 
-      // While busy, Enter must call `chat.steer`!
+      // While busy, Enter must ONLY queue in the pinned strip (no chat.steer and no chat.cancel!)
+      const writesBeforeBusyEnter = writes.length;
       for (const ch of "Focus on tests") sendInput(ch);
       sendInput("\r");
-      await new Promise((r) => setTimeout(r, 20));
-      const steerCall = mock.calls.find((c) => c.op === "chat.steer");
-      assert.equal(steerCall?.params.message, "Focus on tests");
-      assert.equal(steerCall?.params.turnId, activeTurnId);
+      await new Promise((r) => setTimeout(r, 25));
+      assert.equal(mock.calls.some((c) => c.op === "chat.steer"), false, "Busy Enter must not call chat.steer");
+      assert.equal(mock.calls.some((c) => c.op === "chat.cancel"), false, "Busy Enter must not call chat.cancel");
+      const stripAfterBusyEnter = writes.slice(writesBeforeBusyEnter).map(stripTerminalSequences).join("\n");
+      assert.ok(stripAfterBusyEnter.includes("Focus on tests"), "Queued message must appear in the pinned strip");
+      assert.ok(stripAfterBusyEnter.includes("sends after this turn"), "Queued strip must show 'sends after this turn' timing");
 
       // Live `chat.tool` with `display` must render identical structured card
       mock.emit({
@@ -1006,6 +1014,7 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
           },
         },
       });
+      const writesBeforeTurn1End = writes.length;
       mock.emit({
         kind: "event",
         seq: 0,
@@ -1016,8 +1025,44 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
         payload: { chatSessionId: "chat-42", turnId: activeTurnId, assistantTurn: { content: "Done!" } },
       });
       resolveFirstSend();
-      await new Promise((r) => setTimeout(r, 30));
+      await new Promise((r) => setTimeout(r, 35));
+      const afterTurn1End = writes.slice(writesBeforeTurn1End).map(stripTerminalSequences).join("\n");
       assert.ok(writes.map(stripTerminalSequences).join("\n").includes("run-77"), "Live present_result card must render");
+
+      // After turn 1 ends, the queued message drains as chat.send and renders once as a user turn
+      const sendCalls = mock.calls.filter((c) => c.op === "chat.send");
+      assert.equal(sendCalls.length, 2, "Queued message must drain via chat.send after turn end");
+      assert.equal(sendCalls[1]?.params.text, "Focus on tests");
+      assert.equal(
+        (afterTurn1End.match(/[›>] Focus on tests/g) ?? []).length,
+        1,
+        "Drained message must render once as a user turn",
+      );
+      const turn2Id = String(sendCalls[1]?.params.turnId);
+
+      // Explicit send-now (`/now`) steers a queued item into the live turn via chat.steer({ message, turnId })
+      for (const ch of "Urgent steer") sendInput(ch);
+      sendInput("\r");
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(mock.calls.some((c) => c.op === "chat.steer"), false, "Busy Enter queues without steering");
+      for (const ch of "/now") sendInput(ch);
+      sendInput("\r");
+      await new Promise((r) => setTimeout(r, 25));
+      const steerCall = mock.calls.find((c) => c.op === "chat.steer");
+      assert.equal(steerCall?.params.message, "Urgent steer");
+      assert.equal(steerCall?.params.turnId, turn2Id);
+
+      mock.emit({
+        kind: "event",
+        seq: 0,
+        runId: "chat-42",
+        taskId: "chat-42",
+        type: "chat.turn.end",
+        createdAt: Date.now(),
+        payload: { chatSessionId: "chat-42", turnId: turn2Id, assistantTurn: { content: "Second done!" } },
+      });
+      resolveSecondSend();
+      await new Promise((r) => setTimeout(r, 25));
 
       // Clean exit via Ctrl+] -> calls session.leave!
       sendInput("\x1d");

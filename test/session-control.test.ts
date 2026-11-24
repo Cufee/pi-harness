@@ -849,4 +849,124 @@ describe("Non-destructive session takeover and control reclaim", () => {
     sendInput("\x1d");
     await tuiPromise;
   });
+
+  it("rejected chat.steer leaves the active turn running and completes with cancelled: false (while chat.cancel still cancels)", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-steer-no-cancel-"));
+    const sockPath = join(stateDir, "d.sock");
+    const config = withFixtureCatalog({ ...loadConfig(), stateDir, socketPath: sockPath });
+
+    let turnIndex = 0;
+    const handleReadyResolvers: Array<() => void> = [];
+    const turnBarriers: Array<{ promise: Promise<void>; release: () => void }> = [];
+    const makeBarrier = () => {
+      let release!: () => void;
+      const promise = new Promise<void>((r) => {
+        release = r;
+      });
+      return { promise, release };
+    };
+    let abortWhileRunningCalls = 0;
+    const abortedWhileRunning: boolean[] = [];
+    let steerCalls = 0;
+
+    const daemon = new HarnessDaemon(config, {
+      dbPath: ":memory:",
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          const idx = turnIndex++;
+          const barrier = makeBarrier();
+          turnBarriers[idx] = barrier;
+          let running = true;
+          const onAbort = () => {
+            if (running) {
+              abortWhileRunningCalls += 1;
+              barrier.release();
+            }
+          };
+          req.signal.addEventListener("abort", onAbort, { once: true });
+          req.onHandle?.({
+            steer: async () => {
+              steerCalls += 1;
+              return false;
+            },
+            cancel: async () => {
+              barrier.release();
+            },
+          });
+          handleReadyResolvers[idx]?.();
+          req.callbacks.onTextDelta?.(`reply-${idx}`);
+          await barrier.promise;
+          running = false;
+          req.signal.removeEventListener("abort", onAbort);
+          abortedWhileRunning[idx] = req.signal.aborted;
+          return { text: `reply-${idx}`, stopReason: req.signal.aborted ? "cancelled" : "completed" };
+        },
+      }),
+    });
+
+    await daemon.start();
+    try {
+      const c1 = await connect(sockPath);
+      try {
+        const opened = (await c1.client.request("chat.open", { repoRoot: stateDir })) as {
+          session: { id: string };
+        };
+        const chatSessionId = opened.session.id;
+
+        // 1. Start turn 1 and issue chat.steer rejected by Director -> must NOT cancel the turn
+        const ready1 = new Promise<void>((r) => {
+          handleReadyResolvers[0] = r;
+        });
+        const send1 = c1.client.request("chat.send", { chatSessionId, turnId: "turn-reject-steer", text: "hello" });
+        await ready1;
+
+        const steerRes = (await c1.client.request("chat.steer", {
+          chatSessionId,
+          turnId: "turn-reject-steer",
+          message: "steer attempt",
+        })) as { steered: boolean; cancelled: boolean };
+
+        assert.deepEqual(steerRes, { steered: false, cancelled: false });
+        assert.equal(steerCalls, 1);
+        assert.equal(abortWhileRunningCalls, 0, "rejected chat.steer must never cancel the active turn");
+        await tick(50);
+        assert.equal(
+          c1.frames.some((f) => f.type === "chat.turn.end"),
+          false,
+          "active turn must remain running after rejected chat.steer",
+        );
+
+        // Let turn 1 finish naturally -> chat.turn.end must report cancelled: false
+        turnBarriers[0]!.release();
+        await send1;
+        const end1 = await waitFor(() => c1.frames.find((f) => f.type === "chat.turn.end"));
+        assert.equal((end1.payload as { cancelled?: boolean }).cancelled, false);
+        assert.equal(abortedWhileRunning[0], false);
+        assert.equal(abortWhileRunningCalls, 0);
+
+        // 2. Explicit chat.cancel keeps its existing cancel behavior
+        c1.frames.length = 0;
+        const ready2 = new Promise<void>((r) => {
+          handleReadyResolvers[1] = r;
+        });
+        const send2 = c1.client.request("chat.send", { chatSessionId, turnId: "turn-explicit-cancel", text: "second" });
+        await ready2;
+        const cancelRes = (await c1.client.request("chat.cancel", {
+          chatSessionId,
+          turnId: "turn-explicit-cancel",
+        })) as { steered: boolean; cancelled: boolean };
+        assert.deepEqual(cancelRes, { steered: false, cancelled: true });
+        assert.equal(abortWhileRunningCalls, 1);
+        await send2;
+        const end2 = await waitFor(() => c1.frames.find((f) => f.type === "chat.turn.end"));
+        assert.equal((end2.payload as { cancelled?: boolean }).cancelled, true);
+        assert.equal(abortedWhileRunning[1], true);
+      } finally {
+        c1.client.close();
+      }
+    } finally {
+      await daemon.stop();
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
 });

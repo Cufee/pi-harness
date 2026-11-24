@@ -704,8 +704,13 @@ describe("TUI auto-reconnect after daemon restart", () => {
       term.sendInput("\r");
       await waitFor(() => receivedSends.includes("first-turn"), 4000, "first-turn sent");
 
-      // Submit a live steer while busy; server stores it and drops the socket before replying.
+      // Queue a follow-up with busy Enter (no steer yet), then explicitly send now via `/now`;
+      // server stores the steer and drops the socket before replying.
       term.typeText("STEER-LOST-REPLY");
+      term.sendInput("\r");
+      await waitFor(() => term.text().includes("STEER-LOST-REPLY") && term.text().includes("sends after this turn"), 4000, "queued in strip");
+      assert.deepEqual(receivedSteers, [], "busy Enter must queue without sending chat.steer");
+      term.typeText("/now");
       term.sendInput("\r");
 
       await waitFor(

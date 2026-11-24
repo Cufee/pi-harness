@@ -6,8 +6,14 @@ import type { ChatSessionRecord, ChatTurnRecord } from "../src/director/session.
 import type { ChatControlEvent } from "../src/protocol/chat-events.js";
 import type { DaemonEventFrame } from "../src/protocol/daemon-rpc.js";
 import { runDirectorChatTui } from "../src/tui/app.js";
-import { classifyAttentionAudience, classifyChatLine, classifyControlEvent } from "../src/tui/chat-lines.js";
+import {
+  classifyAttentionAudience,
+  classifyChatLine,
+  classifyControlEvent,
+  toAttentionCandidate,
+} from "../src/tui/chat-lines.js";
 import { stripTerminalSequences } from "../src/tui/core/index.js";
+import { evaluateAttentionVerdict } from "../src/visibility/index.js";
 
 const RAW_EVENT_TYPE_RE = /^[a-z_]+\.[a-z_.]+$/;
 
@@ -387,20 +393,119 @@ describe("goal-34 c4: classifyChatLine pure unit tests", () => {
     }
   });
 
-  it("enforces interim local attention policy for escalations and quota events", () => {
-    // Agent-addressed escalation is dropped
-    assert.equal(classifyAttentionAudience({ kind: "escalation", toTaskId: "t-1", severity: "P0", blocking: true }), "drop");
-    // Human-addressed P0 or blocking -> human
-    assert.equal(classifyAttentionAudience({ kind: "escalation", toTaskId: null, severity: "P0", blocking: false }), "human");
-    assert.equal(classifyAttentionAudience({ kind: "escalation", toTaskId: null, severity: "P1", blocking: true }), "human");
-    // Human-addressed non-blocking P1/P2 -> internal
-    assert.equal(classifyAttentionAudience({ kind: "escalation", toTaskId: null, severity: "P1", blocking: false }), "internal");
-    assert.equal(classifyAttentionAudience({ kind: "escalation", toTaskId: null, severity: "P2", blocking: false }), "internal");
+  it("delegates escalation and quota chat-line audience to the shared evaluateAttentionVerdict policy", () => {
+    const cases: Array<{
+      input: Parameters<typeof classifyAttentionAudience>[0];
+      expectedVerdictAudience: ReturnType<typeof evaluateAttentionVerdict>["audience"];
+      expectedReason?: string;
+      expectedChatAudience: ReturnType<typeof classifyAttentionAudience>;
+    }> = [
+      // Agent-addressed escalation: shared policy returns orchestrator/agent_addressed -> dropped from human chat
+      {
+        input: { kind: "escalation", toTaskId: "t-1", severity: "P0", blocking: true },
+        expectedVerdictAudience: "orchestrator",
+        expectedReason: "agent_addressed",
+        expectedChatAudience: "drop",
+      },
+      // Human-addressed P0 or blocking -> human
+      {
+        input: { kind: "escalation", toTaskId: null, severity: "P0", blocking: false },
+        expectedVerdictAudience: "human",
+        expectedChatAudience: "human",
+      },
+      {
+        input: { kind: "escalation", toTaskId: null, severity: "P1", blocking: true },
+        expectedVerdictAudience: "human",
+        expectedChatAudience: "human",
+      },
+      // Human-addressed non-blocking P1/P2 -> orchestrator/not_blocking -> internal
+      {
+        input: { kind: "escalation", toTaskId: null, severity: "P1", blocking: false },
+        expectedVerdictAudience: "orchestrator",
+        expectedReason: "not_blocking",
+        expectedChatAudience: "internal",
+      },
+      {
+        input: { kind: "escalation", toTaskId: null, severity: "P2", blocking: false },
+        expectedVerdictAudience: "orchestrator",
+        expectedReason: "not_blocking",
+        expectedChatAudience: "internal",
+      },
+      // Non-open escalation -> shared policy returns none/not_open -> internal (proves shared policy decides)
+      {
+        input: { kind: "escalation", toTaskId: null, severity: "P0", blocking: true, status: "resolved" },
+        expectedVerdictAudience: "none",
+        expectedReason: "not_open",
+        expectedChatAudience: "internal",
+      },
+      // Quota: manual pause -> human, automatic/other -> none -> internal
+      {
+        input: { kind: "quota", eventType: "quota.run_paused", mode: "manual", reason: "limit reached" },
+        expectedVerdictAudience: "human",
+        expectedChatAudience: "human",
+      },
+      {
+        input: { kind: "quota", eventType: "quota.run_paused", mode: "auto", reason: "5h cooldown" },
+        expectedVerdictAudience: "none",
+        expectedReason: "auto_resume",
+        expectedChatAudience: "internal",
+      },
+      {
+        input: { kind: "quota", eventType: "quota.agent_paused", mode: "manual" },
+        expectedVerdictAudience: "none",
+        expectedReason: "not_paused",
+        expectedChatAudience: "internal",
+      },
+    ];
 
-    // Quota: manual pause -> human, automatic/other -> internal
-    assert.equal(classifyAttentionAudience({ kind: "quota", eventType: "quota.run_paused", mode: "manual" }), "human");
-    assert.equal(classifyAttentionAudience({ kind: "quota", eventType: "quota.run_paused", mode: "auto" }), "internal");
-    assert.equal(classifyAttentionAudience({ kind: "quota", eventType: "quota.agent_paused", mode: "manual" }), "internal");
+    for (const tc of cases) {
+      const verdict = evaluateAttentionVerdict(toAttentionCandidate(tc.input));
+      assert.equal(verdict.audience, tc.expectedVerdictAudience);
+      assert.equal(verdict.reason, tc.expectedReason);
+      assert.equal(classifyAttentionAudience(tc.input), tc.expectedChatAudience);
+    }
+
+    // Verify end-to-end classifyChatLine uses the shared policy for live frames
+    assert.equal(
+      classifyChatLine({
+        source: "live",
+        event: frame("escalation.created", {
+          id: "esc-agent",
+          toTaskId: "t-1",
+          severity: "P0",
+          blocking: true,
+          title: "Agent-only",
+        }),
+      }),
+      null,
+    );
+    assert.equal(
+      classifyChatLine({
+        source: "live",
+        event: frame("escalation.created", {
+          id: "esc-human",
+          toTaskId: null,
+          severity: "P1",
+          blocking: true,
+          title: "Needs decision",
+        }),
+      })?.audience,
+      "human",
+    );
+    assert.equal(
+      classifyChatLine({
+        source: "live",
+        event: frame("quota.run_paused", { mode: "manual", reason: "quota exhausted" }),
+      })?.audience,
+      "human",
+    );
+    assert.equal(
+      classifyChatLine({
+        source: "live",
+        event: frame("quota.run_paused", { mode: "auto", reason: "cooldown" }),
+      })?.audience,
+      "internal",
+    );
   });
 
   it("classifies plain system_notice turns (write_note internal, director resolution internal, interrupted turn single line)", () => {
