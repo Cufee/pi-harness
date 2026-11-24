@@ -150,6 +150,11 @@ else
   mv "$STAGE/rel" "$REL"
 fi
 ln -sfn "$BUN" "$REL/.bun" # each release runs with the Bun it was installed with
+RELEASE_JSON="{\"id\":\"$ID\",\"bunVersion\":\"$BUN_VERSION\"}"
+if [ ! -f "$REL/release.json" ] || [ "$(cat "$REL/release.json" 2>/dev/null || true)" != "$RELEASE_JSON" ]; then
+  printf '%s\n' "$RELEASE_JSON" > "$REL/.release.json.$$"
+  mv -f "$REL/.release.json.$$" "$REL/release.json"
+fi
 
 # --- activate: current symlink, then launcher (each swapped atomically) -----
 rm -f "$INSTALL_DIR/current.new"

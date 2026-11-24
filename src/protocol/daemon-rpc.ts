@@ -1,3 +1,28 @@
+export const DAEMON_PROTOCOL_REV = 8;
+
+export type DaemonLifecycle = "serving";
+
+export type SessionAttachControl = "take" | "view";
+
+export interface ChatOpenParams {
+  chatSessionId?: string;
+  projectId?: string;
+  repoRoot?: string;
+  preferLastGlobal?: boolean;
+  preferLastProject?: boolean;
+  profileId?: string;
+  model?: string;
+  effort?: string;
+  control?: SessionAttachControl;
+}
+
+export interface AttachParams {
+  runId: string;
+  taskId?: string | null;
+  sinceSeq?: number;
+  control?: SessionAttachControl;
+}
+
 export interface RpcRequest {
   kind: "req";
   id: string;

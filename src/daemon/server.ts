@@ -1,19 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, watch, type FSWatcher } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, watch, type FSWatcher } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-
-export const DAEMON_PROTOCOL_REV = 8;
-
-export function currentDaemonBuildId(): string {
-  try {
-    const serverFile = fileURLToPath(import.meta.url);
-    return `${DAEMON_PROTOCOL_REV}:${Math.floor(statSync(serverFile).mtimeMs)}`;
-  } catch {
-    return `${DAEMON_PROTOCOL_REV}:0`;
-  }
-}
 import { ModelCatalogCompiler } from "../catalog/compiler.js";
 import {
   diffHarnessConfig,
@@ -51,16 +39,18 @@ import {
   isReviewInvalidated,
   type ChatControlEvent,
 } from "../protocol/chat-events.js";
-import type {
-  DaemonEventFrame,
-  DaemonOp,
-  InboxItem,
-  RpcRequest,
-  RpcResponse,
-  SessionControlPayload,
-  SessionControlReason,
-  SessionControlState,
-  SnapshotWorktreeEntry,
+import {
+  DAEMON_PROTOCOL_REV,
+  type DaemonEventFrame,
+  type DaemonOp,
+  type InboxItem,
+  type RpcRequest,
+  type RpcResponse,
+  type SessionAttachControl,
+  type SessionControlPayload,
+  type SessionControlReason,
+  type SessionControlState,
+  type SnapshotWorktreeEntry,
 } from "../protocol/daemon-rpc.js";
 import { attachDaemonReader, writeDaemonMessage } from "../protocol/frames.js";
 import { buildGoalDetailDisplay, buildGoalsTableDisplay, reconcileGoalWithLiveRun, summarizeToolDisplay } from "../protocol/tool-display.js";
@@ -71,6 +61,15 @@ import { PiRunner } from "../runners/pi-runner.js";
 import { canonicalPath, runGit } from "../worktree/manager.js";
 import { parseValidatedSshTarget, PeerManager, type PeerIdentity, type PeerLink, type RemoteHostStatus } from "./peer.js";
 import { PtyHost } from "./pty-host.js";
+import { currentRelease } from "./release.js";
+
+export { DAEMON_PROTOCOL_REV };
+
+function parseAttachControl(raw: unknown): SessionAttachControl {
+  if (raw === undefined) return "take";
+  if (raw === "take" || raw === "view") return raw;
+  throw new Error(`Invalid control mode "${String(raw)}". Expected "take" or "view".`);
+}
 
 const SESSION_READ_ONLY_ERROR =
   "Session is read-only here: another terminal has control. Take control first (Ctrl+Y or /take).";
@@ -1208,6 +1207,13 @@ export class HarnessDaemon {
     if (this.chatBindings.get(id) !== socket) throw new Error(SESSION_READ_ONLY_ERROR);
   }
 
+  private chatHistoryThrough(chatSessionId: string): number {
+    const row = this.db.db
+      .prepare("SELECT COALESCE(MAX(seq), 0) AS historyThrough FROM chat_turns WHERE chat_session_id = ?")
+      .get(chatSessionId) as { historyThrough: number };
+    return row.historyThrough;
+  }
+
   private sendChatEvent(
     chatSessionId: string,
     turnId: string,
@@ -1218,13 +1224,14 @@ export class HarnessDaemon {
     if (this.chatTurns.get(chatSessionId)?.id !== turnId) return;
     const viewers = this.chatViewers(chatSessionId);
     if (viewers.length === 0) return;
+    const extra = type === "chat.turn.end" ? { historyThrough: this.chatHistoryThrough(chatSessionId) } : {};
     const frame: DaemonEventFrame = {
       kind: "event",
       seq: 0,
       runId: chatSessionId,
       taskId: chatSessionId,
       type,
-      payload: { ...payload, chatSessionId, turnId },
+      payload: { ...payload, ...extra, chatSessionId, turnId },
       createdAt: Date.now(),
     };
     for (const target of viewers) {
@@ -1249,7 +1256,11 @@ export class HarnessDaemon {
     return { history, historyNext: last < historyThrough ? last : null, historyThrough };
   }
 
-  private bindChatSocket(socket: Socket, chatSessionId: string): { tookOver: boolean } {
+  private bindChatSocket(
+    socket: Socket,
+    chatSessionId: string,
+    control: SessionAttachControl = "take",
+  ): { tookOver: boolean } {
     if (socket.destroyed) throw new Error("Chat connection closed");
     const id = this.resolveChatSessionId(chatSessionId);
     this.cancelIdleShutdown();
@@ -1258,20 +1269,30 @@ export class HarnessDaemon {
       this.unbindSocketSession(socket);
     }
     const prev = this.chatBindings.get(id);
-    const tookOver = Boolean(prev && prev !== socket);
-    this.chatBindings.set(id, socket);
+    let tookOver = false;
+    if (control === "take") {
+      tookOver = Boolean(prev && prev !== socket);
+      this.chatBindings.set(id, socket);
+    }
     this.socketToChatId.set(socket, id);
     this.chatSubscribers.add(socket);
     this.tuiSockets.add(socket);
-    this.director.chats.touchSession(id);
-    if (prev !== socket) {
-      this.bumpControlSeq("chat", id);
-      this.broadcastControl("chat", id, "attached", socket);
+    if (control === "take") {
+      this.director.chats.touchSession(id);
+      if (prev !== socket) {
+        this.bumpControlSeq("chat", id);
+        this.broadcastControl("chat", id, "attached", socket);
+      }
     }
     return { tookOver };
   }
 
-  private bindRunSocket(socket: Socket, runId: string, taskId: string | null): { tookOver: boolean } {
+  private bindRunSocket(
+    socket: Socket,
+    runId: string,
+    taskId: string | null,
+    control: SessionAttachControl = "take",
+  ): { tookOver: boolean } {
     if (socket.destroyed) throw new Error("Run connection closed");
     const id = this.resolveRunId(runId);
     this.cancelIdleShutdown();
@@ -1280,12 +1301,15 @@ export class HarnessDaemon {
       this.unbindSocketSession(socket);
     }
     const prev = this.runBindings.get(id);
-    const tookOver = Boolean(prev && prev !== socket);
-    this.runBindings.set(id, socket);
+    let tookOver = false;
+    if (control === "take") {
+      tookOver = Boolean(prev && prev !== socket);
+      this.runBindings.set(id, socket);
+    }
     const boundAtSeq = this.db.getLatestEventSeq();
     this.attachments.set(socket, { id: randomBytes(8).toString("hex"), boundAtSeq, throughSeq: boundAtSeq, socket, runId: id, taskId });
     this.tuiSockets.add(socket);
-    if (prev !== socket) {
+    if (control === "take" && prev !== socket) {
       this.bumpControlSeq("run", id);
       this.broadcastControl("run", id, "attached", socket);
     }
@@ -2075,6 +2099,7 @@ export class HarnessDaemon {
     switch (req.op) {
       case "ping": {
         const live = this.getLiveWorkSummary();
+        const release = currentRelease();
         return {
           pong: true,
           pid: process.pid,
@@ -2082,7 +2107,9 @@ export class HarnessDaemon {
           hostName: this.peers.localHostName,
           uptimeMs: Date.now() - this.startedAt,
           protocolRev: DAEMON_PROTOCOL_REV,
-          buildId: currentDaemonBuildId(),
+          releaseId: release.releaseId,
+          releaseDir: release.releaseDir,
+          lifecycle: "serving",
           running: live.running,
           liveWork: live.description,
           remotes: this.listRemoteStatuses(),
@@ -2095,12 +2122,17 @@ export class HarnessDaemon {
         }, 25).unref();
         return { shuttingDown: true, pid: process.pid };
 
-      case "status":
+      case "status": {
+        const release = currentRelease();
         return {
           pid: process.pid,
           nodeId: this.nodeId,
           hostName: this.peers.localHostName,
           uptimeMs: Date.now() - this.startedAt,
+          protocolRev: DAEMON_PROTOCOL_REV,
+          releaseId: release.releaseId,
+          releaseDir: release.releaseDir,
+          lifecycle: "serving",
           socketPath: this.config.socketPath,
           configPath: join(this.config.stateDir, "config.json"),
           configWarnings: [...this.globalConfigWarnings, ...this.repoConfigWarnings],
@@ -2121,6 +2153,7 @@ export class HarnessDaemon {
           profiles: this.config.profiles.map((pr) => ({ id: pr.id, kind: pr.kind, billing: pr.billing, enabled: pr.enabled !== false })),
           remotes: this.listRemoteStatuses(),
         };
+      }
 
       case "remote.list":
         return this.listRemoteStatuses();
@@ -2406,6 +2439,7 @@ export class HarnessDaemon {
       }
 
       case "chat.open": {
+        const control = parseAttachControl(p.control);
         const requestedProjectRef = typeof p.projectId === "string" && p.projectId.trim() ? p.projectId.trim() : undefined;
         const explicitProject = requestedProjectRef ? this.db.projects.resolveProject(requestedProjectRef) : null;
         if (requestedProjectRef && !explicitProject) {
@@ -2452,11 +2486,9 @@ export class HarnessDaemon {
         if (boundProject) this.db.projects.touchProject(boundProject.id);
         session = await this.director.resolveOrMigrateSessionModel(session);
 
-        const { tookOver } = this.bindChatSocket(socket, session.id);
+        const { tookOver } = this.bindChatSocket(socket, session.id, control);
         const turn = this.chatTurns.get(session.id);
-        const { historyThrough } = this.db.db.prepare(
-          "SELECT COALESCE(MAX(seq), 0) AS historyThrough FROM chat_turns WHERE chat_session_id = ?",
-        ).get(session.id) as { historyThrough: number };
+        const historyThrough = this.chatHistoryThrough(session.id);
         return {
           session,
           project: boundProject,
@@ -3034,13 +3066,14 @@ export class HarnessDaemon {
       }
 
       case "attach": {
+        const control = parseAttachControl(p.control);
         const rawRunId = String(p.runId);
         const run = this.db.getRun(rawRunId);
         const runId = run?.id ?? rawRunId.trim();
         const rawTaskId = typeof p.taskId === "string" && p.taskId.trim() ? p.taskId.trim() : null;
         const taskId = rawTaskId ? (this.db.getTask(rawTaskId)?.id ?? rawTaskId) : null;
         const sinceSeq = typeof p.sinceSeq === "number" ? p.sinceSeq : 0;
-        const { tookOver } = this.bindRunSocket(socket, runId, taskId);
+        const { tookOver } = this.bindRunSocket(socket, runId, taskId, control);
         const attachment = this.attachments.get(socket)!;
         const page = this.db.getReplayPage(runId, taskId, { sinceSeq, payloadOffset: 0 }, attachment.boundAtSeq);
         attachment.next = page.next;

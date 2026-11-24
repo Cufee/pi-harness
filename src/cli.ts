@@ -1,22 +1,23 @@
 #!/usr/bin/env bun
-import { spawn } from "node:child_process";
-import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, resolve } from "node:path";
 import type { Terminal } from "@earendil-works/pi-tui";
 import { ControlPlaneDb, type EscalationRecord } from "./control-plane/db.js";
 import { findProjectContainingPath, type ProjectBrowseResult, type ProjectSummary } from "./control-plane/projects.js";
 import { ensureTempDir, loadConfig, type AcpProfileConfig } from "./config.js";
 import { loadOrCreateNodeId } from "./control-plane/session-messages.js";
 import { qualifyRemoteCliHints } from "./protocol/chat-events.js";
+import { ensureLocalDaemon, stopLocalDaemon } from "./daemon/launch.js";
 import type { RemoteHostStatus } from "./daemon/peer.js";
 import { DaemonClient, runStdioSocketBridge } from "./daemon/remote.js";
-import { currentDaemonBuildId, DAEMON_PROTOCOL_REV, HarnessDaemon } from "./daemon/server.js";
+import { HarnessDaemon } from "./daemon/server.js";
 import { runDirectorChatTui, runNativeScrollbackTui, type TuiExitAction } from "./tui/app.js";
 import { parseDurationMs } from "./tui/core/index.js";
 import { type FederatedProjectSummary, pickProjectTui } from "./tui/projects.js";
 import type { AttachableSession } from "./tui/store.js";
+
+export { ensureLocalDaemon };
 
 const BOOLEAN_SHORT_FLAGS = new Set(["h"]);
 const BOOLEAN_LONG_FLAGS = new Set([
@@ -176,136 +177,6 @@ async function handleResumeCommand(
   // Hints in the daemon's message name its own CLI; qualify them so they reach the same remote daemon.
   const resultMessage = typeof rawMessage === "string" ? qualifyRemoteCliHints(rawMessage, remoteSelector) : rawMessage;
   console.log(JSON.stringify({ ...(outcome !== undefined ? { outcome, message: resultMessage } : {}), ...rest }, null, 2));
-}
-
-async function stopLocalDaemon(socketPath: string): Promise<boolean> {
-  const probe = new DaemonClient(socketPath);
-  try {
-    await probe.connect();
-    const info = (await probe.request("ping")) as { pid?: number };
-    await probe.request("daemon.shutdown").catch(() => {});
-    probe.close();
-    // Fallback SIGTERM if older daemon didn't recognize `daemon.shutdown`
-    if (typeof info.pid === "number" && info.pid > 0) {
-      await new Promise((r) => setTimeout(r, 120));
-      try {
-        process.kill(info.pid, "SIGTERM");
-      } catch {
-        // already exited
-      }
-    }
-    return true;
-  } catch {
-    probe.close();
-    return false;
-  }
-}
-
-export async function ensureLocalDaemon(socketPath: string): Promise<DaemonClient> {
-  const expectedBuildId = currentDaemonBuildId();
-  const probe = new DaemonClient(socketPath);
-  let needsRestart = false;
-  let busyMismatchError: Error | null = null;
-  try {
-    await probe.connect();
-    const info = (await probe.request("ping")) as {
-      pid?: number;
-      protocolRev?: number;
-      buildId?: string;
-      running?: boolean;
-      liveWork?: string;
-    };
-    if (info.protocolRev === DAEMON_PROTOCOL_REV && info.buildId === expectedBuildId) {
-      // Reuse the live socket directly — avoids a redundant connect/close handshake on every TUI launch!
-      return probe;
-    }
-    if (info.protocolRev !== DAEMON_PROTOCOL_REV && info.running !== false) {
-      probe.close();
-      busyMismatchError = new Error(
-        `Live harnessd (pid ${info.pid ?? "?"}, protocol rev ${info.protocolRev ?? "?"}) has active or unknown work (${info.liveWork ?? "active"}) and will not be stopped automatically for protocol rev ${DAEMON_PROTOCOL_REV}. Wait for work to finish or run \`pi-harness daemon restart\` explicitly.`,
-      );
-    } else if (info.protocolRev === DAEMON_PROTOCOL_REV && info.running !== false) {
-      // Never kill an active daemon with running agents/timers just because source file mtime changed
-      console.error(
-        `[pi-harness] Reusing live harnessd (pid ${info.pid ?? "?"}) despite build change because work is active (${info.liveWork ?? "active"}).`,
-      );
-      return probe;
-    } else {
-      probe.close();
-      needsRestart = true;
-      // Gracefully stop idle outdated daemon so newly built code takes over immediately
-      await stopLocalDaemon(socketPath);
-    }
-  } catch {
-    probe.close();
-  }
-
-  if (busyMismatchError) {
-    throw busyMismatchError;
-  }
-
-  if (needsRestart) {
-    await new Promise((r) => setTimeout(r, 150));
-  }
-
-  // Spawn detached persistent `harnessd` so closing any terminal never stops running agents.
-  // Redirect daemon output to `<stateDir>/daemon.log` so diagnostics are always preserved.
-  const cliPath = fileURLToPath(import.meta.url);
-  const logDir = dirname(socketPath);
-  mkdirSync(logDir, { recursive: true });
-  const logPath = join(logDir, "daemon.log");
-  const logFd = openSync(logPath, "a");
-  const logStart = fstatSync(logFd).size;
-  let exitStatus: string | null = null;
-  try {
-    const child = spawn(process.execPath, [cliPath, "daemon", "serve"], {
-      detached: true,
-      stdio: ["ignore", logFd, logFd],
-    });
-    child.once("exit", (code, signal) => {
-      exitStatus = signal ?? String(code);
-    });
-    child.unref();
-  } finally {
-    closeSync(logFd);
-  }
-
-  for (let i = 0; i < 40; i++) {
-    await new Promise((r) => setTimeout(r, 80));
-    if (existsSync(socketPath)) {
-      const check = new DaemonClient(socketPath);
-      try {
-        await check.connect();
-        const info = (await check.request("ping")) as { buildId?: string };
-        if (info.buildId === expectedBuildId) return check;
-        check.close();
-      } catch {
-        check.close();
-      }
-    }
-    // A socket file means another daemon may still be coming up, so keep polling after our spawn exits.
-    if (exitStatus !== null && !existsSync(socketPath)) throw exitError(exitStatus);
-  }
-  if (exitStatus !== null) throw exitError(exitStatus);
-  throw new Error(`Timed out waiting for harnessd to listen on ${socketPath}`);
-
-  function exitError(status: string): Error {
-    let logged = "";
-    try {
-      const fd = openSync(logPath, "r");
-      try {
-        const end = fstatSync(fd).size;
-        const start = Math.max(logStart, end - 16384);
-        const buf = Buffer.alloc(Math.max(0, end - start));
-        logged = buf.subarray(0, readSync(fd, buf, 0, buf.length, start)).toString("utf8").trim().slice(-2000);
-      } finally {
-        closeSync(fd);
-      }
-    } catch {
-      // An unreadable log must not hide the exit status.
-    }
-    return new Error(`harnessd exited (${status}) before listening on ${socketPath}: ${logged || `no output in ${logPath}`}`);
-  }
 }
 
 function resolveRemoteSpec(
