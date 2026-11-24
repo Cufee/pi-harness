@@ -35,6 +35,7 @@ import {
 import { loadOrCreateNodeId, parseSessionAddress, type SessionMessageRecord } from "../control-plane/session-messages.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { summarizeCost } from "../cost/ledger.js";
+import { GOAL_VERIFICATION_IDLE_NOTE } from "../director/goal-get.js";
 import { DirectorRuntime, StaleWakeEventError } from "../director/runtime.js";
 import { parseGoalCriterionPatches, type GoalCriterion } from "../goals/engine.js";
 import {
@@ -3642,18 +3643,52 @@ export class HarnessDaemon {
         };
       }
 
-      case "goal.amend":
-        return await this.director.amendGoal(String(p.goalId), {
-          rationale: String(p.rationale ?? "Amended by user"),
+      case "goal.amend": {
+        const goalId = String(p.goalId);
+        const rationale = String(p.rationale ?? "Amended by user");
+        const hasMaxReviewCycles = p.maxReviewCycles !== undefined;
+        const hasMaxNoProgressCycles = p.maxNoProgressCycles !== undefined;
+        const hasBudgetPatch = hasMaxReviewCycles || hasMaxNoProgressCycles;
+        const budgetPatch = {
+          ...(hasMaxReviewCycles
+            ? { maxReviewCycles: typeof p.maxReviewCycles === "number" ? p.maxReviewCycles : Number.NaN }
+            : {}),
+          ...(hasMaxNoProgressCycles
+            ? {
+                maxNoProgressCycles:
+                  typeof p.maxNoProgressCycles === "number" ? p.maxNoProgressCycles : Number.NaN,
+              }
+            : {}),
+        };
+        const updateCriteria = parseGoalCriterionPatches(p.updateCriteria);
+        const hasContractPatch =
+          typeof p.title === "string" ||
+          typeof p.description === "string" ||
+          typeof p.appendDescription === "string" ||
+          (Array.isArray(p.addCriteria) && p.addCriteria.length > 0) ||
+          (updateCriteria !== undefined && updateCriteria.length > 0) ||
+          (Array.isArray(p.removeCriteriaIds) && p.removeCriteriaIds.length > 0) ||
+          Array.isArray(p.nonGoals);
+        if (hasBudgetPatch && !hasContractPatch) {
+          return await this.director.amendGoalBudgets(goalId, budgetPatch, rationale, { source: "user" });
+        }
+        const budgetsBefore = hasBudgetPatch ? this.director.goals.updateBudgets(goalId, budgetPatch).before : undefined;
+        const amended = await this.director.amendGoal(goalId, {
+          rationale,
           title: typeof p.title === "string" ? p.title : undefined,
           description: typeof p.description === "string" ? p.description : undefined,
           appendDescription: typeof p.appendDescription === "string" ? p.appendDescription : undefined,
           confirmReplaceDescription: p.confirmReplaceDescription === true ? true : undefined,
           addCriteria: Array.isArray(p.addCriteria) ? (p.addCriteria as GoalCriterion[]) : undefined,
-          updateCriteria: parseGoalCriterionPatches(p.updateCriteria),
+          updateCriteria,
           removeCriteriaIds: Array.isArray(p.removeCriteriaIds) ? (p.removeCriteriaIds as string[]) : undefined,
           nonGoals: Array.isArray(p.nonGoals) ? (p.nonGoals as string[]) : undefined,
         }, { source: "user" });
+        return {
+          ...amended,
+          ...(budgetsBefore ? { budgetsBefore, budgetsAfter: amended.goal.budgets } : {}),
+        };
+      }
 
       case "goal.list":
         return this.director.goals
@@ -3681,7 +3716,22 @@ export class HarnessDaemon {
           );
         }
         const acceptOverrides = reviews.filter((r) => r.source === "director_accept_override");
-        return { goal: g, reviews, acceptOverrides, tasks, escalations, activity, display };
+        const activeVerification = this.director.getActiveVerification(g.id);
+        const verificationNote =
+          (g.status === "verifying" || g.status === "reviewing") && activeVerification === null
+            ? GOAL_VERIFICATION_IDLE_NOTE
+            : undefined;
+        return {
+          goal: g,
+          reviews,
+          acceptOverrides,
+          tasks,
+          escalations,
+          activity,
+          activeVerification,
+          ...(verificationNote !== undefined ? { verificationNote } : {}),
+          display,
+        };
       }
 
       case "goal.table_display": {
@@ -3860,31 +3910,25 @@ export class HarnessDaemon {
       case "run.resume": {
         const runId = this.resolveRunId(String(p.runId));
         this.requireRunControlIfViewer(socket, runId);
-        this.director.assertRunGoalNotTerminal(runId);
-        const priorRunStatus = this.orchestrator.getEffectiveRun(runId)?.status;
-        const res = await this.orchestrator.resumeRun(runId, {
+        return await this.director.resumeRunDetailed(runId, {
           trigger: "manual",
           userMessage: typeof p.message === "string" && p.message.trim() ? p.message.trim() : undefined,
           note: typeof p.note === "string" && p.note.trim() ? p.note.trim() : undefined,
         });
-        this.director.onRunResumed(runId, priorRunStatus, res.outcome === "resumed");
-        return res;
       }
 
       case "task.resume": {
-        const taskBefore = this.db.getTask(String(p.taskId));
+        const taskId = String(p.taskId);
+        const taskBefore = this.db.getTask(taskId);
         if (taskBefore) {
           this.requireRunControlIfViewer(socket, taskBefore.runId);
-          this.director.assertRunGoalNotTerminal(taskBefore.runId);
         }
-        const priorRunStatus = taskBefore ? this.orchestrator.getEffectiveRun(taskBefore.runId)?.status : undefined;
-        const res = await this.orchestrator.resumeTaskDetailed(String(p.taskId), {
+        const res = await this.director.resumeTaskForCaller(taskId, {
           note: typeof p.note === "string" ? p.note : undefined,
           model: typeof p.model === "string" ? p.model : undefined,
           effort: typeof p.effort === "string" ? p.effort : undefined,
           profileId: typeof p.profileId === "string" ? p.profileId : undefined,
         });
-        this.director.onRunResumed(res.task.runId, priorRunStatus, res.outcome === "resumed");
         return {
           resumed: res.outcome === "resumed",
           task: res.task,
@@ -3894,6 +3938,7 @@ export class HarnessDaemon {
           ...(res.queuePosition !== undefined ? { queuePosition: res.queuePosition } : {}),
           ...(res.noteDelivered !== undefined ? { noteDelivered: res.noteDelivered } : {}),
           ...(res.noteDelivery ? { noteDelivery: res.noteDelivery } : {}),
+          ...(res.goalId ? { goalId: res.goalId, goalStatus: res.goalStatus } : {}),
         };
       }
 
@@ -4065,6 +4110,7 @@ export class HarnessDaemon {
             goal,
             reviews: this.director.goals.listReviews(goal.id),
             revisions: this.director.goals.listRevisions(goal.id),
+            activeVerification: this.director.getActiveVerification(goal.id),
           })),
           runs: runEntries,
           escalations,
