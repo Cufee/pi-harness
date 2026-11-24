@@ -147,10 +147,10 @@ export function blockSourceText(block: TranscriptBlock): string {
     case "tool_output":
       return JSON.stringify(block.display, null, 2);
     case "tool_note":
-      return block.text || "tool output";
+      return block.text;
     case "receipt": {
       const tag = block.tag ? `[${block.tag}] ` : "";
-      return `${tag}${block.text}`.trim();
+      return `${tag}${block.text}`;
     }
     case "rows":
       return block.copy;

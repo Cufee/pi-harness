@@ -44,6 +44,7 @@ export function parseMouseEvents(data: string): ScreenMouseEvent[] {
 
 /** Extracts net wheel delta (negative = up, positive = down) from SGR mouse sequences. */
 export function parseMouseWheel(data: string): { delta: number; hadMouse: boolean } {
+  if (data.includes("\x1b[200~")) return { delta: 0, hadMouse: false };
   let delta = 0;
   let hadMouse = false;
   SGR_MOUSE_RX.lastIndex = 0;

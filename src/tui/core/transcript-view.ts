@@ -298,8 +298,13 @@ export class TranscriptView {
     const entry = this.entryById(anchor.blockId);
     if (entry) {
       const count = entry.rows.length;
+      if (this.lastContentWidth === anchor.widthAtCapture) {
+        anchor.rowsAtCapture = count;
+        this.viewport.offset = entry.start + Math.max(0, Math.min(count - 1, anchor.row));
+        return;
+      }
       const mapped =
-        this.lastContentWidth === anchor.widthAtCapture || count === anchor.rowsAtCapture
+        count === anchor.rowsAtCapture
           ? Math.min(count - 1, anchor.row)
           : Math.min(count - 1, Math.floor((anchor.row * count) / Math.max(1, anchor.rowsAtCapture)));
       this.viewport.offset = entry.start + Math.max(0, mapped);
@@ -790,7 +795,8 @@ export class TranscriptView {
 
     if (ev.type === "press") {
       if (ev.button !== "left") return;
-      if (ev.y < 0 || ev.y >= this.lastDrawnRows || ev.x < 0 || ev.x >= this.lastInnerWidth) return;
+      const contentEnd = Math.min(this.lastInnerWidth, 2 + this.lastContentWidth);
+      if (ev.y < 0 || ev.y >= this.lastDrawnRows || ev.x < 2 || ev.x >= contentEnd) return;
       const globalRow = this.viewport.offset + ev.y;
       if (globalRow < 0 || globalRow >= this.totalRows) return;
       const pos = this.globalRowToPos(globalRow);
