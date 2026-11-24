@@ -90,9 +90,11 @@ Every other key can come from `.pi-harness.json`, including `profiles`, `externa
 | `rollover.externalizeBytes` | `2048` | Validated (positive integer) but read by no runtime component; Code Mode spilling uses `codeExec.maxOutputChars`. |
 | `rollover.maxGenerations` | `12` | Generation cap per task to stop unbounded rollover loops (positive integer). |
 
-#### Scope checks
+#### Scope checks and Tier 3 context compaction
 
-Instead of turn caps, the harness runs an advisory scope check on Tier 3 tasks (`src/runners/scope-nudge.ts`). It observes completed tool calls for widening across unrelated workspace areas and search topics, or repeated/stale reads (never raw turn or token counts), and steers the task to return a partial handoff (`partial: true` or `scope_too_large` with proposed splits) when scope keeps expanding. Long bounded reads for a single question continue uninterrupted and rely on compaction.
+Instead of turn caps, the harness runs an advisory scope check on Tier 3 tasks (`src/runners/scope-nudge.ts`). It observes completed tool calls for widening across unrelated workspace areas and search topics, or repeated/stale reads (never raw turn or token counts), and steers the task to return a partial handoff (`partial: true` or `scope_too_large` with proposed splits) when scope keeps expanding.
+
+Tier 3 tasks receive no orchestrator rollover threshold and do not use anchored multi-generation rollover (`request_rollover` remains Tier 1/2 only). On the Pi runner (`src/runners/pi-runner.ts`), Tier 3 tasks compact earlier message history in place when context utilization reaches `DEFAULT_TASK_COMPACTION_THRESHOLD` (`0.78` in `src/config.ts`, or an explicit `rolloverThreshold` passed on the run request) and also compact and retry in place on context-overflow responses, preserving the initial prompt, pending steers, and recent turn context so long bounded reads for a single question continue uninterrupted. On ACP runners, Tier 3 tasks rely on adapter-managed context handling (the Claude ACP adapter still disables native auto-compaction until Tier 3 forwarding is wired in `acp-runner.ts`).
 
 ### `worktree`
 
