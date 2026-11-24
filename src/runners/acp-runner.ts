@@ -406,6 +406,7 @@ export class AcpRunner {
       systemPrompt: req.systemPrompt,
       toolPolicy: req.toolPolicy,
       allowShellInReadOnly: Boolean(req.allowShellInReadOnly),
+      tier: req.tier,
     });
     if ((allowShell || !controlOnly) && req.extraPathDirs?.length) {
       const existingPath = prepared.env.PATH ?? process.env.PATH ?? "";
@@ -484,6 +485,8 @@ export class AcpRunner {
       pendingCost = undefined;
       req.callbacks.onUsage?.(lastUsage);
     };
+    // Tier 3 task agents compact in place rather than using anchored multi-generation rollover.
+    const rolloverThreshold = req.tier === 3 ? undefined : req.rolloverThreshold;
     let rolloverTriggered = false;
     let rolloverWarningSent = false;
     let wrapUpAttempted = false;
@@ -837,21 +840,21 @@ export class AcpRunner {
           }
 
           const ratio = size > 0 ? used / size : 0;
-          const softWarnThreshold = req.rolloverThreshold ? Math.max(0.5, req.rolloverThreshold - 0.12) : undefined;
+          const softWarnThreshold = rolloverThreshold ? Math.max(0.5, rolloverThreshold - 0.12) : undefined;
           if (
             !rolloverWarningSent &&
             !rolloverTriggered &&
             softWarnThreshold &&
-            req.rolloverThreshold &&
+            rolloverThreshold &&
             ratio >= softWarnThreshold &&
-            ratio < req.rolloverThreshold &&
+            ratio < rolloverThreshold &&
             sessionId &&
             activeConnection &&
             (steeringSupported || isAmpProfile)
           ) {
             rolloverWarningSent = true;
             const pct = Math.round(ratio * 100);
-            const limitPct = Math.round(req.rolloverThreshold * 100);
+            const limitPct = Math.round(rolloverThreshold * 100);
             sendSteeringText(
               `Context usage is at ${pct}% (hard rollover at ${limitPct}%). Finish your current atomic step and call \`request_rollover\` with a thorough anchored handoff (goal_invariants, architectural_decisions, active_risks, next_actions) so no context is lost.`,
             );
@@ -859,9 +862,9 @@ export class AcpRunner {
 
           if (
             !rolloverTriggered &&
-            req.rolloverThreshold &&
+            rolloverThreshold &&
             size > 0 &&
-            ratio >= req.rolloverThreshold &&
+            ratio >= rolloverThreshold &&
             sessionId &&
             activeConnection
           ) {
@@ -1399,6 +1402,7 @@ export class AcpRunner {
         systemPrompt: req.systemPrompt,
         toolPolicy: req.toolPolicy,
         allowShellInReadOnly: Boolean(req.allowShellInReadOnly),
+        tier: req.tier,
         model: req.model,
         effort: req.effort,
         mcpServers,
@@ -1680,7 +1684,7 @@ export class AcpRunner {
           };
           if (!hadUsageUpdate) {
             req.callbacks.onUsage?.(lastUsage);
-            if (!rolloverTriggered && req.rolloverThreshold && size > 0 && used / size >= req.rolloverThreshold) {
+            if (!rolloverTriggered && rolloverThreshold && size > 0 && used / size >= rolloverThreshold) {
               rolloverTriggered = true;
             }
           }

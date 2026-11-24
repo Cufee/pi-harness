@@ -2,7 +2,7 @@ import { accessSync, constants, lstatSync, mkdtempSync, realpathSync, rmSync, st
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { ensureTempDir, type AcpAdapterKind, type AcpProfileConfig } from "../config.js";
-import type { ArtifactRecord } from "../control-plane/db.js";
+import type { AgentTier, ArtifactRecord } from "../control-plane/db.js";
 import { isProtectedWritePath } from "./protected-paths.js";
 import type { ToolPolicy } from "./types.js";
 
@@ -1026,6 +1026,7 @@ export function prepareAcpSpawn(
     systemPrompt: string;
     toolPolicy: ToolPolicy;
     allowShellInReadOnly?: boolean;
+    tier?: AgentTier;
   },
 ): PreparedAcpSpawn {
   if (profile.enabled === false) throw new Error(`Runner profile "${profile.id}" is disabled.`);
@@ -1044,8 +1045,16 @@ export function prepareAcpSpawn(
   let prependSystemPromptToTurn1 = false;
 
   if (profile.adapter === "claude") {
-    // Prevent silent auto-compaction so harness controls clean rollover via usage_update
-    env.DISABLE_COMPACT = "1";
+    if (opts.tier === 3) {
+      // Tier 3 tasks compact in place via Claude's native auto-compaction; strip any inherited
+      // DISABLE_COMPACT unless the profile explicitly configured it.
+      if (profile.env?.DISABLE_COMPACT === undefined) {
+        delete env.DISABLE_COMPACT;
+      }
+    } else {
+      // Prevent silent auto-compaction on Tier 1/2 so harness controls clean rollover via usage_update.
+      env.DISABLE_COMPACT = "1";
+    }
   } else if (profile.adapter === "codex") {
     // Block Codex's internal multi_agent subagents via BOTH CLI flag and CODEX_CONFIG JSON
     // (codex-acp v2.9+ reads features from CODEX_CONFIG and can otherwise shadow harness MCP from ~/.codex/config.toml).
@@ -1187,6 +1196,7 @@ export function buildNewSessionParams(
     systemPrompt: string;
     toolPolicy: ToolPolicy;
     allowShellInReadOnly?: boolean;
+    tier?: AgentTier;
     model: string;
     effort?: string | null;
     mcpServers: AcpMcpServerEntry[];
@@ -1250,7 +1260,8 @@ export function buildNewSessionParams(
       ...(opts.toolPolicy === "control_plane_only" ? {
         tools: ["ToolSearch"],
       } : {}),
-      settings: { autoCompactEnabled: false },
+      // Leave Claude native auto-compaction enabled for Tier 3 tasks; Tier 1/2 use harness-controlled rollover.
+      ...(opts.tier === 3 ? {} : { settings: { autoCompactEnabled: false } }),
     };
     claudeOptions.model = opts.model;
     if (effectiveEffort) claudeOptions.effort = effectiveEffort;
