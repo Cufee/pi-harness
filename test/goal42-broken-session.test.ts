@@ -307,4 +307,229 @@ describe("goal-42: broken ACP session detection (executor lost & unsolicited can
       rmSync(cwd, { recursive: true, force: true });
     }
   });
+
+  it("P1-1: does not trigger acp_executor_lost on successful Read/Grep log output or non-Amp profiles", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-g42-p1-1-"));
+    try {
+      // Case A: Amp profile Read & Grep succeeding with a line starting "Error: No executor is connected..."
+      let ampCancelCount = 0;
+      const fakeAmp = agent()
+        .onRequest("initialize", async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: "amp-acp", version: "0.12.0" },
+          agentCapabilities: { sessionCapabilities: {} },
+        } as never))
+        .onRequest("session/new", async () => ({
+          sessionId: "S-g42-p1-1-amp",
+          models: {
+            currentModelId: "anthropic/claude-opus-5-5",
+            availableModels: [{ modelId: "anthropic/claude-opus-5-5", name: "Opus" }],
+          },
+        } as never))
+        .onNotification("session/cancel", async () => {
+          ampCancelCount += 1;
+        })
+        .onRequest("session/prompt", async ({ client: acpClient }) => {
+          await acpClient.notify("session/update", {
+            sessionId: "S-g42-p1-1-amp",
+            update: { sessionUpdate: "tool_call", toolCallId: "tc-read-log", title: "Read", kind: "read", status: "in_progress" },
+          } as never);
+          await acpClient.notify("session/update", {
+            sessionId: "S-g42-p1-1-amp",
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: "tc-read-log",
+              status: "completed",
+              rawOutput:
+                "2026-11-24 incident log\n" +
+                "Error: No executor is connected to run mcp__harness__tree_view. Try again later.\n" +
+                "end of log\n",
+            },
+          } as never);
+          await acpClient.notify("session/update", {
+            sessionId: "S-g42-p1-1-amp",
+            update: { sessionUpdate: "tool_call", toolCallId: "tc-grep-log", title: "Grep", kind: "search", status: "in_progress" },
+          } as never);
+          await acpClient.notify("session/update", {
+            sessionId: "S-g42-p1-1-amp",
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: "tc-grep-log",
+              status: "completed",
+              content: [
+                {
+                  type: "content",
+                  content: {
+                    type: "text",
+                    text: "Error: No executor is connected to run mcp__harness__tree_view. Try again later.",
+                  },
+                },
+              ],
+            },
+          } as never);
+          await acpClient.notify("session/update", {
+            sessionId: "S-g42-p1-1-amp",
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Reviewed incident log." } },
+          } as never);
+          return { stopReason: "end_turn" } as never;
+        });
+
+      const ampRunner = new AcpRunner(AMP_PROFILE);
+      const ampRes = await ampRunner.run(
+        {
+          runId: "r-g42-p1-1-amp",
+          taskId: "t-g42-p1-1-amp",
+          tier: 2,
+          kind: "worker",
+          cwd,
+          toolPolicy: "read_write_workspace",
+          systemPrompt: "Worker",
+          initialPrompt: "Read incident log",
+          model: "anthropic/claude-opus-5-5",
+          tools: [],
+          executeTool: async () => ({}),
+          signal: new AbortController().signal,
+          callbacks: {},
+        },
+        fakeAmp,
+      );
+      assert.equal(ampCancelCount, 0, "successful Read/Grep of incident log must not send session/cancel");
+      assert.equal(ampRes.stopReason, "completed");
+      assert.equal(ampRes.errorCode, undefined);
+
+      // Case B: Non-Amp profile (Claude) must not trigger Amp executor-lost detection.
+      const claudeProfile: AcpProfileConfig = {
+        id: "acp:claude",
+        kind: "acp",
+        adapter: "claude",
+        command: "npx",
+        args: ["-y", "@zed-industries/claude-code-acp"],
+        billing: "subscription",
+      };
+      let claudeCancelCount = 0;
+      const fakeClaude = agent()
+        .onRequest("initialize", async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: "claude-code-acp", version: "0.1.0" },
+          agentCapabilities: { sessionCapabilities: {} },
+        } as never))
+        .onRequest("session/new", async () => ({
+          sessionId: "S-g42-p1-1-claude",
+          models: {
+            currentModelId: "anthropic/claude-opus-5-5",
+            availableModels: [{ modelId: "anthropic/claude-opus-5-5", name: "Opus" }],
+          },
+        } as never))
+        .onNotification("session/cancel", async () => {
+          claudeCancelCount += 1;
+        })
+        .onRequest("session/prompt", async ({ client: acpClient }) => {
+          await acpClient.notify("session/update", {
+            sessionId: "S-g42-p1-1-claude",
+            update: { sessionUpdate: "tool_call", toolCallId: "tc-claude-1", title: "mcp__harness__tree_view", status: "in_progress" },
+          } as never);
+          await acpClient.notify("session/update", {
+            sessionId: "S-g42-p1-1-claude",
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: "tc-claude-1",
+              status: "failed",
+              rawOutput: { error: "No executor is connected to run mcp__harness__tree_view. Try again later." },
+            },
+          } as never);
+          await acpClient.notify("session/update", {
+            sessionId: "S-g42-p1-1-claude",
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Continued after error." } },
+          } as never);
+          return { stopReason: "end_turn" } as never;
+        });
+
+      const claudeRunner = new AcpRunner(claudeProfile);
+      const claudeRes = await claudeRunner.run(
+        {
+          runId: "r-g42-p1-1-claude",
+          taskId: "t-g42-p1-1-claude",
+          tier: 2,
+          kind: "worker",
+          cwd,
+          toolPolicy: "read_write_workspace",
+          systemPrompt: "Worker",
+          initialPrompt: "Check tree",
+          model: "anthropic/claude-opus-5-5",
+          tools: [],
+          executeTool: async () => ({}),
+          signal: new AbortController().signal,
+          callbacks: {},
+        },
+        fakeClaude,
+      );
+      assert.equal(claudeCancelCount, 0, "non-Amp profile must not trigger Amp executor-lost cancellation");
+      assert.equal(claudeRes.stopReason, "completed");
+      assert.equal(claudeRes.errorCode, undefined);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("P2-2: does not classify cancelled turn as acp_executor_lost when permission request offered only reject_once", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-g42-p2-2-"));
+    try {
+      let promptCalls = 0;
+      let observedPermOutcome: unknown;
+      const fakeAmp = agent()
+        .onRequest("initialize", async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: "amp-acp", version: "0.12.0" },
+          agentCapabilities: { sessionCapabilities: {} },
+        } as never))
+        .onRequest("session/new", async () => ({
+          sessionId: "S-g42-p2-2",
+          models: {
+            currentModelId: "anthropic/claude-opus-5-5",
+            availableModels: [{ modelId: "anthropic/claude-opus-5-5", name: "Opus" }],
+          },
+        } as never))
+        .onRequest("session/prompt", async ({ client: acpClient }) => {
+          promptCalls += 1;
+          observedPermOutcome = await acpClient.request("session/request_permission", {
+            sessionId: "S-g42-p2-2",
+            toolCall: {
+              toolCallId: "tc-perm-only-reject",
+              title: "Read",
+              kind: "read",
+              rawInput: { path: join(cwd, "README.md") },
+            },
+            options: [{ optionId: "deny", name: "Reject once", kind: "reject_once" }],
+          } as never);
+          return { stopReason: "cancelled" } as never;
+        });
+
+      const runner = new AcpRunner(AMP_PROFILE);
+      const res = await runner.run(
+        {
+          runId: "r-g42-p2-2",
+          taskId: "t-g42-p2-2",
+          tier: 2,
+          kind: "worker",
+          cwd,
+          toolPolicy: "read_write_workspace",
+          systemPrompt: "Worker",
+          initialPrompt: "Read workspace file",
+          model: "anthropic/claude-opus-5-5",
+          tools: [],
+          executeTool: async () => ({}),
+          signal: new AbortController().signal,
+          callbacks: {},
+        },
+        fakeAmp,
+      );
+
+      assert.deepEqual(observedPermOutcome, { outcome: { outcome: "cancelled" } });
+      assert.equal(promptCalls, 1);
+      assert.equal(res.stopReason, "cancelled");
+      assert.equal(res.errorCode, undefined, "permission-cancelled turn must not be tagged as acp_executor_lost");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 });
