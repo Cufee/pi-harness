@@ -50,7 +50,6 @@ import {
   type DaemonLifecycle,
   type DaemonOp,
   type DaemonReloadParams,
-  type InboxItem,
   type ReloadStatus,
   type RpcRequest,
   type RpcResponse,
@@ -67,6 +66,7 @@ import { ensureOctofs, resolveExternalMcpServers, shouldStageOctofs } from "../t
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
 import { canonicalPath, runGit } from "../worktree/manager.js";
+import { classifyAttention } from "../visibility/index.js";
 import { HotUpdateController } from "./hot-update.js";
 import { parseValidatedSshTarget, PeerManager, type PeerIdentity, type PeerLink, type RemoteHostStatus } from "./peer.js";
 import { PtyHost } from "./pty-host.js";
@@ -1616,6 +1616,51 @@ export class HarnessDaemon {
       .prepare("SELECT chat_session_id FROM goals WHERE linked_run_id = ? AND chat_session_id IS NOT NULL ORDER BY updated_at DESC LIMIT 1")
       .get(runId) as { chat_session_id?: string | null } | undefined;
     return row?.chat_session_id ? String(row.chat_session_id) : null;
+  }
+
+  private assembleWorkSnapshotScope(scope: { chatSessionId?: string; repoRoot?: string; runId?: string }) {
+    const { chatSessionId, repoRoot, runId: filterRunId } = scope;
+    const goals = this.director.goals.listGoals({ repoRoot, chatSessionId }).map(reconcileGoalWithLiveRun);
+    const goalByRunId = new Map(goals.filter((g) => g.linkedRunId).map((g) => [g.linkedRunId!, g]));
+    const runIds = filterRunId
+      ? [filterRunId]
+      : chatSessionId
+        ? this.getRunIdsForChatSession(chatSessionId)
+        : this.db
+            .listRuns(500)
+            .filter((r) => !repoRoot || r.repoRoot === repoRoot)
+            .slice(0, 50)
+            .map((r) => r.id);
+    const runEntries = runIds
+      .map((id) => this.db.getRun(id))
+      .filter((r): r is NonNullable<typeof r> => r !== null)
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .map((raw) => {
+        // Read-only projection: derive the status in memory; never persist it from a snapshot.
+        const tasks = this.db.listTasks(raw.id);
+        const status = deriveRunStatus(raw, tasks, this.orchestrator.isRunActiveInMemory(raw.id));
+        const run = status === raw.status ? raw : { ...raw, status };
+        const escalations = this.db.listEscalations(run.id);
+        return {
+          run,
+          goalId: goalByRunId.get(run.id)?.id ?? null,
+          tasks,
+          escalations,
+          quotaPause: this.orchestrator.getRunQuotaStatus(run.id),
+          activity: buildRunActivitySummary(this.db, run.id),
+        };
+      });
+    const merges = this.db.listMergeQueue({ runIds, limit: 100 });
+    const messages = runIds.flatMap((id) => this.db.listMessagesForRun(id, 50));
+    const dismissals = this.db.listInboxDismissals();
+    const { inbox, internalAttention } = classifyAttention({
+      goals,
+      runs: runEntries,
+      merges,
+      messages,
+      dismissals,
+    });
+    return { goals, runIds, runEntries, merges, messages, inbox, internalAttention };
   }
 
   private fanoutEvent(ev: EventRecord): void {
@@ -3961,37 +4006,9 @@ export class HarnessDaemon {
         const chatSessionId = typeof p.chatSessionId === "string" && p.chatSessionId ? p.chatSessionId : undefined;
         const repoRoot = typeof p.repoRoot === "string" && p.repoRoot ? p.repoRoot : undefined;
         const filterRunId = typeof p.runId === "string" && p.runId ? p.runId : undefined;
-        const goals = this.director.goals.listGoals({ repoRoot, chatSessionId }).map(reconcileGoalWithLiveRun);
-        const goalByRunId = new Map(goals.filter((g) => g.linkedRunId).map((g) => [g.linkedRunId!, g]));
-        const runIds = filterRunId
-          ? [filterRunId]
-          : chatSessionId
-            ? this.getRunIdsForChatSession(chatSessionId)
-            : this.db
-                .listRuns(500)
-                .filter((r) => !repoRoot || r.repoRoot === repoRoot)
-                .slice(0, 50)
-                .map((r) => r.id);
+        const { goals, runIds, runEntries, merges, messages, inbox, internalAttention } =
+          this.assembleWorkSnapshotScope({ chatSessionId, repoRoot, runId: filterRunId });
         const runIdSet = new Set(runIds);
-        const runEntries = runIds
-          .map((id) => this.db.getRun(id))
-          .filter((r): r is NonNullable<typeof r> => r !== null)
-          .sort((a, b) => b.createdAt - a.createdAt)
-          .map((raw) => {
-            // Read-only projection: derive the status in memory; never persist it from a snapshot.
-            const tasks = this.db.listTasks(raw.id);
-            const status = deriveRunStatus(raw, tasks, this.orchestrator.isRunActiveInMemory(raw.id));
-            const run = status === raw.status ? raw : { ...raw, status };
-            const escalations = this.db.listEscalations(run.id);
-            return {
-              run,
-              goalId: goalByRunId.get(run.id)?.id ?? null,
-              tasks,
-              escalations,
-              quotaPause: this.orchestrator.getRunQuotaStatus(run.id),
-              activity: buildRunActivitySummary(this.db, run.id),
-            };
-          });
         // Always include all open/acked escalations without recency truncation, then append recent resolved ones
         const openEscs = this.db.listAllEscalations({ runIds, status: "open", limit: 500 });
         const ackedEscs = this.db.listAllEscalations({ runIds, status: "acked", limit: 500 });
@@ -4019,7 +4036,6 @@ export class HarnessDaemon {
             return true;
           })
           .slice(0, 100);
-        const merges = this.db.listMergeQueue({ runIds, limit: 100 });
         const rawLiveWorktrees = repoRoot
           ? await this.orchestrator.getWorktreeManager(repoRoot).listLive(filterRunId).catch(() => [])
           : [];
@@ -4041,129 +4057,6 @@ export class HarnessDaemon {
             orphaned: wt.orphaned,
             archiveRef: wt.record?.archiveRef ?? null,
           }));
-        const messages = runIds.flatMap((id) => this.db.listMessagesForRun(id, 50));
-
-        // Build severity-sorted Inbox of items needing human attention
-        const inbox: InboxItem[] = [];
-        for (const g of goals) {
-          if (g.status === "awaiting_human") {
-            inbox.push({
-              id: `inbox:goal:${g.id}`,
-              severity: "P0",
-              kind: "goal_awaiting_human",
-              title: `${g.id} (v${g.version}) awaits input: ${g.title}`,
-              detail: g.lastReviewSummary ?? "Goal paused awaiting human review or decision",
-              ref: { kind: "goal", id: g.id, runId: g.linkedRunId ?? undefined, label: `${g.id} ${g.title}` },
-              goalId: g.id,
-              runId: g.linkedRunId,
-              createdAt: g.updatedAt,
-            });
-          }
-        }
-        for (const re of runEntries) {
-          for (const e of re.escalations) {
-            // Only escalations a human must act on reach the inbox: open, human-addressed, and P0 or blocking.
-            // Filter from each run's full escalation list before the snapshot-level 500-row cap can hide older items.
-            if (e.status !== "open" || e.toTaskId !== null || !(e.severity === "P0" || e.blocking)) continue;
-            const owningGoal = goalByRunId.get(e.runId);
-            inbox.push({
-              id: `inbox:esc:${e.id}`,
-              severity: e.severity,
-              kind: "escalation",
-              title: `[${e.severity}/${e.category}] ${e.title}`,
-              detail: `from ${e.fromTaskId} in ${e.runId}${e.blocking ? " · blocking" : ""}`,
-              ref: { kind: "escalation", id: e.id, runId: e.runId, goalId: owningGoal?.id, label: `${e.id} ${e.title}` },
-              goalId: owningGoal?.id ?? null,
-              runId: e.runId,
-              taskId: e.fromTaskId,
-              createdAt: e.createdAt,
-            });
-          }
-        }
-        for (const re of runEntries) {
-          if (re.run.status === "paused_quota") {
-            inbox.push({
-              id: `inbox:quota:${re.run.id}`,
-              severity: re.quotaPause?.mode === "manual" ? "P0" : "P1",
-              kind: "quota_paused",
-              title: `${re.run.id} paused for quota`,
-              detail: re.quotaPause?.reason ?? "Quota limit reached",
-              ref: { kind: "run", id: re.run.id, goalId: re.goalId ?? undefined, label: re.run.id },
-              goalId: re.goalId,
-              runId: re.run.id,
-              createdAt: re.run.updatedAt,
-            });
-          } else if (re.run.status === "failed" && !re.run.id.startsWith("director-tasks-")) {
-            inbox.push({
-              id: `inbox:run:${re.run.id}`,
-              severity: "P1",
-              kind: "run_failed",
-              title: `${re.run.id} failed`,
-              detail: re.run.goal.split("\n")[0] ?? re.run.id,
-              ref: { kind: "run", id: re.run.id, goalId: re.goalId ?? undefined, label: re.run.id },
-              goalId: re.goalId,
-              runId: re.run.id,
-              createdAt: re.run.updatedAt,
-            });
-          }
-          // A Director bucket's task outcomes go to the Director through wait_tasks, not to the human.
-          if (isDirectorTaskContainer(re.run.id)) continue;
-          for (const t of re.tasks) {
-            if (t.status === "blocked" || (t.status === "failed" && re.run.status === "active")) {
-              inbox.push({
-                id: `inbox:task:${t.id}`,
-                severity: t.status === "blocked" ? "P1" : "P2",
-                kind: t.status === "blocked" ? "task_blocked" : "task_failed",
-                title: `${t.id} (${t.status}): ${t.title}`,
-                detail: t.summary ?? `${re.run.id} · T${t.tier}/${t.kind}`,
-                ref: { kind: "task", id: t.id, runId: re.run.id, goalId: re.goalId ?? undefined, label: `${t.id} ${t.title}` },
-                goalId: re.goalId,
-                runId: re.run.id,
-                taskId: t.id,
-                createdAt: t.updatedAt,
-              });
-            }
-          }
-        }
-        for (const m of merges) {
-          if (m.status === "conflict" || m.status === "ci_failed") {
-            const owningGoal = goalByRunId.get(m.runId);
-            inbox.push({
-              id: `inbox:merge:${m.id}`,
-              severity: "P1",
-              kind: "merge_bounced",
-              title: `Merge ${m.id} (${m.status}): ${m.branch}`,
-              detail: (m.log ?? "").split("\n")[0] ?? m.status,
-              ref: { kind: "merge", id: m.id, runId: m.runId, goalId: owningGoal?.id, label: m.id },
-              goalId: owningGoal?.id ?? null,
-              runId: m.runId,
-              taskId: m.taskId,
-              createdAt: m.finishedAt ?? m.createdAt,
-            });
-          }
-        }
-        for (const msg of messages) {
-          if (msg.status === "open") {
-            inbox.push({
-              id: `inbox:msg:${msg.id}`,
-              severity: "P2",
-              kind: "open_message",
-              title: `Open message ${msg.id} (${msg.fromTaskId} -> ${msg.toTaskId})`,
-              detail: msg.question.slice(0, 140),
-              ref: { kind: "message", id: msg.id, runId: msg.runId, label: msg.id },
-              runId: msg.runId,
-              taskId: msg.toTaskId,
-              createdAt: msg.createdAt,
-            });
-          }
-        }
-        const sevRank = { P0: 0, P1: 1, P2: 2, info: 3 };
-        // At equal severity an escalation (the concrete finding) precedes the derived items it causes, such as its
-        // goal awaiting a human after the run settled.
-        const kindRank = (item: InboxItem) => (item.kind === "escalation" ? 0 : 1);
-        inbox.sort(
-          (a, b) => sevRank[a.severity] - sevRank[b.severity] || kindRank(a) - kindRank(b) || b.createdAt - a.createdAt,
-        );
 
         return {
           generatedAt: Date.now(),
@@ -4180,7 +4073,43 @@ export class HarnessDaemon {
           worktrees,
           messages,
           inbox,
+          internalAttention,
         };
+      }
+
+      case "inbox.dismiss": {
+        const itemId = typeof p.itemId === "string" ? p.itemId.trim() : "";
+        const itemCreatedAt = typeof p.itemCreatedAt === "number" ? p.itemCreatedAt : Number.NaN;
+        if (!itemId || !Number.isFinite(itemCreatedAt)) {
+          throw new Error("inbox.dismiss requires itemId and numeric itemCreatedAt");
+        }
+        this.db.dismissInboxItem(itemId, itemCreatedAt);
+        return { dismissed: true };
+      }
+
+      case "inbox.restore": {
+        const itemId = typeof p.itemId === "string" ? p.itemId.trim() : "";
+        if (!itemId) {
+          throw new Error("inbox.restore requires itemId");
+        }
+        const restored = this.db.restoreInboxItem(itemId);
+        return { restored };
+      }
+
+      case "inbox.clear_stale": {
+        const chatSessionId = typeof p.chatSessionId === "string" && p.chatSessionId ? p.chatSessionId : undefined;
+        const repoRoot = typeof p.repoRoot === "string" && p.repoRoot ? p.repoRoot : undefined;
+        const filterRunId = typeof p.runId === "string" && p.runId ? p.runId : undefined;
+        const { inbox } = this.assembleWorkSnapshotScope({ chatSessionId, repoRoot, runId: filterRunId });
+        let dismissed = 0;
+        const now = Date.now();
+        for (const item of inbox) {
+          if (item.kind === "run_failed" || item.kind === "merge_bounced") {
+            this.db.dismissInboxItem(item.id, item.createdAt, now);
+            dismissed += 1;
+          }
+        }
+        return { dismissed };
       }
 
       case "watch.start":

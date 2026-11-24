@@ -642,6 +642,12 @@ CREATE TABLE IF NOT EXISTS cost_baselines (
   total REAL NOT NULL,
   PRIMARY KEY (profile_id, session_key, currency)
 );
+
+CREATE TABLE IF NOT EXISTS inbox_dismissals (
+  item_id TEXT PRIMARY KEY,
+  item_created_at INTEGER NOT NULL,
+  dismissed_at INTEGER NOT NULL
+);
 `;
 
 export class ControlPlaneDb {
@@ -2694,5 +2700,35 @@ export class ControlPlaneDb {
       this.emitEvent(rec.fromRunId, null, "peer.replied", rec);
       return rec;
     });
+  }
+
+  // ---- Inbox dismissals ----
+
+  dismissInboxItem(itemId: string, itemCreatedAt: number, dismissedAt = Date.now()): void {
+    this.db
+      .prepare(
+        `INSERT INTO inbox_dismissals(item_id, item_created_at, dismissed_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(item_id) DO UPDATE SET
+           item_created_at = excluded.item_created_at,
+           dismissed_at = excluded.dismissed_at`,
+      )
+      .run(itemId, itemCreatedAt, dismissedAt);
+  }
+
+  restoreInboxItem(itemId: string): boolean {
+    const res = this.db.prepare("DELETE FROM inbox_dismissals WHERE item_id = ?").run(itemId);
+    return res.changes > 0;
+  }
+
+  listInboxDismissals(): Map<string, number> {
+    const rows = this.db
+      .prepare("SELECT item_id, item_created_at FROM inbox_dismissals")
+      .all() as Array<{ item_id: string; item_created_at: number }>;
+    const map = new Map<string, number>();
+    for (const row of rows) {
+      map.set(row.item_id, row.item_created_at);
+    }
+    return map;
   }
 }

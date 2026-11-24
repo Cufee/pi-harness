@@ -169,6 +169,9 @@ export type DaemonOp =
   | "tree.get"
   | "runs.trees"
   | "work.snapshot"
+  | "inbox.dismiss"
+  | "inbox.restore"
+  | "inbox.clear_stale"
   | "watch.start"
   | "watch.stop"
   | "task.get"
@@ -237,6 +240,8 @@ export interface SnapshotWorktreeEntry {
   archiveRef: string | null;
 }
 
+export type AttentionAudience = "human" | "director" | "orchestrator" | "none";
+
 export interface InboxItem {
   id: string;
   severity: "P0" | "P1" | "P2" | "info";
@@ -256,6 +261,8 @@ export interface InboxItem {
   runId?: string | null;
   taskId?: string | null;
   createdAt: number;
+  audience?: AttentionAudience;
+  hiddenReason?: string;
 }
 
 /** `cost.get` params: the chat session, or the run whose owning session (or the run itself) is wanted. */

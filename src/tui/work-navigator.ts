@@ -81,6 +81,17 @@ interface WorkRowValue {
   quotaRunId?: string;
   quotaReason?: string | null;
   quotaResumeAt?: number | null;
+  inboxItem?: InboxItem;
+  isInternal?: boolean;
+  isDismissed?: boolean;
+}
+
+function formatInboxOpError(action: string, err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (msg.includes("Unknown daemon op")) {
+    return `${action} unavailable: ${msg}`;
+  }
+  return `${action} failed: ${msg}`;
 }
 
 /**
@@ -102,8 +113,7 @@ export class WorkNavigatorScreen implements Screen {
     private readonly deps: InspectorDeps,
     initialTab?: WorkTabId,
   ) {
-    this.activeTab =
-      initialTab ?? (deps.store.state.inbox.length > 0 ? "inbox" : "goals");
+    this.activeTab = initialTab ?? "goals";
     this.list = new TableListView<WorkRowValue>({ columns: TAB_COLUMNS[this.activeTab] });
   }
 
@@ -138,43 +148,70 @@ export class WorkNavigatorScreen implements Screen {
     this.list.setColumns(TAB_COLUMNS[this.activeTab]);
 
     if (this.activeTab === "inbox") {
+      const internalItems = snap.internalAttention ?? [];
+      const showInternal = this.deps.store.showInternal;
       this.list.emptyText = this.deps.store.lastError
         ? "Unable to load inbox — press 'r' to retry."
-        : "Inbox clear — no escalations, paused runs, or pending decisions.";
-      this.list.setTableItems(
-        snap.inbox.map((item: InboxItem) => {
-          const runEntry = item.runId ? this.deps.store.getRunEntry(item.runId) : undefined;
-          const cleanTitle = sanitizeLine(item.title).replace(/^\[P[0-2]\/[^\]]+\]\s*/i, "");
-          const kindLabel = item.kind.replace(/_/g, " ");
-          return {
-            id: item.id,
-            value: {
-              ref: {
-                kind: item.ref.kind,
-                id: item.ref.id,
-                runId: item.ref.runId,
-                goalId: item.ref.goalId,
-                label: item.ref.label ?? item.title,
-              },
-              quickResolveEscId: item.kind === "escalation" ? item.ref.id : undefined,
-              quotaRunId: item.kind === "quota_paused" ? (item.runId ?? item.ref.id) : undefined,
-              quotaReason: runEntry?.quotaPause?.reason ?? item.detail,
-              quotaResumeAt: runEntry?.quotaPause?.resumeAt ?? null,
+        : internalItems.length > 0 && !showInternal
+          ? `Inbox clear — ${internalItems.length} hidden internal item${internalItems.length === 1 ? "" : "s"} (press 'i' to show).`
+          : "Inbox clear — no escalations, paused runs, or pending decisions.";
+
+      const buildInboxRow = (item: InboxItem, isInternal: boolean) => {
+        const runEntry = item.runId ? this.deps.store.getRunEntry(item.runId) : undefined;
+        const cleanTitle = sanitizeLine(item.title).replace(/^\[P[0-2]\/[^\]]+\]\s*/i, "");
+        const kindLabel = item.kind.replace(/_/g, " ");
+        const isDismissed = isInternal && item.hiddenReason === "dismissed";
+        const reasonPrefix = item.hiddenReason
+          ? `[${item.hiddenReason}${item.audience && item.audience !== "none" ? ` · ${item.audience}` : ""}]`
+          : "[internal]";
+        const internalDetail = item.detail ? `${reasonPrefix} ${firstLine(item.detail, 48)}` : reasonPrefix;
+        return {
+          id: isInternal ? `internal:${item.id}` : item.id,
+          value: {
+            ref: {
+              kind: item.ref.kind,
+              id: item.ref.id,
+              runId: item.ref.runId,
+              goalId: item.ref.goalId,
+              label: item.ref.label ?? item.title,
             },
-            searchText: `${item.severity} ${item.kind} ${item.title} ${item.detail} ${item.goalId ?? ""} ${item.runId ?? ""}`,
-            cells: (sel, theme) => {
-              const sevTone = item.severity === "P0" ? "danger" : item.severity === "P1" ? "warn" : "info";
+            quickResolveEscId:
+              item.kind === "escalation" && item.hiddenReason !== "not_open" ? item.ref.id : undefined,
+            quotaRunId: item.kind === "quota_paused" ? (item.runId ?? item.ref.id) : undefined,
+            quotaReason: runEntry?.quotaPause?.reason ?? item.detail,
+            quotaResumeAt: runEntry?.quotaPause?.resumeAt ?? null,
+            inboxItem: item,
+            isInternal,
+            isDismissed,
+          },
+          searchText: `${item.severity} ${item.kind} ${item.title} ${item.detail} ${item.hiddenReason ?? ""} ${item.audience ?? ""} ${item.goalId ?? ""} ${item.runId ?? ""}`,
+          cells: (sel: boolean, theme: Theme) => {
+            if (isInternal) {
               return {
-                sev: tag(item.severity, sevTone, theme),
-                kind: theme.muted(kindLabel),
-                title: sel ? theme.accentBold(cleanTitle) : theme.bold(cleanTitle),
-                detail: theme.muted(firstLine(item.detail, 64)),
+                sev: theme.dim(item.severity),
+                kind: theme.dim(kindLabel),
+                title: sel ? theme.muted(cleanTitle) : theme.dim(cleanTitle),
+                detail: theme.dim(firstLine(internalDetail, 64)),
                 age: theme.dim(formatAge(item.createdAt)),
               };
-            },
-          };
-        }),
-      );
+            }
+            const sevTone = item.severity === "P0" ? "danger" : item.severity === "P1" ? "warn" : "info";
+            return {
+              sev: tag(item.severity, sevTone, theme),
+              kind: theme.muted(kindLabel),
+              title: sel ? theme.accentBold(cleanTitle) : theme.bold(cleanTitle),
+              detail: theme.muted(firstLine(item.detail, 64)),
+              age: theme.dim(formatAge(item.createdAt)),
+            };
+          },
+        };
+      };
+
+      const rows = [
+        ...snap.inbox.map((item) => buildInboxRow(item, false)),
+        ...(showInternal ? internalItems.map((item) => buildInboxRow(item, true)) : []),
+      ];
+      this.list.setTableItems(rows);
       return;
     }
 
@@ -366,6 +403,14 @@ export class WorkNavigatorScreen implements Screen {
       { key: "Enter", label: "inspect" },
       { key: "←→/Tab/1-6", label: "tabs" },
       { key: "/", label: "filter" },
+      ...(this.activeTab === "inbox"
+        ? [
+            ...(sel?.inboxItem && !sel.isInternal ? [{ key: "d", label: "dismiss" }] : []),
+            ...(sel?.isDismissed ? [{ key: "d", label: "restore" }] : []),
+            { key: "D", label: "clear stale" },
+            { key: "i", label: this.deps.store.showInternal ? "hide internal" : "show internal" },
+          ]
+        : []),
       ...(sel?.quickResolveEscId ? [{ key: "R", label: "resolve" }] : []),
       ...(sel?.quotaRunId ? [{ key: "w", label: "wait/resume" }] : []),
       ...(this.activeTab === "escalations"
@@ -504,6 +549,78 @@ export class WorkNavigatorScreen implements Screen {
         );
         return;
       }
+    }
+
+    if (data === "i" && this.activeTab === "inbox") {
+      this.deps.store.showInternal = !this.deps.store.showInternal;
+      this.rebuildList();
+      ctx.requestRender();
+      return;
+    }
+
+    if (data === "d" && this.activeTab === "inbox") {
+      const sel = this.list.selectedItem()?.value;
+      if (sel?.inboxItem && sel.isDismissed) {
+        const itemId = sel.inboxItem.id;
+        void this.deps.client
+          .request<{ restored?: boolean }>("inbox.restore", { itemId })
+          .then(async () => {
+            this.frame.setNotice("Restored inbox item", "ok");
+            await this.deps.store.refresh();
+            ctx.requestRender();
+          })
+          .catch((err) => {
+            this.frame.setNotice(formatInboxOpError("Restore", err), "danger");
+            ctx.requestRender();
+          });
+        return;
+      }
+      if (sel?.inboxItem && !sel.isInternal) {
+        const { id: itemId, createdAt: itemCreatedAt } = sel.inboxItem;
+        void this.deps.client
+          .request<{ dismissed?: boolean }>("inbox.dismiss", { itemId, itemCreatedAt })
+          .then(async () => {
+            this.frame.setNotice("Dismissed inbox item", "ok");
+            await this.deps.store.refresh();
+            ctx.requestRender();
+          })
+          .catch((err) => {
+            this.frame.setNotice(formatInboxOpError("Dismiss", err), "danger");
+            ctx.requestRender();
+          });
+        return;
+      }
+      return;
+    }
+
+    if (data === "D" && this.activeTab === "inbox") {
+      const scope = this.deps.store.currentScope;
+      const staleCount = this.deps.store.state.inbox.filter(
+        (item) => item.kind === "run_failed" || item.kind === "merge_bounced",
+      ).length;
+      this.frame.askConfirm({
+        message:
+          staleCount > 0
+            ? `Dismiss ${staleCount} stale failed-run / bounced-merge item${staleCount === 1 ? "" : "s"}?`
+            : "Clear stale failed-run and bounced-merge items in this scope?",
+        onConfirm: async () => {
+          try {
+            const res = await this.deps.client.request<{ dismissed?: number }>("inbox.clear_stale", {
+              ...(scope.chatSessionId ? { chatSessionId: scope.chatSessionId } : {}),
+              ...(scope.repoRoot ? { repoRoot: scope.repoRoot } : {}),
+              ...(scope.runId ? { runId: scope.runId } : {}),
+            });
+            const count = res?.dismissed ?? 0;
+            this.frame.setNotice(`Dismissed ${count} stale item${count === 1 ? "" : "s"}`, "ok");
+            await this.deps.store.refresh();
+          } catch (err) {
+            this.frame.setNotice(formatInboxOpError("Clear stale", err), "danger");
+          }
+          ctx.requestRender();
+        },
+      });
+      ctx.requestRender();
+      return;
     }
 
     if (data === "a" && this.activeTab === "escalations") {

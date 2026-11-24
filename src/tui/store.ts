@@ -65,6 +65,7 @@ export interface WorkSnapshot {
   worktrees: SnapshotWorktreeEntry[];
   messages: MessageRecord[];
   inbox: InboxItem[];
+  internalAttention?: InboxItem[];
 }
 
 const EMPTY_SNAPSHOT: WorkSnapshot = {
@@ -78,6 +79,7 @@ const EMPTY_SNAPSHOT: WorkSnapshot = {
   worktrees: [],
   messages: [],
   inbox: [],
+  internalAttention: [],
 };
 
 const WORK_EVENT_PREFIXES = ["goal.", "escalation.", "merge.", "timer.", "quota.", "worktree."];
@@ -134,6 +136,7 @@ export class WorkStore {
   private disposed = false;
   private detachEvent: (() => void) | null = null;
   lastError: string | null = null;
+  showInternal = false;
 
   constructor(
     private readonly client: DaemonClient,
@@ -144,6 +147,10 @@ export class WorkStore {
 
   setScope(scope: { chatSessionId?: string; repoRoot?: string; runId?: string }): void {
     this.scope = scope;
+  }
+
+  get currentScope(): Readonly<{ chatSessionId?: string; repoRoot?: string; runId?: string }> {
+    return this.scope;
   }
 
   get state(): WorkSnapshot {
