@@ -497,4 +497,305 @@ describe("TUI auto-reconnect after daemon restart", () => {
       );
     }
   });
+
+  it("run TUI preserves FIFO order across DAEMON_RELOADING rejection for three queued messages", async () => {
+    const stateDir = realpathSync(mkdtempSync(join(tmpdir(), "pi-harness-tui-reconn-fifo-")));
+    const sockPath = join(stateDir, "d.sock");
+    const sockets = new Set<import("node:net").Socket>();
+    const rejected: string[] = [];
+    const received: string[] = [];
+    let rejectFirstResume = true;
+    let clientIdSeq = 0;
+
+    const fakeServer = createServer((socket) => {
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+      const cid = `client-${++clientIdSeq}`;
+      attachDaemonReader(socket, {
+        onMessage: (raw) => {
+          const req = raw as { kind?: string; id?: string; op?: string; params?: Record<string, unknown> };
+          if (req?.kind !== "req" || !req.id) return;
+          const ok = (result: unknown) => writeDaemonMessage(socket, { kind: "res", id: req.id!, ok: true, result });
+          const fail = (error: string) => writeDaemonMessage(socket, { kind: "res", id: req.id!, ok: false, error });
+
+          if (req.op === "ping") {
+            ok({ pong: true, pid: process.pid, protocolRev: DAEMON_PROTOCOL_REV, releaseId: "rel-test" });
+            return;
+          }
+          if (req.op === "attach") {
+            ok({
+              attachmentId: `att-${cid}`,
+              run: { id: "run-1", goal: "FIFO test", repoRoot: stateDir, baseBranch: "main", baseSha: "abc", status: "active" },
+              tasks: [],
+              replay: [],
+              throughSeq: 0,
+              control: { sessionId: "run-1", clientId: cid, controllerClientId: cid, hasControl: true, controlSeq: 1 },
+            });
+            return;
+          }
+          if (req.op === "run.resume") {
+            const msg = String(req.params?.message ?? "");
+            if (rejectFirstResume) {
+              rejectFirstResume = false;
+              rejected.push(msg);
+              fail("DAEMON_RELOADING: harnessd is restarting for an update. Your request was not started. It is safe to retry after reconnect.");
+              // Simulate the daemon closing right after rejecting with DAEMON_RELOADING so the TUI reconnects and drains.
+              socket.end();
+              return;
+            }
+            received.push(msg);
+            ok({ resumed: true, outcome: "resumed", noteDelivered: true });
+            return;
+          }
+          if (req.op === "session.leave") {
+            ok({ ok: true });
+            return;
+          }
+          if (req.op === "work.snapshot") {
+            ok(null);
+            return;
+          }
+          ok([]);
+        },
+        onError: () => {},
+        onEnd: () => {},
+      });
+    });
+
+    await new Promise<void>((resolve) => fakeServer.listen(sockPath, resolve));
+    const client = new DaemonClient(sockPath);
+    const term = makeFakeTerminal(120, 30);
+    let tuiPromise: Promise<{ kind: string }> | null = null;
+    try {
+      await client.connect();
+      tuiPromise = runNativeScrollbackTui({
+        client,
+        runId: "run-1",
+        terminal: term.terminal,
+      });
+
+      await waitFor(() => term.text().includes("run-1"), 4000, "run TUI attached");
+
+      // Drop the initial connection so the TUI goes offline and queues A, B, C.
+      for (const s of [...sockets]) s.destroy();
+      await waitFor(() => term.text().includes("RECONNECTING"), 4000, "run TUI entered reconnecting state");
+
+      for (const msg of ["MSG-A", "MSG-B", "MSG-C"]) {
+        term.typeText(msg);
+        term.sendInput("\r");
+      }
+
+      // Wait until the first send was rejected once and all three messages were subsequently delivered in order.
+      await waitFor(() => received.length === 3, 8000, "all three queued messages delivered");
+      assert.deepEqual(rejected, ["MSG-A"], "first queued message should be rejected once with DAEMON_RELOADING");
+      assert.deepEqual(received, ["MSG-A", "MSG-B", "MSG-C"], "daemon must receive A, B, C exactly once each in order");
+
+      term.sendInput("\x1d");
+      const action = await tuiPromise;
+      tuiPromise = null;
+      assert.equal(action.kind, "exit");
+    } finally {
+      if (tuiPromise) {
+        term.sendInput("\x1d");
+        await tuiPromise.catch(() => {});
+      }
+      client.close();
+      for (const s of [...sockets]) s.destroy();
+      await new Promise<void>((resolve) => fakeServer.close(() => resolve()));
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("chat.steer whose reply is lost in a disconnect is not sent again after reconnect", async () => {
+    const stateDir = realpathSync(mkdtempSync(join(tmpdir(), "pi-harness-tui-reconn-steer-")));
+    const sockPath = join(stateDir, "d.sock");
+    const sockets = new Set<import("node:net").Socket>();
+    const receivedSends: string[] = [];
+    const receivedSteers: string[] = [];
+    const history: Array<{ seq: number; role: string; content: string; createdAt: number }> = [];
+    let clientIdSeq = 0;
+
+    const fakeServer = createServer((socket) => {
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+      const cid = `client-${++clientIdSeq}`;
+      attachDaemonReader(socket, {
+        onMessage: (raw) => {
+          const req = raw as { kind?: string; id?: string; op?: string; params?: Record<string, unknown> };
+          if (req?.kind !== "req" || !req.id) return;
+          const ok = (result: unknown) => writeDaemonMessage(socket, { kind: "res", id: req.id!, ok: true, result });
+
+          if (req.op === "ping") {
+            ok({ pong: true, pid: process.pid, protocolRev: DAEMON_PROTOCOL_REV, releaseId: "rel-test" });
+            return;
+          }
+          if (req.op === "chat.open") {
+            const through = history.length > 0 ? history[history.length - 1]!.seq : 0;
+            ok({
+              session: { id: "chat-1", title: "Steer test", repoRoot: stateDir, projectId: null, profileId: "director", model: "fixture", effort: null },
+              project: null,
+              history: [],
+              historyNext: null,
+              historyThrough: through,
+              busy: false,
+              activeTurnId: null,
+              activeText: "",
+              activePartial: "",
+              control: { sessionId: "chat-1", clientId: cid, controllerClientId: cid, hasControl: true, controlSeq: 1 },
+            });
+            return;
+          }
+          if (req.op === "chat.history") {
+            const afterSeq = Number(req.params?.afterSeq ?? 0);
+            const throughSeq = Number(req.params?.throughSeq ?? Number.MAX_SAFE_INTEGER);
+            const rows = history.filter((r) => r.seq > afterSeq && r.seq <= throughSeq);
+            ok({ history: rows, historyNext: null });
+            return;
+          }
+          if (req.op === "chat.send") {
+            const text = String(req.params?.text ?? "");
+            receivedSends.push(text);
+            history.push({ seq: history.length + 1, role: "user", content: text, createdAt: Date.now() });
+            // Leave the first turn open (no chat.turn.end) so the next submit invokes chat.steer.
+            ok({ started: true });
+            return;
+          }
+          if (req.op === "chat.steer") {
+            const message = String(req.params?.message ?? "");
+            receivedSteers.push(message);
+            // Simulate Director accepting & persisting the steer, then disconnecting before the reply reaches the TUI.
+            history.push({ seq: history.length + 1, role: "user", content: message, createdAt: Date.now() });
+            socket.destroy();
+            return;
+          }
+          if (req.op === "session.leave") {
+            ok({ ok: true });
+            return;
+          }
+          if (req.op === "work.snapshot") {
+            ok(null);
+            return;
+          }
+          ok([]);
+        },
+        onError: () => {},
+        onEnd: () => {},
+      });
+    });
+
+    await new Promise<void>((resolve) => fakeServer.listen(sockPath, resolve));
+    const client = new DaemonClient(sockPath);
+    const term = makeFakeTerminal(120, 30);
+    let tuiPromise: Promise<{ kind: string }> | null = null;
+    try {
+      await client.connect();
+      tuiPromise = runDirectorChatTui({
+        client,
+        repoRoot: stateDir,
+        terminal: term.terminal,
+      });
+
+      await waitFor(() => term.text().includes("chat-1"), 4000, "chat TUI initial render");
+
+      // Start a live turn.
+      term.typeText("first-turn");
+      term.sendInput("\r");
+      await waitFor(() => receivedSends.includes("first-turn"), 4000, "first-turn sent");
+
+      // Submit a live steer while busy; server stores it and drops the socket before replying.
+      term.typeText("STEER-LOST-REPLY");
+      term.sendInput("\r");
+
+      await waitFor(
+        () => term.text().includes("may not have been delivered") && term.text().includes("Reconnected to harnessd"),
+        8000,
+        "steer transport loss noticed and TUI reconnected",
+      );
+
+      // Send a fresh follow-up message after reconnect; any mistakenly queued steer would have drained first.
+      term.typeText("after-reconnect");
+      term.sendInput("\r");
+      await waitFor(() => receivedSends.includes("after-reconnect"), 4000, "after-reconnect sent");
+
+      assert.deepEqual(receivedSteers, ["STEER-LOST-REPLY"], "steer must have been attempted once");
+      assert.deepEqual(
+        receivedSends,
+        ["first-turn", "after-reconnect"],
+        "lost-reply chat.steer must never be resent automatically as a new prompt",
+      );
+
+      term.sendInput("\x1d");
+      const action = await tuiPromise;
+      tuiPromise = null;
+      assert.equal(action.kind, "exit");
+    } finally {
+      if (tuiPromise) {
+        term.sendInput("\x1d");
+        await tuiPromise.catch(() => {});
+      }
+      client.close();
+      for (const s of [...sockets]) s.destroy();
+      await new Promise<void>((resolve) => fakeServer.close(() => resolve()));
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("remote client after explicit daemon stop exits without calling connect()", async () => {
+    const closeListeners = new Set<() => void>();
+    let connectCalls = 0;
+    let sleepCalls = 0;
+    const fakeRemoteClient = {
+      isRemote: true,
+      remoteHost: "buildbox",
+      localSocketPath: null,
+      connected: false,
+      closedByUser: false,
+      connectionEpoch: 1,
+      onClose(fn: () => void) {
+        closeListeners.add(fn);
+        return () => closeListeners.delete(fn);
+      },
+      async connect() {
+        connectCalls += 1;
+        throw new Error("connect() must not be called for stopped remote daemon");
+      },
+      async request() {
+        throw new Error("not connected");
+      },
+      disconnect() {},
+    };
+
+    const statuses: ReconnectStatus[] = [];
+    const handle = installAutoReconnect({
+      client: fakeRemoteClient as unknown as DaemonClient,
+      isStopped: () => false,
+      resync: async () => {},
+      onStatus: (s) => statuses.push(s),
+      sleep: async () => {
+        sleepCalls += 1;
+      },
+    });
+
+    handle.noteDaemonEvent({
+      kind: "event",
+      seq: 0,
+      runId: "",
+      taskId: null,
+      type: "daemon.stopping",
+      payload: { restart: false },
+      createdAt: Date.now(),
+    });
+    for (const fn of [...closeListeners]) fn();
+    await Promise.resolve();
+    handle.dispose();
+
+    assert.equal(connectCalls, 0, "connect() must never be called after remote explicit stop");
+    assert.equal(sleepCalls, 0, "sleep() must not run after remote explicit stop");
+    assert.equal(statuses.length, 1, "expected one final terminal status");
+    assert.equal(statuses[0]!.phase, "incompatible");
+    assert.equal(
+      statuses[0]!.message,
+      "harnessd on buildbox was stopped. Start pi-harness again to reconnect.",
+    );
+  }, 5_000);
 });

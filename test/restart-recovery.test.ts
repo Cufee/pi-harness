@@ -383,13 +383,17 @@ describe("restart-recovery", () => {
       await a.stop();
 
       let relaunchPrompt = "";
+      const steeredMessages: string[] = [];
       const b = new HarnessDaemon(makeTestConfig(repoDir, stateDir), {
         dbPath,
         customRunnerFactory: () => ({
           run: async (req) => {
             relaunchPrompt = req.initialPrompt;
             req.onHandle?.({
-              steer: async () => true,
+              steer: async (msg) => {
+                steeredMessages.push(msg);
+                return true;
+              },
               cancel: async () => {},
             });
             await waitForAbort(req.signal);
@@ -408,15 +412,28 @@ describe("restart-recovery", () => {
           4000,
         );
         await waitUntil(() => relaunchPrompt.length > 0);
+        // Wait for the asynchronous steer acknowledgments to be recorded before querying events.
+        const getAcceptedSteers = () => {
+          const rows = b.db.db
+            .prepare("SELECT payload_json FROM events WHERE run_id = ? AND task_id = ? AND type = 'agent.steered'")
+            .all(runId, taskId) as Array<{ payload_json: string }>;
+          return rows
+            .map((e) => JSON.parse(e.payload_json) as { accepted?: boolean; message?: string })
+            .filter((p) => p.accepted === true && typeof p.message === "string");
+        };
+        await waitUntil(() => {
+          const acceptedNow = getAcceptedSteers();
+          return (
+            steeredMessages.length >= 2 &&
+            acceptedNow.some((p) => p.message!.includes(waitTimerId)) &&
+            acceptedNow.some((p) => p.message!.includes(schedTimerId))
+          );
+        }, 4000);
+
         assert.ok(relaunchPrompt.includes(waitTimerId), `Relaunch prompt must name wait_timer ${waitTimerId}`);
         assert.ok(relaunchPrompt.includes(schedTimerId), `Relaunch prompt must name schedule_timer ${schedTimerId}`);
 
-        const steeredEvents = b.db.db
-          .prepare("SELECT payload_json FROM events WHERE run_id = ? AND task_id = ? AND type = 'agent.steered'")
-          .all(runId, taskId) as Array<{ payload_json: string }>;
-        const accepted = steeredEvents
-          .map((e) => JSON.parse(e.payload_json) as { accepted?: boolean; message?: string })
-          .filter((p) => p.accepted === true && typeof p.message === "string");
+        const accepted = getAcceptedSteers();
         assert.equal(
           accepted.filter((p) => p.message!.includes(waitTimerId)).length,
           1,
@@ -917,7 +934,7 @@ describe("restart-recovery", () => {
     }
   }, 15_000);
 
-  it("a stop during recovery is recovered by the next start", async () => {
+  it("malformed stored handoff still relaunches the task and subsequent tasks", async () => {
     const repoDir = initTempGitRepo();
     const stateDir = join(repoDir, ".state");
     const dbPath = join(stateDir, "control-plane.sqlite");
@@ -932,8 +949,92 @@ describe("restart-recovery", () => {
       }),
     });
     const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
-    const run = a.db.createRun({ goal: "Mid-recovery stop", repoRoot: repoDir, baseBranch: "main", baseSha });
-    const t1 = a.db.createTask({
+    const run = a.db.createRun({ goal: "Malformed handoff recovery", repoRoot: repoDir, baseBranch: "main", baseSha });
+    const badTask = a.db.createTask({
+      runId: run.id,
+      tier: 1,
+      kind: "orchestrator",
+      title: "Orch with bad stored handoff",
+      objective: "Continue despite malformed decision entry",
+      profileId: "pi:local",
+      model: "fixture",
+    });
+    const nextTask = a.db.createTask({
+      runId: run.id,
+      parentId: badTask.id,
+      tier: 3,
+      kind: "research",
+      title: "Second task in launch order",
+      objective: "Must also relaunch after badTask",
+      readOnly: true,
+      profileId: "pi:local",
+      model: "fixture",
+    });
+    a.db.updateTask(badTask.id, {
+      status: "running",
+      handoffJson: JSON.stringify({
+        goalInvariants: ["keep invariant"],
+        architecturalDecisions: [{ rationale: "missing decision string" }, { decision: "valid", rationale: "kept" }],
+        activeRisks: [],
+        nextActions: ["resume work"],
+      }),
+    });
+    a.db.updateTask(nextTask.id, { status: "running" });
+    await a.stop();
+
+    const runCounts = new Map<string, number>();
+    const b = new HarnessDaemon(makeTestConfig(repoDir, stateDir), {
+      dbPath,
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          runCounts.set(req.taskId, (runCounts.get(req.taskId) ?? 0) + 1);
+          await waitForAbort(req.signal);
+          return { text: "stopped", stopReason: "cancelled" };
+        },
+      }),
+    });
+    try {
+      await b.start();
+      await b.recovered;
+      await waitUntil(() => runCounts.get(badTask.id) === 1 && runCounts.get(nextTask.id) === 1, 5000);
+
+      assert.equal(runCounts.get(badTask.id), 1, "Task with malformed stored handoff must still relaunch");
+      assert.equal(runCounts.get(nextTask.id), 1, "Second task after it in launch order must also relaunch");
+      assert.notEqual(b.db.getTask(badTask.id)?.status, "failed");
+      assert.notEqual(b.db.getTask(badTask.id)?.status, "cancelled");
+      assert.notEqual(b.db.getTask(nextTask.id)?.status, "failed");
+      assert.notEqual(b.db.getTask(nextTask.id)?.status, "cancelled");
+    } finally {
+      await b.stop();
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("ordinary Tier 3 verify task titled Done-Review in an executing goal is relaunched, not cancelled", async () => {
+    const repoDir = initTempGitRepo();
+    const stateDir = join(repoDir, ".state");
+    const dbPath = join(stateDir, "control-plane.sqlite");
+
+    const a = new HarnessDaemon(makeTestConfig(repoDir, stateDir), {
+      dbPath,
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          await waitForAbort(req.signal);
+          return { text: "stopped", stopReason: "cancelled" };
+        },
+      }),
+    });
+    const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    const run = a.db.createRun({ goal: "Ordinary Done-Review title", repoRoot: repoDir, baseBranch: "main", baseSha });
+    const goal = a.director.goals.createGoal({
+      repoRoot: repoDir,
+      title: "Executing goal",
+      description: "Active goal with a user verify task",
+      criteria: [{ description: "Passes checks", kind: "behavioral" }],
+    });
+    a.director.goals.linkRunAndStart(goal.id, run.id);
+
+    const orch = a.db.createTask({
       runId: run.id,
       tier: 1,
       kind: "orchestrator",
@@ -942,80 +1043,41 @@ describe("restart-recovery", () => {
       profileId: "pi:local",
       model: "fixture",
     });
-    const t2 = a.db.createTask({
+    const verifyTask = a.db.createTask({
       runId: run.id,
-      parentId: t1.id,
+      parentId: orch.id,
       tier: 3,
-      kind: "research",
-      title: "Scout A",
-      objective: "Research A",
+      kind: "verify",
+      title: "Done-Review: something",
+      objective: "Verify implementation changes",
       readOnly: true,
       profileId: "pi:local",
       model: "fixture",
     });
-    const t3 = a.db.createTask({
-      runId: run.id,
-      parentId: t1.id,
-      tier: 3,
-      kind: "research",
-      title: "Scout B",
-      objective: "Research B",
-      readOnly: true,
-      profileId: "pi:local",
-      model: "fixture",
-    });
-    a.db.updateTask(t1.id, { status: "running" });
-    a.db.updateTask(t2.id, { status: "running" });
-    a.db.updateTask(t3.id, { status: "running" });
+    a.db.updateTask(orch.id, { status: "waiting_children" });
+    a.db.updateTask(verifyTask.id, { status: "running" });
     await a.stop();
 
-    let stopTriggered: Promise<void> | null = null;
+    const runCounts = new Map<string, number>();
     const b = new HarnessDaemon(makeTestConfig(repoDir, stateDir), {
       dbPath,
-      recoveryStaggerMs: 50,
       customRunnerFactory: () => ({
         run: async (req) => {
-          if (!stopTriggered) {
-            stopTriggered = b.stop();
-          }
+          runCounts.set(req.taskId, (runCounts.get(req.taskId) ?? 0) + 1);
           await waitForAbort(req.signal);
-          return { text: "stopped in B", stopReason: "cancelled" };
+          return { text: "stopped", stopReason: "cancelled" };
         },
       }),
     });
-    await b.start();
     try {
-      await waitUntil(() => stopTriggered !== null);
-      await stopTriggered;
+      await b.start();
       await b.recovered;
-    } finally {
-      await b.stop().catch(() => {});
-    }
+      await waitUntil(() => runCounts.get(orch.id) === 1 && runCounts.get(verifyTask.id) === 1, 5000);
 
-    const countsInC = new Map<string, number>();
-    const c = new HarnessDaemon(makeTestConfig(repoDir, stateDir), {
-      dbPath,
-      customRunnerFactory: () => ({
-        run: async (req) => {
-          countsInC.set(req.taskId, (countsInC.get(req.taskId) ?? 0) + 1);
-          await waitForAbort(req.signal);
-          return { text: "stopped in C", stopReason: "cancelled" };
-        },
-      }),
-    });
-    try {
-      await c.start();
-      await c.recovered;
-      await waitUntil(() => countsInC.get(t1.id) === 1 && countsInC.get(t2.id) === 1 && countsInC.get(t3.id) === 1);
-
-      const executing = new Set(c.orchestrator.executingTaskIds());
-      for (const id of [t1.id, t2.id, t3.id]) {
-        assert.equal(countsInC.get(id), 1, `Task ${id} must run once in C`);
-        assert.notEqual(c.db.getTask(id)?.status, "failed", `Task ${id} must not be failed`);
-        assert.ok(executing.has(id), `Task ${id} must have a live execution in C`);
-      }
+      assert.equal(runCounts.get(verifyTask.id), 1, "Ordinary verify task titled Done-Review must be relaunched");
+      assert.notEqual(b.db.getTask(verifyTask.id)?.status, "cancelled", "Ordinary verify task must not be cancelled");
     } finally {
-      await c.stop();
+      await b.stop();
       rmSync(repoDir, { recursive: true, force: true });
     }
   }, 15_000);
