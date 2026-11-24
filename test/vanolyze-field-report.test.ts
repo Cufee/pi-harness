@@ -274,6 +274,7 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
 
     const cancelStarted = Promise.withResolvers<void>();
     const cancelGate = Promise.withResolvers<void>();
+    const widenDossierResults = new Map<string, { path: string; harness_advisory?: string[] }>();
     const emitWidening = (onToolEvent?: NonNullable<Parameters<ReturnType<CustomRunnerFactory>["run"]>[0]["callbacks"]["onToolEvent"]>) => {
       const topics = ["cortexsdk", "nats", "listdevices", "commissioning"];
       for (let i = 0; i < 4; i++) {
@@ -342,7 +343,8 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
             name: "widen.md",
             content: "Survey",
             summary: "Survey",
-          })) as { path: string };
+          })) as { path: string; harness_advisory?: string[] };
+          widenDossierResults.set(req.taskId, dossier);
           await req.executeTool("return_task", {
             status: "completed",
             partial: true,
@@ -445,7 +447,7 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
       assert.ok(partialHandoff.summary?.startsWith("[Partial] Verified area A"));
       assert.ok(partialHandoff.artifact_paths.some((p: string) => p.endsWith("partial-dossier.md")));
 
-      // 4. Tier 3 widening onToolEvent -> emits agent.scope_nudge and agent.steered with "[Harness scope check]"
+      // 4. T3-8: Tier 3 widening onToolEvent -> emits agent.advisory (scope-too-large, tool_result) and attaches harness_advisory
       const widenT3 = await daemon.orchestrator.spawnAndStartTask({
         runId: run.id,
         parentId: parent.id,
@@ -459,20 +461,29 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
       });
       await waitSettled(widenT3.id);
       const t3Events = daemon.db.getEventsSince(run.id, 0, widenT3.id);
+      const t3Advisories = t3Events.filter((e) => e.type === "agent.advisory");
+      assert.equal(t3Advisories.length, 1, "Tier 3 widening sequence must emit exactly one agent.advisory");
+      const t3AdvPayload = t3Advisories[0]!.payload as { rule?: string; delivery?: string; text?: string };
+      assert.equal(t3AdvPayload.rule, "scope-too-large");
+      assert.equal(t3AdvPayload.delivery, "tool_result");
+      const t3DossierResult = widenDossierResults.get(widenT3.id);
       assert.ok(
-        t3Events.some((e) => e.type === "agent.scope_nudge"),
-        "Tier 3 widening sequence must emit agent.scope_nudge",
+        Array.isArray(t3DossierResult?.harness_advisory) &&
+          t3DossierResult.harness_advisory.some((m) => m.startsWith("[harness advisory: scope-too-large]")),
+        "Tier 3 artifact_write result must carry harness_advisory for scope-too-large",
       );
-      assert.ok(
-        t3Events.some(
-          (e) =>
-            e.type === "agent.steered" &&
-            String((e.payload as { message?: string } | null)?.message ?? "").includes("[Harness scope check]"),
-        ),
-        "Tier 3 widening sequence must emit agent.steered with [Harness scope check]",
+      assert.equal(
+        t3Events.some((e) => e.type === "agent.scope_nudge"),
+        false,
+        "Tier 3 widening sequence must not emit legacy agent.scope_nudge",
+      );
+      assert.equal(
+        t3Events.some((e) => e.type === "agent.steered"),
+        false,
+        "Tier 3 widening sequence must not emit agent.steered for an advisory",
       );
 
-      // 5. Same widening sequence on Tier 2 -> no scope nudge and no steer
+      // 5. Same widening sequence on Tier 2 -> no advisory, no agent.scope_nudge, and no steer
       const widenT2 = await daemon.orchestrator.spawnAndStartTask({
         runId: run.id,
         parentId: parent.id,
@@ -488,16 +499,18 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
       await waitSettled(widenT2.id);
       const t2Events = daemon.db.getEventsSince(run.id, 0, widenT2.id);
       assert.equal(
+        t2Events.some((e) => e.type === "agent.advisory"),
+        false,
+        "Tier 2 worker must not receive Tier 3 scope-too-large advisories",
+      );
+      assert.equal(widenDossierResults.get(widenT2.id)?.harness_advisory, undefined);
+      assert.equal(
         t2Events.some((e) => e.type === "agent.scope_nudge"),
         false,
-        "Tier 2 worker must not receive Tier 3 scope nudges",
+        "Tier 2 worker must not emit legacy agent.scope_nudge",
       );
       assert.equal(
-        t2Events.some(
-          (e) =>
-            e.type === "agent.steered" &&
-            String((e.payload as { message?: string } | null)?.message ?? "").includes("[Harness scope check]"),
-        ),
+        t2Events.some((e) => e.type === "agent.steered"),
         false,
         "Tier 2 worker must not be steered by scope check",
       );
@@ -820,6 +833,7 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
     const codeModeTaskReady = Promise.withResolvers<void>();
     const codeModeTaskRelease = Promise.withResolvers<void>();
     const codeModeSteers: string[] = [];
+    let codeModeReturnResult: { harness_advisory?: string[] } | undefined;
 
     const customRunnerFactory: CustomRunnerFactory = () => ({
       async run(req) {
@@ -836,11 +850,11 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
         if (req.initialPrompt.includes("CASE_CODE_MODE_INNER")) {
           codeModeTaskReady.resolve();
           await codeModeTaskRelease.promise;
-          await req.executeTool("return_task", {
+          codeModeReturnResult = (await req.executeTool("return_task", {
             status: "completed",
             summary: "Finished after inner events",
             sources: [{ path: "README.md", note: "done" }],
-          });
+          })) as { harness_advisory?: string[] };
           return { text: "done", stopReason: "completed" };
         }
         return { text: "", stopReason: "completed" };
@@ -1061,7 +1075,7 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
       assert.equal(longHandoff.truncated, true);
       assert.ok(longHandoff.full_summary?.path.includes("output-gen1"));
 
-      // 4. Code Mode inner tool events (actual createCodeExecEventSink path) feed Tier 3 ScopeNudgeMonitor once per gen.
+      // 4. T3-8b: Code Mode inner tool events (actual createCodeExecEventSink path) feed Tier 3 AdvisoryEngine once per gen.
       const cmTask = await daemon.orchestrator.spawnAndStartTask({
         runId: run.id,
         parentId: parent.id,
@@ -1077,7 +1091,7 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
       const liveGen = daemon.db.getTask(cmTask.id)!.generation;
       const sink = daemon.orchestrator.toolExecutor.createCodeExecEventSink(run.id, cmTask.id, liveGen);
 
-      // 3 distinct inner inspect_command calls at cwd '.' -> no nudge, 6 agent.tool events (start+end each, once).
+      // 3 distinct inner inspect_command calls at cwd '.' -> no advisory, 6 agent.tool events (start+end each, once).
       for (const file of ["a.ts", "b.ts", "c.ts"]) {
         const args = { cwd: ".", argv: ["cat", file] };
         sink({ name: "inspect_command", args, phase: "start", via: "code_exec" });
@@ -1085,9 +1099,10 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
       }
       const eventsAfterDistinct = daemon.db.getEventsSince(run.id, 0, cmTask.id);
       assert.equal(eventsAfterDistinct.filter((e) => e.type === "agent.tool").length, 6);
+      assert.equal(eventsAfterDistinct.some((e) => e.type === "agent.advisory"), false);
       assert.equal(eventsAfterDistinct.some((e) => e.type === "agent.scope_nudge"), false);
 
-      // Stale-generation sink must be fenced out (no agent.tool emitted, no nudge).
+      // Stale-generation sink must be fenced out (no agent.tool emitted, no advisory).
       const staleSink = daemon.orchestrator.toolExecutor.createCodeExecEventSink(run.id, cmTask.id, liveGen + 99);
       for (let i = 0; i < 3; i++) {
         const args = { cwd: ".", argv: ["cat", "stale.ts"] };
@@ -1100,20 +1115,14 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
         "Stale-generation inner events must be fenced out",
       );
 
-      // 3 identical consecutive inner inspect_command calls -> triggers agent.scope_nudge and steers live task!
+      // 3 identical consecutive inner inspect_command calls -> queues scope-too-large advisory (no steer without turnOpen).
       for (let i = 0; i < 3; i++) {
         const args = { cwd: ".", argv: ["cat", "repeat.ts"] };
         sink({ name: "inspect_command", args, phase: "start", via: "code_exec" });
         sink({ name: "inspect_command", args, phase: "end", ok: true, result: "ok", via: "code_exec" });
       }
       await Bun.sleep(50);
-      const eventsAfterRepeat = daemon.db.getEventsSince(run.id, 0, cmTask.id);
-      assert.equal(eventsAfterRepeat.filter((e) => e.type === "agent.tool").length, 12);
-      assert.ok(eventsAfterRepeat.some((e) => e.type === "agent.scope_nudge"), "Inner code_exec repeats must trigger scope nudge");
-      assert.ok(
-        codeModeSteers.some((m) => m.includes("[Harness scope check]")),
-        "Inner code_exec scope nudge must steer the live Tier 3 task",
-      );
+      assert.equal(codeModeSteers.length, 0, "Handle without turnOpen must not receive live steer");
 
       codeModeTaskRelease.resolve();
       const cmDeadline = Date.now() + 3_000;
@@ -1121,6 +1130,28 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
         await Bun.sleep(10);
       }
       assert.equal(daemon.db.getTask(cmTask.id)?.status, "completed");
+
+      const eventsAfterRepeat = daemon.db.getEventsSince(run.id, 0, cmTask.id);
+      assert.equal(eventsAfterRepeat.filter((e) => e.type === "agent.tool").length, 12);
+      const cmAdvisories = eventsAfterRepeat.filter((e) => e.type === "agent.advisory");
+      assert.equal(cmAdvisories.length, 1, "Inner code_exec repeats must produce one agent.advisory");
+      const cmAdvPayload = cmAdvisories[0]!.payload as {
+        rule?: string;
+        delivery?: string;
+        data?: { reasons?: string[] };
+      };
+      assert.equal(cmAdvPayload.rule, "scope-too-large");
+      assert.equal(cmAdvPayload.delivery, "tool_result");
+      assert.ok(cmAdvPayload.data?.reasons?.includes("repeated"));
+      assert.ok(
+        Array.isArray(codeModeReturnResult?.harness_advisory) &&
+          codeModeReturnResult.harness_advisory.some(
+            (m) => m.startsWith("[harness advisory: scope-too-large]") && m.includes("repeated"),
+          ),
+        "Tool result must carry harness_advisory for repeated inner code_exec calls",
+      );
+      assert.equal(eventsAfterRepeat.some((e) => e.type === "agent.scope_nudge"), false);
+      assert.equal(eventsAfterRepeat.some((e) => e.type === "agent.steered"), false);
     } finally {
       codeModeTaskRelease.resolve();
       await daemon.stop();
