@@ -1413,7 +1413,7 @@ class ArtifactInspectorScreen implements Screen {
   }
 
   private get showingView(): boolean {
-    return !(this.loading && !this.result) && !this.error;
+    return !this.loading && !this.error;
   }
 
   render(width: number, maxHeight: number, theme: Theme): string[] {
@@ -1438,7 +1438,7 @@ class ArtifactInspectorScreen implements Screen {
       subtitle: `${this.runId} · ${this.artifactPath}`,
       hints,
       renderBody: (innerW, bodyH) => {
-        if (this.loading && !this.result) return [theme.muted("Loading artifact...")];
+        if (this.loading) return [theme.muted("Loading artifact...")];
         if (this.error) return [theme.danger(sanitizeLine(this.error))];
         return this.view.render(innerW, bodyH, theme);
       },

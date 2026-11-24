@@ -910,6 +910,27 @@ describe("Transcript Unification Regressions", () => {
       "clicking below the last content row of a short transcript must leave the tool collapsed",
     );
 
+    // Pressing on the 2-column cursor gutter or scrollbar reserve of a tool header must not fold it.
+    const toolRow0 = shortVisible.findIndex((l) => stripTerminalSequences(l).includes("read_file"));
+    assert.ok(toolRow0 >= 0, "tool header row must be visible");
+    const toolY1 = toolRow0 + 1;
+    const gutterX1 = shortBounds.col + shortRect.col + 1 + 1;
+    sendInput(`\x1b[<0;${gutterX1};${toolY1}M`);
+    sendInput(`\x1b[<0;${gutterX1};${toolY1}m`);
+    assert.equal(
+      compositeVisible().map((l) => stripTerminalSequences(l)).join("\n").includes("SHOULD_STAY_COLLAPSED"),
+      false,
+      "clicking a gutter column on a tool header must leave the tool collapsed",
+    );
+    const scrollbarX1 = shortBounds.col + shortRect.col + (shortRect.width - 2) + 1;
+    sendInput(`\x1b[<0;${scrollbarX1};${toolY1}M`);
+    sendInput(`\x1b[<0;${scrollbarX1};${toolY1}m`);
+    assert.equal(
+      compositeVisible().map((l) => stripTerminalSequences(l)).join("\n").includes("SHOULD_STAY_COLLAPSED"),
+      false,
+      "clicking a scrollbar column on a tool header must leave the tool collapsed",
+    );
+
     nav.closeAll();
     tui.stop();
   });
@@ -1090,6 +1111,16 @@ describe("Transcript Unification Regressions", () => {
       topBodyRow(100),
       topAt100,
       "streaming more text into the anchored block must not shift the paused top row",
+    );
+    const topAt60AfterGrowth = topBodyRow(60);
+    assert.ok(
+      /BLK_B_ROW_0[5-8]/.test(topAt60AfterGrowth),
+      `at width 60 after growth top row must belong to pinned BLK_B_ROW text, got: ${JSON.stringify(topAt60AfterGrowth)}`,
+    );
+    assert.equal(
+      topBodyRow(100),
+      topAt100,
+      "returning to width 100 after growth must restore the exact top visible row",
     );
 
     // Stream more text into a block above the anchored block (task-a): top row must still not drift.
