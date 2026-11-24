@@ -7,12 +7,17 @@ import type { EscalationRecord, TaskRecord } from "../src/control-plane/db.js";
 import type { RunActivitySummary } from "../src/control-plane/telemetry.js";
 import {
   buildGoalGetResult,
+  buildGoalListResult,
   GOAL_GET_LIMITS,
   GOAL_GET_TOOL,
+  GOAL_LIST_LIMITS,
+  GOAL_LIST_TOOL,
   parseGoalGetOptions,
+  parseGoalListOptions,
   type GoalGetDetailInput,
+  type GoalListSummaryInput,
 } from "../src/director/goal-get.js";
-import type { GoalCriterion, GoalRecord, GoalReviewVerdict } from "../src/goals/engine.js";
+import type { GoalCriterion, GoalRecord, GoalReviewVerdict, GoalStatus } from "../src/goals/engine.js";
 
 function makeSynthesizedDetail(opts: {
   repoRoot: string;
@@ -701,5 +706,188 @@ describe("buildGoalGetResult compact output and paging", () => {
     } finally {
       rmSync(tmpRepo, { recursive: true, force: true });
     }
+  });
+});
+
+describe("goal-20 compact goal_list", () => {
+  function makeGoalSummary(
+    idx: number,
+    opts?: {
+      status?: GoalStatus;
+      version?: number;
+      title?: string;
+      updatedAt?: number;
+      openEscalations?: number;
+      reviews?: GoalReviewVerdict[];
+    },
+  ): GoalListSummaryInput {
+    const version = opts?.version ?? (idx % 2) + 1;
+    const id = `goal-${String(idx).padStart(3, "0")}`;
+    const reviews: GoalReviewVerdict[] = opts?.reviews ?? [
+      {
+        id: `rev-${idx}-v1-c3`,
+        goalId: id,
+        goalVersion: 1,
+        cycle: 3,
+        verdict: "changes_requested",
+        criteriaResults: [],
+        blockingIssues: ["old blocking issue".padEnd(400, "x")],
+        summary: "Old v1 review ".padEnd(1_000, "r"),
+        progressFingerprint: `fp-${idx}-1`,
+        createdAt: 1_700_000_000_000 + idx * 100,
+      },
+      {
+        id: `rev-${idx}-v${version}-c1`,
+        goalId: id,
+        goalVersion: version,
+        cycle: 1,
+        verdict: idx % 3 === 0 ? "approved" : "changes_requested",
+        criteriaResults: [],
+        blockingIssues: [],
+        summary: "Latest review ".padEnd(1_000, "l"),
+        progressFingerprint: `fp-${idx}-2`,
+        createdAt: 1_700_000_100_000 + idx * 100,
+      },
+    ];
+    const goal: GoalRecord = {
+      id,
+      chatSessionId: "chat-1",
+      repoRoot: "/tmp/repo",
+      version,
+      title: opts?.title ?? `Goal ${idx}: ` + "T".repeat(220),
+      description: `Huge description for ${id} `.padEnd(40_000, "D"),
+      criteria: [
+        { id: "c1", description: "Criterion ".padEnd(500, "c"), kind: "behavioral", required: true },
+      ],
+      nonGoals: ["non-goal".padEnd(300, "n")],
+      budgets: { maxReviewCycles: 10, maxNoProgressCycles: 3 },
+      verificationMode: "auto",
+      verifyRef: "main",
+      liveProgress: null,
+      status: opts?.status ?? "executing",
+      linkedRunId: `run-${idx}`,
+      reviewCycle: reviews.length,
+      noProgressStreak: 0,
+      lastProgressFingerprint: null,
+      lastReviewSummary: "Very long review summary ".padEnd(2_000, "s"),
+      lastReviewerFailure: null,
+      createdAt: 1_700_000_000_000,
+      updatedAt: opts?.updatedAt ?? 1_700_000_000_000 + idx * 1_000,
+    };
+    return {
+      goal,
+      openEscalations: opts?.openEscalations ?? (idx % 4),
+      reviews,
+    };
+  }
+
+  it("GOAL_LIST_TOOL documents compact default, filters, paging, and goal_get", () => {
+    assert.equal(GOAL_LIST_TOOL.name, "goal_list");
+    assert.match(GOAL_LIST_TOOL.description, /compact/i);
+    assert.match(GOAL_LIST_TOOL.description, /status/i);
+    assert.match(GOAL_LIST_TOOL.description, /default 30.*max 100/i);
+    assert.match(GOAL_LIST_TOOL.description, /page\.nextCursor/);
+    assert.match(GOAL_LIST_TOOL.description, /use goal_get for full detail/i);
+    assert.match(GOAL_LIST_TOOL.description, /presentation_id to present_result/);
+
+    assert.deepEqual(parseGoalListOptions({}), {
+      allProjects: false,
+      status: null,
+      limit: GOAL_LIST_LIMITS.limitDefault,
+      cursor: null,
+    });
+    assert.equal(parseGoalListOptions({ limit: 0 }).limit, 1);
+    assert.equal(parseGoalListOptions({ limit: 500 }).limit, GOAL_LIST_LIMITS.limitMax);
+    assert.equal(parseGoalListOptions({ status: "awaiting_human", cursor: " goal-12 " }).status, "awaiting_human");
+    assert.equal(parseGoalListOptions({ cursor: " goal-12 " }).cursor, "goal-12");
+    assert.throws(() => parseGoalListOptions({ status: "bogus" }), /Unknown goal_list status/);
+  });
+
+  it("returns < 20,000 chars for 30 goals with 40KB descriptions and picks version-aware latestReview", () => {
+    const summaries = Array.from({ length: 30 }, (_, i) => makeGoalSummary(i + 1));
+    const res = buildGoalListResult(summaries, parseGoalListOptions({}), { reserveChars: 120 });
+    const serialized = JSON.stringify(res);
+    assert.ok(serialized.length < GOAL_LIST_LIMITS.budgetChars, `expected < 20,000 chars, got ${serialized.length}`);
+    assert.deepEqual(res.page, { total: 30, returned: 30, nextCursor: null });
+
+    const ids = new Set(res.goals.map((g) => g.id));
+    assert.equal(ids.size, 30);
+    for (const item of res.goals) {
+      assert.equal("description" in item, false, "description text must not appear in goal_list items");
+      assert.ok(item.title.length <= GOAL_LIST_LIMITS.titleMax);
+      assert.ok(item.latestReview, `expected latestReview on ${item.id}`);
+      if (item.version === 2) {
+        assert.equal(item.latestReview.goalVersion, 2);
+        assert.equal(item.latestReview.cycle, 1);
+      } else {
+        assert.equal(item.latestReview.goalVersion, 1);
+        assert.equal(item.latestReview.cycle, 3);
+      }
+    }
+  });
+
+  it("filters by status and pages 120 goals (with equal timestamps and size-guard caps) without duplicates or skips", () => {
+    const statuses: GoalStatus[] = ["draft", "executing", "awaiting_human", "achieved"];
+    // Deliberately reuse updatedAt across buckets to verify deterministic tie-breaking by id.
+    const summaries = Array.from({ length: 120 }, (_, i) =>
+      makeGoalSummary(i + 1, {
+        status: statuses[i % statuses.length],
+        updatedAt: 1_700_000_000_000 + Math.floor(i / 5) * 1_000,
+      }),
+    );
+
+    // Status filter
+    const awaiting = buildGoalListResult(summaries, parseGoalListOptions({ status: "awaiting_human" }));
+    assert.equal(awaiting.page.total, 30);
+    assert.equal(awaiting.page.returned, 30);
+    assert.equal(awaiting.page.nextCursor, null);
+    assert.ok(awaiting.goals.every((g) => g.status === "awaiting_human"));
+
+    // Default paging (limit=30) visits every one of the 120 goals exactly once.
+    const seenDefault = new Set<string>();
+    let cursor: string | null = null;
+    let pages = 0;
+    do {
+      const pageRes = buildGoalListResult(summaries, parseGoalListOptions(cursor ? { cursor } : {}), {
+        reserveChars: 120,
+      });
+      assert.ok(JSON.stringify(pageRes).length < GOAL_LIST_LIMITS.budgetChars);
+      assert.equal(pageRes.page.total, 120);
+      for (const g of pageRes.goals) {
+        assert.ok(!seenDefault.has(g.id), `duplicate goal id ${g.id}`);
+        seenDefault.add(g.id);
+      }
+      cursor = pageRes.page.nextCursor;
+      pages++;
+      assert.ok(pages <= 10, "default paging should complete in 4 pages");
+    } while (cursor !== null);
+    assert.equal(seenDefault.size, 120);
+    assert.equal(pages, 4);
+
+    // Aggressive limit=100 with long titles hits the 20,000-char size guard: shrinks titles, trims page size, and still visits all 120 once.
+    const seenMax = new Set<string>();
+    cursor = null;
+    pages = 0;
+    let sawSizeGuardTrim = false;
+    do {
+      const pageRes = buildGoalListResult(
+        summaries,
+        parseGoalListOptions(cursor ? { limit: 100, cursor } : { limit: 100 }),
+        { reserveChars: 120 },
+      );
+      assert.ok(JSON.stringify(pageRes).length <= GOAL_LIST_LIMITS.budgetChars - 120);
+      if (pageRes.page.nextCursor !== null && pageRes.page.returned < 100) {
+        sawSizeGuardTrim = true;
+      }
+      for (const g of pageRes.goals) {
+        assert.ok(!seenMax.has(g.id), `duplicate goal id ${g.id} under size-guard paging`);
+        seenMax.add(g.id);
+      }
+      cursor = pageRes.page.nextCursor;
+      pages++;
+      assert.ok(pages <= 20, "size-guarded paging must converge");
+    } while (cursor !== null);
+    assert.equal(seenMax.size, 120);
+    assert.ok(sawSizeGuardTrim, "expected limit=100 with 120 goals to trigger 20k size guard and set nextCursor");
   });
 });

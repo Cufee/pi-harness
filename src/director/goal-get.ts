@@ -3,7 +3,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { EscalationRecord, TaskRecord } from "../control-plane/db.js";
 import { compactTaskHandoff } from "../control-plane/handoffs.js";
 import type { RunActivitySummary, TaskActivitySnapshot } from "../control-plane/telemetry.js";
-import type { GoalLiveProgress, GoalRecord, GoalReviewVerdict, ReviewerDiagnostics } from "../goals/engine.js";
+import type { GoalLiveProgress, GoalRecord, GoalReviewVerdict, GoalStatus, ReviewerDiagnostics } from "../goals/engine.js";
 import { isReviewInvalidated } from "../protocol/chat-events.js";
 import type { ToolDefinition } from "../runners/types.js";
 
@@ -361,6 +361,241 @@ function initialShrinkState(opts: GoalGetOptions, sectionSet: Set<GoalGetSection
   };
 }
 
+function sortReviewsNewestFirst(reviews: readonly GoalReviewVerdict[]): GoalReviewVerdict[] {
+  return [...reviews].sort(
+    (a, b) =>
+      b.goalVersion - a.goalVersion ||
+      b.cycle - a.cycle ||
+      b.createdAt - a.createdAt ||
+      (b.id < a.id ? -1 : b.id > a.id ? 1 : 0),
+  );
+}
+
+export const GOAL_LIST_LIMITS = {
+  budgetChars: 20_000, // hard target for JSON.stringify(result)
+  titleMax: 160,
+  limitDefault: 30,
+  limitMax: 100,
+} as const;
+
+export const GOAL_LIST_STATUSES: readonly GoalStatus[] = [
+  "draft",
+  "executing",
+  "verifying",
+  "reviewing",
+  "awaiting_human",
+  "achieved",
+  "paused",
+  "cancelled",
+] as const;
+
+const ALLOWED_GOAL_STATUSES_SET = new Set<string>(GOAL_LIST_STATUSES);
+
+export const GOAL_LIST_TOOL: ToolDefinition = {
+  name: "goal_list",
+  description:
+    "List Goals in this workspace (or across all projects when all_projects is true). " +
+    "Default output is compact (<= 20,000 chars) with per-goal summaries only (id, version, title, status, reviewCycle, linkedRunId, openEscalations, latestReview, updatedAt) and no description text; use goal_get for full detail. " +
+    "Filter by status, control page size with limit (default 30, max 100), and page through more goals via cursor using the returned page.nextCursor. " +
+    "Pass the returned presentation_id to present_result to show the Goals table.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      all_projects: { type: "boolean", description: "When true, list goals across all registered projects." },
+      status: {
+        type: "string",
+        enum: [...GOAL_LIST_STATUSES],
+        description:
+          "Optional goal status filter (draft, executing, verifying, reviewing, awaiting_human, achieved, paused, cancelled).",
+      },
+      limit: {
+        type: "number",
+        description: "Maximum number of goals to return per page. Default 30, max 100.",
+      },
+      cursor: {
+        type: "string",
+        description: "Cursor from a previous call's page.nextCursor to fetch the next page.",
+      },
+    },
+  },
+};
+
+export interface GoalListOptions {
+  allProjects: boolean;
+  status: GoalStatus | null;
+  limit: number;
+  cursor: string | null;
+}
+
+export interface GoalListLatestReview {
+  verdict: GoalReviewVerdict["verdict"];
+  cycle: number;
+  goalVersion: number;
+  createdAt: number;
+}
+
+export interface GoalListSummaryInput {
+  goal: Pick<GoalRecord, "id" | "version" | "title" | "status" | "reviewCycle" | "linkedRunId" | "updatedAt">;
+  openEscalations: number;
+  latestReview?: GoalListLatestReview | null;
+  reviews?: readonly GoalReviewVerdict[];
+}
+
+export interface GoalListContext {
+  /** Optional wire overhead (e.g. `presentation_id`) reserved inside `budgetChars`. */
+  reserveChars?: number;
+}
+
+export interface GoalListItem {
+  id: string;
+  version: number;
+  title: string;
+  status: GoalStatus;
+  reviewCycle: number;
+  linkedRunId: string | null;
+  openEscalations: number;
+  latestReview: GoalListLatestReview | null;
+  updatedAt: number;
+}
+
+export interface GoalListResult {
+  goals: GoalListItem[];
+  page: {
+    total: number;
+    returned: number;
+    nextCursor: string | null;
+  };
+}
+
+export function parseGoalListOptions(args: Record<string, unknown>): GoalListOptions {
+  const allProjects = Boolean(args.all_projects);
+
+  let status: GoalStatus | null = null;
+  if (args.status !== undefined && args.status !== null && args.status !== "") {
+    if (typeof args.status !== "string" || !ALLOWED_GOAL_STATUSES_SET.has(args.status.trim())) {
+      throw new Error(
+        `Unknown goal_list status ${JSON.stringify(args.status)}; allowed values: ${GOAL_LIST_STATUSES.join(", ")}`,
+      );
+    }
+    status = args.status.trim() as GoalStatus;
+  }
+
+  let limit: number = GOAL_LIST_LIMITS.limitDefault;
+  if (typeof args.limit === "number" && Number.isFinite(args.limit)) {
+    limit = Math.min(GOAL_LIST_LIMITS.limitMax, Math.max(1, Math.floor(args.limit)));
+  }
+
+  let cursor: string | null = null;
+  if (typeof args.cursor === "string" && args.cursor.trim()) {
+    cursor = args.cursor.trim();
+  }
+
+  return { allProjects, status, limit, cursor };
+}
+
+export function buildGoalListResult(
+  summaries: readonly GoalListSummaryInput[],
+  opts: GoalListOptions,
+  ctx?: GoalListContext,
+): GoalListResult {
+  const reserveChars =
+    typeof ctx?.reserveChars === "number" && Number.isFinite(ctx.reserveChars) && ctx.reserveChars > 0
+      ? Math.floor(ctx.reserveChars)
+      : 0;
+  const effectiveBudget = Math.max(500, GOAL_LIST_LIMITS.budgetChars - reserveChars);
+
+  const filtered = opts.status ? summaries.filter((s) => s.goal.status === opts.status) : summaries;
+  const sorted = [...filtered].sort(
+    (a, b) =>
+      b.goal.updatedAt - a.goal.updatedAt ||
+      (b.goal.id < a.goal.id ? -1 : b.goal.id > a.goal.id ? 1 : 0),
+  );
+
+  let remaining: GoalListSummaryInput[];
+  if (opts.cursor !== null) {
+    const cursorIdx = sorted.findIndex((s) => s.goal.id === opts.cursor);
+    remaining = cursorIdx >= 0 ? sorted.slice(cursorIdx + 1) : [];
+  } else {
+    remaining = sorted;
+  }
+
+  const pageSlice = remaining.slice(0, opts.limit);
+  const projected = pageSlice.map((s) => {
+    let latestReview: GoalListLatestReview | null = null;
+    if (s.latestReview !== undefined) {
+      latestReview = s.latestReview
+        ? {
+            verdict: s.latestReview.verdict,
+            cycle: s.latestReview.cycle,
+            goalVersion: s.latestReview.goalVersion,
+            createdAt: s.latestReview.createdAt,
+          }
+        : null;
+    } else if (s.reviews && s.reviews.length > 0) {
+      const newest = sortReviewsNewestFirst(s.reviews)[0]!;
+      latestReview = {
+        verdict: newest.verdict,
+        cycle: newest.cycle,
+        goalVersion: newest.goalVersion,
+        createdAt: newest.createdAt,
+      };
+    }
+    return { s, latestReview };
+  });
+
+  const render = (count: number, titleMax: number): GoalListResult => {
+    const goals: GoalListItem[] = projected.slice(0, count).map(({ s, latestReview }) => ({
+      id: s.goal.id,
+      version: s.goal.version,
+      title: clip(s.goal.title, titleMax),
+      status: s.goal.status,
+      reviewCycle: s.goal.reviewCycle,
+      linkedRunId: s.goal.linkedRunId,
+      openEscalations: s.openEscalations,
+      latestReview,
+      updatedAt: s.goal.updatedAt,
+    }));
+    const hasMore = remaining.length > goals.length;
+    const nextCursor = hasMore && goals.length > 0 ? goals[goals.length - 1]!.id : null;
+    return {
+      goals,
+      page: {
+        total: sorted.length,
+        returned: goals.length,
+        nextCursor,
+      },
+    };
+  };
+
+  let titleMax: number = GOAL_LIST_LIMITS.titleMax;
+  let result = render(projected.length, titleMax);
+
+  // Size guard step 1: shrink/clip titles before reducing the returned page count.
+  for (const smallerTitleMax of [80, 40]) {
+    if (JSON.stringify(result).length <= effectiveBudget) break;
+    titleMax = smallerTitleMax;
+    result = render(projected.length, titleMax);
+  }
+
+  // Size guard step 2: reduce returned count to fit budget and advance nextCursor accordingly.
+  if (JSON.stringify(result).length > effectiveBudget) {
+    let lo = 0;
+    let hi = projected.length;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      const candidate = render(mid, titleMax);
+      if (JSON.stringify(candidate).length <= effectiveBudget) {
+        lo = mid;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    result = render(lo, titleMax);
+  }
+
+  return result;
+}
+
 export function buildGoalGetResult(
   detail: GoalGetDetailInput,
   opts: GoalGetOptions,
@@ -386,13 +621,7 @@ export function buildGoalGetResult(
       : writeGoalDescriptionFile(goal, ctx.evidenceDir, ctx.repoRoot ?? goal.repoRoot);
 
   // Version-aware total order newest-first: goalVersion desc, cycle desc, createdAt desc, id desc.
-  const sortedReviews = [...detail.reviews].sort(
-    (a, b) =>
-      b.goalVersion - a.goalVersion ||
-      b.cycle - a.cycle ||
-      b.createdAt - a.createdAt ||
-      (b.id < a.id ? -1 : b.id > a.id ? 1 : 0),
-  );
+  const sortedReviews = sortReviewsNewestFirst(detail.reviews);
 
   // Criterion status lookup: newest review matching current goal.version that evaluated that criterion.
   const latestEvalByCriterion = new Map<string, { cycle: number; passed: boolean; evidence: string }>();

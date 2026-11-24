@@ -85,7 +85,14 @@ import {
   looksLikeGitPush,
   type GoalGate,
 } from "./gate-activity.js";
-import { buildGoalGetResult, GOAL_GET_TOOL, parseGoalGetOptions } from "./goal-get.js";
+import {
+  buildGoalGetResult,
+  buildGoalListResult,
+  GOAL_GET_TOOL,
+  GOAL_LIST_TOOL,
+  parseGoalGetOptions,
+  parseGoalListOptions,
+} from "./goal-get.js";
 import {
   buildDirectorSystemPrompt,
   DIRECTOR_DIRECT_TOOLS,
@@ -461,17 +468,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
       },
     },
   },
-  {
-    name: "goal_list",
-    description:
-      "List Goals in this workspace (or across all projects when all_projects is true) with their version, status, review cycles, and linked run IDs. Pass the returned presentation_id to present_result to show the Goals table.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        all_projects: { type: "boolean", description: "When true, list goals across all registered projects." },
-      },
-    },
-  },
+  GOAL_LIST_TOOL,
   {
     name: "project_list",
     description: "List all registered projects on this daemon host with their paths, git status/branch, and active session/goal counts.",
@@ -5771,12 +5768,19 @@ export class DirectorRuntime {
 
       case "goal_list": {
         // Read-only: queue progress is kept current by admission-queue changes, not by reads.
-        const allProjects = Boolean(args.all_projects);
-        const goals = (allProjects ? this.goals.listGoals({}) : this.goals.listGoals({ repoRoot, chatSessionId })).map(
-          reconcileGoalWithLiveRun,
-        );
+        const opts = parseGoalListOptions(args);
+        const listFilter = opts.allProjects
+          ? { ...(opts.status ? { status: opts.status } : {}) }
+          : { repoRoot, chatSessionId, ...(opts.status ? { status: opts.status } : {}) };
+        const goals = this.goals.listGoals(listFilter).map(reconcileGoalWithLiveRun);
+        const summaries = goals.map((goal) => ({
+          goal,
+          openEscalations: goal.linkedRunId ? this.db.listEscalations(goal.linkedRunId, "unresolved").length : 0,
+          reviews: this.goals.listReviews(goal.id),
+        }));
+        const result = buildGoalListResult(summaries, opts, { reserveChars: 120 });
         const presentation_id = offerPresentation(() => buildGoalsTableDisplay(goals.map((goal) => this.goalDisplayData(goal))));
-        return { goals, presentation_id };
+        return { ...result, presentation_id };
       }
 
       case "project_list": {
