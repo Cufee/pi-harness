@@ -670,6 +670,812 @@ const statusPollingRule: AdvisoryRule<StatusPollingState> = {
   },
 };
 
+// 7. read-only-brief-needs-shell
+const READ_ONLY_GIT_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  "status",
+  "log",
+  "diff",
+  "show",
+  "blame",
+  "rev-parse",
+  "rev-list",
+  "merge-base",
+  "ls-files",
+  "ls-tree",
+  "grep",
+  "cat-file",
+  "describe",
+  "shortlog",
+  "show-ref",
+  "for-each-ref",
+  "remote",
+  "fetch",
+  "ls-remote",
+]);
+
+const ALLOWLISTED_SIMPLE_BINS: ReadonlySet<string> = new Set([
+  "rg",
+  "ls",
+  "cat",
+  "head",
+  "tail",
+  "wc",
+  "nl",
+  "stat",
+]);
+
+const SUBCOMMAND_REQUIRED_BINS: Readonly<Record<string, ReadonlySet<string>>> = {
+  bun: new Set([
+    "run",
+    "install",
+    "i",
+    "add",
+    "remove",
+    "rm",
+    "build",
+    "upgrade",
+    "update",
+    "pm",
+    "link",
+    "unlink",
+    "init",
+    "create",
+    "exec",
+    "x",
+    "dev",
+    "start",
+    "lint",
+    "format",
+    "typecheck",
+    "check",
+    "test",
+  ]),
+  npm: new Set([
+    "run",
+    "install",
+    "i",
+    "ci",
+    "test",
+    "t",
+    "start",
+    "build",
+    "exec",
+    "publish",
+    "pack",
+    "init",
+    "update",
+    "up",
+    "uninstall",
+    "remove",
+    "rm",
+    "audit",
+    "link",
+    "rebuild",
+    "prune",
+    "version",
+    "ls",
+    "outdated",
+  ]),
+  pnpm: new Set([
+    "run",
+    "install",
+    "i",
+    "add",
+    "remove",
+    "rm",
+    "test",
+    "start",
+    "build",
+    "exec",
+    "dlx",
+    "publish",
+    "pack",
+    "init",
+    "update",
+    "up",
+    "audit",
+    "link",
+    "rebuild",
+    "prune",
+    "dev",
+    "lint",
+    "typecheck",
+    "check",
+  ]),
+  yarn: new Set([
+    "run",
+    "install",
+    "add",
+    "remove",
+    "test",
+    "start",
+    "build",
+    "exec",
+    "dlx",
+    "publish",
+    "pack",
+    "init",
+    "upgrade",
+    "up",
+    "audit",
+    "link",
+    "dev",
+    "lint",
+    "typecheck",
+    "check",
+    "workspace",
+    "workspaces",
+  ]),
+  cargo: new Set([
+    "build",
+    "b",
+    "test",
+    "t",
+    "run",
+    "r",
+    "check",
+    "c",
+    "clippy",
+    "fmt",
+    "install",
+    "uninstall",
+    "publish",
+    "bench",
+    "doc",
+    "clean",
+    "update",
+    "add",
+    "remove",
+    "fix",
+    "nextest",
+    "miri",
+    "tarpaulin",
+  ]),
+  go: new Set([
+    "build",
+    "test",
+    "run",
+    "vet",
+    "generate",
+    "mod",
+    "get",
+    "install",
+    "fmt",
+    "tool",
+    "clean",
+    "work",
+  ]),
+  deno: new Set([
+    "run",
+    "test",
+    "task",
+    "compile",
+    "bundle",
+    "bench",
+    "check",
+    "lint",
+    "fmt",
+    "install",
+    "add",
+    "remove",
+    "cache",
+    "serve",
+  ]),
+  docker: new Set([
+    "build",
+    "buildx",
+    "run",
+    "exec",
+    "compose",
+    "up",
+    "down",
+    "start",
+    "stop",
+    "restart",
+    "push",
+    "pull",
+    "ps",
+    "logs",
+    "images",
+    "rm",
+    "rmi",
+  ]),
+  podman: new Set([
+    "build",
+    "run",
+    "exec",
+    "compose",
+    "up",
+    "down",
+    "start",
+    "stop",
+    "restart",
+    "push",
+    "pull",
+    "ps",
+    "logs",
+  ]),
+  kubectl: new Set([
+    "apply",
+    "delete",
+    "create",
+    "get",
+    "describe",
+    "logs",
+    "exec",
+    "rollout",
+    "scale",
+    "port-forward",
+    "patch",
+    "edit",
+  ]),
+  helm: new Set(["install", "upgrade", "uninstall", "template", "lint", "package", "repo", "dependency"]),
+  terraform: new Set(["init", "plan", "apply", "destroy", "validate", "fmt", "output", "state", "import"]),
+  tofu: new Set(["init", "plan", "apply", "destroy", "validate", "fmt", "output", "state", "import"]),
+  nix: new Set(["build", "develop", "run", "flake", "shell", "eval", "check", "fmt", "store"]),
+  bundle: new Set(["exec", "install", "update", "check", "add", "remove"]),
+  mix: new Set(["test", "compile", "deps", "deps.get", "phx.server", "ecto.migrate", "format", "release", "run"]),
+  swift: new Set(["build", "test", "run", "package"]),
+  fly: new Set(["deploy", "launch", "status", "logs", "ssh", "secrets", "apps", "machines"]),
+  flyctl: new Set(["deploy", "launch", "status", "logs", "ssh", "secrets", "apps", "machines"]),
+  dotnet: new Set(["build", "test", "run", "restore", "publish", "clean", "pack", "ef", "tool", "format"]),
+  poetry: new Set(["install", "run", "build", "publish", "add", "remove", "update", "lock", "check"]),
+  uv: new Set(["run", "sync", "pip", "build", "publish", "add", "remove", "lock", "venv", "tool"]),
+  pip: new Set(["install", "uninstall", "freeze", "list", "check", "wheel", "download"]),
+  pip3: new Set(["install", "uninstall", "freeze", "list", "check", "wheel", "download"]),
+  composer: new Set(["install", "update", "require", "remove", "run-script", "dump-autoload", "test"]),
+  git: new Set([
+    "add",
+    "apply",
+    "checkout",
+    "cherry-pick",
+    "clean",
+    "clone",
+    "commit",
+    "init",
+    "merge",
+    "mv",
+    "pull",
+    "push",
+    "rebase",
+    "reset",
+    "restore",
+    "revert",
+    "rm",
+    "stash",
+    "switch",
+    "branch",
+    "tag",
+    ...READ_ONLY_GIT_SUBCOMMANDS,
+  ]),
+};
+
+const ARG_REQUIRED_STANDALONE_BINS: ReadonlySet<string> = new Set(["bunx", "npx", "pnpx"]);
+
+const STANDALONE_SHELL_BINS: ReadonlySet<string> = new Set([
+  "bunx",
+  "npx",
+  "pnpx",
+  "tsx",
+  "ts-node",
+  "vite",
+  "vitest",
+  "jest",
+  "mocha",
+  "webpack",
+  "esbuild",
+  "rollup",
+  "turbo",
+  "nx",
+  "eslint",
+  "prettier",
+  "biome",
+  "oxlint",
+  "playwright",
+  "cypress",
+  "storybook",
+  "prisma",
+  "tsc",
+  "rustc",
+  "rustup",
+  "cmake",
+  "ninja",
+  "meson",
+  "bazel",
+  "buck",
+  "buck2",
+  "gradle",
+  "gradlew",
+  "mvn",
+  "ant",
+  "rake",
+  "scons",
+  "msbuild",
+  "gcc",
+  "g++",
+  "clang",
+  "clang++",
+  "zig",
+  "xcodebuild",
+  "pytest",
+  "pipenv",
+  "pdm",
+  "ruff",
+  "mypy",
+  "flake8",
+  "tox",
+  "nox",
+  "rspec",
+  "rails",
+  "nix-build",
+  "nix-shell",
+  "nixos-rebuild",
+  "docker-compose",
+  "ansible",
+  "pulumi",
+  "vercel",
+  "wrangler",
+  "curl",
+  "wget",
+]);
+
+const INTERPRETER_BINS: ReadonlySet<string> = new Set([
+  "node",
+  "python",
+  "python3",
+  "ruby",
+  "php",
+  "bash",
+  "sh",
+  "zsh",
+]);
+
+const MAKE_NON_TARGETS: ReadonlySet<string> = new Set([
+  "a",
+  "an",
+  "the",
+  "it",
+  "this",
+  "that",
+  "sure",
+  "sense",
+  "changes",
+  "edits",
+  "up",
+  "out",
+  "any",
+  "some",
+  "no",
+  "use",
+]);
+
+const CLI_PRECEDING_TOKENS: ReadonlySet<string> = new Set([
+  "bun",
+  "bunx",
+  "npm",
+  "npx",
+  "pnpm",
+  "pnpx",
+  "yarn",
+  "cargo",
+  "go",
+  "deno",
+  "docker",
+  "docker-compose",
+  "podman",
+  "nix",
+  "make",
+  "uv",
+  "pip",
+  "pip3",
+  "poetry",
+  "bundle",
+  "mix",
+  "swift",
+  "fly",
+  "flyctl",
+  "kubectl",
+  "helm",
+  "terraform",
+  "tofu",
+  "gradle",
+  "gradlew",
+  "mvn",
+  "dotnet",
+  "composer",
+  "run",
+  "exec",
+]);
+
+const DETERMINER_PRECEDING_WORDS: ReadonlySet<string> = new Set([
+  "the",
+  "a",
+  "an",
+  "this",
+  "that",
+  "these",
+  "those",
+  "its",
+  "our",
+  "my",
+  "your",
+  "their",
+  "each",
+  "every",
+  "any",
+  "some",
+  "failed",
+  "failing",
+  "broken",
+  "local",
+  "ci",
+  "prod",
+  "dev",
+  "full",
+  "clean",
+]);
+
+const UNQUOTED_STOP_WORDS: ReadonlySet<string> = new Set([
+  "and",
+  "then",
+  "or",
+  "so",
+  "but",
+  "if",
+  "when",
+  "while",
+  "until",
+  "before",
+  "after",
+  "because",
+  "instead",
+  "to",
+  "for",
+  "into",
+  "onto",
+  "from",
+  "in",
+  "on",
+  "at",
+  "against",
+  "over",
+  "without",
+  "with",
+]);
+
+const FLAG_TAKING_VALUE: ReadonlySet<string> = new Set([
+  "-p",
+  "--project",
+  "-t",
+  "-f",
+  "-m",
+  "-c",
+  "-k",
+  "-o",
+  "-C",
+  "--cwd",
+  "--filter",
+  "--target",
+  "--config",
+]);
+
+const SHELL_INSTRUCTION_VERB_RE =
+  /\b(?:by\s+(?:running|executing)|run|re-?run|execute|exec|invoke|launch|start|build|compile|install|deploy)\b/gi;
+
+const NEGATION_BEFORE_VERB_RE =
+  /\b(?:do\s+not|don['’]t|does\s+not|doesn['’]t|did\s+not|didn['’]t|never|not\s+to|without|avoid|skip|skipping|refrain\s+from|instead\s+of|rather\s+than|no\s+need\s+to|cannot|can['’]t|must\s+not|mustn['’]t|should\s+not|shouldn['’]t|won['’]t|will\s+not|stop)\s+(?:trying\s+to\s+|attempting\s+to\s+|actually\s+|directly\s+|manually\s+)?$/i;
+
+const META_CLAUSE_PREFIX_RE =
+  /\b(?:(?:explain|describe|document|summarize|understand|investigate|analyze|analyse|figure\s+out|find\s+out|determine|check|see|verify|trace|inspect)\s+(?:why|how(?:\s+to)?|what|whether|if)|how\s+to|what\s+happens\s+(?:when|if)|why\s+(?:does|did|would|is|are))\b[^.!?\n;]*$/i;
+
+const DESCRIPTIVE_PREDICATE_AFTER_RE =
+  /^(?:is|are|was|were|does|do|did|fails?|failed|failing|breaks?|broke|broken|errors?|exits?|exited|returns?|returned|outputs?|prints?|produces?|throws?|threw|runs?|ran|takes?|took|uses?|used|works?|worked|hangs?|hung|needs?|requires?|depends?|means?|shows?|says?|contains?|exists?|defined|configured)\b/i;
+
+const INSTRUCTIONAL_CODE_PREFIX_RE =
+  /^(?:(?:[-*•]|\d+[.)])\s*)?(?:(?:then|and|next|finally|first|second|step\s*\d*|steps|command|cmd|run|execute|build|install|start|launch|deploy|verify)\s*:?\s*)?$/i;
+
+const EXPLICIT_REL_SCRIPT_RE = /^\.\/[A-Za-z0-9._/-]+$/;
+const BARE_SCRIPT_PATH_RE =
+  /^(?:(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+\.(?:sh|bash|zsh|py|rb|pl|ps1|bat|cmd|mjs|cjs|ts|js)|[A-Za-z0-9._-]+\.(?:sh|bash|zsh|ps1|bat|cmd))$/;
+const JS_TS_SCRIPT_RE = /^(?:\.\/)?(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.(?:[cm]?[jt]s)$/;
+const INTERPRETER_SCRIPT_RE =
+  /^(?:\.\/)?(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.(?:sh|bash|zsh|py|rb|php|[cm]?js|ts)$/;
+
+function stripFencedCodeBlocks(text: string): string {
+  return text.replace(/```[\s\S]*?```/g, "\n").replace(/~~~[\s\S]*?~~~/g, "\n");
+}
+
+function cleanCommandToken(raw: string): string {
+  let token = raw.replace(/^["'(]+/, "").replace(/[,:;!?)\]]+$/, "");
+  if (token.endsWith(".") && !token.endsWith("...") && token !== ".") {
+    token = token.replace(/\.+$/, "");
+  }
+  return token;
+}
+
+function isAllowlistedInspectCommand(tokens: readonly string[]): boolean {
+  if (tokens.length === 0) return true;
+  const bin = tokens[0]!.toLowerCase();
+  const rest = tokens.slice(1);
+
+  if (ALLOWLISTED_SIMPLE_BINS.has(bin)) return true;
+
+  if (bin === "git") {
+    let i = 0;
+    while (i < rest.length && (rest[i] === "--no-pager" || rest[i] === "-P" || rest[i] === "--no-optional-locks")) {
+      i++;
+    }
+    const sub = rest[i]?.toLowerCase();
+    if (!sub) return true;
+    if (READ_ONLY_GIT_SUBCOMMANDS.has(sub)) return true;
+    if (sub === "branch") {
+      const subArgs = rest.slice(i + 1);
+      return !subArgs.some((a) => /^-[dDmMcC]$/.test(a) || a === "--delete" || a === "--move" || a === "--copy");
+    }
+    if (sub === "tag") {
+      const subArgs = rest.slice(i + 1);
+      return !subArgs.some((a) => /^-[dafsmu]$/.test(a) || a === "--delete" || a === "--annotate" || a === "--sign");
+    }
+    return false;
+  }
+
+  if (bin === "bun") {
+    return rest[0]?.toLowerCase() === "test";
+  }
+
+  if (bin === "bunx") {
+    return rest[0]?.toLowerCase() === "tsc" && rest.slice(1).includes("--noEmit");
+  }
+
+  if (bin === "tsc") {
+    return rest.includes("--noEmit");
+  }
+
+  return false;
+}
+
+function isConcreteShellCommand(tokens: readonly string[], allowBareScriptPath: boolean, fromCodeSpan: boolean): boolean {
+  if (tokens.length === 0) return false;
+  const rawBin = tokens[0]!;
+  const bin = rawBin.toLowerCase();
+  const arg1 = tokens[1];
+  const arg1Lower = arg1?.toLowerCase();
+
+  if (EXPLICIT_REL_SCRIPT_RE.test(rawBin)) return true;
+  if (allowBareScriptPath && BARE_SCRIPT_PATH_RE.test(rawBin)) return true;
+
+  if (bin === "make") {
+    if (!arg1) return fromCodeSpan;
+    if (arg1.startsWith("-")) return true;
+    return /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(arg1) && !MAKE_NON_TARGETS.has(arg1Lower!);
+  }
+
+  if (Object.hasOwn(SUBCOMMAND_REQUIRED_BINS, bin)) {
+    if (!arg1 || !arg1Lower) return false;
+    if (bin === "bun" && JS_TS_SCRIPT_RE.test(arg1)) return true;
+    if (bin === "git") {
+      let i = 1;
+      while (i < tokens.length && (tokens[i] === "--no-pager" || tokens[i] === "-P" || tokens[i] === "--no-optional-locks")) {
+        i++;
+      }
+      const sub = tokens[i]?.toLowerCase();
+      return Boolean(sub && SUBCOMMAND_REQUIRED_BINS.git!.has(sub));
+    }
+    return SUBCOMMAND_REQUIRED_BINS[bin]!.has(arg1Lower);
+  }
+
+  if (STANDALONE_SHELL_BINS.has(bin)) {
+    if (ARG_REQUIRED_STANDALONE_BINS.has(bin)) {
+      return Boolean(arg1 && /^[A-Za-z0-9@._/-]+$/.test(arg1));
+    }
+    return true;
+  }
+
+  if (INTERPRETER_BINS.has(bin)) {
+    if (!arg1) return false;
+    if (arg1.startsWith("-")) return true;
+    if (bin === "php" && arg1Lower === "artisan") return true;
+    return EXPLICIT_REL_SCRIPT_RE.test(arg1) || INTERPRETER_SCRIPT_RE.test(arg1);
+  }
+
+  return false;
+}
+
+function extractUnquotedCommandTokens(rest: string): string[] {
+  const stopIdx = rest.search(/[,;\n()[\]—–]|\.(?:\s|$)/);
+  const head = (stopIdx >= 0 ? rest.slice(0, stopIdx) : rest).trim();
+  if (!head) return [];
+
+  const rawTokens = head.split(/\s+/).filter(Boolean);
+  const out: string[] = [];
+  for (let i = 0; i < rawTokens.length && out.length < 4; i++) {
+    const cleaned = cleanCommandToken(rawTokens[i]!);
+    if (!cleaned) break;
+    const prev = out[out.length - 1];
+    if (out.length >= 1 && !(prev && FLAG_TAKING_VALUE.has(prev)) && UNQUOTED_STOP_WORDS.has(cleaned.toLowerCase())) {
+      break;
+    }
+    out.push(cleaned);
+  }
+  return out;
+}
+
+function firstDisallowedCommandInSpan(span: string, allowBareScriptPath: boolean): string | null {
+  const cleanedSpan = span.trim().replace(/^\$\s+/, "");
+  if (!cleanedSpan) return null;
+  const segments = cleanedSpan.split(/\s*(?:&&|\|\||;|\|)\s*/);
+  for (const seg of segments) {
+    const tokens = seg
+      .trim()
+      .split(/\s+/)
+      .map(cleanCommandToken)
+      .filter(Boolean);
+    if (tokens.length === 0) continue;
+    if (!isConcreteShellCommand(tokens, allowBareScriptPath, true)) continue;
+    if (isAllowlistedInspectCommand(tokens)) continue;
+    return seg.trim();
+  }
+  return null;
+}
+
+function extractDisallowedCommandFromRest(rest: string, allowBareScriptPath: boolean): string | null {
+  const trimmed = rest.trimStart();
+  if (!trimmed) return null;
+
+  const spanMatch = trimmed.match(/^(?:`([^`\n]+)`|"([^"\n]+)"|'([^'\n]+)')/);
+  if (spanMatch) {
+    const inner = spanMatch[1] ?? spanMatch[2] ?? spanMatch[3] ?? "";
+    const found = firstDisallowedCommandInSpan(inner, allowBareScriptPath);
+    if (found) return found;
+    // If the first quoted/backticked command was allowlisted, check an immediately chained span (e.g. `bun test` and `bun run build`).
+    const tail = trimmed.slice(spanMatch[0].length);
+    const chainedMatch = tail.match(/^(?:\s*(?:,|and|then|&&)\s*)(?:`([^`\n]+)`|"([^"\n]+)"|'([^'\n]+)')/i);
+    if (chainedMatch) {
+      const chainedInner = chainedMatch[1] ?? chainedMatch[2] ?? chainedMatch[3] ?? "";
+      return firstDisallowedCommandInSpan(chainedInner, allowBareScriptPath);
+    }
+    return null;
+  }
+
+  const tokens = extractUnquotedCommandTokens(trimmed);
+  if (tokens.length === 0) return null;
+  if (!isConcreteShellCommand(tokens, allowBareScriptPath, false)) return null;
+  if (isAllowlistedInspectCommand(tokens)) return null;
+  return tokens.join(" ");
+}
+
+function isPrecededByWordIn(before: string, set: ReadonlySet<string>): boolean {
+  const m = before.match(/([A-Za-z0-9._-]+)\s+$/);
+  if (!m?.[1]) return false;
+  return set.has(m[1].toLowerCase());
+}
+
+function detectBriefShellCommand(rawBrief: string): string | null {
+  const withoutFences = stripFencedCodeBlocks(rawBrief);
+  const clauses = withoutFences.split(/[\r\n;!?]+|\.(?=\s|$)/);
+
+  for (const clause of clauses) {
+    if (!clause.trim()) continue;
+
+    // Path A: explicit execution/build instruction verb + concrete non-allowlisted command.
+    const verbRe = new RegExp(SHELL_INSTRUCTION_VERB_RE.source, SHELL_INSTRUCTION_VERB_RE.flags);
+    let vm: RegExpExecArray | null;
+    while ((vm = verbRe.exec(clause)) !== null) {
+      const start = vm.index;
+      const end = start + vm[0].length;
+      // Ignore matches embedded inside paths or hyphenated identifiers (e.g. scripts/build.ts, pre-build).
+      if (start > 0 && /[/.\\_-]/.test(clause[start - 1]!)) continue;
+      if (end < clause.length && /[/.\\_-]/.test(clause[end]!)) continue;
+
+      const before = clause.slice(0, start);
+      if (isPrecededByWordIn(before, CLI_PRECEDING_TOKENS)) continue;
+      if (isPrecededByWordIn(before, DETERMINER_PRECEDING_WORDS)) continue;
+      if (NEGATION_BEFORE_VERB_RE.test(before)) continue;
+      if (META_CLAUSE_PREFIX_RE.test(before)) continue;
+
+      const after = clause.slice(end);
+      // Direct form: `<verb> <cmd>` or `<verb>: <cmd>`
+      const directLead = after.match(/^(?:\s*:\s*|\s+)/);
+      if (directLead) {
+        const directRest = after.slice(directLead[0].length);
+        const directFound = extractDisallowedCommandFromRest(directRest, true);
+        if (directFound) return directFound;
+      }
+
+      // Indirect form: `<verb> <short object> with|using|via|by running|by executing <cmd>`
+      const indirectLead = after.match(/^[^,\n]{1,48}?\b(?:with|using|via|by\s+running|by\s+executing)\s+/i);
+      if (indirectLead) {
+        const indirectRest = after.slice(indirectLead[0].length);
+        const indirectFound = extractDisallowedCommandFromRest(indirectRest, true);
+        if (indirectFound) return indirectFound;
+      }
+    }
+
+    // Path B: bare command in an inline code span in an instructional position.
+    const codeSpanRe = /`([^`\n]+)`/g;
+    let cm: RegExpExecArray | null;
+    while ((cm = codeSpanRe.exec(clause)) !== null) {
+      const inner = cm[1] ?? "";
+      const before = clause.slice(0, cm.index);
+      const after = clause.slice(cm.index + cm[0].length).trim();
+
+      if (NEGATION_BEFORE_VERB_RE.test(before)) continue;
+      if (META_CLAUSE_PREFIX_RE.test(before)) continue;
+      if (DESCRIPTIVE_PREDICATE_AFTER_RE.test(after)) continue;
+      if (!INSTRUCTIONAL_CODE_PREFIX_RE.test(before.trim())) continue;
+
+      const found = firstDisallowedCommandInSpan(inner, false);
+      if (found) return found;
+    }
+  }
+
+  return null;
+}
+
+const readOnlyBriefNeedsShellRule: AdvisoryRule<null> = {
+  id: "read-only-brief-needs-shell",
+  roles: ["director", "orchestrator", "worker"],
+  surface: "result",
+  priority: 55,
+  init: () => null,
+  observe(_state, subject, call): Finding | null {
+    if (call.status !== "completed" || call.surface !== "harness" || call.tool !== "spawn_task") {
+      return null;
+    }
+    const args = call.args;
+    if (!args) return null;
+
+    const kind = typeof args.kind === "string" ? args.kind.trim().toLowerCase() : "";
+    const isReadOnlyChild =
+      kind === "research" ||
+      kind === "plan" ||
+      kind === "verify" ||
+      (kind === "execute" && args.read_only === true);
+    if (!isReadOnlyChild) return null;
+
+    const rawBrief = [args.title, args.objective, args.criteria]
+      .filter((v): v is string => typeof v === "string" && v.trim().length > 0)
+      .join("\n");
+    if (!rawBrief) return null;
+
+    const matched = detectBriefShellCommand(rawBrief);
+    if (!matched) return null;
+
+    const res =
+      call.result && typeof call.result === "object" && !Array.isArray(call.result)
+        ? (call.result as Record<string, unknown>)
+        : undefined;
+    const childId =
+      typeof res?.spawned === "string" && res.spawned.trim()
+        ? res.spawned.trim()
+        : typeof res?.taskId === "string" && res.taskId.trim()
+          ? res.taskId.trim()
+          : "the child";
+    const displayChildId = clipSnippet(childId, 2, MAX_DISPLAY_ID_CHARS) || "the child";
+    const matchText = clipSnippet(compactMatchSnippet(matched), 6, MAX_DISPLAY_MATCH_CHARS);
+    const kindLabel = kind === "execute" ? "read-only execute" : kind;
+
+    const alternative =
+      subject.role === "director"
+        ? `Put that run in a goal, or steer ${displayChildId} with steer_task to inspect only.`
+        : subject.role === "worker"
+          ? `Use a kind execute task or run it yourself, or steer ${displayChildId} with steer_child to inspect only.`
+          : `Give that command to a Worker with spawn_worker, or steer ${displayChildId} with steer_child to inspect only.`;
+
+    return {
+      key: childId,
+      what: `The brief for ${displayChildId} asks to run "${matchText}".`,
+      why: `A ${kindLabel} task has no shell and can run only the read-only inspect_command allowlist.`,
+      alternative,
+      data: { childId, kind, readOnly: true, match: matched, tool: call.tool },
+    };
+  },
+  dedupe: {
+    perKey: "subject",
+    maxPerSubject: 2,
+  },
+};
+
 export const ALL_RULES: readonly AdvisoryRule<any>[] = [
   workerEditOutsideScopeRule,
   scopeTooLargeRule,
@@ -677,4 +1483,5 @@ export const ALL_RULES: readonly AdvisoryRule<any>[] = [
   briefCountLimitRule,
   directorSelfReadingRule,
   statusPollingRule,
+  readOnlyBriefNeedsShellRule,
 ];

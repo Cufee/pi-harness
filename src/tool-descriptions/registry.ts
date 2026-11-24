@@ -83,6 +83,15 @@ function returnTaskInputSchema(sourcesDescription: string): Schema {
 const PARTIAL_RETURN_FACT =
   "A task may return early with a partial handoff and proposed splits after a [harness advisory: scope-too-large] advisory.";
 
+const READ_ONLY_NO_SHELL_BASE =
+  "Research, plan, and verify tasks have no shell. They can run only the read-only inspect_command allowlist (git reads, rg, file reads, bun test, bunx tsc --noEmit), so they cannot run builds, installs, package scripts, or other commands.";
+
+const READ_ONLY_NO_SHELL_FACT: PerRole<string> = {
+  default: `${READ_ONLY_NO_SHELL_BASE} Give that work to a Worker with spawn_worker.`,
+  worker: `${READ_ONLY_NO_SHELL_BASE} Give that work to a writable kind execute task or run it yourself.`,
+  director: `${READ_ONLY_NO_SHELL_BASE} Put that work in a goal.`,
+};
+
 const VERIFY_REF_DESC =
   "Branch, tag, origin/<branch> or SHA whose tree deterministic gates and the Done-Reviewer verify. Set it when the goal's work is pushed to a branch other than the run's base branch, which happens when workers push their own branch instead of merging through the queue. Resolves a local ref first, then origin/<ref>, fetching from origin if needed. Fails if it still does not resolve. Default: the run's base branch.";
 
@@ -331,15 +340,17 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     facts: {
       noCounts: { default: NO_COUNTS_FACT },
       partialReturn: { default: PARTIAL_RETURN_FACT },
+      readOnlyNoShell: READ_ONLY_NO_SHELL_FACT,
     },
     description: {
       default:
-        "Spawn a read-only Tier 3 research, plan, or verify task sized to one bounded question or deliverable. Read its handoff with wait_children. {fact:noCounts} {fact:partialReturn}",
+        "Spawn a read-only Tier 3 research, plan, or verify task sized to one bounded question or deliverable. Read its handoff with wait_children. {fact:readOnlyNoShell} {fact:noCounts} {fact:partialReturn}",
       worker:
-        "Spawn a Tier 3 Task Agent (research, plan, execute, or verify) inside your worktree, sized to one bounded question or deliverable. Read its handoff with wait_children. Tasks compact context in place on Pi and Claude runners so long single-question reads continue, and one that ends without return_task still leaves a partial handoff. {fact:noCounts} {fact:partialReturn}",
+        "Spawn a Tier 3 Task Agent (research, plan, execute, or verify) inside your worktree, sized to one bounded question or deliverable. Read its handoff with wait_children. Tasks compact context in place on Pi and Claude runners so long single-question reads continue, and one that ends without return_task still leaves a partial handoff. {fact:readOnlyNoShell} {fact:noCounts} {fact:partialReturn}",
       director:
-        "Spawn a read-only Tier 3 research, plan, or verify task sized to one bounded question or deliverable. When your turn ends and events.wakeDirectorOnGoalSettle is enabled (default on), the daemon wakes this chat when a task you spawned completes, fails, blocks, or returns for re-scope (not on cancel or quota pause); results you already read with wait_tasks do not wake you again. {fact:noCounts} {fact:partialReturn}",
+        "Spawn a read-only Tier 3 research, plan, or verify task sized to one bounded question or deliverable. When your turn ends and events.wakeDirectorOnGoalSettle is enabled (default on), the daemon wakes this chat when a task you spawned completes, fails, blocks, or returns for re-scope (not on cancel or quota pause); results you already read with wait_tasks do not wake you again. {fact:readOnlyNoShell} {fact:noCounts} {fact:partialReturn}",
     },
+    mentions: [{ tool: "inspect_command", as: "child" }],
     inputSchema: {
       default: {
         type: "object",
@@ -768,7 +779,7 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     listed: ({ role, readOnly }) => role !== "execute" || readOnly,
     description: {
       default:
-        "Run one read-only inspection command in your task workspace without a shell (no pipes, redirection, globbing, or chaining). Allowed: git status|log|diff|show|blame|rev-parse|rev-list|merge-base|ls-files|ls-tree|grep|cat-file|describe|shortlog|show-ref|for-each-ref|branch (list)|tag (list)|remote [-v|get-url]|fetch <remote> [<branch>...]|ls-remote <remote>; rg; ls, cat, head, tail, wc, nl, stat; bun test [files] [-t pattern]; bunx tsc --noEmit [-p tsconfig]. Paths must stay inside the workspace and configured read roots. Note: bun test and tsc execute repository code in the task workspace without an OS sandbox (and tsc --noEmit may write .tsbuildinfo when incremental/composite is enabled). Returns exit_code, stdout and stderr tails, and an artifact path holding the full output when it was cut.",
+        "Run one read-only inspection command in your task workspace without a shell (no pipes, redirection, globbing, or chaining). Allowed: git status|log|diff|show|blame|rev-parse|rev-list|merge-base|ls-files|ls-tree|grep|cat-file|describe|shortlog|show-ref|for-each-ref|branch (list)|tag (list)|remote [-v|get-url]|fetch <remote> [<branch>...]|ls-remote <remote>; rg; ls, cat, head, tail, wc, nl, stat; bun test [files] [-t pattern]; bunx tsc --noEmit [-p tsconfig]. Paths must stay inside the workspace and configured read roots. Note: bun test and tsc execute repository code in the task workspace without an OS sandbox (and tsc --noEmit may write .tsbuildinfo when incremental/composite is enabled). Returns exit_code, stdout and stderr tails, and an artifact path holding the full output when it was cut. If your brief asks for a command outside this list, do what inspection allows and name the command and why it is needed in return_task so your parent can assign it to a writable task.",
     },
     inputSchema: {
       default: {

@@ -1718,6 +1718,7 @@ describe("goal-14 slice A advisories", () => {
         "brief-count-limit",
         "director-self-reading",
         "status-polling",
+        "read-only-brief-needs-shell",
       ],
     );
 
