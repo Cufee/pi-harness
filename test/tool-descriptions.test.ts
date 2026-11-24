@@ -737,4 +737,26 @@ describe("tool-descriptions registry", () => {
     assert.ok(fallbackDenied instanceof HarnessRejection);
     assert.equal(fallbackDenied.notice.why, "This role's tool list does not include it.");
   });
+
+  it("FXT-7b return_task sources parameter description matches the sources fact for every role", () => {
+    const returnTaskRoles = ["worker", "execute", "research", "plan", "verify"] as const;
+    for (const role of returnTaskRoles) {
+      const tool = toolsForRole(role).find((t) => t.name === "return_task");
+      assert.ok(tool, `return_task missing from toolsForRole("${role}")`);
+      const props = (tool.inputSchema as { properties?: Record<string, { description?: string }> }).properties;
+      const paramDesc = props?.sources?.description;
+      const factText = toolFact(role, "return_task", "sources");
+      assert.equal(
+        paramDesc,
+        factText,
+        `${role} return_task.inputSchema.properties.sources.description must equal toolFact("${role}", "return_task", "sources")`,
+      );
+      if (role === "research" || role === "plan" || role === "verify") {
+        assert.ok(
+          paramDesc?.includes("unless you pass partial: true with artifact_paths"),
+          `${role} sources parameter description must state the partial artifact-only exception: ${paramDesc}`,
+        );
+      }
+    }
+  });
 });

@@ -1,5 +1,6 @@
 import { contextWarningText } from "../advisories/message.js";
-import { REJECTIONS } from "../advisories/rejections.js";
+import type { Role } from "../advisories/types.js";
+import { allowedToolNames, notYourTool } from "../tool-descriptions/registry.js";
 import { toolEventPreview } from "../protocol/tool-display.js";
 import {
   createModels,
@@ -585,6 +586,21 @@ export class PiRunner {
       description: t.description,
       parameters: t.inputSchema as never,
     }));
+    const piToolNames = new Set(piTools.map((tool) => tool.name));
+    const isReviewer = piToolNames.has("submit_review_verdict") && !piToolNames.has("return_task");
+    const isDirector =
+      req.tier === 1 &&
+      (piToolNames.has("goal_create") || piToolNames.has("read_file") || req.taskId.startsWith("chat-"));
+    const piRole: Role = isReviewer
+      ? "reviewer"
+      : isDirector
+        ? "director"
+        : req.tier === 1
+          ? "orchestrator"
+          : req.tier === 2
+            ? "worker"
+            : req.kind;
+    const piAuthorizedToolNames = new Set([...piToolNames, ...allowedToolNames(piRole)]);
 
     try {
       // The loop ends only when the agent stops calling tools.
@@ -852,9 +868,8 @@ export class PiRunner {
             args: toolEventPreview(call.arguments ?? {}),
           });
           try {
-            if (!piTools.some((tool) => tool.name === call.name)) {
-              const role = req.tier === 1 ? "orchestrator" : req.tier === 2 ? "worker" : req.kind;
-              throw REJECTIONS.notYourTool(call.name, role);
+            if (!piAuthorizedToolNames.has(call.name)) {
+              throw notYourTool(call.name, piRole);
             }
             const out = await req.executeTool(call.name, call.arguments ?? {});
             req.callbacks.onToolEvent?.({

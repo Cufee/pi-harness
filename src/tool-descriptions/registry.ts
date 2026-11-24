@@ -46,6 +46,40 @@ const TASK_ROLES: readonly Role[] = ["orchestrator", "worker", "research", "plan
 const NO_COUNTS_FACT =
   "Do not state turn, tool-call, or token counts in the brief; tasks are never stopped by counts.";
 
+const RETURN_TASK_SOURCES_DEFAULT_FACT =
+  "Include structured sources (path and optional lines, symbol, note) for code you inspected.";
+
+const RETURN_TASK_SOURCES_READ_ONLY_FACT =
+  "List the files and lines you relied on; a handoff without sources is rejected unless you pass partial: true with artifact_paths.";
+
+function returnTaskInputSchema(sourcesDescription: string): Schema {
+  return {
+    type: "object",
+    required: ["status", "summary"],
+    properties: {
+      status: { type: "string", enum: ["completed", "scope_too_large", "blocked"] },
+      summary: { type: "string", description: "Compact handoff (up to 2,000 characters; longer summaries are saved as artifacts)." },
+      partial: {
+        type: "boolean",
+        description:
+          "Set true when handing back incomplete work, for example after a [harness advisory: scope-too-large] advisory. Summarize what is done, cite what you verified, list what remains.",
+      },
+      sources: {
+        type: "array",
+        description: sourcesDescription,
+        items: {
+          type: "object",
+          required: ["path"],
+          properties: { path: { type: "string" }, lines: { type: "string" }, symbol: { type: "string" }, note: { type: "string" } },
+        },
+      },
+      artifact_paths: { type: "array", items: { type: "string" } },
+      evidence_paths: { type: "array", items: { type: "string" } },
+      suggested_splits: { type: "array", items: { type: "string" } },
+    },
+  };
+}
+
 const PARTIAL_RETURN_FACT =
   "A task may return early with a partial handoff and proposed splits after a [harness advisory: scope-too-large] advisory.";
 
@@ -500,10 +534,10 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
         default: "2,000 characters; a longer summary is saved as an artifact.",
       },
       sources: {
-        default: "Include structured sources (path and optional lines, symbol, note) for code you inspected.",
-        research: "List the files and lines you relied on; a handoff without sources is rejected unless you pass partial: true with artifact_paths.",
-        plan: "List the files and lines you relied on; a handoff without sources is rejected unless you pass partial: true with artifact_paths.",
-        verify: "List the files and lines you relied on; a handoff without sources is rejected unless you pass partial: true with artifact_paths.",
+        default: RETURN_TASK_SOURCES_DEFAULT_FACT,
+        research: RETURN_TASK_SOURCES_READ_ONLY_FACT,
+        plan: RETURN_TASK_SOURCES_READ_ONLY_FACT,
+        verify: RETURN_TASK_SOURCES_READ_ONLY_FACT,
       },
       verifyVerdict: {
         default: "For a final verify, completed records a pass and any other status a fail; a handoff with partial: true records neither.",
@@ -525,31 +559,10 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
         "Finish this task or send it back for re-scoping. {fact:scopeSendBack} Summary limit: {fact:summaryLimit} Sources: {fact:sources} {fact:verifyVerdict}",
     },
     inputSchema: {
-      default: {
-        type: "object",
-        required: ["status", "summary"],
-        properties: {
-          status: { type: "string", enum: ["completed", "scope_too_large", "blocked"] },
-          summary: { type: "string", description: "Compact handoff (up to 2,000 characters; longer summaries are saved as artifacts)." },
-          partial: {
-            type: "boolean",
-            description:
-              "Set true when handing back incomplete work, for example after a [harness advisory: scope-too-large] advisory. Summarize what is done, cite what you verified, list what remains.",
-          },
-          sources: {
-            type: "array",
-            description: "Evidence references. Required and non-empty for research, plan, and verify tasks.",
-            items: {
-              type: "object",
-              required: ["path"],
-              properties: { path: { type: "string" }, lines: { type: "string" }, symbol: { type: "string" }, note: { type: "string" } },
-            },
-          },
-          artifact_paths: { type: "array", items: { type: "string" } },
-          evidence_paths: { type: "array", items: { type: "string" } },
-          suggested_splits: { type: "array", items: { type: "string" } },
-        },
-      },
+      default: returnTaskInputSchema(RETURN_TASK_SOURCES_DEFAULT_FACT),
+      research: returnTaskInputSchema(RETURN_TASK_SOURCES_READ_ONLY_FACT),
+      plan: returnTaskInputSchema(RETURN_TASK_SOURCES_READ_ONLY_FACT),
+      verify: returnTaskInputSchema(RETURN_TASK_SOURCES_READ_ONLY_FACT),
     },
   },
   {
@@ -2036,6 +2049,20 @@ export function toolsForRole(role: Role, ctx?: { readOnly: boolean }): ToolDefin
   for (const entry of TOOL_REGISTRY) {
     if (!entry.roles.includes(role)) continue;
     if (entry.listed && !entry.listed({ role, readOnly })) continue;
+    out.push({
+      name: entry.name,
+      description: expandFacts(entry, role),
+      inputSchema: resolvePerRole(entry.inputSchema, role),
+    });
+  }
+  return out;
+}
+
+/** All tools authorized for `role`, including tools hidden from discovery listing (e.g. inspect_command for writable execute). */
+export function allowedToolsForRole(role: Role): ToolDefinition[] {
+  const out: ToolDefinition[] = [];
+  for (const entry of TOOL_REGISTRY) {
+    if (!entry.roles.includes(role)) continue;
     out.push({
       name: entry.name,
       description: expandFacts(entry, role),

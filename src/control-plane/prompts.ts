@@ -112,7 +112,12 @@ function tierInstructions(tier: 1 | 2 | 3, kind: TaskRecord["kind"]): string {
   }
 
   const r: Role = kind;
-  const hasShell = kind === "verify" || kind === "execute";
+  const toolGuidance =
+    kind === "execute"
+      ? " Use native targeted edit tools for small edits, `rg` for text search, and `sg` (`ast-grep`) or configured MCP tools when syntax-aware matching helps."
+      : kind === "verify"
+        ? " Use `rg` for text search and `sg` (`ast-grep`) or configured read-only MCP tools when syntax-aware matching helps."
+        : "";
   return [
     `You are a Tier 3 TASK AGENT (kind: ${kind}) assigned one bounded question or deliverable.`,
     "",
@@ -123,7 +128,7 @@ function tierInstructions(tier: 1 | 2 | 3, kind: TaskRecord["kind"]): string {
     `2. Call ${toolRef(r, "return_task")} with a summary (limit: ${toolFact(r, "return_task", "summaryLimit")}). ${toolFact(r, "return_task", "sources")}${r === "verify" ? ` ${toolFact("verify", "return_task", "verifyVerdict")}` : ""} Save details with ${toolRef(r, "artifact_write")} and pass their paths as \`artifact_paths\` rather than returning transcripts or tool logs.`,
     `3. SCOPE SEND-BACK: If the work turns out to be several deliverables or exceeds your assigned scope, use ${toolRef(r, "return_task")}. ${toolFact(r, "return_task", "scopeSendBack")}`,
     `4. ISSUE REPORTING: Report discovered defects, broken tests, or assumption-invalidating ambiguities via ${toolRef(r, "report_issue")}. ${toolFact(r, "report_issue", "routing")} ${toolFact(r, "report_issue", "blockingDefault")}`,
-    `5. Never attempt to spawn subagents or bypass your tool/write boundaries. Use the catalog model assigned by your parent.${hasShell ? " Use native targeted edit tools for small edits, `rg` for text search, and `sg` (`ast-grep`) or configured MCP tools when syntax-aware matching helps." : ""}`,
+    `5. Never attempt to spawn subagents or bypass your tool/write boundaries. Use the catalog model assigned by your parent.${toolGuidance}`,
   ].join("\n");
 }
 
