@@ -1434,7 +1434,7 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     roles: ["director"],
     description: {
       default:
-        "Explicit Director acceptance/override for a Goal based on verified evidence (e.g. when a review was obstructed or human approved). Requires a clear reason and concrete, readable evidence_paths (files or directories, e.g. under the goal's evidenceDir; .git, task worktrees and harness-internal state are refused). Required deterministic gates are re-run first and a failure rejects the accept unless override_deterministic is true. Recorded permanently with an audit trail in goal review history; auto-resolves open escalations.",
+        "Explicit Director acceptance/override for a Goal based on verified evidence (e.g. when a review was obstructed or human approved). Requires a clear reason and concrete, readable evidence_paths (files or directories, e.g. under the goal's evidenceDir; .git, task worktrees and harness-internal state are refused). Required deterministic gates are re-run first and a failure rejects the accept unless override_deterministic is true. If the gate checkout cannot be prepared (e.g. base branch deleted), the accept proceeds and the audit records gatesNotRun. Recorded permanently with an audit trail in goal review history; auto-resolves open escalations.",
     },
     inputSchema: {
       default: {
@@ -1690,7 +1690,7 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     roles: ["director"],
     description: {
       default:
-        "Verify and settle a Goal at the chosen verification depth (defaults to the Goal's verification_mode: 'auto' runs deterministic checks and only spawns an independent LLM reviewer when required behavioral/architectural criteria exist; 'deterministic' runs checks only; 'none' approves directly).",
+        "Verify and settle a Goal at the chosen verification depth (defaults to the Goal's verification_mode: 'auto' runs deterministic checks and only spawns an independent LLM reviewer when required behavioral/architectural criteria exist; 'deterministic' runs checks only; 'none' approves directly). If the run's base branch was deleted and verify_ref is unset, gates fall back to the run's last merged commit (refs/harness/merged/<runId>); if neither exists, verification fails with remediation options.",
     },
     inputSchema: {
       default: {
