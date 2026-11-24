@@ -51,6 +51,8 @@ export interface QuotaRetryStateEvent {
 
 export interface QuotaPauseInfo {
   reason: string;
+  /** Full matched provider error line (capped at ~2,000 chars) when distinct from the concise `reason`. */
+  detail?: string;
   resetAt?: string | null;
   retryCount: number;
   watchdogTimedOut: boolean;

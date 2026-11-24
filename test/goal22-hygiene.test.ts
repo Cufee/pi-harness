@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir, userInfo } from "node:os";
+import { homedir as bareOsHomedir } from "os";
 import { join, resolve } from "node:path";
 import { describe, it } from "bun:test";
 import { normalizeAttachRunId } from "../src/cli.js";
@@ -9,11 +10,18 @@ import { ControlPlaneToolExecutor, type ToolRuntimeHooks } from "../src/control-
 import { formatQuotaPauseSummary } from "../src/runners/quota-detect.js";
 
 describe("goal-22 hygiene", () => {
-  it("isolates defaultStateDir() into the preload temp home", () => {
+  it("isolates homedir(), defaultStateDir(), and home-derived env vars into the preload temp home", () => {
     const stateDir = resolve(defaultStateDir());
     const home = resolve(process.env.HOME ?? "");
     assert.ok(home.startsWith(resolve(tmpdir())), `expected temp HOME under tmpdir, got ${home}`);
+    assert.equal(resolve(homedir()), home);
+    assert.equal(resolve(bareOsHomedir()), home);
+    assert.equal(resolve(userInfo().homedir), home);
     assert.equal(stateDir, resolve(join(home, ".pi-harness")));
+    assert.equal(resolve(process.env.CODEX_HOME ?? ""), resolve(join(home, ".codex")));
+    assert.equal(resolve(process.env.CLAUDE_CONFIG_DIR ?? ""), resolve(join(home, ".claude")));
+    assert.equal(resolve(process.env.XDG_DATA_HOME ?? ""), resolve(join(home, ".local", "share")));
+    assert.equal(resolve(process.env.XDG_CONFIG_HOME ?? ""), resolve(join(home, ".config")));
   });
 
   it("derives titles cleanly and treats non-string, blank, undefined, and null as missing", () => {
