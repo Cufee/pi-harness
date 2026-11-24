@@ -5,6 +5,8 @@ export interface DetectedQuotaError {
   retryAfterSec?: number;
   resetAtIso?: string;
   summary: string;
+  /** Full matched provider error line (capped at 2,000 chars) for quota diagnostics. */
+  detail: string;
 }
 
 const HARD_QUOTA_PATTERNS: RegExp[] = [
@@ -40,13 +42,13 @@ const TRANSIENT_RATE_LIMIT_PATTERNS: RegExp[] = [
 export function detectQuotaErrorText(text: string): DetectedQuotaError {
   const cleaned = text.trim();
   if (!cleaned) {
-    return { isQuota: false, isHardExhaustion: false, summary: "" };
+    return { isQuota: false, isHardExhaustion: false, summary: "", detail: "" };
   }
 
   const isHard = HARD_QUOTA_PATTERNS.some((rx) => rx.test(cleaned));
   const isTransient = TRANSIENT_RATE_LIMIT_PATTERNS.some((rx) => rx.test(cleaned));
   if (!isHard && !isTransient) {
-    return { isQuota: false, isHardExhaustion: false, summary: "" };
+    return { isQuota: false, isHardExhaustion: false, summary: "", detail: "" };
   }
 
   // Try to parse Retry-After / "retry in X s/m" hints
@@ -93,6 +95,7 @@ export function detectQuotaErrorText(text: string): DetectedQuotaError {
     retryAfterSec,
     resetAtIso,
     summary: firstLine.slice(0, 220),
+    detail: firstLine.slice(0, 2000),
   };
 }
 

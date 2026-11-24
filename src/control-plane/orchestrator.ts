@@ -2776,6 +2776,7 @@ export class HarnessOrchestrator {
         if (res.stopReason === "quota_paused") {
           const qp = res.quotaPause;
           const reason = qp?.reason ?? "Quota / rate limit reached";
+          const detail = qp?.detail?.trim() || reason;
           const fence = this.rolloverFence(latest);
           const pauseHandoff = await this.buildCleanRolloverHandoff({
             runId: run.id,
@@ -2805,11 +2806,11 @@ export class HarnessOrchestrator {
             const prev = latest.resultJson ? JSON.parse(latest.resultJson) : null;
             nextResultJson = JSON.stringify(
               prev && typeof prev === "object" && !Array.isArray(prev)
-                ? { ...prev, quotaDetail: reason }
-                : { quotaDetail: reason },
+                ? { ...prev, quotaDetail: detail }
+                : { quotaDetail: detail },
             );
           } catch {
-            nextResultJson = JSON.stringify({ quotaDetail: reason });
+            nextResultJson = JSON.stringify({ quotaDetail: detail });
           }
           this.taskQuotaHints.set(task.id, {
             wireModel,
@@ -2833,7 +2834,7 @@ export class HarnessOrchestrator {
             profileId: latest.profileId,
             model: latest.model,
             reason,
-            detail: reason,
+            detail,
             resetAt: qp?.resetAt ?? null,
             retryCount: qp?.retryCount ?? 1,
             watchdogTimedOut: Boolean(qp?.watchdogTimedOut),

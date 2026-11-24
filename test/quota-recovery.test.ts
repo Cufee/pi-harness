@@ -421,6 +421,9 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
     let lastHydratedPrompt = "";
 
     const cfg = quotaRunConfig(repoDir, stateDir);
+    const longProviderLine =
+      `HTTP 429 Too Many Requests (sub pool exhausted): ${"diagnostic-token-".repeat(12)}tail-sentinel-273-chars`;
+    const shortReason = longProviderLine.slice(0, 220);
 
     const daemon = new HarnessDaemon(cfg, {
       dbPath: join(stateDir, "cp.sqlite"),
@@ -430,11 +433,17 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
             runAttempts++;
             lastHydratedPrompt = req.initialPrompt;
             if (quotaStillExhausted) {
+              if (runAttempts === 1) {
+                daemon.db.updateTask(req.taskId, {
+                  resultJson: JSON.stringify({ priorKey: "preserve-me", priorCount: 42 }),
+                });
+              }
               return {
                 text: "",
                 stopReason: "quota_paused",
                 quotaPause: {
-                  reason: "429 Too Many Requests (sub pool exhausted)",
+                  reason: shortReason,
+                  detail: longProviderLine,
                   resetAt: null,
                   retryCount: 3,
                   watchdogTimedOut: true,
@@ -470,10 +479,15 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
       assert.ok(pausedOrch?.summary?.startsWith("Paused (quota): "));
       assert.ok(pausedOrch?.summary?.includes("coordinator"), `expected model in summary, got: ${pausedOrch?.summary}`);
       assert.ok(!pausedOrch?.summary?.includes("429 Too Many Requests"), `raw line should not be in summary: ${pausedOrch?.summary}`);
-      const parsedResult = pausedOrch?.resultJson ? (JSON.parse(pausedOrch.resultJson) as { quotaDetail?: string }) : {};
-      assert.equal(parsedResult.quotaDetail, "429 Too Many Requests (sub pool exhausted)");
+      const parsedResult = pausedOrch?.resultJson
+        ? (JSON.parse(pausedOrch.resultJson) as { quotaDetail?: string; priorKey?: string; priorCount?: number })
+        : {};
+      assert.equal(parsedResult.quotaDetail, longProviderLine);
+      assert.equal(parsedResult.priorKey, "preserve-me");
+      assert.equal(parsedResult.priorCount, 42);
       const pausedEvent = daemon.db.getEventsSince(run.id, 0).find((e) => e.type === "quota.agent_paused");
-      assert.equal((pausedEvent?.payload as { detail?: string } | undefined)?.detail, "429 Too Many Requests (sub pool exhausted)");
+      assert.equal((pausedEvent?.payload as { reason?: string } | undefined)?.reason, shortReason);
+      assert.equal((pausedEvent?.payload as { detail?: string } | undefined)?.detail, longProviderLine);
 
       // 2. User manually resumes with a message while quota is STILL exhausted -> resets state machine & walks cleanly back to paused_quota!
       await client.request("run.resume", { runId: run.id, message: "try resuming now" });
@@ -666,6 +680,20 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
     assert.equal(d2.isQuota, true);
     assert.equal(d2.isHardExhaustion, true);
 
-    assert.equal(detectQuotaErrorText("ENOENT: file not found").isQuota, false);
+    const longLine = `HTTP 429 Too Many Requests: ${"x".repeat(230)}END-TAIL-MARKER`;
+    const dLong = detectQuotaErrorText(`unrelated prefix\n${longLine}\nunrelated suffix`);
+    assert.equal(dLong.isQuota, true);
+    assert.equal(dLong.summary.length, 220);
+    assert.equal(dLong.detail, longLine);
+    assert.ok(dLong.detail.endsWith("END-TAIL-MARKER"));
+
+    const hugeLine = `HTTP 429 Too Many Requests: ${"y".repeat(2500)}`;
+    const dHuge = detectQuotaErrorText(hugeLine);
+    assert.equal(dHuge.isQuota, true);
+    assert.equal(dHuge.detail.length, 2000);
+
+    const dNone = detectQuotaErrorText("ENOENT: file not found");
+    assert.equal(dNone.isQuota, false);
+    assert.equal(dNone.detail, "");
   });
 });
