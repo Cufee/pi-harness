@@ -35,6 +35,7 @@ import {
   GoalEngine,
   parseGoalCriterionPatches,
   shouldRunIndependentReview,
+  StaleReviewError,
   type CriterionEvaluation,
   type GateLocation,
   type GoalAcceptOverrideAudit,
@@ -42,6 +43,8 @@ import {
   type GoalCriterion,
   type GoalRecord,
   type GoalReviewVerdict,
+  type ReviewerDiagnostics,
+  type ReviewerStopReason,
   type VerificationMode,
 } from "../goals/engine.js";
 import { isAuthoritativeSource, isBlockedPhase, isCurrentClaim, type GoalLiveProgress, type GoalProgressSource } from "../goals/live-progress.js";
@@ -103,17 +106,62 @@ class FailedRunGatesError extends Error {
   }
 }
 
+export { StaleReviewError };
+
 /** Thrown when the independent Done-Reviewer exhausts its attempts without a structured verdict; no review cycle is consumed. */
 export class ReviewerFailedError extends Error {
   constructor(
     readonly attempts: number,
     readonly detail: string,
     readonly attemptFailures: string[] = [],
+    readonly diagnostics?: ReviewerDiagnostics,
   ) {
     super(
       `Reviewer failed to return a structured verdict after ${attempts} ${attempts === 1 ? "attempt" : "attempts"}; review cycle not consumed${detail ? `: ${detail}` : ""}`,
     );
     this.name = "ReviewerFailedError";
+  }
+}
+
+export interface ActiveReviewInfo {
+  inflightId: string;
+  kind: "review" | "accept";
+  goalVersion: number;
+  cycle: number;
+  phase: "gates" | "reviewer";
+  reviewerTaskId: string | null;
+  runId: string | null;
+  startedAt: number;
+}
+
+/** Thrown when a review is already in flight for a goal (includes in-flight metadata and wait instructions). */
+export class ReviewInProgressError extends Error {
+  constructor(
+    readonly goalId: string,
+    readonly inFlight: ActiveReviewInfo,
+    readonly superseded: boolean,
+  ) {
+    super(
+      `Review already in progress for ${goalId}: ${inFlight.inflightId}, ` +
+        `reviewer task ${inFlight.reviewerTaskId ?? "none yet"}, ` +
+        `goal v${inFlight.goalVersion} cycle ${inFlight.cycle}, phase ${inFlight.phase}. ` +
+        `Wait with goal_wait({ goal_id: "${goalId}" }) (wakes on goal.reviewed) or poll goal_get.`,
+    );
+    this.name = "ReviewInProgressError";
+  }
+}
+
+/** Thrown when a review cannot start because maxReviewCycles is exhausted or a max-cycles escalation is open. */
+export class ReviewBudgetExhaustedError extends Error {
+  constructor(
+    readonly goalId: string,
+    readonly reason: string,
+  ) {
+    super(
+      `Review budget exhausted for ${goalId}: ${reason}. ` +
+        "Amend the goal (goal_amend), accept it with evidence (goal_accept), or re-trigger explicitly with override_review_budget: true.",
+    );
+    this.name = "ReviewBudgetExhaustedError";
   }
 }
 
@@ -511,6 +559,11 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
         goal_id: { type: "string" },
         verification_mode: { type: "string", enum: ["auto", "none", "deterministic", "independent_review"] },
         summary: { type: "string", description: "Optional concise completion summary when verification_mode is 'none'." },
+        override_review_budget: {
+          type: "boolean",
+          description:
+            "Explicitly run an additional review cycle when budgets.maxReviewCycles is reached or a 'Max review cycles reached' escalation is open.",
+        },
       },
     },
   },
@@ -836,6 +889,7 @@ export class DirectorRuntime {
   readonly goals: GoalEngine;
   private activeChats = new Map<string, ActiveChat>();
   private activeReviews = new Map<string, AbortController>();
+  private activeReviewInfo = new Map<string, ActiveReviewInfo>();
   private activeReviewerTools = new Map<
     string,
     { tools: ToolDefinition[]; execute: (name: string, args: Record<string, unknown>) => Promise<unknown> }
@@ -892,6 +946,20 @@ export class DirectorRuntime {
       db.db,
       (id) => {
         this.bumpReviewInvalidationEpoch(id);
+        const info = this.activeReviewInfo.get(id);
+        const latestGoal = this.goals.getGoal(id);
+        if (info && latestGoal && info.goalVersion < latestGoal.version) {
+          const eventRunId = latestGoal.linkedRunId ?? info.runId;
+          if (eventRunId) {
+            this.db.emitEvent(eventRunId, info.reviewerTaskId, "goal.review_superseded", {
+              goalId: id,
+              inflightId: info.inflightId,
+              fromVersion: info.goalVersion,
+              toVersion: latestGoal.version,
+              reviewerTaskId: info.reviewerTaskId,
+            });
+          }
+        }
         this.activeReviews.get(id)?.abort(new Error("Goal changed during review"));
       },
       config.goals,
@@ -972,6 +1040,7 @@ export class DirectorRuntime {
     for (const [goalId, abort] of [...this.activeReviews.entries()]) {
       abort.abort(new Error("Daemon shutting down"));
       this.activeReviews.delete(goalId);
+      this.activeReviewInfo.delete(goalId);
     }
     this.activeReviewerTools.clear();
   }
@@ -1242,9 +1311,12 @@ export class DirectorRuntime {
 
     if (blocker && firstNotice) this.parkBlockedGoal(goal, ev.runId, blocker);
 
+    const budgetExhaustedReason = this.reviewBudgetExhausted(goal);
+
     // Control-plane-driven automatic verification on run completion (removes LLM single point of failure)
     if (
       !blocker &&
+      !budgetExhaustedReason &&
       status === "completed" &&
       this.config.goals?.autoVerifyOnSettle !== false &&
       goal.verificationMode !== "none" &&
@@ -1265,6 +1337,7 @@ export class DirectorRuntime {
     // without a review cycle. Never over a pending P0 (a human decision) or an explicit blocked phase.
     if (
       !blocker &&
+      !budgetExhaustedReason &&
       status === "failed" &&
       cause !== "blocked_escalation" &&
       this.config.goals?.autoVerifyOnSettle !== false &&
@@ -1309,15 +1382,17 @@ export class DirectorRuntime {
                 `Nothing restarts automatically; \`pi-harness resume ${ev.runId}\` or goal_commit continues the same run in place, or review the goal.`,
         );
       } else {
-        // Completed and automatic verification did not launch (disabled, or verification_mode=none).
+        // Completed and automatic verification did not launch (budget exhausted, disabled, or verification_mode=none).
         this.goals.setStatus(
           goal.id,
           "awaiting_human",
-          goal.verificationMode === "none"
-            ? "Linked run completed (verification_mode=none); review or accept to finish."
-            : goal.reviewCycle > 0
-              ? undefined
-              : "Linked run completed (auto-verify disabled); trigger review or accept to finish.",
+          budgetExhaustedReason
+            ? `Review budget exhausted (${budgetExhaustedReason}); amend, goal_accept, or goal_trigger_review with override_review_budget.`
+            : goal.verificationMode === "none"
+              ? "Linked run completed (verification_mode=none); review or accept to finish."
+              : goal.reviewCycle > 0
+                ? undefined
+                : "Linked run completed (auto-verify disabled); trigger review or accept to finish.",
         );
       }
     }
@@ -1326,6 +1401,10 @@ export class DirectorRuntime {
 
     if (!firstNotice || !wakeOnSettle || !goal.chatSessionId) return;
 
+    const budgetExhaustedDetail =
+      status === "completed" && budgetExhaustedReason
+        ? `review budget exhausted (${budgetExhaustedReason}); amend, goal_accept, or goal_trigger_review with override_review_budget`
+        : null;
     const event: ChatControlEvent = {
       kind: "goal.settled",
       goalId: goal.id,
@@ -1345,7 +1424,7 @@ export class DirectorRuntime {
         : blocker
         ? { detail: blockerDetail(blocker), cause: "escalation" }
         : {
-            ...(recordedCause ? { detail: recordedCause } : {}),
+            ...(budgetExhaustedDetail ? { detail: budgetExhaustedDetail } : recordedCause ? { detail: recordedCause } : {}),
             // Only a stop with a recorded operator reason is explicit; a stop derived from settled tasks is not.
             ...(status !== "completed"
               ? { cause: status === "failed" ? "run_failed" : explicitStopReason ? "explicit_stop" : "derived_stopped" }
@@ -1364,6 +1443,7 @@ export class DirectorRuntime {
   ): void {
     // A premature review leaves the pending amendment to decide the settlement; it is not a verification failure.
     if (err instanceof PendingAmendmentError) return;
+    if (err instanceof StaleReviewError || err instanceof ReviewBudgetExhaustedError) return;
     // A review superseded by a stop, resume or pause is not a verification failure either.
     if (launch?.aborted) return;
     if (!this.unsubRunEvents || !goal.chatSessionId || !this.config.events?.wakeDirectorOnGoalSettle) return;
@@ -2929,14 +3009,25 @@ export class DirectorRuntime {
     const running = this.activeReviews.get(initial.id);
     if (running) {
       running.abort(new Error(`Review superseded by goal_accept for ${initial.id}`));
-      const deadline = Date.now() + 5_000;
-      while (this.activeReviews.has(initial.id) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
-      if (this.activeReviews.has(initial.id)) throw new Error(`Review of ${initial.id} is still stopping; retry goal_accept shortly.`);
+      if (!(await this.waitForReviewUnwind(initial.id, 5_000))) {
+        throw new Error(`Review of ${initial.id} is still stopping; retry goal_accept shortly.`);
+      }
     }
     // Re-read after a stopped review: it may have moved the goal (its status is what a failure restores).
     const goal = checkAcceptable(this.goals.getGoal(initial.id));
     const slot = new AbortController();
+    const acceptStartedAt = Date.now();
     this.activeReviews.set(goal.id, slot);
+    this.activeReviewInfo.set(goal.id, {
+      inflightId: `accept:${goal.id}:v${goal.version}:c${goal.reviewCycle + 1}:${acceptStartedAt}`,
+      kind: "accept",
+      goalVersion: goal.version,
+      cycle: goal.reviewCycle + 1,
+      phase: "gates",
+      reviewerTaskId: null,
+      runId: goal.linkedRunId,
+      startedAt: acceptStartedAt,
+    });
     const prevStatus = goal.status;
     let committed = false;
     try {
@@ -3037,8 +3128,36 @@ export class DirectorRuntime {
       }
       throw err;
     } finally {
-      if (this.activeReviews.get(goal.id) === slot) this.activeReviews.delete(goal.id);
+      if (this.activeReviews.get(goal.id) === slot) {
+        this.activeReviews.delete(goal.id);
+        this.activeReviewInfo.delete(goal.id);
+      }
     }
+  }
+
+  private async waitForReviewUnwind(goalId: string, timeoutMs = 5_000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.activeReviews.has(goalId) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return !this.activeReviews.has(goalId);
+  }
+
+  /** Returns a reason when no further review cycle may start without an amend, accept, or explicit override. */
+  private reviewBudgetExhausted(goal: GoalRecord): string | null {
+    const maxCycles = goal.budgets.maxReviewCycles;
+    if (typeof maxCycles === "number" && maxCycles > 0 && goal.reviewCycle >= maxCycles) {
+      return `Max review cycles reached (${goal.reviewCycle}/${maxCycles})`;
+    }
+    if (goal.linkedRunId) {
+      const openMaxEsc = this.db
+        .listEscalations(goal.linkedRunId, "unresolved")
+        .find((e) => e.category === "verification_failed" && e.title.startsWith("Max review cycles reached"));
+      if (openMaxEsc) {
+        return `Open escalation ${openMaxEsc.id}: ${openMaxEsc.title}`;
+      }
+    }
+    return null;
   }
 
   /** Post-commit side effects of an accepted override; each step is best-effort (the goal is already achieved). */
@@ -3111,21 +3230,88 @@ export class DirectorRuntime {
   async verifyAndReviewGoal(
     goalId: string,
     signal?: AbortSignal,
-    opts?: { verificationMode?: VerificationMode; summary?: string; autoTriggered?: boolean; settledRunStatus?: "failed"; onInvalidatedAbort?: () => void },
+    opts?: {
+      verificationMode?: VerificationMode;
+      summary?: string;
+      autoTriggered?: boolean;
+      settledRunStatus?: "failed";
+      onInvalidatedAbort?: () => void;
+      overrideReviewBudget?: boolean;
+    },
   ): Promise<{
     goal: GoalRecord;
     review: GoalReviewVerdict;
     circuitBreakerTripped?: string;
   }> {
-    const goal = this.goals.getGoal(goalId);
+    let goal = this.goals.getGoal(goalId);
     if (!goal) throw new Error(`Unknown goal ${goalId}`);
-    if (this.activeReviews.has(goal.id)) throw new Error(`Review already in progress for ${goal.id}`);
+    if (goal.status === "achieved") {
+      throw new StaleReviewError(goal.id, {
+        reviewedVersion: goal.version,
+        currentVersion: goal.version,
+        currentStatus: goal.status,
+        reason: `Goal ${goal.id} is achieved (accepted); review not started`,
+      });
+    }
     if (goal.status === "paused" || goal.status === "cancelled") throw new Error(`Goal is ${goal.status}`);
+    if (this.activeReviews.has(goal.id)) {
+      const existingAbort = this.activeReviews.get(goal.id)!;
+      const existingInfo = this.activeReviewInfo.get(goal.id) ?? {
+        inflightId: `review:${goal.id}:v${goal.version}:c${goal.reviewCycle + 1}:${Date.now()}`,
+        kind: "review" as const,
+        goalVersion: goal.version,
+        cycle: goal.reviewCycle + 1,
+        phase: "gates" as const,
+        reviewerTaskId: null,
+        runId: goal.linkedRunId,
+        startedAt: Date.now(),
+      };
+      const isSuperseded = existingInfo.goalVersion < goal.version || existingAbort.signal.aborted;
+      if (isSuperseded) {
+        if (!existingAbort.signal.aborted) {
+          existingAbort.abort(new Error(`Review for v${existingInfo.goalVersion} superseded by v${goal.version}`));
+        }
+        await this.waitForReviewUnwind(goal.id, 5_000);
+        const refreshed = this.goals.getGoal(goal.id);
+        if (!refreshed) throw new Error(`Unknown goal ${goalId}`);
+        goal = refreshed;
+        if (goal.status === "achieved") {
+          throw new StaleReviewError(goal.id, {
+            reviewedVersion: goal.version,
+            currentVersion: goal.version,
+            currentStatus: goal.status,
+            reason: `Goal ${goal.id} is achieved (accepted); review not started`,
+          });
+        }
+        if (goal.status === "paused" || goal.status === "cancelled") throw new Error(`Goal is ${goal.status}`);
+        if (this.activeReviews.has(goal.id)) {
+          const stillInfo = this.activeReviewInfo.get(goal.id) ?? existingInfo;
+          throw new ReviewInProgressError(goal.id, stillInfo, stillInfo.goalVersion < goal.version);
+        }
+      } else {
+        throw new ReviewInProgressError(goal.id, existingInfo, false);
+      }
+    }
+    const budgetExhaustedReason = this.reviewBudgetExhausted(goal);
+    if (budgetExhaustedReason && !opts?.overrideReviewBudget) {
+      throw new ReviewBudgetExhaustedError(goal.id, budgetExhaustedReason);
+    }
     // An unacknowledged amendment decides this settlement itself: reject without touching the goal or its recovery.
     const pendingAmend = this.undeliveredAmendments.get(goal.id);
     if (pendingAmend && pendingAmend.version === goal.version) throw new PendingAmendmentError(goal.id, goal.version, pendingAmend.reason);
     const abort = new AbortController();
+    const reviewStartedAt = Date.now();
     this.activeReviews.set(goal.id, abort);
+    this.activeReviewInfo.set(goal.id, {
+      inflightId: `review:${goal.id}:v${goal.version}:c${goal.reviewCycle + 1}:${reviewStartedAt}`,
+      kind: "review",
+      goalVersion: goal.version,
+      cycle: goal.reviewCycle + 1,
+      phase: "gates",
+      reviewerTaskId: null,
+      runId: goal.linkedRunId,
+      startedAt: reviewStartedAt,
+    });
     const reviewSignal = signal ? AbortSignal.any([abort.signal, signal]) : abort.signal;
     const reviewEpoch = this.getReviewInvalidationEpoch(goal.id);
     // A stop arriving mid-review cannot settle the goal while the review holds it; it is replayed once the review has unwound.
@@ -3153,6 +3339,21 @@ export class DirectorRuntime {
       return await this.verifyAndReviewGoalInner(goal, reviewSignal, opts);
     } catch (error) {
       if (!this.disposed) {
+        if (error instanceof StaleReviewError && !error.staleEventRecorded && goal.linkedRunId) {
+          try {
+            this.db.emitEvent(goal.linkedRunId, null, "goal.review_stale", {
+              goalId: goal.id,
+              reviewedVersion: error.reviewedVersion ?? goal.version,
+              currentVersion: error.currentVersion,
+              currentStatus: error.currentStatus,
+              reviewerTaskId: null,
+              verdict: error.verdict ?? null,
+            });
+            error.staleEventRecorded = true;
+          } catch {
+            // DB may already be closing during shutdown
+          }
+        }
         try {
           const current = this.goals.getGoal(goal.id);
           // An invalidated review (pause, resume, stop, amend) must not touch the goal or its latest summary.
@@ -3160,6 +3361,7 @@ export class DirectorRuntime {
           if (epochMatches && current?.version === goal.version && ["executing", "verifying", "reviewing"].includes(current.status)) {
             if (
               error instanceof PendingAmendmentError ||
+              error instanceof StaleReviewError ||
               deferredStopEvent ||
               abort.signal.aborted ||
               this.isRunOccupyingGoalSlot(current.linkedRunId)
@@ -3175,7 +3377,13 @@ export class DirectorRuntime {
                     ? `Blocked on verification: required deterministic gate(s) ${error.failedIds.join(", ")} fail at ${formatGateRefSha(error.location)} (${error.location.isolated ? "_verify worktree, removed" : `primary checkout ${error.location.cwd}`}). All ${error.completedWorkerCount} worker task(s) completed${error.location.note ? `; ${error.location.note}` : ""}. If the work is on another branch, goal_amend verify_ref then goal_trigger_review; otherwise resume ${current.linkedRunId ?? "unknown"} or review.`
                     : `Linked run ${current.linkedRunId ?? "unknown"} failed and required deterministic gate(s) still fail (${error.failedIds.join(", ")}) at ${formatGateRefSha(error.location)}; resume or review.`
                   : error instanceof ReviewerFailedError
-                    ? `Reviewer failed to return a structured verdict after ${error.attempts} ${error.attempts === 1 ? "attempt" : "attempts"}; review cycle not consumed${error.detail ? `: ${error.detail.slice(0, 240)}` : ""}`
+                    ? (() => {
+                        const d = error.diagnostics;
+                        const diagBrief = d
+                          ? ` [task=${d.reviewerTaskId}, model=${d.model}, stopReason=${d.stopReason}${d.rawOutputPaths[0] ? `, output=${d.rawOutputPaths[0]}` : ""}]`
+                          : "";
+                        return `Reviewer failed to return a structured verdict after ${error.attempts} ${error.attempts === 1 ? "attempt" : "attempts"}; review cycle not consumed${diagBrief}${error.detail ? `: ${error.detail.slice(0, 240)}` : ""}`;
+                      })()
                     : `Verification failed: ${msg.slice(0, 240)}`,
               );
             }
@@ -3188,7 +3396,10 @@ export class DirectorRuntime {
       throw error;
     } finally {
       unsubscribe();
-      if (this.activeReviews.get(goal.id) === abort) this.activeReviews.delete(goal.id);
+      if (this.activeReviews.get(goal.id) === abort) {
+        this.activeReviews.delete(goal.id);
+        this.activeReviewInfo.delete(goal.id);
+      }
       if (!this.disposed) {
         // Replayed while the run is still stopped, even after a pause/resume invalidated the review: a stop of
         // a resumed-then-stopped run still has to hand the goal over, and a run resumed since is not replayed.
@@ -3219,9 +3430,17 @@ export class DirectorRuntime {
     circuitBreakerTripped?: string;
   }> {
     const run = goal.linkedRunId ? this.db.getRun(goal.linkedRunId) : null;
-    const assertCurrent = () => {
+    const assertCurrent = (pendingVerdict?: string) => {
       signal.throwIfAborted();
       const current = this.goals.getGoal(goal.id);
+      if (current?.status === "achieved") {
+        throw new StaleReviewError(goal.id, {
+          reviewedVersion: goal.version,
+          currentVersion: current.version,
+          currentStatus: current.status,
+          verdict: pendingVerdict,
+        });
+      }
       if (current?.version !== goal.version || current.status === "paused" || current.status === "cancelled" ||
           (run && this.db.getRun(run.id)?.status === "stopped")) {
         throw new Error(`Goal ${goal.id} changed or stopped during review`);
@@ -3269,6 +3488,7 @@ export class DirectorRuntime {
         evidence: opts?.summary?.trim() || "Marked complete without separate verification pass (verification_mode=none).",
       }));
       const outcome = this.db.transaction(() => {
+        assertCurrent("approved");
         assertNoOpenP0ForFailedRunApproval();
         return this.goals.recordReviewVerdict(goal.id, {
           verdict: "approved",
@@ -3277,6 +3497,7 @@ export class DirectorRuntime {
           summary: opts?.summary?.trim() || "Goal completed directly (verification_mode=none).",
           diffHash: `direct-${Date.now()}`,
           source: "none",
+          expectedVersion: goal.version,
         });
       });
       await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered, signal });
@@ -3331,6 +3552,7 @@ export class DirectorRuntime {
           diffHash: gateResult.diffHash,
           spentUsd: this.sumRunCostUsd(goal.linkedRunId),
           source: "deterministic",
+          expectedVersion: goal.version,
         });
         await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered, signal });
         return outcome;
@@ -3376,6 +3598,7 @@ export class DirectorRuntime {
             diffHash: gateResult.diffHash,
             spentUsd: this.sumRunCostUsd(goal.linkedRunId),
             source: "coordinator_failed",
+            expectedVersion: goal.version,
           });
           await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered, signal });
           return outcome;
@@ -3393,7 +3616,7 @@ export class DirectorRuntime {
         ];
         // Re-checked in the verdict's transaction so a resume or reopened P0 cannot slip in before it is recorded.
         const outcome = this.db.transaction(() => {
-          assertCurrent();
+          assertCurrent("approved");
           assertNoOpenP0ForFailedRunApproval();
           return this.goals.recordReviewVerdict(goal.id, {
             verdict: "approved",
@@ -3406,6 +3629,7 @@ export class DirectorRuntime {
                 : "Approved cleanly without redundant LLM review."),
             diffHash: gateResult.diffHash,
             source: "deterministic",
+            expectedVersion: goal.version,
           });
         });
         await this.handlePostReviewTransition(outcome, { autoTriggered: opts?.autoTriggered, signal });
@@ -3415,13 +3639,14 @@ export class DirectorRuntime {
       // All deterministic checks passed -> spawn fresh read-only Independent Skeptical Reviewer
       let diffStat = "";
       let diffPatch = "";
+      const diffRange = run?.baseSha ? `${run.baseSha}..${verifyRef}` : undefined;
       try {
         diffStat = (
-          await runGit(verifyCwd, run?.baseSha ? ["diff", "--stat", `${run.baseSha}..${verifyRef}`] : ["status", "--short"])
+          await runGit(verifyCwd, diffRange ? ["diff", "--stat", diffRange] : ["status", "--short"])
         ).stdout;
-        if (run?.baseSha) {
-          const rawPatch = (await runGit(verifyCwd, ["diff", `${run.baseSha}..${verifyRef}`])).stdout;
-          diffPatch = rawPatch.length > 24_000 ? `${rawPatch.slice(0, 24_000)}\n... [diff truncated at 24KB]` : rawPatch;
+        if (diffRange) {
+          const rawPatch = (await runGit(verifyCwd, ["diff", diffRange])).stdout;
+          diffPatch = rawPatch.length > 12_000 ? `${rawPatch.slice(0, 12_000)}\n... [diff truncated at 12KB]` : rawPatch;
         }
       } catch {
         diffStat = "";
@@ -3433,8 +3658,35 @@ export class DirectorRuntime {
       const artifactsDir = resolve(goal.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts");
       // A rejected (e.g. symlinked) evidence directory is never advertised or granted to the reviewer.
       const evidenceDir = ensureGoalEvidenceDir(goal.repoRoot, goal.id);
+      let contractPath: string | undefined;
+      if (evidenceDir !== null) {
+        try {
+          const targetContract = join(evidenceDir, `contract-v${goal.version}.md`);
+          if (!existsSync(targetContract) || lstatSync(targetContract).isFile()) {
+            const fullContract = [
+              `# Goal ${goal.id} v${goal.version}: ${goal.title}`,
+              "",
+              "## Description",
+              goal.description,
+              "",
+              "## Acceptance Criteria",
+              ...goal.criteria.map(
+                (c) =>
+                  `- [${c.id}] (${c.kind}${c.required ? ", REQUIRED" : ", optional"}): ${c.description}${c.command ? ` [cmd: ${c.command}]` : ""}`,
+              ),
+              ...(goal.nonGoals.length > 0 ? ["", "## Non-Goals", ...goal.nonGoals.map((ng) => `- ${ng}`)] : []),
+            ].join("\n");
+            writeFileSync(targetContract, `${fullContract}\n`, "utf8");
+            contractPath = targetContract;
+          }
+        } catch {
+          contractPath = undefined;
+        }
+      }
       const reviewerPrompt = this.goals.buildReviewerPrompt(goal, gateResult, diffStat, diffPatch, {
         reviewerMaxTurns,
+        contractPath,
+        diffRange,
         ...(evidenceDir !== null
           ? {
               evidence: {
@@ -3515,6 +3767,12 @@ export class DirectorRuntime {
         model,
         maxTurns: reviewerMaxTurns,
       });
+      const inFlightInfo = this.activeReviewInfo.get(goal.id);
+      if (inFlightInfo && inFlightInfo.goalVersion === goal.version) {
+        inFlightInfo.phase = "reviewer";
+        inFlightInfo.reviewerTaskId = reviewerTask.id;
+        inFlightInfo.runId = reviewRun.id;
+      }
       const cancelAbort = new AbortController();
       const cancelSignal = AbortSignal.any([signal, cancelAbort.signal]);
       const unsubscribe = this.db.onEvent(ev => {
@@ -3546,6 +3804,10 @@ export class DirectorRuntime {
 
       let outcome: ReturnType<GoalEngine["recordReviewVerdict"]>;
       let turnsUsed = 0;
+      let lastCtxPct: number | null = null;
+      const rawOutputPaths: string[] = [];
+      let lastStopReason: ReviewerStopReason = "end_turn_without_verdict";
+      const transcriptHint = `events for task ${reviewerTask.id} (pi-harness watch ${reviewRun.id} / runs.trees)`;
       const bridgeExt = import.meta.url.endsWith(".js") ? "mcp-bridge.js" : "mcp-bridge.ts";
       const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", bridgeExt);
       // Each reviewer session gets its own executor; one from an ended session can never fill the verdict.
@@ -3555,6 +3817,25 @@ export class DirectorRuntime {
       let lastSubmitError: string | null = null;
       let lastAttemptFailure: string | null = null;
       const attemptFailures: string[] = [];
+      const buildDiagnostics = (
+        stopReason: ReviewerStopReason,
+        extra?: { infrastructure?: boolean },
+      ): ReviewerDiagnostics => ({
+        reviewerTaskId: reviewerTask.id,
+        runId: reviewRun.id,
+        profileId: profile.id,
+        model,
+        attempts: Math.max(currentAttempt, 1),
+        stopReason,
+        contextPct: lastCtxPct,
+        turnsUsed,
+        attemptFailures: [...attemptFailures],
+        rawOutputPaths: [...rawOutputPaths],
+        transcript: transcriptHint,
+        goalVersion: goal.version,
+        at: Date.now(),
+        ...(extra?.infrastructure ? { infrastructure: true } : {}),
+      });
       const makeReviewerExecuteTool = (attempt: number) => async (name: string, args: Record<string, unknown>) => {
         if (name === "submit_review_verdict") {
           if (attempt !== activeAttempt) throw new Error("submit_review_verdict: this reviewer session has ended");
@@ -3602,6 +3883,7 @@ export class DirectorRuntime {
           activeAttempt = attempt;
           verdictBox.value = null;
           turnsUsed = 0;
+          lastCtxPct = null;
           submitCallsThisAttempt = 0;
           lastSubmitError = null;
           let attemptTimedOut = false;
@@ -3637,6 +3919,9 @@ export class DirectorRuntime {
           });
           let res: Awaited<ReturnType<typeof runner.run>> | null = null;
           let runErr: unknown = null;
+          let handle: RunnerExecutionHandle | null = null;
+          const pendingSteers: string[] = [];
+          let contextNudgeSent = false;
           try {
             res = await runner.run({
               runId: reviewRun.id,
@@ -3655,6 +3940,10 @@ export class DirectorRuntime {
               maxTurns: reviewerMaxTurns,
               tools: [submitTool],
               executeTool,
+              onHandle: (h) => {
+                handle = h;
+              },
+              drainPendingSteers: () => pendingSteers.splice(0),
               isTaskSettled: () => verdictBox.value !== null,
               missingReturnWrapUpPrompt: missingVerdictWrapUpPrompt,
               daemonSocketPath: this.config.socketPath,
@@ -3687,6 +3976,38 @@ export class DirectorRuntime {
                   this.db.updateTask(reviewerTask.id, { contextUsed: usage.used, contextSize: usage.size });
                   emit("agent.usage", usage);
                   cost.onUsage(usage);
+                  if (usage.size > 0) {
+                    const ratio = usage.used / usage.size;
+                    lastCtxPct = Math.round(ratio * 100);
+                    if (!contextNudgeSent && verdictBox.value === null && ratio >= REVIEWER_CONTEXT_NUDGE_RATIO) {
+                      contextNudgeSent = true;
+                      const pct = lastCtxPct;
+                      const msg =
+                        `Context is at ${pct}%. Stop exploring. Call submit_review_verdict now with what you have verified; ` +
+                        "mark unverified required criteria passed:false with remediation and use changes_requested.";
+                      emit("reviewer.context_nudge", {
+                        goalId: goal.id,
+                        version: goal.version,
+                        attempt,
+                        contextPct: pct,
+                        used: usage.used,
+                        size: usage.size,
+                        message: msg,
+                      });
+                      if (handle) {
+                        void handle
+                          .steer(msg)
+                          .then((ok) => {
+                            if (!ok) pendingSteers.push(msg);
+                          })
+                          .catch(() => {
+                            pendingSteers.push(msg);
+                          });
+                      } else {
+                        pendingSteers.push(msg);
+                      }
+                    }
+                  }
                 },
                 onTurn: (n) => {
                   turnsUsed = n;
@@ -3702,10 +4023,32 @@ export class DirectorRuntime {
             cost.finish();
           }
 
+          // Persist each attempt's raw final text (or error) as a dossier so callers can inspect why a reviewer stopped.
+          if (!cancelSignal.aborted && !this.disposed) {
+            try {
+              const rawContent = runErr
+                ? `${runErr instanceof Error ? runErr.stack || runErr.message : String(runErr)}${res?.text?.trim() ? `\n\n${res.text}` : ""}`
+                : res?.text && res.text.trim().length > 0
+                  ? res.text
+                  : "(empty)";
+              const attemptDossier = writeTaskDossier(
+                this.db,
+                reviewRun,
+                reviewerTask.id,
+                `reviewer-attempt-${attempt}.txt`,
+                rawContent,
+                `Done-Reviewer attempt ${attempt} raw output for ${goal.id} v${goal.version}`,
+              );
+              rawOutputPaths.push(attemptDossier.path);
+            } catch {
+              // Best-effort diagnostics write
+            }
+          }
+
           // Genuine cancellation (goal/run/reviewer cancelled or invalidated) exits immediately without retry.
           cancelSignal.throwIfAborted();
           if (this.db.getTask(reviewerTask.id)?.status !== "running") throw new Error("Reviewer cancelled");
-          assertCurrent();
+          assertCurrent((verdictBox.value as SubmittedVerdict | null)?.verdict);
           if (runErr instanceof PendingAmendmentError) throw runErr;
 
           const keepSubmitted = submittedBeforeAttemptTimeout();
@@ -3723,13 +4066,26 @@ export class DirectorRuntime {
               };
             }
           }
-          if (keepSubmitted || (completedNormally && verdictBox.value)) break;
+          if (keepSubmitted || (completedNormally && verdictBox.value)) {
+            lastStopReason = "submitted";
+            break;
+          }
 
           // Any recoverable attempt failure (runner error, non-completed/empty stopReason, wall-clock timeout, or
           // completed without a valid verdict) is retried once in a fresh session with the concrete failure;
           // nothing is recorded in goal_reviews and no review cycle is consumed.
           const text = res?.text ?? "";
           const runErrMsg = runErr ? (runErr instanceof Error ? runErr.message : String(runErr)) : null;
+          lastStopReason = classifyReviewerStopReason({
+            submitted: false,
+            timedOut: attemptTimedOut,
+            aborted: cancelSignal.aborted,
+            runErrMsg,
+            res,
+            turnsUsed,
+            reviewerMaxTurns,
+            lastCtxPct,
+          });
           const effectiveStopReason = attemptTimedOut ? "timeout" : runErr ? "runner_error" : (res?.stopReason || "(empty)");
           const textParseError = completedNormally && text ? describeReviewerTextParseError(text) : null;
           const errorParts = [
@@ -3756,7 +4112,12 @@ export class DirectorRuntime {
           lastAttemptFailure = attemptDetail;
           attemptFailures.push(attemptDetail);
           if (attempt >= REVIEWER_VERDICT_ATTEMPTS) {
-            throw new ReviewerFailedError(attempt, attemptFailures.join(" | "), attemptFailures);
+            throw new ReviewerFailedError(
+              attempt,
+              attemptFailures.join(" | "),
+              attemptFailures,
+              buildDiagnostics(lastStopReason, { infrastructure: true }),
+            );
           }
           emit("agent.error", {
             error: `Reviewer attempt ${attempt}/${REVIEWER_VERDICT_ATTEMPTS} failed without a usable verdict (${attemptDetail}). Retrying in a fresh reviewer session.`,
@@ -3769,6 +4130,7 @@ export class DirectorRuntime {
             Math.max(currentAttempt, 1),
             attemptFailures.join(" | ") || "Reviewer returned no usable verdict",
             attemptFailures,
+            buildDiagnostics(lastStopReason, { infrastructure: true }),
           );
         }
 
@@ -3808,9 +4170,10 @@ export class DirectorRuntime {
             ? lateFailure
             : null;
         const blockingIssues = submittedVerdict.blockingIssues ?? [];
+        const reviewerDiagnostics = buildDiagnostics("submitted");
         outcome = this.db.transaction(() => {
           if (submittedVerdict?.verdict === "approved" && !unseenFailure) {
-            assertCurrent();
+            assertCurrent("approved");
             assertNoOpenP0ForFailedRunApproval();
           }
           const recorded = this.goals.recordReviewVerdict(goal.id, {
@@ -3831,6 +4194,8 @@ export class DirectorRuntime {
             diffHash: gateResult.diffHash,
             spentUsd: this.sumRunCostUsd(goal.linkedRunId),
             source: unseenFailure ? "coordinator_failed" : "review",
+            expectedVersion: goal.version,
+            diagnostics: reviewerDiagnostics,
           });
           const summary = `${recorded.review.verdict}: ${recorded.review.summary}`.slice(0, 2000);
           const dossier = writeTaskDossier(this.db, reviewRun, reviewerTask.id, "review.json",
@@ -3844,11 +4209,74 @@ export class DirectorRuntime {
           return recorded;
         });
       } catch (err) {
+        if (err instanceof StaleReviewError) {
+          const staleDiag = buildDiagnostics("stale");
+          const staleVerdict = err.verdict ?? verdictBox.value?.verdict ?? null;
+          let staleDossierPath: string | null = null;
+          try {
+            const dossier = writeTaskDossier(
+              this.db,
+              reviewRun,
+              reviewerTask.id,
+              "review-stale.json",
+              JSON.stringify(
+                {
+                  goalId: goal.id,
+                  reviewedVersion: err.reviewedVersion ?? goal.version,
+                  currentVersion: err.currentVersion,
+                  currentStatus: err.currentStatus,
+                  reason: err.message,
+                  verdict: verdictBox.value ?? staleVerdict,
+                  diagnostics: staleDiag,
+                },
+                null,
+                2,
+              ),
+              `Stale review of ${goal.id} v${goal.version}`,
+            );
+            staleDossierPath = dossier.path;
+          } catch {
+            // Best-effort stale dossier write
+          }
+          const staleSummary = `Stale: goal ${goal.id} was ${err.currentStatus ?? "changed"} v${err.currentVersion ?? goal.version} before verdict; ignored`;
+          if (this.db.getTask(reviewerTask.id)?.status === "running") {
+            this.db.updateTask(reviewerTask.id, {
+              status: "completed",
+              summary: staleSummary,
+              resultJson: JSON.stringify({
+                stale: true,
+                summary: staleSummary,
+                diagnostics: staleDiag,
+                ...(staleDossierPath ? { artifact_paths: [staleDossierPath] } : {}),
+              }),
+            });
+          }
+          this.db.emitEvent(reviewRun.id, reviewerTask.id, "goal.review_stale", {
+            goalId: goal.id,
+            reviewedVersion: err.reviewedVersion ?? goal.version,
+            currentVersion: err.currentVersion,
+            currentStatus: err.currentStatus,
+            reviewerTaskId: reviewerTask.id,
+            verdict: staleVerdict,
+            diagnostics: staleDiag,
+          });
+          err.staleEventRecorded = true;
+          throw err;
+        }
         if (err instanceof ReviewerFailedError) {
+          const diag = err.diagnostics ?? buildDiagnostics(lastStopReason, { infrastructure: true });
+          this.goals.recordReviewerFailure(goal.id, diag);
+          this.db.emitEvent(reviewRun.id, reviewerTask.id, "goal.reviewer_failed", {
+            goalId: goal.id,
+            version: goal.version,
+            diagnostics: diag,
+            message: err.message,
+          });
           failReviewer(err.message, {
             reviewerFailed: true,
             attempts: err.attempts,
             attemptFailures: err.attemptFailures,
+            diagnostics: diag,
             summary: err.message,
           });
           throw err;
@@ -3935,6 +4363,7 @@ export class DirectorRuntime {
     const isInvalidated = (g: GoalRecord) =>
       Boolean(opts?.signal?.aborted) ||
       this.getReviewInvalidationEpoch(goal.id) !== reviewEpoch ||
+      (g.status === "achieved" && review.verdict !== "approved") ||
       isReviewInvalidated(g, review);
     const isStillCurrentExecuting = () => {
       const latest = this.goals.getGoal(goal.id);
@@ -4163,6 +4592,7 @@ export class DirectorRuntime {
       if (!inRepo(this.goals.getGoal(goalId)?.repoRoot)) continue;
       abort.abort(new Error(reason));
       this.activeReviews.delete(goalId);
+      this.activeReviewInfo.delete(goalId);
       cancelledReviews++;
     }
     return { cancelledChats, cancelledReviews, cancelledTimers };
@@ -5128,15 +5558,62 @@ export class DirectorRuntime {
       case "goal_trigger_review": {
         // Decouple Done-Reviewer lifecycle from the Director chat turn's AbortSignal so ending the turn
         // or a Code Mode script timeout NEVER kills an in-flight verification review (cancel only via goal amend/stop/shutdown).
-        const reviewed = await this.verifyAndReviewGoal(String(args.goal_id), undefined, {
-          verificationMode:
-            typeof args.verification_mode === "string" &&
-            ["auto", "none", "deterministic", "independent_review"].includes(args.verification_mode)
-              ? (args.verification_mode as VerificationMode)
-              : undefined,
-          summary: typeof args.summary === "string" ? args.summary : undefined,
-        });
-        return { ...reviewed, presentation_id: presentGoal(reviewed.goal) };
+        const targetGoalId = String(args.goal_id);
+        try {
+          const reviewed = await this.verifyAndReviewGoal(targetGoalId, undefined, {
+            verificationMode:
+              typeof args.verification_mode === "string" &&
+              ["auto", "none", "deterministic", "independent_review"].includes(args.verification_mode)
+                ? (args.verification_mode as VerificationMode)
+                : undefined,
+            summary: typeof args.summary === "string" ? args.summary : undefined,
+            overrideReviewBudget: args.override_review_budget === true,
+          });
+          return { ...reviewed, presentation_id: presentGoal(reviewed.goal) };
+        } catch (err) {
+          if (err instanceof StaleReviewError) {
+            const latest = this.goals.getGoal(targetGoalId);
+            return {
+              outcome: "stale",
+              goal: latest,
+              reason: err.message,
+              ...(latest ? { presentation_id: presentGoal(latest) } : {}),
+            };
+          }
+          if (err instanceof ReviewerFailedError) {
+            const latest = this.goals.getGoal(targetGoalId);
+            return {
+              outcome: "reviewer_failed",
+              goal: latest,
+              reviewerFailure: err.diagnostics ?? latest?.lastReviewerFailure ?? null,
+              message: err.message,
+              ...(latest ? { presentation_id: presentGoal(latest) } : {}),
+            };
+          }
+          if (err instanceof ReviewInProgressError) {
+            const latest = this.goals.getGoal(targetGoalId);
+            return {
+              outcome: "review_in_progress",
+              inFlight: err.inFlight,
+              superseded: err.superseded,
+              howToWait: `goal_wait({ goal_id: "${targetGoalId}" }) (wakes on goal.reviewed) or poll goal_get({ goal_id: "${targetGoalId}" })`,
+              message: err.message,
+              ...(latest ? { goal: latest, presentation_id: presentGoal(latest) } : {}),
+            };
+          }
+          if (err instanceof ReviewBudgetExhaustedError) {
+            const latest = this.goals.getGoal(targetGoalId);
+            return {
+              outcome: "review_budget_exhausted",
+              goal: latest,
+              reason: err.reason,
+              howToProceed: `Amend the goal (goal_amend), accept it with evidence (goal_accept), or re-trigger explicitly with goal_trigger_review({ goal_id: "${targetGoalId}", override_review_budget: true }).`,
+              message: err.message,
+              ...(latest ? { presentation_id: presentGoal(latest) } : {}),
+            };
+          }
+          throw err;
+        }
       }
 
       case "goal_pause": {
@@ -5713,6 +6190,37 @@ export function resolveDirectorEvidencePath(repoRoot: string, rawPath: string): 
 const REVIEWER_VERDICTS = ["approved", "changes_requested", "escalate_human"];
 /** Reviewer sessions per review: a completed run without a usable verdict is retried in a fresh session. */
 const REVIEWER_VERDICT_ATTEMPTS = 2;
+/** Context utilization ratio at which the runtime steers the Done-Reviewer to submit its verdict. */
+const REVIEWER_CONTEXT_NUDGE_RATIO = 0.70;
+
+function classifyReviewerStopReason(input: {
+  submitted: boolean;
+  timedOut: boolean;
+  aborted: boolean;
+  runErrMsg: string | null;
+  res: { stopReason?: string; text?: string } | null;
+  turnsUsed: number;
+  reviewerMaxTurns: number;
+  lastCtxPct: number | null;
+}): ReviewerStopReason {
+  if (input.submitted) return "submitted";
+  if (input.aborted) return "cancelled";
+  if (input.timedOut) return "timeout";
+  const errHaystack = `${input.runErrMsg ?? ""}\n${input.res?.text ?? ""}`;
+  if (
+    input.res?.stopReason === "rollover_requested" ||
+    /context|too long|token limit/i.test(errHaystack) ||
+    (input.lastCtxPct !== null && input.lastCtxPct >= 95)
+  ) {
+    return "context_limit";
+  }
+  if (input.runErrMsg || input.res?.stopReason === "error") return "crash";
+  if (input.res?.stopReason === "completed") {
+    if (input.reviewerMaxTurns > 0 && input.turnsUsed >= input.reviewerMaxTurns) return "max_turns";
+    return "end_turn_without_verdict";
+  }
+  return "crash";
+}
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === "object" && !Array.isArray(v);
