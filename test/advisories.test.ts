@@ -308,6 +308,40 @@ describe("goal-14 slice A advisories", () => {
       assert.equal(notices.length, 1, `expected notice for ${kind}`);
       assert.equal(notices[0]!.rule, "read-only-finding-escalation");
       assert.ok(notices[0]!.what.includes("esc-1"));
+      assert.ok(notices[0]!.what.includes("for your parent"));
+      assert.doesNotMatch(notices[0]!.what, /\bthe human\b/);
+      assert.match(notices[0]!.alternative, /Keep going.*return_task.*status "blocked"/);
+      assert.doesNotMatch(notices[0]!.alternative, /blocking:\s*true/);
+    }
+
+    // P0 -> names human recipient (via routedTo: "human" or severity: "P0"), never suggests blocking: true
+    for (const { label, result } of [
+      { label: "routedTo human", result: { escalationId: "esc-p0", severity: "P0", routedTo: "human", blocking: false } },
+      { label: "severity fallback", result: { escalationId: "esc-p0", blocking: false } },
+    ]) {
+      const { engine } = makeEngine();
+      const subject = buildSubject({
+        task: makeTaskRecord({ id: `t-ver-p0-${label}`, tier: 3, kind: "verify", readOnly: true }),
+        workspaceRoot: WORKSPACE,
+        writeScopes: [],
+        writableExtraRoots: [],
+      });
+      const notices = engine.observeHarness(subject, {
+        origin: "result",
+        surface: "harness",
+        tool: "report_issue",
+        status: "completed",
+        args: { category: "code_defect", severity: "P0", title: "critical bug", evidence_paths: ["src/a.ts"] },
+        paths: [],
+        result,
+        inScript: false,
+      });
+      assert.equal(notices.length, 1, `expected P0 notice (${label})`);
+      assert.equal(notices[0]!.rule, "read-only-finding-escalation");
+      assert.ok(notices[0]!.what.includes("for the human"), `${label}: ${notices[0]!.what}`);
+      assert.doesNotMatch(notices[0]!.what, /\byour parent\b/);
+      assert.match(notices[0]!.alternative, /Keep going.*return_task.*status "blocked"/);
+      assert.doesNotMatch(notices[0]!.alternative, /blocking:\s*true/);
     }
 
     // blocking: true -> silent
@@ -1865,11 +1899,22 @@ describe("goal-14 slice A advisories", () => {
       assert.deepEqual((records[0]!.data as { reasons: string[] }).reasons, expectedReasons);
     }
 
-    // 3. read-only-finding-escalation
-    {
+    // 3. read-only-finding-escalation (parent and human recipients)
+    for (const [label, args, result] of [
+      [
+        "read-only-finding-escalation (parent)",
+        { category: "verification_failed", severity: "P1" },
+        { escalationId: "esc-123", routedTo: "t-1", blocking: false },
+      ],
+      [
+        "read-only-finding-escalation (human)",
+        { category: "code_defect", severity: "P0" },
+        { escalationId: "esc-124", severity: "P0", routedTo: "human", blocking: false },
+      ],
+    ] as const) {
       const { engine } = makeEngine();
       const s = buildSubject({
-        task: makeTaskRecord({ id: "b-ro", tier: 3, kind: "verify", readOnly: true }),
+        task: makeTaskRecord({ id: `b-ro-${result.escalationId}`, tier: 3, kind: "verify", readOnly: true }),
         workspaceRoot: WORKSPACE,
         writeScopes: [],
         writableExtraRoots: [],
@@ -1879,13 +1924,13 @@ describe("goal-14 slice A advisories", () => {
         surface: "harness",
         tool: "report_issue",
         status: "completed",
-        args: { category: "verification_failed" },
+        args,
         paths: [],
-        result: { escalationId: "esc-123", blocking: false },
+        result,
         inScript: false,
       });
       assert.ok(n);
-      checkNotice("read-only-finding-escalation", n);
+      checkNotice(label, n);
     }
 
     // 4. brief-count-limit

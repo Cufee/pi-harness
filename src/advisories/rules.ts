@@ -462,13 +462,22 @@ const readOnlyFindingEscalationRule: AdvisoryRule<null> = {
     if (res.blocking !== false) return null;
     const esc = typeof res.escalationId === "string" && res.escalationId.trim() ? res.escalationId.trim() : "escalation";
     const displayEsc = clipSnippet(esc, 1, MAX_DISPLAY_ID_CHARS) || "escalation";
+    const routedTo = typeof res.routedTo === "string" ? res.routedTo.trim() : "";
+    const severity =
+      typeof res.severity === "string"
+        ? res.severity
+        : typeof call.args?.severity === "string"
+          ? call.args.severity
+          : "";
+    const toHuman = routedTo === "human" || (routedTo === "" && severity === "P0");
+    const recipient = toHuman ? "the human" : "your parent";
 
     return {
       key: "read-only-finding-escalation",
-      what: `Your finding was recorded as non-blocking escalation ${displayEsc} for your parent, and this task continues.`,
-      why: "A read-only task delivers findings in its handoff, and its parent decides what blocks.",
+      what: `Your finding was recorded as non-blocking escalation ${displayEsc} for ${recipient}, and this task continues.`,
+      why: "Read-only tasks never block via report_issue and deliver findings in their handoff.",
       alternative:
-        "Put the finding and its evidence in return_task. Pass blocking: true to report_issue only when something stops you from finishing, such as a broken environment.",
+        'Keep going and put the finding and its evidence in return_task, or call return_task with status "blocked" if you cannot produce a result.',
       data: { escalationId: esc, category },
     };
   },

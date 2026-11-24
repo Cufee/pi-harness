@@ -107,10 +107,13 @@ describe("goal-14 slice C1 limits and rejections", () => {
         category: "code_defect",
         title: "Critical defect found in research",
         evidence_paths: ["README.md"],
-      })) as { escalationId: string; blocking: boolean; routedTo: string; advisory?: string };
+      })) as { escalationId: string; blocking: boolean; routedTo: string; advisory?: string; harness_advisory?: string[] };
       assert.equal(resP0.blocking, false);
       assert.equal(resP0.routedTo, "human");
       assert.match(resP0.advisory ?? "", /non-blocking.*return_task/i);
+      assert.ok(Array.isArray(resP0.harness_advisory) && resP0.harness_advisory.length === 1);
+      assert.ok(resP0.harness_advisory[0]!.includes("for the human"));
+      assert.doesNotMatch(resP0.harness_advisory[0]!, /for your parent|blocking:\s*true/);
       assert.equal(db.getTask(resP0Task.id)?.status, "running");
       const escP0 = db.getEscalation(resP0.escalationId)!;
       assert.equal(escP0.blocking, false);
@@ -263,6 +266,40 @@ describe("goal-14 slice C1 limits and rejections", () => {
         /^\[harness advisory: read-only-finding-escalation\] .+ Why: .+ Instead: .+return_task.+/,
       );
       assert.ok(advisoryText.includes(firstRes.escalationId));
+      assert.ok(advisoryText.includes("for your parent"));
+      assert.match(advisoryText, /Keep going.*return_task.*status "blocked"/);
+      assert.doesNotMatch(advisoryText, /blocking:\s*true/);
+
+      // P0 code_defect from a read-only verify task routes to human and names the human recipient in harness_advisory.
+      const p0Verify = db.createTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 3,
+        kind: "verify",
+        title: "Verify P0 defect",
+        objective: "Check critical issue",
+        readOnly: true,
+        profileId: "pi:local",
+      });
+      db.updateTask(p0Verify.id, { status: "running" });
+
+      const p0Res = (await orch.toolExecutor.execute(run.id, p0Verify.id, "report_issue", {
+        severity: "P0",
+        category: "code_defect",
+        title: "Critical defect found during verify",
+        evidence_paths: ["README.md"],
+      })) as { escalationId: string; blocking: boolean; routedTo: string; harness_advisory?: string[] };
+
+      assert.equal(p0Res.blocking, false);
+      assert.equal(p0Res.routedTo, "human");
+      assert.equal(db.getTask(p0Verify.id)?.status, "running");
+      assert.ok(Array.isArray(p0Res.harness_advisory) && p0Res.harness_advisory.length === 1);
+      const p0AdvisoryText = p0Res.harness_advisory[0]!;
+      assert.ok(p0AdvisoryText.includes(p0Res.escalationId));
+      assert.ok(p0AdvisoryText.includes("for the human"));
+      assert.doesNotMatch(p0AdvisoryText, /\byour parent\b/);
+      assert.match(p0AdvisoryText, /Keep going.*return_task.*status "blocked"/);
+      assert.doesNotMatch(p0AdvisoryText, /blocking:\s*true/);
 
       // Second call on the same verify task yields no second advisory (dedupe per subject).
       const secondRes = (await orch.toolExecutor.execute(run.id, verify.id, "report_issue", {
