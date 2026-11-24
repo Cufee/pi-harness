@@ -26,11 +26,28 @@ export class DaemonClient {
   private pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   private eventListeners = new Set<(ev: DaemonEventFrame) => void>();
   private closeListeners = new Set<() => void>();
+  private _closedByUser = false;
 
   constructor(
     private readonly target: string,
     private readonly bridgeCommand?: string,
   ) {}
+
+  get isRemote(): boolean {
+    return this.target.startsWith("ssh://");
+  }
+
+  get localSocketPath(): string | null {
+    return this.isRemote ? null : this.target;
+  }
+
+  get connected(): boolean {
+    return this.writable !== null;
+  }
+
+  get closedByUser(): boolean {
+    return this._closedByUser;
+  }
 
   onEvent(fn: (ev: DaemonEventFrame) => void): () => void {
     this.eventListeners.add(fn);
@@ -43,6 +60,7 @@ export class DaemonClient {
   }
 
   async connect(): Promise<void> {
+    this._closedByUser = false;
     if (this.target.startsWith("ssh://")) {
       const { host, port, remoteCmd } = parseValidatedSshTarget(this.target, this.bridgeCommand);
       const args = ["-T", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"];
@@ -84,7 +102,7 @@ export class DaemonClient {
           t.unref?.();
         }),
       ]).catch((err) => {
-        this.close();
+        this.teardown();
         throw err;
       });
       connected = true;
@@ -138,6 +156,8 @@ export class DaemonClient {
     if (!transport || transport !== this.writable) return;
     this.writable = null;
     this.readable = null;
+    this.socket = null;
+    this.sshProc = null;
     this.detachReader?.();
     this.detachReader = null;
     for (const p of this.pending.values()) {
@@ -160,10 +180,19 @@ export class DaemonClient {
     });
   }
 
-  close(): void {
-    this.socket?.end();
-    this.sshProc?.kill("SIGTERM");
+  private teardown(): void {
+    const sock = this.socket;
+    const proc = this.sshProc;
+    this.socket = null;
+    this.sshProc = null;
+    sock?.end();
+    proc?.kill("SIGTERM");
     this.handleDisconnect(this.writable);
+  }
+
+  close(): void {
+    this._closedByUser = true;
+    this.teardown();
   }
 }
 

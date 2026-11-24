@@ -3,6 +3,7 @@ import { matchesKey, type Terminal } from "@earendil-works/pi-tui";
 import type { ProjectRecord } from "../control-plane/projects.js";
 import type { EventRecord, ReplayPage, RunRecord } from "../control-plane/db.js";
 import { friendlyIdCandidates } from "../control-plane/ids.js";
+import { currentRelease } from "../daemon/release.js";
 import type { DaemonClient } from "../daemon/remote.js";
 import type { ChatSessionRecord, ChatTurnRecord } from "../director/session.js";
 import { formatChatEventSummary, parseChatControlEvent, qualifyRemoteCliHints } from "../protocol/chat-events.js";
@@ -39,6 +40,7 @@ import {
   SettingsScreen,
 } from "./pickers.js";
 import { ProjectsScreen } from "./projects.js";
+import { type AutoReconnectHandle, installAutoReconnect, type ReconnectPing } from "./reconnect.js";
 import { RemotesScreen } from "./remotes.js";
 import { consumeReplay } from "./replay.js";
 import { type AttachableSession, WorkStore } from "./store.js";
@@ -164,6 +166,7 @@ function createSharedShell(spec: SharedShellContext) {
   let exitAction: TuiExitAction = { kind: "exit" };
   let busy = false;
   let phaseText = "Ready";
+  let offlineText: string | null = null;
   let transientHint: string | null = null;
   const controlSessionId = spec.initialControl?.sessionId ?? spec.sessionId;
   let hasControl = spec.initialControl?.hasControl ?? true;
@@ -495,9 +498,11 @@ function createSharedShell(spec: SharedShellContext) {
   ];
 
   const effectivePhaseText = () =>
-    hasControl
-      ? phaseText
-      : `READ-ONLY: ${controllerClientId ? "another terminal has control" : "no terminal has control"} · Ctrl+Y take control`;
+    offlineText
+      ? offlineText
+      : hasControl
+        ? phaseText
+        : `READ-ONLY: ${controllerClientId ? "another terminal has control" : "no terminal has control"} · Ctrl+Y take control`;
 
   const applyControl = (nextControllerId: string | null, nextControlSeq?: number) => {
     if (typeof nextControlSeq === "number" && Number.isFinite(nextControlSeq)) {
@@ -533,6 +538,28 @@ function createSharedShell(spec: SharedShellContext) {
     }
     syncDock();
     spec.onControlChanged?.(hasControl);
+  };
+
+  const resetControl = (state?: SessionControlState) => {
+    if (!state) return;
+    clientId = state.clientId;
+    controllerClientId = state.controllerClientId;
+    hasControl = state.hasControl;
+    lastControlSeq = state.controlSeq ?? 0;
+    syncDock();
+    spec.onControlChanged?.(hasControl);
+  };
+
+  const setOffline = (text: string | null) => {
+    offlineText = text;
+    syncDock();
+  };
+
+  const restoreDraft = (text: string): boolean => {
+    if (!text || dock.editor.getText().length > 0) return false;
+    dock.editor.setText(text);
+    syncDock();
+    return true;
   };
 
   const takeControl = async () => {
@@ -1112,6 +1139,9 @@ function createSharedShell(spec: SharedShellContext) {
     hasControl: () => hasControl,
     clientId: () => clientId,
     applyControl,
+    resetControl,
+    setOffline,
+    restoreDraft,
     setStatus(nextBusy: boolean, nextPhase: string) {
       busy = nextBusy;
       phaseText = nextPhase;
@@ -1182,6 +1212,14 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   let activeProject: ProjectRecord | null = opened.project ?? null;
   let activeTurnId: string | null = opened.activeTurnId;
   let sending = opened.busy;
+  let syncedThroughSeq = opened.historyThrough ?? 0;
+  let reloadingBlocked = false;
+  let uncertainSendText: string | null = null;
+  let incompatibleMessage: string | null = null;
+  let incompatibleDraft = "";
+  let stopped = false;
+  const selfReleaseId = currentRelease().releaseId;
+  const notedMismatchReleases = new Set<string>();
   let turnFrozeSegments = false;
   const frozenTextSet = new Set<string>();
   const settledTurns = new Set<string>();
@@ -1193,6 +1231,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   };
 
   let shell!: ReturnType<typeof createSharedShell>;
+  let reconnect!: AutoReconnectHandle;
 
   const settleTurn = (
     turnId: string | null,
@@ -1275,6 +1314,18 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   };
 
   const dispatchPrompt = async (text: string): Promise<void> => {
+    if (reconnect?.offline || reconnect?.expectingRestart || reloadingBlocked) {
+      shell.queuedMessages.push(text);
+      shell.transcript.appendReceipt({
+        tone: "info",
+        tag: "queued",
+        text: "Queued until harnessd reconnects",
+        timestampMs: Date.now(),
+      });
+      shell.syncDock();
+      return;
+    }
+
     // Busy Enter calls `chat.steer` for live steering! (Ctrl+Q / Alt+Enter queues instead.)
     if (sending) {
       if (activeTurnId) {
@@ -1333,6 +1384,23 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      if (msg.startsWith("DAEMON_RELOADING: ")) {
+        reloadingBlocked = true;
+        shell.queuedMessages.unshift(text);
+        settleTurn(turnId, {
+          error: "Not sent: harnessd is restarting. Queued for resend.",
+          timestampMs: Date.now(),
+        });
+        return;
+      }
+      if (msg.includes("Disconnected from harnessd")) {
+        uncertainSendText = text;
+        settleTurn(turnId, {
+          error: "Connection to harnessd was lost while sending. The message may not have been delivered.",
+          timestampMs: Date.now(),
+        });
+        return;
+      }
       if (msg.includes("Director is already responding") && activeTurnId !== turnId) {
         // A wake turn started right before our send; queue our prompt so it runs right after!
         shell.queuedMessages.unshift(text);
@@ -1351,7 +1419,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   };
 
   const drainQueue = () => {
-    if (!shell.hasControl() || sending || shell.queuedMessages.length === 0) return;
+    if (!shell.hasControl() || sending || reconnect?.offline || reconnect?.expectingRestart || reloadingBlocked || shell.queuedMessages.length === 0) return;
     const next = shell.queuedMessages.shift()!;
     shell.syncDock();
     void dispatchPrompt(next);
@@ -1457,37 +1525,41 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     shell.transcript.appendReceipt({ tone: opts.initialNotice.tone, tag: "host", text: opts.initialNotice.text });
   }
 
-  // Hydrate ALL paginated chat history cleanly as immutable blocks (preserving source timestamps; undated rows never stamped now)
-  for (const turn of fullHistory) {
-    const turnTs = sourceTimestampMs(turn.createdAt);
-    if (turn.role === "user") {
-      shell.transcript.appendUserTurn(turn.content, turnTs);
-    } else if (turn.role === "assistant") {
-      shell.transcript.appendAssistantTurn(turn.content, undefined, turnTs);
-    } else if (turn.role === "tool_output") {
-      const display = parseToolDisplay(turn.display);
-      if (display) {
-        shell.transcript.appendToolOutput(display, turnTs);
-      } else {
-        shell.transcript.appendToolOutputNote(turn.content || turn.toolName || "tool output", turnTs);
+  const renderHistoryRows = (rows: ChatTurnRecord[]) => {
+    for (const turn of rows) {
+      const turnTs = sourceTimestampMs(turn.createdAt);
+      if (turn.role === "user") {
+        shell.transcript.appendUserTurn(turn.content, turnTs);
+      } else if (turn.role === "assistant") {
+        shell.transcript.appendAssistantTurn(turn.content, undefined, turnTs);
+      } else if (turn.role === "tool_output") {
+        const display = parseToolDisplay(turn.display);
+        if (display) {
+          shell.transcript.appendToolOutput(display, turnTs);
+        } else {
+          shell.transcript.appendToolOutputNote(turn.content || turn.toolName || "tool output", turnTs);
+        }
+      } else if (turn.role === "system_notice") {
+        const parsed = turn.event ? parseChatControlEvent(turn.event) : null;
+        const summary = parsed ? settledReceiptText(parsed, opts.remoteSelector ?? opts.remoteHost) : turn.content;
+        const ref: EntityRef | undefined =
+          parsed && "goalId" in parsed && parsed.goalId
+            ? { kind: "goal", id: parsed.goalId, label: `${parsed.goalId}` }
+            : undefined;
+        if (ref) shell.recordRef(ref);
+        shell.transcript.appendReceipt({
+          tone: parsed?.kind === "goal.reviewed" ? "ok" : "info",
+          tag: parsed?.kind ?? "notice",
+          text: summary,
+          ref,
+          timestampMs: turnTs,
+        });
       }
-    } else if (turn.role === "system_notice") {
-      const parsed = turn.event ? parseChatControlEvent(turn.event) : null;
-      const summary = parsed ? settledReceiptText(parsed, opts.remoteSelector ?? opts.remoteHost) : turn.content;
-      const ref: EntityRef | undefined =
-        parsed && "goalId" in parsed && parsed.goalId
-          ? { kind: "goal", id: parsed.goalId, label: `${parsed.goalId}` }
-          : undefined;
-      if (ref) shell.recordRef(ref);
-      shell.transcript.appendReceipt({
-        tone: parsed?.kind === "goal.reviewed" ? "ok" : "info",
-        tag: parsed?.kind ?? "notice",
-        text: summary,
-        ref,
-        timestampMs: turnTs,
-      });
     }
-  }
+  };
+
+  // Hydrate ALL paginated chat history cleanly as immutable blocks (preserving source timestamps; undated rows never stamped now)
+  renderHistoryRows(fullHistory);
 
   if (opened.busy) {
     sending = true;
@@ -1530,6 +1602,8 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       shell.session.tui.requestRender();
       return;
     }
+
+    if (handleDaemonLifecycleEvent(ev, reconnect, shell, true)) return;
 
     // Strict chatSessionId + turnId scoping for all chat.* frames
     if (ev.type.startsWith("chat.")) {
@@ -1624,6 +1698,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
 
       if (ev.type === "chat.turn.end") {
         const assistantTurn = p.assistantTurn as ChatTurnRecord | undefined;
+        syncedThroughSeq = Math.max(syncedThroughSeq, Number(p.historyThrough ?? assistantTurn?.seq ?? 0));
         settleTurn(evTurnId ?? activeTurnId, {
           finalText: assistantTurn?.content,
           error: typeof p.error === "string" && p.error ? p.error : undefined,
@@ -1696,19 +1771,118 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     }
   };
 
+  void shell.session.done.then(() => {
+    stopped = true;
+  });
+
+  const resyncChat = async (ping: ReconnectPing) => {
+    const hadControl = shell.hasControl();
+    buffering = true;
+    earlyBuffer.length = 0;
+    try {
+      const reopened = await opts.client.request<ChatOpenResult>("chat.open", {
+        chatSessionId: chatSession.id,
+        control: hadControl ? "take" : "view",
+      });
+      chatSession = reopened.session;
+      activeProject = reopened.project ?? activeProject;
+      shell.resetControl(reopened.control);
+
+      const fetchedRows: ChatTurnRecord[] = [];
+      const throughSeq = reopened.historyThrough ?? syncedThroughSeq;
+      let afterSeq: number | null = syncedThroughSeq;
+      while (afterSeq !== null && afterSeq < throughSeq) {
+        const page: { history: ChatTurnRecord[]; historyNext?: number | null } = await opts.client.request("chat.history", {
+          chatSessionId: chatSession.id,
+          afterSeq,
+          throughSeq,
+        });
+        for (const row of page.history ?? []) {
+          if (row.seq > syncedThroughSeq) fetchedRows.push(row);
+        }
+        const next: number | null = page.historyNext ?? null;
+        if (next === null || next <= afterSeq) break;
+        afterSeq = next;
+      }
+      if (fetchedRows.length > 0) {
+        renderHistoryRows(fetchedRows);
+      }
+      syncedThroughSeq = Math.max(syncedThroughSeq, throughSeq);
+
+      if (uncertainSendText !== null) {
+        const pendingText = uncertainSendText;
+        uncertainSendText = null;
+        const delivered = fetchedRows.some((r) => r.role === "user" && r.content === pendingText);
+        if (!delivered && shell.restoreDraft(pendingText)) {
+          shell.transcript.appendReceipt({
+            tone: "warn",
+            tag: "send",
+            text: "Your last message was not delivered. It is back in the input box.",
+            timestampMs: Date.now(),
+          });
+        }
+      }
+
+      if ((sending || activeTurnId !== null) && !reopened.busy) {
+        settleTurn(activeTurnId, { cancelled: true, timestampMs: Date.now() });
+      } else if (reopened.busy) {
+        shell.transcript.liveTail.clear();
+        turnFrozeSegments = false;
+        frozenTextSet.clear();
+        activeTurnId = reopened.activeTurnId;
+        sending = true;
+        shell.transcript.liveTail.begin(modelBadge());
+        const seed = reopened.activePartial || (reopened.history.length === 0 ? reopened.activeText : "");
+        if (seed) shell.transcript.liveTail.appendText(seed);
+        shell.setStatus(true, "Director responding...");
+      }
+
+      appendReconnectReceipts(shell, ping, selfReleaseId, notedMismatchReleases, true);
+      buffering = false;
+      for (const ev of earlyBuffer.splice(0)) handleChatEvent(ev);
+      shell.session.tui.requestRender();
+    } catch (err) {
+      buffering = false;
+      earlyBuffer.length = 0;
+      throw err;
+    }
+  };
+
+  reconnect = installAutoReconnect({
+    client: opts.client,
+    isStopped: () => stopped,
+    resync: resyncChat,
+    onStatus: (s) => {
+      if (s.phase === "reconnecting" || s.phase === "waiting_stopped") {
+        shell.setOffline(s.message);
+      } else if (s.phase === "restored") {
+        reloadingBlocked = false;
+        shell.setOffline(null);
+        void shell.store.refresh();
+        drainQueue();
+      } else if (s.phase === "incompatible") {
+        incompatibleMessage = s.message;
+        incompatibleDraft = shell.dock.editor.getText();
+        reconnect.dispose();
+        opts.client.close();
+        void shell.session.stop();
+      }
+    },
+  });
+
   // Switch from buffering to live delivery and flush early events
   liveHandler = handleChatEvent;
   buffering = false;
   for (const ev of earlyBuffer.splice(0)) handleChatEvent(ev);
 
-  const detachClose = opts.client.onClose(() => {
-    void shell.session.stop();
-  });
-
   await shell.store.refresh();
   const action = await shell.waitAndCleanup();
   detachEvents();
-  detachClose();
+  reconnect.dispose();
+  if (incompatibleMessage) {
+    printIncompatibleExit(incompatibleMessage, incompatibleDraft);
+    return { kind: "exit" };
+  }
   return action;
 }
 
@@ -1748,23 +1922,29 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
         })()
       : null);
   const repoRoot = attached.run?.repoRoot ?? process.cwd();
+  let lastEventSeq = 0;
+  let reloadingBlocked = false;
+  let incompatibleMessage: string | null = null;
+  let incompatibleDraft = "";
+  const selfReleaseId = currentRelease().releaseId;
+  const notedMismatchReleases = new Set<string>();
   let shell!: ReturnType<typeof createSharedShell>;
+  let reconnect!: AutoReconnectHandle;
 
-  shell = createSharedShell({
-    mode: "run",
-    client: opts.client,
-    remoteHost: opts.remoteHost ?? null,
-    remoteSelector: opts.remoteSelector ?? null,
-    localRemotes: opts.localRemotes,
-    repoRoot,
-    sessionId: runId,
-    runId,
-    initialControl: attached.control,
-    terminal: opts.terminal,
-    getRightStatus: () => `run ${runId}${boundTaskId ? ` / ${boundTaskId}` : ""}`,
-    getIdleBanner: () => `${runId} (${attached.run?.status ?? "active"}) · Ctrl+G Work · /resume · /stop`,
-    onUserSubmit: async (text) => {
-      shell.transcript.appendUserTurn(text);
+  const dispatchRunSubmit = async (text: string): Promise<void> => {
+    if (reconnect?.offline || reconnect?.expectingRestart || reloadingBlocked) {
+      shell.queuedMessages.push(text);
+      shell.transcript.appendReceipt({
+        tone: "info",
+        tag: "queued",
+        text: "Queued until harnessd reconnects",
+      });
+      shell.syncDock();
+      return;
+    }
+
+    shell.transcript.appendUserTurn(text);
+    try {
       if (boundTaskId) {
         const res = await opts.client.request<{ steered?: boolean }>("task.steer", {
           taskId: boundTaskId,
@@ -1788,8 +1968,67 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
           shell.transcript.appendReceipt({ ...receipt, tag: "run", text: `Guidance not delivered: ${receipt.text}` });
         }
       }
-      shell.session.tui.requestRender();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.startsWith("DAEMON_RELOADING: ")) {
+        reloadingBlocked = true;
+        shell.queuedMessages.unshift(text);
+        shell.transcript.appendReceipt({
+          glyph: shell.theme.glyphs.cross,
+          tone: "danger",
+          tag: "error",
+          text: "Not sent: harnessd is restarting. Queued for resend.",
+        });
+        shell.syncDock();
+        return;
+      }
+      throw err;
+    }
+    shell.session.tui.requestRender();
+  };
+
+  const drainRunQueue = () => {
+    if (!shell.hasControl() || reconnect?.offline || reconnect?.expectingRestart || reloadingBlocked || shell.queuedMessages.length === 0) return;
+    const pending = shell.queuedMessages.splice(0);
+    shell.syncDock();
+    void (async () => {
+      for (const next of pending) {
+        if (!shell.hasControl() || reconnect?.offline || reconnect?.expectingRestart || reloadingBlocked) {
+          shell.queuedMessages.unshift(next);
+          shell.syncDock();
+          break;
+        }
+        try {
+          await dispatchRunSubmit(next);
+        } catch (err) {
+          shell.transcript.appendReceipt({
+            tone: "danger",
+            tag: "error",
+            text: err instanceof Error ? err.message : String(err),
+          });
+          shell.session.tui.requestRender();
+        }
+      }
+    })();
+  };
+
+  shell = createSharedShell({
+    mode: "run",
+    client: opts.client,
+    remoteHost: opts.remoteHost ?? null,
+    remoteSelector: opts.remoteSelector ?? null,
+    localRemotes: opts.localRemotes,
+    repoRoot,
+    sessionId: runId,
+    runId,
+    initialControl: attached.control,
+    onControlChanged: (has) => {
+      if (has) drainRunQueue();
     },
+    terminal: opts.terminal,
+    getRightStatus: () => `run ${runId}${boundTaskId ? ` / ${boundTaskId}` : ""}`,
+    getIdleBanner: () => `${runId} (${attached.run?.status ?? "active"}) · Ctrl+G Work · /resume · /stop`,
+    onUserSubmit: dispatchRunSubmit,
     onCancelActiveTurn: async () => {
       await opts.client.request("run.stop", { runId, reason: "Stopped from TUI" }).catch(() => {});
       return true;
@@ -1820,6 +2059,10 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
     if ("watchId" in ev && ev.watchId) return;
     if (ev.runId !== runId) return;
     if (boundTaskId && ev.taskId && ev.taskId !== boundTaskId) return;
+    if (typeof ev.seq === "number" && ev.seq > 0) {
+      if (ev.seq <= lastEventSeq) return;
+      lastEventSeq = ev.seq;
+    }
 
     const p = (ev.payload ?? {}) as Record<string, unknown>;
     const who = ev.taskId ?? ev.runId;
@@ -1927,44 +2170,112 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
     }
   };
 
-  // Drain ALL paginated replay events (`attached.replay` + `replay.page` + fragments), aborting immediately on detach/close
+  // Drain ALL paginated replay events (`attached.replay` + `replay.page` + fragments), aborting immediately on detach
   let closed = false;
-  const detachClose = opts.client.onClose(() => {
-    closed = true;
-    void shell.session.stop();
-  });
   void shell.session.done.then(() => {
     closed = true;
   });
 
+  const handleRunEvent = (ev: DaemonEventFrame) => {
+    if (handleDaemonLifecycleEvent(ev, reconnect, shell, false)) return;
+    if (ev.type === "session.control_changed") {
+      const p = (ev.payload ?? {}) as Record<string, unknown>;
+      const sid = typeof p.sessionId === "string" ? p.sessionId : ev.runId;
+      if (sid && sid !== controlSessionId && sid !== runId) return;
+      shell.applyControl(
+        typeof p.controllerClientId === "string" ? p.controllerClientId : null,
+        typeof p.controlSeq === "number" ? p.controlSeq : undefined,
+      );
+      return;
+    }
+    renderEventToTranscript(ev);
+  };
+
+  const resyncRun = async (ping: ReconnectPing) => {
+    const hadControl = shell.hasControl();
+    buffering = true;
+    earlyBuffer.length = 0;
+    try {
+      const reattached = await opts.client.request<AttachRunResult>("attach", {
+        runId,
+        ...(boundTaskId ? { taskId: boundTaskId } : {}),
+        sinceSeq: lastEventSeq,
+        control: hadControl ? "take" : "view",
+      });
+      attached = reattached;
+      shell.resetControl(reattached.control);
+      await consumeReplay(
+        opts.client,
+        reattached,
+        { attachmentId: reattached.attachmentId },
+        (ev) => renderEventToTranscript(ev),
+        () => closed,
+      );
+      if (closed) return;
+      if (opts.client.connected === false) {
+        throw new Error("Disconnected from harnessd");
+      }
+      liveHandler = handleRunEvent;
+      buffering = false;
+      for (const ev of earlyBuffer.splice(0)) handleRunEvent(ev);
+      appendReconnectReceipts(shell, ping, selfReleaseId, notedMismatchReleases, false);
+      shell.session.tui.requestRender();
+    } catch (err) {
+      buffering = false;
+      earlyBuffer.length = 0;
+      throw err;
+    }
+  };
+
+  reconnect = installAutoReconnect({
+    client: opts.client,
+    isStopped: () => closed,
+    resync: resyncRun,
+    onStatus: (s) => {
+      if (s.phase === "reconnecting" || s.phase === "waiting_stopped") {
+        shell.setOffline(s.message);
+      } else if (s.phase === "restored") {
+        reloadingBlocked = false;
+        shell.setOffline(null);
+        void shell.store.refresh();
+        drainRunQueue();
+      } else if (s.phase === "incompatible") {
+        incompatibleMessage = s.message;
+        incompatibleDraft = shell.dock.editor.getText();
+        reconnect.dispose();
+        opts.client.close();
+        void shell.session.stop();
+      }
+    },
+  });
+
   try {
-    await consumeReplay(
-      opts.client,
-      attached,
-      { attachmentId: attached.attachmentId },
-      (ev) => renderEventToTranscript(ev),
-      () => closed,
-    );
+    try {
+      await consumeReplay(
+        opts.client,
+        attached,
+        { attachmentId: attached.attachmentId },
+        (ev) => renderEventToTranscript(ev),
+        () => closed,
+      );
+    } catch (err) {
+      if (closed || opts.client.closedByUser || opts.client.connected !== false) throw err;
+    }
 
     if (!closed) {
-      liveHandler = (ev) => {
-        if (ev.type === "session.control_changed") {
-          const p = (ev.payload ?? {}) as Record<string, unknown>;
-          const sid = typeof p.sessionId === "string" ? p.sessionId : ev.runId;
-          if (sid && sid !== controlSessionId && sid !== runId) return;
-          shell.applyControl(
-            typeof p.controllerClientId === "string" ? p.controllerClientId : null,
-            typeof p.controlSeq === "number" ? p.controlSeq : undefined,
-          );
-          return;
-        }
-        renderEventToTranscript(ev);
-      };
-      buffering = false;
-      for (const ev of earlyBuffer.splice(0)) liveHandler(ev);
-      await shell.store.refresh();
+      liveHandler = handleRunEvent;
+      if (opts.client.connected !== false) {
+        buffering = false;
+        for (const ev of earlyBuffer.splice(0)) handleRunEvent(ev);
+        await shell.store.refresh();
+      }
     }
-    return await shell.waitAndCleanup();
+    const action = await shell.waitAndCleanup();
+    if (incompatibleMessage) {
+      printIncompatibleExit(incompatibleMessage, incompatibleDraft);
+      return { kind: "exit" };
+    }
+    return action;
   } catch (err) {
     closed = true;
     await shell.session.stop();
@@ -1973,7 +2284,89 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
   } finally {
     closed = true;
     detachEvents();
-    detachClose();
+    reconnect.dispose();
+  }
+}
+
+function handleDaemonLifecycleEvent(
+  ev: DaemonEventFrame,
+  reconnect: AutoReconnectHandle,
+  shell: ReturnType<typeof createSharedShell>,
+  withTimestamp: boolean,
+): boolean {
+  const p = (ev.payload ?? {}) as Record<string, unknown>;
+  const ts = withTimestamp ? sourceTimestampMs(ev.createdAt) : undefined;
+  if (ev.type === "daemon.reload") {
+    reconnect.noteDaemonEvent(ev);
+    const phase = typeof p.phase === "string" ? p.phase : "";
+    if (phase === "scheduled") {
+      const dueAt = typeof p.dueAt === "number" && Number.isFinite(p.dueAt) ? new Date(p.dueAt).toLocaleTimeString() : "soon";
+      shell.transcript.appendReceipt({
+        tone: "info",
+        tag: "daemon",
+        text: `harnessd restarts for an update at ${dueAt}`,
+        ...(withTimestamp ? { timestampMs: ts } : {}),
+      });
+      shell.session.tui.requestRender();
+    } else if (phase === "draining") {
+      const toRelease = typeof p.toReleaseId === "string" && p.toReleaseId ? p.toReleaseId : "new";
+      shell.transcript.appendReceipt({
+        tone: "warn",
+        tag: "daemon",
+        text: `harnessd is restarting for an update (release ${toRelease}). Messages are queued until it is back.`,
+        ...(withTimestamp ? { timestampMs: ts } : {}),
+      });
+      shell.session.tui.requestRender();
+    }
+    return true;
+  }
+  if (ev.type === "daemon.stopping") {
+    reconnect.noteDaemonEvent(ev);
+    if (p.restart === false) {
+      shell.transcript.appendReceipt({
+        tone: "warn",
+        tag: "daemon",
+        text: "harnessd is stopping.",
+        ...(withTimestamp ? { timestampMs: ts } : {}),
+      });
+      shell.session.tui.requestRender();
+    }
+    return true;
+  }
+  return false;
+}
+
+function appendReconnectReceipts(
+  shell: ReturnType<typeof createSharedShell>,
+  ping: ReconnectPing,
+  selfReleaseId: string,
+  notedMismatchReleases: Set<string>,
+  withTimestamp: boolean,
+): void {
+  const nowTs = withTimestamp ? Date.now() : undefined;
+  const releaseLabel = ping.releaseId ?? "unknown";
+  shell.transcript.appendReceipt({
+    glyph: shell.theme.glyphs.check,
+    tone: "ok",
+    tag: "daemon",
+    text: `Reconnected to harnessd (release ${releaseLabel})`,
+    ...(withTimestamp ? { timestampMs: nowTs } : {}),
+  });
+  if (ping.releaseId && ping.releaseId !== selfReleaseId && !notedMismatchReleases.has(ping.releaseId)) {
+    notedMismatchReleases.add(ping.releaseId);
+    shell.transcript.appendReceipt({
+      tone: "warn",
+      tag: "daemon",
+      text: `harnessd runs release ${ping.releaseId}. This terminal still runs ${selfReleaseId}. Restart it to load the new UI.`,
+      ...(withTimestamp ? { timestampMs: nowTs } : {}),
+    });
+  }
+}
+
+function printIncompatibleExit(message: string, draft: string): void {
+  console.error(message);
+  if (draft.trim()) {
+    console.error(`Unsent draft:\n${draft}`);
   }
 }
 
