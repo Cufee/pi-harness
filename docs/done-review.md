@@ -4,7 +4,7 @@ This reference describes how `pi-harness` runs verification gates and independen
 
 ## Verdict submission, nudge, and retry
 
-`rollover.reviewerMaxTurns` is advisory only. Done-Reviewers are never cancelled by turn count, and each reviewer attempt has an independent 10-minute wall-clock timeout.
+`rollover.reviewerMaxTurns` is advisory only. Done-Reviewers are never cancelled by turn count. As a known pre-existing wall-clock limit (predating goal-18), each reviewer attempt still has an independent 10-minute per-attempt timeout.
 
 1. **Dedicated verdict tool and strict validation:** Every Done-Reviewer receives the `submit_review_verdict` tool (`src/director/runtime.ts`). Both tool calls and fallback fenced JSON text go through `normalizeReviewerVerdict`, which requires a valid `verdict` (`approved`, `changes_requested`, or `escalate_human`), an array of `criteriaResults` objects with string `criterionId`, boolean `passed`, and string `evidence`, optional string array `blockingIssues`, and a non-empty `summary`. Malformed payloads are rejected with a field-level error so the model can correct and resubmit.
 2. **In-session wrap-up nudge:** The runtime passes `isTaskSettled: () => verdictBox.value !== null` and `missingReturnWrapUpPrompt` to `runner.run`. When the reviewer ends a turn without a valid `submit_review_verdict` call, the runner delivers one in-session wrap-up prompt instructing it to call `submit_review_verdict` now.
@@ -19,7 +19,7 @@ Every reviewer run persists structured `ReviewerDiagnostics` (`src/goals/engine.
 | --- | --- |
 | `reviewerTaskId`, `runId`, `profileId`, `model` | Identity and model route of the Tier 3 verify task. |
 | `attempts` | Number of reviewer sessions started (1 or 2). |
-| `stopReason` | `submitted`, `end_turn_without_verdict`, `max_turns`, `context_limit`, `timeout`, `crash`, `cancelled`, or `stale`. |
+| `stopReason` | `submitted`, `end_turn_without_verdict`, `max_turns`, `context_limit`, `quota_paused`, `timeout`, `crash`, `cancelled`, or `stale`. Mapped strictly from the runner's actual stop reason or error (`max_turns` only if the runner reports `max_turns`; `context_limit` only on a real runner context-limit signal such as `rollover_requested` or `context_limit`, never from prose matching or advisory turn counts; `quota_paused` on runner quota pauses; `crash` on runner exceptions or `error`). |
 | `contextPct` | Last reported context utilization percentage (`used / size`), or `null` when unavailable. |
 | `turnsUsed` | Tool-call turns observed in the last attempt. |
 | `attemptFailures` | Concrete failure summary strings from failed attempts. |
@@ -30,13 +30,14 @@ Every reviewer run persists structured `ReviewerDiagnostics` (`src/goals/engine.
 
 - Recorded reviews store diagnostics in `goal_reviews.diagnostics_json` and return them on `review.diagnostics` in `goal_get` and `goal_trigger_review` (non-reviewer rows such as deterministic-only gates or overrides store `null`).
 - Reviewer failures that write no `goal_reviews` row persist diagnostics in `goals.last_reviewer_failure_json` via `GoalEngine.recordReviewerFailure` and expose them as `goal.lastReviewerFailure` on `goal_get`. Recording a later review verdict, accepting the goal, or amending the goal clears `lastReviewerFailure`.
-- The Director `goal_trigger_review` tool catches `ReviewerFailedError` and returns `{ outcome: "reviewer_failed", goal, reviewerFailure, message }` instead of throwing.
+- The Director `goal_trigger_review` tool catches `ReviewerFailedError` and returns `{ outcome: "reviewer_failed", goal, reviewerFailure, message }` instead of throwing. On a stale reviewer, `{ outcome: "stale", goal, reason, diagnostics }` preserves the stale reviewer's diagnostics when available.
 
 ## In-progress review visibility and amendment superseding
 
 The runtime tracks active reviews in `activeReviewInfo` alongside `activeReviews` with `inflightId`, `kind` (`review` or `accept`), `goalVersion`, `cycle`, `phase` (`gates` or `reviewer`), `reviewerTaskId`, `runId`, and `startedAt`.
 
 - Calling `verifyAndReviewGoal` while a review for the same goal version is in flight throws `ReviewInProgressError` containing `inFlight` and wait instructions. The Director `goal_trigger_review` tool catches it and returns `{ outcome: "review_in_progress", inFlight, superseded, howToWait, message }`.
+- Calling `goal_wait({ goal_id })` while a review is in flight tracks that specific `inflightId` and blocks until the review settles (rather than returning `already_settled` when the linked run is completed or null, or remaining blocked if `changes_requested` relaunches the run), waking with `wakeReason: "event"` as soon as the review finishes.
 - When `goal_amend` bumps a goal from `vN` to `vN+1`, `onReviewInvalidated` emits `goal.review_superseded` and aborts the in-flight `vN` review. If `goal_trigger_review` is called immediately afterward while the `vN` review is still unwinding, `verifyAndReviewGoal` waits up to 5 seconds (`waitForReviewUnwind`) for the superseded review to exit and then starts the `vN+1` review cleanly. The superseded `vN` reviewer task finishes as `cancelled` and records no `goal_reviews` row against `vN+1`.
 
 ## Acceptance finality and stale reviews
@@ -54,13 +55,16 @@ Once `goal_accept` marks a goal `achieved`, no in-flight, queued, or newly trigg
 To prevent large goals from exhausting reviewer context before submitting a verdict:
 
 - **Compact reviewer prompt (`buildReviewerPrompt`):**
-  - Descriptions longer than 4 KB are truncated at 4 KB with a pointer to the full contract file written to `<repoRoot>/.harness/goals/<goalId>/contract-v<N>.md` (already inside the reviewer's `extraReadRoots`).
-  - Each criterion renders on one line with its description capped at 300 characters. Deterministic criteria that passed collapse to `- [<id>] PASS (gate)` so the reviewer does not re-verify them.
+  - When the goal evidence directory is valid, the full contract is written to a fresh unique file `<repoRoot>/.harness/goals/<goalId>/contract-v<N>-<id>.md` using `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` so it never overwrites existing evidence or follows symlinks.
+  - Descriptions longer than 4 KB and criterion descriptions longer than 300 characters are truncated only when that full contract file was written successfully and is referenced in the prompt. If the evidence directory or contract file write is unavailable, `buildReviewerPrompt` includes the full description and all non-passed criterion descriptions inline without truncation.
+  - Deterministic criteria that passed collapse to `- [<id>] PASS (gate)` so the reviewer does not re-verify them.
   - Inline diff patches are capped at 12 KB (down from 24 KB), while keeping `git diff --stat` and instructing the reviewer to inspect targeted hunks with `git diff <base>..<ref> -- <path>` and read line ranges instead of whole files.
   - The prompt states the context reserve rule directly: reserve the last 30% of context for the verdict, with a nudge at 70%.
 - **Runtime 70% context nudge:** Inside `verifyAndReviewGoalInner`, the reviewer's `onUsage` callback watches `usage.used / usage.size`. Once utilization crosses 70% (`REVIEWER_CONTEXT_NUDGE_RATIO = 0.70`) and no verdict has been submitted yet, the runtime emits `reviewer.context_nudge` and steers the live reviewer via `onHandle` (`handle.steer`), falling back to `drainPendingSteers` if live steering is unavailable. The nudge instructs the reviewer to stop exploring and call `submit_review_verdict` immediately with verified evidence (marking unverified required criteria `passed: false` under `changes_requested`).
 
 ## Enforcing `budgets.maxReviewCycles`
+
+`budgets.maxReviewCycles` must be a non-negative integer (config default `goals.defaultMaxReviewCycles` is a positive integer, default `4`; negative or non-integer values are rejected at goal creation). A value of `0` means zero review cycles and blocks cycle 1 unless `override_review_budget: true` is passed — `0` does not mean unlimited.
 
 `DirectorRuntime.reviewBudgetExhausted` checks whether `goal.reviewCycle >= goal.budgets.maxReviewCycles` or whether an unresolved `verification_failed` escalation titled `Max review cycles reached...` exists on `goal.linkedRunId`.
 
@@ -71,9 +75,9 @@ To prevent large goals from exhausting reviewer context before submitting a verd
 
 ## Verification checkouts at the goal's merge commit
 
-When the bisecting merge queue (`src/worktree/merge-queue.ts`) merges a run onto the target branch, it updates `refs/harness/merged/<runId>` to the merged commit without pushing to `origin`. If updating that ref fails on a subsequent merge, the queue deletes the stale ref and logs a warning so verification never evaluates an older commit.
+When the bisecting merge queue (`src/worktree/merge-queue.ts`) merges a run onto the target branch, it updates `refs/harness/merged/<runId>` using atomic CAS (`git update-ref <ref> <mergedSha> <expectedOld>`, with no `pack-refs` step) without pushing to `origin`, and records a `merge.promoted` event with `mergedSha`. If updating the ref fails on a subsequent merge, the queue removes the ref in both loose and packed (`packed-refs`, honoring `packed-refs.lock`) form, verifies it no longer resolves, and logs a warning so verification never evaluates an older commit.
 
-`prepareVerifyCheckout` (`src/director/runtime.ts`) checks out the detached `_verify` worktree at `refs/harness/merged/<runId>` whenever that ref exists and is an ancestor of the local base branch tip, falling back to the local base tip otherwise. Sibling goals whose merges sit unpushed on local `main` therefore do not fail another goal's `shipped` gate (`git fetch -q origin && git merge-base --is-ancestor HEAD origin/main`) once that goal's own merge commit has been pushed.
+`prepareVerifyCheckout` (`src/director/runtime.ts`) checks out the detached `_verify` worktree at `refs/harness/merged/<runId>` only when that ref exists, is an ancestor of the local base branch tip, and equals or descends from the run's latest promoted merge SHA (if recorded); otherwise it falls back to the local base tip. Sibling goals whose merges sit unpushed on local `main` therefore do not fail another goal's `shipped` gate (`git fetch -q origin && git merge-base --is-ancestor HEAD origin/main`) once that goal's own merge commit has been pushed.
 
 ## Root causes documented from production runs
 

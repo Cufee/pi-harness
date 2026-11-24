@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, unlinkSync } from "node:fs";
+import { closeSync, constants, existsSync, lstatSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { REJECTIONS } from "../advisories/rejections.js";
 import type { WorktreeConfig } from "../config.js";
@@ -456,42 +456,99 @@ export class BisectingMergeQueue {
 
       // Persist this run's latest merge commit as a git ref so verification checkouts evaluate the goal's
       // own merged commit instead of a later local base tip containing sibling goals' unpushed merges.
-      // Never leave a stale older ref behind on write failure: delete it so prepareVerifyCheckout falls back
-      // to the base branch tip instead of verifying an outdated merge commit.
+      // Use atomic CAS against the previously observed ref value (no pack-refs step). On any failure,
+      // remove both loose and packed forms of the ref and verify it no longer resolves.
       const mergedRef = runMergedRef(next.runId);
+      const prevMergedRefSha = await runGit(this.repoRoot, ["rev-parse", "--verify", `${mergedRef}^{commit}`])
+        .then((r) => r.stdout || null)
+        .catch(() => null);
+      let refUpdated = false;
       try {
-        await runGit(this.repoRoot, ["update-ref", mergedRef, mergedSha]);
+        await runGit(this.repoRoot, ["update-ref", mergedRef, mergedSha, prevMergedRefSha ?? ""]);
+        refUpdated = true;
       } catch (refErr) {
         const refDetail = refErr instanceof Error ? refErr.message : String(refErr);
         let staleRefRemoved = false;
         let deleteDetail: string | null = null;
         try {
           await runGit(this.repoRoot, ["update-ref", "-d", mergedRef]);
-          staleRefRemoved = true;
         } catch (delErr) {
           deleteDetail = delErr instanceof Error ? delErr.message : String(delErr);
-          // A lock file on the ref blocks `git update-ref -d` as well; remove the loose ref file directly so
-          // a stale older commit cannot remain resolvable by prepareVerifyCheckout.
+          // A lock file on the loose ref blocks `git update-ref -d` as well; clean both the loose ref file
+          // and any matching entry in `packed-refs` (honoring `packed-refs.lock`) so an outdated commit
+          // cannot remain resolvable.
           try {
             const gitPathRes = await runGit(this.repoRoot, ["rev-parse", "--git-path", mergedRef]);
             const looseRefPath = resolve(this.repoRoot, gitPathRes.stdout);
             if (existsSync(looseRefPath) && lstatSync(looseRefPath).isFile()) {
               unlinkSync(looseRefPath);
             }
-            const stillResolves = await runGit(this.repoRoot, ["rev-parse", "--verify", `${mergedRef}^{commit}`])
-              .then(() => true)
-              .catch(() => false);
-            staleRefRemoved = !stillResolves;
           } catch (unlinkErr) {
             const unlinkDetail = unlinkErr instanceof Error ? unlinkErr.message : String(unlinkErr);
             deleteDetail = `${deleteDetail}; loose ref cleanup failed: ${unlinkDetail}`;
           }
+          try {
+            const packedPathRes = await runGit(this.repoRoot, ["rev-parse", "--git-path", "packed-refs"]);
+            const packedRefsPath = resolve(this.repoRoot, packedPathRes.stdout);
+            if (existsSync(packedRefsPath) && lstatSync(packedRefsPath).isFile()) {
+              const rawPacked = readFileSync(packedRefsPath, "utf8");
+              const lines = rawPacked.split("\n");
+              const kept: string[] = [];
+              let removedPackedEntry = false;
+              let skipPeeled = false;
+              for (const line of lines) {
+                if (skipPeeled && line.startsWith("^")) {
+                  skipPeeled = false;
+                  continue;
+                }
+                skipPeeled = false;
+                const match = /^[0-9a-fA-F]{40,64}\s+(.+)$/.exec(line);
+                if (match && match[1] === mergedRef) {
+                  removedPackedEntry = true;
+                  skipPeeled = true;
+                  continue;
+                }
+                kept.push(line);
+              }
+              if (removedPackedEntry) {
+                const packedLockPath = `${packedRefsPath}.lock`;
+                const lockFlags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0);
+                let fd: number | null = null;
+                let lockCreated = false;
+                try {
+                  fd = openSync(packedLockPath, lockFlags, 0o644);
+                  lockCreated = true;
+                  writeFileSync(fd, kept.join("\n"), "utf8");
+                  closeSync(fd);
+                  fd = null;
+                  renameSync(packedLockPath, packedRefsPath);
+                  lockCreated = false;
+                } finally {
+                  if (fd !== null) closeSync(fd);
+                  if (lockCreated) {
+                    try {
+                      unlinkSync(packedLockPath);
+                    } catch {
+                      // best-effort lock cleanup
+                    }
+                  }
+                }
+              }
+            }
+          } catch (packedErr) {
+            const packedDetail = packedErr instanceof Error ? packedErr.message : String(packedErr);
+            deleteDetail = `${deleteDetail}; packed-refs cleanup failed: ${packedDetail}`;
+          }
         }
+        const stillResolves = await runGit(this.repoRoot, ["rev-parse", "--verify", `${mergedRef}^{commit}`])
+          .then(() => true)
+          .catch(() => false);
+        staleRefRemoved = !stillResolves;
         const warning =
           `[merge-queue] Failed to update ${mergedRef} to ${mergedSha.slice(0, 8)} (${refDetail}); ` +
           (staleRefRemoved
             ? "removed stale merge ref so verification falls back to base branch tip."
-            : `failed to delete stale merge ref (${deleteDetail ?? "unknown"}); verification may see an outdated ref.`);
+            : `failed to delete stale merge ref (${deleteDetail ?? "unknown"}); verification will reject any ref older than ${mergedSha.slice(0, 8)}.`);
         console.warn(warning);
         ciLogs.push(warning);
         this.db.emitEvent(next.runId, next.taskId, "merge.ref_warning", {
@@ -502,6 +559,17 @@ export class BisectingMergeQueue {
           warning,
         });
       }
+
+      // Record durable merge provenance before marking the item merged so prepareVerifyCheckout
+      // can always reject a stale ref older than this run's latest promoted commit.
+      this.db.emitEvent(next.runId, next.taskId, "merge.promoted", {
+        mergeId: next.id,
+        branch: next.branch,
+        mergedSha,
+        targetBranch,
+        ref: mergedRef,
+        refUpdated,
+      });
 
       const finished = this.db.finishMergeItem(next.id, "merged", ciLogs.join("\n"));
       const curTaskAfterMerge = this.db.getTask(next.taskId);

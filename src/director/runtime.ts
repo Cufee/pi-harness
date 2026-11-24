@@ -166,7 +166,7 @@ export class ReviewInProgressError extends Error {
       `Review already in progress for ${goalId}: ${inFlight.inflightId}, ` +
         `reviewer task ${inFlight.reviewerTaskId ?? "none yet"}, ` +
         `goal v${inFlight.goalVersion} cycle ${inFlight.cycle}, phase ${inFlight.phase}. ` +
-        `Wait with goal_wait({ goal_id: "${goalId}" }) (wakes on goal.reviewed) or poll goal_get.`,
+        `Wait with goal_wait({ goal_id: "${goalId}" }) (blocks until the in-flight review settles) or poll goal_get.`,
     );
     this.name = "ReviewInProgressError";
   }
@@ -902,6 +902,7 @@ export class DirectorRuntime {
   private activeChats = new Map<string, ActiveChat>();
   private activeReviews = new Map<string, AbortController>();
   private activeReviewInfo = new Map<string, ActiveReviewInfo>();
+  private reviewSettledListeners = new Map<string, Set<() => void>>();
   private repoFetchLocks = new Map<string, Promise<void>>();
   private activeReviewerTools = new Map<
     string,
@@ -1058,6 +1059,7 @@ export class DirectorRuntime {
       abort.abort(new Error("Daemon shutting down"));
       this.activeReviews.delete(goalId);
       this.activeReviewInfo.delete(goalId);
+      this.notifyReviewSettled(goalId);
     }
     this.activeReviewerTools.clear();
   }
@@ -3137,13 +3139,32 @@ export class DirectorRuntime {
     }
   }
 
+  private getLatestRunMergedSha(runId: string): string | null {
+    try {
+      const row = this.db.db
+        .prepare(
+          `SELECT payload_json FROM events
+           WHERE run_id = ? AND type IN ('merge.promoted', 'merge.ref_warning')
+           ORDER BY seq DESC LIMIT 1`,
+        )
+        .get(runId) as { payload_json?: string } | undefined;
+      if (!row?.payload_json) return null;
+      const payload = JSON.parse(row.payload_json) as { mergedSha?: unknown } | null;
+      const sha = typeof payload?.mergedSha === "string" ? payload.mergedSha.trim() : "";
+      return /^[0-9a-f]{40,64}$/i.test(sha) ? sha : null;
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Creates the detached `_verify` worktree for verification gates and Done-Review without switching the host
    * checkout's branch. Resolves `goal.verifyRef` when explicitly set (local ref, `origin/<ref>`, then source-only
    * `git fetch --no-tags origin -- <ref>` with `FETCH_HEAD` fallback), failing closed if invalid or unresolved.
    * Otherwise targets `run.baseBranch`, preferring this run's recorded merge commit (`refs/harness/merged/<runId>`)
-   * when it exists and is an ancestor of the base branch tip. Without a verify ref or resolvable base branch,
-   * verification falls back to the primary checkout and records that in `location`.
+   * when it exists, is an ancestor of the base branch tip, and equals or descends from the run's latest promoted
+   * merge commit. Without a verify ref or resolvable base branch, verification falls back to the primary checkout
+   * and records that in `location`.
    */
   private async prepareVerifyCheckout(
     goal: GoalRecord,
@@ -3190,10 +3211,17 @@ export class DirectorRuntime {
         if (!explicit && run) {
           const mergedRefSha = await resolveCommit(runMergedRef(run.id));
           if (mergedRefSha) {
+            const latestMergedSha = this.getLatestRunMergedSha(run.id);
             const isAncestor = await runGit(goal.repoRoot, ["merge-base", "--is-ancestor", mergedRefSha, resolvedSha])
               .then(() => true)
               .catch(() => false);
-            if (isAncestor) targetSha = mergedRefSha;
+            const coversLatestMerge =
+              !latestMergedSha ||
+              mergedRefSha === latestMergedSha ||
+              (await runGit(goal.repoRoot, ["merge-base", "--is-ancestor", latestMergedSha, mergedRefSha])
+                .then(() => true)
+                .catch(() => false));
+            if (isAncestor && coversLatestMerge) targetSha = mergedRefSha;
           }
         }
         const wtMgr = this.orchestrator.getWorktreeManager(goal.repoRoot);
@@ -3424,6 +3452,19 @@ export class DirectorRuntime {
       if (this.activeReviews.get(goal.id) === slot) {
         this.activeReviews.delete(goal.id);
         this.activeReviewInfo.delete(goal.id);
+        this.notifyReviewSettled(goal.id);
+      }
+    }
+  }
+
+  private notifyReviewSettled(goalId: string): void {
+    const listeners = this.reviewSettledListeners.get(goalId);
+    if (!listeners || listeners.size === 0) return;
+    for (const fn of [...listeners]) {
+      try {
+        fn();
+      } catch {
+        // Never break review teardown
       }
     }
   }
@@ -3439,7 +3480,7 @@ export class DirectorRuntime {
   /** Returns a reason when no further review cycle may start without an amend, accept, or explicit override. */
   private reviewBudgetExhausted(goal: GoalRecord): string | null {
     const maxCycles = goal.budgets.maxReviewCycles;
-    if (typeof maxCycles === "number" && maxCycles > 0 && goal.reviewCycle >= maxCycles) {
+    if (typeof maxCycles === "number" && Number.isFinite(maxCycles) && goal.reviewCycle >= maxCycles) {
       return `Max review cycles reached (${goal.reviewCycle}/${maxCycles})`;
     }
     if (goal.linkedRunId) {
@@ -3703,6 +3744,7 @@ export class DirectorRuntime {
       if (this.activeReviews.get(goal.id) === abort) {
         this.activeReviews.delete(goal.id);
         this.activeReviewInfo.delete(goal.id);
+        this.notifyReviewSettled(goal.id);
       }
       if (!this.disposed) {
         // Replayed while the run is still stopped, even after a pause/resume invalidated the review: a stop of
@@ -3971,24 +4013,28 @@ export class DirectorRuntime {
       let contractPath: string | undefined;
       if (evidenceDir !== null) {
         try {
-          const targetContract = join(evidenceDir, `contract-v${goal.version}.md`);
-          if (!existsSync(targetContract) || lstatSync(targetContract).isFile()) {
-            const fullContract = [
-              `# Goal ${goal.id} v${goal.version}: ${goal.title}`,
-              "",
-              "## Description",
-              goal.description,
-              "",
-              "## Acceptance Criteria",
-              ...goal.criteria.map(
-                (c) =>
-                  `- [${c.id}] (${c.kind}${c.required ? ", REQUIRED" : ", optional"}): ${c.description}${c.command ? ` [cmd: ${c.command}]` : ""}`,
-              ),
-              ...(goal.nonGoals.length > 0 ? ["", "## Non-Goals", ...goal.nonGoals.map((ng) => `- ${ng}`)] : []),
-            ].join("\n");
-            writeFileSync(targetContract, `${fullContract}\n`, "utf8");
-            contractPath = targetContract;
+          const fullContract = [
+            `# Goal ${goal.id} v${goal.version}: ${goal.title}`,
+            "",
+            "## Description",
+            goal.description,
+            "",
+            "## Acceptance Criteria",
+            ...goal.criteria.map(
+              (c) =>
+                `- [${c.id}] (${c.kind}${c.required ? ", REQUIRED" : ", optional"}): ${c.description}${c.command ? ` [cmd: ${c.command}]` : ""}`,
+            ),
+            ...(goal.nonGoals.length > 0 ? ["", "## Non-Goals", ...goal.nonGoals.map((ng) => `- ${ng}`)] : []),
+          ].join("\n");
+          const targetContract = join(evidenceDir, `contract-v${goal.version}-${randomUUID().slice(0, 8)}.md`);
+          const openFlags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0);
+          const fd = openSync(targetContract, openFlags, 0o600);
+          try {
+            writeFileSync(fd, `${fullContract}\n`, "utf8");
+          } finally {
+            closeSync(fd);
           }
+          contractPath = targetContract;
         } catch {
           contractPath = undefined;
         }
@@ -4390,9 +4436,6 @@ export class DirectorRuntime {
             aborted: cancelSignal.aborted,
             runErrMsg,
             res,
-            turnsUsed,
-            reviewerMaxTurns,
-            lastCtxPct,
           });
           const effectiveStopReason = attemptTimedOut ? "timeout" : runErr ? "runner_error" : (res?.stopReason || "(empty)");
           const textParseError = completedNormally && text ? describeReviewerTextParseError(text) : null;
@@ -4569,6 +4612,7 @@ export class DirectorRuntime {
             diagnostics: staleDiag,
           });
           err.staleEventRecorded = true;
+          err.diagnostics = staleDiag;
           throw err;
         }
         if (err instanceof ReviewerFailedError) {
@@ -4901,6 +4945,7 @@ export class DirectorRuntime {
       abort.abort(new Error(reason));
       this.activeReviews.delete(goalId);
       this.activeReviewInfo.delete(goalId);
+      this.notifyReviewSettled(goalId);
       cancelledReviews++;
     }
     return { cancelledChats, cancelledReviews, cancelledTimers };
@@ -5977,6 +6022,7 @@ export class DirectorRuntime {
               outcome: "stale",
               goal: latest,
               reason: err.message,
+              ...(err.diagnostics ? { diagnostics: err.diagnostics } : {}),
               ...(latest ? { presentation_id: presentGoal(latest) } : {}),
             };
           }
@@ -5996,7 +6042,7 @@ export class DirectorRuntime {
               outcome: "review_in_progress",
               inFlight: err.inFlight,
               superseded: err.superseded,
-              howToWait: `goal_wait({ goal_id: "${targetGoalId}" }) (wakes on goal.reviewed) or poll goal_get({ goal_id: "${targetGoalId}" })`,
+              howToWait: `goal_wait({ goal_id: "${targetGoalId}" }) (blocks until the in-flight review settles) or poll goal_get({ goal_id: "${targetGoalId}" })`,
               message: err.message,
               ...(latest ? { goal: latest, presentation_id: presentGoal(latest) } : {}),
             };
@@ -6394,6 +6440,19 @@ export class DirectorRuntime {
     const initial = this.goals.getGoal(goalId);
     if (!initial) throw new Error(`Unknown goal ${goalId}`);
 
+    // If a review (or accept verification) is already in flight when goal_wait starts, wait until that
+    // specific in-flight review settles instead of returning already_settled on a completed or null run.
+    const waitedInflightId = this.activeReviews.has(goalId)
+      ? (this.activeReviewInfo.get(goalId)?.inflightId ?? "__active_review__")
+      : null;
+
+    const isWaitedReviewActive = () => {
+      if (waitedInflightId === null) return false;
+      if (!this.activeReviews.has(goalId)) return false;
+      const curId = this.activeReviewInfo.get(goalId)?.inflightId ?? "__active_review__";
+      return curId === waitedInflightId;
+    };
+
     const snapshot = () => {
       const g = this.goals.getGoal(goalId) ?? initial;
       const run = g.linkedRunId ? this.orchestrator.getEffectiveRun(g.linkedRunId) : null;
@@ -6401,7 +6460,8 @@ export class DirectorRuntime {
       const settledGoal = ["achieved", "awaiting_human", "paused", "cancelled"].includes(g.status);
       const settledRun = !run || ["completed", "failed", "stopped", "paused_quota"].includes(run.status);
       const hasP0 = openEscalations.some((e) => e.severity === "P0");
-      return { g, run, openEscalations, done: settledGoal || settledRun || hasP0 };
+      const done = waitedInflightId !== null ? !isWaitedReviewActive() || hasP0 : settledGoal || settledRun || hasP0;
+      return { g, run, openEscalations, done };
     };
 
     const first = snapshot();
@@ -6424,6 +6484,7 @@ export class DirectorRuntime {
         if (done) return;
         done = true;
         unsub();
+        unsubReview();
         clearTimeout(timer);
         if (activeChat) activeChat.waitInterrupts.delete(onInterrupt);
         signal?.removeEventListener("abort", onAbort);
@@ -6449,6 +6510,21 @@ export class DirectorRuntime {
       };
       const onAbort = () => finish("event");
       if (activeChat) activeChat.waitInterrupts.add(onInterrupt);
+      const onReviewSettled = () => {
+        if (snapshot().done) finish("event");
+      };
+      let reviewListenerSet = this.reviewSettledListeners.get(goalId);
+      if (!reviewListenerSet) {
+        reviewListenerSet = new Set();
+        this.reviewSettledListeners.set(goalId, reviewListenerSet);
+      }
+      reviewListenerSet.add(onReviewSettled);
+      const unsubReview = () => {
+        const set = this.reviewSettledListeners.get(goalId);
+        if (!set) return;
+        set.delete(onReviewSettled);
+        if (set.size === 0) this.reviewSettledListeners.delete(goalId);
+      };
       const unsub = this.db.onEvent((ev) => {
         const cur = snapshot();
         if (ev.runId && cur.g.linkedRunId && ev.runId !== cur.g.linkedRunId) return;
@@ -6458,6 +6534,10 @@ export class DirectorRuntime {
         const cur = snapshot();
         if (cur.done) {
           finish("event");
+          return;
+        }
+        if (isWaitedReviewActive()) {
+          finish("fallback_interval");
           return;
         }
         const runId = cur.g.linkedRunId;
@@ -6471,6 +6551,7 @@ export class DirectorRuntime {
       timer.unref?.();
       signal?.addEventListener("abort", onAbort, { once: true });
       if (signal?.aborted) onAbort();
+      else if (snapshot().done) finish("event");
     });
   }
 }
@@ -6605,27 +6686,19 @@ function classifyReviewerStopReason(input: {
   timedOut: boolean;
   aborted: boolean;
   runErrMsg: string | null;
-  res: { stopReason?: string; text?: string } | null;
-  turnsUsed: number;
-  reviewerMaxTurns: number;
-  lastCtxPct: number | null;
+  res: { stopReason?: string } | null;
 }): ReviewerStopReason {
   if (input.submitted) return "submitted";
   if (input.aborted) return "cancelled";
   if (input.timedOut) return "timeout";
-  const errHaystack = `${input.runErrMsg ?? ""}\n${input.res?.text ?? ""}`;
-  if (
-    input.res?.stopReason === "rollover_requested" ||
-    /context|too long|token limit/i.test(errHaystack) ||
-    (input.lastCtxPct !== null && input.lastCtxPct >= 95)
-  ) {
-    return "context_limit";
-  }
-  if (input.runErrMsg || input.res?.stopReason === "error") return "crash";
-  if (input.res?.stopReason === "completed") {
-    if (input.reviewerMaxTurns > 0 && input.turnsUsed >= input.reviewerMaxTurns) return "max_turns";
-    return "end_turn_without_verdict";
-  }
+  if (input.runErrMsg) return "crash";
+  const raw = input.res?.stopReason;
+  if (raw === "cancelled") return "cancelled";
+  if (raw === "quota_paused") return "quota_paused";
+  if (raw === "rollover_requested" || raw === "context_limit") return "context_limit";
+  if (raw === "max_turns") return "max_turns";
+  if (raw === "completed") return "end_turn_without_verdict";
+  if (raw === "error") return "crash";
   return "crash";
 }
 

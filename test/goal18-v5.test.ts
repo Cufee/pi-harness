@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.js";
@@ -266,7 +266,14 @@ describe("goal-18 v5 criteria", () => {
 
     let directorAction: ((executeTool: (name: string, args: Record<string, unknown>) => Promise<unknown>) => Promise<void>) | null =
       null;
-    let reviewerMode: "succeed" | "empty_twice" | "max_turns_twice" = "succeed";
+    let reviewerMode:
+      | "succeed"
+      | "empty_twice"
+      | "completed_high_turns_context_prose"
+      | "quota_paused_twice"
+      | "rollover_twice"
+      | "explicit_max_turns"
+      | "throw_crash" = "succeed";
 
     try {
       const baseCfg = loadConfig(repoRoot);
@@ -303,9 +310,24 @@ describe("goal-18 v5 criteria", () => {
               req.callbacks.onTurn?.(1);
               return { text: "", stopReason: "completed" };
             }
-            // max_turns_twice
-            req.callbacks.onTurn?.(5);
-            return { text: "stopped at max turns without submitting", stopReason: "completed" };
+            if (reviewerMode === "completed_high_turns_context_prose") {
+              req.callbacks.onTurn?.(5);
+              req.callbacks.onUsage?.({ used: 192_000, size: 200_000 });
+              return { text: "finished reviewing the context of the change without submitting", stopReason: "completed" };
+            }
+            if (reviewerMode === "quota_paused_twice") {
+              req.callbacks.onTurn?.(2);
+              return { text: "paused on quota", stopReason: "quota_paused" };
+            }
+            if (reviewerMode === "rollover_twice") {
+              req.callbacks.onTurn?.(3);
+              return { text: "context window exhausted", stopReason: "rollover_requested" };
+            }
+            if (reviewerMode === "explicit_max_turns") {
+              req.callbacks.onTurn?.(5);
+              return { text: "runner hit max turns", stopReason: "max_turns" as unknown as "completed" };
+            }
+            throw new Error("runner backend exception");
           },
         }),
       });
@@ -390,25 +412,55 @@ describe("goal-18 v5 criteria", () => {
         assert.equal(failGet!.reviews.length, 0);
         assert.equal(failGet!.goal.reviewCycle, 0);
 
-        // 3. Reviewer hitting reviewerMaxTurns classifies stopReason as max_turns.
-        reviewerMode = "max_turns_twice";
-        const goalMaxTurns = daemon.director.goals.createGoal({
+        // 3. Normal stopReason="completed" at/above advisory reviewerMaxTurns and prose mentioning "context"
+        // must NOT fabricate max_turns or context_limit; it reports end_turn_without_verdict with turnsUsed preserved.
+        reviewerMode = "completed_high_turns_context_prose";
+        const goalCompletedHighTurns = daemon.director.goals.createGoal({
           chatSessionId: chat.id,
           repoRoot,
-          title: "Diagnostics max turns goal",
-          description: "Check max_turns stop reason classification",
+          title: "Diagnostics completed high turns goal",
+          description: "Check honest stop reason classification for normal completed session",
           criteria: [{ id: "c1", description: "Verified", kind: "behavioral", required: true }],
         });
-        let maxTurnsTrigger: { outcome?: string; reviewerFailure?: ReviewerDiagnostics } | null = null;
+        let highTurnsTrigger: { outcome?: string; reviewerFailure?: ReviewerDiagnostics } | null = null;
         directorAction = async (executeTool) => {
-          maxTurnsTrigger = (await executeTool("goal_trigger_review", { goal_id: goalMaxTurns.id })) as {
+          highTurnsTrigger = (await executeTool("goal_trigger_review", { goal_id: goalCompletedHighTurns.id })) as {
             outcome?: string;
             reviewerFailure?: ReviewerDiagnostics;
           };
         };
-        await daemon.director.sendChatMessage(chat.id, "review max turns goal");
-        assert.equal(maxTurnsTrigger!.outcome, "reviewer_failed");
-        assert.equal(maxTurnsTrigger!.reviewerFailure?.stopReason, "max_turns");
+        await daemon.director.sendChatMessage(chat.id, "review completed high turns goal");
+        assert.equal(highTurnsTrigger!.outcome, "reviewer_failed");
+        assert.equal(highTurnsTrigger!.reviewerFailure?.stopReason, "end_turn_without_verdict");
+        assert.equal(highTurnsTrigger!.reviewerFailure?.turnsUsed, 5);
+        assert.equal(highTurnsTrigger!.reviewerFailure?.contextPct, 96);
+
+        // 4. Genuine runner signals map honestly: quota_paused, rollover_requested -> context_limit, max_turns, crash.
+        for (const [mode, expectedStop] of [
+          ["quota_paused_twice", "quota_paused"],
+          ["rollover_twice", "context_limit"],
+          ["explicit_max_turns", "max_turns"],
+          ["throw_crash", "crash"],
+        ] as const) {
+          reviewerMode = mode;
+          const g = daemon.director.goals.createGoal({
+            chatSessionId: chat.id,
+            repoRoot,
+            title: `Diagnostics ${mode}`,
+            description: `Check ${expectedStop} classification`,
+            criteria: [{ id: "c1", description: "Verified", kind: "behavioral", required: true }],
+          });
+          let res: { outcome?: string; reviewerFailure?: ReviewerDiagnostics } | null = null;
+          directorAction = async (executeTool) => {
+            res = (await executeTool("goal_trigger_review", { goal_id: g.id })) as {
+              outcome?: string;
+              reviewerFailure?: ReviewerDiagnostics;
+            };
+          };
+          await daemon.director.sendChatMessage(chat.id, `review ${mode}`);
+          assert.equal(res!.outcome, "reviewer_failed");
+          assert.equal(res!.reviewerFailure?.stopReason, expectedStop, `expected ${expectedStop} for ${mode}`);
+        }
       } finally {
         await daemon.stop();
       }
@@ -506,9 +558,30 @@ describe("goal-18 v5 criteria", () => {
         assert.ok(toolRes.inFlight?.inflightId.includes(goal.id));
         assert.match(toolRes.howToWait ?? "", /goal_wait/);
 
+        // Following howToWait (goal_wait) while the reviewer is still running MUST actually block
+        // rather than returning already_settled, and wake as soon as the review finishes.
+        let waitSettled = false;
+        let waitResult: { wakeReason?: string; goal?: GoalRecord } | null = null;
+        const waitChatTurn = (async () => {
+          directorAction = async (executeTool) => {
+            waitResult = (await executeTool("goal_wait", {
+              goal_id: goal.id,
+              fallback_interval_s: 30,
+            })) as typeof waitResult;
+            waitSettled = true;
+          };
+          await daemon.director.sendChatMessage(chat.id, "follow howToWait with goal_wait");
+        })();
+        await new Promise((r) => setTimeout(r, 80));
+        assert.equal(waitSettled, false, "goal_wait must stay blocked while in-flight review is still running");
+
         releaseReviewer.resolve();
         const done = await firstReview;
         assert.equal(done.review.verdict, "approved");
+        await waitChatTurn;
+        assert.equal(waitSettled, true);
+        assert.equal(waitResult!.wakeReason, "event");
+        assert.equal(waitResult!.goal?.status, "achieved");
       } finally {
         await daemon.stop();
       }
@@ -729,6 +802,15 @@ describe("goal-18 v5 criteria", () => {
           criteria,
         });
 
+        // Pre-seed an existing contract-v1.md and a dangling symlink in the evidence dir to ensure the
+        // exclusive contract write creates a fresh unique file without overwriting existing evidence or following symlinks.
+        const goalEvidencePath = join(repoRoot, ".harness", "goals", goal.id);
+        mkdirSync(goalEvidencePath, { recursive: true });
+        const existingEvidenceFile = join(goalEvidencePath, "contract-v1.md");
+        writeFileSync(existingEvidenceFile, "pre-existing evidence must stay untouched\n", "utf8");
+        const outsideTarget = join(stateDir, "should-not-be-created.md");
+        symlinkSync(outsideTarget, join(goalEvidencePath, "dangling-link.md"));
+
         const outcome = await daemon.director.verifyAndReviewGoal(goal.id);
         assert.ok(capturedPrompt.length < 16_000, `expected compact prompt < 16000 chars, got ${capturedPrompt.length}`);
         for (const id of criteriaIds) {
@@ -739,9 +821,12 @@ describe("goal-18 v5 criteria", () => {
         assert.ok(capturedPrompt.includes("- [crit-2] PASS (gate)"));
         assert.match(capturedPrompt, /reserve the last 30% of context/i);
 
-        // Full contract file exists on disk with the complete 40KB+ description.
-        const contractFile = join(repoRoot, ".harness", "goals", goal.id, "contract-v1.md");
-        assert.equal(existsSync(contractFile), true);
+        // Fresh exclusive contract file exists on disk with the complete 40KB+ description, while pre-existing file is untouched.
+        assert.equal(readFileSync(existingEvidenceFile, "utf8"), "pre-existing evidence must stay untouched\n");
+        assert.equal(existsSync(outsideTarget), false);
+        const contractFiles = readdirSync(goalEvidencePath).filter((f) => /^contract-v1-[0-9a-f]{8}\.md$/.test(f));
+        assert.equal(contractFiles.length, 1, `expected one unique contract file, found: ${JSON.stringify(contractFiles)}`);
+        const contractFile = join(goalEvidencePath, contractFiles[0]!);
         assert.ok(readFileSync(contractFile, "utf8").includes(bigDescription.trim()));
         assert.ok(capturedPrompt.includes(contractFile));
 
@@ -756,6 +841,52 @@ describe("goal-18 v5 criteria", () => {
         assert.equal(outcome.review.diagnostics?.stopReason, "submitted");
         assert.equal(outcome.review.diagnostics?.contextPct, 75);
         assert.equal(daemon.director.goals.listReviews(goal.id).length, 1);
+
+        // Without a contractPath (e.g. when evidence dir is unavailable), buildReviewerPrompt must NEVER truncate
+        // the description or required criterion text so critical tails stay accessible to the reviewer.
+        const descTailMarker = "CRITICAL_DESCRIPTION_TAIL_QUALIFICATION";
+        const critTailMarker = "CRITICAL_CRITERION_TAIL_QUALIFICATION";
+        const goalNoContract = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Fallback no-contract-file goal",
+          description: `${"A".repeat(4500)} ${descTailMarker}`,
+          criteria: [
+            {
+              id: "tail-req",
+              description: `${"B".repeat(360)} ${critTailMarker}`,
+              kind: "behavioral",
+              required: true,
+            },
+          ],
+        });
+        const inlinePrompt = daemon.director.goals.buildReviewerPrompt(
+          goalNoContract,
+          {
+            allPassed: true,
+            diffHash: "h1",
+            results: [],
+            location: { cwd: repoRoot, ref: "main", sha: "HEAD", isolated: false, source: "repo_root" },
+          },
+          "",
+          undefined,
+          {},
+        );
+        assert.ok(inlinePrompt.includes(descTailMarker), "description tail must not be truncated without contractPath");
+        assert.ok(inlinePrompt.includes(critTailMarker), "criterion tail must not be truncated without contractPath");
+
+        // Runtime fallback: when the goal's evidence path is blocked by a regular file (ensureGoalEvidenceDir -> null),
+        // verifyAndReviewGoal still passes the full description and criterion tails inline to the reviewer.
+        const blockedEvidencePath = join(repoRoot, ".harness", "goals", goalNoContract.id);
+        rmSync(blockedEvidencePath, { recursive: true, force: true });
+        writeFileSync(blockedEvidencePath, "blocking-file-not-a-dir\n", "utf8");
+        capturedPrompt = "";
+        const savedCriteriaIds = [...criteriaIds];
+        criteriaIds.splice(0, criteriaIds.length, "tail-req");
+        await daemon.director.verifyAndReviewGoal(goalNoContract.id);
+        criteriaIds.splice(0, criteriaIds.length, ...savedCriteriaIds);
+        assert.ok(capturedPrompt.includes(descTailMarker), "runtime fallback must include full description tail");
+        assert.ok(capturedPrompt.includes(critTailMarker), "runtime fallback must include full criterion tail");
 
         // Empty output is an infrastructure error, never changes_requested, and never advances reviewCycle or noProgressStreak.
         mode = "empty_infra";
@@ -962,6 +1093,129 @@ describe("goal-18 v5 criteria", () => {
         assert.equal(reviewerCalls, 2);
       } finally {
         holdOrch.resolve();
+        await daemon.stop();
+      }
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("T8 [max-cycles-enforced]: maxReviewCycles=0 blocks cycle 1 without explicit override and rejects invalid negative budgets", async () => {
+    const repoRoot = await makeTempRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-g18v5-state-"));
+    const sockPath = join(stateDir, "d.sock");
+
+    let reviewerCalls = 0;
+    let directorAction: ((executeTool: (name: string, args: Record<string, unknown>) => Promise<unknown>) => Promise<void>) | null =
+      null;
+
+    try {
+      const baseCfg = loadConfig(repoRoot);
+      const config = withFixtureCatalog({
+        ...baseCfg,
+        goals: { ...baseCfg.goals, autoVerifyOnSettle: false },
+        events: { ...baseCfg.events, wakeDirectorOnGoalSettle: false },
+        stateDir,
+        socketPath: sockPath,
+      });
+      const daemon = new HarnessDaemon(config, {
+        dbPath: ":memory:",
+        customRunnerFactory: () => ({
+          run: async (req) => {
+            if (req.taskId.startsWith("chat-") && directorAction) {
+              const fn = directorAction;
+              directorAction = null;
+              await fn(req.executeTool);
+              return { text: "done", stopReason: "completed" };
+            }
+            if (req.kind !== "verify") return { text: "ok", stopReason: "completed" };
+            reviewerCalls += 1;
+            await req.executeTool("submit_review_verdict", {
+              verdict: "approved",
+              criteriaResults: [{ criterionId: "c1", passed: true, evidence: "Verified" }],
+              blockingIssues: [],
+              summary: "Approved via explicit override.",
+            });
+            return { text: "done", stopReason: "completed" };
+          },
+        }),
+      });
+
+      await daemon.start();
+      try {
+        const chat = await daemon.director.createChat({ repoRoot });
+
+        // Invalid negative or non-integer budgets are rejected on goal creation.
+        assert.throws(
+          () =>
+            daemon.director.goals.createGoal({
+              chatSessionId: chat.id,
+              repoRoot,
+              title: "Negative budget goal",
+              description: "Should fail validation",
+              criteria: [{ id: "c1", description: "Verified", kind: "behavioral", required: true }],
+              budgets: { maxReviewCycles: -1 },
+            }),
+          /non-negative integer/,
+        );
+        assert.throws(
+          () =>
+            daemon.director.goals.createGoal({
+              chatSessionId: chat.id,
+              repoRoot,
+              title: "Fractional budget goal",
+              description: "Should fail validation",
+              criteria: [{ id: "c1", description: "Verified", kind: "behavioral", required: true }],
+              budgets: { maxReviewCycles: 1.5 },
+            }),
+          /non-negative integer/,
+        );
+
+        // Zero budget blocks cycle 1 without explicit override.
+        const zeroGoal = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Zero review budget goal",
+          description: "Zero cycles must block cycle 1",
+          criteria: [{ id: "c1", description: "Verified", kind: "behavioral", required: true }],
+          budgets: { maxReviewCycles: 0 },
+        });
+        assert.equal(zeroGoal.budgets.maxReviewCycles, 0);
+
+        let directErr: unknown = null;
+        try {
+          await daemon.director.verifyAndReviewGoal(zeroGoal.id);
+        } catch (err) {
+          directErr = err;
+        }
+        assert.ok(directErr instanceof ReviewBudgetExhaustedError);
+        assert.match(directErr.reason, /Max review cycles reached \(0\/0\)/);
+        assert.equal(reviewerCalls, 0);
+
+        let blockedToolRes!: { outcome?: string; reason?: string };
+        directorAction = async (executeTool) => {
+          blockedToolRes = (await executeTool("goal_trigger_review", { goal_id: zeroGoal.id })) as typeof blockedToolRes;
+        };
+        await daemon.director.sendChatMessage(chat.id, "trigger review on zero-budget goal");
+        assert.equal(blockedToolRes.outcome, "review_budget_exhausted");
+        assert.match(blockedToolRes.reason ?? "", /0\/0/);
+        assert.equal(reviewerCalls, 0);
+
+        // Explicit override_review_budget: true runs cycle 1.
+        let overrideRes!: { outcome?: string; review?: GoalReviewVerdict; goal?: GoalRecord };
+        directorAction = async (executeTool) => {
+          overrideRes = (await executeTool("goal_trigger_review", {
+            goal_id: zeroGoal.id,
+            override_review_budget: true,
+          })) as typeof overrideRes;
+        };
+        await daemon.director.sendChatMessage(chat.id, "override zero-budget goal");
+        assert.equal(overrideRes.outcome, undefined);
+        assert.equal(overrideRes.review?.cycle, 1);
+        assert.equal(overrideRes.goal?.status, "achieved");
+        assert.equal(reviewerCalls, 1);
+      } finally {
         await daemon.stop();
       }
     } finally {

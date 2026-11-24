@@ -285,6 +285,7 @@ export type ReviewerStopReason =
   | "end_turn_without_verdict"
   | "max_turns"
   | "context_limit"
+  | "quota_paused"
   | "timeout"
   | "crash"
   | "cancelled"
@@ -315,6 +316,7 @@ export class StaleReviewError extends Error {
   readonly currentStatus: GoalStatus | null;
   readonly verdict?: string;
   staleEventRecorded?: boolean;
+  diagnostics?: ReviewerDiagnostics;
 
   constructor(
     goalId: string,
@@ -598,8 +600,12 @@ export class GoalEngine {
       }
     }
     const nonGoals = input.nonGoals ?? [];
+    const maxReviewCycles = input.budgets?.maxReviewCycles ?? this.cfg.defaultMaxReviewCycles;
+    if (typeof maxReviewCycles !== "number" || !Number.isInteger(maxReviewCycles) || maxReviewCycles < 0) {
+      throw new Error(`budgets.maxReviewCycles must be a non-negative integer (got ${String(maxReviewCycles)})`);
+    }
     const budgets: GoalBudgets = {
-      maxReviewCycles: input.budgets?.maxReviewCycles ?? this.cfg.defaultMaxReviewCycles,
+      maxReviewCycles,
       maxNoProgressCycles: input.budgets?.maxNoProgressCycles ?? this.cfg.defaultMaxNoProgressCycles,
       maxWallClockMin: input.budgets?.maxWallClockMin,
       maxApiEquivUsd: input.budgets?.maxApiEquivUsd,
@@ -1539,9 +1545,12 @@ export class GoalEngine {
     const CRITERION_DESC_CAP = 300;
     const GATE_EVIDENCE_CAP = 240;
     const passedDetIds = new Set(gateResult.results.filter((r) => r.passed).map((r) => r.criterionId));
-    const descriptionTruncated = goal.description.length > DESC_CAP;
+    const contractPath = ctx?.contractPath?.trim() || undefined;
+    const hasContractFile = Boolean(contractPath);
+    // Never truncate required contract text unless the full contract file was written and is referenced in this prompt.
+    const descriptionTruncated = hasContractFile && goal.description.length > DESC_CAP;
     const compactDescription = descriptionTruncated
-      ? `${goal.description.slice(0, DESC_CAP).trimEnd()}... [truncated at 4 KB${ctx?.contractPath ? `; full contract: ${ctx.contractPath}` : ""}]`
+      ? `${goal.description.slice(0, DESC_CAP).trimEnd()}... [truncated at 4 KB; full contract: ${contractPath}]`
       : goal.description;
     let anyCriterionTruncated = false;
     const criteriaLines = goal.criteria.map((c) => {
@@ -1550,7 +1559,7 @@ export class GoalEngine {
       }
       const singleLine = c.description.replace(/\s+/g, " ").trim();
       const desc =
-        singleLine.length > CRITERION_DESC_CAP
+        hasContractFile && singleLine.length > CRITERION_DESC_CAP
           ? ((anyCriterionTruncated = true), `${singleLine.slice(0, CRITERION_DESC_CAP).trimEnd()}...`)
           : singleLine;
       return `- [${c.id}] (${c.kind}${c.required ? ", REQUIRED" : ", optional"}): ${desc}${c.command ? ` [cmd: ${c.command}]` : ""}`;
@@ -1560,7 +1569,7 @@ export class GoalEngine {
       `# Independent Skeptical Done-Review (Goal ${goal.id} v${goal.version}, Cycle ${goal.reviewCycle + 1}/${goal.budgets.maxReviewCycles})`,
       `Title: ${goal.title}`,
       `Description: ${compactDescription}`,
-      ...(anyCriterionTruncated && !descriptionTruncated && ctx?.contractPath ? [`Full contract: ${ctx.contractPath}`] : []),
+      ...(anyCriterionTruncated && !descriptionTruncated && contractPath ? [`Full contract: ${contractPath}`] : []),
       "",
       "You are an INDEPENDENT, SKEPTICAL REVIEWER — NOT the generator.",
       "Inspect actual code, diffs, and test outputs. Focus on actionable correctness and contract failures; never approve stubbed implementations or unverified claims.",

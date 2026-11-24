@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { loadConfig } from "../src/config.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import { normalizeReviewerVerdict, parseReviewerVerdictJson, ReviewerFailedError } from "../src/director/runtime.js";
@@ -756,6 +756,236 @@ describe("goal-18 Done-Review reliability", () => {
         daemon.director.goals.linkRunAndStart(goal.id, run.id);
         await daemon.director.verifyAndReviewGoal(goal.id);
         assert.equal(verifyCheckoutHead, merged2.mergedSha);
+      } finally {
+        await daemon.stop();
+      }
+    } finally {
+      console.warn = origWarn;
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("removes packed stale refs on update-ref failure so verification checks out merge 2 instead of stale packed merge 1", async () => {
+    const repoRoot = await makeTempRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-g18-packed-state-"));
+    const sockPath = join(stateDir, "d.sock");
+    let verifyCheckoutHead = "";
+    const warnings: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+
+    try {
+      const baseCfg = loadConfig(repoRoot);
+      const config = withFixtureCatalog({
+        ...baseCfg,
+        goals: { ...baseCfg.goals, autoVerifyOnSettle: false },
+        stateDir,
+        socketPath: sockPath,
+      });
+      const daemon = new HarnessDaemon(config, {
+        dbPath: ":memory:",
+        customRunnerFactory: () => ({
+          run: async (req) => {
+            if (req.kind !== "verify") return { text: "ok", stopReason: "completed" };
+            verifyCheckoutHead = (await runGit(req.cwd, ["rev-parse", "HEAD"])).stdout;
+            await req.executeTool("submit_review_verdict", {
+              verdict: "approved",
+              criteriaResults: [{ criterionId: "behavior", passed: true, evidence: `checked ${verifyCheckoutHead}` }],
+              blockingIssues: [],
+              summary: "Verified latest commit.",
+            });
+            return { text: "done", stopReason: "completed" };
+          },
+        }),
+      });
+
+      await daemon.start();
+      try {
+        const wtMgr = daemon.orchestrator.getWorktreeManager(repoRoot);
+        const mq = new BisectingMergeQueue(daemon.db, wtMgr, repoRoot, config.worktree);
+        const baseSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout;
+
+        // Pack merge 1's ref into packed-refs, then hold loose ref .lock during merge 2 (Astra's reproduction).
+        const runA = daemon.db.createRun({ goal: "Packed ref run A", repoRoot, baseBranch: "main", baseSha });
+        const taskA1 = daemon.db.createTask({
+          runId: runA.id,
+          parentId: null,
+          tier: 2,
+          kind: "execute",
+          title: "Worker A1",
+          objective: "Add a1.txt",
+          profileId: "fixture",
+        });
+        const wtA1 = await wtMgr.createForWorker(runA.id, taskA1.id, "main");
+        writeFileSync(join(wtA1.path, "a1.txt"), "a1\n", "utf8");
+        await runGit(wtA1.path, ["add", "a1.txt"]);
+        await runGit(wtA1.path, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "feat: a1"]);
+        daemon.db.enqueueMerge({ runId: runA.id, taskId: taskA1.id, worktreeId: wtA1.id, branch: wtA1.branch });
+        const mergedA1 = await mq.processNext(runA.id);
+        assert.ok(mergedA1?.mergedSha);
+
+        const refA = runMergedRef(runA.id);
+        await runGit(repoRoot, ["pack-refs", "--all"]);
+        const looseRefPathA = resolve(repoRoot, (await runGit(repoRoot, ["rev-parse", "--git-path", refA])).stdout);
+        assert.equal(existsSync(looseRefPathA), false, "expected packed ref to have no loose file");
+        assert.equal((await runGit(repoRoot, ["rev-parse", "--verify", `${refA}^{commit}`])).stdout, mergedA1.mergedSha);
+
+        // Hold loose ref .lock so both update-ref and update-ref -d fail on merge 2.
+        mkdirSync(dirname(looseRefPathA), { recursive: true });
+        writeFileSync(`${looseRefPathA}.lock`, "locked\n", "utf8");
+
+        const taskA2 = daemon.db.createTask({
+          runId: runA.id,
+          parentId: null,
+          tier: 2,
+          kind: "execute",
+          title: "Worker A2",
+          objective: "Add a2.txt",
+          profileId: "fixture",
+        });
+        const wtA2 = await wtMgr.createForWorker(runA.id, taskA2.id, "main");
+        writeFileSync(join(wtA2.path, "a2.txt"), "a2\n", "utf8");
+        await runGit(wtA2.path, ["add", "a2.txt"]);
+        await runGit(wtA2.path, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "feat: a2"]);
+        daemon.db.enqueueMerge({ runId: runA.id, taskId: taskA2.id, worktreeId: wtA2.id, branch: wtA2.branch });
+        const mergedA2 = await mq.processNext(runA.id);
+        assert.ok(mergedA2?.mergedSha);
+        assert.notEqual(mergedA2.mergedSha, mergedA1.mergedSha);
+
+        // Ref must be gone from both loose and packed-refs.
+        const refAStillResolves = await runGit(repoRoot, ["rev-parse", "--verify", `${refA}^{commit}`])
+          .then(() => true)
+          .catch(() => false);
+        assert.equal(refAStillResolves, false, "packed stale merge ref must be removed on update-ref failure");
+        assert.ok(
+          warnings.some((w) => w.includes(refA) && w.includes("removed stale merge ref")),
+          `expected stale ref warning, got: ${JSON.stringify(warnings)}`,
+        );
+
+        const chat = await daemon.director.createChat({ repoRoot });
+        const goalA = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Verify after packed ref cleanup",
+          description: "Must verify merge 2, not stale packed merge 1",
+          criteria: [{ id: "behavior", description: "Behavior verified", kind: "behavioral", required: true }],
+        });
+        daemon.director.goals.linkRunAndStart(goalA.id, runA.id);
+        await daemon.director.verifyAndReviewGoal(goalA.id);
+        assert.equal(verifyCheckoutHead, mergedA2.mergedSha);
+      } finally {
+        await daemon.stop();
+      }
+    } finally {
+      console.warn = origWarn;
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("prepareVerifyCheckout rejects a stale packed merge ref older than the run's latest promoted merge even if packed-refs cleanup was locked", async () => {
+    const repoRoot = await makeTempRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-g18-prov-state-"));
+    const sockPath = join(stateDir, "d.sock");
+    let verifyCheckoutHead = "";
+    const origWarn = console.warn;
+    console.warn = () => {};
+
+    try {
+      await runGit(repoRoot, ["config", "core.packedRefsTimeout", "50"]);
+      const baseCfg = loadConfig(repoRoot);
+      const config = withFixtureCatalog({
+        ...baseCfg,
+        goals: { ...baseCfg.goals, autoVerifyOnSettle: false },
+        stateDir,
+        socketPath: sockPath,
+      });
+      const daemon = new HarnessDaemon(config, {
+        dbPath: ":memory:",
+        customRunnerFactory: () => ({
+          run: async (req) => {
+            if (req.kind !== "verify") return { text: "ok", stopReason: "completed" };
+            verifyCheckoutHead = (await runGit(req.cwd, ["rev-parse", "HEAD"])).stdout;
+            await req.executeTool("submit_review_verdict", {
+              verdict: "approved",
+              criteriaResults: [{ criterionId: "behavior", passed: true, evidence: `checked ${verifyCheckoutHead}` }],
+              blockingIssues: [],
+              summary: "Verified latest commit.",
+            });
+            return { text: "done", stopReason: "completed" };
+          },
+        }),
+      });
+
+      await daemon.start();
+      try {
+        const wtMgr = daemon.orchestrator.getWorktreeManager(repoRoot);
+        const mq = new BisectingMergeQueue(daemon.db, wtMgr, repoRoot, config.worktree);
+        const baseSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout;
+
+        const runB = daemon.db.createRun({ goal: "Packed ref locked run B", repoRoot, baseBranch: "main", baseSha });
+        const taskB1 = daemon.db.createTask({
+          runId: runB.id,
+          parentId: null,
+          tier: 2,
+          kind: "execute",
+          title: "Worker B1",
+          objective: "Add b1.txt",
+          profileId: "fixture",
+        });
+        const wtB1 = await wtMgr.createForWorker(runB.id, taskB1.id, "main");
+        writeFileSync(join(wtB1.path, "b1.txt"), "b1\n", "utf8");
+        await runGit(wtB1.path, ["add", "b1.txt"]);
+        await runGit(wtB1.path, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "feat: b1"]);
+        daemon.db.enqueueMerge({ runId: runB.id, taskId: taskB1.id, worktreeId: wtB1.id, branch: wtB1.branch });
+        const mergedB1 = await mq.processNext(runB.id);
+        assert.ok(mergedB1?.mergedSha);
+
+        const refB = runMergedRef(runB.id);
+        await runGit(repoRoot, ["pack-refs", "--all"]);
+        const looseRefPathB = resolve(repoRoot, (await runGit(repoRoot, ["rev-parse", "--git-path", refB])).stdout);
+        const packedRefsPath = resolve(repoRoot, (await runGit(repoRoot, ["rev-parse", "--git-path", "packed-refs"])).stdout);
+        mkdirSync(dirname(looseRefPathB), { recursive: true });
+        writeFileSync(`${looseRefPathB}.lock`, "locked\n", "utf8");
+        writeFileSync(`${packedRefsPath}.lock`, "locked\n", "utf8");
+
+        const taskB2 = daemon.db.createTask({
+          runId: runB.id,
+          parentId: null,
+          tier: 2,
+          kind: "execute",
+          title: "Worker B2",
+          objective: "Add b2.txt",
+          profileId: "fixture",
+        });
+        const wtB2 = await wtMgr.createForWorker(runB.id, taskB2.id, "main");
+        writeFileSync(join(wtB2.path, "b2.txt"), "b2\n", "utf8");
+        await runGit(wtB2.path, ["add", "b2.txt"]);
+        await runGit(wtB2.path, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "feat: b2"]);
+        daemon.db.enqueueMerge({ runId: runB.id, taskId: taskB2.id, worktreeId: wtB2.id, branch: wtB2.branch });
+        const mergedB2 = await mq.processNext(runB.id);
+        assert.ok(mergedB2?.mergedSha);
+        assert.notEqual(mergedB2.mergedSha, mergedB1.mergedSha);
+
+        // Even though refB still resolves to stale mergedB1 because packed-refs.lock was held,
+        // prepareVerifyCheckout refuses any ref older than the run's latest promoted merge SHA.
+        assert.equal((await runGit(repoRoot, ["rev-parse", "--verify", `${refB}^{commit}`])).stdout, mergedB1.mergedSha);
+        rmSync(`${packedRefsPath}.lock`, { force: true });
+
+        const chat = await daemon.director.createChat({ repoRoot });
+        const goalB = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Verify rejects stale packed ref via provenance",
+          description: "Must verify merge B2, never stale packed merge B1",
+          criteria: [{ id: "behavior", description: "Behavior verified", kind: "behavioral", required: true }],
+        });
+        daemon.director.goals.linkRunAndStart(goalB.id, runB.id);
+        await daemon.director.verifyAndReviewGoal(goalB.id);
+        assert.equal(verifyCheckoutHead, mergedB2.mergedSha);
       } finally {
         await daemon.stop();
       }
