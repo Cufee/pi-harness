@@ -436,6 +436,10 @@ describe("goal-13 re-review regression fixes", () => {
         }
       }
 
+      // Mark orphan runs non-active because restart recovery relaunches tasks of active runs in place.
+      db.updateRunStatus(oldestRunId, "failed");
+      db.updateRunStatus(newestRunId, "failed");
+
       orch.reconcileStaleRunsOnStartup();
 
       const oldestT3 = db.getTask(oldestT3Id)!;
