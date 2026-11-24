@@ -1,5 +1,17 @@
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, rmSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { spawnDaemonDetached } from "./launch.js";
 import { killProcessGroups, listChildProcessGroups } from "./reap.js";
@@ -16,15 +28,96 @@ const LEGACY_REAP_GRACE_MS = 2_500;
 
 export interface SuperviseOptions {
   socketPath: string;
+  stateDir?: string;
   target: ReleaseTarget;
   previous: ReleaseTarget | null;
+  previousRestartSafe?: boolean;
   waitPid?: number;
   stopPid?: number;
+  stopPidStartTime?: string;
   stopRestartSafe?: boolean;
+  childPgids?: number[];
   overlayRoot?: string;
   fromReleaseId?: string;
   affectedRunIds?: string[];
   bootTimeoutMs?: number;
+}
+
+export function readProcStartTime(pid: number): string | null {
+  if (process.platform !== "linux" || !Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const rparen = raw.lastIndexOf(")");
+    if (rparen === -1) return null;
+    const fields = raw.slice(rparen + 2).trim().split(/\s+/);
+    const startTime = fields[19];
+    return startTime && /^\d+$/.test(startTime) ? startTime : null;
+  } catch {
+    return null;
+  }
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function formatServeCommand(rel: ReleaseTarget, stateDir: string | undefined, socketPath: string, includeSocketEnv: boolean): string {
+  const envParts: string[] = [];
+  if (stateDir) {
+    envParts.push(`PI_HARNESS_HOME=${shellQuote(stateDir)}`);
+  }
+  if (includeSocketEnv && (!stateDir || socketPath !== join(stateDir, "daemon.sock"))) {
+    envParts.push(`PI_HARNESS_SOCKET_PATH=${shellQuote(socketPath)}`);
+  }
+  const cmd = `${shellQuote(rel.bunPath)} ${shellQuote(rel.cliPath)} daemon serve`;
+  return envParts.length > 0 ? `${envParts.join(" ")} ${cmd}` : cmd;
+}
+
+function readLogTail(logPath: string, startOffset: number, maxChars = 2000): string {
+  try {
+    const fd = openSync(logPath, "r");
+    try {
+      const end = fstatSync(fd).size;
+      const start = Math.max(startOffset, end - 16_384);
+      if (end <= start) return "";
+      const buf = Buffer.alloc(end - start);
+      const bytesRead = readSync(fd, buf, 0, buf.length, start);
+      return buf.subarray(0, bytesRead).toString("utf8").trim().slice(-maxChars);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return "";
+  }
+}
+
+function writeFallbackFileAtomically(fallbackFilePath: string, content: string): void {
+  const tmpPath = `${fallbackFilePath}.tmp.${process.pid}`;
+  try {
+    mkdirSync(dirname(fallbackFilePath), { recursive: true });
+    writeFileSync(tmpPath, content, "utf8");
+    renameSync(tmpPath, fallbackFilePath);
+  } catch {
+    try {
+      rmSync(tmpPath, { force: true });
+    } catch {
+      // ignore
+    }
+    try {
+      writeFileSync(fallbackFilePath, content, "utf8");
+    } catch (err) {
+      logSupervisor(`failed to write ${fallbackFilePath}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
+
+function logAndWriteFallback(fallbackFilePath: string, lines: string[]): void {
+  const content = `${lines.join("\n")}\n`;
+  writeFallbackFileAtomically(fallbackFilePath, content);
+  logSupervisor(`wrote recovery instructions to ${fallbackFilePath}`);
+  for (const line of lines) {
+    logSupervisor(line);
+  }
 }
 
 function logSupervisor(msg: string): void {
@@ -215,6 +308,7 @@ export async function runSupervisor(o: SuperviseOptions): Promise<number> {
 
   const targetBootTimeoutMs =
     o.bootTimeoutMs ?? parsePositiveEnvMs(process.env.PI_HARNESS_SUPERVISE_BOOT_TIMEOUT_MS) ?? DEFAULT_BOOT_TIMEOUT_MS;
+  const logPath = join(dirname(o.socketPath), "daemon.log");
   const fallbackFilePath = join(dirname(o.socketPath), "reload-fallback.txt");
   try {
     rmSync(fallbackFilePath, { force: true });
@@ -227,20 +321,83 @@ export async function runSupervisor(o: SuperviseOptions): Promise<number> {
   delete process.env.PI_HARNESS_RELOAD_FAILED;
   delete process.env.PI_HARNESS_OVERLAY_ROOT;
   delete process.env.PI_HARNESS_LEGACY_STOP_AT;
+  delete process.env.PI_HARNESS_SOCKET_PATH;
 
   const oldPid = o.waitPid ?? o.stopPid;
+  const oldPidTag = oldPid !== undefined ? String(oldPid) : "none";
   let legacyStopAt: number | undefined;
 
+  const abortReload = (reason: string): number => {
+    logAndWriteFallback(fallbackFilePath, [
+      `# Reload aborted (exit 1): target=${o.target.releaseId} oldPid=${oldPidTag}`,
+      reason,
+      "No successor daemon was started.",
+    ]);
+    return 1;
+  };
+
   if (o.waitPid && o.waitPid > 0) {
+    const pgidsToReap = new Set<number>(o.childPgids ?? []);
     logSupervisor(`waiting up to ${WAIT_OLD_PID_TIMEOUT_MS}ms for old daemon pid ${o.waitPid} to exit`);
-    const exited = await waitForPidExit(o.waitPid, WAIT_OLD_PID_TIMEOUT_MS);
+    let exited = await waitForPidExit(o.waitPid, WAIT_OLD_PID_TIMEOUT_MS);
     if (!exited) {
-      logSupervisor(`old daemon pid ${o.waitPid} still alive after ${WAIT_OLD_PID_TIMEOUT_MS}ms; continuing handover`);
+      for (const pgid of listChildProcessGroups(o.waitPid)) {
+        pgidsToReap.add(pgid);
+      }
+      logSupervisor(`old daemon pid ${o.waitPid} still alive after ${WAIT_OLD_PID_TIMEOUT_MS}ms; sending SIGKILL`);
+      try {
+        process.kill(o.waitPid, "SIGKILL");
+      } catch {
+        // already exited
+      }
+      exited = await waitForPidExit(o.waitPid, LEGACY_SIGKILL_WAIT_MS);
+      if (!exited) {
+        return abortReload(
+          `Old daemon pid ${o.waitPid} survived the wait (${WAIT_OLD_PID_TIMEOUT_MS}ms) and SIGKILL grace (${LEGACY_SIGKILL_WAIT_MS}ms).`,
+        );
+      }
+      logSupervisor(`old daemon pid ${o.waitPid} exited after SIGKILL`);
     } else {
       logSupervisor(`old daemon pid ${o.waitPid} exited`);
     }
+    if (pgidsToReap.size > 0) {
+      const sigkilled = await killProcessGroups([...pgidsToReap], LEGACY_REAP_GRACE_MS);
+      logSupervisor(`handover reap: checked ${pgidsToReap.size} captured process group(s) (sigkill=${sigkilled})`);
+    }
   } else if (o.stopPid && o.stopPid > 0) {
-    const recordedPgids = listChildProcessGroups(o.stopPid);
+    const startTimeMatches = (): boolean => {
+      if (!o.stopPidStartTime) return true;
+      const cur = readProcStartTime(o.stopPid!);
+      return cur === null || cur === o.stopPidStartTime;
+    };
+
+    const preStopPing = await probeDaemonPing(o.socketPath, 1500);
+    if (preStopPing !== null) {
+      if (preStopPing.pid !== o.stopPid) {
+        return abortReload(
+          `Legacy stop refused: socket ${o.socketPath} is served by pid ${preStopPing.pid ?? "unknown"}, expected ${o.stopPid}. Nothing was stopped.`,
+        );
+      }
+      if (preStopPing.reload !== undefined) {
+        return abortReload(
+          `Legacy stop refused: daemon pid ${o.stopPid} on ${o.socketPath} now reports hot-update support. Nothing was stopped.`,
+        );
+      }
+    }
+
+    if (isPidAlive(o.stopPid) && !startTimeMatches()) {
+      return abortReload(
+        `Legacy stop refused: pid ${o.stopPid} start time no longer matches the previewed daemon. Nothing was stopped.`,
+      );
+    }
+
+    const pgidsToReap = new Set<number>(o.childPgids ?? []);
+    if (isPidAlive(o.stopPid)) {
+      for (const pgid of listChildProcessGroups(o.stopPid)) {
+        pgidsToReap.add(pgid);
+      }
+    }
+    const recordedPgids = [...pgidsToReap];
     legacyStopAt = Date.now();
     const stopTimeoutMs = o.stopRestartSafe ? LEGACY_STOP_TIMEOUT_RESTART_SAFE_MS : LEGACY_STOP_TIMEOUT_DEFAULT_MS;
     logSupervisor(
@@ -248,9 +405,16 @@ export async function runSupervisor(o: SuperviseOptions): Promise<number> {
     );
 
     if (isPidAlive(o.stopPid)) {
-      await sendShutdownRpc(o.socketPath);
-      await new Promise((r) => setTimeout(r, 150));
+      if (preStopPing !== null) {
+        await sendShutdownRpc(o.socketPath);
+        await new Promise((r) => setTimeout(r, 150));
+      }
       if (isPidAlive(o.stopPid)) {
+        if (!startTimeMatches()) {
+          return abortReload(
+            `Legacy stop refused: pid ${o.stopPid} identity changed before SIGTERM. Nothing else was signalled.`,
+          );
+        }
         try {
           process.kill(o.stopPid, "SIGTERM");
         } catch {
@@ -260,6 +424,11 @@ export async function runSupervisor(o: SuperviseOptions): Promise<number> {
       const exited = await waitForPidExit(o.stopPid, stopTimeoutMs);
       if (!exited) {
         logSupervisor(`legacy stop: pid ${o.stopPid} still alive after ${stopTimeoutMs}ms; sending SIGKILL`);
+        if (!startTimeMatches()) {
+          return abortReload(
+            `Legacy stop refused: pid ${o.stopPid} identity changed before SIGKILL. No successor was started.`,
+          );
+        }
         try {
           process.kill(o.stopPid, "SIGKILL");
         } catch {
@@ -267,6 +436,11 @@ export async function runSupervisor(o: SuperviseOptions): Promise<number> {
         }
         const killedExit = await waitForPidExit(o.stopPid, LEGACY_SIGKILL_WAIT_MS);
         logSupervisor(`legacy stop: pid ${o.stopPid} after SIGKILL exited=${killedExit}`);
+        if (!killedExit) {
+          return abortReload(
+            `Old daemon pid ${o.stopPid} survived stop timeout (${stopTimeoutMs}ms) and SIGKILL grace (${LEGACY_SIGKILL_WAIT_MS}ms).`,
+          );
+        }
       } else {
         logSupervisor(`legacy stop: pid ${o.stopPid} exited`);
       }
@@ -280,10 +454,25 @@ export async function runSupervisor(o: SuperviseOptions): Promise<number> {
     }
   }
 
-  const targetEnv: Record<string, string> = {};
+  // Never start a successor while the old daemon process is still alive.
+  if (oldPid && oldPid > 0 && isPidAlive(oldPid)) {
+    return abortReload(`Old daemon pid ${oldPid} is still alive before target start.`);
+  }
+
+  const targetEnv: Record<string, string> = {
+    PI_HARNESS_SOCKET_PATH: o.socketPath,
+  };
+  if (o.stateDir) targetEnv.PI_HARNESS_HOME = o.stateDir;
   if (o.fromReleaseId) targetEnv.PI_HARNESS_RELOAD_FROM = o.fromReleaseId;
   if (o.overlayRoot) targetEnv.PI_HARNESS_OVERLAY_ROOT = o.overlayRoot;
   if (legacyStopAt !== undefined) targetEnv.PI_HARNESS_LEGACY_STOP_AT = String(legacyStopAt);
+
+  let targetLogStart = 0;
+  try {
+    targetLogStart = statSync(logPath).size;
+  } catch {
+    // daemon.log may not exist yet
+  }
 
   logSupervisor(`starting target release ${o.target.releaseId} (${o.target.releaseDir}), timeout=${targetBootTimeoutMs}ms`);
   const targetAttempt = await startAndWaitForRelease(
@@ -300,29 +489,82 @@ export async function runSupervisor(o: SuperviseOptions): Promise<number> {
   }
 
   const errorMsg = targetAttempt.error ?? `failed to start release ${o.target.releaseId}`;
+  const bootLogTail = readLogTail(logPath, targetLogStart, 2000);
   logSupervisor(`target release ${o.target.releaseId} failed to boot: ${errorMsg}`);
 
-  if (targetAttempt.childPid && !targetAttempt.childExited) {
+  if (targetAttempt.childPid && (!targetAttempt.childExited || isPidAlive(targetAttempt.childPid))) {
     await killProcessGroups([targetAttempt.childPid], 1000);
+    if (isPidAlive(targetAttempt.childPid)) {
+      try {
+        process.kill(targetAttempt.childPid, "SIGKILL");
+      } catch {
+        // already dead
+      }
+      await waitForPidExit(targetAttempt.childPid, 2000);
+    }
   }
 
-  if (!o.previous) {
-    logSupervisor("no previous release configured for fallback; exiting 1");
-    return 1;
-  }
-
-  const prevRead = readReleaseAt(o.previous.releaseDir);
+  const prevRead = o.previous ? readReleaseAt(o.previous.releaseDir) : null;
   const prev = prevRead ?? o.previous;
   const prevHasReleaseJson = prevRead !== null;
+  const fallbackIsRestartSafe = Boolean(
+    prev &&
+      (o.previousRestartSafe === true ||
+        (o.previousRestartSafe === undefined && prevHasReleaseJson && o.stopRestartSafe !== false)),
+  );
+
+  if (!prev || !fallbackIsRestartSafe) {
+    const lines: string[] = [
+      `# Reload failed (exit 3): target=${o.target.releaseId} oldPid=${oldPidTag}`,
+      `Target release ${o.target.releaseId} (${o.target.releaseDir}) failed to boot: ${errorMsg}`,
+      prev
+        ? `No daemon was started because the only fallback release (${prev.releaseId}, ${prev.releaseDir}) is not restart-safe (starting it automatically would mark interrupted tasks failed).`
+        : "No daemon was started because no fallback release was found.",
+      "",
+      "All work is intact in the database and will resume in place when a hot-update-capable release starts.",
+    ];
+    if (bootLogTail) {
+      lines.push("", "Boot error log tail:", bootLogTail);
+    }
+    lines.push(
+      "",
+      "After fixing the target release, start it with:",
+      `  ${formatServeCommand(o.target, o.stateDir, o.socketPath, true)}`,
+    );
+    if (prev) {
+      lines.push(
+        "",
+        "LAST RESORT (WARNING: starting this pre-feature release marks every interrupted task failed and releases its leases):",
+        `  ${formatServeCommand(prev, o.stateDir, o.socketPath, false)}`,
+      );
+      if (o.affectedRunIds && o.affectedRunIds.length > 0) {
+        lines.push("Then resume every affected run with:");
+        for (const runId of o.affectedRunIds) {
+          lines.push(`  pi-harness resume ${runId}`);
+        }
+      }
+    }
+    logAndWriteFallback(fallbackFilePath, lines);
+    return 3;
+  }
+
+  if (targetAttempt.childPid && isPidAlive(targetAttempt.childPid)) {
+    return abortReload(
+      `Failed target release ${o.target.releaseId} (pid ${targetAttempt.childPid}) is still alive after kill; refusing to start fallback.`,
+    );
+  }
+
   const fallbackEnv: Record<string, string> = {
+    PI_HARNESS_SOCKET_PATH: o.socketPath,
     PI_HARNESS_RELOAD_FAILED: JSON.stringify({
       targetReleaseId: o.target.releaseId,
       error: errorMsg,
     }),
   };
+  if (o.stateDir) fallbackEnv.PI_HARNESS_HOME = o.stateDir;
   if (o.overlayRoot) fallbackEnv.PI_HARNESS_OVERLAY_ROOT = o.overlayRoot;
 
-  // Fallback always gets the default 20s boot timeout even when PI_HARNESS_SUPERVISE_BOOT_TIMEOUT_MS is set (A10).
+  // Fallback always gets the default 20s boot timeout even when PI_HARNESS_SUPERVISE_BOOT_TIMEOUT_MS is set.
   logSupervisor(`falling back to previous release ${prev.releaseId} (${prev.releaseDir}), timeout=${DEFAULT_BOOT_TIMEOUT_MS}ms`);
   const fallbackAttempt = await startAndWaitForRelease(
     prev,
@@ -333,24 +575,6 @@ export async function runSupervisor(o: SuperviseOptions): Promise<number> {
     oldPid,
   );
   if (fallbackAttempt.ok) {
-    const isPreFeatureFallback = !prevHasReleaseJson || fallbackAttempt.ping?.restartSafe !== true;
-    if (isPreFeatureFallback && o.affectedRunIds && o.affectedRunIds.length > 0) {
-      const resumeLines = o.affectedRunIds.map((runId) => `pi-harness resume ${runId}`);
-      const content = [
-        `# Fallback release (${prev.releaseId}) is not restart-safe; resume affected runs with:`,
-        ...resumeLines,
-        "",
-      ].join("\n");
-      try {
-        writeFileSync(fallbackFilePath, content, "utf8");
-        logSupervisor(`wrote fallback resume commands to ${fallbackFilePath}`);
-      } catch (err) {
-        logSupervisor(`failed to write ${fallbackFilePath}: ${err instanceof Error ? err.message : String(err)}`);
-      }
-      for (const line of resumeLines) {
-        logSupervisor(line);
-      }
-    }
     logSupervisor(`fallback release ${prev.releaseId} is serving (pid ${fallbackAttempt.ping?.pid ?? "?"}); exiting 3`);
     return 3;
   }
@@ -358,6 +582,7 @@ export async function runSupervisor(o: SuperviseOptions): Promise<number> {
   if (fallbackAttempt.childPid && !fallbackAttempt.childExited) {
     await killProcessGroups([fallbackAttempt.childPid], 1000);
   }
-  logSupervisor(`fallback release ${prev.releaseId} also failed to boot: ${fallbackAttempt.error ?? "unknown error"}; exiting 1`);
-  return 1;
+  return abortReload(
+    `Target release ${o.target.releaseId} failed to boot (${errorMsg}), and fallback release ${prev.releaseId} also failed to boot (${fallbackAttempt.error ?? "unknown error"}).`,
+  );
 }

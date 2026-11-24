@@ -363,6 +363,7 @@ export class HarnessDaemon {
   private restartExpected = false;
   private stopPromise: Promise<void> | null = null;
   private handoverPromise: Promise<void> | null = null;
+  private capturedStopChildPgids = new Set<number>();
   private reapChildrenOnStop = false;
   private recoveryStaggerMs = 300;
   private readonly overlayRoot: string | undefined;
@@ -1280,6 +1281,11 @@ export class HarnessDaemon {
   private async stopAndHandOverInner(target: ReleaseTarget): Promise<void> {
     this.restartExpected = true;
     const self = currentRelease();
+    if (this.reapChildrenOnStop) {
+      for (const pgid of listChildProcessGroups(process.pid)) {
+        this.capturedStopChildPgids.add(pgid);
+      }
+    }
     let cwd = this.config.stateDir;
     try {
       const currentCwd = process.cwd();
@@ -1291,14 +1297,29 @@ export class HarnessDaemon {
     const spawnOnce = () => {
       if (supervisorSpawned) return;
       supervisorSpawned = true;
+      if (this.reapChildrenOnStop) {
+        for (const pgid of listChildProcessGroups(process.pid)) {
+          this.capturedStopChildPgids.add(pgid);
+        }
+      }
+      const fallbackFilePath = join(dirname(this.config.socketPath), "reload-fallback.txt");
+      try {
+        if (existsSync(fallbackFilePath)) unlinkSync(fallbackFilePath);
+      } catch {
+        // ignore stale fallback cleanup error
+      }
+      const childPgids = [...this.capturedStopChildPgids];
       console.error(`[harnessd ${new Date().toISOString()}] reload: spawning supervisor for ${target.releaseId}`);
       spawnSupervisorDetached(
         self,
         {
           socketPath: this.config.socketPath,
+          stateDir: this.config.stateDir,
           target,
           previous: self,
+          previousRestartSafe: true,
           waitPid: process.pid,
+          ...(childPgids.length > 0 ? { childPgids } : {}),
           overlayRoot: this.overlayRoot,
           fromReleaseId: self.releaseId,
         },
@@ -1333,9 +1354,11 @@ export class HarnessDaemon {
   private async stopInner(_opts?: { reason?: string }): Promise<void> {
     this.enterQuiesce("stopping");
     this.hotUpdate.dispose();
-    const capturedChildPgids = new Set<number>(
-      this.reapChildrenOnStop ? listChildProcessGroups(process.pid) : [],
-    );
+    if (this.reapChildrenOnStop) {
+      for (const pgid of listChildProcessGroups(process.pid)) {
+        this.capturedStopChildPgids.add(pgid);
+      }
+    }
     let recTimer: ReturnType<typeof setTimeout> | null = null;
     await Promise.race([
       this.recovered.catch(() => {}),
@@ -1358,7 +1381,7 @@ export class HarnessDaemon {
     }
     if (this.reapChildrenOnStop) {
       for (const pgid of listChildProcessGroups(process.pid)) {
-        capturedChildPgids.add(pgid);
+        this.capturedStopChildPgids.add(pgid);
       }
     }
     if (this.idleShutdownTimer) {
@@ -1460,7 +1483,7 @@ export class HarnessDaemon {
     }
 
     if (this.reapChildrenOnStop) {
-      await reapChildProcessGroups(process.pid, 2000, capturedChildPgids);
+      await reapChildProcessGroups(process.pid, 2000, this.capturedStopChildPgids);
     }
 
     this.broadcastDaemonEvent("daemon.stopping", { restart: this.restartExpected });

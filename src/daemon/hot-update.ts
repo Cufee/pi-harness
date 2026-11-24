@@ -1,15 +1,19 @@
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { Database } from "bun:sqlite";
-import type { HotUpdateConfig } from "../config.js";
+import {
+  HOT_UPDATE_DRAIN_TIMEOUT_MAX_SEC,
+  HOT_UPDATE_MIN_INTERVAL_MAX_SEC,
+  type HotUpdateConfig,
+} from "../config.js";
 import { classifyInterruptedTasks, formatRecoveryPlan, type RecoveryPlan } from "../control-plane/restart-recovery.js";
 import type { DaemonReloadParams, DaemonReloadReply, ReloadStatus } from "../protocol/daemon-rpc.js";
 import { ensureLocalDaemon, stopLocalDaemon } from "./launch.js";
 import { currentRelease, installedCurrent, readReleaseAt, releaseTargetForDir, type ReleaseIdentity, type ReleaseTarget } from "./release.js";
 import { DaemonClient } from "./remote.js";
-import { spawnSupervisorDetached } from "./supervise.js";
+import { readProcStartTime, spawnSupervisorDetached } from "./supervise.js";
 
 const DEFAULT_BOOT_TIMEOUT_MS = 20_000;
 const STOP_BUDGET_MS = 45_000;
@@ -81,6 +85,7 @@ export class HotUpdateController {
   private scheduleTimer: ReturnType<typeof setTimeout> | null = null;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
   private wakePoll: (() => void) | null = null;
+  private handoverStarted = false;
   private disposed = false;
   private readonly now: () => number;
 
@@ -99,6 +104,24 @@ export class HotUpdateController {
     validateTarget(target, Boolean(p.allowCheckout));
 
     if (target.releaseId === this.host.self.releaseId && !p.force) {
+      if (this.state === "scheduled") {
+        if (this.scheduleTimer) {
+          clearTimeout(this.scheduleTimer);
+          this.scheduleTimer = null;
+        }
+        const cancelledTarget = this.target?.releaseId;
+        this.state = "idle";
+        this.target = null;
+        this.dueAt = undefined;
+        this.host.broadcast({
+          phase: "idle",
+          fromReleaseId: this.host.self.releaseId,
+          ...(cancelledTarget ? { cancelledTargetReleaseId: cancelledTarget } : {}),
+        });
+        this.host.log(
+          `reload: cancelled scheduled reload to ${cancelledTarget ?? "unknown"} (target reverted to current release ${this.host.self.releaseId})`,
+        );
+      }
       return { action: "noop", reason: "already_current", releaseId: this.host.self.releaseId };
     }
 
@@ -122,7 +145,12 @@ export class HotUpdateController {
     const hasLiveAgents =
       agents.tier12.length > 0 || agents.other.length > 0 || agents.chats.length > 0 || agents.reviews > 0;
     const nowMs = this.now();
-    const minIntervalMs = Math.max(0, cfg.minIntervalSec) * 1000;
+    const rawMinIntervalSec = cfg.minIntervalSec;
+    const minIntervalSec =
+      typeof rawMinIntervalSec === "number" && Number.isFinite(rawMinIntervalSec) && rawMinIntervalSec >= 0
+        ? Math.min(rawMinIntervalSec, HOT_UPDATE_MIN_INTERVAL_MAX_SEC)
+        : 900;
+    const minIntervalMs = minIntervalSec * 1000;
     const computedDueAt = this.host.startedAt + minIntervalMs;
 
     if (p.source === "install" && !p.now && hasLiveAgents && minIntervalMs > 0 && nowMs < computedDueAt) {
@@ -179,13 +207,33 @@ export class HotUpdateController {
     wake?.();
   }
 
+  private safeLog(line: string): void {
+    try {
+      this.host.log(line);
+    } catch {
+      // ignore log errors during drain/handover
+    }
+  }
+
+  private safeBroadcast(payload: Record<string, unknown>): void {
+    try {
+      this.host.broadcast(payload);
+    } catch {
+      // ignore broadcast errors during drain/handover
+    }
+  }
+
   private startDrain(target: ReleaseTarget): number {
     if (this.scheduleTimer) {
       clearTimeout(this.scheduleTimer);
       this.scheduleTimer = null;
     }
     const cfg = this.host.config();
-    const drainTimeoutSec = cfg.drainTimeoutSec > 0 ? cfg.drainTimeoutSec : 90;
+    const rawDrainSec = cfg.drainTimeoutSec;
+    const drainTimeoutSec =
+      typeof rawDrainSec === "number" && Number.isFinite(rawDrainSec) && rawDrainSec > 0
+        ? Math.min(rawDrainSec, HOT_UPDATE_DRAIN_TIMEOUT_MAX_SEC)
+        : 90;
     const startedDrainAt = this.now();
     const deadlineAt = startedDrainAt + drainTimeoutSec * 1000;
 
@@ -194,20 +242,19 @@ export class HotUpdateController {
     this.dueAt = undefined;
     this.deadlineAt = deadlineAt;
 
-    this.host.enterDraining();
-    this.host.broadcast({
+    try {
+      this.host.enterDraining();
+    } catch (err) {
+      this.safeLog(`reload: enterDraining error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    this.safeBroadcast({
       phase: "draining",
       fromReleaseId: this.host.self.releaseId,
       toReleaseId: target.releaseId,
       deadlineAt,
     });
 
-    const initialAgents = this.host.liveAgents();
-    this.host.log(
-      `reload: drain started ${this.host.self.releaseId} -> ${target.releaseId} (tier12=${initialAgents.tier12.length}, chats=${initialAgents.chats.length}, other=${initialAgents.other.length}, reviews=${initialAgents.reviews}, deadline=${new Date(deadlineAt).toISOString()})`,
-    );
-
-    void this.runDrain(target, initialAgents, startedDrainAt, deadlineAt, drainTimeoutSec);
+    void this.runDrain(target, startedDrainAt, deadlineAt, drainTimeoutSec);
     return deadlineAt;
   }
 
@@ -230,54 +277,98 @@ export class HotUpdateController {
 
   private async runDrain(
     target: ReleaseTarget,
-    initialAgents: { tier12: string[]; other: string[]; chats: string[]; reviews: number },
     startedDrainAt: number,
     deadlineAt: number,
     drainTimeoutSec: number,
   ): Promise<void> {
-    const trackedTier12 = new Set(initialAgents.tier12);
-    if (initialAgents.tier12.length > 0 || initialAgents.chats.length > 0) {
-      const tier12Text = formatTier12SteerText(drainTimeoutSec);
-      const directorText = formatDirectorSteerText(deadlineAt);
-      await Promise.allSettled([
-        ...initialAgents.tier12.map((taskId) => this.host.steerTask(taskId, tier12Text).catch(() => {})),
-        ...initialAgents.chats.map((chatId) => this.host.steerChat(chatId, directorText).catch(() => {})),
-      ]);
+    try {
+      const initialAgents = this.host.liveAgents();
+      this.safeLog(
+        `reload: drain started ${this.host.self.releaseId} -> ${target.releaseId} (tier12=${initialAgents.tier12.length}, chats=${initialAgents.chats.length}, other=${initialAgents.other.length}, reviews=${initialAgents.reviews}, deadline=${new Date(deadlineAt).toISOString()})`,
+      );
 
-      while (!this.disposed) {
-        const cur = this.host.liveAgents();
-        const activeTier12 = new Set(cur.tier12);
-        for (const id of [...trackedTier12]) {
-          if (!activeTier12.has(id)) {
-            trackedTier12.delete(id);
-            this.host.log(`reload: task ${id} handed off`);
+      const trackedTier12 = new Set(initialAgents.tier12);
+      if (initialAgents.tier12.length > 0 || initialAgents.chats.length > 0) {
+        const tier12Text = formatTier12SteerText(drainTimeoutSec);
+        const directorText = formatDirectorSteerText(deadlineAt);
+        // Fire steers without awaiting them before the poll loop so a hung steer cannot push past deadlineAt.
+        for (const taskId of initialAgents.tier12) {
+          try {
+            Promise.resolve(this.host.steerTask(taskId, tier12Text)).catch((err) => {
+              if (!this.disposed && !this.handoverStarted) {
+                this.safeLog(`reload: steerTask(${taskId}) failed: ${err instanceof Error ? err.message : String(err)}`);
+              }
+            });
+          } catch (err) {
+            if (!this.disposed && !this.handoverStarted) {
+              this.safeLog(`reload: steerTask(${taskId}) threw: ${err instanceof Error ? err.message : String(err)}`);
+            }
           }
         }
-        if (cur.tier12.length === 0 && cur.chats.length === 0) break;
-        const remaining = deadlineAt - this.now();
-        if (remaining <= 0) break;
-        await this.sleepPoll(Math.min(DRAIN_POLL_MS, remaining));
+        for (const chatId of initialAgents.chats) {
+          try {
+            Promise.resolve(this.host.steerChat(chatId, directorText)).catch((err) => {
+              if (!this.disposed && !this.handoverStarted) {
+                this.safeLog(`reload: steerChat(${chatId}) failed: ${err instanceof Error ? err.message : String(err)}`);
+              }
+            });
+          } catch (err) {
+            if (!this.disposed && !this.handoverStarted) {
+              this.safeLog(`reload: steerChat(${chatId}) threw: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
+        }
+
+        while (!this.disposed) {
+          const cur = this.host.liveAgents();
+          const activeTier12 = new Set(cur.tier12);
+          for (const id of [...trackedTier12]) {
+            if (!activeTier12.has(id)) {
+              trackedTier12.delete(id);
+              this.safeLog(`reload: task ${id} handed off`);
+            }
+          }
+          if (cur.tier12.length === 0 && cur.chats.length === 0) break;
+          const remaining = deadlineAt - this.now();
+          if (remaining <= 0) break;
+          await this.sleepPoll(Math.min(DRAIN_POLL_MS, remaining));
+        }
       }
+    } catch (err) {
+      this.safeLog(`reload: drain error: ${err instanceof Error ? err.message : String(err)}`);
     }
 
     // Give the RPC response frame a tick to flush to the caller before stop() ends client sockets.
-    const elapsed = this.now() - startedDrainAt;
-    if (!this.disposed && elapsed < REPLY_FLUSH_MS) {
-      await this.sleepPoll(REPLY_FLUSH_MS - elapsed);
+    try {
+      const elapsed = this.now() - startedDrainAt;
+      if (!this.disposed && elapsed < REPLY_FLUSH_MS) {
+        await this.sleepPoll(REPLY_FLUSH_MS - elapsed);
+      }
+    } catch {
+      // proceed to handover even if clock/flush check throws
     }
 
-    if (this.disposed) return;
+    if (this.disposed || this.handoverStarted) return;
+    this.handoverStarted = true;
 
-    const remaining = this.host.liveAgents();
-    this.host.log(
-      `reload: drain finished (remaining tier12=${remaining.tier12.length}, chats=${remaining.chats.length}); restarting to ${target.releaseId}`,
-    );
-    this.host.broadcast({
+    try {
+      const remaining = this.host.liveAgents();
+      this.safeLog(
+        `reload: drain finished (remaining tier12=${remaining.tier12.length}, chats=${remaining.chats.length}); restarting to ${target.releaseId}`,
+      );
+    } catch {
+      this.safeLog(`reload: drain finished; restarting to ${target.releaseId}`);
+    }
+    this.safeBroadcast({
       phase: "restarting",
       fromReleaseId: this.host.self.releaseId,
       toReleaseId: target.releaseId,
     });
-    await this.host.stopAndHandOver(target);
+    try {
+      await this.host.stopAndHandOver(target);
+    } catch (err) {
+      this.safeLog(`reload: stopAndHandOver failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 }
 
@@ -300,34 +391,89 @@ export function parsePositiveEnvMs(raw: string | undefined): number | undefined 
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
-async function probePing(socketPath: string, timeoutMs = 2000): Promise<DaemonPingInfo | null> {
+type ProbePingResult =
+  | { kind: "ok"; info: DaemonPingInfo }
+  | { kind: "no_listener" }
+  | { kind: "inconclusive"; error: string };
+
+async function probePingDetailed(socketPath: string, timeoutMs = 2000): Promise<ProbePingResult> {
   const client = new DaemonClient(socketPath);
   let timer: ReturnType<typeof setTimeout> | null = null;
   try {
-    await Promise.race([
-      client.connect(),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error("connect timeout")), timeoutMs);
-        timer.unref?.();
-      }),
-    ]);
+    try {
+      await Promise.race([
+        client.connect(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("connect timeout")), timeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === "ENOENT" || code === "ECONNREFUSED") {
+        return { kind: "no_listener" };
+      }
+      return { kind: "inconclusive", error: err instanceof Error ? err.message : String(err) };
+    }
     if (timer) {
       clearTimeout(timer);
       timer = null;
     }
-    const info = await Promise.race([
-      client.request<DaemonPingInfo>("ping"),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error("ping timeout")), timeoutMs);
-        timer.unref?.();
-      }),
-    ]);
-    return info;
-  } catch {
-    return null;
+    try {
+      const info = await Promise.race([
+        client.request<DaemonPingInfo>("ping"),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("ping timeout")), timeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+      if (!info || typeof info !== "object") {
+        return { kind: "inconclusive", error: "invalid ping reply" };
+      }
+      return { kind: "ok", info };
+    } catch (err) {
+      return { kind: "inconclusive", error: err instanceof Error ? err.message : String(err) };
+    }
   } finally {
     if (timer) clearTimeout(timer);
     client.close();
+  }
+}
+
+async function probePing(socketPath: string, timeoutMs = 2000): Promise<DaemonPingInfo | null> {
+  const res = await probePingDetailed(socketPath, timeoutMs);
+  return res.kind === "ok" ? res.info : null;
+}
+
+function canonicalPath(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
+}
+
+function resolveHomeFromProc(pid: number): string | null {
+  if (process.platform !== "linux" || !Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const raw = readFileSync(`/proc/${pid}/environ`);
+    let piHome: string | null = null;
+    let userHome: string | null = null;
+    for (const entry of raw.toString("utf8").split("\0")) {
+      if (!entry) continue;
+      if (entry.startsWith("PI_HARNESS_HOME=")) {
+        const val = entry.slice("PI_HARNESS_HOME=".length).trim();
+        if (val) piHome = resolve(val);
+      } else if (entry.startsWith("HOME=")) {
+        const val = entry.slice("HOME=".length).trim();
+        if (val) userHome = val;
+      }
+    }
+    if (piHome) return piHome;
+    if (userHome) return resolve(join(userHome, ".pi-harness"));
+    return null;
+  } catch {
+    return null;
   }
 }
 
@@ -418,6 +564,27 @@ async function printFallbackFileIfPresent(socketPath: string, waitForFile: boole
   }
 }
 
+function readMatchingFallbackFile(
+  socketPath: string,
+  targetReleaseId: string,
+  oldPid?: number,
+): { code: 1 | 3; text: string } | null {
+  const fallbackFilePath = join(dirname(socketPath), "reload-fallback.txt");
+  if (!existsSync(fallbackFilePath)) return null;
+  try {
+    const text = readFileSync(fallbackFilePath, "utf8").trim();
+    if (!text) return null;
+    const firstLine = text.split("\n", 1)[0] ?? "";
+    if (!firstLine.includes(`target=${targetReleaseId}`)) return null;
+    if (oldPid !== undefined && !firstLine.includes(`oldPid=${oldPid}`)) return null;
+    if (firstLine.startsWith("# Reload aborted (exit 1):")) return { code: 1, text };
+    if (firstLine.startsWith("# Reload failed (exit 3):")) return { code: 3, text };
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export async function waitForDaemonReload(opts: {
   socketPath: string;
   targetReleaseId: string;
@@ -433,20 +600,32 @@ export async function waitForDaemonReload(opts: {
   while (Date.now() < waitDeadline) {
     await new Promise((r) => setTimeout(r, 150));
     const ping = await probePing(opts.socketPath, 2000);
-    if (!ping) continue;
-    if (opts.oldPid !== undefined && ping.pid === opts.oldPid) continue;
-    if (ping.releaseId === opts.targetReleaseId) {
-      console.log(`reloaded harnessd to release ${ping.releaseId} (pid ${ping.pid ?? "?"}).`);
-      return 0;
+    const fallbackStatus = readMatchingFallbackFile(opts.socketPath, opts.targetReleaseId, opts.oldPid);
+    if (fallbackStatus?.code === 1) {
+      console.error(fallbackStatus.text);
+      return 1;
     }
+    if (!ping) {
+      if (fallbackStatus?.code === 3) {
+        console.error(fallbackStatus.text);
+        return 3;
+      }
+      continue;
+    }
+    if (opts.oldPid !== undefined && ping.pid === opts.oldPid) continue;
     const waitForFallbackFile =
       Boolean(opts.expectFallbackFile) || (Boolean(opts.hasAffectedRuns) && ping.restartSafe !== true);
+    // Check lastError before matching releaseId so a forced same-release restart that fell back reports exit 3.
     if (ping.reload?.lastError?.targetReleaseId === opts.targetReleaseId) {
       console.error(
         `reload failed: harnessd could not start release ${opts.targetReleaseId} (${ping.reload.lastError.error}) and is back on release ${ping.releaseId ?? "unknown"} (pid ${ping.pid ?? "?"}).`,
       );
       await printFallbackFileIfPresent(opts.socketPath, waitForFallbackFile);
       return 3;
+    }
+    if (ping.releaseId === opts.targetReleaseId) {
+      console.log(`reloaded harnessd to release ${ping.releaseId} (pid ${ping.pid ?? "?"}).`);
+      return 0;
     }
     if (opts.legacy) {
       console.error(
@@ -455,6 +634,12 @@ export async function waitForDaemonReload(opts: {
       await printFallbackFileIfPresent(opts.socketPath, waitForFallbackFile);
       return 3;
     }
+  }
+
+  const finalFallback = readMatchingFallbackFile(opts.socketPath, opts.targetReleaseId, opts.oldPid);
+  if (finalFallback) {
+    console.error(finalFallback.text);
+    return finalFallback.code;
   }
 
   console.error(`Timed out waiting for harnessd to reload to release ${opts.targetReleaseId}.`);
@@ -515,11 +700,24 @@ async function runLegacyReloadCli(params: {
     return 1;
   }
 
+  const expectedPid = info.pid;
+  const expectedStartTime = readProcStartTime(expectedPid);
+  const procHome = resolveHomeFromProc(expectedPid);
+  if (procHome && opts.stateDir && canonicalPath(procHome) !== canonicalPath(opts.stateDir)) {
+    console.error(
+      `Running harnessd (pid ${expectedPid}) uses PI_HARNESS_HOME=${procHome}, which differs from this CLI's resolved state dir (${opts.stateDir}). Re-run with PI_HARNESS_HOME=${procHome}.`,
+    );
+    return 1;
+  }
+  const daemonStateDir = procHome ?? opts.stateDir ?? dirname(opts.socketPath);
+  const defaultDbPath = resolve(join(daemonStateDir, "control-plane.sqlite"));
+
   // Step 1: read-only dry run against SQLite (same classification as `daemon recover --dry-run`).
   const rawDb = opts.dbPath?.trim() ?? "";
   const dbPath = rawDb
     ? resolve(rawDb === "~" || rawDb.startsWith("~/") ? join(homedir(), rawDb.slice(1)) : rawDb)
-    : join(opts.stateDir ?? dirname(opts.socketPath), "control-plane.sqlite");
+    : defaultDbPath;
+  const dbDiffersFromStateDir = Boolean(rawDb) && canonicalPath(dbPath) !== canonicalPath(defaultDbPath);
 
   let plan: RecoveryPlan;
   try {
@@ -538,9 +736,15 @@ async function runLegacyReloadCli(params: {
     return 1;
   }
   console.log(formatRecoveryPlan(plan));
+  if (dbDiffersFromStateDir) {
+    console.log(
+      `Warning: --db (${dbPath}) differs from the resolved daemon database (${defaultDbPath}); this preview is for a different database.`,
+    );
+  }
 
   // Step 2: resolve fallback release (--previous, else ping.releaseDir, else /proc/<pid>/cmdline, else none).
   let previous: ReleaseTarget | null = null;
+  let previousRestartSafe = false;
   if (opts.previousDir) {
     const prevDir = resolve(opts.previousDir);
     if (!existsSync(prevDir)) {
@@ -556,13 +760,27 @@ async function runLegacyReloadCli(params: {
       console.error(`Invalid --previous directory: bun binary not found at ${previous.bunPath}`);
       return 1;
     }
+    const prevHasReleaseJson = readReleaseAt(previous.releaseDir) !== null;
+    const sameAsRunning = Boolean(info.releaseDir && canonicalPath(previous.releaseDir) === canonicalPath(info.releaseDir));
+    previousRestartSafe = prevHasReleaseJson && (!sameAsRunning || info.restartSafe === true);
   } else if (info.releaseDir && existsSync(join(info.releaseDir, "src", "cli.ts"))) {
     previous = releaseTargetForDir(info.releaseDir);
+    previousRestartSafe = readReleaseAt(previous.releaseDir) !== null && info.restartSafe === true;
   } else {
-    previous = resolveFallbackFromProc(info.pid);
+    previous = resolveFallbackFromProc(expectedPid);
+    previousRestartSafe = Boolean(previous && readReleaseAt(previous.releaseDir) !== null && info.restartSafe === true);
   }
 
-  const affectedRunIds = [...new Set(plan.relaunch.map((t) => t.runId))];
+  const affectedRunIds = [
+    ...new Set(
+      [
+        ...plan.relaunch.map((t) => t.runId),
+        ...plan.cancelReviews.map((t) => t.runId),
+        ...plan.reviewGoals.map((g) => g.runId),
+        ...plan.legacyFail.map((t) => t.runId),
+      ].filter(Boolean),
+    ),
+  ];
   const runningReleaseLabel = info.releaseId
     ? `${info.releaseId}${info.releaseDir ? ` (${info.releaseDir})` : ""}`
     : "pre-feature";
@@ -573,7 +791,9 @@ async function runLegacyReloadCli(params: {
     [
       "",
       "Legacy reload plan:",
-      `  Running daemon: pid ${info.pid}, release ${runningReleaseLabel}, restart-safe: ${restartSafeLabel}`,
+      `  Running daemon: pid ${expectedPid}, release ${runningReleaseLabel}, restart-safe: ${restartSafeLabel}`,
+      `  Socket path: ${opts.socketPath}`,
+      `  State dir: ${daemonStateDir}`,
       `  Target release: ${target.releaseId} (${target.releaseDir})`,
       `  Fallback release: ${fallbackLabel}`,
       `  Affected runs: ${affectedRunIds.length > 0 ? affectedRunIds.join(", ") : "none"}`,
@@ -590,7 +810,22 @@ async function runLegacyReloadCli(params: {
   );
 
   // Step 3: confirmation (TTY prompt or --yes; non-TTY without --yes exits 2).
-  if (!opts.yes) {
+  // When --db differs from the resolved database, require --yes in addition to interactive confirmation.
+  if (dbDiffersFromStateDir) {
+    if (!opts.yes) {
+      console.error(
+        `Not confirmed: --db (${dbPath}) differs from the resolved database (${defaultDbPath}). Pass --yes in addition to confirming interactively.`,
+      );
+      return 2;
+    }
+    if (process.stdin.isTTY) {
+      const confirmed = await promptLegacyConfirmation();
+      if (!confirmed) {
+        console.error("Not confirmed. Nothing was changed.");
+        return 2;
+      }
+    }
+  } else if (!opts.yes) {
     if (!process.stdin.isTTY) {
       console.error("Not confirmed. Pass --yes to run without a prompt.");
       return 2;
@@ -602,9 +837,35 @@ async function runLegacyReloadCli(params: {
     }
   }
 
+  // Re-verify the exact daemon previewed before handing off to the supervisor.
+  const recheck = await probePing(opts.socketPath, 2000);
+  if (!recheck) {
+    console.error(
+      `Running harnessd on ${opts.socketPath} did not answer re-check after confirmation (expected pid ${expectedPid}); nothing was stopped.`,
+    );
+    return 1;
+  }
+  if (recheck.pid !== expectedPid) {
+    console.error(
+      `Daemon on ${opts.socketPath} changed PID from ${expectedPid} to ${recheck.pid ?? "unknown"} after preview; refusing to stop.`,
+    );
+    return 1;
+  }
+  if (recheck.reload !== undefined) {
+    console.error("This daemon now supports hot update. Run pi-harness daemon reload.");
+    return 1;
+  }
+  if (expectedStartTime) {
+    const curStartTime = readProcStartTime(expectedPid);
+    if (curStartTime !== null && curStartTime !== expectedStartTime) {
+      console.error(`Daemon pid ${expectedPid} start time changed after preview; refusing to stop.`);
+      return 1;
+    }
+  }
+
   // Step 4: hand off to the detached supervisor.
   let cwd = dirname(opts.socketPath);
-  const procCwd = resolveCwdFromProc(info.pid);
+  const procCwd = resolveCwdFromProc(expectedPid);
   if (procCwd) {
     cwd = procCwd;
   } else {
@@ -616,13 +877,23 @@ async function runLegacyReloadCli(params: {
     }
   }
 
+  const fallbackFilePath = join(dirname(opts.socketPath), "reload-fallback.txt");
+  try {
+    rmSync(fallbackFilePath, { force: true });
+  } catch {
+    // ignore stale fallback cleanup error
+  }
+
   spawnSupervisorDetached(
     self,
     {
       socketPath: opts.socketPath,
+      stateDir: daemonStateDir,
       target,
       previous,
-      stopPid: info.pid,
+      previousRestartSafe,
+      stopPid: expectedPid,
+      ...(expectedStartTime ? { stopPidStartTime: expectedStartTime } : {}),
       stopRestartSafe: info.restartSafe === true,
       ...(info.releaseId ? { fromReleaseId: info.releaseId } : {}),
       ...(affectedRunIds.length > 0 ? { affectedRunIds } : {}),
@@ -635,13 +906,11 @@ async function runLegacyReloadCli(params: {
 
   if (!opts.wait) return 0;
 
-  const expectFallbackFile = Boolean(
-    previous && affectedRunIds.length > 0 && (readReleaseAt(previous.releaseDir) === null || info.restartSafe !== true),
-  );
+  const expectFallbackFile = !previous || !previousRestartSafe;
   return await waitForDaemonReload({
     socketPath: opts.socketPath,
     targetReleaseId: target.releaseId,
-    oldPid: info.pid,
+    oldPid: expectedPid,
     deadlineAt: Date.now(),
     legacy: true,
     expectFallbackFile,
@@ -694,7 +963,7 @@ export async function runDaemonReloadCli(opts: DaemonReloadCliOptions): Promise<
       client.close();
       return await runLegacyReloadCli({ opts, self, target, allowCheckout, info });
     }
-    if (info.releaseId === target.releaseId && !opts.force) {
+    if (info.releaseId === target.releaseId && !opts.force && info.reload?.state !== "scheduled") {
       console.log(`already running release ${target.releaseId}`);
       return 0;
     }
@@ -748,11 +1017,17 @@ export async function runDaemonReloadCli(opts: DaemonReloadCliOptions): Promise<
  * - With `ping.reload`: immediate forced reload with `--wait`.
  * - Without `ping.reload` and busy (`running !== false`): prints the legacy notice and returns 1 without stopping.
  * - Without `ping.reload` and idle (`running === false`): stops, waits for the old PID to exit, spawns and verifies a new PID.
- * Returns `null` when no daemon is currently listening so the caller can start a fresh one.
+ * - On an inconclusive probe (timeout/error while a listener may exist): prints an error and returns 1 without stopping.
+ * Returns `null` only when positively nothing is listening (`ENOENT`/`ECONNREFUSED`) so the caller can start a fresh one.
  */
 export async function tryReloadForDaemonRestart(socketPath: string): Promise<number | null> {
-  const ping = await probePing(socketPath, 2000);
-  if (!ping) return null;
+  const probe = await probePingDetailed(socketPath, 2000);
+  if (probe.kind === "no_listener") return null;
+  if (probe.kind === "inconclusive") {
+    console.error("harnessd did not answer; nothing was stopped.");
+    return 1;
+  }
+  const ping = probe.info;
   const self = currentRelease();
   const target = installedCurrent(self) ?? self;
   if (ping.reload !== undefined) {

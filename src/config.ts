@@ -206,11 +206,103 @@ export interface HotUpdateConfig {
   minIntervalSec: number;
 }
 
+export const HOT_UPDATE_DRAIN_TIMEOUT_MIN_SEC = 5;
+export const HOT_UPDATE_DRAIN_TIMEOUT_MAX_SEC = 600;
+export const HOT_UPDATE_MIN_INTERVAL_MIN_SEC = 0;
+export const HOT_UPDATE_MIN_INTERVAL_MAX_SEC = 86_400;
+
 export const DEFAULT_HOT_UPDATE_CONFIG: HotUpdateConfig = {
   mode: "auto",
   drainTimeoutSec: 90,
   minIntervalSec: 900,
 };
+
+export function normalizeHotUpdateConfig(
+  raw: unknown,
+  fallback: HotUpdateConfig = DEFAULT_HOT_UPDATE_CONFIG,
+): { config: HotUpdateConfig; warnings: string[] } {
+  const warnings: string[] = [];
+  const baseMode: "auto" | "manual" =
+    fallback.mode === "auto" || fallback.mode === "manual" ? fallback.mode : DEFAULT_HOT_UPDATE_CONFIG.mode;
+  const clampNum = (v: unknown, min: number, max: number, dflt: number): number =>
+    typeof v === "number" && Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : dflt;
+  const baseDrain = clampNum(
+    fallback.drainTimeoutSec,
+    HOT_UPDATE_DRAIN_TIMEOUT_MIN_SEC,
+    HOT_UPDATE_DRAIN_TIMEOUT_MAX_SEC,
+    DEFAULT_HOT_UPDATE_CONFIG.drainTimeoutSec,
+  );
+  const baseMinInterval = clampNum(
+    fallback.minIntervalSec,
+    HOT_UPDATE_MIN_INTERVAL_MIN_SEC,
+    HOT_UPDATE_MIN_INTERVAL_MAX_SEC,
+    DEFAULT_HOT_UPDATE_CONFIG.minIntervalSec,
+  );
+  const base: HotUpdateConfig = { mode: baseMode, drainTimeoutSec: baseDrain, minIntervalSec: baseMinInterval };
+
+  if (raw === undefined) return { config: base, warnings };
+  if (!isPlainObject(raw)) {
+    warnings.push("hotUpdate must be an object; using defaults");
+    return { config: base, warnings };
+  }
+
+  let mode: "auto" | "manual" = base.mode;
+  if ("mode" in raw && raw.mode !== undefined) {
+    if (raw.mode === "auto" || raw.mode === "manual") {
+      mode = raw.mode;
+    } else {
+      warnings.push(`hotUpdate.mode must be "auto" or "manual"; using "${base.mode}"`);
+    }
+  }
+
+  let drainTimeoutSec = base.drainTimeoutSec;
+  if ("drainTimeoutSec" in raw && raw.drainTimeoutSec !== undefined) {
+    if (typeof raw.drainTimeoutSec === "number" && Number.isFinite(raw.drainTimeoutSec)) {
+      if (raw.drainTimeoutSec < HOT_UPDATE_DRAIN_TIMEOUT_MIN_SEC) {
+        drainTimeoutSec = HOT_UPDATE_DRAIN_TIMEOUT_MIN_SEC;
+        warnings.push(
+          `hotUpdate.drainTimeoutSec out of range (${HOT_UPDATE_DRAIN_TIMEOUT_MIN_SEC}..${HOT_UPDATE_DRAIN_TIMEOUT_MAX_SEC}); clamped to ${drainTimeoutSec}`,
+        );
+      } else if (raw.drainTimeoutSec > HOT_UPDATE_DRAIN_TIMEOUT_MAX_SEC) {
+        drainTimeoutSec = HOT_UPDATE_DRAIN_TIMEOUT_MAX_SEC;
+        warnings.push(
+          `hotUpdate.drainTimeoutSec out of range (${HOT_UPDATE_DRAIN_TIMEOUT_MIN_SEC}..${HOT_UPDATE_DRAIN_TIMEOUT_MAX_SEC}); clamped to ${drainTimeoutSec}`,
+        );
+      } else {
+        drainTimeoutSec = raw.drainTimeoutSec;
+      }
+    } else {
+      warnings.push(
+        `hotUpdate.drainTimeoutSec must be a finite number in ${HOT_UPDATE_DRAIN_TIMEOUT_MIN_SEC}..${HOT_UPDATE_DRAIN_TIMEOUT_MAX_SEC}; using ${base.drainTimeoutSec}`,
+      );
+    }
+  }
+
+  let minIntervalSec = base.minIntervalSec;
+  if ("minIntervalSec" in raw && raw.minIntervalSec !== undefined) {
+    if (typeof raw.minIntervalSec === "number" && Number.isFinite(raw.minIntervalSec)) {
+      if (raw.minIntervalSec < HOT_UPDATE_MIN_INTERVAL_MIN_SEC) {
+        minIntervalSec = HOT_UPDATE_MIN_INTERVAL_MIN_SEC;
+        warnings.push(
+          `hotUpdate.minIntervalSec out of range (${HOT_UPDATE_MIN_INTERVAL_MIN_SEC}..${HOT_UPDATE_MIN_INTERVAL_MAX_SEC}); clamped to ${minIntervalSec}`,
+        );
+      } else if (raw.minIntervalSec > HOT_UPDATE_MIN_INTERVAL_MAX_SEC) {
+        minIntervalSec = HOT_UPDATE_MIN_INTERVAL_MAX_SEC;
+        warnings.push(
+          `hotUpdate.minIntervalSec out of range (${HOT_UPDATE_MIN_INTERVAL_MIN_SEC}..${HOT_UPDATE_MIN_INTERVAL_MAX_SEC}); clamped to ${minIntervalSec}`,
+        );
+      } else {
+        minIntervalSec = raw.minIntervalSec;
+      }
+    } else {
+      warnings.push(
+        `hotUpdate.minIntervalSec must be a finite number in ${HOT_UPDATE_MIN_INTERVAL_MIN_SEC}..${HOT_UPDATE_MIN_INTERVAL_MAX_SEC}; using ${base.minIntervalSec}`,
+      );
+    }
+  }
+
+  return { config: { mode, drainTimeoutSec, minIntervalSec }, warnings };
+}
 
 export interface HarnessConfig {
   stateDir: string;
@@ -640,10 +732,13 @@ export function readRepoConfig(repoRoot?: string): Record<string, unknown> {
   return (repoRoot ? readJsonIfExists(join(repoRoot, ".pi-harness.json")) : undefined) ?? {};
 }
 
-export function loadConfig(repoRoot?: string): HarnessConfig {
+export function loadConfig(repoRoot?: string, runtimeOverrides?: { socketPath?: string }): HarnessConfig {
   const stateDir = resolve(defaultStateDir());
   mkdirSync(stateDir, { recursive: true });
-  return resolveConfig(readJsonIfExists(join(stateDir, "config.json")) ?? {}, readRepoConfig(repoRoot), { stateDir });
+  return resolveConfig(readJsonIfExists(join(stateDir, "config.json")) ?? {}, readRepoConfig(repoRoot), {
+    stateDir,
+    ...(runtimeOverrides?.socketPath ? { socketPath: runtimeOverrides.socketPath } : {}),
+  });
 }
 
 /**
@@ -773,10 +868,13 @@ export function resolveConfig(
   };
 
   // Hot-update policy is operator-controlled and global-only.
-  const hotUpdate: HotUpdateConfig = {
-    ...(base ? base.hotUpdate : DEFAULT_HOT_UPDATE_CONFIG),
-    ...(globalCfg.hotUpdate as Partial<HotUpdateConfig> | undefined),
-  };
+  const { config: hotUpdate, warnings: hotUpdateWarnings } = normalizeHotUpdateConfig(
+    globalCfg.hotUpdate,
+    base ? base.hotUpdate : DEFAULT_HOT_UPDATE_CONFIG,
+  );
+  for (const w of hotUpdateWarnings) {
+    console.error(`[harness] ${w}`);
+  }
 
   const profiles =
     Array.isArray(merged.profiles) && merged.profiles.length > 0 ? merged.profiles : (base?.profiles ?? defaultProfiles());
@@ -1045,8 +1143,22 @@ export function validateConfigRaw(raw: unknown): string[] {
   });
   section("hotUpdate", {
     mode: [oneOf("auto", "manual"), '"auto" or "manual"'],
-    drainTimeoutSec: POSITIVE,
-    minIntervalSec: NON_NEG,
+    drainTimeoutSec: [
+      (v) =>
+        typeof v === "number" &&
+        Number.isFinite(v) &&
+        v >= HOT_UPDATE_DRAIN_TIMEOUT_MIN_SEC &&
+        v <= HOT_UPDATE_DRAIN_TIMEOUT_MAX_SEC,
+      `a finite number in ${HOT_UPDATE_DRAIN_TIMEOUT_MIN_SEC}..${HOT_UPDATE_DRAIN_TIMEOUT_MAX_SEC}`,
+    ],
+    minIntervalSec: [
+      (v) =>
+        typeof v === "number" &&
+        Number.isFinite(v) &&
+        v >= HOT_UPDATE_MIN_INTERVAL_MIN_SEC &&
+        v <= HOT_UPDATE_MIN_INTERVAL_MAX_SEC,
+      `a finite number in ${HOT_UPDATE_MIN_INTERVAL_MIN_SEC}..${HOT_UPDATE_MIN_INTERVAL_MAX_SEC}`,
+    ],
   });
   if ("quotaEndpoint" in doc && doc.quotaEndpoint !== null) {
     const endpoint = doc.quotaEndpoint;
