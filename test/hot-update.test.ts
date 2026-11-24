@@ -459,7 +459,11 @@ describe("daemon hot-update subprocess e2e", () => {
       const reloadRes = await runCli(relB, ["daemon", "reload", "--from-install", "--target", relB.releaseDir], env);
       assert.equal(reloadRes.code, 0, `expected exit 0 notice, got ${reloadRes.code}: stderr=${reloadRes.stderr}`);
       assert.ok(reloadRes.stdout.includes("daemon reload --legacy"), `expected --legacy notice in stdout:\n${reloadRes.stdout}`);
-      assert.ok(reloadRes.stdout.includes("does not support hot update"), `expected notice text in stdout:\n${reloadRes.stdout}`);
+      assert.ok(
+        reloadRes.stdout.includes(`harnessd (pid ${pidA}, release rel-a,`) &&
+          reloadRes.stdout.includes("does not support hot update"),
+        `expected notice text in stdout:\n${reloadRes.stdout}`,
+      );
 
       // Verify the daemon was not restarted after 1 s.
       await new Promise((r) => setTimeout(r, 1000));

@@ -190,4 +190,6 @@ if [ "${PI_HARNESS_NO_RELOAD:-0}" != 1 ]; then
     3) log "harnessd could not start release $ID and is back on the previous release (install succeeded; current still points to releases/$ID)"; exit 1 ;;
     *) log "warning: harnessd was not reloaded (exit $rc). Run: pi-harness daemon reload" ;;
   esac
+else
+  "$BUN" "$REL/src/cli.ts" daemon reload --from-install --check || true
 fi

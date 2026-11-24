@@ -13,7 +13,7 @@ From a checkout with Bun on `PATH`, `bun run install` runs the same script. A pl
 | --- | --- | --- |
 | `PI_HARNESS_INSTALL_DIR` | `~/.pi-harness/install` | Staged Bun, releases and caches |
 | `PI_HARNESS_BIN_DIR` | `~/.local/bin` | Where `pi-harness` and `harness` are written |
-| `PI_HARNESS_NO_RELOAD` | `0` | Set to `1` to skip reloading a running daemon after activation |
+| `PI_HARNESS_NO_RELOAD` | `0` | Set to `1` to skip reloading a running daemon after activation; runs `daemon reload --from-install --check` instead |
 | `PI_HARNESS_RELOAD_WAIT` | terminal-dependent | Set to `1` to wait for reload completion, `0` to return immediately (defaults to waiting when stdout is a terminal) |
 
 State (`config.json`, the SQLite database, daemon socket) is untouched. Its locations are configured independently of the install: the state directory is `$PI_HARNESS_HOME` (default `~/.pi-harness`, one level above the default install directory), and the daemon socket can live elsewhere (see `socketPath` in [configuration.md](./configuration.md)). Each run that reaches activation, including unchanged re-runs, attempts to append one line (UTC time, user, pid, release id, source path) to `$PI_HARNESS_HOME/install-audit.log`; the append is best-effort and write errors are ignored, so exit status 0 does not guarantee an audit line was written. `pi-harness` has no `--version` flag; `--help` is the smoke test.
@@ -42,7 +42,7 @@ The launcher is `exec "$release/.bun" "$release/src/cli.ts" "$@"`: the staged Bu
 3. On the four targets with a pin (macOS and Linux, arm64 and x64), downloads `octofs` `0.26.0` from its GitHub release and checks the pinned SHA-256 before unpacking; the daemon offers it to agents as an MCP server (opt-out and the on-demand fallback are in [configuration.md](./configuration.md)).
 4. Copies the runtime files into a release directory and runs `bun install --frozen-lockfile --production`. The frozen lockfile fails on any drift from `bun.lock` instead of re-resolving; `bun.lock` carries integrity hashes. Dev dependencies (`tsc`, `protoc-gen-es`) are not installed; `src/gen` is committed.
 5. Writes `release.json`, swaps `current`, and rewrites the launcher.
-6. Releases `.lock` and removes its staging directory, then invokes `daemon reload --from-install` from the new release unless `PI_HARNESS_NO_RELOAD=1` (never starting a daemon if none is running).
+6. Releases `.lock` and removes its staging directory, then invokes `daemon reload --from-install` from the new release (or `daemon reload --from-install --check` when `PI_HARNESS_NO_RELOAD=1`), never starting a daemon if none is running.
 
 A `.lock` directory prevents concurrent installs; remove it if a killed install left it behind.
 
@@ -85,7 +85,7 @@ The pinned version is Bun 1.4.5 (published 2026-11-19, the latest release when t
 
 After activating a release and appending to `install-audit.log`, `install.sh` removes its staging directory and `.lock`, clears its exit trap, and runs `"$BUN" "$REL/src/cli.ts" daemon reload --from-install` from the newly installed release. Releasing `.lock` first ensures a waiting reload does not block another install. `install.sh` never starts a daemon when none is running.
 
-When stdout is a terminal, or when `PI_HARNESS_RELOAD_WAIT=1`, `install.sh` passes `--wait` so the CLI waits for a draining reload to finish. Set `PI_HARNESS_RELOAD_WAIT=0` to return immediately after the daemon accepts the request, or `PI_HARNESS_NO_RELOAD=1` to skip the reload step for one install. To disable automatic reloads for all installs, set `hotUpdate.mode` to `"manual"` in global `config.json` (see [configuration.md](./configuration.md#hotupdate)).
+When stdout is a terminal, or when `PI_HARNESS_RELOAD_WAIT=1`, `install.sh` passes `--wait` so the CLI waits for a draining reload to finish. Set `PI_HARNESS_RELOAD_WAIT=0` to return immediately after the daemon accepts the request, or `PI_HARNESS_NO_RELOAD=1` to skip triggering a reload for one install (the installer runs `daemon reload --from-install --check` instead and ignores any non-zero exit). To disable automatic reloads for all installs, set `hotUpdate.mode` to `"manual"` in global `config.json` (see [configuration.md](./configuration.md#hotupdate)).
 
 ### Output and exit status
 
@@ -94,9 +94,11 @@ When stdout is a terminal, or when `PI_HARNESS_RELOAD_WAIT=1`, `install.sh` pass
 - No daemon listening: `harnessd is not running. Release <id> is used on next start.` (exit `0`).
 - Already on the target release: `already running release <id>` (exit `0`).
 - Draining: `reload: harnessd pid <P> release <A> -> <B>, draining up to <N>s (<liveWork>)`, followed when `--wait` is active by `reloaded harnessd to release <B> (pid <P2>).` (exit `0`).
-- Rate-limited: `reload scheduled for <ISO UTC> (rate limit). Run "pi-harness daemon reload" to apply now.` (exit `0`; `--wait` does not block on a `scheduled` reply).
-- Manual mode: `reload skipped (mode_manual). Run "pi-harness daemon reload" to apply manually.` (exit `0`).
-- Daemon predates hot-update support: prints the bootstrap notice and exits `0` without restarting it (see [First activation](#first-activation)).
+- Rate-limited: `reload scheduled for <ISO UTC> (rate limit): harnessd pid <P> release <A> -> <B>. Run "pi-harness daemon reload" to apply now.` (exit `0`; `--wait` does not block on a `scheduled` reply).
+- Manual mode: `reload skipped (mode_manual).` followed by `harnessd (pid <P>) is still running release <A>; release <B> is installed. Run: pi-harness daemon reload` (exit `0`).
+- Daemon predates hot-update support: prints the bootstrap notice (naming `pid <P>`, `release <A>` when reported, and the installed release `<B>`) and exits `0` without restarting it (see [First activation](#first-activation)).
+
+Run `pi-harness daemon reload --check` to inspect whether the running daemon matches the installed release without sending `daemon.reload` or stopping anything (`--check` takes precedence over `--legacy`, `--now`, `--wait`, and `--force`). It exits `0` and prints one of: `harnessd is not running. Release <B> is used on next start.`, `already running release <B>`, the legacy bootstrap notice when the daemon predates hot-update support, or `harnessd (pid <P>) is still running release <A>; release <B> is installed. Run: pi-harness daemon reload` (appending ` (reload scheduled)` or ` (reload draining)` when a reload is already scheduled or draining). `install.sh` runs `daemon reload --from-install --check` when `PI_HARNESS_NO_RELOAD=1`.
 
 `pi-harness daemon reload` uses these exit codes:
 

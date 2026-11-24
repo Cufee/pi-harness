@@ -495,10 +495,16 @@ async function waitForPidExit(pid: number, timeoutMs: number): Promise<boolean> 
   return !isPidAlive(pid);
 }
 
+export function formatReleaseMismatchNotice(info: DaemonPingInfo, targetReleaseId: string): string {
+  const runningRelease = typeof info.releaseId === "string" && info.releaseId.length > 0 ? info.releaseId : "unknown";
+  return `harnessd (pid ${info.pid ?? "?"}) is still running release ${runningRelease}; release ${targetReleaseId} is installed. Run: pi-harness daemon reload`;
+}
+
 export function formatLegacyBootstrapNotice(info: DaemonPingInfo, targetReleaseId: string): string {
   const workLabel = info.liveWork || (info.running === false ? "idle" : "active work");
+  const releasePart = typeof info.releaseId === "string" && info.releaseId.length > 0 ? `, release ${info.releaseId}` : "";
   return [
-    `harnessd (pid ${info.pid ?? "?"}, ${workLabel}) does not support hot update and was not restarted.`,
+    `harnessd (pid ${info.pid ?? "?"}${releasePart}, ${workLabel}) does not support hot update and was not restarted.`,
     `Release ${targetReleaseId} is installed and is used on the next daemon start.`,
     `To restart it now and resume its work in place, run from a terminal (not from an agent):`,
     `  pi-harness daemon recover --dry-run`,
@@ -660,6 +666,7 @@ export interface DaemonReloadCliOptions {
   now?: boolean;
   wait?: boolean;
   force?: boolean;
+  check?: boolean;
 }
 
 async function promptLegacyConfirmation(): Promise<boolean> {
@@ -958,6 +965,20 @@ export async function runDaemonReloadCli(opts: DaemonReloadCliOptions): Promise<
   let reply: DaemonReloadReply;
   try {
     info = await client.request<DaemonPingInfo>("ping");
+    if (opts.check) {
+      if (info.releaseId === target.releaseId) {
+        console.log(`already running release ${target.releaseId}`);
+      } else if (info.reload === undefined) {
+        console.log(formatLegacyBootstrapNotice(info, target.releaseId));
+      } else {
+        const suffix =
+          info.reload.state === "scheduled" || info.reload.state === "draining"
+            ? ` (reload ${info.reload.state})`
+            : "";
+        console.log(`${formatReleaseMismatchNotice(info, target.releaseId)}${suffix}`);
+      }
+      return 0;
+    }
     if (opts.legacy) {
       // Close the probe socket before running dry-run / prompt / supervisor stop.
       client.close();
@@ -989,11 +1010,12 @@ export async function runDaemonReloadCli(opts: DaemonReloadCliOptions): Promise<
       console.log(`already running release ${reply.releaseId}`);
       return 0;
     case "skipped":
-      console.log(`reload skipped (${reply.reason}). Run "pi-harness daemon reload" to apply manually.`);
+      console.log(`reload skipped (${reply.reason}).`);
+      console.log(formatReleaseMismatchNotice(info, target.releaseId));
       return 0;
     case "scheduled":
       console.log(
-        `reload scheduled for ${new Date(reply.dueAt).toISOString()} (rate limit). Run "pi-harness daemon reload" to apply now.`,
+        `reload scheduled for ${new Date(reply.dueAt).toISOString()} (rate limit): harnessd pid ${info.pid ?? "?"} release ${info.releaseId || "unknown"} -> ${reply.targetReleaseId}. Run "pi-harness daemon reload" to apply now.`,
       );
       return 0;
     case "draining": {
