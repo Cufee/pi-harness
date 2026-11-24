@@ -527,15 +527,24 @@ describe("Session Scoping, Model Selection, Dynamic Telemetry & Timers", () => {
         "completed",
       );
 
-      // Startup stale-run reconciliation clears orphaned `running` tasks left by a dead daemon
-      const staleRun = daemon.db.createRun({ goal: "Dead daemon run", repoRoot: repoDir, baseBranch: "main", baseSha: "abc" });
-      const staleTask = daemon.db.createTask({
-        runId: staleRun.id, tier: 1, kind: "orchestrator", title: "Orphan", objective: "Old", profileId: "acp:codex", model: "openai/gpt-6.2-astra",
+      // Startup reconciliation holds tasks of active runs for in-place recovery and fails orphans of stopped runs.
+      const activeRun = daemon.db.createRun({ goal: "Active run across restart", repoRoot: repoDir, baseBranch: "main", baseSha: "abc" });
+      const activeTask = daemon.db.createTask({
+        runId: activeRun.id, tier: 1, kind: "orchestrator", title: "Live orchestrator", objective: "Resume", profileId: "acp:codex", model: "openai/gpt-6.2-astra",
       });
-      daemon.db.updateTask(staleTask.id, { status: "running" });
-      daemon.orchestrator.reconcileStaleRunsOnStartup();
-      assert.equal(daemon.db.getTask(staleTask.id)?.status, "failed");
-      assert.equal(daemon.db.getRun(staleRun.id)?.status, "failed");
+      daemon.db.updateTask(activeTask.id, { status: "running" });
+      const stoppedRun = daemon.db.createRun({ goal: "Stopped dead daemon run", repoRoot: repoDir, baseBranch: "main", baseSha: "abc" });
+      const stoppedTask = daemon.db.createTask({
+        runId: stoppedRun.id, tier: 1, kind: "orchestrator", title: "Orphan", objective: "Old", profileId: "acp:codex", model: "openai/gpt-6.2-astra",
+      });
+      daemon.db.updateTask(stoppedTask.id, { status: "running" });
+      daemon.db.updateRunStatus(stoppedRun.id, "stopped");
+      const held = daemon.orchestrator.reconcileStaleRunsOnStartup();
+      assert.ok(held.includes(activeTask.id), "Active run task must be held for in-place recovery");
+      assert.equal(daemon.db.getTask(activeTask.id)?.status, "running");
+      assert.equal(daemon.orchestrator.getEffectiveRun(activeRun.id)?.status, "active");
+      assert.equal(daemon.db.getTask(stoppedTask.id)?.status, "failed");
+      assert.equal(daemon.db.getRun(stoppedRun.id)?.status, "stopped");
 
       // 3. Native goal UI printing for the user and structured Director goal creation
       const chat = await client.request<{ session: { id: string } }>("chat.create", {

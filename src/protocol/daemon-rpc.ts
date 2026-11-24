@@ -1,6 +1,6 @@
 export const DAEMON_PROTOCOL_REV = 8;
 
-export type DaemonLifecycle = "serving";
+export type DaemonLifecycle = "serving" | "draining" | "stopping";
 
 export type SessionAttachControl = "take" | "view";
 

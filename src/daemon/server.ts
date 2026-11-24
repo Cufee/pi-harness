@@ -27,6 +27,7 @@ import { directorTaskRunOwner } from "../control-plane/ids.js";
 import { canonicalProjectPath, type ProjectRecord } from "../control-plane/projects.js";
 import type { ChatSessionRecord } from "../director/session.js";
 import { deriveRunStatus, HarnessOrchestrator, isDirectorTaskContainer, type CustomRunnerFactory } from "../control-plane/orchestrator.js";
+import { listInterruptedReviewGoals, replayInterruptedReviews } from "../control-plane/restart-recovery.js";
 import { loadOrCreateNodeId, parseSessionAddress, type SessionMessageRecord } from "../control-plane/session-messages.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { summarizeCost } from "../cost/ledger.js";
@@ -42,6 +43,7 @@ import {
 import {
   DAEMON_PROTOCOL_REV,
   type DaemonEventFrame,
+  type DaemonLifecycle,
   type DaemonOp,
   type InboxItem,
   type RpcRequest,
@@ -61,7 +63,10 @@ import { PiRunner } from "../runners/pi-runner.js";
 import { canonicalPath, runGit } from "../worktree/manager.js";
 import { parseValidatedSshTarget, PeerManager, type PeerIdentity, type PeerLink, type RemoteHostStatus } from "./peer.js";
 import { PtyHost } from "./pty-host.js";
+import { reapChildProcessGroups } from "./reap.js";
 import { currentRelease } from "./release.js";
+import { acquireStartLock } from "./start-lock.js";
+import { WakeupStore, type PendingWake } from "./wakeup-store.js";
 
 export { DAEMON_PROTOCOL_REV };
 
@@ -73,6 +78,101 @@ function parseAttachControl(raw: unknown): SessionAttachControl {
 
 const SESSION_READ_ONLY_ERROR =
   "Session is read-only here: another terminal has control. Take control first (Ctrl+Y or /take).";
+
+const WORK_STARTING_OPS = new Set<DaemonOp>([
+  "chat.send",
+  "chat.steer",
+  "goal.commit",
+  "goal.resume",
+  "goal.review",
+  "goal.accept",
+  "run.create",
+  "run.resume",
+  "task.resume",
+  "run.schedule_resume",
+]);
+
+interface TrackedTurnTool {
+  name: string;
+  status: string;
+  args: string;
+}
+
+interface ActiveChatTurn {
+  id: string;
+  text: string;
+  cancelling: boolean;
+  startedAt: number;
+  tools: Map<string, TrackedTurnTool>;
+  toolCounter: number;
+}
+
+function trackTurnTool(
+  turn: ActiveChatTurn,
+  ev: { id?: string; name: string; status: string; args?: string },
+): void {
+  const key = ev.id ? ev.id : `${ev.name}#${turn.toolCounter++}`;
+  const normArgs = typeof ev.args === "string" ? ev.args.replace(/\s+/g, " ").trim().slice(0, 160) : "";
+  const prev = turn.tools.get(key);
+  turn.tools.set(key, {
+    name: ev.name,
+    status: ev.status,
+    args: normArgs || prev?.args || "",
+  });
+}
+
+function formatInterruptedTurnDetails(
+  tools: TrackedTurnTool[],
+  tasks: Array<{ id: string; title: string; status: string }>,
+): string {
+  if (tools.length === 0 && tasks.length === 0) {
+    return "No tool calls were recorded for the interrupted turn.";
+  }
+  const lines: string[] = [];
+  if (tools.length > 0) {
+    lines.push("Tool calls of the interrupted turn:");
+    const completed: TrackedTurnTool[] = [];
+    const failed: TrackedTurnTool[] = [];
+    const inFlight: TrackedTurnTool[] = [];
+    for (const t of tools) {
+      if (/^(completed|done|success|ok)$/i.test(t.status)) completed.push(t);
+      else if (/^(failed|error|cancelled)$/i.test(t.status)) failed.push(t);
+      else inFlight.push(t);
+    }
+    for (const t of completed) lines.push(`- completed: ${t.name}${t.args ? ` ${t.args}` : ""}`);
+    for (const t of failed) lines.push(`- failed: ${t.name}${t.args ? ` ${t.args}` : ""}`);
+    for (const t of inFlight) lines.push(`- in flight when cancelled (outcome unknown): ${t.name}${t.args ? ` ${t.args}` : ""}`);
+  }
+  if (tasks.length > 0) {
+    lines.push(
+      `Tasks delegated during the turn (they exist, do not spawn them again): ${tasks
+        .map((t) => `${t.id} "${t.title}" (${t.status})`)
+        .join(", ")}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+function formatInterruptedTurnNotice(
+  tools: TrackedTurnTool[],
+  tasks: Array<{ id: string; title: string; status: string }>,
+): string {
+  return [
+    "[harness] The daemon restarted while this turn was running. The turn was cancelled and its text so far is saved above.",
+    formatInterruptedTurnDetails(tools, tasks),
+  ].join("\n");
+}
+
+function formatContinuationTurnPrompt(
+  tools: TrackedTurnTool[],
+  tasks: Array<{ id: string; title: string; status: string }>,
+): string {
+  return [
+    "Your previous turn was interrupted by a daemon restart. Its saved text is in the history above.",
+    formatInterruptedTurnDetails(tools, tasks),
+    "Continue from there. Do not repeat tool calls listed as completed. For calls listed as in flight, check their effect first (goal list, task tree) and repeat only what did not happen.",
+  ].join("\n");
+}
 
 interface ClientAttachment {
   id: string;
@@ -221,8 +321,17 @@ export class HarnessDaemon {
   readonly orchestrator: HarnessOrchestrator;
   readonly director: DirectorRuntime;
   readonly ptyHost = new PtyHost();
+  readonly instanceNonce = randomBytes(6).toString("hex");
+  recovered: Promise<void> = Promise.resolve();
 
   private server: Server | null = null;
+  private lifecycle: DaemonLifecycle = "serving";
+  private wakesGated = true;
+  private restartExpected = false;
+  private stopPromise: Promise<void> | null = null;
+  private reapChildrenOnStop = false;
+  private recoveryStaggerMs = 300;
+  private wakeups: WakeupStore;
   private allSockets = new Set<Socket>();
   private clientIds = new WeakMap<Socket, string>();
   private attachments = new Map<Socket, ClientAttachment>();
@@ -232,7 +341,7 @@ export class HarnessDaemon {
   private chatBindings = new Map<string, Socket>();
   /** Monotonic per-session ownership sequence (`chat:<id>` or `run:<id>`), incremented on every control change. */
   private controlSeqs = new Map<string, number>();
-  private chatTurns = new Map<string, { id: string; text: string; cancelling: boolean }>();
+  private chatTurns = new Map<string, ActiveChatTurn>();
   private pendingWakeups = new Map<string, ChatControlEvent[]>();
   /** The goal's review invalidation epoch when a review-derived event was raised; a later epoch means the goal moved past it. */
   private eventReviewEpochs = new WeakMap<ChatControlEvent, number>();
@@ -272,6 +381,8 @@ export class HarnessDaemon {
       autoQuitWhenIdle?: boolean;
       hostName?: string;
       repoRoot?: string;
+      reapChildrenOnStop?: boolean;
+      recoveryStaggerMs?: number;
     },
   ) {
     this.repoOverlay = readRepoConfig(opts?.repoRoot);
@@ -283,12 +394,16 @@ export class HarnessDaemon {
     this.reloadBase = opts?.repoRoot ? undefined : structuredClone(config);
     this.autoQuitWhenIdle = Boolean(opts?.autoQuitWhenIdle);
     this.hasCustomRunner = Boolean(opts?.customRunnerFactory);
+    this.reapChildrenOnStop = Boolean(opts?.reapChildrenOnStop);
+    this.recoveryStaggerMs = opts?.recoveryStaggerMs ?? (this.hasCustomRunner ? 0 : 300);
     const dbPath = opts?.dbPath ?? join(config.stateDir, "control-plane.sqlite");
     this.db = new ControlPlaneDb(dbPath);
+    this.wakeups = new WakeupStore(this.db.db);
     this.nodeId = dbPath === ":memory:" ? `node-${randomBytes(6).toString("hex")}` : loadOrCreateNodeId(config.stateDir);
     this.quota = new QuotaClient(config.quotaEndpoint);
     this.catalog = new ModelCatalogCompiler(config, this.quota);
     this.orchestrator = new HarnessOrchestrator(this.db, config, this.catalog, this.quota, opts?.customRunnerFactory);
+    this.orchestrator.setInstanceNonce(this.instanceNonce);
     this.director = new DirectorRuntime(this.db, config, this.catalog, this.quota, this.orchestrator, opts?.customRunnerFactory);
     this.peers = new PeerManager(
       this.nodeId,
@@ -313,6 +428,19 @@ export class HarnessDaemon {
   }
 
   /**
+   * Transitions the daemon into `draining` or `stopping` once: gates new work and Director wakes,
+   * and suspends timers without cancelling pending rows. Idempotent.
+   */
+  enterQuiesce(phase: "draining" | "stopping"): void {
+    if (this.lifecycle !== "stopping") {
+      this.lifecycle = phase;
+    }
+    this.orchestrator.beginQuiesce();
+    this.wakesGated = true;
+    this.db.timers.suspend();
+  }
+
+  /**
    * Event-driven wakeup for Tier 0 Director when a typed control-plane event fires
    * (e.g. `goal.settled`, `timer.fired`) — zero polling, zero string-prefix parsing.
    */
@@ -321,6 +449,12 @@ export class HarnessDaemon {
     if (isDirectorSourcedGoalEvent(event)) return;
     this.stampReviewEpoch(event);
     if (event.kind === "goal.reviewed" && this.isStaleQueuedEvent(event)) return;
+    if (this.wakesGated) {
+      const q = this.pendingWakeups.get(chatSessionId) ?? [];
+      q.push(event);
+      this.pendingWakeups.set(chatSessionId, q);
+      return;
+    }
     const activeTurn = this.chatTurns.get(chatSessionId);
     if (activeTurn) {
       // Queue background goal/timer/peer events until the active Director turn finishes instead of interrupting mid-turn!
@@ -338,6 +472,7 @@ export class HarnessDaemon {
    * stale, or left queued exactly once.
    */
   private drainPendingWakeup(chatSessionId: string): void {
+    if (this.wakesGated) return;
     if (this.chatTurns.has(chatSessionId)) return;
     const queued = this.pendingWakeups.get(chatSessionId);
     if (!queued || queued.length === 0) {
@@ -435,6 +570,12 @@ export class HarnessDaemon {
   }
 
   private async runDirectorWakeupTurn(chatSessionId: string, event: ChatControlEvent): Promise<void> {
+    if (this.wakesGated) {
+      const q = this.pendingWakeups.get(chatSessionId) ?? [];
+      q.push(event);
+      this.pendingWakeups.set(chatSessionId, q);
+      return;
+    }
     if (this.chatTurns.has(chatSessionId)) {
       const q = this.pendingWakeups.get(chatSessionId) ?? [];
       q.push(event);
@@ -450,7 +591,7 @@ export class HarnessDaemon {
     }
     event = liveEvent;
     const id = `wake-${randomBytes(4).toString("hex")}`;
-    const turn = { id, text: "", cancelling: false };
+    const turn: ActiveChatTurn = { id, text: "", cancelling: false, startedAt: Date.now(), tools: new Map(), toolCounter: 0 };
     this.chatTurns.set(chatSessionId, turn);
     this.sendChatEvent(chatSessionId, id, "chat.turn.start", {
       reason: event.kind,
@@ -466,6 +607,7 @@ export class HarnessDaemon {
           this.sendChatEvent(chatSessionId, id, "chat.delta", { delta });
         },
         (tool) => {
+          trackTurnTool(turn, tool);
           this.sendChatEvent(chatSessionId, id, "chat.tool", tool);
         },
         { event, revalidateEvent: (ev) => this.revalidateWakeEvent(ev) },
@@ -489,6 +631,45 @@ export class HarnessDaemon {
           cancelled: turn.cancelling,
         });
       }
+    } finally {
+      this.chatTurns.delete(chatSessionId);
+      this.drainPendingWakeup(chatSessionId);
+    }
+  }
+
+  private async runContinuationTurn(chatSessionId: string, text: string, opts?: { bypassGate?: boolean }): Promise<void> {
+    if ((!opts?.bypassGate && this.wakesGated) || this.chatTurns.has(chatSessionId)) return;
+    if (!this.director.chats.getSession(chatSessionId)) return;
+    const id = `continue-${randomBytes(4).toString("hex")}`;
+    const turn: ActiveChatTurn = { id, text: "", cancelling: false, startedAt: Date.now(), tools: new Map(), toolCounter: 0 };
+    this.chatTurns.set(chatSessionId, turn);
+    this.sendChatEvent(chatSessionId, id, "chat.turn.start", {
+      reason: "daemon.restart",
+      summary: "Continuing after daemon restart",
+    });
+    try {
+      const result = await this.director.sendChatMessage(
+        chatSessionId,
+        text,
+        (delta) => {
+          turn.text += delta;
+          this.sendChatEvent(chatSessionId, id, "chat.delta", { delta });
+        },
+        (tool) => {
+          trackTurnTool(turn, tool);
+          this.sendChatEvent(chatSessionId, id, "chat.tool", tool);
+        },
+        { turnRole: "system_notice" },
+      );
+      this.sendChatEvent(chatSessionId, id, "chat.turn.end", {
+        assistantTurn: result.assistantTurn,
+        cancelled: turn.cancelling,
+      });
+    } catch (err) {
+      this.sendChatEvent(chatSessionId, id, "chat.turn.end", {
+        error: err instanceof Error ? err.message : String(err),
+        cancelled: turn.cancelling,
+      });
     } finally {
       this.chatTurns.delete(chatSessionId);
       this.drainPendingWakeup(chatSessionId);
@@ -692,39 +873,52 @@ export class HarnessDaemon {
     await this.ptyHost.init();
     const sockPath = this.config.socketPath;
     mkdirSync(dirname(sockPath), { recursive: true, mode: 0o700 });
-    if (existsSync(sockPath)) {
-      const sockState = await probeUnixSocketState(sockPath);
-      if (sockState === "live") {
-        throw new Error(`Refusing to start harnessd: another live daemon is already listening on ${sockPath}`);
+    const startLock = await acquireStartLock(dirname(sockPath));
+    try {
+      if (existsSync(sockPath)) {
+        const sockState = await probeUnixSocketState(sockPath);
+        if (sockState === "live") {
+          throw new Error(`Refusing to start harnessd: another live daemon is already listening on ${sockPath}`);
+        }
+        if (sockState === "unknown") {
+          throw new Error(`Refusing to unlink ${sockPath}: socket liveness could not be confirmed (timed out or inaccessible)`);
+        }
+        try {
+          unlinkSync(sockPath);
+        } catch {
+          // ignore stale socket removal error
+        }
       }
-      if (sockState === "unknown") {
-        throw new Error(`Refusing to unlink ${sockPath}: socket liveness could not be confirmed (timed out or inaccessible)`);
-      }
-      try {
-        unlinkSync(sockPath);
-      } catch {
-        // ignore stale socket removal error
-      }
+
+      this.unsubEvents = this.db.onEvent((ev) => this.fanoutEvent(ev));
+
+      this.server = createServer((socket) => this.handleConnection(socket));
+      await new Promise<void>((resolve, reject) => {
+        this.server!.once("error", reject);
+        this.server!.listen(sockPath, () => {
+          try {
+            chmodSync(sockPath, 0o600);
+          } catch {
+            // ignore on unsupported filesystems
+          }
+          resolve();
+        });
+      });
+    } finally {
+      startLock.release();
     }
 
-    this.unsubEvents = this.db.onEvent((ev) => this.fanoutEvent(ev));
-
-    this.server = createServer((socket) => this.handleConnection(socket));
-    await new Promise<void>((resolve, reject) => {
-      this.server!.once("error", reject);
-      this.server!.listen(sockPath, () => {
-        try {
-          chmodSync(sockPath, 0o600);
-        } catch {
-          // ignore on unsupported filesystems
-        }
-        resolve();
-      });
-    });
-
-    // Reconcile stale runs/goals and restore durable timers AFTER the daemon socket is bound,
+    // Reconcile stale runs/goals AFTER the daemon socket is bound,
     // so immediate wakeups / MCP bridges can connect without racing socket creation!
-    this.orchestrator.reconcileStaleRunsOnStartup();
+    const interruptedReviewGoals = listInterruptedReviewGoals(this.db.db);
+    const legacyStopAtRaw = Number(process.env.PI_HARNESS_LEGACY_STOP_AT);
+    delete process.env.PI_HARNESS_LEGACY_STOP_AT;
+    const legacyStopAt = Number.isFinite(legacyStopAtRaw) && legacyStopAtRaw > 0 ? legacyStopAtRaw : undefined;
+    const reloadFrom = process.env.PI_HARNESS_RELOAD_FROM;
+    delete process.env.PI_HARNESS_RELOAD_FROM;
+    const heldTaskIds = this.orchestrator.reconcileStaleRunsOnStartup(
+      legacyStopAt !== undefined ? { legacyStopAt } : undefined,
+    );
     this.director.goals.reconcileStaleGoalsOnStartup();
     try {
       // Escalations left open on runs whose goals all settled (achieved/cancelled) are resolved once at startup.
@@ -732,7 +926,38 @@ export class HarnessDaemon {
     } catch {
       // Best effort; the escalations stay listable and resolvable.
     }
-    this.db.timers.restorePending();
+    replayInterruptedReviews(this.db, this.director.goals, interruptedReviewGoals);
+
+    // Register saved continuation turns synchronously before ungating wakes and before any RPC runs (A1).
+    const savedWakeups = this.wakeups.takeAll();
+    const chatsToDrain = new Set<string>();
+    for (const row of savedWakeups) {
+      if (row.kind !== "continue") continue;
+      if (!this.director.chats.getSession(row.chatSessionId)) continue;
+      const p = (row.payload ?? {}) as {
+        tools?: TrackedTurnTool[];
+        tasks?: Array<{ id: string; title: string; status: string }>;
+      };
+      const text = formatContinuationTurnPrompt(
+        Array.isArray(p.tools) ? p.tools : [],
+        Array.isArray(p.tasks) ? p.tasks : [],
+      );
+      void this.runContinuationTurn(row.chatSessionId, text, { bypassGate: true });
+    }
+    for (const row of savedWakeups) {
+      if (row.kind !== "event" || !row.payload || typeof row.payload !== "object") continue;
+      if (!this.director.chats.getSession(row.chatSessionId)) continue;
+      const q = this.pendingWakeups.get(row.chatSessionId) ?? [];
+      q.push(row.payload as ChatControlEvent);
+      this.pendingWakeups.set(row.chatSessionId, q);
+      chatsToDrain.add(row.chatSessionId);
+    }
+    if (this.lifecycle === "serving") {
+      this.wakesGated = false;
+      for (const chatId of new Set([...chatsToDrain, ...this.pendingWakeups.keys()])) {
+        if (!this.chatTurns.has(chatId)) this.drainPendingWakeup(chatId);
+      }
+    }
 
     // Non-blocking startup orphan worktree sweep + periodic hourly sweep across known repos
     void this.sweepAllKnownRepos().catch(() => {});
@@ -763,6 +988,26 @@ export class HarnessDaemon {
       console.error(`[harnessd ${new Date().toISOString()}] config warning: ${w}`);
     }
 
+    this.recovered = this.finishRecovery(heldTaskIds, reloadFrom).catch((err) => {
+      console.error(
+        `[harnessd ${new Date().toISOString()}] recovery failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+
+    return sockPath;
+  }
+
+  private async finishRecovery(heldTaskIds: string[], reloadFrom?: string): Promise<void> {
+    if (heldTaskIds.length > 0) {
+      const reason = reloadFrom
+        ? `update to release ${currentRelease().releaseId}`
+        : "daemon restart";
+      await this.orchestrator.recoverInterruptedTasks(heldTaskIds, reason, this.recoveryStaggerMs);
+    }
+    if (this.lifecycle !== "serving") return;
+
+    this.db.timers.restorePending();
+
     // Recover any durable inbound peer wakeups that were persisted before a crash/restart
     for (const pending of this.db.sessionMessages.listPendingInboundWakes()) {
       if (!this.director.chats.getSession(pending.toSessionId)) {
@@ -780,11 +1025,18 @@ export class HarnessDaemon {
         hopCount: pending.hopCount,
       });
     }
-
-    return sockPath;
   }
 
-  async stop(): Promise<void> {
+  stop(opts?: { reason?: string }): Promise<void> {
+    return (this.stopPromise ??= this.stopInner(opts));
+  }
+
+  private async stopInner(_opts?: { reason?: string }): Promise<void> {
+    this.enterQuiesce("stopping");
+    await Promise.race([
+      this.recovered.catch(() => {}),
+      new Promise<void>((r) => setTimeout(r, 5000)),
+    ]);
     if (this.idleShutdownTimer) {
       clearTimeout(this.idleShutdownTimer);
       this.idleShutdownTimer = null;
@@ -799,13 +1051,95 @@ export class HarnessDaemon {
     this.flushingPeers.clear();
     this.pendingFlushPeers.clear();
     this.peers.dispose();
+
+    const continueRows: PendingWake[] = [];
+    for (const [chatId, turn] of [...this.chatTurns.entries()]) {
+      const tools = [...turn.tools.values()];
+      turn.cancelling = true;
+      await Promise.race([
+        this.director.cancelChat(chatId).catch(() => {}),
+        new Promise<void>((r) => setTimeout(r, 5000)),
+      ]);
+      // Yield one macrotask so the active turn handler finishes and sends chat.turn.end.
+      await new Promise<void>((r) => setTimeout(r, 0));
+      const tasks: Array<{ id: string; title: string; status: string }> = [];
+      for (const run of this.orchestrator.listDirectorTaskRuns(chatId)) {
+        for (const t of this.db.listTasks(run.id)) {
+          if (t.profileId !== "director" && t.createdAt >= turn.startedAt) {
+            tasks.push({ id: t.id, title: t.title, status: t.status });
+          }
+        }
+      }
+      try {
+        this.director.chats.appendTurn(chatId, "system_notice", formatInterruptedTurnNotice(tools, tasks));
+      } catch {
+        // ignore if session disappeared
+      }
+      continueRows.push({
+        chatSessionId: chatId,
+        kind: "continue",
+        payload: { tools, tasks },
+      });
+    }
+
+    await this.orchestrator.shutdownAndWait(10_000);
     this.director.dispose();
-    this.orchestrator.dispose();
-    this.pendingWakeups.clear();
     this.unsubEvents?.();
     this.ptyHost.closeAll();
-    for (const sock of this.allSockets) {
-      sock.destroy();
+
+    // Snapshot pending wakeups after orchestrator/director unwind so late-queued wakes are not lost (A2).
+    const wakeupSnapshot: PendingWake[] = [...continueRows];
+    for (const [chatId, events] of this.pendingWakeups.entries()) {
+      for (const ev of events) {
+        const flat = ev.kind === "goal.events_batch" ? ev.events : [ev];
+        for (const item of flat) {
+          if (item.kind === "session.message_received") continue;
+          wakeupSnapshot.push({ chatSessionId: chatId, kind: "event", payload: item });
+        }
+      }
+    }
+    this.pendingWakeups.clear();
+    try {
+      this.wakeups.append(wakeupSnapshot);
+    } catch {
+      // ignore if DB already closed
+    }
+
+    if (this.reapChildrenOnStop) {
+      await reapChildProcessGroups(process.pid, 2000);
+    }
+
+    this.broadcastDaemonEvent("daemon.stopping", { restart: this.restartExpected });
+    const openSockets = [...this.allSockets].filter((s) => !s.destroyed);
+    if (openSockets.length > 0) {
+      await new Promise<void>((resolve) => {
+        let remaining = openSockets.length;
+        let settled = false;
+        const done = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          for (const s of openSockets) {
+            if (!s.destroyed) s.destroy();
+          }
+          done();
+        }, 200);
+        timer.unref?.();
+        for (const s of openSockets) {
+          s.once("close", () => {
+            remaining--;
+            if (remaining <= 0) done();
+          });
+          try {
+            s.end();
+          } catch {
+            s.destroy();
+          }
+        }
+      });
     }
     this.allSockets.clear();
     this.attachments.clear();
@@ -828,6 +1162,21 @@ export class HarnessDaemon {
       }
     }
     this.db.close();
+  }
+
+  private broadcastDaemonEvent(type: string, payload: Record<string, unknown>): void {
+    const frame: DaemonEventFrame = {
+      kind: "event",
+      seq: 0,
+      runId: "",
+      taskId: null,
+      type,
+      payload,
+      createdAt: Date.now(),
+    };
+    for (const sock of this.tuiSockets) {
+      if (!sock.destroyed) writeDaemonMessage(sock, frame);
+    }
   }
 
   private async sweepAllKnownRepos(): Promise<void> {
@@ -1383,13 +1732,13 @@ export class HarnessDaemon {
     }
 
     // If the last interactive TUI disconnected abruptly (e.g. terminal window closed) and nothing is running, quit cleanly
-    if (this.autoQuitWhenIdle && wasTui) {
+    if (this.autoQuitWhenIdle && wasTui && this.lifecycle === "serving") {
       const work = this.getLiveWorkSummary();
       if (!work.running) {
         this.cancelIdleShutdown();
         this.idleShutdownTimer = setTimeout(() => {
           this.idleShutdownTimer = null;
-          if (!this.getLiveWorkSummary().running) {
+          if (this.lifecycle === "serving" && !this.getLiveWorkSummary().running) {
             void this.stop().finally(() => process.exit(0));
           }
         }, 1200);
@@ -2094,6 +2443,10 @@ export class HarnessDaemon {
   }
 
   private async dispatch(socket: Socket, req: RpcRequest): Promise<unknown> {
+    if (this.lifecycle !== "serving" && WORK_STARTING_OPS.has(req.op)) {
+      const action = this.lifecycle === "draining" || this.restartExpected ? "harnessd is restarting for an update" : "harnessd is stopping";
+      throw new Error(`DAEMON_RELOADING: ${action}. Your request was not started. It is safe to retry after reconnect.`);
+    }
     const p = req.params ?? {};
 
     switch (req.op) {
@@ -2109,7 +2462,8 @@ export class HarnessDaemon {
           protocolRev: DAEMON_PROTOCOL_REV,
           releaseId: release.releaseId,
           releaseDir: release.releaseDir,
-          lifecycle: "serving",
+          lifecycle: this.lifecycle,
+          restartSafe: true,
           running: live.running,
           liveWork: live.description,
           remotes: this.listRemoteStatuses(),
@@ -2117,6 +2471,7 @@ export class HarnessDaemon {
       }
 
       case "daemon.shutdown":
+        if (p.restart === true) this.restartExpected = true;
         setTimeout(() => {
           void this.stop().finally(() => process.exit(0));
         }, 25).unref();
@@ -2132,7 +2487,8 @@ export class HarnessDaemon {
           protocolRev: DAEMON_PROTOCOL_REV,
           releaseId: release.releaseId,
           releaseDir: release.releaseDir,
-          lifecycle: "serving",
+          lifecycle: this.lifecycle,
+          restartSafe: true,
           socketPath: this.config.socketPath,
           configPath: join(this.config.stateDir, "config.json"),
           configWarnings: [...this.globalConfigWarnings, ...this.repoConfigWarnings],
@@ -2667,7 +3023,7 @@ export class HarnessDaemon {
         this.requireChatOwner(socket, chatSessionId);
         if (this.chatTurns.has(chatSessionId)) throw new Error("Director is already responding");
         const id = typeof p.turnId === "string" && p.turnId ? p.turnId : req.id;
-        const turn = { id, text: "", cancelling: false };
+        const turn: ActiveChatTurn = { id, text: "", cancelling: false, startedAt: Date.now(), tools: new Map(), toolCounter: 0 };
         this.chatTurns.set(chatSessionId, turn);
         this.sendChatEvent(chatSessionId, id, "chat.turn.start", { reason: "user", text: String(p.text) }, socket);
         try {
@@ -2678,6 +3034,7 @@ export class HarnessDaemon {
               this.sendChatEvent(chatSessionId, id, "chat.delta", { delta });
             },
             (tool) => {
+              trackTurnTool(turn, tool);
               this.sendChatEvent(chatSessionId, id, "chat.tool", tool);
             },
           );
@@ -3729,9 +4086,15 @@ export class HarnessDaemon {
         return { ok: true };
 
       case "tool.call": {
-        // An orchestrator task's bridge sends `<taskId>@g<generation>` (see AcpRunner); callers may also pass expectedGeneration.
-        const token = /^(.+)@g(\d+)$/.exec(String(p.taskId));
-        const taskId = token ? token[1]! : String(p.taskId);
+        // An orchestrator task's bridge sends `<taskId>@g<generation>@<nonce>` (see AcpRunner).
+        const rawTaskId = String(p.taskId);
+        const token = /^(.+?)@g(\d+)(?:@([0-9a-f]+))?$/.exec(rawTaskId);
+        if (token && token[3] !== this.instanceNonce) {
+          throw new Error(
+            `Stale tool call for task ${token[1]}: this agent session belongs to a previous harnessd process (the daemon restarted). Nothing was executed. The task continues in a new session. End this session.`,
+          );
+        }
+        const taskId = token ? token[1]! : rawTaskId;
         const expectedGeneration = p.expectedGeneration ?? (token ? Number(token[2]) : undefined);
         const name = String(p.name);
         const args = (p.args ?? {}) as Record<string, unknown>;

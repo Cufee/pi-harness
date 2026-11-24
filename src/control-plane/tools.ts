@@ -26,6 +26,7 @@ import { findRunDossier, readRunDossier, readWorkspaceArtifact, spillSummaryOver
 import { compactTaskHandoff, isReadOnlyKind, settleTaskMinimalFallback, SUMMARY_LIMIT, validateTaskHandoff } from "./handoffs.js";
 import { expandHomePath } from "./projects.js";
 import type { AnchoredHandoff } from "./prompts.js";
+import { spawnDuplicateAdvisory } from "./restart-recovery.js";
 import {
   type DroppedProgressEntry,
   filterProgressPatch,
@@ -1105,11 +1106,13 @@ export class ControlPlaneToolExecutor {
           signal: callerSignal ?? scriptSignal ?? this.hooks.getTaskCancelSignal?.(taskId),
         });
         const qEntry = this.db.admissionQueue.get("worker", created.id);
+        const warning = spawnDuplicateAdvisory(this.db, task, created.id, String(args.title));
         return {
           spawned: created.id,
           status: created.status,
           worktreeId: created.worktreeId,
           ...(qEntry ? { queued: true, queuePosition: qEntry.position } : {}),
+          ...(warning ? { warning } : {}),
         };
       }
 
@@ -1175,7 +1178,8 @@ export class ControlPlaneToolExecutor {
           dependsOn: Array.isArray(args.depends_on) ? (args.depends_on as string[]) : [],
           signal: callerSignal ?? scriptSignal ?? this.hooks.getTaskCancelSignal?.(taskId),
         });
-        return { spawned: created.id, kind: created.kind, readOnly: created.readOnly, status: created.status };
+        const warning = spawnDuplicateAdvisory(this.db, task, created.id, String(args.title));
+        return { spawned: created.id, kind: created.kind, readOnly: created.readOnly, status: created.status, ...(warning ? { warning } : {}) };
       }
 
       case "wait_tasks":

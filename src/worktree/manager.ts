@@ -33,7 +33,7 @@ function isWithin(parent: string, child: string): boolean {
   return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
-const ACTIVE_TASK_STATUSES = new Set(["running", "draining", "waiting_children", "merging", "paused_quota"]);
+const ACTIVE_TASK_STATUSES = new Set(["ready", "running", "draining", "waiting_children", "merging", "paused_quota"]);
 const SCRATCH_KINDS = new Set(["_verify", "_integration"]);
 
 /** Lock reason on every worktree the harness creates; only this reason marks a lock the harness may override on removal. */

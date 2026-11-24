@@ -863,9 +863,25 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
         model: "fixture/fixture",
       });
 
-      // 2a. Daemon-startup orphan failure: non-Tier-1 gets partial fallback + indexed artifacts; Tier 1 stays bare.
-      const orphanT1 = daemon.db.createTask({
+      // 2a. Daemon-startup reconciliation: active runs hold tasks for in-place recovery; non-active runs fail orphans
+      // with partial fallback + indexed artifacts (Tier 1 stays bare).
+      const activeRunTask = daemon.db.createTask({
         runId: run.id,
+        parentId: parent.id,
+        tier: 3,
+        kind: "research",
+        title: "Active T3",
+        objective: "Resume in place",
+        readOnly: true,
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      daemon.db.updateTask(activeRunTask.id, { status: "running" });
+
+      const stoppedRun = daemon.db.createRun({ goal: "Stopped orphan run", repoRoot, baseBranch: "main", baseSha: "HEAD" });
+      daemon.db.updateRunStatus(stoppedRun.id, "stopped");
+      const orphanT1 = daemon.db.createTask({
+        runId: stoppedRun.id,
         tier: 1,
         kind: "orchestrator",
         title: "Orphan T1",
@@ -875,8 +891,8 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
       });
       daemon.db.updateTask(orphanT1.id, { status: "running" });
       const orphanT3 = daemon.db.createTask({
-        runId: run.id,
-        parentId: parent.id,
+        runId: stoppedRun.id,
+        parentId: orphanT1.id,
         tier: 3,
         kind: "research",
         title: "Orphan T3",
@@ -886,13 +902,15 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
         model: "fixture/fixture",
       });
       daemon.db.updateTask(orphanT3.id, { status: "running" });
-      const orphanArt = (await daemon.orchestrator.toolExecutor.execute(run.id, orphanT3.id, "artifact_write", {
+      const orphanArt = (await daemon.orchestrator.toolExecutor.execute(stoppedRun.id, orphanT3.id, "artifact_write", {
         name: "orphan-notes.md",
         content: "partial notes before crash",
         summary: "Orphan notes",
       })) as { path: string };
 
-      daemon.orchestrator.reconcileStaleRunsOnStartup();
+      const held = daemon.orchestrator.reconcileStaleRunsOnStartup();
+      assert.ok(held.includes(activeRunTask.id), "Active run task must be held for in-place recovery, not failed");
+      assert.equal(daemon.db.getTask(activeRunTask.id)?.status, "running");
 
       const orphanT1Handoff = compactTaskHandoff(daemon.db.getTask(orphanT1.id)!);
       assert.equal(orphanT1Handoff.status, "failed");

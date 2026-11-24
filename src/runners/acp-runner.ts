@@ -1388,7 +1388,7 @@ export class AcpRunner {
             { name: "PI_HARNESS_RUN_ID", value: req.runId },
             // `<taskId>@g<generation>` is an execution token the bridge forwards verbatim, so the daemon refuses tool
             // calls from this bridge once that generation is no longer the task's live one.
-            { name: "PI_HARNESS_TASK_ID", value: req.taskGeneration !== undefined ? `${req.taskId}@g${req.taskGeneration}` : req.taskId },
+            { name: "PI_HARNESS_TASK_ID", value: req.taskGeneration !== undefined ? `${req.taskId}@g${req.taskGeneration}${req.daemonInstanceNonce ? `@${req.daemonInstanceNonce}` : ""}` : req.taskId },
           ],
         });
       }
