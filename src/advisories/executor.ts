@@ -6,9 +6,27 @@ import { ControlPlaneToolExecutor, type ToolRuntimeHooks } from "../control-plan
 import type { AdvisoryEngine } from "./engine.js";
 import { attachNotices } from "./message.js";
 import { roleOf } from "./roles.js";
-import type { Subject } from "./types.js";
+import type { Notice, Subject } from "./types.js";
 
 const MAX_INSPECT_OPERANDS = 16;
+
+function isCodeExecFailureResult(result: unknown): boolean {
+  return (
+    result !== null &&
+    typeof result === "object" &&
+    !Array.isArray(result) &&
+    (result as Record<string, unknown>).ok === false
+  );
+}
+
+function logAdvisoryError(phase: string, err: unknown, runId: string, taskId: string, tool: string): void {
+  try {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[advisories] fail-open error in ${phase} (run=${runId} task=${taskId} tool=${tool}): ${msg}`);
+  } catch {
+    // Logging must never break fail-open tool execution.
+  }
+}
 
 export interface AdvisedExecutorOptions {
   engine: AdvisoryEngine;
@@ -106,6 +124,48 @@ export class AdvisedToolExecutor extends ControlPlaneToolExecutor {
     this.adv = adv;
   }
 
+  private deliverNotices(
+    subjectId: string,
+    notices: Notice[],
+    result: unknown,
+    runId: string,
+    taskId: string,
+    name: string,
+  ): unknown {
+    if (notices.length === 0) return result;
+    let attached = false;
+    let annotated: unknown = result;
+    try {
+      const out = attachNotices(result, notices);
+      attached = out.attached;
+      annotated = out.result;
+    } catch (err) {
+      logAdvisoryError("attach_notices", err, runId, taskId, name);
+      try {
+        this.adv.engine.requeue(subjectId, notices);
+      } catch (reqErr) {
+        logAdvisoryError("requeue", reqErr, runId, taskId, name);
+      }
+      return result;
+    }
+
+    if (attached) {
+      try {
+        this.adv.engine.delivered(subjectId, notices, "tool_result");
+      } catch (err) {
+        logAdvisoryError("record_delivery", err, runId, taskId, name);
+      }
+      return annotated;
+    }
+
+    try {
+      this.adv.engine.requeue(subjectId, notices);
+    } catch (err) {
+      logAdvisoryError("requeue", err, runId, taskId, name);
+    }
+    return result;
+  }
+
   override async execute(
     runId: string,
     taskId: string,
@@ -114,37 +174,38 @@ export class AdvisedToolExecutor extends ControlPlaneToolExecutor {
     scriptSignal?: AbortSignal,
     callerSignal?: AbortSignal,
   ): Promise<unknown> {
-    const task = this.advDb.getTask(taskId);
-    if (!task || task.runId !== runId) {
-      return super.execute(runId, taskId, name, args, scriptSignal, callerSignal);
+    let task: TaskRecord | null = null;
+    let subject: Subject | null = null;
+    try {
+      const found = this.advDb.getTask(taskId);
+      if (found && found.runId === runId) {
+        const role = roleOf(found);
+        if (role !== "director" && role !== "reviewer") {
+          task = found;
+          subject = this.adv.subjectFor(found);
+        }
+      }
+    } catch (err) {
+      logAdvisoryError("subject_lookup", err, runId, taskId, name);
+      task = null;
+      subject = null;
     }
 
-    const role = roleOf(task);
-    if (role === "director" || role === "reviewer") {
-      return super.execute(runId, taskId, name, args, scriptSignal, callerSignal);
-    }
-
-    const subject = this.adv.subjectFor(task);
-    if (!subject) {
-      return super.execute(runId, taskId, name, args, scriptSignal, callerSignal);
-    }
-
-    if (name === "__list_tools" || name === "tool_search") {
+    if (!task || !subject || name === "__list_tools" || name === "tool_search") {
       return super.execute(runId, taskId, name, args, scriptSignal, callerSignal);
     }
 
     if (name === "code_exec") {
       const result = await super.execute(runId, taskId, name, args, scriptSignal, callerSignal);
-      if (scriptSignal === undefined) {
-        const notices = this.adv.engine.take(subject.id);
-        if (notices.length > 0) {
-          const { result: annotated, attached } = attachNotices(result, notices);
-          if (attached) {
-            this.adv.engine.delivered(subject.id, notices, "tool_result");
-            return annotated;
-          }
-          this.adv.engine.requeue(subject.id, notices);
+      if (scriptSignal === undefined && !isCodeExecFailureResult(result)) {
+        let notices: Notice[] = [];
+        try {
+          notices = this.adv.engine.take(subject.id);
+        } catch (err) {
+          logAdvisoryError("take", err, runId, taskId, name);
+          return result;
         }
+        return this.deliverNotices(subject.id, notices, result, runId, taskId, name);
       }
       return result;
     }
@@ -154,50 +215,55 @@ export class AdvisedToolExecutor extends ControlPlaneToolExecutor {
     try {
       result = await super.execute(runId, taskId, name, args, scriptSignal, callerSignal);
     } catch (err) {
-      this.adv.engine.observeHarness(subject, {
-        origin: "result",
-        surface: "harness",
-        tool: name,
-        status: "failed",
-        args,
-        paths: [],
-        inScript,
-      });
+      try {
+        this.adv.engine.observeHarness(subject, {
+          origin: "result",
+          surface: "harness",
+          tool: name,
+          status: "failed",
+          args,
+          paths: [],
+          inScript,
+        });
+      } catch (advErr) {
+        logAdvisoryError("observe_failed", advErr, runId, taskId, name);
+      }
       throw err;
     }
 
-    const notices = this.adv.engine.observeHarness(subject, {
-      origin: "result",
-      surface: "harness",
-      tool: name,
-      status: "completed",
-      args,
-      paths: [],
-      result,
-      inScript,
-    });
+    let notices: Notice[] = [];
+    try {
+      notices = this.adv.engine.observeHarness(subject, {
+        origin: "result",
+        surface: "harness",
+        tool: name,
+        status: "completed",
+        args,
+        paths: [],
+        result,
+        inScript,
+      });
+    } catch (err) {
+      logAdvisoryError("observe_completed", err, runId, taskId, name);
+    }
 
-    if (name === "inspect_command") {
-      const workspaceRoot = this.adv.workspaceRootFor?.(task) ?? subject.workspaceRoot;
-      const paths = extractInspectCommandPaths(args, workspaceRoot);
-      if (paths.length > 0) {
-        this.adv.engine.noteActivity(subject.id, paths);
-      }
-    } else if (name === "artifact_read") {
-      const workspaceRoot = this.adv.workspaceRootFor?.(task) ?? subject.workspaceRoot;
-      const paths = extractArtifactReadPaths(args, workspaceRoot);
-      if (paths.length > 0) {
-        this.adv.engine.noteActivity(subject.id, paths);
+    if (name === "inspect_command" || name === "artifact_read") {
+      try {
+        const workspaceRoot = this.adv.workspaceRootFor?.(task) ?? subject.workspaceRoot;
+        const paths =
+          name === "inspect_command"
+            ? extractInspectCommandPaths(args, workspaceRoot)
+            : extractArtifactReadPaths(args, workspaceRoot);
+        if (paths.length > 0) {
+          this.adv.engine.noteActivity(subject.id, paths);
+        }
+      } catch (err) {
+        logAdvisoryError("note_activity", err, runId, taskId, name);
       }
     }
 
     if (!inScript && notices.length > 0) {
-      const { result: annotated, attached } = attachNotices(result, notices);
-      if (attached) {
-        this.adv.engine.delivered(subject.id, notices, "tool_result");
-        return annotated;
-      }
-      this.adv.engine.requeue(subject.id, notices);
+      return this.deliverNotices(subject.id, notices, result, runId, taskId, name);
     }
 
     return result;
