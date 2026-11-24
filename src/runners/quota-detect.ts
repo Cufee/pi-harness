@@ -95,3 +95,54 @@ export function detectQuotaErrorText(text: string): DetectedQuotaError {
     summary: firstLine.slice(0, 220),
   };
 }
+
+export interface QuotaPauseSummaryInput {
+  provider?: string | null;
+  profileId?: string | null;
+  model?: string | null;
+  resetAt?: string | number | null;
+  hard?: boolean;
+}
+
+function parseResetAt(resetAt: string | number | null | undefined): Date | null {
+  if (typeof resetAt === "number") {
+    if (!Number.isFinite(resetAt)) return null;
+    const d = new Date(resetAt);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  if (typeof resetAt === "string") {
+    const trimmed = resetAt.trim();
+    if (!trimmed) return null;
+    const ms = Date.parse(trimmed);
+    if (!Number.isFinite(ms)) return null;
+    const d = new Date(ms);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  return null;
+}
+
+function formatUtcTimestamp(date: Date): string {
+  const yyyy = date.getUTCFullYear();
+  const mm = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(date.getUTCDate()).padStart(2, "0");
+  const hh = String(date.getUTCHours()).padStart(2, "0");
+  const min = String(date.getUTCMinutes()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd} ${hh}:${min} UTC`;
+}
+
+/** Formats a clean summary for a quota-paused task without raw provider stderr lines. */
+export function formatQuotaPauseSummary(input: QuotaPauseSummaryInput): string {
+  const source = input.provider?.trim() || input.profileId?.trim() || "";
+  const model = input.model?.trim() || "";
+  const targetParts: string[] = [];
+  if (source && (!model || (!model.startsWith(`${source}/`) && !model.startsWith(`${source}:`)))) {
+    targetParts.push(source);
+  }
+  if (model) targetParts.push(model);
+
+  const status = input.hard ? "quota exhausted" : "rate-limited";
+  const subject = targetParts.length > 0 ? `${targetParts.join(" ")} ${status}` : status;
+  const resetDate = parseResetAt(input.resetAt);
+  const resetPart = resetDate ? `resets ${formatUtcTimestamp(resetDate)}` : "reset time unknown";
+  return `Paused (quota): ${subject}; ${resetPart}`;
+}
