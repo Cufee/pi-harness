@@ -713,7 +713,17 @@ export class ControlPlaneToolExecutor {
             };
           }
         }
-        const taskStatus = status === "scope_too_large" ? "returned_for_rescope" : status;
+        const readOnlyBlockedWithResult =
+          isReadOnlyKind(task.kind) &&
+          status === "blocked" &&
+          fullSummary.trim().length > 0 &&
+          (sources.length > 0 || artifactPaths.length > 0);
+        const taskStatus =
+          status === "scope_too_large"
+            ? "returned_for_rescope"
+            : readOnlyBlockedWithResult
+              ? "completed"
+              : status;
         let committed = false;
         try {
           const result = this.db.transaction(() => {
@@ -775,13 +785,13 @@ export class ControlPlaneToolExecutor {
             if (task.kind === "verify") {
               const liveStatuses = ["running", "waiting_children", "ready", "pending", "draining", "merging"];
               const otherLive = this.db.listTasks(runId).some((t) => t.id !== taskId && liveStatuses.includes(t.status));
-              const intermediate = partial || (task.tier === 3 && otherLive) || (taskStatus !== "completed" && otherLive);
+              const intermediate = partial || (task.tier === 3 && otherLive) || (status !== "completed" && otherLive);
               this.updateLinkedGoalProgress(
                 runId,
                 taskId,
                 intermediate
                   ? { summary: summary.slice(0, 300) }
-                  : { verificationStatus: taskStatus === "completed" ? "passed" : "failed", summary: summary.slice(0, 300) },
+                  : { verificationStatus: status === "completed" ? "passed" : "failed", summary: summary.slice(0, 300) },
                 "verify_task",
               );
             }
