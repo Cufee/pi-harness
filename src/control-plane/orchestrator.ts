@@ -7,6 +7,7 @@ import type { ModelCatalogCompiler } from "../catalog/compiler.js";
 import type { QuotaClient } from "../quota/client.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
+import { formatQuotaPauseSummary } from "../runners/quota-detect.js";
 import { ScopeNudgeMonitor } from "../runners/scope-nudge.js";
 import { toolPolicyForTask } from "../runners/types.js";
 import { recordCostInvocation } from "../cost/ledger.js";
@@ -2785,6 +2786,31 @@ export class HarnessOrchestrator {
             result: res,
           });
           if (this.rolloverFenceBroken(exec, task.id, fence)) return;
+          const pausedProfile = this.config.profiles.find((p) => p.id === latest.profileId) ?? profile;
+          const provider =
+            pausedProfile?.kind === "pi"
+              ? pausedProfile.provider
+              : pausedProfile?.adapter && pausedProfile.adapter !== "generic"
+                ? pausedProfile.adapter
+                : undefined;
+          const quotaSummary = formatQuotaPauseSummary({
+            provider,
+            profileId: latest.profileId,
+            model: latest.model ?? wireModel,
+            resetAt: qp?.resetAt ?? null,
+            hard: qp?.isHardExhaustion,
+          });
+          let nextResultJson: string;
+          try {
+            const prev = latest.resultJson ? JSON.parse(latest.resultJson) : null;
+            nextResultJson = JSON.stringify(
+              prev && typeof prev === "object" && !Array.isArray(prev)
+                ? { ...prev, quotaDetail: reason }
+                : { quotaDetail: reason },
+            );
+          } catch {
+            nextResultJson = JSON.stringify({ quotaDetail: reason });
+          }
           this.taskQuotaHints.set(task.id, {
             wireModel,
             profileId: latest.profileId,
@@ -2795,8 +2821,9 @@ export class HarnessOrchestrator {
           });
           this.db.updateTask(task.id, {
             status: "paused_quota",
-            summary: `Paused (quota): ${reason.slice(0, 240)}`,
+            summary: quotaSummary,
             handoffJson: JSON.stringify(pauseHandoff),
+            resultJson: nextResultJson,
           });
           this.db.emitEvent(run.id, task.id, "quota.agent_paused", {
             runId: run.id,
@@ -2806,6 +2833,7 @@ export class HarnessOrchestrator {
             profileId: latest.profileId,
             model: latest.model,
             reason,
+            detail: reason,
             resetAt: qp?.resetAt ?? null,
             retryCount: qp?.retryCount ?? 1,
             watchdogTimedOut: Boolean(qp?.watchdogTimedOut),
