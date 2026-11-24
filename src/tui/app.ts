@@ -1760,6 +1760,8 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
 
     // Live control-plane notices (escalations, goal lifecycle, quota pause/resume)
     if (ev.type === "escalation.created") {
+      // Only human-addressed escalations alert the chat; agent-addressed ones belong to their recipient.
+      if (p.toTaskId != null) return;
       const escId = String(p.id ?? p.escalationId ?? "");
       const title = String(p.title ?? "Escalation raised");
       const sev = String(p.severity ?? "P1");

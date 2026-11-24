@@ -7,6 +7,8 @@ import { ModelCatalogCompiler } from "../src/catalog/compiler.js";
 import { loadConfig } from "../src/config.js";
 import { ControlPlaneDb } from "../src/control-plane/db.js";
 import { HarnessOrchestrator } from "../src/control-plane/orchestrator.js";
+import { buildImmutableSystemPrompt } from "../src/control-plane/prompts.js";
+import { toolsForTier } from "../src/control-plane/tools.js";
 import { QuotaClient } from "../src/quota/client.js";
 
 it("requires structured sources for read-only handoffs and externalizes only oversized summaries", async () => {
@@ -165,6 +167,136 @@ it("does not commit a scope send-back when summary overflow fails and records it
     const artifacts = db.listArtifacts(run.id, child.id);
     assert.equal(artifacts.length, 1);
     assert.equal(readFileSync(artifacts[0]!.path, "utf8"), summary);
+  } finally {
+    db.close();
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+it("keeps read-only report_issue non-blocking and auto-resolves agent-addressed escalations on settlement", async () => {
+  const repoRoot = mkdtempSync(join(tmpdir(), "pi-harness-handoff-"));
+  const db = new ControlPlaneDb(":memory:");
+  try {
+    const config = { ...loadConfig(repoRoot), stateDir: repoRoot };
+    const quota = new QuotaClient();
+    const orch = new HarnessOrchestrator(db, config, new ModelCatalogCompiler(config, quota), quota);
+    const run = db.createRun({ goal: "Escalation hygiene", repoRoot, baseBranch: "main", baseSha: "abc" });
+    const parent = db.createTask({
+      runId: run.id, tier: 1, kind: "orchestrator", title: "Parent", objective: "Coordinate", profileId: "acp:codex",
+    });
+
+    assert.ok(toolsForTier(3).some((t) => t.name === "report_issue"));
+    assert.match(buildImmutableSystemPrompt(3, "execute", "off"), /P0 and P1 end your task/);
+
+    for (const kind of ["research", "plan", "verify"] as const) {
+      const child = db.createTask({
+        runId: run.id, parentId: parent.id, tier: 3, kind, title: kind, objective: "Inspect", profileId: "acp:codex",
+      });
+      const res = (await orch.toolExecutor.execute(run.id, child.id, "report_issue", {
+        severity: "P1", category: "code_defect", title: `${kind} finding`, evidence_paths: ["a.ts"],
+      })) as { escalationId: string; severity: string; routedTo: string; blocking: boolean; harness_advisory?: string[] };
+      assert.equal(res.severity, "P1");
+      assert.equal(res.routedTo, parent.id);
+      assert.equal(res.blocking, false);
+      assert.ok(
+        Array.isArray(res.harness_advisory) &&
+          res.harness_advisory.some((a) => a.includes("read-only-finding-escalation")),
+        `Expected read-only-finding-escalation advisory for ${kind}`,
+      );
+      const esc = db.getEscalation(res.escalationId)!;
+      assert.equal(esc.blocking, false);
+      assert.equal(esc.status, "open");
+      assert.equal(esc.toTaskId, parent.id);
+      assert.equal(db.getTask(child.id)?.status, "ready");
+      assert.match(buildImmutableSystemPrompt(3, kind, "off"), /non-blocking and you keep working/);
+
+      const p0Res = (await orch.toolExecutor.execute(run.id, child.id, "report_issue", {
+        severity: "P0", category: "security_risk", title: `${kind} P0`, evidence_paths: ["a.ts"], blocking: false,
+      })) as { escalationId: string; routedTo: string; blocking: boolean };
+      assert.equal(p0Res.routedTo, "human");
+      assert.equal(p0Res.blocking, false);
+      assert.equal(db.getEscalation(p0Res.escalationId)?.blocking, false);
+      assert.equal(db.getTask(child.id)?.status, "ready");
+
+      db.updateTask(child.id, { status: "completed" });
+      const resolved = db.getEscalation(res.escalationId)!;
+      assert.equal(resolved.status, "resolved");
+      assert.equal(resolved.resolution, `Auto-resolved: raising task ${child.id} completed`);
+      assert.equal(db.getEscalation(p0Res.escalationId)?.status, "open");
+    }
+
+    // Director bucket owner routing reports `director:<chatSessionId>` as routedTo.
+    const bucket = await orch.ensureDirectorTaskRun("chat-99", repoRoot);
+    const [bucketOwner] = db.listTasks(bucket.id, { parentId: null });
+    assert.ok(bucketOwner);
+    const bucketChild = db.createTask({
+      runId: bucket.id, parentId: bucketOwner.id, tier: 3, kind: "research", title: "Bucket research", objective: "Inspect", profileId: "acp:codex",
+    });
+    const bucketRes = (await orch.toolExecutor.execute(bucket.id, bucketChild.id, "report_issue", {
+      severity: "P1", category: "code_defect", title: "Bucket finding", evidence_paths: ["a.ts"],
+    })) as { escalationId: string; routedTo: string; blocking: boolean };
+    assert.equal(bucketRes.routedTo, "director:chat-99");
+    assert.equal(bucketRes.blocking, false);
+    db.updateTask(bucketChild.id, { status: "completed" });
+    assert.equal(db.getEscalation(bucketRes.escalationId)?.status, "resolved");
+
+    const workerA = db.createTask({
+      runId: run.id, parentId: parent.id, tier: 2, kind: "worker", title: "Worker A", objective: "A", profileId: "acp:codex",
+    });
+    const resA = (await orch.toolExecutor.execute(run.id, workerA.id, "report_issue", {
+      severity: "P1", category: "code_defect", title: "Blocker A", evidence_paths: ["a.ts"],
+    })) as { escalationId: string; blocking: boolean; harness_advisory?: string[] };
+    assert.equal(resA.blocking, true);
+    assert.equal(resA.harness_advisory, undefined);
+    assert.equal(db.getTask(workerA.id)?.status, "blocked");
+    assert.equal(db.getEscalation(resA.escalationId)?.status, "open");
+    assert.equal(db.getEscalation(resA.escalationId)?.toTaskId, parent.id);
+    db.updateTask(workerA.id, { status: "running" });
+    db.updateTask(workerA.id, { status: "completed" });
+    assert.equal(db.getEscalation(resA.escalationId)?.status, "resolved");
+    assert.equal(db.getEscalation(resA.escalationId)?.resolution, `Auto-resolved: raising task ${workerA.id} completed`);
+
+    const workerB = db.createTask({
+      runId: run.id, parentId: parent.id, tier: 2, kind: "worker", title: "Worker B", objective: "B", profileId: "acp:codex",
+    });
+    const resB = (await orch.toolExecutor.execute(run.id, workerB.id, "report_issue", {
+      severity: "P2", category: "code_defect", title: "Note B", evidence_paths: ["b.ts"], blocking: false,
+    })) as { escalationId: string };
+    db.updateTask(workerB.id, { status: "completed" });
+    assert.equal(db.getEscalation(resB.escalationId)?.status, "open");
+
+    const workerC = db.createTask({
+      runId: run.id, parentId: parent.id, tier: 2, kind: "worker", title: "Worker C", objective: "C", profileId: "acp:codex",
+    });
+    const resC = (await orch.toolExecutor.execute(run.id, workerC.id, "report_issue", {
+      severity: "P0", category: "security_risk", title: "Human C", evidence_paths: ["c.ts"],
+    })) as { escalationId: string; routedTo: string };
+    assert.equal(resC.routedTo, "human");
+    assert.equal(db.getEscalation(resC.escalationId)?.toTaskId, null);
+    db.updateTask(workerC.id, { status: "running" });
+    db.updateTask(workerC.id, { status: "completed" });
+    assert.equal(db.getEscalation(resC.escalationId)?.status, "open");
+
+    const workerD = db.createTask({
+      runId: run.id, parentId: parent.id, tier: 2, kind: "worker", title: "Worker D", objective: "D", profileId: "acp:codex",
+    });
+    const resD = (await orch.toolExecutor.execute(run.id, workerD.id, "return_task", {
+      status: "scope_too_large", summary: "Too wide", evidence_paths: ["d.ts"], suggested_splits: ["Part 1", "Part 2"],
+    })) as { escalationId: string };
+    assert.equal(db.getTask(workerD.id)?.status, "returned_for_rescope");
+    assert.equal(db.getEscalation(resD.escalationId)?.status, "open");
+    db.updateTask(workerD.id, { status: "cancelled" });
+    assert.equal(db.getEscalation(resD.escalationId)?.status, "resolved");
+    assert.equal(db.getEscalation(resD.escalationId)?.resolution, `Auto-resolved: raising task ${workerD.id} cancelled`);
+
+    const workerE = db.createTask({
+      runId: run.id, parentId: parent.id, tier: 2, kind: "worker", title: "Worker E", objective: "E", profileId: "acp:codex",
+    });
+    const resE = (await orch.toolExecutor.execute(run.id, workerE.id, "report_issue", {
+      severity: "P1", category: "broken_test", title: "Blocker E", evidence_paths: ["e.ts"],
+    })) as { escalationId: string };
+    db.updateTask(workerE.id, { status: "failed" });
+    assert.equal(db.getEscalation(resE.escalationId)?.status, "open");
   } finally {
     db.close();
     rmSync(repoRoot, { recursive: true, force: true });

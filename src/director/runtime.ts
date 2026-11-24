@@ -1317,12 +1317,35 @@ export class DirectorRuntime {
       return;
     }
 
-    // Wake Director immediately on P0 escalations or manual quota pauses for any linked Goal
+    // Record bucket-owner escalations on their Director chat, and wake Director on P0 escalations for linked Goals
     if (ev.type === "escalation.created") {
+      const p = ev.payload as {
+        id?: string;
+        severity?: string;
+        category?: string;
+        title?: string;
+        fromTaskId?: string;
+        toTaskId?: string | null;
+      } | null;
+      const bucketSessionId = directorTaskRunOwner(ev.runId);
+      if (bucketSessionId && p?.toTaskId) {
+        const owner = this.db.listTasks(ev.runId, { parentId: null })[0];
+        if (owner && p.toTaskId === owner.id && this.chats.getSession(bucketSessionId)) {
+          const escId = String(p.id ?? "unknown");
+          const sev = String(p.severity ?? "P1");
+          const cat = p.category ? `/${p.category}` : "";
+          const from = String(p.fromTaskId ?? ev.taskId ?? "unknown");
+          const title = String(p.title ?? "Escalation raised");
+          this.chats.appendTurn(
+            bucketSessionId,
+            "system_notice",
+            `Escalation ${escId} [${sev}${cat}] from ${from}: ${title} (close with resolve_escalation).`,
+          );
+        }
+      }
       if (!wakeOnSettle) return;
       // The caller creating this escalation wakes the Director itself (blocked settle or review transition).
       if (this.suppressEscalationWakeRuns.has(ev.runId)) return;
-      const p = ev.payload as { id?: string; severity?: string; title?: string } | null;
       if (p?.severity !== "P0") return;
       const row = this.db.db
         .prepare("SELECT id FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1")
