@@ -716,14 +716,28 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
       await cancelRescopeP;
       assert.equal(daemon.db.getTask(tRescope.id)?.status, "returned_for_rescope");
 
-      const tBlocked = await daemon.orchestrator.spawnAndStartTask({
+      const blockedParent = daemon.db.createTask({
         runId: run.id,
         parentId: parent.id,
+        tier: 2,
+        kind: "worker",
+        title: "Blocked race worker",
+        objective: "Parent worker for writable execute task",
+        readOnly: false,
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      daemon.db.updateTask(blockedParent.id, { status: "running" });
+      await daemon.orchestrator.getWorktreeManager(repoRoot).createForWorker(run.id, blockedParent.id);
+
+      const tBlocked = await daemon.orchestrator.spawnAndStartTask({
+        runId: run.id,
+        parentId: blockedParent.id,
         tier: 3,
-        kind: "research",
+        kind: "execute",
         title: "Blocked race",
         objective: "CASE_CANCEL_RACE_BLOCKED",
-        readOnly: true,
+        readOnly: false,
         profileId: "pi:local",
         model: "fixture/fixture",
       });
@@ -895,10 +909,10 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
         runId: run.id,
         parentId: parent.id,
         tier: 3,
-        kind: "research",
+        kind: "execute",
         title: "Blocked T3",
         objective: "Research",
-        readOnly: true,
+        readOnly: false,
         profileId: "pi:local",
         model: "fixture/fixture",
       });
