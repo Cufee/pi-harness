@@ -1,14 +1,18 @@
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawnDaemonDetached } from "./launch.js";
-import { killProcessGroups } from "./reap.js";
+import { killProcessGroups, listChildProcessGroups } from "./reap.js";
 import { readReleaseAt, type ReleaseTarget } from "./release.js";
 import { DaemonClient } from "./remote.js";
 import { parsePositiveEnvMs, type DaemonPingInfo } from "./hot-update.js";
 
 const DEFAULT_BOOT_TIMEOUT_MS = 20_000;
 const WAIT_OLD_PID_TIMEOUT_MS = 5_000;
+const LEGACY_STOP_TIMEOUT_DEFAULT_MS = 10_000;
+const LEGACY_STOP_TIMEOUT_RESTART_SAFE_MS = 30_000;
+const LEGACY_SIGKILL_WAIT_MS = 5_000;
+const LEGACY_REAP_GRACE_MS = 2_500;
 
 export interface SuperviseOptions {
   socketPath: string;
@@ -16,6 +20,7 @@ export interface SuperviseOptions {
   previous: ReleaseTarget | null;
   waitPid?: number;
   stopPid?: number;
+  stopRestartSafe?: boolean;
   overlayRoot?: string;
   fromReleaseId?: string;
   affectedRunIds?: string[];
@@ -74,6 +79,36 @@ async function probeDaemonPing(socketPath: string, timeoutMs = 1500): Promise<Da
   }
 }
 
+async function sendShutdownRpc(socketPath: string, timeoutMs = 2000): Promise<void> {
+  const client = new DaemonClient(socketPath);
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    await Promise.race([
+      client.connect(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("connect timeout")), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    await Promise.race([
+      client.request("daemon.shutdown", { restart: true }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("shutdown timeout")), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } catch {
+    // Pre-feature daemon may not recognize daemon.shutdown or may already be closing.
+  } finally {
+    if (timer) clearTimeout(timer);
+    client.close();
+  }
+}
+
 interface BootAttemptResult {
   ok: boolean;
   ping?: DaemonPingInfo;
@@ -88,6 +123,7 @@ async function startAndWaitForRelease(
   env: Record<string, string>,
   bootTimeoutMs: number,
   expectedReleaseId: string | null,
+  oldPid?: number,
 ): Promise<BootAttemptResult> {
   let exitStatus: string | null = null;
   const child = spawnDaemonDetached(release, socketPath, env);
@@ -98,10 +134,17 @@ async function startAndWaitForRelease(
     exitStatus = err.message;
   });
 
+  const matches = (ping: DaemonPingInfo | null): ping is DaemonPingInfo =>
+    Boolean(
+      ping &&
+        (oldPid === undefined || ping.pid !== oldPid) &&
+        (expectedReleaseId === null || ping.releaseId === expectedReleaseId),
+    );
+
   const deadline = Date.now() + bootTimeoutMs;
   while (Date.now() < deadline) {
     const ping = await probeDaemonPing(socketPath, Math.min(1500, Math.max(200, deadline - Date.now())));
-    if (ping && (expectedReleaseId === null || ping.releaseId === expectedReleaseId)) {
+    if (matches(ping)) {
       return { ok: true, ping, childPid: child.pid, childExited: exitStatus !== null };
     }
     if (exitStatus !== null && !existsSync(socketPath)) {
@@ -118,7 +161,7 @@ async function startAndWaitForRelease(
 
   // Final check at deadline before declaring timeout.
   const finalPing = await probeDaemonPing(socketPath, 500);
-  if (finalPing && (expectedReleaseId === null || finalPing.releaseId === expectedReleaseId)) {
+  if (matches(finalPing)) {
     return { ok: true, ping: finalPing, childPid: child.pid, childExited: exitStatus !== null };
   }
 
@@ -172,12 +215,21 @@ export async function runSupervisor(o: SuperviseOptions): Promise<number> {
 
   const targetBootTimeoutMs =
     o.bootTimeoutMs ?? parsePositiveEnvMs(process.env.PI_HARNESS_SUPERVISE_BOOT_TIMEOUT_MS) ?? DEFAULT_BOOT_TIMEOUT_MS;
+  const fallbackFilePath = join(dirname(o.socketPath), "reload-fallback.txt");
+  try {
+    rmSync(fallbackFilePath, { force: true });
+  } catch {
+    // ignore
+  }
 
   // Scrub handover env vars so spawned daemons only receive what this supervisor explicitly sets.
   delete process.env.PI_HARNESS_RELOAD_FROM;
   delete process.env.PI_HARNESS_RELOAD_FAILED;
   delete process.env.PI_HARNESS_OVERLAY_ROOT;
   delete process.env.PI_HARNESS_LEGACY_STOP_AT;
+
+  const oldPid = o.waitPid ?? o.stopPid;
+  let legacyStopAt: number | undefined;
 
   if (o.waitPid && o.waitPid > 0) {
     logSupervisor(`waiting up to ${WAIT_OLD_PID_TIMEOUT_MS}ms for old daemon pid ${o.waitPid} to exit`);
@@ -188,14 +240,50 @@ export async function runSupervisor(o: SuperviseOptions): Promise<number> {
       logSupervisor(`old daemon pid ${o.waitPid} exited`);
     }
   } else if (o.stopPid && o.stopPid > 0) {
-    // Seam for slice 4a-2: legacy stopPid path plugs in here.
-    logSupervisor(`stopPid (${o.stopPid}) is not supported in this build`);
-    return 1;
+    const recordedPgids = listChildProcessGroups(o.stopPid);
+    legacyStopAt = Date.now();
+    const stopTimeoutMs = o.stopRestartSafe ? LEGACY_STOP_TIMEOUT_RESTART_SAFE_MS : LEGACY_STOP_TIMEOUT_DEFAULT_MS;
+    logSupervisor(
+      `legacy stop: pid=${o.stopPid}, restartSafe=${Boolean(o.stopRestartSafe)}, timeout=${stopTimeoutMs}ms, recordedPgids=[${recordedPgids.join(",")}], legacyStopAt=${legacyStopAt}`,
+    );
+
+    if (isPidAlive(o.stopPid)) {
+      await sendShutdownRpc(o.socketPath);
+      await new Promise((r) => setTimeout(r, 150));
+      if (isPidAlive(o.stopPid)) {
+        try {
+          process.kill(o.stopPid, "SIGTERM");
+        } catch {
+          // already exited
+        }
+      }
+      const exited = await waitForPidExit(o.stopPid, stopTimeoutMs);
+      if (!exited) {
+        logSupervisor(`legacy stop: pid ${o.stopPid} still alive after ${stopTimeoutMs}ms; sending SIGKILL`);
+        try {
+          process.kill(o.stopPid, "SIGKILL");
+        } catch {
+          // already exited
+        }
+        const killedExit = await waitForPidExit(o.stopPid, LEGACY_SIGKILL_WAIT_MS);
+        logSupervisor(`legacy stop: pid ${o.stopPid} after SIGKILL exited=${killedExit}`);
+      } else {
+        logSupervisor(`legacy stop: pid ${o.stopPid} exited`);
+      }
+    } else {
+      logSupervisor(`legacy stop: pid ${o.stopPid} already exited`);
+    }
+
+    if (recordedPgids.length > 0) {
+      const sigkilled = await killProcessGroups(recordedPgids, LEGACY_REAP_GRACE_MS);
+      logSupervisor(`legacy stop: reaped ${recordedPgids.length} recorded process group(s) (sigkill=${sigkilled})`);
+    }
   }
 
   const targetEnv: Record<string, string> = {};
   if (o.fromReleaseId) targetEnv.PI_HARNESS_RELOAD_FROM = o.fromReleaseId;
   if (o.overlayRoot) targetEnv.PI_HARNESS_OVERLAY_ROOT = o.overlayRoot;
+  if (legacyStopAt !== undefined) targetEnv.PI_HARNESS_LEGACY_STOP_AT = String(legacyStopAt);
 
   logSupervisor(`starting target release ${o.target.releaseId} (${o.target.releaseDir}), timeout=${targetBootTimeoutMs}ms`);
   const targetAttempt = await startAndWaitForRelease(
@@ -204,6 +292,7 @@ export async function runSupervisor(o: SuperviseOptions): Promise<number> {
     targetEnv,
     targetBootTimeoutMs,
     o.target.releaseId,
+    oldPid,
   );
   if (targetAttempt.ok) {
     logSupervisor(`target release ${o.target.releaseId} is serving (pid ${targetAttempt.ping?.pid ?? "?"})`);
@@ -222,7 +311,9 @@ export async function runSupervisor(o: SuperviseOptions): Promise<number> {
     return 1;
   }
 
-  const prev = readReleaseAt(o.previous.releaseDir) ?? o.previous;
+  const prevRead = readReleaseAt(o.previous.releaseDir);
+  const prev = prevRead ?? o.previous;
+  const prevHasReleaseJson = prevRead !== null;
   const fallbackEnv: Record<string, string> = {
     PI_HARNESS_RELOAD_FAILED: JSON.stringify({
       targetReleaseId: o.target.releaseId,
@@ -238,10 +329,28 @@ export async function runSupervisor(o: SuperviseOptions): Promise<number> {
     o.socketPath,
     fallbackEnv,
     DEFAULT_BOOT_TIMEOUT_MS,
-    prev.releaseId,
+    prevHasReleaseJson ? prev.releaseId : null,
+    oldPid,
   );
   if (fallbackAttempt.ok) {
-    // Seam for slice 4a-2: check !fallbackAttempt.ping?.restartSafe && o.affectedRunIds to write reload-fallback.txt.
+    const isPreFeatureFallback = !prevHasReleaseJson || fallbackAttempt.ping?.restartSafe !== true;
+    if (isPreFeatureFallback && o.affectedRunIds && o.affectedRunIds.length > 0) {
+      const resumeLines = o.affectedRunIds.map((runId) => `pi-harness resume ${runId}`);
+      const content = [
+        `# Fallback release (${prev.releaseId}) is not restart-safe; resume affected runs with:`,
+        ...resumeLines,
+        "",
+      ].join("\n");
+      try {
+        writeFileSync(fallbackFilePath, content, "utf8");
+        logSupervisor(`wrote fallback resume commands to ${fallbackFilePath}`);
+      } catch (err) {
+        logSupervisor(`failed to write ${fallbackFilePath}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      for (const line of resumeLines) {
+        logSupervisor(line);
+      }
+    }
     logSupervisor(`fallback release ${prev.releaseId} is serving (pid ${fallbackAttempt.ping?.pid ?? "?"}); exiting 3`);
     return 3;
   }
