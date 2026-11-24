@@ -138,6 +138,7 @@ describe("goal-20 integration: DirectorRuntime gate-activity events and compact 
           remote: "origin",
           refs: ["abc1234..def5678 main -> main"],
           confirmed: true,
+          toolCallId: "c1",
         });
 
         // Re-emitting completed (both without and with args) yields no duplicate event.
@@ -195,6 +196,86 @@ describe("goal-20 integration: DirectorRuntime gate-activity events and compact 
         });
         assert.equal(gateEvents().length, 2);
 
+        // Non-shell file write mentioning "git push" and shell echo mentioning "git push" produce NO events (P2-c).
+        daemon.db.emitEvent(run.id, worker.id, "agent.tool", {
+          id: "w1",
+          name: "Write",
+          kind: "edit",
+          status: "in_progress",
+          title: "Write README.md",
+          args: JSON.stringify({ path: "README.md", content: "To publish, run git push origin main" }),
+        });
+        daemon.db.emitEvent(run.id, worker.id, "agent.tool", {
+          id: "w1",
+          name: "Write",
+          kind: "edit",
+          status: "completed",
+          title: "Write README.md",
+          result: "ok",
+        });
+        daemon.db.emitEvent(run.id, worker.id, "agent.tool", {
+          id: "e1",
+          name: "Bash",
+          kind: "execute",
+          status: "completed",
+          title: "Bash",
+          args: JSON.stringify({ command: 'echo "To publish, run git push origin main"' }),
+          result: "To publish, run git push origin main",
+        });
+        assert.equal(gateEvents().length, 2, "non-shell writes and echoed push text must not emit remote_push");
+
+        // Partially rejected multi-ref push (status: failed, but one ref updated in error text) DOES emit confirmed remote_push (P2-d).
+        daemon.db.emitEvent(run.id, worker.id, "agent.tool", {
+          id: "c3",
+          name: "Bash",
+          kind: "execute",
+          status: "in_progress",
+          title: "Bash",
+          args: JSON.stringify({ command: "git push origin feat main" }),
+        });
+        daemon.db.emitEvent(run.id, worker.id, "agent.tool", {
+          id: "c3",
+          name: "Bash",
+          kind: "execute",
+          status: "failed",
+          title: "Bash",
+          error:
+            "To origin\n   aaa1111..bbb2222  feat -> feat\n ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs",
+        });
+        assert.equal(gateEvents().length, 3);
+        const partialEv = gateEvents()[2]!;
+        assert.equal(partialEv.activity, "remote_push");
+        assert.equal(partialEv.confirmed, true);
+        assert.deepEqual(partialEv.refs, ["aaa1111..bbb2222 feat -> feat"]);
+        assert.equal(partialEv.toolCallId, "c3");
+
+        // Fully rejected push (status: failed, no updated refs) produces NO event (P2-d).
+        daemon.db.emitEvent(run.id, worker.id, "agent.tool", {
+          id: "c4",
+          name: "Bash",
+          kind: "execute",
+          status: "failed",
+          title: "Bash",
+          args: JSON.stringify({ command: "git push origin main" }),
+          error: "To origin\n ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs",
+        });
+        assert.equal(gateEvents().length, 3);
+
+        // Push followed by a failing command (status: failed, ref update confirmed in error text) DOES emit remote_push (P2-d).
+        daemon.db.emitEvent(run.id, worker.id, "agent.tool", {
+          id: "c5",
+          name: "Bash",
+          kind: "execute",
+          status: "failed",
+          title: "Bash",
+          args: JSON.stringify({ command: "git push origin feat2 && false" }),
+          error: "To origin\n   ccc1111..ddd2222  feat2 -> feat2\nexit status 1",
+        });
+        assert.equal(gateEvents().length, 4);
+        assert.equal(gateEvents()[3]!.confirmed, true);
+        assert.deepEqual(gateEvents()[3]!.refs, ["ccc1111..ddd2222 feat2 -> feat2"]);
+        assert.equal(gateEvents()[3]!.toolCallId, "c5");
+
         // When wakes are disabled, gate activity is still recorded as a system_notice turn.
         daemon.director.updateConfig({
           ...config,
@@ -209,7 +290,7 @@ describe("goal-20 integration: DirectorRuntime gate-activity events and compact 
           objective: "Edit files",
           profileId: "fixture",
         });
-        assert.equal(gateEvents().length, 2, "must not call wakeHandler when wakeDirectorOnGoalSettle is false");
+        assert.equal(gateEvents().length, 4, "must not call wakeHandler when wakeDirectorOnGoalSettle is false");
         const notices = daemon.director.chats
           .getHistory(chat.id)
           .filter((t) => t.role === "system_notice" && t.event?.kind === "goal.gate_activity");
@@ -369,10 +450,11 @@ describe("goal-20 integration: DirectorRuntime gate-activity events and compact 
           run: async (req) => {
             if (req.taskId.startsWith("chat-")) {
               defaultResult = (await req.executeTool("goal_get", { goal_id: goalId })) as Record<string, unknown>;
+              const firstCursor = (defaultResult.reviewsPage as { nextBefore: string | null }).nextBefore;
               pagedResult = (await req.executeTool("goal_get", {
                 goal_id: goalId,
                 sections: ["reviews"],
-                reviews_before_cycle: 12,
+                reviews_before: firstCursor,
                 reviews_limit: 5,
               })) as Record<string, unknown>;
               return { text: "inspected", stopReason: "completed" };
@@ -472,11 +554,11 @@ describe("goal-20 integration: DirectorRuntime gate-activity events and compact 
           assert.ok(["passed", "failed", "not_evaluated"].includes(c.status), `unexpected status ${c.status}`);
         }
 
-        const reviewsOut = defaultResult.reviews as Array<{ cycle: number; criteriaResults?: unknown[] }>;
+        const reviewsOut = defaultResult.reviews as Array<{ id: string; cycle: number; criteriaResults?: unknown[] }>;
         assert.equal(reviewsOut.length, 1);
         assert.equal(reviewsOut[0]!.cycle, 12);
         assert.equal(reviewsOut[0]!.criteriaResults?.length, 18);
-        assert.deepEqual(defaultResult.reviewsPage, { total: 12, returned: 1, nextBeforeCycle: 12 });
+        assert.deepEqual(defaultResult.reviewsPage, { total: 12, returned: 1, nextBefore: reviewsOut[0]!.id });
 
         const goalOut = defaultResult.goal as { description: { chars: number; path: string | null } };
         assert.equal(goalOut.description.chars, 40_000);

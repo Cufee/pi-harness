@@ -141,6 +141,8 @@ export type ChatControlEvent =
       refs?: string[];
       /** remote_push: true when the tool output shows a ref update; false when only the command was seen. */
       confirmed?: boolean;
+      /** remote_push: tool call / occurrence id used to keep distinct pushes separate when coalescing. */
+      toolCallId?: string;
     }
   | {
       /** Goal lifecycle events queued during a busy Director turn, coalesced and delivered in one turn (oldest first). */
@@ -176,7 +178,9 @@ export function coalesceGoalEvents(events: GoalLifecycleChatEvent[]): GoalLifecy
     e.kind === "task.settled"
       ? `task:${e.taskId}`
       : e.kind === "goal.gate_activity"
-        ? `gate:${e.runId}:${e.activity}:${e.taskId}:${(e.refs ?? []).join(",")}:${e.command ?? ""}`
+        ? e.toolCallId
+          ? `gate:${e.runId}:${e.activity}:${e.taskId}:call:${e.toolCallId}`
+          : `gate:${e.runId}:${e.activity}:${e.taskId}:${(e.refs ?? []).join(",")}:${e.command ?? ""}`
         : `${e.goalId}\u0000${e.kind}`;
   const last = new Map<string, number>();
   const firstFrom = new Map<string, number>();
@@ -434,6 +438,7 @@ export function parseChatControlEvent(raw: unknown): ChatControlEvent | null {
       const title = typeof r.title === "string" ? r.title.replace(/\s+/g, " ").trim().slice(0, 160) : "";
       const command = typeof r.command === "string" ? r.command.replace(/\s+/g, " ").trim().slice(0, 200) : "";
       const remote = typeof r.remote === "string" ? r.remote.trim().slice(0, 200) : "";
+      const toolCallId = typeof r.toolCallId === "string" ? r.toolCallId.trim().slice(0, 120) : "";
       const refs = Array.isArray(r.refs)
         ? r.refs
             .filter((x): x is string => typeof x === "string" && x.trim().length > 0)
@@ -457,6 +462,7 @@ export function parseChatControlEvent(raw: unknown): ChatControlEvent | null {
         ...(remote ? { remote } : {}),
         ...(refs.length > 0 ? { refs } : {}),
         ...(typeof r.confirmed === "boolean" ? { confirmed: r.confirmed } : {}),
+        ...(toolCallId ? { toolCallId } : {}),
       };
     }
     case "goal.events_batch": {

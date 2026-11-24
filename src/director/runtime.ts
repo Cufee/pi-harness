@@ -77,6 +77,7 @@ import {
   buildGateActivityEvent,
   detectGitPush,
   goalGateState,
+  isShellToolEvent,
   looksLikeGitPush,
   type GoalGate,
 } from "./gate-activity.js";
@@ -1209,20 +1210,29 @@ export class DirectorRuntime {
       if (directorTaskRunOwner(ev.runId) !== null) return;
       const p = ev.payload as {
         id?: string;
+        name?: string;
+        kind?: string;
         status?: string;
         title?: string;
         args?: unknown;
         result?: unknown;
+        error?: unknown;
+        denied?: unknown;
       } | null;
       if (!p || typeof p.status !== "string") return;
       const callId = typeof p.id === "string" && p.id ? p.id : null;
       const cacheKey = callId ? `${ev.taskId}:${callId}` : null;
-      const titleText = typeof p.title === "string" ? p.title : "";
+      const rawTitle = typeof p.title === "string" ? p.title.trim() : "";
+      const titleCmdText = rawTitle.replace(/^(?:bash|sh|zsh|shell|terminal|execute|run)(?::\s+|\s+(?=(?:[A-Za-z_]\w*=\S*\s+)*(?:\/\S*\/)?git\b))/i, "");
       const argsText =
         typeof p.args === "string" ? p.args : p.args && typeof p.args === "object" ? JSON.stringify(p.args) : "";
-      const ownText = [titleText, argsText].filter(Boolean).join("\n");
+      const ownText = [argsText, titleCmdText].filter(Boolean).join("\n");
+      const stringifyOutput = (v: unknown): string | undefined =>
+        typeof v === "string" ? v : v && typeof v === "object" ? JSON.stringify(v) : undefined;
+      const hasExplicitNonShellKind = typeof p.kind === "string" && p.kind.trim().length > 0 && !isShellToolEvent(p);
 
       if (p.status === "pending" || p.status === "in_progress") {
+        if (!isShellToolEvent(p)) return;
         if (cacheKey && ownText && looksLikeGitPush(ownText)) {
           if (this.pendingPushCommands.has(cacheKey)) {
             this.pendingPushCommands.delete(cacheKey);
@@ -1236,25 +1246,19 @@ export class DirectorRuntime {
       }
 
       if (p.status === "failed" || p.status === "error" || p.status === "cancelled") {
-        if (cacheKey) this.pendingPushCommands.delete(cacheKey);
-        return;
-      }
-
-      if (p.status === "completed") {
         const cachedText = cacheKey ? this.pendingPushCommands.get(cacheKey) : undefined;
         if (cacheKey) this.pendingPushCommands.delete(cacheKey);
+        if (p.status === "cancelled" || p.denied || hasExplicitNonShellKind) return;
+        if (!cachedText && !isShellToolEvent(p)) return;
         const commandText = ownText && looksLikeGitPush(ownText) ? ownText : cachedText ?? ownText;
         if (!commandText || !looksLikeGitPush(commandText)) return;
-        const resultText =
-          typeof p.result === "string"
-            ? p.result
-            : p.result && typeof p.result === "object"
-              ? JSON.stringify(p.result)
-              : undefined;
-        const push = detectGitPush(commandText, resultText);
-        if (!push) return;
+        const failureText = [stringifyOutput(p.result), stringifyOutput(p.error)].filter(Boolean).join("\n");
+        if (!failureText) return;
+        const push = detectGitPush(commandText, failureText);
+        if (!push || !push.confirmed) return;
         const taskTier = this.db.getTask(ev.taskId)?.tier ?? 2;
-        const dedupeKey = `push:${ev.taskId}:${callId ?? ev.seq}`;
+        const toolCallId = callId ?? String(ev.seq);
+        const dedupeKey = `push:${ev.taskId}:${toolCallId}`;
         this.notifyGateActivity(ev.runId, dedupeKey, (goal, gate) =>
           buildGateActivityEvent(goal, gate, "remote_push", {
             runId: ev.runId,
@@ -1264,6 +1268,34 @@ export class DirectorRuntime {
             remote: push.remote,
             refs: push.refs,
             confirmed: push.confirmed,
+            toolCallId,
+          }),
+        );
+        return;
+      }
+
+      if (p.status === "completed") {
+        const cachedText = cacheKey ? this.pendingPushCommands.get(cacheKey) : undefined;
+        if (cacheKey) this.pendingPushCommands.delete(cacheKey);
+        if (hasExplicitNonShellKind || (!cachedText && !isShellToolEvent(p))) return;
+        const commandText = ownText && looksLikeGitPush(ownText) ? ownText : cachedText ?? ownText;
+        if (!commandText || !looksLikeGitPush(commandText)) return;
+        const resultText = stringifyOutput(p.result);
+        const push = detectGitPush(commandText, resultText);
+        if (!push) return;
+        const taskTier = this.db.getTask(ev.taskId)?.tier ?? 2;
+        const toolCallId = callId ?? String(ev.seq);
+        const dedupeKey = `push:${ev.taskId}:${toolCallId}`;
+        this.notifyGateActivity(ev.runId, dedupeKey, (goal, gate) =>
+          buildGateActivityEvent(goal, gate, "remote_push", {
+            runId: ev.runId,
+            taskId: ev.taskId!,
+            taskTier,
+            command: push.command,
+            remote: push.remote,
+            refs: push.refs,
+            confirmed: push.confirmed,
+            toolCallId,
           }),
         );
       }
@@ -5807,21 +5839,18 @@ export class DirectorRuntime {
         const detail = this.goalDisplayData(g);
         const opts = parseGoalGetOptions(args);
         const evidenceDir = goalEvidenceDirOrNull(g);
-        const result = buildGoalGetResult(detail, opts, { evidenceDir, repoRoot: g.repoRoot });
-        // Preserve goal-18 v5 reviewer diagnostics fields (added on main after goal-20 Part A).
-        if (opts.sections.includes("goal") && result.goal && typeof result.goal === "object") {
-          (result.goal as Record<string, unknown>).lastReviewerFailure = detail.goal.lastReviewerFailure ?? null;
-        }
-        if (opts.sections.includes("reviews") && Array.isArray(result.reviews) && result.reviews.length > 0) {
-          const newestOut = result.reviews[0] as Record<string, unknown> | undefined;
-          const newestSrc =
-            newestOut && typeof newestOut.id === "string"
-              ? detail.reviews.find((r) => r.id === newestOut.id)
-              : undefined;
-          if (newestOut && newestSrc && newestSrc.diagnostics !== undefined) {
-            newestOut.diagnostics = newestSrc.diagnostics;
-          }
-        }
+        const reviewDiagnostics = new Map(
+          detail.reviews
+            .filter((r) => r.diagnostics !== undefined)
+            .map((r) => [r.id, r.diagnostics ?? null] as const),
+        );
+        const result = buildGoalGetResult(detail, opts, {
+          evidenceDir,
+          repoRoot: g.repoRoot,
+          lastReviewerFailure: detail.goal.lastReviewerFailure ?? null,
+          reviewDiagnostics,
+          reserveChars: 120,
+        });
         return {
           ...result,
           presentation_id: offerPresentation(() => buildGoalDetailDisplay(detail)),
