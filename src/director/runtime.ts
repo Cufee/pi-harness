@@ -3193,12 +3193,13 @@ export class DirectorRuntime {
    * Creates the detached `_verify` worktree for verification gates and Done-Review without switching the host
    * checkout's branch. Resolves `goal.verifyRef` when explicitly set (local ref, `origin/<ref>`, then source-only
    * `git fetch --no-tags origin -- <ref>` with `FETCH_HEAD` fallback), failing closed with `VerifyCheckoutError`
-   * if invalid or unresolved. Otherwise targets `run.baseBranch`, preferring this run's recorded merge commit
-   * (`refs/harness/merged/<runId>`) when it exists, is an ancestor of the base branch tip, and equals or descends
-   * from the run's latest promoted merge commit. If `run.baseBranch` no longer exists locally or on origin, falls
-   * back to `refs/harness/merged/<runId>` (source `"merged_commit"`); if neither exists (and HEAD is not that
-   * unborn branch), fails with `VerifyCheckoutError` naming remedies. Without a verify ref or run base branch,
-   * verification runs in the primary checkout and records that in `location`.
+   * if invalid or unresolved. Otherwise targets `run.baseBranch`, preferring this run's latest promoted merge
+   * commit from durable `merge.promoted` provenance (or legacy `refs/harness/merged/<runId>` when no provenance
+   * is recorded) when it resolves and is an ancestor of the base branch tip; otherwise falls back to the base
+   * branch tip. If `run.baseBranch` no longer exists locally or on origin, falls back to the latest promoted merge
+   * commit (or `refs/harness/merged/<runId>` when no provenance is recorded, source `"merged_commit"`); if neither
+   * exists (and HEAD is not that unborn branch), fails with `VerifyCheckoutError` naming remedies. Without a verify
+   * ref or run base branch, verification runs in the primary checkout and records that in `location`.
    */
   private async prepareVerifyCheckout(
     goal: GoalRecord,
@@ -3259,19 +3260,15 @@ export class DirectorRuntime {
       if (resolvedSha) {
         let targetSha = resolvedSha;
         if (!explicit && run) {
-          const mergedRefSha = await resolveCommit(runMergedRef(run.id));
-          if (mergedRefSha) {
-            const latestMergedSha = this.getLatestRunMergedSha(run.id);
-            const isAncestor = await runGit(goal.repoRoot, ["merge-base", "--is-ancestor", mergedRefSha, resolvedSha])
+          const latestMergedSha = this.getLatestRunMergedSha(run.id);
+          const candidateSha = latestMergedSha
+            ? await resolveCommit(latestMergedSha)
+            : await resolveCommit(runMergedRef(run.id));
+          if (candidateSha) {
+            const isAncestor = await runGit(goal.repoRoot, ["merge-base", "--is-ancestor", candidateSha, resolvedSha])
               .then(() => true)
               .catch(() => false);
-            const coversLatestMerge =
-              !latestMergedSha ||
-              mergedRefSha === latestMergedSha ||
-              (await runGit(goal.repoRoot, ["merge-base", "--is-ancestor", latestMergedSha, mergedRefSha])
-                .then(() => true)
-                .catch(() => false));
-            if (isAncestor && coversLatestMerge) targetSha = mergedRefSha;
+            if (isAncestor) targetSha = candidateSha;
           }
         }
         await addScratch(targetSha, resolvedRefName);
@@ -3281,11 +3278,22 @@ export class DirectorRuntime {
         );
       } else {
         const mergedRef = run ? runMergedRef(run.id) : null;
-        const mergedSha = mergedRef ? await resolveCommit(mergedRef) : null;
-        if (mergedSha && mergedRef && run) {
-          await addScratch(mergedSha, mergedRef);
+        const latestMergedSha = run ? this.getLatestRunMergedSha(run.id) : null;
+        const mergedSha = latestMergedSha
+          ? await resolveCommit(latestMergedSha)
+          : mergedRef
+            ? await resolveCommit(mergedRef)
+            : null;
+        if (mergedSha && run) {
+          const mergedLabel =
+            !latestMergedSha && mergedRef
+              ? mergedRef
+              : mergedRef && (await resolveCommit(mergedRef)) === mergedSha
+                ? mergedRef
+                : "merge.promoted";
+          await addScratch(mergedSha, mergedLabel);
           source = "merged_commit";
-          note = `base branch '${run.baseBranch}' no longer exists locally or on origin; verified run ${run.id}'s last merged commit ${mergedSha.slice(0, 7)} (${mergedRef}). To verify another ref, goal_amend verify_ref`;
+          note = `base branch '${run.baseBranch}' no longer exists locally or on origin; verified run ${run.id}'s last merged commit ${mergedSha.slice(0, 7)} (${mergedLabel}). To verify another ref, goal_amend verify_ref`;
         } else {
           // Keep existing unborn-branch behavior when HEAD equals run.baseBranch; fail closed otherwise.
           const headBranch = await runGit(goal.repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])

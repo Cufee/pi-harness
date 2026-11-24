@@ -871,4 +871,257 @@ describe("goal-18 Done-Review reliability", () => {
       rmSync(stateDir, { recursive: true, force: true });
     }
   });
+
+  it("prepareVerifyCheckout uses merge.promoted provenance over stale or missing merge refs even after an unpushed sibling merges onto main", async () => {
+    const repoRoot = await makeTempRepo();
+    const bareOrigin = mkdtempSync(join(tmpdir(), "pi-harness-g18-prov-origin-"));
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-g18-prov-comb-state-"));
+    const sockPath = join(stateDir, "d.sock");
+    const observedHeads: string[] = [];
+    const origWarn = console.warn;
+    console.warn = () => {};
+
+    try {
+      await runGit(bareOrigin, ["init", "--bare"]);
+      await runGit(repoRoot, ["remote", "add", "origin", bareOrigin]);
+      await runGit(repoRoot, ["push", "-u", "origin", "main"]);
+      await runGit(repoRoot, ["config", "core.packedRefsTimeout", "50"]);
+
+      const baseCfg = loadConfig(repoRoot);
+      const config = withFixtureCatalog({
+        ...baseCfg,
+        goals: { ...baseCfg.goals, autoVerifyOnSettle: false },
+        stateDir,
+        socketPath: sockPath,
+      });
+      const daemon = new HarnessDaemon(config, {
+        dbPath: ":memory:",
+        customRunnerFactory: () => ({
+          run: async (req) => {
+            if (req.kind !== "verify") return { text: "ok", stopReason: "completed" };
+            const head = (await runGit(req.cwd, ["rev-parse", "HEAD"])).stdout;
+            observedHeads.push(head);
+            await req.executeTool("submit_review_verdict", {
+              verdict: "approved",
+              criteriaResults: [{ criterionId: "behavior", passed: true, evidence: `checked ${head}` }],
+              blockingIssues: [],
+              summary: `Verified at ${head}.`,
+            });
+            return { text: "done", stopReason: "completed" };
+          },
+        }),
+      });
+
+      await daemon.start();
+      try {
+        const wtMgr = daemon.orchestrator.getWorktreeManager(repoRoot);
+        const mq = new BisectingMergeQueue(daemon.db, wtMgr, repoRoot, config.worktree);
+        const initialBaseSha = (await runGit(repoRoot, ["rev-parse", "main"])).stdout;
+
+        // Case 1: ref write fails on merge 2 due to pre-created locks (leaving a stale packed ref at merge 1),
+        // merge 2 is pushed to origin/main, then an unpushed sibling merges onto local main.
+        const runA = daemon.db.createRun({ goal: "Stale ref + sibling run A", repoRoot, baseBranch: "main", baseSha: initialBaseSha });
+        const taskA1 = daemon.db.createTask({
+          runId: runA.id,
+          parentId: null,
+          tier: 2,
+          kind: "execute",
+          title: "Worker A1",
+          objective: "Add a1.txt",
+          profileId: "fixture",
+        });
+        const wtA1 = await wtMgr.createForWorker(runA.id, taskA1.id, "main");
+        writeFileSync(join(wtA1.path, "a1.txt"), "a1\n", "utf8");
+        await runGit(wtA1.path, ["add", "a1.txt"]);
+        await runGit(wtA1.path, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "feat: a1"]);
+        daemon.db.enqueueMerge({ runId: runA.id, taskId: taskA1.id, worktreeId: wtA1.id, branch: wtA1.branch });
+        const mergedA1 = await mq.processNext(runA.id);
+        assert.ok(mergedA1?.mergedSha);
+
+        const refA = runMergedRef(runA.id);
+        await runGit(repoRoot, ["pack-refs", "--all"]);
+        const looseRefPathA = resolve(repoRoot, (await runGit(repoRoot, ["rev-parse", "--git-path", refA])).stdout);
+        const packedRefsPath = resolve(repoRoot, (await runGit(repoRoot, ["rev-parse", "--git-path", "packed-refs"])).stdout);
+        mkdirSync(dirname(looseRefPathA), { recursive: true });
+        writeFileSync(`${looseRefPathA}.lock`, "locked\n", "utf8");
+        writeFileSync(`${packedRefsPath}.lock`, "locked\n", "utf8");
+
+        const taskA2 = daemon.db.createTask({
+          runId: runA.id,
+          parentId: null,
+          tier: 2,
+          kind: "execute",
+          title: "Worker A2",
+          objective: "Add a2.txt",
+          profileId: "fixture",
+        });
+        const wtA2 = await wtMgr.createForWorker(runA.id, taskA2.id, "main");
+        writeFileSync(join(wtA2.path, "a2.txt"), "a2\n", "utf8");
+        await runGit(wtA2.path, ["add", "a2.txt"]);
+        await runGit(wtA2.path, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "feat: a2"]);
+        daemon.db.enqueueMerge({ runId: runA.id, taskId: taskA2.id, worktreeId: wtA2.id, branch: wtA2.branch });
+        const mergedA2 = await mq.processNext(runA.id);
+        assert.ok(mergedA2?.mergedSha);
+        assert.notEqual(mergedA2.mergedSha, mergedA1.mergedSha);
+
+        // Release locks for subsequent git commands while refA remains stale at mergedA1.
+        rmSync(`${looseRefPathA}.lock`, { force: true });
+        rmSync(`${packedRefsPath}.lock`, { force: true });
+        assert.equal((await runGit(repoRoot, ["rev-parse", "--verify", `${refA}^{commit}`])).stdout, mergedA1.mergedSha);
+
+        // Push Goal A's second merge commit to origin/main, then merge an unpushed sibling onto local main.
+        await runGit(repoRoot, ["push", "origin", `${mergedA2.mergedSha}:refs/heads/main`]);
+
+        const runSibling1 = daemon.db.createRun({
+          goal: "Unpushed sibling 1",
+          repoRoot,
+          baseBranch: "main",
+          baseSha: mergedA2.mergedSha,
+        });
+        const taskS1 = daemon.db.createTask({
+          runId: runSibling1.id,
+          parentId: null,
+          tier: 2,
+          kind: "execute",
+          title: "Worker S1",
+          objective: "Add s1.txt",
+          profileId: "fixture",
+        });
+        const wtS1 = await wtMgr.createForWorker(runSibling1.id, taskS1.id, "main");
+        writeFileSync(join(wtS1.path, "s1.txt"), "unpushed sibling 1\n", "utf8");
+        await runGit(wtS1.path, ["add", "s1.txt"]);
+        await runGit(wtS1.path, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "feat: unpushed sibling 1"]);
+        daemon.db.enqueueMerge({ runId: runSibling1.id, taskId: taskS1.id, worktreeId: wtS1.id, branch: wtS1.branch });
+        const mergedS1 = await mq.processNext(runSibling1.id);
+        assert.ok(mergedS1?.mergedSha);
+        assert.notEqual(mergedS1.mergedSha, mergedA2.mergedSha);
+
+        const localMainOnOrigin1 = await runGit(repoRoot, ["merge-base", "--is-ancestor", "main", "origin/main"])
+          .then(() => true)
+          .catch(() => false);
+        assert.equal(localMainOnOrigin1, false, "local main should sit ahead of origin/main with unpushed sibling 1");
+
+        const chat = await daemon.director.createChat({ repoRoot });
+        const goalA = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Goal A shipped with stale merge ref + sibling",
+          description: "Must verify promoted merge A2 even when refA is stale and local main has an unpushed sibling",
+          criteria: [
+            {
+              id: "shipped",
+              description: "Goal A's merge commit is on origin/main",
+              kind: "deterministic",
+              command: "git fetch -q origin && git merge-base --is-ancestor HEAD origin/main",
+              required: true,
+            },
+            { id: "behavior", description: "Behavior verified", kind: "behavioral", required: true },
+          ],
+        });
+        daemon.director.goals.linkRunAndStart(goalA.id, runA.id);
+
+        const outcomeA = await daemon.director.verifyAndReviewGoal(goalA.id);
+        assert.equal(observedHeads[0], mergedA2.mergedSha);
+        assert.notEqual(observedHeads[0], mergedS1.mergedSha);
+        assert.notEqual(observedHeads[0], mergedA1.mergedSha);
+        assert.equal(outcomeA.review.verdict, "approved");
+        assert.equal(outcomeA.goal.status, "achieved");
+        const shippedA = outcomeA.review.criteriaResults.find((c) => c.criterionId === "shipped");
+        assert.equal(shippedA?.passed, true);
+        assert.equal(shippedA?.gate?.sha, mergedA2.mergedSha);
+
+        // Case 2: ref write fails on merge 1 due to pre-created lock (so refs/harness/merged/<runId> does not exist at all),
+        // followed by pushing the promoted merge and merging another unpushed sibling onto local main.
+        const runC = daemon.db.createRun({ goal: "Missing ref + sibling run C", repoRoot, baseBranch: "main", baseSha: mergedS1.mergedSha });
+        const refC = runMergedRef(runC.id);
+        const looseRefPathC = resolve(repoRoot, (await runGit(repoRoot, ["rev-parse", "--git-path", refC])).stdout);
+        mkdirSync(dirname(looseRefPathC), { recursive: true });
+        writeFileSync(`${looseRefPathC}.lock`, "locked\n", "utf8");
+
+        const taskC = daemon.db.createTask({
+          runId: runC.id,
+          parentId: null,
+          tier: 2,
+          kind: "execute",
+          title: "Worker C",
+          objective: "Add c1.txt",
+          profileId: "fixture",
+        });
+        const wtC = await wtMgr.createForWorker(runC.id, taskC.id, "main");
+        writeFileSync(join(wtC.path, "c1.txt"), "c1\n", "utf8");
+        await runGit(wtC.path, ["add", "c1.txt"]);
+        await runGit(wtC.path, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "feat: c1"]);
+        daemon.db.enqueueMerge({ runId: runC.id, taskId: taskC.id, worktreeId: wtC.id, branch: wtC.branch });
+        const mergedC = await mq.processNext(runC.id);
+        assert.ok(mergedC?.mergedSha);
+        rmSync(`${looseRefPathC}.lock`, { force: true });
+
+        // Confirm refs/harness/merged/<runC.id> does not exist.
+        const refCExists = await runGit(repoRoot, ["rev-parse", "--verify", `${refC}^{commit}`])
+          .then(() => true)
+          .catch(() => false);
+        assert.equal(refCExists, false, "expected advisory merge ref to be absent after locked write");
+
+        await runGit(repoRoot, ["push", "origin", `${mergedC.mergedSha}:refs/heads/main`]);
+
+        const runSibling2 = daemon.db.createRun({
+          goal: "Unpushed sibling 2",
+          repoRoot,
+          baseBranch: "main",
+          baseSha: mergedC.mergedSha,
+        });
+        const taskS2 = daemon.db.createTask({
+          runId: runSibling2.id,
+          parentId: null,
+          tier: 2,
+          kind: "execute",
+          title: "Worker S2",
+          objective: "Add s2.txt",
+          profileId: "fixture",
+        });
+        const wtS2 = await wtMgr.createForWorker(runSibling2.id, taskS2.id, "main");
+        writeFileSync(join(wtS2.path, "s2.txt"), "unpushed sibling 2\n", "utf8");
+        await runGit(wtS2.path, ["add", "s2.txt"]);
+        await runGit(wtS2.path, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "feat: unpushed sibling 2"]);
+        daemon.db.enqueueMerge({ runId: runSibling2.id, taskId: taskS2.id, worktreeId: wtS2.id, branch: wtS2.branch });
+        const mergedS2 = await mq.processNext(runSibling2.id);
+        assert.ok(mergedS2?.mergedSha);
+        assert.notEqual(mergedS2.mergedSha, mergedC.mergedSha);
+
+        const goalC = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Goal C shipped with missing merge ref + sibling",
+          description: "Must verify promoted merge C even when refC is missing and local main has an unpushed sibling",
+          criteria: [
+            {
+              id: "shipped",
+              description: "Goal C's merge commit is on origin/main",
+              kind: "deterministic",
+              command: "git fetch -q origin && git merge-base --is-ancestor HEAD origin/main",
+              required: true,
+            },
+            { id: "behavior", description: "Behavior verified", kind: "behavioral", required: true },
+          ],
+        });
+        daemon.director.goals.linkRunAndStart(goalC.id, runC.id);
+
+        const outcomeC = await daemon.director.verifyAndReviewGoal(goalC.id);
+        assert.equal(observedHeads[1], mergedC.mergedSha);
+        assert.notEqual(observedHeads[1], mergedS2.mergedSha);
+        assert.equal(outcomeC.review.verdict, "approved");
+        assert.equal(outcomeC.goal.status, "achieved");
+        const shippedC = outcomeC.review.criteriaResults.find((c) => c.criterionId === "shipped");
+        assert.equal(shippedC?.passed, true);
+        assert.equal(shippedC?.gate?.sha, mergedC.mergedSha);
+      } finally {
+        await daemon.stop();
+      }
+    } finally {
+      console.warn = origWarn;
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(bareOrigin, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
 });
