@@ -17,6 +17,11 @@ export interface MergeOutcome {
   bouncedReason?: string;
 }
 
+/** Git ref storing the latest commit merged onto the target branch for a run. */
+export function runMergedRef(runId: string): string {
+  return `refs/harness/merged/${runId}`;
+}
+
 export interface MergeProcessOptions {
   preserveLiveTask?: boolean;
   signal?: AbortSignal;
@@ -433,6 +438,10 @@ export class BisectingMergeQueue {
           );
         }
       }
+
+      // Persist this run's latest merge commit as a git ref so verification checkouts evaluate the goal's
+      // own merged commit instead of a later local base tip containing sibling goals' unpushed merges.
+      await runGit(this.repoRoot, ["update-ref", runMergedRef(next.runId), mergedSha]).catch(() => {});
 
       const finished = this.db.finishMergeItem(next.id, "merged", ciLogs.join("\n"));
       const curTaskAfterMerge = this.db.getTask(next.taskId);
