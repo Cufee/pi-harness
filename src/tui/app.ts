@@ -24,6 +24,7 @@ import {
   ImmutableTranscript,
   Navigator,
   parseDurationMs,
+  type PinnedAttentionItem,
   RecentRefsRing,
   sanitizeLine,
   TerminalSession,
@@ -181,6 +182,8 @@ function createSharedShell(spec: SharedShellContext) {
   // Shares goal-33's `store.showInternal` flag (default false) with the Work Navigator.
   const MAX_HIDDEN_INTERNAL_LINES = 200;
   const hiddenInternalLines: Array<{ line: ClassifiedChatLine; timestampMs?: number | null }> = [];
+  const MAX_PINNED_ALERTS = 20;
+  const pinnedAlerts: PinnedAttentionItem[] = [];
 
   let dock!: FixedDock;
   let navigator!: Navigator;
@@ -231,18 +234,29 @@ function createSharedShell(spec: SharedShellContext) {
     glyph ? theme.glyphs[glyph] : undefined;
   const appendClassifiedLine = (
     line: ClassifiedChatLine,
-    optsLine?: { timestampMs?: number | null },
+    optsLine?: { timestampMs?: number | null; fromReplay?: boolean },
   ): boolean => {
     if (line.audience === "human") {
       if (line.ref) recentRefs.push(line.ref);
+      const glyph = resolveLineGlyph(line.glyph);
       transcript.appendReceipt({
-        glyph: resolveLineGlyph(line.glyph),
+        glyph,
         tone: line.tone,
         tag: line.tag,
         text: line.text,
         ref: line.ref,
         timestampMs: optsLine?.timestampMs,
       });
+      if (!optsLine?.fromReplay && transcript.liveTail.isActive) {
+        if (pinnedAlerts.length >= MAX_PINNED_ALERTS) pinnedAlerts.shift();
+        pinnedAlerts.push({
+          glyph,
+          tone: line.tone,
+          tag: line.tag,
+          text: line.text,
+        });
+        if (dock) syncDock();
+      }
       return true;
     }
     if (store.showInternal) {
@@ -1090,8 +1104,9 @@ function createSharedShell(spec: SharedShellContext) {
       case "clear":
         transcript.clearAll();
         hiddenInternalLines.length = 0;
+        pinnedAlerts.length = 0;
         spec.onClear?.();
-        session.tui.requestRender();
+        syncDock();
         return true;
       case "help":
         transcript.appendLines(["", ...renderHelp(spec.mode), ""]);
@@ -1124,6 +1139,7 @@ function createSharedShell(spec: SharedShellContext) {
       transientHint: null,
       rightStatus: spec.getRightStatus(),
       queuedCount: 0,
+      pinnedAlerts: [],
       queuedItems: [],
       canSteerQueued: Boolean(spec.onSteerQueued),
       hints: hasControl ? dockHints : readOnlyHints,
@@ -1131,6 +1147,10 @@ function createSharedShell(spec: SharedShellContext) {
     onSubmit: (raw) => {
       const text = raw.trim();
       if (!text) return;
+      if (pinnedAlerts.length > 0) {
+        pinnedAlerts.length = 0;
+        syncDock();
+      }
       if (text.startsWith("/")) {
         void handleSlash(text).catch((err) => {
           appendLiveReceipt({
@@ -1174,6 +1194,7 @@ function createSharedShell(spec: SharedShellContext) {
       transientHint,
       rightStatus: spec.getRightStatus(),
       queuedCount: queue.queuedLength,
+      pinnedAlerts: [...pinnedAlerts],
       queuedItems: queue.list(),
       canSteerQueued: Boolean(spec.onSteerQueued),
       hints: hasControl ? dockHints : readOnlyHints,
@@ -1418,6 +1439,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   let incompatibleMessage: string | null = null;
   let incompatibleDraft = "";
   let stopped = false;
+  let lastDaemonPid: number | null = null;
   const selfReleaseId = currentRelease().releaseId;
   const notedMismatchReleases = new Set<string>();
   const settledTurns = new Set<string>();
@@ -1425,20 +1447,27 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   let cancelOrigin: CancelOrigin = null;
   type PendingChatSend = { itemId: string; turnId: string; text: string; timestampMs: number };
   let pendingSend: PendingChatSend | null = null;
+  const inFlightSteers = new Map<string, { turnId: string; text: string }>();
   const unconfirmedMeta = new Map<string, { turnId: string | null; timestampMs: number }>();
+  const MATCHING_TRANSCRIPT_HINT = "a matching message is in the transcript; drop if same";
   const renderedSeqs = new Set<number>();
   const turnRenderedUsers: string[] = [];
   const turnFrozenSegments: string[] = [];
   const turnRenderedTools: string[] = [];
+  let turnHasAssistantHeader = false;
 
   const toolOutputFingerprint = (display: unknown): string => JSON.stringify(display);
   const resetTurnLiveTrackers = () => {
     turnRenderedUsers.length = 0;
     turnFrozenSegments.length = 0;
     turnRenderedTools.length = 0;
+    turnHasAssistantHeader = false;
   };
   const recordFrozenText = (frozen: string | null) => {
-    if (frozen && frozen.trim()) turnFrozenSegments.push(frozen);
+    if (frozen && frozen.trim()) {
+      turnFrozenSegments.push(frozen);
+      turnHasAssistantHeader = true;
+    }
   };
 
   const modelBadge = () => {
@@ -1451,17 +1480,34 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   let reconnect!: AutoReconnectHandle;
 
   const confirmPendingSend = (turnId: string | null, optsConfirm?: { skipUserCard?: boolean }): boolean => {
-    if (!pendingSend) return false;
-    if (turnId && pendingSend.turnId !== turnId) return false;
-    const ps = pendingSend;
-    pendingSend = null;
-    shell.queue.removeById(ps.itemId);
-    if (!optsConfirm?.skipUserCard) {
-      shell.transcript.appendUserTurn(ps.text, ps.timestampMs);
-      turnRenderedUsers.push(ps.text);
+    if (pendingSend) {
+      if (turnId && pendingSend.turnId !== turnId) return false;
+      const ps = pendingSend;
+      pendingSend = null;
+      shell.queue.removeById(ps.itemId);
+      if (!optsConfirm?.skipUserCard) {
+        shell.transcript.appendUserTurn(ps.text, ps.timestampMs);
+        turnRenderedUsers.push(ps.text);
+      }
+      shell.syncDock();
+      return true;
     }
-    shell.syncDock();
-    return true;
+    if (turnId) {
+      for (const [itemId, meta] of unconfirmedMeta) {
+        if (meta.turnId !== turnId) continue;
+        const item = shell.queue.get(itemId);
+        unconfirmedMeta.delete(itemId);
+        if (!item) continue;
+        shell.queue.removeById(itemId);
+        if (!optsConfirm?.skipUserCard) {
+          shell.transcript.appendUserTurn(item.text, meta.timestampMs);
+          turnRenderedUsers.push(item.text);
+        }
+        shell.syncDock();
+        return true;
+      }
+    }
+    return false;
   };
 
   const requeuePendingSend = (turnId: string, reason: ChatQueueReason): boolean => {
@@ -1630,6 +1676,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
 
     const turnId = activeTurnId;
     shell.queue.markSending(itemId);
+    inFlightSteers.set(itemId, { turnId, text: current.text });
     shell.syncDock();
     try {
       const res = await opts.client.request<{ steered?: boolean }>("chat.steer", {
@@ -1637,7 +1684,9 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         turnId,
         message: current.text,
       });
+      const stillInFlight = inFlightSteers.delete(itemId);
       if (res?.steered) {
+        if (!stillInFlight) return;
         confirmPendingSend(turnId);
         shell.queue.removeById(itemId);
         const steeredAt = Date.now();
@@ -1660,6 +1709,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       // If the active turn ended or cancelled while `chat.steer` was in flight, drain immediately!
       if (!sending) drainQueue();
     } catch (err) {
+      inFlightSteers.delete(itemId);
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.startsWith("DAEMON_RELOADING: ")) {
         reloadingBlocked = true;
@@ -1959,8 +2009,8 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
 
   type ReplayResult = {
     renderedAssistantCount: number;
-    renderedAssistantAfterLastBoundary: boolean;
-    renderedAssistantSegments: string[];
+    renderedToolCount: number;
+    detachedCovered: boolean;
   };
 
   const renderHistoryRows = (
@@ -1970,15 +2020,18 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       liveRenderedUsers?: string[];
       liveFrozenSegments?: string[];
       liveRenderedTools?: string[];
+      detachedText?: string;
     },
   ): ReplayResult => {
     let nextAssistantMeta = optsReplay?.firstAssistantMeta;
     const skipUsers = optsReplay?.liveRenderedUsers;
     const skipFrozen = optsReplay?.liveFrozenSegments;
     const skipTools = optsReplay?.liveRenderedTools;
+    const detachedTrimmed = optsReplay?.detachedText?.trim() ?? "";
     let renderedAssistantCount = 0;
-    let renderedAssistantAfterLastBoundary = false;
-    const renderedAssistantSegments: string[] = [];
+    let renderedToolCount = 0;
+    let detachedCovered = false;
+    let passedDetachedPosition = false;
 
     for (const turn of rows) {
       if (typeof turn.seq === "number" && turn.seq > 0) {
@@ -1987,12 +2040,13 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       }
       const turnTs = sourceTimestampMs(turn.createdAt);
       if (turn.role === "user") {
-        renderedAssistantAfterLastBoundary = false;
         if (skipUsers && skipUsers.length > 0 && skipUsers[0] === turn.content) {
           skipUsers.shift();
           continue;
         }
         shell.transcript.appendUserTurn(turn.content, turnTs);
+        // New user boundary first discovered in replay (not observed live).
+        passedDetachedPosition = true;
       } else if (turn.role === "assistant") {
         const content = turn.content;
         const meta = nextAssistantMeta;
@@ -2004,11 +2058,22 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         if (content.trim()) {
           shell.transcript.appendAssistantTurn(content, meta, turnTs);
           renderedAssistantCount += 1;
-          renderedAssistantAfterLastBoundary = true;
-          renderedAssistantSegments.push(content);
+          // Detached live text is covered only by a NEW assistant row at the exact position
+          // right after all live-observed boundaries, before any replay-discovered boundary.
+          if (
+            detachedTrimmed &&
+            !detachedCovered &&
+            !passedDetachedPosition &&
+            (skipTools?.length ?? 0) === 0 &&
+            (skipFrozen?.length ?? 0) === 0
+          ) {
+            if (content.trim().startsWith(detachedTrimmed)) {
+              detachedCovered = true;
+            }
+            passedDetachedPosition = true;
+          }
         }
       } else if (turn.role === "tool_output") {
-        renderedAssistantAfterLastBoundary = false;
         const display = parseToolDisplay(turn.display);
         const fp = display ? toolOutputFingerprint(display) : (turn.content || turn.toolName || "tool output");
         if (skipTools && skipTools.length > 0 && skipTools[0] === fp) {
@@ -2020,20 +2085,23 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         } else {
           shell.transcript.appendToolOutputNote(turn.content || turn.toolName || "tool output", turnTs);
         }
+        renderedToolCount += 1;
+        // New tool boundary first discovered in replay (not observed live).
+        passedDetachedPosition = true;
       } else if (turn.role === "system_notice") {
         const classified = classifyChatLine(
           { source: "replay", turn },
           { remoteHost: opts.remoteSelector ?? opts.remoteHost },
         );
         if (classified) {
-          shell.appendClassifiedLine(classified, { timestampMs: turnTs });
+          shell.appendClassifiedLine(classified, { timestampMs: turnTs, fromReplay: true });
         }
       }
     }
     return {
       renderedAssistantCount,
-      renderedAssistantAfterLastBoundary,
-      renderedAssistantSegments,
+      renderedToolCount,
+      detachedCovered,
     };
   };
 
@@ -2043,10 +2111,9 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   if (opened.busy) {
     sending = true;
     shell.transcript.beginLiveTurn(modelBadge());
-    // Seed from `activePartial` (only the unpersisted tail since last mid-turn flush) to avoid duplicating persisted turns!
-    const seed =
-      opened.activePartial ||
-      (opened.history.length === 0 && syncedThroughSeq === 0 ? opened.activeText : "");
+    // Seed strictly from `activePartial` (only the unpersisted tail since last mid-turn flush).
+    // Never fall back to cumulative `activeText`, which retains already-flushed segments.
+    const seed = typeof opened.activePartial === "string" ? opened.activePartial : "";
     if (seed) shell.transcript.liveTail.appendText(seed);
     shell.setStatus(true, "Director responding...");
   }
@@ -2125,7 +2192,26 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         if (p.role === "user") {
           const origin = typeof p.originClientId === "string" ? p.originClientId : null;
           const fromOther = origin ? origin !== shell.clientId() : !shell.hasControl();
-          if (fromOther && typeof p.message === "string") {
+          if (!fromOther && typeof p.message === "string") {
+            for (const [steerId, meta] of inFlightSteers) {
+              if ((!evTurnId || meta.turnId === evTurnId) && meta.text === p.message) {
+                inFlightSteers.delete(steerId);
+                shell.queue.removeById(steerId);
+                const steeredAt = evTs ?? Date.now();
+                recordFrozenText(shell.transcript.freezeLiveText(steeredAt));
+                shell.transcript.appendUserTurn(meta.text, steeredAt);
+                turnRenderedUsers.push(meta.text);
+                shell.transcript.appendReceipt({
+                  tone: "info",
+                  tag: "steered",
+                  text: "Delivered live steering to Director",
+                  timestampMs: steeredAt,
+                });
+                shell.syncDock();
+                break;
+              }
+            }
+          } else if (fromOther && typeof p.message === "string") {
             recordFrozenText(shell.transcript.freezeLiveText(evTs));
             shell.transcript.appendUserTurn(p.message);
             turnRenderedUsers.push(p.message);
@@ -2252,6 +2338,12 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         throw new Error("Disconnected from harnessd");
       }
 
+      const pidChanged =
+        lastDaemonPid !== null && typeof ping.pid === "number" && ping.pid > 0 && ping.pid !== lastDaemonPid;
+      if (typeof ping.pid === "number" && ping.pid > 0) {
+        lastDaemonPid = ping.pid;
+      }
+
       chatSession = reopened.session;
       activeProject = reopened.project ?? activeProject;
       shell.resetControl(reopened.control);
@@ -2260,9 +2352,12 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       const prevSnap = shell.transcript.liveTail.snapshot();
       const prevTurnId = activeTurnId;
       const wasActive = sending || activeTurnId !== null;
+      const hadLiveAssistantBeforeReplay = turnHasAssistantHeader;
       shell.transcript.liveTail.clear();
 
-      // 2. Reconcile any unconfirmed sends against persisted user rows (consuming each row at most once).
+      // 2. Reconcile sends strictly by identity (turn ID), never by history text equality.
+      // Matching user rows in history only prevent a second user card on turn-ID confirmation
+      // or attach a corroborating hint to unconfirmed items without removing them.
       for (const id of [...unconfirmedMeta.keys()]) {
         if (!shell.queue.get(id)) unconfirmedMeta.delete(id);
       }
@@ -2281,12 +2376,14 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       let unconfirmedTurnNotDelivered = false;
       if (pendingSend) {
         const ps = pendingSend;
-        const matchIdx = unmatchedFetchedUsers.indexOf(ps.text);
-        if (matchIdx >= 0) {
-          unmatchedFetchedUsers.splice(matchIdx, 1);
-          confirmPendingSend(ps.turnId, { skipUserCard: true });
-        } else if (reopened.busy && reopened.activeTurnId === ps.turnId) {
-          confirmPendingSend(ps.turnId);
+        if (reopened.busy && reopened.activeTurnId === ps.turnId) {
+          const replayRowIdx = unmatchedFetchedUsers.indexOf(ps.text);
+          if (replayRowIdx >= 0) {
+            unmatchedFetchedUsers.splice(replayRowIdx, 1);
+            confirmPendingSend(ps.turnId, { skipUserCard: true });
+          } else {
+            confirmPendingSend(ps.turnId);
+          }
         } else {
           pendingSend = null;
           shell.queue.markUnconfirmed(ps.itemId);
@@ -2296,18 +2393,23 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       for (const item of shell.queue.list()) {
         if (item.state !== "unconfirmed") continue;
         const meta = unconfirmedMeta.get(item.id);
-        const matchIdx = unmatchedFetchedUsers.indexOf(item.text);
-        if (matchIdx >= 0) {
-          unmatchedFetchedUsers.splice(matchIdx, 1);
+        if (meta?.turnId && reopened.busy && reopened.activeTurnId === meta.turnId) {
           shell.queue.removeById(item.id);
           unconfirmedMeta.delete(item.id);
-        } else if (meta?.turnId && reopened.busy && reopened.activeTurnId === meta.turnId) {
-          shell.queue.removeById(item.id);
-          unconfirmedMeta.delete(item.id);
-          shell.transcript.appendUserTurn(item.text, meta.timestampMs);
-          turnRenderedUsers.push(item.text);
-        } else if (meta?.turnId && meta.turnId === prevTurnId && !reopened.busy) {
-          unconfirmedTurnNotDelivered = true;
+          const replayRowIdx = unmatchedFetchedUsers.indexOf(item.text);
+          if (replayRowIdx >= 0) {
+            unmatchedFetchedUsers.splice(replayRowIdx, 1);
+          } else {
+            shell.transcript.appendUserTurn(item.text, meta.timestampMs);
+            turnRenderedUsers.push(item.text);
+          }
+        } else {
+          if (unmatchedFetchedUsers.includes(item.text)) {
+            shell.queue.markUnconfirmed(item.id, MATCHING_TRANSCRIPT_HINT);
+          }
+          if (meta?.turnId && meta.turnId === prevTurnId && !reopened.busy) {
+            unconfirmedTurnNotDelivered = true;
+          }
         }
       }
 
@@ -2316,33 +2418,53 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         fetchedRows.length > 0
           ? renderHistoryRows(fetchedRows, {
               firstAssistantMeta:
-                wasActive && prevSnap.frozenSegmentCount === 0 ? (prevSnap.modelLabel ?? modelBadge()) : undefined,
+                wasActive && !hadLiveAssistantBeforeReplay ? (prevSnap.modelLabel ?? modelBadge()) : undefined,
               liveRenderedUsers: turnRenderedUsers,
               liveFrozenSegments: turnFrozenSegments,
               liveRenderedTools: turnRenderedTools,
+              detachedText: wasActive ? prevSnap.text : undefined,
             })
-          : { renderedAssistantCount: 0, renderedAssistantAfterLastBoundary: false, renderedAssistantSegments: [] };
+          : { renderedAssistantCount: 0, renderedToolCount: 0, detachedCovered: false };
+      if (wasActive && replay.renderedAssistantCount > 0) {
+        turnHasAssistantHeader = true;
+      }
       syncedThroughSeq = Math.max(syncedThroughSeq, throughSeq);
 
-      // 4. Rebuild live tail or settle based on reopen snapshot and whether fetched rows cover the final segment.
+      // 4. Rebuild live tail or settle based on reopen snapshot and detached-segment coverage.
       if (wasActive && !reopened.busy) {
-        const fetchedCoversFinalSegment = replay.renderedAssistantAfterLastBoundary;
-        const hasUnpersistedTail = Boolean(prevSnap.text.trim());
-        const cause: CancelOrigin =
-          cancelOrigin ?? (reconnect?.expectingRestart || reloadingBlocked ? "restart" : "reconnect");
-        if (unconfirmedTurnNotDelivered && !hasUnpersistedTail && replay.renderedAssistantCount === 0) {
+        const hasDetachedText = Boolean(prevSnap.text.trim());
+        const hasRestartEvidence =
+          cancelOrigin === "restart" ||
+          Boolean(reconnect?.expectingRestart) ||
+          reloadingBlocked ||
+          pidChanged;
+        if (hasDetachedText) {
+          if (replay.detachedCovered) {
+            settleTurn(prevTurnId, {
+              cancelled: hasRestartEvidence,
+              cancelCause: hasRestartEvidence ? "restart" : undefined,
+              timestampMs: Date.now(),
+              discardLiveText: true,
+            });
+          } else {
+            settleTurn(prevTurnId, {
+              finalText: prevSnap.text,
+              cancelled: true,
+              cancelCause: hasRestartEvidence ? "restart" : "reconnect",
+              timestampMs: Date.now(),
+              discardLiveText: false,
+            });
+          }
+        } else {
+          const persistedTurnOutput =
+            hadLiveAssistantBeforeReplay || replay.renderedAssistantCount > 0 || replay.renderedToolCount > 0;
+          const shouldReportEarlyEnd =
+            hasRestartEvidence || (!unconfirmedTurnNotDelivered && !persistedTurnOutput);
           settleTurn(prevTurnId, {
-            cancelled: false,
+            cancelled: shouldReportEarlyEnd,
+            cancelCause: shouldReportEarlyEnd ? (hasRestartEvidence ? "restart" : "reconnect") : undefined,
             timestampMs: Date.now(),
             discardLiveText: true,
-          });
-        } else {
-          settleTurn(prevTurnId, {
-            finalText: fetchedCoversFinalSegment ? undefined : hasUnpersistedTail ? prevSnap.text : undefined,
-            cancelled: !fetchedCoversFinalSegment,
-            cancelCause: cause,
-            timestampMs: Date.now(),
-            discardLiveText: fetchedCoversFinalSegment,
           });
         }
       } else if (reopened.busy) {
@@ -2350,17 +2472,11 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         if (!sameTurn) resetTurnLiveTrackers();
         activeTurnId = reopened.activeTurnId;
         sending = true;
-        const seed =
-          reopened.activePartial ||
-          (reopened.history.length === 0 && throughSeq === 0 ? reopened.activeText : "");
-        const combinedFrozen = sameTurn
-          ? [prevSnap.frozenText, ...replay.renderedAssistantSegments].filter(Boolean).join("")
-          : undefined;
+        // `activePartial` is authoritative for the current post-flush segment (never fall back to cumulative `activeText`).
+        const seed = typeof reopened.activePartial === "string" ? reopened.activePartial : "";
         shell.transcript.resyncLiveTurn({
           modelLabel: modelBadge(),
           seedText: seed,
-          preserveFrozen: sameTurn,
-          frozenText: combinedFrozen,
         });
         shell.setStatus(true, "Director responding...");
       } else {

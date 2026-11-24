@@ -1091,21 +1091,326 @@ describe("goal-34 c2: runDirectorChatTui pinned queue strip end-to-end", () => {
     mock.disconnect();
     await waitFor(() => text().includes("Reconnected to harnessd") && text().includes("SF8-FINAL-ANSWER"), 5000, "reconnected");
 
-    // STEER-DELIVERED was reconciled (removed from strip, rendered once as user card),
-    // while STEER-LOST stayed in the strip as `may not have been delivered` (NOT auto-resent, composer draft intact)!
+    // Neither lost steer is removed by text equality; STEER-DELIVERED gets the matching-transcript hint,
+    // while STEER-LOST stays as `may not have been delivered` (NOT auto-resent, composer draft intact)!
     const midScreen = text();
     assert.ok(midScreen.includes("may not have been delivered"), "Undelivered steer must stay in strip as unconfirmed");
+    assert.ok(
+      midScreen.includes("a matching message is in the transcript; drop if same"),
+      "Unconfirmed steer with matching transcript row must show matching-transcript hint instead of disappearing",
+    );
     assert.ok(midScreen.includes("STEER-LOST"), "Undelivered steer text must not be lost");
     assert.ok(midScreen.includes("NEW-DRAFT-IN-COMPOSER"), "Existing composer draft must stay intact");
     assert.equal(mock.calls.filter((c) => c.op === "chat.send").length, 1, "Unconfirmed item must NEVER auto-resend");
     assert.equal((midScreen.match(/[›>] STEER-DELIVERED/g) ?? []).length, 1, "Delivered steer rendered once from history");
 
-    // Drop the unconfirmed item with Alt+Q -> strip clears (no "1 may not have been delivered" row remains)!
+    // Drop both unconfirmed items independently with Alt+Q -> strip clears completely!
     sendInput("\x1bq");
-    await waitFor(() => !text().includes("1 may not have been delivered"), 3000, "Alt+Q dropped unconfirmed item");
+    await waitFor(() => !text().includes("2 may not have been delivered"), 3000, "first Alt+Q dropped STEER-LOST");
+    sendInput("\x1bq");
+    await waitFor(
+      () => !text().includes("1 unconfirmed · a matching message is in the transcript"),
+      3000,
+      "second Alt+Q dropped STEER-DELIVERED",
+    );
 
     resolveSend();
     sendInput("\x1d");
     await runPromise;
+  });
+
+  it("review-2 blocker 3: identical history text never falsely confirms an undelivered steer or held unconfirmed item; turn ID confirms on busy reopen; equal-string steers stay distinct", async () => {
+    // Part A: Lost steer + identical text sent by another controller while offline -> item MUST stay in strip with matching-transcript hint,
+    // and a held unconfirmed item MUST survive a later reconnect with an unrelated same-text row!
+    {
+      const { terminal, text, sendInput, typeText } = makeFakeTerminal(120, 30);
+      const session = makeChatSession("chat-q34-r2b3-a");
+      let openCount = 0;
+      const persistedHistory: ChatTurnRecord[] = [];
+      let resolveSend!: () => void;
+      const sendGate = new Promise<void>((r) => (resolveSend = r));
+
+      const mock = makeMockClient(async (op, params) => {
+        if (op === "ping") return { pong: true, pid: process.pid, protocolRev: 8, releaseId: "rel-r2b3" };
+        if (op === "chat.open") {
+          openCount += 1;
+          return {
+            session,
+            history: [],
+            historyNext: null,
+            historyThrough: persistedHistory.length,
+            activeTurnId: null,
+            activeText: "",
+            activePartial: "",
+            tookOver: false,
+            busy: false,
+          };
+        }
+        if (op === "chat.history") {
+          const afterSeq = Number(params.afterSeq ?? 0);
+          return { history: persistedHistory.filter((r) => r.seq > afterSeq), historyNext: null };
+        }
+        if (op === "work.snapshot") return emptyWorkSnapshot();
+        if (op === "chat.send") {
+          await sendGate;
+          return { ok: true };
+        }
+        if (op === "chat.steer") {
+          await new Promise(() => {});
+        }
+        if (op === "session.leave") return { daemonWillQuit: false };
+        return {};
+      });
+
+      const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+      await waitFor(() => text().includes("chat-q34-r2b3-a"), 3000, "initial render");
+
+      // Start confirmed turn 1
+      typeText("Turn 1 R2B3");
+      sendInput("\r");
+      await waitFor(() => mock.calls.some((c) => c.op === "chat.send"), 3000, "turn 1 send");
+      const t1 = String(mock.calls.find((c) => c.op === "chat.send")!.params.turnId);
+      mock.emit({
+        kind: "event",
+        seq: 1,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.delta",
+        createdAt: Date.now(),
+        payload: { chatSessionId: session.id, turnId: t1, delta: "Working R2B3" },
+      });
+      await waitFor(() => text().includes("Working R2B3"), 3000, "turn 1 confirmed");
+
+      // Queue two steers: one whose text another controller will send during reconnect #1,
+      // and one that stays held with no match on reconnect #1 and meets an unrelated same-text row on reconnect #2.
+      typeText("SAME-OTHER-CTRL");
+      sendInput("\r");
+      await waitFor(() => text().includes("SAME-OTHER-CTRL"), 3000, "queued 1");
+      typeText("HELD-LATER-SAME");
+      sendInput("\r");
+      await waitFor(() => text().includes("HELD-LATER-SAME"), 3000, "queued 2");
+
+      sendInput("\x1bs");
+      await waitFor(() => mock.calls.filter((c) => c.op === "chat.steer").length === 1, 3000, "steer 1");
+      sendInput("\x1bs");
+      await waitFor(() => mock.calls.filter((c) => c.op === "chat.steer").length === 2, 3000, "steer 2");
+
+      // Reconnect #1: another controller persisted SAME-OTHER-CTRL; HELD-LATER-SAME is not in history yet.
+      persistedHistory.push(
+        { seq: 1, chatSessionId: session.id, role: "user", content: "Turn 1 R2B3", createdAt: Date.now() },
+        { seq: 2, chatSessionId: session.id, role: "user", content: "SAME-OTHER-CTRL", createdAt: Date.now() },
+        { seq: 3, chatSessionId: session.id, role: "assistant", content: "R2B3-DONE-1", createdAt: Date.now() },
+      );
+
+      mock.disconnect();
+      await waitFor(() => text().includes("R2B3-DONE-1") && openCount >= 2, 5000, "reconnect #1");
+
+      // Inspect via /queue: BOTH items MUST still be present as unconfirmed!
+      typeText("/queue");
+      sendInput("\r");
+      await waitFor(() => text().includes("Queue (2):"), 3000, "/queue shows both unconfirmed items after reconnect #1");
+      const afterR1 = text();
+      assert.ok(afterR1.includes("SAME-OTHER-CTRL"), "Lost steer with matching history row must stay in strip");
+      assert.ok(
+        afterR1.includes("matching message") && afterR1.includes("transcript"),
+        "Item with matching history row must hint that a matching message is in the transcript",
+      );
+      assert.ok(afterR1.includes("HELD-LATER-SAME"), "Held unconfirmed item must stay in strip");
+      assert.equal(mock.calls.filter((c) => c.op === "chat.send").length, 1, "Unconfirmed items must never auto-resend");
+
+      // Reconnect #2: another controller sends an unrelated row matching HELD-LATER-SAME!
+      persistedHistory.push(
+        { seq: 4, chatSessionId: session.id, role: "user", content: "HELD-LATER-SAME", createdAt: Date.now() },
+        { seq: 5, chatSessionId: session.id, role: "assistant", content: "R2B3-DONE-2", createdAt: Date.now() },
+      );
+      mock.disconnect();
+      await waitFor(() => text().includes("R2B3-DONE-2") && openCount >= 3, 5000, "reconnect #2");
+
+      typeText("/queue");
+      sendInput("\r");
+      await waitFor(() => countOccurrences(text(), "Queue (2):") >= 2, 3000, "both items survive reconnect #2");
+      const afterR2 = text();
+      assert.equal(
+        (afterR2.match(/[›>] SAME-OTHER-CTRL/g) ?? []).length,
+        1,
+        "SAME-OTHER-CTRL user card renders once from history",
+      );
+      assert.equal(
+        (afterR2.match(/[›>] HELD-LATER-SAME/g) ?? []).length,
+        1,
+        "HELD-LATER-SAME user card renders once from history",
+      );
+
+      resolveSend();
+      sendInput("\x1d");
+      await runPromise;
+    }
+
+    // Part B: Turn-ID confirmation on busy reopen moves the item to sent with ONE user card
+    {
+      const { terminal, text, sendInput, typeText } = makeFakeTerminal(120, 30);
+      const session = makeChatSession("chat-q34-r2b3-b");
+      let openCount = 0;
+      let sentTurnId = "";
+
+      const mock = makeMockClient(async (op, params) => {
+        if (op === "ping") return { pong: true, pid: process.pid, protocolRev: 8, releaseId: "rel-r2b3b" };
+        if (op === "chat.open") {
+          openCount += 1;
+          if (openCount === 1) {
+            return {
+              session,
+              history: [],
+              historyNext: null,
+              historyThrough: 0,
+              activeTurnId: null,
+              activeText: "",
+              activePartial: "",
+              tookOver: false,
+              busy: false,
+            };
+          }
+          return {
+            session,
+            history: [],
+            historyNext: null,
+            historyThrough: 1,
+            activeTurnId: sentTurnId,
+            activeText: "",
+            activePartial: "",
+            tookOver: false,
+            busy: true,
+          };
+        }
+        if (op === "chat.history") {
+          const afterSeq = Number(params.afterSeq ?? 0);
+          const rows: ChatTurnRecord[] = [
+            { seq: 1, chatSessionId: session.id, role: "user", content: "TURNID-CONFIRM-MSG", createdAt: Date.now() },
+          ];
+          return { history: rows.filter((r) => r.seq > afterSeq), historyNext: null };
+        }
+        if (op === "work.snapshot") return emptyWorkSnapshot();
+        if (op === "chat.send") {
+          sentTurnId = String(params.turnId ?? "");
+          await new Promise(() => {});
+        }
+        if (op === "session.leave") return { daemonWillQuit: false };
+        return {};
+      });
+
+      const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+      await waitFor(() => text().includes("chat-q34-r2b3-b"), 3000, "initial render part B");
+
+      // Send prompt, disconnect BEFORE any delta or chat.send reply -> moves to unconfirmed with turnId
+      typeText("TURNID-CONFIRM-MSG");
+      sendInput("\r");
+      await waitFor(() => sentTurnId !== "", 3000, "chat.send dispatched");
+
+      mock.disconnect();
+      await waitFor(() => text().includes("Reconnected to harnessd") && openCount >= 2, 5000, "reconnected busy with matching turnId");
+
+      // Verify /queue is empty (confirmed by turnId!) and user card rendered ONCE!
+      typeText("/queue");
+      sendInput("\r");
+      await waitFor(() => text().includes("Queue is empty."), 3000, "turn-ID confirmation cleared queue strip");
+
+      const out = text();
+      assert.equal(
+        (out.match(/[›>] TURNID-CONFIRM-MSG/g) ?? []).length,
+        1,
+        "Turn-ID confirmed message must render exactly ONE user card",
+      );
+
+      sendInput("\x1d");
+      await runPromise;
+    }
+
+    // Part C: Equal-string lost steers stay distinct in the strip even when one matching user row appears in history
+    {
+      const { terminal, text, sendInput, typeText } = makeFakeTerminal(120, 30);
+      const session = makeChatSession("chat-q34-r2b3-c");
+      let openCount = 0;
+      let resolveSend!: () => void;
+      const sendGate = new Promise<void>((r) => (resolveSend = r));
+
+      const mock = makeMockClient(async (op, params) => {
+        if (op === "ping") return { pong: true, pid: process.pid, protocolRev: 8, releaseId: "rel-r2b3c" };
+        if (op === "chat.open") {
+          openCount += 1;
+          return {
+            session,
+            history: [],
+            historyNext: null,
+            historyThrough: openCount === 1 ? 0 : 3,
+            activeTurnId: null,
+            activeText: "",
+            activePartial: "",
+            tookOver: false,
+            busy: false,
+          };
+        }
+        if (op === "chat.history") {
+          const afterSeq = Number(params.afterSeq ?? 0);
+          const rows: ChatTurnRecord[] = [
+            { seq: 1, chatSessionId: session.id, role: "user", content: "Base Equal", createdAt: Date.now() },
+            { seq: 2, chatSessionId: session.id, role: "user", content: "PING-EQUAL", createdAt: Date.now() },
+            { seq: 3, chatSessionId: session.id, role: "assistant", content: "EQUAL-DONE", createdAt: Date.now() },
+          ];
+          return { history: rows.filter((r) => r.seq > afterSeq), historyNext: null };
+        }
+        if (op === "work.snapshot") return emptyWorkSnapshot();
+        if (op === "chat.send") {
+          await sendGate;
+          return { ok: true };
+        }
+        if (op === "chat.steer") {
+          await new Promise(() => {});
+        }
+        if (op === "session.leave") return { daemonWillQuit: false };
+        return {};
+      });
+
+      const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+      await waitFor(() => text().includes("chat-q34-r2b3-c"), 3000, "initial render part C");
+
+      typeText("Base Equal");
+      sendInput("\r");
+      await waitFor(() => mock.calls.some((c) => c.op === "chat.send"), 3000, "base send");
+      const t1 = String(mock.calls.find((c) => c.op === "chat.send")!.params.turnId);
+      mock.emit({
+        kind: "event",
+        seq: 1,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.delta",
+        createdAt: Date.now(),
+        payload: { chatSessionId: session.id, turnId: t1, delta: "Running equal" },
+      });
+      await waitFor(() => text().includes("Running equal"), 3000, "confirmed");
+
+      // Two steers with identical text
+      typeText("PING-EQUAL");
+      sendInput("\r");
+      await waitFor(() => text().includes("1 queued"), 3000, "queued 1");
+      typeText("PING-EQUAL");
+      sendInput("\r");
+      await waitFor(() => text().includes("2 queued"), 3000, "queued 2");
+
+      sendInput("\x1bs");
+      await waitFor(() => mock.calls.filter((c) => c.op === "chat.steer").length === 1, 3000, "steer 1");
+      sendInput("\x1bs");
+      await waitFor(() => mock.calls.filter((c) => c.op === "chat.steer").length === 2, 3000, "steer 2");
+
+      mock.disconnect();
+      await waitFor(() => text().includes("EQUAL-DONE") && openCount >= 2, 5000, "reconnected equal");
+
+      typeText("/queue");
+      sendInput("\r");
+      await waitFor(() => text().includes("Queue (2):"), 3000, "both equal-string steers remain in strip");
+
+      resolveSend();
+      sendInput("\x1d");
+      await runPromise;
+    }
   });
 });

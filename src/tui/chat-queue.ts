@@ -13,6 +13,8 @@ export interface ChatQueueItem {
   readonly text: string;
   readonly state: ChatQueueItemState;
   readonly reason: ChatQueueReason;
+  /** Optional hint for `unconfirmed` items (for example when a matching message exists in history). */
+  readonly hint?: string;
 }
 
 export function formatQueueReason(reason: ChatQueueReason): string {
@@ -28,9 +30,11 @@ export function formatQueueReason(reason: ChatQueueReason): string {
   }
 }
 
-export function formatQueueItemState(item: Pick<ChatQueueItem, "state" | "reason">): string {
+export function formatQueueItemState(item: Pick<ChatQueueItem, "state" | "reason" | "hint">): string {
   if (item.state === "sending") return "sending";
-  if (item.state === "unconfirmed") return "may not have been delivered";
+  if (item.state === "unconfirmed") {
+    return item.hint ? `unconfirmed · ${item.hint}` : "may not have been delivered";
+  }
   return `queued · ${formatQueueReason(item.reason)}`;
 }
 
@@ -87,7 +91,8 @@ export class ChatQueueModel {
   markSending(id: string): ChatQueueItem | null {
     const idx = this.items.findIndex((item) => item.id === id);
     if (idx < 0) return null;
-    const updated: ChatQueueItem = { ...this.items[idx]!, state: "sending" };
+    const { hint: _hint, ...rest } = this.items[idx]!;
+    const updated: ChatQueueItem = { ...rest, state: "sending" };
     this.items[idx] = updated;
     return { ...updated };
   }
@@ -95,16 +100,25 @@ export class ChatQueueModel {
   markQueued(id: string, reason: ChatQueueReason): ChatQueueItem | null {
     const idx = this.items.findIndex((item) => item.id === id);
     if (idx < 0) return null;
-    const updated: ChatQueueItem = { ...this.items[idx]!, state: "queued", reason };
+    const { hint: _hint, ...rest } = this.items[idx]!;
+    const updated: ChatQueueItem = { ...rest, state: "queued", reason };
     this.items[idx] = updated;
     return { ...updated };
   }
 
   /** Marks an item whose transport dropped mid-send as `unconfirmed` so it is never resent automatically. */
-  markUnconfirmed(id: string): ChatQueueItem | null {
+  markUnconfirmed(id: string, hint?: string): ChatQueueItem | null {
     const idx = this.items.findIndex((item) => item.id === id);
     if (idx < 0) return null;
-    const updated: ChatQueueItem = { ...this.items[idx]!, state: "unconfirmed" };
+    const cur = this.items[idx]!;
+    const nextHint = hint ?? cur.hint;
+    const updated: ChatQueueItem = {
+      id: cur.id,
+      text: cur.text,
+      reason: cur.reason,
+      state: "unconfirmed",
+      ...(nextHint ? { hint: nextHint } : {}),
+    };
     this.items[idx] = updated;
     return { ...updated };
   }

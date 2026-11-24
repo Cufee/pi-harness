@@ -142,6 +142,7 @@ function createVirtualScreen(rows: number) {
     feed,
     lines: () => lines.map((l) => l.trimEnd()),
     text: () => lines.map((l) => l.trimEnd()).join("\n"),
+    viewportText: () => lines.slice(viewportTop, viewportTop + rows).map((l) => l.trimEnd()).join("\n"),
   };
 }
 
@@ -179,6 +180,8 @@ function makeFakeTerminal(cols = 110, rows = 30) {
     writes,
     /** Final rendered terminal state (scrollback + viewport), NOT concatenated raw writes. */
     text: () => screen.text(),
+    /** Visible terminal viewport ONLY (last `rows` rows, excluding scrollback). */
+    viewportText: () => screen.viewportText(),
     rawWrites: () => stripTerminalSequences(writes.join("")),
     sendInput: (data: string) => onDataCb?.(data),
     typeText: (str: string) => {
@@ -864,20 +867,183 @@ describe("goal-34 c3: Director chat assistant replies render exactly once", () =
     }
   });
 
-  it("occurrence 2 (dupe-reply-repro-2): renders reply once after reconnect with reopened.busy, activePartial seed, and mid-turn goal event", async () => {
-    const { terminal, writes, text, sendInput } = makeFakeTerminal(120, 30);
-    const session = makeChatSession("chat-34-repro2");
-    const reply = "goal-26 stopped a third time because the worker exceeded its scope.";
-    let openCount = 0;
+  it("occurrence 2 (dupe-reply-repro-2): post-reconnect streamed deltas + mid-turn goal line renders reply once in order; post-settle goal line never repeats reply", async () => {
+    // Case A: Exact sequence from dupe-reply-repro-2.md:
+    // reconnect -> both daemon receipts -> reply streams as deltas AFTER reconnect -> unique goal line -> chat.turn.end.
+    {
+      const { terminal, writes, text, sendInput } = makeFakeTerminal(160, 30);
+      const session = makeChatSession("chat-34-repro2");
+      const replyPart1 = "goal-26 stopped a third time ";
+      const replyPart2 = "because the worker exceeded its scope.";
+      const reply = `${replyPart1}${replyPart2}`;
+      const uniqueGoalReceipt = "B1 merged cleanly · review-receipt-unique-26";
+      let openCount = 0;
 
-    const mock = makeMockClient(async (op) => {
-      if (op === "ping") {
-        // Different releaseId so appendReconnectReceipts appends BOTH reconnect receipts while liveTail is seeded
-        return { pong: true, pid: process.pid, protocolRev: 8, releaseId: "d9c4aec62a78" };
-      }
-      if (op === "chat.open") {
-        openCount += 1;
-        if (openCount === 1) {
+      const mock = makeMockClient(async (op) => {
+        if (op === "ping") {
+          // Different releaseId so appendReconnectReceipts appends BOTH reconnect receipts before the reply streams
+          return { pong: true, pid: process.pid, protocolRev: 8, releaseId: "d9c4aec62a78" };
+        }
+        if (op === "chat.open") {
+          openCount += 1;
+          if (openCount === 1) {
+            return {
+              session,
+              history: [],
+              historyNext: null,
+              historyThrough: 0,
+              activeTurnId: null,
+              activeText: "",
+              activePartial: "",
+              tookOver: false,
+              busy: false,
+            };
+          }
+          // Reconnect into busy turn BEFORE deltas arrive so receipts render first, then deltas stream
+          return {
+            session,
+            history: [],
+            historyNext: null,
+            historyThrough: 0,
+            activeTurnId: "turn-repro2",
+            activeText: "",
+            activePartial: "",
+            tookOver: false,
+            busy: true,
+          };
+        }
+        if (op === "chat.history") return { history: [], historyNext: null };
+        if (op === "work.snapshot") return emptyWorkSnapshot();
+        if (op === "session.leave") return { daemonWillQuit: false };
+        return {};
+      });
+
+      const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+      await waitFor(() => text().includes("chat-34-repro2"), 3000, "initial render");
+
+      // 1. Reconnect -> both daemon receipts appear first
+      mock.disconnect();
+      await waitFor(
+        () =>
+          text().includes("Reconnected to harnessd (release d9c4aec62a78)") &&
+          text().includes("harnessd runs release d9c4aec62a78"),
+        5000,
+        "both reconnect receipts rendered",
+      );
+
+      // 2. Reply streams as deltas AFTER the reconnect
+      mock.emit({
+        kind: "event",
+        seq: 8,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.delta",
+        createdAt: Date.now(),
+        payload: { chatSessionId: session.id, turnId: "turn-repro2", delta: replyPart1 },
+      });
+      mock.emit({
+        kind: "event",
+        seq: 9,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.delta",
+        createdAt: Date.now(),
+        payload: { chatSessionId: session.id, turnId: "turn-repro2", delta: replyPart2 },
+      });
+      await waitFor(() => text().includes(reply), 3000, "streamed reply visible after reconnect");
+
+      // 3. Internal goal.progress (hidden) + human-visible goal.reviewed with unique receipt text
+      mock.emit({
+        kind: "event",
+        seq: 10,
+        runId: "run-26",
+        taskId: null,
+        type: "goal.progress",
+        createdAt: Date.now(),
+        payload: { goalId: "goal-26", phase: "implementing", summary: "INTERNAL-REPRO2-PROGRESS" },
+      });
+      mock.emit({
+        kind: "event",
+        seq: 11,
+        runId: "run-26",
+        taskId: null,
+        type: "goal.reviewed",
+        createdAt: Date.now(),
+        payload: {
+          goalId: "goal-26",
+          version: 1,
+          cycle: 1,
+          verdict: "approve",
+          status: "achieved",
+          summary: uniqueGoalReceipt,
+        },
+      });
+      await waitFor(() => text().includes(uniqueGoalReceipt), 3000, "unique goal receipt rendered");
+
+      // 4. Normal (non-cancelled) chat.turn.end carrying full reply
+      const writesBeforeEnd = writes.length;
+      mock.emit({
+        kind: "event",
+        seq: 12,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.turn.end",
+        createdAt: Date.now(),
+        payload: {
+          chatSessionId: session.id,
+          turnId: "turn-repro2",
+          historyThrough: 2,
+          assistantTurn: {
+            seq: 2,
+            chatSessionId: session.id,
+            role: "assistant",
+            content: reply,
+            createdAt: Date.now(),
+          } satisfies ChatTurnRecord,
+        },
+      });
+      await waitFor(
+        () => stripTerminalSequences(writes.slice(writesBeforeEnd).join("")).includes("Ready"),
+        3000,
+        "repro2 turn settled",
+      );
+
+      sendInput("\x1d");
+      await runPromise;
+
+      const out = text();
+      const dockSplit = out.indexOf("Agents:");
+      const transcriptPart = dockSplit >= 0 ? out.slice(0, dockSplit) : out;
+      assert.equal(
+        countOccurrences(out, reply),
+        1,
+        `Expected repro2 reply to appear exactly once, got ${countOccurrences(out, reply)}`,
+      );
+      assert.equal(
+        countOccurrences(transcriptPart, uniqueGoalReceipt),
+        1,
+        "Unique goal receipt must appear once in the transcript",
+      );
+      assert.equal(countOccurrences(out, "INTERNAL-REPRO2-PROGRESS"), 0, "Internal progress must stay hidden");
+      const reconnectedIdx = transcriptPart.indexOf("Reconnected to harnessd (release d9c4aec62a78)");
+      const mismatchIdx = transcriptPart.indexOf("harnessd runs release d9c4aec62a78");
+      const goalIdx = transcriptPart.indexOf(uniqueGoalReceipt);
+      const replyIdx = transcriptPart.indexOf(reply);
+      assert.ok(reconnectedIdx >= 0 && reconnectedIdx < mismatchIdx, "Reconnected receipt must precede release-mismatch notice");
+      assert.ok(mismatchIdx < goalIdx && goalIdx < replyIdx, "Reconnect receipts precede mid-turn goal receipt and settled reply");
+    }
+
+    // Case B: Goal line arriving AFTER the turn has already settled renders below the reply without repeating it
+    {
+      const { terminal, text, sendInput, typeText } = makeFakeTerminal(120, 30);
+      const session = makeChatSession("chat-34-repro2-post");
+      const settledReply = "SETTLED-BEFORE-GOAL-REPLY-26: already complete.";
+      const postSettleGoal = "POST-SETTLE-UNIQUE-GOAL-RECEIPT-26";
+      let resolveSend!: () => void;
+      const sendGate = new Promise<void>((r) => (resolveSend = r));
+
+      const mock = makeMockClient(async (op) => {
+        if (op === "chat.open") {
           return {
             session,
             history: [],
@@ -890,100 +1056,85 @@ describe("goal-34 c3: Director chat assistant replies render exactly once", () =
             busy: false,
           };
         }
-        return {
-          session,
-          history: [],
-          historyNext: null,
-          historyThrough: 0,
-          activeTurnId: "turn-repro2",
-          activeText: reply,
-          activePartial: reply,
-          tookOver: false,
-          busy: true,
-        };
-      }
-      if (op === "chat.history") return { history: [], historyNext: null };
-      if (op === "work.snapshot") return emptyWorkSnapshot();
-      if (op === "session.leave") return { daemonWillQuit: false };
-      return {};
-    });
+        if (op === "work.snapshot") return emptyWorkSnapshot();
+        if (op === "chat.send") {
+          await sendGate;
+          return { ok: true };
+        }
+        if (op === "session.leave") return { daemonWillQuit: false };
+        return {};
+      });
 
-    const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
-    await waitFor(() => text().includes("chat-34-repro2"), 3000, "initial render");
+      const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+      await waitFor(() => text().includes("chat-34-repro2-post"), 3000, "initial render post-settle");
 
-    // Reconnect while daemon is busy with a non-empty activePartial seed
-    mock.disconnect();
-    await waitFor(
-      () => text().includes("Reconnected to harnessd (release d9c4aec62a78)") && text().includes(reply),
-      5000,
-      "reconnected with activePartial seed",
-    );
+      typeText("Check goal-26");
+      sendInput("\r");
+      await waitFor(() => mock.calls.some((c) => c.op === "chat.send"), 3000, "chat.send");
+      const turnId = String(mock.calls.find((c) => c.op === "chat.send")!.params.turnId);
 
-    // Mid-turn goal.* events arrive (a progress event and a human-visible review)
-    mock.emit({
-      kind: "event",
-      seq: 10,
-      runId: "run-26",
-      taskId: null,
-      type: "goal.progress",
-      createdAt: Date.now(),
-      payload: { goalId: "goal-26", phase: "implementing", summary: "B1 merged to local main" },
-    });
-    mock.emit({
-      kind: "event",
-      seq: 11,
-      runId: "run-26",
-      taskId: null,
-      type: "goal.reviewed",
-      createdAt: Date.now(),
-      payload: {
-        goalId: "goal-26",
-        version: 1,
-        cycle: 1,
-        verdict: "approve",
-        status: "achieved",
-        summary: "B1 merged cleanly",
-      },
-    });
-    await new Promise((r) => setTimeout(r, 30));
-
-    // Normal (non-cancelled) chat.turn.end carrying full reply
-    const writesBeforeEnd = writes.length;
-    mock.emit({
-      kind: "event",
-      seq: 12,
-      runId: session.id,
-      taskId: session.id,
-      type: "chat.turn.end",
-      createdAt: Date.now(),
-      payload: {
-        chatSessionId: session.id,
-        turnId: "turn-repro2",
-        historyThrough: 2,
-        assistantTurn: {
-          seq: 2,
+      mock.emit({
+        kind: "event",
+        seq: 1,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.delta",
+        createdAt: Date.now(),
+        payload: { chatSessionId: session.id, turnId, delta: settledReply },
+      });
+      mock.emit({
+        kind: "event",
+        seq: 2,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.turn.end",
+        createdAt: Date.now(),
+        payload: {
           chatSessionId: session.id,
-          role: "assistant",
-          content: reply,
-          createdAt: Date.now(),
-        } satisfies ChatTurnRecord,
-      },
-    });
-    await waitFor(
-      () => stripTerminalSequences(writes.slice(writesBeforeEnd).join("")).includes("Ready"),
-      3000,
-      "repro2 turn settled",
-    );
-    await waitFor(() => text().includes("goal-26"), 3000, "goal-26 receipt rendered");
+          turnId,
+          historyThrough: 2,
+          assistantTurn: {
+            seq: 2,
+            chatSessionId: session.id,
+            role: "assistant",
+            content: settledReply,
+            createdAt: Date.now(),
+          } satisfies ChatTurnRecord,
+        },
+      });
+      resolveSend();
+      await waitFor(() => text().includes(settledReply) && text().includes("Ready"), 3000, "turn settled before goal event");
 
-    sendInput("\x1d");
-    await runPromise;
+      // Goal line arrives AFTER settlement
+      mock.emit({
+        kind: "event",
+        seq: 3,
+        runId: "run-26",
+        taskId: null,
+        type: "goal.reviewed",
+        createdAt: Date.now(),
+        payload: {
+          goalId: "goal-26",
+          version: 1,
+          cycle: 1,
+          verdict: "approve",
+          status: "achieved",
+          summary: postSettleGoal,
+        },
+      });
+      await waitFor(() => text().includes(postSettleGoal), 3000, "post-settle goal receipt rendered");
 
-    assert.equal(
-      countOccurrences(text(), reply),
-      1,
-      `Expected repro2 reply to appear exactly once, got ${countOccurrences(text(), reply)}`,
-    );
+      sendInput("\x1d");
+      await runPromise;
+
+      const out = text();
+      assert.equal(countOccurrences(out, settledReply), 1, "Post-settle goal line must not duplicate settled reply");
+      assert.equal(countOccurrences(out, postSettleGoal), 1, "Post-settle goal receipt must render once");
+      assert.ok(
+        out.indexOf(settledReply) < out.indexOf(postSettleGoal),
+        "Settled reply must appear before post-settle goal receipt",
+      );
+    }
   });
 
   it("renders reply once and prints no 'Turn cancelled.' when turn finishes offline before reconnect", async () => {
@@ -1281,7 +1432,7 @@ describe("goal-34 c3: Director chat assistant replies render exactly once", () =
       tr.beginLiveTurn("director · test");
       tr.liveTail.appendText("Yes.");
       tr.appendToolOutput({ kind: "run_activity", data: { runId: "run-u1", phase: "active", elapsedMs: 100, tasks: [] } });
-      tr.resyncLiveTurn({ modelLabel: "director · test", seedText: "Yes. Next.", preserveFrozen: true });
+      tr.resyncLiveTurn({ modelLabel: "director · test", seedText: "Yes. Next." });
       const reseeded = tr.liveTail.snapshot();
       assert.equal(reseeded.text, "Yes. Next.", "Reconnect seed must not strip frozen prefix from distinct post-flush segment");
     }
@@ -2002,5 +2153,826 @@ describe("goal-34 c3: Director chat assistant replies render exactly once", () =
       false,
       "Removed steer_cancelled inference must never appear",
     );
+  });
+
+  it("review-2 blocker 1: idle reconnect after offline tool flush renders INTRO once with no early-end line, including goal notice, post-tool tail, and second reconnect", async () => {
+    // (a) Stream INTRO (no live tool card), disconnect; daemon persists assistant INTRO + tool_output and finishes with no further text.
+    {
+      const { terminal, text, sendInput } = makeFakeTerminal(120, 30);
+      const session = makeChatSession("chat-34-r2b1-a");
+      let openCount = 0;
+      const history: ChatTurnRecord[] = [];
+
+      const mock = makeMockClient(async (op, params) => {
+        if (op === "ping") return { pong: true, pid: process.pid, protocolRev: 8, releaseId: "rel-r2b1" };
+        if (op === "chat.open") {
+          openCount += 1;
+          if (openCount === 1) {
+            return {
+              session,
+              history: [],
+              historyNext: null,
+              historyThrough: 0,
+              activeTurnId: null,
+              activeText: "",
+              activePartial: "",
+              tookOver: false,
+              busy: false,
+            };
+          }
+          return {
+            session,
+            history: [],
+            historyNext: null,
+            historyThrough: history.length,
+            activeTurnId: null,
+            activeText: "",
+            activePartial: "",
+            tookOver: false,
+            busy: false,
+          };
+        }
+        if (op === "chat.history") {
+          const afterSeq = Number(params.afterSeq ?? 0);
+          return { history: history.filter((r) => r.seq > afterSeq), historyNext: null };
+        }
+        if (op === "work.snapshot") return emptyWorkSnapshot();
+        if (op === "session.leave") return { daemonWillQuit: false };
+        return {};
+      });
+
+      const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+      await waitFor(() => text().includes("chat-34-r2b1-a"), 3000, "initial render (a)");
+
+      mock.emit({
+        kind: "event",
+        seq: 1,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.turn.start",
+        createdAt: Date.now(),
+        payload: { chatSessionId: session.id, turnId: "wake-r2b1-a", reason: "goal.progress" },
+      });
+      mock.emit({
+        kind: "event",
+        seq: 2,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.delta",
+        createdAt: Date.now(),
+        payload: { chatSessionId: session.id, turnId: "wake-r2b1-a", delta: "INTRO-R2B1-A" },
+      });
+      await waitFor(() => text().includes("INTRO-R2B1-A"), 3000, "INTRO streaming (a)");
+
+      history.push(
+        { seq: 1, chatSessionId: session.id, role: "assistant", content: "INTRO-R2B1-A", createdAt: Date.now() },
+        {
+          seq: 2,
+          chatSessionId: session.id,
+          role: "tool_output",
+          content: "run-r2b1-a",
+          toolName: "present_result",
+          display: { kind: "run_activity", data: { runId: "run-r2b1-a", phase: "active", elapsedMs: 300, tasks: [] } },
+          createdAt: Date.now(),
+        },
+      );
+
+      mock.disconnect();
+      await waitFor(() => text().includes("Reconnected to harnessd") && text().includes("run-r2b1-a"), 5000, "reconnected (a)");
+
+      sendInput("\x1d");
+      await runPromise;
+
+      const out = text();
+      assert.equal(countOccurrences(out, "INTRO-R2B1-A"), 1, "(a) INTRO must render exactly once");
+      assert.equal(countOccurrences(out, "run-r2b1-a"), 1, "(a) tool card must render once");
+      assert.equal(out.includes("Turn ended while disconnected"), false, "(a) must not print early-end line");
+      assert.equal(out.includes("Turn ended early"), false, "(a) must not print restart early-end line");
+      assert.equal(out.includes("Turn cancelled"), false, "(a) must not print Turn cancelled");
+    }
+
+    // (b) + (d): Same scenario with a human-visible goal system_notice after the tool row, plus a second reconnect.
+    {
+      const { terminal, text, sendInput } = makeFakeTerminal(120, 30);
+      const session = makeChatSession("chat-34-r2b1-b");
+      let openCount = 0;
+      const history: ChatTurnRecord[] = [];
+
+      const mock = makeMockClient(async (op, params) => {
+        if (op === "ping") return { pong: true, pid: process.pid, protocolRev: 8, releaseId: "rel-r2b1" };
+        if (op === "chat.open") {
+          openCount += 1;
+          if (openCount === 1) {
+            return {
+              session,
+              history: [],
+              historyNext: null,
+              historyThrough: 0,
+              activeTurnId: null,
+              activeText: "",
+              activePartial: "",
+              tookOver: false,
+              busy: false,
+            };
+          }
+          return {
+            session,
+            history: [],
+            historyNext: null,
+            historyThrough: history.length,
+            activeTurnId: null,
+            activeText: "",
+            activePartial: "",
+            tookOver: false,
+            busy: false,
+          };
+        }
+        if (op === "chat.history") {
+          const afterSeq = Number(params.afterSeq ?? 0);
+          return { history: history.filter((r) => r.seq > afterSeq), historyNext: null };
+        }
+        if (op === "work.snapshot") return emptyWorkSnapshot();
+        if (op === "session.leave") return { daemonWillQuit: false };
+        return {};
+      });
+
+      const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+      await waitFor(() => text().includes("chat-34-r2b1-b"), 3000, "initial render (b)");
+
+      mock.emit({
+        kind: "event",
+        seq: 1,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.turn.start",
+        createdAt: Date.now(),
+        payload: { chatSessionId: session.id, turnId: "wake-r2b1-b", reason: "goal.progress" },
+      });
+      mock.emit({
+        kind: "event",
+        seq: 2,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.delta",
+        createdAt: Date.now(),
+        payload: { chatSessionId: session.id, turnId: "wake-r2b1-b", delta: "INTRO-R2B1-B" },
+      });
+      await waitFor(() => text().includes("INTRO-R2B1-B"), 3000, "INTRO streaming (b)");
+
+      history.push(
+        { seq: 1, chatSessionId: session.id, role: "assistant", content: "INTRO-R2B1-B", createdAt: Date.now() },
+        {
+          seq: 2,
+          chatSessionId: session.id,
+          role: "tool_output",
+          content: "run-r2b1-b",
+          toolName: "present_result",
+          display: { kind: "run_activity", data: { runId: "run-r2b1-b", phase: "active", elapsedMs: 300, tasks: [] } },
+          createdAt: Date.now(),
+        },
+        {
+          seq: 3,
+          chatSessionId: session.id,
+          role: "system_notice",
+          content: "GOAL-NOTICE-R2B1 achieved",
+          event: {
+            kind: "goal.reviewed",
+            goalId: "goal-r2b1",
+            goalVersion: 1,
+            cycle: 1,
+            verdict: "approve",
+            status: "achieved",
+            summary: "GOAL-NOTICE-R2B1 achieved",
+          },
+          createdAt: Date.now(),
+        },
+      );
+
+      // First reconnect (idle)
+      mock.disconnect();
+      await waitFor(
+        () => text().includes("run-r2b1-b") && text().includes("GOAL-NOTICE-R2B1 achieved"),
+        5000,
+        "reconnected #1 (b)",
+      );
+      const afterFirst = text();
+      assert.equal(countOccurrences(afterFirst, "INTRO-R2B1-B"), 1, "(b) INTRO must not repeat below goal notice");
+      assert.ok(
+        afterFirst.indexOf("INTRO-R2B1-B") < afterFirst.indexOf("GOAL-NOTICE-R2B1 achieved"),
+        "(b) INTRO must appear before the goal notice",
+      );
+      assert.equal(afterFirst.includes("Turn ended while disconnected"), false, "(b) no early-end line");
+
+      // (d) Second reconnect changes nothing
+      mock.disconnect();
+      await waitFor(() => openCount >= 3, 5000, "reconnected #2 (d)");
+      await new Promise((r) => setTimeout(r, 40));
+
+      sendInput("\x1d");
+      await runPromise;
+
+      const afterSecond = text();
+      assert.equal(countOccurrences(afterSecond, "INTRO-R2B1-B"), 1, "(d) second reconnect must keep INTRO at 1");
+      assert.equal(countOccurrences(afterSecond, "run-r2b1-b"), 1, "(d) second reconnect must keep tool card at 1");
+      assert.equal(countOccurrences(afterSecond, "GOAL-NOTICE-R2B1 achieved"), 1, "(d) goal notice stays at 1");
+      assert.equal(afterSecond.includes("Turn ended while disconnected"), false, "(d) still no early-end line");
+    }
+
+    // (c) Real unpersisted post-tool tail after a LIVE tool card is preserved once.
+    {
+      const { terminal, text, sendInput } = makeFakeTerminal(120, 30);
+      const session = makeChatSession("chat-34-r2b1-c");
+      let openCount = 0;
+
+      const mock = makeMockClient(async (op) => {
+        if (op === "ping") return { pong: true, pid: process.pid, protocolRev: 8, releaseId: "rel-r2b1" };
+        if (op === "chat.open") {
+          openCount += 1;
+          return {
+            session,
+            history: [],
+            historyNext: null,
+            historyThrough: openCount === 1 ? 0 : 2,
+            activeTurnId: null,
+            activeText: "",
+            activePartial: "",
+            tookOver: false,
+            busy: false,
+          };
+        }
+        if (op === "chat.history") {
+          return {
+            history: [
+              { seq: 1, chatSessionId: session.id, role: "assistant", content: "PRE-TOOL-R2B1-C", createdAt: Date.now() },
+              {
+                seq: 2,
+                chatSessionId: session.id,
+                role: "tool_output",
+                content: "run-r2b1-c",
+                toolName: "present_result",
+                display: { kind: "run_activity", data: { runId: "run-r2b1-c", phase: "active", elapsedMs: 200, tasks: [] } },
+                createdAt: Date.now(),
+              },
+            ],
+            historyNext: null,
+          };
+        }
+        if (op === "work.snapshot") return emptyWorkSnapshot();
+        if (op === "session.leave") return { daemonWillQuit: false };
+        return {};
+      });
+
+      const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+      await waitFor(() => text().includes("chat-34-r2b1-c"), 3000, "initial render (c)");
+
+      mock.emit({
+        kind: "event",
+        seq: 1,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.turn.start",
+        createdAt: Date.now(),
+        payload: { chatSessionId: session.id, turnId: "wake-r2b1-c", reason: "goal.progress" },
+      });
+      mock.emit({
+        kind: "event",
+        seq: 2,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.delta",
+        createdAt: Date.now(),
+        payload: { chatSessionId: session.id, turnId: "wake-r2b1-c", delta: "PRE-TOOL-R2B1-C" },
+      });
+      mock.emit({
+        kind: "event",
+        seq: 3,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.tool",
+        createdAt: Date.now(),
+        payload: {
+          chatSessionId: session.id,
+          turnId: "wake-r2b1-c",
+          name: "present_result",
+          status: "completed",
+          display: { kind: "run_activity", data: { runId: "run-r2b1-c", phase: "active", elapsedMs: 200, tasks: [] } },
+        },
+      });
+      mock.emit({
+        kind: "event",
+        seq: 4,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.delta",
+        createdAt: Date.now(),
+        payload: { chatSessionId: session.id, turnId: "wake-r2b1-c", delta: "UNPERSISTED-TAIL-R2B1-C" },
+      });
+      await waitFor(() => text().includes("UNPERSISTED-TAIL-R2B1-C"), 3000, "post-tool tail streaming (c)");
+
+      mock.disconnect();
+      await waitFor(() => text().includes("Reconnected to harnessd"), 5000, "reconnected (c)");
+
+      sendInput("\x1d");
+      await runPromise;
+
+      const out = text();
+      assert.equal(countOccurrences(out, "PRE-TOOL-R2B1-C"), 1, "(c) pre-tool segment rendered once");
+      assert.equal(countOccurrences(out, "UNPERSISTED-TAIL-R2B1-C"), 1, "(c) unpersisted post-tool tail preserved once");
+    }
+  });
+
+  it("review-2 blocker 2: two equal assistant segments with distinct seqs both render on live settle and across busy reopen, without re-adding flushed cumulative activeText", async () => {
+    // Part A: Live settle of "Yes." -> tool card -> "Yes." (distinct seqs)
+    {
+      const { terminal, text, sendInput, typeText } = makeFakeTerminal(120, 30);
+      const session = makeChatSession("chat-34-r2b2-live");
+      let resolveSend!: () => void;
+      const sendGate = new Promise<void>((r) => (resolveSend = r));
+
+      const mock = makeMockClient(async (op) => {
+        if (op === "chat.open") {
+          return {
+            session,
+            history: [],
+            historyNext: null,
+            historyThrough: 0,
+            activeTurnId: null,
+            activeText: "",
+            activePartial: "",
+            tookOver: false,
+            busy: false,
+          };
+        }
+        if (op === "work.snapshot") return emptyWorkSnapshot();
+        if (op === "chat.send") {
+          await sendGate;
+          return { ok: true };
+        }
+        if (op === "session.leave") return { daemonWillQuit: false };
+        return {};
+      });
+
+      const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+      await waitFor(() => text().includes("chat-34-r2b2-live"), 3000, "initial render live");
+
+      typeText("confirm twice");
+      sendInput("\r");
+      await waitFor(() => mock.calls.some((c) => c.op === "chat.send"), 3000, "chat.send");
+      const turnId = String(mock.calls.find((c) => c.op === "chat.send")!.params.turnId);
+
+      mock.emit({
+        kind: "event",
+        seq: 1,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.delta",
+        createdAt: Date.now(),
+        payload: { chatSessionId: session.id, turnId, delta: "EQUAL-SEG-YES." },
+      });
+      await waitFor(() => text().includes("EQUAL-SEG-YES."), 3000, "first Yes. visible");
+
+      mock.emit({
+        kind: "event",
+        seq: 2,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.tool",
+        createdAt: Date.now(),
+        payload: {
+          chatSessionId: session.id,
+          turnId,
+          name: "present_result",
+          status: "completed",
+          display: { kind: "run_activity", data: { runId: "run-r2b2-live", phase: "active", elapsedMs: 250, tasks: [] } },
+        },
+      });
+      await waitFor(() => text().includes("run-r2b2-live"), 3000, "tool card rendered");
+
+      mock.emit({
+        kind: "event",
+        seq: 3,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.delta",
+        createdAt: Date.now(),
+        payload: { chatSessionId: session.id, turnId, delta: "EQUAL-SEG-YES." },
+      });
+      mock.emit({
+        kind: "event",
+        seq: 4,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.turn.end",
+        createdAt: Date.now(),
+        payload: {
+          chatSessionId: session.id,
+          turnId,
+          historyThrough: 4,
+          assistantTurn: {
+            seq: 4,
+            chatSessionId: session.id,
+            role: "assistant",
+            content: "EQUAL-SEG-YES.",
+            createdAt: Date.now(),
+          } satisfies ChatTurnRecord,
+        },
+      });
+      resolveSend();
+      await waitFor(() => text().includes("Ready"), 3000, "turn settled");
+
+      sendInput("\x1d");
+      await runPromise;
+
+      const out = text();
+      assert.equal(
+        countOccurrences(out, "EQUAL-SEG-YES."),
+        2,
+        `Both equal segments with distinct seqs must render on live settle, got ${countOccurrences(out, "EQUAL-SEG-YES.")}`,
+      );
+      const firstIdx = out.indexOf("EQUAL-SEG-YES.");
+      const toolIdx = out.indexOf("run-r2b2-live");
+      const secondIdx = out.lastIndexOf("EQUAL-SEG-YES.");
+      assert.ok(firstIdx < toolIdx && toolIdx < secondIdx, "Tool card must sit between the two equal segments");
+    }
+
+    // Part B: Busy reopen where post-flush activePartial equals the frozen pre-tool segment
+    {
+      const { terminal, text, sendInput } = makeFakeTerminal(120, 30);
+      const session = makeChatSession("chat-34-r2b2-reopen");
+      let openCount = 0;
+
+      const mock = makeMockClient(async (op, params) => {
+        if (op === "ping") return { pong: true, pid: process.pid, protocolRev: 8, releaseId: "rel-r2b2" };
+        if (op === "chat.open") {
+          openCount += 1;
+          if (openCount === 1) {
+            return {
+              session,
+              history: [],
+              historyNext: null,
+              historyThrough: 0,
+              activeTurnId: null,
+              activeText: "",
+              activePartial: "",
+              tookOver: false,
+              busy: false,
+            };
+          }
+          return {
+            session,
+            history: [],
+            historyNext: null,
+            historyThrough: 2,
+            activeTurnId: "wake-r2b2",
+            activeText: "EQUAL-REOPEN-YES.EQUAL-REOPEN-YES.",
+            activePartial: "EQUAL-REOPEN-YES.",
+            tookOver: false,
+            busy: true,
+          };
+        }
+        if (op === "chat.history") {
+          const afterSeq = Number(params.afterSeq ?? 0);
+          const rows: ChatTurnRecord[] = [
+            { seq: 1, chatSessionId: session.id, role: "assistant", content: "EQUAL-REOPEN-YES.", createdAt: Date.now() },
+            {
+              seq: 2,
+              chatSessionId: session.id,
+              role: "tool_output",
+              content: "run-r2b2-reopen",
+              toolName: "present_result",
+              display: { kind: "run_activity", data: { runId: "run-r2b2-reopen", phase: "active", elapsedMs: 250, tasks: [] } },
+              createdAt: Date.now(),
+            },
+          ];
+          return { history: rows.filter((r) => r.seq > afterSeq), historyNext: null };
+        }
+        if (op === "work.snapshot") return emptyWorkSnapshot();
+        if (op === "session.leave") return { daemonWillQuit: false };
+        return {};
+      });
+
+      const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+      await waitFor(() => text().includes("chat-34-r2b2-reopen"), 3000, "initial render reopen");
+
+      mock.emit({
+        kind: "event",
+        seq: 1,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.turn.start",
+        createdAt: Date.now(),
+        payload: { chatSessionId: session.id, turnId: "wake-r2b2", reason: "goal.progress" },
+      });
+      mock.emit({
+        kind: "event",
+        seq: 2,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.delta",
+        createdAt: Date.now(),
+        payload: { chatSessionId: session.id, turnId: "wake-r2b2", delta: "EQUAL-REOPEN-YES." },
+      });
+      mock.emit({
+        kind: "event",
+        seq: 3,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.tool",
+        createdAt: Date.now(),
+        payload: {
+          chatSessionId: session.id,
+          turnId: "wake-r2b2",
+          name: "present_result",
+          status: "completed",
+          display: { kind: "run_activity", data: { runId: "run-r2b2-reopen", phase: "active", elapsedMs: 250, tasks: [] } },
+        },
+      });
+      await waitFor(() => text().includes("run-r2b2-reopen"), 3000, "tool card before disconnect");
+
+      mock.disconnect();
+      await waitFor(() => text().includes("Reconnected to harnessd"), 5000, "reconnected busy");
+
+      // Second segment must be visible in live tail after reseed even though it equals the frozen segment!
+      assert.equal(
+        countOccurrences(text(), "EQUAL-REOPEN-YES."),
+        2,
+        "Post-flush activePartial equal to frozen segment must survive busy reopen reseed",
+      );
+
+      mock.emit({
+        kind: "event",
+        seq: 4,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.turn.end",
+        createdAt: Date.now(),
+        payload: {
+          chatSessionId: session.id,
+          turnId: "wake-r2b2",
+          historyThrough: 3,
+          assistantTurn: {
+            seq: 3,
+            chatSessionId: session.id,
+            role: "assistant",
+            content: "EQUAL-REOPEN-YES.",
+            createdAt: Date.now(),
+          } satisfies ChatTurnRecord,
+        },
+      });
+      await waitFor(() => text().includes("Ready"), 3000, "reopen turn settled");
+
+      sendInput("\x1d");
+      await runPromise;
+
+      const out = text();
+      assert.equal(
+        countOccurrences(out, "EQUAL-REOPEN-YES."),
+        2,
+        `Both equal segments must remain after busy reopen + turn.end, got ${countOccurrences(out, "EQUAL-REOPEN-YES.")}`,
+      );
+    }
+
+    // Part C: Busy reopen with empty activePartial after flush must NOT fall back to cumulative activeText
+    {
+      const { terminal, text, sendInput } = makeFakeTerminal(120, 30);
+      const session = makeChatSession("chat-34-r2b2-empty-partial");
+      let openCount = 0;
+
+      const mock = makeMockClient(async (op) => {
+        if (op === "ping") return { pong: true, pid: process.pid, protocolRev: 8, releaseId: "rel-r2b2c" };
+        if (op === "chat.open") {
+          openCount += 1;
+          if (openCount === 1) {
+            return {
+              session,
+              history: [],
+              historyNext: null,
+              historyThrough: 0,
+              activeTurnId: null,
+              activeText: "",
+              activePartial: "",
+              tookOver: false,
+              busy: false,
+            };
+          }
+          return {
+            session,
+            history: [],
+            historyNext: null,
+            historyThrough: 0,
+            activeTurnId: "wake-r2b2c",
+            activeText: "CUMULATIVE-DISCARDED-ATTEMPT",
+            activePartial: "",
+            tookOver: false,
+            busy: true,
+          };
+        }
+        if (op === "chat.history") return { history: [], historyNext: null };
+        if (op === "work.snapshot") return emptyWorkSnapshot();
+        if (op === "session.leave") return { daemonWillQuit: false };
+        return {};
+      });
+
+      const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+      await waitFor(() => text().includes("chat-34-r2b2-empty-partial"), 3000, "initial render part C");
+
+      mock.disconnect();
+      await waitFor(() => text().includes("Reconnected to harnessd") && openCount >= 2, 5000, "reconnected busy part C");
+
+      sendInput("\x1d");
+      await runPromise;
+
+      assert.equal(
+        countOccurrences(text(), "CUMULATIVE-DISCARDED-ATTEMPT"),
+        0,
+        "Empty activePartial must never fall back to cumulative activeText",
+      );
+    }
+  });
+
+  it("review-2 should-fix 4: human-needed live alerts stay pinned in the visible viewport during a long reply, overflow with '+N more', ignore internal lines, and clear on non-interrupting submit", async () => {
+    const { terminal, text, viewportText, sendInput, typeText } = makeFakeTerminal(120, 24);
+    const session = makeChatSession("chat-34-r2sf4");
+    const longLines = Array.from({ length: 40 }, (_, i) => `LONG-LIVE-LINE-${String(i + 1).padStart(2, "0")}`);
+    const longReply = longLines.join("\n");
+    let resolveSend!: () => void;
+    const sendGate = new Promise<void>((r) => (resolveSend = r));
+    let resolveSecondSend!: () => void;
+    const secondSendGate = new Promise<void>((r) => (resolveSecondSend = r));
+    let sendCount = 0;
+
+    const mock = makeMockClient(async (op) => {
+      if (op === "chat.open") {
+        return {
+          session,
+          history: [],
+          historyNext: null,
+          historyThrough: 0,
+          activeTurnId: null,
+          activeText: "",
+          activePartial: "",
+          tookOver: false,
+          busy: false,
+        };
+      }
+      if (op === "work.snapshot") return emptyWorkSnapshot();
+      if (op === "chat.send") {
+        sendCount += 1;
+        if (sendCount === 1) await sendGate;
+        else await secondSendGate;
+        return { ok: true };
+      }
+      if (op === "session.leave") return { daemonWillQuit: false };
+      return {};
+    });
+
+    const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+    await waitFor(() => viewportText().includes("chat-34-r2sf4"), 3000, "initial render");
+
+    // Start a live turn and stream a reply taller than the 24-row viewport
+    typeText("Start long analysis");
+    sendInput("\r");
+    await waitFor(() => mock.calls.some((c) => c.op === "chat.send"), 3000, "chat.send");
+    const turnId = String(mock.calls.find((c) => c.op === "chat.send")!.params.turnId);
+
+    mock.emit({
+      kind: "event",
+      seq: 1,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.delta",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId, delta: longReply },
+    });
+    await waitFor(
+      () => viewportText().includes("LONG-LIVE-LINE-40") && !viewportText().includes("LONG-LIVE-LINE-01"),
+      3000,
+      "long reply scrolled past viewport top",
+    );
+
+    // Emit an internal line (must NEVER pin) + 4 human-needed P0 escalations (must pin with bounded rows + '+N more')
+    mock.emit({
+      kind: "event",
+      seq: 2,
+      runId: "run-sf4",
+      taskId: null,
+      type: "goal.progress",
+      createdAt: Date.now(),
+      payload: { goalId: "goal-sf4", phase: "implementing", summary: "INTERNAL-NO-PIN-SF4" },
+    });
+    for (const [idx, title] of [
+      "ESC-HUMAN-ALERT-1: Approve prod deploy",
+      "ESC-HUMAN-ALERT-2: Confirm schema cutover",
+      "ESC-HUMAN-ALERT-3: Approve DNS switch",
+      "ESC-HUMAN-ALERT-4: Confirm rollback window",
+    ].entries()) {
+      mock.emit({
+        kind: "event",
+        seq: 3 + idx,
+        runId: "run-sf4",
+        taskId: `t-sf4-${idx + 1}`,
+        type: "escalation.created",
+        createdAt: Date.now(),
+        payload: {
+          id: `esc-sf4-${idx + 1}`,
+          toTaskId: null,
+          severity: "P0",
+          blocking: true,
+          title,
+        },
+      });
+    }
+
+    // Assert strictly on the LAST VIEWPORT ROWS (viewportText), NOT scrollback!
+    await waitFor(
+      () =>
+        viewportText().includes("ESC-HUMAN-ALERT-1: Approve prod deploy") &&
+        viewportText().includes("+2 more"),
+      2000,
+      "pinned human alerts + overflow visible in last viewport rows",
+    );
+    const vpWhileStreaming = viewportText();
+    assert.equal(
+      vpWhileStreaming.includes("LONG-LIVE-LINE-01"),
+      false,
+      "Top of long reply is in scrollback, confirming alert is rendered in the pinned dock",
+    );
+    assert.equal(
+      vpWhileStreaming.includes("INTERNAL-NO-PIN-SF4"),
+      false,
+      "Internal lines must never appear in the pinned attention strip",
+    );
+
+    // Clear pinned alerts via a non-interrupting user action (submitting a follow-up message while busy -> queues without cancelling!)
+    typeText("Follow up after seeing alerts");
+    sendInput("\r");
+    await waitFor(
+      () =>
+        !viewportText().includes("ESC-HUMAN-ALERT-1: Approve prod deploy") &&
+        viewportText().includes("Follow up after seeing alerts"),
+      2000,
+      "non-interrupting submit cleared pinned alerts and queued follow-up",
+    );
+    assert.equal(
+      mock.calls.some((c) => c.op === "chat.cancel"),
+      false,
+      "Clearing pinned alerts via submit must not cancel the active turn",
+    );
+
+    // Now finish the long turn; reply must render ONCE (never frozen or duplicated) and receipts remain in scrollback!
+    mock.emit({
+      kind: "event",
+      seq: 10,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.turn.end",
+      createdAt: Date.now(),
+      payload: {
+        chatSessionId: session.id,
+        turnId,
+        historyThrough: 2,
+        assistantTurn: {
+          seq: 2,
+          chatSessionId: session.id,
+          role: "assistant",
+          content: longReply,
+          createdAt: Date.now(),
+        } satisfies ChatTurnRecord,
+      },
+    });
+    resolveSend();
+    await waitFor(() => mock.calls.filter((c) => c.op === "chat.send").length === 2, 3000, "queued follow-up drained");
+    const turn2Id = String(mock.calls.filter((c) => c.op === "chat.send")[1]!.params.turnId);
+    mock.emit({
+      kind: "event",
+      seq: 11,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.turn.end",
+      createdAt: Date.now(),
+      payload: {
+        chatSessionId: session.id,
+        turnId: turn2Id,
+        historyThrough: 4,
+        assistantTurn: {
+          seq: 4,
+          chatSessionId: session.id,
+          role: "assistant",
+          content: "FOLLOWUP-DONE-SF4",
+          createdAt: Date.now(),
+        } satisfies ChatTurnRecord,
+      },
+    });
+    resolveSecondSend();
+    await waitFor(() => text().includes("FOLLOWUP-DONE-SF4"), 3000, "follow-up settled");
+
+    sendInput("\x1d");
+    await runPromise;
+
+    const fullOut = text();
+    assert.equal(countOccurrences(fullOut, "LONG-LIVE-LINE-01"), 1, "Long reply line 1 must render exactly once");
+    assert.equal(countOccurrences(fullOut, "LONG-LIVE-LINE-40"), 1, "Long reply line 40 must render exactly once");
+    assert.ok(fullOut.includes("ESC-HUMAN-ALERT-1: Approve prod deploy"), "Immutable receipt remains in transcript");
+    assert.ok(fullOut.includes("ESC-HUMAN-ALERT-4: Confirm rollback window"), "All human receipts remain in transcript");
   });
 });

@@ -98,8 +98,7 @@ function renderTimestampDivider(label: string, width: number, theme: Theme): str
 /**
  * Strictly-bottom-only streaming tail for the active assistant turn.
  * Renders only while a turn is live; when the turn finishes, its final content is frozen into
- * `ImmutableTranscript` and this tail resets to empty. Also records any text already frozen
- * mid-turn so settlement and reconnect resync never render the exact same segment twice.
+ * `ImmutableTranscript` and this tail resets to empty.
  */
 export class LiveTurnTail implements Component {
   private text = "";
@@ -109,8 +108,6 @@ export class LiveTurnTail implements Component {
   private modelLabel: string | undefined;
   private textTimestampMs: number | null = null;
   private activityTimestampMs: number | null = null;
-  private frozenText = "";
-  private frozenSegmentCount = 0;
 
   constructor(
     private readonly theme: Theme,
@@ -125,46 +122,20 @@ export class LiveTurnTail implements Component {
     this.modelLabel = modelLabel;
     this.textTimestampMs = null;
     this.activityTimestampMs = null;
-    this.frozenText = "";
-    this.frozenSegmentCount = 0;
   }
 
   /**
-   * Resets the streaming tail on reconnect while optionally preserving already-frozen text
-   * from the same in-flight turn. `seedText` is the daemon's post-flush `activePartial`, so it is
-   * kept intact unless it equals the already-frozen text of this turn (after trim).
+   * Resets the streaming tail on reconnect. `seedText` is the daemon's post-flush `activePartial`,
+   * which is authoritative for the current segment and is always kept.
    */
-  reseed(seedText: string, modelLabel?: string, preserveFrozen = false, frozenTextOverride?: string): void {
-    const prevFrozen =
-      typeof frozenTextOverride === "string"
-        ? frozenTextOverride
-        : preserveFrozen
-          ? this.frozenText
-          : "";
-    const prevCount =
-      typeof frozenTextOverride === "string"
-        ? frozenTextOverride.trim()
-          ? Math.max(1, this.frozenSegmentCount)
-          : 0
-        : preserveFrozen
-          ? this.frozenSegmentCount
-          : 0;
+  reseed(seedText: string, modelLabel?: string): void {
     this.active = true;
-    this.text = "";
+    this.text = seedText;
     this.thought = "";
     this.tools = [];
     this.modelLabel = modelLabel;
     this.textTimestampMs = null;
     this.activityTimestampMs = null;
-    this.frozenText = prevFrozen;
-    this.frozenSegmentCount = prevCount;
-    if (seedText) {
-      if (this.frozenSegmentCount > 0 && seedText.trim() === this.frozenText.trim()) {
-        this.text = "";
-      } else {
-        this.text = seedText;
-      }
-    }
   }
 
   appendText(delta: string, timestampMs?: number | null): void {
@@ -198,8 +169,6 @@ export class LiveTurnTail implements Component {
     tools: LiveToolPill[];
     modelLabel?: string;
     textTimestampMs: number | null;
-    frozenText: string;
-    frozenSegmentCount: number;
   } {
     return {
       text: this.text,
@@ -207,8 +176,6 @@ export class LiveTurnTail implements Component {
       tools: [...this.tools],
       modelLabel: this.modelLabel,
       textTimestampMs: this.textTimestampMs,
-      frozenText: this.frozenText,
-      frozenSegmentCount: this.frozenSegmentCount,
     };
   }
 
@@ -220,8 +187,6 @@ export class LiveTurnTail implements Component {
     this.modelLabel = undefined;
     this.textTimestampMs = null;
     this.activityTimestampMs = null;
-    this.frozenText = "";
-    this.frozenSegmentCount = 0;
   }
 
   get isActive(): boolean {
@@ -275,7 +240,7 @@ export class LiveTurnTail implements Component {
     return out;
   }
 
-  /** Consumes and returns accumulated live text, recording any non-empty frozen segment on the tail. */
+  /** Consumes and returns accumulated live text before a daemon flush point. */
   takeText(): { text: string; modelLabel: string; timestampMs: number | null } {
     const text = this.text;
     const hasText = Boolean(text.trim());
@@ -285,8 +250,6 @@ export class LiveTurnTail implements Component {
     this.thought = "";
     if (hasText) {
       this.modelLabel = undefined;
-      this.frozenText += text;
-      this.frozenSegmentCount += 1;
     }
     this.textTimestampMs = null;
     this.activityTimestampMs = null;
@@ -389,19 +352,17 @@ export class ImmutableTranscript extends Container {
     this.frozenContainer.addChild(new FrozenBlock((w) => renderTranscriptBlock(block, w, t, "expanded")));
   }
 
-  /** Starts a new live assistant turn, resetting frozen-text tracking for the turn. */
+  /** Starts a new live assistant turn. */
   beginLiveTurn(modelLabel?: string): void {
     this.liveTail.begin(modelLabel);
   }
 
-  /** Reseeds the live turn on reconnect, preserving already-frozen text when staying on the same turn. */
+  /** Reseeds the live turn on reconnect with the daemon's post-flush `activePartial`. */
   resyncLiveTurn(opts: {
     modelLabel?: string;
     seedText?: string;
-    preserveFrozen?: boolean;
-    frozenText?: string;
   }): void {
-    this.liveTail.reseed(opts.seedText ?? "", opts.modelLabel, opts.preserveFrozen ?? false, opts.frozenText);
+    this.liveTail.reseed(opts.seedText ?? "", opts.modelLabel);
   }
 
   /**
@@ -418,9 +379,9 @@ export class ImmutableTranscript extends Container {
 
   /**
    * Settles the active live turn using the daemon's final persisted assistant segment.
-   * Because every mid-turn TUI freeze coincides with a daemon flush, `finalText` is the final
-   * segment (not cumulative) and replaces the unfrozen live text when present. Only when
-   * `finalText` equals this turn's already-frozen text (after trim) is it skipped as a duplicate.
+   * Because every mid-turn TUI freeze coincides with a daemon flush, `finalText` (with a fresh seq)
+   * is authoritative for the current segment and replaces the unfrozen live text. Callers suppress
+   * already-rendered persisted rows by seq via `discardLiveText: true`.
    */
   settleLiveTurn(opts?: {
     finalText?: string;
@@ -431,15 +392,7 @@ export class ImmutableTranscript extends Container {
     const snap = this.liveTail.snapshot();
     let toAppend = "";
     if (!opts?.discardLiveText) {
-      if (typeof opts?.finalText === "string") {
-        if (snap.frozenSegmentCount > 0 && opts.finalText.trim() === snap.frozenText.trim()) {
-          toAppend = "";
-        } else {
-          toAppend = opts.finalText;
-        }
-      } else {
-        toAppend = snap.text;
-      }
+      toAppend = typeof opts?.finalText === "string" ? opts.finalText : snap.text;
     }
 
     this.liveTail.clear();
@@ -557,6 +510,13 @@ export interface LiveHudItem {
   ref: EntityRef;
 }
 
+export interface PinnedAttentionItem {
+  glyph?: string;
+  tone?: Tone;
+  tag?: string;
+  text: string;
+}
+
 export interface DockState {
   /** Numbered active goal / blocking escalation slots for Alt+1..5 quick-jump. */
   slots: AttentionSlot[];
@@ -578,6 +538,8 @@ export interface DockState {
   transientHint?: string | null;
   rightStatus: string;
   queuedCount: number;
+  /** Pinned human-audience alerts that arrived while a live turn was streaming (cleared on next user submit/command). */
+  pinnedAlerts?: readonly PinnedAttentionItem[];
   /** Pinned pending/sending user messages rendered directly above the composer. */
   queuedItems?: readonly ChatQueueItem[];
   /** Whether the queue strip supports explicit send-now steering (default true). */
@@ -922,18 +884,57 @@ export class FixedDock implements Component {
   }
 
   /** Uses available terminal rows above the baseline dock while reserving space for the transcript. */
-  private queueStripMaxRows(): number {
+  private dynamicStripBudget(): number {
     const rows = this.tuiRef.terminal?.rows ?? 30;
     const baseDockRows = this.hudRowCount() + 7;
     return Math.max(1, rows - baseDockRows - 6);
   }
 
-  private renderQueueStripRows(width: number): string[] {
+  private renderPinnedAlertsRows(width: number, maxRows: number): string[] {
+    const items = this.state.pinnedAlerts;
+    if (!items || items.length === 0) return [];
+    const t = this.theme;
+    const g = t.glyphs;
+    const boundedMax = Math.max(1, Math.min(3, maxRows));
+    const singleRowOverflow = boundedMax === 1 && items.length > 1;
+    const visibleCap =
+      items.length <= boundedMax
+        ? items.length
+        : singleRowOverflow
+          ? 1
+          : Math.max(1, boundedMax - 1);
+    const shown = items.slice(0, visibleCap);
+    const hidden = Math.max(0, items.length - shown.length);
+    const out: string[] = [];
+
+    for (let i = 0; i < shown.length; i += 1) {
+      const item = shown[i]!;
+      const tone: Tone = item.tone ?? "warn";
+      const glyph = item.glyph ?? g.warn;
+      const tagPart = item.tag ? `[${sanitizeLine(item.tag)}] ` : "";
+      const cleanText = firstLine(sanitizeLine(item.text), Math.max(20, width));
+      const prefix = ` ${t.paint(tone, `${glyph} ${tagPart}`)}`;
+      const right = singleRowOverflow && hidden > 0 ? `${t.muted(`+${hidden} more`)} ` : "";
+      if (right && visibleWidth(prefix) + 12 + visibleWidth(right) <= width) {
+        const avail = width - visibleWidth(prefix) - visibleWidth(right) - 2;
+        out.push(splitRow(`${prefix}${clamp(cleanText, avail)}`, right, width));
+      } else {
+        out.push(fit(`${prefix}${cleanText}`, width));
+      }
+    }
+
+    if (!singleRowOverflow && hidden > 0) {
+      out.push(fit(`  ${t.muted(`+${hidden} more`)}`, width));
+    }
+
+    return out;
+  }
+
+  private renderQueueStripRows(width: number, maxRows: number): string[] {
     const items = this.state.queuedItems;
     if (!items || items.length === 0) return [];
     const t = this.theme;
     const g = t.glyphs;
-    const maxRows = this.queueStripMaxRows();
     const visibleCap = items.length <= maxRows ? items.length : Math.max(1, maxRows - 1);
     const shown = items.slice(0, visibleCap);
     const hidden = Math.max(0, items.length - shown.length);
@@ -995,12 +996,15 @@ export class FixedDock implements Component {
   render(width: number): string[] {
     const w = Math.max(12, Math.floor(width));
     const hudRows = this.renderHudRows(w, this.hudRowCount());
-    const queueRows = this.renderQueueStripRows(w);
+    const budget = this.dynamicStripBudget();
+    const alertRows = this.renderPinnedAlertsRows(w, budget);
+    const queueRows = this.renderQueueStripRows(w, Math.max(1, budget - alertRows.length));
     const lines: string[] = [
       this.theme.border(this.theme.glyphs.barH.repeat(w)),
       ...hudRows,
       this.renderAgentCountsRow(w),
       this.renderStatusRow(w),
+      ...alertRows,
       ...queueRows,
       ...this.editor.render(w).map((l) => clamp(l, w)),
       fit(` ${renderHintBar(this.state.hints, Math.max(1, w - 2), this.theme)}`, w),
