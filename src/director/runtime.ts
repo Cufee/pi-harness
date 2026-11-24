@@ -4,6 +4,10 @@ import { open as openFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { attachNotices } from "../advisories/message.js";
+import { REJECTIONS } from "../advisories/rejections.js";
+import { buildDirectorSubject } from "../advisories/subject.js";
+import type { Subject } from "../advisories/types.js";
 import {
   compareSemanticVersions,
   parseClaudeFamilyVersion,
@@ -874,6 +878,10 @@ interface ChatSelection {
   model?: string | null;
   effort?: string | null;
   title?: string;
+}
+
+interface DirectorTurnState {
+  subject: Subject;
 }
 
 interface ActiveChat {
@@ -4238,9 +4246,7 @@ export class DirectorRuntime {
               allowShellInReadOnly: checkout.isolated,
               model: wireModel,
               effort: reviewerEffort,
-              systemPrompt:
-                "You are an independent read-only Done-Reviewer operating in a disposable verification checkout of the target branch. Inspect the implementation, diffs, and verification evidence for each required criterion — you may run tests, linters, git diff, rg, sg, or tmux checks freely to verify behavior, but never edit tracked repository code or delegate. Call submit_review_verdict if available, or return the requested JSON verdict with concrete sources for every required criterion. " +
-                `You may get one advisory progress check-in around ${reviewerMaxTurns} tool-call turns; the harness does not stop you by turn count. The review has a hard 10-minute wall-clock limit. Submit as soon as every required criterion has evidence; a changes_requested verdict with partial evidence is better than none.`,
+              systemPrompt: buildReviewerSystemPrompt(),
               initialPrompt: attempt === 1 ? reviewerPrompt : `${reviewerPrompt}\n\n${retryNote}`,
               maxTurns: reviewerMaxTurns,
               tools: [submitTool],
@@ -4972,11 +4978,16 @@ export class DirectorRuntime {
     return snap.totals.find((t) => t.currency === "USD")?.amount ?? 0;
   }
 
-  private directorExecutor(session: { id: string; repoRoot: string }, signal: AbortSignal, onToolEvent?: RunnerCallbacks["onToolEvent"]) {
+  private directorExecutor(
+    session: { id: string; repoRoot: string },
+    signal: AbortSignal,
+    onToolEvent: RunnerCallbacks["onToolEvent"] | undefined,
+    turn: DirectorTurnState,
+  ) {
     const presentations = new Map<string, { toolName: string; build: () => ToolDisplayPayload }>();
     // project_switch takes effect for every later inner tool call, including later calls in the same script.
     const currentRepoRoot = () => this.chats.getSession(session.id)?.repoRoot ?? session.repoRoot;
-    return createCodeModeExecutor({
+    const base = createCodeModeExecutor({
       ...this.config.codeExec,
       mode: effectiveCodeMode(this.config.codeMode),
       allowedTools: () => DIRECTOR_TOOLS,
@@ -4992,11 +5003,52 @@ export class DirectorRuntime {
           presentations.delete(id);
           return { presented: true };
         }
-        return this.executeDirectorTool(session.id, currentRepoRoot(), name, args, effectiveSignal, (build) => {
-          const id = randomUUID();
-          presentations.set(id, { toolName: name, build });
-          return id;
+        const inScript = execSignal !== undefined;
+        const repoRoot = currentRepoRoot();
+        if (turn.subject.workspaceRoot !== repoRoot) {
+          turn.subject = { ...turn.subject, workspaceRoot: repoRoot };
+        }
+        const paths =
+          name === "read_file" && typeof args.path === "string" && args.path.trim()
+            ? [args.path.trim()]
+            : [];
+        let result: unknown;
+        try {
+          result = await this.executeDirectorTool(session.id, repoRoot, name, args, effectiveSignal, (build) => {
+            const id = randomUUID();
+            presentations.set(id, { toolName: name, build });
+            return id;
+          });
+        } catch (err) {
+          this.orchestrator.advisories.observeHarness(turn.subject, {
+            origin: "result",
+            surface: "harness",
+            tool: name,
+            status: "failed",
+            args,
+            paths,
+            inScript,
+          });
+          throw err;
+        }
+        const postRepoRoot = currentRepoRoot();
+        if (turn.subject.workspaceRoot !== postRepoRoot) {
+          turn.subject = { ...turn.subject, workspaceRoot: postRepoRoot };
+        }
+        const notices = this.orchestrator.advisories.observeHarness(turn.subject, {
+          origin: "result",
+          surface: "harness",
+          tool: name,
+          status: "completed",
+          args,
+          paths,
+          result,
+          inScript,
         });
+        if (notices.length > 0) {
+          this.orchestrator.advisories.requeue(turn.subject.id, notices);
+        }
+        return result;
       },
       artifactsDir: () => resolve(currentRepoRoot(), this.config.worktree.artifactsDir ?? ".harness/artifacts"),
       pythonCacheDir: join(this.config.stateDir, "code-mode", "python"),
@@ -5010,18 +5062,44 @@ export class DirectorRuntime {
       signal,
       onToolEvent: onToolEvent && codeExecEventSink(onToolEvent),
     });
+    return {
+      tools: base.tools,
+      execute: async (name: string, args: Record<string, unknown>): Promise<unknown> => {
+        const result = await base.execute(name, args);
+        const notices = this.orchestrator.advisories.take(turn.subject.id);
+        if (notices.length > 0) {
+          const { result: annotated, attached } = attachNotices(result, notices);
+          if (attached) {
+            this.orchestrator.advisories.delivered(turn.subject.id, notices, "tool_result");
+            return annotated;
+          }
+          this.orchestrator.advisories.requeue(turn.subject.id, notices);
+        }
+        return result;
+      },
+    };
   }
 
   /** Reuse the active turn's executor so MCP and in-process calls share cancellation and tool events. */
   async executeDirectorMcpTool(chatSessionId: string, name: string, args: Record<string, unknown>): Promise<unknown> {
     let executor = this.activeChats.get(chatSessionId)?.executor;
+    let throwawayTurn: DirectorTurnState | null = null;
     if (!executor) {
       const session = this.chats.getSession(chatSessionId);
       if (!session) throw new Error(`Unknown chat session ${chatSessionId}`);
       // Idle chats support discovery and legacy direct calls, but cannot launch a script outside a turn.
-      executor = this.directorExecutor(session, AbortSignal.abort());
+      throwawayTurn = {
+        subject: buildDirectorSubject({ sessionId: session.id, repoRoot: session.repoRoot, userMessage: "" }),
+      };
+      executor = this.directorExecutor(session, AbortSignal.abort(), undefined, throwawayTurn);
     }
-    return name === "__list_tools" ? executor.tools() : executor.execute(name, args);
+    try {
+      return name === "__list_tools" ? executor.tools() : await executor.execute(name, args);
+    } finally {
+      if (throwawayTurn && !this.activeChats.has(chatSessionId)) {
+        this.orchestrator.advisories.settle(throwawayTurn.subject.id);
+      }
+    }
   }
 
   private isStaleTaskSettlement(event: Extract<ChatControlEvent, { kind: "task.settled" }>): boolean {
@@ -5082,7 +5160,10 @@ export class DirectorRuntime {
     // Reserve cancellable ActiveChat BEFORE awaiting cold catalog migration so Esc during migration cancels cleanly
     const abort = new AbortController();
     const { promise: settled, resolve: markSettled } = Promise.withResolvers<void>();
-    const preExecutor = this.directorExecutor(session, abort.signal, onToolEvent);
+    const turn: DirectorTurnState = {
+      subject: buildDirectorSubject({ sessionId: session.id, repoRoot: session.repoRoot, userMessage }),
+    };
+    const preExecutor = this.directorExecutor(session, abort.signal, onToolEvent, turn);
     const active: ActiveChat = {
       abort,
       executor: preExecutor,
@@ -5178,7 +5259,7 @@ export class DirectorRuntime {
       const prompt = `${contextTranscript ? `Prior conversation:\n${contextTranscript}\n\n` : ""}Workspace: ${session.repoRoot}${goalBanner}\n\n${currentTurnBlock}`;
 
       const mode = effectiveCodeMode(this.config.codeMode);
-      const executor = this.directorExecutor(session, abort.signal, onToolEvent);
+      const executor = this.directorExecutor(session, abort.signal, onToolEvent, turn);
       active.executor = executor;
       const bridgeExt = import.meta.url.endsWith(".js") ? "mcp-bridge.js" : "mcp-bridge.ts";
       const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", bridgeExt);
@@ -5268,6 +5349,7 @@ export class DirectorRuntime {
       this.flushChatPartial(chatSessionId, active);
       throw error;
     } finally {
+      this.orchestrator.advisories.settle(turn.subject.id);
       abort.abort();
       if (this.activeChats.get(chatSessionId) === active) {
         this.activeChats.delete(chatSessionId);
@@ -5510,14 +5592,14 @@ export class DirectorRuntime {
           return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
         });
         if (!matchedRoot) {
-          throw new Error("write_note path must be inside .harness/goals/, .harness/notes/, or a configured extraWriteRoots directory");
+          throw REJECTIONS.directorNoteRoot(rawPath);
         }
         const checkTarget = (path: string) => {
           const rel = relative(matchedRoot, path);
           if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-            throw new Error("write_note parent symlink escapes allowed write root");
+            throw REJECTIONS.directorNoteRoot(rawPath);
           }
-          if (isProtectedWritePath(matchedRoot, path)) throw new Error("write_note target is protected");
+          if (isProtectedWritePath(matchedRoot, path)) throw REJECTIONS.directorNoteRoot(rawPath);
         };
         checkTarget(expandedTarget);
         let ancestor = dirname(expandedTarget);
@@ -5527,7 +5609,7 @@ export class DirectorRuntime {
         if (lstatSync(matchedRoot, { throwIfNoEntry: false })) {
           checkTarget(realAncestor);
         } else if (realAncestor !== ancestor) {
-          throw new Error("write_note parent symlink escapes allowed write root");
+          throw REJECTIONS.directorNoteRoot(rawPath);
         }
         const target = resolve(realAncestor, relative(ancestor, expandedTarget));
         checkTarget(target);
@@ -6458,21 +6540,28 @@ export function resolveDirectorReadablePath(repoRoot: string, rawPath: string): 
   const target = realpathSync(candidate);
   const relToRepo = relative(root, target);
   const inRepo = relToRepo !== ".." && !relToRepo.startsWith(`..${sep}`) && !isAbsolute(relToRepo);
-  const protectedMessage = "read_file cannot read protected paths (.git, task worktrees, or harness-internal state)";
   if (inRepo) {
     const parts = relToRepo.split(sep).map((p) => p.toLowerCase());
     // Block .git and .harness/worktrees, while permitting .harness/goals, .harness/artifacts, and .harness/notes.
     if (parts.includes(".git") || (parts[0] === ".harness" && !["artifacts", "goals", "notes"].includes(parts[1] ?? ""))) {
-      throw new Error(protectedMessage);
+      throw REJECTIONS.directorProtectedRead(rawPath);
     }
   } else {
     // Check the whole canonical path so the veto holds wherever the file lives.
     const parts = target.split(sep).map((p) => p.toLowerCase());
     if (parts.includes(".git") || parts.some((p, i) => p === ".harness" && parts[i + 1] === "worktrees")) {
-      throw new Error(protectedMessage);
+      throw REJECTIONS.directorProtectedRead(rawPath);
     }
   }
   return { target, inRepo, display: inRepo ? relToRepo : target };
+}
+
+/** System prompt for the independent read-only Done-Reviewer session. */
+export function buildReviewerSystemPrompt(): string {
+  return (
+    "You are an independent read-only Done-Reviewer operating in a disposable verification checkout of the target branch. Inspect the implementation, diffs, and verification evidence for each required criterion — you may run tests, linters, git diff, rg, sg, or tmux checks freely to verify behavior, but never edit tracked repository code or delegate. Call submit_review_verdict if available, or return the requested JSON verdict with concrete sources for every required criterion. " +
+    "The review has a hard 10-minute wall-clock limit. Submit as soon as every required criterion has evidence; a changes_requested verdict with partial evidence is better than none."
+  );
 }
 
 /** goal_accept evidence: a readable regular file or directory under the same policy as read_file. */

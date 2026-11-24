@@ -1,7 +1,7 @@
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
 import assert from "node:assert/strict";
 import { describe, it } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, saveGlobalConfig, type AcpProfileConfig, type HarnessConfig } from "../src/config.js";
@@ -1452,6 +1452,172 @@ it("reports Blocked on verification settlement wording when a failed run's worke
         assert.ok(settledEvent.detail?.includes(`main@${sha7}`), settledEvent.detail);
       }
       assert.ok(wakes.length >= 1);
+    } finally {
+      await daemon.stop();
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+it("T3-15: Director self-reading advisory fires once per turn and stays silent on named, paged, .harness, and post-delegation reads", async () => {
+  const repoRoot = await makeTempRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-t315-state-"));
+  try {
+    const areas = ["src/alpha", "src/beta", "src/gamma"];
+    const sourceFiles: string[] = [];
+    for (const area of areas) {
+      mkdirSync(join(repoRoot, area), { recursive: true });
+      const count = area === "src/gamma" ? 4 : 5;
+      for (let i = 1; i <= count; i++) {
+        const rel = `${area}/file${i}.ts`;
+        writeFileSync(join(repoRoot, rel), `export const v_${i} = "${rel}";\n`, "utf8");
+        sourceFiles.push(rel);
+      }
+    }
+    // 14 distinct source files across 3 areas
+    assert.equal(sourceFiles.length, 14);
+
+    // One large file for paging reads
+    mkdirSync(join(repoRoot, "src/big"), { recursive: true });
+    const bigLines = Array.from({ length: 120 }, (_, i) => `export const line_${i + 1} = ${i + 1};`).join("\n") + "\n";
+    writeFileSync(join(repoRoot, "src/big/large.ts"), bigLines, "utf8");
+
+    // 12 files under .harness/notes across 3 subdirs
+    const harnessFiles: string[] = [];
+    for (const sub of [".harness/notes/a", ".harness/notes/b", ".harness/notes/c"]) {
+      mkdirSync(join(repoRoot, sub), { recursive: true });
+      for (let i = 1; i <= 4; i++) {
+        const rel = `${sub}/note${i}.md`;
+        writeFileSync(join(repoRoot, rel), `note ${rel}\n`, "utf8");
+        harnessFiles.push(rel);
+      }
+    }
+
+    type ReadRes = { content: string; harness_advisory?: string[] };
+    type Scenario = "fire_14" | "second_turn_12" | "user_named_dirs" | "paging_one_file" | "harness_reads" | "after_spawn_task";
+    let scenario: Scenario = "fire_14";
+    const resultsByScenario = new Map<Scenario, ReadRes[]>();
+    let directorTurnRuns = 0;
+
+    const config = withFixtureCatalog({
+      ...loadConfig(repoRoot),
+      stateDir,
+      socketPath: join(stateDir, "d.sock"),
+      codeMode: "off",
+    });
+    const daemon = new HarnessDaemon(config, {
+      dbPath: ":memory:",
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          if (req.kind === "research") {
+            await req.executeTool("return_task", {
+              status: "completed",
+              summary: "Delegated read done",
+              sources: [{ path: "status.txt", lines: "1" }],
+            });
+            return { stopReason: "completed", text: "done" };
+          }
+          directorTurnRuns += 1;
+          const out: ReadRes[] = [];
+          if (scenario === "fire_14") {
+            for (const rel of sourceFiles) {
+              out.push((await req.executeTool("read_file", { path: rel })) as ReadRes);
+            }
+          } else if (scenario === "second_turn_12" || scenario === "user_named_dirs") {
+            for (const rel of sourceFiles.slice(0, 12)) {
+              out.push((await req.executeTool("read_file", { path: rel })) as ReadRes);
+            }
+          } else if (scenario === "paging_one_file") {
+            for (let p = 0; p < 15; p++) {
+              out.push(
+                (await req.executeTool("read_file", {
+                  path: "src/big/large.ts",
+                  start_line: p * 5 + 1,
+                  end_line: p * 5 + 5,
+                })) as ReadRes,
+              );
+            }
+          } else if (scenario === "harness_reads") {
+            for (const rel of harnessFiles) {
+              out.push((await req.executeTool("read_file", { path: rel })) as ReadRes);
+            }
+          } else if (scenario === "after_spawn_task") {
+            const spawned = (await req.executeTool("spawn_task", {
+              title: "Research repo",
+              objective: "Inspect status.txt and report findings",
+              kind: "research",
+              model: req.model,
+            })) as { spawned: string; harness_advisory?: string[] };
+            assert.ok(spawned.spawned);
+            assert.equal(spawned.harness_advisory, undefined);
+            for (const rel of sourceFiles.slice(0, 12)) {
+              out.push((await req.executeTool("read_file", { path: rel })) as ReadRes);
+            }
+          }
+          resultsByScenario.set(scenario, out);
+          return { stopReason: "completed", text: `finished ${scenario}` };
+        },
+      }),
+    });
+
+    try {
+      const chat = await daemon.director.createChat({ repoRoot });
+
+      // 1. 14 distinct files across 3 areas, no spawn_task: every read returns content, only 12th has advisory, no extra turn
+      scenario = "fire_14";
+      directorTurnRuns = 0;
+      await daemon.director.sendChatMessage(chat.id, "How is this codebase structured?");
+      assert.equal(directorTurnRuns, 1, "advisory must never open an extra turn");
+      const fire14 = resultsByScenario.get("fire_14")!;
+      assert.equal(fire14.length, 14);
+      for (let i = 0; i < fire14.length; i++) {
+        assert.ok(fire14[i]!.content.includes(sourceFiles[i]!), `read ${i + 1} must still return content`);
+      }
+      const annotatedIndices = fire14
+        .map((r, i) => (r.harness_advisory ? i : -1))
+        .filter((i) => i !== -1);
+      assert.deepEqual(annotatedIndices, [11], "exactly the 12th read must carry the advisory");
+      const notice = fire14[11]!.harness_advisory!;
+      assert.equal(notice.length, 1);
+      assert.match(notice[0]!, /^\[harness advisory: director-self-reading\] .+ Why: .+ Instead: .+/);
+
+      // 2. Second turn with the same reads fires again (per-turn subject settled in finally)
+      scenario = "second_turn_12";
+      directorTurnRuns = 0;
+      await daemon.director.sendChatMessage(chat.id, "Check the codebase again");
+      assert.equal(directorTurnRuns, 1);
+      const turn2 = resultsByScenario.get("second_turn_12")!;
+      assert.equal(turn2[11]!.harness_advisory?.length, 1);
+      assert.match(turn2[11]!.harness_advisory![0]!, /^\[harness advisory: director-self-reading\] /);
+
+      // 3. Silent: user message names those directories
+      scenario = "user_named_dirs";
+      await daemon.director.sendChatMessage(chat.id, "Inspect src/alpha, src/beta, and src/gamma please");
+      const namedRes = resultsByScenario.get("user_named_dirs")!;
+      assert.ok(namedRes.every((r) => r.harness_advisory === undefined), "user-named dirs must stay silent");
+
+      // 4. Silent: paging one large file many times
+      scenario = "paging_one_file";
+      await daemon.director.sendChatMessage(chat.id, "Read through the large file");
+      const pagedRes = resultsByScenario.get("paging_one_file")!;
+      assert.equal(pagedRes.length, 15);
+      assert.ok(pagedRes.every((r) => r.harness_advisory === undefined), "paging one file must stay silent");
+
+      // 5. Silent: reads under .harness/
+      scenario = "harness_reads";
+      await daemon.director.sendChatMessage(chat.id, "Review my saved notes");
+      const harnessRes = resultsByScenario.get("harness_reads")!;
+      assert.equal(harnessRes.length, 12);
+      assert.ok(harnessRes.every((r) => r.harness_advisory === undefined), ".harness/ reads must stay silent");
+
+      // 6. Silent: reads after a spawn_task earlier in the turn
+      scenario = "after_spawn_task";
+      await daemon.director.sendChatMessage(chat.id, "Investigate and delegate");
+      const postSpawnRes = resultsByScenario.get("after_spawn_task")!;
+      assert.equal(postSpawnRes.length, 12);
+      assert.ok(postSpawnRes.every((r) => r.harness_advisory === undefined), "reads after spawn_task must stay silent");
     } finally {
       await daemon.stop();
     }
