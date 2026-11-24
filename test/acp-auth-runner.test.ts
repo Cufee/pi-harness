@@ -289,6 +289,301 @@ describe("AcpRunner auth classification, authOk, and tools-missing fail-fast", (
     }
   });
 
+  it("classifies a diagnostic-only wrap-up turn as auth_required and sets cooldown after an ordinary or tool-using first turn", async () => {
+    for (const includeTurn1HarnessTool of [false, true]) {
+      const quota = new QuotaClient();
+      const signals: PassiveQuotaSignal[] = [];
+      let promptCalls = 0;
+
+      const mockAgent = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
+        .onRequest("session/new", async () => ({
+          sessionId: `sess-wrapup-auth-${includeTurn1HarnessTool ? "tools" : "text"}`,
+          models: { currentModelId: "fixture", availableModels: [{ modelId: "fixture", name: "Fixture" }] },
+        } as never))
+        .onRequest("session/prompt", async ({ client: acpClient }) => {
+          promptCalls++;
+          const sessionId = `sess-wrapup-auth-${includeTurn1HarnessTool ? "tools" : "text"}`;
+          if (promptCalls === 1) {
+            if (includeTurn1HarnessTool) {
+              await acpClient.notify("session/update", {
+                sessionId,
+                update: {
+                  sessionUpdate: "tool_call",
+                  toolCallId: "tc-1",
+                  title: "mcp__harness__task_get",
+                  status: "completed",
+                },
+              } as never);
+            }
+            await acpClient.notify("session/update", {
+              sessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "Review finished." },
+              },
+            } as never);
+            return { stopReason: "end_turn" } as never;
+          }
+          await acpClient.notify("session/update", {
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "Not logged in · Please run /login" },
+            },
+          } as never);
+          return { stopReason: "end_turn" } as never;
+        });
+
+      const runner = new AcpRunner(makeProfile({ id: "acp:amp", adapter: "generic", command: "npx", args: ["-y", "amp-acp"] }));
+      let caught: unknown;
+      try {
+        await runner.run(
+          makeRequest({
+            daemonSocketPath: "/tmp/dummy-harness.sock",
+            mcpBridgeEntrypoint: "/tmp/dummy-mcp-bridge.js",
+            harnessToolsListedSince: () => true,
+            harnessToolsGraceMs: 200,
+            missingReturnWrapUpPrompt: "Please call return_task",
+            callbacks: {
+              onPassiveQuota: (sig) => {
+                signals.push(sig);
+                quota.ingestPassiveSignal(sig);
+              },
+            },
+          }),
+          mockAgent,
+        );
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.equal(promptCalls, 2);
+      assert.ok(caught instanceof AcpProfileError, `expected AcpProfileError, got ${String(caught)}`);
+      assert.equal(caught.kind, "auth_required");
+      assert.equal(caught.profileId, "acp:amp");
+      assert.match(caught.message, /Not logged in · Please run \/login/);
+      assert.doesNotMatch(caught.message, /Review finished\./);
+      assert.equal(signals.filter((s) => s.raw.sessionFailure === "auth_required").length, 1);
+      assert.equal(signals[signals.length - 1]!.raw.sessionFailure, "auth_required");
+      assert.equal(signals[signals.length - 1]!.raw.detail, "Not logged in · Please run /login");
+      const authStatus = quota.authStatus("acp:amp");
+      assert.ok(authStatus !== null, "wrap-up auth diagnostic must override earlier authOk and set QuotaClient cooldown");
+      assert.match(authStatus.detail, /Not logged in · Please run \/login/);
+    }
+  });
+
+  it("fails fast on a tool-free auth diagnostic in turn 1 without dispatching turn 2, while tool-bearing turn 1 allows healthy harness-tool wrap-up", async () => {
+    // Semantics: auth text classification is per-turn fail-fast. A standalone tool-free diagnostic
+    // in turn 1 settles immediately with auth_required + cooldown without sending turn 2 even if
+    // turn 2 would call harness tools. When turn 1 actually executed a tool alongside diagnostic-shaped
+    // text, turn 1 is not treated as a tool-free auth failure and a healthy turn 2 completes cleanly.
+    {
+      const quota = new QuotaClient();
+      const signals: PassiveQuotaSignal[] = [];
+      let promptCalls = 0;
+
+      const mockAgent = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
+        .onRequest("session/new", async () => ({
+          sessionId: "sess-turn1-diag-failfast",
+          models: { currentModelId: "fixture", availableModels: [{ modelId: "fixture", name: "Fixture" }] },
+        } as never))
+        .onRequest("session/prompt", async ({ client: acpClient }) => {
+          promptCalls++;
+          if (promptCalls === 1) {
+            await acpClient.notify("session/update", {
+              sessionId: "sess-turn1-diag-failfast",
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "Not logged in · Please run /login" },
+              },
+            } as never);
+            return { stopReason: "end_turn" } as never;
+          }
+          await acpClient.notify("session/update", {
+            sessionId: "sess-turn1-diag-failfast",
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: "tc-return",
+              title: "mcp__harness__return_task",
+              status: "completed",
+            },
+          } as never);
+          await acpClient.notify("session/update", {
+            sessionId: "sess-turn1-diag-failfast",
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "Done." },
+            },
+          } as never);
+          return { stopReason: "end_turn" } as never;
+        });
+
+      const runner = new AcpRunner(makeProfile({ id: "acp:amp", adapter: "generic", command: "npx", args: ["-y", "amp-acp"] }));
+      let caught: unknown;
+      try {
+        await runner.run(
+          makeRequest({
+            daemonSocketPath: "/tmp/dummy-harness.sock",
+            mcpBridgeEntrypoint: "/tmp/dummy-mcp-bridge.js",
+            harnessToolsListedSince: () => true,
+            harnessToolsGraceMs: 200,
+            missingReturnWrapUpPrompt: "Please call return_task",
+            callbacks: {
+              onPassiveQuota: (sig) => {
+                signals.push(sig);
+                quota.ingestPassiveSignal(sig);
+              },
+            },
+          }),
+          mockAgent,
+        );
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.equal(promptCalls, 1);
+      assert.ok(caught instanceof AcpProfileError, `expected AcpProfileError, got ${String(caught)}`);
+      assert.equal(caught.kind, "auth_required");
+      assert.equal(signals.length, 1);
+      assert.equal(signals[0]!.raw.sessionFailure, "auth_required");
+      assert.equal(signals.some((s) => s.raw.authOk === true), false);
+      assert.ok(quota.authStatus("acp:amp") !== null);
+    }
+
+    {
+      const quota = new QuotaClient();
+      const signals: PassiveQuotaSignal[] = [];
+      let promptCalls = 0;
+
+      const mockAgent = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
+        .onRequest("session/new", async () => ({
+          sessionId: "sess-turn1-tool-then-healthy-turn2",
+          models: { currentModelId: "fixture", availableModels: [{ modelId: "fixture", name: "Fixture" }] },
+        } as never))
+        .onRequest("session/prompt", async ({ client: acpClient }) => {
+          promptCalls++;
+          if (promptCalls === 1) {
+            await acpClient.notify("session/update", {
+              sessionId: "sess-turn1-tool-then-healthy-turn2",
+              update: {
+                sessionUpdate: "tool_call",
+                toolCallId: "tc-read",
+                title: "read_file",
+                status: "completed",
+              },
+            } as never);
+            await acpClient.notify("session/update", {
+              sessionId: "sess-turn1-tool-then-healthy-turn2",
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "Not logged in · Please run /login" },
+              },
+            } as never);
+            return { stopReason: "end_turn" } as never;
+          }
+          await acpClient.notify("session/update", {
+            sessionId: "sess-turn1-tool-then-healthy-turn2",
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: "tc-return",
+              title: "mcp__harness__return_task",
+              status: "completed",
+            },
+          } as never);
+          await acpClient.notify("session/update", {
+            sessionId: "sess-turn1-tool-then-healthy-turn2",
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "Wrapped up cleanly." },
+            },
+          } as never);
+          return { stopReason: "end_turn" } as never;
+        });
+
+      const runner = new AcpRunner(makeProfile({ id: "acp:amp", adapter: "generic", command: "npx", args: ["-y", "amp-acp"] }));
+      const res = await runner.run(
+        makeRequest({
+          daemonSocketPath: "/tmp/dummy-harness.sock",
+          mcpBridgeEntrypoint: "/tmp/dummy-mcp-bridge.js",
+          harnessToolsListedSince: () => true,
+          harnessToolsGraceMs: 200,
+          missingReturnWrapUpPrompt: "Please call return_task",
+          callbacks: {
+            onPassiveQuota: (sig) => {
+              signals.push(sig);
+              quota.ingestPassiveSignal(sig);
+            },
+          },
+        }),
+        mockAgent,
+      );
+
+      assert.equal(promptCalls, 2);
+      assert.equal(res.stopReason, "completed");
+      assert.equal(res.wrapUpAttempted, true);
+      assert.equal(quota.authStatus("acp:amp"), null);
+      assert.equal(signals.some((s) => s.raw.sessionFailure !== undefined), false);
+      assert.equal(signals.filter((s) => s.raw.authOk === true).length, 1);
+    }
+  });
+
+  it("keeps command-first prose on wrap-up non-auth after an ordinary first turn", async () => {
+    const quota = new QuotaClient();
+    const signals: PassiveQuotaSignal[] = [];
+    let promptCalls = 0;
+
+    const mockAgent = agent()
+      .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
+      .onRequest("session/new", async () => ({
+        sessionId: "sess-wrapup-prose",
+        models: { currentModelId: "fixture", availableModels: [{ modelId: "fixture", name: "Fixture" }] },
+      } as never))
+      .onRequest("session/prompt", async ({ client: acpClient }) => {
+        promptCalls++;
+        const text =
+          promptCalls === 1
+            ? "Review finished."
+            : "Run /login only if the user asks to switch accounts.";
+        await acpClient.notify("session/update", {
+          sessionId: "sess-wrapup-prose",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text },
+          },
+        } as never);
+        return { stopReason: "end_turn" } as never;
+      });
+
+    const runner = new AcpRunner(makeProfile({ id: "acp:amp", adapter: "generic", command: "npx", args: ["-y", "amp-acp"] }));
+    const res = await runner.run(
+      makeRequest({
+        daemonSocketPath: "/tmp/dummy-harness.sock",
+        mcpBridgeEntrypoint: "/tmp/dummy-mcp-bridge.js",
+        harnessToolsListedSince: () => true,
+        harnessToolsGraceMs: 200,
+        missingReturnWrapUpPrompt: "Please call return_task",
+        callbacks: {
+          onPassiveQuota: (sig) => {
+            signals.push(sig);
+            quota.ingestPassiveSignal(sig);
+          },
+        },
+      }),
+      mockAgent,
+    );
+
+    assert.equal(promptCalls, 2);
+    assert.equal(res.stopReason, "completed");
+    assert.equal(res.wrapUpAttempted, true);
+    assert.equal(res.text, "Review finished.\n\nRun /login only if the user asks to switch accounts.");
+    assert.equal(quota.authStatus("acp:amp"), null);
+    assert.equal(signals.some((s) => s.raw.sessionFailure !== undefined), false);
+    assert.equal(signals.filter((s) => s.raw.authOk === true).length, 1);
+  });
+
   it("settles structured _meta.jetbrains.air.sessionFailure.code=auth_required once without authOk, wrap-up, or completion", async () => {
     const quota = new QuotaClient();
     const signals: PassiveQuotaSignal[] = [];

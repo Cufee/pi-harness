@@ -532,6 +532,7 @@ export class AcpRunner {
     const idleTimeoutMs = Math.max(0, req.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS);
 
     let accumulatedText = "";
+    let turnText = "";
     let textSinceLastTool = "";
     let needsParagraphBreak = false;
     let lastUsage: RunnerUsage | undefined;
@@ -908,8 +909,7 @@ export class AcpRunner {
     let turnDeniedTools: string[] = [];
     let turnSucceededTools = 0;
     let turnToolCalls = 0;
-    let totalToolCalls = 0;
-    let totalSucceededTools = 0;
+    let turnHarnessToolCallObserved = false;
     const allToolFailures: string[] = [];
     let authOkSent = false;
     let authFailed = false;
@@ -973,6 +973,7 @@ export class AcpRunner {
     };
     const markHarnessToolObserved = () => {
       harnessToolCallObserved = true;
+      turnHarnessToolCallObserved = true;
       toolsNotYetListed = false;
       toolsMissingError = null;
       if (!toolsCheckPassed) {
@@ -1131,10 +1132,14 @@ export class AcpRunner {
           `The harness skips this profile when it recommends or auto-routes models until a cooldown expires or a session succeeds.`,
       );
     };
+    // Per-turn fail-fast auth classification: evaluate only the current turn's full assistant
+    // reply and turn-local tool activity so a standalone auth diagnostic on turn 1 fails fast
+    // without wrap-up, and a standalone diagnostic on a later turn (such as wrap-up) overrides
+    // earlier authOk instead of being masked by prior turns' text or tool calls.
     const matchesAuthTextHeuristic = (sessionFailed = false): boolean => {
-      if (totalSucceededTools !== 0 || harnessToolCallObserved) return false;
-      if (!sessionFailed && (allToolFailures.length > 0 || totalToolCalls > 0 || turnToolCalls > 0)) return false;
-      return isStandaloneAcpAuthDiagnostic(accumulatedText);
+      if (turnSucceededTools !== 0 || turnHarnessToolCallObserved) return false;
+      if (!sessionFailed && (turnFailedTools.length > 0 || turnDeniedTools.length > 0 || turnToolCalls > 0)) return false;
+      return isStandaloneAcpAuthDiagnostic(turnText);
     };
     let lastIdenticalFailureKey = "";
     let identicalFailureStreak = 0;
@@ -1317,6 +1322,7 @@ export class AcpRunner {
             }
             needsParagraphBreak = false;
             accumulatedText += chunk;
+            turnText += content.text;
             textSinceLastTool += content.text;
             req.callbacks.onTextDelta?.(chunk);
           }
@@ -1416,7 +1422,6 @@ export class AcpRunner {
           }
         } else if (kind === "tool_call" || kind === "tool_call_update") {
           turnToolCalls += 1;
-          totalToolCalls += 1;
           if (accumulatedText.length > 0) needsParagraphBreak = true;
           textSinceLastTool = "";
           const callId = update.toolCallId ? String(update.toolCallId) : update.id ? String(update.id) : undefined;
@@ -1482,7 +1487,6 @@ export class AcpRunner {
             textSinceQuotaRejection = "";
             disarmQuotaWatchdog(true);
             turnSucceededTools += 1;
-            totalSucceededTools += 1;
             if (kind === "tool_call" || wasInFlight) {
               emitAuthOk();
             }
@@ -2178,6 +2182,8 @@ export class AcpRunner {
         turnDeniedTools = [];
         turnSucceededTools = 0;
         turnToolCalls = 0;
+        turnHarnessToolCallObserved = false;
+        turnText = "";
         textSinceLastTool = "";
         steerHandoff.cancelIssuedForTurn = false;
 
@@ -2359,7 +2365,7 @@ export class AcpRunner {
         }
 
         if (matchesAuthTextHeuristic(Boolean(toolsMissingError))) {
-          failAuthRequired(accumulatedText);
+          failAuthRequired(turnText);
         }
         if (toolsMissingError && !checkHarnessToolsReady()) {
           clearToolsWatchers();
@@ -2682,7 +2688,7 @@ export class AcpRunner {
         failAuthRequired(errMsg);
       }
       if (matchesAuthTextHeuristic(true)) {
-        failAuthRequired(accumulatedText);
+        failAuthRequired(turnText);
       }
       // Harvest structured `rateLimit` info from ACP JSON-RPC error data (e.g. Claude `turnErrorData` when refused before first usage)
       const rawData =
