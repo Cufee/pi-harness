@@ -263,6 +263,47 @@ describe("goal-37: default views show goals, not machinery", () => {
     await store.refresh();
     assert.equal(store.showInternal, false);
 
+    // Wire a FixedDock via store.subscribe (mirroring app.ts syncDock) to observe global showInternal propagation
+    const initHud = store.buildLiveHud();
+    const dock = new FixedDock(tui, theme, {
+      onSubmit: () => {},
+      initialState: {
+        slots: initHud.slots,
+        idleBanner: "[pi-harness] · chat-37 · Director Chat",
+        agentCounts: initHud.agentCounts,
+        hudItems: initHud.hudItems,
+        hudSecondaryLine: initHud.hudSecondaryLine,
+        activeGoalsCount: initHud.activeGoalsCount,
+        needYouCount: store.state.inbox.length,
+        showInternal: store.showInternal,
+        busy: false,
+        phaseText: "Ready",
+        rightStatus: "director · opus",
+        queuedCount: 0,
+        hints: [{ key: "Ctrl+G", label: "Work" }],
+      },
+    });
+    const observedShowInternal: boolean[] = [];
+    const syncDock = () => {
+      observedShowInternal.push(store.showInternal);
+      const hud = store.buildLiveHud();
+      dock.update({
+        slots: hud.slots,
+        agentCounts: hud.agentCounts,
+        hudItems: hud.hudItems,
+        hudSecondaryLine: hud.hudSecondaryLine,
+        activeGoalsCount: hud.activeGoalsCount,
+        needYouCount: store.state.inbox.length,
+        showInternal: store.showInternal,
+      });
+    };
+    const unsubStore = store.subscribe(syncDock);
+
+    const renderDock = () => dock.render(120).map(stripTerminalSequences).join("\n");
+    const dockBeforeToggle = renderDock();
+    assert.ok(dockBeforeToggle.includes("1 need you"), "Default dock must show simplified '1 need you' count");
+    assert.equal(dockBeforeToggle.includes("1 esc"), false, "Default dock must not show internal '1 esc' count");
+
     const deps = { client: mock.client, store, repoRoot: "/repo" };
     const workNav = new WorkNavigatorScreen(deps);
     nav.push(workNav);
@@ -290,17 +331,25 @@ describe("goal-37: default views show goals, not machinery", () => {
     workNav.handleInput("4", ctx);
     assert.equal(workNav.currentTab, "inbox");
 
-    // Return to Goals and press 'i' (proves global toggle outside Inbox)
+    // Return to Goals and press 'i' (proves global toggle outside Inbox propagates via store subscriber to dock)
     workNav.handleInput("2", ctx);
     assert.equal(workNav.currentTab, "goals");
-    const snapshotCallsBeforeToggle = mock.calls.filter((c) => c.op === "work.snapshot").length;
+    const subscriberCallsBeforeShow = observedShowInternal.length;
     workNav.handleInput("i", ctx);
     assert.equal(store.showInternal, true);
     await waitFor(
-      () => mock.calls.filter((c) => c.op === "work.snapshot").length > snapshotCallsBeforeToggle,
+      () => observedShowInternal.length > subscriberCallsBeforeShow,
       1000,
-      "store.refresh triggered on 'i' toggle",
+      "store subscriber notified on 'i' showInternal toggle",
     );
+    assert.equal(
+      observedShowInternal[observedShowInternal.length - 1],
+      true,
+      "store subscriber must observe store.showInternal === true after 'i' toggle",
+    );
+    const dockAfterShow = renderDock();
+    assert.ok(dockAfterShow.includes("1 esc"), "Dock counts row must reflect showInternal full breakdown ('1 esc') after 'i'");
+    assert.equal(dockAfterShow.includes("1 need you"), false, "Dock counts row must leave simplified '1 need you' mode when showInternal is true");
 
     const internalPlain = workNav.render(120, 24, theme).map(stripTerminalSequences).join("\n");
     maybeWriteEvidence("navigator-showInternal.txt", internalPlain);
@@ -311,18 +360,33 @@ describe("goal-37: default views show goals, not machinery", () => {
     assert.ok(internalPlain.includes("1-6"), "showInternal navigator hint must show 1-6");
     assert.ok(internalPlain.includes("i hide internal"), "showInternal navigator must show 'i hide internal'");
 
-    // "6" selects Worktrees; pressing 'i' again falls back to Goals and hides internal tabs
+    // "6" selects Worktrees; pressing 'i' again falls back to Goals, hides internal tabs, and restores default dock counts
     workNav.handleInput("6", ctx);
     assert.equal(workNav.currentTab, "worktrees");
+    const subscriberCallsBeforeHide = observedShowInternal.length;
     workNav.handleInput("i", ctx);
     assert.equal(store.showInternal, false);
     assert.equal(workNav.currentTab, "goals");
+    await waitFor(
+      () => observedShowInternal.length > subscriberCallsBeforeHide,
+      1000,
+      "store subscriber notified on 'i' hide internal toggle",
+    );
+    assert.equal(
+      observedShowInternal[observedShowInternal.length - 1],
+      false,
+      "store subscriber must observe store.showInternal === false after hiding internal",
+    );
+    const dockAfterHide = renderDock();
+    assert.ok(dockAfterHide.includes("1 need you"), "Dock counts row must return to simplified '1 need you' after hiding internal");
+    assert.equal(dockAfterHide.includes("1 esc"), false, "Dock counts row must hide internal '1 esc' after hiding internal");
 
     const afterHidePlain = workNav.render(120, 24, theme).map(stripTerminalSequences).join("\n");
     assert.equal(afterHidePlain.includes("Worktrees"), false, "Worktrees tab must disappear after hiding internal");
     assert.equal(afterHidePlain.includes("Runs"), false, "Runs tab must disappear after hiding internal");
     assert.equal(afterHidePlain.includes("Timers"), false, "Timers tab must disappear after hiding internal");
 
+    unsubStore();
     store.dispose();
   });
 
@@ -528,6 +592,9 @@ describe("goal-37: default views show goals, not machinery", () => {
     await waitFor(() => mock.calls.some((c) => c.op === "chat.send"), 3000, "chat.send called");
     const turnId = String(mock.calls.find((c) => c.op === "chat.send")!.params.turnId);
 
+    const callId1 = "tc-payload-alpha-1";
+    const callId2 = "tc-payload-beta-2";
+
     mock.emit({
       kind: "event",
       seq: 1,
@@ -538,7 +605,7 @@ describe("goal-37: default views show goals, not machinery", () => {
       payload: {
         chatSessionId: session.id,
         turnId,
-        toolCallId: "tc-1",
+        toolCallId: callId1,
         name: "read_file",
         status: "completed",
       },
@@ -553,7 +620,7 @@ describe("goal-37: default views show goals, not machinery", () => {
       payload: {
         chatSessionId: session.id,
         turnId,
-        toolCallId: "tc-2",
+        toolCallId: callId2,
         name: "run_tests",
         status: "completed",
       },
@@ -580,27 +647,43 @@ describe("goal-37: default views show goals, not machinery", () => {
     });
     resolveSend1();
 
-    await waitFor(() => text().includes("[tools] 2 calls"), 3000, "collapsed tools receipt rendered");
+    await waitFor(() => text().includes("[tools]"), 3000, "collapsed tools receipt rendered");
     const transcriptBeforeInspector = text();
-    assert.ok(transcriptBeforeInspector.includes("[tools] 2 calls"), "Tools receipt must collapse to '[tools] 2 calls'");
-    assert.equal(transcriptBeforeInspector.includes("call(s):"), false, "Tools receipt must not use verbose 'call(s):'");
+    const receiptLines = transcriptBeforeInspector
+      .split("\n")
+      .filter((l) => l.includes("[tools]"));
+    assert.ok(receiptLines.length > 0, "Rendered transcript must contain a '[tools]' receipt line");
+    for (const line of receiptLines) {
+      assert.ok(line.includes("2 calls"), `Tools receipt line must contain '2 calls', got: ${line}`);
+      assert.equal(line.includes("read_file"), false, `Tools receipt line must not include tool label 'read_file', got: ${line}`);
+      assert.equal(line.includes("run_tests"), false, `Tools receipt line must not include tool label 'run_tests', got: ${line}`);
+      assert.equal(line.includes("call(s):"), false, `Tools receipt line must not use verbose 'call(s):', got: ${line}`);
+    }
+    assert.equal(transcriptBeforeInspector.includes(callId1), false, "Payload-only tool call id 1 must not appear in transcript before Ctrl+X");
+    assert.equal(transcriptBeforeInspector.includes(callId2), false, "Payload-only tool call id 2 must not appear in transcript before Ctrl+X");
 
-    // Open Ctrl+X inspector and verify both tool labels are present in the inspector payload
+    // Open Ctrl+X inspector and verify both payload-only call IDs (not just labels) appear in the inspector output
     const writesBeforeInspect = writes.length;
     sendInput("\x18");
     await waitFor(
-      () => {
-        const out = since(writesBeforeInspect);
-        return out.includes("read_file") && out.includes("run_tests");
-      },
+      () => since(writesBeforeInspect).includes("Esc close"),
       3000,
-      "Ctrl+X inspector showing both tool labels",
+      "Ctrl+X inspector opened",
     );
 
     const inspectorOut = since(writesBeforeInspect);
-    const receiptLine = transcriptBeforeInspector
-      .split("\n")
-      .find((l) => l.includes("[tools] 2 calls")) ?? "[tools] 2 calls";
+    assert.ok(
+      inspectorOut.includes(callId1),
+      "Ctrl+X inspector must render first payload-only tool call id from settled.tools",
+    );
+    assert.ok(
+      inspectorOut.includes(callId2),
+      "Ctrl+X inspector must render second payload-only tool call id from settled.tools",
+    );
+    assert.ok(inspectorOut.includes("read_file"), "Ctrl+X inspector must include first tool label");
+    assert.ok(inspectorOut.includes("run_tests"), "Ctrl+X inspector must include second tool label");
+
+    const receiptLine = receiptLines[receiptLines.length - 1]!;
     maybeWriteEvidence(
       "tools-receipt.txt",
       `=== Transcript receipt ===\n${receiptLine.trim()}\n\n=== Ctrl+X inspector ===\n${inspectorOut.trim()}`,
