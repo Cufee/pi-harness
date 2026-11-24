@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { canonicalProjectPath } from "./projects.js";
 
 export type AdmissionLane = "goal" | "worker";
 export type QueuePositionInput = number | "front" | "back";
@@ -40,6 +41,33 @@ export class AdmissionQueue {
 
   constructor(private readonly db: Database) {
     this.db.exec(ADMISSION_QUEUE_SCHEMA);
+    this.migrateRepoRoots();
+  }
+
+  private migrateRepoRoots(): void {
+    const distinct = this.db
+      .prepare("SELECT DISTINCT lane, repo_root FROM admission_queue")
+      .all() as Array<{ lane: AdmissionLane; repo_root: string }>;
+    const toRewrite: Array<{ lane: AdmissionLane; rawRoot: string; canonRoot: string }> = [];
+    for (const row of distinct) {
+      const canonRoot = canonicalProjectPath(row.repo_root);
+      if (canonRoot !== row.repo_root) {
+        toRewrite.push({ lane: row.lane, rawRoot: row.repo_root, canonRoot });
+      }
+    }
+    if (toRewrite.length === 0) return;
+
+    this.db.transaction(() => {
+      const upd = this.db.prepare("UPDATE admission_queue SET repo_root = ? WHERE lane = ? AND repo_root = ?");
+      const affected = new Map<string, { lane: AdmissionLane; canonRoot: string }>();
+      for (const item of toRewrite) {
+        upd.run(item.canonRoot, item.lane, item.rawRoot);
+        affected.set(`${item.lane}\0${item.canonRoot}`, { lane: item.lane, canonRoot: item.canonRoot });
+      }
+      for (const { lane, canonRoot } of affected.values()) {
+        this.normalizePositions(lane, canonRoot);
+      }
+    }).immediate();
   }
 
   onChange(fn: (lane?: AdmissionLane) => void): () => void {
@@ -79,13 +107,14 @@ export class AdmissionQueue {
   }
 
   private normalizePositions(lane: AdmissionLane, repoRoot: string): void {
+    const canonRoot = canonicalProjectPath(repoRoot);
     const rows = this.db
       .prepare(
         `SELECT target_id FROM admission_queue
          WHERE lane = ? AND repo_root = ?
-         ORDER BY position ASC, created_at ASC`,
+         ORDER BY force_start DESC, position ASC, created_at ASC`,
       )
-      .all(lane, repoRoot) as Array<{ target_id: string }>;
+      .all(lane, canonRoot) as Array<{ target_id: string }>;
     const stmt = this.db.prepare("UPDATE admission_queue SET position = ? WHERE lane = ? AND target_id = ?");
     for (let i = 0; i < rows.length; i++) {
       stmt.run(i + 1, lane, rows[i]!.target_id);
@@ -116,7 +145,7 @@ export class AdmissionQueue {
     }
     if (opts?.repoRoot) {
       clauses.push("repo_root = ?");
-      params.push(opts.repoRoot);
+      params.push(canonicalProjectPath(opts.repoRoot));
     }
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
     const rows = this.db
@@ -134,25 +163,31 @@ export class AdmissionQueue {
     launchOpts?: Record<string, unknown> | null;
     note?: string | null;
   }): AdmissionQueueEntry {
+    const canonRoot = canonicalProjectPath(input.repoRoot);
     const entry = this.db.transaction(() => {
       const existing = this.get(input.lane, input.targetId);
       const siblings = this.db
         .prepare(
-          `SELECT target_id FROM admission_queue
+          `SELECT target_id, force_start FROM admission_queue
            WHERE lane = ? AND repo_root = ? AND target_id != ?
-           ORDER BY position ASC, created_at ASC`,
+           ORDER BY force_start DESC, position ASC, created_at ASC`,
         )
-        .all(input.lane, input.repoRoot, input.targetId) as Array<{ target_id: string }>;
+        .all(input.lane, canonRoot, input.targetId) as Array<{ target_id: string; force_start: number }>;
 
-      const ordered = siblings.map((s) => s.target_id);
+      const force = input.forceStart !== undefined ? (input.forceStart ? 1 : 0) : existing?.forceStart ? 1 : 0;
+      const ordered = siblings.map((s) => ({ targetId: s.target_id, forced: Number(s.force_start ?? 0) !== 0 }));
       const insertIdx =
-        existing && input.position === undefined
+        existing && existing.repoRoot === canonRoot && input.position === undefined
           ? Math.min(ordered.length, Math.max(0, existing.position - 1))
           : this.resolveTargetIndex(ordered.length, input.position);
-      ordered.splice(insertIdx, 0, input.targetId);
+      ordered.splice(insertIdx, 0, { targetId: input.targetId, forced: force !== 0 });
+      const partitioned = [
+        ...ordered.filter((item) => item.forced),
+        ...ordered.filter((item) => !item.forced),
+      ];
+      const finalPosition = partitioned.findIndex((item) => item.targetId === input.targetId) + 1;
 
       const now = existing?.createdAt ?? Date.now();
-      const force = input.forceStart !== undefined ? (input.forceStart ? 1 : 0) : existing?.forceStart ? 1 : 0;
       const optsJson =
         input.launchOpts !== undefined
           ? input.launchOpts
@@ -174,11 +209,14 @@ export class AdmissionQueue {
              launch_opts_json = excluded.launch_opts_json,
              note = excluded.note`,
         )
-        .run(input.lane, input.repoRoot, input.targetId, insertIdx + 1, force, optsJson, note, now);
+        .run(input.lane, canonRoot, input.targetId, finalPosition, force, optsJson, note, now);
 
       const upd = this.db.prepare("UPDATE admission_queue SET position = ? WHERE lane = ? AND target_id = ?");
-      for (let i = 0; i < ordered.length; i++) {
-        upd.run(i + 1, input.lane, ordered[i]!);
+      for (let i = 0; i < partitioned.length; i++) {
+        upd.run(i + 1, input.lane, partitioned[i]!.targetId);
+      }
+      if (existing && existing.repoRoot !== canonRoot) {
+        this.normalizePositions(input.lane, existing.repoRoot);
       }
       return this.get(input.lane, input.targetId)!;
     }).immediate();
@@ -204,18 +242,22 @@ export class AdmissionQueue {
   }
 
   markForceStart(lane: AdmissionLane, targetId: string): AdmissionQueueEntry | null {
-    const existing = this.get(lane, targetId);
-    if (!existing) return null;
-    this.db.prepare("UPDATE admission_queue SET force_start = 1 WHERE lane = ? AND target_id = ?").run(lane, targetId);
-    const updated = this.get(lane, targetId)!;
+    const updated = this.db.transaction(() => {
+      const existing = this.get(lane, targetId);
+      if (!existing) return null;
+      this.db.prepare("UPDATE admission_queue SET force_start = 1 WHERE lane = ? AND target_id = ?").run(lane, targetId);
+      this.normalizePositions(lane, existing.repoRoot);
+      return this.get(lane, targetId)!;
+    }).immediate();
+    if (!updated) return null;
     this.notify(lane);
     return updated;
   }
 
   remove(lane: AdmissionLane, targetId: string): boolean {
-    const existing = this.get(lane, targetId);
-    if (!existing) return false;
     const removed = this.db.transaction(() => {
+      const existing = this.get(lane, targetId);
+      if (!existing) return false;
       const res = this.db.prepare("DELETE FROM admission_queue WHERE lane = ? AND target_id = ?").run(lane, targetId);
       if (res.changes > 0) this.normalizePositions(lane, existing.repoRoot);
       return res.changes > 0;
@@ -225,6 +267,7 @@ export class AdmissionQueue {
   }
 
   peekNext(lane: AdmissionLane, repoRoot: string): AdmissionQueueEntry | null {
+    const canonRoot = canonicalProjectPath(repoRoot);
     const row = this.db
       .prepare(
         `SELECT * FROM admission_queue
@@ -232,7 +275,7 @@ export class AdmissionQueue {
          ORDER BY force_start DESC, position ASC, created_at ASC
          LIMIT 1`,
       )
-      .get(lane, repoRoot) as Record<string, unknown> | undefined;
+      .get(lane, canonRoot) as Record<string, unknown> | undefined;
     return row ? this.mapRow(row) : null;
   }
 
@@ -241,7 +284,7 @@ export class AdmissionQueue {
     const entry = this.get(lane, targetId);
     if (!entry) return true;
     if (entry.forceStart) return true;
-    const next = this.peekNext(lane, repoRoot);
+    const next = this.peekNext(lane, canonicalProjectPath(repoRoot));
     return !next || next.targetId === targetId;
   }
 }
