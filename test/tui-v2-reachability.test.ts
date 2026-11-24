@@ -39,6 +39,7 @@ import {
 } from "../src/tui/pickers.js";
 import { WorkStore, type WorkSnapshot } from "../src/tui/store.js";
 import { WorkNavigatorScreen } from "../src/tui/work-navigator.js";
+import { withFixtureCatalog } from "./fixtures/launch-config.js";
 
 function initTempGitRepo(): string {
   const dir = mkdtempSync(join(tmpdir(), "pi-harness-tuiv2-repo-"));
@@ -126,9 +127,11 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
     const repoDir = initTempGitRepo();
     const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-tuiv2-state-"));
     const sockPath = join(stateDir, "d.sock");
-    const cfg = loadConfig(repoDir);
-    cfg.stateDir = stateDir;
-    cfg.socketPath = sockPath;
+    const cfg = withFixtureCatalog({
+      ...loadConfig(repoDir),
+      stateDir,
+      socketPath: sockPath,
+    });
 
     const daemon = new HarnessDaemon(cfg);
     await daemon.start();
