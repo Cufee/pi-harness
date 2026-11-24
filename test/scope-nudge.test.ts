@@ -175,4 +175,105 @@ describe("ScopeNudgeMonitor", () => {
       else assert.ok(res?.includes("repeated"));
     }
   });
+
+  it("distinguishes inspect_command by normalized argv at the same cwd and nudges on 3 identical consecutive calls", () => {
+    const monitor = new ScopeNudgeMonitor({ workspaceRoot });
+
+    // Three different cat argv at the same cwd must NOT nudge and must count as progress.
+    for (const file of ["a.ts", "b.ts", "c.ts"]) {
+      const res = monitor.observe({
+        name: "inspect_command",
+        status: "completed",
+        args: { cwd: ".", argv: ["cat", file] },
+      });
+      assert.equal(res, null);
+      assert.equal(monitor.signals().repeatStreak, 1);
+      assert.equal(monitor.signals().staleStreak, 0);
+    }
+
+    // 12 more distinct commands at cwd '.' must not trigger stale spinning either.
+    for (let i = 0; i < 12; i++) {
+      assert.equal(
+        monitor.observe({
+          name: "inspect_command",
+          status: "completed",
+          args: { cwd: ".", argv: ["cat", `extra-${i}.ts`] },
+        }),
+        null,
+      );
+      assert.equal(monitor.signals().staleStreak, 0);
+    }
+
+    // Three identical consecutive calls at the same cwd DO nudge.
+    assert.equal(
+      monitor.observe({ name: "inspect_command", status: "completed", args: { cwd: ".", argv: ["cat", "same.ts"] } }),
+      null,
+    );
+    assert.equal(
+      monitor.observe({ name: "inspect_command", status: "completed", args: { cwd: ".", argv: ["cat", "same.ts"] } }),
+      null,
+    );
+    const nudge = monitor.observe({
+      name: "inspect_command",
+      status: "completed",
+      args: { cwd: ".", argv: ["cat", "same.ts"] },
+    });
+    assert.ok(nudge?.includes("[Harness scope check]"));
+    assert.match(nudge!, /repeated.*3 times/i);
+  });
+
+  it("skips scoring when inputs cannot distinguish operations (cwd alone, truncated argv, outer code_exec)", () => {
+    const monitor = new ScopeNudgeMonitor({ workspaceRoot });
+
+    // cwd alone with no argv/path/query must be skipped, never scored as repeats or stale.
+    for (let i = 0; i < 15; i++) {
+      assert.equal(monitor.observe({ name: "inspect_command", status: "completed", args: { cwd: "." } }), null);
+    }
+    assert.equal(monitor.signals().repeatStreak, 0);
+    assert.equal(monitor.signals().staleStreak, 0);
+
+    // Truncated argv in preview cannot distinguish commands -> skip scoring.
+    const truncatedArgv = '{"cwd":".","argv":["cat","' + "a".repeat(500) + "…";
+    for (let i = 0; i < 5; i++) {
+      assert.equal(monitor.observe({ name: "inspect_command", status: "completed", args: truncatedArgv }), null);
+    }
+    assert.equal(monitor.signals().repeatStreak, 0);
+
+    // Outer code_exec wrapper stays opaque even if repeated.
+    for (let i = 0; i < 5; i++) {
+      assert.equal(
+        monitor.observe({ name: "code_exec", status: "completed", args: { code: "output(1)", path: "src/a.ts" } }),
+        null,
+      );
+    }
+    assert.equal(monitor.signals().repeatStreak, 0);
+  });
+
+  it("counts consecutive identical calls for repeatStreak (not lifetime frequency) and merges cached in_progress fields by id", () => {
+    const monitor = new ScopeNudgeMonitor({ workspaceRoot });
+
+    // Spaced revisits to a.ts (lifetime count = 3, consecutive streak = 1) must NOT nudge.
+    assert.equal(monitor.observe({ name: "read", status: "completed", args: { path: "src/a.ts" } }), null);
+    assert.equal(monitor.observe({ name: "read", status: "completed", args: { path: "src/b.ts" } }), null);
+    assert.equal(monitor.observe({ name: "read", status: "completed", args: { path: "src/a.ts" } }), null);
+    assert.equal(monitor.observe({ name: "read", status: "completed", args: { path: "src/c.ts" } }), null);
+    assert.equal(monitor.observe({ name: "read", status: "completed", args: { path: "src/a.ts" } }), null);
+    assert.equal(monitor.signals().repeatStreak, 1);
+
+    // Intermediate in_progress update carrying only kind must not wipe cached args for the same id.
+    for (let i = 0; i < 3; i++) {
+      const id = `merge-${i}`;
+      assert.equal(
+        monitor.observe({ id, name: "inspect_command", status: "in_progress", args: { cwd: ".", argv: ["cat", "z.ts"] } }),
+        null,
+      );
+      assert.equal(
+        monitor.observe({ id, name: "inspect_command", status: "in_progress", kind: "read" }),
+        null,
+      );
+      const res = monitor.observe({ id, name: "inspect_command", status: "completed" });
+      if (i < 2) assert.equal(res, null);
+      else assert.ok(res?.includes("repeated"));
+    }
+  });
 });

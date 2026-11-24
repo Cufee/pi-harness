@@ -452,13 +452,13 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
         return {
           ...tool,
           description:
-            "Spawn a read-only Tier 3 research, plan, or verify task. No turn limit. When your turn ends, the daemon wakes this chat when a task you spawned completes, fails, blocks, or returns for re-scope (config events.wakeDirectorOnGoalSettle); results you already read with wait_tasks do not wake you again. A task may return early with partial: true or scope_too_large and suggested splits after a harness scope check.",
+            "Spawn a read-only Tier 3 research, plan, or verify task. No turn limit. When your turn ends and events.wakeDirectorOnGoalSettle is enabled (default on), the daemon wakes this chat when a task you spawned completes, fails, blocks, or returns for re-scope (not on cancel or quota pause); results you already read with wait_tasks do not wake you again. A task may return early with partial: true or scope_too_large and suggested splits after a harness scope check.",
         };
       }
       if (tool.name === "wait_tasks" || tool.name === "wait_children") {
         return {
           ...tool,
-          description: `${tool.description} Waits only within this turn; if you end your turn instead, this chat is woken when each delegated task settles.`,
+          description: `${tool.description} Waits only within this turn; if you end your turn instead, the daemon wakes this chat only when events.wakeDirectorOnGoalSettle is enabled (default on) and the task completes, fails, blocks, or returns for re-scope (not on cancel or quota pause).`,
         };
       }
       return tool;

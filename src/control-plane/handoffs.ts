@@ -1,4 +1,5 @@
-import type { EscalationRecord, TaskKind, TaskRecord } from "./db.js";
+import { relative } from "node:path";
+import type { ControlPlaneDb, EscalationRecord, TaskKind, TaskRecord } from "./db.js";
 
 export function isReadOnlyKind(kind: string): kind is "research" | "plan" | "verify" {
   return kind === "research" || kind === "plan" || kind === "verify";
@@ -6,6 +7,104 @@ export function isReadOnlyKind(kind: string): kind is "research" | "plan" | "ver
 
 export const SUMMARY_LIMIT = 2000;
 type TaskSource = { path: string; lines?: string; symbol?: string; note?: string };
+
+export interface FallbackGitSummary {
+  head?: string;
+  branch?: string;
+  committed?: string;
+  uncommitted?: string;
+  status?: string[];
+}
+
+export function formatFallbackSummary(input: {
+  repoRoot: string;
+  reason: string;
+  wtPath: string | null;
+  git: FallbackGitSummary;
+  paths: string[];
+  outputPath: string | null;
+  text: string;
+  excerptLimit: number;
+}): { summary: string; outputClipped: boolean } {
+  const { repoRoot, reason, wtPath, git, paths, outputPath, text, excerptLimit } = input;
+  const header = `[Partial handoff: task ended without return_task (${reason}); unverified, synthesized by the harness]`;
+  const gitLine = wtPath
+    ? `Git: ${git.branch ?? "?"} @ ${git.head?.slice(0, 12) ?? "?"}; committed since base: ${git.committed ?? "unknown"}; ` +
+      `uncommitted: ${git.uncommitted ?? "unknown"}${git.status?.length ? ` (${git.status.length} changed path(s))` : ""}`
+    : "Git: no worktree";
+  const displayPaths = paths.slice(0, 5).map((p) => {
+    const rel = relative(repoRoot, p);
+    return rel && !rel.startsWith("..") ? rel : p;
+  });
+  const more = paths.length > 5 ? `, +${paths.length - 5} more` : "";
+  const artLine = paths.length
+    ? `Artifacts: ${paths.length} indexed: ${displayPaths.join(", ")}${more}`
+    : "Artifacts: 0 indexed";
+  const pointer = outputPath ? `\n[Full output: ${relative(repoRoot, outputPath)}]` : "";
+  const fixed = `${header}\n${gitLine}\n${artLine}\nFinal output (unstructured excerpt):\n`;
+  const budget = Math.max(0, Math.min(excerptLimit, SUMMARY_LIMIT - fixed.length - pointer.length));
+  const outputClipped = Boolean(text) && text.length > budget;
+  const excerpt = !text ? "(no final output)" : !outputClipped ? text : `…${text.slice(-(budget - 1))}`;
+  return {
+    summary: `${fixed}${excerpt}${pointer}`.slice(0, SUMMARY_LIMIT),
+    outputClipped,
+  };
+}
+
+/**
+ * Synchronously settles a task to a terminal status. For non-Tier-1 tasks, writes a minimal
+ * partial fallback payload (`partial: true`, reason, and already-indexed artifact paths) in the
+ * same DB update that sets the terminal status, so parents never observe a bare terminal row.
+ * Tier 1 tasks retain their bare status/summary update unchanged.
+ */
+export function settleTaskMinimalFallback(
+  db: ControlPlaneDb,
+  task: Pick<TaskRecord, "id" | "runId" | "tier">,
+  status: "failed" | "cancelled" | "blocked",
+  summary: string,
+  reason: string,
+): void {
+  if (task.tier === 1) {
+    db.updateTask(task.id, { status, summary });
+    return;
+  }
+  const run = db.getRun(task.runId);
+  if (!run) {
+    db.updateTask(task.id, { status, summary });
+    return;
+  }
+  let artifactPaths: string[] = [];
+  try {
+    artifactPaths = db.listArtifacts(run.id, task.id, 50).map((a) => a.path).slice(0, 20);
+  } catch {
+    artifactPaths = [];
+  }
+  const { summary: fallbackSummary, outputClipped } = formatFallbackSummary({
+    repoRoot: run.repoRoot,
+    reason,
+    wtPath: null,
+    git: {},
+    paths: artifactPaths,
+    outputPath: null,
+    text: "",
+    excerptLimit: 1200,
+  });
+  db.updateTask(task.id, {
+    status,
+    summary,
+    resultJson: JSON.stringify({
+      status,
+      fallback: {
+        reason,
+        wrap_up_attempted: false,
+        partial: true,
+        output_truncated: outputClipped,
+        summary: fallbackSummary,
+        artifact_paths: artifactPaths,
+      },
+    }),
+  });
+}
 
 export function validateTaskHandoff(kind: TaskKind, args: Record<string, unknown>) {
   const fullSummary = args.summary;
@@ -85,9 +184,11 @@ export function compactTaskHandoff(task: TaskRecord, escalations: EscalationReco
         ...(typeof meta.total_chars === "number" && Number.isFinite(meta.total_chars) ? { total_chars: meta.total_chars } : {}),
       };
     } else if (fallback) {
-      const m = /\n\[Full output: ([^\]]+)\]$/.exec(fallback.summary);
-      const matched = m?.[1] ? matchRecordedArtifactPath(m[1], artifactPaths) : null;
-      if (matched) overflow = { path: matched, next_offset: 0 };
+      if (fallback.output_truncated !== false) {
+        const m = /\n\[Full output: ([^\]]+)\]$/.exec(fallback.summary);
+        const matched = m?.[1] ? matchRecordedArtifactPath(m[1], artifactPaths) : null;
+        if (matched) overflow = { path: matched, next_offset: 0 };
+      }
     } else if (typeof task.summary === "string") {
       const m = /\n\n\[Full summary: ([^\]]+)\]$/.exec(task.summary);
       const matched = m?.[1] ? matchRecordedArtifactPath(m[1], artifactPaths) : null;

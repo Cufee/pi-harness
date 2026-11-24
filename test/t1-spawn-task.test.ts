@@ -155,7 +155,19 @@ it.each(["research", "plan", "verify"] as const)("lets Tier 1 spawn and await a 
       title: "Read notes", objective: "Exit without submitting", kind, model: scout.id, effort: "medium",
     }) as { spawned: string };
     const unsourcedWait = await execute("wait_tasks", { ids: [unsourced], timeout_s: 1 }) as {
-      children: Array<{ id: string; title: string; kind: string; status: string; partial?: boolean; summary: string; sources: unknown[]; artifact_paths: string[]; escalations: unknown[] }>;
+      children: Array<{
+        id: string;
+        title: string;
+        kind: string;
+        status: string;
+        partial?: boolean;
+        truncated?: boolean;
+        full_summary?: unknown;
+        summary: string;
+        sources: unknown[];
+        artifact_paths: string[];
+        escalations: unknown[];
+      }>;
     };
     assert.equal(unsourcedWait.children.length, 1);
     const [unsourcedHandoff] = unsourcedWait.children;
@@ -165,6 +177,9 @@ it.each(["research", "plan", "verify"] as const)("lets Tier 1 spawn and await a 
     assert.equal(unsourcedHandoff.kind, kind);
     assert.equal(unsourcedHandoff.status, "failed");
     assert.equal(unsourcedHandoff.partial, true);
+    // Short read-only fallback output is shown in full even though saved to a dossier: must not claim truncated:true.
+    assert.equal(unsourcedHandoff.truncated, undefined);
+    assert.equal(unsourcedHandoff.full_summary, undefined);
     assert.ok(unsourcedHandoff.summary.startsWith("[Partial handoff: task ended without return_task (missing_return_task)"));
     assert.ok(unsourcedHandoff.summary.includes("Unstructured runner output"));
     assert.deepEqual(unsourcedHandoff.sources, []);

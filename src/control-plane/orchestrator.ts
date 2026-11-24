@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { HarnessConfig, RunnerProfileConfig } from "../config.js";
 import type { ModelCatalogCompiler } from "../catalog/compiler.js";
 import type { QuotaClient } from "../quota/client.js";
@@ -11,7 +11,7 @@ import { ScopeNudgeMonitor } from "../runners/scope-nudge.js";
 import { toolPolicyForTask } from "../runners/types.js";
 import { recordCostInvocation } from "../cost/ledger.js";
 import { resolveLaunchRoute } from "./launch-route.js";
-import type { RunAgentRequest, RunAgentResult, RunnerExecutionHandle } from "../runners/types.js";
+import type { RunAgentRequest, RunAgentResult, RunnerCallbacks, RunnerExecutionHandle } from "../runners/types.js";
 import { MAX_STEER_CONTINUATIONS } from "../runners/types.js";
 import { BisectingMergeQueue } from "../worktree/merge-queue.js";
 import { invalidateGateEnvCache, type GateRuntimeConfig } from "../tools/gate-env.js";
@@ -22,7 +22,7 @@ import { WriteScopeConflictError, type AgentTier, type ControlPlaneDb, type RunR
 import { buildHydrationTurn, buildImmutableSystemPrompt, buildMissingReturnWrapUpPrompt, type AnchoredHandoff } from "./prompts.js";
 import { spillSummaryOverflow, writeUniqueTaskDossier } from "./dossiers.js";
 import { ControlPlaneToolExecutor, compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./tools.js";
-import { SUMMARY_LIMIT } from "./handoffs.js";
+import { formatFallbackSummary, settleTaskMinimalFallback, SUMMARY_LIMIT } from "./handoffs.js";
 import { directorTaskRunId, directorTaskRunOwner, isDirectorTaskContainer } from "./ids.js";
 import { canonicalProjectPath } from "./projects.js";
 import { ensureGoalEvidenceDir } from "../goals/engine.js";
@@ -43,6 +43,11 @@ interface ActiveTaskExecution {
   steerChain?: Promise<void>;
   /** "settling" from the moment runner.run() returns: steering can no longer reach that session. */
   phase?: "starting" | "running" | "settling";
+  /** Generation-fenced tool event observer shared by runner callbacks and Code Mode inner events. */
+  observeToolEvent?: (
+    expectedGeneration: number,
+    ev: Parameters<NonNullable<RunnerCallbacks["onToolEvent"]>>[0],
+  ) => void;
 }
 
 /** Steering messages a task may have queued at once. */
@@ -349,6 +354,24 @@ export class HarnessOrchestrator {
       resumeTask: (taskId, opts) => this.resumeTask(taskId, opts),
       resumeTaskDetailed: (taskId, opts) => this.resumeTaskDetailed(taskId, opts),
       forceStartWorker: (taskId, opts) => this.forceStartWorker(taskId, opts),
+      onTaskToolEvent: (runId, taskId, expectedGeneration, ev) => {
+        const exec = this.active.get(taskId);
+        if (exec?.observeToolEvent && exec.runnerGeneration === expectedGeneration) {
+          exec.observeToolEvent(expectedGeneration, ev);
+          return;
+        }
+        // Fallback when no live execution is registered (e.g. non-active/synthetic caller) and task is still live at this generation.
+        const t = this.db.getTask(taskId);
+        if (
+          t &&
+          t.runId === runId &&
+          t.generation === expectedGeneration &&
+          !exec &&
+          !["completed", "cancelled", "failed", "returned_for_rescope", "blocked"].includes(t.status)
+        ) {
+          this.db.emitEvent(runId, taskId, "agent.tool", ev);
+        }
+      },
     }, config);
     // Wakes deferred activations waiting on a write lease whenever a holder can no longer write.
     this.unsubLeaseEvents = db.onEvent((ev) => {
@@ -721,7 +744,7 @@ export class HarnessOrchestrator {
       let interrupted = false;
       for (const t of tasks) {
         if (LIVE_TASK_STATUSES.has(t.status) || t.status === "ready" || t.status === "pending") {
-          this.db.updateTask(t.id, { status: "failed", summary: "Interrupted by daemon restart" });
+          settleTaskMinimalFallback(this.db, t, "failed", "Interrupted by daemon restart", "daemon_restart");
           mutated = true;
           interrupted = true;
         }
@@ -1067,7 +1090,14 @@ export class HarnessOrchestrator {
               });
               this.db.updateTask(task.id, { summary: `Queued for worker slot (#${qEntry.position})` });
             } else {
-              this.db.updateTask(task.id, { status: "failed", summary: "Could not allocate the worker worktree." });
+              const errDetail = String(error instanceof Error ? error.message : error).replace(/\s+/g, " ").trim().slice(0, 200);
+              settleTaskMinimalFallback(
+                this.db,
+                task,
+                "failed",
+                "Could not allocate the worker worktree.",
+                errDetail ? `worktree_allocation_failed: ${errDetail}` : "worktree_allocation_failed",
+              );
               throw error;
             }
           } finally {
@@ -1116,7 +1146,16 @@ export class HarnessOrchestrator {
       if (this.disposed) return;
       const task = this.db.getTask(taskId);
       if (!task || entry.abort.signal.aborted) return;
-      this.db.updateTask(taskId, { status: "failed", summary: `Task launch failed: ${String(err instanceof Error ? err.message : err).slice(0, 240)}` });
+      if (this.active.get(taskId) !== entry) return;
+      if (entry.runnerGeneration !== undefined && task.generation !== entry.runnerGeneration) return;
+      const detail = String(err instanceof Error ? err.message : err).replace(/\s+/g, " ").trim().slice(0, 240);
+      settleTaskMinimalFallback(
+        this.db,
+        task,
+        "failed",
+        `Task launch failed: ${detail}`,
+        detail ? `launch_failed: ${detail}` : "launch_failed",
+      );
       this.db.emitEvent(task.runId, taskId, "agent.error", { error: String(err) });
     }).finally(() => {
       // An entry evicted after a cancel-unwind timeout must never remove the newer generation's entry.
@@ -2298,6 +2337,39 @@ export class HarnessOrchestrator {
       let genToolEvents = 0;
       const scopeMonitor = task.tier === 3 ? new ScopeNudgeMonitor({ workspaceRoot: cwd }) : null;
       const isCurrent = () => this.isCurrentExecution(task.id, exec, runnerGen);
+      const isTaskSettled = () => {
+        const t = this.db.getTask(task.id);
+        return !t || t.generation !== runnerGen ||
+          ["completed", "returned_for_rescope", "blocked", "cancelled", "failed"].includes(t.status);
+      };
+      const observeToolEvent: NonNullable<RunnerCallbacks["onToolEvent"]> = (ev) => {
+        if (!isCurrent()) return;
+        genToolEvents += 1;
+        this.db.emitEvent(run.id, task.id, "agent.tool", ev);
+        if (scopeMonitor && !isTaskSettled()) {
+          const status = ev.status === "pending" ? "in_progress" : ev.status;
+          if (status === "in_progress" || status === "completed" || status === "failed") {
+            const nudge = scopeMonitor.observe({
+              id: ev.id,
+              name: ev.name,
+              kind: ev.kind,
+              status,
+              args: ev.args,
+            });
+            if (nudge) {
+              this.db.emitEvent(run.id, task.id, "agent.scope_nudge", {
+                signals: scopeMonitor.signals(),
+                message: nudge,
+              });
+              void this.steerTaskDetailed(task.id, nudge);
+            }
+          }
+        }
+      };
+      exec.observeToolEvent = (expectedGeneration, ev) => {
+        if (expectedGeneration !== runnerGen) return;
+        observeToolEvent(ev);
+      };
       const generation = new AbortController();
       exec.generationSignal = AbortSignal.any([generation.signal, exec.abort.signal]);
       const cost = recordCostInvocation(this.db, {
@@ -2360,11 +2432,7 @@ export class HarnessOrchestrator {
             }
           : undefined,
         allowShellInReadOnly: task.kind === "verify",
-        isTaskSettled: () => {
-          const t = this.db.getTask(task.id);
-          return !t || t.generation !== task.generation ||
-            ["completed", "returned_for_rescope", "blocked", "cancelled", "failed"].includes(t.status);
-        },
+        isTaskSettled,
         missingReturnWrapUpPrompt: task.tier !== 1 ? buildMissingReturnWrapUpPrompt(task.tier, task.kind) : undefined,
         drainPendingSteers: () => (isCurrent() ? this.drainPendingSteers(task.id) : []),
         signal: exec.generationSignal,
@@ -2431,30 +2499,7 @@ export class HarnessOrchestrator {
               title: task.title,
             });
           },
-          onToolEvent: (ev) => {
-            if (!isCurrent()) return;
-            genToolEvents += 1;
-            this.db.emitEvent(run.id, task.id, "agent.tool", ev);
-            if (scopeMonitor && !runnerReq.isTaskSettled?.()) {
-              const status = ev.status === "pending" ? "in_progress" : ev.status;
-              if (status === "in_progress" || status === "completed" || status === "failed") {
-                const nudge = scopeMonitor.observe({
-                  id: ev.id,
-                  name: ev.name,
-                  kind: ev.kind,
-                  status,
-                  args: ev.args,
-                });
-                if (nudge) {
-                  this.db.emitEvent(run.id, task.id, "agent.scope_nudge", {
-                    signals: scopeMonitor.signals(),
-                    message: nudge,
-                  });
-                  void this.steerTaskDetailed(task.id, nudge);
-                }
-              }
-            }
-          },
+          onToolEvent: observeToolEvent,
         },
       };
 
@@ -2470,7 +2515,8 @@ export class HarnessOrchestrator {
           exec.phase = "settling";
         });
         if (this.disposed) return;
-        const latest = this.db.getTask(task.id)!;
+        const latest = this.db.getTask(task.id);
+        if (!latest || this.active.get(task.id) !== exec || latest.generation !== runnerGen) return;
         if (exec.abort.signal.aborted || latest.status === "cancelled") {
           if (latest.tier !== 1 && !["completed", "returned_for_rescope", "blocked"].includes(latest.status)) {
             const why = exec.abort.signal.reason instanceof Error ? exec.abort.signal.reason.message : "";
@@ -2478,7 +2524,7 @@ export class HarnessOrchestrator {
             await this.writeFallbackHandoff(
               latest, run, wt, res, "cancelled", baseSummary,
               why ? `cancelled: ${why}` : "cancelled",
-              { allowAborted: true },
+              { exec, expectedGeneration: runnerGen, allowAborted: true },
             );
           }
           return;
@@ -2498,7 +2544,7 @@ export class HarnessOrchestrator {
                 latest, run, wt, res, "failed",
                 "Task ended without a valid sourced handoff.",
                 "invalid_handoff",
-                { allowStatus: "completed" },
+                { exec, expectedGeneration: runnerGen, allowStatus: "completed" },
               );
             }
           }
@@ -2533,21 +2579,27 @@ export class HarnessOrchestrator {
             this.taskAutoRolloverProgress.set(task.id, { fp, streak });
             if (streak >= 2) {
               const summary = `Aborted after ${streak} consecutive zero-progress automatic rollovers (no commits, worktree edits, artifacts, or child tasks).`;
+              let settled = false;
               if (task.tier === 1) {
-                this.db.updateTask(task.id, { status: "failed", summary });
+                if (this.active.get(task.id) === exec && !this.rolloverFenceBroken(exec, task.id, fence)) {
+                  this.db.updateTask(task.id, { status: "failed", summary });
+                  settled = true;
+                }
               } else {
-                await this.settleWithoutReturn(exec, latest, run, wt, res, "failed", summary, "zero_progress_rollover");
+                settled = await this.settleWithoutReturn(exec, runnerGen, latest, run, wt, res, "failed", summary, "zero_progress_rollover");
               }
-              this.db.createEscalation({
-                runId: run.id,
-                fromTaskId: task.id,
-                toTaskId: task.parentId,
-                severity: task.tier === 1 ? "P0" : "P1",
-                category: "budget_exhausted",
-                title: `Task ${task.id} looped ${streak}x on auto-rollover with zero progress`,
-                evidencePaths: [],
-                blocking: true,
-              });
+              if (settled) {
+                this.db.createEscalation({
+                  runId: run.id,
+                  fromTaskId: task.id,
+                  toTaskId: task.parentId,
+                  severity: task.tier === 1 ? "P0" : "P1",
+                  category: "budget_exhausted",
+                  title: `Task ${task.id} looped ${streak}x on auto-rollover with zero progress`,
+                  evidencePaths: [],
+                  blocking: true,
+                });
+              }
               return;
             }
           } else {
@@ -2555,21 +2607,27 @@ export class HarnessOrchestrator {
           }
           if (nextGen > maxGenerations) {
             const summary = `Exceeded max rollover generations (${maxGenerations}); escalating to prevent infinite rollover loop.`;
+            let settled = false;
             if (task.tier === 1) {
-              this.db.updateTask(task.id, { status: "failed", summary });
+              if (this.active.get(task.id) === exec && !this.rolloverFenceBroken(exec, task.id, fence)) {
+                this.db.updateTask(task.id, { status: "failed", summary });
+                settled = true;
+              }
             } else {
-              await this.settleWithoutReturn(exec, latest, run, wt, res, "failed", summary, "max_generations");
+              settled = await this.settleWithoutReturn(exec, runnerGen, latest, run, wt, res, "failed", summary, "max_generations");
             }
-            this.db.createEscalation({
-              runId: run.id,
-              fromTaskId: task.id,
-              toTaskId: task.parentId,
-              severity: task.tier === 1 ? "P0" : "P1",
-              category: "budget_exhausted",
-              title: `Task ${task.id} hit max rollover generations (${maxGenerations})`,
-              evidencePaths: [],
-              blocking: true,
-            });
+            if (settled) {
+              this.db.createEscalation({
+                runId: run.id,
+                fromTaskId: task.id,
+                toTaskId: task.parentId,
+                severity: task.tier === 1 ? "P0" : "P1",
+                category: "budget_exhausted",
+                title: `Task ${task.id} hit max rollover generations (${maxGenerations})`,
+                evidencePaths: [],
+                blocking: true,
+              });
+            }
             return;
           }
           const nextHandoff = await this.buildCleanRolloverHandoff({
@@ -2645,12 +2703,14 @@ export class HarnessOrchestrator {
           const why = exec.abort.signal.reason instanceof Error ? exec.abort.signal.reason.message : "";
           const baseSummary = why ? `Cancelled: ${why}` : "Cancelled";
           if (latest.tier === 1) {
-            this.db.updateTask(task.id, { status: "cancelled", summary: baseSummary });
+            if (this.active.get(task.id) === exec && this.db.getTask(task.id)?.generation === runnerGen) {
+              this.db.updateTask(task.id, { status: "cancelled", summary: baseSummary });
+            }
           } else {
             await this.writeFallbackHandoff(
               latest, run, wt, res, "cancelled", baseSummary,
               why ? `cancelled: ${why}` : "cancelled",
-              { allowAborted: true },
+              { exec, expectedGeneration: runnerGen, allowAborted: true },
             );
           }
           return;
@@ -2662,7 +2722,7 @@ export class HarnessOrchestrator {
           if (latest.tier === 1) {
             this.db.updateTask(task.id, { status: "failed", summary: baseSummary });
           } else {
-            await this.settleWithoutReturn(exec, latest, run, wt, res, "failed", baseSummary, "runner_cancelled");
+            await this.settleWithoutReturn(exec, runnerGen, latest, run, wt, res, "failed", baseSummary, "runner_cancelled");
           }
           return;
         }
@@ -2688,14 +2748,14 @@ export class HarnessOrchestrator {
             this.db.updateTask(task.id, { status: "failed", summary: baseSummary });
           } else {
             await this.settleWithoutReturn(
-              exec, latest, run, wt, res, "failed", baseSummary,
+              exec, runnerGen, latest, run, wt, res, "failed", baseSummary,
               detail ? `runner_error: ${detail}` : "runner_error",
             );
           }
           return;
         }
         if (isReadOnlyKind(latest.kind)) {
-          await this.settleWithoutReturn(exec, latest, run, wt, res, "failed", "Task ended without a valid sourced handoff.", "missing_return_task");
+          await this.settleWithoutReturn(exec, runnerGen, latest, run, wt, res, "failed", "Task ended without a valid sourced handoff.", "missing_return_task");
           return;
         }
 
@@ -2727,9 +2787,10 @@ export class HarnessOrchestrator {
                 () => true,
                 () => false,
               ));
+            if (!isCurrent()) return;
             if (dirty || hasUnmergedCommits || latestWt.status === "bounced" || latestWt.status === "queued") {
               await this.settleWithoutReturn(
-                exec, latest, run, latestWt, res, "failed",
+                exec, runnerGen, latest, run, latestWt, res, "failed",
                 `Worker exited with unmerged/dirty worktree (status: ${latestWt.status}, dirty: ${dirty}, unmergedCommits: ${hasUnmergedCommits}).`,
               );
               return;
@@ -2744,7 +2805,7 @@ export class HarnessOrchestrator {
         this.taskAutoRolloverProgress.delete(task.id);
         // Agent finished its turn naturally without calling `return_task`
         if (latest.tier !== 1) {
-          await this.settleWithoutReturn(exec, latest, run, wt, res, "completed", res.text.slice(0, 1000) || "Completed");
+          await this.settleWithoutReturn(exec, runnerGen, latest, run, wt, res, "completed", res.text.slice(0, 1000) || "Completed");
           return;
         }
         const finalReply = res.text.trim();
@@ -2807,6 +2868,8 @@ export class HarnessOrchestrator {
           const latestAborted = this.db.getTask(task.id);
           if (
             latestAborted &&
+            this.active.get(task.id) === exec &&
+            latestAborted.generation === runnerGen &&
             latestAborted.tier !== 1 &&
             !["completed", "returned_for_rescope", "blocked"].includes(latestAborted.status)
           ) {
@@ -2815,15 +2878,17 @@ export class HarnessOrchestrator {
             await this.writeFallbackHandoff(
               latestAborted, run, wt, null, "cancelled", baseSummary,
               why ? `cancelled: ${why}` : "cancelled",
-              { allowAborted: true },
+              { exec, expectedGeneration: runnerGen, allowAborted: true },
             );
           }
           return;
         }
+        // If this execution was evicted or superseded while running, never touch its successor.
+        const latest = this.db.getTask(task.id);
+        if (!latest || this.active.get(task.id) !== exec || latest.generation !== runnerGen) return;
         // If an explicit clean rollover was scheduled right before the runner rejected on cancel, proceed with rollover!
         const explicitRollover = this.pendingRollovers.get(task.id);
-        const latest = this.db.getTask(task.id);
-        if (explicitRollover && latest && latest.generation + 1 <= maxGenerations) {
+        if (explicitRollover && latest.generation + 1 <= maxGenerations) {
           this.pendingRollovers.delete(task.id);
           const nextGen = latest.generation + 1;
           const fence = this.rolloverFence(latest);
@@ -2857,11 +2922,10 @@ export class HarnessOrchestrator {
         const flat = msg.replace(/\s+/g, " ").trim();
         const clipped = flat.length <= 240 ? flat : `${flat.slice(0, 150)} … ${flat.slice(-87)}`;
         const baseSummary = `Task runner failed before settlement: ${clipped}`;
-        const target = latest ?? task;
-        if (target.tier === 1) {
+        if (latest.tier === 1) {
           this.db.updateTask(task.id, { status: "failed", summary: baseSummary });
         } else {
-          await this.settleWithoutReturn(exec, target, run, wt, null, "failed", baseSummary, `runner_error: ${clipped}`);
+          await this.settleWithoutReturn(exec, runnerGen, latest, run, wt, null, "failed", baseSummary, `runner_error: ${clipped}`);
         }
         this.db.emitEvent(run.id, task.id, "agent.error", { error: msg });
         return;
@@ -2871,6 +2935,7 @@ export class HarnessOrchestrator {
         exec.generationSignal = undefined;
         exec.handle = undefined;
         exec.steerChain = undefined;
+        exec.observeToolEvent = undefined;
         // A queued steer never crosses into the next generation: its prompt is rebuilt from the amended task row.
         if (!this.disposed && (this.db.getTask(task.id)?.generation ?? runnerGen) > runnerGen && exec.pendingSteers?.length) {
           const stale = exec.pendingSteers.filter((item) => item.generation <= runnerGen);
@@ -2884,9 +2949,11 @@ export class HarnessOrchestrator {
   /**
    * Race-gated wrapper for settling a non-Tier-1 task that ended without return_task.
    * Writes nothing if the task was cancelled, settled, or resumed while git/artifact evidence was gathered.
+   * Returns true iff this generation actually won settlement.
    */
   private async settleWithoutReturn(
     exec: ActiveTaskExecution,
+    expectedGeneration: number,
     task: TaskRecord,
     run: RunRecord,
     wt: WorktreeRecord | null,
@@ -2894,14 +2961,15 @@ export class HarnessOrchestrator {
     status: "completed" | "failed",
     baseSummary: string,
     reason = "missing_return_task",
-  ): Promise<void> {
-    await this.writeFallbackHandoff(task, run, wt, res, status, baseSummary, reason, { exec });
+  ): Promise<boolean> {
+    return this.writeFallbackHandoff(task, run, wt, res, status, baseSummary, reason, { exec, expectedGeneration });
   }
 
   /**
    * Writes a non-empty partial fallback handoff (`resultJson.fallback` with `partial: true`, inline
    * artifact list, git summary, and output excerpt/dossier) for any non-Tier-1 task ending without
    * `return_task` (read-only natural end, error, cancel, throw, zero-progress abort, maxGenerations).
+   * Returns true iff this execution and generation won the post-await race gate and committed.
    */
   private async writeFallbackHandoff(
     task: TaskRecord,
@@ -2911,10 +2979,13 @@ export class HarnessOrchestrator {
     status: "completed" | "failed" | "cancelled",
     baseSummary: string,
     reason: string,
-    opts?: { exec?: ActiveTaskExecution; allowAborted?: boolean; allowStatus?: TaskStatus },
-  ): Promise<void> {
-    if (this.disposed) return;
-    const gen = task.generation;
+    opts: { exec: ActiveTaskExecution; expectedGeneration: number; allowAborted?: boolean; allowStatus?: TaskStatus },
+  ): Promise<boolean> {
+    if (this.disposed) return false;
+    const gen = opts.expectedGeneration;
+    const preRow = this.db.getTask(task.id);
+    if (!preRow || preRow.generation !== gen || this.active.get(task.id) !== opts.exec) return false;
+
     const git: { head?: string; branch?: string; committed?: string; uncommitted?: string; status?: string[] } = {};
     const wtPath = wt && !wt.cleanedAt && existsSync(wt.path) ? wt.path : null;
     if (wtPath) {
@@ -2939,21 +3010,21 @@ export class HarnessOrchestrator {
       artifactPaths = [];
     }
 
-    // Generation-guarded race gate (synchronous up to the transaction).
-    if (this.disposed) return;
+    // Execution-identity and generation-guarded race gate (synchronous up to the transaction).
+    if (this.disposed) return false;
     const row = this.db.getTask(task.id);
-    if (!row || row.generation !== gen) return;
-    if (opts?.allowAborted) {
-      if (["completed", "returned_for_rescope", "blocked"].includes(row.status)) return;
-    } else if (opts?.allowStatus) {
-      if (row.status !== opts.allowStatus) return;
-    } else if (opts?.exec) {
+    if (!row || row.generation !== gen) return false;
+    if (this.active.get(task.id) !== opts.exec) return false;
+    if (opts.allowAborted) {
+      if (["completed", "returned_for_rescope", "blocked"].includes(row.status)) return false;
+    } else if (opts.allowStatus) {
+      if (opts.exec.abort.signal.aborted || row.status !== opts.allowStatus) return false;
+    } else {
       if (
-        this.active.get(task.id) !== opts.exec ||
         opts.exec.abort.signal.aborted ||
         !["running", "waiting_children", "draining"].includes(row.status)
       ) {
-        return;
+        return false;
       }
     }
 
@@ -2976,7 +3047,7 @@ export class HarnessOrchestrator {
         }
       }
       const paths = outputPath && !artifactPaths.includes(outputPath) ? [...artifactPaths, outputPath] : artifactPaths;
-      const summary = this.formatFallbackSummary({
+      const { summary, outputClipped } = formatFallbackSummary({
         repoRoot: run.repoRoot,
         reason,
         wtPath,
@@ -2997,6 +3068,7 @@ export class HarnessOrchestrator {
             wrap_up_attempted: Boolean(res?.wrapUpAttempted),
             ...(res ? { stop_reason: res.stopReason } : {}),
             partial: true,
+            output_truncated: outputClipped,
             summary,
             artifact_paths: paths,
             ...(wtPath ? { git } : {}),
@@ -3004,37 +3076,7 @@ export class HarnessOrchestrator {
         }),
       });
     });
-  }
-
-  private formatFallbackSummary(input: {
-    repoRoot: string;
-    reason: string;
-    wtPath: string | null;
-    git: { head?: string; branch?: string; committed?: string; uncommitted?: string; status?: string[] };
-    paths: string[];
-    outputPath: string | null;
-    text: string;
-    excerptLimit: number;
-  }): string {
-    const { repoRoot, reason, wtPath, git, paths, outputPath, text, excerptLimit } = input;
-    const header = `[Partial handoff: task ended without return_task (${reason}); unverified, synthesized by the harness]`;
-    const gitLine = wtPath
-      ? `Git: ${git.branch ?? "?"} @ ${git.head?.slice(0, 12) ?? "?"}; committed since base: ${git.committed ?? "unknown"}; ` +
-        `uncommitted: ${git.uncommitted ?? "unknown"}${git.status?.length ? ` (${git.status.length} changed path(s))` : ""}`
-      : "Git: no worktree";
-    const displayPaths = paths.slice(0, 5).map((p) => {
-      const rel = relative(repoRoot, p);
-      return rel && !rel.startsWith("..") ? rel : p;
-    });
-    const more = paths.length > 5 ? `, +${paths.length - 5} more` : "";
-    const artLine = paths.length
-      ? `Artifacts: ${paths.length} indexed: ${displayPaths.join(", ")}${more}`
-      : "Artifacts: 0 indexed";
-    const pointer = outputPath ? `\n[Full output: ${relative(repoRoot, outputPath)}]` : "";
-    const fixed = `${header}\n${gitLine}\n${artLine}\nFinal output (unstructured excerpt):\n`;
-    const budget = Math.max(0, Math.min(excerptLimit, SUMMARY_LIMIT - fixed.length - pointer.length));
-    const excerpt = !text ? "(no final output)" : text.length <= budget ? text : `…${text.slice(-(budget - 1))}`;
-    return `${fixed}${excerpt}${pointer}`.slice(0, SUMMARY_LIMIT);
+    return true;
   }
 
   /** Generation and stop/cancel epochs before a rollover or quota-pause handoff is awaited. */
@@ -3579,48 +3621,19 @@ export class HarnessOrchestrator {
       });
     }
     await cancelled;
+    if (this.disposed) return;
+    const currentExec = this.active.get(taskId);
+    const task = this.db.getTask(taskId);
+    // Fence after await: if another execution or generation now owns this task (e.g. evicted via
+    // cancel-unwind timeout and resumed), do not wipe its task-keyed state or overwrite its row.
+    if (!before || !task || task.generation !== before.generation) return;
+    if (exec ? currentExec !== undefined && currentExec !== exec : currentExec !== undefined) return;
     this.taskQuotaHints.delete(taskId);
     this.taskResumeNotes.delete(taskId);
     this.pendingRollovers.delete(taskId);
-    const task = this.db.getTask(taskId);
-    if (task && !["completed", "cancelled", "failed"].includes(task.status)) {
+    if (!["completed", "cancelled", "failed", "blocked", "returned_for_rescope"].includes(task.status)) {
       const baseSummary = `Cancelled: ${reason}`;
-      const run = task.tier !== 1 ? this.db.getRun(task.runId) : null;
-      if (run && task.tier !== 1) {
-        let artifactPaths: string[] = [];
-        try {
-          artifactPaths = this.db.listArtifacts(run.id, task.id, 50).map((a) => a.path).slice(0, 20);
-        } catch {
-          artifactPaths = [];
-        }
-        const cancelReason = reason ? `cancelled: ${reason}` : "cancelled";
-        const fallbackSummary = this.formatFallbackSummary({
-          repoRoot: run.repoRoot,
-          reason: cancelReason,
-          wtPath: null,
-          git: {},
-          paths: artifactPaths,
-          outputPath: null,
-          text: "",
-          excerptLimit: 1200,
-        });
-        this.db.updateTask(taskId, {
-          status: "cancelled",
-          summary: baseSummary,
-          resultJson: JSON.stringify({
-            status: "cancelled",
-            fallback: {
-              reason: cancelReason,
-              wrap_up_attempted: false,
-              partial: true,
-              summary: fallbackSummary,
-              artifact_paths: artifactPaths,
-            },
-          }),
-        });
-      } else {
-        this.db.updateTask(taskId, { status: "cancelled", summary: baseSummary });
-      }
+      settleTaskMinimalFallback(this.db, task, "cancelled", baseSummary, reason ? `cancelled: ${reason}` : "cancelled");
       // No runner loop will exit for a queued or never-launched task, so settle its run here (a stop sweep does that itself).
       if (!exec && !opts?.bulk) this.afterTaskInactiveInRun(task.runId);
     }
