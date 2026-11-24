@@ -200,6 +200,7 @@ export function compactTaskHandoff(task: TaskRecord, escalations: EscalationReco
     title: task.title,
     kind: task.kind,
     status: task.status,
+    ...(task.goalVersion != null ? { goalVersion: task.goalVersion } : {}),
     summary,
     ...(!paused && (result?.partial === true || result?.fallback?.partial === true) ? { partial: true as const } : {}),
     ...(overflow

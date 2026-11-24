@@ -414,6 +414,12 @@ export class AcpRunner {
     for (const [key, value] of Object.entries(req.extraEnv ?? {})) {
       if (typeof value === "string" && !/^path$/i.test(key)) prepared.env[key] = value;
     }
+    const isAmpProfileEarly = isAmpAcpProfile(this.profile);
+    if (isAmpProfileEarly && prepared.env.AMP_ACP_CANCEL_MODE === undefined && prepared.env.AMP_ACP_EXECUTOR !== "orb") {
+      prepared.env.AMP_ACP_CANCEL_MODE = "steer";
+    }
+    const ampCancelSteerEnabled =
+      isAmpProfileEarly && prepared.env.AMP_ACP_CANCEL_MODE === "steer" && prepared.env.AMP_ACP_EXECUTOR !== "orb";
 
     const child = testAgent
       ? null
@@ -1442,6 +1448,9 @@ export class AcpRunner {
         }
       }
 
+      let promptInFlight = false;
+      let steerHandoffPromise: Promise<Record<string, unknown>> | null = null;
+
       req.onHandle?.({
         steer: async (message: string) => {
           if (!sessionId) return false;
@@ -1458,12 +1467,58 @@ export class AcpRunner {
           }
           if (isAmpProfile) {
             try {
-              await conn.agent.request("_amp/session/steer", {
+              const steerRes = (await conn.agent.request("_amp/session/steer", {
                 sessionId,
                 steerId: randomUUID(),
                 prompt: [{ type: "text", text: message }],
-              });
-              return true;
+              })) as { outcome?: unknown; reason?: unknown } | null | undefined;
+              const outcome = typeof steerRes?.outcome === "string" ? steerRes.outcome : undefined;
+              if (outcome === "startedNewTurn") return true;
+              if (outcome === "failed") return false;
+              if (outcome === "queued") {
+                // amp-acp's _amp/session/steer queues mid-turn messages for the next turn, which never runs for
+                // one-turn workers. With AMP_ACP_CANCEL_MODE=steer on a local session, hand off via session/cancel
+                // followed by session/prompt so amp-acp writes {"steer":true} to the still-running Amp process.
+                if (
+                  ampCancelSteerEnabled &&
+                  promptInFlight &&
+                  !steerHandoffPromise &&
+                  !req.signal.aborted &&
+                  !rolloverTriggered &&
+                  !idleTimedOut &&
+                  !wrapUpTimedOut &&
+                  !wrapUpAttempted
+                ) {
+                  let resolveDispatched!: (ok: boolean) => void;
+                  const dispatched = new Promise<boolean>((resolveDispatch) => {
+                    resolveDispatched = resolveDispatch;
+                  });
+                  const handoff = (async () => {
+                    try {
+                      await conn.agent.notify("session/cancel", { sessionId });
+                      const nextPrompt = conn.agent.request("session/prompt", {
+                        sessionId,
+                        prompt: [{ type: "text", text: message }],
+                      } as never) as unknown as Promise<Record<string, unknown>>;
+                      resolveDispatched(true);
+                      return await nextPrompt;
+                    } catch (err) {
+                      resolveDispatched(false);
+                      throw err;
+                    }
+                  })();
+                  handoff.catch(() => {});
+                  steerHandoffPromise = handoff;
+                  const ok = await dispatched;
+                  if (!ok) {
+                    if (steerHandoffPromise === handoff) steerHandoffPromise = null;
+                    return false;
+                  }
+                  return true;
+                }
+                return false;
+              }
+              return false;
             } catch {
               return false;
             }
@@ -1501,6 +1556,7 @@ export class AcpRunner {
       // One bounded wrap-up turn when the agent ends naturally without settling its task (no return_task).
       let wrapUpTimedOut = false;
       let steerContinuations = 0;
+      let pendingSteerTurnPromise: Promise<Record<string, unknown>> | null = null;
 
       for (let recoveryAttempt = 0; recoveryAttempt <= MAX_TOTAL_RECOVERY_CONTINUATIONS; recoveryAttempt++) {
         turnsUsed += 1;
@@ -1512,66 +1568,75 @@ export class AcpRunner {
         turnSucceededTools = 0;
         textSinceLastTool = "";
 
-        const promptPromise = conn.agent.request("session/prompt", {
-          sessionId,
-          prompt: [{ type: "text", text: nextPromptText }],
-        } as never) as unknown as Promise<Record<string, unknown>>;
+        const promptPromise =
+          pendingSteerTurnPromise ??
+          (conn.agent.request("session/prompt", {
+            sessionId,
+            prompt: [{ type: "text", text: nextPromptText }],
+          } as never) as unknown as Promise<Record<string, unknown>>);
+        pendingSteerTurnPromise = null;
 
-        promptRes = await new Promise<Record<string, unknown>>((resolvePrompt, rejectPromptRaw) => {
-          resolveActivePromptOnGrace = resolvePrompt;
-          // When the harness cut the wrap-up turn off at its time cap, an adapter that answers session/cancel by
-          // rejecting the pending prompt ("Request cancelled") ends the turn normally, like a cancelled response would.
-          // Abort, rollover, idle timeout, child death, quota and any other RPC error still reject.
-          const rejectPrompt = (err: unknown) => {
-            if (wrapUpTimedOut && !req.signal.aborted && !rolloverTriggered && !idleTimedOut && !(childGoneError && err === childGoneError)) {
-              const detail = `${err instanceof Error ? err.message : String(err)} ${acpErrorDetail(err)}`;
-              const code = (err as { code?: unknown } | null)?.code;
-              const name = err instanceof Error ? err.name : "";
-              // Only a complete diagnostic field counts: a cancellation phrase quoted inside a longer error is prose.
-              const wholeCancel = /^(?:(?:request|operation|prompt|turn)\s+)?(?:cancell?ed|aborted)(?:\s+by\s+(?:user|client))?\.?$/i;
-              const explicitCancel = [err instanceof Error ? err.message : String(err), ...acpErrorParts(err)].some((f) =>
-                wholeCancel.test(f.trim()),
-              );
-              // Structured codes decide first: -32800 (plain or wrapped by an internal error) is a cancellation and any
-              // other specific code, however its prose reads, is a genuine RPC error. Only a wrapper with no specific
-              // code falls back to a whole-phrase "request cancelled", or a code-less abort.
-              const nested = code === undefined || code === -32603 || typeof code !== "number" ? nestedRpcCode(err) : undefined;
-              const isCancelled =
-                code === -32800 ||
-                (typeof nested === "number" && nested === -32800) ||
-                (nested === undefined && code === -32603 && explicitCancel) ||
-                (nested === undefined && typeof code !== "number" && (name === "AbortError" || explicitCancel));
-              if (isCancelled && !detectQuotaErrorText(detail).isQuota) {
-                resolvePrompt({ stopReason: "end_turn" });
-                return;
+        promptInFlight = true;
+        try {
+          promptRes = await new Promise<Record<string, unknown>>((resolvePrompt, rejectPromptRaw) => {
+            resolveActivePromptOnGrace = resolvePrompt;
+            // When the harness cut the wrap-up turn off at its time cap (or handed off via cancel-then-prompt
+            // steering), an adapter that answers session/cancel by rejecting the pending prompt ("Request cancelled")
+            // ends that turn cleanly. Abort, rollover, idle timeout, child death, quota and other RPC errors still reject.
+            const rejectPrompt = (err: unknown) => {
+              const expectedCancel = wrapUpTimedOut || steerHandoffPromise !== null;
+              if (expectedCancel && !req.signal.aborted && !rolloverTriggered && !idleTimedOut && !(childGoneError && err === childGoneError)) {
+                const detail = `${err instanceof Error ? err.message : String(err)} ${acpErrorDetail(err)}`;
+                const code = (err as { code?: unknown } | null)?.code;
+                const name = err instanceof Error ? err.name : "";
+                // Only a complete diagnostic field counts: a cancellation phrase quoted inside a longer error is prose.
+                const wholeCancel = /^(?:(?:request|operation|prompt|turn)\s+)?(?:cancell?ed|aborted)(?:\s+by\s+(?:user|client))?\.?$/i;
+                const explicitCancel = [err instanceof Error ? err.message : String(err), ...acpErrorParts(err)].some((f) =>
+                  wholeCancel.test(f.trim()),
+                );
+                // Structured codes decide first: -32800 (plain or wrapped by an internal error) is a cancellation and any
+                // other specific code, however its prose reads, is a genuine RPC error. Only a wrapper with no specific
+                // code falls back to a whole-phrase "request cancelled", or a code-less abort.
+                const nested = code === undefined || code === -32603 || typeof code !== "number" ? nestedRpcCode(err) : undefined;
+                const isCancelled =
+                  code === -32800 ||
+                  (typeof nested === "number" && nested === -32800) ||
+                  (nested === undefined && code === -32603 && explicitCancel) ||
+                  (nested === undefined && typeof code !== "number" && (name === "AbortError" || explicitCancel));
+                if (isCancelled && !detectQuotaErrorText(detail).isQuota) {
+                  resolvePrompt({ stopReason: steerHandoffPromise !== null ? "cancelled" : "end_turn" });
+                  return;
+                }
               }
+              rejectPromptRaw(err);
+            };
+            rejectActivePromptOnChildExit = rejectPrompt;
+            if (child && (child.exitCode !== null || child.signalCode !== null)) {
+              // The child died before this prompt started: fail now rather than wait on a dead pipe.
+              childGoneError = new Error(childExitMessage(child.exitCode, child.signalCode));
+              clearIdleWatchdog();
+              promptPromise.catch(() => {});
+              rejectPrompt(childGoneError);
+              return;
             }
-            rejectPromptRaw(err);
-          };
-          rejectActivePromptOnChildExit = rejectPrompt;
-          if (child && (child.exitCode !== null || child.signalCode !== null)) {
-            // The child died before this prompt started: fail now rather than wait on a dead pipe.
-            childGoneError = new Error(childExitMessage(child.exitCode, child.signalCode));
-            clearIdleWatchdog();
-            promptPromise.catch(() => {});
-            rejectPrompt(childGoneError);
-            return;
-          }
-          if (idleTimeoutMs > 0) {
-            rejectActivePromptOnIdle = rejectPrompt;
-            resetIdleWatchdog();
-          }
-          promptPromise.then(
-            (val) => {
-              clearIdleWatchdog();
-              resolvePrompt(val);
-            },
-            (err) => {
-              clearIdleWatchdog();
-              rejectPrompt(err);
-            },
-          );
-        });
+            if (idleTimeoutMs > 0) {
+              rejectActivePromptOnIdle = rejectPrompt;
+              resetIdleWatchdog();
+            }
+            promptPromise.then(
+              (val) => {
+                clearIdleWatchdog();
+                resolvePrompt(val);
+              },
+              (err) => {
+                clearIdleWatchdog();
+                rejectPrompt(err);
+              },
+            );
+          });
+        } finally {
+          promptInFlight = false;
+        }
 
         // Harvest passive quota & terminal sessionFailure signals
         const promptMeta = (promptRes._meta ?? {}) as Record<string, unknown>;
@@ -1652,7 +1717,22 @@ export class AcpRunner {
           req.signal.aborted ||
           ["quota_exhausted", "rate_limited", "budget_exhausted"].includes(airFailureCode)
         ) {
+          steerHandoffPromise = null;
           break;
+        }
+
+        // A cancel-then-prompt steer hand-off replaced this turn: continue by awaiting the replacement prompt.
+        if (steerHandoffPromise) {
+          const handoff = steerHandoffPromise;
+          steerHandoffPromise = null;
+          if (req.isTaskSettled?.()) {
+            if (sessionId) void conn.agent.notify("session/cancel", { sessionId }).catch(() => {});
+            break;
+          }
+          pendingSteerTurnPromise = handoff;
+          if (accumulatedText.length > 0) needsParagraphBreak = true;
+          recoveryAttempt -= 1;
+          continue;
         }
 
         // The wrap-up turn is final: no breaker, silent-recovery or adapter-limit continuation after it.
