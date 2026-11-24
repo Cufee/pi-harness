@@ -802,6 +802,51 @@ export class GoalEngine {
     return this.getGoal(g.id)!;
   }
 
+  /** Updates review/no-progress budgets without bumping version, changing status, or resetting cycle counters. */
+  updateBudgets(
+    goalIdStr: string,
+    patch: { maxReviewCycles?: number; maxNoProgressCycles?: number },
+  ): { goal: GoalRecord; before: GoalBudgets } {
+    const cur = this.getGoal(goalIdStr);
+    if (!cur) throw new Error(`Unknown goal ${goalIdStr}`);
+    if (cur.status === "achieved" || cur.status === "cancelled") {
+      throw new Error(`Cannot update budgets on a ${cur.status} goal`);
+    }
+    if (patch.maxReviewCycles !== undefined) {
+      if (
+        typeof patch.maxReviewCycles !== "number" ||
+        !Number.isInteger(patch.maxReviewCycles) ||
+        patch.maxReviewCycles < 0
+      ) {
+        throw new Error(`budgets.maxReviewCycles must be a non-negative integer (got ${String(patch.maxReviewCycles)})`);
+      }
+    }
+    if (patch.maxNoProgressCycles !== undefined) {
+      if (
+        typeof patch.maxNoProgressCycles !== "number" ||
+        !Number.isInteger(patch.maxNoProgressCycles) ||
+        patch.maxNoProgressCycles < 1
+      ) {
+        throw new Error(
+          `budgets.maxNoProgressCycles must be a positive integer (got ${String(patch.maxNoProgressCycles)})`,
+        );
+      }
+    }
+
+    const before: GoalBudgets = { ...cur.budgets };
+    const nextBudgets: GoalBudgets = {
+      ...cur.budgets,
+      ...(patch.maxReviewCycles !== undefined ? { maxReviewCycles: patch.maxReviewCycles } : {}),
+      ...(patch.maxNoProgressCycles !== undefined ? { maxNoProgressCycles: patch.maxNoProgressCycles } : {}),
+    };
+
+    this.db
+      .prepare("UPDATE goals SET budgets_json = ?, updated_at = ? WHERE id = ?")
+      .run(JSON.stringify(nextBudgets), Date.now(), cur.id);
+
+    return { goal: this.getGoal(cur.id)!, before };
+  }
+
   /** Resolves escalations on a settled goal's linked run; a failure here never fails the committed transition. */
   private settleEscalations(goal: GoalRecord, status: "achieved" | "cancelled"): void {
     if (!goal.linkedRunId) return;
