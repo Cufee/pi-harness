@@ -78,6 +78,8 @@ export interface RunnerCallbacks {
     result?: string;
     error?: string;
     via?: "code_exec";
+    paths?: string[];
+    denied?: string;
     /** Structured rich output (contract/tool-display-v1); events without it render as a compact tool pill. */
     display?: ToolDisplayPayload;
   }) => void;
@@ -86,6 +88,7 @@ export interface RunnerCallbacks {
 export interface RunnerExecutionHandle {
   steer(message: string): Promise<boolean>;
   cancel(reason?: string): Promise<void>;
+  turnOpen?: () => boolean;
 }
 
 export interface ToolDefinition {

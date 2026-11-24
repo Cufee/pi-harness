@@ -2,12 +2,12 @@ import { isAbsolute, relative, resolve } from "node:path";
 import type { ScopeFinding, ScopeSignalSource } from "../advisories/types.js";
 
 /**
- * Pure, I/O-free scope-check monitor for Tier 3 tasks.
+ * Pure, I/O-free scope-check signal source for Tier 3 tasks.
  *
- * Watches completed tool calls and returns an advisory steering message when activity indicates
- * that the assignment is widening across multiple deliverables or spinning without progress.
- * Raw turn counts, token counts, file counts, and context sizes are never inputs: a long bounded
- * read for one question continues uninterrupted and relies on compaction for context management.
+ * Watches completed tool calls and reports structured scope findings through `evaluate()` when
+ * activity indicates that the assignment is widening across multiple deliverables or spinning
+ * without progress. Raw turn counts, token counts, file counts, and context sizes are never
+ * inputs: a long bounded read for one question stays silent.
  *
  * ## Observed inputs
  * Only `status === "completed"` calls are scored (`in_progress` calls are cached by `id` so
@@ -41,12 +41,10 @@ import type { ScopeFinding, ScopeSignalSource } from "../advisories/types.js";
  *   or complete `argv`/`command`, or truncated distinguishing inputs) are skipped rather than scored
  *   as repeats or lack of progress.
  *
- * ## Fire rule and cadence
- * - Fires when `(W && T) || S`. `W` alone never fires, so a bounded single-topic search across
- *   many areas (e.g. finding every caller of one symbol) is never nudged.
- * - Maximum **2** nudges per monitor (per runner generation). A second nudge fires only after
- *   either `distinctAreas` grew by at least `6` more areas while `W && T` holds, or `S` holds
- *   again after at least `12` additional path-bearing calls since the first nudge.
+ * ## Evaluation
+ * - `evaluate()` reports a `ScopeFinding` when `(W && T) || S`. `W` alone never fires, so a
+ *   bounded single-topic search across many areas (e.g. finding every caller of one symbol)
+ *   stays silent. Cadence and notice formatting live in `src/advisories/rules.ts`.
  */
 
 export interface ScopeToolCall {
@@ -171,9 +169,6 @@ const WIDENING_MIN_NEW_IN_WINDOW = 6;
 const TOPIC_MIN_COUNT = 4;
 const REPEAT_THRESHOLD = 3;
 const STALE_THRESHOLD = 12;
-const SECOND_NUDGE_AREA_GROWTH = 6;
-const SECOND_NUDGE_SPIN_CALLS = 12;
-const MAX_NUDGES = 2;
 const MAX_PENDING_CACHE = 256;
 
 interface ParsedArgsResult {
@@ -456,11 +451,6 @@ function extractOperationKey(args: Record<string, unknown>): string {
   return entries.length > 0 ? JSON.stringify(entries) : "";
 }
 
-function sampleList(items: string[], max = 5): string {
-  if (items.length <= max) return items.join(", ");
-  return `${items.slice(0, max).join(", ")}, ...`;
-}
-
 export class ScopeNudgeMonitor implements ScopeSignalSource {
   private readonly workspaceRoot: string;
   private readonly areaDepth: number;
@@ -477,17 +467,13 @@ export class ScopeNudgeMonitor implements ScopeSignalSource {
   private lastToolName = "";
   private repeatStreak = 0;
   private staleStreak = 0;
-  private legacyStaleStreak = 0;
-  private nudgeCount = 0;
-  private areasAtFirstNudge = 0;
-  private callsAtFirstNudge = 0;
 
   constructor(opts: ScopeNudgeOptions) {
     this.workspaceRoot = resolve(opts.workspaceRoot);
     this.areaDepth = Math.max(1, opts.areaDepth ?? 2);
   }
 
-  observe(call: ScopeToolCall): string | null {
+  observe(call: ScopeToolCall): void {
     if (call.status === "in_progress") {
       if (call.id && (call.args !== undefined || call.kind !== undefined)) {
         const existing = this.pendingById.get(call.id);
@@ -500,21 +486,21 @@ export class ScopeNudgeMonitor implements ScopeSignalSource {
           kind: call.kind !== undefined ? call.kind : existing?.kind,
         });
       }
-      return null;
+      return;
     }
 
     const cached = call.id ? this.pendingById.get(call.id) : undefined;
     if (call.id) this.pendingById.delete(call.id);
 
-    if (call.status !== "completed") return null;
+    if (call.status !== "completed") return;
 
     const toolName = call.name.trim();
-    if (!toolName || IGNORED_TOOLS.has(toolName.toLowerCase())) return null;
+    if (!toolName || IGNORED_TOOLS.has(toolName.toLowerCase())) return;
 
     const kind = call.kind ?? cached?.kind;
     const rawArgs = mergeDefinedArgs(cached?.args, call.args);
     const parsed = parseArgsObject(rawArgs);
-    if (!parsed || parsed.incompleteDistinguishing) return null;
+    if (!parsed || parsed.incompleteDistinguishing) return;
     const parsedArgs = parsed.args;
 
     const extractedPaths = extractPaths(call, kind, parsedArgs);
@@ -524,7 +510,7 @@ export class ScopeNudgeMonitor implements ScopeSignalSource {
     const hasNonCwdPath = extractedPaths.some((p) => !p.fromCwd);
 
     // Skip calls whose inputs cannot distinguish operations (for example cwd alone with no path, query, or argv/op).
-    if (!hasNonCwdPath && !query && !opKey) return null;
+    if (!hasNonCwdPath && !query && !opKey) return;
 
     const addedNewTopic = topicTokens.length > 0 ? this.recordTopic(topicTokens) : false;
 
@@ -577,82 +563,19 @@ export class ScopeNudgeMonitor implements ScopeSignalSource {
     if (isNewProgress) this.seenProgressKeys.add(callKey);
     if (isNewProgress || addedNewTopic) {
       this.staleStreak = 0;
-      this.legacyStaleStreak = 0;
     } else {
       this.staleStreak += 1;
-      this.legacyStaleStreak += 1;
     }
-
-    if (this.nudgeCount >= MAX_NUDGES) return null;
-
-    const finding = this.evaluateWithStale(this.legacyStaleStreak);
-    if (!finding) return null;
-
-    const wideAndMultiTopic = Boolean(finding.widening);
-    const spinning = Boolean(finding.repeated || finding.stale);
-    const marks = this.marks();
-
-    if (this.nudgeCount === 1) {
-      const areaGrewEnough = wideAndMultiTopic && marks.areas >= this.areasAtFirstNudge + SECOND_NUDGE_AREA_GROWTH;
-      const spunAgainEnough = spinning && marks.scoredCalls - this.callsAtFirstNudge >= SECOND_NUDGE_SPIN_CALLS;
-      if (!areaGrewEnough && !spunAgainEnough) return null;
-    }
-
-    const reasons: string[] = [];
-    if (finding.widening) {
-      reasons.push(
-        `you have opened ${finding.widening.areas.length} areas (${sampleList(finding.widening.areas)}) and searched ${finding.widening.topics.length} unrelated topics (${sampleList(finding.widening.topics)})`,
-      );
-    }
-    if (finding.repeated) {
-      reasons.push(`you repeated the same ${finding.repeated.tool} call ${finding.repeated.times} times`);
-    }
-    if (finding.stale) {
-      reasons.push(`the last ${finding.stale.reads} reads found nothing new`);
-    }
-
-    if (this.nudgeCount === 0) {
-      this.areasAtFirstNudge = marks.areas;
-      this.callsAtFirstNudge = marks.scoredCalls;
-    }
-    this.nudgeCount += 1;
-    // Require a fresh streak of stale reads before stale-spinning can trigger a second nudge.
-    if (finding.stale) this.legacyStaleStreak = 0;
-
-    return (
-      `[Harness scope check] This is advisory; nothing was cancelled. ` +
-      `Your activity suggests this task is larger than one bounded assignment: ${reasons.join("; ")}. ` +
-      `If you are still answering one bounded question, continue. ` +
-      `Otherwise stop widening now: save what you found with artifact_write, then call return_task with ` +
-      `status "scope_too_large", partial: true, a summary of what you verified, sources for it, artifact_paths, ` +
-      `and suggested_splits proposing one independent task per area or deliverable still open.`
-    );
   }
 
   evaluate(): ScopeFinding | null {
-    return this.evaluateWithStale(this.staleStreak);
-  }
-
-  marks(): { areas: number; scoredCalls: number } {
-    return {
-      areas: this.areaFirstSeenAt.size,
-      scoredCalls: this.scoredCallCount,
-    };
-  }
-
-  resetStale(): void {
-    this.staleStreak = 0;
-    this.legacyStaleStreak = 0;
-  }
-
-  private evaluateWithStale(staleStreak: number): ScopeFinding | null {
     const sig = this.signals();
     const widening = sig.distinctAreas.length >= WIDENING_MIN_AREAS && sig.newAreasInWindow >= WIDENING_MIN_NEW_IN_WINDOW;
     const topicSpread = sig.searchTopics.length >= TOPIC_MIN_COUNT;
     const wideAndMultiTopic = widening && topicSpread;
 
     const repeatedNow = this.repeatStreak >= REPEAT_THRESHOLD;
-    const staleNow = staleStreak >= STALE_THRESHOLD;
+    const staleNow = this.staleStreak >= STALE_THRESHOLD;
 
     if (!wideAndMultiTopic && !repeatedNow && !staleNow) return null;
 
@@ -671,10 +594,21 @@ export class ScopeNudgeMonitor implements ScopeSignalSource {
     }
     if (staleNow) {
       finding.stale = {
-        reads: staleStreak,
+        reads: this.staleStreak,
       };
     }
     return finding;
+  }
+
+  marks(): { areas: number; scoredCalls: number } {
+    return {
+      areas: this.areaFirstSeenAt.size,
+      scoredCalls: this.scoredCallCount,
+    };
+  }
+
+  resetStale(): void {
+    this.staleStreak = 0;
   }
 
   signals(): ScopeSignals {

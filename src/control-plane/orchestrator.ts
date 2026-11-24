@@ -14,7 +14,14 @@ import { recordCostInvocation } from "../cost/ledger.js";
 import { resolveLaunchRoute } from "./launch-route.js";
 import type { RunAgentRequest, RunAgentResult, RunnerCallbacks, RunnerExecutionHandle } from "../runners/types.js";
 import { MAX_STEER_CONTINUATIONS } from "../runners/types.js";
-import { BisectingMergeQueue } from "../worktree/merge-queue.js";
+import { BisectingMergeQueue, filesOutsideWriteScopes } from "../worktree/merge-queue.js";
+import { AdvisoryEngine } from "../advisories/engine.js";
+import { AdvisedToolExecutor } from "../advisories/executor.js";
+import { formatNotice } from "../advisories/message.js";
+import { isDoneReviewTask, roleOf } from "../advisories/roles.js";
+import { ALL_RULES, SCOPE_ROLES } from "../advisories/rules.js";
+import { buildSubject } from "../advisories/subject.js";
+import type { AdvisoryRecord, Subject } from "../advisories/types.js";
 import { invalidateGateEnvCache, type GateRuntimeConfig } from "../tools/gate-env.js";
 import { nativeToolsPathDirs, resolveExternalMcpServers } from "../tools/native-tools.js";
 import { canonicalPath, runGit, WorktreeConcurrencyLimitError, WorktreeManager } from "../worktree/manager.js";
@@ -22,12 +29,20 @@ import type { QueuePositionInput } from "./admission-queue.js";
 import { WriteScopeConflictError, type AgentTier, type ControlPlaneDb, type RunRecord, type TaskKind, type TaskRecord, type TaskStatus, type WorktreeRecord } from "./db.js";
 import { buildHydrationTurn, buildImmutableSystemPrompt, buildMissingReturnWrapUpPrompt, type AnchoredHandoff } from "./prompts.js";
 import { spillSummaryOverflow, writeUniqueTaskDossier } from "./dossiers.js";
-import { ControlPlaneToolExecutor, compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./tools.js";
+import { ControlPlaneToolExecutor, compactTaskHandoff, isReadOnlyKind, toolsForTier, validateTaskHandoff } from "./tools.js";
 import { formatFallbackSummary, settleTaskMinimalFallback, SUMMARY_LIMIT } from "./handoffs.js";
 import { applyRecoveryPhaseA, classifyInterruptedTasks, relaunchInterruptedTasks } from "./restart-recovery.js";
 import { directorTaskRunId, directorTaskRunOwner, isDirectorTaskContainer } from "./ids.js";
 import { canonicalProjectPath } from "./projects.js";
-import { ensureGoalEvidenceDir } from "../goals/engine.js";
+import { ensureGoalEvidenceDir, goalEvidenceDir } from "../goals/engine.js";
+
+const HARNESS_TOOL_NAMES: ReadonlySet<string> = new Set([
+  ...toolsForTier(1).map((t) => t.name),
+  ...toolsForTier(2).map((t) => t.name),
+  ...toolsForTier(3).map((t) => t.name),
+  "code_exec",
+  "tool_search",
+]);
 
 interface ActiveTaskExecution {
   taskId: string;
@@ -45,6 +60,8 @@ interface ActiveTaskExecution {
   pendingSteers?: Array<{ generation: number; message: string; onOutcome?: (accepted: boolean, reason: string) => void }>;
   /** Serializes every steer to the current handle so live steers never overtake queued ones still draining. */
   steerChain?: Promise<void>;
+  /** Tracks in-flight live advisory steers so generation/task teardown waits briefly for requeue before dropping. */
+  liveSteerPending?: Promise<void>;
   /** "settling" from the moment runner.run() returns: steering can no longer reach that session. */
   phase?: "starting" | "running" | "settling";
   /** Generation-fenced tool event observer shared by runner callbacks and Code Mode inner events. */
@@ -133,11 +150,6 @@ export class RunStartStoppedError extends Error {
     super(`No run was started in ${repoRoot}: a stop was issued while the run was starting. Nothing is running; start it again to continue.`);
     this.name = "RunStartStoppedError";
   }
-}
-
-/** The Director's independent Done-Reviewer: review activity, not execution, so it never drives run status. */
-function isDoneReviewTask(t: TaskRecord): boolean {
-  return t.tier === 3 && t.kind === "verify" && t.title.startsWith("Done-Review:");
 }
 
 /**
@@ -321,6 +333,7 @@ export class HarnessOrchestrator {
   private steerReservedBatches = new Set<string>();
   /** The note-free base message of resume results, so a joined caller never inherits the first caller's note prose. */
   private resumeBaseMessages = new WeakMap<object, string>();
+  readonly advisories: AdvisoryEngine;
   readonly toolExecutor: ControlPlaneToolExecutor;
 
   constructor(
@@ -330,7 +343,15 @@ export class HarnessOrchestrator {
     public quota: QuotaClient,
     private readonly customRunnerFactory?: CustomRunnerFactory,
   ) {
-    this.toolExecutor = new ControlPlaneToolExecutor(db, () => this.catalog, {
+    this.advisories = new AdvisoryEngine({
+      rules: ALL_RULES,
+      createScopeSource: (s) => (SCOPE_ROLES.has(s.role) ? new ScopeNudgeMonitor({ workspaceRoot: s.workspaceRoot }) : null),
+      filesOutsideWriteScopes,
+      harnessToolNames: HARNESS_TOOL_NAMES,
+      record: (entry) => this.recordAdvisory(entry),
+      firedBefore: (subject) => this.advisoriesFiredBefore(subject),
+    });
+    this.toolExecutor = new AdvisedToolExecutor(db, () => this.catalog, {
       spawnAndStartTask: (input) => this.spawnAndStartTask(input),
       waitForChildren: (parentId, ids, mode, timeoutMs, signal) =>
         this.waitForChildrenEventDriven(parentId, ids, mode, timeoutMs, signal),
@@ -383,7 +404,10 @@ export class HarnessOrchestrator {
           this.db.emitEvent(runId, taskId, "agent.tool", ev);
         }
       },
-    }, config);
+    }, config, {
+      engine: this.advisories,
+      subjectFor: (task) => this.advisorySubject(task),
+    });
     // Wakes deferred activations waiting on a write lease whenever a holder can no longer write.
     this.unsubLeaseEvents = db.onEvent((ev) => {
       if (this.leaseWaitQueue.size === 0) return;
@@ -1246,7 +1270,7 @@ export class HarnessOrchestrator {
         }
       }
     }
-    entry.promise = this.runTaskWithRollovers(taskId, entry).catch((err) => {
+    entry.promise = Promise.resolve().then(() => this.runTaskWithRollovers(taskId, entry)).catch((err) => {
       if (this.disposed) return;
       const task = this.db.getTask(taskId);
       if (!task || entry.abort.signal.aborted) return;
@@ -1268,6 +1292,7 @@ export class HarnessOrchestrator {
         this.active.delete(taskId);
         this.pendingRollovers.delete(taskId);
         if (!this.disposed) this.disposeSteeringState(taskId);
+        this.advisories.settle(taskId);
       }
       for (const item of entry.pendingSteers?.splice(0) ?? []) item.onOutcome?.(false, "generation_ended_without_handle");
       if (this.disposed) return;
@@ -2449,7 +2474,7 @@ export class HarnessOrchestrator {
       const maxGenerations = this.config.rollover.maxGenerations ?? 12;
 
       let genToolEvents = 0;
-      const scopeMonitor = task.tier === 3 ? new ScopeNudgeMonitor({ workspaceRoot: cwd }) : null;
+      const subject = this.advisorySubject(hydratedTask);
       const isCurrent = () => this.isCurrentExecution(task.id, exec, runnerGen);
       const isTaskSettled = () => {
         const t = this.db.getTask(task.id);
@@ -2460,25 +2485,8 @@ export class HarnessOrchestrator {
         if (!isCurrent()) return;
         genToolEvents += 1;
         this.db.emitEvent(run.id, task.id, "agent.tool", ev);
-        if (scopeMonitor && !isTaskSettled()) {
-          const status = ev.status === "pending" ? "in_progress" : ev.status;
-          if (status === "in_progress" || status === "completed" || status === "failed") {
-            const nudge = scopeMonitor.observe({
-              id: ev.id,
-              name: ev.name,
-              kind: ev.kind,
-              status,
-              args: ev.args,
-            });
-            if (nudge) {
-              this.db.emitEvent(run.id, task.id, "agent.scope_nudge", {
-                signals: scopeMonitor.signals(),
-                message: nudge,
-              });
-              void this.steerTaskDetailed(task.id, nudge);
-            }
-          }
-        }
+        if (!subject || isTaskSettled()) return;
+        if (this.advisories.observeEvent(subject, ev)) void this.steerLive(task.id);
       };
       exec.observeToolEvent = (expectedGeneration, ev) => {
         if (expectedGeneration !== runnerGen) return;
@@ -3079,6 +3087,23 @@ export class HarnessOrchestrator {
         exec.handle = undefined;
         exec.steerChain = undefined;
         exec.observeToolEvent = undefined;
+        const liveSteer = exec.liveSteerPending;
+        exec.liveSteerPending = undefined;
+        if (liveSteer) {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([
+              liveSteer.catch(() => {}),
+              new Promise<void>((r) => {
+                timer = setTimeout(r, 50);
+                timer.unref?.();
+              }),
+            ]);
+          } finally {
+            if (timer) clearTimeout(timer);
+          }
+        }
+        this.advisories.generationEnded(task.id);
         // A queued steer never crosses into the next generation: its prompt is rebuilt from the amended task row.
         if (!this.disposed && (this.db.getTask(task.id)?.generation ?? runnerGen) > runnerGen && exec.pendingSteers?.length) {
           const stale = exec.pendingSteers.filter((item) => item.generation <= runnerGen);
@@ -3671,6 +3696,121 @@ export class HarnessOrchestrator {
     });
     exec.steerChain = step.then(() => {}, () => {});
     return step;
+  }
+
+  private advisorySubject(task: TaskRecord): Subject | null {
+    const role = roleOf(task);
+    if (role === "director" || role === "reviewer") return null;
+    const run = this.db.getRun(task.runId);
+    if (!run) return null;
+    const wt = task.worktreeId ? this.db.getWorktree(task.worktreeId) : null;
+    const workspaceRoot = wt?.path ?? run.repoRoot;
+    let writeScopes: string[] = [];
+    if (role === "worker") {
+      writeScopes = this.db.listAssignedWriteScopes(run.id, task.id);
+    } else if (role === "execute") {
+      const own = this.db.listAssignedWriteScopes(run.id, task.id);
+      writeScopes = own.length > 0 ? own : task.parentId ? this.db.listAssignedWriteScopes(run.id, task.parentId) : [];
+    }
+    const toolPolicy = toolPolicyForTask(task.tier, task.kind, task.readOnly);
+    const linkedGoal = this.resolveLinkedGoalForRun(run.id);
+    let writableExtraRoots: string[] = [];
+    if (toolPolicy === "read_write_workspace") {
+      if (linkedGoal) {
+        let goalEvDir: string | null = null;
+        try {
+          goalEvDir = goalEvidenceDir(run.repoRoot, linkedGoal.id);
+        } catch {
+          goalEvDir = null;
+        }
+        writableExtraRoots = [...(goalEvDir ? [goalEvDir] : []), ...(this.config.worktree.extraWriteRoots ?? [])];
+      } else {
+        writableExtraRoots = [join(run.repoRoot, ".harness", "goals"), ...(this.config.worktree.extraWriteRoots ?? [])];
+      }
+    }
+    return buildSubject({
+      task,
+      workspaceRoot,
+      writeScopes,
+      writableExtraRoots,
+    });
+  }
+
+  private recordAdvisory(entry: AdvisoryRecord): void {
+    if (this.disposed) return;
+    let runId = entry.subject.runId;
+    let taskId = entry.subject.taskId;
+    if ((!runId || !taskId) && entry.subject.id.startsWith("chat:")) {
+      const ownerId = entry.subject.id.slice("chat:".length);
+      const runs = this.listDirectorTaskRuns(ownerId);
+      const newest = runs[runs.length - 1];
+      if (!newest) return;
+      const owner = this.db.listTasks(newest.id, { parentId: null })[0];
+      if (!owner) return;
+      runId = newest.id;
+      taskId = owner.id;
+    }
+    if (!runId) return;
+    this.db.emitEvent(runId, taskId, "agent.advisory", {
+      rule: entry.notice.rule,
+      key: entry.key,
+      level: entry.notice.level,
+      what: entry.notice.what,
+      why: entry.notice.why,
+      alternative: entry.notice.alternative,
+      text: formatNotice(entry.notice),
+      delivery: entry.delivery,
+      ...(entry.data !== undefined ? { data: entry.data } : {}),
+    });
+  }
+
+  private advisoriesFiredBefore(subject: Subject): Array<{ rule: string; key: string }> {
+    if (!subject.runId || !subject.taskId || this.disposed) return [];
+    const rows = this.db.db
+      .prepare("SELECT payload_json FROM events WHERE run_id = ? AND task_id = ? AND type = 'agent.advisory' ORDER BY seq ASC")
+      .all(subject.runId, subject.taskId) as Array<{ payload_json: string }>;
+    const out: Array<{ rule: string; key: string }> = [];
+    for (const row of rows) {
+      try {
+        const parsed = JSON.parse(row.payload_json) as { rule?: unknown; key?: unknown } | null;
+        if (typeof parsed?.rule === "string" && typeof parsed?.key === "string") {
+          out.push({ rule: parsed.rule, key: parsed.key });
+        }
+      } catch {
+        // Ignore malformed event payloads.
+      }
+    }
+    return out;
+  }
+
+  /** Live delivery only: no queue, no continuation, no agent.steered event. */
+  private async steerLive(taskId: string): Promise<void> {
+    const exec = this.active.get(taskId);
+    const handle = exec?.handle;
+    if (!exec || !handle || exec.abort.signal.aborted || exec.phase !== "running") return;
+    if (handle.turnOpen?.() !== true) return;
+    if ((this.waitingChildrenTasks.get(taskId) ?? 0) > 0) return;
+    const sentGen = exec.runnerGeneration;
+    const notices = this.advisories.take(taskId);
+    if (notices.length === 0) return;
+    const pending = (async () => {
+      const ok = await this.steerHandleChained(exec, handle, notices.map(formatNotice).join("\n\n")).catch(() => false);
+      const stillOpen =
+        this.active.get(taskId) === exec &&
+        exec.phase === "running" &&
+        exec.handle === handle &&
+        exec.runnerGeneration === sentGen &&
+        handle.turnOpen?.() === true;
+      if (ok && stillOpen) this.advisories.delivered(taskId, notices, "steer");
+      else this.advisories.requeue(taskId, notices);
+    })();
+    const prev = exec.liveSteerPending;
+    const chained = prev ? prev.then(() => pending, () => pending) : pending;
+    exec.liveSteerPending = chained;
+    await pending;
+    if (exec.liveSteerPending === chained) {
+      exec.liveSteerPending = undefined;
+    }
   }
 
   /**

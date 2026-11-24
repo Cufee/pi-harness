@@ -30,16 +30,19 @@ const REJECTION_PRIORITY = 110;
 const POSTED_PRIORITY = 90;
 
 interface PendingItem {
+  subject: Subject;
   notice: Notice;
   key: string;
   priority: number;
   seq: number;
   lifetime: "generation" | "subject";
+  generation: number;
   data?: unknown;
 }
 
 interface SubjectState {
   subject: Subject;
+  generation: number;
   parser: NativeEventParser | null;
   scope: ScopeSignalSource | null;
   ruleStates: Map<string, unknown>;
@@ -100,6 +103,7 @@ export class AdvisoryEngine {
 
     const created: SubjectState = {
       subject,
+      generation: 0,
       parser: null,
       scope: null,
       ruleStates: new Map(),
@@ -198,11 +202,13 @@ export class AdvisoryEngine {
         alternative: finding.alternative,
       };
       this.enqueue(st, {
+        subject: st.subject,
         notice,
         key,
         priority: rule.priority,
         seq: ++this.seq,
         lifetime: rule.dedupe.perKey,
+        generation: st.generation,
         data: finding.data,
       });
     }
@@ -251,11 +257,13 @@ export class AdvisoryEngine {
         st.deniedGenKeys.add(ck);
         st.deniedGenCount += 1;
         this.enqueue(st, {
+          subject: st.subject,
           notice,
           key,
           priority: REJECTION_PRIORITY,
           seq: ++this.seq,
           lifetime: "generation",
+          generation: st.generation,
           data: { denied: merged.denied, tool: merged.name, paths: merged.paths },
         });
       }
@@ -311,11 +319,13 @@ export class AdvisoryEngine {
     const st = this.ensureSubject(subject);
     const existingIdx = st.pending.findIndex((p) => p.notice.rule === notice.rule && p.key === opts.key);
     const item: PendingItem = {
+      subject: st.subject,
       notice,
       key: opts.key,
       priority: notice.level === "rejection" ? REJECTION_PRIORITY : POSTED_PRIORITY,
       seq: ++this.seq,
       lifetime: opts.lifetime,
+      generation: st.generation,
     };
     this.noticeMeta.set(notice, item);
     if (existingIdx !== -1) {
@@ -338,21 +348,52 @@ export class AdvisoryEngine {
   requeue(subjectId: string, notices: Notice[]): void {
     if (notices.length === 0) return;
     const st = this.subjects.get(subjectId);
-    if (!st) return;
-    const restored: PendingItem[] = notices.map((notice) => {
+    if (!st) {
+      for (const notice of notices) {
+        const meta = this.noticeMeta.get(notice);
+        if (!meta) continue;
+        this.deps.record({
+          subject: meta.subject,
+          notice,
+          key: meta.key,
+          delivery: "dropped",
+          ...(meta.data !== undefined ? { data: meta.data } : {}),
+        });
+      }
+      return;
+    }
+    const restored: PendingItem[] = [];
+    for (const notice of notices) {
       const meta = this.noticeMeta.get(notice);
-      if (meta) return meta;
+      if (meta) {
+        if (meta.lifetime === "generation" && meta.generation !== st.generation) {
+          this.deps.record({
+            subject: st.subject,
+            notice,
+            key: meta.key,
+            delivery: "dropped",
+            ...(meta.data !== undefined ? { data: meta.data } : {}),
+          });
+          continue;
+        }
+        restored.push(meta);
+        continue;
+      }
       const fallback: PendingItem = {
+        subject: st.subject,
         notice,
         key: notice.rule,
         priority: 0,
         seq: ++this.seq,
         lifetime: "subject",
+        generation: st.generation,
       };
       this.noticeMeta.set(notice, fallback);
-      return fallback;
-    });
-    st.pending = [...restored, ...st.pending];
+      restored.push(fallback);
+    }
+    if (restored.length > 0) {
+      st.pending = [...restored, ...st.pending];
+    }
   }
 
   /** Mark notices delivered. Writes the events. */
@@ -414,6 +455,7 @@ export class AdvisoryEngine {
       }
     }
     st.pending = kept;
+    st.generation += 1;
     st.ruleStates.clear();
     st.firedGenKeys.clear();
     st.firedGenCounts.clear();
