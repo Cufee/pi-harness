@@ -129,6 +129,10 @@ export interface RunAgentRequest {
   /** Daemon Unix socket path + auth token for ACP stdio MCP bridge subprocesses */
   daemonSocketPath?: string;
   mcpBridgeEntrypoint?: string;
+  /** Returns true once the harness MCP bridge for this task has answered `__list_tools` at or after `sinceMs`. */
+  harnessToolsListedSince?: (sinceMs: number) => boolean;
+  /** Override grace period (ms) to wait for the harness MCP bridge to list tools before failing fast; `0` disables the check. */
+  harnessToolsGraceMs?: number;
   /** Optional external stdio MCP servers forwarded alongside the harness bridge (e.g. octofs, ast-grep). */
   externalMcpServers?: ExternalMcpServerConfig[];
   /** Extra directories prepended to PATH for shell-enabled ACP agents (bundled ast-grep / octofs). */

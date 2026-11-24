@@ -24,6 +24,8 @@ import {
   type AcpConfigOption,
   type AcpMcpServerEntry,
 } from "./acp-shims.js";
+import { ACP_AUTH_TEXT_RE, AcpProfileError, isAcpAuthError } from "./acp-profile-error.js";
+export { ACP_AUTH_TEXT_RE, AcpProfileError, isAcpAuthError, type AcpProfileErrorKind } from "./acp-profile-error.js";
 import { isProtectedWritePath } from "./protected-paths.js";
 import { detectQuotaErrorText } from "./quota-detect.js";
 import { MAX_RUNNER_STEER_CONTINUATIONS, validateRunPolicy } from "./types.js";
@@ -378,7 +380,21 @@ const DEFAULT_QUOTA_RETRY_TIMEOUT_MS = 45_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 45_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 600_000;
 const DEFAULT_STEER_ACK_TIMEOUT_MS = 15_000;
+const DEFAULT_TOOLS_GRACE_MS = 20_000;
+const TOOLS_POLL_INTERVAL_MS = 100;
 const ACCEPTED_STEER_STOP_REASONS = new Set(["end_turn", "max_tokens", "max_turn_requests"]);
+
+function resolveToolsGraceMs(override?: number): number {
+  if (typeof override === "number" && Number.isFinite(override)) {
+    return Math.max(0, override);
+  }
+  const rawEnv = process.env.PI_HARNESS_TOOLS_GRACE_MS?.trim();
+  if (rawEnv !== undefined && rawEnv !== "") {
+    const parsed = Number(rawEnv);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return DEFAULT_TOOLS_GRACE_MS;
+}
 
 export interface AcpRunnerOptions {
   steerAckTimeoutMs?: number;
@@ -861,7 +877,40 @@ export class AcpRunner {
     let turnFailedTools: Array<{ title: string; detail?: string }> = [];
     let turnDeniedTools: string[] = [];
     let turnSucceededTools = 0;
+    let totalSucceededTools = 0;
     const allToolFailures: string[] = [];
+    let authOkSent = false;
+    const emitAuthOk = () => {
+      if (authOkSent) return;
+      authOkSent = true;
+      req.callbacks.onPassiveQuota?.({
+        profileId: this.profile.id,
+        model: null,
+        raw: { authOk: true },
+        observedAt: Date.now(),
+      });
+    };
+    const failAuthRequired = (detailText: string): never => {
+      const detail = detailText.trim();
+      req.callbacks.onPassiveQuota?.({
+        profileId: this.profile.id,
+        model: null,
+        raw: { sessionFailure: "auth_required", detail: detail.slice(0, 300) },
+        observedAt: Date.now(),
+      });
+      throw new AcpProfileError(
+        "auth_required",
+        this.profile.id,
+        `ACP profile ${this.profile.id} is not authenticated (${detail.slice(0, 200)}). ` +
+          `Log in with the profile's CLI (${basename(this.profile.command)}) and retry, or choose another model. ` +
+          `The harness skips this profile when it recommends or auto-routes models until a cooldown expires or a session succeeds.`,
+      );
+    };
+    const matchesAuthTextHeuristic = (): boolean => {
+      if (totalSucceededTools !== 0 || allToolFailures.length > 0) return false;
+      const trimmed = accumulatedText.trim();
+      return trimmed.length > 0 && trimmed.length < 400 && ACP_AUTH_TEXT_RE.test(trimmed);
+    };
     let lastIdenticalFailureKey = "";
     let identicalFailureStreak = 0;
     let identicalFailureBreakerTripped = false;
@@ -1157,6 +1206,7 @@ export class AcpRunner {
             steerHandoff.ack.settleAck(true);
           }
           if (kind === "tool_call") {
+            emitAuthOk();
             advanceTurnWaveIfNeeded();
             if (callId && status !== "completed" && status !== "failed") {
               inFlightToolCalls.add(callId);
@@ -1196,6 +1246,7 @@ export class AcpRunner {
             textSinceQuotaRejection = "";
             disarmQuotaWatchdog(true);
             turnSucceededTools += 1;
+            totalSucceededTools += 1;
             // Any successful tool call resets the identical-failure streak so exploratory debugging never trips the breaker
             identicalFailureStreak = 0;
             lastIdenticalFailureKey = "";
@@ -1765,6 +1816,7 @@ export class AcpRunner {
         additionalDirectories: [...new Set([...extraReadRoots, ...extraWriteRoots])],
       });
 
+      const sessionStartMs = Date.now();
       const newSessionRes = (await withTimeout(
         conn.agent.request("session/new", newSessionParams as never),
         startupTimeoutMs,
@@ -1804,6 +1856,52 @@ export class AcpRunner {
           if (!reportedModelSatisfies(this.profile.adapter, reply, current, req.model, newSessionRes)) {
             throw new Error(`Could not select model ${req.model}: ${action.method} reported ${current}`);
           }
+        }
+      }
+
+      const toolsGraceMs = resolveToolsGraceMs(req.harnessToolsGraceMs);
+      if (hasHarnessBridge && req.harnessToolsListedSince && toolsGraceMs > 0) {
+        const deadline = Date.now() + toolsGraceMs;
+        let listed = req.harnessToolsListedSince(sessionStartMs);
+        while (!listed && !req.signal.aborted) {
+          if (child && (child.exitCode !== null || child.signalCode !== null)) {
+            childGoneError ??= new Error(childExitMessage(child.exitCode, child.signalCode));
+            throw childGoneError;
+          }
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) break;
+          await new Promise<void>((resolveSleep) => {
+            const onPollAbort = () => {
+              clearTimeout(timer);
+              resolveSleep();
+            };
+            const timer = setTimeout(() => {
+              req.signal.removeEventListener("abort", onPollAbort);
+              resolveSleep();
+            }, Math.min(TOOLS_POLL_INTERVAL_MS, remaining));
+            timer.unref?.();
+            req.signal.addEventListener("abort", onPollAbort, { once: true });
+          });
+          if (req.signal.aborted) break;
+          listed = req.harnessToolsListedSince(sessionStartMs);
+        }
+        if (req.signal.aborted) {
+          return {
+            text: accumulatedText,
+            stopReason: "cancelled",
+            usage: lastUsage,
+            sessionId,
+          };
+        }
+        if (!listed) {
+          throw new AcpProfileError(
+            "tools_missing",
+            this.profile.id,
+            `ACP profile ${this.profile.id} started a session without the harness MCP tools: ` +
+              `the harness bridge was never asked for its tool list within ${toolsGraceMs} ms, ` +
+              `so return_task and spawn_task are unavailable. Check that the profile's CLI supports and loads MCP servers; ` +
+              `respawn or retry on another profile.`,
+          );
         }
       }
 
@@ -2036,6 +2134,13 @@ export class AcpRunner {
           break;
         }
 
+        if (matchesAuthTextHeuristic()) {
+          failAuthRequired(accumulatedText);
+        }
+        if (rawStop !== "cancelled") {
+          emitAuthOk();
+        }
+
         // A cancel-then-prompt steer hand-off replaced this turn: continue by awaiting the replacement prompt.
         if (steerHandoff.pending) {
           const handoff = steerHandoff.pending;
@@ -2254,6 +2359,7 @@ export class AcpRunner {
         ...(wrapUpAttempted ? { wrapUpAttempted: true } : {}),
       };
     } catch (err) {
+      if (err instanceof AcpProfileError) throw err;
       if (this.profile.adapter === "codex" && turnSucceededTools === 0) {
         const primaryMsg = (spawnErr ?? err) instanceof Error ? (spawnErr ?? err as Error).message : String(spawnErr ?? err);
         const codexMisconfig = detectCodexCodeModeMisconfig(`${primaryMsg}\n${stderrBuf}\n${allToolFailures.join("\n")}`);
@@ -2303,6 +2409,9 @@ export class AcpRunner {
       const baseMsg = primary instanceof Error ? primary.message : String(primary);
       const errDetail = acpErrorDetail(primary);
       const errMsg = errDetail && !baseMsg.includes(errDetail) ? `${baseMsg}: ${errDetail}` : baseMsg;
+      if (isAcpAuthError(primary, errMsg)) {
+        failAuthRequired(errMsg);
+      }
       // Harvest structured `rateLimit` info from ACP JSON-RPC error data (e.g. Claude `turnErrorData` when refused before first usage)
       const rawData =
         (primary as { data?: unknown } | null)?.data ?? (primary as { cause?: { data?: unknown } } | null)?.cause?.data;
