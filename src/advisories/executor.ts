@@ -1,4 +1,4 @@
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import type { HarnessConfig } from "../config.js";
 import type { ControlPlaneDb, TaskRecord } from "../control-plane/db.js";
@@ -55,6 +55,39 @@ function extractInspectCommandPaths(args: Record<string, unknown>, workspaceRoot
     }
   }
   return out;
+}
+
+function extractArtifactReadPaths(args: Record<string, unknown>, workspaceRoot: string): string[] {
+  if (typeof args.path !== "string") return [];
+  const trimmed = args.path.trim();
+  if (!trimmed) return [];
+
+  let realRoot: string;
+  try {
+    realRoot = realpathSync(workspaceRoot);
+  } catch {
+    realRoot = resolve(workspaceRoot);
+  }
+
+  const candidate = resolve(realRoot, trimmed);
+  if (!existsSync(candidate)) return [];
+  try {
+    if (!statSync(candidate).isFile()) return [];
+  } catch {
+    return [];
+  }
+
+  let realCandidate: string;
+  try {
+    realCandidate = realpathSync(candidate);
+  } catch {
+    realCandidate = candidate;
+  }
+
+  const rel = relative(realRoot, realCandidate).replaceAll("\\", "/");
+  if (!rel || rel === "." || rel === ".." || rel.startsWith("../") || isAbsolute(rel)) return [];
+  if (rel === ".harness" || rel.startsWith(".harness/")) return [];
+  return [rel];
 }
 
 export class AdvisedToolExecutor extends ControlPlaneToolExecutor {
@@ -147,6 +180,12 @@ export class AdvisedToolExecutor extends ControlPlaneToolExecutor {
     if (name === "inspect_command") {
       const workspaceRoot = this.adv.workspaceRootFor?.(task) ?? subject.workspaceRoot;
       const paths = extractInspectCommandPaths(args, workspaceRoot);
+      if (paths.length > 0) {
+        this.adv.engine.noteActivity(subject.id, paths);
+      }
+    } else if (name === "artifact_read") {
+      const workspaceRoot = this.adv.workspaceRootFor?.(task) ?? subject.workspaceRoot;
+      const paths = extractArtifactReadPaths(args, workspaceRoot);
       if (paths.length > 0) {
         this.adv.engine.noteActivity(subject.id, paths);
       }

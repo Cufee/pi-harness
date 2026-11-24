@@ -309,6 +309,7 @@ export class NativeEventParser {
   private readonly absRoot: string;
   private readonly harnessToolNames: ReadonlySet<string>;
   private readonly pending = new Map<string, PendingEntry>();
+  private readonly terminalIds = new Set<string>();
 
   constructor(opts: { workspaceRoot: string; harnessToolNames: ReadonlySet<string> }) {
     this.absRoot = resolve(opts.workspaceRoot);
@@ -318,7 +319,8 @@ export class NativeEventParser {
   /**
    * pending / in_progress: caches args, kind, title, and paths under ev.id and returns null.
    * completed / failed: merges the cached fields with this event, deletes the cache entry, returns the merged event.
-   * An event with no id is parsed by itself. The cache holds at most 256 calls and drops the oldest.
+   * Remembers up to 256 terminal call ids per generation and drops a second terminal event for any of them.
+   * An event with no id is parsed by itself. The pending cache holds at most 256 calls and drops the oldest.
    */
   push(ev: ToolEventLike): MergedEvent | null {
     const parsedArgs = parseRawArgs(ev.args);
@@ -327,6 +329,9 @@ export class NativeEventParser {
 
     if (status === "in_progress") {
       if (ev.id) {
+        if (this.terminalIds.has(ev.id)) {
+          return null;
+        }
         const prev = this.pending.get(ev.id);
         if (!prev && this.pending.size >= MAX_PENDING_CACHE) {
           const oldest = this.pending.keys().next().value;
@@ -347,6 +352,18 @@ export class NativeEventParser {
 
     if (status !== "completed" && status !== "failed") {
       return null;
+    }
+
+    if (ev.id) {
+      if (this.terminalIds.has(ev.id)) {
+        this.pending.delete(ev.id);
+        return null;
+      }
+      if (this.terminalIds.size >= MAX_PENDING_CACHE) {
+        const oldest = this.terminalIds.values().next().value;
+        if (oldest !== undefined) this.terminalIds.delete(oldest);
+      }
+      this.terminalIds.add(ev.id);
     }
 
     const cached = ev.id ? this.pending.get(ev.id) : undefined;

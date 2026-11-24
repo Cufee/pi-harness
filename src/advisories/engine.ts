@@ -59,6 +59,7 @@ function compositeKey(rule: string, key: string): string {
 
 export class AdvisoryEngine {
   private readonly deps: EngineDeps;
+  private readonly rulesById: Map<string, AdvisoryRule>;
   private readonly subjects = new Map<string, SubjectState>();
   private readonly noticeMeta = new WeakMap<Notice, PendingItem>();
   private seq = 0;
@@ -68,6 +69,7 @@ export class AdvisoryEngine {
       ...deps,
       rules: [...deps.rules],
     };
+    this.rulesById = new Map(this.deps.rules.map((r) => [r.id, r]));
   }
 
   private ensureSubject(subject: Subject): SubjectState {
@@ -87,6 +89,8 @@ export class AdvisoryEngine {
     const firedSubjectCounts = new Map<string, number>();
     const prior = this.deps.firedBefore?.(subject) ?? [];
     for (const item of prior) {
+      const rule = this.rulesById.get(item.rule);
+      if (!rule || rule.dedupe.perKey !== "subject") continue;
       const ck = compositeKey(item.rule, item.key);
       if (!firedSubjectKeys.has(ck)) {
         firedSubjectKeys.add(ck);
@@ -285,9 +289,10 @@ export class AdvisoryEngine {
   }
 
   /**
-   * A harness or Director tool call finished. Evaluates result-surface rules and queues findings.
-   * Returns every pending notice, highest priority first, and removes them from the queue.
-   * Returns [] and leaves the queue alone when call.inScript is true or call.status is "failed".
+   * A harness or Director tool call finished. Rules evaluate and update their state for every call,
+   * including calls with `inScript` true or `status` `"failed"`. For such a call the method returns `[]`
+   * and leaves every finding queued for the outer or next top-level result. For any other call it returns
+   * every pending notice, highest priority first, and removes them from the queue.
    */
   observeHarness(subject: Subject, call: ObservedCall): Notice[] {
     const st = this.ensureSubject(subject);
@@ -367,7 +372,10 @@ export class AdvisoryEngine {
     }
   }
 
-  /** Workspace paths the executor saw a harness tool read (inspect_command operands that exist). */
+  /**
+   * Workspace paths the executor saw a harness tool read: `inspect_command` operands that exist,
+   * and the path of an `artifact_read` of a workspace file.
+   */
   noteActivity(subjectId: string, paths: string[]): void {
     const st = this.subjects.get(subjectId);
     if (!st) return;
