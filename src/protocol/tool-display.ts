@@ -145,6 +145,16 @@ export function reconcileGoalWithLiveRun(goal: GoalRecord): GoalRecord {
     else delete next.criteriaResults;
     return next;
   };
+  const staleVersion =
+    (lp.reporterGoalVersion != null && lp.reporterGoalVersion < goal.version) ||
+    (lp.goalVersion !== undefined && lp.goalVersion < goal.version);
+  if (staleVersion) {
+    const liveProgress = stripStaleLiveProgress(lp, {
+      clearBlockedPhase: true,
+      clearCompletedPhase: true,
+    }).next;
+    return { ...goal, liveProgress };
+  }
   if (goal.status === "draft" || goal.status === "paused" || goal.status === "achieved" || goal.status === "cancelled") {
     const filtered = filterUnknownCriteria(lp);
     return filtered === lp ? goal : { ...goal, liveProgress: filtered };
@@ -154,10 +164,12 @@ export function reconcileGoalWithLiveRun(goal: GoalRecord): GoalRecord {
     lp.runId !== undefined ||
     lp.reviewCycle !== undefined ||
     lp.reporterGoalVersion != null;
-  const staleReporter = lp.reporterGoalVersion != null && lp.reporterGoalVersion < goal.version;
-  if (staleReporter || (hasProvenance && !isCurrentClaim(goal, lp))) {
-    // A stale blocked phase (and its summary) belongs to the stale claim, so it is hidden too.
-    const liveProgress = stripStaleLiveProgress(lp, { clearBlockedPhase: true }).next;
+  if (hasProvenance && !isCurrentClaim(goal, lp)) {
+    // A stale blocked/completed phase belongs to the stale claim, so it is hidden too.
+    const liveProgress = stripStaleLiveProgress(lp, {
+      clearBlockedPhase: true,
+      clearCompletedPhase: true,
+    }).next;
     return { ...goal, liveProgress };
   }
   const filtered = filterUnknownCriteria(lp);
