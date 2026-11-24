@@ -72,7 +72,7 @@ export class TimerManager {
   private waiters = new Map<string, Set<(res: { timer: TimerRecord; wakeReason: string }) => void>>();
   private onFireCallback: ((timer: TimerRecord, wakeReason: string) => void) | null = null;
   private disposed = false;
-  private suspended = false;
+  private suspendMode: "none" | "startup" | "stopping" = "none";
 
   constructor(private readonly db: Database) {
     this.db.exec(TIMER_SCHEMA);
@@ -83,12 +83,24 @@ export class TimerManager {
   }
 
   /**
+   * Suspends arming, firing, and early triggers during daemon startup/Phase B until `restorePending()`
+   * runs. Unlike `suspend()`, `schedule()` still inserts pending rows (unarmed) so continuation turns
+   * and early-relaunched tasks can schedule timers before Phase B finishes.
+   */
+  suspendForStartup(): void {
+    if (this.suspendMode !== "none") return;
+    this.suspendMode = "startup";
+    for (const h of this.handles.values()) clearTimeout(h);
+    this.handles.clear();
+  }
+
+  /**
    * Suspends timer firing and creation during daemon drain/stop without mutating SQLite rows.
    * Pending rows stay `pending` for the next daemon start; active waiters unblock with `daemon_restart`.
    */
   suspend(): void {
-    if (this.suspended) return;
-    this.suspended = true;
+    if (this.suspendMode === "stopping") return;
+    this.suspendMode = "stopping";
     for (const h of this.handles.values()) clearTimeout(h);
     this.handles.clear();
     const pendingWaiters = [...this.waiters.entries()];
@@ -102,9 +114,12 @@ export class TimerManager {
     }
   }
 
-  /** Re-arms any pending timers persisted before a daemon restart. */
+  /** Un-suspends startup suspension (if active) and re-arms any pending timers persisted before a daemon restart. */
   restorePending(): void {
-    if (this.disposed || this.suspended) return;
+    if (this.disposed || this.suspendMode === "stopping") return;
+    if (this.suspendMode === "startup") {
+      this.suspendMode = "none";
+    }
     const rows = this.db
       .prepare("SELECT * FROM timers WHERE status = 'pending' ORDER BY wake_at ASC")
       .all() as Record<string, unknown>[];
@@ -124,7 +139,7 @@ export class TimerManager {
     wakeOnEvent?: TimerWakeEvent;
     resumeGoal?: boolean;
   }): TimerRecord {
-    if (this.suspended) {
+    if (this.suspendMode === "stopping") {
       throw new Error(
         "harnessd is restarting, so no new timer can be created. Existing timers stay scheduled and fire after the restart. Tier 1 and 2: call request_rollover now.",
       );
@@ -217,6 +232,7 @@ export class TimerManager {
 
   /** Fires any pending timers matching `predicate` early (e.g. when a subscribed event occurs). */
   triggerEarly(predicate: (t: TimerRecord) => boolean, wakeReason: string): TimerRecord[] {
+    if (this.disposed || this.suspendMode !== "none") return [];
     const pending = this.list({ status: "pending" });
     const fired: TimerRecord[] = [];
     for (const t of pending) {
@@ -235,7 +251,7 @@ export class TimerManager {
     if (existing.status !== "pending") {
       return Promise.resolve({ timer: existing, wakeReason: existing.firedReason ?? existing.status });
     }
-    if (this.suspended) {
+    if (this.suspendMode === "stopping") {
       return Promise.resolve({ timer: existing, wakeReason: "daemon_restart" });
     }
     if (signal?.aborted) {
@@ -252,7 +268,7 @@ export class TimerManager {
       const onAbort = () => {
         set?.delete(onDone);
         if (set?.size === 0) this.waiters.delete(existing.id);
-        if (this.suspended) {
+        if (this.suspendMode === "stopping") {
           resolve({ timer: this.get(existing.id) ?? existing, wakeReason: "daemon_restart" });
           return;
         }
@@ -282,14 +298,14 @@ export class TimerManager {
   }
 
   private armHandle(timer: TimerRecord): void {
-    if (this.disposed || this.suspended || timer.status !== "pending") return;
+    if (this.disposed || this.suspendMode !== "none" || timer.status !== "pending") return;
     this.clearHandle(timer.id);
 
     const remaining = timer.wakeAt - Date.now();
     if (remaining <= 0) {
       const h = setTimeout(() => {
         this.handles.delete(timer.id);
-        if (this.disposed || this.suspended) return;
+        if (this.disposed || this.suspendMode !== "none") return;
         this.fire(timer.id, "timer_expired");
       }, 0);
       h.unref?.();
@@ -300,7 +316,7 @@ export class TimerManager {
     const chunk = Math.min(remaining, MAX_TIMEOUT_CHUNK_MS);
     const h = setTimeout(() => {
       this.handles.delete(timer.id);
-      if (this.disposed || this.suspended) return;
+      if (this.disposed || this.suspendMode !== "none") return;
       const latest = this.get(timer.id);
       if (!latest || latest.status !== "pending") return;
       if (latest.wakeAt - Date.now() > 50) {
@@ -314,7 +330,7 @@ export class TimerManager {
   }
 
   private fire(id: string, wakeReason: string): TimerRecord | null {
-    if (this.suspended) return null;
+    if (this.suspendMode !== "none") return null;
     this.clearHandle(id);
     const now = Date.now();
     const res = this.db

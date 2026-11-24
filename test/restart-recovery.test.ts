@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +7,7 @@ import { describe, it } from "bun:test";
 import { ModelCatalogCompiler } from "../src/catalog/compiler.js";
 import { loadConfig } from "../src/config.js";
 import type { CustomRunnerFactory } from "../src/control-plane/orchestrator.js";
+import { listChildProcessGroups, reapChildProcessGroups } from "../src/daemon/reap.js";
 import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import type { RunAgentRequest, RunAgentResult } from "../src/runners/types.js";
@@ -759,8 +760,21 @@ describe("restart-recovery", () => {
           status: "completed",
           args: '{"title":"Inspect config"}',
         });
+        req.callbacks.onToolEvent?.({
+          id: "tc-unwind-1",
+          name: "check_status",
+          status: "in_progress",
+          args: '{"scope":"config"}',
+        });
         turnAReadyToStop = true;
         await waitForAbort(req.signal);
+        // Simulate a tool completing during the cancel unwind before the runner returns.
+        req.callbacks.onToolEvent?.({
+          id: "tc-unwind-1",
+          name: "check_status",
+          status: "completed",
+          args: '{"scope":"config"}',
+        });
         return { text: "Working on delegating the scout.", stopReason: "cancelled" };
       },
     });
@@ -770,6 +784,13 @@ describe("restart-recovery", () => {
     const clientA = new DaemonClient(cfgA.socketPath);
     await clientA.connect();
     let chatId = "";
+    let turnEndHistoryThrough: number | null = null;
+    clientA.onEvent((ev) => {
+      if (ev.type === "chat.turn.end") {
+        const p = ev.payload as { historyThrough?: unknown };
+        if (typeof p.historyThrough === "number") turnEndHistoryThrough = p.historyThrough;
+      }
+    });
     try {
       const opened = await clientA.request<{ session: { id: string } }>("chat.create", {
         repoRoot: repoDir,
@@ -817,11 +838,30 @@ describe("restart-recovery", () => {
     const b = new HarnessDaemon(cfgB, { dbPath, customRunnerFactory: runnerB });
     try {
       const historyBeforeB = b.director.chats.getHistory(chatId, 0, 50);
+      const partialTurn = historyBeforeB.find(
+        (h) => h.role === "assistant" && h.content.includes("Working on delegating the scout."),
+      );
       const notice = historyBeforeB.find(
         (h) => h.role === "system_notice" && h.content.includes("daemon restarted while this turn was running"),
       );
+      assert.ok(partialTurn, "Expected flushed assistant partial turn before notice");
       assert.ok(notice, "Expected system_notice turn after stop");
+      assert.ok(partialTurn.seq < notice.seq, "Notice must be appended after the final partial assistant turn");
+      if (turnEndHistoryThrough !== null) {
+        assert.ok(
+          turnEndHistoryThrough < notice.seq,
+          `chat.turn.end historyThrough (${turnEndHistoryThrough}) must precede notice seq (${notice.seq})`,
+        );
+      }
       assert.ok(notice.content.includes("spawn_task"), `Notice should mention spawn_task: ${notice.content}`);
+      assert.ok(
+        notice.content.includes("- completed: check_status"),
+        `Tool completed during unwind must be listed as completed: ${notice.content}`,
+      );
+      assert.ok(
+        !notice.content.includes("in flight when cancelled (outcome unknown): check_status"),
+        `Tool completed during unwind must not be listed as in flight: ${notice.content}`,
+      );
       assert.ok(notice.content.includes(spawnedTaskId), `Notice should mention ${spawnedTaskId}: ${notice.content}`);
 
       await b.start();
@@ -1079,6 +1119,320 @@ describe("restart-recovery", () => {
     } finally {
       await b.stop();
       rmSync(repoDir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("early-trigger task timer stays pending while owner is held during phase B and steers once", async () => {
+    const repoDir = initTempGitRepo();
+    const stateDir = join(repoDir, ".state");
+    const dbPath = join(stateDir, "control-plane.sqlite");
+
+    const a = new HarnessDaemon(makeTestConfig(repoDir, stateDir), { dbPath });
+    const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    const run = a.db.createRun({ goal: "Timer phase B guard", repoRoot: repoDir, baseBranch: "main", baseSha });
+    const t1 = a.db.createTask({
+      runId: run.id,
+      tier: 1,
+      kind: "orchestrator",
+      title: "Orch launched first",
+      objective: "Launches before held owner",
+      profileId: "pi:local",
+      model: "fixture",
+    });
+    const owner = a.db.createTask({
+      runId: run.id,
+      parentId: t1.id,
+      tier: 2,
+      kind: "worker",
+      title: "Held owner with any timer",
+      objective: "Owns wake_on_event any timer",
+      readOnly: true,
+      profileId: "pi:local",
+      model: "fixture",
+    });
+    const child = a.db.createTask({
+      runId: run.id,
+      parentId: owner.id,
+      tier: 3,
+      kind: "research",
+      title: "Child settling during phase B",
+      objective: "Settles while owner is still held",
+      readOnly: true,
+      profileId: "pi:local",
+      model: "fixture",
+    });
+    a.db.updateTask(t1.id, { status: "running" });
+    a.db.updateTask(owner.id, { status: "running" });
+    const timer = a.db.timers.schedule({
+      ownerKind: "task",
+      ownerId: owner.id,
+      runId: run.id,
+      delaySeconds: 0.45,
+      reason: "wake owner after restart",
+      wakeOnEvent: "any",
+    });
+    await a.stop();
+
+    let ownerStarted = false;
+    let statusAfterChildSettled: string | undefined;
+    let statusWhenOwnerStarted: string | undefined;
+    const ownerSteers: string[] = [];
+
+    const b = new HarnessDaemon(makeTestConfig(repoDir, stateDir), {
+      dbPath,
+      recoveryStaggerMs: 150,
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          if (req.taskId === t1.id) {
+            assert.equal(ownerStarted, false, "t1 must launch before held Tier 2 owner");
+            // Startup suspension must allow schedule() without throwing (unarmed until restorePending).
+            const tempTimer = b.db.timers.schedule({
+              ownerKind: "task",
+              ownerId: t1.id,
+              runId: run.id,
+              delaySeconds: 60,
+              reason: "scheduled during startup",
+            });
+            b.db.timers.cancel(tempTimer.id, "cleanup");
+            // Settle owner's child while owner is still held in Phase B.
+            b.db.updateTask(child.id, { status: "completed", summary: "settled during phase B" });
+            statusAfterChildSettled = b.db.timers.get(timer.id)?.status;
+          }
+          if (req.taskId === owner.id) {
+            ownerStarted = true;
+            statusWhenOwnerStarted = b.db.timers.get(timer.id)?.status;
+            req.onHandle?.({
+              steer: async (msg) => {
+                ownerSteers.push(msg);
+                return true;
+              },
+              cancel: async () => {},
+            });
+          }
+          await waitForAbort(req.signal);
+          return { text: "stopped", stopReason: "cancelled" };
+        },
+      }),
+    });
+    try {
+      await b.start();
+      await b.recovered;
+
+      assert.equal(
+        statusAfterChildSettled,
+        "pending",
+        "Event-triggered timer must remain pending when child settles while owner is held",
+      );
+      assert.equal(
+        statusWhenOwnerStarted,
+        "pending",
+        "Timer must still be pending until Phase B finishes and restorePending arms it",
+      );
+
+      const getAcceptedSteers = () => {
+        const rows = b.db.db
+          .prepare("SELECT payload_json FROM events WHERE run_id = ? AND task_id = ? AND type = 'agent.steered'")
+          .all(run.id, owner.id) as Array<{ payload_json: string }>;
+        return rows
+          .map((e) => JSON.parse(e.payload_json) as { accepted?: boolean; message?: string })
+          .filter((p) => p.accepted === true && typeof p.message === "string" && p.message.includes(timer.id));
+      };
+      await waitUntil(
+        () =>
+          b.db.timers.get(timer.id)?.status === "fired" &&
+          ownerSteers.some((m) => m.includes(timer.id)) &&
+          getAcceptedSteers().length >= 1,
+        4000,
+      );
+      await new Promise((r) => setTimeout(r, 80));
+
+      assert.equal(ownerSteers.filter((m) => m.includes(timer.id)).length, 1, "Owner must be steered exactly once");
+      assert.equal(getAcceptedSteers().length, 1, "Expected exactly one accepted steer event");
+    } finally {
+      await b.stop();
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("interrupted review of a failed-run goal replays once after restart", async () => {
+    const repoDir = initTempGitRepo();
+    const stateDir = join(repoDir, ".state");
+    const dbPath = join(stateDir, "control-plane.sqlite");
+
+    const a = new HarnessDaemon(makeTestConfig(repoDir, stateDir), { dbPath });
+    const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    const chat = a.director.chats.createSession({
+      repoRoot: repoDir,
+      title: "Review replay chat",
+      profileId: "pi:local",
+      model: "fixture",
+    });
+
+    const runFailed = a.db.createRun({ goal: "Failed run under review", repoRoot: repoDir, baseBranch: "main", baseSha });
+    const goalFailed = a.director.goals.createGoal({
+      repoRoot: repoDir,
+      chatSessionId: chat.id,
+      title: "Failed-run review goal",
+      description: "Verify failed run can still be reviewed after restart",
+      criteria: [{ id: "c1", kind: "behavioral", description: "Check behavior", required: true }],
+    });
+    a.director.goals.linkRunAndStart(goalFailed.id, runFailed.id);
+    a.db.db.prepare("UPDATE runs SET status = 'failed' WHERE id = ?").run(runFailed.id);
+    a.director.goals.setStatus(goalFailed.id, "reviewing");
+
+    const runStopped = a.db.createRun({ goal: "Stopped run under review", repoRoot: repoDir, baseBranch: "main", baseSha });
+    const goalStopped = a.director.goals.createGoal({
+      repoRoot: repoDir,
+      chatSessionId: chat.id,
+      title: "Stopped-run review goal",
+      description: "Falls back to Director wake when run is stopped",
+      criteria: [{ id: "c1", kind: "behavioral", description: "Check stopped", required: true }],
+    });
+    a.director.goals.linkRunAndStart(goalStopped.id, runStopped.id);
+    a.db.db.prepare("UPDATE runs SET status = 'stopped' WHERE id = ?").run(runStopped.id);
+    a.director.goals.setStatus(goalStopped.id, "reviewing");
+    await a.stop();
+
+    let reviewerRuns = 0;
+    const chatWakePrompts: string[] = [];
+    const cfgB = makeTestConfig(repoDir, stateDir);
+    // Disable autoVerifyOnSettle so the test also proves manual/non-auto reviews replay.
+    cfgB.goals = { ...cfgB.goals, autoVerifyOnSettle: false };
+    const b = new HarnessDaemon(cfgB, {
+      dbPath,
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          if (req.kind === "verify") {
+            reviewerRuns += 1;
+            await req.executeTool("submit_review_verdict", {
+              verdict: "approved",
+              criteriaResults: [{ criterionId: "c1", passed: true, evidence: "Verified after restart" }],
+              blockingIssues: [],
+              summary: "Approved on replayed failed-run review",
+            });
+            return { text: "approved", stopReason: "completed" };
+          }
+          if (req.taskId.startsWith("chat-")) {
+            chatWakePrompts.push(req.initialPrompt);
+            return { text: "noted", stopReason: "completed" };
+          }
+          return { text: "ok", stopReason: "completed" };
+        },
+      }),
+    });
+    try {
+      await b.start();
+      await b.recovered;
+
+      await waitUntil(
+        () =>
+          b.director.goals.getGoal(goalFailed.id)?.status === "achieved" &&
+          chatWakePrompts.some((p) => p.includes(goalStopped.id) && p.includes("interrupted by daemon restart")),
+        6000,
+      );
+      await new Promise((r) => setTimeout(r, 120));
+
+      assert.equal(reviewerRuns, 1, "Interrupted failed-run review must replay exactly once");
+      assert.equal(b.director.goals.getGoal(goalFailed.id)?.status, "achieved");
+      assert.equal(b.director.goals.getGoal(goalStopped.id)?.status, "awaiting_human");
+      const fallbackEvents = b.director.chats
+        .getHistory(chat.id, 0, 50)
+        .filter(
+          (t) =>
+            t.event?.kind === "goal.settled" &&
+            t.event.goalId === goalStopped.id &&
+            (t.event.detail ?? "").includes("interrupted by daemon restart"),
+        );
+      assert.equal(fallbackEvents.length, 1, "Fallback Director wake for unreplayable goal must fire once");
+    } finally {
+      await b.stop();
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("reapChildProcessGroups kills a captured detached child group after its leader exits", async () => {
+    if (process.platform === "win32") return;
+
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (err) {
+        return (err as NodeJS.ErrnoException).code === "EPERM";
+      }
+    };
+    const isGroupAlive = (pgid: number): boolean => {
+      try {
+        process.kill(-pgid, 0);
+        return true;
+      } catch (err) {
+        return (err as NodeJS.ErrnoException).code === "EPERM";
+      }
+    };
+
+    const grandchildCode = 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);';
+    const leaderCode = `
+      const { spawn } = require("node:child_process");
+      const g = spawn(process.execPath, ["-e", ${JSON.stringify(grandchildCode)}], { stdio: "ignore" });
+      process.stdout.write("GRANDCHILD:" + g.pid + "\\n");
+      process.on("SIGTERM", () => process.exit(0));
+      setInterval(() => {}, 1000);
+    `;
+    const parentCode = `
+      const { spawn } = require("node:child_process");
+      const l = spawn(process.execPath, ["-e", ${JSON.stringify(leaderCode)}], {
+        detached: true,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      process.stdout.write("LEADER:" + l.pid + "\\n");
+      l.stdout.on("data", (d) => process.stdout.write(d));
+      setInterval(() => {}, 1000);
+    `;
+
+    const parent = spawn(process.execPath, ["-e", parentCode], { stdio: ["ignore", "pipe", "pipe"] });
+    let leaderPid = 0;
+    let grandchildPid = 0;
+    let outBuf = "";
+    parent.stdout?.on("data", (chunk: Buffer) => {
+      outBuf += chunk.toString("utf8");
+      const lMatch = outBuf.match(/LEADER:(\d+)/);
+      const gMatch = outBuf.match(/GRANDCHILD:(\d+)/);
+      if (lMatch) leaderPid = Number(lMatch[1]);
+      if (gMatch) grandchildPid = Number(gMatch[1]);
+    });
+
+    try {
+      await waitUntil(() => leaderPid > 0 && grandchildPid > 0, 5000);
+      assert.ok(parent.pid && parent.pid > 0);
+
+      // Capture direct detached child PGIDs before unwind while the group leader is still alive.
+      const captured = listChildProcessGroups(parent.pid);
+      assert.ok(captured.includes(leaderPid), `Expected captured PGIDs ${captured.join(",")} to include ${leaderPid}`);
+
+      // Group leader exits on SIGTERM while grandchild ignores SIGTERM and stays alive in PGID = leaderPid.
+      process.kill(leaderPid, "SIGTERM");
+      await waitUntil(() => !isAlive(leaderPid), 3000);
+      assert.equal(isAlive(grandchildPid), true, "Grandchild must still be alive after leader exits");
+      assert.equal(
+        listChildProcessGroups(parent.pid).includes(leaderPid),
+        false,
+        "Post-exit listing alone can no longer discover the orphaned process group",
+      );
+
+      // Reaping with the pre-unwind captured PGIDs kills the surviving grandchild group and waits until gone.
+      const sigkilled = await reapChildProcessGroups(parent.pid, 200, captured);
+      assert.ok(sigkilled >= 1, `Expected SIGKILL on SIGTERM-ignoring grandchild group, got ${sigkilled}`);
+      assert.equal(isAlive(grandchildPid), false, "Grandchild must be gone before reapChildProcessGroups returns");
+      assert.equal(isGroupAlive(leaderPid), false, "Process group must be gone before reapChildProcessGroups returns");
+    } finally {
+      for (const target of [leaderPid ? -leaderPid : 0, grandchildPid, leaderPid, parent.pid ?? 0]) {
+        if (!target) continue;
+        try {
+          process.kill(target, "SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
     }
   }, 15_000);
 });

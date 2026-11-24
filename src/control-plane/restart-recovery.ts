@@ -4,6 +4,7 @@ import type { AgentTier, ControlPlaneDb, TaskKind, TaskRecord } from "./db.js";
 import { settleTaskMinimalFallback } from "./handoffs.js";
 import { directorTaskRunOwner, isDirectorTaskContainer } from "./ids.js";
 import type { AnchoredHandoff } from "./prompts.js";
+import type { GoalRecord } from "../goals/engine.js";
 import { toolPolicyForTask } from "../runners/types.js";
 import type { WorktreeManager } from "../worktree/manager.js";
 
@@ -725,6 +726,12 @@ function latestMergeRowForTask(
   }
 }
 
+const lastRecoveryFailures = new WeakMap<ControlPlaneDb, Array<{ id: string; error: string }>>();
+
+export function getLastRecoveryFailures(db: ControlPlaneDb): Array<{ id: string; error: string }> {
+  return [...(lastRecoveryFailures.get(db) ?? [])];
+}
+
 export async function relaunchInterruptedTasks(
   host: RecoveryHost,
   taskIds: string[],
@@ -732,6 +739,7 @@ export async function relaunchInterruptedTasks(
 ): Promise<string[]> {
   const launched: string[] = [];
   const failed: { id: string; error: string }[] = [];
+  lastRecoveryFailures.set(host.db, failed);
   if (taskIds.length === 0) return launched;
   console.error(`[harnessd ${new Date().toISOString()}] recovery: starting phase B for ${taskIds.length} task(s)`);
 
@@ -782,8 +790,11 @@ export async function relaunchInterruptedTasks(
             const prevWt = wt;
             const mgr = host.worktrees(run.repoRoot);
             try {
-              if (await mgr.isGitRepo()) {
+              const isRepo = await mgr.isGitRepo();
+              if (host.isStopping()) break;
+              if (isRepo) {
                 wt = await mgr.createForWorker(run.id, task.id, undefined, { force: true });
+                if (host.isStopping()) break;
                 const prevId = prevWt?.id ?? task.worktreeId;
                 const branchHint = prevWt?.branch ? ` (previous branch ${prevWt.branch})` : "";
                 archiveWorktreeNote =
@@ -795,6 +806,7 @@ export async function relaunchInterruptedTasks(
                       : " (nothing unmerged was archived).");
               }
             } catch (err) {
+              if (host.isStopping()) break;
               const msg = err instanceof Error ? err.message : String(err);
               const failure = { id: taskId, error: `worktree recreation failed: ${msg}` };
               failed.push(failure);
@@ -830,8 +842,10 @@ export async function relaunchInterruptedTasks(
             : task;
         if (wasLive && fromStatus !== "draining") {
           handoff = await host.buildHandoff(taskForHandoff, wt?.path ?? null, opts.reason, null);
+          if (host.isStopping()) break;
         } else if (fromStatus === "draining") {
           handoff = await host.buildHandoff(taskForHandoff, wt?.path ?? null, opts.reason, parsedStored.handoff);
+          if (host.isStopping()) break;
         } else if (parsedStored.handoff !== null) {
           handoff = parsedStored.handoff;
         } else if (parsedStored.malformed) {
@@ -841,6 +855,7 @@ export async function relaunchInterruptedTasks(
           handoff = sanitizeRestartHandoff(handoff);
         }
       } catch (handoffErr) {
+        if (host.isStopping()) break;
         const msg = handoffErr instanceof Error ? handoffErr.message : String(handoffErr);
         console.error(
           `[harnessd ${new Date().toISOString()}] recovery: ${taskId} handoff failed (${msg}); falling back to minimal recovery handoff`,
@@ -960,6 +975,7 @@ export async function relaunchInterruptedTasks(
         await new Promise((r) => setTimeout(r, opts.staggerMs));
       }
     } catch (err) {
+      if (host.isStopping()) break;
       const msg = err instanceof Error ? err.message : String(err);
       const failure = { id: taskId, error: msg };
       failed.push(failure);
@@ -973,40 +989,60 @@ export async function relaunchInterruptedTasks(
     }
   }
 
-  if (failed.length > 0) {
-    console.error(
-      `[harnessd ${new Date().toISOString()}] recovery: degraded phase B (${launched.length} launched, ${failed.length} failed: ${failed.map((f) => f.id).join(", ")})`,
-    );
-  }
-
   return launched;
+}
+
+export interface ReviewReplayHost {
+  getGoal(id: string): GoalRecord | null;
+  setGoalExecuting(id: string): unknown;
+  startReview(goalId: string, opts: { autoTriggered: boolean; settledRunStatus?: "failed" }): Promise<unknown>;
+  queueFallbackWake(
+    goal: GoalRecord,
+    runId: string,
+    runStatus: "completed" | "failed" | "stopped",
+    detail: string,
+  ): void;
+  isStopping(): boolean;
 }
 
 export function replayInterruptedReviews(
   db: ControlPlaneDb,
-  goals: { setStatus(id: string, status: "executing"): unknown },
+  host: ReviewReplayHost,
   rows: { goalId: string; runId: string }[],
 ): void {
   for (const { goalId, runId } of rows) {
+    if (host.isStopping()) break;
+    const goal = host.getGoal(goalId);
+    if (!goal || goal.status !== "awaiting_human") continue;
     const run = db.getRun(runId);
-    if (!run) continue;
-    if (run.status === "completed" || run.status === "failed") {
-      let payload: Record<string, unknown> = { status: run.status };
-      try {
-        const ev = db.db
-          .prepare("SELECT payload_json FROM events WHERE run_id = ? AND type = 'run.status' ORDER BY seq DESC LIMIT 1")
-          .get(runId) as { payload_json: string } | undefined;
-        if (ev?.payload_json) {
-          const parsed = JSON.parse(ev.payload_json) as Record<string, unknown>;
-          if (parsed && typeof parsed === "object") payload = parsed;
-        }
-      } catch {
-        // fallback to minimal status payload
-      }
-      db.emitEvent(runId, null, "run.status", { ...payload, replayed: true });
-    } else if (run.status === "active" || run.status === "paused_quota") {
-      goals.setStatus(goalId, "executing");
+    if (run && (run.status === "active" || run.status === "paused_quota")) {
+      host.setGoalExecuting(goalId);
+      continue;
     }
+    if (run && (run.status === "completed" || run.status === "failed")) {
+      const runStatus = run.status;
+      const reviewOpts =
+        runStatus === "failed"
+          ? { autoTriggered: true, settledRunStatus: "failed" as const }
+          : { autoTriggered: true };
+      void host.startReview(goalId, reviewOpts).catch((err) => {
+        if (host.isStopping()) return;
+        if (
+          err instanceof Error &&
+          (err.name === "ReviewInProgressError" || err.name === "StaleReviewError")
+        ) {
+          return;
+        }
+        const latest = host.getGoal(goalId);
+        if (!latest || latest.status !== "awaiting_human") return;
+        const msg = err instanceof Error ? err.message : String(err);
+        host.queueFallbackWake(latest, runId, runStatus, msg);
+      });
+      continue;
+    }
+    const fallbackStatus = run?.status === "stopped" ? "stopped" : "failed";
+    const reason = run ? `linked run ${runId} is ${run.status}` : `linked run ${runId} no longer exists`;
+    host.queueFallbackWake(goal, runId, fallbackStatus, reason);
   }
 }
 

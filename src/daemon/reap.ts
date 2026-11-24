@@ -26,7 +26,7 @@ export function listChildProcessGroups(parentPid: number): number[] {
     const ppid = Number(parts[1]);
     const pgid = Number(parts[2]);
     if (!Number.isInteger(pid) || !Number.isInteger(ppid) || !Number.isInteger(pgid)) continue;
-    if (ppid === parentPid && pgid === pid && pgid > 0 && pgid !== process.pid) {
+    if (ppid === parentPid && pgid === pid && pgid > 0 && pgid !== process.pid && pgid !== parentPid) {
       pgids.add(pgid);
     }
   }
@@ -43,12 +43,20 @@ function isProcessGroupAlive(pgid: number): boolean {
   }
 }
 
-/** Sends SIGTERM to every given process group, waits up to graceMs, then SIGKILLs survivors; returns SIGKILL count. */
+/**
+ * Sends SIGTERM to every given process group, waits up to graceMs, then SIGKILLs survivors
+ * and waits until the killed groups are gone (bounded); returns SIGKILL count.
+ */
 export async function killProcessGroups(pgids: number[], graceMs: number): Promise<number> {
   if (process.platform === "win32" || pgids.length === 0) return 0;
-  const remaining = new Set<number>();
+  const unique = new Set<number>();
   for (const pgid of pgids) {
-    if (!Number.isInteger(pgid) || pgid <= 0) continue;
+    if (Number.isInteger(pgid) && pgid > 0 && pgid !== process.pid) {
+      unique.add(pgid);
+    }
+  }
+  const remaining = new Set<number>();
+  for (const pgid of unique) {
     try {
       process.kill(-pgid, "SIGTERM");
       remaining.add(pgid);
@@ -66,23 +74,46 @@ export async function killProcessGroups(pgids: number[], graceMs: number): Promi
       if (!isProcessGroupAlive(pgid)) remaining.delete(pgid);
     }
     if (remaining.size === 0 || Date.now() >= deadline) break;
-    await new Promise((r) => setTimeout(r, Math.min(50, Math.max(1, deadline - Date.now()))));
+    await new Promise((r) => setTimeout(r, Math.min(25, Math.max(1, deadline - Date.now()))));
   }
 
   let killed = 0;
+  const killedGroups = new Set<number>();
   for (const pgid of remaining) {
     if (!isProcessGroupAlive(pgid)) continue;
     try {
       process.kill(-pgid, "SIGKILL");
       killed++;
+      killedGroups.add(pgid);
     } catch {
       // already gone or inaccessible
     }
   }
+
+  if (killedGroups.size > 0) {
+    const killDeadline = Date.now() + Math.min(2000, Math.max(500, graceMs));
+    while (killedGroups.size > 0) {
+      for (const pgid of [...killedGroups]) {
+        if (!isProcessGroupAlive(pgid)) killedGroups.delete(pgid);
+      }
+      if (killedGroups.size === 0 || Date.now() >= killDeadline) break;
+      await new Promise((r) => setTimeout(r, Math.min(25, Math.max(1, killDeadline - Date.now()))));
+    }
+  }
+
   return killed;
 }
 
-export async function reapChildProcessGroups(parentPid = process.pid, graceMs = 2000): Promise<number> {
-  const pgids = listChildProcessGroups(parentPid);
-  return killProcessGroups(pgids, graceMs);
+export async function reapChildProcessGroups(
+  parentPid = process.pid,
+  graceMs = 2000,
+  extraPgids: Iterable<number> = [],
+): Promise<number> {
+  const pgids = new Set<number>(extraPgids);
+  for (const pgid of listChildProcessGroups(parentPid)) {
+    pgids.add(pgid);
+  }
+  pgids.delete(process.pid);
+  pgids.delete(parentPid);
+  return killProcessGroups([...pgids], graceMs);
 }
