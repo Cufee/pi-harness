@@ -1,6 +1,6 @@
 import { realpathSync, rmSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { recommendModelsByTaskKind, routingSkips, type ModelCatalogCompiler } from "../catalog/compiler.js";
+import { recommendModelsByTaskKind, type CompiledModelEntry, type ModelCatalogCompiler } from "../catalog/compiler.js";
 import { CODE_EXEC_TOOL_NAME, TOOL_SEARCH_TOOL_NAME, createCodeModeExecutor, effectiveCodeMode, exposedTools } from "../code-mode/index.js";
 import type { HarnessConfig } from "../config.js";
 import { codeExecEventSink } from "../protocol/tool-display.js";
@@ -366,18 +366,27 @@ export class ControlPlaneToolExecutor {
       }
 
       case "list_models": {
-        const compiled = await this.getCatalogCompiler().getCatalog({
+        const compiled = await this.getCatalogCompiler().getCatalogWithRoutingSkips({
           cwd: run.repoRoot,
           role: typeof args.role === "string" ? args.role : undefined,
           maxApiEquivUsd: typeof args.max_api_equiv_usd === "number" ? args.max_api_equiv_usd : undefined,
           excludeExhausted: Boolean(args.exclude_exhausted),
+        });
+        const formatQuota = (q: NonNullable<CompiledModelEntry["quota"]>) => ({
+          availability: q.availabilityName,
+          exhausted: q.exhausted,
+          remainingPct: q.effectiveRemainingRatio === null ? null : Math.round(q.effectiveRemainingRatio * 100),
+          bucket: q.bindingBucketId,
+          nextAvailableAt: q.nextAvailableAt,
+          reason: q.reason ?? null,
+          ...(q.unavailableReason ? { unavailableReason: q.unavailableReason } : {}),
         });
         return {
           syncedAt: compiled.syncedAt,
           sources: compiled.sources,
           sessionModelContext: this.resolveSessionModelContext(runId),
           recommendedByKind: recommendModelsByTaskKind(compiled.models, { avoidModelId: task.model }),
-          skippedForRouting: routingSkips(compiled.models),
+          skippedForRouting: compiled.skippedForRouting,
           models: compiled.models.map((m) => ({
             id: m.id,
             family: m.family,
@@ -391,18 +400,7 @@ export class ControlPlaneToolExecutor {
             costPerTaskUsd: m.costPerTaskUsd,
             apiEquivCostUsd: m.apiEquivCostUsd,
             timePerTaskS: m.timePerTaskSeconds,
-            quota: m.quota
-              ? {
-                  availability: m.quota.availabilityName,
-                  exhausted: m.quota.exhausted,
-                  remainingPct:
-                    m.quota.effectiveRemainingRatio === null ? null : Math.round(m.quota.effectiveRemainingRatio * 100),
-                  bucket: m.quota.bindingBucketId,
-                  nextAvailableAt: m.quota.nextAvailableAt,
-                  reason: m.quota.reason ?? null,
-                  ...(m.quota.unavailableReason ? { unavailableReason: m.quota.unavailableReason } : {}),
-                }
-              : null,
+            quota: m.quota ? formatQuota(m.quota) : null,
             recommendedFor: m.recommendedFor,
             ...(m.alternateRoutes.length > 0
               ? {
@@ -410,6 +408,7 @@ export class ControlPlaneToolExecutor {
                     profile: r.profileId,
                     wireModel: r.wireModelId,
                     billing: r.billing,
+                    ...(r.quota ? { quota: formatQuota(r.quota) } : {}),
                   })),
                 }
               : {}),

@@ -25,6 +25,10 @@ import {
   type BenchmarkSourceName,
 } from "./sources.js";
 
+export interface CompiledModelRoute extends ModelRoute {
+  quota?: ResolvedModelQuota | null;
+}
+
 export interface CompiledModelEntry {
   id: string;
   family: string;
@@ -36,8 +40,8 @@ export interface CompiledModelEntry {
   benchmarks: Partial<Record<BenchmarkSourceName, number>>;
   contextK: number | null;
   efforts: string[];
-  preferredRoute: ModelRoute;
-  alternateRoutes: ModelRoute[];
+  preferredRoute: CompiledModelRoute;
+  alternateRoutes: CompiledModelRoute[];
   /** Marginal USD per task ($0 for subscription/local) */
   costPerTaskUsd: number | null;
   /** Equivalent API USD per task so agents still respect scarce frontier subscription quotas */
@@ -84,18 +88,33 @@ export interface RoutingSkip {
   until: string | null;
 }
 
+function routeQuota(m: CompiledModelEntry, route: CompiledModelRoute): ResolvedModelQuota | null | undefined {
+  return route.quota !== undefined ? route.quota : route === m.preferredRoute ? m.quota : null;
+}
+
 /**
- * Lists models currently skipped by auto-routing because their resolved quota is blocked on authentication.
+ * Lists model routes currently skipped by auto-routing because their resolved quota is blocked on authentication.
  */
 export function routingSkips(models: CompiledModelEntry[]): RoutingSkip[] {
-  return models
-    .filter((m) => m.quota?.unavailableReason === "auth")
-    .map((m) => ({
-      model: m.id,
-      profile: m.preferredRoute.profileId,
-      reason: "auth" as const,
-      until: m.quota?.nextAvailableAt ?? null,
-    }));
+  const skips: RoutingSkip[] = [];
+  const seen = new Set<string>();
+  for (const m of models) {
+    for (const route of [m.preferredRoute, ...m.alternateRoutes]) {
+      if (!route) continue;
+      const quota = routeQuota(m, route);
+      if (quota?.unavailableReason !== "auth") continue;
+      const key = `${route.profileId}\0${m.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      skips.push({
+        model: m.id,
+        profile: route.profileId,
+        reason: "auth",
+        until: quota.nextAvailableAt ?? null,
+      });
+    }
+  }
+  return skips;
 }
 
 /**
@@ -106,17 +125,25 @@ export function recommendModelsByTaskKind(
   models: CompiledModelEntry[],
   opts?: { avoidModelId?: string | null; enabledProfiles?: RunnerProfileConfig[]; preferAcp?: boolean },
 ): Record<"orchestrator" | "worker" | "research" | "plan" | "execute" | "verify", TaskModelRecommendation | null> {
-  // With `enabledProfiles`, recommend only routes on enabled profiles (ACP first when `preferAcp`);
-  // without it, every model recommends its preferred route as before.
+  // With `enabledProfiles`, recommend only available routes on enabled profiles (healthy ACP first when `preferAcp`);
+  // without it, check the preferred route's availability as before.
   const enabledById = opts?.enabledProfiles
     ? new Map(opts.enabledProfiles.filter((p) => p.enabled !== false).map((p) => [p.id, p]))
     : null;
-  const routeFor = (m: CompiledModelEntry): ModelRoute | undefined => {
-    if (!enabledById) return m.preferredRoute;
-    const routes = [m.preferredRoute, ...m.alternateRoutes].filter((r) => r && enabledById.has(r.profileId));
-    return (opts?.preferAcp ? routes.find((r) => enabledById.get(r.profileId)?.kind === "acp") : undefined) ?? routes[0];
+  const routeFor = (m: CompiledModelEntry): CompiledModelRoute | undefined => {
+    if (!enabledById && !opts?.preferAcp) {
+      return !isQuotaUnavailable(routeQuota(m, m.preferredRoute)) ? m.preferredRoute : undefined;
+    }
+    const routes = [m.preferredRoute, ...m.alternateRoutes].filter(
+      (r) => r && (!enabledById || enabledById.has(r.profileId)) && !isQuotaUnavailable(routeQuota(m, r)),
+    );
+    return (
+      (opts?.preferAcp
+        ? routes.find((r) => (enabledById ? enabledById.get(r.profileId)?.kind === "acp" : r.runner === "acp"))
+        : undefined) ?? routes[0]
+    );
   };
-  const pool = models.filter((m) => m.enabled !== false && !isQuotaUnavailable(m.quota) && routeFor(m) !== undefined);
+  const pool = models.filter((m) => m.enabled !== false && routeFor(m) !== undefined);
   const byRank = [...pool].sort((a, b) => (b.codingScore ?? -1) - (a.codingScore ?? -1) || a.id.localeCompare(b.id));
 
   const pickByRoles = (
@@ -214,6 +241,19 @@ export interface CompiledModelCatalog {
   /** Optional per-session model selection context set by the discovery/director agent (empty/null by default). */
   sessionModelContext?: string | null;
   models: CompiledModelEntry[];
+}
+
+export interface GetCatalogOptions {
+  forceSync?: boolean;
+  cwd?: string;
+  role?: string;
+  maxApiEquivUsd?: number;
+  excludeExhausted?: boolean;
+  includeDisabled?: boolean;
+}
+
+export interface CompiledModelCatalogWithSkips extends CompiledModelCatalog {
+  skippedForRouting: RoutingSkip[];
 }
 
 const CLAUDE_BARE_FAMILY_RE = /^(?:anthropic\/)?(?:claude-)?(opus|sonnet|haiku|fable)(?:\[[^\]]+\])?$/i;
@@ -612,14 +652,7 @@ export class ModelCatalogCompiler {
     };
   }
 
-  async getCatalog(opts?: {
-    forceSync?: boolean;
-    cwd?: string;
-    role?: string;
-    maxApiEquivUsd?: number;
-    excludeExhausted?: boolean;
-    includeDisabled?: boolean;
-  }): Promise<CompiledModelCatalog> {
+  async getCatalogWithRoutingSkips(opts?: GetCatalogOptions): Promise<CompiledModelCatalogWithSkips> {
     const enabledProfileIds = new Set(
       this.config.profiles.filter((p) => p.enabled !== false).map((p) => p.id),
     );
@@ -644,16 +677,17 @@ export class ModelCatalogCompiler {
           (route) => route && enabledProfileIds.has(route.profileId),
         );
         if (allRoutes.length === 0) return [];
-        const resolvedRoutes = allRoutes.map((route) => ({
-          route,
-          quota:
-            this.quotaClient?.resolveForModel({
-              profileId: route.profileId,
-              provider: route.provider,
-              wireModelId: route.wireModelId,
-              canonicalModelId: m.id,
-            }) ?? null,
-        }));
+        const resolvedRoutes = allRoutes.map((route) => {
+          const quota = this.quotaClient
+            ? this.quotaClient.resolveForModel({
+                profileId: route.profileId,
+                provider: route.provider,
+                wireModelId: route.wireModelId,
+                canonicalModelId: m.id,
+              })
+            : (route.quota ?? (route === m.preferredRoute ? (m.quota ?? null) : null));
+          return { route, quota };
+        });
 
         let chosenIndex = 0;
         if (isQuotaUnavailable(resolvedRoutes[0]?.quota)) {
@@ -666,11 +700,11 @@ export class ModelCatalogCompiler {
         }
 
         const chosen = resolvedRoutes[chosenIndex]!;
-        const preferredRoute = chosen.route;
-        const promoted = preferredRoute !== m.preferredRoute;
-        const alternateRoutes = resolvedRoutes
+        const promoted = chosen.route !== m.preferredRoute;
+        const preferredRoute: CompiledModelRoute = { ...chosen.route, quota: chosen.quota };
+        const alternateRoutes: CompiledModelRoute[] = resolvedRoutes
           .filter((_, idx) => idx !== chosenIndex)
-          .map((r) => r.route);
+          .map((r) => ({ ...r.route, quota: r.quota }));
         const costPerTaskUsd =
           !promoted
             ? m.costPerTaskUsd
@@ -688,7 +722,7 @@ export class ModelCatalogCompiler {
               : m.efforts;
 
         const enabled = isModelEnabledInCatalog(m.id, this.config.catalog);
-        const quota = chosen.quota ?? (!promoted ? (m.quota ?? null) : null);
+        const quota = chosen.quota;
         return [{
           ...m,
           preferredRoute,
@@ -698,18 +732,27 @@ export class ModelCatalogCompiler {
           quota,
           enabled,
         }];
-      })
-      .filter((m) => {
-        if (!opts?.includeDisabled && m.enabled === false) return false;
-        if (opts?.excludeExhausted && isQuotaUnavailable(m.quota)) return false;
-        if (opts?.role && !m.recommendedFor.includes(opts.role)) return false;
-        if (opts?.maxApiEquivUsd !== undefined && m.apiEquivCostUsd !== null && m.apiEquivCostUsd > opts.maxApiEquivUsd) {
-          return false;
-        }
-        return true;
       });
 
-    return { ...catalog, models: enrichedModels };
+    const beforeAvailability = enrichedModels.filter((m) => {
+      if (!opts?.includeDisabled && m.enabled === false) return false;
+      if (opts?.role && !m.recommendedFor.includes(opts.role)) return false;
+      if (opts?.maxApiEquivUsd !== undefined && m.apiEquivCostUsd !== null && m.apiEquivCostUsd > opts.maxApiEquivUsd) {
+        return false;
+      }
+      return true;
+    });
+    const skippedForRouting = routingSkips(beforeAvailability);
+    const models = opts?.excludeExhausted
+      ? beforeAvailability.filter((m) => !isQuotaUnavailable(m.quota))
+      : beforeAvailability;
+
+    return { ...catalog, models, skippedForRouting };
+  }
+
+  async getCatalog(opts?: GetCatalogOptions): Promise<CompiledModelCatalog> {
+    const { skippedForRouting: _skipped, ...catalog } = await this.getCatalogWithRoutingSkips(opts);
+    return catalog;
   }
 
   async sync(cwd: string, injectedInventory?: Map<string, ProbedModelInfo[]>): Promise<CompiledModelCatalog> {

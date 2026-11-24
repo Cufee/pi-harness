@@ -13,6 +13,8 @@ interface LaunchSelection {
   cwd?: string;
   profileId?: string | null;
   model?: string | null;
+  /** True for internal automatic selections so blocked routes are skipped instead of treated as user overrides. */
+  automatic?: boolean;
 }
 
 export async function resolveLaunchRoute(config: HarnessConfig, selection: LaunchSelection): Promise<{
@@ -30,7 +32,7 @@ export async function resolveLaunchRoute(config: HarnessConfig, selection: Launc
   if (model != null && !model.trim()) throw new Error("Select a nonblank catalog model.");
 
   const compiler = selection.catalog ?? new ModelCatalogCompiler(config, selection.quota);
-  const snapshot = await compiler.getCatalog({ cwd, excludeExhausted: model == null && !selection.quota });
+  const snapshot = await compiler.getCatalog({ cwd, excludeExhausted: false });
   const preferred = tier <= 1 ? config.defaultOrchestratorProfile : tier === 2 ? config.defaultWorkerProfile : config.defaultTaskProfile;
   const candidates: Array<{ profile: RunnerProfileConfig; model: string; wireModel: string; unavailable: boolean }> = [];
   const skipped: Array<{ profile: string; model: string; reason: "auth" | "quota"; until: string | null }> = [];
@@ -61,10 +63,10 @@ export async function resolveLaunchRoute(config: HarnessConfig, selection: Launc
         wireModelId: route.wireModelId,
         canonicalModelId: canonicalId,
       });
-      const effectiveQuota = routeQuota ?? (route === entry.preferredRoute ? entry.quota : null);
+      const effectiveQuota = routeQuota ?? route.quota ?? (route === entry.preferredRoute ? entry.quota : null);
       const unavailable = isQuotaUnavailable(effectiveQuota);
       const authBlocked = effectiveQuota?.unavailableReason === "auth";
-      if (unavailable && (model == null || (profileId == null && !authBlocked))) {
+      if (unavailable && (selection.automatic || model == null || (profileId == null && !authBlocked))) {
         skipped.push({
           profile: route.profileId,
           model: canonicalId,

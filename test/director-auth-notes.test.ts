@@ -401,4 +401,195 @@ describe("Director write_note extraWriteRoots, list_models skippedForRouting, an
       rmSync(stateDir, { recursive: true, force: true });
     }
   });
+
+  it("Director reviewer auto-selection falls back from auth-blocked ACP alternate to healthy pi, list_models reports blocked alternates before exclude_exhausted, and explicit selection still launches with warning", async () => {
+    const repoRoot = await makeTempGitRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-dir-alt-auth-state-"));
+    const profiles: RunnerProfileConfig[] = [
+      {
+        id: "pi:openai",
+        kind: "pi",
+        provider: "openai",
+        models: ["gpt-6.2-astra"],
+        billing: "subscription",
+        enabled: true,
+      },
+      {
+        id: "acp:amp",
+        kind: "acp",
+        adapter: "generic",
+        command: "npx",
+        args: ["-y", "amp-acp"],
+        billing: "api",
+        enabled: true,
+      },
+      {
+        id: "acp:gemini",
+        kind: "acp",
+        adapter: "gemini",
+        command: "gemini",
+        args: ["--acp"],
+        billing: "subscription",
+        enabled: true,
+      },
+    ];
+    const base = loadConfig(repoRoot);
+    const config: HarnessConfig = {
+      ...base,
+      stateDir,
+      socketPath: join(stateDir, "d.sock"),
+      codeMode: "off",
+      profiles,
+      defaultOrchestratorProfile: "pi:openai",
+      defaultWorkerProfile: "pi:openai",
+      defaultTaskProfile: "pi:openai",
+      catalog: { ttlHours: 24 },
+      quotaEndpoint: undefined,
+    };
+    const evidence = {
+      ...RANKING_COHORT,
+      revision: "https://www.vals.ai/_astro/benchmark_view_terminal_bench_4.TestFix1.json",
+      asOf: new Date().toISOString().slice(0, 10),
+    };
+    const compiler = new ModelCatalogCompiler(config);
+    const compiled = compiler.compileFromData({
+      enabledProfiles: profiles,
+      inventory: new Map([
+        ["pi:openai", [{ wireModelId: "gpt-6.2-astra" }]],
+        ["acp:amp", [{ wireModelId: "openai/gpt-6.2-astra" }]],
+        ["acp:gemini", [{ wireModelId: "gemini-4-neon" }]],
+      ]),
+      profileStatuses: [
+        { profileId: "pi:openai", status: "ok", modelCount: 1 },
+        { profileId: "acp:amp", status: "ok", modelCount: 1 },
+        { profileId: "acp:gemini", status: "ok", modelCount: 1 },
+      ],
+      modelsDev: [],
+      openRouter: [],
+      litellmDep: new Map(),
+      benchmarks: [
+        {
+          source: "vals_tb4",
+          rawModelName: "openai/gpt-6.2-astra",
+          canonicalKeyHint: "openai/gpt-6.2-astra",
+          effort: "high",
+          codingScore: 76,
+          costPerTaskUsd: 5.0,
+          timePerTaskSeconds: 900,
+          evidence,
+        },
+        {
+          source: "vals_tb4",
+          rawModelName: "google/gemini-4-neon",
+          canonicalKeyHint: "google/gemini-4-neon",
+          effort: "high",
+          codingScore: 74,
+          costPerTaskUsd: 3.0,
+          timePerTaskSeconds: 600,
+          evidence,
+        },
+      ],
+      sources: ["vals_ai"],
+    });
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(compiler.cachePath, JSON.stringify(compiled), "utf8");
+
+    let explicitSpawn: { spawned: string; warning?: string } | undefined;
+    const spawnedProfiles: string[] = [];
+    const daemon = new HarnessDaemon(config, {
+      dbPath: ":memory:",
+      customRunnerFactory: (profile) => ({
+        run: async (req) => {
+          if (req.kind === "orchestrator" && req.runId === req.taskId) {
+            explicitSpawn = (await req.executeTool("spawn_task", {
+              kind: "research",
+              title: "Explicit blocked ACP alternate",
+              objective: "Inspect repo",
+              profile_id: "acp:amp",
+              model: "openai/gpt-6.2-astra",
+            })) as { spawned: string; warning?: string };
+            await req.executeTool("wait_tasks", { ids: [explicitSpawn.spawned], timeout_s: 5 });
+          } else {
+            spawnedProfiles.push(profile.id);
+          }
+          return { stopReason: "completed", text: "done" };
+        },
+      }),
+    });
+
+    interface DirectorListModelsResult {
+      models: Array<{ id: string }>;
+      skippedForRouting: RoutingSkip[];
+      recommendedByKind: Record<string, { model: string; profile?: string } | null>;
+    }
+
+    try {
+      const chat = await daemon.director.createChat({
+        repoRoot,
+        profileId: "pi:openai",
+        model: "openai/gpt-6.2-astra",
+      });
+
+      const observedAt = Date.now();
+      const expectedUntil = new Date(observedAt + AUTH_COOLDOWN_BASE_MS).toISOString();
+      daemon.orchestrator.quota.ingestPassiveSignal({
+        profileId: "acp:amp",
+        model: null,
+        raw: { sessionFailure: "auth_required", detail: "Authentication required" },
+        observedAt,
+      });
+      daemon.orchestrator.quota.ingestPassiveSignal({
+        profileId: "acp:gemini",
+        model: null,
+        raw: { sessionFailure: "auth_required", detail: "Authentication required" },
+        observedAt,
+      });
+
+      // 1. Automatic reviewer selection must pick healthy pi:openai, never auth-blocked acp:amp.
+      const reviewerRoute = await (
+        daemon.director as unknown as {
+          resolveReviewerRoute: (
+            cwd: string,
+            authorModel: string | undefined,
+          ) => Promise<{ profile: RunnerProfileConfig; model: string; wireModel: string; effort: string | undefined }>;
+        }
+      ).resolveReviewerRoute(repoRoot, "anthropic/claude-opus-5-5");
+      assert.equal(reviewerRoute.profile.id, "pi:openai");
+      assert.equal(reviewerRoute.model, "openai/gpt-6.2-astra");
+
+      // 2. Director list_models reports blocked alternate (and single-route blocked model) both with and without exclude_exhausted.
+      const expectedSkips: RoutingSkip[] = [
+        { model: "openai/gpt-6.2-astra", profile: "acp:amp", reason: "auth", until: expectedUntil },
+        { model: "google/gemini-4-neon", profile: "acp:gemini", reason: "auth", until: expectedUntil },
+      ];
+      const allModels = (await daemon.director.executeDirectorMcpTool(chat.id, "list_models", {
+        exclude_exhausted: false,
+      })) as DirectorListModelsResult;
+      assert.deepEqual(allModels.skippedForRouting, expectedSkips);
+
+      const availableOnly = (await daemon.director.executeDirectorMcpTool(chat.id, "list_models", {
+        exclude_exhausted: true,
+      })) as DirectorListModelsResult;
+      assert.deepEqual(
+        availableOnly.models.map((m) => m.id),
+        ["openai/gpt-6.2-astra"],
+      );
+      assert.deepEqual(availableOnly.skippedForRouting, expectedSkips);
+      assert.equal(availableOnly.recommendedByKind.verify?.profile, "pi:openai");
+
+      // 3. Explicit selection of the auth-blocked ACP alternate still launches with a warning.
+      await daemon.director.sendChatMessage(chat.id, "Spawn explicit blocked alternate");
+      assert.ok(explicitSpawn?.spawned, "explicit blocked ACP alternate should still spawn");
+      assert.ok(explicitSpawn?.warning, "explicit blocked ACP alternate should include an auth warning");
+      assert.ok(
+        explicitSpawn.warning.includes("acp:amp") && explicitSpawn.warning.includes(expectedUntil),
+        `expected warning to mention acp:amp and ${expectedUntil}, got: ${explicitSpawn.warning}`,
+      );
+      assert.deepEqual(spawnedProfiles, ["acp:amp"]);
+    } finally {
+      await daemon.stop();
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
 });

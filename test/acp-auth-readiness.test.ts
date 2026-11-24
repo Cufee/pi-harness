@@ -296,6 +296,189 @@ describe("ACP auth readiness, routing skips, profile errors, and prompt consiste
     }
   });
 
+  it("preserves per-route auth availability on alternates so preferAcp falls back, automatic launch skips, explicit overrides stay allowed, and skips survive excludeExhausted", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-alt-route-auth-"));
+    try {
+      const profiles: RunnerProfileConfig[] = [
+        {
+          id: "pi:openai",
+          kind: "pi",
+          provider: "openai",
+          models: ["gpt-6.2-astra"],
+          billing: "subscription",
+          enabled: true,
+        },
+        {
+          id: "acp:amp",
+          kind: "acp",
+          adapter: "generic",
+          command: "npx",
+          args: ["-y", "amp-acp"],
+          billing: "api",
+          enabled: true,
+        },
+        {
+          id: "acp:gemini",
+          kind: "acp",
+          adapter: "gemini",
+          command: "gemini",
+          args: ["--acp"],
+          billing: "subscription",
+          enabled: true,
+        },
+      ];
+      const config: HarnessConfig = {
+        ...loadConfig(stateDir),
+        stateDir,
+        profiles,
+        defaultOrchestratorProfile: "pi:openai",
+        defaultWorkerProfile: "pi:openai",
+        defaultTaskProfile: "pi:openai",
+        catalog: { ttlHours: 24 },
+      };
+      const quota = new QuotaClient();
+      const evidence = {
+        ...RANKING_COHORT,
+        revision: "https://www.vals.ai/_astro/benchmark_view_terminal_bench_4.TestFix1.json",
+        asOf: new Date().toISOString().slice(0, 10),
+      };
+      const compiler = new ModelCatalogCompiler(config, quota);
+      const compiled = compiler.compileFromData({
+        enabledProfiles: profiles,
+        inventory: new Map([
+          ["pi:openai", [{ wireModelId: "gpt-6.2-astra" }]],
+          ["acp:amp", [{ wireModelId: "openai/gpt-6.2-astra" }]],
+          ["acp:gemini", [{ wireModelId: "gemini-4-neon" }]],
+        ]),
+        modelsDev: [],
+        openRouter: [],
+        litellmDep: new Map(),
+        benchmarks: [
+          {
+            source: "vals_tb4",
+            rawModelName: "openai/gpt-6.2-astra",
+            canonicalKeyHint: "openai/gpt-6.2-astra",
+            effort: "high",
+            codingScore: 76,
+            costPerTaskUsd: 5.0,
+            timePerTaskSeconds: 900,
+            evidence,
+          },
+          {
+            source: "vals_tb4",
+            rawModelName: "google/gemini-4-neon",
+            canonicalKeyHint: "google/gemini-4-neon",
+            effort: "high",
+            codingScore: 74,
+            costPerTaskUsd: 3.0,
+            timePerTaskSeconds: 600,
+            evidence,
+          },
+        ],
+        sources: ["vals_ai"],
+      });
+      writeFileSync(compiler.cachePath, JSON.stringify(compiled), "utf8");
+
+      const observedAt = Date.now();
+      const expectedUntil = new Date(observedAt + AUTH_COOLDOWN_BASE_MS).toISOString();
+      quota.ingestPassiveSignal({
+        profileId: "acp:amp",
+        model: null,
+        raw: { sessionFailure: "auth_required", detail: "Authentication required" },
+        observedAt,
+      });
+      quota.ingestPassiveSignal({
+        profileId: "acp:gemini",
+        model: null,
+        raw: { sessionFailure: "auth_required", detail: "Authentication required" },
+        observedAt,
+      });
+
+      // Enrichment retains per-route auth quota on the blocked ACP alternate.
+      const unfiltered = await compiler.getCatalog({ excludeExhausted: false });
+      const astra = unfiltered.models.find((m) => m.id === "openai/gpt-6.2-astra");
+      assert.ok(astra);
+      assert.equal(astra.preferredRoute.profileId, "pi:openai");
+      assert.equal(astra.preferredRoute.quota, null);
+      assert.equal(astra.alternateRoutes[0]?.profileId, "acp:amp");
+      assert.equal(astra.alternateRoutes[0]?.quota?.unavailableReason, "auth");
+      assert.equal(astra.alternateRoutes[0]?.quota?.nextAvailableAt, expectedUntil);
+
+      // preferAcp must skip the auth-blocked ACP alternate and fall back to healthy pi:openai
+      // both with and without enabledProfiles.
+      const recsWithProfiles = recommendModelsByTaskKind(unfiltered.models, {
+        enabledProfiles: profiles,
+        preferAcp: true,
+      });
+      assert.equal(recsWithProfiles.verify?.model, "openai/gpt-6.2-astra");
+      assert.equal(recsWithProfiles.verify?.profile, "pi:openai");
+
+      const recsPreferAcpOnly = recommendModelsByTaskKind(unfiltered.models, { preferAcp: true });
+      assert.equal(recsPreferAcpOnly.verify?.model, "openai/gpt-6.2-astra");
+      assert.equal(recsPreferAcpOnly.verify?.profile, "pi:openai");
+
+      // routingSkips includes both the blocked alternate and the single-route blocked model.
+      assert.deepEqual(routingSkips(unfiltered.models), [
+        { model: "openai/gpt-6.2-astra", profile: "acp:amp", reason: "auth", until: expectedUntil },
+        { model: "google/gemini-4-neon", profile: "acp:gemini", reason: "auth", until: expectedUntil },
+      ]);
+
+      // getCatalogWithRoutingSkips computes skips before excludeExhausted removes unavailable models.
+      const filtered = await compiler.getCatalogWithRoutingSkips({ excludeExhausted: true });
+      assert.deepEqual(
+        filtered.models.map((m) => m.id),
+        ["openai/gpt-6.2-astra"],
+      );
+      assert.deepEqual(filtered.skippedForRouting, [
+        { model: "openai/gpt-6.2-astra", profile: "acp:amp", reason: "auth", until: expectedUntil },
+        { model: "google/gemini-4-neon", profile: "acp:gemini", reason: "auth", until: expectedUntil },
+      ]);
+
+      // Internal automatic launch rejects an auth-blocked (profileId, model) pick instead of treating it as a user override.
+      await assert.rejects(
+        () =>
+          resolveLaunchRoute(config, {
+            tier: 3,
+            catalog: compiler,
+            quota,
+            profileId: "acp:amp",
+            model: "openai/gpt-6.2-astra",
+            automatic: true,
+          }),
+        (err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          assert.match(msg, /No eligible current catalog route/);
+          assert.ok(msg.includes(`acp:amp/openai/gpt-6.2-astra (auth: needs login until ${expectedUntil})`), msg);
+          return true;
+        },
+      );
+
+      // Internal automatic launch with model-only skips auth-blocked ACP and picks healthy pi:openai.
+      const autoModel = await resolveLaunchRoute(config, {
+        tier: 3,
+        catalog: compiler,
+        quota,
+        model: "openai/gpt-6.2-astra",
+        automatic: true,
+      });
+      assert.equal(autoModel.profile.id, "pi:openai");
+      assert.equal(autoModel.model, "openai/gpt-6.2-astra");
+
+      // Explicit user/agent selection of the blocked ACP alternate remains allowed (warning-only override).
+      const explicitBlocked = await resolveLaunchRoute(config, {
+        tier: 3,
+        catalog: compiler,
+        quota,
+        profileId: "acp:amp",
+        model: "openai/gpt-6.2-astra",
+      });
+      assert.equal(explicitBlocked.profile.id, "acp:amp");
+      assert.equal(explicitBlocked.model, "openai/gpt-6.2-astra");
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
   it("classifies ACP auth errors via -32000 (direct/nested) and text patterns, and rejects non-auth errors", () => {
     const err = new AcpProfileError("auth_required", "acp:gemini", "Login needed");
     assert.ok(err instanceof Error);

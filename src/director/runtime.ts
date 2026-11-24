@@ -12,7 +12,6 @@ import {
   compareSemanticVersions,
   parseClaudeFamilyVersion,
   recommendModelsByTaskKind,
-  routingSkips,
   type CompiledModelEntry,
   type ModelCatalogCompiler,
 } from "../catalog/compiler.js";
@@ -4907,6 +4906,7 @@ export class DirectorRuntime {
           model: rung.model,
           catalog: this.catalog,
           quota: this.quota,
+          automatic: true,
         });
         const matchesRec = rec != null && route.profile.id === rec.profile && route.model === rec.model;
         const effort = matchesRec && rec.effort && rec.effort !== "default" ? rec.effort : undefined;
@@ -6529,7 +6529,7 @@ export class DirectorRuntime {
 
       case "list_models": {
         const session = this.chats.getSession(chatSessionId);
-        const catalog = await this.catalog.getCatalog({
+        const catalog = await this.catalog.getCatalogWithRoutingSkips({
           cwd: repoRoot,
           excludeExhausted: Boolean(args.exclude_exhausted),
         });
@@ -6537,7 +6537,7 @@ export class DirectorRuntime {
           ...catalog,
           sessionModelContext: session?.modelSelectionContext ?? null,
           recommendedByKind: recommendModelsByTaskKind(catalog.models, { avoidModelId: session?.model }),
-          skippedForRouting: routingSkips(catalog.models),
+          skippedForRouting: catalog.skippedForRouting,
         };
       }
 
