@@ -179,3 +179,15 @@ AUDIT_LOG="$STATE_DIR/install-audit.log"
 mkdir -p "$STATE_DIR"
 printf '%s user=%s pid=%s release=%s src=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${USER:-unknown}" "$$" "$ID" "${SRC:-unknown}" >> "$AUDIT_LOG" 2>/dev/null || true
 case ":$PATH:" in *":$BIN_DIR:"*) ;; *) log "add $BIN_DIR to PATH to run pi-harness by name" ;; esac
+
+rm -rf "$STAGE" "$LOCK"; trap - EXIT
+if [ "${PI_HARNESS_NO_RELOAD:-0}" != 1 ]; then
+  set -- daemon reload --from-install
+  if [ "${PI_HARNESS_RELOAD_WAIT:-}" = 1 ] || { [ -z "${PI_HARNESS_RELOAD_WAIT:-}" ] && [ -t 1 ]; }; then set -- "$@" --wait; fi
+  rc=0; "$BUN" "$REL/src/cli.ts" "$@" || rc=$?
+  case $rc in
+    0) ;;
+    3) log "harnessd could not start release $ID and is back on the previous release (install succeeded; current still points to releases/$ID)"; exit 1 ;;
+    *) log "warning: harnessd was not reloaded (exit $rc). Run: pi-harness daemon reload" ;;
+  esac
+fi

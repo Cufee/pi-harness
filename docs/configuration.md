@@ -7,14 +7,15 @@ This reference covers `pi-harness` configuration files, precedence, extra filesy
 - **Global file**: `$PI_HARNESS_HOME/config.json` (default `~/.pi-harness/config.json`). The state directory itself comes from the `PI_HARNESS_HOME` environment variable; a `stateDir` key in `config.json` does not set it (though a non-string value is still rejected on reload).
 - **Repository overlay**: `<repoRoot>/.pi-harness.json`.
 - **Precedence** (lowest to highest): built-in defaults, global file, repository overlay.
-- **Merge rules**: `codeExec`, `rollover`, `worktree`, `goals`, `events`, `catalog`, and `quotaRetry` merge key by key. Scalars, arrays, and `quotaEndpoint` replace whole (`"quotaEndpoint": null` clears an inherited endpoint). An empty `profiles` array falls back to the built-in default profiles.
+- **Merge rules**: `codeExec`, `rollover`, `worktree`, `goals`, `events`, `catalog`, `quotaRetry`, and `hotUpdate` merge key by key. Scalars, arrays, and `quotaEndpoint` replace whole (`"quotaEndpoint": null` clears an inherited endpoint). An empty `profiles` array falls back to the built-in default profiles.
 - **Overlay snapshot**: `harnessd` loads one repository overlay once at startup (one overlay per daemon, not per project). `pi-harness daemon serve` reads it from its `--repo` path, or else its working directory; a daemon auto-spawned by any other command reads it from that command's working directory, not from the command's `--repo` flag. Editing `.pi-harness.json` requires a daemon restart from the intended directory.
-- **Global-only keys**: the repository overlay cannot set these five keys; values placed there are ignored:
+- **Global-only keys**: the repository overlay cannot set these six keys; values placed there are ignored:
   - `worktree.extraReadRoots`
   - `worktree.extraWriteRoots`
   - `goals.gateShell`
   - `goals.gateEnv`
   - `remotes`
+  - `hotUpdate`
 
 Every other key can come from `.pi-harness.json`, including `profiles`, `externalMcpServers`, `worktree.setupCommand`, and `worktree.ciCommands`, which execute commands; start `harnessd` only from repositories whose overlay you trust.
 
@@ -153,6 +154,16 @@ Tier 3 tasks receive no orchestrator rollover threshold and do not use anchored 
 
 When neither a reset time nor confirmed current capacity provides a schedule (or when `autoResumeEnabled` is `false`), no fallback timer is started and the run waits for a manual resume (or `pi-harness resume <run-id> --in <dur>`).
 
+### `hotUpdate`
+
+Global-only; values placed in `.pi-harness.json` are ignored with a `config warning:`. See [Runtime install](./runtime-install.md#hot-update) for the reload lifecycle and installer environment variables (`PI_HARNESS_NO_RELOAD`, `PI_HARNESS_RELOAD_WAIT`).
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `hotUpdate.mode` | `"auto"` | `"auto"` or `"manual"`. In `"manual"` mode, `install.sh` activates the release on disk without reloading the running daemon. |
+| `hotUpdate.drainTimeoutSec` | `90` | Maximum seconds to wait for live Tier 1/2 agents and Director turns to hand off before stopping (`> 0`). |
+| `hotUpdate.minIntervalSec` | `900` | Minimum seconds of daemon uptime between install-triggered reloads while agents are live (`>= 0`; `0` disables the rate limit). Idle daemons and manual `pi-harness daemon reload` bypass this limit. |
+
 ### `quotaEndpoint`, `profiles`, `remotes`, and `externalMcpServers`
 
 | Key | Default | Notes |
@@ -173,7 +184,7 @@ When neither a reset time nor confirmed current capacity provides a schedule (or
 
 | Takes effect | Settings |
 | --- | --- |
-| Immediately | `worktree` keys other than the roots (raising `maxConcurrentWorkers` starts queued workers); `goals.gateTimeoutMs`, `gateShell`, `gateEnv`, `autoVerifyOnSettle`, and `maxConcurrentGoals` (raising it starts queued goals); `remotes`; `quotaEndpoint`; `catalog`; `profiles`; `worktree.extraWriteRoots` for Director `write_note`; `events` for Director settlement and wait handlers (a wait already in progress keeps the value read when it started); `codeMode` and `codeExec` for an existing task's next MCP tool discovery (`tools/list`) and Code Mode dispatch; `externalMcpServers` for daemon config, `daemon status`, and background `octofs` staging; `quotaRetry.fallbackCooldownSec`, `maxCooldownSec`, `autoResumeEnabled`, and `earlyWakePollMs` when the next quota pause is handled (timers already armed are not reconfigured) |
+| Immediately | `worktree` keys other than the roots (raising `maxConcurrentWorkers` starts queued workers); `goals.gateTimeoutMs`, `gateShell`, `gateEnv`, `autoVerifyOnSettle`, and `maxConcurrentGoals` (raising it starts queued goals); `remotes`; `quotaEndpoint`; `catalog`; `profiles`; `worktree.extraWriteRoots` for Director `write_note`; `events` for Director settlement and wait handlers (a wait already in progress keeps the value read when it started); `codeMode` and `codeExec` for an existing task's next MCP tool discovery (`tools/list`) and Code Mode dispatch; `externalMcpServers` for daemon config, `daemon status`, and background `octofs` staging; `quotaRetry.fallbackCooldownSec`, `maxCooldownSec`, `autoResumeEnabled`, and `earlyWakePollMs` when the next quota pause is handled (timers already armed are not reconfigured); `hotUpdate` for subsequent `daemon.reload` requests (a drain or scheduled reload already in progress keeps the values read when it started) |
 | When a task or goal is created | `goals.defaultMaxReviewCycles` and `defaultMaxNoProgressCycles` (copied into the new goal contract; existing goals keep theirs) |
 | At agent launch or generation (running sessions keep theirs) | `worktree.extraReadRoots`, `worktree.extraWriteRoots`; `externalMcpServers` entries for newly started ACP sessions; `codeMode` and `codeExec` initial prompt and runner tool list (later MCP tool discovery and Code Mode dispatches read the current mode and limits); `quotaRetry.nativeRetryTimeoutMs`; `rollover.orchestratorThreshold`, `workerThreshold`, and `maxGenerations`; default profiles |
 | Only after a daemon restart | state directory (`PI_HARNESS_HOME`), `socketPath`, the repository overlay |
@@ -182,7 +193,7 @@ To change `socketPath` or `PI_HARNESS_HOME`, run `pi-harness daemon stop` while 
 
 ## Inspecting effective settings
 
-`pi-harness daemon status` (or plain `pi-harness daemon`) prints the daemon's `status` response as JSON. It reports a subset of the settings; alongside `pid`, `socketPath`, and `uptimeMs`, check:
+`pi-harness daemon status` (or plain `pi-harness daemon`) prints the daemon's `status` response as JSON. It reports a subset of the settings; alongside `pid`, `socketPath`, `uptimeMs`, `releaseId`, `releaseDir`, `lifecycle`, `restartSafe`, and `reload` (see [Runtime install](./runtime-install.md#inspecting-status-and-dry-run-recovery)), check:
 
 - `configPath`: path to the global `config.json` the daemon watches.
 - `configWarnings`: array of value-free warnings for known keys at unsupported locations in `config.json` or the startup `.pi-harness.json` overlay (including global-only keys in the overlay).
@@ -193,7 +204,7 @@ An empty `extraReadRoots` after you set roots can mean the key is misplaced, it 
 
 ## CLI
 
-- `pi-harness daemon serve | status | stop | restart [--remote <alias|ssh://host>]`: `serve` runs in the foreground on the local host. `restart` updates a running daemon after an install (a fresh install needs no restart, and an idle daemon from an older build is replaced automatically) and applies startup-fixed settings.
+- `pi-harness daemon serve | status | stop | restart | reload | recover --dry-run [--remote <alias|ssh://host>]`: `serve`, `reload`, and `recover --dry-run` run locally. `reload [--now] [--wait] [--target <dir>]` hot-updates a running daemon in place (see [Runtime install](./runtime-install.md#hot-update)). `restart` runs an immediate forced hot reload with `--wait` when the local daemon supports hot update; against a pre-feature daemon it stops and restarts the daemon (do not use `daemon stop` or `daemon restart` on a pre-feature daemon while runs are active; use `daemon reload --legacy`).
 - `pi-harness resume <run-id> [--in 15m | --message "<msg>"]`: resumes a run immediately; `--in <dur>` instead schedules a delayed resume of a quota-paused run (clamped to 1 s to 24 h). `--in` and `--message` cannot be combined.
 - `pi-harness run resume <run-id> ...` is an alias for `pi-harness resume` and rejects `--profile`, `--model`, and `--effort`. To start a new run whose goal begins with `resume`, quote a multi-word goal, or use `pi-harness run -- resume ...`, which works for any such goal, including the single word.
 - `pi-harness [--resume] [-p <project>] [--repo <path>]` on a TTY opens the project picker instead of the last-used project. `--resume` opens the registered local project containing the current directory, choosing the innermost project when nested. With no matching project, it opens the picker with a warning. `-p`, `--project`, and `--repo` open that target directly and take precedence over `--resume`.
