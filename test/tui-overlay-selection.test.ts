@@ -12,6 +12,7 @@ import {
   ModalScreen,
   Navigator,
   normalizeSelection,
+  RecentRefsRing,
   type Screen,
   type ScreenContext,
   snapCellRange,
@@ -26,7 +27,7 @@ import {
   openEntityInspector,
   TaskInspectorScreen,
 } from "../src/tui/inspectors.js";
-import { KbDetailScreen } from "../src/tui/pickers.js";
+import { GoToPaletteScreen, KbDetailScreen } from "../src/tui/pickers.js";
 import type { WorkStore } from "../src/tui/store.js";
 
 function makeFakeTerminal(cols = 100, rows = 26) {
@@ -1116,7 +1117,135 @@ describe("Shared Navigator overlay text selection", () => {
     assert.ok(shortPlain.includes("Reason:"), `Expected prompt visible at maxHeight 7 in:\n${shortPlain}`);
     assert.ok(shortPlain.includes("Copied 8 chars"), `Expected copy notice visible at maxHeight 7 in:\n${shortPlain}`);
 
+    // 4) Goal-Inspector shape (subtitle + tabs) at maxHeight 6: active prompt/confirm and copy notice stay visible.
+    const goalFrame = new Frame();
+    goalFrame.askPrompt({ label: "Amendment rationale / instruction", onSubmit: () => {} });
+    goalFrame.setNotice("Copied 8 chars", "ok");
+    const goalRendered = goalFrame.render({
+      width: 72,
+      maxHeight: 6,
+      theme,
+      breadcrumbs: ["goal-41"],
+      subtitle: "TUI: text selection and copy work in every modal and card",
+      tabs: [
+        { id: "overview", label: "Overview" },
+        { id: "tasks", label: "Tasks", count: 4 },
+      ],
+      activeTabId: "overview",
+      hints: [{ key: "Esc", label: "back" }],
+      renderBody: () => ["Goal body line 1", "Goal body line 2"],
+    });
+    assert.ok(goalRendered.length <= 6);
+    const goalPlain = goalRendered.map((l) => stripTerminalSequences(l)).join("\n");
+    assert.ok(
+      goalPlain.includes("Amendment rationale / instruction:"),
+      `Expected prompt visible at maxHeight 6 with subtitle+tabs in:\n${goalPlain}`,
+    );
+    assert.ok(
+      goalPlain.includes("Copied 8 chars"),
+      `Expected copy notice visible at maxHeight 6 with subtitle+tabs in:\n${goalPlain}`,
+    );
+
     nav.closeAll();
     tui.stop();
+  });
+
+  it("never leaks scrollbar APC tags when cached Viewport or TableListView rows are reused across renders", () => {
+    const theme = createTheme({ color: true, ascii: false });
+    const { terminal, writes } = makeFakeTerminal(72, 16);
+    const tui = new ModalScreen(terminal);
+    const nav = new Navigator(tui, terminal, theme);
+    const frame = new Frame();
+    const viewport = new Viewport();
+    const list = new TableListView<{ id: string }>({
+      columns: [{ key: "id", header: "ID" }],
+    });
+    const rawLines = Array.from({ length: 20 }, (_, i) => `row-${i + 1} content`);
+    list.setItems(rawLines.map((s, i) => ({ id: `id-${i}`, value: { id: `id-${i}` }, searchText: s, cells: () => ({ id: s }) })));
+
+    let cachedVpClone: string[] | null = null;
+    let cachedListClone: string[] | null = null;
+    let mode: "vp" | "list" = "vp";
+
+    const screen: Screen = {
+      title: "CachedRows",
+      variant: "dialog",
+      render(width, maxHeight, t) {
+        return frame.render({
+          width,
+          maxHeight,
+          theme: t,
+          breadcrumbs: ["CachedRows"],
+          hints: [{ key: "Esc", label: "close" }],
+          renderBody: (innerW, bodyH) => {
+            if (mode === "vp") {
+              if (!cachedVpClone) {
+                cachedVpClone = [...viewport.render(rawLines, innerW, bodyH, t)];
+              }
+              return cachedVpClone;
+            }
+            if (!cachedListClone) {
+              cachedListClone = [...list.render(innerW, bodyH, t)];
+            }
+            return cachedListClone;
+          },
+        });
+      },
+      handleInput() {},
+    };
+
+    tui.start();
+    nav.push(screen);
+    (tui as unknown as { doRender: () => void }).doRender();
+    // Second render reuses the saved overflowing Viewport rows from the first capture.
+    writes.length = 0;
+    nav.requestRender();
+    (tui as unknown as { doRender: () => void }).doRender();
+    const secondVpOutput = [...compositeVisible(tui, terminal), ...writes].join("\n");
+    assert.equal(secondVpOutput.includes("\x1b_hsb:"), false, "cached Viewport rows must never leak hsb APC tags");
+
+    // Same check for TableListView rows reused across captures.
+    mode = "list";
+    (tui as unknown as { doRender: () => void }).doRender();
+    writes.length = 0;
+    nav.requestRender();
+    (tui as unknown as { doRender: () => void }).doRender();
+    const secondListOutput = [...compositeVisible(tui, terminal), ...writes].join("\n");
+    assert.equal(secondListOutput.includes("\x1b_hsb:"), false, "cached TableListView rows must never leak hsb APC tags");
+
+    // Direct Viewport.render outside any Frame capture must also never emit hsb APC tags.
+    const directOut = viewport.render(cachedVpClone ?? rawLines, 60, 4, theme).join("\n");
+    assert.equal(directOut.includes("\x1b_hsb:"), false, "direct Viewport.render outside capture must not emit hsb APC tags");
+
+    nav.closeAll();
+    tui.stop();
+  });
+
+  it("keeps the selected command visible in GoToPaletteScreen at 72x7 (two-row minimum for ordinary bodies)", () => {
+    const theme = createTheme({ color: false, ascii: false });
+    const deps: InspectorDeps = {
+      repoRoot: "/tmp/repo",
+      store: {
+        state: {
+          inbox: [],
+          goals: [],
+          runs: [],
+          escalations: [],
+          timers: [],
+          worktrees: [],
+          merges: [],
+        },
+      } as unknown as WorkStore,
+      client: {} as unknown as DaemonClient,
+    };
+    const palette = new GoToPaletteScreen(deps, new RecentRefsRing(), [
+      { id: "cmd:settings", label: "Open Settings", detail: "Configure models", run: () => {} },
+    ]);
+
+    const rendered = palette.render(72, 7, theme);
+    assert.ok(rendered.length <= 7);
+    const plain = rendered.map((l) => stripTerminalSequences(l)).join("\n");
+    assert.ok(plain.includes("/ "), `Expected filter row visible at 72x7 in:\n${plain}`);
+    assert.ok(plain.includes("Open Settings"), `Expected selected command visible at 72x7 in:\n${plain}`);
   });
 });

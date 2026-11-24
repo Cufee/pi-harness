@@ -2,7 +2,12 @@ import { Input, matchesKey } from "@earendil-works/pi-tui";
 import { type Hint, renderHintBar } from "./keymap.js";
 import { clamp, fillLineBg, fit, sanitizeLine, splitRow, visibleWidth } from "./text.js";
 import type { Theme, Tone } from "./tokens.js";
-import { beginScrollbarCapture, endScrollbarCapture, type ScrollbarCapture } from "./viewport.js";
+import {
+  beginScrollbarCapture,
+  endScrollbarCapture,
+  type ScrollbarCapture,
+  stripScrollbarTags,
+} from "./viewport.js";
 
 export interface FrameTab {
   id: string;
@@ -198,13 +203,22 @@ export class Frame {
     opts?: { hasTabs?: boolean; hasSubtitle?: boolean; padY?: boolean },
   ): number {
     // top(1) + header(1) + [sub(1)] + [tabs(1)] + midRule(1) + [topPad(1)+botPad(1)] + [inline/notice(1)] + footRule(1) + footer(1) + bot(1)
+    const maxH = Math.floor(maxHeight);
     let chrome = 6;
     if (opts?.hasSubtitle) chrome += 1;
     if (opts?.hasTabs) chrome += 1;
-    if (this.confirmState || this.promptState || this.notice) chrome += 1;
-    const usePadY = opts?.padY ?? maxHeight >= chrome + 5;
+    const hasInline = Boolean(this.confirmState || this.promptState);
+    if (hasInline || this.notice) chrome += 1;
+    const usePadY = opts?.padY ?? maxH >= chrome + 5;
     if (usePadY) chrome += 2;
-    return Math.max(1, Math.floor(maxHeight) - chrome);
+    const natural = maxH - chrome;
+    if (!hasInline) {
+      return Math.max(2, natural);
+    }
+    if (natural >= 2) return natural;
+    const headerRows = 2 + (opts?.hasSubtitle ? 1 : 0) + (opts?.hasTabs ? 1 : 0);
+    const maxBodyToKeepInline = Math.max(0, maxH - headerRows - 2);
+    return Math.min(Math.max(1, natural), maxBodyToKeepInline);
   }
 
   render(opts: {
@@ -238,7 +252,7 @@ export class Frame {
     const botBorder = fillLineBg(bdr(`${g.boxBL}${g.barH.repeat(Math.max(1, w - 2))}${g.boxBR}`), w, theme.surfaceBg);
 
     const boxRow = (content: string) =>
-      fillLineBg(`${bdr(g.barV)}${padStr}${fit(content, innerW)}${padStr}${bdr(g.barV)}`, w, theme.surfaceBg);
+      fillLineBg(`${bdr(g.barV)}${padStr}${fit(stripScrollbarTags(content), innerW)}${padStr}${bdr(g.barV)}`, w, theme.surfaceBg);
 
     const crumbText = opts.breadcrumbs
       .map((c, i) => (i === opts.breadcrumbs.length - 1 ? theme.accentBold(c) : theme.muted(c)))
@@ -250,6 +264,7 @@ export class Frame {
 
     const hasSubtitle = Boolean(opts.subtitle);
     const hasTabs = Boolean(opts.tabs && opts.tabs.length > 0);
+    const hasInline = Boolean(this.confirmState || this.promptState);
 
     if (opts.subtitle) {
       textRows.push(out.length);
@@ -269,54 +284,64 @@ export class Frame {
       out.push(boxRow(clamp(parts.join("  "), innerW)));
     }
 
-    out.push(midBorder);
-
-    const baseChrome = 6 + (hasSubtitle ? 1 : 0) + (hasTabs ? 1 : 0) + (this.confirmState || this.promptState || this.notice ? 1 : 0);
+    const baseChrome = 6 + (hasSubtitle ? 1 : 0) + (hasTabs ? 1 : 0) + (hasInline || this.notice ? 1 : 0);
     const padY = maxH >= baseChrome + 5;
     const availBody = this.bodyHeight(maxH, { hasTabs, hasSubtitle, padY });
+    const showMidBorder = !hasInline || availBody > 0;
 
+    if (showMidBorder) out.push(midBorder);
     if (padY) out.push(boxRow(""));
 
     const bodyRow = out.length;
-    beginScrollbarCapture();
-    let rawBodyLines: string[];
-    let scrollbarCapture: ScrollbarCapture | undefined;
-    try {
-      rawBodyLines = opts.renderBody(innerW, availBody);
-    } finally {
-      scrollbarCapture = endScrollbarCapture();
-    }
-    const bodyLines = rawBodyLines.slice(0, availBody);
     const bodyRows: number[] = [];
     const rowWidths = new Map<number, number>();
-    for (const rawLine of bodyLines) {
-      const { line, contentWidth } = scrollbarCapture
-        ? scrollbarCapture.consume(rawLine)
-        : { line: rawLine, contentWidth: undefined };
-      const idx = out.length;
-      out.push(boxRow(line));
-      textRows.push(idx);
-      bodyRows.push(idx);
-      if (contentWidth !== undefined) {
-        rowWidths.set(idx, Math.max(1, Math.min(innerW, contentWidth)));
+    let bodyLineCount = 0;
+    if (availBody > 0) {
+      beginScrollbarCapture();
+      let scrollbarCapture: ScrollbarCapture | undefined;
+      try {
+        let rawBodyLines: string[];
+        try {
+          rawBodyLines = opts.renderBody(innerW, availBody);
+        } finally {
+          scrollbarCapture = endScrollbarCapture();
+        }
+        const bodyLines = rawBodyLines.slice(0, availBody);
+        bodyLineCount = bodyLines.length;
+        for (const rawLine of bodyLines) {
+          const { line, contentWidth } = scrollbarCapture
+            ? scrollbarCapture.consume(rawLine)
+            : { line: stripScrollbarTags(rawLine), contentWidth: undefined };
+          const idx = out.length;
+          out.push(boxRow(line));
+          textRows.push(idx);
+          bodyRows.push(idx);
+          if (contentWidth !== undefined) {
+            rowWidths.set(idx, Math.max(1, Math.min(innerW, contentWidth)));
+          }
+        }
+        if (bodyLines.length === 0) out.push(boxRow(""));
+      } finally {
+        scrollbarCapture?.cleanup();
       }
     }
-    if (bodyLines.length === 0) out.push(boxRow(""));
 
     this.bodyRect = {
       row: bodyRow,
       col: 1 + padX,
       width: innerW,
-      height: Math.min(bodyLines.length, Math.max(0, maxH - bodyRow)),
+      height: Math.min(bodyLineCount, Math.max(0, maxH - bodyRow)),
     };
 
     if (padY) out.push(boxRow(""));
 
+    const showSubtleRule = !hasInline || out.length + 2 < maxH;
+    const footerRowIdx = out.length + 1 + (showSubtleRule ? 1 : 0);
     const inlineNotice =
-      (this.confirmState || this.promptState) && this.notice
+      hasInline && this.notice
         ? clamp(theme.paint(this.notice.tone, this.notice.text), Math.max(1, innerW))
         : "";
-    const noticeOnInline = Boolean(inlineNotice) && out.length + 2 >= maxH;
+    const noticeOnInline = Boolean(inlineNotice) && footerRowIdx >= maxH;
 
     if (this.confirmState) {
       const label = this.confirmState.confirmLabel ?? "y/Enter confirm · n/Esc cancel";
@@ -342,7 +367,7 @@ export class Frame {
       out.push(boxRow(theme.paint(this.notice.tone, this.notice.text)));
     }
 
-    out.push(subtleRule);
+    if (showSubtleRule) out.push(subtleRule);
 
     const footerHints = this.confirmState
       ? [

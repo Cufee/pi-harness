@@ -2,7 +2,7 @@ import { fuzzyFilter, Input, matchesKey } from "@earendil-works/pi-tui";
 import { type ColumnSpec, computeColumnLayout, formatColumnRow } from "./layout.js";
 import { clamp, fillLineBg, fit, sanitizeLine, visibleWidth } from "./text.js";
 import type { Theme } from "./tokens.js";
-import { parseMouseWheel, Viewport } from "./viewport.js";
+import { parseMouseWheel, trackScrollbarTaggedArray, Viewport } from "./viewport.js";
 
 export interface ListItem<T> {
   id: string;
@@ -314,6 +314,9 @@ export class ListView<T> {
       this.viewport.ensureVisible(this.selectedIdx, bodyHeight);
     }
     out.push(...this.viewport.render(rows, w, bodyHeight, theme));
+    if (this.viewport.lastScrollbarWidth > 0) {
+      trackScrollbarTaggedArray(out);
+    }
     return out;
   }
 }

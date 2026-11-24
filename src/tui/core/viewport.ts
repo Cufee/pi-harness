@@ -57,14 +57,24 @@ export function parseMouseWheel(data: string): { delta: number; hadMouse: boolea
   return { delta, hadMouse };
 }
 
+const SCROLLBAR_TAG_MARKER = "\x1b_hsb:";
+const ANY_SCROLLBAR_TAG_RX = /\x1b_hsb:([^:\x1b]+):(\d+)\x1b\\/g;
+
+/** Strips any internal scrollbar geometry APC tags from a rendered line. */
+export function stripScrollbarTags(line: string): string {
+  if (!line.includes(SCROLLBAR_TAG_MARKER)) return line;
+  ANY_SCROLLBAR_TAG_RX.lastIndex = 0;
+  return line.replace(ANY_SCROLLBAR_TAG_RX, "");
+}
+
 export interface ScrollbarCapture {
   consume(line: string): { line: string; contentWidth: number | undefined };
+  cleanup(): void;
 }
 
 interface ActiveScrollbarCapture {
   token: string;
-  prefix: string;
-  rx: RegExp;
+  taggedArrays: string[][];
 }
 
 let nextScrollbarCaptureId = 0;
@@ -75,25 +85,47 @@ export function beginScrollbarCapture(): void {
   const token = `${++nextScrollbarCaptureId}_${Math.random().toString(36).slice(2, 10)}`;
   scrollbarCaptureStack.push({
     token,
-    prefix: `\x1b_hsb:${token}:`,
-    rx: new RegExp(`\x1b_hsb:${token}:(\\d+)\x1b\\\\`, "g"),
+    taggedArrays: [],
   });
 }
 
-/** Ends scrollbar capture and returns a consumer that strips this render's tags and recovers row widths. */
+/** Registers a newly allocated row array that may hold captured scrollbar tags so it is cleaned after capture ends. */
+export function trackScrollbarTaggedArray(lines: string[]): void {
+  const active = scrollbarCaptureStack[scrollbarCaptureStack.length - 1];
+  if (active) active.taggedArrays.push(lines);
+}
+
+/** Ends scrollbar capture and returns a consumer that strips all scrollbar tags and recovers current-render widths. */
 export function endScrollbarCapture(): ScrollbarCapture | undefined {
   const active = scrollbarCaptureStack.pop();
   if (!active) return undefined;
+  let cleaned = false;
   return {
     consume(line: string) {
-      if (!line.includes(active.prefix)) return { line, contentWidth: undefined };
+      if (!line.includes(SCROLLBAR_TAG_MARKER)) return { line, contentWidth: undefined };
       let contentWidth: number | undefined;
-      active.rx.lastIndex = 0;
-      const clean = line.replace(active.rx, (_, rawW: string) => {
-        contentWidth = Number(rawW);
+      ANY_SCROLLBAR_TAG_RX.lastIndex = 0;
+      const clean = line.replace(ANY_SCROLLBAR_TAG_RX, (_, tok: string, rawW: string) => {
+        if (tok === active.token) {
+          contentWidth = Number(rawW);
+        }
         return "";
       });
       return { line: clean, contentWidth };
+    },
+    cleanup() {
+      if (cleaned) return;
+      cleaned = true;
+      for (const arr of active.taggedArrays) {
+        if (Object.isFrozen(arr)) continue;
+        for (let i = 0; i < arr.length; i++) {
+          const item = arr[i];
+          if (typeof item === "string" && item.includes(SCROLLBAR_TAG_MARKER)) {
+            arr[i] = stripScrollbarTags(item);
+          }
+        }
+      }
+      active.taggedArrays.length = 0;
     },
   };
 }
@@ -182,7 +214,7 @@ export class Viewport {
     const slice = lines.slice(this.offset, this.offset + h);
 
     if (!needsScrollbar) {
-      return slice.map((l) => clamp(l, w));
+      return slice.map((l) => clamp(stripScrollbarTags(l), w));
     }
 
     const maxOff = Math.max(1, lines.length - h);
@@ -193,11 +225,12 @@ export class Viewport {
     const tag = activeCapture ? `\x1b_hsb:${activeCapture.token}:${bodyWidth}\x1b\\` : "";
     const out: string[] = [];
     for (let i = 0; i < h; i++) {
-      const content = fit(slice[i] ?? "", bodyWidth);
+      const content = fit(stripScrollbarTags(slice[i] ?? ""), bodyWidth);
       const isThumb = i >= thumbTop && i < thumbTop + thumbSize;
       const bar = isThumb ? theme.accent(theme.glyphs.scrollThumb) : theme.muted(theme.glyphs.scrollTrack);
       out.push(`${tag}${content} ${bar}`);
     }
+    if (activeCapture) activeCapture.taggedArrays.push(out);
     return out;
   }
 
