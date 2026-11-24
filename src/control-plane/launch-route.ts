@@ -33,6 +33,7 @@ export async function resolveLaunchRoute(config: HarnessConfig, selection: Launc
   const snapshot = await compiler.getCatalog({ cwd, excludeExhausted: model == null && !selection.quota });
   const preferred = tier <= 1 ? config.defaultOrchestratorProfile : tier === 2 ? config.defaultWorkerProfile : config.defaultTaskProfile;
   const candidates: Array<{ profile: RunnerProfileConfig; model: string; wireModel: string; unavailable: boolean }> = [];
+  const skipped: Array<{ profile: string; model: string; reason: "auth" | "quota"; until: string | null }> = [];
   for (const entry of snapshot.models) {
     if (!entry.id.trim() || modelPlaceholder.test(entry.id)) continue;
     const bareId = entry.id.slice(entry.id.lastIndexOf("/") + 1);
@@ -60,10 +61,18 @@ export async function resolveLaunchRoute(config: HarnessConfig, selection: Launc
         wireModelId: route.wireModelId,
         canonicalModelId: canonicalId,
       });
-      const unavailable = routeQuota
-        ? isQuotaUnavailable(routeQuota)
-        : route === entry.preferredRoute && isQuotaUnavailable(entry.quota);
-      if ((model == null || profileId == null) && unavailable) continue;
+      const effectiveQuota = routeQuota ?? (route === entry.preferredRoute ? entry.quota : null);
+      const unavailable = isQuotaUnavailable(effectiveQuota);
+      const authBlocked = effectiveQuota?.unavailableReason === "auth";
+      if (unavailable && (model == null || (profileId == null && !authBlocked))) {
+        skipped.push({
+          profile: route.profileId,
+          model: canonicalId,
+          reason: authBlocked ? "auth" : "quota",
+          until: effectiveQuota?.nextAvailableAt ?? null,
+        });
+        continue;
+      }
       candidates.push({ profile, model: canonicalId, wireModel: route.wireModelId, unavailable });
     }
   }
@@ -77,5 +86,16 @@ export async function resolveLaunchRoute(config: HarnessConfig, selection: Launc
       : pool;
   const candidate = capabilityPool.find((route) => route.profile.id === preferred) ?? capabilityPool[0];
   if (candidate) return { profile: candidate.profile, model: candidate.model, wireModel: candidate.wireModel };
-  throw new Error(`No eligible current catalog route for ${model ?? "an available model"} on ${profileId ?? "enabled profiles"} at tier ${tier}. Refresh the catalog and select an advertised model.`);
+  const skippedDetail =
+    skipped.length > 0
+      ? ` Skipped: ${skipped
+          .slice(0, 8)
+          .map((s) =>
+            s.reason === "auth"
+              ? `${s.profile}/${s.model} (auth: needs login${s.until ? ` until ${s.until}` : ""})`
+              : `${s.profile}/${s.model} (quota${s.until ? `: unavailable until ${s.until}` : ""})`,
+          )
+          .join(", ")}${skipped.length > 8 ? ` (+${skipped.length - 8} more)` : ""}.`
+      : "";
+  throw new Error(`No eligible current catalog route for ${model ?? "an available model"} on ${profileId ?? "enabled profiles"} at tier ${tier}. Refresh the catalog and select an advertised model.${skippedDetail}`);
 }

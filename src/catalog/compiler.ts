@@ -77,6 +77,27 @@ function pickEffort(supported: string[], preferred: string[]): string | undefine
   return real[0];
 }
 
+export interface RoutingSkip {
+  model: string;
+  profile: string;
+  reason: "auth";
+  until: string | null;
+}
+
+/**
+ * Lists models currently skipped by auto-routing because their resolved quota is blocked on authentication.
+ */
+export function routingSkips(models: CompiledModelEntry[]): RoutingSkip[] {
+  return models
+    .filter((m) => m.quota?.unavailableReason === "auth")
+    .map((m) => ({
+      model: m.id,
+      profile: m.preferredRoute.profileId,
+      reason: "auth" as const,
+      until: m.quota?.nextAvailableAt ?? null,
+    }));
+}
+
 /**
  * Computes concrete task-kind-aware model + effort recommendations from the user's currently enabled
  * catalog so Orchestrators & Workers stop spawning every task on the exact same model as Director.

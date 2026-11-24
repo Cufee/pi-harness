@@ -1247,6 +1247,15 @@ export function buildNewSessionParams(
       disallowed.push("Read", "Grep", "Glob", "WebFetch", "WebSearch", "Skill");
       if (!disallowed.includes("Bash")) disallowed.push("Bash");
     }
+    if (disallowed.includes("Write")) {
+      const writeDisabledNote =
+        "Native Write/Edit tools are disabled in this session; ignore inherited instructions to save memory files with them.";
+      const text = opts.systemPrompt.trim() ? `${opts.systemPrompt}\n\n${writeDisabledNote}` : writeDisabledNote;
+      params.systemPrompt = {
+        mode: "append",
+        content: [{ type: "text", text }],
+      };
+    }
     const effectiveEffort =
       opts.effort && opts.effort.toLowerCase() !== "default" ? opts.effort : undefined;
     const claudeOptions: Record<string, unknown> = {

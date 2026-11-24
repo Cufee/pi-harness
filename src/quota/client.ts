@@ -27,6 +27,17 @@ import {
 } from "./local-harvest.js";
 import { resolveModelCapacity, type ResolvedModelQuota } from "./schema.js";
 
+export const AUTH_COOLDOWN_BASE_MS = 300_000;
+export const AUTH_COOLDOWN_MAX_MS = 3_600_000;
+
+/**
+ * Exponential cooldown for ACP authentication failures: 5, 15, 45, then capped at 60 minutes.
+ */
+export function authCooldownMs(failures: number): number {
+  const n = Math.max(1, Math.floor(failures));
+  return Math.min(AUTH_COOLDOWN_BASE_MS * 3 ** (n - 1), AUTH_COOLDOWN_MAX_MS);
+}
+
 const PASSIVE_FAILURE_FALLBACK_TTL_MS = 15 * 60_000;
 
 /**
@@ -120,8 +131,23 @@ export class QuotaClient {
   private lastLocalHarvestMs = 0;
   private passiveBuckets = new Map<string, QuotaBucket>();
   private passiveExhaustedProfiles = new Map<string, { resetAt?: string; observedAt: number; reason: string }>();
+  private authFailures = new Map<string, { failures: number; observedAt: number; until: number; detail: string }>();
 
   constructor(private readonly config?: QuotaEndpointConfig) {}
+
+  /**
+   * Returns active authentication failure cooldown state for a profile, or null when healthy or expired.
+   * Expired entries stay in memory until `authOk` clears them so repeat failures escalate back-off.
+   */
+  authStatus(profileId: string, now = Date.now()): { until: string; failures: number; detail: string } | null {
+    const entry = this.authFailures.get(profileId);
+    if (!entry || now >= entry.until) return null;
+    return {
+      until: new Date(entry.until).toISOString(),
+      failures: entry.failures,
+      detail: entry.detail,
+    };
+  }
 
   isConfigured(): boolean {
     return Boolean(this.config?.url);
@@ -460,6 +486,10 @@ export class QuotaClient {
   ingestPassiveSignal(signal: PassiveQuotaSignal): void {
     const raw = signal.raw;
 
+    if (raw.authOk === true) {
+      this.authFailures.delete(signal.profileId);
+    }
+
     // 0. Codex CLI / `codex-acp` rate_limits (primary / secondary windows + credits)
     if (Array.isArray(raw.codexRateLimits) || (raw.codexRateLimits && typeof raw.codexRateLimits === "object")) {
       const list = (Array.isArray(raw.codexRateLimits) ? raw.codexRateLimits : [raw.codexRateLimits]) as CodexRateLimitsRaw[];
@@ -600,9 +630,18 @@ export class QuotaClient {
       return;
     }
 
-    // 2. Terminal ACP `sessionFailure` (`quota_exhausted`, `rate_limited`, `budget_exhausted`)
+    // 2. Terminal ACP `sessionFailure` (`auth_required`, `quota_exhausted`, `rate_limited`, `budget_exhausted`)
     if (typeof raw.sessionFailure === "string") {
       const failure = raw.sessionFailure;
+      if (failure === "auth_required") {
+        const prev = this.authFailures.get(signal.profileId);
+        const failures = (prev?.failures ?? 0) + 1;
+        const observedAt = signal.observedAt;
+        const until = observedAt + authCooldownMs(failures);
+        const detail = String(raw.detail ?? "").slice(0, 300);
+        this.authFailures.set(signal.profileId, { failures, observedAt, until, detail });
+        return;
+      }
       if (failure === "quota_exhausted" || failure === "rate_limited" || failure === "budget_exhausted") {
         const key = `${signal.profileId}:${signal.model ?? "*"}`;
         this.passiveExhaustedProfiles.set(key, {
@@ -650,6 +689,25 @@ export class QuotaClient {
     canonicalModelId?: string;
   }): (ResolvedModelQuota & { unavailable: boolean }) | null {
     const now = Date.now();
+    const auth = this.authStatus(query.profileId, now);
+    if (auth) {
+      const resolved: ResolvedModelQuota = {
+        availability: AvailabilityStatus.DISABLED,
+        availabilityName: "NEEDS_LOGIN",
+        exhausted: false,
+        effectiveRemainingRatio: null,
+        bindingBucketId: `${query.profileId}:auth`,
+        bindingWindowLabel: "auth",
+        nextAvailableAt: auth.until,
+        estimatedRequestsRemaining: 0,
+        costMultiplier: null,
+        overageActive: false,
+        unavailableReason: "auth",
+        reason: `ACP profile ${query.profileId} needs login (auth failed ${auth.failures}x; skipped until ${auth.until} or a successful session)`,
+      };
+      return { ...resolved, unavailable: isQuotaUnavailable(resolved) };
+    }
+
     const mergedBuckets = new Map<string, QuotaBucket>();
     for (const b of this.snapshot?.buckets ?? []) {
       mergedBuckets.set(b.bucketId, clone(QuotaBucketSchema, b));
