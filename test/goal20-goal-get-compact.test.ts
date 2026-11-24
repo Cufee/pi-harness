@@ -270,12 +270,12 @@ describe("buildGoalGetResult compact output and paging", () => {
       assert.equal(criteria[17]!.evaluatedInCycle, null);
 
       // Reviews: newest first, cycle 12 with criteriaResults, reviewsPage accurate (12 + 1 stale = 13 total).
-      const reviews = res.reviews as Array<{ cycle: number; criteriaResults?: unknown[]; stale: boolean }>;
+      const reviews = res.reviews as Array<{ id: string; cycle: number; criteriaResults?: unknown[]; stale: boolean }>;
       assert.equal(reviews.length, 1);
       assert.equal(reviews[0]!.cycle, 12);
       assert.equal(reviews[0]!.stale, false);
       assert.equal(reviews[0]!.criteriaResults?.length, 17);
-      assert.deepEqual(res.reviewsPage, { total: 13, returned: 1, nextBeforeCycle: 12 });
+      assert.deepEqual(res.reviewsPage, { total: 13, returned: 1, nextBefore: "rev-12" });
 
       // Goal description excerpt + repo-relative file containing exact full description.
       const goalOut = res.goal as {
@@ -313,19 +313,20 @@ describe("buildGoalGetResult compact output and paging", () => {
     }
   });
 
-  it("pages older reviews with reviews_before_cycle and reviews_limit (only newest returned includes criteriaResults)", () => {
+  it("pages older reviews with reviews_before cursor and reviews_limit (only newest returned includes criteriaResults)", () => {
     const tmpRepo = mkdtempSync(join(tmpdir(), "pi-harness-goal20-page-"));
     try {
       const detail = makeSynthesizedDetail({ repoRoot: tmpRepo });
-      // Default single call checks reviewsPage = { total: 12, returned: 1, nextBeforeCycle: 12 }.
+      // Default single call checks reviewsPage = { total: 12, returned: 1, nextBefore: "rev-12" }.
       const first = buildGoalGetResult(detail, parseGoalGetOptions({}), { evidenceDir: null, repoRoot: tmpRepo });
-      assert.deepEqual(first.reviewsPage, { total: 12, returned: 1, nextBeforeCycle: 12 });
+      assert.deepEqual(first.reviewsPage, { total: 12, returned: 1, nextBefore: "rev-12" });
       assert.equal((first.reviews as Array<{ criteriaResults?: unknown[] }>)[0]!.criteriaResults?.length, 18);
 
-      // Page 5 older reviews before cycle 12.
-      const opts = parseGoalGetOptions({ reviews_before_cycle: 12, reviews_limit: 5 });
+      // Page 5 older reviews before rev-12.
+      const opts = parseGoalGetOptions({ reviews_before: "rev-12", reviews_limit: 5 });
       const res = buildGoalGetResult(detail, opts, { evidenceDir: null, repoRoot: tmpRepo });
       const reviews = res.reviews as Array<{
+        id: string;
         cycle: number;
         criteriaResults?: unknown[];
         passedCount?: number;
@@ -342,12 +343,60 @@ describe("buildGoalGetResult compact output and paging", () => {
         assert.equal((older.passedCount ?? 0) + (older.failedCount ?? 0), 18);
         assert.equal(older.failedCriteria?.length, older.failedCount);
       }
-      assert.deepEqual(res.reviewsPage, { total: 12, returned: 5, nextBeforeCycle: 7 });
+      assert.deepEqual(res.reviewsPage, { total: 12, returned: 5, nextBefore: "rev-7" });
       assert.ok(JSON.stringify(res).length <= GOAL_GET_LIMITS.budgetChars);
 
       // Clamp reviews_limit to [1, 10].
       assert.equal(parseGoalGetOptions({ reviews_limit: 0 }).reviewsLimit, 1);
       assert.equal(parseGoalGetOptions({ reviews_limit: 99 }).reviewsLimit, 10);
+    } finally {
+      rmSync(tmpRepo, { recursive: true, force: true });
+    }
+  });
+
+  it("orders and pages multi-version reviews after amendment without skipping equal-cycle reviews (P1-a)", () => {
+    const tmpRepo = mkdtempSync(join(tmpdir(), "pi-harness-goal20-ver-"));
+    try {
+      const detail = makeSynthesizedDetail({ repoRoot: tmpRepo, goalVersion: 2, reviewsCount: 0, criteriaCount: 2 });
+      detail.goal.reviewCycle = 2;
+      const makeRev = (id: string, goalVersion: number, cycle: number, createdAt: number): GoalReviewVerdict => ({
+        id,
+        goalId: detail.goal.id,
+        goalVersion,
+        cycle,
+        verdict: "changes_requested",
+        criteriaResults: [{ criterionId: "c1", passed: true, evidence: `v${goalVersion}c${cycle}` }],
+        blockingIssues: [],
+        summary: `Review v${goalVersion}c${cycle}`,
+        progressFingerprint: `fp-${id}`,
+        createdAt,
+        source: "review",
+      });
+      // Unordered input mixing v1c1, v1c11, v2c1, v2c2 (note v1c11 has higher cycle than v2c1, and v1c1 == v2c1 cycle).
+      detail.reviews = [
+        makeRev("rev-v1c1", 1, 1, 1_000),
+        makeRev("rev-v1c11", 1, 11, 2_000),
+        makeRev("rev-v2c1", 2, 1, 3_000),
+        makeRev("rev-v2c2", 2, 2, 4_000),
+      ];
+
+      // Walk 1 review at a time using reviewsPage.nextBefore and assert exact total order with zero skipped items.
+      const walked: string[] = [];
+      let cursor: string | null = null;
+      for (let i = 0; i < 6; i++) {
+        const res = buildGoalGetResult(
+          detail,
+          parseGoalGetOptions({ sections: ["reviews"], reviews_limit: 1, ...(cursor ? { reviews_before: cursor } : {}) }),
+          { evidenceDir: null, repoRoot: tmpRepo },
+        );
+        const revs = res.reviews as Array<{ id: string }>;
+        for (const r of revs) walked.push(r.id);
+        const page = res.reviewsPage as { total: number; returned: number; nextBefore: string | null };
+        assert.equal(page.total, 4);
+        cursor = page.nextBefore;
+        if (!cursor) break;
+      }
+      assert.deepEqual(walked, ["rev-v2c2", "rev-v2c1", "rev-v1c11", "rev-v1c1"]);
     } finally {
       rmSync(tmpRepo, { recursive: true, force: true });
     }
@@ -470,14 +519,187 @@ describe("buildGoalGetResult compact output and paging", () => {
     }
   });
 
-  it("exports GOAL_GET_TOOL with presentation_id wording and paging schema", () => {
+  it("exports GOAL_GET_TOOL with presentation_id wording, cursor paging schema, and accurate handoff guidance", () => {
     assert.equal(GOAL_GET_TOOL.name, "goal_get");
     assert.match(GOAL_GET_TOOL.description, /presentation_id to present_result/);
+    assert.doesNotMatch(GOAL_GET_TOOL.description, /Full task handoffs:\s*run_status/);
+    assert.match(GOAL_GET_TOOL.description, /artifactPaths/);
     const props = (GOAL_GET_TOOL.inputSchema as { properties: Record<string, unknown> }).properties;
     assert.ok("goal_id" in props);
     assert.ok("sections" in props);
     assert.ok("reviews_limit" in props);
-    assert.ok("reviews_before_cycle" in props);
+    assert.ok("reviews_before" in props);
+    assert.ok(!("reviews_before_cycle" in props));
     assert.ok("description_offset" in props);
+  });
+
+  it("bounds wire JSON <= 40,000 chars for 150 open escalations, huge diagnostics, and quote/newline-heavy descriptions (P1-b)", () => {
+    const tmpRepo = mkdtempSync(join(tmpdir(), "pi-harness-goal20-bound-"));
+    try {
+      const detail = makeSynthesizedDetail({
+        repoRoot: tmpRepo,
+        descriptionChars: 40_000,
+        criteriaCount: 18,
+        reviewsCount: 12,
+        workerTaskCount: 40,
+      });
+      detail.openEscalations = Array.from({ length: 150 }, (_, i) => ({
+        id: `esc-${i + 1}`,
+        runId: "run-20",
+        fromTaskId: "t-1",
+        toTaskId: null,
+        severity: "P0" as const,
+        category: "ambiguous_spec" as const,
+        title: `Escalation ${i + 1}: `.padEnd(200, "E"),
+        evidencePaths: [],
+        attempted: [],
+        suggestedSplits: [],
+        blocking: true,
+        status: "open" as const,
+        resolution: null,
+        createdAt: 10_000 + i,
+        ackedAt: null,
+      }));
+      const bigDiag = {
+        reviewerTaskId: "t-rev",
+        runId: "run-20",
+        profileId: "p1",
+        model: "openai/gpt-6.2-astra",
+        attempts: 2,
+        stopReason: "submitted" as const,
+        contextPct: 42,
+        turnsUsed: 4,
+        attemptFailures: ["failure ".repeat(100)],
+        rawOutputPaths: [".harness/goals/goal-20/raw.txt"],
+        transcript: "T".repeat(30_000),
+        goalVersion: detail.goal.version,
+        at: 50_000,
+      };
+      detail.goal.lastReviewerFailure = bigDiag;
+      detail.reviews[detail.reviews.length - 1]!.diagnostics = bigDiag;
+
+      const res = buildGoalGetResult(detail, parseGoalGetOptions({}), { evidenceDir: null, repoRoot: tmpRepo });
+      const size = JSON.stringify(res).length;
+      assert.ok(size <= GOAL_GET_LIMITS.budgetChars, `expected <= 40000 chars with 150 escalations + big diagnostics, got ${size}`);
+      const escPage = res.escalationsPage as { total: number; returned: number; omitted: number };
+      assert.equal(escPage.total, 150);
+      assert.ok(escPage.returned <= GOAL_GET_LIMITS.escalationsMax);
+      assert.equal(escPage.omitted, 150 - escPage.returned);
+      const criteria = res.criteria as Array<{ id: string; status: string }>;
+      assert.equal(criteria.length, 18);
+
+      // Quote/newline-heavy 30,000-char description: every page <= 40,000 JSON chars and walking nextOffset reconstructs verbatim.
+      const escapedHeavy = '"\n'.repeat(15_000);
+      assert.equal(escapedHeavy.length, 30_000);
+      detail.goal.description = escapedHeavy;
+      let rebuilt = "";
+      let offset: number | null = 0;
+      let pages = 0;
+      while (offset !== null) {
+        const pageRes = buildGoalGetResult(
+          detail,
+          parseGoalGetOptions({ sections: ["description"], description_offset: offset }),
+          { evidenceDir: null, repoRoot: tmpRepo },
+        );
+        const pageJsonLen = JSON.stringify(pageRes).length;
+        assert.ok(pageJsonLen <= GOAL_GET_LIMITS.budgetChars, `description page ${pages} exceeded 40k: ${pageJsonLen}`);
+        const dp = pageRes.descriptionPage as { offset: number; text: string; chars: number; nextOffset: number | null };
+        assert.equal(dp.offset, offset);
+        assert.equal(dp.chars, 30_000);
+        rebuilt += dp.text;
+        offset = dp.nextOffset;
+        pages++;
+        assert.ok(pages <= 5, "should complete in a few pages");
+      }
+      assert.equal(rebuilt, escapedHeavy);
+      assert.ok(pages >= 2, "quote/newline-heavy 30k text must split across >=2 pages to stay under JSON budget");
+    } finally {
+      rmSync(tmpRepo, { recursive: true, force: true });
+    }
+  });
+
+  it("returns unclipped criteria and latest review fields for narrow explicit sections while within budget (P2-f)", () => {
+    const tmpRepo = mkdtempSync(join(tmpdir(), "pi-harness-goal20-unclip-"));
+    try {
+      const detail = makeSynthesizedDetail({
+        repoRoot: tmpRepo,
+        criteriaCount: 3,
+        criterionDescChars: 600,
+        reviewsCount: 2,
+        workerTaskCount: 2,
+      });
+      detail.goal.criteria[0]!.command = "bun test " + "--flag ".repeat(45); // > 200 chars
+      detail.tasks[1]!.resultJson = JSON.stringify({
+        summary: "Full worker summary: " + "W".repeat(500),
+        artifact_paths: [".harness/artifacts/run-20/t-2/report.md"],
+      });
+
+      const critRes = buildGoalGetResult(detail, parseGoalGetOptions({ sections: ["criteria"] }), {
+        evidenceDir: null,
+        repoRoot: tmpRepo,
+      });
+      assert.deepEqual(critRes.truncated, []);
+      const crit0 = (critRes.criteria as Array<{ description: string; command?: string; evidence?: string }>)[0]!;
+      assert.equal(crit0.description, detail.goal.criteria[0]!.description);
+      assert.equal(crit0.command, detail.goal.criteria[0]!.command);
+      assert.equal(crit0.evidence, detail.reviews[1]!.criteriaResults[0]!.evidence);
+
+      const revRes = buildGoalGetResult(detail, parseGoalGetOptions({ sections: ["reviews"], reviews_limit: 1 }), {
+        evidenceDir: null,
+        repoRoot: tmpRepo,
+      });
+      assert.deepEqual(revRes.truncated, []);
+      const rev0 = (revRes.reviews as Array<{
+        summary: string;
+        blockingIssues: string[];
+        criteriaResults: Array<{ evidence?: string; remediation?: string }>;
+      }>)[0]!;
+      assert.equal(rev0.summary, detail.reviews[1]!.summary);
+      assert.deepEqual(rev0.blockingIssues, detail.reviews[1]!.blockingIssues);
+      assert.equal(rev0.criteriaResults[0]!.evidence, detail.reviews[1]!.criteriaResults[0]!.evidence);
+      assert.equal(rev0.criteriaResults[1]!.remediation, detail.reviews[1]!.criteriaResults[1]!.remediation);
+
+      const runRes = buildGoalGetResult(detail, parseGoalGetOptions({ sections: ["run"] }), {
+        evidenceDir: null,
+        repoRoot: tmpRepo,
+      });
+      const workerOut = (runRes.tasks as Array<{ id: string; summary: string | null; artifactPaths?: string[] }>).find(
+        (t) => t.id === "t-2",
+      )!;
+      assert.deepEqual(workerOut.artifactPaths, [".harness/artifacts/run-20/t-2/report.md"]);
+    } finally {
+      rmSync(tmpRepo, { recursive: true, force: true });
+    }
+  });
+
+  it("marks tasks with null goalVersion as stale on amended goals (v2+) and current on v1 (P2-g)", () => {
+    const tmpRepo = mkdtempSync(join(tmpdir(), "pi-harness-goal20-nullver-"));
+    try {
+      const detailV1 = makeSynthesizedDetail({ repoRoot: tmpRepo, goalVersion: 1, workerTaskCount: 1, reviewsCount: 0 });
+      detailV1.tasks[1]!.goalVersion = null;
+      const resV1 = buildGoalGetResult(detailV1, parseGoalGetOptions({ sections: ["run"] }), {
+        evidenceDir: null,
+        repoRoot: tmpRepo,
+      });
+      const taskV1 = (resV1.tasks as Array<{ id: string; goalVersion: number | null; staleGoalVersion: boolean }>).find(
+        (t) => t.id === "t-2",
+      )!;
+      assert.equal(taskV1.goalVersion, null);
+      assert.equal(taskV1.staleGoalVersion, false);
+
+      const detailV2 = makeSynthesizedDetail({ repoRoot: tmpRepo, goalVersion: 2, workerTaskCount: 1, reviewsCount: 0 });
+      detailV2.tasks[1]!.goalVersion = null;
+      const resV2 = buildGoalGetResult(detailV2, parseGoalGetOptions({ sections: ["run"] }), {
+        evidenceDir: null,
+        repoRoot: tmpRepo,
+      });
+      const taskV2 = (resV2.tasks as Array<{ id: string; goalVersion: number | null; staleGoalVersion: boolean }>).find(
+        (t) => t.id === "t-2",
+      )!;
+      assert.equal(taskV2.goalVersion, null);
+      assert.equal(taskV2.staleGoalVersion, true);
+    } finally {
+      rmSync(tmpRepo, { recursive: true, force: true });
+    }
   });
 });

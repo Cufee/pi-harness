@@ -5,6 +5,7 @@ import {
   buildGateActivityEvent,
   detectGitPush,
   goalGateState,
+  isShellToolEvent,
   looksLikeGitPush,
 } from "../src/director/gate-activity.js";
 import type { GoalRecord } from "../src/goals/engine.js";
@@ -111,20 +112,54 @@ describe("detectGitPush and looksLikeGitPush", () => {
     });
   });
 
-  it("rejects non-push git subcommands and dry-runs", () => {
+  it("rejects non-push git subcommands, bundled dry-run flags, echoed/quoted prose, and non-command JSON fields", () => {
     for (const cmd of [
       "git stash push -m x",
       "git log --grep push",
+      "git commit -m 'document git push origin main'",
       "git push --dry-run origin main",
       "git push -n origin main",
+      "git push -nu origin main",
+      "git push -un origin main",
+      "git push -fn origin main",
+      "echo 'git push origin main'",
+      'echo "To publish, run git push origin main"',
+      "echo git push origin main",
+      "printf 'git push origin main\\n'",
+      "cat <<'EOF'\ngit push origin main\nEOF",
+      "# git push origin main",
+      JSON.stringify({ path: "README.md", content: "To publish, run git push origin main" }),
+      JSON.stringify({ command: "bun test", description: "Run tests before git push origin main" }),
     ]) {
       assert.equal(looksLikeGitPush(cmd), false, `expected looksLikeGitPush false for: ${cmd}`);
       assert.equal(detectGitPush(cmd, "To origin\n   abc..def  main -> main"), null, `expected null for: ${cmd}`);
     }
+
+    // `-ono-verify` attaches value to `-o` rather than setting `-n` (dry-run).
+    assert.equal(looksLikeGitPush("git push -ono-verify origin main"), true);
+    assert.equal(
+      detectGitPush("git push -ono-verify origin main", "To origin\n   1111111..2222222  main -> main")?.confirmed,
+      true,
+    );
   });
 
-  it("returns null when output indicates nothing was pushed", () => {
+  it("classifies shell vs non-shell tool events via isShellToolEvent", () => {
+    assert.equal(isShellToolEvent({ kind: "execute", name: "Bash", title: "Bash" }), true);
+    assert.equal(isShellToolEvent({ name: "Bash", title: "Bash" }), true);
+    assert.equal(isShellToolEvent({ name: "shell_command", title: "shell_command" }), true);
+    assert.equal(isShellToolEvent({ kind: "edit", name: "Write", title: "Write README.md" }), false);
+    assert.equal(isShellToolEvent({ kind: "read", name: "Read", title: "Read README.md" }), false);
+    assert.equal(isShellToolEvent({ name: "create_file", title: "create_file" }), false);
+    assert.equal(isShellToolEvent({ name: "edit_file", title: "edit_file" }), false);
+  });
+
+  it("returns null when output indicates nothing was pushed, including porcelain [up to date]", () => {
     assert.equal(detectGitPush("git push origin main", "Everything up-to-date\n"), null);
+    assert.equal(
+      detectGitPush("git push --porcelain origin main", "To origin\n=\trefs/heads/main:refs/heads/main\t[up to date]\nDone\n"),
+      null,
+    );
+    assert.equal(detectGitPush("git push origin main", "To origin\n = [up to date]      main -> main\n"), null);
     assert.equal(
       detectGitPush(
         "git push origin main",
@@ -133,6 +168,17 @@ describe("detectGitPush and looksLikeGitPush", () => {
       null,
     );
     assert.equal(detectGitPush("git push origin main", "fatal: could not read Username"), null);
+
+    // Porcelain actual ref update still confirms.
+    assert.deepEqual(
+      detectGitPush("git push --porcelain origin feat", "To origin\n*\trefs/heads/feat:refs/heads/feat\t[new branch]\nDone\n"),
+      {
+        command: "git push --porcelain origin feat",
+        remote: "origin",
+        refs: ["[new branch] refs/heads/feat -> refs/heads/feat"],
+        confirmed: true,
+      },
+    );
   });
 
   it("returns confirmed=false when result output is missing or truncated without ref lines", () => {
@@ -228,6 +274,7 @@ describe("goal.gate_activity chat event parsing, coalescing, and formatting", ()
       remote: "origin",
       refs: ["e38b213..a3328cf HEAD -> main"],
       confirmed: true,
+      toolCallId: "call-42",
     });
     assert.deepEqual(parseChatControlEvent(JSON.parse(JSON.stringify(pushEv))), pushEv);
 
@@ -275,6 +322,34 @@ describe("goal.gate_activity chat event parsing, coalescing, and formatting", ()
     assert.deepEqual(
       coalesced.map((e) => (e.kind === "goal.gate_activity" ? `${e.activity}:${e.taskId}` : e.kind)),
       ["remote_push:t-11", "remote_push:t-10", "worker_spawned:t-12"],
+    );
+
+    // Two distinct quiet pushes from the same task with identical command and empty refs stay separate via toolCallId.
+    const quiet1 = buildGateActivityEvent(goal, gate, "remote_push", {
+      runId: "run-1",
+      taskId: "t-10",
+      taskTier: 2,
+      command: "git push origin main",
+      remote: "origin",
+      refs: [],
+      confirmed: false,
+      toolCallId: "call-1",
+    });
+    const quiet2 = buildGateActivityEvent(goal, gate, "remote_push", {
+      runId: "run-1",
+      taskId: "t-10",
+      taskTier: 2,
+      command: "git push origin main",
+      remote: "origin",
+      refs: [],
+      confirmed: false,
+      toolCallId: "call-2",
+    });
+    const coalescedQuiet = coalesceGoalEvents([quiet1, quiet2, quiet1] as GoalLifecycleChatEvent[]);
+    assert.equal(coalescedQuiet.length, 2);
+    assert.deepEqual(
+      coalescedQuiet.map((e) => (e.kind === "goal.gate_activity" ? e.toolCallId : null)),
+      ["call-2", "call-1"],
     );
   });
 
