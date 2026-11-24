@@ -413,8 +413,6 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     proc?.stdout?.destroy();
     proc?.stderr?.destroy();
     for (const socket of sockets) socket.destroy();
-    if (server.listening) await new Promise<void>(resolve => server.close(() => resolve()));
-    if (dir) await rm(dir, { recursive: true, force: true });
     if (result.timedOut || result.cancelled) {
       result.phase = phase;
       result.phases = phases;
@@ -422,6 +420,13 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     }
     if (result.timedOut && timeoutDetail) {
       console.error(`[harnessd ${new Date().toISOString()}] code_exec timeout: ${timeoutDetail}`);
+    }
+    if (server.listening) {
+      try { await new Promise<void>(resolve => server.close(() => resolve())); } catch {}
+    }
+    if (dir) {
+      try { await rm(dir, { recursive: true, force: true }); }
+      catch (e) { console.error(`[harnessd ${new Date().toISOString()}] code_exec cleanup failed: ${dir}: ${message(e)}`); }
     }
   }
   return result;
