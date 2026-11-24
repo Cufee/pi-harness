@@ -8,6 +8,7 @@ import { ProjectStore } from "./projects.js";
 import { SessionMessageStore } from "./session-messages.js";
 import { TimerManager } from "./timers.js";
 import { KnowledgeBaseStore } from "../kb/store.js";
+import { REJECTIONS } from "../advisories/rejections.js";
 
 export const SUMMARY_LIMIT = 2000;
 const DERIVED_TITLE_MAX_CHARS = 80;
@@ -240,6 +241,7 @@ export interface ArtifactRecord {
   summary: string;
   gitSha: string | null;
   exitCode: number | null;
+  origin?: "agent";
   createdAt: number;
 }
 
@@ -508,6 +510,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
   summary TEXT NOT NULL,
   git_sha TEXT,
   exit_code INTEGER,
+  origin TEXT,
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id, created_at);
@@ -657,6 +660,12 @@ export class ControlPlaneDb {
     );
     if (!taskColumns.has("goal_version")) {
       this.db.exec("ALTER TABLE tasks ADD COLUMN goal_version INTEGER;");
+    }
+    const artifactColumns = new Set(
+      (this.db.prepare("PRAGMA table_info(artifacts)").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    if (!artifactColumns.has("origin")) {
+      this.db.exec("ALTER TABLE artifacts ADD COLUMN origin TEXT;");
     }
     this.kb = new KnowledgeBaseStore(this.db);
     this.timers = new TimerManager(this.db);
@@ -1586,14 +1595,16 @@ export class ControlPlaneDb {
     summary: string;
     gitSha?: string | null;
     exitCode?: number | null;
+    origin?: "agent";
   }): ArtifactRecord {
     const id = nextFriendlyId(this.db, "art", "artifacts");
     const now = Date.now();
+    const origin = input.origin === "agent" ? "agent" : null;
     this.db
       .prepare(
-        "INSERT INTO artifacts(id, run_id, task_id, kind, path, summary, git_sha, exit_code, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO artifacts(id, run_id, task_id, kind, path, summary, git_sha, exit_code, origin, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
-      .run(id, input.runId, input.taskId, input.kind, input.path, input.summary.slice(0, 1000), input.gitSha ?? null, input.exitCode ?? null, now);
+      .run(id, input.runId, input.taskId, input.kind, input.path, input.summary.slice(0, 1000), input.gitSha ?? null, input.exitCode ?? null, origin, now);
     const art: ArtifactRecord = {
       id,
       runId: input.runId,
@@ -1603,6 +1614,7 @@ export class ControlPlaneDb {
       summary: input.summary.slice(0, 1000),
       gitSha: input.gitSha ?? null,
       exitCode: input.exitCode ?? null,
+      ...(origin ? { origin } : {}),
       createdAt: now,
     };
     this.emitEvent(input.runId, input.taskId, "artifact.recorded", { id, kind: art.kind, path: art.path });
@@ -1662,6 +1674,14 @@ export class ControlPlaneDb {
     return Number(row?.n ?? 0);
   }
 
+  /** Distinct paths of agent-written dossiers (`kind = 'dossier'` and `origin = 'agent'`) for a task. */
+  listAgentDossierPaths(runId: string, taskId: string): string[] {
+    const rows = this.db
+      .prepare("SELECT DISTINCT path FROM artifacts WHERE run_id = ? AND task_id = ? AND kind = 'dossier' AND origin = 'agent'")
+      .all(runId, taskId) as Array<{ path: string }>;
+    return rows.map((r) => String(r.path));
+  }
+
   listArtifacts(runId: string, taskId?: string, limit = 100, kind?: ArtifactRecord["kind"]): ArtifactRecord[] {
     let sql = "SELECT * FROM artifacts WHERE run_id = ?";
     const params: string[] = [runId];
@@ -1683,6 +1703,7 @@ export class ControlPlaneDb {
       summary: String(r.summary),
       gitSha: r.git_sha ? String(r.git_sha) : null,
       exitCode: r.exit_code == null ? null : Number(r.exit_code),
+      ...(r.origin === "agent" ? { origin: "agent" as const } : {}),
       createdAt: Number(r.created_at),
     }));
   }
@@ -1699,9 +1720,10 @@ export class ControlPlaneDb {
     attempted?: string[];
     suggestedSplits?: string[];
     blocking?: boolean;
+    tool?: string;
   }): EscalationRecord {
-    if (input.evidencePaths.length === 0) {
-      throw new Error("Escalations require at least one concrete evidence path or artifact reference");
+    if (input.category !== "scope_too_large" && input.evidencePaths.length === 0) {
+      throw REJECTIONS.escalationEvidence(input.tool ?? "report_issue");
     }
     if (input.category === "scope_too_large" && (input.suggestedSplits?.length ?? 0) < 2) {
       throw new Error("scope_too_large requires at least 2 concrete suggested_splits so parent can re-scope cleanly");
@@ -2519,9 +2541,9 @@ export class ControlPlaneDb {
         .get(input.topicKey, from.id, to.id, to.id, from.id) as { cnt: number };
       const nextRound = Number(pairCount.cnt) + 1;
       if (nextRound > maxRounds) {
-        throw new Error(
-          `ERR_CROSS_RUN_MAX_ROUNDS: topic '${input.topicKey}' between ${from.id} and ${to.id} exceeded max_rounds=${maxRounds}. Escalate to human P0.`,
-        );
+        const err = REJECTIONS.peerRoundCap(input.topicKey, maxRounds, to.id);
+        err.message = `${err.message} (ERR_CROSS_RUN_MAX_ROUNDS)`;
+        throw err;
       }
 
       // Prune expired wait edges and run DFS from `to.id` to detect any cycle reaching `from.id`
