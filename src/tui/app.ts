@@ -1105,7 +1105,7 @@ function createSharedShell(spec: SharedShellContext) {
             : "Internal lines: hidden (use /internal to show).",
         });
         if (store.showInternal) flushHiddenInternalLines();
-        session.tui.requestRender();
+        syncDock();
         return true;
       }
       case "clear":
@@ -1139,6 +1139,8 @@ function createSharedShell(spec: SharedShellContext) {
       hudItems: initialHud.hudItems,
       hudSecondaryLine: initialHud.hudSecondaryLine,
       activeGoalsCount: initialHud.activeGoalsCount,
+      needYouCount: store.state.inbox.length,
+      showInternal: store.showInternal,
       idleBanner: spec.getIdleBanner(),
       busy: false,
       phaseText: effectivePhaseText(),
@@ -1194,6 +1196,8 @@ function createSharedShell(spec: SharedShellContext) {
       hudItems: hud.hudItems,
       hudSecondaryLine: hud.hudSecondaryLine,
       activeGoalsCount: hud.activeGoalsCount,
+      needYouCount: store.state.inbox.length,
+      showInternal: store.showInternal,
       idleBanner: spec.getIdleBanner(),
       busy,
       phaseText: effectivePhaseText(),
@@ -1584,6 +1588,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     resetTurnLiveTrackers();
 
     if (settled.tools.length > 0) {
+      const failedCount = settled.tools.filter((t) => t.status === "error").length;
       const ref: EntityRef = {
         kind: "tool_call",
         id: `tools-${Date.now()}`,
@@ -1593,9 +1598,9 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       shell.recordRef(ref);
       shell.transcript.appendReceipt({
         glyph: shell.theme.glyphs.check,
-        tone: settled.tools.some((t) => t.status === "error") ? "warn" : "muted",
+        tone: failedCount > 0 ? "warn" : "muted",
         tag: "tools",
-        text: `${settled.tools.length} call(s): ${settled.tools.map((t) => t.label).join(", ")}`,
+        text: `${settled.tools.length} ${settled.tools.length === 1 ? "call" : "calls"}${failedCount > 0 ? ` · ${failedCount} failed` : ""}`,
         ref,
         timestampMs: settleTs,
       });

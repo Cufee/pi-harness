@@ -29,6 +29,8 @@ export type WorkTabId = "inbox" | "goals" | "runs" | "escalations" | "timers" | 
 
 const TAB_ORDER: readonly WorkTabId[] = ["inbox", "goals", "runs", "escalations", "timers", "worktrees"];
 
+const INTERNAL_TABS: ReadonlySet<WorkTabId> = new Set(["runs", "timers", "worktrees"]);
+
 const TAB_COLUMNS: Record<WorkTabId, ColumnSpec[]> = {
   inbox: [
     { key: "sev", header: "SEV", width: 5, priority: 0 },
@@ -96,8 +98,9 @@ function formatInboxOpError(action: string, err: unknown): string {
 
 /**
  * Unified Work Navigator (`Ctrl+G`, `Ctrl+T` for Runs).
- * Surfaces every object in the harness across 6 aligned-table tabs with Left/Right + Tab + 1-6 navigation,
- * live badges, store error visibility, quick-resolve, quota wait picker, and Enter drill-down.
+ * Surfaces Inbox, Goals, and Escalations by default, and reveals internal Runs, Timers, and Worktrees tabs
+ * when `store.showInternal` is enabled (toggled with `i`) or opened directly. Supports Left/Right + Tab + 1-N
+ * navigation, live badges, store error visibility, quick-resolve, quota wait picker, and Enter drill-down.
  */
 export class WorkNavigatorScreen implements Screen {
   readonly variant = "sheet" as const;
@@ -105,6 +108,7 @@ export class WorkNavigatorScreen implements Screen {
   private readonly frame = new Frame();
   private nav: Navigator | null = null;
   private readonly list: TableListView<WorkRowValue>;
+  private readonly pinnedTab: WorkTabId | null;
   private activeTab: WorkTabId;
   private unresolvedEscalationsOnly = true;
   private unsub: (() => void) | null = null;
@@ -113,8 +117,25 @@ export class WorkNavigatorScreen implements Screen {
     private readonly deps: InspectorDeps,
     initialTab?: WorkTabId,
   ) {
+    this.pinnedTab = initialTab && INTERNAL_TABS.has(initialTab) ? initialTab : null;
     this.activeTab = initialTab ?? "goals";
     this.list = new TableListView<WorkRowValue>({ columns: TAB_COLUMNS[this.activeTab] });
+  }
+
+  private visibleTabs(): WorkTabId[] {
+    return TAB_ORDER.filter(
+      (t) => this.deps.store.showInternal || !INTERNAL_TABS.has(t) || t === this.pinnedTab,
+    );
+  }
+
+  private ensureVisibleTab(): boolean {
+    if (!this.visibleTabs().includes(this.activeTab)) {
+      this.activeTab = "goals";
+      this.list.setColumns(TAB_COLUMNS.goals);
+      this.list.clearFilter();
+      return true;
+    }
+    return false;
   }
 
   onShow(ctx: ScreenContext): void {
@@ -144,6 +165,7 @@ export class WorkNavigatorScreen implements Screen {
   }
 
   private rebuildList(): void {
+    this.ensureVisibleTab();
     const snap = this.deps.store.state;
     this.list.setColumns(TAB_COLUMNS[this.activeTab]);
 
@@ -387,9 +409,11 @@ export class WorkNavigatorScreen implements Screen {
   }
 
   render(width: number, maxHeight: number, theme: Theme): string[] {
+    if (this.ensureVisibleTab()) this.rebuildList();
     const snap = this.deps.store.state;
     const unresolvedEsc = this.deps.store.unresolvedEscalationsCount;
-    const tabs: FrameTab[] = [
+    const visible = this.visibleTabs();
+    const allTabs: Array<FrameTab & { id: WorkTabId }> = [
       { id: "inbox", label: "Inbox", count: snap.inbox.length, tone: snap.inbox.length > 0 ? "danger" : undefined },
       { id: "goals", label: "Goals", count: snap.goals.length },
       { id: "runs", label: "Runs", count: snap.runs.length },
@@ -397,20 +421,21 @@ export class WorkNavigatorScreen implements Screen {
       { id: "timers", label: "Timers", count: this.deps.store.pendingTimersCount },
       { id: "worktrees", label: "Worktrees", count: snap.worktrees.length + snap.merges.length },
     ];
+    const tabs: FrameTab[] = allTabs.filter((t) => visible.includes(t.id));
 
     const sel = this.list.selectedItem()?.value;
     const hints: Hint[] = [
       { key: "Enter", label: "inspect" },
-      { key: "←→/Tab/1-6", label: "tabs" },
+      { key: `←→/Tab/1-${visible.length}`, label: "tabs" },
       { key: "/", label: "filter" },
       ...(this.activeTab === "inbox"
         ? [
             ...(sel?.inboxItem && !sel.isInternal ? [{ key: "d", label: "dismiss" }] : []),
             ...(sel?.isDismissed ? [{ key: "d", label: "restore" }] : []),
             { key: "D", label: "clear stale" },
-            { key: "i", label: this.deps.store.showInternal ? "hide internal" : "show internal" },
           ]
         : []),
+      { key: "i", label: this.deps.store.showInternal ? "hide internal" : "show internal" },
       ...(sel?.quickResolveEscId ? [{ key: "R", label: "resolve" }] : []),
       ...(sel?.quotaRunId ? [{ key: "w", label: "wait/resume" }] : []),
       ...(this.activeTab === "escalations"
@@ -479,7 +504,7 @@ export class WorkNavigatorScreen implements Screen {
     }
 
     if (
-      handleTabKeys(data, TAB_ORDER, this.activeTab, (next) => {
+      handleTabKeys(data, this.visibleTabs(), this.activeTab, (next) => {
         this.setTab(next);
       })
     ) {
@@ -551,10 +576,12 @@ export class WorkNavigatorScreen implements Screen {
       }
     }
 
-    if (data === "i" && this.activeTab === "inbox") {
+    if (data === "i") {
       this.deps.store.showInternal = !this.deps.store.showInternal;
+      this.ensureVisibleTab();
       this.rebuildList();
       ctx.requestRender();
+      void this.deps.store.refresh();
       return;
     }
 

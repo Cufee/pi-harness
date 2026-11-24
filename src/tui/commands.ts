@@ -15,7 +15,7 @@ export const COMMAND_SPECS: CommandSpec[] = [
   { name: "projects", aliases: ["project", "proj"], usage: "/projects [name|add <path>|switch <name>]", description: "Manage, create, browse, or switch local & remote projects (Ctrl+P)", modes: ["chat", "run"] },
   { name: "remotes", aliases: ["remote", "hosts"], usage: "/remotes [add <name> <ssh> | connect <name>]", description: "Manage remote SSH peer hosts and switch active host", modes: ["chat", "run"] },
   { name: "send", usage: "/send <host:chat|chat-id> <message>", description: "Send a peer message to any local or remote session (wakes recipient)", modes: ["chat"] },
-  { name: "work", usage: "/work [tab]", description: "Open Work Navigator (Ctrl+G) — Inbox, Goals, Runs, Escalations, Timers, Worktrees", modes: ["chat", "run"] },
+  { name: "work", usage: "/work [tab]", description: "Open Work Navigator (Ctrl+G) — Inbox, Goals, Escalations (Runs, Timers, Worktrees with /internal)", modes: ["chat", "run"] },
   { name: "inbox", usage: "/inbox", description: "Jump straight to Inbox (open escalations, awaiting_human goals, blockers)", modes: ["chat", "run"] },
   { name: "escalations", aliases: ["esc"], usage: "/escalations", description: "Open Escalations tab to inspect, acknowledge, or resolve escalations", modes: ["chat", "run"] },
   { name: "goals", usage: "/goals", description: "Open Goals tab in Work Navigator", modes: ["chat", "run"] },
@@ -38,7 +38,7 @@ export const COMMAND_SPECS: CommandSpec[] = [
   { name: "now", usage: "/now [n]", description: "Steer a queued message into the live turn now (default: 1, or Alt+S)", modes: ["chat"] },
   { name: "queue", usage: "/queue", description: "List all queued, sending, and unconfirmed messages with position and state", modes: ["chat", "run"] },
   { name: "drop", aliases: ["unqueue"], usage: "/drop [n|all]", description: "Drop a queued message without sending it (default: latest)", modes: ["chat", "run"] },
-  { name: "internal", usage: "/internal", description: "Toggle showing internal harness lines in the chat transcript", modes: ["chat"] },
+  { name: "internal", usage: "/internal", description: "Toggle internal details: chat lines, Runs/Timers/Worktrees tabs, full dock breakdown", modes: ["chat", "run"] },
   { name: "clear", usage: "/clear", description: "Clear the local transcript view", modes: ["chat", "run"] },
   { name: "help", aliases: ["?"], usage: "/help", description: "Show commands and keyboard shortcuts", modes: ["chat", "run"] },
   { name: "quit", aliases: ["exit", "detach"], usage: "/quit", description: "Detach from TUI (daemon and background runs keep running)", modes: ["chat", "run"] },
@@ -71,7 +71,7 @@ export function createCommandAutocomplete(mode: TuiMode): CombinedAutocompletePr
 
 export const KEYBOARD_SHORTCUTS: ReadonlyArray<{ key: string; description: string }> = [
   { key: "Ctrl+P", description: "Open Projects manager/picker (select, create, clone, browse, switch session)" },
-  { key: "Ctrl+G", description: "Open Work Navigator (Inbox / Goals / Runs / Escalations / Timers / Worktrees)" },
+  { key: "Ctrl+G", description: "Open Work Navigator (Inbox / Goals / Escalations; i shows internal tabs)" },
   { key: "Ctrl+T", description: "Open Runs tab directly in Work Navigator" },
   { key: "Ctrl+O", description: "Go-To-Anything fuzzy palette (pinned commands, inbox blockers, entities)" },
   { key: "Ctrl+,", description: "Open Settings (ACP CLIs, Enabled Models, Runtime Defaults)" },

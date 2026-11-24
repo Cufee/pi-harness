@@ -595,6 +595,7 @@ describe("Main Screen Status HUD", () => {
       hudItems: busyHud.hudItems,
       hudSecondaryLine: busyHud.hudSecondaryLine,
       activeGoalsCount: busyHud.activeGoalsCount,
+      showInternal: true,
       busy: true,
       phaseText: "Coordinating goals…",
       queuedCount: 2,

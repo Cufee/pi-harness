@@ -529,6 +529,10 @@ export interface DockState {
   hudSecondaryLine?: string | null;
   /** Total active/in-flight goals count. */
   activeGoalsCount?: number;
+  /** Human-actionable inbox items (snap.inbox.length). */
+  needYouCount?: number;
+  /** Mirrors WorkStore.showInternal: full agent breakdown when true. */
+  showInternal?: boolean;
   /** Status row: left phase/action + spinner; right model/quota/queue summary. */
   busy: boolean;
   phaseText: string;
@@ -608,7 +612,7 @@ export class UndoableEditor extends Editor {
  * Constant-height bottom dock!
  *   Row 1: Top separator rule (always 1 row)
  *   Row 2-3: Compact Live Goals & Activity HUD with `Alt+1`..`Alt+5` badges (always 2 rows; 1 row on ultra-short <18-row terminals)
- *   Row 4: Live Agent State Counts strip (active / waiting / blocked / paused / queued + esc / merges, always 1 row)
+ *   Row 4: Live Agent State Counts strip (active / need you / goals by default; full agent breakdown when showInternal is true, always 1 row)
  *   Row 5: Unified Status / Spinner / Model / Queue bar with `statusBg` fill (always 1 row)
  *   Row 6+: Composer (`UndoableEditor` with `paddingX: 2` & `› ` prompt cue)
  *   Last Row: Keybinding HintBar (always 1 row)
@@ -780,6 +784,60 @@ export class FixedDock implements Component {
     const sep = t.dim(` ${g.sep} `);
     const mergeGlyph = g.ascii ? "M" : "⇄";
     const activeGoals = this.state.activeGoalsCount ?? 0;
+
+    if (!this.state.showInternal) {
+      const needYou = this.state.needYouCount ?? 0;
+      const active = c.active;
+
+      if (active === 0 && needYou === 0) {
+        const left = ` ${t.muted("Agents:")} ${t.dim(`0 active ${g.sep} idle`)}`;
+        const right =
+          activeGoals > 0
+            ? `${t.accent(`${activeGoals} active ${activeGoals === 1 ? "goal" : "goals"}`)} `
+            : `${t.dim("Ctrl+G Work")} `;
+        return visibleWidth(left) + 2 + visibleWidth(right) <= width
+          ? splitRow(left, right, width)
+          : fit(left, width);
+      }
+
+      const buildDefaultLine = (mode: "full" | "compact" | "micro"): string => {
+        const parts: string[] = [];
+        if (mode === "full") {
+          if (active > 0) parts.push(t.ok(`${g.running} ${active} active`));
+          else if (needYou > 0) parts.push(t.dim("0 active"));
+          if (needYou > 0) parts.push(t.danger(`${g.warn} ${needYou} need you`));
+          return ` ${t.muted("Agents:")} ${parts.join(sep)}`;
+        }
+        if (mode === "compact") {
+          if (active > 0) parts.push(t.ok(`${g.running} ${active} act`));
+          else if (needYou > 0) parts.push(t.dim("0 act"));
+          if (needYou > 0) parts.push(t.danger(`${g.warn} ${needYou} need you`));
+          return ` ${t.muted("Agents:")} ${parts.join(sep)}`;
+        }
+        if (active > 0) parts.push(t.ok(`${active}a`));
+        else if (needYou > 0) parts.push(t.dim("0a"));
+        if (needYou > 0) parts.push(t.danger(`!${needYou}`));
+        return ` ${t.muted("Agents:")} ${parts.join(sep)}`;
+      };
+
+      const full = buildDefaultLine("full");
+      const chosen =
+        visibleWidth(full) <= width
+          ? full
+          : (() => {
+              const compact = buildDefaultLine("compact");
+              return visibleWidth(compact) <= width ? compact : buildDefaultLine("micro");
+            })();
+
+      const right =
+        activeGoals > 0
+          ? `${t.accent(`${activeGoals} ${activeGoals === 1 ? "goal" : "goals"}`)} `
+          : "";
+      if (right && visibleWidth(chosen) + 2 + visibleWidth(right) <= width) {
+        return splitRow(chosen, right, width);
+      }
+      return fit(chosen, width);
+    }
 
     const totalSignal =
       c.active + c.waiting + c.blocked + c.paused + c.queued + c.failed + c.openEscalations + c.activeMerges;
