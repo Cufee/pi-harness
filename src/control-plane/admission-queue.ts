@@ -48,21 +48,43 @@ export class AdmissionQueue {
     const distinct = this.db
       .prepare("SELECT DISTINCT lane, repo_root FROM admission_queue")
       .all() as Array<{ lane: AdmissionLane; repo_root: string }>;
+    if (distinct.length === 0) return;
+
     const toRewrite: Array<{ lane: AdmissionLane; rawRoot: string; canonRoot: string }> = [];
+    const affected = new Map<string, { lane: AdmissionLane; canonRoot: string }>();
+    const partitions = new Map<string, { lane: AdmissionLane; canonRoot: string }>();
     for (const row of distinct) {
       const canonRoot = canonicalProjectPath(row.repo_root);
+      const key = `${row.lane}\0${canonRoot}`;
+      partitions.set(key, { lane: row.lane, canonRoot });
       if (canonRoot !== row.repo_root) {
         toRewrite.push({ lane: row.lane, rawRoot: row.repo_root, canonRoot });
+        affected.set(key, { lane: row.lane, canonRoot });
       }
     }
-    if (toRewrite.length === 0) return;
+
+    // Also normalize canonical-only partitions whose persisted positions violate force_start ordering or density.
+    const posStmt = this.db.prepare(
+      `SELECT position FROM admission_queue
+       WHERE lane = ? AND repo_root = ?
+       ORDER BY force_start DESC, position ASC, created_at ASC`,
+    );
+    for (const [key, partition] of partitions) {
+      if (affected.has(key)) continue;
+      const rows = posStmt.all(partition.lane, partition.canonRoot) as Array<{ position: number }>;
+      if (rows.some((r, idx) => Number(r.position) !== idx + 1)) {
+        affected.set(key, partition);
+      }
+    }
+
+    if (toRewrite.length === 0 && affected.size === 0) return;
 
     this.db.transaction(() => {
-      const upd = this.db.prepare("UPDATE admission_queue SET repo_root = ? WHERE lane = ? AND repo_root = ?");
-      const affected = new Map<string, { lane: AdmissionLane; canonRoot: string }>();
-      for (const item of toRewrite) {
-        upd.run(item.canonRoot, item.lane, item.rawRoot);
-        affected.set(`${item.lane}\0${item.canonRoot}`, { lane: item.lane, canonRoot: item.canonRoot });
+      if (toRewrite.length > 0) {
+        const upd = this.db.prepare("UPDATE admission_queue SET repo_root = ? WHERE lane = ? AND repo_root = ?");
+        for (const item of toRewrite) {
+          upd.run(item.canonRoot, item.lane, item.rawRoot);
+        }
       }
       for (const { lane, canonRoot } of affected.values()) {
         this.normalizePositions(lane, canonRoot);

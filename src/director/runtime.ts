@@ -972,6 +972,7 @@ interface QueuedGoalResumeOpts {
   userMessage?: string;
   trigger?: "manual" | "auto_timer" | "quota_recovered" | "user_timer";
   continueCompleted?: boolean;
+  allowCompleted?: boolean;
   taskId?: string;
   model?: string;
   effort?: string;
@@ -1308,6 +1309,9 @@ export class DirectorRuntime {
     if (ev.type === "task.status" && ev.taskId) {
       const payload = ev.payload as { to?: string; status?: string } | null;
       const st = String(payload?.to ?? payload?.status ?? "");
+      if (st === "cancelled") {
+        this.invalidateQueuedResumeForTask(ev.taskId);
+      }
       if (["completed", "failed", "cancelled", "blocked", "returned_for_rescope", "paused_quota"].includes(st)) {
         const child = this.db.getTask(ev.taskId);
         if (child?.parentId) {
@@ -1582,8 +1586,18 @@ export class DirectorRuntime {
     if (!row) return;
     const goal = this.goals.getGoal(row.id);
     if (!goal) return;
+    if (status === "stopped") {
+      const stopReason = (ev.payload as { reason?: string } | null)?.reason?.trim() || "Run stopped";
+      this.invalidateQueuedResumeForRun(ev.runId, stopReason);
+    }
     if (["achieved", "cancelled", "paused"].includes(goal.status)) this.undeliveredAmendments.delete(goal.id);
     if (["achieved", "cancelled", "paused", "verifying", "reviewing"].includes(goal.status)) return;
+    // While a review (even an aborted one still unwinding) owns this goal's review slot for this run,
+    // defer settlement consumption so verifyAndReviewGoal's finally block replays it without burning its dedupe key.
+    const activeReview = this.activeReviewInfo.get(goal.id);
+    if (this.activeReviews.has(goal.id) && activeReview?.kind === "review" && activeReview.runId === ev.runId) {
+      return;
+    }
 
     // Cancel this chat's timers whose settlement subscription covers this goal (we're handling settlement now).
     // A timer bound to a Goal matches only that Goal; only an unbound `any` timer matches every Goal of the chat.
@@ -2374,6 +2388,7 @@ export class DirectorRuntime {
     opts?: QueuedGoalResumeOpts,
     entryFence?: GoalLaunchFence,
     fromQueueDrain = false,
+    validateBeforeActivate?: () => boolean,
   ): Promise<GoalCommitResult> {
     const inflight = this.launchingGoals.get(goal.id);
     if (inflight) return inflight;
@@ -2383,7 +2398,7 @@ export class DirectorRuntime {
     });
     slot.catch(() => {});
     this.launchingGoals.set(goal.id, slot);
-    this.resumeLinkedGoalRunBody(goal, linked, opts, entryFence, fromQueueDrain, slot).then(settle.resolve, settle.reject);
+    this.resumeLinkedGoalRunBody(goal, linked, opts, entryFence, fromQueueDrain, slot, validateBeforeActivate).then(settle.resolve, settle.reject);
     return slot;
   }
 
@@ -2394,6 +2409,7 @@ export class DirectorRuntime {
     entryFence: GoalLaunchFence | undefined,
     fromQueueDrain: boolean,
     slot: Promise<GoalCommitResult>,
+    validateBeforeActivate?: () => boolean,
   ): Promise<GoalCommitResult> {
     const stopFence = entryFence?.stop ?? this.orchestrator.launchStopFence(goal.repoRoot);
     const pauseEpochBefore = entryFence?.pauseEpoch ?? this.goalPauseEpoch.get(goal.id) ?? 0;
@@ -2423,6 +2439,8 @@ export class DirectorRuntime {
       if (opts?.taskId) {
         const taskRes = await this.orchestrator.resumeTaskDetailed(opts.taskId, {
           ...(note ? { note } : {}),
+          ...(opts.allowCompleted ? { allowCompleted: true } : {}),
+          ...(validateBeforeActivate ? { validateBeforeActivate } : {}),
           ...(opts.model ? { model: opts.model } : {}),
           ...(opts.effort ? { effort: opts.effort } : {}),
           ...(opts.profileId ? { profileId: opts.profileId } : {}),
@@ -2435,7 +2453,14 @@ export class DirectorRuntime {
         };
         if (taskRes.outcome === "resumed" || taskRes.outcome === "already_active") {
           resumedActive = true;
-          if (taskRes.outcome === "resumed") this.undeliveredAmendments.delete(goal.id);
+          // Clear Tier 1's pending amendment only when Tier 1 itself resumed (never on an unrelated worker resume).
+          if (
+            taskRes.outcome === "resumed" &&
+            taskRes.task.tier === 1 &&
+            taskRes.task.profileId !== "director"
+          ) {
+            this.clearUndeliveredAmendment(goal.id, this.goals.getGoal(goal.id)?.version);
+          }
           this.onRunResumed(linked.id, linked.status, taskRes.outcome === "resumed");
           const fresh = this.goals.getGoal(goal.id)!;
           const pausedSince =
@@ -2474,8 +2499,13 @@ export class DirectorRuntime {
       const extra = { runStatus: res.runStatus, resumedTaskIds: res.resumedTaskIds, runResult: res };
       if (res.outcome === "resumed" || res.outcome === "already_active") {
         resumedActive = true;
-        // The resumed Tier 1 reads the current contract from its run row.
-        if (res.outcome === "resumed") this.undeliveredAmendments.delete(goal.id);
+        // Clear Tier 1's pending amendment only if Tier 1 itself resumed (not when only a quota-paused child resumed).
+        if (res.outcome === "resumed") {
+          const orch = this.db.listTasks(linked.id).find((t) => t.tier === 1 && t.profileId !== "director");
+          if (orch && res.resumedTaskIds.includes(orch.id)) {
+            this.clearUndeliveredAmendment(goal.id, this.goals.getGoal(goal.id)?.version);
+          }
+        }
         // Every in-place resume (RPC, Director tool, timer) starts the new epoch here, before the goal is re-read.
         this.onRunResumed(linked.id, linked.status, res.outcome === "resumed");
         const fresh = this.goals.getGoal(goal.id)!;
@@ -2543,8 +2573,12 @@ export class DirectorRuntime {
       trigger?: "manual" | "auto_timer" | "quota_recovered" | "user_timer";
       /** Explicit resume callers opt in to continuing a completed Tier 1 orchestrator on an awaiting_human goal. */
       continueCompleted?: boolean;
+      /** When set alongside resumeTaskId, allows resuming a completed task (e.g. internal Tier 1 relaunches). */
+      allowCompleted?: boolean;
       /** When set, resume this specific task in the goal's linked run instead of calling resumeRun. */
       resumeTaskId?: string;
+      /** Runtime-only guard checked right before activating a task resume (never persisted to the queue). */
+      validateBeforeActivate?: () => boolean;
     },
   ): Promise<GoalCommitResult> {
     let goal = this.goals.getGoal(goalId);
@@ -2664,6 +2698,7 @@ export class DirectorRuntime {
               ...(opts?.userMessage?.trim() ? { userMessage: opts.userMessage.trim() } : {}),
               ...(opts?.trigger ? { trigger: opts.trigger } : {}),
               ...(opts?.continueCompleted ? { continueCompleted: true } : {}),
+              ...(opts?.allowCompleted ? { allowCompleted: true } : {}),
               ...(opts?.resumeTaskId ? { taskId: opts.resumeTaskId } : {}),
               ...(opts?.model ? { model: opts.model } : {}),
               ...(opts?.effort ? { effort: opts.effort } : {}),
@@ -2732,6 +2767,7 @@ export class DirectorRuntime {
           userMessage: opts?.userMessage,
           trigger: opts?.trigger,
           continueCompleted: opts?.continueCompleted,
+          allowCompleted: opts?.allowCompleted,
           taskId: opts?.resumeTaskId,
           model: opts?.model,
           effort: opts?.effort,
@@ -2739,6 +2775,7 @@ export class DirectorRuntime {
         },
         entryFence,
         false,
+        opts?.validateBeforeActivate,
       );
     }
     if (freshLinked?.status === "completed" && goal.status === "awaiting_human" && !opts?.continueCompleted) {
@@ -2916,6 +2953,111 @@ export class DirectorRuntime {
   }
 
   /**
+   * Invalidates any queued resume intent for a run's linked goal (called on run.stop / run.status -> stopped).
+   * Bumps goalPauseEpoch to fence in-flight commits, clears pending undelivered amendments, cancels resume timers,
+   * and removes the goal from the admission queue without altering goal.status.
+   */
+  invalidateQueuedResumeForRun(runId: string, reason = "Run stopped"): boolean {
+    const goal = this.goalForRun(runId);
+    if (!goal) return false;
+    this.goalPauseEpoch.set(goal.id, (this.goalPauseEpoch.get(goal.id) ?? 0) + 1);
+    this.undeliveredAmendments.delete(goal.id);
+    for (const t of this.db.timers.list({ ownerKind: "chat", status: "pending" })) {
+      if (t.resumeGoal === true && t.goalId === goal.id) this.db.timers.cancel(t.id, reason);
+    }
+    const removed = this.db.admissionQueue.remove("goal", goal.id);
+    if (removed) this.syncQueuedGoalProgress();
+    return removed;
+  }
+
+  /**
+   * Invalidates a task-specific queued resume intent when that task is cancelled (task.cancel / task.status -> cancelled).
+   * Leaves run-level or other-task queued intents untouched.
+   */
+  invalidateQueuedResumeForTask(taskId: string, _reason = "Task cancelled"): boolean {
+    const task = this.db.getTask(taskId);
+    if (!task) return false;
+    const goal = this.goalForRun(task.runId);
+    if (!goal) return false;
+    const entry = this.db.admissionQueue.get("goal", goal.id);
+    const launchOpts = (entry?.launchOpts ?? null) as QueuedGoalLaunchOpts | null;
+    if (!entry || launchOpts?.resume?.taskId !== taskId) return false;
+    this.goalPauseEpoch.set(goal.id, (this.goalPauseEpoch.get(goal.id) ?? 0) + 1);
+    const removed = this.db.admissionQueue.remove("goal", goal.id);
+    if (removed) this.syncQueuedGoalProgress();
+    return removed;
+  }
+
+  /**
+   * Admission gate for quota recovery (`auto_timer`, `quota_recovered`, `user_timer`, or manual `resumeRunFromQuota`).
+   * Preserves the fast path for runs with no linked goal or executing goals that already hold a quota slot;
+   * routes non-slot-holders through `commitGoalDetailed` so `maxConcurrentGoals` and FIFO ordering apply before activation.
+   */
+  async admitQuotaResume(
+    runId: string,
+    opts?: { trigger?: "manual" | "auto_timer" | "quota_recovered" | "user_timer"; userMessage?: string },
+  ): Promise<
+    | { mode: "fast_path" }
+    | {
+        mode: "handled";
+        resumed: boolean;
+        queued: boolean;
+        queuePosition?: number;
+        resumedTaskIds: string[];
+        run: RunRecord;
+        goalId: string;
+        goalStatus: GoalStatus;
+      }
+  > {
+    const goal = this.goalForRun(runId);
+    if (!goal || this.isGoalOccupyingSlot(goal)) {
+      return { mode: "fast_path" };
+    }
+    const rawRun = this.db.getRun(runId);
+    if (!rawRun) throw new Error(`Unknown run ${runId}`);
+    if (goal.status === "achieved" || goal.status === "cancelled") {
+      return {
+        mode: "handled",
+        resumed: false,
+        queued: false,
+        resumedTaskIds: [],
+        run: rawRun,
+        goalId: goal.id,
+        goalStatus: goal.status,
+      };
+    }
+    const trigger = opts?.trigger ?? "quota_recovered";
+    // Automatic quota recovery must not resurrect an explicitly paused goal; user_timer/manual still go through admission.
+    if (goal.status === "paused" && (trigger === "auto_timer" || trigger === "quota_recovered")) {
+      return {
+        mode: "handled",
+        resumed: false,
+        queued: false,
+        resumedTaskIds: [],
+        run: rawRun,
+        goalId: goal.id,
+        goalStatus: goal.status,
+      };
+    }
+    const commitRes = await this.commitGoalDetailed(goal.id, {
+      trigger,
+      ...(opts?.userMessage ? { userMessage: opts.userMessage } : {}),
+    });
+    const runAfter =
+      commitRes.runResult?.run ?? this.orchestrator.getEffectiveRun(runId) ?? this.db.getRun(runId) ?? rawRun;
+    return {
+      mode: "handled",
+      resumed: commitRes.outcome === "resumed",
+      queued: commitRes.outcome === "queued",
+      ...(commitRes.queuePosition !== undefined ? { queuePosition: commitRes.queuePosition } : {}),
+      resumedTaskIds: commitRes.resumedTaskIds ?? [],
+      run: runAfter,
+      goalId: commitRes.goal.id,
+      goalStatus: commitRes.goal.status,
+    };
+  }
+
+  /**
    * Explicit pause (or cancel) of a goal: wins over any launch or resume already in flight, cancels pending chat
    * timers that would resume it, leaves the admission queue, stops its linked run and admits queued goals.
    */
@@ -2993,17 +3135,35 @@ export class DirectorRuntime {
           if (!next.forceStart && activeCount >= limit) break;
           const launchOpts = (next.launchOpts ?? {}) as QueuedGoalLaunchOpts;
           try {
+            const hasQueuedResume = launchOpts.resume !== undefined;
             const linked = goal.linkedRunId ? this.orchestrator.getEffectiveRun(goal.linkedRunId) : null;
-            const linkedResumable = Boolean(
-              linked &&
-                (launchOpts.resume?.taskId ||
-                  (linked.status !== "active" &&
-                    (linked.status !== "completed" || launchOpts.resume?.continueCompleted))),
-            );
-            const res =
-              linkedResumable && linked
-                ? await this.resumeLinkedGoalRun(goal, linked, launchOpts.resume, undefined, true)
-                : await this.launchCommittedGoal(goal, launchOpts, true);
+            if (linked?.status === "stopped") {
+              // Never restart a stopped run from queue drain (preserves goal-30 stop fences).
+              this.db.admissionQueue.remove("goal", next.targetId);
+              continue;
+            }
+            let res: GoalCommitResult;
+            if (linked) {
+              const canResumeLinked =
+                Boolean(launchOpts.resume?.taskId) ||
+                linked.status === "active" ||
+                linked.status === "paused_quota" ||
+                linked.status === "failed" ||
+                (linked.status === "completed" && Boolean(launchOpts.resume?.continueCompleted));
+              if (!canResumeLinked) {
+                // Completed linked run without opt-in to continue: drop stale queue entry without creating a fresh run.
+                this.db.admissionQueue.remove("goal", next.targetId);
+                continue;
+              }
+              // When the linked run became active (or is resumable), re-evaluate in place rather than starting a fresh run.
+              res = await this.resumeLinkedGoalRun(goal, linked, launchOpts.resume, undefined, true);
+            } else if (hasQueuedResume) {
+              // Durable resume intent without a linked run must not turn into a fresh run launch.
+              this.db.admissionQueue.remove("goal", next.targetId);
+              continue;
+            } else {
+              res = await this.launchCommittedGoal(goal, launchOpts, true);
+            }
             if (res.outcome === "started" || res.outcome === "resumed") startedIds.push(goal.id);
           } catch (err) {
             this.db.admissionQueue.remove("goal", next.targetId);
@@ -3064,6 +3224,7 @@ export class DirectorRuntime {
         ...(resumeOpts?.userMessage ? { userMessage: resumeOpts.userMessage } : {}),
         ...(resumeOpts?.trigger ? { trigger: resumeOpts.trigger } : {}),
         ...(resumeOpts?.continueCompleted ? { continueCompleted: true } : {}),
+        ...(resumeOpts?.allowCompleted ? { allowCompleted: true } : {}),
         ...(resumeOpts?.taskId ? { resumeTaskId: resumeOpts.taskId } : {}),
         forceStart: true,
       });
@@ -3112,10 +3273,124 @@ export class DirectorRuntime {
     }
   }
 
+  /**
+   * Pre-validates combined goal amendment inputs (contract patch, budget patch, and/or verifyRef)
+   * before any engine write occurs, preventing partial persistence on rejection.
+   */
+  private validateGoalAmendInputs(
+    goalId: string,
+    input: {
+      contractPatch?: Parameters<GoalEngine["amendGoal"]>[1];
+      budgetPatch?: { maxReviewCycles?: number; maxNoProgressCycles?: number };
+      hasVerifyRef?: boolean;
+      verifyRefVal?: string | null;
+    },
+  ): void {
+    const cur = this.goals.getGoal(goalId);
+    if (!cur) throw new Error(`Unknown goal ${goalId}`);
+
+    if (input.hasVerifyRef) {
+      if (cur.status === "cancelled") throw new Error("Cannot amend a cancelled goal");
+      validateVerifyRef(input.verifyRefVal);
+    }
+
+    if (input.budgetPatch) {
+      if (cur.status === "achieved" || cur.status === "cancelled") {
+        throw new Error(`Cannot update budgets on a ${cur.status} goal`);
+      }
+      if (input.budgetPatch.maxReviewCycles !== undefined) {
+        if (
+          typeof input.budgetPatch.maxReviewCycles !== "number" ||
+          !Number.isInteger(input.budgetPatch.maxReviewCycles) ||
+          input.budgetPatch.maxReviewCycles < 0
+        ) {
+          throw new Error(
+            `budgets.maxReviewCycles must be a non-negative integer (got ${String(input.budgetPatch.maxReviewCycles)})`,
+          );
+        }
+      }
+      if (input.budgetPatch.maxNoProgressCycles !== undefined) {
+        if (
+          typeof input.budgetPatch.maxNoProgressCycles !== "number" ||
+          !Number.isInteger(input.budgetPatch.maxNoProgressCycles) ||
+          input.budgetPatch.maxNoProgressCycles < 1
+        ) {
+          throw new Error(
+            `budgets.maxNoProgressCycles must be a positive integer (got ${String(input.budgetPatch.maxNoProgressCycles)})`,
+          );
+        }
+      }
+    }
+
+    if (input.contractPatch) {
+      const patch = input.contractPatch;
+      if (cur.status === "cancelled") throw new Error("Cannot amend a cancelled goal");
+      const removedSet = new Set(patch.removeCriteriaIds ?? []);
+      let nextCriteria = cur.criteria.filter((c) => !removedSet.has(c.id));
+      for (const upd of patch.updateCriteria ?? []) {
+        const idx = nextCriteria.findIndex((c) => c.id === upd.id);
+        if (idx >= 0) {
+          const existing = nextCriteria[idx]!;
+          nextCriteria[idx] = {
+            id: existing.id,
+            description: upd.description !== undefined ? upd.description : existing.description,
+            kind: upd.kind !== undefined ? upd.kind : existing.kind,
+            command: upd.command !== undefined ? upd.command : existing.command,
+            required: upd.required !== undefined ? upd.required : existing.required,
+          };
+        } else {
+          throw new Error(
+            `Unknown criterion id '${upd.id}' in updateCriteria (current: ${nextCriteria.map((c) => c.id).join(", ")})`,
+          );
+        }
+      }
+      const addedCriteria: GoalCriterion[] = (patch.addCriteria ?? []).map((c, idx) => ({
+        id: c.id ?? `c${cur.version + 1}_${idx + 1}`,
+        description: c.description,
+        kind: c.kind,
+        command: c.command,
+        required: c.required !== false,
+      }));
+      nextCriteria = [...nextCriteria, ...addedCriteria];
+      if (nextCriteria.length === 0 && (cur.verificationMode !== "none" || cur.criteria.length > 0)) {
+        throw new Error("Goal amendment cannot remove all acceptance criteria");
+      }
+      for (const c of nextCriteria) {
+        if (c.kind === "deterministic" && !c.command?.trim()) {
+          throw new Error(
+            `Deterministic criterion '${c.id}' requires a non-empty shell 'command' (or change kind to 'behavioral'/'architectural').`,
+          );
+        }
+      }
+      if (patch.description !== undefined && patch.appendDescription !== undefined) {
+        throw new Error("Provide either description (full replacement) or appendDescription (extend), not both.");
+      }
+      if (patch.appendDescription !== undefined) {
+        if (!patch.appendDescription.trim()) throw new Error("appendDescription must be a non-empty string.");
+      } else if (patch.description !== undefined) {
+        const replaced = patch.description.trim();
+        if (!replaced) {
+          throw new Error("description replacement cannot be empty; omit it to keep the current description.");
+        }
+        if (replaced !== cur.description && replaced.length < cur.description.length && !patch.confirmReplaceDescription) {
+          throw new Error(
+            `Refusing to replace goal ${cur.id} description (${cur.description.length} chars) with shorter text (${replaced.length} chars). "description" replaces the whole description. Use append_description/appendDescription to add instructions, or pass confirm_replace_description/confirmReplaceDescription: true.`,
+          );
+        }
+      }
+    }
+  }
+
   async amendGoal(
     goalId: string,
     patch: Parameters<GoalEngine["amendGoal"]>[1],
-    opts?: { source?: "director" | "user" | "external"; actorChatSessionId?: string },
+    opts?: {
+      source?: "director" | "user" | "external";
+      actorChatSessionId?: string;
+      budgets?: { maxReviewCycles?: number; maxNoProgressCycles?: number };
+      hasVerifyRef?: boolean;
+      verifyRef?: string | null;
+    },
   ): Promise<{
     goal: GoalRecord;
     delta: ReturnType<GoalEngine["amendGoal"]>["delta"];
@@ -3123,10 +3398,20 @@ export class DirectorRuntime {
     affectedTasks: AffectedAmendmentTask[];
     supersededEscalationIds: string[];
     openEscalations: Array<Pick<EscalationRecord, "id" | "severity" | "category" | "title">>;
+    budgetsBefore?: GoalBudgets;
+    budgetsAfter?: GoalBudgets;
   }> {
+    this.validateGoalAmendInputs(goalId, {
+      contractPatch: patch,
+      budgetPatch: opts?.budgets,
+      hasVerifyRef: opts?.hasVerifyRef,
+      verifyRefVal: opts?.verifyRef,
+    });
     const preAmendGoal = this.goals.getGoal(goalId);
     const heldSlotBeforeAmend = preAmendGoal ? this.isGoalOccupyingSlot(preAmendGoal) : false;
-    const { goal, delta, supersededEscalationIds } = this.goals.amendGoal(goalId, patch);
+    const budgetsBefore = opts?.budgets ? this.goals.updateBudgets(goalId, opts.budgets).before : undefined;
+    const { goal: amendedBase, delta, supersededEscalationIds } = this.goals.amendGoal(goalId, patch);
+    const goal = opts?.hasVerifyRef ? this.goals.setVerifyRef(amendedBase.id, opts.verifyRef ?? null) : amendedBase;
     const source = opts?.source ?? "external";
     let amendedGoal = goal;
     let delivery: { delivered: boolean; via: "steer" | "resume" | "none"; reason?: string } = { delivered: false, via: "none" };
@@ -3353,10 +3638,26 @@ export class DirectorRuntime {
             ) {
               if (!heldSlotBeforeAmend) {
                 const commitRes = await this.commitGoalDetailed(goal.id, {
+                  resumeTaskId: orch.id,
+                  allowCompleted: true,
                   continueCompleted: true,
                   note: steerMsg,
+                  validateBeforeActivate: isStillAmendedExecuting,
                 });
-                if (commitRes.outcome === "resumed" || commitRes.outcome === "already_active") {
+                const taskRes = commitRes.taskResult;
+                // Only report delivery when this Tier 1 itself resumed or acknowledged a live native steer.
+                const orchDelivered = Boolean(
+                  (taskRes &&
+                    taskRes.task.id === orch.id &&
+                    (taskRes.outcome === "resumed" ||
+                      (taskRes.noteDelivered === true &&
+                        taskRes.noteDelivery?.mode === "native" &&
+                        taskRes.noteDelivery?.live === true))) ||
+                    (!taskRes &&
+                      commitRes.outcome === "resumed" &&
+                      (commitRes.resumedTaskIds ?? []).includes(orch.id)),
+                );
+                if (orchDelivered) {
                   delivered = true;
                   amendedGoal = commitRes.goal;
                 } else if (commitRes.outcome === "queued") {
@@ -3367,7 +3668,7 @@ export class DirectorRuntime {
                     "awaiting_human",
                     `Amended; queued for a goal slot (#${commitRes.queuePosition ?? "?"}); the run resumes on the amended contract when admitted`,
                   );
-                  this.clearUndeliveredAmendment(goal.id, goal.version);
+                  tracker.markUndelivered("queued for a goal slot");
                   this.syncQueuedGoalProgress();
                   delivery = { delivered: false, via: "none", reason: "queued for a goal slot" };
                 }
@@ -3433,7 +3734,15 @@ export class DirectorRuntime {
         // Escalations table may be absent.
       }
     }
-    return { goal: amendedGoal, delta, delivery, affectedTasks, supersededEscalationIds, openEscalations };
+    return {
+      goal: amendedGoal,
+      delta,
+      delivery,
+      affectedTasks,
+      supersededEscalationIds,
+      openEscalations,
+      ...(budgetsBefore ? { budgetsBefore, budgetsAfter: amendedGoal.budgets } : {}),
+    };
   }
 
   /**
@@ -3478,9 +3787,13 @@ export class DirectorRuntime {
         if (esc.category !== "verification_failed") continue;
         const matchesMaxCycles =
           esc.title.startsWith("Max review cycles reached") &&
+          budgets.maxReviewCycles !== undefined &&
+          budgetsAfter.maxReviewCycles > budgetsBefore.maxReviewCycles &&
           budgetsAfter.maxReviewCycles > goal.reviewCycle;
         const matchesNoProgress =
           esc.title.startsWith("No-progress circuit breaker tripped") &&
+          budgets.maxNoProgressCycles !== undefined &&
+          budgetsAfter.maxNoProgressCycles > budgetsBefore.maxNoProgressCycles &&
           budgetsAfter.maxNoProgressCycles > goal.noProgressStreak;
         if (!matchesMaxCycles && !matchesNoProgress) continue;
         const { escalation: updated, transitioned } = this.db.tryResolveEscalation(esc.id, resolutionText, {
@@ -3517,6 +3830,17 @@ export class DirectorRuntime {
       queuePosition?: number;
     } = { action: "none", message: "" };
 
+    const liftedReviewBudget =
+      budgetsAfter.maxReviewCycles > budgetsBefore.maxReviewCycles &&
+      goal.reviewCycle >= budgetsBefore.maxReviewCycles &&
+      budgetsAfter.maxReviewCycles > goal.reviewCycle;
+    const liftedNoProgressBudget =
+      budgetsAfter.maxNoProgressCycles > budgetsBefore.maxNoProgressCycles &&
+      goal.noProgressStreak >= budgetsBefore.maxNoProgressCycles &&
+      budgetsAfter.maxNoProgressCycles > goal.noProgressStreak;
+    const liftedExhaustedBudget =
+      liftedReviewBudget || liftedNoProgressBudget || resolvedEscalationIds.length > 0;
+
     const budgetBlocked = this.reviewBudgetExhausted(freshGoal);
     const noProgressBlocked =
       freshGoal.noProgressStreak >= budgetsAfter.maxNoProgressCycles
@@ -3537,6 +3861,14 @@ export class DirectorRuntime {
       continuation = {
         action: "none",
         message: `Goal ${freshGoal.id} has no linked run to continue.`,
+      };
+    } else if (!liftedExhaustedBudget) {
+      continuation = {
+        action: "none",
+        message:
+          changedParts.length === 0
+            ? `Budgets unchanged (${deltaText}); goal ${freshGoal.id} remains awaiting_human.`
+            : `Budgets updated (${deltaText}), but no exhausted review or no-progress budget was lifted; goal ${freshGoal.id} remains awaiting_human.`,
       };
     } else if (budgetBlocked) {
       continuation = {
@@ -3744,24 +4076,47 @@ export class DirectorRuntime {
     }
     // Still live: its settlement runs recovery again if the amendment is still unacknowledged.
     if (this.isRunOccupyingGoalSlot(current.linkedRunId)) return;
-    this.clearUndeliveredAmendment(goalId, version);
     const orch = current.linkedRunId ? this.db.listTasks(current.linkedRunId).find((t) => t.tier === 1) : undefined;
-    const resumed = orch
-      ? await this.orchestrator
-          .resumeTaskDetailed(orch.id, {
-            allowCompleted: true,
-            note: pending.steerMsg,
-            validateBeforeActivate: () => {
-              const g = this.goals.getGoal(goalId);
-              return g !== null && g.version === version && g.status === "executing";
-            },
-          })
-          .then(
-            (r) => r.outcome === "resumed" || (r.noteDelivered === true && r.noteDelivery?.mode === "native" && r.noteDelivery?.live === true),
-            () => false,
-          )
-      : false;
-    if (resumed && orch && this.goals.getGoal(goalId)?.version === version) {
+    if (!orch) {
+      this.clearUndeliveredAmendment(goalId, version);
+      this.handOffStrandedGoal(current, pending.reason);
+      return;
+    }
+    const isStillPendingExecuting = () => {
+      const g = this.goals.getGoal(goalId);
+      return g !== null && g.version === version && g.status === "executing";
+    };
+    const commitRes = await this.commitGoalDetailed(goalId, {
+      resumeTaskId: orch.id,
+      allowCompleted: true,
+      continueCompleted: true,
+      note: pending.steerMsg,
+      validateBeforeActivate: isStillPendingExecuting,
+    }).catch(() => null);
+    if (commitRes?.outcome === "queued") {
+      // Park in awaiting_human so drainGoalQueue admits this goal when a slot opens; keep pending amendment armed.
+      if (isStillPendingExecuting()) {
+        this.goals.setStatus(
+          goalId,
+          "awaiting_human",
+          `Amended; queued for a goal slot (#${commitRes.queuePosition ?? "?"}); the run resumes on the amended contract when admitted`,
+        );
+        this.syncQueuedGoalProgress();
+      }
+      return;
+    }
+    const taskRes = commitRes?.taskResult;
+    const resumed = Boolean(
+      (taskRes &&
+        taskRes.task.id === orch.id &&
+        (taskRes.outcome === "resumed" ||
+          (taskRes.noteDelivered === true &&
+            taskRes.noteDelivery?.mode === "native" &&
+            taskRes.noteDelivery?.live === true))) ||
+        (!taskRes && commitRes?.outcome === "resumed" && (commitRes.resumedTaskIds ?? []).includes(orch.id)),
+    );
+    this.clearUndeliveredAmendment(goalId, version);
+    if (resumed && this.goals.getGoal(goalId)?.version === version) {
       const curOrch = this.db.getTask(orch.id);
       if (curOrch && (curOrch.goalVersion == null || curOrch.goalVersion < version)) {
         this.db.updateTask(orch.id, { goalVersion: version });
@@ -4338,6 +4693,10 @@ export class DirectorRuntime {
         this.activeReviewInfo.delete(goal.id);
         this.notifyReviewSettled(goal.id);
       }
+      if (!this.disposed && committed) {
+        this.syncQueuedGoalProgress();
+        void this.drainGoalQueue(goal.repoRoot).catch(() => {});
+      }
     }
   }
 
@@ -4687,7 +5046,7 @@ export class DirectorRuntime {
           const settleStatus = String((deferredSettleEvent.payload as { status?: string } | null)?.status ?? "");
           if (
             settled &&
-            settled.version === goal.version &&
+            settled.linkedRunId === deferredSettleEvent.runId &&
             settled.status === "executing" &&
             this.db.getRun(deferredSettleEvent.runId)?.status === settleStatus
           ) {
@@ -5673,21 +6032,51 @@ export class DirectorRuntime {
       const latest = this.goals.getGoal(goal.id);
       return latest !== null && !isInvalidated(latest) && latest.status === "executing";
     };
+    let queuedForSlot = false;
     if (goal.status === "executing" && isStillCurrentExecuting()) {
-      // Wake / steer Tier 1 Orchestrator — or relaunch in-place if Tier 1 already settled!
+      // Wake / steer Tier 1 Orchestrator — or relaunch in-place through goal admission if Tier 1 already settled!
       const orch = goal.linkedRunId ? this.db.listTasks(goal.linkedRunId).find((t) => t.tier === 1) : undefined;
       let delivered = false;
       if (orch) {
         const msg = formatChangesRequestedSteer(goal, review);
         delivered = await this.orchestrator.steerTask(orch.id, msg).catch(() => false);
         if (!delivered && isStillCurrentExecuting()) {
-          delivered = await this.orchestrator
-            .resumeTaskDetailed(orch.id, { allowCompleted: true, note: msg, validateBeforeActivate: isStillCurrentExecuting })
-            // An idempotent "already active" return delivers the note only when it was steered in.
-            .then((r) => r.outcome === "resumed" || r.noteDelivered === true, () => false);
+          const commitRes = await this.commitGoalDetailed(goal.id, {
+            resumeTaskId: orch.id,
+            allowCompleted: true,
+            continueCompleted: true,
+            note: msg,
+            validateBeforeActivate: isStillCurrentExecuting,
+          }).catch(() => null);
+          if (commitRes?.outcome === "queued") {
+            queuedForSlot = true;
+            if (isStillCurrentExecuting()) {
+              goal = this.goals.setStatus(
+                goal.id,
+                "awaiting_human",
+                `Changes requested; queued for a goal slot (#${commitRes.queuePosition ?? "?"}); the run resumes when admitted.`,
+              );
+              outcome.goal = goal;
+              this.syncQueuedGoalProgress();
+            }
+          } else {
+            const taskRes = commitRes?.taskResult;
+            delivered = Boolean(
+              (taskRes &&
+                taskRes.task.id === orch.id &&
+                (taskRes.outcome === "resumed" || taskRes.noteDelivered === true)) ||
+                (!taskRes &&
+                  commitRes?.outcome === "resumed" &&
+                  (commitRes.resumedTaskIds ?? []).includes(orch.id)),
+            );
+            if (delivered && commitRes) {
+              goal = commitRes.goal;
+              outcome.goal = goal;
+            }
+          }
         }
       }
-      if (!delivered && isStillCurrentExecuting()) {
+      if (!delivered && !queuedForSlot && isStillCurrentExecuting()) {
         const reason = !goal.linkedRunId
           ? "no linked run to apply requested changes"
           : orch
@@ -5714,7 +6103,7 @@ export class DirectorRuntime {
       goal.chatSessionId &&
         opts?.autoTriggered &&
         this.config.events?.wakeDirectorOnGoalSettle !== false &&
-        (goal.status === "achieved" || goal.status === "awaiting_human"),
+        (goal.status === "achieved" || (goal.status === "awaiting_human" && !queuedForSlot)),
     );
 
     if (goal.linkedRunId) {
@@ -5733,7 +6122,7 @@ export class DirectorRuntime {
         this.db.updateRunStatus(goal.linkedRunId, "completed");
         this.autoResolveGoalEscalations(goal.linkedRunId, `Auto-resolved: goal ${goal.id} achieved`);
         void this.drainGoalQueue(goal.repoRoot).catch(() => {});
-      } else if (goal.status === "awaiting_human") {
+      } else if (goal.status === "awaiting_human" && !queuedForSlot) {
         void this.drainGoalQueue(goal.repoRoot).catch(() => {});
         const orch = this.db.listTasks(goal.linkedRunId).find((t) => t.tier === 1);
         if (orch) {
@@ -6592,7 +6981,9 @@ export class DirectorRuntime {
             throw new Error(`Task ${targetId} does not belong to this workspace; this chat may not cancel it. The operator can use \`pi-harness stop ${targetTask.runId}\`.`);
           }
           // Any task of this workspace this chat may control, not just synthetic Director tasks.
-          await this.orchestrator.cancelTask(targetTask.id, typeof args.reason === "string" ? args.reason : "Cancelled by Director");
+          const cancelReason = typeof args.reason === "string" ? args.reason : "Cancelled by Director";
+          this.invalidateQueuedResumeForTask(targetTask.id, cancelReason);
+          await this.orchestrator.cancelTask(targetTask.id, cancelReason);
           return { cancelled: targetTask.id, runId: targetTask.runId };
         }
         return this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, name, args, signal);
@@ -6794,6 +7185,11 @@ export class DirectorRuntime {
           (Array.isArray(args.remove_criteria_ids) && args.remove_criteria_ids.length > 0) ||
           Array.isArray(args.non_goals);
         if (hasBudgetPatch && !hasContractPatch) {
+          this.validateGoalAmendInputs(goalId, {
+            budgetPatch,
+            hasVerifyRef,
+            verifyRefVal,
+          });
           if (hasVerifyRef) this.goals.setVerifyRef(goalId, verifyRefVal);
           const budgetRes = await this.amendGoalBudgets(goalId, budgetPatch, String(args.rationale ?? ""), {
             source: "director",
@@ -6815,32 +7211,36 @@ export class DirectorRuntime {
             presentation_id: presentGoal(updated),
           };
         }
-        const budgetsBefore = hasBudgetPatch ? this.goals.updateBudgets(goalId, budgetPatch).before : undefined;
-        const amended = await this.amendGoal(goalId, {
-          rationale: String(args.rationale),
-          title: typeof args.title === "string" ? args.title : undefined,
-          description: typeof args.description === "string" ? args.description : undefined,
-          appendDescription: typeof args.append_description === "string" ? args.append_description : undefined,
-          confirmReplaceDescription: args.confirm_replace_description === true ? true : undefined,
-          addCriteria: Array.isArray(args.add_criteria) ? (args.add_criteria as GoalCriterion[]) : undefined,
-          updateCriteria,
-          removeCriteriaIds: Array.isArray(args.remove_criteria_ids) ? (args.remove_criteria_ids as string[]) : undefined,
-          nonGoals: Array.isArray(args.non_goals) ? (args.non_goals as string[]) : undefined,
-        }, { source: "director", actorChatSessionId: chatSessionId });
+        const amended = await this.amendGoal(
+          goalId,
+          {
+            rationale: String(args.rationale),
+            title: typeof args.title === "string" ? args.title : undefined,
+            description: typeof args.description === "string" ? args.description : undefined,
+            appendDescription: typeof args.append_description === "string" ? args.append_description : undefined,
+            confirmReplaceDescription: args.confirm_replace_description === true ? true : undefined,
+            addCriteria: Array.isArray(args.add_criteria) ? (args.add_criteria as GoalCriterion[]) : undefined,
+            updateCriteria,
+            removeCriteriaIds: Array.isArray(args.remove_criteria_ids) ? (args.remove_criteria_ids as string[]) : undefined,
+            nonGoals: Array.isArray(args.non_goals) ? (args.non_goals as string[]) : undefined,
+          },
+          {
+            source: "director",
+            actorChatSessionId: chatSessionId,
+            ...(hasBudgetPatch ? { budgets: budgetPatch } : {}),
+            ...(hasVerifyRef ? { hasVerifyRef: true, verifyRef: verifyRefVal } : {}),
+          },
+        );
         if (hasVerifyRef) {
-          const updated = this.goals.setVerifyRef(amended.goal.id, verifyRefVal);
-          const targetDesc = updated.verifyRef ?? "the run's base branch";
+          const targetDesc = amended.goal.verifyRef ?? "the run's base branch";
           return {
             ...amended,
-            ...(budgetsBefore ? { budgetsBefore, budgetsAfter: updated.budgets } : {}),
-            goal: updated,
             hint: `call goal_trigger_review to re-run gates at ${targetDesc}`,
-            presentation_id: presentGoal(updated),
+            presentation_id: presentGoal(amended.goal),
           };
         }
         return {
           ...amended,
-          ...(budgetsBefore ? { budgetsBefore, budgetsAfter: amended.goal.budgets } : {}),
           presentation_id: presentGoal(amended.goal),
         };
       }

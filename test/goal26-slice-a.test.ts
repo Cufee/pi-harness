@@ -268,4 +268,34 @@ describe("goal-26 slice A: AdmissionQueue canonical repoRoot/forceStart order & 
       rmSync(repoRoot, { recursive: true, force: true });
     }
   });
+
+  it("(e) normalizes canonical-only forceStart order violations on AdmissionQueue construction without path rewrites", () => {
+    const repoRoot = realpathSync(mkdtempSync(join(tmpdir(), "pi-goal26-slice-a-canon-force-")));
+    const db = new Database(":memory:");
+    try {
+      new AdmissionQueue(db);
+      const insertRaw = db.prepare(
+        `INSERT INTO admission_queue(lane, repo_root, target_id, position, force_start, launch_opts_json, note, created_at)
+         VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)`,
+      );
+      // Canonical repo_root only, no alias rewrite needed, but forced B sits behind ordinary A at position 2.
+      insertRaw.run("goal", repoRoot, "A", 1, 0, 100);
+      insertRaw.run("goal", repoRoot, "B", 2, 1, 200);
+
+      const migrated = new AdmissionQueue(db);
+      const entries = migrated.list({ lane: "goal", repoRoot });
+      assert.deepEqual(
+        entries.map((e) => [e.targetId, e.position, e.forceStart]),
+        [
+          ["B", 1, true],
+          ["A", 2, false],
+        ],
+      );
+      assert.equal(migrated.peekNext("goal", repoRoot)?.targetId, "B");
+      assert.equal(migrated.peekNext("goal", repoRoot)?.position, 1);
+    } finally {
+      db.close();
+      rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
 });
