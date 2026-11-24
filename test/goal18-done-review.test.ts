@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { describe, it } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { loadConfig } from "../src/config.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
-import { ReviewerFailedError } from "../src/director/runtime.js";
+import { normalizeReviewerVerdict, parseReviewerVerdictJson, ReviewerFailedError } from "../src/director/runtime.js";
 import { runGit } from "../src/worktree/manager.js";
 import { BisectingMergeQueue, runMergedRef } from "../src/worktree/merge-queue.js";
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
@@ -355,6 +355,413 @@ describe("goal-18 Done-Review reliability", () => {
     } finally {
       rmSync(repoRoot, { recursive: true, force: true });
       rmSync(bareOrigin, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects malformed verdict shapes in tool and text paths, retries with validation error, and never burns a cycle", async () => {
+    // Unit-level strict validation checks across all malformed shapes, while keeping valid partial negative reviews allowed.
+    assert.equal(normalizeReviewerVerdict({ verdict: "approved", criteriaResults: "not an array", summary: "ok" }), null);
+    assert.equal(normalizeReviewerVerdict({ verdict: "approved", summary: "ok" }), null);
+    assert.equal(
+      normalizeReviewerVerdict({
+        verdict: "approved",
+        criteriaResults: [{ criterionId: "c1", passed: "true", evidence: "checked" }],
+        summary: "ok",
+      }),
+      null,
+    );
+    assert.equal(
+      normalizeReviewerVerdict({
+        verdict: "approved",
+        criteriaResults: [{ criterionId: "c1", passed: true }],
+        summary: "ok",
+      }),
+      null,
+    );
+    assert.equal(
+      normalizeReviewerVerdict({
+        verdict: "approved",
+        criteriaResults: [{ passed: true, evidence: "missing id" }],
+        summary: "ok",
+      }),
+      null,
+    );
+    assert.equal(
+      normalizeReviewerVerdict({
+        verdict: "approved",
+        criteriaResults: [{ criterionId: "c1", passed: true, evidence: "ok" }, { bad: true }],
+        summary: "ok",
+      }),
+      null,
+    );
+    assert.equal(
+      normalizeReviewerVerdict({
+        verdict: "changes_requested",
+        criteriaResults: [],
+        blockingIssues: "not an array",
+        summary: "ok",
+      }),
+      null,
+    );
+    assert.equal(
+      normalizeReviewerVerdict({
+        verdict: "changes_requested",
+        criteriaResults: [],
+        blockingIssues: [42],
+        summary: "ok",
+      }),
+      null,
+    );
+    assert.equal(normalizeReviewerVerdict({ verdict: "approved", criteriaResults: [] }), null);
+    assert.equal(normalizeReviewerVerdict({ verdict: "approved", criteriaResults: [], summary: "   " }), null);
+    assert.equal(
+      parseReviewerVerdictJson('```json\n{"verdict":"approved","criteriaResults":"not an array","summary":"ok"}\n```'),
+      null,
+    );
+    // Partial but well-formed changes_requested verdict remains accepted.
+    const validPartial = normalizeReviewerVerdict({
+      verdict: "changes_requested",
+      criteriaResults: [],
+      blockingIssues: ["c1 still missing"],
+      summary: "Partial review found missing c1.",
+    });
+    assert.equal(validPartial?.verdict, "changes_requested");
+
+    const repoRoot = await makeTempRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-g18-state-"));
+    const sockPath = join(stateDir, "d.sock");
+    const prompts: string[] = [];
+
+    try {
+      const baseCfg = loadConfig(repoRoot);
+      const config = withFixtureCatalog({
+        ...baseCfg,
+        goals: { ...baseCfg.goals, autoVerifyOnSettle: false },
+        stateDir,
+        socketPath: sockPath,
+      });
+      const daemon = new HarnessDaemon(config, {
+        dbPath: ":memory:",
+        customRunnerFactory: () => ({
+          run: async (req) => {
+            if (req.kind !== "verify") return { text: "ok", stopReason: "completed" };
+            prompts.push(req.initialPrompt);
+            if (prompts.length === 1) {
+              await assert.rejects(
+                () =>
+                  req.executeTool("submit_review_verdict", {
+                    verdict: "approved",
+                    criteriaResults: "not an array",
+                    summary: "malformed criteriaResults",
+                  }),
+                /criteriaResults must be an array/,
+              );
+              // Rejected malformed tool call leaves verdictBox empty (unsettled).
+              assert.equal(req.isTaskSettled!(), false);
+              // Also emit malformed fenced JSON in text — must also be rejected, never coerced.
+              return {
+                text: '```json\n{"verdict":"approved","criteriaResults":"not an array","summary":"malformed"}\n```',
+                stopReason: "completed",
+              };
+            }
+            // Attempt 2 also submits malformed criterion item (non-boolean passed) and ends without valid verdict.
+            await assert.rejects(
+              () =>
+                req.executeTool("submit_review_verdict", {
+                  verdict: "approved",
+                  criteriaResults: [{ criterionId: "c1", passed: "yes", evidence: "checked" }],
+                  summary: "non-boolean passed",
+                }),
+              /passed must be a boolean/,
+            );
+            assert.equal(req.isTaskSettled!(), false);
+            return { text: "still no valid verdict", stopReason: "completed" };
+          },
+        }),
+      });
+
+      await daemon.start();
+      try {
+        const chat = await daemon.director.createChat({ repoRoot });
+        const goal = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Malformed verdict rejection goal",
+          description: "Malformed criteriaResults must never record a review or burn a cycle",
+          criteria: [{ id: "c1", description: "Behavior verified", kind: "behavioral", required: true }],
+        });
+
+        let caught: unknown = null;
+        try {
+          await daemon.director.verifyAndReviewGoal(goal.id);
+        } catch (err) {
+          caught = err;
+        }
+
+        assert.ok(caught instanceof ReviewerFailedError, `expected ReviewerFailedError, got ${String(caught)}`);
+        assert.equal(caught.attempts, 2);
+        assert.equal(prompts.length, 2, "must retry once after malformed verdict");
+        assert.match(prompts[1]!, /criteriaResults must be an array/);
+        assert.equal(daemon.director.goals.listReviews(goal.id).length, 0);
+        const updatedGoal = daemon.director.goals.getGoal(goal.id)!;
+        assert.equal(updatedGoal.reviewCycle, 0);
+        assert.equal(updatedGoal.lastProgressFingerprint, null);
+        assert.equal(updatedGoal.status, "awaiting_human");
+      } finally {
+        await daemon.stop();
+      }
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("retries once on recoverable runner/stopReason failures, records one review on attempt 2 recovery, and never retries genuine cancellation", async () => {
+    const repoRoot = await makeTempRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-g18-state-"));
+    const sockPath = join(stateDir, "d.sock");
+
+    try {
+      const baseCfg = loadConfig(repoRoot);
+      const config = withFixtureCatalog({
+        ...baseCfg,
+        goals: { ...baseCfg.goals, autoVerifyOnSettle: false },
+        stateDir,
+        socketPath: sockPath,
+      });
+
+      let mode: "throw-then-succeed" | "error-stop-twice" | "cancel-attempt-1" = "throw-then-succeed";
+      const prompts: string[] = [];
+      let cancelController: AbortController | null = null;
+
+      const daemon = new HarnessDaemon(config, {
+        dbPath: ":memory:",
+        customRunnerFactory: () => ({
+          run: async (req) => {
+            if (req.kind !== "verify") return { text: "ok", stopReason: "completed" };
+            prompts.push(req.initialPrompt);
+            if (mode === "throw-then-succeed") {
+              if (prompts.length === 1) {
+                throw new Error("ECONNRESET: transient reviewer transport failure");
+              }
+              await req.executeTool("submit_review_verdict", {
+                verdict: "approved",
+                criteriaResults: [{ criterionId: "c1", passed: true, evidence: "Verified on attempt 2" }],
+                blockingIssues: [],
+                summary: "Recovered on attempt 2.",
+              });
+              return { text: "approved", stopReason: "completed" };
+            }
+            if (mode === "error-stop-twice") {
+              if (prompts.length === 1) {
+                return { text: "", stopReason: "error" };
+              }
+              return { text: "", stopReason: "" as never };
+            }
+            // mode === "cancel-attempt-1"
+            cancelController!.abort(new Error("user cancelled review"));
+            return { text: "", stopReason: "cancelled" };
+          },
+        }),
+      });
+
+      await daemon.start();
+      try {
+        const chat = await daemon.director.createChat({ repoRoot });
+
+        // 1. Runner throws on attempt 1 -> retried with error detail -> valid verdict on attempt 2 records exactly one review.
+        const goalRecover = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Recoverable runner error goal",
+          description: "Attempt 1 runner error recovers on attempt 2",
+          criteria: [{ id: "c1", description: "Behavior verified", kind: "behavioral", required: true }],
+        });
+        const outcome = await daemon.director.verifyAndReviewGoal(goalRecover.id);
+        assert.equal(prompts.length, 2);
+        assert.match(prompts[1]!, /stopReason=runner_error/);
+        assert.match(prompts[1]!, /ECONNRESET: transient reviewer transport failure/);
+        assert.equal(outcome.review.verdict, "approved");
+        assert.equal(outcome.goal.status, "achieved");
+        assert.equal(outcome.goal.reviewCycle, 1);
+        assert.equal(daemon.director.goals.listReviews(goalRecover.id).length, 1);
+
+        // 2. Non-completed / empty stopReason across both attempts -> ReviewerFailedError with zero reviews and cycle unchanged.
+        mode = "error-stop-twice";
+        prompts.length = 0;
+        const goalErrStop = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Errored stopReason twice goal",
+          description: "Two errored/empty stopReasons fail as ReviewerFailedError without burning a cycle",
+          criteria: [{ id: "c1", description: "Behavior verified", kind: "behavioral", required: true }],
+        });
+        let caughtErrStop: unknown = null;
+        try {
+          await daemon.director.verifyAndReviewGoal(goalErrStop.id);
+        } catch (err) {
+          caughtErrStop = err;
+        }
+        assert.ok(caughtErrStop instanceof ReviewerFailedError, `expected ReviewerFailedError, got ${String(caughtErrStop)}`);
+        assert.equal(caughtErrStop.attempts, 2);
+        assert.equal(prompts.length, 2);
+        assert.match(prompts[1]!, /stopReason=error/);
+        assert.match(caughtErrStop.detail, /stopReason=\(empty\)/);
+        assert.equal(daemon.director.goals.listReviews(goalErrStop.id).length, 0);
+        assert.equal(daemon.director.goals.getGoal(goalErrStop.id)?.reviewCycle, 0);
+        assert.equal(daemon.director.goals.getGoal(goalErrStop.id)?.status, "awaiting_human");
+
+        // 3. Genuine cancellation exits after attempt 1 with NO retry.
+        mode = "cancel-attempt-1";
+        prompts.length = 0;
+        cancelController = new AbortController();
+        const goalCancel = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Cancelled review goal",
+          description: "Genuine cancellation must not retry",
+          criteria: [{ id: "c1", description: "Behavior verified", kind: "behavioral", required: true }],
+        });
+        let caughtCancel: unknown = null;
+        try {
+          await daemon.director.verifyAndReviewGoal(goalCancel.id, cancelController.signal);
+        } catch (err) {
+          caughtCancel = err;
+        }
+        assert.ok(caughtCancel, "expected cancellation error");
+        assert.equal(caughtCancel instanceof ReviewerFailedError, false, "genuine cancellation must not become ReviewerFailedError");
+        assert.equal(prompts.length, 1, "genuine cancellation must not trigger attempt 2");
+        assert.equal(daemon.director.goals.listReviews(goalCancel.id).length, 0);
+      } finally {
+        await daemon.stop();
+      }
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("deletes stale refs/harness/merged/<runId> and logs a warning when update-ref fails on a later merge", async () => {
+    const repoRoot = await makeTempRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-g18-state-"));
+    const sockPath = join(stateDir, "d.sock");
+    let verifyCheckoutHead = "";
+    const warnings: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+
+    try {
+      const baseSha = (await runGit(repoRoot, ["rev-parse", "main"])).stdout;
+      const baseCfg = loadConfig(repoRoot);
+      const config = withFixtureCatalog({
+        ...baseCfg,
+        goals: { ...baseCfg.goals, autoVerifyOnSettle: false },
+        stateDir,
+        socketPath: sockPath,
+      });
+      const daemon = new HarnessDaemon(config, {
+        dbPath: ":memory:",
+        customRunnerFactory: () => ({
+          run: async (req) => {
+            if (req.kind !== "verify") return { text: "ok", stopReason: "completed" };
+            verifyCheckoutHead = (await runGit(req.cwd, ["rev-parse", "HEAD"])).stdout;
+            await req.executeTool("submit_review_verdict", {
+              verdict: "approved",
+              criteriaResults: [{ criterionId: "behavior", passed: true, evidence: `Verified at ${verifyCheckoutHead}` }],
+              blockingIssues: [],
+              summary: "Verified at base tip after stale ref removal.",
+            });
+            return { text: "approved", stopReason: "completed" };
+          },
+        }),
+      });
+
+      await daemon.start();
+      try {
+        const wtMgr = daemon.orchestrator.getWorktreeManager(repoRoot);
+        const mq = new BisectingMergeQueue(daemon.db, wtMgr, repoRoot, config.worktree, {
+          gateShell: config.goals.gateShell,
+          gateEnv: config.goals.gateEnv,
+          stateDir,
+        });
+
+        const run = daemon.db.createRun({ goal: "Two-merge run", repoRoot, baseBranch: "main", baseSha });
+
+        // Merge 1 lands sha1 and writes refs/harness/merged/<runId>.
+        const task1 = daemon.db.createTask({
+          runId: run.id,
+          parentId: null,
+          tier: 2,
+          kind: "execute",
+          title: "Worker 1",
+          objective: "Add m1.txt",
+          profileId: "fixture",
+        });
+        const wt1 = await wtMgr.createForWorker(run.id, task1.id, "main");
+        writeFileSync(join(wt1.path, "m1.txt"), "one\n", "utf8");
+        await runGit(wt1.path, ["add", "m1.txt"]);
+        await runGit(wt1.path, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "feat: merge 1"]);
+        daemon.db.enqueueMerge({ runId: run.id, taskId: task1.id, worktreeId: wt1.id, branch: wt1.branch });
+        const merged1 = await mq.processNext(run.id);
+        assert.ok(merged1?.mergedSha);
+
+        const mergedRef = runMergedRef(run.id);
+        const refAfter1 = (await runGit(repoRoot, ["rev-parse", "--verify", `${mergedRef}^{commit}`])).stdout;
+        assert.equal(refAfter1, merged1.mergedSha);
+
+        // Hold a lock file on refs/harness/merged/<runId> so merge 2's update-ref fails.
+        const refFilePath = resolve(repoRoot, (await runGit(repoRoot, ["rev-parse", "--git-path", mergedRef])).stdout);
+        writeFileSync(`${refFilePath}.lock`, "locked\n", "utf8");
+
+        const task2 = daemon.db.createTask({
+          runId: run.id,
+          parentId: null,
+          tier: 2,
+          kind: "execute",
+          title: "Worker 2",
+          objective: "Add m2.txt",
+          profileId: "fixture",
+        });
+        const wt2 = await wtMgr.createForWorker(run.id, task2.id, "main");
+        writeFileSync(join(wt2.path, "m2.txt"), "two\n", "utf8");
+        await runGit(wt2.path, ["add", "m2.txt"]);
+        await runGit(wt2.path, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "feat: merge 2"]);
+        daemon.db.enqueueMerge({ runId: run.id, taskId: task2.id, worktreeId: wt2.id, branch: wt2.branch });
+        const merged2 = await mq.processNext(run.id);
+        assert.ok(merged2?.mergedSha);
+        assert.notEqual(merged2.mergedSha, merged1.mergedSha);
+
+        // Stale ref pointing to sha1 must have been removed, and a warning must have been logged.
+        const refStillExists = await runGit(repoRoot, ["rev-parse", "--verify", `${mergedRef}^{commit}`])
+          .then(() => true)
+          .catch(() => false);
+        assert.equal(refStillExists, false, "stale merge ref must be deleted when update-ref fails");
+        assert.ok(
+          warnings.some((w) => w.includes(mergedRef) && w.includes("removed stale merge ref")),
+          `expected merge ref warning, got: ${JSON.stringify(warnings)}`,
+        );
+
+        // Verification checkout must fall back to base tip (sha2), NOT stale sha1.
+        const chat = await daemon.director.createChat({ repoRoot });
+        const goal = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Fallback after stale ref delete",
+          description: "Verify checkout evaluates merge 2 instead of stale merge 1",
+          criteria: [{ id: "behavior", description: "Behavior verified", kind: "behavioral", required: true }],
+        });
+        daemon.director.goals.linkRunAndStart(goal.id, run.id);
+        await daemon.director.verifyAndReviewGoal(goal.id);
+        assert.equal(verifyCheckoutHead, merged2.mergedSha);
+      } finally {
+        await daemon.stop();
+      }
+    } finally {
+      console.warn = origWarn;
+      rmSync(repoRoot, { recursive: true, force: true });
       rmSync(stateDir, { recursive: true, force: true });
     }
   });

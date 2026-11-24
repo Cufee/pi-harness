@@ -2770,7 +2770,8 @@ export class DirectorRuntime {
    * Creates the detached `_verify` worktree for verification gates and Done-Review without touching the host
    * checkout. Resolves `goal.verifyRef` when explicitly set (local ref, `origin/<ref>`, then `git fetch --no-tags origin`),
    * failing closed if unresolved. Otherwise targets `run.baseBranch`, preferring this run's recorded merge commit
-   * (`refs/harness/merged/<runId>`) when it exists and is an ancestor of the base branch tip. Without a verify ref or
+   * (`refs/harness/merged/<runId>`) when it exists and is an ancestor of the base branch tip. When that merge ref is
+   * used, all gates evaluate the goal's merge-commit snapshot, not later integrated main. Without a verify ref or
    * resolvable base branch, verification falls back to the primary checkout and records that in `location`.
    */
   private async prepareVerifyCheckout(
@@ -3514,23 +3515,23 @@ export class DirectorRuntime {
         model,
         maxTurns: reviewerMaxTurns,
       });
-      const abort = new AbortController();
-      const reviewerSignal = AbortSignal.any([signal, abort.signal]);
+      const cancelAbort = new AbortController();
+      const cancelSignal = AbortSignal.any([signal, cancelAbort.signal]);
       const unsubscribe = this.db.onEvent(ev => {
         if (ev.runId !== reviewRun.id) return;
         if ((ev.taskId === reviewerTask.id && ev.type === "task.status" && (ev.payload as { to: string }).to === "cancelled") ||
             (ev.type === "run.status" && (ev.payload as { status: string }).status === "stopped")) {
-          abort.abort(new Error("Reviewer cancelled"));
+          cancelAbort.abort(new Error("Reviewer cancelled"));
         }
       });
       const emit = (type: string, payload: unknown) => {
-        if (!reviewerSignal.aborted) this.db.emitEvent(reviewRun.id, reviewerTask.id, type, payload);
+        if (!cancelSignal.aborted) this.db.emitEvent(reviewRun.id, reviewerTask.id, type, payload);
       };
 
       const failedSummary = "Independent reviewer failed before completing verification.";
       const failReviewer = (msg: string, result?: Record<string, unknown>) => {
         if (this.db.getTask(reviewerTask.id)?.status !== "running") return;
-        if (reviewerSignal.aborted && !(timedOut && !signal.aborted)) {
+        if (cancelSignal.aborted) {
           this.db.updateTask(reviewerTask.id, { status: "cancelled", summary: "Reviewer cancelled" });
           return;
         }
@@ -3545,9 +3546,6 @@ export class DirectorRuntime {
 
       let outcome: ReturnType<GoalEngine["recordReviewVerdict"]>;
       let turnsUsed = 0;
-      let timedOut = false;
-      // O1: the wall-clock limit fired after a valid verdict was submitted: record that verdict.
-      const submittedBeforeTimeout = () => timedOut && verdictBox.value !== null && !signal.aborted;
       const bridgeExt = import.meta.url.endsWith(".js") ? "mcp-bridge.js" : "mcp-bridge.ts";
       const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", bridgeExt);
       // Each reviewer session gets its own executor; one from an ended session can never fill the verdict.
@@ -3561,35 +3559,28 @@ export class DirectorRuntime {
         if (name === "submit_review_verdict") {
           if (attempt !== activeAttempt) throw new Error("submit_review_verdict: this reviewer session has ended");
           submitCallsThisAttempt += 1;
-          const v = normalizeReviewerVerdict<Partial<SubmittedVerdict>>(args);
+          const v = normalizeReviewerVerdict<SubmittedVerdict>(args);
           if (!v) {
             const reason = describeReviewerVerdictError(args);
             lastSubmitError = reason;
             throw new Error(
-              `submit_review_verdict: ${reason}; expected verdict (approved | changes_requested | escalate_human) and criteriaResults[{criterionId, passed, evidence}]`,
+              `submit_review_verdict: ${reason}; expected verdict (approved | changes_requested | escalate_human), criteriaResults[{criterionId, passed, evidence}], optional blockingIssues (string[]), and non-empty summary`,
             );
           }
           lastSubmitError = null;
           verdictBox.value = {
-            verdict: v.verdict as SubmittedVerdict["verdict"],
-            criteriaResults: v.criteriaResults ?? [],
+            verdict: v.verdict,
+            criteriaResults: v.criteriaResults,
             blockingIssues: v.blockingIssues ?? [],
-            summary: typeof v.summary === "string" ? v.summary : "",
+            summary: v.summary,
           };
           return { recorded: true };
         }
         throw new Error(`Unknown reviewer tool ${name}`);
       };
-      // The 10-minute wall-clock limit applies to each reviewer session.
+      // The 10-minute wall-clock limit applies independently to each reviewer attempt; timing out attempt 1
+      // aborts only that attempt's signal so attempt 2 can still run with a fresh timeout.
       let reviewerTimeout: ReturnType<typeof setTimeout> | undefined;
-      const armReviewerTimeout = () => {
-        clearTimeout(reviewerTimeout);
-        reviewerTimeout = setTimeout(() => {
-          timedOut = true;
-          abort.abort(new Error("Independent Done-Reviewer timed out after 10 minutes"));
-        }, 600_000);
-        reviewerTimeout.unref?.();
-      };
       const missingVerdictWrapUpPrompt =
         "You ended your turn without calling `submit_review_verdict`. Call `submit_review_verdict` now with " +
         "`verdict` (`approved`, `changes_requested`, or `escalate_human`), `criteriaResults` " +
@@ -3597,14 +3588,15 @@ export class DirectorRuntime {
         "`blockingIssues`, and `summary`. Partial evidence with `changes_requested` is fine; do not end your turn without submitting a verdict. " +
         "If `submit_review_verdict` is unavailable, end with one fenced json verdict object matching that schema.";
       try {
-        if (this.db.getTask(reviewerTask.id)?.status === "cancelled") abort.abort(new Error("Reviewer cancelled"));
-        this.db.updateTask(reviewerTask.id, { status: reviewerSignal.aborted ? "cancelled" : "running" });
-        reviewerSignal.throwIfAborted();
+        if (this.db.getTask(reviewerTask.id)?.status === "cancelled") cancelAbort.abort(new Error("Reviewer cancelled"));
+        this.db.updateTask(reviewerTask.id, { status: cancelSignal.aborted ? "cancelled" : "running" });
+        cancelSignal.throwIfAborted();
         for (let attempt = 1; ; attempt++) {
           if (attempt > 1) {
             // A cancelled, stopped or otherwise settled reviewer task ends the review between sessions.
-            reviewerSignal.throwIfAborted();
+            cancelSignal.throwIfAborted();
             if (this.db.getTask(reviewerTask.id)?.status !== "running") throw new Error("Reviewer cancelled");
+            assertCurrent();
           }
           currentAttempt = attempt;
           activeAttempt = attempt;
@@ -3612,7 +3604,17 @@ export class DirectorRuntime {
           turnsUsed = 0;
           submitCallsThisAttempt = 0;
           lastSubmitError = null;
-          armReviewerTimeout();
+          let attemptTimedOut = false;
+          const attemptAbort = new AbortController();
+          const attemptSignal = AbortSignal.any([cancelSignal, attemptAbort.signal]);
+          // O1: the wall-clock limit fired after a valid verdict was submitted: record that verdict.
+          const submittedBeforeAttemptTimeout = () => attemptTimedOut && verdictBox.value !== null && !cancelSignal.aborted;
+          clearTimeout(reviewerTimeout);
+          reviewerTimeout = setTimeout(() => {
+            attemptTimedOut = true;
+            attemptAbort.abort(new Error("Independent Done-Reviewer timed out after 10 minutes"));
+          }, 600_000);
+          reviewerTimeout.unref?.();
           const retryNote: string =
             `RETRY (attempt ${attempt}/${REVIEWER_VERDICT_ATTEMPTS}): attempt ${attempt - 1} for this exact review ended without a usable verdict. ` +
             `Concrete failure from attempt ${attempt - 1}: ${lastAttemptFailure ?? "unknown"}. ` +
@@ -3634,6 +3636,7 @@ export class DirectorRuntime {
             wireModel,
           });
           let res: Awaited<ReturnType<typeof runner.run>> | null = null;
+          let runErr: unknown = null;
           try {
             res = await runner.run({
               runId: reviewRun.id,
@@ -3671,7 +3674,7 @@ export class DirectorRuntime {
                 HARNESS_GOALS_DIR: goalsDir,
                 HARNESS_ARTIFACTS_DIR: artifactsDir,
               },
-              signal: reviewerSignal,
+              signal: attemptSignal,
               callbacks: {
                 onSessionId: (sid) => {
                   this.db.updateTask(reviewerTask.id, { sessionId: sid });
@@ -3692,38 +3695,49 @@ export class DirectorRuntime {
               },
             });
           } catch (err) {
-            if (!submittedBeforeTimeout()) throw err;
+            runErr = err;
           } finally {
+            clearTimeout(reviewerTimeout);
+            reviewerTimeout = undefined;
             cost.finish();
           }
-          const keepSubmitted = submittedBeforeTimeout();
-          if (!keepSubmitted) {
-            reviewerSignal.throwIfAborted();
-            if (res && res.stopReason !== "completed") {
-              throw new Error(`Reviewer stopped: ${res.stopReason}. ${res.text}`);
-            }
-          }
-          assertCurrent();
 
-          // Fallback JSON parse if reviewer returned JSON text instead of calling submit_review_verdict
-          if (!verdictBox.value && res) {
-            const parsed = parseReviewerVerdictJson<Partial<SubmittedVerdict>>(res.text);
+          // Genuine cancellation (goal/run/reviewer cancelled or invalidated) exits immediately without retry.
+          cancelSignal.throwIfAborted();
+          if (this.db.getTask(reviewerTask.id)?.status !== "running") throw new Error("Reviewer cancelled");
+          assertCurrent();
+          if (runErr instanceof PendingAmendmentError) throw runErr;
+
+          const keepSubmitted = submittedBeforeAttemptTimeout();
+          const completedNormally = !runErr && !attemptTimedOut && res?.stopReason === "completed";
+
+          // Fallback JSON parse if reviewer completed normally and returned JSON text instead of calling submit_review_verdict
+          if (completedNormally && !verdictBox.value && res) {
+            const parsed = parseReviewerVerdictJson<SubmittedVerdict>(res.text);
             if (parsed) {
               verdictBox.value = {
-                verdict: parsed.verdict as SubmittedVerdict["verdict"],
-                criteriaResults: parsed.criteriaResults ?? [],
+                verdict: parsed.verdict,
+                criteriaResults: parsed.criteriaResults,
                 blockingIssues: parsed.blockingIssues ?? [],
-                summary: typeof parsed.summary === "string" ? parsed.summary : "",
+                summary: parsed.summary,
               };
             }
           }
-          if (verdictBox.value) break;
+          if (keepSubmitted || (completedNormally && verdictBox.value)) break;
 
-          // A completed session without a usable verdict is retried once in a fresh session with the concrete error;
+          // Any recoverable attempt failure (runner error, non-completed/empty stopReason, wall-clock timeout, or
+          // completed without a valid verdict) is retried once in a fresh session with the concrete failure;
           // nothing is recorded in goal_reviews and no review cycle is consumed.
           const text = res?.text ?? "";
-          const textParseError = text ? describeReviewerTextParseError(text) : null;
+          const runErrMsg = runErr ? (runErr instanceof Error ? runErr.message : String(runErr)) : null;
+          const effectiveStopReason = attemptTimedOut ? "timeout" : runErr ? "runner_error" : (res?.stopReason || "(empty)");
+          const textParseError = completedNormally && text ? describeReviewerTextParseError(text) : null;
           const errorParts = [
+            attemptTimedOut ? `reviewer session timed out${runErrMsg ? `: ${runErrMsg}` : ""}` : null,
+            !attemptTimedOut && runErrMsg ? `runner error: ${runErrMsg}` : null,
+            !attemptTimedOut && !runErr && res?.stopReason !== "completed"
+              ? `non-completed stopReason=${JSON.stringify(res?.stopReason ?? "")}`
+              : null,
             lastSubmitError ? `submit_review_verdict rejected: ${lastSubmitError}` : null,
             textParseError ? `final text parse failed: ${textParseError}` : null,
           ].filter((part): part is string => part !== null);
@@ -3732,7 +3746,7 @@ export class DirectorRuntime {
           const outputTail = text.trim().slice(-300) || "(empty)";
           const attemptDetail: string = [
             `attempt ${attempt}/${REVIEWER_VERDICT_ATTEMPTS}`,
-            `stopReason=${res?.stopReason ?? "unknown"}`,
+            `stopReason=${effectiveStopReason}`,
             `submit_review_verdict=${submitSummary}`,
             errorParts.length > 0 ? errorParts.join("; ") : "no parseable JSON verdict in final text",
             `turnsUsed=${turnsUsed}`,
@@ -3744,7 +3758,9 @@ export class DirectorRuntime {
           if (attempt >= REVIEWER_VERDICT_ATTEMPTS) {
             throw new ReviewerFailedError(attempt, attemptFailures.join(" | "), attemptFailures);
           }
-          emit("agent.error", { error: `Reviewer returned no usable verdict (${attemptDetail}). Retrying in a fresh reviewer session.` });
+          emit("agent.error", {
+            error: `Reviewer attempt ${attempt}/${REVIEWER_VERDICT_ATTEMPTS} failed without a usable verdict (${attemptDetail}). Retrying in a fresh reviewer session.`,
+          });
         }
 
         const submittedVerdict = verdictBox.value;
@@ -3838,31 +3854,14 @@ export class DirectorRuntime {
           throw err;
         }
         const detail = err instanceof Error ? err.message : String(err);
-        // A wall-clock timeout without a verdict is a reviewer failure with the full diagnostic, not a bare abort.
-        if (timedOut && !signal.aborted) {
-          const timeoutDetail =
-            `attempt ${Math.max(currentAttempt, 1)}/${REVIEWER_VERDICT_ATTEMPTS}, stopReason=timeout, ` +
-            `submit_review_verdict=${submitCallsThisAttempt > 0 ? `called (${submitCallsThisAttempt}x, rejected)` : "not called"}, ` +
-            `turnsUsed=${turnsUsed}, reviewerMaxTurns=${reviewerMaxTurns} advisory` +
-            (lastSubmitError ? `, submit_review_verdict rejected: ${lastSubmitError}` : "") +
-            `; ${detail}`;
-          const failures = [...attemptFailures, timeoutDetail];
-          const timeoutErr = new ReviewerFailedError(Math.max(currentAttempt, 1), failures.join(" | "), failures);
-          failReviewer(timeoutErr.message, {
-            reviewerFailed: true,
-            attempts: timeoutErr.attempts,
-            attemptFailures: failures,
-            summary: timeoutErr.message,
-          });
-          throw timeoutErr;
-        }
         failReviewer(detail, {
           reviewerFailed: true,
           attempts: Math.max(currentAttempt, 1),
           attemptFailures,
           summary: `${failedSummary} (${detail}; turns=${turnsUsed})`,
         });
-        reviewerSignal.throwIfAborted();
+        cancelSignal.throwIfAborted();
+        if (err instanceof PendingAmendmentError) throw err;
         throw new Error(`${failedSummary} (${detail}; turns=${turnsUsed})`);
       } finally {
         activeAttempt = 0;
@@ -5719,48 +5718,116 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === "object" && !Array.isArray(v);
 }
 
-/** Normalizes one reviewer criterion result (snake_case aliases, strict `passed === true`); null without an id. */
-export function normalizeCriterionEvaluation(raw: unknown): CriterionEvaluation | null {
-  if (!isPlainObject(raw)) return null;
-  const id = raw.criterionId ?? raw.criterion_id;
-  if (typeof id !== "string" || !id.trim()) return null;
+function validateCriterionEvaluation(raw: unknown, index: number): { value: CriterionEvaluation } | { error: string } {
+  if (!isPlainObject(raw)) {
+    return {
+      error: `criteriaResults[${index}] must be an object (got ${raw === null ? "null" : Array.isArray(raw) ? "array" : typeof raw})`,
+    };
+  }
+  const id = raw.criterionId !== undefined ? raw.criterionId : raw.criterion_id;
+  if (typeof id !== "string" || !id.trim()) {
+    return { error: `criteriaResults[${index}].criterionId must be a non-empty string` };
+  }
+  if (typeof raw.passed !== "boolean") {
+    return {
+      error: `criteriaResults[${index}].passed must be a boolean (got ${raw.passed === undefined ? "missing" : raw.passed === null ? "null" : typeof raw.passed})`,
+    };
+  }
+  if (typeof raw.evidence !== "string") {
+    return {
+      error: `criteriaResults[${index}].evidence must be a string (got ${raw.evidence === undefined ? "missing" : raw.evidence === null ? "null" : typeof raw.evidence})`,
+    };
+  }
+  if (raw.remediation !== undefined && typeof raw.remediation !== "string") {
+    return {
+      error: `criteriaResults[${index}].remediation must be a string when provided (got ${raw.remediation === null ? "null" : typeof raw.remediation})`,
+    };
+  }
   return {
-    criterionId: id.trim(),
-    passed: raw.passed === true,
-    evidence: typeof raw.evidence === "string" ? raw.evidence : "",
-    ...(typeof raw.remediation === "string" ? { remediation: raw.remediation } : {}),
+    value: {
+      criterionId: id.trim(),
+      passed: raw.passed,
+      evidence: raw.evidence,
+      ...(typeof raw.remediation === "string" ? { remediation: raw.remediation } : {}),
+    },
   };
 }
 
-/**
- * Normalizes a reviewer verdict: unwraps one `{ review }` / `{ result }` level, accepts snake_case aliases,
- * requires a known verdict, and coerces criteria and blocking issues. Never adds a key the input lacked.
- */
-export function normalizeReviewerVerdict<T extends { verdict?: unknown }>(raw: unknown): T | null {
-  if (!isPlainObject(raw)) return null;
+/** Validates and normalizes one reviewer criterion result (snake_case aliases, strict boolean `passed` and string `evidence`). */
+export function normalizeCriterionEvaluation(raw: unknown): CriterionEvaluation | null {
+  const res = validateCriterionEvaluation(raw, 0);
+  return "value" in res ? res.value : null;
+}
+
+function validateReviewerVerdict<T extends { verdict?: unknown }>(raw: unknown): { value: T } | { error: string } {
+  if (!isPlainObject(raw)) {
+    return {
+      error: `verdict payload must be a JSON object (got ${raw === null ? "null" : Array.isArray(raw) ? "array" : typeof raw})`,
+    };
+  }
   let obj = raw;
   if (typeof obj.verdict !== "string") {
     const inner = isPlainObject(obj.review) ? obj.review : isPlainObject(obj.result) ? obj.result : null;
-    if (!inner) return null;
+    if (!inner) {
+      return { error: 'missing string field "verdict" (expected approved | changes_requested | escalate_human)' };
+    }
     obj = inner;
   }
   const verdict = typeof obj.verdict === "string" ? obj.verdict.trim() : "";
-  if (!REVIEWER_VERDICTS.includes(verdict)) return null;
+  if (!REVIEWER_VERDICTS.includes(verdict)) {
+    return { error: `invalid verdict ${JSON.stringify(verdict)} (expected approved | changes_requested | escalate_human)` };
+  }
   const { criteria_results, blocking_issues, ...rest } = obj;
-  const out: Record<string, unknown> = { ...rest, verdict };
-  const criteria = rest.criteriaResults ?? criteria_results;
-  if (criteria !== undefined) {
-    out.criteriaResults = Array.isArray(criteria)
-      ? criteria.map(normalizeCriterionEvaluation).filter((c): c is CriterionEvaluation => c !== null)
-      : [];
+  const criteria = rest.criteriaResults !== undefined ? rest.criteriaResults : criteria_results;
+  if (!Array.isArray(criteria)) {
+    return {
+      error: `criteriaResults must be an array (got ${criteria === undefined ? "missing" : criteria === null ? "null" : typeof criteria})`,
+    };
   }
-  const issues = rest.blockingIssues ?? blocking_issues;
+  const normalizedCriteria: CriterionEvaluation[] = [];
+  for (let i = 0; i < criteria.length; i++) {
+    const item = validateCriterionEvaluation(criteria[i], i);
+    if ("error" in item) return { error: item.error };
+    normalizedCriteria.push(item.value);
+  }
+  const issues = rest.blockingIssues !== undefined ? rest.blockingIssues : blocking_issues;
+  let normalizedIssues: string[] | undefined;
   if (issues !== undefined) {
-    out.blockingIssues =
-      typeof issues === "string" ? [issues] : Array.isArray(issues) ? issues.filter((i): i is string => typeof i === "string") : [];
+    if (!Array.isArray(issues)) {
+      return {
+        error: `blockingIssues must be an array of strings when provided (got ${issues === null ? "null" : typeof issues})`,
+      };
+    }
+    for (let i = 0; i < issues.length; i++) {
+      if (typeof issues[i] !== "string") {
+        return { error: `blockingIssues[${i}] must be a string (got ${issues[i] === null ? "null" : typeof issues[i]})` };
+      }
+    }
+    normalizedIssues = issues as string[];
   }
-  if (rest.summary !== undefined && typeof rest.summary !== "string") out.summary = String(rest.summary);
-  return out as T;
+  if (typeof rest.summary !== "string" || !rest.summary.trim()) {
+    return {
+      error: `summary must be a non-empty string (got ${rest.summary === undefined ? "missing" : rest.summary === null ? "null" : typeof rest.summary === "string" ? "empty string" : typeof rest.summary})`,
+    };
+  }
+  const out: Record<string, unknown> = {
+    ...rest,
+    verdict,
+    criteriaResults: normalizedCriteria,
+    summary: rest.summary,
+  };
+  if (normalizedIssues !== undefined) out.blockingIssues = normalizedIssues;
+  return { value: out as T };
+}
+
+/**
+ * Strictly validates and normalizes a reviewer verdict: unwraps one `{ review }` / `{ result }` level, accepts
+ * snake_case aliases, requires a known verdict, a valid `criteriaResults` array (each item having non-empty string
+ * `criterionId`, boolean `passed`, and string `evidence`), optional string[] `blockingIssues`, and non-empty `summary`.
+ */
+export function normalizeReviewerVerdict<T extends { verdict?: unknown }>(raw: unknown): T | null {
+  const res = validateReviewerVerdict<T>(raw);
+  return "value" in res ? res.value : null;
 }
 
 const VERDICT_SCAN_BYTES = 256 * 1024;
@@ -5791,22 +5858,10 @@ function balancedObjectEnd(text: string, start: number): number {
 
 /** Explains why `normalizeReviewerVerdict` rejected a value, for tool errors and retry diagnostics. */
 export function describeReviewerVerdictError(raw: unknown): string {
-  if (!isPlainObject(raw)) {
-    return `verdict payload must be a JSON object (got ${raw === null ? "null" : Array.isArray(raw) ? "array" : typeof raw})`;
-  }
-  let obj = raw;
-  if (typeof obj.verdict !== "string") {
-    const inner = isPlainObject(obj.review) ? obj.review : isPlainObject(obj.result) ? obj.result : null;
-    if (!inner) {
-      return 'missing string field "verdict" (expected approved | changes_requested | escalate_human)';
-    }
-    obj = inner;
-  }
-  const verdict = typeof obj.verdict === "string" ? obj.verdict.trim() : "";
-  if (!REVIEWER_VERDICTS.includes(verdict)) {
-    return `invalid verdict ${JSON.stringify(verdict)} (expected approved | changes_requested | escalate_human)`;
-  }
-  return "verdict must be approved | changes_requested | escalate_human, with criteriaResults[{criterionId, passed, evidence}]";
+  const res = validateReviewerVerdict(raw);
+  return "error" in res
+    ? res.error
+    : "verdict must be approved | changes_requested | escalate_human, with criteriaResults[{criterionId, passed, evidence}] and non-empty summary";
 }
 
 /** Explains why `parseReviewerVerdictJson` could not extract a valid verdict from reviewer text. */
