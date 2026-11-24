@@ -10,6 +10,42 @@ import { TimerManager } from "./timers.js";
 import { KnowledgeBaseStore } from "../kb/store.js";
 
 export const SUMMARY_LIMIT = 2000;
+const DERIVED_TITLE_MAX_CHARS = 80;
+
+function normalizeTitleCandidate(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const lower = trimmed.toLowerCase();
+  if (lower === "undefined" || lower === "null") return null;
+  return trimmed;
+}
+
+export function deriveTitle(
+  raw: unknown,
+  sources: unknown[],
+  fallback: string,
+): { title: string; derived: boolean } {
+  const direct = normalizeTitleCandidate(raw);
+  if (direct !== null) {
+    return { title: direct, derived: false };
+  }
+  for (const source of sources) {
+    if (typeof source !== "string") continue;
+    const firstLine = source
+      .split(/\r?\n/)
+      .map((line) => normalizeTitleCandidate(line))
+      .find((line): line is string => line !== null);
+    if (firstLine) {
+      const title =
+        firstLine.length > DERIVED_TITLE_MAX_CHARS
+          ? `${firstLine.slice(0, DERIVED_TITLE_MAX_CHARS - 1).trimEnd()}…`
+          : firstLine;
+      return { title, derived: true };
+    }
+  }
+  return { title: fallback, derived: true };
+}
 
 export interface FallbackGitSummary {
   head?: string;
@@ -1076,7 +1112,7 @@ export class ControlPlaneDb {
     parentId?: string | null;
     tier: AgentTier;
     kind: TaskKind;
-    title: string;
+    title?: string;
     objective: string;
     criteria?: string;
     readOnly?: boolean;
@@ -1091,6 +1127,7 @@ export class ControlPlaneDb {
     return this.transaction(() => {
       const id = nextFriendlyId(this.db, "t", "tasks");
       const now = Date.now();
+      const { title } = deriveTitle(input.title, [input.objective], `Untitled ${input.kind} task`);
       const deps = input.dependsOn ?? [];
       const scopes = input.writeScopes ?? [];
 
@@ -1173,7 +1210,7 @@ export class ControlPlaneDb {
           input.parentId ?? null,
           input.tier,
           input.kind,
-          input.title,
+          title,
           input.objective,
           input.criteria ?? "",
           input.readOnly ? 1 : 0,
@@ -1657,7 +1694,7 @@ export class ControlPlaneDb {
     toTaskId: string | null;
     severity: EscalationSeverity;
     category: EscalationCategory;
-    title: string;
+    title?: string;
     evidencePaths: string[];
     attempted?: string[];
     suggestedSplits?: string[];
@@ -1671,6 +1708,11 @@ export class ControlPlaneDb {
     }
     const id = nextFriendlyId(this.db, "esc", "escalations");
     const now = Date.now();
+    const { title } = deriveTitle(
+      input.title,
+      [...(input.attempted ?? []), input.evidencePaths[0]],
+      `Untitled ${input.category} issue`,
+    );
     this.db
       .prepare(
         `INSERT INTO escalations(
@@ -1685,7 +1727,7 @@ export class ControlPlaneDb {
         input.toTaskId,
         input.severity,
         input.category,
-        input.title,
+        title,
         JSON.stringify(input.evidencePaths),
         JSON.stringify(input.attempted ?? []),
         JSON.stringify(input.suggestedSplits ?? []),
