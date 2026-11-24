@@ -39,6 +39,7 @@ import type { SteerTaskResult } from "./orchestrator.js";
 import { REJECTIONS } from "../advisories/rejections.js";
 import { roleOf } from "../advisories/roles.js";
 import { allowedToolNames, notYourTool, toolsForRole } from "../tool-descriptions/index.js";
+import { allowedToolsForRole } from "../tool-descriptions/registry.js";
 
 export { readRunDossier } from "./dossiers.js";
 export { compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./handoffs.js";
@@ -145,6 +146,10 @@ export function toolsForTask(task: TaskToolSubject): ToolDefinition[] {
   return toolsForRole(roleOf(task), { readOnly: task.readOnly || isReadOnlyKind(task.kind) });
 }
 
+export function allowedToolsForTask(task: TaskToolSubject): ToolDefinition[] {
+  return allowedToolsForRole(roleOf(task));
+}
+
 export function toolsForTier(tier: AgentTier): ToolDefinition[] {
   if (tier === 1) return toolsForRole("orchestrator");
   if (tier === 2) return toolsForRole("worker");
@@ -232,7 +237,7 @@ export class ControlPlaneToolExecutor {
       const res = await createCodeModeExecutor({
         ...this.config.codeExec,
         mode,
-        allowedTools: () => toolsForTask(task),
+        allowedTools: () => (name === CODE_EXEC_TOOL_NAME ? allowedToolsForTask(task) : toolsForTask(task)),
         execute: (inner, input, execSignal) => {
           if (
             signal?.aborted ||

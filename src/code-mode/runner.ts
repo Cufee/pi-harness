@@ -18,6 +18,8 @@ export interface CodeExecToolEvent {
 }
 export interface CodeExecOptions {
   code: string; tools: ToolDefinition[];
+  /** Optional authorized callable tool names beyond listed `tools` (e.g. unlisted-but-allowed role tools). */
+  allowedToolNames?: Iterable<string>;
   /** Default TypeScript. Python runs a harness-managed CPython under the same sandbox and IPC. */
   language?: CodeLanguage;
   /** Python only: exact `name==version` wheel pins. */
@@ -203,6 +205,10 @@ export function createCodeExecIpcServer(ctx: {
   });
 }
 
+export function codeExecCallableNames(opts: Pick<CodeExecOptions, "tools" | "allowedToolNames">): Set<string> {
+  return new Set([...opts.tools.map((t) => t.name), ...(opts.allowedToolNames ?? [])]);
+}
+
 export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult> {
   const result: CodeExecResult = { ok: false, preview: "", logs: "", toolCalls: 0 };
   let python: PythonRuntime | undefined;
@@ -219,7 +225,7 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
       return result;
     }
   }
-  const names = new Set(opts.tools.map(t => t.name));
+  const names = codeExecCallableNames(opts);
   const sockets = new Set<Socket>();
   const execAbort = new AbortController();
   let child: ChildProcess | undefined, dir: string | undefined, output: unknown, sandboxDenial = false, stopped = false;
@@ -267,7 +273,13 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     if (python) {
       [cmd, ...args] = pythonSandboxCommand(python.exe, python.roots, dir, socket);
       env = pythonSandboxEnv(dir);
-      const { module, stubs } = pythonModule(pythonTools(opts.tools).map(t => t.name), generatePythonDeclarations(opts.tools));
+      const extraPythonTools = [...names]
+        .filter((n) => !opts.tools.some((t) => t.name === n))
+        .map((name): ToolDefinition => ({ name, description: "", inputSchema: {} }));
+      const { module, stubs } = pythonModule(
+        pythonTools([...opts.tools, ...extraPythonTools]).map((t) => t.name),
+        generatePythonDeclarations(opts.tools),
+      );
       await Promise.all([
         writeFile(join(dir, "_cm_bridge.py"), pythonBridge(socket)), writeFile(join(dir, "_cm_guard.py"), pythonGuard),
         writeFile(join(dir, "_cm_entry.py"), pythonEntry(python.sitePackages)), writeFile(join(dir, "script.py"), opts.code),
