@@ -89,6 +89,16 @@ describe("goal-42 Slice B: Tier 1 relaunch on ACP_EXECUTOR_LOST_ERROR_CODE", () 
           profileId: "pi:local",
           model: "fixture/fixture",
         });
+        const seededRisk = `Seeded prior risk (${stopReason}): worker-B holds shared lease`;
+        const seededAction = `Seeded prior action (${stopReason}): verify slice C after relaunch`;
+        db.updateTask(t1.id, {
+          handoffJson: JSON.stringify({
+            goalInvariants: ["Never lose prior handoff state"],
+            architecturalDecisions: [{ decision: "Use wait-routed steering", rationale: "Avoids cancel-steer" }],
+            activeRisks: [seededRisk],
+            nextActions: [seededAction],
+          }),
+        });
 
         orch.launchTaskLoop(t1.id);
         await waitUntil(
@@ -105,6 +115,25 @@ describe("goal-42 Slice B: Tier 1 relaunch on ACP_EXECUTOR_LOST_ERROR_CODE", () 
           genPrompts[1]?.includes(ACP_EXECUTOR_LOST_ERROR_CODE) ||
             genPrompts[1]?.includes("No executor is connected during wait_children"),
           "Generation 2 hydration prompt must carry generation 1 handoff context",
+        );
+        const persistedHandoff = finalTask.handoffJson
+          ? (JSON.parse(finalTask.handoffJson) as { activeRisks?: string[]; nextActions?: string[] })
+          : null;
+        assert.ok(
+          persistedHandoff?.activeRisks?.includes(seededRisk),
+          `Expected prior activeRisks to survive executor-loss relaunch (${stopReason}), got: ${JSON.stringify(persistedHandoff?.activeRisks)}`,
+        );
+        assert.ok(
+          persistedHandoff?.nextActions?.includes(seededAction),
+          `Expected prior nextActions to survive executor-loss relaunch (${stopReason}), got: ${JSON.stringify(persistedHandoff?.nextActions)}`,
+        );
+        assert.ok(
+          genPrompts[1]?.includes(seededRisk),
+          `Generation 2 prompt must include prior activeRisk (${stopReason})`,
+        );
+        assert.ok(
+          genPrompts[1]?.includes(seededAction),
+          `Generation 2 prompt must include prior nextAction (${stopReason})`,
         );
 
         const rolloverEvents = db
@@ -312,4 +341,188 @@ describe("goal-42 Slice B: Tier 1 relaunch on ACP_EXECUTOR_LOST_ERROR_CODE", () 
       }
     });
   }
+
+  it("P1-2: coded acp_executor_lost beats context-overflow text heuristics on both Tier 2 (fails without rollover) and Tier 1 (relaunches with acp_executor_lost)", async () => {
+    const { root, repoRoot, stateDir, baseSha } = await makeTempGitRepo("pi-g42-p12-overflow-");
+    const t2Gens: number[] = [];
+    const t1Gens: number[] = [];
+
+    const { db, orch } = makeOrchestrator(repoRoot, stateDir, () => ({
+      run: async (req) => {
+        if (req.tier === 2) {
+          t2Gens.push(req.taskGeneration ?? t2Gens.length + 1);
+          return {
+            text: "Observed earlier note: maximum context length exceeded; then No executor is connected",
+            stopReason: "error",
+            errorCode: ACP_EXECUTOR_LOST_ERROR_CODE,
+          };
+        }
+        const gen = req.taskGeneration ?? t1Gens.length + 1;
+        t1Gens.push(gen);
+        if (gen === 1) {
+          return {
+            text: "maximum context length exceeded in log excerpt; No executor is connected",
+            stopReason: "error",
+            errorCode: ACP_EXECUTOR_LOST_ERROR_CODE,
+          };
+        }
+        return { text: "T1 recovered in gen 2", stopReason: "completed" };
+      },
+    }));
+
+    try {
+      const run = db.createRun({
+        goal: "Coded executor loss beats overflow text heuristic",
+        repoRoot,
+        baseBranch: "main",
+        baseSha,
+      });
+      const t1 = db.createTask({
+        runId: run.id,
+        tier: 1,
+        kind: "orchestrator",
+        title: "Tier 1 with overflow text in error",
+        objective: "Relaunch with acp_executor_lost reason",
+        readOnly: true,
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      db.updateTask(t1.id, { status: "running" });
+
+      const t2 = await orch.spawnAndStartTask({
+        runId: run.id,
+        parentId: t1.id,
+        tier: 2,
+        kind: "worker",
+        title: "Tier 2 with overflow text in error",
+        objective: "Must fail immediately with acp_executor_lost",
+        readOnly: false,
+        writeScopes: ["README.md"],
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+
+      await waitUntil(
+        () => ["completed", "failed", "cancelled", "paused_quota"].includes(db.getTask(t2.id)?.status ?? ""),
+        8_000,
+        "T2 settles",
+      );
+
+      const finalT2 = db.getTask(t2.id)!;
+      assert.deepEqual(t2Gens, [1], `Tier 2 must fail in gen 1 without overflow rollover, got gens ${JSON.stringify(t2Gens)}`);
+      assert.equal(finalT2.status, "failed");
+      assert.equal(finalT2.generation, 1);
+      assert.ok(finalT2.summary?.includes(ACP_EXECUTOR_LOST_ERROR_CODE));
+      const t2Result = finalT2.resultJson ? (JSON.parse(finalT2.resultJson) as { errorCode?: string }) : null;
+      assert.equal(t2Result?.errorCode, ACP_EXECUTOR_LOST_ERROR_CODE);
+      assert.equal(
+        db.getEventsSince(run.id, 0, t2.id).filter((e) => e.type === "agent.rollover").length,
+        0,
+        "Tier 2 must NOT emit agent.rollover on acp_executor_lost",
+      );
+
+      // Now run Tier 1 with the same overflow text + coded acp_executor_lost
+      db.updateTask(t1.id, { status: "ready" });
+      orch.launchTaskLoop(t1.id);
+      await waitUntil(() => db.getTask(t1.id)?.status === "completed", 8_000, "T1 completes after relaunch");
+
+      assert.deepEqual(t1Gens, [1, 2]);
+      const t1Rollovers = db.getEventsSince(run.id, 0, t1.id).filter((e) => e.type === "agent.rollover");
+      assert.equal(t1Rollovers.length, 1);
+      assert.deepEqual(t1Rollovers[0]!.payload, {
+        fromGen: 1,
+        toGen: 2,
+        reason: "acp_executor_lost",
+      });
+    } finally {
+      await orch.dispose();
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("P1-2: coded acp_executor_lost beats child-quota propagation on Tier 2 (fails instead of paused_quota)", async () => {
+    const { root, repoRoot, stateDir, baseSha } = await makeTempGitRepo("pi-g42-p12-child-quota-");
+    const t2Gens: number[] = [];
+
+    const { db, orch } = makeOrchestrator(repoRoot, stateDir, () => ({
+      run: async (req) => {
+        t2Gens.push(req.taskGeneration ?? t2Gens.length + 1);
+        // Seed a quota-paused Tier 3 child under this Tier 2 worker before failing with acp_executor_lost.
+        const child = db.createTask({
+          runId: req.runId,
+          parentId: req.taskId,
+          tier: 3,
+          kind: "research",
+          title: "Quota-paused Tier 3 child",
+          objective: "Paused on provider quota",
+          readOnly: true,
+          profileId: "pi:local",
+          model: "fixture/fixture",
+        });
+        db.updateTask(child.id, { status: "paused_quota", summary: "Paused on quota" });
+        return {
+          text: "No executor is connected",
+          stopReason: "error",
+          errorCode: ACP_EXECUTOR_LOST_ERROR_CODE,
+        };
+      },
+    }));
+
+    try {
+      const run = db.createRun({
+        goal: "Coded executor loss beats child quota propagation",
+        repoRoot,
+        baseBranch: "main",
+        baseSha,
+      });
+      const parent = db.createTask({
+        runId: run.id,
+        tier: 1,
+        kind: "orchestrator",
+        title: "Parent T1",
+        objective: "Parent",
+        readOnly: true,
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      db.updateTask(parent.id, { status: "running" });
+
+      const worker = await orch.spawnAndStartTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 2,
+        kind: "worker",
+        title: "Tier 2 with quota-paused T3 child",
+        objective: "Must fail with acp_executor_lost rather than becoming paused_quota",
+        readOnly: false,
+        writeScopes: ["README.md"],
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+
+      await waitUntil(
+        () => ["completed", "failed", "cancelled", "paused_quota"].includes(db.getTask(worker.id)?.status ?? ""),
+        8_000,
+        "T2 settles",
+      );
+
+      const finalWorker = db.getTask(worker.id)!;
+      assert.deepEqual(t2Gens, [1]);
+      assert.equal(finalWorker.status, "failed", `Expected failed, got ${finalWorker.status}`);
+      assert.ok(
+        finalWorker.summary?.includes(ACP_EXECUTOR_LOST_ERROR_CODE),
+        `Expected ${ACP_EXECUTOR_LOST_ERROR_CODE} in worker summary, got: ${finalWorker.summary}`,
+      );
+      const parsed = finalWorker.resultJson
+        ? (JSON.parse(finalWorker.resultJson) as { errorCode?: string; fallback?: { error_code?: string } })
+        : null;
+      assert.equal(parsed?.errorCode, ACP_EXECUTOR_LOST_ERROR_CODE);
+      assert.equal(parsed?.fallback?.error_code, ACP_EXECUTOR_LOST_ERROR_CODE);
+    } finally {
+      await orch.dispose();
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
