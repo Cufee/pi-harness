@@ -1538,14 +1538,16 @@ export class ControlPlaneToolExecutor {
           wakeOnEvent:
             args.wake_on_event === "child_settled" || args.wake_on_event === "any" ? args.wake_on_event : "none",
         });
+        const sig = scriptSignal ?? this.hooks.getTaskSignal(taskId);
+        // Register the waiter before emitting events so any immediate fire wakes wait_timer instead of steering.
+        const waitPromise = this.db.timers.waitForTimer(timer.id, sig);
         this.db.emitEvent(runId, taskId, "agent.timer_sleep", {
           timerId: timer.id,
           wakeAt: timer.wakeAt,
           reason: timer.reason,
           wakeOnEvent: timer.wakeOnEvent,
         });
-        const sig = scriptSignal ?? this.hooks.getTaskSignal(taskId);
-        const res = await this.db.timers.waitForTimer(timer.id, sig);
+        const res = await waitPromise;
         return {
           timerId: res.timer.id,
           status: res.timer.status,

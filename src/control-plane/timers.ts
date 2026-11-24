@@ -1,6 +1,11 @@
 import type { Database } from "bun:sqlite";
 import { friendlyIdCandidates, nextFriendlyId } from "./ids.js";
 
+export interface TimerFireMeta {
+  /** True when at least one active `waitForTimer` caller received this fire directly. */
+  deliveredToWaiter: boolean;
+}
+
 export type TimerOwnerKind = "chat" | "task";
 export type TimerStatus = "pending" | "fired" | "cancelled";
 export type TimerWakeEvent = "none" | "user_message" | "goal_settled" | "child_settled" | "any";
@@ -69,8 +74,11 @@ const MAX_TIMEOUT_CHUNK_MS = 2_000_000_000;
  */
 export class TimerManager {
   private handles = new Map<string, ReturnType<typeof setTimeout>>();
-  private waiters = new Map<string, Set<(res: { timer: TimerRecord; wakeReason: string }) => void>>();
-  private onFireCallback: ((timer: TimerRecord, wakeReason: string) => void) | null = null;
+  private waiters = new Map<
+    string,
+    { taskOwnerId: string | null; fns: Set<(res: { timer: TimerRecord; wakeReason: string }) => void> }
+  >();
+  private onFireCallback: ((timer: TimerRecord, wakeReason: string, meta: TimerFireMeta) => void) | null = null;
   private disposed = false;
   private suspendMode: "none" | "startup" | "stopping" = "none";
 
@@ -78,8 +86,32 @@ export class TimerManager {
     this.db.exec(TIMER_SCHEMA);
   }
 
-  setOnFire(cb: (timer: TimerRecord, wakeReason: string) => void): void {
+  setOnFire(cb: (timer: TimerRecord, wakeReason: string, meta: TimerFireMeta) => void): void {
     this.onFireCallback = cb;
+  }
+
+  /** True when `taskId` currently has at least one active `wait_timer` call awaiting a timer it owns. */
+  isTaskWaitingTimer(taskId: string): boolean {
+    for (const entry of this.waiters.values()) {
+      if (entry.taskOwnerId === taskId && entry.fns.size > 0) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Unblocks any active `wait_timer` calls owned by `taskId` without invoking `onFireCallback`
+   * (used to deliver incoming steering/amendments through an active `wait_timer` result).
+   */
+  wakeTaskWaiters(taskId: string, wakeReason = "steered"): number {
+    const ids: string[] = [];
+    for (const [id, entry] of this.waiters) {
+      if (entry.taskOwnerId === taskId && entry.fns.size > 0) ids.push(id);
+    }
+    let woken = 0;
+    for (const id of ids) {
+      if (this.cancel(id, wakeReason)) woken += 1;
+    }
+    return woken;
   }
 
   /**
@@ -105,10 +137,10 @@ export class TimerManager {
     this.handles.clear();
     const pendingWaiters = [...this.waiters.entries()];
     this.waiters.clear();
-    for (const [id, set] of pendingWaiters) {
+    for (const [id, entry] of pendingWaiters) {
       const rec = this.get(id);
       if (!rec) continue;
-      for (const fn of set) {
+      for (const fn of entry.fns) {
         fn({ timer: rec, wakeReason: "daemon_restart" });
       }
     }
@@ -260,14 +292,17 @@ export class TimerManager {
     }
 
     return new Promise((resolve) => {
-      let set = this.waiters.get(existing.id);
-      if (!set) {
-        set = new Set();
-        this.waiters.set(existing.id, set);
+      let entry = this.waiters.get(existing.id);
+      if (!entry) {
+        entry = {
+          taskOwnerId: existing.ownerKind === "task" ? existing.ownerId : null,
+          fns: new Set(),
+        };
+        this.waiters.set(existing.id, entry);
       }
       const onAbort = () => {
-        set?.delete(onDone);
-        if (set?.size === 0) this.waiters.delete(existing.id);
+        entry?.fns.delete(onDone);
+        if (entry?.fns.size === 0) this.waiters.delete(existing.id);
         if (this.suspendMode === "stopping") {
           resolve({ timer: this.get(existing.id) ?? existing, wakeReason: "daemon_restart" });
           return;
@@ -279,7 +314,7 @@ export class TimerManager {
         signal?.removeEventListener("abort", onAbort);
         resolve(res);
       };
-      set.add(onDone);
+      entry.fns.add(onDone);
       signal?.addEventListener("abort", onAbort, { once: true });
     });
   }
@@ -288,9 +323,9 @@ export class TimerManager {
     this.disposed = true;
     for (const h of this.handles.values()) clearTimeout(h);
     this.handles.clear();
-    for (const [id, set] of this.waiters) {
+    for (const [id, entry] of this.waiters) {
       const rec = this.get(id);
-      for (const fn of set) {
+      for (const fn of entry.fns) {
         if (rec) fn({ timer: rec, wakeReason: "disposed" });
       }
     }
@@ -338,9 +373,9 @@ export class TimerManager {
       .run(wakeReason, now, id);
     if (res.changes === 0) return null;
     const updated = this.get(id)!;
-    this.resolveWaiters(id, updated, wakeReason);
+    const waiterCount = this.resolveWaiters(id, updated, wakeReason);
     if (!this.disposed) {
-      this.onFireCallback?.(updated, wakeReason);
+      this.onFireCallback?.(updated, wakeReason, { deliveredToWaiter: waiterCount > 0 });
     }
     return updated;
   }
@@ -353,11 +388,16 @@ export class TimerManager {
     }
   }
 
-  private resolveWaiters(id: string, timer: TimerRecord, wakeReason: string): void {
-    const set = this.waiters.get(id);
-    if (!set) return;
+  private resolveWaiters(id: string, timer: TimerRecord, wakeReason: string): number {
+    const entry = this.waiters.get(id);
+    if (!entry) return 0;
     this.waiters.delete(id);
-    for (const fn of set) fn({ timer, wakeReason });
+    let count = 0;
+    for (const fn of entry.fns) {
+      count += 1;
+      fn({ timer, wakeReason });
+    }
+    return count;
   }
 
   private mapRow(r: Record<string, unknown>): TimerRecord {

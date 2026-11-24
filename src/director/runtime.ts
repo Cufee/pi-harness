@@ -33,7 +33,7 @@ import { directorTaskRunOwner } from "../control-plane/ids.js";
 import { canonicalProjectPath, type ProjectRecord } from "../control-plane/projects.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { recordCostInvocation, summarizeCost } from "../cost/ledger.js";
-import { timerMatchesGoalSettlement, type TimerRecord } from "../control-plane/timers.js";
+import { timerMatchesGoalSettlement, type TimerFireMeta, type TimerRecord } from "../control-plane/timers.js";
 import {
   ensureGoalEvidenceDir,
   GoalEngine,
@@ -1097,8 +1097,8 @@ export class DirectorRuntime {
     this.unsubGoalQueue = this.db.admissionQueue.onChange((lane) => {
       if (!this.disposed && (!lane || lane === "goal")) this.syncQueuedGoalProgress();
     });
-    this.db.timers.setOnFire((timer, wakeReason) => {
-      void this.handleTimerFired(timer, wakeReason);
+    this.db.timers.setOnFire((timer, wakeReason, meta) => {
+      void this.handleTimerFired(timer, wakeReason, meta);
     });
   }
 
@@ -1141,8 +1141,11 @@ export class DirectorRuntime {
     this.activeReviewerTools.clear();
   }
 
-  private async handleTimerFired(timer: TimerRecord, wakeReason: string): Promise<void> {
+  private async handleTimerFired(timer: TimerRecord, wakeReason: string, meta?: TimerFireMeta): Promise<void> {
     if (timer.ownerKind === "task") {
+      // A timer awaited via wait_timer delivers its wakeup through the wait_timer tool result;
+      // steering the task would race with that in-flight tool call.
+      if (meta?.deliveredToWaiter) return;
       // Deliver scheduled timer wakeup to the owning Tier 1/2 agent
       const msg = `[SCHEDULED TIMER ${timer.id} FIRED (${wakeReason})]: ${timer.reason}`;
       await this.orchestrator.steerTask(timer.ownerId, msg).catch(() => {});

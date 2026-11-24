@@ -179,6 +179,14 @@ pi-harness daemon reload --legacy --wait
 - After a hard daemon crash, nothing reaps old agent processes.
 - An old-release TUI keeps its old UI until you restart it.
 
+## Amp ACP steering (`AMP_ACP_CANCEL_MODE`)
+
+`AcpRunner` defaults `AMP_ACP_CANCEL_MODE` to `off` (queued next-turn delivery) for Amp ACP sessions. Sending `session/cancel` to Amp while a tool call is in flight can disconnect Amp's MCP tool executor for the remainder of the session (`No executor is connected`).
+
+- **Default (`off` / unset)**: steers and soft rollover warnings return `false` from native live delivery and queue cleanly for the next turn or active wait tool without sending `session/cancel`.
+- **Explicit opt-in (`AMP_ACP_CANCEL_MODE=steer`)**: on local CLI Amp sessions (not Orb or `AMP_ACP_TRANSPORT=sdk`), `AcpRunner` allows cancel-then-prompt mid-turn steering only when no tool call is in flight. If any tool call is running, `handle.steer` still refuses native delivery and falls back to queued delivery without sending `session/cancel`.
+- **Explicit stop/cancel**: user stop, abort, and `handle.cancel` always send `session/cancel` promptly and are never queued.
+
 ## Why not Nix, mise or pixi
 
 Compared on 2026-11-22 against the upstream sources named below.

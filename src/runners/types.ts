@@ -179,10 +179,17 @@ export function validateRunPolicy(req: RunAgentRequest): void {
   }
 }
 
+/** Stable error code on `RunAgentResult` when an ACP session loses its tool executor or ends with an unsolicited cancel. */
+export const ACP_EXECUTOR_LOST_ERROR_CODE = "acp_executor_lost" as const;
+
+export type RunnerErrorCode = typeof ACP_EXECUTOR_LOST_ERROR_CODE;
+
 export interface RunAgentResult {
   text: string;
   // Tasks are never stopped by turn count, so there is no turn-limit stop reason.
   stopReason: "completed" | "cancelled" | "rollover_requested" | "quota_paused" | "error";
+  /** Machine-readable failure classification for broken sessions (e.g. `acp_executor_lost`). */
+  errorCode?: RunnerErrorCode;
   usage?: RunnerUsage;
   sessionId?: string;
   quotaPause?: QuotaPauseInfo;

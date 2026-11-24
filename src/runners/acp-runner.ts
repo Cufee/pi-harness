@@ -43,8 +43,18 @@ export {
 } from "./acp-profile-error.js";
 import { isProtectedWritePath } from "./protected-paths.js";
 import { detectQuotaErrorText } from "./quota-detect.js";
-import { MAX_RUNNER_STEER_CONTINUATIONS, validateRunPolicy } from "./types.js";
-import type { ProbedModelInfo, QuotaPauseInfo, RunAgentRequest, RunAgentResult, RunnerCost, RunnerUsage, ToolPolicy } from "./types.js";
+import { ACP_EXECUTOR_LOST_ERROR_CODE, MAX_RUNNER_STEER_CONTINUATIONS, validateRunPolicy } from "./types.js";
+import type {
+  ProbedModelInfo,
+  QuotaPauseInfo,
+  RunAgentRequest,
+  RunAgentResult,
+  RunnerCost,
+  RunnerErrorCode,
+  RunnerUsage,
+  ToolPolicy,
+} from "./types.js";
+export { ACP_EXECUTOR_LOST_ERROR_CODE, type RunnerErrorCode } from "./types.js";
 
 /** Returns an accurate, human-readable description of the active tool policy and permissions. */
 export function describeToolPolicyMode(toolPolicy: ToolPolicy, allowShellInReadOnly = false): string {
@@ -363,6 +373,59 @@ function stderrTail(buf: string, max = 500): string {
   return out || (lines.at(-1)?.slice(-max) ?? "");
 }
 
+const EXECUTOR_LOST_RE = /No executor is connected/i;
+const EXECUTOR_LOST_LINE_RE =
+  /^\s*(?:Uncaught\s+)?(?:(?:Tool|MCP|RPC)[^:\n]*:\s*)?(?:Error:\s*)?No executor is connected\b/im;
+const EXECUTOR_LOST_TEST_NOISE_RE = /\b(?:AssertionError|bun test)\b|^\s*\d+\s*\|/m;
+
+function collectToolUpdateOutputText(update: Record<string, unknown>): string {
+  const parts: string[] = [];
+  const collect = (val: unknown, depth = 0): void => {
+    if (depth > 4 || val == null) return;
+    if (typeof val === "string") {
+      if (val.trim()) parts.push(val);
+      return;
+    }
+    if (Array.isArray(val)) {
+      for (const item of val) collect(item, depth + 1);
+      return;
+    }
+    if (typeof val === "object") {
+      const obj = val as Record<string, unknown>;
+      for (const key of ["text", "error", "message", "stderr", "output", "result", "content"]) {
+        if (key in obj) collect(obj[key], depth + 1);
+      }
+    }
+  };
+  collect(update.rawOutput);
+  collect(update.content);
+  return parts.join("\n").trim();
+}
+
+function detectExecutorLostToolUpdate(update: Record<string, unknown>, status: string): string | null {
+  const text = collectToolUpdateOutputText(update);
+  if (!text || !EXECUTOR_LOST_RE.test(text)) return null;
+  const lineMatch = text.match(EXECUTOR_LOST_LINE_RE);
+  if (lineMatch) {
+    const start = lineMatch.index ?? 0;
+    return text.slice(start, start + 220).trim();
+  }
+  const rawOut = update.rawOutput;
+  const rawOutIsError = Boolean(
+    rawOut &&
+      typeof rawOut === "object" &&
+      ((rawOut as { isError?: unknown }).isError === true ||
+        typeof (rawOut as { error?: unknown }).error === "string"),
+  );
+  const isErrorShape = status === "failed" || rawOutIsError;
+  // Require an error-shaped short result without test-runner or code-listing noise so normal
+  // file reads, greps, or failing test logs mentioning this phrase never abort a healthy session.
+  if (isErrorShape && text.length <= 500 && !EXECUTOR_LOST_TEST_NOISE_RE.test(text)) {
+    return text.slice(0, 220);
+  }
+  return null;
+}
+
 function extractToolErrorSnippet(update: Record<string, unknown>): string | undefined {
   const rawOut = update.rawOutput;
   if (typeof rawOut === "string" && rawOut.trim()) return rawOut.trim().slice(0, 220);
@@ -474,12 +537,13 @@ export class AcpRunner {
     const isAmpProfile = isAmpAcpProfile(this.profile);
     const ampExecutorIsOrb = prepared.env.AMP_ACP_EXECUTOR?.trim().toLowerCase() === "orb";
     const ampTransportIsSdk = prepared.env.AMP_ACP_TRANSPORT?.trim().toLowerCase() === "sdk";
-    if (isAmpProfile && prepared.env.AMP_ACP_CANCEL_MODE === undefined && !ampExecutorIsOrb && !ampTransportIsSdk) {
-      prepared.env.AMP_ACP_CANCEL_MODE = "steer";
-    }
+    // Default AMP_ACP_CANCEL_MODE to off (queued delivery): sending session/cancel to Amp mid-turn can
+    // drop Amp's MCP tool executor for the rest of the session ("No executor is connected").
+    // Cancel-then-prompt steering stays available only via explicit AMP_ACP_CANCEL_MODE=steer opt-in.
+    const ampCancelMode = prepared.env.AMP_ACP_CANCEL_MODE?.trim().toLowerCase() ?? "off";
     const ampCancelSteerEnabled =
       isAmpProfile &&
-      prepared.env.AMP_ACP_CANCEL_MODE === "steer" &&
+      ampCancelMode === "steer" &&
       !ampExecutorIsOrb &&
       !ampTransportIsSdk;
 
@@ -559,6 +623,12 @@ export class AcpRunner {
     let turnsUsed = 0;
     let completedToolInWave = false;
     const inFlightToolCalls = new Set<string>();
+    let anonymousInFlightToolCalls = 0;
+    const hasInFlightToolCall = () => inFlightToolCalls.size > 0 || anonymousInFlightToolCalls > 0;
+    let harnessCancelIssuedForTurn = false;
+    let steerAckTimedOut = false;
+    let brokenSessionCode: RunnerErrorCode | null = null;
+    let brokenSessionDetail = "";
     const seenToolCallIds = new Set<string>();
     let sessionId: string | undefined;
     let steeringSupported = false;
@@ -696,7 +766,7 @@ export class AcpRunner {
       if (idleTimer) clearTimeout(idleTimer);
       // When an acknowledged tool call (e.g. `wait_children`, `wait_timer`, `submit_for_merge`) is in flight,
       // give it a generous ceiling instead of tripping the short model-inactivity timer.
-      const effectiveMs = inFlightToolCalls.size > 0 ? Math.max(idleTimeoutMs, 1_800_000) : idleTimeoutMs;
+      const effectiveMs = hasInFlightToolCall() ? Math.max(idleTimeoutMs, 1_800_000) : idleTimeoutMs;
       idleTimer = setTimeout(() => {
         idleTimer = null;
         if (quotaWatchdogTriggered || rolloverTriggered || req.signal.aborted) return;
@@ -724,6 +794,7 @@ export class AcpRunner {
       !idleTimedOut &&
       !wrapUpAttempted &&
       !wrapUpTimedOut &&
+      !brokenSessionCode &&
       !childGoneError &&
       !(child && (child.exitCode !== null || child.signalCode !== null)) &&
       !req.isTaskSettled?.();
@@ -735,6 +806,7 @@ export class AcpRunner {
         !conn ||
         !ampCancelSteerEnabled ||
         !promptInFlight ||
+        hasInFlightToolCall() ||
         steerHandoff.pending !== null ||
         steerHandoff.ack !== null ||
         !canStartSteerHandoff(conn)
@@ -785,6 +857,7 @@ export class AcpRunner {
         steerHandoff.ack = state;
       }
       steerHandoff.cancelIssuedForTurn = true;
+      harnessCancelIssuedForTurn = true;
       req.signal.addEventListener("abort", onAckAbort, { once: true });
 
       try {
@@ -814,6 +887,8 @@ export class AcpRunner {
             if (state.ackSettled) return;
             // Cancel the unacknowledged replacement so it cannot deliver later alongside harness fallback.
             if (sessionId && activeConnection === conn) {
+              steerAckTimedOut = true;
+              harnessCancelIssuedForTurn = true;
               void conn.agent.notify("session/cancel", { sessionId }).catch(() => {});
               armCancelGraceTimer("cancelled");
             }
@@ -883,6 +958,7 @@ export class AcpRunner {
         if (
           ampCancelSteerEnabled &&
           promptInFlight &&
+          !hasInFlightToolCall() &&
           steerHandoff.pending === null &&
           steerHandoff.ack === null &&
           canStartSteerHandoff()
@@ -898,7 +974,7 @@ export class AcpRunner {
       }
     };
     const advanceTurnWaveIfNeeded = () => {
-      if (!completedToolInWave || inFlightToolCalls.size > 0) return;
+      if (!completedToolInWave || hasInFlightToolCall()) return;
       completedToolInWave = false;
       turnsUsed += 1;
       req.callbacks.onTurn?.(turnsUsed);
@@ -1439,11 +1515,12 @@ export class AcpRunner {
           }
           if (kind === "tool_call") {
             advanceTurnWaveIfNeeded();
-            if (callId && status !== "completed" && status !== "failed" && status !== "cancelled") {
-              inFlightToolCalls.add(callId);
+            if (status !== "completed" && status !== "failed" && status !== "cancelled") {
+              if (callId) inFlightToolCalls.add(callId);
+              else anonymousInFlightToolCalls += 1;
             }
-          } else if (callId && (status === "in_progress" || status === "pending")) {
-            inFlightToolCalls.add(callId);
+          } else if (status !== "completed" && status !== "failed" && status !== "cancelled") {
+            if (callId) inFlightToolCalls.add(callId);
           }
           const rawTitle = update.title ? String(update.title) : update.name ? String(update.name) : undefined;
           if (callId && rawTitle) {
@@ -1476,30 +1553,50 @@ export class AcpRunner {
             codexExternalCalls.delete(callId);
           }
           const wasInFlight = Boolean(callId && inFlightToolCalls.has(callId));
+          const executorLostSnippet = detectExecutorLostToolUpdate(update, status);
+          if (executorLostSnippet && !brokenSessionCode) {
+            brokenSessionCode = ACP_EXECUTOR_LOST_ERROR_CODE;
+            brokenSessionDetail = executorLostSnippet;
+            steerHandoff.ack?.settleAck(false);
+            steerHandoff.pending?.settleAck(false);
+            if (sessionId && activeConnection && !req.signal.aborted && !rolloverTriggered) {
+              harnessCancelIssuedForTurn = true;
+              void activeConnection.agent.notify("session/cancel", { sessionId }).catch(() => {});
+              armCancelGraceTimer("cancelled");
+            }
+          }
           if (status === "completed") {
             if (callId) {
               inFlightToolCalls.delete(callId);
               harnessToolCallIds.delete(callId);
+            } else {
+              anonymousInFlightToolCalls = Math.max(0, anonymousInFlightToolCalls - 1);
             }
             resetIdleWatchdog();
             completedToolInWave = true;
-            quotaRejected = false;
-            textSinceQuotaRejection = "";
-            disarmQuotaWatchdog(true);
-            turnSucceededTools += 1;
-            if (kind === "tool_call" || wasInFlight) {
-              emitAuthOk();
+            if (!executorLostSnippet) {
+              quotaRejected = false;
+              textSinceQuotaRejection = "";
+              disarmQuotaWatchdog(true);
+              turnSucceededTools += 1;
+              if (kind === "tool_call" || wasInFlight) {
+                emitAuthOk();
+              }
+              if (isHarnessCall) {
+                markHarnessToolObserved();
+              }
+              // Any successful tool call resets the identical-failure streak so exploratory debugging never trips the breaker
+              identicalFailureStreak = 0;
+              lastIdenticalFailureKey = "";
+            } else {
+              allToolFailures.push(`${resolvedTitle}: ${executorLostSnippet}`);
             }
-            if (isHarnessCall) {
-              markHarnessToolObserved();
-            }
-            // Any successful tool call resets the identical-failure streak so exploratory debugging never trips the breaker
-            identicalFailureStreak = 0;
-            lastIdenticalFailureKey = "";
           } else if (status === "failed") {
             if (callId) {
               inFlightToolCalls.delete(callId);
               harnessToolCallIds.delete(callId);
+            } else {
+              anonymousInFlightToolCalls = Math.max(0, anonymousInFlightToolCalls - 1);
             }
             resetIdleWatchdog();
             completedToolInWave = true;
@@ -1513,14 +1610,17 @@ export class AcpRunner {
               lastIdenticalFailureKey = failKey;
               identicalFailureStreak = 1;
             }
-            if (identicalFailureStreak >= IDENTICAL_FAILURE_BREAKER && !identicalFailureBreakerTripped && sessionId && activeConnection) {
+            if (!brokenSessionCode && identicalFailureStreak >= IDENTICAL_FAILURE_BREAKER && !identicalFailureBreakerTripped && sessionId && activeConnection) {
               identicalFailureBreakerTripped = true;
+              harnessCancelIssuedForTurn = true;
               void activeConnection.agent.notify("session/cancel", { sessionId }).catch(() => {});
             }
           } else if (status === "cancelled") {
             if (callId) {
               inFlightToolCalls.delete(callId);
               harnessToolCallIds.delete(callId);
+            } else {
+              anonymousInFlightToolCalls = Math.max(0, anonymousInFlightToolCalls - 1);
             }
           }
           const eventPaths = Array.isArray(update.locations)
@@ -2132,9 +2232,12 @@ export class AcpRunner {
             }
           }
           if (isAmpProfile) {
+            // Never cancel-steer while a tool call is in flight: sending session/cancel to Amp mid-tool
+            // can drop Amp's MCP executor. Return false so the orchestrator queues delivery (queued_turn).
+            if (hasInFlightToolCall()) return false;
             // Pick one delivery owner before sending: never probe the mutating _amp/session/steer next-turn queue.
-            // On local CLI sessions with AMP_ACP_CANCEL_MODE=steer, hand off one mid-turn steer via session/cancel
-            // followed by replacement session/prompt and confirm live delivery only on correlated receipt.
+            // With explicit AMP_ACP_CANCEL_MODE=steer on local CLI sessions (and no tool in flight), hand off one
+            // mid-turn steer via session/cancel + replacement session/prompt and confirm only on correlated receipt.
             // Otherwise return false immediately so the harness queue owns delivery without duplication.
             return await startAmpCancelSteer(message, { waitForAck: true });
           }
@@ -2146,6 +2249,7 @@ export class AcpRunner {
             rolloverTriggered = true;
           }
           if (sessionId) {
+            harnessCancelIssuedForTurn = true;
             await conn.agent.notify("session/cancel", { sessionId }).catch(() => {});
           }
           if (reason === "clean_rollover") {
@@ -2178,6 +2282,7 @@ export class AcpRunner {
         req.callbacks.onTurn?.(turnsUsed);
         completedToolInWave = false;
         inFlightToolCalls.clear();
+        anonymousInFlightToolCalls = 0;
         turnFailedTools = [];
         turnDeniedTools = [];
         turnSucceededTools = 0;
@@ -2186,6 +2291,7 @@ export class AcpRunner {
         turnText = "";
         textSinceLastTool = "";
         steerHandoff.cancelIssuedForTurn = false;
+        harnessCancelIssuedForTurn = false;
 
         promptInFlight = true;
         try {
@@ -2209,7 +2315,8 @@ export class AcpRunner {
             const rejectPrompt = (err: unknown) => {
               const steerCancelled = steerHandoff.pending !== null || steerHandoff.cancelIssuedForTurn;
               const toolsCancelled = toolsMissingError !== null;
-              const expectedCancel = wrapUpTimedOut || steerCancelled || toolsCancelled;
+              const brokenCancelled = brokenSessionCode !== null;
+              const expectedCancel = wrapUpTimedOut || steerCancelled || toolsCancelled || brokenCancelled;
               if (expectedCancel && !req.signal.aborted && !rolloverTriggered && !idleTimedOut && !(childGoneError && err === childGoneError)) {
                 const detail = `${err instanceof Error ? err.message : String(err)} ${acpErrorDetail(err)}`;
                 const code = (err as { code?: unknown } | null)?.code;
@@ -2229,7 +2336,7 @@ export class AcpRunner {
                   (nested === undefined && code === -32603 && explicitCancel) ||
                   (nested === undefined && typeof code !== "number" && (name === "AbortError" || explicitCancel));
                 if (isCancelled && !detectQuotaErrorText(detail).isQuota && !isAcpAuthError(err, detail)) {
-                  resolvePrompt({ stopReason: steerCancelled || toolsCancelled ? "cancelled" : "end_turn" });
+                  resolvePrompt({ stopReason: steerCancelled || toolsCancelled || brokenCancelled ? "cancelled" : "end_turn" });
                   return;
                 }
               }
@@ -2348,11 +2455,12 @@ export class AcpRunner {
           (quotaRetryHits > 0 && turnSucceededTools === 0 && turnQuotaDetected.isQuota) ||
           shortHardQuotaText;
 
-        // Never continue if rollover, quota watchdog, quota rejection, user abort, or quota failure occurred
+        // Never continue if rollover, quota watchdog, quota rejection, broken session, user abort, or quota failure occurred
         if (
           rolloverTriggered ||
           quotaWatchdogTriggered ||
           turnQuotaFalseCompletion ||
+          brokenSessionCode !== null ||
           req.signal.aborted ||
           ["quota_exhausted", "rate_limited", "budget_exhausted"].includes(airFailureCode)
         ) {
@@ -2389,6 +2497,7 @@ export class AcpRunner {
           if (handoff.abortedBeforeSend || req.isTaskSettled?.()) {
             handoff.settleAck(false);
             if (req.isTaskSettled?.() && sessionId) {
+              harnessCancelIssuedForTurn = true;
               void conn.agent.notify("session/cancel", { sessionId }).catch(() => {});
             }
             break;
@@ -2443,7 +2552,10 @@ export class AcpRunner {
         // any reasoning/response after the failure, prompt it to continue thinking on the same session.
         // If the model DOES emit text (e.g. explaining it cannot do something), we accept it immediately!
         const hadToolProblem = turnFailedTools.length > 0 || turnDeniedTools.length > 0;
-        const stoppedSilentAfterTool = hadToolProblem && (textSinceLastTool.trim().length === 0 || rawStop === "cancelled");
+        const stoppedSilentAfterTool =
+          hadToolProblem &&
+          ((rawStop !== "cancelled" && textSinceLastTool.trim().length === 0) ||
+            (rawStop === "cancelled" && turnDeniedTools.length > 0));
         if (
           stoppedSilentAfterTool &&
           consecutiveSilentRecoveries < MAX_CONSECUTIVE_SILENT_RECOVERIES &&
@@ -2585,6 +2697,21 @@ export class AcpRunner {
         };
       }
 
+      if (brokenSessionCode && !rolloverTriggered && !req.signal.aborted) {
+        const msg = brokenSessionDetail
+          ? `ACP session broken (${brokenSessionCode}): ${brokenSessionDetail}`
+          : `ACP session broken (${brokenSessionCode})`;
+        return {
+          text: accumulatedText ? `${accumulatedText}\n\n${msg}` : msg,
+          stopReason: "error",
+          errorCode: brokenSessionCode,
+          usage: lastUsage,
+          sessionId,
+          toolFailures: allToolFailures.length > 0 ? allToolFailures : undefined,
+          ...(wrapUpAttempted ? { wrapUpAttempted: true } : {}),
+        };
+      }
+
       if (
         toolsCheckEnabled &&
         !checkHarnessToolsReady() &&
@@ -2624,10 +2751,18 @@ export class AcpRunner {
         : rawStop === "cancelled" || req.signal.aborted
           ? "cancelled"
           : "completed";
+      const unsolicitedCancel =
+        stopReason === "cancelled" &&
+        !rolloverTriggered &&
+        !req.signal.aborted &&
+        !harnessCancelIssuedForTurn &&
+        !steerAckTimedOut &&
+        turnDeniedTools.length === 0;
 
       return {
         text: accumulatedText,
         stopReason,
+        ...(unsolicitedCancel ? { errorCode: ACP_EXECUTOR_LOST_ERROR_CODE } : {}),
         usage: lastUsage,
         sessionId,
         toolFailures: allToolFailures.length > 0 ? allToolFailures : undefined,
@@ -2652,6 +2787,20 @@ export class AcpRunner {
           usage: lastUsage,
           sessionId,
           toolFailures: allToolFailures.length > 0 ? allToolFailures : undefined,
+        };
+      }
+      if (brokenSessionCode && !req.signal.aborted) {
+        const msg = brokenSessionDetail
+          ? `ACP session broken (${brokenSessionCode}): ${brokenSessionDetail}`
+          : `ACP session broken (${brokenSessionCode})`;
+        return {
+          text: accumulatedText ? `${accumulatedText}\n\n${msg}` : msg,
+          stopReason: "error",
+          errorCode: brokenSessionCode,
+          usage: lastUsage,
+          sessionId,
+          toolFailures: allToolFailures.length > 0 ? allToolFailures : undefined,
+          ...(wrapUpAttempted ? { wrapUpAttempted: true } : {}),
         };
       }
       if (idleTimedOut && !quotaWatchdogTriggered) {
