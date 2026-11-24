@@ -36,6 +36,7 @@ import {
   parseGoalCriterionPatches,
   shouldRunIndependentReview,
   StaleReviewError,
+  validateVerifyRef,
   type CriterionEvaluation,
   type GateLocation,
   type GoalAcceptOverrideAudit,
@@ -244,9 +245,9 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
     name: "goal_create",
     description:
       "Draft a structured, versioned Goal Contract with concrete deterministic check commands and behavioral/architectural acceptance criteria. " +
-      "Deterministic criteria run as shell commands in a detached `_verify` git worktree that the harness creates and removes. " +
+      "Deterministic criteria run as shell commands in a detached `_verify` git worktree that the harness creates and cleans up. " +
       "It checks out verify_ref when set, otherwise the linked run's base branch (the branch the primary checkout had when the run started). " +
-      "Without a run or base branch, commands run in the primary checkout itself, and results say so. The primary checkout is never modified. " +
+      "Without a run or resolvable base branch, commands run in the primary checkout itself, and results say so; the harness never switches the primary checkout's branch or modifies it itself. " +
       "Commands get HARNESS_REPO_ROOT (primary checkout path), HARNESS_VERIFY_REF, HARNESS_VERIFY_SHA, HARNESS_GOAL_ID and HARNESS_GOAL_EVIDENCE_DIR. " +
       "Each gate result records the cwd, ref and SHA it ran at (goal_get reviews[].criteriaResults[].gate).",
     inputSchema: {
@@ -890,6 +891,7 @@ export class DirectorRuntime {
   private activeChats = new Map<string, ActiveChat>();
   private activeReviews = new Map<string, AbortController>();
   private activeReviewInfo = new Map<string, ActiveReviewInfo>();
+  private repoFetchLocks = new Map<string, Promise<void>>();
   private activeReviewerTools = new Map<
     string,
     { tools: ToolDefinition[]; execute: (name: string, args: Record<string, unknown>) => Promise<unknown> }
@@ -2847,18 +2849,57 @@ export class DirectorRuntime {
   }
 
   /**
-   * Creates the detached `_verify` worktree for verification gates and Done-Review without touching the host
-   * checkout. Resolves `goal.verifyRef` when explicitly set (local ref, `origin/<ref>`, then `git fetch --no-tags origin`),
-   * failing closed if unresolved. Otherwise targets `run.baseBranch`, preferring this run's recorded merge commit
-   * (`refs/harness/merged/<runId>`) when it exists and is an ancestor of the base branch tip. When that merge ref is
-   * used, all gates evaluate the goal's merge-commit snapshot, not later integrated main. Without a verify ref or
-   * resolvable base branch, verification falls back to the primary checkout and records that in `location`.
+   * Fetches a validated source-only ref from origin without writing `refs/heads/*` or touching HEAD/index.
+   * Serialized per repo so a `FETCH_HEAD` fallback (for tags or refs outside the remote refmap) cannot race
+   * with a concurrent review on the same repository.
+   */
+  private async fetchVerifyRefCommit(
+    repoRoot: string,
+    wanted: string,
+    fetchRef: string,
+    resolveCommit: (ref: string) => Promise<string | null>,
+  ): Promise<{ sha: string; refName: string } | null> {
+    const prev = this.repoFetchLocks.get(repoRoot) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const tail = prev.then(() => gate);
+    this.repoFetchLocks.set(repoRoot, tail);
+    await prev;
+    try {
+      const fetched = await runGit(repoRoot, ["fetch", "--no-tags", "origin", "--", fetchRef])
+        .then(() => true)
+        .catch(() => false);
+      if (!fetched) return null;
+      const remoteTracking = await resolveCommit(`refs/remotes/origin/${fetchRef}`);
+      if (remoteTracking) return { sha: remoteTracking, refName: `origin/${fetchRef}` };
+      const localOrWanted = await resolveCommit(wanted);
+      if (localOrWanted) return { sha: localOrWanted, refName: wanted };
+      const fetchHead = await resolveCommit("FETCH_HEAD");
+      if (fetchHead) return { sha: fetchHead, refName: wanted };
+      return null;
+    } finally {
+      release();
+      if (this.repoFetchLocks.get(repoRoot) === tail) {
+        this.repoFetchLocks.delete(repoRoot);
+      }
+    }
+  }
+
+  /**
+   * Creates the detached `_verify` worktree for verification gates and Done-Review without switching the host
+   * checkout's branch. Resolves `goal.verifyRef` when explicitly set (local ref, `origin/<ref>`, then source-only
+   * `git fetch --no-tags origin -- <ref>` with `FETCH_HEAD` fallback), failing closed if invalid or unresolved.
+   * Otherwise targets `run.baseBranch`, preferring this run's recorded merge commit (`refs/harness/merged/<runId>`)
+   * when it exists and is an ancestor of the base branch tip. Without a verify ref or resolvable base branch,
+   * verification falls back to the primary checkout and records that in `location`.
    */
   private async prepareVerifyCheckout(
     goal: GoalRecord,
     run: RunRecord | null,
   ): Promise<{ verifyCwd: string; verifyRef: string; isolated: boolean; location: GateLocation; cleanup: () => Promise<void> }> {
-    const explicitRef = goal.verifyRef?.trim() || "";
+    const explicitRef = goal.verifyRef ? (validateVerifyRef(goal.verifyRef) ?? "") : "";
     const explicit = Boolean(explicitRef);
     const wanted = explicitRef || run?.baseBranch || "";
     let verifyCwd = goal.repoRoot;
@@ -2886,15 +2927,11 @@ export class DirectorRuntime {
       }
       if (!resolvedSha && explicit) {
         const fetchRef = wanted.startsWith("origin/") ? wanted.slice("origin/".length) : wanted;
-        if (fetchRef && !fetchRef.startsWith("-")) {
-          await runGit(goal.repoRoot, ["fetch", "--no-tags", "origin", fetchRef]).catch(() => {});
-          resolvedSha = await resolveCommit(`refs/remotes/origin/${fetchRef}`);
-          if (resolvedSha) {
-            resolvedRefName = `origin/${fetchRef}`;
-          } else {
-            resolvedSha = await resolveCommit(wanted);
-            if (resolvedSha) resolvedRefName = wanted;
-          }
+        validateVerifyRef(fetchRef);
+        const fetched = await this.fetchVerifyRefCommit(goal.repoRoot, wanted, fetchRef, resolveCommit);
+        if (fetched) {
+          resolvedSha = fetched.sha;
+          resolvedRefName = fetched.refName;
         }
       }
 
@@ -3044,7 +3081,9 @@ export class DirectorRuntime {
             throw slot.signal.reason instanceof Error ? slot.signal.reason : new Error(`goal_accept for ${goal.id} was interrupted`);
           }
           const fresh = checkAcceptable(this.goals.getGoal(goal.id));
-          if (fresh.version !== goal.version) throw new Error(`Goal ${goal.id} changed during goal_accept`);
+          if (fresh.version !== goal.version || (fresh.verifyRef ?? null) !== (goal.verifyRef ?? null)) {
+            throw new Error(`Goal ${goal.id} changed during goal_accept`);
+          }
           verifyRef = checkout.location.sha
             ? `${checkout.location.ref}@${checkout.location.sha}`
             : checkout.location.ref;
@@ -3100,9 +3139,13 @@ export class DirectorRuntime {
       const summary =
         `[${by} ACCEPTED OVERRIDE] ${reason} (${evidenceSummary})` +
         (failedDeterministic.length ? ` [deterministic override: ${failedDeterministic.join(", ")}]` : "");
-      // A pause, amend or cancel during the gates aborts this slot: never commit over it.
+      // A pause, amend, verify_ref change or cancel during the gates aborts this slot: never commit over it.
       if (slot.signal.aborted) {
         throw slot.signal.reason instanceof Error ? slot.signal.reason : new Error(`goal_accept for ${goal.id} was interrupted`);
+      }
+      const latestBeforeCommit = checkAcceptable(this.goals.getGoal(goal.id));
+      if (latestBeforeCommit.version !== goal.version || (latestBeforeCommit.verifyRef ?? null) !== (goal.verifyRef ?? null)) {
+        throw new Error(`Goal ${goal.id} changed during goal_accept`);
       }
       const outcome = this.goals.acceptGoalOverride(goal.id, {
         expectedVersion: goal.version,
@@ -3358,6 +3401,7 @@ export class DirectorRuntime {
           const current = this.goals.getGoal(goal.id);
           // An invalidated review (pause, resume, stop, amend) must not touch the goal or its latest summary.
           const epochMatches = this.getReviewInvalidationEpoch(goal.id) === reviewEpoch;
+          const verifyRefChanged = current ? (current.verifyRef ?? null) !== (goal.verifyRef ?? null) : false;
           if (epochMatches && current?.version === goal.version && ["executing", "verifying", "reviewing"].includes(current.status)) {
             if (
               error instanceof PendingAmendmentError ||
@@ -3374,7 +3418,7 @@ export class DirectorRuntime {
                 "awaiting_human",
                 error instanceof FailedRunGatesError
                   ? error.workersCompleted
-                    ? `Blocked on verification: required deterministic gate(s) ${error.failedIds.join(", ")} fail at ${formatGateRefSha(error.location)} (${error.location.isolated ? "_verify worktree, removed" : `primary checkout ${error.location.cwd}`}). All ${error.completedWorkerCount} worker task(s) completed${error.location.note ? `; ${error.location.note}` : ""}. If the work is on another branch, goal_amend verify_ref then goal_trigger_review; otherwise resume ${current.linkedRunId ?? "unknown"} or review.`
+                    ? `Blocked on verification: required deterministic gate(s) ${error.failedIds.join(", ")} fail at ${formatGateRefSha(error.location)} (${error.location.isolated ? `_verify worktree ${error.location.cwd}` : `primary checkout ${error.location.cwd}`}). All ${error.completedWorkerCount} worker task(s) completed${error.location.note ? `; ${error.location.note}` : ""}. If the work is on another branch, goal_amend verify_ref then goal_trigger_review; otherwise resume ${current.linkedRunId ?? "unknown"} or review.`
                     : `Linked run ${current.linkedRunId ?? "unknown"} failed and required deterministic gate(s) still fail (${error.failedIds.join(", ")}) at ${formatGateRefSha(error.location)}; resume or review.`
                   : error instanceof ReviewerFailedError
                     ? (() => {
@@ -3387,6 +3431,16 @@ export class DirectorRuntime {
                     : `Verification failed: ${msg.slice(0, 240)}`,
               );
             }
+          } else if (
+            verifyRefChanged &&
+            current &&
+            current.version === goal.version &&
+            (current.status === "verifying" || current.status === "reviewing") &&
+            goal.status !== "verifying" &&
+            goal.status !== "reviewing"
+          ) {
+            // Metadata-only verify_ref change invalidated this review without changing status; restore pre-review status.
+            this.goals.setStatus(goal.id, goal.status);
           }
         } catch {
           // DB may already be closing during shutdown
@@ -3430,6 +3484,7 @@ export class DirectorRuntime {
     circuitBreakerTripped?: string;
   }> {
     const run = goal.linkedRunId ? this.db.getRun(goal.linkedRunId) : null;
+    const expectedVerifyRef = goal.verifyRef ?? null;
     const assertCurrent = (pendingVerdict?: string) => {
       signal.throwIfAborted();
       const current = this.goals.getGoal(goal.id);
@@ -3441,8 +3496,13 @@ export class DirectorRuntime {
           verdict: pendingVerdict,
         });
       }
-      if (current?.version !== goal.version || current.status === "paused" || current.status === "cancelled" ||
-          (run && this.db.getRun(run.id)?.status === "stopped")) {
+      if (
+        current?.version !== goal.version ||
+        (current.verifyRef ?? null) !== expectedVerifyRef ||
+        current.status === "paused" ||
+        current.status === "cancelled" ||
+        (run && this.db.getRun(run.id)?.status === "stopped")
+      ) {
         throw new Error(`Goal ${goal.id} changed or stopped during review`);
       }
       const pendingAmend = this.undeliveredAmendments.get(goal.id);
@@ -3532,7 +3592,7 @@ export class DirectorRuntime {
           const workerTasks = goal.linkedRunId
             ? this.db
                 .listTasks(goal.linkedRunId)
-                .filter((t) => t.profileId !== "director" && t.tier >= 2 && !isReadOnlyKind(t.kind))
+                .filter((t) => t.profileId !== "director" && t.tier === 2 && !t.readOnly && !isReadOnlyKind(t.kind))
             : [];
           const workersCompleted = workerTasks.length > 0 && workerTasks.every((t) => t.status === "completed");
           throw new FailedRunGatesError(
@@ -5336,7 +5396,9 @@ export class DirectorRuntime {
       case "goal_amend": {
         const goalId = String(args.goal_id);
         const hasVerifyRef = typeof args.verify_ref === "string" || args.verify_ref === null;
-        const verifyRefVal = args.verify_ref === null ? null : typeof args.verify_ref === "string" ? args.verify_ref : null;
+        const verifyRefVal = hasVerifyRef
+          ? validateVerifyRef(args.verify_ref === null ? null : String(args.verify_ref))
+          : null;
         const updateCriteria = parseGoalCriterionPatches(args.update_criteria, "update_criteria");
         const hasContractPatch =
           typeof args.title === "string" ||
