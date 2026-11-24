@@ -107,6 +107,12 @@ export interface EventsConfig {
   wakeDirectorOnGoalSettle: boolean;
 }
 
+/**
+ * Default context utilization ratio triggering in-place compaction for Tier 3 task agents
+ * on the Pi runner when no explicit `rolloverThreshold` is supplied on the request.
+ */
+export const DEFAULT_TASK_COMPACTION_THRESHOLD = 0.78;
+
 export interface RolloverConfig {
   /** Context ratio triggering Tier 1 Orchestrator clean relay (default 0.72) */
   orchestratorThreshold: number;
