@@ -13,14 +13,15 @@ import type { BisectingMergeQueue } from "../worktree/merge-queue.js";
 import { runGit, type WorktreeManager } from "../worktree/manager.js";
 import type { AdmissionLane, QueuePositionInput } from "./admission-queue.js";
 import { directorTaskRunOwner, isDirectorTaskContainer } from "./ids.js";
-import type {
-  AgentTier,
-  ControlPlaneDb,
-  EscalationCategory,
-  EscalationSeverity,
-  RunRecord,
-  TaskKind,
-  TaskRecord,
+import {
+  deriveTitle,
+  type AgentTier,
+  type ControlPlaneDb,
+  type EscalationCategory,
+  type EscalationSeverity,
+  type RunRecord,
+  type TaskKind,
+  type TaskRecord,
 } from "./db.js";
 import { findRunDossier, readRunDossier, readWorkspaceArtifact, spillSummaryOverflow, writeCodeOutput, writeTaskDossier, writeUniqueTaskDossier } from "./dossiers.js";
 import { compactTaskHandoff, isReadOnlyKind, settleTaskMinimalFallback, SUMMARY_LIMIT, validateTaskHandoff } from "./handoffs.js";
@@ -123,6 +124,10 @@ function optionalProfile(value: unknown): string | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "string" || !value.trim()) throw new Error("Select an enabled runner profile.");
   return value;
+}
+
+function derivedTitleNote(title: string): string {
+  return `title was missing; derived '${title}'. Pass a short title next time.`;
 }
 
 const waitChildrenTool: ToolDefinition = {
@@ -1086,14 +1091,16 @@ export class ControlPlaneToolExecutor {
             );
           }
         }
+        const objective = typeof args.objective === "string" ? args.objective : "";
+        const { title, derived } = deriveTitle(args.title, [objective, args.criteria], "Untitled worker task");
         const posArg = args.position as QueuePositionInput | undefined;
         const created = await this.hooks.spawnAndStartTask({
           runId,
           parentId: taskId,
           tier: 2,
           kind: "worker",
-          title: String(args.title),
-          objective: String(args.objective),
+          title,
+          objective,
           criteria: typeof args.criteria === "string" ? args.criteria : "",
           readOnly: false,
           profileId: optionalProfile(args.profile_id),
@@ -1106,13 +1113,14 @@ export class ControlPlaneToolExecutor {
           signal: callerSignal ?? scriptSignal ?? this.hooks.getTaskCancelSignal?.(taskId),
         });
         const qEntry = this.db.admissionQueue.get("worker", created.id);
-        const warning = spawnDuplicateAdvisory(this.db, task, created.id, String(args.title));
+        const warning = spawnDuplicateAdvisory(this.db, task, created.id, created.title);
         return {
           spawned: created.id,
           status: created.status,
           worktreeId: created.worktreeId,
           ...(qEntry ? { queued: true, queuePosition: qEntry.position } : {}),
           ...(warning ? { warning } : {}),
+          ...(derived ? { note: derivedTitleNote(created.title) } : {}),
         };
       }
 
@@ -1163,13 +1171,15 @@ export class ControlPlaneToolExecutor {
         if (!readOnlyKind && kind !== "execute") throw new Error(`Unknown spawn_task kind: ${kind}`);
         if (task.status === "draining") throw new Error("Cannot spawn tasks while draining for rollover.");
 
+        const objective = typeof args.objective === "string" ? args.objective : "";
+        const { title, derived } = deriveTitle(args.title, [objective, args.criteria], `Untitled ${kind} task`);
         const created = await this.hooks.spawnAndStartTask({
           runId,
           parentId: taskId,
           tier: 3,
           kind,
-          title: String(args.title),
-          objective: String(args.objective),
+          title,
+          objective,
           criteria: typeof args.criteria === "string" ? args.criteria : "",
           readOnly: readOnlyKind || args.read_only === true,
           profileId: optionalProfile(args.profile_id),
@@ -1178,8 +1188,15 @@ export class ControlPlaneToolExecutor {
           dependsOn: Array.isArray(args.depends_on) ? (args.depends_on as string[]) : [],
           signal: callerSignal ?? scriptSignal ?? this.hooks.getTaskCancelSignal?.(taskId),
         });
-        const warning = spawnDuplicateAdvisory(this.db, task, created.id, String(args.title));
-        return { spawned: created.id, kind: created.kind, readOnly: created.readOnly, status: created.status, ...(warning ? { warning } : {}) };
+        const warning = spawnDuplicateAdvisory(this.db, task, created.id, created.title);
+        return {
+          spawned: created.id,
+          kind: created.kind,
+          readOnly: created.readOnly,
+          status: created.status,
+          ...(warning ? { warning } : {}),
+          ...(derived ? { note: derivedTitleNote(created.title) } : {}),
+        };
       }
 
       case "wait_tasks":
@@ -1474,13 +1491,18 @@ export class ControlPlaneToolExecutor {
         const blocking = args.blocking === undefined ? severity !== "P2" : Boolean(args.blocking);
 
         const toTaskId = severity === "P0" ? null : task.parentId;
+        const { title, derived } = deriveTitle(
+          args.title,
+          [args.summary, args.body, ...attempted, evidencePaths[0]],
+          `Untitled ${category} issue`,
+        );
         const esc = this.db.createEscalation({
           runId,
           fromTaskId: taskId,
           toTaskId,
           severity,
           category,
-          title: String(args.title),
+          title,
           evidencePaths,
           attempted,
           blocking,
@@ -1490,7 +1512,12 @@ export class ControlPlaneToolExecutor {
           settleTaskMinimalFallback(this.db, task, "blocked", blockedSummary, `blocked: ${esc.id} (${esc.title.slice(0, 160)})`);
           this.hooks.stopTaskForBlockingIssue?.(taskId, blockedSummary);
         }
-        return { escalationId: esc.id, severity: esc.severity, routedTo: toTaskId ?? "human" };
+        return {
+          escalationId: esc.id,
+          severity: esc.severity,
+          routedTo: toTaskId ?? "human",
+          ...(derived ? { note: derivedTitleNote(esc.title) } : {}),
+        };
       }
 
       case "ack_escalation": {
@@ -1905,20 +1932,31 @@ export class ControlPlaneToolExecutor {
         const headSha = await runGit(run.repoRoot, ["rev-parse", "HEAD"])
           .then((r) => r.stdout || run.baseSha)
           .catch(() => run.baseSha);
+        const kind = String(args.kind) as KbKind;
+        const evidencePaths = Array.isArray(args.evidence_paths) ? (args.evidence_paths as string[]) : [];
+        const { title, derived } = deriveTitle(
+          args.title,
+          [args.summary, args.context_md, args.body, args.content, evidencePaths[0]],
+          `Untitled ${kind} entry`,
+        );
         const entry = this.db.kb.propose({
           repoScope: run.repoRoot,
-          kind: String(args.kind) as KbKind,
-          title: String(args.title),
+          kind,
+          title,
           summary: String(args.summary),
           contextMd: String(args.context_md),
           tags: Array.isArray(args.tags) ? (args.tags as string[]) : [],
           pathGlobs: Array.isArray(args.path_globs) ? (args.path_globs as string[]) : [],
-          evidencePaths: Array.isArray(args.evidence_paths) ? (args.evidence_paths as string[]) : [],
+          evidencePaths,
           verifiedSha: headSha,
           sourceRunId: runId,
           sourceTaskId: taskId,
         });
-        return { id: entry.id, status: entry.status };
+        return {
+          id: entry.id,
+          status: entry.status,
+          ...(derived ? { note: derivedTitleNote(entry.title) } : {}),
+        };
       }
 
       case "kb_flag_stale": {

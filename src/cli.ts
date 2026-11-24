@@ -112,6 +112,17 @@ function matchRunIdToken(raw: string): string | null {
   return null;
 }
 
+/** Normalizes an attach target token to a canonical run ID if it names a run (case-insensitive), else null. */
+export function normalizeAttachRunId(raw: string): string | null {
+  const trimmed = raw.trim();
+  const matched = matchRunIdToken(trimmed);
+  if (matched) return matched;
+  if (/^run[-_]/i.test(trimmed) && trimmed.length > 4) {
+    return `run-${trimmed.slice(4)}`;
+  }
+  return null;
+}
+
 const RUN_CREATE_ONLY_FLAGS = ["profile", "model", "effort"] as const;
 const RUN_RESUME_USAGE = [
   'Usage: pi-harness run resume <run-id> [--in 15m | --message "<msg>"]',
@@ -1078,13 +1089,14 @@ async function main(): Promise<void> {
           return;
         }
         handoffClientToTui = true;
-        if (targetId.startsWith("run-")) {
+        const attachRunId = normalizeAttachRunId(targetId);
+        if (attachRunId) {
           await runInteractiveSessionLoop(
             client,
             {
               kind: "run",
               repoRoot,
-              runId: targetId,
+              runId: attachRunId,
               initialTaskId: typeof flags.task === "string" ? flags.task : null,
             },
             hostCtx,

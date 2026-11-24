@@ -466,6 +466,15 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
       assert.equal(q1?.resumeAt, null);
       assert.equal(runAttempts, 1);
 
+      const pausedOrch = daemon.db.listTasks(run.id).find((t) => t.tier === 1);
+      assert.ok(pausedOrch?.summary?.startsWith("Paused (quota): "));
+      assert.ok(pausedOrch?.summary?.includes("coordinator"), `expected model in summary, got: ${pausedOrch?.summary}`);
+      assert.ok(!pausedOrch?.summary?.includes("429 Too Many Requests"), `raw line should not be in summary: ${pausedOrch?.summary}`);
+      const parsedResult = pausedOrch?.resultJson ? (JSON.parse(pausedOrch.resultJson) as { quotaDetail?: string }) : {};
+      assert.equal(parsedResult.quotaDetail, "429 Too Many Requests (sub pool exhausted)");
+      const pausedEvent = daemon.db.getEventsSince(run.id, 0).find((e) => e.type === "quota.agent_paused");
+      assert.equal((pausedEvent?.payload as { detail?: string } | undefined)?.detail, "429 Too Many Requests (sub pool exhausted)");
+
       // 2. User manually resumes with a message while quota is STILL exhausted -> resets state machine & walks cleanly back to paused_quota!
       await client.request("run.resume", { runId: run.id, message: "try resuming now" });
       await waitUntil(() => runAttempts === 2 && daemon.db.getRun(run.id)?.status === "paused_quota");
@@ -618,6 +627,14 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
       assert.equal(qStatus?.mode, "auto_timer");
       assert.equal(qStatus?.source, "quota_endpoint");
       assert.ok(qStatus?.resumeAt);
+
+      const pausedWorkerA = daemon.db.listTasks(run.id).find((t) => t.title === "Worker A (claude quota)");
+      assert.ok(pausedWorkerA?.summary?.startsWith("Paused (quota): "));
+      assert.ok(pausedWorkerA?.summary?.includes("claude-sonnet-4-5"), `expected model in summary, got: ${pausedWorkerA?.summary}`);
+      assert.ok(pausedWorkerA?.summary?.includes("quota exhausted"), `expected hard exhaustion wording, got: ${pausedWorkerA?.summary}`);
+      assert.ok(!pausedWorkerA?.summary?.includes("Claude 5h pool exhausted"), `raw line should not be in summary: ${pausedWorkerA?.summary}`);
+      const workerResult = pausedWorkerA?.resultJson ? (JSON.parse(pausedWorkerA.resultJson) as { quotaDetail?: string }) : {};
+      assert.equal(workerResult.quotaDetail, "Claude 5h pool exhausted");
 
       // Flip endpoint available; auto-resume timer fires (~3.25s with safety cushion) and finishes the entire run!
       endpointAvailable = true;
