@@ -1,3 +1,4 @@
+import { contextWarningText } from "../advisories/message.js";
 import { REJECTIONS } from "../advisories/rejections.js";
 import { toolEventPreview } from "../protocol/tool-display.js";
 import {
@@ -940,9 +941,7 @@ export class PiRunner {
           rolloverWarningSent = true;
           const pct = Math.round(ratio * 100);
           const limitPct = Math.round(rolloverThreshold * 100);
-          steeringQueue.push(
-            `Context usage is at ${pct}% (hard rollover at ${limitPct}%). Finish your current atomic step and call \`request_rollover\` with a thorough anchored handoff (goal_invariants, architectural_decisions, active_risks, next_actions) so no context is lost.`,
-          );
+          steeringQueue.push(contextWarningText(req.tier, pct, limitPct));
         }
       }
     } finally {

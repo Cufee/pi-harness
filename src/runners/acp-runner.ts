@@ -1,4 +1,4 @@
-import { formatNotice } from "../advisories/message.js";
+import { contextWarningText, formatNotice } from "../advisories/message.js";
 import { deniedNotice, HarnessRejection, REJECTIONS } from "../advisories/rejections.js";
 import { toolEventPreview } from "../protocol/tool-display.js";
 import { randomUUID } from "node:crypto";
@@ -869,9 +869,7 @@ export class AcpRunner {
             rolloverWarningSent = true;
             const pct = Math.round(ratio * 100);
             const limitPct = Math.round(rolloverThreshold * 100);
-            sendSteeringText(
-              `Context usage is at ${pct}% (hard rollover at ${limitPct}%). Finish your current atomic step and call \`request_rollover\` with a thorough anchored handoff (goal_invariants, architectural_decisions, active_risks, next_actions) so no context is lost.`,
-            );
+            sendSteeringText(contextWarningText(req.tier, pct, limitPct));
           }
 
           if (
@@ -953,6 +951,11 @@ export class AcpRunner {
               void activeConnection.agent.notify("session/cancel", { sessionId }).catch(() => {});
             }
           }
+          const eventPaths = Array.isArray(update.locations)
+            ? update.locations
+                .map((loc) => (loc && typeof loc === "object" ? (loc as { path?: unknown }).path : undefined))
+                .filter((locPath): locPath is string => typeof locPath === "string" && locPath.trim().length > 0)
+            : [];
           req.callbacks.onToolEvent?.({
             id: callId,
             name: resolvedTitle,
@@ -960,6 +963,7 @@ export class AcpRunner {
             kind: update.kind ? String(update.kind) : undefined,
             title: resolvedTitle,
             args: toolEventPreview(update.rawInput),
+            ...(eventPaths.length > 0 ? { paths: eventPaths } : {}),
             ...(status === "failed" ? { error: toolEventPreview(update.rawOutput) } : { result: toolEventPreview(update.rawOutput) }),
           });
           for (const art of extractArtifactsFromToolUpdate(update)) {
@@ -1346,6 +1350,17 @@ export class AcpRunner {
           );
           turnDeniedTools.push(deniedText);
           allToolFailures.push(deniedText);
+          req.callbacks.onToolEvent?.({
+            id: callId,
+            name: deniedLabel,
+            status: "failed",
+            kind: toolKind,
+            title: deniedLabel,
+            args: toolEventPreview(Object.keys(deniedArgs).length > 0 ? deniedArgs : undefined),
+            ...(deniedPaths.length > 0 ? { paths: deniedPaths } : {}),
+            error: deniedText,
+            denied: deniedRule,
+          });
           return (
             denyOpt
               ? { outcome: { outcome: "selected", optionId: denyOpt.optionId } }
@@ -1612,6 +1627,7 @@ export class AcpRunner {
             armCancelGraceTimer("cancelled");
           }
         },
+        turnOpen: () => promptInFlight,
       });
 
       const shouldPrependSystemPrompt =
@@ -1644,16 +1660,16 @@ export class AcpRunner {
         turnSucceededTools = 0;
         textSinceLastTool = "";
 
-        const promptPromise =
-          pendingSteerTurnPromise ??
-          (conn.agent.request("session/prompt", {
-            sessionId,
-            prompt: [{ type: "text", text: nextPromptText }],
-          } as never) as unknown as Promise<Record<string, unknown>>);
-        pendingSteerTurnPromise = null;
-
         promptInFlight = true;
         try {
+          const promptPromise =
+            pendingSteerTurnPromise ??
+            (conn.agent.request("session/prompt", {
+              sessionId,
+              prompt: [{ type: "text", text: nextPromptText }],
+            } as never) as unknown as Promise<Record<string, unknown>>);
+          pendingSteerTurnPromise = null;
+
           promptRes = await new Promise<Record<string, unknown>>((resolvePrompt, rejectPromptRaw) => {
             resolveActivePromptOnGrace = resolvePrompt;
             // When the harness cut the wrap-up turn off at its time cap (or handed off via cancel-then-prompt

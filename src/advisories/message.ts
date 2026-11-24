@@ -49,7 +49,7 @@ export function contextWarningNotice(tier: 1 | 2 | 3, pct: number, limitPct: num
   const why = "Anything that is not in a handoff or an artifact is lost at the rollover.";
   const alternative =
     tier === 3
-      ? "Save your findings so far with artifact_write now. You continue from your artifacts after the rollover. If your answer is ready, call return_task."
+      ? "Save findings that are not yet in a dossier with artifact_write now. You continue from your dossiers after the rollover. If your answer is ready, call return_task."
       : "Finish the current step, then call request_rollover with an anchored handoff (goal_invariants, architectural_decisions, active_risks, next_actions).";
   return {
     level: "advisory",
