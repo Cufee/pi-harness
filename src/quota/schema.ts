@@ -20,6 +20,7 @@ export interface ResolvedModelQuota {
   estimatedRequestsRemaining: number | null;
   costMultiplier: number | null;
   overageActive: boolean;
+  unavailableReason?: "auth" | "quota";
   reason?: string;
 }
 
