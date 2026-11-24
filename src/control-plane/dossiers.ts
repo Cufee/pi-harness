@@ -4,6 +4,7 @@ import { basename, extname, isAbsolute, join, relative, resolve, sep } from "nod
 import type { ControlPlaneDb, RunRecord } from "./db.js";
 import { SUMMARY_LIMIT } from "./handoffs.js";
 import { scanMaxFileIndex, writeUniqueFile } from "./ids.js";
+import { REJECTIONS } from "../advisories/rejections.js";
 
 export function dossierDirectory(repoRoot: string, ...parts: string[]): string {
   let path = realpathSync(repoRoot);
@@ -27,7 +28,7 @@ export function writeTaskDossier(db: ControlPlaneDb, run: RunRecord, taskId: str
   } finally {
     rmSync(temp, { force: true });
   }
-  return db.recordArtifact({ runId: run.id, taskId, kind: "dossier", path, summary });
+  return db.recordArtifact({ runId: run.id, taskId, kind: "dossier", path, summary, origin: "agent" });
 }
 
 /**
@@ -327,7 +328,7 @@ export function readWorkspaceArtifact(root: string, requested: string, maxChars:
   const rel = relative(realpathSync(root), path);
   const parts = rel.toLowerCase().split(sep);
   if (isAbsolute(rel) || parts[0] === ".." || parts.includes(".git") || parts.includes(".harness")) {
-    throw new Error(`Artifact outside the task workspace: ${requested}`);
+    throw REJECTIONS.artifactOutsideWorkspace(requested);
   }
   return readArtifact(path, maxChars, offset);
 }
