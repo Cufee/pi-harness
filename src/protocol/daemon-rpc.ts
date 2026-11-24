@@ -1,6 +1,31 @@
+import type { ReleaseTarget } from "../daemon/release.js";
+
 export const DAEMON_PROTOCOL_REV = 8;
 
 export type DaemonLifecycle = "serving" | "draining" | "stopping";
+
+export interface DaemonReloadParams {
+  target?: ReleaseTarget;
+  allowCheckout?: boolean;
+  source: "install" | "cli";
+  now?: boolean;
+  force?: boolean;
+}
+
+export type DaemonReloadReply =
+  | { action: "noop"; reason: "already_current"; releaseId: string }
+  | { action: "skipped"; reason: "mode_manual" }
+  | { action: "scheduled"; targetReleaseId: string; dueAt: number; liveWork: string }
+  | { action: "draining"; targetReleaseId: string; deadlineAt: number; liveWork: string };
+
+export interface ReloadStatus {
+  state: "idle" | "scheduled" | "draining";
+  targetReleaseId?: string;
+  dueAt?: number;
+  deadlineAt?: number;
+  previousReleaseId?: string;
+  lastError?: { targetReleaseId: string; error: string };
+}
 
 export type SessionAttachControl = "take" | "view";
 
@@ -80,6 +105,7 @@ export type DaemonOp =
   | "ping"
   | "status"
   | "daemon.shutdown"
+  | "daemon.reload"
   | "config.get"
   | "config.update"
   | "profiles.upsert"

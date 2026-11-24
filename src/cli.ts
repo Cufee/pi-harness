@@ -11,9 +11,11 @@ import { ensureTempDir, loadConfig, type AcpProfileConfig } from "./config.js";
 import { loadOrCreateNodeId } from "./control-plane/session-messages.js";
 import { qualifyRemoteCliHints } from "./protocol/chat-events.js";
 import { ensureLocalDaemon, stopLocalDaemon } from "./daemon/launch.js";
+import { runDaemonReloadCli, tryReloadForDaemonRestart } from "./daemon/hot-update.js";
 import type { RemoteHostStatus } from "./daemon/peer.js";
 import { DaemonClient, runStdioSocketBridge } from "./daemon/remote.js";
 import { HarnessDaemon } from "./daemon/server.js";
+import { runSupervisor, type SuperviseOptions } from "./daemon/supervise.js";
 import { runDirectorChatTui, runNativeScrollbackTui, type TuiExitAction } from "./tui/app.js";
 import { parseDurationMs } from "./tui/core/index.js";
 import { type FederatedProjectSummary, pickProjectTui } from "./tui/projects.js";
@@ -37,6 +39,10 @@ const BOOLEAN_LONG_FLAGS = new Set([
   "direct",
   "dry-run",
   "resume",
+  "now",
+  "wait",
+  "from-install",
+  "supervise",
 ]);
 
 export interface ParsedArgs {
@@ -286,6 +292,7 @@ Usage:
   pi-harness escalations resolve <escalation-id> --reason "<text>" [--json] [--remote <alias|ssh://host>]
   pi-harness profiles [list | add <id> <cmd> [args...] | remove <id> | probe <id>]
   pi-harness daemon serve | status | stop | restart [--remote <alias|ssh://host>]
+  pi-harness daemon reload [--now] [--wait] [--target <dir>] [--from-install]
   pi-harness daemon recover --dry-run [--db <path>] [--json]
   pi-harness run "<goal>" [-p <project>] [--profile id] [--model id] [--effort level] [--detach] [--remote <alias|ssh://host>]
   pi-harness run resume <run-id> [--in 15m | --message "<msg>"] [--remote <alias|ssh://host>]
@@ -564,6 +571,13 @@ async function main(): Promise<void> {
     printHelp();
     return;
   }
+  if (cmd === "daemon" && positional[1] === "reload" && flags.supervise === true) {
+    const rawOpts = requireStringFlag(flags, "options-json");
+    if (!rawOpts) throw new Error("Missing --options-json for --supervise");
+    const supOpts = JSON.parse(rawOpts) as SuperviseOptions;
+    const code = await runSupervisor(supOpts);
+    process.exit(code);
+  }
 
   const rawRemote = requireStringFlag(flags, "remote");
   const hostFlag = requireStringFlag(flags, "host");
@@ -572,7 +586,12 @@ async function main(): Promise<void> {
   }
   const projectFlag = requireStringFlag(flags, "project") ?? (typeof flags.p === "string" ? flags.p.trim() : undefined);
   const explicitRepoFlag = requireStringFlag(flags, "repo");
-  const rawRepoRoot = explicitRepoFlag ?? process.cwd();
+  let overlayRootEnv: string | undefined;
+  if (cmd === "daemon" && positional[1] === "serve") {
+    overlayRootEnv = process.env.PI_HARNESS_OVERLAY_ROOT?.trim() || undefined;
+    delete process.env.PI_HARNESS_OVERLAY_ROOT;
+  }
+  const rawRepoRoot = explicitRepoFlag ?? overlayRootEnv ?? process.cwd();
   let repoRoot: string;
   try {
     repoRoot = realpathSync(rawRepoRoot);
@@ -684,16 +703,39 @@ async function main(): Promise<void> {
         console.error(`[harnessd ${new Date().toISOString()}] unhandledRejection:`, reason);
       });
       ensureTempDir();
-      const daemon = new HarnessDaemon(config, { autoQuitWhenIdle: true, repoRoot, reapChildrenOnStop: true });
+      const disableReloadRpc = process.env.PI_HARNESS_TEST_NO_RELOAD === "1";
+      delete process.env.PI_HARNESS_TEST_NO_RELOAD;
+      const daemon = new HarnessDaemon(config, {
+        autoQuitWhenIdle: true,
+        repoRoot,
+        overlayRoot: repoRoot,
+        reapChildrenOnStop: true,
+        disableReloadRpc,
+      });
       const sock = await daemon.start();
       try {
         writeFileSync(join(config.stateDir, "daemon.pid"), `${process.pid}\n`, "utf8");
       } catch {
         // ignore pid write failure
       }
-      process.on("SIGTERM", () => void daemon.stop().finally(() => process.exit(0)));
-      process.on("SIGINT", () => void daemon.stop().finally(() => process.exit(0)));
+      process.on("SIGTERM", () => void daemon.shutdownAndExit({ reason: "SIGTERM" }));
+      process.on("SIGINT", () => void daemon.shutdownAndExit({ reason: "SIGINT" }));
       console.error(`[harnessd ${new Date().toISOString()}] listening on ${sock} (pid ${process.pid})`);
+      return;
+    }
+    if (sub === "reload") {
+      if (remoteSpec.target) {
+        throw new Error(`\`daemon reload\` only runs locally; omit --remote (got --remote ${rawRemote}).`);
+      }
+      const targetDir = requireStringFlag(flags, "target");
+      const code = await runDaemonReloadCli({
+        socketPath: config.socketPath,
+        targetDir,
+        fromInstall: flags["from-install"] === true,
+        now: flags.now === true,
+        wait: flags.wait === true,
+      });
+      if (code !== 0) process.exit(code);
       return;
     }
     if (sub === "stop") {
@@ -728,6 +770,11 @@ async function main(): Promise<void> {
         } finally {
           restartClient.close();
         }
+        return;
+      }
+      const reloadCode = await tryReloadForDaemonRestart(config.socketPath);
+      if (reloadCode !== null) {
+        if (reloadCode !== 0) process.exit(reloadCode);
         return;
       }
       await stopLocalDaemon(config.socketPath);
