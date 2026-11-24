@@ -120,6 +120,7 @@ export class TranscriptView {
   private selAnchor: CellPos | null = null;
   private selHead: CellPos | null = null;
   private dragging = false;
+  private dragStart: { x: number; y: number } | null = null;
 
   private readAnchor: ReadAnchor | null = null;
   private pausedAtRows = 0;
@@ -227,6 +228,7 @@ export class TranscriptView {
     this.selMode = "none";
     this.selAnchor = null;
     this.selHead = null;
+    this.dragStart = null;
   }
 
   private normalizedSelection(): NormalizedSelection | null {
@@ -432,6 +434,7 @@ export class TranscriptView {
         this.clearSelection();
       }
       this.dragging = false;
+      this.dragStart = null;
     }
     this.lastInnerWidth = innerW;
     this.lastContentWidth = contentW;
@@ -804,6 +807,7 @@ export class TranscriptView {
       this.clearSelection();
       const col = this.toContentCol(ev.x);
       this.dragging = true;
+      this.dragStart = { x: ev.x, y: ev.y };
       this.cursor = { blockId: pos.blockId, row: pos.row };
       this.selAnchor = { blockId: pos.blockId, row: pos.row, col };
       this.selHead = { blockId: pos.blockId, row: pos.row, col };
@@ -833,7 +837,8 @@ export class TranscriptView {
       if (
         this.selHead.blockId !== this.selAnchor.blockId ||
         this.selHead.row !== this.selAnchor.row ||
-        this.selHead.col !== this.selAnchor.col
+        this.selHead.col !== this.selAnchor.col ||
+        (this.dragStart !== null && (ev.x !== this.dragStart.x || ev.y !== this.dragStart.y))
       ) {
         this.selMode = "cell";
       }
@@ -842,7 +847,9 @@ export class TranscriptView {
 
     if (ev.type === "release") {
       if (!this.dragging || !this.selAnchor) return;
+      const dragStart = this.dragStart;
       this.dragging = false;
+      this.dragStart = null;
       const pos = this.bodyRowToPos(ev.y);
       if (pos) {
         const col = this.toContentCol(ev.x);
@@ -853,7 +860,8 @@ export class TranscriptView {
       const moved =
         head.blockId !== this.selAnchor.blockId ||
         head.row !== this.selAnchor.row ||
-        head.col !== this.selAnchor.col;
+        head.col !== this.selAnchor.col ||
+        (dragStart !== null && (ev.x !== dragStart.x || ev.y !== dragStart.y));
 
       if (moved) {
         this.selMode = "cell";
