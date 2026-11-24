@@ -31,9 +31,12 @@ import { isAbsolute, relative, resolve } from "node:path";
  * - **W (widening)**: `distinctAreas.length >= 8` AND at least `6` of the last `12` path-bearing
  *   calls entered an area first seen within that 12-call window (`newAreasInWindow >= 6`).
  * - **T (topic spread)**: `searchTopics.length >= 4` distinct search topic clusters.
- * - **S (spinning / no progress)**: the same normalized `(tool + path + range/query)` call
- *   completed `3` or more times (`repeatStreak >= 3`), OR `12` consecutive path-bearing calls
- *   added no new `(tool + path + range)` key and no new search topic (`staleStreak >= 12`).
+ * - **S (spinning / no progress)**: the same normalized `(tool + path + range + query + argv/op)`
+ *   call completed `3` or more times consecutively (`repeatStreak >= 3`), OR `12` consecutive
+ *   scored calls added no new `(tool + path + range + query + argv/op)` key and no new search
+ *   topic (`staleStreak >= 12`). Calls whose inputs cannot distinguish operations (for example
+ *   `cwd` alone without a path, query, or complete `argv`/`command`, or truncated distinguishing
+ *   inputs) are skipped rather than scored as repeats or lack of progress.
  *
  * ## Fire rule and cadence
  * - Fires when `(W && T) || S`. `W` alone never fires, so a bounded single-topic search across
@@ -87,6 +90,10 @@ const RANGE_KEYS = [
   "endLine",
   "offset",
   "limit",
+  "max_bytes",
+  "maxBytes",
+  "max_chars",
+  "maxChars",
   "lines",
   "line",
   "range",
@@ -95,7 +102,35 @@ const RANGE_KEYS = [
   "to",
 ] as const;
 
+const DISTINGUISHING_STRING_KEYS = [
+  "command",
+  "cmd",
+  "glob",
+  "include",
+  "exclude",
+  "type",
+  "file_type",
+  "task_id",
+  "action",
+  "mode",
+] as const;
+
+const DISTINGUISHING_ARRAY_KEYS = ["path_globs", "ids"] as const;
+
+const TRUNCATION_SENSITIVE_STRING_KEYS = [
+  "command",
+  "cmd",
+  "query",
+  "pattern",
+  "regex",
+  "symbol",
+  "term",
+  "glob",
+] as const;
+
 const IGNORED_TOOLS = new Set([
+  "code_exec",
+  "tool_search",
   "return_task",
   "artifact_write",
   "report_issue",
@@ -138,21 +173,42 @@ const SECOND_NUDGE_SPIN_CALLS = 12;
 const MAX_NUDGES = 2;
 const MAX_PENDING_CACHE = 256;
 
-function parseArgsObject(raw: string | Record<string, unknown> | undefined): Record<string, unknown> | null {
+interface ParsedArgsResult {
+  args: Record<string, unknown>;
+  incompleteDistinguishing: boolean;
+}
+
+function parseJsonStringArray(rawArrayBody: string): string[] | null {
+  try {
+    const parsed = JSON.parse(`[${rawArrayBody}]`);
+    if (Array.isArray(parsed) && parsed.every((item) => typeof item === "string" || typeof item === "number" || typeof item === "boolean")) {
+      return parsed.map((item) => String(item));
+    }
+  } catch {
+    // Incomplete or malformed array literal.
+  }
+  return null;
+}
+
+function parseArgsObject(raw: string | Record<string, unknown> | undefined): ParsedArgsResult | null {
   if (!raw) return null;
-  if (typeof raw === "object" && !Array.isArray(raw)) return raw;
+  if (typeof raw === "object" && !Array.isArray(raw)) {
+    return { args: raw, incompleteDistinguishing: false };
+  }
   if (typeof raw !== "string") return null;
   const trimmed = raw.trim();
   if (!trimmed) return null;
   try {
     const parsed = JSON.parse(trimmed);
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
+      return { args: parsed as Record<string, unknown>, incompleteDistinguishing: false };
     }
   } catch {
     // Truncated JSON preview (toolEventPreview cuts at 512 chars): fall back to key-value extraction.
   }
   const out: Record<string, unknown> = {};
+  let incompleteDistinguishing = false;
+
   const strRe = /"([A-Za-z0-9_]+)"\s*:\s*"((?:\\.|[^"\\])*)"/g;
   for (const m of trimmed.matchAll(strRe)) {
     const key = m[1];
@@ -172,15 +228,53 @@ function parseArgsObject(raw: string | Record<string, unknown> | undefined): Rec
       out[key] = Number(numVal);
     }
   }
-  const pathsMatch = /"paths"\s*:\s*\[([^\]]*)/.exec(trimmed);
-  if (pathsMatch?.[1]) {
-    const items: string[] = [];
-    for (const m of pathsMatch[1].matchAll(/"((?:\\.|[^"\\])*)"/g)) {
-      if (m[1]) items.push(m[1]);
+  for (const arrKey of ["argv", "paths", "path_globs", "ids"] as const) {
+    const closedMatch = new RegExp(`"${arrKey}"\\s*:\\s*\\[([^\\]]*)\\]`).exec(trimmed);
+    if (closedMatch?.[1] !== undefined) {
+      const items = parseJsonStringArray(closedMatch[1]);
+      if (items) {
+        out[arrKey] = items;
+      } else {
+        incompleteDistinguishing = true;
+      }
+    } else if (new RegExp(`"${arrKey}"\\s*:\\s*\\[`).test(trimmed)) {
+      incompleteDistinguishing = true;
     }
-    if (items.length > 0) out.paths = items;
   }
-  return Object.keys(out).length > 0 ? out : null;
+  for (const key of TRUNCATION_SENSITIVE_STRING_KEYS) {
+    if (!(key in out) && new RegExp(`"${key}"\\s*:\\s*"`).test(trimmed)) {
+      incompleteDistinguishing = true;
+    }
+  }
+  if (Object.keys(out).length === 0 && !incompleteDistinguishing) return null;
+  return { args: out, incompleteDistinguishing };
+}
+
+function mergeDefinedArgs(
+  prev: string | Record<string, unknown> | undefined,
+  next: string | Record<string, unknown> | undefined,
+): string | Record<string, unknown> | undefined {
+  if (next === undefined) return prev;
+  if (typeof next === "string") return next.trim() ? next : prev;
+  if (prev === undefined) return next;
+  if (typeof prev === "object" && !Array.isArray(prev) && typeof next === "object" && !Array.isArray(next)) {
+    const merged: Record<string, unknown> = { ...prev };
+    for (const [key, value] of Object.entries(next)) {
+      if (value !== undefined) merged[key] = value;
+    }
+    return merged;
+  }
+  if (typeof prev === "string" && typeof next === "object" && !Array.isArray(next)) {
+    const definedEntries = Object.entries(next).filter(([, value]) => value !== undefined);
+    if (definedEntries.length === 0) return prev;
+    const parsedPrev = parseArgsObject(prev);
+    if (parsedPrev && !parsedPrev.incompleteDistinguishing) {
+      const merged: Record<string, unknown> = { ...parsedPrev.args };
+      for (const [key, value] of definedEntries) merged[key] = value;
+      return merged;
+    }
+  }
+  return next;
 }
 
 function stripGlobWildcardTail(pattern: string): string | null {
@@ -207,6 +301,7 @@ function stripLineSuffix(raw: string): { path: string; lineSuffix?: string } {
 interface ExtractedPath {
   path: string;
   isDirHint: boolean;
+  fromCwd?: boolean;
   lineSuffix?: string;
 }
 
@@ -216,18 +311,18 @@ function extractPaths(
   args: Record<string, unknown>,
 ): ExtractedPath[] {
   const results: ExtractedPath[] = [];
-  const pushRaw = (val: unknown, isDirHint: boolean) => {
+  const pushRaw = (val: unknown, isDirHint: boolean, fromCwd = false) => {
     if (typeof val !== "string") return;
     for (const part of val.split("|")) {
       const trimmed = part.trim();
       if (!trimmed) continue;
       const { path, lineSuffix } = stripLineSuffix(trimmed);
-      if (path) results.push({ path, isDirHint: isDirHint || path.endsWith("/"), lineSuffix });
+      if (path) results.push({ path, isDirHint: isDirHint || path.endsWith("/"), fromCwd, lineSuffix });
     }
   };
 
   for (const key of SINGLE_PATH_KEYS) {
-    if (key in args) pushRaw(args[key], DIR_ONLY_KEYS.has(key));
+    if (key in args) pushRaw(args[key], DIR_ONLY_KEYS.has(key), key === "cwd");
   }
   if (Array.isArray(args.paths)) {
     for (const entry of args.paths) pushRaw(entry, false);
@@ -309,6 +404,38 @@ function extractRangeKey(args: Record<string, unknown>, lineSuffixes: string[]):
   return parts.join("&");
 }
 
+function extractOperationKey(args: Record<string, unknown>): string {
+  const parts: string[] = [];
+  if (Array.isArray(args.argv) && args.argv.length > 0) {
+    const normalized = args.argv
+      .filter((item) => typeof item === "string" || typeof item === "number" || typeof item === "boolean")
+      .map((item) => String(item).trim());
+    if (normalized.length === args.argv.length) {
+      parts.push(`argv=${JSON.stringify(normalized)}`);
+    }
+  }
+  for (const key of DISTINGUISHING_STRING_KEYS) {
+    const v = args[key];
+    if (typeof v === "string" && v.trim()) {
+      const normalized = key === "command" || key === "cmd" ? v.trim().replace(/\s+/g, " ") : v.trim();
+      parts.push(`${key}=${normalized}`);
+    }
+  }
+  for (const key of DISTINGUISHING_ARRAY_KEYS) {
+    const v = args[key];
+    if (Array.isArray(v) && v.length > 0) {
+      const normalized = v
+        .filter((item) => typeof item === "string" || typeof item === "number")
+        .map((item) => String(item).trim())
+        .sort();
+      if (normalized.length > 0) {
+        parts.push(`${key}=${JSON.stringify(normalized)}`);
+      }
+    }
+  }
+  return parts.join("&");
+}
+
 function sampleList(items: string[], max = 5): string {
   if (items.length <= max) return items.join(", ");
   return `${items.slice(0, max).join(", ")}, ...`;
@@ -322,15 +449,16 @@ export class ScopeNudgeMonitor {
   private readonly areaFirstSeenAt = new Map<string, number>();
   private readonly recentPathCalls: Array<{ areas: string[] }> = [];
   private readonly topicClusters: Array<{ label: string; tokens: Set<string> }> = [];
-  private readonly callCounts = new Map<string, number>();
-  private readonly seenPathRangeKeys = new Set<string>();
+  private readonly seenProgressKeys = new Set<string>();
 
   private pathCallCount = 0;
+  private scoredCallCount = 0;
+  private lastCallKey: string | null = null;
   private repeatStreak = 0;
   private staleStreak = 0;
   private nudgeCount = 0;
   private areasAtFirstNudge = 0;
-  private pathCallsAtFirstNudge = 0;
+  private callsAtFirstNudge = 0;
 
   constructor(opts: ScopeNudgeOptions) {
     this.workspaceRoot = resolve(opts.workspaceRoot);
@@ -340,11 +468,15 @@ export class ScopeNudgeMonitor {
   observe(call: ScopeToolCall): string | null {
     if (call.status === "in_progress") {
       if (call.id && (call.args !== undefined || call.kind !== undefined)) {
-        if (this.pendingById.size >= MAX_PENDING_CACHE) {
+        const existing = this.pendingById.get(call.id);
+        if (!existing && this.pendingById.size >= MAX_PENDING_CACHE) {
           const oldest = this.pendingById.keys().next().value;
           if (oldest !== undefined) this.pendingById.delete(oldest);
         }
-        this.pendingById.set(call.id, { args: call.args, kind: call.kind });
+        this.pendingById.set(call.id, {
+          args: mergeDefinedArgs(existing?.args, call.args),
+          kind: call.kind !== undefined ? call.kind : existing?.kind,
+        });
       }
       return null;
     }
@@ -358,16 +490,19 @@ export class ScopeNudgeMonitor {
     if (!toolName || IGNORED_TOOLS.has(toolName.toLowerCase())) return null;
 
     const kind = call.kind ?? cached?.kind;
-    const rawArgs = call.args !== undefined ? call.args : cached?.args;
-    const parsedArgs = parseArgsObject(rawArgs);
-    if (!parsedArgs) return null;
+    const rawArgs = mergeDefinedArgs(cached?.args, call.args);
+    const parsed = parseArgsObject(rawArgs);
+    if (!parsed || parsed.incompleteDistinguishing) return null;
+    const parsedArgs = parsed.args;
 
     const extractedPaths = extractPaths(call, kind, parsedArgs);
     const query = extractQuery(call, kind, parsedArgs);
     const topicTokens = query ? extractTopicTokens(query) : [];
+    const opKey = extractOperationKey(parsedArgs);
+    const hasNonCwdPath = extractedPaths.some((p) => !p.fromCwd);
 
-    // Calls with neither path nor query never count.
-    if (extractedPaths.length === 0 && !query) return null;
+    // Skip calls whose inputs cannot distinguish operations (for example cwd alone with no path, query, or argv/op).
+    if (!hasNonCwdPath && !query && !opKey) return null;
 
     const addedNewTopic = topicTokens.length > 0 ? this.recordTopic(topicTokens) : false;
 
@@ -392,10 +527,14 @@ export class ScopeNudgeMonitor {
     const rangeKey = extractRangeKey(parsedArgs, lineSuffixes);
     const queryKey = query ? query.toLowerCase().replace(/\s+/g, " ").trim() : "";
 
-    const callKey = `${toolKey}::${pathKey}::${rangeKey}::${queryKey}`;
-    const nextRepeat = (this.callCounts.get(callKey) ?? 0) + 1;
-    this.callCounts.set(callKey, nextRepeat);
-    this.repeatStreak = nextRepeat;
+    const callKey = `${toolKey}::${pathKey}::${rangeKey}::${queryKey}::${opKey}`;
+    if (this.lastCallKey === callKey) {
+      this.repeatStreak += 1;
+    } else {
+      this.lastCallKey = callKey;
+      this.repeatStreak = 1;
+    }
+    this.scoredCallCount += 1;
 
     if (callAreas.length > 0) {
       const callIndex = this.pathCallCount;
@@ -409,18 +548,14 @@ export class ScopeNudgeMonitor {
       if (this.recentPathCalls.length > WIDENING_WINDOW) {
         this.recentPathCalls.shift();
       }
+    }
 
-      const pathRangeKey = `${toolKey}::${pathKey}::${rangeKey}`;
-      const isNewPathRange = !this.seenPathRangeKeys.has(pathRangeKey);
-      if (isNewPathRange) this.seenPathRangeKeys.add(pathRangeKey);
-
-      if (isNewPathRange || addedNewTopic) {
-        this.staleStreak = 0;
-      } else {
-        this.staleStreak += 1;
-      }
-    } else if (addedNewTopic) {
+    const isNewProgress = !this.seenProgressKeys.has(callKey);
+    if (isNewProgress) this.seenProgressKeys.add(callKey);
+    if (isNewProgress || addedNewTopic) {
       this.staleStreak = 0;
+    } else {
+      this.staleStreak += 1;
     }
 
     if (this.nudgeCount >= MAX_NUDGES) return null;
@@ -430,7 +565,7 @@ export class ScopeNudgeMonitor {
     const topicSpread = sig.searchTopics.length >= TOPIC_MIN_COUNT;
     const wideAndMultiTopic = widening && topicSpread;
 
-    const repeatedNow = nextRepeat >= REPEAT_THRESHOLD;
+    const repeatedNow = this.repeatStreak >= REPEAT_THRESHOLD;
     const staleNow = this.staleStreak >= STALE_THRESHOLD;
     const spinning = repeatedNow || staleNow;
 
@@ -438,7 +573,7 @@ export class ScopeNudgeMonitor {
 
     if (this.nudgeCount === 1) {
       const areaGrewEnough = wideAndMultiTopic && sig.distinctAreas.length >= this.areasAtFirstNudge + SECOND_NUDGE_AREA_GROWTH;
-      const spunAgainEnough = spinning && this.pathCallCount - this.pathCallsAtFirstNudge >= SECOND_NUDGE_SPIN_CALLS;
+      const spunAgainEnough = spinning && this.scoredCallCount - this.callsAtFirstNudge >= SECOND_NUDGE_SPIN_CALLS;
       if (!areaGrewEnough && !spunAgainEnough) return null;
     }
 
@@ -449,7 +584,7 @@ export class ScopeNudgeMonitor {
       );
     }
     if (repeatedNow) {
-      reasons.push(`you repeated the same ${toolName} call ${nextRepeat} times`);
+      reasons.push(`you repeated the same ${toolName} call ${this.repeatStreak} times`);
     }
     if (staleNow) {
       reasons.push(`the last ${this.staleStreak} reads found nothing new`);
@@ -457,7 +592,7 @@ export class ScopeNudgeMonitor {
 
     if (this.nudgeCount === 0) {
       this.areasAtFirstNudge = sig.distinctAreas.length;
-      this.pathCallsAtFirstNudge = this.pathCallCount;
+      this.callsAtFirstNudge = this.scoredCallCount;
     }
     this.nudgeCount += 1;
     // Require a fresh streak of stale reads before stale-spinning can trigger a second nudge.

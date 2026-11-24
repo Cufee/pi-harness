@@ -450,8 +450,20 @@ it("wakes an idle Director chat when a Director-spawned Tier 3 task settles, ski
               const resume = req.tools.find((t) => t.name === "resume_task");
               assert.ok(spawn?.description.includes("No turn limit"));
               assert.ok(spawn?.description.includes("daemon wakes this chat"));
-              assert.ok(waitT?.description.includes("Waits only within this turn"));
-              assert.ok(waitC?.description.includes("Waits only within this turn"));
+              assert.ok(spawn?.description.includes("events.wakeDirectorOnGoalSettle"));
+              assert.ok(spawn?.description.includes("completes, fails, blocks, or returns for re-scope"));
+              assert.ok(spawn?.description.includes("not on cancel"));
+              for (const waitTool of [waitT, waitC]) {
+                assert.ok(waitTool?.description.includes("Waits only within this turn"));
+                assert.ok(waitTool?.description.includes("events.wakeDirectorOnGoalSettle"));
+                assert.ok(waitTool?.description.includes("default on"));
+                assert.ok(waitTool?.description.includes("completes, fails, blocks, or returns for re-scope"));
+                assert.ok(waitTool?.description.includes("not on cancel"));
+              }
+              assert.ok(req.systemPrompt.includes("events.wakeDirectorOnGoalSettle"));
+              assert.ok(req.systemPrompt.includes("default on"));
+              assert.ok(req.systemPrompt.includes("completes, fails, blocks, or returns for re-scope"));
+              assert.ok(req.systemPrompt.includes("not on cancel"));
               assert.ok(resume?.description.includes("does not reset or impose any turn limit"));
               sawToolDescriptions = true;
             }

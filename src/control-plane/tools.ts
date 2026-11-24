@@ -6,7 +6,7 @@ import type { HarnessConfig } from "../config.js";
 import { codeExecEventSink } from "../protocol/tool-display.js";
 import { checkReadOnlyArgv, isSafeGitRemoteUrl, parseReadOnlyGitNetworkCommand } from "../runners/acp-shims.js";
 import { isProtectedWritePath } from "../runners/protected-paths.js";
-import type { ToolDefinition } from "../runners/types.js";
+import type { RunnerCallbacks, ToolDefinition } from "../runners/types.js";
 import { filterTrustedPath, resolveGateEnv, resolveTrustedBinary, runArgv } from "../tools/gate-env.js";
 import type { KbKind } from "../kb/store.js";
 import type { BisectingMergeQueue } from "../worktree/merge-queue.js";
@@ -22,7 +22,7 @@ import type {
   TaskRecord,
 } from "./db.js";
 import { findRunDossier, readRunDossier, readWorkspaceArtifact, spillSummaryOverflow, writeCodeOutput, writeTaskDossier, writeUniqueTaskDossier } from "./dossiers.js";
-import { compactTaskHandoff, isReadOnlyKind, SUMMARY_LIMIT, validateTaskHandoff } from "./handoffs.js";
+import { compactTaskHandoff, isReadOnlyKind, settleTaskMinimalFallback, SUMMARY_LIMIT, validateTaskHandoff } from "./handoffs.js";
 import { expandHomePath } from "./projects.js";
 import type { AnchoredHandoff } from "./prompts.js";
 import { mergeGoalLiveProgress, type GoalLiveProgress, type GoalProgressSource } from "../goals/live-progress.js";
@@ -97,6 +97,13 @@ export interface ToolRuntimeHooks {
     opts?: { note?: string; profileId?: string; model?: string; effort?: string },
   ) => Promise<{ task: TaskRecord; outcome: string; message: string; queuePosition?: number; noteDelivered?: boolean }>;
   forceStartWorker?: (taskId: string, opts?: { bypassQuota?: boolean; reason?: string }) => Promise<unknown>;
+  /** Generation-fenced inner tool event observer (e.g. for Code Mode inner calls). */
+  onTaskToolEvent?: (
+    runId: string,
+    taskId: string,
+    expectedGeneration: number,
+    ev: Parameters<NonNullable<RunnerCallbacks["onToolEvent"]>>[0],
+  ) => void;
 }
 
 function requiredModel(args: Record<string, unknown>) {
@@ -831,6 +838,17 @@ export class ControlPlaneToolExecutor {
     return exposedTools(toolsForTier(tier), this.config.codeMode);
   }
 
+  /** Creates the Code Mode inner-event sink fenced to one task generation. */
+  createCodeExecEventSink(runId: string, taskId: string, expectedGeneration: number) {
+    return codeExecEventSink((ev) => {
+      if (this.hooks.onTaskToolEvent) {
+        this.hooks.onTaskToolEvent(runId, taskId, expectedGeneration, ev);
+      } else {
+        this.db.emitEvent(runId, taskId, "agent.tool", ev);
+      }
+    });
+  }
+
   /**
    * `callerSignal` is the calling turn's abort signal (e.g. a Director chat turn). Unlike `scriptSignal`
    * it does not imply code_exec, so it never trips the active-generation gate for synthetic owners.
@@ -875,6 +893,7 @@ export class ControlPlaneToolExecutor {
     }
     if (mode !== "off" && (name === CODE_EXEC_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME)) {
       const signal = this.hooks.getTaskSignal(taskId);
+      const callerGeneration = task.generation;
       return createCodeModeExecutor({
         ...this.config.codeExec,
         mode,
@@ -884,7 +903,7 @@ export class ControlPlaneToolExecutor {
         pythonCacheDir: join(this.config.stateDir, "code-mode", "python"),
         saveOutput: (name, json) => writeCodeOutput(this.db, run, taskId, name, json),
         signal,
-        onToolEvent: codeExecEventSink((ev) => this.db.emitEvent(runId, taskId, "agent.tool", ev)),
+        onToolEvent: this.createCodeExecEventSink(runId, taskId, callerGeneration),
       }).execute(name, args);
     }
 
@@ -1196,8 +1215,35 @@ export class ControlPlaneToolExecutor {
         if (status !== "completed" && status !== "blocked" && status !== "scope_too_large") {
           throw new Error("return_task requires status completed, blocked, or scope_too_large");
         }
+        const callerSignal = scriptSignal ?? this.hooks.getTaskSignal(taskId);
+        const callerCancelSignal = this.hooks.getTaskCancelSignal?.(taskId);
+        const assertReturnStillValid = () => {
+          const current = this.db.getTask(taskId);
+          if (!current || current.generation !== task.generation) {
+            throw new Error(
+              `Stale return_task for task ${taskId} generation ${task.generation}` +
+                (current ? ` (current generation ${current.generation})` : "") +
+                ": task generation moved on before settlement.",
+            );
+          }
+          if (callerSignal?.aborted || callerCancelSignal?.aborted) {
+            throw new Error(`return_task aborted for task ${taskId}: task execution was cancelled or superseded.`);
+          }
+          if (callerSignal && this.hooks.getTaskSignal(taskId) !== callerSignal) {
+            throw new Error(`Stale return_task for task ${taskId}: caller is no longer the active execution.`);
+          }
+          const invalidStatus = callerSignal
+            ? !["running", "waiting_children", "draining"].includes(current.status)
+            : ["completed", "cancelled", "failed", "returned_for_rescope", "blocked", "paused_quota"].includes(current.status);
+          if (invalidStatus) {
+            throw new Error(`return_task rejected for task ${taskId}: task is already ${current.status}.`);
+          }
+        };
+
         const { summary: fullSummary, sources, artifactPaths, partial } = validateTaskHandoff(task.kind, args);
         let summary = partial && !fullSummary.startsWith("[Partial]") ? `[Partial] ${fullSummary}` : fullSummary;
+
+        assertReturnStillValid();
 
         if (status === "completed") {
           const activeKids = this.db
@@ -1240,6 +1286,10 @@ export class ControlPlaneToolExecutor {
           }
         }
 
+        // Revalidate caller generation, live status, and cancellation after awaited worktree checks
+        // and before spilling summary overflow or committing settlement.
+        assertReturnStillValid();
+
         const paths = [...artifactPaths];
         let overflowPath: string | undefined;
         let summaryOverflow: { path: string; next_offset: number; total_chars: number } | undefined;
@@ -1257,8 +1307,9 @@ export class ControlPlaneToolExecutor {
           }
         }
         const taskStatus = status === "scope_too_large" ? "returned_for_rescope" : status;
+        let committed = false;
         try {
-          return this.db.transaction(() => {
+          const result = this.db.transaction(() => {
             let escalationId: string | undefined;
             let suggestedSplits: string[] | undefined;
             if (status === "scope_too_large") {
@@ -1310,12 +1361,14 @@ export class ControlPlaneToolExecutor {
             }
             return { returned: true, status: taskStatus, ...(escalationId ? { escalationId } : {}) };
           });
+          committed = true;
+          return result;
         } catch (error) {
           if (overflowPath) rmSync(overflowPath, { force: true });
           throw error;
         } finally {
           // Tear down a merged Tier 2 worktree once the worker settles via return_task
-          if (status === "completed" && task.tier === 2 && task.worktreeId) {
+          if (committed && status === "completed" && task.tier === 2 && task.worktreeId) {
             const wt = this.db.getWorktree(task.worktreeId);
             if (wt && wt.status === "merged" && !wt.cleanedAt) {
               void this.hooks
@@ -1347,8 +1400,9 @@ export class ControlPlaneToolExecutor {
           blocking,
         });
         if (blocking) {
-          this.db.updateTask(taskId, { status: "blocked", summary: `Blocked on ${esc.id}: ${esc.title}` });
-          this.hooks.stopTaskForBlockingIssue?.(taskId, `Blocked on ${esc.id}: ${esc.title}`);
+          const blockedSummary = `Blocked on ${esc.id}: ${esc.title}`;
+          settleTaskMinimalFallback(this.db, task, "blocked", blockedSummary, `blocked: ${esc.id} (${esc.title.slice(0, 160)})`);
+          this.hooks.stopTaskForBlockingIssue?.(taskId, blockedSummary);
         }
         return { escalationId: esc.id, severity: esc.severity, routedTo: toTaskId ?? "human" };
       }
