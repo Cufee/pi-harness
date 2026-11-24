@@ -84,7 +84,7 @@ it.each(["research", "plan", "verify"] as const)("lets Tier 1 spawn and await a 
     assert.deepEqual(properties.kind?.enum?.toSorted(), ["plan", "research", "verify"]);
     assert.deepEqual(Object.keys(properties).toSorted(), ["effort", "kind", "model", "objective", "profile_id", "title"]);
     const assignment = { title: "Read deployment notes", objective: "Find how deployment starts" };
-    await assert.rejects(() => execute("spawn_task", { ...assignment, kind: "execute" }), /Tier 1.*only permits research, plan, and verify/);
+    await assert.rejects(() => execute("spawn_task", { ...assignment, kind: "execute" }), /\[harness blocked: spawn-execute-needs-worker\]/);
     assert.equal(catalogCalls, 0);
     assert.deepEqual(db.listTasks(run.id, { parentId: parent.id }), []);
 

@@ -28,9 +28,9 @@ describe("Tier role instructions", () => {
     const prompt = buildDirectorSystemPrompt("off");
     assert.match(prompt, /never edit code or run shell commands yourself/i);
     assert.match(prompt, /delegate lookups.*read-only research, plan, or verify.*spawn_task/i);
-    assert.match(prompt, /concrete model from list_models/i);
-    assert.match(prompt, /summary and sources via wait_tasks.*artifacts on demand/i);
-    assert.match(prompt, /read files directly with read_file/i);
+    assert.match(prompt, /concrete model from `list_models`/i);
+    assert.match(prompt, /summary and sources via `wait_tasks`.*artifacts on demand/i);
+    assert.match(prompt, /read files directly with `read_file`/i);
     assert.match(prompt, /goal_create.*commit it immediately.*clear action request/i);
     assert.match(prompt, /sensible defaults.*ask only.*ambiguous or irreversible/i);
     assert.match(prompt, /separate goals for distinct requests.*amend the relevant active goal/i);
@@ -43,7 +43,7 @@ describe("Tier role instructions", () => {
     assert.match(prompt, /read-only file\/search access.*never editing files or running mutating commands/i);
     assert.match(prompt, /1 cohesive Tier 2 Worker/i);
     assert.match(prompt, /implementation to Tier 2 Workers with disjoint write_scopes.*Blackboard/i);
-    assert.match(prompt, /always choose a concrete model ID from list_models/i);
+    assert.match(prompt, /always choose a concrete model ID from `list_models`/i);
     assert.match(prompt, /spawn_task.*read-only research, planning, and verification/i);
     assert.match(prompt, /wait_children.*summaries.*sources.*artifact_paths.*artifact_read.*more detail/i);
     assert.match(prompt, /kb_search.*kb_propose.*kb_promote.*kb_archive.*kb_flag_stale/i);
@@ -80,8 +80,11 @@ describe("Tier role instructions", () => {
     }
     assert.match(prompt, /never attempt to spawn subagents/i);
     assert.match(prompt, /catalog model assigned by your parent/i);
-    assert.match(prompt, /return_task.*2,000 characters.*sources.*path.*lines.*symbol.*note/i);
-    assert.match(prompt, /research, plan, and verify tasks must include at least one source/i);
+    if (kind === "execute") {
+      assert.match(prompt, /return_task.*2,000 characters.*structured sources.*path.*lines.*symbol.*note/i);
+    } else {
+      assert.match(prompt, /return_task.*2,000 characters.*files and lines.*handoff without sources is rejected/i);
+    }
     assert.match(prompt, /artifact_write.*artifact_paths.*transcripts or tool logs/i);
   });
 
@@ -241,7 +244,29 @@ describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () =>
       assert.equal(finalOrch.generation, 2);
       assert.equal(finalOrch.status, "completed");
 
-      // Create a Tier 3 task and test scope_too_large guardrail
+      // Create a Tier 3 task and test scope_too_large send-back with < 2 splits (accepted with splitsMissing: true)
+      const oneSplitChild = db.createTask({
+        runId: run.id,
+        parentId: orchestratorTask.id,
+        tier: 3,
+        kind: "execute",
+        title: "One-split task",
+        objective: "Rewrite entire compiler",
+        profileId: "acp:claude",
+      });
+
+      const oneSplitRes = (await orch.toolExecutor.execute(run.id, oneSplitChild.id, "return_task", {
+        status: "scope_too_large",
+        summary: "Too big",
+        evidence_paths: ["src/compiler.ts"],
+        suggested_splits: ["only one"],
+      })) as { status: string; escalationId: string; splitsMissing?: boolean };
+
+      assert.equal(oneSplitRes.status, "returned_for_rescope");
+      assert.equal(oneSplitRes.splitsMissing, true);
+      assert.equal(db.getTask(oneSplitChild.id)?.status, "returned_for_rescope");
+
+      // Accepted cleanly when evidence + >= 2 splits provided (no splitsMissing)
       const child = db.createTask({
         runId: run.id,
         parentId: orchestratorTask.id,
@@ -252,27 +277,15 @@ describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () =>
         profileId: "acp:claude",
       });
 
-      // Rejected when missing suggested_splits (< 2)
-      await assert.rejects(
-        () =>
-          orch.toolExecutor.execute(run.id, child.id, "return_task", {
-            status: "scope_too_large",
-            summary: "Too big",
-            evidence_paths: ["src/compiler.ts"],
-            suggested_splits: ["only one"],
-          }),
-        /at least 2 concrete suggested_splits/,
-      );
-
-      // Accepted when evidence + >= 2 splits provided
       const res = (await orch.toolExecutor.execute(run.id, child.id, "return_task", {
         status: "scope_too_large",
         summary: "Spans parser and codegen",
         evidence_paths: ["src/parser.ts", "src/codegen.ts"],
         suggested_splits: ["Refactor parser AST", "Update codegen emitter"],
-      })) as { status: string; escalationId: string };
+      })) as { status: string; escalationId: string; splitsMissing?: boolean };
 
       assert.equal(res.status, "returned_for_rescope");
+      assert.equal(res.splitsMissing, undefined);
       assert.equal(db.getTask(child.id)?.status, "returned_for_rescope");
       const esc = db.getEscalation(res.escalationId)!;
       assert.equal(esc.category, "scope_too_large");
@@ -306,7 +319,7 @@ describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () =>
             status: "completed",
             summary: "Done early",
           }),
-        /Settlement gate rejected/,
+        /harness blocked: settlement-/,
       );
 
       db.close();
@@ -527,7 +540,7 @@ describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () =>
     // 8 most recent settled tasks (5..12) kept; 4 oldest (1..4) omitted with 1-line pointer
     for (let i = 5; i <= 12; i++) assert.ok(prompt.includes(`t-settled-${i}`), `expected t-settled-${i}`);
     for (let i = 1; i <= 4; i++) assert.ok(!prompt.includes(`t-settled-${i} `), `expected t-settled-${i} to be omitted`);
-    assert.ok(prompt.includes("... and 4 older settled tasks (use tree_view or task_get for details)"));
+    assert.ok(prompt.includes("... and 4 older settled tasks (use `tree_view` or `task_get` for details)"));
 
     // Blackboard entry bounded to 500 chars with blackboard_get hint
     assert.ok(prompt.includes("small_key: {\"ok\":true}"));

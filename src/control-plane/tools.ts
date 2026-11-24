@@ -36,6 +36,9 @@ import {
   type GoalProgressSource,
 } from "../goals/live-progress.js";
 import type { SteerTaskResult } from "./orchestrator.js";
+import { REJECTIONS } from "../advisories/rejections.js";
+import { roleOf } from "../advisories/roles.js";
+import { allowedToolNames, notYourTool, toolsForRole } from "../tool-descriptions/index.js";
 
 export { readRunDossier } from "./dossiers.js";
 export { compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./handoffs.js";
@@ -130,713 +133,22 @@ function derivedTitleNote(title: string): string {
   return `title was missing; derived '${title}'. Pass a short title next time.`;
 }
 
-const waitChildrenTool: ToolDefinition = {
-  name: "wait_children",
-  description:
-    "Event-driven wait for child tasks (zero polling; wakes immediately on completion or escalation). Optional fallback_interval_s configures a dead-agent watchdog wakeup (defaults to a long interval so you never thrash). A handoff with truncated: true carries full_summary.path/next_offset; page it with artifact_read.",
-  inputSchema: {
-    type: "object",
-    properties: {
-      ids: { type: "array", items: { type: "string" } },
-      mode: { type: "string", enum: ["any", "all"] },
-      fallback_interval_s: {
-        type: "number",
-        description: "Optional fallback wakeup interval in seconds in case a child hangs or dies (default: config.events.fallbackWakeupIntervalSec, 600s).",
-      },
-      timeout_s: {
-        type: "number",
-        description: "Alias for fallback_interval_s.",
-      },
-    },
-  },
-};
+export type TaskToolSubject = Pick<TaskRecord, "runId" | "tier" | "kind" | "profileId" | "title" | "readOnly">;
 
-const cancelChildTool: ToolDefinition = {
-  name: "cancel_child",
-  description: "Cancel a running child task cleanly and release its write leases.",
-  inputSchema: {
-    type: "object",
-    required: ["task_id", "reason"],
-    properties: {
-      task_id: { type: "string" },
-      reason: { type: "string" },
-    },
-  },
-};
+const READ_ONLY_FINDING_CATEGORIES = new Set<EscalationCategory>([
+  "verification_failed",
+  "code_defect",
+  "broken_test",
+]);
 
-const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
-  {
-    name: "tree_view",
-    tiers: [1, 2, 3],
-    description: "Inspect the live hierarchical tree of tasks, statuses, models, context usage, and open escalations from SQLite.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        include_settled: { type: "boolean", description: "Include completed/cancelled tasks (default true)" },
-      },
-    },
-  },
-  {
-    name: "task_get",
-    tiers: [1, 2, 3],
-    description: "Get the compact handoff, indexed dossiers, and escalations for a task in this run.",
-    inputSchema: {
-      type: "object",
-      required: ["task_id"],
-      properties: { task_id: { type: "string" } },
-    },
-  },
-  {
-    name: "list_models",
-    tiers: [1, 2],
-    description:
-      "List currently enabled latest-per-family models ranked by coding quality with cost/task, time/task, live subscription quota availability, recommendedByKind, and any per-session model selection context.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        role: { type: "string", description: "Optional role filter (orchestrator, worker_execution, codebase_research, independent_verifier)" },
-        max_api_equiv_usd: { type: "number", description: "Optional upper bound on API-equivalent USD per task" },
-        exclude_exhausted: { type: "boolean", description: "Hide models whose quota bucket is currently exhausted (default false)" },
-      },
-    },
-  },
-  {
-    name: "spawn_worker",
-    tiers: [1],
-    description:
-      "Spawn a Tier 2 Worker in its own isolated git worktree with disjoint write_scopes. Workers dynamically manage sub-tasks and submit via the merge queue.",
-    inputSchema: {
-      type: "object",
-      required: ["objective", "write_scopes", "model"],
-      properties: {
-        title: { type: "string", description: "Short task title; derived from objective if omitted." },
-        objective: { type: "string" },
-        criteria: { type: "string" },
-        write_scopes: { type: "array", items: { type: "string" }, description: "Disjoint glob patterns owned by this worker (e.g. ['src/auth/**'])" },
-        profile_id: { type: "string" },
-        model: { type: "string" },
-        effort: { type: "string" },
-        depends_on: { type: "array", items: { type: "string" } },
-        position: {
-          description: "Optional queue position if maxConcurrentWorkers is full: 1-based integer (1 = next up), 'front', or 'back' (default).",
-        },
-        force_start: {
-          type: "boolean",
-          description: "Emergency override: start immediately bypassing maxConcurrentWorkers. Do NOT abuse — use only for urgent blockers.",
-        },
-      },
-    },
-  },
-  {
-    name: "spawn_task",
-    tiers: [1],
-    description:
-      "Spawn a read-only Tier 3 research, plan, or verify task. Read its handoff with wait_children. Tasks have no turn limit; a task whose scope keeps widening is nudged to return a partial handoff (partial: true or scope_too_large with suggested_splits).",
-    inputSchema: {
-      type: "object",
-      required: ["kind", "objective", "model"],
-      properties: {
-        kind: { type: "string", enum: ["research", "plan", "verify"] },
-        profile_id: { type: "string" },
-        title: { type: "string", description: "Short task title; derived from objective if omitted." },
-        objective: { type: "string" },
-        model: { type: "string" },
-        effort: { type: "string" },
-      },
-    },
-  },
-  {
-    name: "spawn_task",
-    tiers: [2],
-    description:
-      "Spawn a Tier 3 research, plan, execute, or verify task inside this Worker's worktree. Read its handoff with wait_children. Tasks have no turn limit and compact context in place on Pi and Claude runners so long single-question reads continue; a task whose scope keeps widening may be nudged to return a partial handoff (partial: true or scope_too_large with suggested_splits), and one that ends without return_task still leaves a partial handoff.",
-    inputSchema: {
-      type: "object",
-      required: ["kind", "objective", "model"],
-      properties: {
-        kind: { type: "string", enum: ["research", "plan", "execute", "verify"] },
-        title: { type: "string", description: "Short task title; derived from objective if omitted." },
-        objective: { type: "string" },
-        criteria: { type: "string" },
-        read_only: { type: "boolean", description: "Opt an execute task into read-only access. Research, plan, and verify are always read-only." },
-        profile_id: { type: "string" },
-        model: { type: "string" },
-        effort: { type: "string" },
-        depends_on: { type: "array", items: { type: "string" } },
-      },
-    },
-  },
-  { ...waitChildrenTool, tiers: [1, 2] },
-  { ...waitChildrenTool, name: "wait_tasks", tiers: [1, 2] },
-  {
-    name: "steer_child",
-    tiers: [1],
-    description: "Send mid-turn steering guidance to a running child agent. Steering never restarts a settled child; use resume_task with a note for that.",
-    inputSchema: {
-      type: "object",
-      required: ["task_id", "message"],
-      properties: {
-        task_id: { type: "string" },
-        message: { type: "string" },
-      },
-    },
-  },
-  {
-    // Tier 2 has no resume_task: a settled child is replaced by delegating a fresh task.
-    name: "steer_child",
-    tiers: [2],
-    description: "Send mid-turn steering guidance to a running child agent. Steering never restarts a settled child; spawn a new task for further work.",
-    inputSchema: {
-      type: "object",
-      required: ["task_id", "message"],
-      properties: {
-        task_id: { type: "string" },
-        message: { type: "string" },
-      },
-    },
-  },
-  { ...cancelChildTool, tiers: [1, 2] },
-  { ...cancelChildTool, name: "cancel_task", tiers: [1] },
-  {
-    name: "report_goal_progress",
-    tiers: [1, 2],
-    description:
-      "Report live goal progress, verification status, and checked criteria results back to the owning Goal so the Goals table and cards reflect what agents are actually doing.",
-    inputSchema: {
-      type: "object",
-      required: ["summary"],
-      properties: {
-        summary: { type: "string", description: "Concise live progress or verification update." },
-        phase: {
-          type: "string",
-          description:
-            "Short current phase label (e.g. 'planning', 'implementing', 'verifying'). Phase 'blocked' means you cannot proceed without a human: automatic verification is skipped when the run settles and the Director is woken with your summary and remediation. Use it only for genuine blockers.",
-        },
-        verification_status: {
-          type: "string",
-          enum: ["not_needed", "in_progress", "passed", "failed"],
-          description:
-            "Current verification state as decided/observed by the agent. 'failed' prevents automatic approval of this goal revision until you report again (passed, failed, or phase 'blocked').",
-        },
-        criteria_results: {
-          type: "array",
-          items: {
-            type: "object",
-            required: ["criterion_id", "passed", "evidence"],
-            properties: {
-              criterion_id: { type: "string" },
-              passed: { type: "boolean" },
-              evidence: { type: "string" },
-              remediation: { type: "string" },
-            },
-          },
-        },
-      },
-    },
-  },
-  {
-    name: "return_task",
-    tiers: [2, 3],
-    description:
-      "Finish this task OR send it back up the chain if scope is too large (`scope_too_large` requires evidence_paths and >= 2 suggested_splits).",
-    inputSchema: {
-      type: "object",
-      required: ["status", "summary"],
-      properties: {
-        status: { type: "string", enum: ["completed", "scope_too_large", "blocked"] },
-        summary: { type: "string", description: "Compact handoff (up to 2,000 characters; longer summaries are saved as artifacts)." },
-        partial: {
-          type: "boolean",
-          description:
-            "Set true when handing back incomplete work, for example after a harness scope check. Summarize what is done, cite what you verified, list what remains.",
-        },
-        sources: {
-          type: "array",
-          description: "Evidence references. Required and non-empty for research, plan, and verify tasks.",
-          items: {
-            type: "object",
-            required: ["path"],
-            properties: { path: { type: "string" }, lines: { type: "string" }, symbol: { type: "string" }, note: { type: "string" } },
-          },
-        },
-        artifact_paths: { type: "array", items: { type: "string" } },
-        evidence_paths: { type: "array", items: { type: "string" } },
-        suggested_splits: { type: "array", items: { type: "string" } },
-      },
-    },
-  },
-  {
-    name: "report_issue",
-    tiers: [1, 2, 3],
-    description: "Raise a discovered code defect, broken test, interface conflict, or ambiguity up the chain.",
-    inputSchema: {
-      type: "object",
-      required: ["severity", "category", "evidence_paths"],
-      properties: {
-        severity: { type: "string", enum: ["P0", "P1", "P2"] },
-        category: {
-          type: "string",
-          enum: [
-            "scope_too_large",
-            "code_defect",
-            "broken_test",
-            "interface_conflict",
-            "ambiguous_spec",
-            "blocked_dependency",
-            "verification_failed",
-            "budget_exhausted",
-            "env_failure",
-            "security_risk",
-          ],
-        },
-        title: { type: "string", description: "Short issue title; derived from attempted, evidence_paths, or category if omitted." },
-        evidence_paths: { type: "array", items: { type: "string" } },
-        attempted: { type: "array", items: { type: "string" } },
-        blocking: { type: "boolean" },
-      },
-    },
-  },
-  {
-    name: "ack_escalation",
-    tiers: [1, 2],
-    description: "Acknowledge and resolve an open escalation or scope send-back from a child agent.",
-    inputSchema: {
-      type: "object",
-      required: ["escalation_id", "resolution"],
-      properties: {
-        escalation_id: { type: "string" },
-        resolution: { type: "string" },
-      },
-    },
-  },
-  {
-    name: "request_rollover",
-    tiers: [1, 2],
-    description:
-      "Request a clean control-plane rollover to a fresh session (optionally switching model/effort) with an anchored handoff before context overflow.",
-    inputSchema: {
-      type: "object",
-      required: ["goal_invariants", "next_actions"],
-      properties: {
-        goal_invariants: { type: "array", items: { type: "string" } },
-        architectural_decisions: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: { decision: { type: "string" }, rationale: { type: "string" } },
-          },
-        },
-        active_risks: { type: "array", items: { type: "string" } },
-        next_actions: { type: "array", items: { type: "string" } },
-        target_profile_id: { type: "string" },
-        target_model: { type: "string" },
-        target_effort: { type: "string" },
-      },
-    },
-  },
-  {
-    name: "query_predecessor",
-    tiers: [1, 2],
-    description: "Search persisted SQLite event & artifact traces from predecessor generations (Seance) without loading old context.",
-    inputSchema: {
-      type: "object",
-      required: ["query"],
-      properties: {
-        query: { type: "string" },
-        limit: { type: "number" },
-      },
-    },
-  },
-  {
-    name: "artifact_write",
-    tiers: [1, 2, 3],
-    description: "Write a durable research dossier, plan, or log artifact to disk and register it in the Deterministic Artifact Index.",
-    inputSchema: {
-      type: "object",
-      required: ["name", "content", "summary"],
-      properties: {
-        name: { type: "string" },
-        content: { type: "string" },
-        summary: { type: "string" },
-      },
-    },
-  },
-  {
-    name: "artifact_read",
-    tiers: [1, 2, 3],
-    description:
-      "Read a dossier by path (Tier 1: indexed dossiers in this run only) or list indexed artifacts for a task. Returns totalChars, hasMore and nextOffset for long files; call again with offset=nextOffset until hasMore is false. Pass task_id with path for a Director task from another workspace.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        path: { type: "string" },
-        task_id: { type: "string" },
-        max_chars: { type: "number" },
-        offset: { type: "number", description: "Character offset for paginating large artifacts (default 0)." },
-      },
-    },
-  },
-  {
-    name: "inspect_command",
-    tiers: [3],
-    description:
-      "Run one read-only inspection command in your task workspace without a shell (no pipes, redirection, globbing, or chaining). Allowed: git status|log|diff|show|blame|rev-parse|rev-list|merge-base|ls-files|ls-tree|grep|cat-file|describe|shortlog|show-ref|for-each-ref|branch (list)|tag (list)|remote [-v|get-url]|fetch <remote> [<branch>...]|ls-remote <remote>; rg; ls, cat, head, tail, wc, nl, stat; bun test [files] [-t pattern]; bunx tsc --noEmit [-p tsconfig]. Paths must stay inside the workspace and configured read roots. Note: bun test and tsc execute repository code in the task workspace without an OS sandbox (and tsc --noEmit may write .tsbuildinfo when incremental/composite is enabled). Returns exit_code, stdout and stderr tails, and an artifact path holding the full output when it was cut.",
-    inputSchema: {
-      type: "object",
-      required: ["argv"],
-      properties: {
-        argv: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-          description: 'Command and arguments, e.g. ["git","log","-5","--oneline"].',
-        },
-        cwd: { type: "string", description: "Workspace-relative directory (default: workspace root)." },
-        timeout_s: { type: "number", description: "Default 120; max 900 (bun test / tsc)." },
-      },
-    },
-  },
-  {
-    name: "blackboard_set",
-    tiers: [1, 2],
-    description: "Publish a shared interface contract, schema, or architectural decision to the run Blackboard.",
-    inputSchema: {
-      type: "object",
-      required: ["key", "value"],
-      properties: {
-        key: { type: "string" },
-        value: {},
-      },
-    },
-  },
-  {
-    name: "blackboard_get",
-    tiers: [1, 2, 3],
-    description: "Read one or all shared contracts/decisions from the run Blackboard.",
-    inputSchema: {
-      type: "object",
-      properties: { key: { type: "string" } },
-    },
-  },
-  {
-    name: "ask_agent",
-    tiers: [1, 2],
-    description: "Send a bounded, control-plane-mediated question to another Tier 1 or Tier 2 agent in this run (no freeform chat loops). Tier 3 agents cannot reply; steer your own Tier 3 children instead.",
-    inputSchema: {
-      type: "object",
-      required: ["target_id", "question"],
-      properties: {
-        target_id: { type: "string" },
-        question: { type: "string" },
-      },
-    },
-  },
-  {
-    name: "reply_agent",
-    tiers: [1, 2],
-    description: "Reply to a mediated peer question received via `ask_agent`.",
-    inputSchema: {
-      type: "object",
-      required: ["message_id", "answer"],
-      properties: {
-        message_id: { type: "string" },
-        answer: { type: "string" },
-      },
-    },
-  },
-  {
-    name: "worktree_status",
-    tiers: [2],
-    description: "Inspect git branch, dirty state, and merge-queue status for this Worker's isolated worktree.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "submit_for_merge",
-    tiers: [2],
-    description: "Enqueue this Worker's committed worktree branch into the deterministic bisecting merge queue.",
-    inputSchema: {
-      type: "object",
-      required: ["summary"],
-      properties: { summary: { type: "string" } },
-    },
-  },
-  // ---- Curated Knowledge Base (2-stage progressive disclosure) ----
-  {
-    name: "kb_search",
-    tiers: [1, 2, 3],
-    description: "Stage 1 KB discovery: search by FTS5 query and/or structured filters (path_globs, tags, kinds). Returns compact cards only.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: { type: "string" },
-        path_globs: { type: "array", items: { type: "string" } },
-        tags: { type: "array", items: { type: "string" } },
-        kinds: { type: "array", items: { type: "string", enum: ["invariant", "gotcha", "architecture", "decision", "convention"] } },
-        include_candidates: { type: "boolean" },
-        include_stale: { type: "boolean" },
-        limit: { type: "number" },
-      },
-    },
-  },
-  {
-    name: "kb_get",
-    tiers: [1, 2, 3],
-    description: "Stage 2 KB read: fetch full context_md and evidence_paths for specific KB entry IDs returned by kb_search.",
-    inputSchema: {
-      type: "object",
-      required: ["ids"],
-      properties: { ids: { type: "array", items: { type: "string" } } },
-    },
-  },
-  {
-    name: "kb_propose",
-    tiers: [1, 2],
-    description:
-      "Propose a high-leverage non-obvious finding as an unverified KB candidate with mandatory context_md and evidence_paths. Candidates stay hidden from default kb_search results until a Tier 1 Orchestrator verifies them with kb_promote.",
-    inputSchema: {
-      type: "object",
-      required: ["kind", "summary", "context_md", "evidence_paths"],
-      properties: {
-        kind: { type: "string", enum: ["invariant", "gotcha", "architecture", "decision", "convention"] },
-        title: { type: "string", description: "Short entry title; derived from summary or context_md if omitted." },
-        summary: { type: "string" },
-        context_md: { type: "string" },
-        tags: { type: "array", items: { type: "string" } },
-        path_globs: { type: "array", items: { type: "string" } },
-        evidence_paths: { type: "array", items: { type: "string" } },
-      },
-    },
-  },
-  {
-    name: "kb_flag_stale",
-    tiers: [1, 2, 3],
-    description: "Immediately flag an inaccurate or outdated KB entry as stale so other agents are not misled.",
-    inputSchema: {
-      type: "object",
-      required: ["id", "reason"],
-      properties: { id: { type: "string" }, reason: { type: "string" } },
-    },
-  },
-  {
-    name: "kb_promote",
-    tiers: [1],
-    description: "Promote a candidate or stale KB entry in this repository to active/verified status.",
-    inputSchema: {
-      type: "object",
-      required: ["id"],
-      properties: {
-        id: { type: "string" },
-        title: { type: "string" },
-        summary: { type: "string" },
-        context_md: { type: "string" },
-        verified_sha: { type: "string" },
-      },
-    },
-  },
-  {
-    name: "kb_archive",
-    tiers: [1],
-    description: "Archive an obsolete or superseded KB entry in this repository (bi-temporal; preserves history).",
-    inputSchema: {
-      type: "object",
-      required: ["id"],
-      properties: {
-        id: { type: "string" },
-        reason: { type: "string" },
-        superseded_by: { type: "string" },
-      },
-    },
-  },
-  // ---- Cross-Run Coordination (strictly Tier 1 Orchestrator-to-Orchestrator) ----
-  {
-    name: "list_peer_runs",
-    tiers: [1],
-    description: "Discover active sibling runs in harnessd, their coordination_group, repo_root, base_branch, and active write scopes.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "contract_publish",
-    tiers: [1],
-    description: "Publish or freeze a versioned cross-run interface contract (single-writer, immutable versions, optimistic expected_version).",
-    inputSchema: {
-      type: "object",
-      required: ["namespace", "key", "payload", "summary"],
-      properties: {
-        namespace: { type: "string" },
-        key: { type: "string" },
-        payload: {},
-        summary: { type: "string" },
-        status: { type: "string", enum: ["draft", "frozen", "deprecated"] },
-        expected_version: { type: "number" },
-      },
-    },
-  },
-  {
-    name: "contract_get",
-    tiers: [1],
-    description: "Read the latest or a pinned version of a cross-run contract.",
-    inputSchema: {
-      type: "object",
-      required: ["namespace", "key"],
-      properties: { namespace: { type: "string" }, key: { type: "string" }, version: { type: "number" } },
-    },
-  },
-  {
-    name: "peer_notify",
-    tiers: [1],
-    description: "Send a non-blocking advisory to another top-level run's Orchestrator (zero deadlock risk).",
-    inputSchema: {
-      type: "object",
-      required: ["to_run_id", "topic_key", "message"],
-      properties: { to_run_id: { type: "string" }, topic_key: { type: "string" }, message: { type: "string" } },
-    },
-  },
-  {
-    name: "peer_request",
-    tiers: [1],
-    description:
-      "Send a bounded cross-run request to a coordinated sibling Orchestrator (enforces max_rounds=2 and DFS deadlock cycle detection).",
-    inputSchema: {
-      type: "object",
-      required: ["to_run_id", "topic_key", "message"],
-      properties: {
-        to_run_id: { type: "string" },
-        topic_key: { type: "string" },
-        message: { type: "string" },
-        timeout_s: { type: "number" },
-      },
-    },
-  },
-  {
-    name: "peer_reply",
-    tiers: [1],
-    description: "Reply to an open cross-run peer_request and release its wait-graph edge.",
-    inputSchema: {
-      type: "object",
-      required: ["request_id", "reply"],
-      properties: { request_id: { type: "string" }, reply: { type: "string" } },
-    },
-  },
-  {
-    name: "wait_timer",
-    tiers: [1, 2],
-    description:
-      "Explicitly sleep with zero token burn for a duration (delay_seconds) or until an ISO timestamp (wake_at, e.g. a quota reset time), optionally waking early when a subscribed event occurs (child_settled, any). Work productively by default — use this when pacing around quota limits/resets per user/session instructions or waiting for a timed condition.",
-    inputSchema: {
-      type: "object",
-      required: ["reason"],
-      properties: {
-        delay_seconds: { type: "number", description: "Seconds to sleep before waking." },
-        wake_at: { type: "string", description: "ISO-8601 UTC timestamp to wake at (e.g. a quota resetsAt value)." },
-        reason: { type: "string", description: "Concise reason for sleeping (shown in live run telemetry)." },
-        wake_on_event: {
-          type: "string",
-          enum: ["none", "child_settled", "any"],
-          description: "Optional early-wake event trigger (default: 'none').",
-        },
-      },
-    },
-  },
-  {
-    name: "schedule_timer",
-    tiers: [1, 2],
-    description:
-      "Schedule a durable non-blocking timer (survives daemon restart) for a reminder without blocking the current turn. When it fires (or a child of yours settles, with wake_on_event child_settled/any), the reason is delivered as a steering message only if this task is still running, for example inside wait_children; it does not restart a finished task.",
-    inputSchema: {
-      type: "object",
-      required: ["reason"],
-      properties: {
-        delay_seconds: { type: "number", description: "Seconds from now until the timer fires." },
-        wake_at: { type: "string", description: "ISO-8601 UTC timestamp when the timer should fire." },
-        reason: { type: "string", description: "Concise description of what to do when the timer fires." },
-        wake_on_event: { type: "string", enum: ["none", "child_settled", "any"] },
-      },
-    },
-  },
-  {
-    name: "list_timers",
-    tiers: [1, 2],
-    description: "List pending or recent durable timers owned by this task.",
-    inputSchema: {
-      type: "object",
-      properties: { status: { type: "string", enum: ["pending", "fired", "cancelled"] } },
-    },
-  },
-  {
-    name: "cancel_timer",
-    tiers: [1, 2],
-    description: "Cancel a pending durable timer by ID (e.g. timer-1).",
-    inputSchema: {
-      type: "object",
-      required: ["timer_id"],
-      properties: { timer_id: { type: "string" }, reason: { type: "string" } },
-    },
-  },
-  {
-    name: "resume_task",
-    tiers: [1],
-    description:
-      "Resume a failed, crashed, blocked, or cancelled child task in-place with a recovery handoff instead of spawning a duplicate task. A Worker keeps its worktree and WIP commits when the worktree still exists; a cancelled Worker's worktree was archived, so it restarts in a fresh worktree from the base branch. Safe to repeat: when the task is already running, queued, waiting, or completed it returns its current state (outcome + message) without restarting anything.",
-    inputSchema: {
-      type: "object",
-      required: ["task_id"],
-      properties: {
-        task_id: { type: "string", description: "Failed/crashed child task ID (e.g. t-2)." },
-        note: { type: "string", description: "Optional guidance for the resumed generation." },
-        model: { type: "string", description: "Optional replacement model ID from list_models." },
-        effort: { type: "string", description: "Optional reasoning effort override." },
-        profile_id: { type: "string", description: "Optional ACP/Pi profile override." },
-      },
-    },
-  },
-  {
-    name: "queue_list",
-    tiers: [1, 2],
-    description: "Inspect the unified admission queue (queued goals & workers, 1-based positions, and active concurrency limits).",
-    inputSchema: {
-      type: "object",
-      properties: {
-        lane: { type: "string", enum: ["goal", "worker"], description: "Optional lane filter ('goal' or 'worker')." },
-      },
-    },
-  },
-  {
-    name: "queue_reorder",
-    tiers: [1, 2],
-    description: "Move a queued worker (or goal) in the admission queue to any 1-based position ('front', 'back', or integer >= 1).",
-    inputSchema: {
-      type: "object",
-      required: ["target_id", "position"],
-      properties: {
-        lane: { type: "string", enum: ["goal", "worker"], description: "Queue lane (defaults to 'worker' for t-* IDs, 'goal' for goal-* IDs)." },
-        target_id: { type: "string", description: "Queued task ID (e.g. t-4) or goal ID (e.g. goal-2)." },
-        position: { description: "Target position: 1-based integer (1 = next up), 'front', or 'back'." },
-      },
-    },
-  },
-  {
-    name: "queue_force_start",
-    tiers: [1],
-    description:
-      "Emergency override: force-start a queued worker immediately bypassing maxConcurrentWorkers (and optionally bypassing a quota pause when bypass_quota=true). WARNING: Do NOT abuse this override — use only for urgent blockers or explicit user requests.",
-    inputSchema: {
-      type: "object",
-      required: ["target_id"],
-      properties: {
-        target_id: { type: "string", description: "Queued or quota-paused worker task ID (e.g. t-4)." },
-        bypass_quota: { type: "boolean", description: "If true, also force-resume even when paused on quota (use sparingly!)." },
-        reason: { type: "string", description: "Brief justification for bypassing the limit." },
-      },
-    },
-  },
-];
+export function toolsForTask(task: TaskToolSubject): ToolDefinition[] {
+  return toolsForRole(roleOf(task), { readOnly: task.readOnly || isReadOnlyKind(task.kind) });
+}
 
 export function toolsForTier(tier: AgentTier): ToolDefinition[] {
-  return ALL_TOOL_DEFS.filter((t) => t.tiers.includes(tier)).map(({ name, description, inputSchema }) => ({
-    name,
-    description,
-    inputSchema,
-  }));
+  if (tier === 1) return toolsForRole("orchestrator");
+  if (tier === 2) return toolsForRole("worker");
+  return toolsForRole("execute", { readOnly: true });
 }
 
 export class ControlPlaneToolExecutor {
@@ -847,8 +159,9 @@ export class ControlPlaneToolExecutor {
     private readonly config: HarnessConfig,
   ) {}
 
-  tools(tier: AgentTier): ToolDefinition[] {
-    return exposedTools(toolsForTier(tier), this.config.codeMode);
+  tools(target: AgentTier | TaskToolSubject): ToolDefinition[] {
+    const raw = typeof target === "number" ? toolsForTier(target) : toolsForTask(target);
+    return exposedTools(raw, this.config.codeMode);
   }
 
   /** Creates the Code Mode inner-event sink fenced to one task generation. */
@@ -912,14 +225,14 @@ export class ControlPlaneToolExecutor {
     if (!run) throw new Error(`Run ${runId} not found`);
 
     if (name === "__list_tools") {
-      return this.tools(task.tier);
+      return this.tools(task);
     }
     if (mode !== "off" && (name === CODE_EXEC_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME)) {
       const signal = callerTaskSignal;
       const res = await createCodeModeExecutor({
         ...this.config.codeExec,
         mode,
-        allowedTools: () => toolsForTier(task.tier),
+        allowedTools: () => toolsForTask(task),
         execute: (inner, input, execSignal) => {
           if (
             signal?.aborted ||
@@ -941,9 +254,9 @@ export class ControlPlaneToolExecutor {
       return inScript ? res : this.attachPendingSteers(taskId, res, callerGeneration, signal);
     }
 
-    const allowed = new Set(toolsForTier(task.tier).map((t) => t.name));
-    if (!allowed.has(name)) {
-      throw new Error(`Tool '${name}' is not permitted for Tier ${task.tier} agent ${taskId}`);
+    const role = roleOf(task);
+    if (!allowedToolNames(role).has(name)) {
+      throw notYourTool(name, role);
     }
 
     const result = await this.executeTool(runId, taskId, task, run, name, args, scriptSignal, callerSignal);
@@ -1084,10 +397,10 @@ export class ControlPlaneToolExecutor {
 
       case "spawn_worker": {
         if (task.status === "draining") {
-          throw new Error("Orchestrator is DRAINING for rollover — finish handoff instead of spawning new workers.");
+          throw REJECTIONS.draining("spawn_worker");
         }
         const writeScopes = Array.isArray(args.write_scopes) ? (args.write_scopes as string[]) : [];
-        if (writeScopes.length === 0) throw new Error("spawn_worker requires non-empty write_scopes");
+        if (writeScopes.length === 0) throw REJECTIONS.writeScopesRequired();
         // Avoid starving sibling runs with a blanket repo-root wildcard when other active runs share this target branch
         const hasBlanketWildcard = writeScopes.some((s) => {
           const n = s.trim().replace(/^\.\//, "").replace(/\/+$/, "");
@@ -1098,9 +411,7 @@ export class ControlPlaneToolExecutor {
             .listRuns(100)
             .some((r) => r.id !== runId && r.status === "active" && r.repoRoot === run.repoRoot && r.baseBranch === run.baseBranch);
           if (otherActiveSameBranch) {
-            throw new Error(
-              `Blanket write_scopes (${writeScopes.join(", ")}) are not allowed while another active run targets (${run.repoRoot}:${run.baseBranch}). Specify scoped module/directory globs instead.`,
-            );
+            throw REJECTIONS.writeScopesBlanket(writeScopes, run.baseBranch);
           }
         }
         const objective = typeof args.objective === "string" ? args.objective : "";
@@ -1177,11 +488,11 @@ export class ControlPlaneToolExecutor {
         const kind = String(args.kind);
         const readOnlyKind = isReadOnlyKind(kind);
         const fromOrchestrator = task.tier === 1;
-        if (fromOrchestrator && !readOnlyKind) {
-          throw new Error("Tier 1 spawn_task only permits research, plan, and verify; use spawn_worker for implementation.");
+        if (fromOrchestrator && kind === "execute") {
+          throw REJECTIONS.spawnExecuteNeedsWorker();
         }
         if (!readOnlyKind && kind !== "execute") throw new Error(`Unknown spawn_task kind: ${kind}`);
-        if (task.status === "draining") throw new Error("Cannot spawn tasks while draining for rollover.");
+        if (task.status === "draining") throw REJECTIONS.draining("spawn_task");
 
         const objective = typeof args.objective === "string" ? args.objective : "";
         const { title, derived } = deriveTitle(args.title, [objective, args.criteria], `Untitled ${kind} task`);
@@ -1347,8 +658,9 @@ export class ControlPlaneToolExecutor {
             .listTasks(runId, { parentId: taskId })
             .filter((c) => ["running", "ready", "pending", "waiting_children", "merging"].includes(c.status));
           if (activeKids.length > 0) {
-            throw new Error(
-              `Settlement gate rejected completion: ${activeKids.length} child task(s) are still active (${activeKids.map((k) => k.id).join(", ")}).`,
+            throw REJECTIONS.settlementLiveChildren(
+              activeKids.map((k) => k.id),
+              activeKids.length,
             );
           }
           if (task.tier === 2 && task.worktreeId) {
@@ -1356,14 +668,10 @@ export class ControlPlaneToolExecutor {
             if (wt && !wt.cleanedAt) {
               const wtMgr = this.hooks.getWorktreeManager(run.repoRoot);
               if (await wtMgr.isDirty(wt.path)) {
-                throw new Error(
-                  `Settlement gate rejected completion: worktree ${wt.path} has uncommitted changes. Commit and call submit_for_merge first.`,
-                );
+                throw REJECTIONS.settlementDirtyWorktree();
               }
               if (wt.status === "queued" || wt.status === "bounced") {
-                throw new Error(
-                  `Settlement gate rejected completion: worktree merge status is '${wt.status}'. Resolve issues and complete submit_for_merge before returning completed.`,
-                );
+                throw REJECTIONS.settlementUnmerged(`worktree merge status is '${wt.status}'`, run.baseBranch);
               }
               // Verify any commits on the worker's HEAD are actually contained in targetBranch (catches unmerged commits
               // AND post-merge commits added after an earlier submit_for_merge!).
@@ -1374,8 +682,9 @@ export class ControlPlaneToolExecutor {
                   () => false,
                 );
                 if (!contained) {
-                  throw new Error(
-                    `Settlement gate rejected completion: worktree HEAD (${wtHead.slice(0, 8)}) has unmerged commits not on ${run.baseBranch}. Call submit_for_merge first.`,
+                  throw REJECTIONS.settlementUnmerged(
+                    `worktree HEAD (${wtHead.slice(0, 8)}) has unmerged commits`,
+                    run.baseBranch,
                   );
                 }
               }
@@ -1421,6 +730,7 @@ export class ControlPlaneToolExecutor {
                 evidencePaths: Array.isArray(args.evidence_paths) ? (args.evidence_paths as string[]) : paths,
                 suggestedSplits,
                 blocking: true,
+                tool: "return_task",
               }).id;
             }
             if (overflowPath) {
@@ -1474,10 +784,12 @@ export class ControlPlaneToolExecutor {
                 "verify_task",
               );
             }
+            const splitsMissing = status === "scope_too_large" && (suggestedSplits?.length ?? 0) < 2;
             return {
               returned: true,
               status: taskStatus,
               ...(escalationId ? { escalationId } : {}),
+              ...(splitsMissing ? { splitsMissing: true } : {}),
               ...(amendmentNotice ? { amendmentNotice, staleGoalVersion } : {}),
             };
           });
@@ -1505,9 +817,18 @@ export class ControlPlaneToolExecutor {
         const category = String(args.category) as EscalationCategory;
         const evidencePaths = Array.isArray(args.evidence_paths) ? (args.evidence_paths as string[]) : [];
         const attempted = Array.isArray(args.attempted) ? (args.attempted as string[]) : [];
-        const blocking = args.blocking === undefined ? severity !== "P2" : Boolean(args.blocking);
+        const role = roleOf(task);
+        const readOnlyFinding =
+          (role === "research" || role === "plan" || role === "verify") &&
+          READ_ONLY_FINDING_CATEGORIES.has(category);
+        const blocking =
+          args.blocking === undefined
+            ? readOnlyFinding
+              ? false
+              : severity !== "P2"
+            : Boolean(args.blocking);
 
-        const toTaskId = severity === "P0" ? null : task.parentId;
+        const toTaskId = readOnlyFinding && !blocking ? task.parentId : severity === "P0" ? null : task.parentId;
         const { title, derived } = deriveTitle(
           args.title,
           [args.summary, args.body, ...attempted, evidencePaths[0]],
@@ -1523,6 +844,7 @@ export class ControlPlaneToolExecutor {
           evidencePaths,
           attempted,
           blocking,
+          tool: "report_issue",
         });
         if (blocking) {
           const blockedSummary = `Blocked on ${esc.id}: ${esc.title}`;
@@ -1533,6 +855,7 @@ export class ControlPlaneToolExecutor {
           escalationId: esc.id,
           severity: esc.severity,
           routedTo: toTaskId ?? "human",
+          blocking,
           ...(derived ? { note: derivedTitleNote(esc.title) } : {}),
         };
       }
@@ -1594,9 +917,6 @@ export class ControlPlaneToolExecutor {
       }
 
       case "inspect_command": {
-        if (!(task.readOnly || isReadOnlyKind(task.kind))) {
-          throw new Error("inspect_command is for read-only tasks; use your shell");
-        }
         if (!Array.isArray(args.argv) || args.argv.length === 0 || !args.argv.every((a) => typeof a === "string")) {
           throw new Error("inspect_command requires argv as a non-empty array of strings");
         }
@@ -1612,7 +932,7 @@ export class ControlPlaneToolExecutor {
         try {
           cwd = realpathSync(resolve(realRoot, requestedCwd));
         } catch {
-          throw new Error(`inspect_command cwd does not exist: ${requestedCwd}`);
+          throw REJECTIONS.inspectCwd(requestedCwd);
         }
         const relCwd = relative(realRoot, cwd);
         if (
@@ -1622,7 +942,7 @@ export class ControlPlaneToolExecutor {
           isProtectedWritePath(realRoot, cwd) ||
           !statSync(cwd).isDirectory()
         ) {
-          throw new Error(`inspect_command cwd must be a non-protected directory inside the task workspace: ${requestedCwd}`);
+          throw REJECTIONS.inspectCwd(requestedCwd);
         }
         // Only operator global config (config.worktree.extraReadRoots) may authorize external read roots;
         // repository-configurable artifactsDir and dossier symlinks outside realRoot are never promoted.
@@ -1642,7 +962,7 @@ export class ControlPlaneToolExecutor {
         const readRoots = [realRoot, ...resolvedExtraReadRoots.filter((r) => r !== realRoot)];
         const verdict = checkReadOnlyArgv(argv, { cwd, readRoots, protectedRoots: readRoots });
         if (!verdict.ok) {
-          throw new Error(`inspect_command rejected: ${verdict.reason}`);
+          throw REJECTIONS.readOnlyArgv(argv[0] ?? "", verdict.reason);
         }
         const rawTimeout = args.timeout_s === undefined ? 120 : Number(args.timeout_s);
         if (!Number.isFinite(rawTimeout) || rawTimeout <= 0) {
@@ -1850,6 +1170,11 @@ export class ControlPlaneToolExecutor {
           stderr: clip(r.stderr),
           truncated,
           ...(outputPath ? { output_path: outputPath } : {}),
+          ...(r.stopped || truncated
+            ? {
+                hint: "Output was cut. Narrow the command with a path, a glob, or a match limit, or page the saved output with artifact_read.",
+              }
+            : {}),
         };
       }
 
@@ -1906,7 +1231,7 @@ export class ControlPlaneToolExecutor {
         if (!wt) throw new Error(`Worktree ${task.worktreeId} missing`);
         const mgr = this.hooks.getWorktreeManager(run.repoRoot);
         if (await mgr.isDirty(wt.path)) {
-          throw new Error("Cannot submit_for_merge while worktree has uncommitted changes. Commit first.");
+          throw REJECTIONS.submitDirtyWorktree();
         }
         const item = this.db.enqueueMerge({ runId, taskId, worktreeId: wt.id, branch: wt.branch });
         // Use the true task cancellation signal (not generation/rollover signal) so an auto-rollover never aborts an in-flight merge.

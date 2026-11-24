@@ -49,6 +49,9 @@ const NO_COUNTS_FACT =
 const PARTIAL_RETURN_FACT =
   "A task may return early with a partial handoff and proposed splits after a [harness advisory: scope-too-large] advisory.";
 
+const VERIFY_REF_DESC =
+  "Branch, tag, origin/<branch> or SHA whose tree deterministic gates and the Done-Reviewer verify. Set it when the goal's work is pushed to a branch other than the run's base branch, which happens when workers push their own branch instead of merging through the queue. Resolves a local ref first, then origin/<ref>, fetching from origin if needed. Fails if it still does not resolve. Default: the run's base branch.";
+
 const WAIT_EVENT_DRIVEN_FACT: PerRole<string> = {
   default: "Event-driven wait for child tasks (zero polling; wakes immediately on completion or escalation).",
   director:
@@ -299,7 +302,7 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
       default:
         "Spawn a read-only Tier 3 research, plan, or verify task sized to one bounded question or deliverable. Read its handoff with wait_children. {fact:noCounts} {fact:partialReturn}",
       worker:
-        "Spawn a Tier 3 Task Agent (research, plan, execute, or verify) inside your worktree, sized to one bounded question or deliverable. Read its handoff with wait_children. {fact:noCounts} {fact:partialReturn}",
+        "Spawn a Tier 3 Task Agent (research, plan, execute, or verify) inside your worktree, sized to one bounded question or deliverable. Read its handoff with wait_children. Tasks compact context in place on Pi and Claude runners so long single-question reads continue, and one that ends without return_task still leaves a partial handoff. {fact:noCounts} {fact:partialReturn}",
       director:
         "Spawn a read-only Tier 3 research, plan, or verify task sized to one bounded question or deliverable. When your turn ends and events.wakeDirectorOnGoalSettle is enabled (default on), the daemon wakes this chat when a task you spawned completes, fails, blocks, or returns for re-scope (not on cancel or quota pause); results you already read with wait_tasks do not wake you again. {fact:noCounts} {fact:partialReturn}",
     },
@@ -507,13 +510,17 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
       },
       scopeSendBack: {
         default:
-          "Status scope_too_large sends the task back for re-scoping (or pass partial: true with artifact_paths for a partial handoff); add suggested_splits, one per open area, when you can.",
+          "Status scope_too_large sends the task back for re-scoping; add suggested_splits, one per open area, when you can.",
+        research:
+          "Status scope_too_large sends the task back for re-scoping; pass sources, or partial: true with artifact_paths, and add suggested_splits, one per open area, when you can.",
+        plan:
+          "Status scope_too_large sends the task back for re-scoping; pass sources, or partial: true with artifact_paths, and add suggested_splits, one per open area, when you can.",
+        verify:
+          "Status scope_too_large sends the task back for re-scoping; pass sources, or partial: true with artifact_paths, and add suggested_splits, one per open area, when you can.",
       },
     },
     description: {
-      default: "Finish this task or send it back for re-scoping. {fact:scopeSendBack} Summary limit: {fact:summaryLimit}",
-      research: "Finish this task or send it back for re-scoping. {fact:scopeSendBack} Summary limit: {fact:summaryLimit} Sources: {fact:sources}",
-      plan: "Finish this task or send it back for re-scoping. {fact:scopeSendBack} Summary limit: {fact:summaryLimit} Sources: {fact:sources}",
+      default: "Finish this task or send it back for re-scoping. {fact:scopeSendBack} Summary limit: {fact:summaryLimit} Sources: {fact:sources}",
       verify:
         "Finish this task or send it back for re-scoping. {fact:scopeSendBack} Summary limit: {fact:summaryLimit} Sources: {fact:sources} {fact:verifyVerdict}",
     },
@@ -527,7 +534,7 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
           partial: {
             type: "boolean",
             description:
-              "Set true when handing back incomplete work, for example after a harness scope check. Summarize what is done, cite what you verified, list what remains.",
+              "Set true when handing back incomplete work, for example after a [harness advisory: scope-too-large] advisory. Summarize what is done, cite what you verified, list what remains.",
           },
           sources: {
             type: "array",
@@ -560,9 +567,12 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
       },
       routing: {
         default: "P0 goes to the human, P1 and P2 to your parent.",
-        research: "A finding goes to your parent; any other P0 goes to the human.",
-        plan: "A finding goes to your parent; any other P0 goes to the human.",
-        verify: "A finding goes to your parent; any other P0 goes to the human.",
+        research:
+          "A finding (verification_failed, code_defect, broken_test) goes to your parent unless you pass blocking: true; any other P0 goes to the human, and P1 and P2 to your parent.",
+        plan:
+          "A finding (verification_failed, code_defect, broken_test) goes to your parent unless you pass blocking: true; any other P0 goes to the human, and P1 and P2 to your parent.",
+        verify:
+          "A finding (verification_failed, code_defect, broken_test) goes to your parent unless you pass blocking: true; any other P0 goes to the human, and P1 and P2 to your parent.",
       },
     },
     description: {
@@ -629,9 +639,15 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
   {
     name: "request_rollover",
     roles: ["orchestrator", "worker"],
+    facts: {
+      progress: {
+        default:
+          "A rollover that follows another with nothing new in between (no commit, child change, newly read file, or added dossier content) stops the task.",
+      },
+    },
     description: {
       default:
-        "Request a clean control-plane rollover to a fresh session (optionally switching model/effort) with an anchored handoff before context overflow.",
+        "Request a clean control-plane rollover to a fresh session (optionally switching model/effort) with an anchored handoff before context overflow. {fact:progress}",
     },
     inputSchema: {
       default: {
@@ -1317,7 +1333,12 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     roles: ["director"],
     description: {
       default:
-        "Draft a structured, versioned Goal Contract with concrete deterministic check commands and behavioral/architectural acceptance criteria.",
+        "Draft a structured, versioned Goal Contract with concrete deterministic check commands and behavioral/architectural acceptance criteria. " +
+        "Deterministic criteria run as shell commands in a detached `_verify` git worktree that the harness creates and removes. " +
+        "It checks out verify_ref when set, otherwise the linked run's base branch (the branch the primary checkout had when the run started). " +
+        "Without a run or base branch, commands run in the primary checkout itself, and results say so. The primary checkout is never modified. " +
+        "Commands get HARNESS_REPO_ROOT (primary checkout path), HARNESS_VERIFY_REF, HARNESS_VERIFY_SHA, HARNESS_GOAL_ID and HARNESS_GOAL_EVIDENCE_DIR. " +
+        "Each gate result records the cwd, ref and SHA it ran at (goal_get reviews[].criteriaResults[].gate).",
     },
     inputSchema: {
       default: {
@@ -1348,6 +1369,7 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
             description:
               "Verification depth chosen by the agent based on risk (default 'auto': runs deterministic checks and only spawns an independent LLM reviewer if required behavioral/architectural criteria exist).",
           },
+          verify_ref: { type: "string", description: VERIFY_REF_DESC },
           commit_immediately: { type: "boolean", description: "Start autonomous Tier 1 execution with the selected model" },
           model: { type: "string", minLength: 1, description: "Required for immediate commit. Select from list_models." },
           profile_id: { type: "string" },
@@ -1453,7 +1475,7 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     roles: ["director"],
     description: {
       default:
-        "Amend an active or draft Goal Contract (vN -> vN+1), invalidating stale reviews and notifying the running Tier 1 Orchestrator with the exact delta. description REPLACES the entire description; use append_description to add instructions while keeping the existing text. add_criteria adds, update_criteria merges by id, remove_criteria_ids removes. Amending supersedes this goal's open verification_failed escalations only; other escalations stay open.",
+        "Amend an active or draft Goal Contract (vN -> vN+1), invalidating stale reviews and notifying the running Tier 1 Orchestrator with the exact delta. description REPLACES the entire description; use append_description to add instructions while keeping the existing text. add_criteria adds, update_criteria merges by id, remove_criteria_ids removes. Amending supersedes this goal's open verification_failed escalations only; other escalations stay open. Updating only verify_ref is a metadata change (does not bump version, change status, or steer running tasks); call goal_trigger_review to re-run gates.",
     },
     inputSchema: {
       default: {
@@ -1494,6 +1516,10 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
           },
           remove_criteria_ids: { type: "array", items: { type: "string" } },
           non_goals: { type: "array", items: { type: "string" } },
+          verify_ref: {
+            type: "string",
+            description: `${VERIFY_REF_DESC} Pass "" to clear verify_ref and fall back to the run's base branch.`,
+          },
         },
       },
     },
@@ -1565,13 +1591,34 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     roles: ["director"],
     description: {
       default:
-        "Inspect a Goal's criteria, latest review, linked run tree, and open escalations. Pass the returned presentation_id to present_result to show the Goal detail card.",
+        "Inspect a Goal. Default output is compact and always fits one tool result: goal header with a description excerpt and a path to the full text, " +
+        "every criterion with its id, kind, required flag and latest status, a compact summary of the latest review, the run's tasks (summaries and artifact paths) and activity, and open escalations. " +
+        "Narrow it with sections (goal, description, criteria, reviews, run, escalations); requesting a narrow section set (such as sections: ['criteria'] or ['reviews']) returns unclipped fields while within budget. " +
+        "Page older reviews with reviews_limit (default 1, max 10; only the newest returned review includes criteriaResults) and reviews_before (pass reviewsPage.nextBefore). " +
+        "Read the full description with read_file on description.path, or sections: ['description'] with description_offset (pages up to 30000 JSON chars). Read task handoff artifacts with read_file on tasks[].artifactPaths (use run_status for full run telemetry). " +
+        "Pass the returned presentation_id to present_result to show the Goal detail card.",
     },
     inputSchema: {
       default: {
         type: "object",
         required: ["goal_id"],
-        properties: { goal_id: { type: "string" } },
+        properties: {
+          goal_id: { type: "string" },
+          sections: {
+            type: "array",
+            items: { type: "string", enum: ["goal", "description", "criteria", "reviews", "run", "escalations"] },
+            description: "Sections to return. Default: goal, criteria, reviews, run, escalations (description is opt-in).",
+          },
+          reviews_limit: { type: "number", description: "Reviews to return, newest first. Default 1, max 10." },
+          reviews_before: {
+            type: "string",
+            description: "Return reviews older than this review id (pass reviewsPage.nextBefore).",
+          },
+          description_offset: {
+            type: "number",
+            description: "Character offset into the full description when sections includes description. Default 0.",
+          },
+        },
       },
     },
     whenDenied: GOAL_TOOL_DENIED,
@@ -1629,6 +1676,11 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
           goal_id: { type: "string" },
           verification_mode: { type: "string", enum: ["auto", "none", "deterministic", "independent_review"] },
           summary: { type: "string", description: "Optional concise completion summary when verification_mode is 'none'." },
+          override_review_budget: {
+            type: "boolean",
+            description:
+              "Explicitly run an additional review cycle when budgets.maxReviewCycles is reached or a 'Max review cycles reached' escalation is open.",
+          },
         },
       },
     },
