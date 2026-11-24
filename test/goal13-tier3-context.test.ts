@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "bun:test";
-import { DEFAULT_TASK_COMPACTION_THRESHOLD, type PiProfileConfig } from "../src/config.js";
+import { agent } from "@agentclientprotocol/sdk/unstable";
+import {
+  DEFAULT_TASK_COMPACTION_THRESHOLD,
+  type AcpProfileConfig,
+  type PiProfileConfig,
+} from "../src/config.js";
+import { AcpRunner } from "../src/runners/acp-runner.js";
+import { buildNewSessionParams, prepareAcpSpawn } from "../src/runners/acp-shims.js";
 import { PiRunner, resolvePiCompactionThreshold } from "../src/runners/pi-runner.js";
 import type { RunAgentRequest } from "../src/runners/types.js";
 
@@ -428,5 +435,222 @@ describe("goal-13 Tier 3 in-place compaction on PiRunner", () => {
       JSON.stringify(t2NoThreshServer.requests[1]!.messages).includes("CHUNK_1_MARKER"),
       "Tier 2 without rolloverThreshold must not run Tier 3 compaction",
     );
+  });
+});
+
+describe("goal-13 Tier 3 native compaction on Claude ACP runner", () => {
+  const claudeProfile: AcpProfileConfig = {
+    id: "acp:claude",
+    kind: "acp",
+    adapter: "claude",
+    command: "noop",
+    billing: "subscription",
+  };
+
+  it("leaves DISABLE_COMPACT unset for Claude Tier 3 (even if inherited) while keeping it set for Tier 1, Tier 2, and omitted tier", () => {
+    const prev = process.env.DISABLE_COMPACT;
+    process.env.DISABLE_COMPACT = "1";
+    try {
+      const t3 = prepareAcpSpawn(claudeProfile, {
+        systemPrompt: "Bounded research task",
+        toolPolicy: "read_only_workspace",
+        tier: 3,
+      });
+      assert.equal(t3.env.DISABLE_COMPACT, undefined);
+      t3.cleanup();
+
+      const t3Exec = prepareAcpSpawn(claudeProfile, {
+        systemPrompt: "Bounded execute task",
+        toolPolicy: "read_write_workspace",
+        tier: 3,
+      });
+      assert.equal(t3Exec.env.DISABLE_COMPACT, undefined);
+      t3Exec.cleanup();
+
+      const t1 = prepareAcpSpawn(claudeProfile, {
+        systemPrompt: "Orchestrator",
+        toolPolicy: "read_only_workspace",
+        tier: 1,
+      });
+      assert.equal(t1.env.DISABLE_COMPACT, "1");
+      t1.cleanup();
+
+      const t2 = prepareAcpSpawn(claudeProfile, {
+        systemPrompt: "Worker",
+        toolPolicy: "read_write_workspace",
+        tier: 2,
+      });
+      assert.equal(t2.env.DISABLE_COMPACT, "1");
+      t2.cleanup();
+
+      const omitted = prepareAcpSpawn(claudeProfile, {
+        systemPrompt: "Default caller",
+        toolPolicy: "read_write_workspace",
+      });
+      assert.equal(omitted.env.DISABLE_COMPACT, "1");
+      omitted.cleanup();
+    } finally {
+      if (prev === undefined) delete process.env.DISABLE_COMPACT;
+      else process.env.DISABLE_COMPACT = prev;
+    }
+  });
+
+  it("omits autoCompactEnabled:false in buildNewSessionParams for Claude Tier 3 and keeps it for Tier 1, Tier 2, and omitted tier", () => {
+    const getClaudeOptions = (params: Record<string, unknown>) =>
+      ((params._meta as Record<string, unknown> | undefined)?.claudeCode as { options?: Record<string, unknown> } | undefined)
+        ?.options;
+
+    for (const toolPolicy of ["read_only_workspace", "read_write_workspace"] as const) {
+      const { params } = buildNewSessionParams("claude", {
+        cwd: process.cwd(),
+        systemPrompt: "Tier 3 task",
+        toolPolicy,
+        tier: 3,
+        model: "sonnet",
+        mcpServers: [],
+      });
+      const opts = getClaudeOptions(params);
+      assert.ok(opts);
+      assert.equal(opts.settings, undefined);
+      assert.equal(opts.model, "sonnet");
+    }
+
+    for (const tier of [1, 2, undefined] as const) {
+      const { params } = buildNewSessionParams("claude", {
+        cwd: process.cwd(),
+        systemPrompt: `Tier ${tier ?? "default"}`,
+        toolPolicy: tier === 1 ? "read_only_workspace" : "read_write_workspace",
+        tier,
+        model: "opus",
+        mcpServers: [],
+      });
+      const opts = getClaudeOptions(params);
+      assert.deepEqual(opts?.settings, { autoCompactEnabled: false });
+    }
+  });
+
+  it("forwards req.tier from AcpRunner.run into Claude session/new and never triggers anchored rollover for Tier 3", async () => {
+    const runClaudeWithMock = async (
+      reqOverrides: Partial<RunAgentRequest>,
+      mode: "usage_update" | "prompt_usage_only" = "usage_update",
+    ) => {
+      let seenSessionNewParams: Record<string, unknown> | undefined;
+      let cancelReceived = false;
+      const steerMessages: string[] = [];
+
+      const mockAgent = agent()
+        .onRequest("initialize", async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: "@agentclientprotocol/claude-agent-acp", version: "0.109.0" },
+          agentCapabilities: { sessionCapabilities: { systemPrompt: {}, options: {} } },
+          _meta: { steering: { supported: true } },
+        } as never))
+        .onRequest("session/new", async ({ params }) => {
+          seenSessionNewParams = params as unknown as Record<string, unknown>;
+          return {
+            sessionId: "sess-claude-tier",
+            models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+          } as never;
+        })
+        .onRequest("session/set_mode", async () => ({}))
+        .onNotification("session/cancel", async () => {
+          cancelReceived = true;
+        })
+        .onRequest("*", async ({ method, params }) => {
+          if (method === "_session/steering") {
+            steerMessages.push(JSON.stringify(params));
+            return {};
+          }
+          return {};
+        })
+        .onRequest("session/prompt", async ({ client: acpClient }) => {
+          if (mode === "usage_update") {
+            // Soft warning band (70% for 0.78 threshold), then hard rollover band (85%).
+            await acpClient.notify("session/update", {
+              sessionId: "sess-claude-tier",
+              update: { sessionUpdate: "usage_update", used: 70_000, size: 100_000 },
+            } as never);
+            await acpClient.notify("session/update", {
+              sessionId: "sess-claude-tier",
+              update: { sessionUpdate: "usage_update", used: 85_000, size: 100_000 },
+            } as never);
+            await new Promise((r) => setTimeout(r, 20));
+          }
+          return {
+            stopReason: cancelReceived ? "cancelled" : "end_turn",
+            usage: { totalTokens: 85_000, inputTokens: 84_000, outputTokens: 1_000 },
+          } as never;
+        });
+
+      const runner = new AcpRunner(claudeProfile);
+      const result = await runner.run(
+        makeRequest({
+          model: "opus",
+          contextWindow: 100_000,
+          tools: [],
+          ...reqOverrides,
+        }),
+        mockAgent,
+      );
+      const claudeOpts = (
+        (seenSessionNewParams?._meta as Record<string, unknown> | undefined)?.claudeCode as
+          | { options?: Record<string, unknown> }
+          | undefined
+      )?.options;
+      return { result, claudeOpts, cancelReceived, steerMessages };
+    };
+
+    // Tier 3 with undefined rolloverThreshold (orchestrator default): compaction enabled, completes cleanly.
+    const t3Default = await runClaudeWithMock({
+      tier: 3,
+      kind: "research",
+      toolPolicy: "read_only_workspace",
+      rolloverThreshold: undefined,
+    });
+    assert.equal(t3Default.claudeOpts?.settings, undefined);
+    assert.equal(t3Default.cancelReceived, false);
+    assert.equal(t3Default.steerMessages.length, 0);
+    assert.equal(t3Default.result.stopReason, "completed");
+
+    // Tier 3 even if a caller passes rolloverThreshold (via usage_update or PromptResponse.usage fallback):
+    // still ignores anchored rollover and keeps native compaction.
+    for (const mode of ["usage_update", "prompt_usage_only"] as const) {
+      const t3Explicit = await runClaudeWithMock(
+        {
+          tier: 3,
+          kind: "execute",
+          toolPolicy: "read_write_workspace",
+          rolloverThreshold: 0.78,
+        },
+        mode,
+      );
+      assert.equal(t3Explicit.claudeOpts?.settings, undefined);
+      assert.equal(t3Explicit.cancelReceived, false);
+      assert.equal(t3Explicit.steerMessages.length, 0);
+      assert.equal(t3Explicit.result.stopReason, "completed");
+    }
+
+    // Tier 1 keeps autoCompactEnabled:false and triggers anchored rollover_requested.
+    const t1 = await runClaudeWithMock({
+      tier: 1,
+      kind: "orchestrator",
+      toolPolicy: "read_only_workspace",
+      rolloverThreshold: 0.72,
+    });
+    assert.deepEqual(t1.claudeOpts?.settings, { autoCompactEnabled: false });
+    assert.equal(t1.cancelReceived, true);
+    assert.equal(t1.result.stopReason, "rollover_requested");
+
+    // Tier 2 keeps autoCompactEnabled:false, receives soft rollover steer, and triggers anchored rollover_requested.
+    const t2 = await runClaudeWithMock({
+      tier: 2,
+      kind: "worker",
+      toolPolicy: "read_write_workspace",
+      rolloverThreshold: 0.78,
+    });
+    assert.deepEqual(t2.claudeOpts?.settings, { autoCompactEnabled: false });
+    assert.ok(t2.steerMessages.some((m) => m.includes("request_rollover")));
+    assert.equal(t2.cancelReceived, true);
+    assert.equal(t2.result.stopReason, "rollover_requested");
   });
 });
