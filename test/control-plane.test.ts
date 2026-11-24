@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "bun:test";
+import { countWords, WORD_BUDGET } from "../src/advisories/message.js";
 import { HarnessRejection } from "../src/advisories/rejections.js";
 import { ModelCatalogCompiler } from "../src/catalog/compiler.js";
 import { loadConfig } from "../src/config.js";
@@ -945,7 +946,7 @@ describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () =>
       assert.equal(db.getTask(worker.id)?.status, "running");
       await runGit(wt.path, ["checkout", "--", "report.md"]);
 
-      // 3. Blank ref or non-worker callers are rejected with informative errors.
+      // 3. Blank ref, non-worker callers, and non-completed statuses are rejected with informative errors.
       await assert.rejects(
         () =>
           orch.toolExecutor.execute(run.id, worker.id, "return_task", {
@@ -955,6 +956,18 @@ describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () =>
           }),
         /non-empty string ref/,
       );
+      for (const badStatus of ["blocked", "scope_too_large"] as const) {
+        await assert.rejects(
+          () =>
+            orch.toolExecutor.execute(run.id, worker.id, "return_task", {
+              status: badStatus,
+              summary: `Cannot finish (${badStatus})`,
+              external_deliverable: { ref: "origin-ext/feature-x" },
+            }),
+          /only supported with status 'completed'/,
+        );
+      }
+      assert.equal(db.getTask(worker.id)?.status, "running");
       const t3 = db.createTask({
         runId: run.id,
         parentId: worker.id,
@@ -977,7 +990,8 @@ describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () =>
       );
       db.updateTask(t3.id, { status: "completed" });
 
-      // 4. Queued/in-flight merge-queue item still rejects even with external_deliverable.
+      // 4. Queued/in-flight merge-queue item still rejects even with external_deliverable,
+      // and instructs the worker to wait for the existing merge (not re-submit or retry external_deliverable).
       const queuedWorker = db.createTask({
         runId: run.id,
         parentId: orchTask.id,
@@ -1004,6 +1018,15 @@ describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () =>
         (err: unknown) => {
           assert.ok(err instanceof HarnessRejection);
           assert.equal(err.notice.rule, "settlement-unmerged");
+          assert.ok(
+            countWords(err.notice) <= WORD_BUDGET,
+            `merge-in-flight rejection exceeded ${WORD_BUDGET}-word budget: ${countWords(err.notice)}`,
+          );
+          assert.match(err.message, /^\[harness blocked: settlement-unmerged\] .+ Why: .+ Allowed: .+$/);
+          assert.ok(err.message.toLowerCase().includes("wait"), `expected wait guidance, got: ${err.message}`);
+          assert.ok(err.message.includes("worktree_status"), `expected worktree_status guidance, got: ${err.message}`);
+          assert.ok(!err.message.includes("submit_for_merge"), `must not suggest submit_for_merge: ${err.message}`);
+          assert.ok(!err.message.includes("external_deliverable"), `must not suggest external_deliverable: ${err.message}`);
           return true;
         },
       );
@@ -1088,6 +1111,94 @@ describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () =>
         { evidenceDir: null, repoRoot },
       ) as { tasks?: Array<{ id: string; externalDeliverable?: unknown }> };
       assert.deepEqual(goalGet.tasks?.[0]?.externalDeliverable, parsedResult.external_deliverable);
+
+      // 6. Merged worktree followed by a new unmerged commit settled via external_deliverable:
+      // HEAD must stay reachable through immediate finally-block teardown AND later wtMgr.sweep().
+      const mergedWorker = db.createTask({
+        runId: run.id,
+        parentId: orchTask.id,
+        tier: 2,
+        kind: "worker",
+        title: "Merged then external worker",
+        objective: "Merge fix then commit report externally",
+        readOnly: false,
+        writeScopes: ["merged-part.md", "post-merge-report.md"],
+        profileId: "pi:local",
+      });
+      db.updateTask(mergedWorker.id, { status: "running" });
+      const mergedWt = await wtMgr.createForWorker(run.id, mergedWorker.id, baseSha);
+      db.updateTask(mergedWorker.id, { worktreeId: mergedWt.id });
+
+      // Simulate an initial commit merged into main (leaving worktree status = 'merged').
+      writeFileSync(join(mergedWt.path, "merged-part.md"), "# Merged change\n", "utf8");
+      await runGit(mergedWt.path, ["add", "merged-part.md"]);
+      await runGit(mergedWt.path, ["-c", "user.name=test", "-c", "user.email=test@local", "commit", "-m", "Merged change"]);
+      await runGit(repoRoot, ["merge", "--ff-only", mergedWt.branch]);
+      db.updateWorktree(mergedWt.id, { status: "merged" });
+
+      // Worker commits additional work after merge and settles via external_deliverable.
+      writeFileSync(join(mergedWt.path, "post-merge-report.md"), "# Post-merge report\n", "utf8");
+      await runGit(mergedWt.path, ["add", "post-merge-report.md"]);
+      await runGit(mergedWt.path, ["-c", "user.name=test", "-c", "user.email=test@local", "commit", "-m", "Post-merge report"]);
+      const postMergeHead = (await runGit(mergedWt.path, ["rev-parse", "HEAD"])).stdout;
+
+      const mergedExtRes = (await orch.toolExecutor.execute(run.id, mergedWorker.id, "return_task", {
+        status: "completed",
+        summary: "Merged base fix and archived post-merge report externally",
+        external_deliverable: {
+          ref: "origin-ext/post-merge-report",
+          sha: postMergeHead,
+        },
+      })) as { returned: boolean; status: string };
+      assert.equal(mergedExtRes.returned, true);
+      assert.equal(mergedExtRes.status, "completed");
+
+      // Yield to allow any fire-and-forget async teardown in return_task's finally block to run.
+      await new Promise((r) => setTimeout(r, 150));
+
+      const expectedArchiveRef = `refs/harness/archive/${run.id}/${mergedWorker.id}`;
+      const settledMerged = db.getTask(mergedWorker.id)!;
+      assert.equal(settledMerged.status, "completed");
+      const parsedMergedResult = JSON.parse(settledMerged.resultJson ?? "{}") as {
+        external_deliverable?: {
+          ref: string;
+          sha?: string;
+          worktree_head: string | null;
+          unmerged_commits: string[];
+          archive_ref?: string;
+        };
+      };
+      assert.deepEqual(parsedMergedResult.external_deliverable, {
+        ref: "origin-ext/post-merge-report",
+        sha: postMergeHead,
+        worktree_head: postMergeHead,
+        unmerged_commits: [postMergeHead],
+        archive_ref: expectedArchiveRef,
+      });
+      assert.deepEqual(compactTaskHandoff(settledMerged).external_deliverable, parsedMergedResult.external_deliverable);
+
+      const wtAfterSettle = db.getWorktree(mergedWt.id)!;
+      assert.equal(wtAfterSettle.cleanedAt, null);
+      assert.equal(wtAfterSettle.status, "active");
+      assert.equal(wtAfterSettle.archiveRef, expectedArchiveRef);
+      assert.equal((await runGit(repoRoot, ["rev-parse", expectedArchiveRef])).stdout, postMergeHead);
+
+      // Subsequent sweep tears down the retired worktree while keeping postMergeHead reachable under refs/harness/archive.
+      await wtMgr.sweep({ runId: run.id });
+      const wtAfterSweep = db.getWorktree(mergedWt.id)!;
+      assert.notEqual(wtAfterSweep.cleanedAt, null);
+      assert.equal(wtAfterSweep.status, "archived");
+      assert.equal(wtAfterSweep.archiveRef, expectedArchiveRef);
+      assert.equal((await runGit(repoRoot, ["rev-parse", expectedArchiveRef])).stdout, postMergeHead);
+      const containingRefs = (
+        await runGit(repoRoot, ["for-each-ref", "--format=%(refname)", "--contains", postMergeHead, "refs/harness/archive"])
+      ).stdout
+        .split(/\r?\n/)
+        .filter(Boolean);
+      assert.ok(
+        containingRefs.includes(expectedArchiveRef),
+        `expected ${expectedArchiveRef} to contain ${postMergeHead}, got: ${containingRefs.join(", ")}`,
+      );
     } finally {
       db.close();
       rmSync(repoRoot, { recursive: true, force: true });

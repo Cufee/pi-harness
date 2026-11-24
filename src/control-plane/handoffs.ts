@@ -27,6 +27,7 @@ export interface ExternalDeliverableInput {
 export interface ExternalDeliverableRecord extends ExternalDeliverableInput {
   worktree_head: string | null;
   unmerged_commits: string[];
+  archive_ref?: string;
 }
 
 /**
@@ -95,6 +96,11 @@ export function validateTaskHandoff(kind: TaskKind, args: Record<string, unknown
   if (args.external_deliverable !== undefined) {
     if (kind !== "worker") {
       throw new Error("return_task external_deliverable is only supported for Tier 2 workers.");
+    }
+    if (args.status !== undefined && args.status !== "completed") {
+      throw new Error(
+        `return_task external_deliverable is only supported with status 'completed' (got '${String(args.status)}'). Use status 'completed' to settle an external deliverable, or omit external_deliverable when returning '${String(args.status)}'.`,
+      );
     }
     const raw = args.external_deliverable;
     if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {

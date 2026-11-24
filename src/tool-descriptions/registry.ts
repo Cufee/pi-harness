@@ -82,7 +82,7 @@ function returnTaskInputSchema(
       type: "object",
       required: ["ref"],
       description:
-        "Worker-only; use when the deliverable is not meant for local main (pushed to another remote/branch, a PR URL, or an artifact/report). Completes without submit_for_merge.",
+        "Worker-only, status 'completed' only; use when the deliverable is not meant for local main (pushed to another remote/branch, a PR URL, or an artifact/report). Completes without submit_for_merge.",
       properties: {
         ref: {
           type: "string",

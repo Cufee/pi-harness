@@ -104,12 +104,16 @@ export const REJECTIONS = {
     );
   },
 
-  settlementUnmerged(detail: string, branch: string): HarnessRejection {
+  settlementUnmerged(detail: string, branch: string, opts?: { mergeInFlight?: boolean }): HarnessRejection {
     return rejection(
       "settlement-unmerged",
       `return_task completed was rejected: ${stripTrailingDot(compactWords(detail, 12))}.`,
-      `Completing now would leave your commits outside ${branch}.`,
-      `Call submit_for_merge for ${branch} changes, or return_task with external_deliverable {ref} when pushed elsewhere or a report, or status blocked.`,
+      opts?.mergeInFlight
+        ? `A merge into ${branch} is still in flight.`
+        : `Completing now would leave your commits outside ${branch}.`,
+      opts?.mergeInFlight
+        ? "Wait for the existing merge to finish (check worktree_status), then call return_task, or return_task with status blocked."
+        : `Call submit_for_merge for ${branch} changes, or return_task with external_deliverable {ref} when pushed elsewhere or a report, or status blocked.`,
     );
   },
 

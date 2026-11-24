@@ -22,6 +22,7 @@ import {
   type RunRecord,
   type TaskKind,
   type TaskRecord,
+  type WorktreeRecord,
 } from "./db.js";
 import { findRunDossier, readRunDossier, readWorkspaceArtifact, spillSummaryOverflow, writeCodeOutput, writeTaskDossier, writeUniqueTaskDossier } from "./dossiers.js";
 import {
@@ -659,6 +660,11 @@ export class ControlPlaneToolExecutor {
         if (args.external_deliverable !== undefined && (task.tier !== 2 || task.kind !== "worker")) {
           throw new Error("return_task external_deliverable is only supported for Tier 2 workers.");
         }
+        if (args.external_deliverable !== undefined && status !== "completed") {
+          throw new Error(
+            `return_task external_deliverable is only supported with status 'completed' (got '${status}'). Use status 'completed' to settle an external deliverable, or omit external_deliverable when returning '${status}'.`,
+          );
+        }
         const { summary: fullSummary, sources, artifactPaths, partial, externalDeliverable } = validateTaskHandoff(task.kind, args);
         let summary = partial && !fullSummary.startsWith("[Partial]") ? `[Partial] ${fullSummary}` : fullSummary;
 
@@ -666,6 +672,7 @@ export class ControlPlaneToolExecutor {
 
         const MAX_EXTERNAL_UNMERGED_COMMITS = 50;
         let recordedExternalDeliverable: ExternalDeliverableRecord | undefined;
+        let preserveMergedWorktree: { wt: WorktreeRecord; wtMgr: WorktreeManager } | undefined;
 
         if (status === "completed") {
           const activeKids = this.db
@@ -691,6 +698,7 @@ export class ControlPlaneToolExecutor {
                 throw REJECTIONS.settlementUnmerged(
                   `worktree merge status is '${activeMerge?.status ?? wt.status}'`,
                   run.baseBranch,
+                  { mergeInFlight: true },
                 );
               }
               if (!externalDeliverable && wt.status === "bounced") {
@@ -699,7 +707,12 @@ export class ControlPlaneToolExecutor {
               const wtHead = await runGit(wt.path, ["rev-parse", "HEAD"]).then((r) => r.stdout).catch(() => null);
               if (externalDeliverable) {
                 let unmergedCommits: string[] = [];
+                let headContainedInBase = false;
                 if (wtHead) {
+                  headContainedInBase = await runGit(run.repoRoot, ["merge-base", "--is-ancestor", wtHead, run.baseBranch]).then(
+                    () => true,
+                    () => false,
+                  );
                   const revListRaw = await runGit(run.repoRoot, [
                     "rev-list",
                     `--max-count=${MAX_EXTERNAL_UNMERGED_COMMITS}`,
@@ -716,6 +729,9 @@ export class ControlPlaneToolExecutor {
                         .catch(() => ""),
                     );
                   unmergedCommits = revListRaw ? revListRaw.split(/\r?\n/).filter(Boolean) : [];
+                }
+                if (wt.status === "merged" && (!headContainedInBase || unmergedCommits.length > 0)) {
+                  preserveMergedWorktree = { wt, wtMgr };
                 }
                 recordedExternalDeliverable = {
                   ...externalDeliverable,
@@ -750,6 +766,17 @@ export class ControlPlaneToolExecutor {
         // Revalidate caller generation, live status, and cancellation after awaited worktree checks
         // and before spilling summary overflow or committing settlement.
         assertReturnStillValid();
+
+        if (preserveMergedWorktree) {
+          const archiveRef = await preserveMergedWorktree.wtMgr.snapshotToArchiveRef(preserveMergedWorktree.wt);
+          assertReturnStillValid();
+          if (archiveRef && recordedExternalDeliverable) {
+            recordedExternalDeliverable = {
+              ...recordedExternalDeliverable,
+              archive_ref: archiveRef,
+            };
+          }
+        }
 
         const paths = [...artifactPaths];
         let overflowPath: string | undefined;
@@ -818,6 +845,11 @@ export class ControlPlaneToolExecutor {
             } catch {
               // goals table may not exist in standalone ControlPlaneDb unit tests
             }
+            if (preserveMergedWorktree) {
+              // Post-merge commits were settled externally; clear 'merged' status so neither
+              // immediate teardown nor later sweep() removes the worktree/branch without archiving.
+              this.db.updateWorktree(preserveMergedWorktree.wt.id, { status: "active" });
+            }
             this.db.updateTask(taskId, {
               status: taskStatus,
               summary,
@@ -866,7 +898,7 @@ export class ControlPlaneToolExecutor {
           throw error;
         } finally {
           // Tear down a merged Tier 2 worktree once the worker settles via return_task
-          if (committed && status === "completed" && task.tier === 2 && task.worktreeId) {
+          if (committed && !preserveMergedWorktree && status === "completed" && task.tier === 2 && task.worktreeId) {
             const wt = this.db.getWorktree(task.worktreeId);
             if (wt && wt.status === "merged" && !wt.cleanedAt) {
               void this.hooks
