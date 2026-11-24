@@ -212,6 +212,11 @@ An empty `extraReadRoots` after you set roots can mean the key is misplaced, it 
 - `pi-harness [--resume] [-p <project>] [--repo <path>]` on a TTY opens the project picker instead of the last-used project. `--resume` opens the registered local project containing the current directory, choosing the innermost project when nested. With no matching project, it opens the picker with a warning. `-p`, `--project`, and `--repo` open that target directly and take precedence over `--resume`.
 - `pi-harness --remote <alias|ssh://host>` on a TTY, without `-p`, `--project`, or `--repo`, always opens a picker of that host's registered projects, including when the host has no registered projects.
 - Session control: when a second TUI attaches to an open session, the first stays connected in read-only mode and keeps its draft. Pressing `Ctrl+Y` or running `/take` reclaims control and makes the other terminal read-only.
+- `pi-harness inbox [--all] [--run <run-id>] [--json] [--remote <alias|ssh://host>]`: lists the same human-visible items as the TUI Inbox from `work.snapshot`, with a hidden count hint when internal items exist. Pass `--all` to append `internalAttention` with audience and hidden reason, or `--json` for raw JSON output.
+- `pi-harness escalations [list] [--all] [--status open|acked|resolved|all] [--run <run-id>] [--limit <n>] [--json] [--remote <alias|ssh://host>]`: defaults to escalations the shared attention policy marks human-visible, with a hidden count hint. Pass `--all` or an explicit `--status` for the raw `escalation.list` output.
+- `pi-harness goals [list [--json] | review <id> | pause <id> | cancel <id>] [--remote <alias|ssh://host>]`: prints a table by default; pass `--json` for raw `goal.list` JSON output. With `--remote` and no `--repo`, both table and `--json` output list goals across all repositories on the remote host instead of filtering by the local working directory.
+- `pi-harness runs [--all] [--json] [--remote <alias|ssh://host>]`: hides `director-tasks-*` container runs by default in both table and `--json` output, with a hidden count hint in table output; pass `--all` to include them.
+- `pi-harness tree <run-id> [--remote <alias|ssh://host>]`: stays raw JSON debug output for the run, task, and escalation tree.
 - `pi-harness --help` lists the primary commands.
 
 ## Director tools

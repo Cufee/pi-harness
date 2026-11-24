@@ -5,11 +5,14 @@ import { join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import type { Terminal } from "@earendil-works/pi-tui";
 import { ControlPlaneDb, type EscalationRecord } from "./control-plane/db.js";
+import { isDirectorTaskContainer } from "./control-plane/ids.js";
 import { findProjectContainingPath, type ProjectBrowseResult, type ProjectSummary } from "./control-plane/projects.js";
 import { classifyInterruptedTasks, formatRecoveryPlan } from "./control-plane/restart-recovery.js";
 import { ensureTempDir, loadConfig, type AcpProfileConfig } from "./config.js";
 import { loadOrCreateNodeId } from "./control-plane/session-messages.js";
+import type { GoalRecord } from "./goals/engine.js";
 import { qualifyRemoteCliHints } from "./protocol/chat-events.js";
+import type { InboxItem } from "./protocol/daemon-rpc.js";
 import { ensureLocalDaemon, stopLocalDaemon } from "./daemon/launch.js";
 import { runDaemonReloadCli, tryReloadForDaemonRestart } from "./daemon/hot-update.js";
 import type { RemoteHostStatus } from "./daemon/peer.js";
@@ -17,7 +20,7 @@ import { DaemonClient, runStdioSocketBridge } from "./daemon/remote.js";
 import { HarnessDaemon } from "./daemon/server.js";
 import { runSupervisor, type SuperviseOptions } from "./daemon/supervise.js";
 import { runDirectorChatTui, runNativeScrollbackTui, type TuiExitAction } from "./tui/app.js";
-import { parseDurationMs } from "./tui/core/index.js";
+import { formatAge, parseDurationMs } from "./tui/core/index.js";
 import { type FederatedProjectSummary, pickProjectTui } from "./tui/projects.js";
 import type { AttachableSession } from "./tui/store.js";
 
@@ -280,8 +283,128 @@ async function connectClient(configSocketPath: string, remoteTarget?: string, br
   return client;
 }
 
-function printHelp(): void {
-  console.log(`pi-harness — CLI-first, daemonized interactive Director + 3-tier multi-agent coding harness
+function singleLine(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function truncateDisplay(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  if (maxLen <= 1) return text.slice(0, Math.max(0, maxLen));
+  return `${text.slice(0, maxLen - 1)}…`;
+}
+
+function formatUtcTimestamp(tsMs: number): string {
+  return `${new Date(tsMs).toISOString().replace("T", " ").slice(0, 19)}Z`;
+}
+
+export function formatGoalsTable(
+  goals: ReadonlyArray<Pick<GoalRecord, "id" | "status" | "version" | "updatedAt" | "title">>,
+  columns?: number,
+): string {
+  if (goals.length === 0) return "No goals found.";
+  const maxW = Math.max(80, columns || process.stdout.columns || 120);
+  const idW = Math.max(12, ...goals.map((g) => g.id.length));
+  const statusW = Math.max(14, ...goals.map((g) => g.status.length));
+  const verW = Math.max(4, ...goals.map((g) => `v${g.version}`.length));
+  const updatedW = 21;
+  const prefixW = idW + 1 + statusW + 1 + verW + 1 + updatedW + 1;
+  const titleW = Math.max(16, maxW - prefixW);
+  const lines = [
+    `${"GOAL".padEnd(idW)} ${"STATUS".padEnd(statusW)} ${"VER".padEnd(verW)} ${"UPDATED (UTC)".padEnd(updatedW)} TITLE`,
+  ];
+  for (const g of goals) {
+    const ver = `v${g.version}`;
+    const ts = formatUtcTimestamp(g.updatedAt);
+    const title = truncateDisplay(singleLine(g.title), titleW);
+    lines.push(`${g.id.padEnd(idW)} ${g.status.padEnd(statusW)} ${ver.padEnd(verW)} ${ts.padEnd(updatedW)} ${title}`);
+  }
+  return lines.join("\n");
+}
+
+export function formatInboxOutput(
+  inbox: ReadonlyArray<InboxItem>,
+  internalAttention: ReadonlyArray<InboxItem>,
+  opts: { showAll: boolean; columns?: number; now?: number },
+): string {
+  const maxW = Math.max(80, opts.columns || process.stdout.columns || 120);
+  const now = opts.now ?? Date.now();
+  const lines: string[] = [];
+
+  if (inbox.length === 0) {
+    lines.push("Inbox is empty.");
+  } else {
+    const sevW = 4;
+    const kindW = Math.max(4, ...inbox.map((i) => i.kind.length));
+    const ages = inbox.map((i) => formatAge(i.createdAt, now));
+    const ageW = Math.max(3, ...ages.map((a) => a.length));
+    const titles = inbox.map((i) => singleLine(i.title));
+    const details = inbox.map((i) => singleLine(i.detail));
+    const rem = Math.max(32, maxW - (sevW + 1 + kindW + 1 + ageW + 1));
+    const maxTitleLen = Math.max(5, ...titles.map((t) => t.length));
+    const maxDetailLen = Math.max(6, ...details.map((d) => d.length));
+    const reservedDetail = Math.min(maxDetailLen, Math.max(16, Math.floor(rem * 0.4)));
+    const titleW = Math.min(maxTitleLen, Math.max(16, rem - 2 - reservedDetail));
+    const detailW = Math.max(16, rem - titleW - 2);
+    lines.push(`${"SEV".padEnd(sevW)} ${"KIND".padEnd(kindW)} ${"AGE".padEnd(ageW)} ${"TITLE".padEnd(titleW)}  DETAIL`);
+    for (let idx = 0; idx < inbox.length; idx++) {
+      const item = inbox[idx]!;
+      const title = truncateDisplay(titles[idx]!, titleW);
+      const detail = truncateDisplay(details[idx]!, detailW);
+      lines.push(
+        `${item.severity.padEnd(sevW)} ${item.kind.padEnd(kindW)} ${ages[idx]!.padEnd(ageW)} ${title.padEnd(titleW)}  ${detail}`,
+      );
+    }
+  }
+
+  if (opts.showAll && internalAttention.length > 0) {
+    lines.push("");
+    lines.push(`Internal attention (${internalAttention.length}):`);
+    const sevW = 4;
+    const kindW = Math.max(4, ...internalAttention.map((i) => i.kind.length));
+    const auds = internalAttention.map((i) => i.audience ?? "none");
+    const audW = Math.max(8, ...auds.map((a) => a.length));
+    const reasons = internalAttention.map((i) => i.hiddenReason ?? "internal");
+    const reasonW = Math.max(6, ...reasons.map((r) => r.length));
+    const ages = internalAttention.map((i) => formatAge(i.createdAt, now));
+    const ageW = Math.max(3, ...ages.map((a) => a.length));
+    const prefixW = sevW + 1 + kindW + 1 + audW + 1 + reasonW + 1 + ageW + 1;
+    const summaryW = Math.max(24, maxW - prefixW);
+    lines.push(
+      `${"SEV".padEnd(sevW)} ${"KIND".padEnd(kindW)} ${"AUDIENCE".padEnd(audW)} ${"REASON".padEnd(reasonW)} ${"AGE".padEnd(ageW)} TITLE / DETAIL`,
+    );
+    for (let idx = 0; idx < internalAttention.length; idx++) {
+      const item = internalAttention[idx]!;
+      const title = singleLine(item.title);
+      const detail = singleLine(item.detail);
+      const summary = truncateDisplay(detail ? `${title} — ${detail}` : title, summaryW);
+      lines.push(
+        `${item.severity.padEnd(sevW)} ${item.kind.padEnd(kindW)} ${auds[idx]!.padEnd(audW)} ${reasons[idx]!.padEnd(reasonW)} ${ages[idx]!.padEnd(ageW)} ${summary}`,
+      );
+    }
+  } else if (!opts.showAll && internalAttention.length > 0) {
+    lines.push(`(${internalAttention.length} internal item(s) hidden; use --all)`);
+  }
+
+  return lines.join("\n");
+}
+
+function validateInboxInvocation(positional: string[], flags: Record<string, string | boolean>): void {
+  const hasFlag = (k: string) => Object.prototype.hasOwnProperty.call(flags, k);
+  const usage = "Usage: pi-harness inbox [--all] [--run <run-id>] [--json] [--remote <alias|ssh://host>]";
+  const allowed = new Set(["all", "run", "json", "remote", "repo", "project", "p"]);
+  if (hasFlag("json") && flags.json !== true) throw new Error("--json does not take a value");
+  if (hasFlag("all") && flags.all !== true) throw new Error("--all does not take a value");
+  for (const key of Object.keys(flags)) {
+    if (!allowed.has(key)) throw new Error(`Flag --${key} is not supported for 'inbox'`);
+  }
+  if (positional.length > 1) throw new Error(usage);
+  if (hasFlag("run") && !(typeof flags.run === "string" && flags.run.trim().length > 0)) {
+    throw new Error(`--run requires a run id. ${usage}`);
+  }
+}
+
+export function formatHelp(): string {
+  return `pi-harness — CLI-first, daemonized interactive Director + 3-tier multi-agent coding harness
 
 Usage:
   pi-harness [--resume] [-p <project>] [--remote <alias|ssh://host>]
@@ -302,8 +425,12 @@ Usage:
   pi-harness chat [--resume] [-p <project>] [--remote <alias|ssh://host>]
   pi-harness chat send <target> "<message>" [--from <chat-id>] [--no-reply]
                                                     Send a message to any local (chat-1) or remote (gpu-box:chat-4) chat
-  pi-harness goals [list | review <id> | pause <id> | cancel <id>]
-  pi-harness escalations [list] [--status open|acked|resolved|all] [--run <run-id>] [--limit <n>] [--json] [--remote <alias|ssh://host>]
+  pi-harness inbox [--all] [--run <run-id>] [--json] [--remote <alias|ssh://host>]
+                                                    Show human-visible inbox items (--all appends internal attention)
+  pi-harness goals [list [--json] | review <id> | pause <id> | cancel <id>] [--remote <alias|ssh://host>]
+                                                    List goals as a table (--json for raw JSON), or review/pause/cancel a goal
+  pi-harness escalations [list] [--all] [--status open|acked|resolved|all] [--run <run-id>] [--limit <n>] [--json] [--remote <alias|ssh://host>]
+                                                    Show human-visible escalations by default (--all or --status shows raw list)
   pi-harness escalations reconcile [--direct [--db <path>]] [--json] [--remote <alias|ssh://host>]
   pi-harness escalations resolve <escalation-id> --reason "<text>" [--json] [--remote <alias|ssh://host>]
   pi-harness profiles [list | add <id> <cmd> [args...] | remove <id> | probe <id>]
@@ -315,8 +442,10 @@ Usage:
   pi-harness run resume <run-id> [--in 15m | --message "<msg>"] [--remote <alias|ssh://host>]
                                                     Alias for \`pi-harness resume\`; to start a new run whose goal begins
                                                     with "resume", quote a multi-word goal or use \`pi-harness run -- resume ...\`
-  pi-harness runs [--json] [--remote <alias|ssh://host>]
+  pi-harness runs [--all] [--json] [--remote <alias|ssh://host>]
+                                                    List runs (hides director-tasks-* containers unless --all)
   pi-harness tree <run-id> [--remote <alias|ssh://host>]
+                                                    Dump raw run/task/escalation tree JSON (debug view)
   pi-harness steer <task-id> "<message>" [--remote <alias|ssh://host>]
   pi-harness resume <run-id> [--in 15m | --message "<msg>"] [--remote <alias|ssh://host>]
   pi-harness stop <run-id> [--remote <alias|ssh://host>]
@@ -324,7 +453,11 @@ Usage:
   pi-harness quota [show | sync] [--remote <alias|ssh://host>]
   pi-harness worktrees [list | clean [--all]] [--remote <alias|ssh://host>]
   pi-harness bridge                                 (stdio <-> local Unix socket bridge for remote SSH attach)
-`);
+`;
+}
+
+function printHelp(): void {
+  console.log(formatHelp());
 }
 
 type ChatStart = {
@@ -857,7 +990,11 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Validate every escalations invocation before connectClient, so malformed ones never open a DB or start a daemon.
+  // Validate every escalations and inbox invocation before connectClient, so malformed ones never open a DB or start a daemon.
+  if (cmd === "inbox") {
+    validateInboxInvocation(positional, flags);
+  }
+
   if (cmd === "escalations") {
     const hasFlag = (k: string) => Object.prototype.hasOwnProperty.call(flags, k);
     const sub = positional[1] ?? "list";
@@ -867,7 +1004,7 @@ async function main(): Promise<void> {
     const common = ["json", "remote", "repo", "project", "p"];
     const allowed = new Set([
       ...common,
-      ...(sub === "list" ? ["status", "run", "limit"] : sub === "reconcile" ? ["direct", "db"] : ["reason"]),
+      ...(sub === "list" ? ["all", "status", "run", "limit"] : sub === "reconcile" ? ["direct", "db"] : ["reason"]),
     ]);
     if (hasFlag("direct")) {
       if (sub !== "reconcile") throw new Error("--direct is only supported for 'escalations reconcile'");
@@ -883,8 +1020,10 @@ async function main(): Promise<void> {
       if (!allowed.has(key)) throw new Error(`Flag --${key} is not supported for 'escalations ${sub}'`);
     }
     if (sub === "list") {
-      const listUsage = "Usage: pi-harness escalations [list] [--status open|acked|resolved|all] [--run <run-id>] [--limit <n>] [--json]";
+      const listUsage =
+        "Usage: pi-harness escalations [list] [--all] [--status open|acked|resolved|all] [--run <run-id>] [--limit <n>] [--json]";
       if (positional.length > 2) throw new Error(listUsage);
+      if (hasFlag("all") && flags.all !== true) throw new Error("--all does not take a value");
       if (hasFlag("status") && !(typeof flags.status === "string" && ["open", "acked", "resolved", "all"].includes(flags.status))) {
         throw new Error(listUsage);
       }
@@ -1217,6 +1356,27 @@ async function main(): Promise<void> {
         break;
       }
 
+      case "inbox": {
+        const runIdFilter = typeof flags.run === "string" && flags.run.trim() ? flags.run.trim() : undefined;
+        const snapParams: Record<string, unknown> = {};
+        if (runIdFilter) snapParams.runId = runIdFilter;
+        if (explicitRepoFlag) snapParams.repoRoot = repoRoot;
+        const snap = await client.request<{ inbox?: InboxItem[]; internalAttention?: InboxItem[] }>(
+          "work.snapshot",
+          snapParams,
+        );
+        const matchesRun = (item: InboxItem) => !runIdFilter || item.runId === runIdFilter;
+        const inbox = (snap.inbox ?? []).filter(matchesRun);
+        const internalAttention = (snap.internalAttention ?? []).filter(matchesRun);
+        const showAll = flags.all === true;
+        if (flags.json) {
+          console.log(JSON.stringify(showAll ? [...inbox, ...internalAttention] : inbox, null, 2));
+        } else {
+          console.log(formatInboxOutput(inbox, internalAttention, { showAll }));
+        }
+        break;
+      }
+
       case "goals": {
         const sub = positional[1] ?? "list";
         if (sub === "review") {
@@ -1226,7 +1386,13 @@ async function main(): Promise<void> {
         } else if (sub === "cancel") {
           console.log(JSON.stringify(await client.request("goal.cancel", { goalId: positional[2] }), null, 2));
         } else {
-          console.log(JSON.stringify(await client.request("goal.list", { repoRoot }), null, 2));
+          const listParams = remoteSpec.target && !explicitRepoFlag ? {} : { repoRoot };
+          const goals = (await client.request<GoalRecord[]>("goal.list", listParams)) ?? [];
+          if (flags.json) {
+            console.log(JSON.stringify(goals, null, 2));
+          } else {
+            console.log(formatGoalsTable(goals));
+          }
         }
         break;
       }
@@ -1235,43 +1401,96 @@ async function main(): Promise<void> {
         const sub = positional[1] ?? "list";
         if (sub === "list") {
           const status = flags.status;
+          const useRawList = flags.all === true || status !== undefined;
           const limit = typeof flags.limit === "string" ? Math.max(1, Math.min(1000, Number(flags.limit))) : 500;
-          const params: Record<string, unknown> = { limit };
-          if (typeof flags.run === "string" && flags.run.trim()) params.runId = flags.run.trim();
+          const runIdFilter = typeof flags.run === "string" && flags.run.trim() ? flags.run.trim() : undefined;
           let items: EscalationRecord[];
           let truncated: boolean;
-          if (status === undefined) {
-            // Unresolved = open + acked. Query each status separately so the row limit applies after the status
-            // filter (resolved rows never crowd them out), on every daemon version.
-            const [open, acked] = await Promise.all([
-              client.request<EscalationRecord[]>("escalation.list", { ...params, status: "open" }),
-              client.request<EscalationRecord[]>("escalation.list", { ...params, status: "acked" }),
-            ]);
-            const byId = new Map<string, EscalationRecord>();
-            for (const e of [...open, ...acked]) byId.set(e.id, e);
-            const combined = [...byId.values()].sort((a, b) => b.createdAt - a.createdAt);
-            // Older daemons cap each page at 100 rows regardless of the requested limit.
-            const openCapped = open.length >= limit || (limit > 100 && open.length === 100);
-            const ackedCapped = acked.length >= limit || (limit > 100 && acked.length === 100);
-            truncated = combined.length > limit || openCapped || ackedCapped;
-            items = combined.slice(0, limit);
+          let hiddenCount = 0;
+
+          if (!useRawList) {
+            // Default view uses the daemon's shared attention policy from work.snapshot.
+            const snapParams: Record<string, unknown> = {};
+            if (runIdFilter) snapParams.runId = runIdFilter;
+            if (explicitRepoFlag) snapParams.repoRoot = repoRoot;
+            const snap = await client.request<{
+              inbox?: InboxItem[];
+              runs?: Array<{ escalations?: EscalationRecord[] }>;
+              escalations?: EscalationRecord[];
+            }>("work.snapshot", snapParams);
+            const escById = new Map<string, EscalationRecord>();
+            for (const runEntry of snap.runs ?? []) {
+              for (const e of runEntry.escalations ?? []) {
+                escById.set(e.id, e);
+              }
+            }
+            for (const e of snap.escalations ?? []) {
+              if (!escById.has(e.id)) escById.set(e.id, e);
+            }
+            const visibleEscIds = new Set<string>();
+            for (const item of snap.inbox ?? []) {
+              if (item.kind !== "escalation") continue;
+              const escId =
+                item.ref?.kind === "escalation" && item.ref.id
+                  ? item.ref.id
+                  : item.id.startsWith("inbox:esc:")
+                    ? item.id.slice("inbox:esc:".length)
+                    : null;
+              if (escId) visibleEscIds.add(escId);
+            }
+            const allEscalations = [...escById.values()];
+            const visibleAll = [...visibleEscIds]
+              .map((id) => escById.get(id))
+              .filter((e): e is EscalationRecord => e !== undefined)
+              .sort((a, b) => b.createdAt - a.createdAt);
+            hiddenCount = allEscalations.filter(
+              (e) => (e.status === "open" || e.status === "acked") && !visibleEscIds.has(e.id),
+            ).length;
+            truncated = visibleAll.length > limit;
+            items = visibleAll.slice(0, limit);
           } else {
-            if (status === "open" || status === "acked" || status === "resolved") params.status = status;
-            const raw = await client.request<EscalationRecord[]>("escalation.list", params);
-            // Older daemons cap each page at 100 rows regardless of the requested limit.
-            truncated = raw.length >= limit || (limit > 100 && raw.length === 100);
-            items = raw.slice(0, limit);
+            const params: Record<string, unknown> = { limit };
+            if (runIdFilter) params.runId = runIdFilter;
+            if (status === undefined) {
+              // Unresolved = open + acked. Query each status separately so the row limit applies after the status
+              // filter (resolved rows never crowd them out), on every daemon version.
+              const [open, acked] = await Promise.all([
+                client.request<EscalationRecord[]>("escalation.list", { ...params, status: "open" }),
+                client.request<EscalationRecord[]>("escalation.list", { ...params, status: "acked" }),
+              ]);
+              const byId = new Map<string, EscalationRecord>();
+              for (const e of [...open, ...acked]) byId.set(e.id, e);
+              const combined = [...byId.values()].sort((a, b) => b.createdAt - a.createdAt);
+              // Older daemons cap each page at 100 rows regardless of the requested limit.
+              const openCapped = open.length >= limit || (limit > 100 && open.length === 100);
+              const ackedCapped = acked.length >= limit || (limit > 100 && acked.length === 100);
+              truncated = combined.length > limit || openCapped || ackedCapped;
+              items = combined.slice(0, limit);
+            } else {
+              if (status === "open" || status === "acked" || status === "resolved") params.status = status;
+              const raw = await client.request<EscalationRecord[]>("escalation.list", params);
+              // Older daemons cap each page at 100 rows regardless of the requested limit.
+              truncated = raw.length >= limit || (limit > 100 && raw.length === 100);
+              items = raw.slice(0, limit);
+            }
           }
+
           if (flags.json) {
             console.log(JSON.stringify(items, null, 2));
           } else if (items.length === 0) {
             console.log("No escalations found.");
+            if (hiddenCount > 0) {
+              console.log(`(${hiddenCount} internal escalation(s) hidden; use --all)`);
+            }
           } else {
             for (const e of items) {
               console.log(`${e.id}  ${e.severity}  ${e.category}  ${e.status}  ${e.runId}  ${e.title}`);
             }
             if (truncated) {
               console.log(`(showing first ${items.length} matching escalation(s); narrow with --run or raise --limit)`);
+            }
+            if (hiddenCount > 0) {
+              console.log(`(${hiddenCount} internal escalation(s) hidden; use --all)`);
             }
           }
         } else if (sub === "reconcile") {
@@ -1330,13 +1549,32 @@ async function main(): Promise<void> {
       }
 
       case "runs": {
-        const runs = (await client.request<
-          Array<{ id: string; status: string; repoRoot: string; goal: string; updatedAt: number }>
-        >("run.list")) ?? [];
+        const showAll = flags.all === true;
+        const allRuns =
+          (await client.request<
+            Array<{ id: string; status: string; repoRoot: string; goal: string; updatedAt: number }>
+          >("run.list", { limit: 100 })) ?? [];
+        let hiddenContainers = 0;
+        const runs: typeof allRuns = [];
+        if (showAll) {
+          runs.push(...allRuns);
+        } else {
+          for (const r of allRuns) {
+            if (runs.length >= 20) break;
+            if (isDirectorTaskContainer(r.id)) {
+              hiddenContainers++;
+            } else {
+              runs.push(r);
+            }
+          }
+        }
         if (flags.json) {
           console.log(JSON.stringify(runs, null, 2));
         } else if (runs.length === 0) {
           console.log("No runs found.");
+          if (hiddenContainers > 0) {
+            console.log(`(${hiddenContainers} internal container run(s) hidden; use --all)`);
+          }
         } else {
           const maxW = Math.max(80, process.stdout.columns || 120);
           const goalW = Math.max(16, maxW - 73);
@@ -1344,8 +1582,11 @@ async function main(): Promise<void> {
           for (const r of runs) {
             const ws = (r.repoRoot.split("/").filter(Boolean).pop() ?? r.repoRoot).slice(0, 16);
             const firstLine = (r.goal.split("\n")[0] ?? "").trim().slice(0, goalW);
-            const ts = `${new Date(r.updatedAt).toISOString().replace("T", " ").slice(0, 19)}Z`;
+            const ts = formatUtcTimestamp(r.updatedAt);
             console.log(`${r.id.padEnd(16)} ${r.status.padEnd(13)} ${ts.padEnd(21)} ${ws.padEnd(17)} ${firstLine}`);
+          }
+          if (hiddenContainers > 0) {
+            console.log(`(${hiddenContainers} internal container run(s) hidden; use --all)`);
           }
         }
         break;
