@@ -2,9 +2,11 @@
 import { existsSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { Database } from "bun:sqlite";
 import type { Terminal } from "@earendil-works/pi-tui";
 import { ControlPlaneDb, type EscalationRecord } from "./control-plane/db.js";
 import { findProjectContainingPath, type ProjectBrowseResult, type ProjectSummary } from "./control-plane/projects.js";
+import { classifyInterruptedTasks, formatRecoveryPlan } from "./control-plane/restart-recovery.js";
 import { ensureTempDir, loadConfig, type AcpProfileConfig } from "./config.js";
 import { loadOrCreateNodeId } from "./control-plane/session-messages.js";
 import { qualifyRemoteCliHints } from "./protocol/chat-events.js";
@@ -33,6 +35,7 @@ const BOOLEAN_LONG_FLAGS = new Set([
   "no-create",
   "exclude-exhausted",
   "direct",
+  "dry-run",
   "resume",
 ]);
 
@@ -272,6 +275,7 @@ Usage:
   pi-harness escalations resolve <escalation-id> --reason "<text>" [--json] [--remote <alias|ssh://host>]
   pi-harness profiles [list | add <id> <cmd> [args...] | remove <id> | probe <id>]
   pi-harness daemon serve | status | stop | restart [--remote <alias|ssh://host>]
+  pi-harness daemon recover --dry-run [--db <path>] [--json]
   pi-harness run "<goal>" [-p <project>] [--profile id] [--model id] [--effort level] [--detach] [--remote <alias|ssh://host>]
   pi-harness run resume <run-id> [--in 15m | --message "<msg>"] [--remote <alias|ssh://host>]
                                                     Alias for \`pi-harness resume\`; to start a new run whose goal begins
@@ -669,7 +673,7 @@ async function main(): Promise<void> {
         console.error(`[harnessd ${new Date().toISOString()}] unhandledRejection:`, reason);
       });
       ensureTempDir();
-      const daemon = new HarnessDaemon(config, { autoQuitWhenIdle: true, repoRoot });
+      const daemon = new HarnessDaemon(config, { autoQuitWhenIdle: true, repoRoot, reapChildrenOnStop: true });
       const sock = await daemon.start();
       try {
         writeFileSync(join(config.stateDir, "daemon.pid"), `${process.pid}\n`, "utf8");
@@ -719,6 +723,30 @@ async function main(): Promise<void> {
       const c = await ensureLocalDaemon(config.socketPath);
       c.close();
       console.log("Restarted harnessd.");
+      return;
+    }
+    if (sub === "recover") {
+      if (flags["dry-run"] !== true) {
+        throw new Error("Only --dry-run is supported. Recovery runs when the daemon starts.");
+      }
+      const rawDb = typeof flags.db === "string" ? flags.db.trim() : "";
+      const dbPath = rawDb
+        ? resolve(rawDb === "~" || rawDb.startsWith("~/") ? join(homedir(), rawDb.slice(1)) : rawDb)
+        : join(config.stateDir, "control-plane.sqlite");
+      if (!existsSync(dbPath)) {
+        throw new Error(`Database not found: ${dbPath}`);
+      }
+      const raw = new Database(dbPath, { readonly: true });
+      try {
+        const plan = classifyInterruptedTasks(raw);
+        if (flags.json === true) {
+          console.log(JSON.stringify(plan, null, 2));
+        } else {
+          console.log(formatRecoveryPlan(plan));
+        }
+      } finally {
+        raw.close();
+      }
       return;
     }
     const client = await connectClient(config.socketPath, remoteSpec.target, remoteSpec.bridgeCommand);
