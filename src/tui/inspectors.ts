@@ -274,13 +274,25 @@ export class EscalationInspectorScreen implements Screen {
         label: "Resolution note",
         initialValue: "Resolved by user",
         onSubmit: async (note) => {
-          await this.deps.client.request("escalation.ack", {
-            escalationId: esc.id,
-            resolution: note,
-            resolve: true,
-          });
-          this.frame.setNotice(`Resolved ${esc.id}`, "ok");
-          await Promise.all([this.load(ctx), this.deps.store.refresh()]);
+          try {
+            const res = await this.deps.client.request<{ alreadyResolved?: boolean; deliveredTo?: string[] }>(
+              "escalation.resolve",
+              {
+                escalationId: esc.id,
+                reason: note,
+              },
+            );
+            if (res?.alreadyResolved) {
+              this.frame.setNotice(`${esc.id} was already resolved`, "info");
+            } else {
+              const delivered = res?.deliveredTo?.length ? ` (sent to ${res.deliveredTo.join(", ")})` : "";
+              this.frame.setNotice(`Resolved ${esc.id}${delivered}`, "ok");
+            }
+            await Promise.all([this.load(ctx), this.deps.store.refresh()]);
+          } catch (err) {
+            this.frame.setNotice(`Resolve failed: ${err instanceof Error ? err.message : String(err)}`, "danger");
+            ctx.requestRender();
+          }
         },
       });
       ctx.requestRender();
@@ -503,6 +515,7 @@ export class GoalInspectorScreen implements Screen {
     const run = g?.linkedRunId ? this.deps.store.getRunEntry(g.linkedRunId) : undefined;
     const openEscs = run ? run.escalations.filter((e) => e.status === "open" || e.status === "acked") : [];
     const canResume = g ? isGoalResumable(g, run?.run.status) : false;
+    const canAccept = Boolean(g && g.status !== "draft" && g.status !== "achieved" && g.status !== "cancelled");
 
     const tabs = [
       { id: "overview", label: "Overview" },
@@ -515,6 +528,7 @@ export class GoalInspectorScreen implements Screen {
       { key: "←→/Tab/1-4", label: "tabs" },
       ...(g?.status === "draft" ? [{ key: "c", label: "commit" }] : []),
       { key: "v", label: "review" },
+      ...(canAccept ? [{ key: "A", label: "accept" }] : []),
       { key: "m", label: "amend" },
       ...(canResume
         ? [{ key: "u", label: "resume" }]
@@ -724,6 +738,41 @@ export class GoalInspectorScreen implements Screen {
           await this.deps.client.request("goal.cancel", { goalId: g.id });
           this.frame.setNotice(`Cancelled ${g.id}`, "danger");
           await this.deps.store.refresh();
+        },
+      });
+      ctx.requestRender();
+      return;
+    }
+
+    if (data === "A" && g.status !== "draft" && g.status !== "achieved" && g.status !== "cancelled") {
+      this.frame.askPrompt({
+        label: "Accept reason",
+        onSubmit: (reason) => {
+          this.frame.askPrompt({
+            label: "Evidence paths (comma or space separated)",
+            onSubmit: async (raw) => {
+              const evidencePaths = raw.split(/[\s,]+/).filter(Boolean);
+              if (evidencePaths.length === 0) {
+                this.frame.setNotice("Accept requires at least one evidence path", "warn");
+                ctx.requestRender();
+                return;
+              }
+              try {
+                await this.deps.client.request("goal.accept", {
+                  goalId: g.id,
+                  reason,
+                  evidencePaths,
+                });
+                this.frame.setNotice(`Accepted ${g.id}`, "ok");
+                await this.deps.store.refresh();
+                ctx.requestRender();
+              } catch (err) {
+                this.frame.setNotice(`Accept failed: ${err instanceof Error ? err.message : String(err)}`, "danger");
+                ctx.requestRender();
+              }
+            },
+          });
+          ctx.requestRender();
         },
       });
       ctx.requestRender();

@@ -262,6 +262,20 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
       // 2. Ack without resolving -> verify acked escalation STILL appears in unresolved Escalations tab!
       await client.request("escalation.ack", { escalationId: esc.id, resolution: "Investigating", resolve: false });
       assert.equal(daemon.db.getEscalation(esc.id)?.status, "acked");
+      assert.equal(
+        daemon.db
+          .getEventsSince(run.id, 0)
+          .some((e) => e.type === "escalation.updated" && (e.payload as { resolvedBy?: string }).resolvedBy !== undefined),
+        false,
+        "escalation.ack(resolve:false) must not record resolvedBy",
+      );
+      assert.equal(
+        daemon.director.chats
+          .getHistory(chat.session.id)
+          .some((t) => t.role === "system_notice" && /Escalation .* resolved by/.test(t.content)),
+        false,
+        "escalation.ack(resolve:false) must not emit a resolved system_notice",
+      );
 
       const store = new WorkStore(client, { chatSessionId: chat.session.id, repoRoot: repoDir });
       await store.refresh();
@@ -334,11 +348,45 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
       nav.current!.handleInput("\x7f", screenCtx);
       assert.deepEqual(nav.breadcrumbs, ["Work", esc.id]);
 
-      // Press 'r' -> Enter -> resolves escalation live against daemon!
+      // Press 'r' -> type answer -> Enter -> resolves escalation live via escalation.resolve!
       nav.current!.handleInput("r", screenCtx);
+      nav.current!.handleInput("\x15", screenCtx); // Clear default text
+      for (const ch of "Approved rev 6") nav.current!.handleInput(ch, screenCtx);
       nav.current!.handleInput("\r", screenCtx);
       await new Promise((r) => setTimeout(r, 60));
       assert.equal(daemon.db.getEscalation(esc.id)?.status, "resolved");
+      assert.equal(daemon.db.getEscalation(esc.id)?.resolution, "Approved rev 6");
+
+      const resolvedEvents = daemon.db
+        .getEventsSince(run.id, 0)
+        .filter(
+          (e) =>
+            e.type === "escalation.updated" &&
+            (e.payload as { id?: string; status?: string; resolvedBy?: string }).id === esc.id &&
+            (e.payload as { status?: string }).status === "resolved",
+        );
+      assert.equal(resolvedEvents.length, 1);
+      assert.equal((resolvedEvents[0]!.payload as { resolvedBy?: string }).resolvedBy, "operator");
+      assert.equal((resolvedEvents[0]!.payload as { resolution?: string }).resolution, "Approved rev 6");
+
+      const chatNotices = daemon.director.chats
+        .getHistory(chat.session.id)
+        .filter((t) => t.role === "system_notice" && /Escalation .* resolved by operator/.test(t.content));
+      assert.equal(chatNotices.length, 1);
+      assert.ok(chatNotices[0]!.content.includes("Approved rev 6"));
+
+      // Re-resolving reports alreadyResolved notice without duplicating audit event or chat notice
+      nav.current!.handleInput("r", screenCtx);
+      nav.current!.handleInput("\r", screenCtx);
+      await new Promise((r) => setTimeout(r, 60));
+      const alreadyRendered = nav.current!.render(100, 24, theme).map(stripTerminalSequences).join("\n");
+      assert.ok(alreadyRendered.includes(`${esc.id} was already resolved`));
+      assert.equal(
+        daemon.director.chats
+          .getHistory(chat.session.id)
+          .filter((t) => t.role === "system_notice" && /Escalation .* resolved by operator/.test(t.content)).length,
+        1,
+      );
 
       // Inspect RunInspectorScreen tree connectors (`├─` vs `└─`)
       nav.push(new RunInspectorScreen(run.id, deps));
@@ -1143,5 +1191,212 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
     const exitAction = await runPromise;
     assert.equal(exitAction.kind, "exit");
     assert.ok(mock.calls.some((c) => c.op === "session.leave"));
+  });
+
+  it("verifies EscalationInspector 'a' ack distinct from resolve, WorkNavigator 'R' escalation.resolve, and GoalInspector 'A' goal.accept", async () => {
+    const theme = createTheme({ color: false, ascii: false });
+    const { terminal } = makeFakeTerminal(120, 30);
+    const tui = new ModalScreen(terminal);
+    const nav = new Navigator(tui, terminal, theme);
+    const ctx = { navigator: nav, theme, requestRender: () => {}, writeTerminal: () => {} };
+
+    const now = Date.now();
+    const escRecord = {
+      id: "esc-1",
+      runId: "run-1",
+      fromTaskId: "t-2",
+      toTaskId: null,
+      severity: "P0" as const,
+      category: "blocked_dependency" as const,
+      title: "Choose storage backend",
+      evidencePaths: ["src/db.ts"],
+      attempted: [],
+      suggestedSplits: [],
+      blocking: true,
+      status: "open" as const,
+      resolution: null,
+      createdAt: now,
+      ackedAt: null,
+    };
+
+    const makeGoal = (id: string, status: "executing" | "achieved" | "draft" | "cancelled") => ({
+      goal: {
+        id,
+        chatSessionId: "chat-1",
+        repoRoot: "/repo",
+        version: 1,
+        title: `Goal ${id}`,
+        description: `Description for ${id}`,
+        criteria: [],
+        nonGoals: [],
+        budgets: { maxReviewCycles: 3, maxNoProgressCycles: 2 },
+        status,
+        linkedRunId: null,
+        reviewCycle: 0,
+        noProgressStreak: 0,
+        lastProgressFingerprint: null,
+        lastReviewSummary: null,
+        createdAt: now,
+        updatedAt: now,
+      },
+      reviews: [],
+      revisions: [],
+    });
+
+    let resolveCount = 0;
+    let failAccept = false;
+    const mock = makeMockClient(async (op) => {
+      if (op === "work.snapshot") {
+        return {
+          generatedAt: now,
+          latestSeq: 1,
+          goals: [
+            makeGoal("goal-exec", "executing"),
+            makeGoal("goal-done", "achieved"),
+            makeGoal("goal-draft", "draft"),
+            makeGoal("goal-cancelled", "cancelled"),
+          ],
+          runs: [],
+          escalations: [escRecord],
+          timers: [],
+          merges: [],
+          worktrees: [],
+          messages: [],
+          inbox: [],
+        } satisfies WorkSnapshot;
+      }
+      if (op === "escalation.get") {
+        return { escalation: escRecord, run: null, fromTask: null, goal: null };
+      }
+      if (op === "escalation.ack") {
+        return { ...escRecord, status: "acked" };
+      }
+      if (op === "escalation.resolve") {
+        resolveCount += 1;
+        if (resolveCount === 1) {
+          return { escalation: { ...escRecord, status: "resolved" }, alreadyResolved: false, deliveredTo: ["t-1"] };
+        }
+        return { escalation: { ...escRecord, status: "resolved" }, alreadyResolved: true, deliveredTo: [] };
+      }
+      if (op === "goal.accept") {
+        if (failAccept) throw new Error("deterministic gate c1 failed");
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const store = new WorkStore(mock.client, { repoRoot: "/repo" });
+    await store.refresh();
+    const deps = { client: mock.client, store, repoRoot: "/repo" };
+
+    // 1. EscalationInspector 'a' stays on escalation.ack with resolve: false
+    const escScreen = new EscalationInspectorScreen("esc-1", deps);
+    nav.push(escScreen);
+    await new Promise((r) => setTimeout(r, 20));
+    escScreen.handleInput("a", ctx);
+    escScreen.handleInput("\x15", ctx);
+    for (const ch of "Investigating issue") escScreen.handleInput(ch, ctx);
+    escScreen.handleInput("\r", ctx);
+    await new Promise((r) => setTimeout(r, 20));
+
+    const ackCalls = mock.calls.filter((c) => c.op === "escalation.ack");
+    assert.equal(ackCalls.length, 1);
+    assert.deepEqual(ackCalls[0]!.params, {
+      escalationId: "esc-1",
+      resolution: "Investigating issue",
+      resolve: false,
+    });
+    assert.equal(mock.calls.filter((c) => c.op === "escalation.resolve").length, 0);
+    nav.pop();
+
+    // 2. WorkNavigator 'R' sends escalation.resolve with typed reason (no escalation.ack)
+    mock.calls.length = 0;
+    const workNav = new WorkNavigatorScreen(deps, "escalations");
+    nav.push(workNav);
+    workNav.handleInput("R", ctx);
+    workNav.handleInput("\x15", ctx);
+    for (const ch of "Use SQLite") workNav.handleInput(ch, ctx);
+    workNav.handleInput("\r", ctx);
+    await new Promise((r) => setTimeout(r, 20));
+
+    const navResolveCalls = mock.calls.filter((c) => c.op === "escalation.resolve");
+    assert.equal(navResolveCalls.length, 1);
+    assert.deepEqual(navResolveCalls[0]!.params, { escalationId: "esc-1", reason: "Use SQLite" });
+    assert.equal(mock.calls.filter((c) => c.op === "escalation.ack").length, 0);
+    const firstResolveRender = workNav.render(120, 24, theme).map(stripTerminalSequences).join("\n");
+    assert.ok(firstResolveRender.includes("Resolved esc-1 (sent to t-1)"));
+
+    // Second 'R' returning alreadyResolved shows info notice
+    workNav.handleInput("R", ctx);
+    workNav.handleInput("\r", ctx);
+    await new Promise((r) => setTimeout(r, 20));
+    const alreadyRender = workNav.render(120, 24, theme).map(stripTerminalSequences).join("\n");
+    assert.ok(alreadyRender.includes("esc-1 was already resolved"));
+    nav.pop();
+
+    // 3. GoalInspector 'A' sends goal.accept with reason + evidencePaths, no overrideDeterministic
+    mock.calls.length = 0;
+    const execGoalScreen = new GoalInspectorScreen("goal-exec", deps);
+    nav.push(execGoalScreen);
+    const execHints = execGoalScreen.render(120, 24, theme).map(stripTerminalSequences).join("\n");
+    assert.ok(execHints.includes("A accept"), "Executing goal must offer A accept hint");
+
+    execGoalScreen.handleInput("A", ctx);
+    for (const ch of "Operator verified") execGoalScreen.handleInput(ch, ctx);
+    execGoalScreen.handleInput("\r", ctx);
+    for (const ch of "proof.txt, out/log.txt") execGoalScreen.handleInput(ch, ctx);
+    execGoalScreen.handleInput("\r", ctx);
+    await new Promise((r) => setTimeout(r, 20));
+
+    const acceptCalls = mock.calls.filter((c) => c.op === "goal.accept");
+    assert.equal(acceptCalls.length, 1);
+    assert.deepEqual(acceptCalls[0]!.params, {
+      goalId: "goal-exec",
+      reason: "Operator verified",
+      evidencePaths: ["proof.txt", "out/log.txt"],
+    });
+    assert.equal("overrideDeterministic" in acceptCalls[0]!.params, false);
+    const acceptedRender = execGoalScreen.render(120, 24, theme).map(stripTerminalSequences).join("\n");
+    assert.ok(acceptedRender.includes("Accepted goal-exec"));
+
+    // Separator-only evidence paths do not send goal.accept
+    execGoalScreen.handleInput("A", ctx);
+    for (const ch of "Some reason") execGoalScreen.handleInput(ch, ctx);
+    execGoalScreen.handleInput("\r", ctx);
+    for (const ch of ",,,") execGoalScreen.handleInput(ch, ctx);
+    execGoalScreen.handleInput("\r", ctx);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(mock.calls.filter((c) => c.op === "goal.accept").length, 1);
+
+    // Failed goal.accept displays error in notice
+    failAccept = true;
+    execGoalScreen.handleInput("A", ctx);
+    for (const ch of "Try accept") execGoalScreen.handleInput(ch, ctx);
+    execGoalScreen.handleInput("\r", ctx);
+    for (const ch of "proof.txt") execGoalScreen.handleInput(ch, ctx);
+    execGoalScreen.handleInput("\r", ctx);
+    await new Promise((r) => setTimeout(r, 20));
+    const failRender = execGoalScreen.render(120, 24, theme).map(stripTerminalSequences).join("\n");
+    assert.ok(failRender.includes("Accept failed: deterministic gate c1 failed"));
+    nav.pop();
+
+    // 4. GoalInspector 'A' is NOT offered or handled for achieved, draft, or cancelled goals
+    for (const blockedGoalId of ["goal-done", "goal-draft", "goal-cancelled"]) {
+      mock.calls.length = 0;
+      const screen = new GoalInspectorScreen(blockedGoalId, deps);
+      nav.push(screen);
+      const rendered = screen.render(120, 24, theme).map(stripTerminalSequences).join("\n");
+      assert.equal(rendered.includes("A accept"), false, `${blockedGoalId} must not offer A accept`);
+      screen.handleInput("A", ctx);
+      for (const ch of "Should not submit") screen.handleInput(ch, ctx);
+      screen.handleInput("\r", ctx);
+      for (const ch of "proof.txt") screen.handleInput(ch, ctx);
+      screen.handleInput("\r", ctx);
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(mock.calls.filter((c) => c.op === "goal.accept").length, 0);
+      nav.pop();
+    }
+
+    store.dispose();
   });
 });
