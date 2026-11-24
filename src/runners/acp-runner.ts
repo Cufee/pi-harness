@@ -647,6 +647,7 @@ export class AcpRunner {
     let quotaRejected = false;
     let textSinceQuotaRejection = "";
     let lastQuotaReason = "";
+    let lastQuotaDetail = "";
     let lastQuotaResetAt: string | null = null;
     let lastQuotaHard = false;
 
@@ -667,10 +668,11 @@ export class AcpRunner {
       }
     };
 
-    const noteQuotaSignal = (info: { reason: string; resetAt?: string | null; isHardExhaustion?: boolean }) => {
+    const noteQuotaSignal = (info: { reason: string; detail?: string; resetAt?: string | null; isHardExhaustion?: boolean }) => {
       if (quotaWatchdogTriggered || rolloverTriggered || req.signal.aborted) return;
       quotaRetryHits += 1;
       if (info.reason) lastQuotaReason = info.reason;
+      if (info.detail) lastQuotaDetail = info.detail;
       if (info.resetAt) lastQuotaResetAt = info.resetAt;
       if (info.isHardExhaustion) lastQuotaHard = true;
 
@@ -712,6 +714,7 @@ export class AcpRunner {
       if (detected.isQuota) {
         noteQuotaSignal({
           reason: detected.summary,
+          detail: detected.detail,
           resetAt: detected.resetAtIso ?? null,
           isHardExhaustion: detected.isHardExhaustion,
         });
@@ -729,6 +732,15 @@ export class AcpRunner {
           const line = lines[i]!;
           if (i === 0 && stderrPartialMatched) {
             stderrPartialMatched = false;
+            if (!quotaWatchdogTriggered && !rolloverTriggered && !req.signal.aborted) {
+              const fullDetected = detectQuotaErrorText(line);
+              if (fullDetected.isQuota) {
+                if (fullDetected.summary) lastQuotaReason = fullDetected.summary;
+                if (fullDetected.detail) lastQuotaDetail = fullDetected.detail;
+                if (fullDetected.resetAtIso) lastQuotaResetAt = fullDetected.resetAtIso;
+                if (fullDetected.isHardExhaustion) lastQuotaHard = true;
+              }
+            }
             continue;
           }
           if (line.trim()) inspectStderrText(line);
@@ -1921,6 +1933,10 @@ export class AcpRunner {
           lastQuotaReason ||
           (finalQuotaDetected.isQuota ? finalQuotaDetected.summary : "") ||
           (airFailureCode ? `ACP sessionFailure: ${airFailureCode}` : `Rate-limit retry timed out after ${Math.round(quotaTimeoutMs / 1000)}s`);
+        const detail =
+          lastQuotaDetail ||
+          (finalQuotaDetected.isQuota ? finalQuotaDetected.detail : "") ||
+          reason;
         const resetAt = lastQuotaResetAt ?? finalQuotaDetected.resetAtIso ?? null;
         req.callbacks.onPassiveQuota?.({
           profileId: this.profile.id,
@@ -1933,6 +1949,7 @@ export class AcpRunner {
         });
         const quotaPause: QuotaPauseInfo = {
           reason,
+          detail,
           resetAt,
           retryCount: Math.max(1, quotaRetryHits),
           watchdogTimedOut: quotaWatchdogTriggered,
@@ -2071,6 +2088,7 @@ export class AcpRunner {
         Boolean(errRateLimit);
       if (quotaSignal) {
         const reason = lastQuotaReason || detected.summary || errMsg;
+        const detail = lastQuotaDetail || detected.detail || reason;
         const resetAt = lastQuotaResetAt ?? detected.resetAtIso ?? null;
         const isHard = lastQuotaHard || detected.isHardExhaustion;
         req.callbacks.onPassiveQuota?.({
@@ -2089,6 +2107,7 @@ export class AcpRunner {
           sessionId,
           quotaPause: {
             reason,
+            detail,
             resetAt,
             retryCount: Math.max(1, quotaRetryHits),
             watchdogTimedOut: quotaWatchdogTriggered,

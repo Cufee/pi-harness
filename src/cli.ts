@@ -121,10 +121,11 @@ function matchRunIdToken(raw: string): string | null {
 /** Normalizes an attach target token to a canonical run ID if it names a run (case-insensitive), else null. */
 export function normalizeAttachRunId(raw: string): string | null {
   const trimmed = raw.trim();
-  const matched = matchRunIdToken(trimmed);
+  const normalized = trimmed.replace(/^run[-_]/i, "run-");
+  const matched = matchRunIdToken(normalized);
   if (matched) return matched;
-  if (/^run[-_]/i.test(trimmed) && trimmed.length > 4) {
-    return `run-${trimmed.slice(4)}`;
+  if (normalized.startsWith("run-") && normalized.length > 4) {
+    return normalized;
   }
   return null;
 }

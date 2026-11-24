@@ -309,10 +309,15 @@ describe("goal-22 hygiene", () => {
   });
 
   it("normalizes attach run IDs case-insensitively and leaves non-run targets untouched", () => {
+    assert.equal(normalizeAttachRunId("run-00001234"), "run-00001234");
+    assert.equal(normalizeAttachRunId("RUN-00001234"), normalizeAttachRunId("run-00001234"));
+    assert.equal(normalizeAttachRunId("Run_00001234"), normalizeAttachRunId("run-00001234"));
+    assert.equal(normalizeAttachRunId("RUN-ABCDEF12"), normalizeAttachRunId("run-ABCDEF12"));
     assert.equal(normalizeAttachRunId("RUN-5"), "run-5");
     assert.equal(normalizeAttachRunId("run-5"), "run-5");
     assert.equal(normalizeAttachRunId("Run_abcdef12"), "run-abcdef12");
     assert.equal(normalizeAttachRunId("RUN-dir-chat-1"), "run-dir-chat-1");
+    assert.equal(normalizeAttachRunId("RUN-"), null);
     assert.equal(normalizeAttachRunId("chat-x"), null);
   });
 

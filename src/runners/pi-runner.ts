@@ -779,6 +779,7 @@ export class PiRunner {
               usage: lastUsage,
               quotaPause: {
                 reason: detected.summary,
+                detail: detected.detail,
                 resetAt: detected.resetAtIso ?? null,
                 retryCount,
                 watchdogTimedOut: !detected.isHardExhaustion && remaining <= 500,

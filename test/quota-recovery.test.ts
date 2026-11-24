@@ -10,7 +10,7 @@ import { create, toJsonString } from "@bufbuild/protobuf";
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { ModelCatalogCompiler } from "../src/catalog/compiler.js";
-import { defaultProfiles, loadConfig, type AcpProfileConfig } from "../src/config.js";
+import { defaultProfiles, loadConfig, type AcpProfileConfig, type PiProfileConfig } from "../src/config.js";
 import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import {
@@ -23,6 +23,7 @@ import {
 } from "../src/gen/quota_pb.js";
 import { AcpRunner } from "../src/runners/acp-runner.js";
 import { buildPostSessionActions } from "../src/runners/acp-shims.js";
+import { PiRunner } from "../src/runners/pi-runner.js";
 import { detectQuotaErrorText } from "../src/runners/quota-detect.js";
 import type { QuotaRetryStateEvent, RunAgentRequest, RunAgentResult } from "../src/runners/types.js";
 import { parseDurationMs } from "../src/tui/core/index.js";
@@ -695,5 +696,153 @@ describe("Tool-Failure Recovery, Robust Circuit Breaker & Subscription-Pool Quot
     const dNone = detectQuotaErrorText("ENOENT: file not found");
     assert.equal(dNone.isQuota, false);
     assert.equal(dNone.detail, "");
+  });
+
+  it("preserves untruncated >220-char provider quota lines in quotaPause.detail and resultJson.quotaDetail across AcpRunner and PiRunner", async () => {
+    const longQuotaLine =
+      `You've hit your individual spend limit: ${"provider-context-".repeat(13)}END-QUOTA-DETAIL-MARKER`;
+    assert.ok(longQuotaLine.length > 220);
+    const acpProfile: AcpProfileConfig = {
+      id: "acp:claude",
+      kind: "acp",
+      adapter: "claude",
+      command: "noop",
+      billing: "subscription",
+    };
+
+    // 1. AcpRunner turn-end hard quota message -> untruncated detail in quotaPause.detail
+    const acpTextAgent = agent()
+      .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
+      .onRequest("session/new", async () => ({
+        sessionId: "sess-detail-text",
+        models: { currentModelId: "fixture", availableModels: [{ modelId: "fixture", name: "Fixture" }] },
+      } as never))
+      .onRequest("session/prompt", async ({ client: acpClient }) => {
+        await acpClient.notify("session/update", {
+          sessionId: "sess-detail-text",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: longQuotaLine },
+          },
+        } as never);
+        return { stopReason: "end_turn" } as never;
+      });
+
+    const acpTextRes = await new AcpRunner(acpProfile).run(
+      {
+        runId: "r-detail-1",
+        taskId: "t-detail-1",
+        tier: 2,
+        kind: "worker",
+        cwd: process.cwd(),
+        toolPolicy: "read_write_workspace",
+        model: "fixture",
+        systemPrompt: "Worker",
+        initialPrompt: "Work",
+        maxTurns: 5,
+        tools: [],
+        executeTool: async () => ({}),
+        signal: new AbortController().signal,
+        callbacks: {},
+      },
+      acpTextAgent,
+    );
+    assert.equal(acpTextRes.stopReason, "quota_paused");
+    assert.equal(acpTextRes.quotaPause?.reason, longQuotaLine.slice(0, 220));
+    assert.equal(acpTextRes.quotaPause?.detail, longQuotaLine);
+    assert.ok(acpTextRes.quotaPause?.detail?.endsWith("END-QUOTA-DETAIL-MARKER"));
+
+    // 2. AcpRunner error/catch path wired through HarnessDaemon -> untruncated line lands in resultJson.quotaDetail
+    const longRpcLine = `HTTP 429 Too Many Requests (quota exceeded): ${"rpc-trace-".repeat(20)}RPC-DETAIL-MARKER`;
+    assert.ok(longRpcLine.length > 220);
+    const acpErrAgent = agent()
+      .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
+      .onRequest("session/new", async () => ({
+        sessionId: "sess-detail-err",
+        models: { currentModelId: "coordinator", availableModels: [{ modelId: "coordinator", name: "Coordinator" }] },
+      } as never))
+      .onRequest("session/prompt", async () => {
+        throw new Error(longRpcLine);
+      });
+
+    const repoDir = initTempGitRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-qdetail-"));
+    const cfg = quotaRunConfig(repoDir, stateDir);
+    const daemon = new HarnessDaemon(cfg, {
+      dbPath: join(stateDir, "cp.sqlite"),
+      customRunnerFactory: () => ({
+        run: (req: RunAgentRequest) => new AcpRunner(acpProfile).run(req, acpErrAgent),
+      }),
+    });
+
+    await daemon.start();
+    try {
+      const { run } = await daemon.orchestrator.startRun({
+        goal: "Verify AcpRunner quota detail persistence",
+        repoRoot: repoDir,
+        profileId: "pi:local",
+      });
+      await waitUntil(() => daemon.db.getRun(run.id)?.status === "paused_quota", 4000);
+      const pausedOrch = daemon.db.listTasks(run.id).find((t) => t.tier === 1);
+      assert.ok(pausedOrch?.summary?.startsWith("Paused (quota): "));
+      const parsedResult = pausedOrch?.resultJson
+        ? (JSON.parse(pausedOrch.resultJson) as { quotaDetail?: string })
+        : {};
+      assert.ok(parsedResult.quotaDetail && parsedResult.quotaDetail.length > 220);
+      assert.ok(parsedResult.quotaDetail?.includes(longRpcLine), `expected full RPC line, got: ${parsedResult.quotaDetail}`);
+      assert.ok(parsedResult.quotaDetail?.endsWith("RPC-DETAIL-MARKER"));
+      const pausedEvent = daemon.db.getEventsSince(run.id, 0).find((e) => e.type === "quota.agent_paused");
+      assert.equal((pausedEvent?.payload as { detail?: string } | undefined)?.detail, parsedResult.quotaDetail);
+      assert.equal((pausedEvent?.payload as { reason?: string } | undefined)?.reason?.length, 220);
+    } finally {
+      await daemon.stop();
+      rmSync(repoDir, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+
+    // 3. PiRunner HTTP 429 hard quota error -> untruncated detail in quotaPause.detail
+    const piServer = Bun.serve({
+      port: 0,
+      fetch: () =>
+        new Response(JSON.stringify({ error: { message: longQuotaLine, type: "insufficient_quota" } }), {
+          status: 429,
+          headers: { "content-type": "application/json" },
+        }),
+    });
+    try {
+      const piProfile: PiProfileConfig = {
+        id: "pi:test-quota",
+        kind: "pi",
+        provider: "local-test",
+        api: "openai-completions",
+        baseUrl: `${piServer.url.toString().replace(/\/$/, "")}/v1`,
+        billing: "local",
+        models: ["test-model"],
+      };
+      const piRes = await new PiRunner(piProfile).run({
+        runId: "r-pi-detail",
+        taskId: "t-pi-detail",
+        tier: 2,
+        kind: "worker",
+        cwd: process.cwd(),
+        toolPolicy: "read_only_workspace",
+        model: "test-model",
+        systemPrompt: "Worker",
+        initialPrompt: "Work",
+        tools: [],
+        executeTool: async () => ({}),
+        signal: new AbortController().signal,
+        callbacks: {},
+      });
+      assert.equal(piRes.stopReason, "quota_paused");
+      assert.equal(piRes.quotaPause?.reason.length, 220);
+      assert.ok(piRes.quotaPause?.detail && piRes.quotaPause.detail.length > 220);
+      assert.ok(
+        piRes.quotaPause?.detail?.includes("END-QUOTA-DETAIL-MARKER"),
+        `expected full provider line in PiRunner quotaPause.detail, got: ${piRes.quotaPause?.detail}`,
+      );
+    } finally {
+      piServer.stop(true);
+    }
   });
 });
