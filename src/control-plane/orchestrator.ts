@@ -267,9 +267,10 @@ export interface ResumeRunResult {
   resumed: boolean;
   resumedTaskIds: string[];
   run: RunRecord;
-  outcome: "resumed" | "already_active" | "already_completed" | "nothing_to_resume";
+  outcome: "resumed" | "already_active" | "already_completed" | "nothing_to_resume" | "queued";
   runStatus: RunRecord["status"];
   message: string;
+  queuePosition?: number;
   cause?: string;
   activeTaskIds?: string[];
   failed?: Array<{ taskId: string; error: string }>;
@@ -280,7 +281,7 @@ export interface ResumeRunResult {
   /** True when the run was already running (outcome "already_active"). */
   alreadyRunning?: boolean;
   /** Machine-readable reason for a resume that restarted nothing. */
-  reason?: "already_running" | "no_resumable_tasks" | "blocked_on_escalation" | "already_completed";
+  reason?: "already_running" | "no_resumable_tasks" | "blocked_on_escalation" | "already_completed" | "queued_for_goal_slot";
 }
 
 interface RolloverProgress {
@@ -2121,7 +2122,7 @@ export class HarnessOrchestrator {
       priorHandoff,
       explicitHandoff: null,
       worktreePath: wt?.path ?? null,
-      result: { text: priorReason, stopReason: "error" },
+      result: { text: priorReason, stopReason: task.status === "completed" ? "completed" : "error" },
     });
     const archiveNote = archivedFrom
       ? `The previous worktree ${archivedFrom.worktreeId} was archived when the task was cancelled; this generation starts on a fresh worktree from base branch ${run.baseBranch || "HEAD"}` +
@@ -2223,7 +2224,12 @@ export class HarnessOrchestrator {
    */
   async resumeRun(
     runId: string,
-    opts?: { trigger?: "manual" | "auto_timer" | "quota_recovered" | "user_timer"; userMessage?: string; note?: string },
+    opts?: {
+      trigger?: "manual" | "auto_timer" | "quota_recovered" | "user_timer";
+      userMessage?: string;
+      note?: string;
+      resumeCompletedOrchestrator?: boolean;
+    },
   ): Promise<ResumeRunResult> {
     if (!this.db.getRun(runId)) throw new Error(`Unknown run ${runId}`);
     // Epochs (run, repo, all runs, and every task's cancel epoch) are captured at request time, without yielding
@@ -2318,7 +2324,14 @@ export class HarnessOrchestrator {
 
   private async resumeRunInternal(
     runId: string,
-    opts: { trigger?: "manual" | "auto_timer" | "quota_recovered" | "user_timer"; userMessage?: string; note?: string } | undefined,
+    opts:
+      | {
+          trigger?: "manual" | "auto_timer" | "quota_recovered" | "user_timer";
+          userMessage?: string;
+          note?: string;
+          resumeCompletedOrchestrator?: boolean;
+        }
+      | undefined,
     snapshot: StopSnapshot,
   ): Promise<ResumeRunResult> {
     // Runners cancelled by an earlier stop are waited for, so they are never reported as already active. One deadline
@@ -2385,9 +2398,11 @@ export class HarnessOrchestrator {
     }
 
     // NEVER revive cancelled child workers or completed tasks on `resumeRun`! The Tier 1 orchestrator is resumed
-    // in place (also when an explicit stop cancelled it), plus workers interrupted by a daemon restart.
+    // in place (also when an explicit stop cancelled it, or when completed and explicitly opted in via
+    // resumeCompletedOrchestrator), plus workers interrupted by a daemon restart.
     const orch = tasks.find((t) => t.tier === 1 && t.profileId !== "director");
     const RESUMABLE_ORCH = new Set(["failed", "blocked", "returned_for_rescope", "cancelled"]);
+    if (opts?.resumeCompletedOrchestrator) RESUMABLE_ORCH.add("completed");
     const RESUMABLE_ORPHAN = new Set(["failed", "blocked", "returned_for_rescope"]);
     const candidates = tasks.filter((t) => {
       if (t.profileId === "director" || this.isLiveExecution(t.id) || this.allocatingWorktrees.has(t.id) || this.recoveringTasks.has(t.id)) return false;
@@ -2399,6 +2414,7 @@ export class HarnessOrchestrator {
       return false;
     });
     const cancelledChildren = tasks.filter((t) => t.status === "cancelled" && t.id !== orch?.id && t.profileId !== "director");
+    const blockedChildren = tasks.filter((t) => t.status === "blocked" && t.id !== orch?.id && t.profileId !== "director");
     if (candidates.length === 0 && windingDown.length > 0) {
       return this.runResult(run.id, "nothing_to_resume", `Run ${run.id} was not resumed: ${windingDown.map((f) => f.error).join(" ")}`, {
         failed: windingDown,
@@ -2435,13 +2451,32 @@ export class HarnessOrchestrator {
           : "No child tasks were restarted.");
       note = note ? `${header}\n${note}` : header;
     }
+    const resumingCompletedOrch = Boolean(
+      opts?.resumeCompletedOrchestrator &&
+      orch &&
+      orch.status === "completed" &&
+      candidates.some((t) => t.id === orch.id),
+    );
+    if (resumingCompletedOrch) {
+      const ids = blockedChildren.slice(0, 12).map((t) => t.id);
+      const blockedPart = ids.length > 0
+        ? ` Blocked tasks NOT restarted: ${ids.join(", ")} (resume_task them if still needed).`
+        : "";
+      const header =
+        `Run ${run.id}'s orchestrator had completed and its goal was handed to a human; a fresh generation continues from its anchored handoff.${blockedPart} Open escalations are listed in your hydration.`;
+      note = note ? `${header}\n${note}` : header;
+    }
     const resumedTaskIds: string[] = [];
     const failed: Array<{ taskId: string; error: string }> = [...windingDown];
     let noteSteered = false;
     let noteDelivery: SteerTaskResult | undefined;
     for (const t of candidates) {
       try {
-        const res = await this.resumeTaskInternal(t.id, note ? { note } : undefined, snapshot, deadline);
+        const allowCompleted = Boolean(resumingCompletedOrch && orch && t.id === orch.id);
+        const taskOpts = note || allowCompleted
+          ? { ...(note ? { note } : {}), ...(allowCompleted ? { allowCompleted: true } : {}) }
+          : undefined;
+        const res = await this.resumeTaskInternal(t.id, taskOpts, snapshot, deadline);
         if (res.outcome === "resumed") resumedTaskIds.push(res.task.id);
         if (res.noteDelivered) noteSteered = true;
         if (res.noteDelivery) noteDelivery = res.noteDelivery;
@@ -2467,7 +2502,14 @@ export class HarnessOrchestrator {
         ...(callerNote ? { noteDelivered: noteSteered } : {}),
       });
     }
-    const notRestarted = cancelledChildren.length > 0 ? ` Cancelled tasks were not restarted: ${cancelledChildren.slice(0, 12).map((t) => t.id).join(", ")}.` : "";
+    const notRestartedParts: string[] = [];
+    if (cancelledChildren.length > 0) {
+      notRestartedParts.push(`Cancelled tasks were not restarted: ${cancelledChildren.slice(0, 12).map((t) => t.id).join(", ")}.`);
+    }
+    if (resumingCompletedOrch && blockedChildren.length > 0) {
+      notRestartedParts.push(`Blocked tasks were not restarted: ${blockedChildren.slice(0, 12).map((t) => t.id).join(", ")}.`);
+    }
+    const notRestarted = notRestartedParts.length > 0 ? ` ${notRestartedParts.join(" ")}` : "";
     return {
       ...this.runResult(run.id, "resumed", `Run ${run.id} resumed in place: ${resumedTaskIds.join(", ")}.${notRestarted}`, {
         ...(failed.length > 0 ? { failed } : {}),
@@ -3600,7 +3642,9 @@ export class HarnessOrchestrator {
           ? `Generation ${input.task.generation} ended before completing: ${input.result.text.slice(0, 300)}`
           : input.result.stopReason === "quota_paused"
             ? `Generation ${input.task.generation} paused on a quota or rate limit.`
-            : resetRisk(),
+            : input.result.stopReason === "completed"
+              ? `Generation ${input.task.generation} completed previously; continuing in a fresh generation from its anchored handoff.`
+              : resetRisk(),
     ];
     const nextActions: string[] = [];
 
@@ -3671,7 +3715,8 @@ export class HarnessOrchestrator {
       const excerpt = lastText.length > 600 ? `…${lastText.slice(-600)}` : lastText;
       nextActions.push(`Predecessor gen ${input.task.generation} final progress note: ${excerpt}`);
     }
-    const preservePriorLists = input.result.errorCode === ACP_EXECUTOR_LOST_ERROR_CODE;
+    const preservePriorLists =
+      input.result.stopReason === "completed" || input.result.errorCode === ACP_EXECUTOR_LOST_ERROR_CODE;
     const finalActiveRisks =
       preservePriorLists && Array.isArray(input.priorHandoff?.activeRisks) && input.priorHandoff.activeRisks.length > 0
         ? mergeUnique(activeRisks, input.priorHandoff.activeRisks)
