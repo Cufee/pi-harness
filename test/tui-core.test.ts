@@ -649,6 +649,10 @@ describe("TUI v2 Core Primitives", () => {
 
 function makeStubLiveDeps(initialReplay: EventRecord[] = []) {
   const listeners = new Set<(ev: DaemonEventFrame) => void>();
+  let resolveWatchStart: (() => void) | null = null;
+  const watchStarted = new Promise<void>((r) => {
+    resolveWatchStart = r;
+  });
   const client = {
     onEvent(cb: (ev: DaemonEventFrame) => void) {
       listeners.add(cb);
@@ -658,6 +662,7 @@ function makeStubLiveDeps(initialReplay: EventRecord[] = []) {
     },
     async request(op: string) {
       if (op === "watch.start") {
+        resolveWatchStart?.();
         return { watchId: "watch-test", throughSeq: initialReplay.length, replay: initialReplay };
       }
       if (op === "replay.page") {
@@ -679,15 +684,22 @@ function makeStubLiveDeps(initialReplay: EventRecord[] = []) {
     const frame: DaemonEventFrame = { ...ev, kind: "event", seq: nextSeq++, watchId: "watch-test" };
     for (const cb of listeners) cb(frame);
   };
-  return { deps, emit };
+  const waitReady = async () => {
+    await watchStarted;
+    await new Promise<void>((r) => setImmediate(r));
+  };
+  return { deps, emit, waitReady };
 }
 
 describe("Transcript Unification Regressions", () => {
+  // Local 12:34:56 on a non-DST date so formatClock() is deterministic across clocks and timezones.
+  const FIXED_EVENT_TIME = new Date(2026, 0, 15, 12, 34, 56).getTime();
+
   it("renders LiveTranscriptScreen fenced code via the same Markdown truecolor path as ImmutableTranscript with zero raw SGR fragments at widths 100 and 60", async () => {
     const goCode = [
       "var Plan = fct.Plan{",
       '\tName: "hv-functional",',
-      "\tCount: 42,",
+      "\tCount: 987654,",
       '\tSteps: []fct.Step{{Name: "boot_long_wrapped_segment_for_narrow_width_check_final_token"}},',
       "}",
     ].join("\n");
@@ -697,6 +709,14 @@ describe("Transcript Unification Regressions", () => {
     try {
       const tcTheme = createTheme({ color: true, ascii: false });
       const rawFragmentRe = /38;2;|\d+;\d+;\d+m/;
+
+      const codeBlockRows = (lines: readonly string[]): string[] => {
+        const start = lines.findIndex((l) => stripTerminalSequences(l).includes("```go"));
+        assert.ok(start >= 0, "expected opening ```go fence row");
+        const end = lines.findIndex((l, idx) => idx > start && /(?:^|\s)```(?:\s|$)/.test(stripTerminalSequences(l)));
+        assert.ok(end > start, "expected closing ``` fence row");
+        return lines.slice(start + 1, end);
+      };
 
       const tokenFgSgr = (lines: readonly string[], token: string): string | null => {
         for (const line of lines) {
@@ -728,27 +748,28 @@ describe("Transcript Unification Regressions", () => {
       const mainChat = new ImmutableTranscript(tcTheme);
       mainChat.appendAssistantTurn(goMd);
       const mainRows100 = mainChat.render(100);
-      const tokens = ["var", '"hv-functional"', "42"];
+      const mainCodeRows100 = codeBlockRows(mainRows100);
+      const tokens = ["var", '"hv-functional"', "987654"];
       const mainTokenStyles = new Map<string, string>();
       for (const tok of tokens) {
-        const sgr = tokenFgSgr(mainRows100, tok);
+        const sgr = tokenFgSgr(mainCodeRows100, tok);
         assert.ok(sgr && sgr.startsWith("\x1b[38;2;"), `expected truecolor SGR on token ${tok} in ImmutableTranscript`);
         mainTokenStyles.set(tok, sgr);
       }
 
-      const { deps, emit } = makeStubLiveDeps();
+      const { deps, emit, waitReady } = makeStubLiveDeps();
       const { terminal } = makeFakeTerminal(100, 24);
       const tui = new ModalScreen(terminal);
       const nav = new Navigator(tui, terminal, tcTheme);
       const screen = new LiveTranscriptScreen("run-1", "task-1", deps);
       nav.push(screen);
-      await new Promise((r) => setTimeout(r, 15));
+      await waitReady();
 
       emit({
         runId: "run-1",
         taskId: "task-1",
         type: "agent.text_delta",
-        createdAt: Date.now(),
+        createdAt: FIXED_EVENT_TIME,
         payload: { delta: goMd },
       });
 
@@ -758,9 +779,10 @@ describe("Transcript Unification Regressions", () => {
         renderedByWidth.set(width, rows);
         const plainJoined = rows.map((r) => stripTerminalSequences(r)).join("\n");
         assert.ok(plainJoined.includes("final_token"), `wrapped long code line must retain final_token at width ${width}`);
+        const codeRows = codeBlockRows(rows);
         for (const tok of tokens) {
           assert.equal(
-            tokenFgSgr(rows, tok),
+            tokenFgSgr(codeRows, tok),
             mainTokenStyles.get(tok),
             `token ${tok} truecolor SGR must match ImmutableTranscript at width ${width}`,
           );
@@ -786,21 +808,20 @@ describe("Transcript Unification Regressions", () => {
     const { terminal, writes, sendInput } = makeFakeTerminal(100, 24);
     const tui = new ModalScreen(terminal);
     const nav = new Navigator(tui, terminal, theme);
-    const now = Date.now();
-    const { deps } = makeStubLiveDeps([
+    const { deps, waitReady } = makeStubLiveDeps([
       {
         seq: 1,
         runId: "run-1",
         taskId: "task-1",
         type: "agent.text_delta",
-        createdAt: now,
+        createdAt: FIXED_EVENT_TIME,
         payload: { delta: "Alpha bravo charlie delta\nSecond A界B 🚀 echo foxtrot" },
       },
     ]);
     const screen = new LiveTranscriptScreen("run-1", "task-1", deps);
     tui.start();
     nav.push(screen);
-    await new Promise((r) => setTimeout(r, 15));
+    await waitReady();
 
     const compositeVisible = () => {
       const composited = (
@@ -873,13 +894,13 @@ describe("Transcript Unification Regressions", () => {
 
     // Short transcript: clicking below the last drawn content row must not fold the last tool.
     nav.closeAll();
-    const { deps: shortDeps } = makeStubLiveDeps([
+    const { deps: shortDeps, waitReady: waitShortReady } = makeStubLiveDeps([
       {
         seq: 1,
         runId: "run-1",
         taskId: "task-1",
         type: "agent.tool",
-        createdAt: now,
+        createdAt: FIXED_EVENT_TIME,
         payload: {
           id: "call-short",
           name: "read_file",
@@ -890,7 +911,7 @@ describe("Transcript Unification Regressions", () => {
     ]);
     const shortScreen = new LiveTranscriptScreen("run-1", "task-1", shortDeps);
     nav.push(shortScreen);
-    await new Promise((r) => setTimeout(r, 15));
+    await waitShortReady();
     const shortVisible = compositeVisible();
     assert.equal(
       shortVisible.map((l) => stripTerminalSequences(l)).join("\n").includes("SHOULD_STAY_COLLAPSED"),
@@ -937,15 +958,14 @@ describe("Transcript Unification Regressions", () => {
 
   it("folds and unfolds tool blocks via Enter while keeping the top visible row stable when paused", async () => {
     const theme = createTheme({ color: false, ascii: false });
-    const now = Date.now();
     const longResult = Array.from({ length: 55 }, (_, i) => `RESULT_LINE_${String(i + 1).padStart(2, "0")}`).join("\n");
-    const { deps } = makeStubLiveDeps([
+    const { deps, waitReady } = makeStubLiveDeps([
       {
         seq: 1,
         runId: "run-1",
         taskId: "task-1",
         type: "agent.text_delta",
-        createdAt: now,
+        createdAt: FIXED_EVENT_TIME,
         payload: { delta: "INTRO_ONE\n\nINTRO_TWO\n\nUNIQUE_ANCHOR_ROW_ALPHA\n\nIntro trailing line" },
       },
       {
@@ -953,7 +973,7 @@ describe("Transcript Unification Regressions", () => {
         runId: "run-1",
         taskId: "task-1",
         type: "agent.tool",
-        createdAt: now + 1000,
+        createdAt: FIXED_EVENT_TIME + 1000,
         payload: {
           id: "call-1",
           name: "read_file",
@@ -967,7 +987,7 @@ describe("Transcript Unification Regressions", () => {
         runId: "run-1",
         taskId: "task-1",
         type: "agent.text_delta",
-        createdAt: now + 2000,
+        createdAt: FIXED_EVENT_TIME + 2000,
         payload: { delta: Array.from({ length: 50 }, (_, i) => `Trailing line ${i + 1}`).join("\n\n") },
       },
     ]);
@@ -978,7 +998,7 @@ describe("Transcript Unification Regressions", () => {
     const ctx = { navigator: nav, theme, requestRender: () => {}, writeTerminal: () => {} };
     const screen = new LiveTranscriptScreen("run-1", "task-1", deps);
     nav.push(screen);
-    await new Promise((r) => setTimeout(r, 15));
+    await waitReady();
 
     const bodyRow = (rows: string[]) => {
       const rect = (screen as unknown as { frame: Frame }).frame.bodyRect!;
@@ -1051,16 +1071,15 @@ describe("Transcript Unification Regressions", () => {
 
   it("restores the exact top visible row across a 100 -> 60 -> 100 width resize while paused", async () => {
     const theme = createTheme({ color: false, ascii: false });
-    const now = Date.now();
     const makeMultiRow = (tag: string, count: number) =>
       Array.from({ length: count }, (_, i) => `${tag}_ROW_${String(i + 1).padStart(2, "0")} long_token_for_wrapping_between_widths`).join(
         "\n\n",
       );
 
-    const { deps, emit } = makeStubLiveDeps([
-      { seq: 1, runId: "run-1", taskId: "task-a", type: "agent.text_delta", createdAt: now, payload: { delta: makeMultiRow("BLK_A", 8) } },
-      { seq: 2, runId: "run-1", taskId: "task-b", type: "agent.text_delta", createdAt: now + 100, payload: { delta: makeMultiRow("BLK_B", 16) } },
-      { seq: 3, runId: "run-1", taskId: "task-c", type: "agent.text_delta", createdAt: now + 200, payload: { delta: makeMultiRow("BLK_C", 16) } },
+    const { deps, emit, waitReady } = makeStubLiveDeps([
+      { seq: 1, runId: "run-1", taskId: "task-a", type: "agent.text_delta", createdAt: FIXED_EVENT_TIME, payload: { delta: makeMultiRow("BLK_A", 8) } },
+      { seq: 2, runId: "run-1", taskId: "task-b", type: "agent.text_delta", createdAt: FIXED_EVENT_TIME + 100, payload: { delta: makeMultiRow("BLK_B", 16) } },
+      { seq: 3, runId: "run-1", taskId: "task-c", type: "agent.text_delta", createdAt: FIXED_EVENT_TIME + 200, payload: { delta: makeMultiRow("BLK_C", 16) } },
     ]);
 
     const { terminal } = makeFakeTerminal(100, 20);
@@ -1069,7 +1088,7 @@ describe("Transcript Unification Regressions", () => {
     const ctx = { navigator: nav, theme, requestRender: () => {}, writeTerminal: () => {} };
     const screen = new LiveTranscriptScreen("run-1", undefined, deps);
     nav.push(screen);
-    await new Promise((r) => setTimeout(r, 15));
+    await waitReady();
 
     const topBodyRow = (width: number) => {
       const rows = screen.render(width, 20, theme);
@@ -1104,7 +1123,7 @@ describe("Transcript Unification Regressions", () => {
       runId: "run-1",
       taskId: "task-b",
       type: "agent.text_delta",
-      createdAt: now + 300,
+      createdAt: FIXED_EVENT_TIME + 300,
       payload: { delta: "\n\n" + makeMultiRow("BLK_B_STREAM", 20) },
     });
     assert.equal(
@@ -1128,7 +1147,7 @@ describe("Transcript Unification Regressions", () => {
       runId: "run-1",
       taskId: "task-a",
       type: "agent.text_delta",
-      createdAt: now + 400,
+      createdAt: FIXED_EVENT_TIME + 400,
       payload: { delta: "\n\n" + makeMultiRow("BLK_A_STREAM", 20) },
     });
     assert.equal(
