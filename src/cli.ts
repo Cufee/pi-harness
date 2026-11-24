@@ -41,6 +41,7 @@ const BOOLEAN_LONG_FLAGS = new Set([
   "resume",
   "now",
   "wait",
+  "check",
   "from-install",
   "legacy",
   "yes",
@@ -295,7 +296,7 @@ Usage:
   pi-harness escalations resolve <escalation-id> --reason "<text>" [--json] [--remote <alias|ssh://host>]
   pi-harness profiles [list | add <id> <cmd> [args...] | remove <id> | probe <id>]
   pi-harness daemon serve | status | stop | restart [--remote <alias|ssh://host>]
-  pi-harness daemon reload [--now] [--wait] [--target <dir>] [--from-install]
+  pi-harness daemon reload [--now] [--wait] [--check] [--target <dir>] [--from-install]
   pi-harness daemon reload --legacy [--yes] [--wait] [--previous <dir>] [--target <dir>] [--db <path>]
   pi-harness daemon recover --dry-run [--db <path>] [--json]
   pi-harness run "<goal>" [-p <project>] [--profile id] [--model id] [--effort level] [--detach] [--remote <alias|ssh://host>]
@@ -748,6 +749,7 @@ async function main(): Promise<void> {
         fromInstall: flags["from-install"] === true,
         now: flags.now === true,
         wait: flags.wait === true,
+        check: flags.check === true,
       });
       if (code !== 0) process.exit(code);
       return;
