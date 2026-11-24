@@ -453,6 +453,7 @@ export class HarnessDaemon {
     this.orchestrator = new HarnessOrchestrator(this.db, config, this.catalog, this.quota, opts?.customRunnerFactory);
     this.orchestrator.setInstanceNonce(this.instanceNonce);
     this.director = new DirectorRuntime(this.db, config, this.catalog, this.quota, this.orchestrator, opts?.customRunnerFactory);
+    this.orchestrator.setQuotaResumeGate((runId, opts) => this.director.admitQuotaResume(runId, opts));
     this.peers = new PeerManager(
       this.nodeId,
       DAEMON_PROTOCOL_REV,
@@ -3672,22 +3673,24 @@ export class HarnessDaemon {
         if (hasBudgetPatch && !hasContractPatch) {
           return await this.director.amendGoalBudgets(goalId, budgetPatch, rationale, { source: "user" });
         }
-        const budgetsBefore = hasBudgetPatch ? this.director.goals.updateBudgets(goalId, budgetPatch).before : undefined;
-        const amended = await this.director.amendGoal(goalId, {
-          rationale,
-          title: typeof p.title === "string" ? p.title : undefined,
-          description: typeof p.description === "string" ? p.description : undefined,
-          appendDescription: typeof p.appendDescription === "string" ? p.appendDescription : undefined,
-          confirmReplaceDescription: p.confirmReplaceDescription === true ? true : undefined,
-          addCriteria: Array.isArray(p.addCriteria) ? (p.addCriteria as GoalCriterion[]) : undefined,
-          updateCriteria,
-          removeCriteriaIds: Array.isArray(p.removeCriteriaIds) ? (p.removeCriteriaIds as string[]) : undefined,
-          nonGoals: Array.isArray(p.nonGoals) ? (p.nonGoals as string[]) : undefined,
-        }, { source: "user" });
-        return {
-          ...amended,
-          ...(budgetsBefore ? { budgetsBefore, budgetsAfter: amended.goal.budgets } : {}),
-        };
+        return await this.director.amendGoal(
+          goalId,
+          {
+            rationale,
+            title: typeof p.title === "string" ? p.title : undefined,
+            description: typeof p.description === "string" ? p.description : undefined,
+            appendDescription: typeof p.appendDescription === "string" ? p.appendDescription : undefined,
+            confirmReplaceDescription: p.confirmReplaceDescription === true ? true : undefined,
+            addCriteria: Array.isArray(p.addCriteria) ? (p.addCriteria as GoalCriterion[]) : undefined,
+            updateCriteria,
+            removeCriteriaIds: Array.isArray(p.removeCriteriaIds) ? (p.removeCriteriaIds as string[]) : undefined,
+            nonGoals: Array.isArray(p.nonGoals) ? (p.nonGoals as string[]) : undefined,
+          },
+          {
+            source: "user",
+            ...(hasBudgetPatch ? { budgets: budgetPatch } : {}),
+          },
+        );
       }
 
       case "goal.list":
@@ -3851,6 +3854,7 @@ export class HarnessDaemon {
           // Stop the chat's live turn first so it cannot delegate again, then cancel the container's children.
           cancelledChat = await this.director.cancelChat(directorTaskRunOwner(runId) ?? "");
         }
+        this.director.invalidateQueuedResumeForRun(runId, reason);
         await this.orchestrator.stopRun(runId, reason);
         return { stopped: true, ...(cancelledChat ? { cancelledChat } : {}) };
       }
@@ -4204,7 +4208,9 @@ export class HarnessDaemon {
         const taskId = String(p.taskId);
         const task = this.db.getTask(taskId);
         if (task) this.requireRunControlIfViewer(socket, task.runId);
-        await this.orchestrator.cancelTask(taskId, String(p.reason ?? "Cancelled by user"));
+        const reason = String(p.reason ?? "Cancelled by user");
+        this.director.invalidateQueuedResumeForTask(taskId, reason);
+        await this.orchestrator.cancelTask(taskId, reason);
         return { cancelled: true };
       }
 

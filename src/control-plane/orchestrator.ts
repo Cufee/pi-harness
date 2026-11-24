@@ -422,6 +422,15 @@ export class HarnessOrchestrator {
   private taskResumeNotes = new Map<string, { kind?: "quota" | "resume"; reason?: string; userMessage?: string | null }>();
   private runQuotaStates = new Map<string, InternalRunQuotaState>();
   private runConsecutiveQuotaPauses = new Map<string, number>();
+  private quotaResumeGate:
+    | ((
+        runId: string,
+        opts?: { trigger?: "manual" | "auto_timer" | "quota_recovered" | "user_timer"; userMessage?: string },
+      ) => Promise<
+        | { mode: "fast_path" }
+        | { mode: "handled"; resumed: boolean; queued: boolean; resumedTaskIds: string[]; run: RunRecord }
+      >)
+    | null = null;
   private taskRolloverProgress = new Map<string, RolloverProgress>();
   private quiescenceCheckPending = new Set<string>();
   /** Runs with a stopRun in progress (a resume issued after a stop waits for it). */
@@ -1672,6 +1681,10 @@ export class HarnessOrchestrator {
     return this.getRunQuotaStatus(runId)!;
   }
 
+  setQuotaResumeGate(fn: typeof this.quotaResumeGate): void {
+    this.quotaResumeGate = fn;
+  }
+
   /**
    * Resumes a quota-paused run (manually, via user-chosen wait timer, via Quota Endpoint timer,
    * or early wakeup) and COMPLETELY RESETS the quota pause state machine.
@@ -1680,8 +1693,24 @@ export class HarnessOrchestrator {
    */
   async resumeRunFromQuota(
     runId: string,
-    opts?: { trigger?: "manual" | "auto_timer" | "quota_recovered" | "user_timer"; userMessage?: string },
+    opts?: {
+      trigger?: "manual" | "auto_timer" | "quota_recovered" | "user_timer";
+      userMessage?: string;
+      bypassAdmission?: boolean;
+    },
   ): Promise<{ resumed: boolean; resumedTaskIds: string[]; run: RunRecord }> {
+    if (!opts?.bypassAdmission && this.quotaResumeGate) {
+      const priorQuotaState = this.runQuotaStates.get(runId);
+      const gate = await this.quotaResumeGate(runId, opts);
+      if (gate.mode === "handled") {
+        if ((gate.queued || !gate.resumed) && this.runQuotaStates.get(runId) === priorQuotaState) {
+          // Keep tasks paused_quota for when drainGoalQueue admits this goal, but disarm timers so they do not re-fire.
+          this.clearRunQuotaTimers(runId);
+          this.runQuotaStates.delete(runId);
+        }
+        return { resumed: gate.resumed, resumedTaskIds: gate.resumedTaskIds, run: gate.run };
+      }
+    }
     const { fenced: _none, ...res } = this.resumeRunFromQuotaInternal(runId, opts);
     return res;
   }
