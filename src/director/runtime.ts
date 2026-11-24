@@ -3193,13 +3193,16 @@ export class DirectorRuntime {
    * Creates the detached `_verify` worktree for verification gates and Done-Review without switching the host
    * checkout's branch. Resolves `goal.verifyRef` when explicitly set (local ref, `origin/<ref>`, then source-only
    * `git fetch --no-tags origin -- <ref>` with `FETCH_HEAD` fallback), failing closed with `VerifyCheckoutError`
-   * if invalid or unresolved. Otherwise targets `run.baseBranch`, preferring this run's latest promoted merge
-   * commit from durable `merge.promoted` provenance (or legacy `refs/harness/merged/<runId>` when no provenance
-   * is recorded) when it resolves and is an ancestor of the base branch tip; otherwise falls back to the base
-   * branch tip. If `run.baseBranch` no longer exists locally or on origin, falls back to the latest promoted merge
-   * commit (or `refs/harness/merged/<runId>` when no provenance is recorded, source `"merged_commit"`); if neither
-   * exists (and HEAD is not that unborn branch), fails with `VerifyCheckoutError` naming remedies. Without a verify
-   * ref or run base branch, verification runs in the primary checkout and records that in `location`.
+   * if invalid or unresolved. For plain-folder runs (non-Git workspaces or `baseSha === "none"` without an
+   * explicit `verifyRef`), skips Git lookups and runs directly in `goal.repoRoot` (`source: "repo_root"`).
+   * Otherwise resolves `run.baseBranch` strictly in branch namespaces (`refs/heads/<branch>`, then
+   * `refs/remotes/origin/<branch>`), preferring this run's latest promoted merge commit from durable
+   * `merge.promoted` provenance (or legacy `refs/harness/merged/<runId>` when no provenance is recorded) when it
+   * resolves and is an ancestor of the base branch tip. If `run.baseBranch` no longer exists locally or on origin,
+   * falls back to `refs/harness/merged/<runId>` (source `"merged_commit"`) only when it covers the run's latest
+   * promoted merge commit; if the ref is stale or missing (and HEAD is not that unborn branch), fails closed with
+   * `VerifyCheckoutError` naming remedies. Without a verify ref or run base branch, verification runs in the
+   * primary checkout and records that in `location`.
    */
   private async prepareVerifyCheckout(
     goal: GoalRecord,
@@ -3208,6 +3211,7 @@ export class DirectorRuntime {
     const explicitRef = goal.verifyRef ? (validateVerifyRef(goal.verifyRef) ?? "") : "";
     const explicit = Boolean(explicitRef);
     const wanted = explicitRef || run?.baseBranch || "";
+    const wtMgr = this.orchestrator.getWorktreeManager(goal.repoRoot);
     let verifyCwd = goal.repoRoot;
     let verifyRef = wanted || "HEAD";
     let refName = wanted || "HEAD";
@@ -3219,12 +3223,30 @@ export class DirectorRuntime {
       verifyScratch = null;
       await scratch?.remove();
     };
+
+    if (!explicit && (!wtMgr.isGitRepo() || run?.baseSha === "none")) {
+      const folderRef = run?.baseBranch || "workspace";
+      return {
+        verifyCwd: goal.repoRoot,
+        verifyRef: folderRef,
+        isolated: false,
+        location: {
+          cwd: goal.repoRoot,
+          ref: folderRef,
+          sha: "",
+          isolated: false,
+          source: "repo_root",
+          note: `ran in the primary checkout (${folderRef}), not an isolated worktree`,
+        },
+        cleanup,
+      };
+    }
+
     const resolveCommit = (ref: string): Promise<string | null> =>
       runGit(goal.repoRoot, ["rev-parse", "--verify", `${ref}^{commit}`])
         .then((r) => r.stdout || null)
         .catch(() => null);
     const addScratch = async (targetSha: string, targetRefName: string) => {
-      const wtMgr = this.orchestrator.getWorktreeManager(goal.repoRoot);
       const scratch = await wtMgr.addScratchWorktree("_verify", `${goal.id}-${randomUUID().slice(0, 8)}`, targetSha);
       verifyScratch = scratch;
       verifyCwd = scratch.path;
@@ -3241,19 +3263,31 @@ export class DirectorRuntime {
     };
 
     if (wanted) {
-      let resolvedSha = await resolveCommit(wanted);
+      let resolvedSha: string | null = null;
       let resolvedRefName = wanted;
-      if (!resolvedSha && !wanted.startsWith("origin/") && !wanted.startsWith("refs/")) {
-        resolvedSha = await resolveCommit(`refs/remotes/origin/${wanted}`);
-        if (resolvedSha) resolvedRefName = `origin/${wanted}`;
-      }
-      if (!resolvedSha && explicit) {
-        const fetchRef = wanted.startsWith("origin/") ? wanted.slice("origin/".length) : wanted;
-        validateVerifyRef(fetchRef);
-        const fetched = await this.fetchVerifyRefCommit(goal.repoRoot, wanted, fetchRef, resolveCommit);
-        if (fetched) {
-          resolvedSha = fetched.sha;
-          resolvedRefName = fetched.refName;
+      if (explicit) {
+        resolvedSha = await resolveCommit(wanted);
+        if (!resolvedSha && !wanted.startsWith("origin/") && !wanted.startsWith("refs/")) {
+          resolvedSha = await resolveCommit(`refs/remotes/origin/${wanted}`);
+          if (resolvedSha) resolvedRefName = `origin/${wanted}`;
+        }
+        if (!resolvedSha) {
+          const fetchRef = wanted.startsWith("origin/") ? wanted.slice("origin/".length) : wanted;
+          validateVerifyRef(fetchRef);
+          const fetched = await this.fetchVerifyRefCommit(goal.repoRoot, wanted, fetchRef, resolveCommit);
+          if (fetched) {
+            resolvedSha = fetched.sha;
+            resolvedRefName = fetched.refName;
+          }
+        }
+      } else {
+        // Restrict implicit recorded-branch lookup to branch namespaces so a same-name tag cannot shadow it.
+        const branchName = wanted.replace(/^refs\/heads\//, "");
+        resolvedRefName = branchName;
+        resolvedSha = await resolveCommit(`refs/heads/${branchName}`);
+        if (!resolvedSha) {
+          resolvedSha = await resolveCommit(`refs/remotes/origin/${branchName}`);
+          if (resolvedSha) resolvedRefName = `origin/${branchName}`;
         }
       }
 
@@ -3278,22 +3312,23 @@ export class DirectorRuntime {
         );
       } else {
         const mergedRef = run ? runMergedRef(run.id) : null;
+        const mergedRefSha = mergedRef ? await resolveCommit(mergedRef) : null;
         const latestMergedSha = run ? this.getLatestRunMergedSha(run.id) : null;
-        const mergedSha = latestMergedSha
-          ? await resolveCommit(latestMergedSha)
-          : mergedRef
-            ? await resolveCommit(mergedRef)
-            : null;
-        if (mergedSha && run) {
-          const mergedLabel =
-            !latestMergedSha && mergedRef
-              ? mergedRef
-              : mergedRef && (await resolveCommit(mergedRef)) === mergedSha
-                ? mergedRef
-                : "merge.promoted";
-          await addScratch(mergedSha, mergedLabel);
+        if (mergedRefSha && mergedRef && run) {
+          const coversLatestMerge =
+            !latestMergedSha ||
+            mergedRefSha === latestMergedSha ||
+            (await runGit(goal.repoRoot, ["merge-base", "--is-ancestor", latestMergedSha, mergedRefSha])
+              .then(() => true)
+              .catch(() => false));
+          if (!coversLatestMerge) {
+            throw new VerifyCheckoutError(
+              `Cannot verify goal ${goal.id}: run base branch '${run.baseBranch}' no longer exists (not local, not on origin) and ${mergedRef} (${mergedRefSha.slice(0, 7)}) is stale (does not contain run ${run.id}'s latest promoted commit ${latestMergedSha!.slice(0, 7)}). Set goal_amend verify_ref to a branch or SHA with the work, then goal_trigger_review; or goal_accept with override_deterministic: true.`,
+            );
+          }
+          await addScratch(mergedRefSha, mergedRef);
           source = "merged_commit";
-          note = `base branch '${run.baseBranch}' no longer exists locally or on origin; verified run ${run.id}'s last merged commit ${mergedSha.slice(0, 7)} (${mergedLabel}). To verify another ref, goal_amend verify_ref`;
+          note = `base branch '${run.baseBranch}' no longer exists locally or on origin; verified run ${run.id}'s last merged commit ${mergedRefSha.slice(0, 7)} (${mergedRef}). To verify another ref, goal_amend verify_ref`;
         } else {
           // Keep existing unborn-branch behavior when HEAD equals run.baseBranch; fail closed otherwise.
           const headBranch = await runGit(goal.repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])
@@ -3303,8 +3338,11 @@ export class DirectorRuntime {
             source = "repo_root";
             refName = headBranch;
           } else {
+            const missingDetail = latestMergedSha
+              ? `has no merged ref (${runMergedRef(run!.id)}; latest promoted commit was ${latestMergedSha.slice(0, 7)})`
+              : `has no merged commit (${runMergedRef(run!.id)})`;
             throw new VerifyCheckoutError(
-              `Cannot verify goal ${goal.id}: run base branch '${run!.baseBranch}' no longer exists (not local, not on origin) and run ${run!.id} has no merged commit (${runMergedRef(run!.id)}). Set goal_amend verify_ref to a branch or SHA with the work, then goal_trigger_review; or goal_accept with override_deterministic: true.`,
+              `Cannot verify goal ${goal.id}: run base branch '${run!.baseBranch}' no longer exists (not local, not on origin) and run ${run!.id} ${missingDetail}. Set goal_amend verify_ref to a branch or SHA with the work, then goal_trigger_review; or goal_accept with override_deterministic: true.`,
             );
           }
         }
