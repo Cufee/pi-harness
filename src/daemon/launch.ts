@@ -75,7 +75,7 @@ export async function ensureLocalDaemon(socketPath: string): Promise<DaemonClien
     if (info.protocolRev === DAEMON_PROTOCOL_REV) {
       if ((!info.releaseId || info.releaseId !== selfRelease.releaseId) && process.stderr.isTTY) {
         console.error(
-          `[pi-harness] harnessd runs release ${info.releaseId || "unknown"}, this CLI is ${selfRelease.releaseId}. Run \`pi-harness daemon restart\` to apply the installed release.`,
+          `[pi-harness] harnessd runs release ${info.releaseId || "unknown"}, this CLI is ${selfRelease.releaseId}. Run \`pi-harness daemon reload\` to apply the installed release.`,
         );
       }
       return probe;
@@ -88,7 +88,7 @@ export async function ensureLocalDaemon(socketPath: string): Promise<DaemonClien
     } else if (info.running !== false) {
       probe.close();
       mismatchError = new Error(
-        `Live harnessd (pid ${info.pid ?? "?"}, protocol rev ${info.protocolRev ?? "?"}) has active or unknown work (${info.liveWork ?? "active"}) and will not be stopped automatically for protocol rev ${DAEMON_PROTOCOL_REV}. Wait for work to finish or run \`pi-harness daemon restart\` explicitly.`,
+        `Live harnessd (pid ${info.pid ?? "?"}, protocol rev ${info.protocolRev ?? "?"}) has active or unknown work (${info.liveWork ?? "active"}) and will not be stopped automatically for protocol rev ${DAEMON_PROTOCOL_REV}. Wait for work to finish or run \`pi-harness daemon reload\` explicitly.`,
       );
     } else {
       probe.close();

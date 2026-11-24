@@ -200,6 +200,18 @@ export interface RemoteHostConfig {
   reverseAccess?: "messages" | "full";
 }
 
+export interface HotUpdateConfig {
+  mode: "auto" | "manual";
+  drainTimeoutSec: number;
+  minIntervalSec: number;
+}
+
+export const DEFAULT_HOT_UPDATE_CONFIG: HotUpdateConfig = {
+  mode: "auto",
+  drainTimeoutSec: 90,
+  minIntervalSec: 900,
+};
+
 export interface HarnessConfig {
   stateDir: string;
   socketPath: string;
@@ -220,6 +232,7 @@ export interface HarnessConfig {
   catalog: CatalogConfig;
   quotaRetry: QuotaRetryConfig;
   quotaEndpoint?: QuotaEndpointConfig;
+  hotUpdate: HotUpdateConfig;
 }
 
 /** Top-level keys whose value is a nested section (neither a string nor a list). */
@@ -280,6 +293,7 @@ const CONFIG_SECTION_KEYS: { [S in ConfigSection]: { [K in keyof NonNullable<Har
     earlyWakePollMs: true,
   },
   quotaEndpoint: { url: true, headers: true, pollIntervalSec: true, timeoutMs: true, format: true },
+  hotUpdate: { mode: true, drainTimeoutSec: true, minIntervalSec: true },
 };
 
 /** Top-level keys a config file may set; stateDir always comes from the environment. */
@@ -300,6 +314,7 @@ const CONFIG_TOP_LEVEL_KEYS: { [K in Exclude<keyof HarnessConfig, "stateDir">]-?
   catalog: true,
   quotaRetry: true,
   quotaEndpoint: true,
+  hotUpdate: true,
 };
 
 /** Honored only in the global config.json; resolveConfig strips these from the repo layer. */
@@ -309,6 +324,7 @@ const GLOBAL_ONLY_CONFIG_KEYS: ReadonlySet<string> = new Set([
   "worktree.extraWriteRoots",
   "goals.gateShell",
   "goals.gateEnv",
+  "hotUpdate",
 ]);
 
 const CONFIG_SECTIONS = Object.keys(CONFIG_SECTION_KEYS) as ConfigSection[];
@@ -756,6 +772,12 @@ export function resolveConfig(
     ...(repoCfg.quotaRetry as Partial<QuotaRetryConfig> | undefined),
   };
 
+  // Hot-update policy is operator-controlled and global-only.
+  const hotUpdate: HotUpdateConfig = {
+    ...(base ? base.hotUpdate : DEFAULT_HOT_UPDATE_CONFIG),
+    ...(globalCfg.hotUpdate as Partial<HotUpdateConfig> | undefined),
+  };
+
   const profiles =
     Array.isArray(merged.profiles) && merged.profiles.length > 0 ? merged.profiles : (base?.profiles ?? defaultProfiles());
 
@@ -802,6 +824,7 @@ export function resolveConfig(
       "quotaEndpoint" in merged
         ? ((merged.quotaEndpoint as QuotaEndpointConfig | null | undefined) ?? undefined)
         : base?.quotaEndpoint,
+    hotUpdate,
   };
 }
 
@@ -1020,6 +1043,11 @@ export function validateConfigRaw(raw: unknown): string[] {
     earlyWakePollMs: POSITIVE,
     autoResumeEnabled: BOOLEAN,
   });
+  section("hotUpdate", {
+    mode: [oneOf("auto", "manual"), '"auto" or "manual"'],
+    drainTimeoutSec: POSITIVE,
+    minIntervalSec: NON_NEG,
+  });
   if ("quotaEndpoint" in doc && doc.quotaEndpoint !== null) {
     const endpoint = doc.quotaEndpoint;
     if (!isPlainObject(endpoint)) {
@@ -1064,7 +1092,7 @@ export function diffHarnessConfig(prev: HarnessConfig, next: HarnessConfig): Con
     changes.push(showValues ? { path: key, from: a, to: b } : { path: key });
   }
 
-  for (const key of ["codeExec", "rollover", "worktree", "goals", "events", "catalog", "quotaRetry"] as const) {
+  for (const key of ["codeExec", "rollover", "worktree", "goals", "events", "catalog", "quotaRetry", "hotUpdate"] as const) {
     const rawA: unknown = prev[key] ?? {};
     const rawB: unknown = next[key] ?? {};
     if (!isPlainObject(rawA) || !isPlainObject(rawB)) {
@@ -1078,7 +1106,9 @@ export function diffHarnessConfig(prev: HarnessConfig, next: HarnessConfig): Con
       const showValues =
         !neverShowValues &&
         ((isPrintable(rawA[sub]) && isPrintable(rawB[sub])) ||
-          (path === "catalog.modelFilterMode" && typeof rawA[sub] !== "object" && typeof rawB[sub] !== "object"));
+          ((path === "catalog.modelFilterMode" || path === "hotUpdate.mode") &&
+            typeof rawA[sub] !== "object" &&
+            typeof rawB[sub] !== "object"));
       changes.push(showValues ? { path, from: rawA[sub], to: rawB[sub] } : { path });
     }
   }
@@ -1136,6 +1166,14 @@ export function saveGlobalConfig(config: HarnessConfig): string {
 
 /** The exact `config.json` text `saveGlobalConfig` writes for `config`. */
 export function serializeGlobalConfig(config: HarnessConfig): string {
+  const hotUpdateOut: Partial<HotUpdateConfig> = {};
+  if (config.hotUpdate.mode !== DEFAULT_HOT_UPDATE_CONFIG.mode) hotUpdateOut.mode = config.hotUpdate.mode;
+  if (config.hotUpdate.drainTimeoutSec !== DEFAULT_HOT_UPDATE_CONFIG.drainTimeoutSec) {
+    hotUpdateOut.drainTimeoutSec = config.hotUpdate.drainTimeoutSec;
+  }
+  if (config.hotUpdate.minIntervalSec !== DEFAULT_HOT_UPDATE_CONFIG.minIntervalSec) {
+    hotUpdateOut.minIntervalSec = config.hotUpdate.minIntervalSec;
+  }
   const serialized = {
     profiles: config.profiles,
     ...(config.remotes?.length ? { remotes: config.remotes } : {}),
@@ -1151,6 +1189,7 @@ export function serializeGlobalConfig(config: HarnessConfig): string {
     events: config.events,
     catalog: config.catalog,
     quotaRetry: config.quotaRetry,
+    ...(Object.keys(hotUpdateOut).length > 0 ? { hotUpdate: hotUpdateOut } : {}),
     ...(config.socketPath !== defaultSocketPath(config.stateDir) ? { socketPath: config.socketPath } : {}),
     ...(config.quotaEndpoint ? { quotaEndpoint: config.quotaEndpoint } : {}),
   };

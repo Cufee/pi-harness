@@ -83,3 +83,29 @@ export function installedCurrent(self: ReleaseIdentity = currentRelease()): Rele
     return null;
   }
 }
+
+export function releaseTargetForDir(dir: string): ReleaseTarget {
+  const installed = readReleaseAt(dir);
+  if (installed) {
+    return {
+      releaseId: installed.releaseId,
+      releaseDir: installed.releaseDir,
+      bunPath: installed.bunPath,
+      cliPath: installed.cliPath,
+    };
+  }
+  let resolvedDir: string;
+  try {
+    resolvedDir = realpathSync(dir);
+  } catch {
+    resolvedDir = resolve(dir);
+  }
+  const hash = createHash("sha256").update(resolvedDir).digest("hex").slice(0, 12);
+  const bunCandidate = join(resolvedDir, ".bun");
+  return {
+    releaseId: `dev-${hash}`,
+    releaseDir: resolvedDir,
+    bunPath: existsSync(bunCandidate) ? bunCandidate : process.execPath,
+    cliPath: join(resolvedDir, "src", "cli.ts"),
+  };
+}
