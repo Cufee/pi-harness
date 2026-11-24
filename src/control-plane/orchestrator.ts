@@ -532,7 +532,11 @@ export class HarnessOrchestrator {
         },
         setResumeNote: (taskId, note) => this.taskResumeNotes.set(taskId, note),
         release: (taskId) => this.recoveringTasks.delete(taskId),
-        launch: (taskId) => this.launchTaskLoop(taskId),
+        launch: (taskId) => {
+          this.recoveringTasks.delete(taskId);
+          this.launchTaskLoop(taskId, { fromRecovery: true });
+        },
+        isActive: (taskId) => this.active.has(taskId),
         isStopping: () => this.quiescing || this.disposed,
       },
       taskIds,
@@ -789,7 +793,7 @@ export class HarnessOrchestrator {
     const tasks = this.db.listTasks(runId);
     const live = this.isRunActiveInMemory(runId);
     const derived = deriveRunStatus(run, tasks, live);
-    if (derived !== run.status) {
+    if (derived !== run.status && !this.quiescing && !this.disposed) {
       const why = (derived === "failed" ? failedCause : undefined) ?? deriveRunCause(tasks, derived);
       this.db.updateRunStatus(runId, derived, why?.reason, why?.cause);
       return this.db.getRun(runId);
@@ -804,7 +808,7 @@ export class HarnessOrchestrator {
     const tasks = this.db.listTasks(runId);
     const live = this.isRunActiveInMemory(runId);
     const derived = deriveRunStatus(run, tasks, live);
-    if (derived !== run.status && tasks.length > 0) {
+    if (derived !== run.status && tasks.length > 0 && !this.quiescing && !this.disposed) {
       const why = deriveRunCause(tasks, derived);
       this.db.updateRunStatus(runId, derived, why?.reason, why?.cause);
       return this.db.getRun(runId);
@@ -1215,9 +1219,10 @@ export class HarnessOrchestrator {
     return updated;
   }
 
-  launchTaskLoop(taskId: string): void {
+  launchTaskLoop(taskId: string, opts?: { fromRecovery?: boolean }): void {
     if (this.active.has(taskId) || this.allocatingWorktrees.has(taskId)) return;
     if (this.quiescing) { this.recoveringTasks.add(taskId); return; }
+    if (this.recoveringTasks.has(taskId) && !opts?.fromRecovery) return;
     const abort = new AbortController();
     const entry: ActiveTaskExecution = {
       taskId,
@@ -1778,7 +1783,7 @@ export class HarnessOrchestrator {
       this.resumeBaseMessages.set(result, baseMessage);
       return result;
     }
-    if (this.isLiveExecution(task.id) || this.allocatingWorktrees.has(task.id)) {
+    if (this.isLiveExecution(task.id) || this.allocatingWorktrees.has(task.id) || this.recoveringTasks.has(task.id)) {
       const noteDelivery = opts?.note?.trim() ? await this.steerTaskDetailed(task.id, opts.note.trim()) : undefined;
       const noteDelivered = noteDelivery?.steered;
       const baseMessage = `Task ${task.id} in ${where} is already ${task.status} (generation ${task.generation}); nothing was restarted.`;
@@ -2167,7 +2172,7 @@ export class HarnessOrchestrator {
     }
 
     const liveIds = tasks
-      .filter((t) => t.profileId !== "director" && (this.isLiveExecution(t.id) || this.allocatingWorktrees.has(t.id) || LIVE_TASK_STATUSES.has(t.status)))
+      .filter((t) => t.profileId !== "director" && (this.isLiveExecution(t.id) || this.allocatingWorktrees.has(t.id) || this.recoveringTasks.has(t.id) || LIVE_TASK_STATUSES.has(t.status)))
       .map((t) => t.id);
     const container = isDirectorTaskContainer(run.id);
     // A caller's note on a run that is already active is delivered to its live orchestrator, never dropped silently.
@@ -2200,7 +2205,7 @@ export class HarnessOrchestrator {
     const RESUMABLE_ORCH = new Set(["failed", "blocked", "returned_for_rescope", "cancelled"]);
     const RESUMABLE_ORPHAN = new Set(["failed", "blocked", "returned_for_rescope"]);
     const candidates = tasks.filter((t) => {
-      if (t.profileId === "director" || this.isLiveExecution(t.id) || this.allocatingWorktrees.has(t.id)) return false;
+      if (t.profileId === "director" || this.isLiveExecution(t.id) || this.allocatingWorktrees.has(t.id) || this.recoveringTasks.has(t.id)) return false;
       if (windingDownIds.has(t.id)) return false;
       if (orch && t.id === orch.id) return RESUMABLE_ORCH.has(t.status);
       if (t.status === "cancelled" || t.status === "completed") return false;
@@ -2362,7 +2367,7 @@ export class HarnessOrchestrator {
             }
           }
           if (exec.abort.signal.aborted) {
-            this.db.admissionQueue.remove("worker", task.id);
+            if (!this.disposed) this.db.admissionQueue.remove("worker", task.id);
             return;
           }
         }

@@ -85,6 +85,7 @@ const WORK_STARTING_OPS = new Set<DaemonOp>([
   "goal.commit",
   "goal.resume",
   "goal.review",
+  "goal.accept",
   "run.create",
   "run.resume",
   "task.resume",
@@ -325,7 +326,7 @@ export class HarnessDaemon {
 
   private server: Server | null = null;
   private lifecycle: DaemonLifecycle = "serving";
-  private wakesGated = false;
+  private wakesGated = true;
   private restartExpected = false;
   private stopPromise: Promise<void> | null = null;
   private reapChildrenOnStop = false;
@@ -636,8 +637,8 @@ export class HarnessDaemon {
     }
   }
 
-  private async runContinuationTurn(chatSessionId: string, text: string): Promise<void> {
-    if (this.wakesGated || this.chatTurns.has(chatSessionId)) return;
+  private async runContinuationTurn(chatSessionId: string, text: string, opts?: { bypassGate?: boolean }): Promise<void> {
+    if ((!opts?.bypassGate && this.wakesGated) || this.chatTurns.has(chatSessionId)) return;
     if (!this.director.chats.getSession(chatSessionId)) return;
     const id = `continue-${randomBytes(4).toString("hex")}`;
     const turn: ActiveChatTurn = { id, text: "", cancelling: false, startedAt: Date.now(), tools: new Map(), toolCounter: 0 };
@@ -911,7 +912,10 @@ export class HarnessDaemon {
     // so immediate wakeups / MCP bridges can connect without racing socket creation!
     const interruptedReviewGoals = listInterruptedReviewGoals(this.db.db);
     const legacyStopAtRaw = Number(process.env.PI_HARNESS_LEGACY_STOP_AT);
+    delete process.env.PI_HARNESS_LEGACY_STOP_AT;
     const legacyStopAt = Number.isFinite(legacyStopAtRaw) && legacyStopAtRaw > 0 ? legacyStopAtRaw : undefined;
+    const reloadFrom = process.env.PI_HARNESS_RELOAD_FROM;
+    delete process.env.PI_HARNESS_RELOAD_FROM;
     const heldTaskIds = this.orchestrator.reconcileStaleRunsOnStartup(
       legacyStopAt !== undefined ? { legacyStopAt } : undefined,
     );
@@ -923,6 +927,37 @@ export class HarnessDaemon {
       // Best effort; the escalations stay listable and resolvable.
     }
     replayInterruptedReviews(this.db, this.director.goals, interruptedReviewGoals);
+
+    // Register saved continuation turns synchronously before ungating wakes and before any RPC runs (A1).
+    const savedWakeups = this.wakeups.takeAll();
+    const chatsToDrain = new Set<string>();
+    for (const row of savedWakeups) {
+      if (row.kind !== "continue") continue;
+      if (!this.director.chats.getSession(row.chatSessionId)) continue;
+      const p = (row.payload ?? {}) as {
+        tools?: TrackedTurnTool[];
+        tasks?: Array<{ id: string; title: string; status: string }>;
+      };
+      const text = formatContinuationTurnPrompt(
+        Array.isArray(p.tools) ? p.tools : [],
+        Array.isArray(p.tasks) ? p.tasks : [],
+      );
+      void this.runContinuationTurn(row.chatSessionId, text, { bypassGate: true });
+    }
+    for (const row of savedWakeups) {
+      if (row.kind !== "event" || !row.payload || typeof row.payload !== "object") continue;
+      if (!this.director.chats.getSession(row.chatSessionId)) continue;
+      const q = this.pendingWakeups.get(row.chatSessionId) ?? [];
+      q.push(row.payload as ChatControlEvent);
+      this.pendingWakeups.set(row.chatSessionId, q);
+      chatsToDrain.add(row.chatSessionId);
+    }
+    if (this.lifecycle === "serving") {
+      this.wakesGated = false;
+      for (const chatId of new Set([...chatsToDrain, ...this.pendingWakeups.keys()])) {
+        if (!this.chatTurns.has(chatId)) this.drainPendingWakeup(chatId);
+      }
+    }
 
     // Non-blocking startup orphan worktree sweep + periodic hourly sweep across known repos
     void this.sweepAllKnownRepos().catch(() => {});
@@ -953,7 +988,7 @@ export class HarnessDaemon {
       console.error(`[harnessd ${new Date().toISOString()}] config warning: ${w}`);
     }
 
-    this.recovered = this.finishRecovery(heldTaskIds).catch((err) => {
+    this.recovered = this.finishRecovery(heldTaskIds, reloadFrom).catch((err) => {
       console.error(
         `[harnessd ${new Date().toISOString()}] recovery failed: ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -962,34 +997,14 @@ export class HarnessDaemon {
     return sockPath;
   }
 
-  private async finishRecovery(heldTaskIds: string[]): Promise<void> {
+  private async finishRecovery(heldTaskIds: string[], reloadFrom?: string): Promise<void> {
     if (heldTaskIds.length > 0) {
-      const reason = process.env.PI_HARNESS_RELOAD_FROM
+      const reason = reloadFrom
         ? `update to release ${currentRelease().releaseId}`
         : "daemon restart";
       await this.orchestrator.recoverInterruptedTasks(heldTaskIds, reason, this.recoveryStaggerMs);
     }
     if (this.lifecycle !== "serving") return;
-
-    const savedWakeups = this.wakeups.takeAll();
-    for (const row of savedWakeups) {
-      if (row.kind !== "continue") continue;
-      if (!this.director.chats.getSession(row.chatSessionId)) continue;
-      const p = (row.payload ?? {}) as {
-        tools?: TrackedTurnTool[];
-        tasks?: Array<{ id: string; title: string; status: string }>;
-      };
-      const text = formatContinuationTurnPrompt(
-        Array.isArray(p.tools) ? p.tools : [],
-        Array.isArray(p.tasks) ? p.tasks : [],
-      );
-      void this.runContinuationTurn(row.chatSessionId, text);
-    }
-    for (const row of savedWakeups) {
-      if (row.kind !== "event" || !row.payload || typeof row.payload !== "object") continue;
-      if (!this.director.chats.getSession(row.chatSessionId)) continue;
-      this.scheduleDirectorWakeup(row.chatSessionId, row.payload as ChatControlEvent);
-    }
 
     this.db.timers.restorePending();
 
@@ -1018,6 +1033,10 @@ export class HarnessDaemon {
 
   private async stopInner(_opts?: { reason?: string }): Promise<void> {
     this.enterQuiesce("stopping");
+    await Promise.race([
+      this.recovered.catch(() => {}),
+      new Promise<void>((r) => setTimeout(r, 5000)),
+    ]);
     if (this.idleShutdownTimer) {
       clearTimeout(this.idleShutdownTimer);
       this.idleShutdownTimer = null;
@@ -1063,6 +1082,12 @@ export class HarnessDaemon {
       });
     }
 
+    await this.orchestrator.shutdownAndWait(10_000);
+    this.director.dispose();
+    this.unsubEvents?.();
+    this.ptyHost.closeAll();
+
+    // Snapshot pending wakeups after orchestrator/director unwind so late-queued wakes are not lost (A2).
     const wakeupSnapshot: PendingWake[] = [...continueRows];
     for (const [chatId, events] of this.pendingWakeups.entries()) {
       for (const ev of events) {
@@ -1079,11 +1104,6 @@ export class HarnessDaemon {
     } catch {
       // ignore if DB already closed
     }
-
-    await this.orchestrator.shutdownAndWait(10_000);
-    this.director.dispose();
-    this.unsubEvents?.();
-    this.ptyHost.closeAll();
 
     if (this.reapChildrenOnStop) {
       await reapChildProcessGroups(process.pid, 2000);
@@ -1712,13 +1732,13 @@ export class HarnessDaemon {
     }
 
     // If the last interactive TUI disconnected abruptly (e.g. terminal window closed) and nothing is running, quit cleanly
-    if (this.autoQuitWhenIdle && wasTui) {
+    if (this.autoQuitWhenIdle && wasTui && this.lifecycle === "serving") {
       const work = this.getLiveWorkSummary();
       if (!work.running) {
         this.cancelIdleShutdown();
         this.idleShutdownTimer = setTimeout(() => {
           this.idleShutdownTimer = null;
-          if (!this.getLiveWorkSummary().running) {
+          if (this.lifecycle === "serving" && !this.getLiveWorkSummary().running) {
             void this.stop().finally(() => process.exit(0));
           }
         }, 1200);

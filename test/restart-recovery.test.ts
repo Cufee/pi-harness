@@ -77,7 +77,10 @@ describe("restart-recovery", () => {
     let childT3Id = "";
     let workerId = "";
     let readyTaskId = "";
+    let readyWithHandoffId = "";
     let pendingTaskId = "";
+    let drainRunId = "";
+    let drainOrchId = "";
     let workerRunning = false;
     let childT3Running = false;
 
@@ -106,8 +109,8 @@ describe("restart-recovery", () => {
           const dep = (await req.executeTool("spawn_task", {
             kind: "research",
             title: "Dependent scout",
-            objective: "Waits for Active scout",
-            depends_on: [childT3Id],
+            objective: "Waits for Leased worker",
+            depends_on: [workerId],
             profile_id: "pi:local",
             model: "fixture",
           })) as { spawned: string };
@@ -156,7 +159,7 @@ describe("restart-recovery", () => {
           a.db.getTask(orchId)?.status === "waiting_children",
       );
 
-      // Insert an unlaunched `ready` task into the active run before stopping.
+      // Insert an unlaunched `ready` task and a `ready` sibling with a drain-steered handoff (X2 check).
       const readyRec = a.db.createTask({
         runId,
         parentId: orchId,
@@ -170,6 +173,30 @@ describe("restart-recovery", () => {
       });
       readyTaskId = readyRec.id;
 
+      const readyHandoffRec = a.db.createTask({
+        runId,
+        parentId: orchId,
+        tier: 3,
+        kind: "research",
+        title: "Held ready scout with handoff",
+        objective: "Must wait for phase B sanitize instead of early launch",
+        readOnly: true,
+        profileId: "pi:local",
+        model: "fixture",
+      });
+      readyWithHandoffId = readyHandoffRec.id;
+      a.db.updateTask(readyWithHandoffId, {
+        handoffJson: JSON.stringify({
+          goalInvariants: [],
+          architecturalDecisions: [],
+          activeRisks: [],
+          nextActions: [
+            "Steered update: [harness:daemon-restart] call request_rollover now",
+            "Keep real next action",
+          ],
+        }),
+      });
+
       const beforeTasks = a.db.listTasks(runId);
       taskIdsBeforeStop = beforeTasks.map((t) => t.id).sort();
       statusesBeforeStop = new Map(beforeTasks.map((t) => [t.id, t.status]));
@@ -179,7 +206,35 @@ describe("restart-recovery", () => {
       assert.equal(statusesBeforeStop.get(childT3Id), "running");
       assert.equal(statusesBeforeStop.get(workerId), "running");
       assert.equal(statusesBeforeStop.get(readyTaskId), "ready");
+      assert.equal(statusesBeforeStop.get(readyWithHandoffId), "ready");
       assert.equal(statusesBeforeStop.get(pendingTaskId), "pending");
+
+      // N2 regression (A13): a run whose only unsettled task is a `ready` Tier 1 with a handoff stays `active`
+      // when getEffectiveRun is read during quiesce.
+      const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+      const drainRun = a.db.createRun({ goal: "Drain N2 run", repoRoot: repoDir, baseBranch: "main", baseSha });
+      drainRunId = drainRun.id;
+      const drainOrch = a.db.createTask({
+        runId: drainRunId,
+        tier: 1,
+        kind: "orchestrator",
+        title: "Drained T1",
+        objective: "Handed off during drain",
+        profileId: "pi:local",
+        model: "fixture",
+      });
+      drainOrchId = drainOrch.id;
+      a.db.updateTask(drainOrchId, {
+        handoffJson: JSON.stringify({
+          goalInvariants: [],
+          architecturalDecisions: [],
+          activeRisks: [],
+          nextActions: ["Resume after drain"],
+        }),
+      });
+      a.enterQuiesce("draining");
+      a.orchestrator.launchTaskLoop(drainOrchId);
+      assert.equal(a.orchestrator.getEffectiveRun(drainRunId)?.status, "active");
 
       await a.stop();
     } finally {
@@ -192,6 +247,16 @@ describe("restart-recovery", () => {
       run: async (req: RunAgentRequest): Promise<RunAgentResult> => {
         runCountsB.set(req.taskId, (runCountsB.get(req.taskId) ?? 0) + 1);
         promptsB.set(req.taskId, req.initialPrompt);
+        // X2 check: finish childT3Id cleanly during phase B stagger so afterTaskInactiveInRun fires while
+        // held ready siblings have not yet been launched by phase B.
+        if (req.taskId === childT3Id) {
+          await req.executeTool("return_task", {
+            status: "completed",
+            summary: "quick finish",
+            sources: [{ path: "README.md", note: "verified" }],
+          });
+          return { text: "quick finish", stopReason: "completed" };
+        }
         await waitForAbort(req.signal);
         return { text: "stopped", stopReason: "cancelled" };
       },
@@ -203,10 +268,11 @@ describe("restart-recovery", () => {
       recoveryStaggerMs: 25,
     });
     try {
-      // Verify a.stop() did not rewrite any task status in SQLite.
+      // Verify a.stop() did not rewrite any task status in SQLite and kept drainRunId active (A13).
       for (const [id, status] of statusesBeforeStop) {
         assert.equal(b.db.getTask(id)?.status, status, `Task ${id} status must be unchanged after stop`);
       }
+      assert.equal(b.db.getRun(drainRunId)?.status, "active", "Drain N2 run must stay active after stop");
 
       await b.start();
       // Between phase A and phase B completion, getEffectiveRun must stay active.
@@ -217,7 +283,9 @@ describe("restart-recovery", () => {
           runCountsB.get(orchId) === 1 &&
           runCountsB.get(childT3Id) === 1 &&
           runCountsB.get(workerId) === 1 &&
-          runCountsB.get(readyTaskId) === 1,
+          runCountsB.get(readyTaskId) === 1 &&
+          runCountsB.get(readyWithHandoffId) === 1 &&
+          runCountsB.get(drainOrchId) === 1,
       );
 
       const afterTasks = b.db.listTasks(runId);
@@ -244,17 +312,26 @@ describe("restart-recovery", () => {
       assert.equal(runCountsB.get(childT3Id), 1);
       assert.equal(runCountsB.get(workerId), 1);
       assert.equal(runCountsB.get(readyTaskId), 1);
+      assert.equal(runCountsB.get(readyWithHandoffId), 1);
       assert.equal(runCountsB.get(pendingTaskId) ?? 0, 0);
       assert.equal(b.db.getTask(pendingTaskId)?.status, "pending");
 
       const orchPrompt = promptsB.get(orchId) ?? "";
       assert.ok(orchPrompt.includes(childT3Id), "Orchestrator prompt must contain child ID");
       assert.ok(orchPrompt.includes("tree_view"), "Orchestrator prompt must mention tree_view");
+
+      // X2 check: held ready sibling ran once through phase B with sanitized handoff (never launched early by afterTaskInactiveInRun).
+      const readyHandoffPrompt = promptsB.get(readyWithHandoffId) ?? "";
+      assert.ok(
+        !readyHandoffPrompt.includes("[harness:daemon-restart]"),
+        "Held ready sibling prompt must strip drain steer marker",
+      );
+      assert.ok(readyHandoffPrompt.includes("Keep real next action"));
     } finally {
       await b.stop();
       rmSync(repoDir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   it("wait_timer and schedule_timer rows survive a stop", async () => {
     const repoDir = initTempGitRepo();
@@ -357,7 +434,7 @@ describe("restart-recovery", () => {
       await a.stop().catch(() => {});
       rmSync(repoDir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   it("only active runs are recovered", async () => {
     const repoDir = initTempGitRepo();
@@ -434,7 +511,7 @@ describe("restart-recovery", () => {
       await b.stop();
       rmSync(repoDir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   it("missing worktree is recreated and a merged worktree survives the sweep", async () => {
     const repoDir = initTempGitRepo();
@@ -540,7 +617,7 @@ describe("restart-recovery", () => {
       await b.stop();
       rmSync(repoDir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   it("stale bridge token is refused", async () => {
     const repoDir = initTempGitRepo();
@@ -627,7 +704,7 @@ describe("restart-recovery", () => {
       await b.stop();
       rmSync(repoDir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   it("interrupted Director turn keeps its tool list and does not respawn", async () => {
     const repoDir = initTempGitRepo();
@@ -748,7 +825,7 @@ describe("restart-recovery", () => {
       await b.stop();
       rmSync(repoDir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   it("queued wakeups are saved at a plain stop and delivered once", async () => {
     const repoDir = initTempGitRepo();
@@ -838,7 +915,7 @@ describe("restart-recovery", () => {
       await b.stop();
       rmSync(repoDir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   it("a stop during recovery is recovered by the next start", async () => {
     const repoDir = initTempGitRepo();
@@ -892,13 +969,15 @@ describe("restart-recovery", () => {
     a.db.updateTask(t3.id, { status: "running" });
     await a.stop();
 
-    const launchedInB: string[] = [];
+    let stopTriggered: Promise<void> | null = null;
     const b = new HarnessDaemon(makeTestConfig(repoDir, stateDir), {
       dbPath,
       recoveryStaggerMs: 50,
       customRunnerFactory: () => ({
         run: async (req) => {
-          launchedInB.push(req.taskId);
+          if (!stopTriggered) {
+            stopTriggered = b.stop();
+          }
           await waitForAbort(req.signal);
           return { text: "stopped in B", stopReason: "cancelled" };
         },
@@ -906,8 +985,8 @@ describe("restart-recovery", () => {
     });
     await b.start();
     try {
-      await waitUntil(() => launchedInB.length >= 1);
-      await b.stop();
+      await waitUntil(() => stopTriggered !== null);
+      await stopTriggered;
       await b.recovered;
     } finally {
       await b.stop().catch(() => {});
@@ -939,5 +1018,5 @@ describe("restart-recovery", () => {
       await c.stop();
       rmSync(repoDir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 });

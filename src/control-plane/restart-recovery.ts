@@ -4,6 +4,7 @@ import type { ControlPlaneDb, TaskRecord } from "./db.js";
 import { settleTaskMinimalFallback } from "./handoffs.js";
 import { isDirectorTaskContainer } from "./ids.js";
 import type { AnchoredHandoff } from "./prompts.js";
+import { toolPolicyForTask } from "../runners/types.js";
 import type { WorktreeManager } from "../worktree/manager.js";
 
 export const DRAIN_STEER_MARKER = "[harness:daemon-restart]";
@@ -57,6 +58,7 @@ export interface RecoveryHost {
   setResumeNote(taskId: string, note: { kind: "resume"; reason: string; userMessage: string }): void;
   release(taskId: string): void;
   launch(taskId: string): void;
+  isActive?(taskId: string): boolean;
   isStopping(): boolean;
 }
 
@@ -175,6 +177,7 @@ export function classifyInterruptedTasks(raw: Database, opts?: { legacyStopAt?: 
   const relaunch: PlannedTask[] = [];
   const untouched: PlannedTask[] = [];
   const legacyFail: PlannedTask[] = [];
+  const runsWithHeldOrQuota = new Set<string>();
 
   for (const row of remaining) {
     const runId = String(row.run_id);
@@ -182,13 +185,35 @@ export function classifyInterruptedTasks(raw: Database, opts?: { legacyStopAt?: 
     if (recoverableRunSet.has(runId)) {
       if (LIVE_STATUSES.has(status) || status === "ready") {
         relaunch.push(toPlanned(row));
-      } else if (status === "pending" || status === "paused_quota") {
+        runsWithHeldOrQuota.add(runId);
+      } else if (status === "paused_quota") {
+        untouched.push(toPlanned(row));
+        runsWithHeldOrQuota.add(runId);
+      } else if (status === "pending") {
         untouched.push(toPlanned(row));
       }
     } else if (LIVE_STATUSES.has(status) || status === "ready" || status === "pending") {
       legacyFail.push(toPlanned(row));
     }
   }
+
+  // Only keep runs in recoverableRunIds that actually have a held or paused_quota task (A15);
+  // empty active runs (or ones with only unresolvable pending tasks) fall through to the legacy loop.
+  for (const runId of [...recoverableRunSet]) {
+    if (!runsWithHeldOrQuota.has(runId)) {
+      recoverableRunSet.delete(runId);
+    }
+  }
+  const finalUntouched: PlannedTask[] = [];
+  for (const t of untouched) {
+    if (!recoverableRunSet.has(t.runId) && t.status === "pending") {
+      legacyFail.push(t);
+    } else {
+      finalUntouched.push(t);
+    }
+  }
+  untouched.length = 0;
+  untouched.push(...finalUntouched);
 
   relaunch.sort((a, b) => a.tier - b.tier || a.createdAt - b.createdAt || a.id.localeCompare(b.id));
 
@@ -444,6 +469,10 @@ export async function relaunchInterruptedTasks(
   for (let i = 0; i < taskIds.length; i++) {
     const taskId = taskIds[i]!;
     if (host.isStopping()) break;
+    if (host.isActive?.(taskId)) {
+      host.release(taskId);
+      continue;
+    }
 
     const task = host.db.getTask(taskId);
     const run = task ? host.db.getRun(task.runId) : null;
@@ -460,37 +489,47 @@ export async function relaunchInterruptedTasks(
     let wt = task.worktreeId ? host.db.getWorktree(task.worktreeId) : null;
     let mergedWorktreeNote: string | null = null;
     let archiveWorktreeNote: string | null = null;
+    const policy = toolPolicyForTask(task.tier, task.kind, task.readOnly);
 
     if (task.worktreeId) {
-      if (wt && wt.runId === task.runId && existsSync(wt.path)) {
-        if (wt.status !== "active" && wt.status !== "merged") {
-          host.db.updateWorktree(wt.id, { status: "active", cleanedAt: null });
-          wt = host.db.getWorktree(wt.id);
-        } else if (wt.status === "merged") {
-          mergedWorktreeNote = `Your branch ${wt.branch} is already merged. Do not edit or resubmit. Call return_task with your summary.`;
-        }
-      } else {
-        const prevWt = wt;
-        const mgr = host.worktrees(run.repoRoot);
-        try {
-          if (await mgr.isGitRepo()) {
-            wt = await mgr.createForWorker(run.id, task.id, undefined, { force: true });
-            const prevId = prevWt?.id ?? task.worktreeId;
-            archiveWorktreeNote =
-              `The previous worktree ${prevId} was archived before the daemon restart; this generation starts on a fresh worktree from base branch ${run.baseBranch || "HEAD"}` +
-              (prevWt?.archiveRef
-                ? ` and the archived work is at ${prevWt.archiveRef} (inspect it with \`git log ${prevWt.archiveRef}\` and cherry-pick what is still needed).`
-                : " (nothing unmerged was archived).");
+      if (policy === "read_write_workspace" && (!wt || wt.taskId === task.id)) {
+        if (wt && wt.runId === task.runId && existsSync(wt.path)) {
+          if (wt.status !== "active" && wt.status !== "merged") {
+            host.db.updateWorktree(wt.id, { status: "active", cleanedAt: null });
+            wt = host.db.getWorktree(wt.id);
+          } else if (wt.status === "merged") {
+            mergedWorktreeNote = `Your branch ${wt.branch} is already merged. Do not edit or resubmit. Call return_task with your summary.`;
           }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.error(`[harnessd ${new Date().toISOString()}] recovery: skipped ${taskId} (worktree recreation failed: ${msg})`);
-          host.db.emitEvent(run.id, task.id, "agent.error", {
-            error: `Recovery worktree recreation failed: ${msg}`,
-          });
-          host.release(task.id);
-          continue;
+        } else {
+          const prevWt = wt;
+          const mgr = host.worktrees(run.repoRoot);
+          try {
+            if (await mgr.isGitRepo()) {
+              wt = await mgr.createForWorker(run.id, task.id, undefined, { force: true });
+              const prevId = prevWt?.id ?? task.worktreeId;
+              const branchHint = prevWt?.branch ? ` (previous branch ${prevWt.branch})` : "";
+              archiveWorktreeNote =
+                `The previous worktree ${prevId}${branchHint} was archived before the daemon restart; this generation starts on a fresh worktree from base branch ${run.baseBranch || "HEAD"}` +
+                (prevWt?.archiveRef
+                  ? ` and the archived work is at ${prevWt.archiveRef} (inspect it with \`git log ${prevWt.archiveRef}\` and cherry-pick what is still needed).`
+                  : prevWt?.branch
+                    ? ` (nothing unmerged was archived; check \`git log ${prevWt.branch}\` if any commits remain on the previous branch).`
+                    : " (nothing unmerged was archived).");
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`[harnessd ${new Date().toISOString()}] recovery: skipped ${taskId} (worktree recreation failed: ${msg})`);
+            host.db.emitEvent(run.id, task.id, "agent.error", {
+              error: `Recovery worktree recreation failed: ${msg}`,
+            });
+            host.release(task.id);
+            continue;
+          }
         }
+      } else if (!wt || wt.runId !== task.runId || !existsSync(wt.path)) {
+        // Read-only / inherited worktree whose checkout is gone: clear worktreeId so the runner falls back to run.repoRoot.
+        host.db.updateTask(task.id, { worktreeId: null });
+        wt = null;
       }
     }
 

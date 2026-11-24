@@ -680,8 +680,8 @@ async function main(): Promise<void> {
       } catch {
         // ignore pid write failure
       }
-      process.on("SIGTERM", () => void daemon.stop().then(() => process.exit(0)));
-      process.on("SIGINT", () => void daemon.stop().then(() => process.exit(0)));
+      process.on("SIGTERM", () => void daemon.stop().finally(() => process.exit(0)));
+      process.on("SIGINT", () => void daemon.stop().finally(() => process.exit(0)));
       console.error(`[harnessd ${new Date().toISOString()}] listening on ${sock} (pid ${process.pid})`);
       return;
     }
