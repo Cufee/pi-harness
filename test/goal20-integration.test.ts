@@ -1016,7 +1016,7 @@ describe("goal-20 integration: DirectorRuntime gate-activity events and compact 
           daemon.db.tryResolveEscalation(esc.id, i === 11 ? longResolution : `Resolved item ${i}`);
           if (i === 11) longResolvedId = esc.id;
         }
-        // Also seed a resolved escalation with whitespace-only resolution; it must not be returned or counted.
+        // Also seed resolved escalations with whitespace-only resolutions (spaces and tab); neither may be returned or counted.
         const emptyEsc = daemon.db.createEscalation({
           runId: run.id,
           fromTaskId: t1.id,
@@ -1028,6 +1028,17 @@ describe("goal-20 integration: DirectorRuntime gate-activity events and compact 
           blocking: false,
         });
         daemon.db.tryResolveEscalation(emptyEsc.id, "   ");
+        const tabEsc = daemon.db.createEscalation({
+          runId: run.id,
+          fromTaskId: t1.id,
+          toTaskId: null,
+          severity: "P2",
+          category: "code_defect",
+          title: "Tab-only resolution",
+          evidencePaths: ["README.md"],
+          blocking: false,
+        });
+        daemon.db.tryResolveEscalation(tabEsc.id, "\t");
 
         // Leave one open escalation that goal_accept auto-resolves.
         const acceptedEsc = daemon.db.createEscalation({
@@ -1080,9 +1091,18 @@ describe("goal-20 integration: DirectorRuntime gate-activity events and compact 
         assert.equal(typeof compactLong.resolvedAt, "number");
         assert.ok(compactLong.resolution.length <= GOAL_GET_LIMITS.escalationResolution);
         assert.equal(
-          compact.recentlyResolvedEscalations.some((e) => e.id === emptyEsc.id),
+          compact.recentlyResolvedEscalations.some((e) => e.id === emptyEsc.id || e.id === tabEsc.id),
           false,
-          "whitespace-only resolved escalation must be excluded",
+          "whitespace-only resolved escalations (spaces or tab) must be excluded",
+        );
+        assert.equal(
+          compact.recentlyResolvedEscalations.every((e) => e.resolution.trim() !== ""),
+          true,
+          "compact resolved escalation page must contain no blank resolutions",
+        );
+        assert.equal(
+          compact.recentlyResolvedEscalationsPage.omitted,
+          compact.recentlyResolvedEscalationsPage.total - compact.recentlyResolvedEscalationsPage.returned,
         );
 
         // 2. Full goal_get (all sections) and narrow escalations section (unclipped resolution).
@@ -1094,6 +1114,15 @@ describe("goal-20 integration: DirectorRuntime gate-activity events and compact 
         assert.deepEqual(full.openEscalations, []);
         assert.equal(full.recentlyResolvedEscalations.length, GOAL_GET_LIMITS.recentEscalationsMax);
         assert.deepEqual(full.recentlyResolvedEscalationsPage, { total: 12, returned: 10, omitted: 2 });
+        assert.equal(
+          full.recentlyResolvedEscalations.every((e) => e.resolution.trim() !== ""),
+          true,
+          "full resolved escalation page must contain no blank resolutions",
+        );
+        assert.equal(
+          full.recentlyResolvedEscalationsPage.omitted,
+          full.recentlyResolvedEscalationsPage.total - full.recentlyResolvedEscalationsPage.returned,
+        );
         const fullAccepted = full.recentlyResolvedEscalations.find((e) => e.id === acceptedEsc.id);
         assert.ok(fullAccepted, "goal_accept auto-resolved escalation must appear in full goal_get");
         assert.equal(fullAccepted.status, "resolved");

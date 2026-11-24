@@ -1829,27 +1829,28 @@ export class ControlPlaneDb {
   listRecentlyResolvedEscalations(runId: string, limit = 10): RecentlyResolvedEscalation[] {
     const capped = Math.floor(limit);
     if (capped <= 0) return [];
-    const rows = this.db
-      .prepare(
-        `SELECT id FROM escalations
-         WHERE run_id = ? AND status = 'resolved' AND resolution IS NOT NULL AND TRIM(resolution) != ''
-         ORDER BY acked_at DESC, rowid DESC
-         LIMIT ?`,
-      )
-      .all(runId, capped) as Array<{ id: string }>;
+    using statement = this.db.prepare(
+      `SELECT id, from_task_id, severity, category, title, resolution, acked_at
+       FROM escalations
+       WHERE run_id = ? AND status = 'resolved' AND resolution IS NOT NULL
+       ORDER BY acked_at DESC, rowid DESC`,
+    );
+    const rows = statement.iterate(runId) as Iterable<Record<string, unknown>>;
     const out: RecentlyResolvedEscalation[] = [];
+    // Must match runtime.ts resolvedEscalationsTotal predicate so page and total agree on blank resolutions.
     for (const r of rows) {
-      const esc = this.getEscalation(r.id);
-      if (!esc || !esc.resolution) continue;
+      const resolution = r.resolution ? String(r.resolution) : null;
+      if (resolution == null || resolution.trim() === "") continue;
       out.push({
-        id: esc.id,
-        fromTaskId: esc.fromTaskId,
-        severity: esc.severity,
-        category: esc.category,
-        title: esc.title,
-        resolution: esc.resolution,
-        resolvedAt: esc.ackedAt,
+        id: String(r.id),
+        fromTaskId: String(r.from_task_id),
+        severity: String(r.severity) as EscalationSeverity,
+        category: String(r.category) as EscalationCategory,
+        title: String(r.title),
+        resolution,
+        resolvedAt: r.acked_at == null ? null : Number(r.acked_at),
       });
+      if (out.length >= capped) break;
     }
     return out;
   }
