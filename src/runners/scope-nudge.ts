@@ -407,11 +407,11 @@ function extractRangeKey(args: Record<string, unknown>, lineSuffixes: string[]):
 function extractOperationKey(args: Record<string, unknown>): string {
   const parts: string[] = [];
   if (Array.isArray(args.argv) && args.argv.length > 0) {
-    const normalized = args.argv
+    const verbatim = args.argv
       .filter((item) => typeof item === "string" || typeof item === "number" || typeof item === "boolean")
-      .map((item) => String(item).trim());
-    if (normalized.length === args.argv.length) {
-      parts.push(`argv=${JSON.stringify(normalized)}`);
+      .map((item) => String(item));
+    if (verbatim.length === args.argv.length) {
+      parts.push(`argv=${JSON.stringify(verbatim)}`);
     }
   }
   for (const key of DISTINGUISHING_STRING_KEYS) {

@@ -222,6 +222,45 @@ describe("ScopeNudgeMonitor", () => {
     assert.match(nudge!, /repeated.*3 times/i);
   });
 
+  it("preserves verbatim argv tokens (including whitespace) in repeat and progress keys", () => {
+    const monitor = new ScopeNudgeMonitor({ workspaceRoot });
+
+    for (const pattern of [" = ", " =", "= "]) {
+      const res = monitor.observe({
+        name: "inspect_command",
+        status: "completed",
+        args: { cwd: ".", argv: ["rg", "-F", pattern, "src"] },
+      });
+      assert.equal(res, null);
+      assert.equal(monitor.signals().repeatStreak, 1);
+      assert.equal(monitor.signals().staleStreak, 0);
+    }
+
+    assert.equal(
+      monitor.observe({
+        name: "inspect_command",
+        status: "completed",
+        args: { cwd: ".", argv: ["rg", "-F", " = ", "src"] },
+      }),
+      null,
+    );
+    assert.equal(
+      monitor.observe({
+        name: "inspect_command",
+        status: "completed",
+        args: { cwd: ".", argv: ["rg", "-F", " = ", "src"] },
+      }),
+      null,
+    );
+    const nudge = monitor.observe({
+      name: "inspect_command",
+      status: "completed",
+      args: { cwd: ".", argv: ["rg", "-F", " = ", "src"] },
+    });
+    assert.ok(nudge?.includes("[Harness scope check]"));
+    assert.match(nudge!, /repeated.*3 times/i);
+  });
+
   it("skips scoring when inputs cannot distinguish operations (cwd alone, truncated argv, outer code_exec)", () => {
     const monitor = new ScopeNudgeMonitor({ workspaceRoot });
 
