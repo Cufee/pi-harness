@@ -1,3 +1,4 @@
+import { REJECTIONS } from "../advisories/rejections.js";
 import {
   buildMinimalFallbackResultJson,
   formatFallbackSummary,
@@ -70,7 +71,7 @@ export function validateTaskHandoff(kind: TaskKind, args: Record<string, unknown
     !Array.isArray(rawSources) ||
     (isReadOnlyKind(kind) && rawSources.length === 0 && !(partial && artifactPaths.length > 0))
   ) {
-    throw new Error(`return_task requires a non-empty sources array for ${kind} tasks (each source needs a path)`);
+    throw REJECTIONS.handoffSources(kind);
   }
   const sources: TaskSource[] = rawSources.map((source) => {
     const { path, lines, symbol, note } = source ?? {};

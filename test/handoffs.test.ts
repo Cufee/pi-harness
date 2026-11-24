@@ -32,8 +32,12 @@ it("requires structured sources for read-only handoffs and externalizes only ove
       const returnTask = (extra: Record<string, unknown>) =>
         orch.toolExecutor.execute(run.id, child.id, "return_task", { status: "completed", summary, ...extra });
 
-      await assert.rejects(() => returnTask({}), new RegExp(`non-empty sources array for ${kind}`));
-      await assert.rejects(() => returnTask({ sources: [] }), /non-empty sources/);
+      await assert.rejects(() => returnTask({}), {
+        message: new RegExp(`^\\[harness blocked: handoff-sources\\] .*a ${kind} handoff needs at least one source\\. Why: .+ Allowed: .+`),
+      });
+      await assert.rejects(() => returnTask({ sources: [] }), {
+        message: /^\[harness blocked: handoff-sources\] .+ Why: .+ Allowed: .+/,
+      });
       await assert.rejects(() => returnTask({ sources: [{ lines: "1-2" }] }), /non-empty path/);
       assert.equal(db.getTask(child.id)?.status, "ready");
       assert.deepEqual(db.listArtifacts(run.id, child.id), []);

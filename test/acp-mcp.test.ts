@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "bun:test";
 import { agent } from "@agentclientprotocol/sdk/unstable";
+import { REJECTIONS } from "../src/advisories/rejections.js";
 import { loadConfig, type AcpProfileConfig } from "../src/config.js";
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
 import { DaemonClient } from "../src/daemon/remote.js";
@@ -82,7 +83,7 @@ describe("ACP role policies", () => {
         }).onRequest("session/prompt", async ({ client, params: { sessionId } }) => {
           const ctrlMode = describeToolPolicyMode("control_plane_only", false);
           await assert.rejects(client.request("fs/read_text_file", { sessionId, path }), { data: { details: `Read denied: agent is running in ${ctrlMode} mode` } });
-          await assert.rejects(client.request("fs/write_text_file", { sessionId, path, content: "changed" }), { data: { details: `Write denied: agent is running in ${ctrlMode} mode` } });
+          await assert.rejects(client.request("fs/write_text_file", { sessionId, path, content: "changed" }), { data: { details: REJECTIONS.readOnlyWrite(path).message } });
           const permission = async (kind: "read" | "search" | "edit" | "execute" | "other", tool?: string) => {
             const res = await client.request("session/request_permission", {
               sessionId, toolCall: { toolCallId: `call-${kind}-${tool ?? "native"}`, title: roleTool, kind, locations: [{ path }],
@@ -1054,9 +1055,9 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
           const text = ((params.prompt as Array<{ text?: string }>) ?? []).map((b) => b.text ?? "").join("\n");
           recoveryPrompts.push(text);
           if (promptCalls === 1) {
-            // Write attempt must report "read-only workspace with verification shell (no file writes)", never "strictly read-only"
+            // Write attempt must return the read-only-write rejection and never claim "strictly read-only"
             await assert.rejects(client.request("fs/write_text_file", { sessionId: params.sessionId, path: target, content: "mutated" }), {
-              data: { details: "Write denied: agent is running in read-only workspace with verification shell (no file writes) mode" },
+              data: { details: REJECTIONS.readOnlyWrite(target).message },
             });
             // Denied edit permission triggers continuation recovery on silent stop
             const perm = await client.request("session/request_permission", {
@@ -1112,8 +1113,8 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
       assert.equal(res.text, "Verified via shell.");
       assert.equal(recoveryPrompts.length, 2);
       assert.ok(
-        recoveryPrompts[1]!.includes("read-only workspace with verification shell (no file writes)"),
-        `Expected accurate policy phrasing in recovery prompt, got: ${recoveryPrompts[1]}`,
+        recoveryPrompts[1]!.includes(REJECTIONS.readOnlyWrite(target).message),
+        `Expected blocked write notice in recovery prompt, got: ${recoveryPrompts[1]}`,
       );
       assert.equal(
         recoveryPrompts[1]!.includes("strictly read-only"),
@@ -1484,6 +1485,202 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
       assert.equal(orbResult.stopReason, "completed");
     } finally {
       rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("T-acp-text: read-only write, outside-roots, protected-path, and denied recovery prompts use the blocked shape", async () => {
+    const BLOCKED_SHAPE = /^\[harness blocked: [\w-]+\] .+ Why: .+ Allowed: .+/;
+    const baseDir = mkdtempSync(join(tmpdir(), "acp-blocked-texts-"));
+    const cwd = join(baseDir, "workspace");
+    const outsideFile = join(baseDir, "outside.txt");
+    mkdirSync(join(cwd, ".git"), { recursive: true });
+    const insideFile = join(cwd, "note.txt");
+    const gitConfig = join(cwd, ".git", "config");
+    writeFileSync(insideFile, "original-inside", "utf8");
+    writeFileSync(outsideFile, "outside-secret", "utf8");
+    writeFileSync(gitConfig, "[core]\n\trepositoryformatversion = 0\n", "utf8");
+
+    try {
+      const recoveryPrompts: string[] = [];
+      let promptCalls = 0;
+
+      const readOnlyFixture = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {} }))
+        .onRequest("session/new", async () => ({
+          sessionId: "s-ro",
+          models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+        }))
+        .onRequest("session/prompt", async ({ client, params }) => {
+          promptCalls += 1;
+          const text = ((params.prompt as Array<{ text?: string }>) ?? []).map((b) => b.text ?? "").join("\n");
+          recoveryPrompts.push(text);
+
+          if (promptCalls === 1) {
+            // 1. Read-only fs/write_text_file returns blocked shape and writes nothing
+            let writeErr: { data?: { details?: string } } | undefined;
+            try {
+              await client.request("fs/write_text_file", { sessionId: params.sessionId, path: insideFile, content: "mutated" });
+            } catch (err) {
+              writeErr = err as { data?: { details?: string } };
+            }
+            const writeDetails = writeErr?.data?.details ?? "";
+            assert.match(writeDetails, BLOCKED_SHAPE);
+            assert.match(writeDetails, /^\[harness blocked: read-only-write\] /);
+
+            // 2. Path outside the workspace returns blocked shape (outside-roots)
+            let outsideErr: { data?: { details?: string } } | undefined;
+            try {
+              await client.request("fs/read_text_file", { sessionId: params.sessionId, path: outsideFile });
+            } catch (err) {
+              outsideErr = err as { data?: { details?: string } };
+            }
+            const outsideDetails = outsideErr?.data?.details ?? "";
+            assert.match(outsideDetails, BLOCKED_SHAPE);
+            assert.match(outsideDetails, /^\[harness blocked: outside-roots\] /);
+
+            // 3. Protected path (.git/config) returns blocked shape (protected-path)
+            let protectedErr: { data?: { details?: string } } | undefined;
+            try {
+              await client.request("fs/read_text_file", { sessionId: params.sessionId, path: gitConfig });
+            } catch (err) {
+              protectedErr = err as { data?: { details?: string } };
+            }
+            const protectedDetails = protectedErr?.data?.details ?? "";
+            assert.match(protectedDetails, BLOCKED_SHAPE);
+            assert.match(protectedDetails, /^\[harness blocked: protected-path\] /);
+
+            // 4. Denied permission calls (L22 read-only-shell, L26 read-only-mcp, tool-policy) trigger recovery prompt
+            const denyOpts = [
+              { kind: "allow_once", optionId: "allow", name: "Allow" },
+              { kind: "reject_once", optionId: "deny", name: "Deny" },
+            ];
+            const outcomeOf = (resp: unknown): string => {
+              const out = (resp as { outcome: { outcome: string; optionId?: string } }).outcome;
+              return out.outcome === "selected" ? (out.optionId ?? "") : out.outcome;
+            };
+            const shellPerm = await client.request("session/request_permission", {
+              sessionId: params.sessionId,
+              toolCall: { toolCallId: "sh-1", title: "Bash", kind: "execute", rawInput: { command: "rm -rf src" } },
+              options: denyOpts,
+            });
+            assert.equal(outcomeOf(shellPerm), "deny");
+
+            const mcpPerm = await client.request("session/request_permission", {
+              sessionId: params.sessionId,
+              toolCall: {
+                toolCallId: "mcp-1",
+                title: "mcp__github__create_issue",
+                kind: "other",
+                _meta: { claudeCode: { toolName: "mcp__github__create_issue", mcpServer: { name: "github", source: "dynamic" } } },
+              },
+              options: denyOpts,
+            });
+            assert.equal(outcomeOf(mcpPerm), "deny");
+
+            const policyPerm = await client.request("session/request_permission", {
+              sessionId: params.sessionId,
+              toolCall: { toolCallId: "pol-1", title: "custom_tool", kind: "other" },
+              options: denyOpts,
+            });
+            assert.equal(outcomeOf(policyPerm), "deny");
+
+            return { stopReason: "end_turn" };
+          }
+
+          await client.notify("session/update", {
+            sessionId: params.sessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Recovered." } },
+          });
+          return { stopReason: "end_turn" };
+        });
+
+      const roRes = await new AcpRunner(profile("claude")).run(
+        {
+          runId: "r-text-ro",
+          taskId: "t-text-ro",
+          tier: 3,
+          kind: "research",
+          cwd,
+          model: "opus",
+          systemPrompt: "Researcher",
+          initialPrompt: "inspect",
+          toolPolicy: "read_only_workspace",
+          externalMcpServers: [{ name: "github", command: "unused", args: [] }],
+          tools: [],
+          executeTool: async () => ({}),
+          signal: new AbortController().signal,
+          callbacks: {},
+        },
+        readOnlyFixture,
+      );
+
+      assert.equal(roRes.stopReason, "completed");
+      assert.equal(readFileSync(insideFile, "utf8"), "original-inside");
+      assert.equal(recoveryPrompts.length, 2);
+      const recovery = recoveryPrompts[1]!;
+      assert.ok(recovery.includes("[harness blocked: read-only-shell] "), `missing read-only-shell notice: ${recovery}`);
+      assert.ok(recovery.includes("[harness blocked: read-only-mcp] "), `missing read-only-mcp notice: ${recovery}`);
+      assert.ok(recovery.includes("[harness blocked: tool-policy] "), `missing tool-policy notice: ${recovery}`);
+      for (const line of recovery.split("\n").filter((l) => l.includes("[harness blocked: "))) {
+        assert.match(line.replace(/^- /, ""), BLOCKED_SHAPE);
+      }
+
+      // Writable mode: protected-path write and outside-roots write also return blocked shape and write nothing
+      const rwFixture = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {} }))
+        .onRequest("session/new", async () => ({
+          sessionId: "s-rw",
+          models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+        }))
+        .onRequest("session/prompt", async ({ client, params }) => {
+          let protWriteErr: { data?: { details?: string } } | undefined;
+          try {
+            await client.request("fs/write_text_file", { sessionId: params.sessionId, path: gitConfig, content: "corrupted" });
+          } catch (err) {
+            protWriteErr = err as { data?: { details?: string } };
+          }
+          assert.match(protWriteErr?.data?.details ?? "", BLOCKED_SHAPE);
+          assert.match(protWriteErr?.data?.details ?? "", /^\[harness blocked: protected-path\] /);
+
+          let outWriteErr: { data?: { details?: string } } | undefined;
+          try {
+            await client.request("fs/write_text_file", { sessionId: params.sessionId, path: outsideFile, content: "escaped" });
+          } catch (err) {
+            outWriteErr = err as { data?: { details?: string } };
+          }
+          assert.match(outWriteErr?.data?.details ?? "", BLOCKED_SHAPE);
+          assert.match(outWriteErr?.data?.details ?? "", /^\[harness blocked: outside-roots\] /);
+
+          await client.notify("session/update", {
+            sessionId: params.sessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Checked rw." } },
+          });
+          return { stopReason: "end_turn" };
+        });
+
+      const rwRes = await new AcpRunner(profile("claude")).run(
+        {
+          runId: "r-text-rw",
+          taskId: "t-text-rw",
+          tier: 2,
+          kind: "worker",
+          cwd,
+          model: "opus",
+          systemPrompt: "Worker",
+          initialPrompt: "edit",
+          toolPolicy: "read_write_workspace",
+          tools: [],
+          executeTool: async () => ({}),
+          signal: new AbortController().signal,
+          callbacks: {},
+        },
+        rwFixture,
+      );
+      assert.equal(rwRes.stopReason, "completed");
+      assert.equal(readFileSync(gitConfig, "utf8"), "[core]\n\trepositoryformatversion = 0\n");
+      assert.equal(readFileSync(outsideFile, "utf8"), "outside-secret");
+    } finally {
+      rmSync(baseDir, { recursive: true, force: true });
     }
   });
 });

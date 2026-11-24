@@ -1,3 +1,4 @@
+import { REJECTIONS } from "../advisories/rejections.js";
 import { toolEventPreview } from "../protocol/tool-display.js";
 import {
   createModels,
@@ -850,7 +851,8 @@ export class PiRunner {
           });
           try {
             if (!piTools.some((tool) => tool.name === call.name)) {
-              throw new Error(`Tool ${call.name} is unavailable to this agent.`);
+              const role = req.tier === 1 ? "orchestrator" : req.tier === 2 ? "worker" : req.kind;
+              throw REJECTIONS.notYourTool(call.name, role);
             }
             const out = await req.executeTool(call.name, call.arguments ?? {});
             req.callbacks.onToolEvent?.({

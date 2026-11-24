@@ -1,5 +1,6 @@
 import { existsSync, lstatSync, unlinkSync } from "node:fs";
 import { resolve } from "node:path";
+import { REJECTIONS } from "../advisories/rejections.js";
 import type { WorktreeConfig } from "../config.js";
 import type { ControlPlaneDb, MergeQueueRecord } from "../control-plane/db.js";
 import { KnowledgeMaintainer } from "../kb/maintainer.js";
@@ -80,6 +81,38 @@ function isWildcardWriteScope(scope: string): boolean {
   return norm === "*" || norm === "**" || norm === "**/*";
 }
 
+export function filesOutsideWriteScopes(files: string[], writeScopes: string[]): string[] {
+  const scopes = writeScopes.map((s) => s.trim()).filter(Boolean);
+  if (scopes.length === 0 || scopes.some(isWildcardWriteScope)) {
+    return [];
+  }
+
+  const normalizedFiles = files
+    .map((f) => f.trim().replace(/^\.\//, ""))
+    .filter(Boolean);
+  if (normalizedFiles.length === 0) return [];
+
+  const matchers = scopes.map((raw) => {
+    const norm = raw.replace(/^\.\//, "");
+    if (norm.endsWith("/")) {
+      const glob = new Bun.Glob(`${norm}**`);
+      return (file: string) => glob.match(file);
+    }
+    const glob = new Bun.Glob(norm);
+    const isPlainPath = !/[*?[{]/.test(norm);
+    return (file: string) => glob.match(file) || (isPlainPath && file.startsWith(`${norm}/`));
+  });
+
+  const outOfScope: string[] = [];
+  for (const file of normalizedFiles) {
+    if (ALLOWED_SHARED_METADATA_FILES.has(file)) continue;
+    if (!matchers.some((match) => match(file))) {
+      outOfScope.push(file);
+    }
+  }
+  return outOfScope;
+}
+
 async function checkWriteScopes(
   repoRoot: string,
   targetBranch: string,
@@ -96,27 +129,7 @@ async function checkWriteScopes(
     .split("\0")
     .map((f) => f.trim().replace(/^\.\//, ""))
     .filter(Boolean);
-  if (changedFiles.length === 0) return [];
-
-  const matchers = scopes.map((raw) => {
-    const norm = raw.replace(/^\.\//, "");
-    if (norm.endsWith("/")) {
-      const glob = new Bun.Glob(`${norm}**`);
-      return (file: string) => glob.match(file);
-    }
-    const glob = new Bun.Glob(norm);
-    const isPlainPath = !/[*?[{]/.test(norm);
-    return (file: string) => glob.match(file) || (isPlainPath && file.startsWith(`${norm}/`));
-  });
-
-  const outOfScope: string[] = [];
-  for (const file of changedFiles) {
-    if (ALLOWED_SHARED_METADATA_FILES.has(file)) continue;
-    if (!matchers.some((match) => match(file))) {
-      outOfScope.push(file);
-    }
-  }
-  return outOfScope;
+  return filesOutsideWriteScopes(changedFiles, scopes);
 }
 
 /**
@@ -317,7 +330,7 @@ export class BisectingMergeQueue {
       const assignedWriteScopes = this.db.listAssignedWriteScopes(next.runId, next.taskId);
       const outOfScopeFiles = await checkWriteScopes(this.repoRoot, targetBranch, next.branch, assignedWriteScopes);
       if (outOfScopeFiles.length > 0) {
-        const log = `Write-scope violation: modified files outside assigned write_scopes (${assignedWriteScopes.join(", ")}):\n${outOfScopeFiles.join("\n")}`;
+        const log = REJECTIONS.writeScopeMerge(outOfScopeFiles, assignedWriteScopes).message;
         return this.bounce(next, "ci_failed", log, targetBranch, opts);
       }
 
