@@ -263,6 +263,16 @@ export interface EscalationRecord {
   ackedAt: number | null;
 }
 
+export interface RecentlyResolvedEscalation {
+  id: string;
+  fromTaskId: string;
+  severity: EscalationSeverity;
+  category: EscalationCategory;
+  title: string;
+  resolution: string;
+  resolvedAt: number | null;
+}
+
 export interface MessageRecord {
   id: string;
   runId: string;
@@ -1797,6 +1807,35 @@ export class ControlPlaneDb {
           .prepare("SELECT * FROM escalations WHERE run_id = ? ORDER BY created_at DESC")
           .all(runId) as Record<string, unknown>[]);
     return rows.map((r) => this.getEscalation(String(r.id))!);
+  }
+
+  /** Newest resolved escalations on a run that carry a resolution, for hydration and tree_view. */
+  listRecentlyResolvedEscalations(runId: string, limit = 10): RecentlyResolvedEscalation[] {
+    const capped = Math.floor(limit);
+    if (capped <= 0) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT id FROM escalations
+         WHERE run_id = ? AND status = 'resolved' AND resolution IS NOT NULL AND TRIM(resolution) != ''
+         ORDER BY acked_at DESC, rowid DESC
+         LIMIT ?`,
+      )
+      .all(runId, capped) as Array<{ id: string }>;
+    const out: RecentlyResolvedEscalation[] = [];
+    for (const r of rows) {
+      const esc = this.getEscalation(r.id);
+      if (!esc || !esc.resolution) continue;
+      out.push({
+        id: esc.id,
+        fromTaskId: esc.fromTaskId,
+        severity: esc.severity,
+        category: esc.category,
+        title: esc.title,
+        resolution: esc.resolution,
+        resolvedAt: esc.ackedAt,
+      });
+    }
+    return out;
   }
 
   listAllEscalations(opts?: {

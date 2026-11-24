@@ -306,6 +306,7 @@ export class ControlPlaneToolExecutor {
           .listTasks(runId)
           .filter((t) => includeSettled || !["completed", "cancelled", "failed"].includes(t.status));
         const escalations = this.db.listEscalations(runId, "open");
+        const recentlyResolvedEscalations = this.db.listRecentlyResolvedEscalations(runId, 10);
         const pendingMsgs = this.db.listOpenMessages(taskId);
         const answeredMsgs = this.db.listAnsweredMessagesFrom(taskId);
         const openPeerRequests = task.tier === 1 ? this.db.listOpenPeerExchangesForRun(runId) : [];
@@ -326,6 +327,7 @@ export class ControlPlaneToolExecutor {
             summary: compactTaskHandoff(t).summary,
           })),
           openEscalations: escalations,
+          ...(recentlyResolvedEscalations.length > 0 ? { recentlyResolvedEscalations } : {}),
           inboxMessages: pendingMsgs.map((m) => ({
             id: m.id,
             from: m.fromTaskId,

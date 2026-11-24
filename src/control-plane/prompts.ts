@@ -4,7 +4,14 @@ import { codeModePromptSection, type CodeMode } from "../code-mode/sdk.js";
 import type { KbCard } from "../kb/store.js";
 import { allowedToolNames, toolFact, toolRef } from "../tool-descriptions/index.js";
 import { compactTaskHandoff, isReadOnlyKind } from "./handoffs.js";
-import type { ArtifactRecord, EscalationRecord, MessageRecord, PeerExchangeRecord, TaskRecord } from "./db.js";
+import type {
+  ArtifactRecord,
+  EscalationRecord,
+  MessageRecord,
+  PeerExchangeRecord,
+  RecentlyResolvedEscalation,
+  TaskRecord,
+} from "./db.js";
 
 /**
  * KV-cache-safe immutable system prompts per tier.
@@ -154,6 +161,7 @@ export function buildHydrationTurn(input: {
   tasksSnapshot: TaskRecord[];
   artifacts: ArtifactRecord[];
   openEscalations: EscalationRecord[];
+  recentlyResolvedEscalations?: ReadonlyArray<RecentlyResolvedEscalation | EscalationRecord>;
   blackboard: Record<string, { value: unknown; authorTaskId: string }>;
   scopedKbHints?: KbCard[];
   openPeerRequests?: PeerExchangeRecord[];
@@ -252,6 +260,18 @@ export function buildHydrationTurn(input: {
         `- [${e.severity}/${e.category}] ${e.id} from ${e.fromTaskId}: ${e.title} (evidence: ${e.evidencePaths.join(", ")}${
           e.suggestedSplits.length ? `; splits: ${e.suggestedSplits.join(" | ")}` : ""
         })`,
+      );
+    }
+  }
+
+  const resolvedEscalations = (input.recentlyResolvedEscalations ?? []).filter(
+    (e) => typeof e.resolution === "string" && e.resolution.trim().length > 0,
+  );
+  if (resolvedEscalations.length > 0) {
+    lines.push("", "## Recently resolved escalations (human or Director answers)");
+    for (const e of resolvedEscalations.slice(0, 10)) {
+      lines.push(
+        `- [${e.severity}/${e.category}] ${e.id} from ${e.fromTaskId}: ${e.title} -> ${e.resolution!.slice(0, 500)}`,
       );
     }
   }
