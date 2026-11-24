@@ -10,6 +10,7 @@ import { resolveConfig, validateConfigRaw } from "../src/config.js";
 import {
   formatLegacyBootstrapNotice,
   HotUpdateController,
+  runDaemonReloadCli,
   tryReloadForDaemonRestart,
   waitForDaemonReload,
   type HotUpdateHost,
@@ -1351,6 +1352,92 @@ describe("hot-update controller, supervisor, and config unit checks", () => {
         await new Promise<void>((r) => server.close(() => r()));
         rmSync(socketPath, { force: true });
       }
+    },
+    20_000,
+  );
+
+  it(
+    "slice U fix 2: runDaemonReloadCli sends ping and daemon.reload on a single connection",
+    async () => {
+      const { homeDir, releasesDir, fakeDir, socketPath } = createSandbox("hu-u-single-conn-");
+      const relB = buildReleaseDir(releasesDir, "rel-b");
+      writeHarnessHome(homeDir, { socketPath, fakeDir });
+
+      let acceptedConnections = 0;
+      const seenOps: string[] = [];
+      const sockets = new Set<Socket>();
+      const server = createServer((sock) => {
+        acceptedConnections += 1;
+        sockets.add(sock);
+        sock.once("close", () => sockets.delete(sock));
+        attachDaemonReader(sock, {
+          onMessage: (msg) => {
+            const req = msg as { id?: string; op?: string };
+            if (typeof req.op === "string") seenOps.push(req.op);
+            if (req.op === "ping") {
+              writeDaemonMessage(sock, {
+                kind: "res",
+                id: req.id ?? "1",
+                ok: true,
+                result: {
+                  pong: true,
+                  pid: 4242,
+                  releaseId: "rel-a",
+                  restartSafe: true,
+                  reload: { state: "idle" },
+                },
+              });
+            } else if (req.op === "daemon.reload") {
+              writeDaemonMessage(sock, {
+                kind: "res",
+                id: req.id ?? "2",
+                ok: true,
+                result: {
+                  action: "noop",
+                  releaseId: "rel-a",
+                },
+              });
+            }
+          },
+        });
+      });
+      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+      try {
+        const code = await runDaemonReloadCli({
+          socketPath,
+          targetDir: relB.releaseDir,
+        });
+        assert.equal(code, 0, `expected exit 0, got ${code}`);
+        assert.equal(acceptedConnections, 1, `expected exactly 1 accepted connection, got ${acceptedConnections}`);
+        assert.deepEqual(seenOps, ["ping", "daemon.reload"]);
+      } finally {
+        for (const s of sockets) s.destroy();
+        await new Promise<void>((r) => server.close(() => r()));
+        rmSync(socketPath, { force: true });
+      }
+    },
+    20_000,
+  );
+
+  it(
+    "slice U fix 2: daemon reload rejects --check=true combined with --supervise",
+    async () => {
+      const { homeDir, releasesDir, fakeDir, socketPath, env } = createSandbox("hu-u-check-sup-");
+      const relB = buildReleaseDir(releasesDir, "rel-b");
+      writeHarnessHome(homeDir, { socketPath, fakeDir });
+
+      const res = await runCli(
+        relB,
+        ["daemon", "reload", "--check=true", "--supervise", "--options-json", "{}"],
+        env,
+      );
+      assert.notEqual(res.code, 0, `expected non-zero exit, got 0: stdout=${res.stdout} stderr=${res.stderr}`);
+      assert.ok(
+        res.stderr.includes("--check cannot be combined with --supervise"),
+        `expected conflict error in stderr:\n${res.stderr}`,
+      );
+      assert.equal(existsSync(join(dirname(socketPath), "reload-fallback.txt")), false, "must not write supervisor fallback");
+      assert.equal(existsSync(join(homeDir, "daemon.log")), false, "must not start supervisor daemon log");
     },
     20_000,
   );

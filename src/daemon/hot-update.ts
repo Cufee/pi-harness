@@ -418,20 +418,28 @@ export function parsePositiveEnvMs(raw: string | undefined): number | undefined 
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
+type ProbePingClientResult =
+  | { kind: "ok"; info: DaemonPingInfo; client: DaemonClient }
+  | { kind: "no_listener" }
+  | { kind: "inconclusive"; error: string };
+
 type ProbePingResult =
   | { kind: "ok"; info: DaemonPingInfo }
   | { kind: "no_listener" }
   | { kind: "inconclusive"; error: string };
 
-async function probePingDetailed(socketPath: string, timeoutMs = 2000): Promise<ProbePingResult> {
+async function probePingClient(socketPath: string, timeoutMs = 2000): Promise<ProbePingClientResult> {
+  const deadline = Date.now() + timeoutMs;
   const client = new DaemonClient(socketPath);
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let keepOpen = false;
   try {
+    const connectBudgetMs = Math.max(0, deadline - Date.now());
     try {
       await Promise.race([
         client.connect(),
         new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error("connect timeout")), timeoutMs);
+          timer = setTimeout(() => reject(new Error("connect timeout")), connectBudgetMs);
           timer.unref?.();
         }),
       ]);
@@ -441,30 +449,50 @@ async function probePingDetailed(socketPath: string, timeoutMs = 2000): Promise<
         return { kind: "no_listener" };
       }
       return { kind: "inconclusive", error: err instanceof Error ? err.message : String(err) };
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
     }
-    if (timer) {
-      clearTimeout(timer);
-      timer = null;
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      return { kind: "inconclusive", error: "ping timeout" };
     }
     try {
       const info = await Promise.race([
         client.request<DaemonPingInfo>("ping"),
         new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error("ping timeout")), timeoutMs);
+          timer = setTimeout(() => reject(new Error("ping timeout")), remainingMs);
           timer.unref?.();
         }),
       ]);
       if (!info || typeof info !== "object") {
         return { kind: "inconclusive", error: "invalid ping reply" };
       }
-      return { kind: "ok", info };
+      keepOpen = true;
+      return { kind: "ok", info, client };
     } catch (err) {
       return { kind: "inconclusive", error: err instanceof Error ? err.message : String(err) };
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
     }
   } finally {
     if (timer) clearTimeout(timer);
-    client.close();
+    if (!keepOpen) client.close();
   }
+}
+
+async function probePingDetailed(socketPath: string, timeoutMs = 2000): Promise<ProbePingResult> {
+  const res = await probePingClient(socketPath, timeoutMs);
+  if (res.kind === "ok") {
+    res.client.close();
+    return { kind: "ok", info: res.info };
+  }
+  return res;
 }
 
 async function probePing(socketPath: string, timeoutMs = 2000): Promise<DaemonPingInfo | null> {
@@ -997,7 +1025,7 @@ export async function runDaemonReloadCli(opts: DaemonReloadCliOptions): Promise<
   }
 
   const explicitTargetDir = opts.targetDir ? resolve(opts.targetDir) : undefined;
-  const probe = await probePingDetailed(opts.socketPath, opts.check ? CHECK_PROBE_TIMEOUT_MS : RELOAD_RPC_TIMEOUT_MS);
+  const probe = await probePingClient(opts.socketPath, opts.check ? CHECK_PROBE_TIMEOUT_MS : RELOAD_RPC_TIMEOUT_MS);
   if (probe.kind === "no_listener") {
     console.log(`harnessd is not running. Release ${target.releaseId} is used on next start.`);
     return 0;
@@ -1015,78 +1043,74 @@ export async function runDaemonReloadCli(opts: DaemonReloadCliOptions): Promise<
     return 1;
   }
 
-  const info = probe.info;
-  if (opts.check) {
-    if (info.releaseId === target.releaseId) {
-      console.log(`already running release ${target.releaseId}`);
-    } else if (info.reload === undefined) {
-      console.log(formatLegacyBootstrapNotice(info, target.releaseId, explicitTargetDir));
-    } else {
-      console.log(formatReleaseMismatchNotice(info, target.releaseId, explicitTargetDir));
-    }
-    if (info.reload && (info.reload.state === "scheduled" || info.reload.state === "draining")) {
-      const pendingTarget =
-        typeof info.reload.targetReleaseId === "string" && info.reload.targetReleaseId.length > 0
-          ? info.reload.targetReleaseId
-          : "unknown";
-      const duePart =
-        typeof info.reload.dueAt === "number" && Number.isFinite(info.reload.dueAt)
-          ? ` (due ${new Date(info.reload.dueAt).toISOString()})`
-          : "";
-      console.log(`reload pending: ${info.reload.state} to release ${pendingTarget}${duePart}`);
-    }
-    return 0;
-  }
-  if (opts.legacy) {
-    return await runLegacyReloadCli({ opts, self, target, allowCheckout, info });
-  }
-  if (info.releaseId === target.releaseId && !opts.force && info.reload?.state !== "scheduled") {
-    console.log(`already running release ${target.releaseId}`);
-    return 0;
-  }
-  if (info.reload === undefined) {
-    console.log(formatLegacyBootstrapNotice(info, target.releaseId, explicitTargetDir));
-    return 0;
-  }
-
-  const source: "install" | "cli" = opts.fromInstall ? "install" : "cli";
-  const params: DaemonReloadParams = {
-    target,
-    allowCheckout,
-    source,
-    ...(opts.now ? { now: true } : {}),
-    ...(opts.force ? { force: true } : {}),
-  };
-
-  const client = new DaemonClient(opts.socketPath);
+  const { info, client } = probe;
   let reply: DaemonReloadReply;
   try {
-    let connectNoListener = false;
-    const reloadOp = (async () => {
-      try {
-        await client.connect();
-      } catch (err) {
-        const code = (err as NodeJS.ErrnoException)?.code;
-        if (code === "ENOENT" || code === "ECONNREFUSED") {
-          connectNoListener = true;
-          return null;
-        }
-        throw err;
+    if (opts.check) {
+      if (info.releaseId === target.releaseId) {
+        console.log(`already running release ${target.releaseId}`);
+      } else if (info.reload === undefined) {
+        console.log(formatLegacyBootstrapNotice(info, target.releaseId, explicitTargetDir));
+      } else {
+        console.log(formatReleaseMismatchNotice(info, target.releaseId, explicitTargetDir));
       }
-      return await client.request<DaemonReloadReply>("daemon.reload", params as unknown as Record<string, unknown>);
-    })();
-    const res = await withDeadline(reloadOp, RELOAD_RPC_TIMEOUT_MS);
-    if (connectNoListener || res === null) {
-      console.log(`harnessd is not running. Release ${target.releaseId} is used on next start.`);
+      if (info.reload && (info.reload.state === "scheduled" || info.reload.state === "draining")) {
+        const pendingTarget =
+          typeof info.reload.targetReleaseId === "string" && info.reload.targetReleaseId.length > 0
+            ? info.reload.targetReleaseId
+            : "unknown";
+        const duePart =
+          typeof info.reload.dueAt === "number" && Number.isFinite(info.reload.dueAt)
+            ? ` (due ${new Date(info.reload.dueAt).toISOString()})`
+            : "";
+        console.log(`reload pending: ${info.reload.state} to release ${pendingTarget}${duePart}`);
+      }
       return 0;
     }
-    reply = res;
-  } catch (err) {
-    if (err instanceof ReloadRpcTimeoutError) {
-      console.error("harnessd did not answer daemon.reload within 30s. Run: pi-harness daemon reload");
-      return 1;
+    if (opts.legacy) {
+      // Close the probe socket before running dry-run / prompt / supervisor stop.
+      client.close();
+      return await runLegacyReloadCli({ opts, self, target, allowCheckout, info });
     }
-    throw err;
+    if (info.releaseId === target.releaseId && !opts.force && info.reload?.state !== "scheduled") {
+      console.log(`already running release ${target.releaseId}`);
+      return 0;
+    }
+    if (info.reload === undefined) {
+      console.log(formatLegacyBootstrapNotice(info, target.releaseId, explicitTargetDir));
+      return 0;
+    }
+
+    const source: "install" | "cli" = opts.fromInstall ? "install" : "cli";
+    const params: DaemonReloadParams = {
+      target,
+      allowCheckout,
+      source,
+      ...(opts.now ? { now: true } : {}),
+      ...(opts.force ? { force: true } : {}),
+    };
+
+    try {
+      reply = await withDeadline(
+        client.request<DaemonReloadReply>("daemon.reload", params as unknown as Record<string, unknown>),
+        RELOAD_RPC_TIMEOUT_MS,
+      );
+    } catch (err) {
+      if (err instanceof ReloadRpcTimeoutError) {
+        console.error("harnessd did not answer daemon.reload within 30s. Run: pi-harness daemon reload");
+        return 1;
+      }
+      if (
+        err instanceof Error &&
+        (err.message === "Disconnected from harnessd" ||
+          err.message === "DaemonClient not connected" ||
+          err.message === "Failed to write request to daemon stream")
+      ) {
+        console.error("harnessd closed the connection before answering daemon.reload. Run: pi-harness daemon reload");
+        return 1;
+      }
+      throw err;
+    }
   } finally {
     client.close();
   }

@@ -589,6 +589,9 @@ async function main(): Promise<void> {
     return;
   }
   if (cmd === "daemon" && positional[1] === "reload" && flags.supervise === true) {
+    if (flags.check === true) {
+      throw new Error("--check cannot be combined with --supervise");
+    }
     const rawOpts = requireStringFlag(flags, "options-json");
     if (!rawOpts) throw new Error("Missing --options-json for --supervise");
     const supOpts = JSON.parse(rawOpts) as SuperviseOptions;
