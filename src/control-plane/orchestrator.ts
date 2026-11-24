@@ -2726,17 +2726,51 @@ export class HarnessOrchestrator {
           exec.handle = h;
           // Queued steers go onto the chain synchronously, so any live steer issued after the handle appears waits behind them.
           for (const item of exec.pendingSteers?.splice(0) ?? []) {
+            const isStalePreHandle = () => {
+              if (
+                !isCurrent() ||
+                item.generation !== runnerGen ||
+                exec.handle !== h ||
+                exec.runnerGeneration !== runnerGen ||
+                exec.phase === "settling" ||
+                isTaskSettled()
+              ) {
+                return true;
+              }
+              const curRun = this.db.getRun(run.id);
+              return Boolean(curRun && curRun.status === "stopped" && !isDirectorTaskContainer(run.id));
+            };
             exec.steerChain = (exec.steerChain ?? Promise.resolve()).then(async () => {
-              if (!isCurrent() || item.generation !== runnerGen || exec.handle !== h) {
+              if (isStalePreHandle()) {
                 item.onOutcome?.(false, "generation_superseded");
+                return;
+              }
+              if (this.isTaskInBlockingWait(task.id)) {
+                const waitOutcome = this.enqueueBlockingWaitSteer(task.id, item.message);
+                item.onOutcome?.(
+                  waitOutcome === "queued_wait",
+                  waitOutcome === "queued_wait" ? "queued_wait" : "queue_full",
+                );
                 return;
               }
               const accepted = await h.steer(item.message).catch(() => false);
-              if (!isCurrent() || item.generation !== runnerGen || exec.handle !== h || exec.runnerGeneration !== runnerGen) {
+              if (isStalePreHandle()) {
                 item.onOutcome?.(false, "generation_superseded");
                 return;
               }
-              this.db.emitEvent(run.id, task.id, "agent.steered", { message: item.message, accepted });
+              if (!accepted && this.isTaskInBlockingWait(task.id)) {
+                const waitOutcome = this.enqueueBlockingWaitSteer(task.id, item.message);
+                item.onOutcome?.(
+                  waitOutcome === "queued_wait",
+                  waitOutcome === "queued_wait" ? "queued_wait" : "queue_full",
+                );
+                return;
+              }
+              this.db.emitEvent(run.id, task.id, "agent.steered", {
+                message: item.message,
+                accepted,
+                ...(accepted ? { mode: "native", live: true } : {}),
+              });
               item.onOutcome?.(accepted, accepted ? "delivered" : "steer_rejected");
             }).catch(() => {});
           }
@@ -2856,6 +2890,65 @@ export class HarnessOrchestrator {
           return;
         }
 
+        // Coded ACP executor loss takes precedence over text-based overflow heuristics and child-quota propagation.
+        if (res.errorCode === ACP_EXECUTOR_LOST_ERROR_CODE) {
+          let priorHandoff = handoff;
+          if (latest.handoffJson) {
+            try {
+              priorHandoff = JSON.parse(latest.handoffJson) as AnchoredHandoff;
+            } catch {
+              priorHandoff = handoff;
+            }
+          }
+          if (latest.tier === 1) {
+            if (
+              await this.rollOver({
+                exec,
+                runnerGen,
+                run,
+                latest,
+                wt,
+                priorHandoff,
+                res,
+                explicit: undefined,
+                reason: "acp_executor_lost",
+              })
+            ) {
+              continue;
+            }
+            return;
+          }
+          this.pendingRollovers.delete(task.id);
+          const detail = res.text.trim().slice(-240);
+          const failures = res.toolFailures?.length
+            ? ` Last tool failure: ${res.toolFailures[res.toolFailures.length - 1]!.slice(0, 200)}`
+            : "";
+          const baseSummary =
+            res.stopReason === "cancelled"
+              ? `Runner ended the session as cancelled without a harness cancellation [${ACP_EXECUTOR_LOST_ERROR_CODE}].${failures}`
+              : detail
+                ? `Task runner reported an error [${ACP_EXECUTOR_LOST_ERROR_CODE}]: ${detail}`
+                : `Task runner reported an error [${ACP_EXECUTOR_LOST_ERROR_CODE}].`;
+          const fallbackReason =
+            res.stopReason === "cancelled"
+              ? ACP_EXECUTOR_LOST_ERROR_CODE
+              : detail
+                ? `${ACP_EXECUTOR_LOST_ERROR_CODE}: ${detail}`
+                : ACP_EXECUTOR_LOST_ERROR_CODE;
+          await this.settleWithoutReturn(
+            exec,
+            runnerGen,
+            latest,
+            run,
+            wt,
+            res,
+            "failed",
+            baseSummary,
+            fallbackReason,
+          );
+          return;
+        }
+
         // Clean rollover requested via explicit `request_rollover`, the context threshold, or a provider context overflow.
         // Turn and generation counts never force a rollover or stop a task.
         const explicitRollover = this.pendingRollovers.get(task.id);
@@ -2966,24 +3059,6 @@ export class HarnessOrchestrator {
               why ? `cancelled: ${why}` : "cancelled",
               { exec, expectedGeneration: runnerGen, allowAborted: true },
             );
-          }
-          return;
-        }
-        if (res.errorCode === ACP_EXECUTOR_LOST_ERROR_CODE && latest.tier === 1) {
-          if (
-            await this.rollOver({
-              exec,
-              runnerGen,
-              run,
-              latest,
-              wt,
-              priorHandoff: handoff,
-              res,
-              explicit: undefined,
-              reason: "acp_executor_lost",
-            })
-          ) {
-            continue;
           }
           return;
         }
@@ -3596,15 +3671,24 @@ export class HarnessOrchestrator {
       const excerpt = lastText.length > 600 ? `…${lastText.slice(-600)}` : lastText;
       nextActions.push(`Predecessor gen ${input.task.generation} final progress note: ${excerpt}`);
     }
-    if (nextActions.length === 0) {
-      nextActions.push("Resume from authoritative SQLite Task Tree, Blackboard, and Artifact Index.");
+    const preservePriorLists = input.result.errorCode === ACP_EXECUTOR_LOST_ERROR_CODE;
+    const finalActiveRisks =
+      preservePriorLists && Array.isArray(input.priorHandoff?.activeRisks) && input.priorHandoff.activeRisks.length > 0
+        ? mergeUnique(activeRisks, input.priorHandoff.activeRisks)
+        : activeRisks;
+    const finalNextActions =
+      preservePriorLists && Array.isArray(input.priorHandoff?.nextActions) && input.priorHandoff.nextActions.length > 0
+        ? mergeUnique(input.priorHandoff.nextActions, nextActions)
+        : nextActions;
+    if (finalNextActions.length === 0) {
+      finalNextActions.push("Resume from authoritative SQLite Task Tree, Blackboard, and Artifact Index.");
     }
 
     return {
       goalInvariants: mergeUnique(priorInvariants.length > 0 ? priorInvariants : [input.task.objective], []),
       architecturalDecisions: priorDecisions,
-      activeRisks,
-      nextActions,
+      activeRisks: finalActiveRisks,
+      nextActions: finalNextActions,
     };
   }
 
@@ -3966,6 +4050,27 @@ export class HarnessOrchestrator {
   }
 
   /**
+   * Routes a steer synchronously to a task's active blocking wait (`wait_children` or `wait_timer`):
+   * appends to `pendingSteers`, wakes timer waiters, and emits `agent.steered` with `mode: "queued_wait"`.
+   */
+  private enqueueBlockingWaitSteer(taskId: string, message: string): "queued_wait" | "queue_full" {
+    const queue = this.pendingSteers.get(taskId) ?? [];
+    if (queue.length >= MAX_PENDING_STEERS) return "queue_full";
+    this.pendingSteers.set(taskId, [...queue, message]);
+    this.db.timers.wakeTaskWaiters(taskId, "steered");
+    const task = this.db.getTask(taskId);
+    if (task) {
+      this.db.emitEvent(task.runId, taskId, "agent.steered", {
+        message,
+        accepted: true,
+        mode: "queued_wait",
+        live: true,
+      });
+    }
+    return "queued_wait";
+  }
+
+  /**
    * Steers a task and reports exactly how the message will be delivered (native session, the task's current
    * wait_children or wait_timer, or its next turn) or why it was refused. The only await is the native steer; every queue and
    * cap decision after it is synchronous, so concurrent steers never strand a message.
@@ -4016,16 +4121,26 @@ export class HarnessOrchestrator {
     const exec = this.active.get(taskId)!;
 
     // Phase 1 (the only await): a task blocked in wait_children or wait_timer gets the message through that wait instead.
-    let native = false;
+    let chainedOutcome: "native" | "queued_wait" | "queue_full" | "rejected" | "stale" = "rejected";
     // The generation and handle the native steer targets: a completion for an older one is never accepted.
     const sentGeneration = exec.runnerGeneration;
     const sentHandle = exec.handle;
     if (!this.isTaskInBlockingWait(taskId) && sentHandle) {
       try {
-        native = await this.steerHandleChained(exec, sentHandle, message);
+        chainedOutcome = await this.steerHandleChained(taskId, exec, sentHandle, message);
       } catch {
-        native = false;
+        chainedOutcome = "rejected";
       }
+    }
+    if (chainedOutcome === "queued_wait") {
+      // Already enqueued, woke waiters, and emitted agent.steered(queued_wait) synchronously inside the serialized steer step.
+      const current = this.db.getTask(taskId) ?? task;
+      return { steered: true, live: true, mode: "queued_wait", taskId, runId: current.runId, status: current.status };
+    }
+    if (chainedOutcome === "queue_full") {
+      const queued = (this.pendingSteers.get(taskId) ?? []).length;
+      return refuse("queue_full", `Steering was not delivered: task ${taskId} already has ${queued} undelivered steering messages queued.`,
+        "Wait for the task to take the queued steering, then send again.");
     }
 
     // Phase 2 (sync, no await before return): re-read everything.
@@ -4035,13 +4150,16 @@ export class HarnessOrchestrator {
         : null
     ) ?? refuseSettledOrStopped();
     if (late) return late;
+    if (chainedOutcome === "stale") {
+      return refuse("no_session", `Steering was not delivered: task ${taskId} moved to a new session while the steer was in flight.`, resumeHint(this.db.getTask(taskId) ?? task));
+    }
     const current = this.db.getTask(taskId)!;
     const accept = (mode: "native" | "queued_wait" | "queued_turn"): SteerTaskResult => {
       const live = mode === "native" || mode === "queued_wait";
       this.db.emitEvent(current.runId, taskId, "agent.steered", { message, accepted: true, mode, live });
       return { steered: true, live, mode, taskId, runId: current.runId, status: this.db.getTask(taskId)?.status ?? current.status };
     };
-    if (native) return accept("native");
+    if (chainedOutcome === "native") return accept("native");
     const queue = this.pendingSteers.get(taskId) ?? [];
     const queued = queue.length;
     if (queued >= MAX_PENDING_STEERS) {
@@ -4050,9 +4168,8 @@ export class HarnessOrchestrator {
     }
     if (this.isTaskInBlockingWait(taskId)) {
       // The waiter's agent.steered listener (wait_children) or wakeTaskWaiters (wait_timer) ends its wait synchronously; costs no continuation.
-      this.pendingSteers.set(taskId, [...queue, message]);
-      this.db.timers.wakeTaskWaiters(taskId, "steered");
-      return accept("queued_wait");
+      this.enqueueBlockingWaitSteer(taskId, message);
+      return { steered: true, live: true, mode: "queued_wait", taskId, runId: current.runId, status: this.db.getTask(taskId)?.status ?? current.status };
     }
     const used = this.steerContinuations.get(taskId) ?? 0;
     if (queued === 0 && used >= MAX_STEER_CONTINUATIONS) {
@@ -4244,17 +4361,53 @@ export class HarnessOrchestrator {
 
   /**
    * Sends a steer to the execution's current handle. Every native steer goes through one chain, so a steer never
-   * overtakes earlier ones (including queued-before-handle steers) still draining; false when the session moved on.
+   * overtakes earlier ones (including queued-before-handle steers) still draining; re-checks blocking waits inside
+   * the serialized step so a steer queued behind an in-flight native steer never calls `handle.steer` once the task
+   * enters `wait_children` or `wait_timer`.
    */
-  private steerHandleChained(exec: ActiveTaskExecution, handle: RunnerExecutionHandle, message: string): Promise<boolean> {
+  private steerHandleChained(
+    taskId: string,
+    exec: ActiveTaskExecution,
+    handle: RunnerExecutionHandle,
+    message: string,
+  ): Promise<"native" | "queued_wait" | "queue_full" | "rejected" | "stale"> {
     const expectedGen = exec.runnerGeneration;
-    const stale = () => exec.handle !== handle || exec.runnerGeneration !== expectedGen || exec.abort.signal.aborted;
-    const step = (exec.steerChain ?? Promise.resolve()).then(async () => {
-      if (stale()) return false;
-      const accepted = await handle.steer(message);
-      // A completion that arrives after the session rolled over or ended belongs to no live session.
-      return accepted && !stale();
-    });
+    const stale = () => {
+      if (
+        this.active.get(taskId) !== exec ||
+        exec.handle !== handle ||
+        exec.runnerGeneration !== expectedGen ||
+        exec.abort.signal.aborted ||
+        exec.phase === "settling"
+      ) {
+        return true;
+      }
+      const t = this.db.getTask(taskId);
+      if (!t || TERMINAL_TASK_STATUSES.has(t.status)) return true;
+      const run = this.db.getRun(t.runId);
+      return Boolean(run && run.status === "stopped" && !isDirectorTaskContainer(t.runId));
+    };
+    const step = (exec.steerChain ?? Promise.resolve()).then(
+      async (): Promise<"native" | "queued_wait" | "queue_full" | "rejected" | "stale"> => {
+        if (stale()) return "stale";
+        if (this.isTaskInBlockingWait(taskId)) {
+          return this.enqueueBlockingWaitSteer(taskId, message);
+        }
+        let accepted = false;
+        try {
+          accepted = await handle.steer(message);
+        } catch {
+          accepted = false;
+        }
+        // A completion that arrives after the session rolled over or ended belongs to no live session.
+        if (stale()) return "stale";
+        if (accepted) return "native";
+        if (this.isTaskInBlockingWait(taskId)) {
+          return this.enqueueBlockingWaitSteer(taskId, message);
+        }
+        return "rejected";
+      },
+    );
     exec.steerChain = step.then(() => {}, () => {});
     return step;
   }
@@ -4354,17 +4507,31 @@ export class HarnessOrchestrator {
     const sentGen = exec.runnerGeneration;
     const notices = this.advisories.take(taskId);
     if (notices.length === 0) return;
-    const pending = (async () => {
-      const ok = await this.steerHandleChained(exec, handle, notices.map(formatNotice).join("\n\n")).catch(() => false);
+    const isLiveNow = () =>
+      this.active.get(taskId) === exec &&
+      exec.phase === "running" &&
+      exec.handle === handle &&
+      exec.runnerGeneration === sentGen &&
+      !exec.abort.signal.aborted &&
+      handle.turnOpen?.() === true &&
+      !this.isTaskInBlockingWait(taskId);
+    const step = (exec.steerChain ?? Promise.resolve()).then(async () => {
+      if (!isLiveNow()) return false;
+      const accepted = await handle.steer(notices.map(formatNotice).join("\n\n")).catch(() => false);
       const stillOpen =
         this.active.get(taskId) === exec &&
         exec.phase === "running" &&
         exec.handle === handle &&
         exec.runnerGeneration === sentGen &&
+        !exec.abort.signal.aborted &&
         handle.turnOpen?.() === true;
-      if (ok && stillOpen) this.advisories.delivered(taskId, notices, "steer");
+      return accepted && stillOpen;
+    });
+    exec.steerChain = step.then(() => {}, () => {});
+    const pending = step.then((ok) => {
+      if (ok) this.advisories.delivered(taskId, notices, "steer");
       else this.advisories.requeue(taskId, notices);
-    })();
+    });
     const prev = exec.liveSteerPending;
     const chained = prev ? prev.then(() => pending, () => pending) : pending;
     exec.liveSteerPending = chained;
@@ -4389,20 +4556,8 @@ export class HarnessOrchestrator {
     if (!exec || exec.abort.signal.aborted || exec.phase === "settling") return { delivered: false, mode: "none" };
     if (exec.promptBuilt !== true) return { delivered: true, mode: "initial_prompt" };
     const deliverViaBlockingWait = (): { delivered: boolean; mode: "queued_wait" | "none" } => {
-      const queue = this.pendingSteers.get(taskId) ?? [];
-      if (queue.length >= MAX_PENDING_STEERS) return { delivered: false, mode: "none" };
-      this.pendingSteers.set(taskId, [...queue, message]);
-      this.db.timers.wakeTaskWaiters(taskId, "steered");
-      const task = this.db.getTask(taskId);
-      if (task) {
-        this.db.emitEvent(task.runId, taskId, "agent.steered", {
-          message,
-          accepted: true,
-          mode: "queued_wait",
-          live: true,
-        });
-      }
-      return { delivered: true, mode: "queued_wait" };
+      const waitOutcome = this.enqueueBlockingWaitSteer(taskId, message);
+      return waitOutcome === "queued_wait" ? { delivered: true, mode: "queued_wait" } : { delivered: false, mode: "none" };
     };
     if (this.isTaskInBlockingWait(taskId)) {
       return deliverViaBlockingWait();
@@ -4410,7 +4565,13 @@ export class HarnessOrchestrator {
     if (exec.handle) {
       const sentGeneration = exec.runnerGeneration;
       const sentHandle = exec.handle;
-      const ok = await this.steerHandleChained(exec, sentHandle, message).catch(() => false);
+      const outcome = await this.steerHandleChained(taskId, exec, sentHandle, message).catch(() => "rejected" as const);
+      if (outcome === "queued_wait") {
+        return { delivered: true, mode: "queued_wait" };
+      }
+      if (outcome === "queue_full" || outcome === "stale") {
+        return { delivered: false, mode: "none" };
+      }
       // A completion for an older session must not be recorded against (or wake) its successor.
       const curExec = this.active.get(taskId);
       if (
@@ -4419,11 +4580,18 @@ export class HarnessOrchestrator {
       ) {
         return { delivered: false, mode: "none" };
       }
+      const ok = outcome === "native";
       if (!ok && this.isTaskInBlockingWait(taskId)) {
         return deliverViaBlockingWait();
       }
       const task = this.db.getTask(taskId);
-      if (task) this.db.emitEvent(task.runId, taskId, "agent.steered", { message, accepted: ok });
+      if (task) {
+        this.db.emitEvent(task.runId, taskId, "agent.steered", {
+          message,
+          accepted: ok,
+          ...(ok ? { mode: "native", live: true } : {}),
+        });
+      }
       return { delivered: ok, mode: ok ? "steer" : "none" };
     }
     (exec.pendingSteers ??= []).push({
@@ -4687,9 +4855,12 @@ export class HarnessOrchestrator {
           }
         }
         if (ev.type === "agent.steered" && ev.taskId !== null && parentIds.has(ev.taskId)) {
-          targets = getTargets();
-          finish("steered");
-          return;
+          const p = ev.payload as { mode?: string; accepted?: boolean } | null;
+          if (p?.mode === "queued_wait" && p.accepted !== false) {
+            targets = getTargets();
+            finish("steered");
+            return;
+          }
         }
         if (ev.type === "task.status" || ev.type === "run.status") {
           checkEvent();
