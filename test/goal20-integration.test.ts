@@ -7,6 +7,7 @@ import { loadConfig } from "../src/config.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import type { GoalCriterion } from "../src/goals/engine.js";
 import type { ChatControlEvent } from "../src/protocol/chat-events.js";
+import { serializeToolResult } from "../src/runners/mcp-bridge.js";
 import { runGit } from "../src/worktree/manager.js";
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
 
@@ -276,6 +277,35 @@ describe("goal-20 integration: DirectorRuntime gate-activity events and compact 
         assert.deepEqual(gateEvents()[3]!.refs, ["ccc1111..ddd2222 feat2 -> feat2"]);
         assert.equal(gateEvents()[3]!.toolCallId, "c5");
 
+        // Fetch followed by a rejected push (status: failed) must NOT emit remote_push from fetch's ref line (P2 fetch-then-push).
+        daemon.db.emitEvent(run.id, worker.id, "agent.tool", {
+          id: "c6",
+          name: "Bash",
+          kind: "execute",
+          status: "failed",
+          title: "Bash",
+          args: JSON.stringify({ command: "git fetch && git push origin main" }),
+          error:
+            "From origin\n   1234567..89abcde  main -> origin/main\nTo origin\n ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs",
+        });
+        assert.equal(gateEvents().length, 4, "fetch ref line before rejected push must not trigger remote_push");
+
+        // Partial deletion push ('- [deleted] topic' + rejected main, status: failed) MUST emit confirmed remote_push (P2 deletion).
+        daemon.db.emitEvent(run.id, worker.id, "agent.tool", {
+          id: "c7",
+          name: "Bash",
+          kind: "execute",
+          status: "failed",
+          title: "Bash",
+          args: JSON.stringify({ command: "git push origin :topic :main" }),
+          error:
+            "To origin\n - [deleted]         topic\n ! [rejected]        main -> main (remote rejected)\nerror: failed to push some refs",
+        });
+        assert.equal(gateEvents().length, 5);
+        assert.equal(gateEvents()[4]!.confirmed, true);
+        assert.deepEqual(gateEvents()[4]!.refs, ["[deleted] topic"]);
+        assert.equal(gateEvents()[4]!.toolCallId, "c7");
+
         // When wakes are disabled, gate activity is still recorded as a system_notice turn.
         daemon.director.updateConfig({
           ...config,
@@ -290,7 +320,7 @@ describe("goal-20 integration: DirectorRuntime gate-activity events and compact 
           objective: "Edit files",
           profileId: "fixture",
         });
-        assert.equal(gateEvents().length, 4, "must not call wakeHandler when wakeDirectorOnGoalSettle is false");
+        assert.equal(gateEvents().length, 5, "must not call wakeHandler when wakeDirectorOnGoalSettle is false");
         const notices = daemon.director.chats
           .getHistory(chat.id)
           .filter((t) => t.role === "system_notice" && t.event?.kind === "goal.gate_activity");
@@ -541,8 +571,8 @@ describe("goal-20 integration: DirectorRuntime gate-activity events and compact 
 
         await daemon.director.sendChatMessage(chat.id, "inspect large goal");
         assert.ok(defaultResult, "expected default goal_get result");
-        const serialized = JSON.stringify(defaultResult);
-        assert.ok(serialized.length < 50_000, `expected <50,000 chars, got ${serialized.length}`);
+        const serialized = serializeToolResult(defaultResult);
+        assert.ok(serialized.length <= 40_000, `expected <=40,000 wire chars, got ${serialized.length}`);
         assert.equal(typeof defaultResult.presentation_id, "string");
 
         const criteriaOut = defaultResult.criteria as Array<{ id: string; status: string }>;
@@ -567,7 +597,7 @@ describe("goal-20 integration: DirectorRuntime gate-activity events and compact 
 
         // Verify paging through Director tool path.
         assert.ok(pagedResult, "expected paged goal_get result");
-        assert.ok(JSON.stringify(pagedResult).length < 50_000);
+        assert.ok(serializeToolResult(pagedResult).length <= 40_000);
         const pagedReviews = pagedResult.reviews as Array<{ cycle: number; criteriaResults?: unknown[] }>;
         assert.deepEqual(
           pagedReviews.map((r) => r.cycle),
@@ -706,8 +736,8 @@ describe("goal-20 integration: DirectorRuntime gate-activity events and compact 
           page: { total: number; returned: number; nextCursor: string | null };
           presentation_id: string;
         };
-        const jsonLen30 = JSON.stringify(list30).length;
-        assert.ok(jsonLen30 < 20_000, `expected < 20,000 chars for 30 large goals, got ${jsonLen30}`);
+        const jsonLen30 = serializeToolResult(list30).length;
+        assert.ok(jsonLen30 <= 20_000, `expected <= 20,000 wire chars for 30 large goals, got ${jsonLen30}`);
         assert.deepEqual(list30.page, { total: 30, returned: 30, nextCursor: null });
         assert.deepEqual(new Set(list30.goals.map((g) => g.id)), new Set(first30Ids));
         assert.equal(typeof list30.presentation_id, "string");
@@ -754,7 +784,7 @@ describe("goal-20 integration: DirectorRuntime gate-activity events and compact 
             "goal_list",
             cursor ? { cursor } : {},
           )) as typeof list30;
-          assert.ok(JSON.stringify(res).length < 20_000, `page ${pageCount} exceeded 20,000 chars`);
+          assert.ok(serializeToolResult(res).length <= 20_000, `page ${pageCount} exceeded 20,000 wire chars`);
           assert.equal(res.page.total, 120);
           for (const g of res.goals) {
             assert.ok(!seenIds.has(g.id), `duplicate goal id ${g.id} across pages`);

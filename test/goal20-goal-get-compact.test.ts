@@ -9,6 +9,7 @@ import {
   buildGoalGetResult,
   buildGoalListResult,
   GOAL_GET_LIMITS,
+  GOAL_GET_SECTIONS,
   GOAL_GET_TOOL,
   GOAL_LIST_LIMITS,
   GOAL_LIST_TOOL,
@@ -18,6 +19,7 @@ import {
   type GoalListSummaryInput,
 } from "../src/director/goal-get.js";
 import type { GoalCriterion, GoalRecord, GoalReviewVerdict, GoalStatus } from "../src/goals/engine.js";
+import { serializeToolResult } from "../src/runners/mcp-bridge.js";
 
 function makeSynthesizedDetail(opts: {
   repoRoot: string;
@@ -121,7 +123,14 @@ function makeSynthesizedDetail(opts: {
           remediation: (idx + cycle) % 2 === 1 ? `Fix ${c.id} in cycle ${cycle}: `.padEnd(400, "r") : undefined,
           gate:
             c.kind === "deterministic"
-              ? { cwd: "/tmp/verify", ref: "main", sha: "abc1234", isolated: true, source: "run_base_branch" }
+              ? {
+                  cwd: "/tmp/verify",
+                  ref: "main",
+                  sha: "abc1234",
+                  isolated: true,
+                  source: "run_base_branch",
+                  note: "Verified in detached worktree",
+                }
               : undefined,
         })),
       blockingIssues: Array.from({ length: 15 }, (_, bi) => `Blocking issue ${cycle}.${bi + 1}: `.padEnd(400, "b")),
@@ -256,11 +265,15 @@ describe("buildGoalGetResult compact output and paging", () => {
     try {
       const evidenceDir = join(tmpRepo, ".harness", "goals", "goal-20");
       const detail = makeSynthesizedDetail({ repoRoot: tmpRepo, includeStaleReview: true });
-      const res = buildGoalGetResult(detail, parseGoalGetOptions({}), { evidenceDir, repoRoot: tmpRepo });
+      const res = buildGoalGetResult(detail, parseGoalGetOptions({}), {
+        evidenceDir,
+        repoRoot: tmpRepo,
+        reserveChars: 120,
+      });
 
-      const jsonLen = JSON.stringify(res).length;
-      assert.ok(jsonLen < 50_000, `expected < 50000 chars, got ${jsonLen}`);
-      assert.ok(jsonLen <= GOAL_GET_LIMITS.budgetChars, `expected <= 40000 chars, got ${jsonLen}`);
+      const wireLen = serializeToolResult({ ...res, presentation_id: "00000000-0000-0000-0000-000000000001" }).length;
+      assert.ok(wireLen < 50_000, `expected < 50000 chars, got ${wireLen}`);
+      assert.ok(wireLen <= GOAL_GET_LIMITS.budgetChars, `expected <= 40000 wire chars, got ${wireLen}`);
 
       // Criteria: all 18 ids with valid status; last criterion is not_evaluated despite stale v2 review passing it.
       const criteria = res.criteria as Array<{ id: string; status: string; evaluatedInCycle: number | null }>;
@@ -536,6 +549,9 @@ describe("buildGoalGetResult compact output and paging", () => {
     assert.ok("reviews_before" in props);
     assert.ok(!("reviews_before_cycle" in props));
     assert.ok("description_offset" in props);
+    assert.ok("criteria_offset" in props);
+    assert.match(GOAL_GET_TOOL.description, /criteria_offset/);
+    assert.match(GOAL_GET_TOOL.description, /recentlyResolvedEscalations/);
   });
 
   it("bounds wire JSON <= 40,000 chars for 150 open escalations, huge diagnostics, and quote/newline-heavy descriptions (P1-b)", () => {
@@ -657,12 +673,44 @@ describe("buildGoalGetResult compact output and paging", () => {
       const rev0 = (revRes.reviews as Array<{
         summary: string;
         blockingIssues: string[];
-        criteriaResults: Array<{ evidence?: string; remediation?: string }>;
+        criteriaResults: Array<{
+          evidence?: string;
+          remediation?: string;
+          gate?: { cwd: string; ref: string; sha: string; isolated: boolean; source: string; note?: string };
+        }>;
       }>)[0]!;
       assert.equal(rev0.summary, detail.reviews[1]!.summary);
       assert.deepEqual(rev0.blockingIssues, detail.reviews[1]!.blockingIssues);
       assert.equal(rev0.criteriaResults[0]!.evidence, detail.reviews[1]!.criteriaResults[0]!.evidence);
       assert.equal(rev0.criteriaResults[1]!.remediation, detail.reviews[1]!.criteriaResults[1]!.remediation);
+      // P2: gate provenance includes cwd, ref, sha, isolated, source, and note (matching goal_create docs).
+      assert.deepEqual(rev0.criteriaResults[0]!.gate, {
+        cwd: "/tmp/verify",
+        ref: "main",
+        sha: "abc1234",
+        isolated: true,
+        source: "run_base_branch",
+        note: "Verified in detached worktree",
+      });
+
+      // Default (non-narrow) goal_get also retains gate cwd/ref/sha/isolated/source/note when within budget.
+      const defaultRes = buildGoalGetResult(detail, parseGoalGetOptions({}), {
+        evidenceDir: null,
+        repoRoot: tmpRepo,
+      });
+      const defaultRev0 = (defaultRes.reviews as typeof revRes.reviews as Array<{
+        criteriaResults: Array<{
+          gate?: { cwd: string; ref: string; sha: string; isolated: boolean; source: string; note?: string };
+        }>;
+      }>)[0]!;
+      assert.deepEqual(defaultRev0.criteriaResults[0]!.gate, {
+        cwd: "/tmp/verify",
+        ref: "main",
+        sha: "abc1234",
+        isolated: true,
+        source: "run_base_branch",
+        note: "Verified in detached worktree",
+      });
 
       const runRes = buildGoalGetResult(detail, parseGoalGetOptions({ sections: ["run"] }), {
         evidenceDir: null,
@@ -672,6 +720,180 @@ describe("buildGoalGetResult compact output and paging", () => {
         (t) => t.id === "t-2",
       )!;
       assert.deepEqual(workerOut.artifactPaths, [".harness/artifacts/run-20/t-2/report.md"]);
+    } finally {
+      rmSync(tmpRepo, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds serializeToolResult (indented MCP/ACP wire format) <= 40,000 chars for the 30-task/3-artifact re-review fixture (P1)", () => {
+    const tmpRepo = mkdtempSync(join(tmpdir(), "pi-harness-goal20-p1-wire-"));
+    try {
+      const detail = makeSynthesizedDetail({
+        repoRoot: tmpRepo,
+        descriptionChars: 40_000,
+        criteriaCount: 18,
+        reviewsCount: 12,
+        workerTaskCount: 29,
+      });
+      // Match re-review fixture: short review evidence, 116-char task summaries, 3 artifact paths per task.
+      for (const rev of detail.reviews) {
+        for (const cr of rev.criteriaResults) {
+          cr.evidence = `ok ${cr.criterionId}`;
+          cr.remediation = undefined;
+        }
+      }
+      for (const t of detail.tasks) {
+        t.resultJson = JSON.stringify({
+          summary: `Task ${t.id} completed cleanly `.padEnd(116, "x"),
+          artifact_paths: [
+            `.harness/artifacts/run-20/${t.id}/plan.md`,
+            `.harness/artifacts/run-20/${t.id}/report.md`,
+            `.harness/artifacts/run-20/${t.id}/verify.md`,
+          ],
+        });
+      }
+      const res = buildGoalGetResult(detail, parseGoalGetOptions({}), {
+        evidenceDir: null,
+        repoRoot: tmpRepo,
+        reserveChars: 120,
+      });
+      const wire = serializeToolResult({ ...res, presentation_id: "00000000-0000-0000-0000-000000000001" });
+      assert.ok(wire.length <= GOAL_GET_LIMITS.budgetChars, `expected wire <= 40,000 chars, got ${wire.length}`);
+    } finally {
+      rmSync(tmpRepo, { recursive: true, force: true });
+    }
+  });
+
+  it("clips oversized verifyRef/header scalars before dropping rows and preserves/pages large criterion lists (P2)", () => {
+    const tmpRepo = mkdtempSync(join(tmpdir(), "pi-harness-goal20-p2-scalars-"));
+    try {
+      const presId = "00000000-0000-0000-0000-000000000001";
+
+      // 1. 51,000-char verifyRef (even with zero criteria/reviews/tasks) must stay <= 40,000 wire chars.
+      const emptyDetail = makeSynthesizedDetail({
+        repoRoot: tmpRepo,
+        descriptionChars: 500,
+        criteriaCount: 0,
+        reviewsCount: 0,
+        workerTaskCount: 0,
+      });
+      emptyDetail.goal.verifyRef = "r".repeat(51_000);
+      emptyDetail.goal.title = "t".repeat(51_000);
+      emptyDetail.goal.liveProgress = {
+        phase: "p".repeat(51_000),
+        summary: "ok",
+        updatedAt: 50_000,
+      };
+      const emptyRes = buildGoalGetResult(emptyDetail, parseGoalGetOptions({}), {
+        evidenceDir: null,
+        repoRoot: tmpRepo,
+        reserveChars: 120,
+      });
+      const emptyWire = serializeToolResult({ ...emptyRes, presentation_id: presId });
+      assert.ok(emptyWire.length <= GOAL_GET_LIMITS.budgetChars, `expected <= 40,000 wire chars, got ${emptyWire.length}`);
+      assert.ok((emptyRes.truncated as string[]).includes("goal.header"));
+      const emptyGoal = emptyRes.goal as { verifyRef: string; title: string };
+      assert.ok(emptyGoal.verifyRef.length <= 240);
+      assert.ok(emptyGoal.title.length <= 240);
+
+      // 2. 51,000-char verifyRef on a normal goal clips the header WITHOUT dropping criteria or tasks.
+      const normalDetail = makeSynthesizedDetail({
+        repoRoot: tmpRepo,
+        descriptionChars: 500,
+        criteriaCount: 5,
+        criterionDescChars: 60,
+        reviewsCount: 1,
+        workerTaskCount: 3,
+      });
+      normalDetail.goal.verifyRef = "v".repeat(51_000);
+      normalDetail.reviews[0]!.criteriaResults[0]!.gate = {
+        cwd: "/tmp/verify",
+        ref: "v".repeat(51_000),
+        sha: "abc1234",
+        isolated: true,
+        source: "verify_ref",
+      };
+      const normalRes = buildGoalGetResult(normalDetail, parseGoalGetOptions({}), {
+        evidenceDir: null,
+        repoRoot: tmpRepo,
+        reserveChars: 120,
+      });
+      assert.ok(serializeToolResult({ ...normalRes, presentation_id: presId }).length <= GOAL_GET_LIMITS.budgetChars);
+      assert.equal((normalRes.criteria as unknown[]).length, 5);
+      assert.equal((normalRes.tasks as unknown[]).length, 4);
+
+      // 3. 340 short criteria: ALL 340 IDs + statuses survive in one response via compact {id, status} floor.
+      const detail340 = makeSynthesizedDetail({
+        repoRoot: tmpRepo,
+        descriptionChars: 200,
+        criteriaCount: 340,
+        criterionDescChars: 30,
+        reviewsCount: 1,
+        workerTaskCount: 0,
+      });
+      const res340 = buildGoalGetResult(detail340, parseGoalGetOptions({}), {
+        evidenceDir: null,
+        repoRoot: tmpRepo,
+        reserveChars: 120,
+      });
+      const wire340 = serializeToolResult({ ...res340, presentation_id: presId });
+      assert.ok(wire340.length <= GOAL_GET_LIMITS.budgetChars, `expected 340 criteria <= 40,000 wire chars, got ${wire340.length}`);
+      const crit340 = res340.criteria as Array<{ id: string; status: string }>;
+      assert.equal(crit340.length, 340);
+      assert.deepEqual(
+        crit340.map((c) => c.id),
+        detail340.goal.criteria.map((c) => c.id),
+      );
+      assert.deepEqual(res340.criteriaPage, {
+        offset: 0,
+        total: 340,
+        returned: 340,
+        omitted: 0,
+        nextOffset: null,
+      });
+
+      // 4. 900 short criteria (exceeding 40k even in minimal {id, status} form): pages cleanly via criteria_offset + criteriaPage.nextOffset.
+      const detail900 = makeSynthesizedDetail({
+        repoRoot: tmpRepo,
+        descriptionChars: 200,
+        criteriaCount: 900,
+        criterionDescChars: 20,
+        reviewsCount: 0,
+        workerTaskCount: 0,
+      });
+      const seenCritIds = new Set<string>();
+      let cOffset: number | null = 0;
+      let cPages = 0;
+      while (cOffset !== null) {
+        const pageRes = buildGoalGetResult(
+          detail900,
+          parseGoalGetOptions({ sections: ["criteria"], criteria_offset: cOffset }),
+          { evidenceDir: null, repoRoot: tmpRepo, reserveChars: 120 },
+        );
+        const pageWire = serializeToolResult({ ...pageRes, presentation_id: presId });
+        assert.ok(pageWire.length <= GOAL_GET_LIMITS.budgetChars, `criteria page ${cPages} exceeded 40k: ${pageWire.length}`);
+        const cp = pageRes.criteriaPage as {
+          offset: number;
+          total: number;
+          returned: number;
+          omitted: number;
+          nextOffset: number | null;
+        };
+        assert.equal(cp.offset, cOffset);
+        assert.equal(cp.total, 900);
+        const items = pageRes.criteria as Array<{ id: string; status: string }>;
+        assert.equal(items.length, cp.returned);
+        for (const item of items) {
+          assert.ok(!seenCritIds.has(item.id), `duplicate criterion id ${item.id}`);
+          seenCritIds.add(item.id);
+          assert.ok(["passed", "failed", "not_evaluated"].includes(item.status));
+        }
+        cOffset = cp.nextOffset;
+        cPages++;
+        assert.ok(cPages <= 10, "900 criteria paging must converge");
+      }
+      assert.ok(cPages >= 2, "900 criteria should span >= 2 pages under 40k wire budget");
+      assert.equal(seenCritIds.size, 900);
     } finally {
       rmSync(tmpRepo, { recursive: true, force: true });
     }
@@ -703,6 +925,129 @@ describe("buildGoalGetResult compact output and paging", () => {
       )!;
       assert.equal(taskV2.goalVersion, null);
       assert.equal(taskV2.staleGoalVersion, true);
+    } finally {
+      rmSync(tmpRepo, { recursive: true, force: true });
+    }
+  });
+
+  it("includes capped escalation history with status, clipped resolution, resolvedAt, and omitted count (v3 escalation-history)", () => {
+    const tmpRepo = mkdtempSync(join(tmpdir(), "pi-harness-goal20-eschist-"));
+    try {
+      const presId = "00000000-0000-0000-0000-000000000001";
+      const detail = makeSynthesizedDetail({
+        repoRoot: tmpRepo,
+        descriptionChars: 1_000,
+        criteriaCount: 4,
+        reviewsCount: 1,
+        workerTaskCount: 1,
+      });
+      // Add an acked escalation alongside the open one.
+      detail.openEscalations.push({
+        id: "esc-acked",
+        runId: "run-20",
+        fromTaskId: "t-2",
+        toTaskId: "t-1",
+        severity: "P1",
+        category: "code_defect",
+        title: "Acked defect",
+        evidencePaths: [],
+        attempted: [],
+        suggestedSplits: [],
+        blocking: false,
+        status: "acked",
+        resolution: "Acknowledged note: ".padEnd(400, "a"),
+        createdAt: 4_000,
+        ackedAt: 4_500,
+      });
+      // 14 resolved escalations (input has newest 12 or full 14, total = 14); default caps to newest 10 with omitted: 4.
+      const longResolution = "Resolved via goal_accept override: ".padEnd(500, "z");
+      detail.recentlyResolvedEscalations = Array.from({ length: 12 }, (_, i) => ({
+        id: `esc-res-${i + 1}`,
+        fromTaskId: "t-1",
+        severity: i % 2 === 0 ? "P0" : "P1",
+        category: "verification_failed",
+        title: `Resolved issue ${i + 1}`,
+        resolution: i === 11 ? longResolution : `Fixed item ${i + 1}`,
+        resolvedAt: 10_000 + i * 1_000,
+      }));
+      detail.resolvedEscalationsTotal = 14;
+
+      // 1. Default compact goal_get: newest 10 resolved, status/resolution/resolvedAt present, resolution clipped, omitted = 4.
+      const compact = buildGoalGetResult(detail, parseGoalGetOptions({}), {
+        evidenceDir: null,
+        repoRoot: tmpRepo,
+        reserveChars: 120,
+      });
+      assert.ok(serializeToolResult({ ...compact, presentation_id: presId }).length <= GOAL_GET_LIMITS.budgetChars);
+      const compactOpen = compact.openEscalations as Array<{
+        id: string;
+        status: string;
+        resolution?: string;
+        ackedAt?: number;
+      }>;
+      const ackedEntry = compactOpen.find((e) => e.id === "esc-acked")!;
+      assert.equal(ackedEntry.status, "acked");
+      assert.equal(ackedEntry.ackedAt, 4_500);
+      assert.ok(ackedEntry.resolution && ackedEntry.resolution.length <= GOAL_GET_LIMITS.escalationResolution);
+
+      const compactResolved = compact.recentlyResolvedEscalations as Array<{
+        id: string;
+        status: string;
+        resolution: string;
+        resolvedAt: number | null;
+      }>;
+      assert.equal(compactResolved.length, 10);
+      assert.equal(compactResolved[0]!.id, "esc-res-12");
+      assert.equal(compactResolved[0]!.status, "resolved");
+      assert.equal(compactResolved[0]!.resolvedAt, 21_000);
+      assert.ok(compactResolved[0]!.resolution.length <= GOAL_GET_LIMITS.escalationResolution);
+      assert.equal(compactResolved[9]!.id, "esc-res-3");
+      assert.deepEqual(compact.recentlyResolvedEscalationsPage, { total: 14, returned: 10, omitted: 4 });
+
+      // 2. Full sections form includes escalation history too.
+      const full = buildGoalGetResult(detail, parseGoalGetOptions({ sections: [...GOAL_GET_SECTIONS] }), {
+        evidenceDir: null,
+        repoRoot: tmpRepo,
+        reserveChars: 120,
+      });
+      assert.ok(serializeToolResult({ ...full, presentation_id: presId }).length <= GOAL_GET_LIMITS.budgetChars);
+      assert.equal((full.recentlyResolvedEscalations as unknown[]).length, 10);
+      assert.deepEqual(full.recentlyResolvedEscalationsPage, { total: 14, returned: 10, omitted: 4 });
+
+      // 3. Narrow sections: ['escalations'] returns unclipped resolution when within budget.
+      const narrow = buildGoalGetResult(detail, parseGoalGetOptions({ sections: ["escalations"] }), {
+        evidenceDir: null,
+        repoRoot: tmpRepo,
+        reserveChars: 120,
+      });
+      const narrowResolved = narrow.recentlyResolvedEscalations as Array<{ id: string; resolution: string }>;
+      assert.equal(narrowResolved[0]!.resolution, longResolution);
+
+      // 4. Adversarial huge resolutions stay strictly <= 40,000 wire chars.
+      const hugeDetail = makeSynthesizedDetail({
+        repoRoot: tmpRepo,
+        descriptionChars: 1_000,
+        criteriaCount: 2,
+        reviewsCount: 0,
+        workerTaskCount: 0,
+      });
+      hugeDetail.recentlyResolvedEscalations = Array.from({ length: 10 }, (_, i) => ({
+        id: `esc-huge-${i + 1}`,
+        fromTaskId: "t-1",
+        severity: "P0",
+        category: "verification_failed",
+        title: `Huge ${i + 1}: `.padEnd(6_000, "t"),
+        resolution: `Resolution ${i + 1}: `.padEnd(10_000, "r"),
+        resolvedAt: 20_000 + i * 100,
+      }));
+      const hugeNarrow = buildGoalGetResult(hugeDetail, parseGoalGetOptions({ sections: ["escalations"] }), {
+        evidenceDir: null,
+        repoRoot: tmpRepo,
+        reserveChars: 120,
+      });
+      const hugeWire = serializeToolResult({ ...hugeNarrow, presentation_id: presId });
+      assert.ok(hugeWire.length <= GOAL_GET_LIMITS.budgetChars, `expected <= 40,000 wire chars, got ${hugeWire.length}`);
+      assert.ok((hugeNarrow.truncated as string[]).includes("escalations.compact"));
     } finally {
       rmSync(tmpRepo, { recursive: true, force: true });
     }
@@ -803,11 +1148,12 @@ describe("goal-20 compact goal_list", () => {
     assert.throws(() => parseGoalListOptions({ status: "bogus" }), /Unknown goal_list status/);
   });
 
-  it("returns < 20,000 chars for 30 goals with 40KB descriptions and picks version-aware latestReview", () => {
+  it("returns < 20,000 wire chars (serializeToolResult) for 30 goals with 40KB descriptions, 160-quote titles, and limit=100 (P1)", () => {
+    const presId = "00000000-0000-0000-0000-000000000001";
     const summaries = Array.from({ length: 30 }, (_, i) => makeGoalSummary(i + 1));
     const res = buildGoalListResult(summaries, parseGoalListOptions({}), { reserveChars: 120 });
-    const serialized = JSON.stringify(res);
-    assert.ok(serialized.length < GOAL_LIST_LIMITS.budgetChars, `expected < 20,000 chars, got ${serialized.length}`);
+    const serialized = serializeToolResult({ ...res, presentation_id: presId });
+    assert.ok(serialized.length <= GOAL_LIST_LIMITS.budgetChars, `expected <= 20,000 wire chars, got ${serialized.length}`);
     assert.deepEqual(res.page, { total: 30, returned: 30, nextCursor: null });
 
     const ids = new Set(res.goals.map((g) => g.id));
@@ -824,6 +1170,30 @@ describe("goal-20 compact goal_list", () => {
         assert.equal(item.latestReview.cycle, 3);
       }
     }
+
+    // Re-review P1 fixture: 30 goals with 40KB descriptions and 160-quote titles must stay <= 20,000 wire chars.
+    const quotedSummaries = Array.from({ length: 30 }, (_, i) =>
+      makeGoalSummary(i + 1, { title: '"'.repeat(160) }),
+    );
+    const quotedRes = buildGoalListResult(quotedSummaries, parseGoalListOptions({}), { reserveChars: 120 });
+    const quotedWire = serializeToolResult({ ...quotedRes, presentation_id: presId });
+    assert.ok(
+      quotedWire.length <= GOAL_LIST_LIMITS.budgetChars,
+      `expected 30 quoted-title goals <= 20,000 wire chars, got ${quotedWire.length}`,
+    );
+    assert.equal(quotedRes.page.returned, 30);
+
+    // Re-review P1 fixture: limit=100 with ordinary titles must stay <= 20,000 wire chars and set nextCursor.
+    const ordinary100 = Array.from({ length: 100 }, (_, i) =>
+      makeGoalSummary(i + 1, { title: `Ordinary goal title ${i + 1}` }),
+    );
+    const page100 = buildGoalListResult(ordinary100, parseGoalListOptions({ limit: 100 }), { reserveChars: 120 });
+    const wire100 = serializeToolResult({ ...page100, presentation_id: presId });
+    assert.ok(
+      wire100.length <= GOAL_LIST_LIMITS.budgetChars,
+      `expected limit=100 <= 20,000 wire chars, got ${wire100.length}`,
+    );
+    assert.ok(page100.page.returned < 100 && page100.page.nextCursor !== null);
   });
 
   it("filters by status and pages 120 goals (with equal timestamps and size-guard caps) without duplicates or skips", () => {
@@ -875,7 +1245,7 @@ describe("goal-20 compact goal_list", () => {
         parseGoalListOptions(cursor ? { limit: 100, cursor } : { limit: 100 }),
         { reserveChars: 120 },
       );
-      assert.ok(JSON.stringify(pageRes).length <= GOAL_LIST_LIMITS.budgetChars - 120);
+      assert.ok(serializeToolResult(pageRes).length <= GOAL_LIST_LIMITS.budgetChars - 120);
       if (pageRes.page.nextCursor !== null && pageRes.page.returned < 100) {
         sawSizeGuardTrim = true;
       }

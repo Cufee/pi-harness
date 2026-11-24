@@ -58,6 +58,14 @@ async function daemonCall(socketPath: string, op: RpcRequest["op"], params: Reco
   });
 }
 
+/**
+ * Serializes a daemon tool result into the exact text payload sent over MCP/ACP.
+ * Shared with size-bounded builders (e.g. `goal_get`, `goal_list`) so budget checks match wire output.
+ */
+export function serializeToolResult(result: unknown): string {
+  return typeof result === "string" ? result : JSON.stringify(result, null, 2);
+}
+
 export async function startStdioMcpBridge(opts?: { socketPath?: string; runId?: string; taskId?: string }): Promise<void> {
   const socketPath = opts?.socketPath ?? process.env.PI_HARNESS_SOCKET;
   const runId = opts?.runId ?? process.env.PI_HARNESS_RUN_ID;
@@ -99,7 +107,7 @@ export async function startStdioMcpBridge(opts?: { socketPath?: string; runId?: 
       });
       return {
         ...(name === CODE_EXEC_TOOL_NAME && (result as CodeExecResult | null | undefined)?.ok === false ? { isError: true } : {}),
-        content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result, null, 2) }],
+        content: [{ type: "text", text: serializeToolResult(result) }],
       };
     } catch (err) {
       return {

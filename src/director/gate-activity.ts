@@ -75,11 +75,13 @@ export function isShellToolEvent(payload: { kind?: unknown; name?: unknown; titl
   return false;
 }
 
-const REF_UPDATE_RE =
-  /^\s*([+*!= -]?)\s*(\S+?\.\.\.?\S+|\[new (?:branch|tag)\]|\[deleted\])\s+(\S+)\s+->\s+(\S+)/gm;
-const PORCELAIN_REF_UPDATE_RE =
-  /^([+* -])\t(\S*):(\S+)\t(\S+?\.\.\.?\S+|\[new (?:branch|tag)\]|\[deleted\])/gm;
-const REMOTE_TO_RE = /^\s*To\s+(\S+)/m;
+const REF_UPDATE_LINE_RE =
+  /^\s*([+*!= -]?)\s*(\S+?\.\.\.?\S+|\[new (?:branch|tag|reference)\]|\[deleted\])\s+(\S+)\s+->\s+(\S+)/;
+const REF_DELETE_LINE_RE = /^\s*-\s+\[deleted\]\s+(\S+)(?:\s+\([^)]*\))?\s*$/;
+const PORCELAIN_REF_UPDATE_LINE_RE =
+  /^([+* -])\t(\S*):(\S+)\t(\S+?\.\.\.?\S+|\[new (?:branch|tag|reference)\]|\[deleted\])/;
+const REMOTE_TO_LINE_RE = /^\s*To\s+(\S+)/;
+const REMOTE_FROM_LINE_RE = /^\s*From\s+(\S+)/;
 const NO_PUSH_RESULT_RE = /(?:Everything up-to-date|\[up to date\]|\[rejected\]|^\s*(?:error|fatal):)/im;
 
 const PUSH_FLAGS_WITH_VALUE = new Set([
@@ -460,6 +462,74 @@ function hasDryRunPushFlag(pushArgs: string[]): boolean {
   return false;
 }
 
+function unwrapCommandStartIndex(tokens: ShellToken[]): number {
+  let idx = 0;
+  // Strip leading shell keywords, env assignments, and command wrappers (`env`, `command`, `exec`, `nohup`, `sudo`).
+  while (idx < tokens.length) {
+    const tok = tokens[idx]!.value;
+    if (SHELL_LEADING_KEYWORDS.has(tok) || ENV_ASSIGN_RE.test(tok)) {
+      idx++;
+      continue;
+    }
+    if (tok === "command" || tok === "exec" || tok === "nohup") {
+      idx++;
+      while (idx < tokens.length && tokens[idx]!.value.startsWith("-")) idx++;
+      continue;
+    }
+    if (tok === "env") {
+      idx++;
+      while (idx < tokens.length) {
+        const t = tokens[idx]!.value;
+        if (t === "-u" || t === "-C" || t === "-S") {
+          idx += 2;
+          continue;
+        }
+        if (t.startsWith("-") || ENV_ASSIGN_RE.test(t)) {
+          idx++;
+          continue;
+        }
+        break;
+      }
+      continue;
+    }
+    if (tok === "sudo") {
+      idx++;
+      while (idx < tokens.length) {
+        const t = tokens[idx]!.value;
+        if (t === "-u" || t === "-g" || t === "-C") {
+          idx += 2;
+          continue;
+        }
+        if (t.startsWith("-")) {
+          idx++;
+          continue;
+        }
+        break;
+      }
+      continue;
+    }
+    break;
+  }
+  return idx;
+}
+
+function findGitSubcommandIndex(tokens: ShellToken[], gitIdx: number): number {
+  let subIdx = gitIdx + 1;
+  while (subIdx < tokens.length) {
+    const t = tokens[subIdx]!.value;
+    if (GIT_GLOBAL_FLAGS_WITH_VALUE.has(t)) {
+      subIdx += 2;
+      continue;
+    }
+    if (t.startsWith("-")) {
+      subIdx++;
+      continue;
+    }
+    break;
+  }
+  return subIdx;
+}
+
 function findGitPushInScript(script: string, depth: number): string | null {
   if (depth > 4) return null;
   for (const seg of splitShellSegments(script)) {
@@ -469,54 +539,7 @@ function findGitPushInScript(script: string, depth: number): string | null {
     }
     if (!seg.raw) continue;
     const tokens = tokenizeShellSegment(seg.raw);
-    let idx = 0;
-
-    // Strip leading shell keywords, env assignments, and command wrappers (`env`, `command`, `exec`, `nohup`, `sudo`).
-    while (idx < tokens.length) {
-      const tok = tokens[idx]!.value;
-      if (SHELL_LEADING_KEYWORDS.has(tok) || ENV_ASSIGN_RE.test(tok)) {
-        idx++;
-        continue;
-      }
-      if (tok === "command" || tok === "exec" || tok === "nohup") {
-        idx++;
-        while (idx < tokens.length && tokens[idx]!.value.startsWith("-")) idx++;
-        continue;
-      }
-      if (tok === "env") {
-        idx++;
-        while (idx < tokens.length) {
-          const t = tokens[idx]!.value;
-          if (t === "-u" || t === "-C" || t === "-S") {
-            idx += 2;
-            continue;
-          }
-          if (t.startsWith("-") || ENV_ASSIGN_RE.test(t)) {
-            idx++;
-            continue;
-          }
-          break;
-        }
-        continue;
-      }
-      if (tok === "sudo") {
-        idx++;
-        while (idx < tokens.length) {
-          const t = tokens[idx]!.value;
-          if (t === "-u" || t === "-g" || t === "-C") {
-            idx += 2;
-            continue;
-          }
-          if (t.startsWith("-")) {
-            idx++;
-            continue;
-          }
-          break;
-        }
-        continue;
-      }
-      break;
-    }
+    const idx = unwrapCommandStartIndex(tokens);
 
     if (idx >= tokens.length) continue;
     const cmdToken = tokens[idx]!;
@@ -539,21 +562,7 @@ function findGitPushInScript(script: string, depth: number): string | null {
 
     if (cmd !== "git" && !cmd.endsWith("/git")) continue;
 
-    // Scan git global options between `git` and the subcommand.
-    let subIdx = idx + 1;
-    while (subIdx < tokens.length) {
-      const t = tokens[subIdx]!.value;
-      if (GIT_GLOBAL_FLAGS_WITH_VALUE.has(t)) {
-        subIdx += 2;
-        continue;
-      }
-      if (t.startsWith("-")) {
-        subIdx++;
-        continue;
-      }
-      break;
-    }
-
+    const subIdx = findGitSubcommandIndex(tokens, idx);
     if (subIdx >= tokens.length || tokens[subIdx]!.value !== "push") continue;
     const pushArgs = tokens.slice(subIdx + 1).map((t) => t.value);
     if (hasDryRunPushFlag(pushArgs)) continue;
@@ -561,6 +570,46 @@ function findGitPushInScript(script: string, depth: number): string | null {
     return seg.raw.slice(cmdToken.start).replace(/\s+/g, " ").trim();
   }
   return null;
+}
+
+function hasGitFetchOrPullInScript(script: string, depth: number): boolean {
+  if (depth > 4) return false;
+  for (const seg of splitShellSegments(script)) {
+    for (const sub of seg.substitutions) {
+      if (hasGitFetchOrPullInScript(sub, depth + 1)) return true;
+    }
+    if (!seg.raw) continue;
+    const tokens = tokenizeShellSegment(seg.raw);
+    const idx = unwrapCommandStartIndex(tokens);
+    if (idx >= tokens.length) continue;
+    const cmd = tokens[idx]!.value;
+
+    if (SHELL_BIN_RE.test(cmd)) {
+      for (let i = idx + 1; i < tokens.length; i++) {
+        const t = tokens[i]!.value;
+        if (t === "--") break;
+        if (!t.startsWith("-")) break;
+        if (/^-[a-zA-Z]*c$/.test(t) && tokens[i + 1]) {
+          if (hasGitFetchOrPullInScript(tokens[i + 1]!.value, depth + 1)) return true;
+          break;
+        }
+      }
+      continue;
+    }
+
+    if (cmd !== "git" && !cmd.endsWith("/git")) continue;
+    const subIdx = findGitSubcommandIndex(tokens, idx);
+    const sub = tokens[subIdx]?.value;
+    if (sub === "fetch" || sub === "pull") return true;
+  }
+  return false;
+}
+
+function hasGitFetchOrPull(text: string): boolean {
+  for (const candidate of extractCommandCandidates(text)) {
+    if (hasGitFetchOrPullInScript(candidate, 0)) return true;
+  }
+  return false;
 }
 
 function extractGitPushSegment(text: string): string | null {
@@ -663,33 +712,64 @@ export function detectGitPush(commandText: string, resultText: string | undefine
   }
 
   const normalized = normalizeResultText(resultText);
-  const remoteMatch = REMOTE_TO_RE.exec(normalized);
-  const remote = remoteMatch?.[1]?.trim().slice(0, 200) || cmdRemote;
+  const lines = normalized.split(/\r?\n/);
+  const hasToHeader = lines.some((line) => REMOTE_TO_LINE_RE.test(line));
+  const allowHeaderlessRefs = !hasToHeader && !hasGitFetchOrPull(commandText);
 
+  let section: "unknown" | "from" | "to" = "unknown";
+  let remoteFromOutput: string | undefined;
+  let remoteWithPush: string | undefined;
+  let currentToRemote: string | undefined;
   const refs: string[] = [];
-  REF_UPDATE_RE.lastIndex = 0;
-  let refMatch: RegExpExecArray | null;
-  while ((refMatch = REF_UPDATE_RE.exec(normalized)) !== null) {
-    const flag = refMatch[1] ?? "";
-    if (flag === "!" || flag === "=") continue;
-    const summary = refMatch[2]!;
-    const fromRef = refMatch[3]!;
-    const toRef = refMatch[4]!;
-    refs.push(`${summary} ${fromRef} -> ${toRef}`.slice(0, 200));
-    if (refs.length >= 5) break;
-  }
 
-  if (refs.length === 0) {
-    PORCELAIN_REF_UPDATE_RE.lastIndex = 0;
-    let pMatch: RegExpExecArray | null;
-    while ((pMatch = PORCELAIN_REF_UPDATE_RE.exec(normalized)) !== null) {
+  for (const line of lines) {
+    if (REMOTE_FROM_LINE_RE.test(line)) {
+      section = "from";
+      currentToRemote = undefined;
+      continue;
+    }
+    const toMatch = REMOTE_TO_LINE_RE.exec(line);
+    if (toMatch) {
+      section = "to";
+      currentToRemote = toMatch[1]?.trim().slice(0, 200) || undefined;
+      if (currentToRemote) remoteFromOutput = currentToRemote;
+      continue;
+    }
+
+    const inPushOutput = section === "to" || (allowHeaderlessRefs && section === "unknown");
+    if (!inPushOutput || refs.length >= 5) continue;
+
+    const refMatch = REF_UPDATE_LINE_RE.exec(line);
+    if (refMatch) {
+      const flag = refMatch[1] ?? "";
+      if (flag === "!" || flag === "=") continue;
+      const summary = refMatch[2]!;
+      const fromRef = refMatch[3]!;
+      const toRef = refMatch[4]!;
+      refs.push(`${summary} ${fromRef} -> ${toRef}`.slice(0, 200));
+      if (currentToRemote && !remoteWithPush) remoteWithPush = currentToRemote;
+      continue;
+    }
+
+    const delMatch = REF_DELETE_LINE_RE.exec(line);
+    if (delMatch) {
+      const deletedRef = delMatch[1]!;
+      refs.push(`[deleted] ${deletedRef}`.slice(0, 200));
+      if (currentToRemote && !remoteWithPush) remoteWithPush = currentToRemote;
+      continue;
+    }
+
+    const pMatch = PORCELAIN_REF_UPDATE_LINE_RE.exec(line);
+    if (pMatch) {
       const fromRef = pMatch[2] || "(deleted)";
       const toRef = pMatch[3]!;
       const summary = pMatch[4]!;
       refs.push(`${summary} ${fromRef} -> ${toRef}`.slice(0, 200));
-      if (refs.length >= 5) break;
+      if (currentToRemote && !remoteWithPush) remoteWithPush = currentToRemote;
     }
   }
+
+  const remote = remoteWithPush || remoteFromOutput || cmdRemote;
 
   if (refs.length > 0) {
     return {
