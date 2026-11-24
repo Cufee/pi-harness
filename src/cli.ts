@@ -591,9 +591,12 @@ async function main(): Promise<void> {
   const projectFlag = requireStringFlag(flags, "project") ?? (typeof flags.p === "string" ? flags.p.trim() : undefined);
   const explicitRepoFlag = requireStringFlag(flags, "repo");
   let overlayRootEnv: string | undefined;
+  let socketPathEnv: string | undefined;
   if (cmd === "daemon" && positional[1] === "serve") {
     overlayRootEnv = process.env.PI_HARNESS_OVERLAY_ROOT?.trim() || undefined;
     delete process.env.PI_HARNESS_OVERLAY_ROOT;
+    socketPathEnv = process.env.PI_HARNESS_SOCKET_PATH?.trim() || undefined;
+    delete process.env.PI_HARNESS_SOCKET_PATH;
   }
   const rawRepoRoot = explicitRepoFlag ?? overlayRootEnv ?? process.cwd();
   let repoRoot: string;
@@ -602,7 +605,7 @@ async function main(): Promise<void> {
   } catch {
     repoRoot = resolve(rawRepoRoot);
   }
-  const config = loadConfig(repoRoot);
+  const config = loadConfig(repoRoot, socketPathEnv ? { socketPath: resolve(socketPathEnv) } : undefined);
   const remoteSpec = resolveRemoteSpec(rawRemote, config.remotes);
   const hostCtx = {
     localSocketPath: config.socketPath,
@@ -788,7 +791,6 @@ async function main(): Promise<void> {
         if (reloadCode !== 0) process.exit(reloadCode);
         return;
       }
-      await stopLocalDaemon(config.socketPath);
       const c = await ensureLocalDaemon(config.socketPath);
       c.close();
       console.log("Restarted harnessd.");

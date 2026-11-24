@@ -103,27 +103,32 @@ When stdout is a terminal, or when `PI_HARNESS_RELOAD_WAIT=1`, `install.sh` pass
 | Exit code | Meaning |
 | --- | --- |
 | `0` | Reloaded, accepted, scheduled, skipped, bootstrap notice printed, or no daemon running |
-| `1` | Other error (invalid target, checkout without `--target`, dry-run failure, or supervisor error) |
-| `2` | Confirmation missing for `daemon reload --legacy` without a terminal or `--yes` |
-| `3` | Target release failed to boot and the daemon is back on the previous release |
-| `4` | Timed out waiting for the new release to serve (`--wait`) |
+| `1` | Other error (invalid target, checkout without `--target`, dry-run failure, legacy PID/home mismatch, or supervisor abort recorded in `reload-fallback.txt`) |
+| `2` | Confirmation missing for `daemon reload --legacy` without a terminal or `--yes` (or `--db` pointing at a different database without `--yes`) |
+| `3` | Target release failed to boot (daemon fell back to a restart-safe previous release, or left no daemon running with recovery instructions in `reload-fallback.txt` when the fallback is pre-feature) |
+| `4` | Timed out waiting for the new release to serve (`--wait`); detached supervisor errors that produce neither a serving daemon nor `reload-fallback.txt` can surface as exit `4` |
 
-`install.sh` maps CLI exit `0` to `0`, maps exit `3` to `1` after noting that the install succeeded and `current` still points to the new release, and maps any other non-zero exit code to a warning recommending `pi-harness daemon reload` with exit `0`.
+`install.sh` maps CLI exit `0` to `0`, maps exit `3` to `1` after noting that the install succeeded and `current` still points to the new release, and maps any other non-zero exit code to a warning recommending `pi-harness daemon reload` with exit `0`. A manual `pi-harness daemon reload` targets the already-installed `current` release (or `--target <dir>`) and does not change disk symlinks.
 
 ### Drain and in-place resume
 
-1. **Drain**: when the daemon begins draining, its lifecycle moves to `"draining"`, work-starting RPCs are rejected with `DAEMON_RELOADING: ...`, and timers are suspended without cancelling them. Live Tier 1 orchestrators and Tier 2 workers that are running a session receive a steer asking them to call `request_rollover` within `hotUpdate.drainTimeoutSec` (default `90` seconds). Live Director chat turns receive one `system_notice` asking them to end the turn before the deadline; at the deadline, `stop()` cancels them with buffered text flushed and records their tool calls so a continuation turn runs on startup. Tier 3 task agents, Done-Reviews, verification gates, merges, and `code_exec` scripts are not steered and not waited for; they stop when the drain ends. When no Tier 1/2 agent or Director turn is running, the drain finishes immediately.
-2. **Handover**: the old daemon stops, reaps its child agent process groups, spawns a detached handover supervisor, and exits. The supervisor waits for the old PID to exit and starts the target release.
+1. **Drain**: when the daemon begins draining, its lifecycle moves to `"draining"`, work-starting RPCs are rejected with `DAEMON_RELOADING: ...`, and timers are suspended without cancelling them. Live Tier 1 orchestrators and Tier 2 workers that are running a session receive a steer asking them to call `request_rollover` within `hotUpdate.drainTimeoutSec` (default `90` seconds, read when the drain starts). Live Director chat turns receive one `system_notice` asking them to end the turn before the deadline; at the deadline, `stop()` cancels them (waiting up to 5 seconds) to flush buffered text and record their tool calls so a continuation turn runs on startup. Steer delivery is raced against the drain deadline so an unresponsive steer never extends the drain. Tier 3 task agents, Done-Reviews, verification gates, merges, and `code_exec` scripts are not steered and not waited for; they stop when the drain ends. When no Tier 1/2 agent or Director turn is running, the drain finishes immediately.
+2. **Handover**: the old daemon captures child agent process groups, stops, reaps those groups, spawns a detached handover supervisor, and exits. The supervisor waits for the old PID to exit (sending `SIGKILL` after the wait if needed), reaps any surviving captured process groups, refuses to start a successor if the old PID is still alive (recording the reason in `<sockDir>/reload-fallback.txt` and exiting `1`), and starts the target release with the stopped daemon's home and socket path.
 3. **In-place resume**: the new daemon recovers interrupted tasks of `active` and `paused_quota` runs (plus children of Director containers) in place, keeping the same task IDs, worktrees, write leases, and generation counts without marking tasks `failed` or `cancelled`. Pending timers (`wait_timer` and `schedule_timer`) stay `pending` and fire once into the resumed task. Queued Director wakeups captured at stop are replayed once. Tasks in runs whose stored status is not `active` or `paused_quota` keep the legacy failure behavior.
 4. **What is redone and cost**: interrupted merges are closed as `ci_failed` and re-run CI when the worker resumes; interrupted Done-Reviews are cancelled and replayed (re-running verification gates and the reviewer); active PTYs, `code_exec` scripts, and in-memory quota `--in` timers do not survive a restart. Each live Tier 1/2 agent spends one extra model turn on cached context to write its rollover handoff, and each resumed agent hydrates fresh context and re-reads working files (expect roughly 1 to 5 minutes per active agent to return to steady state).
 
 ### Rate limit
 
-While agents are live, install-triggered reloads are rate-limited to at most once every `hotUpdate.minIntervalSec` seconds (default `900`, 15 minutes) since the daemon started. An idle daemon reloads immediately. An install inside the cooldown window receives a `scheduled` reply naming the UTC due time and exits `0` immediately even with `--wait`; later installs during the window coalesce to the newest target release while keeping the original due time. Running `pi-harness daemon reload` directly (or with `--now`) bypasses the rate limit and drains immediately.
+While agents are live, install-triggered reloads are rate-limited to at most once every `hotUpdate.minIntervalSec` seconds (default `900`, 15 minutes) since the daemon started. An idle daemon reloads immediately. An install inside the cooldown window receives a `scheduled` reply naming the UTC due time and exits `0` immediately even with `--wait`; later installs during the window coalesce to the newest target release while keeping the original due time. Re-installing the release the daemon already runs clears a scheduled reload to another target and returns `already_current`. Running `pi-harness daemon reload` directly (or with `--now`) bypasses the rate limit and drains immediately.
 
 ### Fallback on boot failure
 
-The supervisor waits up to 20 seconds for the target release to answer `ping` with the expected `releaseId`. If the target exits early or times out, the supervisor restarts the previous release with `reload.lastError` set to `{ targetReleaseId, error }`, and that release's startup recovery resumes active work. `current` is left pointing to the newly installed release so you can inspect or fix it without the installer reverting symlinks. Callers waiting with `--wait` exit `3`, `install.sh` exits `1`, and `pi-harness daemon status` shows `reload.lastError`.
+The supervisor waits up to 20 seconds for the target release to answer `ping` with the expected `releaseId`. If the target exits early or times out:
+
+- When the previous release is restart-safe (`release.json` and `restartSafe: true`), the supervisor restarts it with `reload.lastError` set to `{ targetReleaseId, error }`, and that release's startup recovery resumes active work. Callers waiting with `--wait` exit `3` (including on a forced same-release restart that fell back), `install.sh` exits `1`, and `pi-harness daemon status` shows `reload.lastError`.
+- When the only fallback is a pre-feature release (no `release.json` or no `restartSafe` in its `ping`), the supervisor fails closed instead of auto-starting it: it leaves no daemon running, writes recovery instructions to `daemon.log` and `<sockDir>/reload-fallback.txt`, and `--wait` prints that file and exits `3`.
+
+In both cases `current` is left pointing to the newly installed release so you can inspect or fix it without the installer reverting symlinks.
 
 ### TUI reconnect
 
@@ -148,21 +153,29 @@ Run `pi-harness daemon recover --dry-run [--db <path>] [--json]` at any time to 
 
 ### First activation
 
-A daemon started from a build that predates hot-update support omits `reload` from `ping`. Running `install.sh` or `pi-harness daemon reload` against it activates the new release on disk, prints the bootstrap notice, and exits `0` without touching the running daemon.
+A daemon started from a build that predates hot-update support omits `reload` from `ping`. Running `install.sh` activates the new release on disk, prints the bootstrap notice, and exits `0` without touching the running daemon. Running `pi-harness daemon reload` manually targets the already-installed `current` release without changing symlinks, prints the same notice, and exits `0`.
 
 Never run `pi-harness daemon stop` or `pi-harness daemon restart` against a pre-feature daemon while runs are active. Those commands skip child process-group reaping and `wait_timer` revival, which leaves old agents running beside resumed copies and leaves cancelled `wait_timer` rows cancelled.
 
-`pi-harness daemon reload --legacy` is the only supported first-activation path. Run it from an interactive terminal, never from inside an agent (stopping the old daemon kills agent process groups, which would terminate the command mid-handover):
+`pi-harness daemon reload --legacy` is the only supported first-activation path. Run it from an independent interactive terminal, never from inside an agent and never from a terminal attached to a TUI of that daemon (stopping the old daemon kills agent process groups and closes attached old-release TUIs):
 
 ```sh
 pi-harness daemon recover --dry-run
 pi-harness daemon reload --legacy --wait
 ```
 
-1. Review the dry-run report: confirm every task of an active run appears under relaunched and nothing unexpected appears under legacy-failed.
-2. Run `pi-harness daemon reload --legacy --wait`. It repeats the dry run, displays the running PID, running release, target release, and resolved fallback release (override with `--previous <dir>`, `--target <dir>`, or `--db <path>`), and asks for confirmation (pass `--yes` in non-interactive shells; without confirmation it exits `2`).
+1. Review the dry-run report: confirm interrupted tasks of active runs appear under relaunched, untouched `pending` and `paused_quota` tasks and cancelled Done-Reviewers appear in their own sections, and nothing unexpected appears under legacy-failed.
+2. Run `pi-harness daemon reload --legacy --wait`. It repeats the dry run against the resolved `PI_HARNESS_HOME` database (`--db <path>` changes only what the preview reads; when `--db` differs from the resolved database it prints a warning and requires `--yes` in addition to interactive confirmation), binds the preview to the running daemon's PID and home, displays the running PID, running release, target release, and resolved fallback release (override with `--previous <dir>` or `--target <dir>`), and asks for confirmation (pass `--yes` in non-interactive shells; without confirmation it exits `2`). After confirmation it re-checks the daemon PID and refuses to stop if the PID changed or the daemon now supports hot update; the supervisor also verifies `ping.pid` matches right before shutdown and refuses to start a successor if the old PID does not exit.
 3. On the first activation against a pre-feature daemon, the following are not preserved: attached old-release TUIs exit; an in-flight Director turn is aborted and its unflushed tail is lost without a tool list or continuation turn; queued Director wakeups are lost; agents write no rollover handoffs and resume from harness-built recovery handoffs; in-flight merges, reviews, and gates run again; PTYs, `code_exec` runs, and quota `--in` timers are lost. `wait_timer` rows cancelled by the old daemon during shutdown are revived to `pending` by the new daemon.
-4. If the command exits `3`, the supervisor fell back to the pre-feature daemon, which marks interrupted tasks `failed` as before. The supervisor writes `pi-harness resume <run>` commands for every affected run to `daemon.log` and `<sockDir>/reload-fallback.txt`. Run those commands to resume the runs, then inspect `daemon.log` for the boot error.
+4. If the command exits `3` and the only fallback is a pre-feature release, the supervisor does not auto-start the old daemon (starting a pre-feature daemon marks every interrupted task `failed`). It leaves no daemon running and writes recovery instructions to `daemon.log` and `<sockDir>/reload-fallback.txt` (printed by `--wait`): the boot error tail, confirmation that all work is intact in the database and will resume in place when a hot-update-capable release starts, the exact command to start the target release after fixing it, and, as a clearly labelled last resort, the command to start the old release with a warning that it fails interrupted tasks followed by `pi-harness resume <run>` for every affected run (relaunch, review cancel/replay, and legacy-fail).
+
+### Known limitations
+
+- An event-triggered timer (`wake_on_event` `child_settled` or `any`) whose event happens while the daemon restarts fires at its due time instead of early.
+- Agent subprocesses that left their process group (started a separate session) are fenced from harness tools by the daemon nonce but are not killed during handover reaping.
+- A Director turn that does not stop within 5 seconds of cancellation can lose its unflushed tail.
+- After a hard daemon crash, nothing reaps old agent processes.
+- An old-release TUI keeps its old UI until you restart it.
 
 ## Why not Nix, mise or pixi
 

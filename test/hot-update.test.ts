@@ -1,11 +1,22 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, it } from "bun:test";
+import { resolveConfig, validateConfigRaw } from "../src/config.js";
+import {
+  HotUpdateController,
+  tryReloadForDaemonRestart,
+  waitForDaemonReload,
+  type HotUpdateHost,
+} from "../src/daemon/hot-update.js";
 import { DaemonClient } from "../src/daemon/remote.js";
+import { runSupervisor } from "../src/daemon/supervise.js";
 import type { DaemonEventFrame } from "../src/protocol/daemon-rpc.js";
+import { attachDaemonReader, writeDaemonMessage } from "../src/protocol/frames.js";
 import { installAutoReconnect, type AutoReconnectHandle } from "../src/tui/reconnect.js";
 import {
   buildReleaseDir,
@@ -772,5 +783,446 @@ describe("daemon hot-update subprocess e2e", () => {
       assert.equal(finalTimerSteers.length, 1);
     },
     45_000,
+  );
+
+  it(
+    "case 7: legacy reload with broken target and pre-feature fallback leaves no daemon running and writes recovery instructions",
+    async () => {
+      const { homeDir, releasesDir, fakeDir, repoDir, socketPath, env, sandbox } = createSandbox("hu-c7-");
+      const relA = buildReleaseDir(releasesDir, "rel-a");
+      const relPreFeature = buildReleaseDir(releasesDir, "rel-old");
+      // Remove release.json to simulate a pre-feature fallback release directory.
+      rmSync(join(relPreFeature.releaseDir, "release.json"), { force: true });
+      const relC = buildReleaseDir(releasesDir, "rel-c", { brokenServe: true });
+      writeHarnessHome(homeDir, {
+        socketPath,
+        fakeDir,
+        hotUpdate: { mode: "auto", drainTimeoutSec: 20, minIntervalSec: 0 },
+      });
+
+      const bootEnv = { ...env, PI_HARNESS_SUPERVISE_BOOT_TIMEOUT_MS: "3000" };
+      const { pid: pidA } = await startDaemon(relA, { ...bootEnv, PI_HARNESS_TEST_NO_RELOAD: "1" });
+      sandbox.extraDaemonPids.push(pidA);
+
+      const created = await rpc<{ run: { id: string } }>(socketPath, "run.create", {
+        goal: "FAKE_ROLE=orchestrator verify fail-closed pre-feature fallback",
+        repoRoot: repoDir,
+      });
+      const runId = created.run.id;
+
+      await pollUntil(
+        async () => {
+          const r = await rpc<{ tasks: Array<{ tier: number; status: string }> }>(socketPath, "run.get", { runId });
+          return r.tasks.some((t) => t.tier === 3 && t.status === "running");
+        },
+        15_000,
+        "child running before broken legacy reload",
+      );
+
+      const reloadRes = await runCli(
+        relA,
+        [
+          "daemon",
+          "reload",
+          "--legacy",
+          "--yes",
+          "--wait",
+          "--previous",
+          relPreFeature.releaseDir,
+          "--target",
+          relC.releaseDir,
+        ],
+        bootEnv,
+      );
+      assert.equal(
+        reloadRes.code,
+        3,
+        `expected exit 3 when target fails to boot with pre-feature fallback, got ${reloadRes.code}: stdout=${reloadRes.stdout} stderr=${reloadRes.stderr}`,
+      );
+
+      // No daemon may be listening on the socket after failing closed.
+      await pollUntil(() => !isPidAlive(pidA), 5_000, "old daemon pid exited");
+      let listening = true;
+      try {
+        await rpc(socketPath, "ping");
+      } catch {
+        listening = false;
+      }
+      assert.equal(listening, false, "pre-feature fallback must not be auto-started");
+
+      const fallbackFilePath = join(dirname(socketPath), "reload-fallback.txt");
+      assert.ok(existsSync(fallbackFilePath), `expected ${fallbackFilePath} to exist`);
+      const fallbackText = readFileSync(fallbackFilePath, "utf8");
+      assert.ok(fallbackText.includes("brokenServe"), `expected boot error tail in reload-fallback.txt:\n${fallbackText}`);
+      assert.ok(
+        fallbackText.includes("intact in the database"),
+        `expected intact-database note in reload-fallback.txt:\n${fallbackText}`,
+      );
+      assert.ok(fallbackText.includes(relC.cliPath), `expected target start command in reload-fallback.txt:\n${fallbackText}`);
+      assert.ok(fallbackText.includes("LAST RESORT"), `expected LAST RESORT section in reload-fallback.txt:\n${fallbackText}`);
+      assert.ok(
+        fallbackText.includes(relPreFeature.cliPath),
+        `expected old-release start command in reload-fallback.txt:\n${fallbackText}`,
+      );
+      assert.ok(
+        fallbackText.includes(`pi-harness resume ${runId}`),
+        `expected affected run resume command in reload-fallback.txt:\n${fallbackText}`,
+      );
+      assert.ok(
+        reloadRes.stderr.includes(`pi-harness resume ${runId}`),
+        `expected --wait stderr to print reload-fallback.txt:\n${reloadRes.stderr}`,
+      );
+    },
+    45_000,
+  );
+});
+
+describe("hot-update controller, supervisor, and config unit checks", () => {
+  it(
+    "finding #22: drain deadline holds even when steerTask never resolves",
+    async () => {
+      const { releasesDir } = createSandbox("hu-u22-");
+      const relA = buildReleaseDir(releasesDir, "rel-a");
+      const relB = buildReleaseDir(releasesDir, "rel-b");
+
+      let handoverCount = 0;
+      let handoverAt = 0;
+      let steerCalls = 0;
+      const host: HotUpdateHost = {
+        config: () => ({ mode: "auto", drainTimeoutSec: 0.05, minIntervalSec: 0 }),
+        startedAt: Date.now() - 10_000,
+        self: { kind: "installed", ...relA },
+        liveAgents: () => ({ tier12: ["t-stuck"], other: [], chats: [], reviews: 0 }),
+        liveWorkDescription: () => "1 task",
+        enterDraining: () => {},
+        steerTask: () => {
+          steerCalls++;
+          return new Promise(() => {}); // never resolves
+        },
+        steerChat: () => new Promise(() => {}),
+        broadcast: () => {},
+        stopAndHandOver: async () => {
+          handoverCount++;
+          handoverAt = Date.now();
+        },
+        log: () => {},
+      };
+
+      const controller = new HotUpdateController(host);
+      const startedAt = Date.now();
+      const reply = controller.request({ source: "cli", target: relB });
+      assert.equal(reply.action, "draining");
+      assert.equal(steerCalls, 1);
+
+      await pollUntil(() => handoverCount > 0, 1_500, "stopAndHandOver called after 50ms deadline");
+      const elapsed = handoverAt - startedAt;
+      assert.equal(handoverCount, 1, "stopAndHandOver must be called once");
+      assert.ok(elapsed >= 40 && elapsed < 1_000, `expected handover shortly after 50ms deadline, got ${elapsed}ms`);
+      controller.dispose();
+    },
+    10_000,
+  );
+
+  it(
+    "finding #22: drain error still triggers stopAndHandOver once",
+    async () => {
+      const { releasesDir } = createSandbox("hu-u22-err-");
+      const relA = buildReleaseDir(releasesDir, "rel-a");
+      const relB = buildReleaseDir(releasesDir, "rel-b");
+
+      let handoverCount = 0;
+      let callNum = 0;
+      const host: HotUpdateHost = {
+        config: () => ({ mode: "auto", drainTimeoutSec: 0.05, minIntervalSec: 0 }),
+        startedAt: Date.now() - 10_000,
+        self: { kind: "installed", ...relA },
+        liveAgents: () => {
+          callNum++;
+          if (callNum >= 2) throw new Error("simulated drain failure");
+          return { tier12: ["t-1"], other: [], chats: [], reviews: 0 };
+        },
+        liveWorkDescription: () => "1 task",
+        enterDraining: () => {},
+        steerTask: async () => {},
+        steerChat: async () => {},
+        broadcast: () => {},
+        stopAndHandOver: async () => {
+          handoverCount++;
+        },
+        log: () => {},
+      };
+
+      const controller = new HotUpdateController(host);
+      controller.request({ source: "cli", target: relB });
+      await pollUntil(() => handoverCount > 0, 1_500, "stopAndHandOver called after drain throw");
+      assert.equal(handoverCount, 1);
+      controller.dispose();
+    },
+    10_000,
+  );
+
+  it(
+    "finding #26: requesting the already-running release clears a scheduled reload to another target",
+    async () => {
+      const { releasesDir } = createSandbox("hu-u26-");
+      const relA = buildReleaseDir(releasesDir, "rel-a");
+      const relB = buildReleaseDir(releasesDir, "rel-b");
+
+      let handoverCount = 0;
+      const nowMs = Date.now();
+      const host: HotUpdateHost = {
+        config: () => ({ mode: "auto", drainTimeoutSec: 30, minIntervalSec: 60 }),
+        startedAt: nowMs,
+        self: { kind: "installed", ...relA },
+        liveAgents: () => ({ tier12: ["t-1"], other: [], chats: [], reviews: 0 }),
+        liveWorkDescription: () => "1 task",
+        enterDraining: () => {},
+        steerTask: async () => {},
+        steerChat: async () => {},
+        broadcast: () => {},
+        stopAndHandOver: async () => {
+          handoverCount++;
+        },
+        log: () => {},
+        now: () => nowMs,
+      };
+
+      const controller = new HotUpdateController(host);
+      const sched = controller.request({ source: "install", target: relB });
+      assert.equal(sched.action, "scheduled");
+      assert.equal(controller.status().state, "scheduled");
+      assert.equal(controller.status().targetReleaseId, "rel-b");
+
+      const reverted = controller.request({ source: "install", target: relA });
+      assert.deepEqual(reverted, { action: "noop", reason: "already_current", releaseId: "rel-a" });
+      assert.deepEqual(controller.status(), { state: "idle" });
+      assert.equal(handoverCount, 0);
+      controller.dispose();
+    },
+    10_000,
+  );
+
+  it(
+    "finding #24: waitForDaemonReload reports exit 3 when forced same-release restart fell back with lastError",
+    async () => {
+      const { socketPath } = createSandbox("hu-u24-");
+      const deadChild = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+      await new Promise<void>((r) => deadChild.once("exit", () => r()));
+      const fakeOldPid = deadChild.pid!;
+      const fakeNewPid = process.pid;
+
+      const sockets = new Set<Socket>();
+      const server = createServer((sock) => {
+        sockets.add(sock);
+        sock.once("close", () => sockets.delete(sock));
+        attachDaemonReader(sock, {
+          onMessage: (msg) => {
+            const req = msg as { id?: string; op?: string };
+            if (req.op === "ping") {
+              writeDaemonMessage(sock, {
+                kind: "res",
+                id: req.id ?? "1",
+                ok: true,
+                result: {
+                  pong: true,
+                  pid: fakeNewPid,
+                  releaseId: "rel-a",
+                  restartSafe: true,
+                  reload: {
+                    state: "idle",
+                    lastError: { targetReleaseId: "rel-a", error: "simulated boot failure" },
+                  },
+                },
+              });
+            }
+          },
+        });
+      });
+      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+      try {
+        const code = await waitForDaemonReload({
+          socketPath,
+          targetReleaseId: "rel-a",
+          oldPid: fakeOldPid,
+          deadlineAt: Date.now(),
+        });
+        assert.equal(code, 3, "forced same-release fallback with matching lastError must return exit 3");
+      } finally {
+        for (const s of sockets) s.destroy();
+        await new Promise<void>((r) => server.close(() => r()));
+        rmSync(socketPath, { force: true });
+      }
+    },
+    10_000,
+  );
+
+  it(
+    "finding #25: tryReloadForDaemonRestart distinguishes missing listener from inconclusive ping timeout",
+    async () => {
+      const { socketPath, root } = createSandbox("hu-u25-");
+
+      // Missing socket -> positively no listener -> returns null.
+      const absentCode = await tryReloadForDaemonRestart(join(root, "does-not-exist.sock"));
+      assert.equal(absentCode, null);
+
+      // Listener accepts connections but never answers ping -> inconclusive -> exits 1 without sending shutdown.
+      let sawShutdown = false;
+      const sockets = new Set<Socket>();
+      const server = createServer((sock) => {
+        sockets.add(sock);
+        sock.once("close", () => sockets.delete(sock));
+        attachDaemonReader(sock, {
+          onMessage: (msg) => {
+            const req = msg as { op?: string };
+            if (req.op === "daemon.shutdown") sawShutdown = true;
+            // Intentionally never reply to ping.
+          },
+        });
+      });
+      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+      try {
+        const inconclusiveCode = await tryReloadForDaemonRestart(socketPath);
+        assert.equal(inconclusiveCode, 1);
+        assert.equal(sawShutdown, false, "inconclusive probe must never send daemon.shutdown");
+      } finally {
+        for (const s of sockets) s.destroy();
+        await new Promise<void>((r) => server.close(() => r()));
+        rmSync(socketPath, { force: true });
+      }
+    },
+    10_000,
+  );
+
+  it(
+    "finding #19: supervisor refuses legacy stop when socket PID does not match expected stopPid",
+    async () => {
+      const { socketPath, homeDir, releasesDir } = createSandbox("hu-u19-");
+      const relB = buildReleaseDir(releasesDir, "rel-b");
+      const deadChild = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+      await new Promise<void>((r) => deadChild.once("exit", () => r()));
+      const expectedStopPid = deadChild.pid!;
+
+      let sawShutdown = false;
+      const sockets = new Set<Socket>();
+      const server = createServer((sock) => {
+        sockets.add(sock);
+        sock.once("close", () => sockets.delete(sock));
+        attachDaemonReader(sock, {
+          onMessage: (msg) => {
+            const req = msg as { id?: string; op?: string };
+            if (req.op === "ping") {
+              writeDaemonMessage(sock, {
+                kind: "res",
+                id: req.id ?? "1",
+                ok: true,
+                result: { pong: true, pid: process.pid, releaseId: "rel-other" },
+              });
+            } else if (req.op === "daemon.shutdown") {
+              sawShutdown = true;
+            }
+          },
+        });
+      });
+      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+      try {
+        const code = await runSupervisor({
+          socketPath,
+          stateDir: homeDir,
+          target: relB,
+          previous: null,
+          stopPid: expectedStopPid,
+        });
+        assert.equal(code, 1);
+        assert.equal(sawShutdown, false, "supervisor must not send daemon.shutdown when ping.pid !== stopPid");
+        const fallbackText = readFileSync(join(dirname(socketPath), "reload-fallback.txt"), "utf8");
+        assert.ok(fallbackText.includes("# Reload aborted (exit 1):"), fallbackText);
+        assert.ok(fallbackText.includes(`expected ${expectedStopPid}`), fallbackText);
+      } finally {
+        for (const s of sockets) s.destroy();
+        await new Promise<void>((r) => server.close(() => r()));
+        rmSync(socketPath, { force: true });
+      }
+    },
+    10_000,
+  );
+
+  it(
+    "finding #20: supervisor reaps surviving captured childPgids after waitPid exits",
+    async () => {
+      const { socketPath, homeDir, releasesDir, sandbox } = createSandbox("hu-u20-");
+      const brokenTarget = buildReleaseDir(releasesDir, "rel-broken", { brokenServe: true });
+
+      const waitChild = spawn(process.execPath, ["-e", "setTimeout(() => process.exit(0), 60)"], {
+        stdio: "ignore",
+      });
+      const survivingChild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
+        detached: true,
+        stdio: "ignore",
+      });
+      const survivingPid = survivingChild.pid!;
+      sandbox.cleanupHandles.push(() => {
+        try {
+          process.kill(-survivingPid, "SIGKILL");
+        } catch {
+          // already dead
+        }
+      });
+
+      const code = await runSupervisor({
+        socketPath,
+        stateDir: homeDir,
+        target: brokenTarget,
+        previous: null,
+        waitPid: waitChild.pid!,
+        childPgids: [survivingPid],
+        bootTimeoutMs: 2_000,
+      });
+      assert.equal(code, 3);
+      assert.equal(isPidAlive(waitChild.pid!), false, "waitPid must have exited");
+      assert.equal(isPidAlive(survivingPid), false, "supervisor must reap surviving captured childPgids");
+    },
+    10_000,
+  );
+
+  it(
+    "finding #27: hotUpdate config is validated and clamped at startup and rejected out of bounds on live reload",
+    () => {
+      const { homeDir } = createSandbox("hu-u27-");
+
+      const low = resolveConfig(
+        { hotUpdate: { mode: "bogus", drainTimeoutSec: 1, minIntervalSec: -5 } },
+        {},
+        { stateDir: homeDir },
+      );
+      assert.equal(low.hotUpdate.mode, "auto");
+      assert.equal(low.hotUpdate.drainTimeoutSec, 5);
+      assert.equal(low.hotUpdate.minIntervalSec, 0);
+
+      const high = resolveConfig(
+        { hotUpdate: { mode: "manual", drainTimeoutSec: 1e12, minIntervalSec: 1e12 } },
+        {},
+        { stateDir: homeDir },
+      );
+      assert.equal(high.hotUpdate.mode, "manual");
+      assert.equal(high.hotUpdate.drainTimeoutSec, 600);
+      assert.equal(high.hotUpdate.minIntervalSec, 86_400);
+
+      const nonFinite = resolveConfig(
+        { hotUpdate: { drainTimeoutSec: Number.NaN, minIntervalSec: Number.POSITIVE_INFINITY } },
+        {},
+        { stateDir: homeDir },
+      );
+      assert.equal(nonFinite.hotUpdate.drainTimeoutSec, 90);
+      assert.equal(nonFinite.hotUpdate.minIntervalSec, 900);
+
+      assert.deepEqual(validateConfigRaw({ hotUpdate: { mode: "auto", drainTimeoutSec: 5, minIntervalSec: 0 } }), []);
+      assert.deepEqual(validateConfigRaw({ hotUpdate: { mode: "manual", drainTimeoutSec: 600, minIntervalSec: 86_400 } }), []);
+      assert.ok(validateConfigRaw({ hotUpdate: { mode: "bogus" } }).some((e) => e.includes("hotUpdate.mode")));
+      assert.ok(validateConfigRaw({ hotUpdate: { drainTimeoutSec: 4 } }).some((e) => e.includes("hotUpdate.drainTimeoutSec")));
+      assert.ok(validateConfigRaw({ hotUpdate: { drainTimeoutSec: 601 } }).some((e) => e.includes("hotUpdate.drainTimeoutSec")));
+      assert.ok(validateConfigRaw({ hotUpdate: { minIntervalSec: -1 } }).some((e) => e.includes("hotUpdate.minIntervalSec")));
+      assert.ok(validateConfigRaw({ hotUpdate: { minIntervalSec: 86_401 } }).some((e) => e.includes("hotUpdate.minIntervalSec")));
+    },
+    10_000,
   );
 });
