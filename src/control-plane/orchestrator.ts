@@ -56,6 +56,8 @@ const MAX_PENDING_STEERS = 20;
 /** Structured outcome of a steering request: how it will be delivered, or why it was refused. */
 export interface SteerTaskResult {
   steered: boolean;
+  /** True when the steer reached the active session or woke a waiting tool immediately; false when queued for a later turn or refused. */
+  live: boolean;
   /** native: taken by the live session; queued_wait: delivered by the task's current wait_children; queued_turn: opens its next turn. */
   mode: "native" | "queued_wait" | "queued_turn" | "refused";
   taskId: string;
@@ -302,6 +304,8 @@ export class HarnessOrchestrator {
   private disposed = false;
   /** Accepted steering not yet delivered (FIFO per task, at most MAX_PENDING_STEERS). */
   private pendingSteers = new Map<string, string[]>();
+  /** Goal version to bind onto a task once its queued amendment steer is actually drained. */
+  private amendBindOnDrain = new Map<string, number>();
   /** In-flight waitForChildrenEventDriven calls per waiting task. */
   private waitingChildrenTasks = new Map<string, number>();
   /** Steering continuation turns reserved by the current execution of a task. */
@@ -590,6 +594,7 @@ export class HarnessOrchestrator {
     this.steerContinuations.delete(taskId);
     this.steerReservedBatches.delete(taskId);
     this.waitingChildrenTasks.delete(taskId);
+    this.amendBindOnDrain.delete(taskId);
     const undelivered = this.pendingSteers.get(taskId);
     this.pendingSteers.delete(taskId);
     const owner = this.db.getTask(taskId);
@@ -1695,6 +1700,10 @@ export class HarnessOrchestrator {
     if (task.status === "ready") {
       const won = this.stopWonSince(task, snap);
       if (won) throw new Error(this.resumeNotAppliedMessage(task, won));
+      const linkedGoalVersion = this.db.getLinkedGoalVersion(task.runId);
+      if (linkedGoalVersion !== null && task.goalVersion !== linkedGoalVersion) {
+        this.db.updateTask(task.id, { goalVersion: linkedGoalVersion });
+      }
       this.launchTaskLoop(task.id);
       return {
         task: this.db.getTask(task.id)!,
@@ -1885,6 +1894,7 @@ export class HarnessOrchestrator {
     }
 
     const nextGen = task.generation + 1;
+    const linkedGoalVersion = this.db.getLinkedGoalVersion(run.id);
     // Lease acquisition and the switch to ready are one transaction.
     this.db.transaction(() => {
       if (needsLeases) this.db.reacquireWriteLeasesForTask(run.id, task.id);
@@ -1898,6 +1908,7 @@ export class HarnessOrchestrator {
         summary: null,
         sessionId: null,
         handoffJson: JSON.stringify(handoff),
+        ...(linkedGoalVersion !== null ? { goalVersion: linkedGoalVersion } : {}),
       });
     });
 
@@ -3383,7 +3394,7 @@ export class HarnessOrchestrator {
   async steerTaskDetailed(taskId: string, message: string): Promise<SteerTaskResult> {
     const task = this.db.getTask(taskId);
     if (!task) {
-      return { steered: false, mode: "refused", taskId, runId: "", status: "failed", code: "not_found", reason: `Unknown task ${taskId}.` };
+      return { steered: false, live: false, mode: "refused", taskId, runId: "", status: "failed", code: "not_found", reason: `Unknown task ${taskId}.` };
     }
     const resumeHint = (t: TaskRecord) =>
       t.status === "completed"
@@ -3391,7 +3402,7 @@ export class HarnessOrchestrator {
         : `resume_task({ task_id: "${t.id}", note })`;
     const refuse = (code: NonNullable<SteerTaskResult["code"]>, reason: string, nextAction?: string): SteerTaskResult => {
       const t = this.db.getTask(taskId) ?? task;
-      return { steered: false, mode: "refused", taskId, runId: t.runId, status: t.status, code, reason, ...(nextAction ? { nextAction } : {}) };
+      return { steered: false, live: false, mode: "refused", taskId, runId: t.runId, status: t.status, code, reason, ...(nextAction ? { nextAction } : {}) };
     };
     const settledStatuses = ["cancelled", "failed", "completed", "blocked", "returned_for_rescope"];
     const refuseSettledOrStopped = (): SteerTaskResult | null => {
@@ -3447,8 +3458,9 @@ export class HarnessOrchestrator {
     if (late) return late;
     const current = this.db.getTask(taskId)!;
     const accept = (mode: "native" | "queued_wait" | "queued_turn"): SteerTaskResult => {
-      this.db.emitEvent(current.runId, taskId, "agent.steered", { message, accepted: true, mode });
-      return { steered: true, mode, taskId, runId: current.runId, status: this.db.getTask(taskId)?.status ?? current.status };
+      const live = mode === "native" || mode === "queued_wait";
+      this.db.emitEvent(current.runId, taskId, "agent.steered", { message, accepted: true, mode, live });
+      return { steered: true, live, mode, taskId, runId: current.runId, status: this.db.getTask(taskId)?.status ?? current.status };
     };
     if (native) return accept("native");
     const queue = this.pendingSteers.get(taskId) ?? [];
@@ -3477,9 +3489,17 @@ export class HarnessOrchestrator {
     return accept("queued_turn");
   }
 
+  /** Records a goal version to bind onto `taskId` when its queued amendment steer is drained. */
+  setAmendBindOnDrain(taskId: string, version: number): void {
+    const existing = this.amendBindOnDrain.get(taskId);
+    if (existing === undefined || version > existing) {
+      this.amendBindOnDrain.set(taskId, version);
+    }
+  }
+
   /**
    * Takes every queued steering message of a task (oldest first); drains are never refused. A batch taken by a
-   * wait_children (`viaWait`) used no continuation turn, so the continuation it reserved is released.
+   * wait_children or control-plane tool (`viaWait`) used no continuation turn, so the continuation it reserved is released.
    */
   drainPendingSteers(taskId: string, opts?: { viaWait?: boolean }): string[] {
     const q = this.pendingSteers.get(taskId);
@@ -3489,6 +3509,17 @@ export class HarnessOrchestrator {
       const used = (this.steerContinuations.get(taskId) ?? 0) - 1;
       if (used > 0) this.steerContinuations.set(taskId, used);
       else this.steerContinuations.delete(taskId);
+    }
+    const pendingGoalVersion = this.amendBindOnDrain.get(taskId);
+    if (pendingGoalVersion !== undefined) {
+      this.amendBindOnDrain.delete(taskId);
+      const cur = this.db.getTask(taskId);
+      const isTerminal = cur
+        ? ["completed", "cancelled", "failed", "blocked", "returned_for_rescope"].includes(cur.status)
+        : true;
+      if (cur && !isTerminal && (cur.goalVersion == null || cur.goalVersion < pendingGoalVersion)) {
+        this.db.updateTask(taskId, { goalVersion: pendingGoalVersion });
+      }
     }
     return q;
   }
@@ -3634,6 +3665,17 @@ export class HarnessOrchestrator {
     if (!["completed", "cancelled", "failed", "blocked", "returned_for_rescope"].includes(task.status)) {
       const baseSummary = `Cancelled: ${reason}`;
       settleTaskMinimalFallback(this.db, task, "cancelled", baseSummary, reason ? `cancelled: ${reason}` : "cancelled");
+      const linkedGoalVersion = this.db.getLinkedGoalVersion(task.runId);
+      if (linkedGoalVersion !== null && task.goalVersion != null && task.goalVersion < linkedGoalVersion) {
+        this.db.emitEvent(task.runId, task.id, "goal.amendment_task", {
+          taskId: task.id,
+          tier: task.tier,
+          boundVersion: task.goalVersion,
+          toVersion: linkedGoalVersion,
+          action: "cancelled",
+          reason,
+        });
+      }
       // No runner loop will exit for a queued or never-launched task, so settle its run here (a stop sweep does that itself).
       if (!exec && !opts?.bulk) this.afterTaskInactiveInRun(task.runId);
     }

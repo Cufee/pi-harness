@@ -563,3 +563,412 @@ it("wakes an idle Director chat when a Director-spawned Tier 3 task settles, ski
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+it("goal_amend delivers delta to running workers and reports per task", async () => {
+  const repoRoot = await makeTempRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-amend-workers-state-"));
+  const sockPath = join(stateDir, "d.sock");
+  try {
+    const baseCfg = loadConfig(repoRoot);
+    const config = withFixtureCatalog({
+      ...baseCfg,
+      codeMode: "off",
+      goals: { ...baseCfg.goals, autoVerifyOnSettle: false },
+      stateDir,
+      socketPath: sockPath,
+    });
+    const releaseAll = Promise.withResolvers<void>();
+    const workersReady = Promise.withResolvers<void>();
+    let liveWorkerId = "";
+    let queuedWorkerId = "";
+    let readyHandles = 0;
+    const liveSteers: string[] = [];
+    const t1Steers: string[] = [];
+
+    const daemon = new HarnessDaemon(config, {
+      dbPath: ":memory:",
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          if (req.tier === 1) {
+            req.onHandle?.({
+              steer: async (msg) => {
+                t1Steers.push(msg);
+                return true;
+              },
+              cancel: async () => {
+                releaseAll.resolve();
+              },
+            });
+            const r1 = (await req.executeTool("spawn_worker", {
+              title: "Worker covering c2",
+              objective: "Implement criterion c2 cleanly",
+              criteria: "Satisfies c2",
+              write_scopes: ["a.txt"],
+              model: "fixture/fixture",
+            })) as { spawned: string };
+            liveWorkerId = r1.spawned;
+            const r2 = (await req.executeTool("spawn_worker", {
+              title: "Worker covering c1",
+              objective: "Implement criterion c1 cleanly",
+              criteria: "Satisfies c1",
+              write_scopes: ["b.txt"],
+              model: "fixture/fixture",
+            })) as { spawned: string };
+            queuedWorkerId = r2.spawned;
+            await releaseAll.promise;
+            return { text: "t1 done", stopReason: "completed" };
+          }
+          if (req.taskId === liveWorkerId) {
+            req.onHandle?.({
+              steer: async (msg) => {
+                liveSteers.push(msg);
+                return true;
+              },
+              cancel: async () => {
+                releaseAll.resolve();
+              },
+            });
+            readyHandles += 1;
+            if (readyHandles === 2) workersReady.resolve();
+            await releaseAll.promise;
+            return { text: "live worker done", stopReason: "completed" };
+          }
+          if (req.taskId === queuedWorkerId) {
+            req.onHandle?.({
+              steer: async () => false,
+              cancel: async () => {
+                releaseAll.resolve();
+              },
+            });
+            readyHandles += 1;
+            if (readyHandles === 2) workersReady.resolve();
+            await releaseAll.promise;
+            return { text: "queued worker done", stopReason: "completed" };
+          }
+          return { text: "ok", stopReason: "completed" };
+        },
+      }),
+    });
+
+    await daemon.start();
+    try {
+      const goal = daemon.director.goals.createGoal({
+        repoRoot,
+        title: "Amend delivery test",
+        description: "Test per-task amendment delivery",
+        criteria: [
+          { id: "c1", description: "Criterion one", kind: "behavioral", required: true },
+          { id: "c2", description: "Criterion two", kind: "behavioral", required: true },
+        ],
+        verificationMode: "none",
+      });
+      await daemon.director.commitGoal(goal.id);
+      await workersReady.promise;
+
+      assert.equal(daemon.db.getTask(liveWorkerId)?.goalVersion, 1);
+      assert.equal(daemon.db.getTask(queuedWorkerId)?.goalVersion, 1);
+
+      const amended = await daemon.director.amendGoal(goal.id, {
+        removeCriteriaIds: ["c2"],
+        rationale: "Scope cut: drop c2",
+      });
+
+      const liveEntry = amended.affectedTasks.find((a) => a.taskId === liveWorkerId);
+      const queuedEntry = amended.affectedTasks.find((a) => a.taskId === queuedWorkerId);
+      assert.ok(liveEntry, "expected affectedTasks entry for live worker");
+      assert.ok(queuedEntry, "expected affectedTasks entry for queued worker");
+      assert.equal(liveEntry.action, "delivered");
+      assert.equal(liveEntry.mode, "native");
+      assert.equal(liveEntry.live, true);
+      assert.equal(liveEntry.boundVersion, 1);
+      assert.deepEqual(liveEntry.scopeHit, ["c2"]);
+
+      assert.equal(queuedEntry.action, "queued");
+      assert.equal(queuedEntry.mode, "queued_turn");
+      assert.equal(queuedEntry.live, false);
+      assert.equal(queuedEntry.boundVersion, 1);
+      assert.deepEqual(queuedEntry.scopeHit, []);
+
+      // Live worker received formatted delta and rebound immediately; queued worker stays bound to v1 until drained.
+      assert.equal(liveSteers.length, 1);
+      assert.ok(liveSteers[0]!.includes("v1 -> v2"));
+      assert.ok(liveSteers[0]!.includes("Removed criteria: c2"));
+      assert.equal(daemon.db.getTask(liveWorkerId)?.goalVersion, 2);
+      assert.equal(daemon.db.getTask(queuedWorkerId)?.goalVersion, 1);
+
+      // T1 steer lists affected tasks and their delivery results.
+      assert.ok(t1Steers.some((m) => m.includes(liveWorkerId) && m.includes("delivered") && m.includes(queuedWorkerId) && m.includes("queued")));
+
+      // goal.amendment_task events emitted for both affected tasks.
+      const runId = amended.goal.linkedRunId!;
+      const events = daemon.db.db
+        .prepare("SELECT task_id, payload_json FROM events WHERE run_id = ? AND type = 'goal.amendment_task'")
+        .all(runId) as Array<{ task_id: string; payload_json: string }>;
+      assert.equal(events.length, 2);
+      const byTask = new Map(events.map((e) => [e.task_id, JSON.parse(e.payload_json) as { action: string }]));
+      assert.equal(byTask.get(liveWorkerId)?.action, "delivered");
+      assert.equal(byTask.get(queuedWorkerId)?.action, "queued");
+
+      // Safety net: any control-plane tool call by the queued worker drains steeringMessages and rebinds to v2.
+      const treeRes = (await daemon.orchestrator.toolExecutor.execute(runId, queuedWorkerId, "tree_view", {})) as {
+        steeringMessages?: string[];
+        tasks: Array<{ id: string; goalVersion: number | null }>;
+      };
+      assert.ok(Array.isArray(treeRes.steeringMessages) && treeRes.steeringMessages.length === 1);
+      assert.ok(treeRes.steeringMessages[0]!.includes("Removed criteria: c2"));
+      assert.equal(daemon.db.getTask(queuedWorkerId)?.goalVersion, 2);
+    } finally {
+      releaseAll.resolve();
+      await daemon.stop();
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+it("report_goal_progress drops stale entries with a note and keeps summary", async () => {
+  const repoRoot = await makeTempRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-stale-progress-state-"));
+  const sockPath = join(stateDir, "d.sock");
+  try {
+    const baseCfg = loadConfig(repoRoot);
+    const config = withFixtureCatalog({
+      ...baseCfg,
+      codeMode: "off",
+      goals: { ...baseCfg.goals, autoVerifyOnSettle: false },
+      stateDir,
+      socketPath: sockPath,
+    });
+    const releaseAll = Promise.withResolvers<void>();
+    const workerReady = Promise.withResolvers<void>();
+    let workerId = "";
+    let staleReturnWorkerId = "";
+    let readyCount = 0;
+
+    const daemon = new HarnessDaemon(config, {
+      dbPath: ":memory:",
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          if (req.tier === 1) {
+            req.onHandle?.({
+              steer: async () => true,
+              cancel: async () => releaseAll.resolve(),
+            });
+            const r1 = (await req.executeTool("spawn_worker", {
+              title: "Stale progress worker",
+              objective: "Work on v1",
+              write_scopes: ["p1.txt"],
+              model: "fixture/fixture",
+            })) as { spawned: string };
+            workerId = r1.spawned;
+            const r2 = (await req.executeTool("spawn_worker", {
+              title: "Stale return worker",
+              objective: "Work on v1 and return",
+              write_scopes: ["p2.txt"],
+              model: "fixture/fixture",
+            })) as { spawned: string };
+            staleReturnWorkerId = r2.spawned;
+            await releaseAll.promise;
+            return { text: "t1 done", stopReason: "completed" };
+          }
+          req.onHandle?.({
+            steer: async () => false,
+            cancel: async () => releaseAll.resolve(),
+          });
+          readyCount += 1;
+          if (readyCount === 2) workerReady.resolve();
+          await releaseAll.promise;
+          return { text: "worker done", stopReason: "completed" };
+        },
+      }),
+    });
+
+    await daemon.start();
+    try {
+      const goal = daemon.director.goals.createGoal({
+        repoRoot,
+        title: "Stale progress test",
+        description: "Verify stale progress filtering",
+        criteria: [
+          { id: "c1", description: "Keep me", kind: "behavioral", required: true },
+          { id: "c2", description: "Remove me", kind: "behavioral", required: true },
+        ],
+        verificationMode: "none",
+      });
+      await daemon.director.commitGoal(goal.id);
+      await workerReady.promise;
+      const runId = daemon.director.goals.getGoal(goal.id)!.linkedRunId!;
+
+      // Seed v1 progress including c2 + completed phase before amending.
+      await daemon.orchestrator.toolExecutor.execute(runId, workerId, "report_goal_progress", {
+        summary: "v1 finished",
+        phase: "completed",
+        verification_status: "passed",
+        criteria_results: [{ criterion_id: "c2", passed: true, evidence: "v1 ok" }],
+      });
+      assert.equal(daemon.director.goals.getGoal(goal.id)?.liveProgress?.phase, "completed");
+
+      // Amending to v2 drops c2 and clears old-version phase/summary/claims.
+      const amended = await daemon.director.amendGoal(goal.id, {
+        removeCriteriaIds: ["c2"],
+        rationale: "Drop c2 in v2",
+      });
+      assert.equal(amended.goal.liveProgress, null);
+
+      // Worker still bound to v1 reports passed/completed + removed criterion c2 + a summary.
+      assert.equal(daemon.db.getTask(workerId)?.goalVersion, 1);
+      const progRes = (await daemon.orchestrator.toolExecutor.execute(runId, workerId, "report_goal_progress", {
+        summary: "Progress note from v1 worker",
+        phase: "completed",
+        verification_status: "passed",
+        criteria_results: [{ criterion_id: "c2", passed: true, evidence: "stale check" }],
+      })) as {
+        recorded: boolean;
+        goalId: string;
+        dropped?: Array<{ field: string; value: string; reason: string }>;
+        note?: string;
+        steeringMessages?: string[];
+      };
+
+      assert.equal(progRes.recorded, true);
+      assert.equal(progRes.goalId, goal.id);
+      assert.equal(progRes.dropped?.length, 3);
+      assert.ok(progRes.note && progRes.note.includes("c2") && progRes.note.includes("v1"));
+      assert.ok(progRes.steeringMessages?.length === 1, "queued amendment steer should piggyback on tool result");
+
+      const stored = daemon.director.goals.getGoal(goal.id)!;
+      assert.equal(stored.liveProgress?.summary, "Progress note from v1 worker");
+      assert.equal(stored.liveProgress?.verificationStatus, undefined);
+      assert.equal(stored.liveProgress?.phase, undefined);
+      assert.equal(stored.liveProgress?.criteriaResults, undefined);
+
+      // Stale worker calling return_task is accepted with amendmentNotice and staleGoalVersion in resultJson.
+      assert.equal(daemon.db.getTask(staleReturnWorkerId)?.goalVersion, 1);
+      const retRes = (await daemon.orchestrator.toolExecutor.execute(runId, staleReturnWorkerId, "return_task", {
+        status: "completed",
+        summary: "Finished old v1 assignment",
+        sources: [],
+      })) as { returned: boolean; amendmentNotice?: string; staleGoalVersion?: { bound: number; current: number } };
+      assert.equal(retRes.returned, true);
+      assert.ok(retRes.amendmentNotice?.includes("v2"));
+      assert.deepEqual(retRes.staleGoalVersion, { bound: 1, current: 2 });
+      const settledTask = daemon.db.getTask(staleReturnWorkerId)!;
+      assert.equal(settledTask.goalVersion, 1, "settled stale worker must keep its bound goalVersion");
+      assert.deepEqual(JSON.parse(settledTask.resultJson!).staleGoalVersion, { bound: 1, current: 2 });
+    } finally {
+      releaseAll.resolve();
+      await daemon.stop();
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+it("goal_get shows task goalVersion and staleGoalVersion", async () => {
+  const repoRoot = await makeTempRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-goal-version-state-"));
+  const sockPath = join(stateDir, "d.sock");
+  try {
+    const baseCfg = loadConfig(repoRoot);
+    const config = withFixtureCatalog({
+      ...baseCfg,
+      codeMode: "off",
+      goals: { ...baseCfg.goals, autoVerifyOnSettle: false },
+      stateDir,
+      socketPath: sockPath,
+    });
+    const releaseAll = Promise.withResolvers<void>();
+    const workerReady = Promise.withResolvers<void>();
+    let workerId = "";
+    let goalId = "";
+    type GoalGetRes = {
+      tasks: Array<{ id: string; goalVersion: number | null; staleGoalVersion: boolean }>;
+      activity: { tasks: Array<{ id: string; goalVersion?: number | null; lastAmendmentAction?: string | null }> } | null;
+    };
+    let goalGetResult: GoalGetRes | undefined;
+
+    const daemon = new HarnessDaemon(config, {
+      dbPath: ":memory:",
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          if (req.taskId.startsWith("chat-")) {
+            goalGetResult = (await req.executeTool("goal_get", { goal_id: goalId })) as GoalGetRes;
+            return { text: "inspected", stopReason: "completed" };
+          }
+          if (req.tier === 1) {
+            req.onHandle?.({
+              steer: async () => true,
+              cancel: async () => releaseAll.resolve(),
+            });
+            const r = (await req.executeTool("spawn_worker", {
+              title: "v1 worker",
+              objective: "Do work",
+              write_scopes: ["v.txt"],
+              model: "fixture/fixture",
+            })) as { spawned: string };
+            workerId = r.spawned;
+            await releaseAll.promise;
+            return { text: "t1 done", stopReason: "completed" };
+          }
+          req.onHandle?.({
+            steer: async () => false,
+            cancel: async () => releaseAll.resolve(),
+          });
+          workerReady.resolve();
+          await releaseAll.promise;
+          return { text: "w done", stopReason: "completed" };
+        },
+      }),
+    });
+
+    await daemon.start();
+    try {
+      const chat = await daemon.director.createChat({ repoRoot });
+      const goal = daemon.director.goals.createGoal({
+        chatSessionId: chat.id,
+        repoRoot,
+        title: "Goal version visibility",
+        description: "Check goal_get task version fields",
+        criteria: [{ id: "c1", description: "Works", kind: "behavioral", required: true }],
+        verificationMode: "none",
+      });
+      goalId = goal.id;
+      await daemon.director.commitGoal(goal.id);
+      await workerReady.promise;
+
+      await daemon.director.amendGoal(
+        goal.id,
+        {
+          appendDescription: "Extra requirement in v2",
+          rationale: "Add v2 scope",
+        },
+        { source: "director", actorChatSessionId: chat.id },
+      );
+
+      await daemon.director.sendChatMessage(chat.id, "inspect goal");
+      assert.ok(goalGetResult, "expected goal_get result");
+      const got = goalGetResult;
+
+      const workerRow = got.tasks.find((t) => t.id === workerId);
+      const t1Row = got.tasks.find((t) => t.id !== workerId);
+      assert.ok(workerRow, "expected worker row in goal_get.tasks");
+      assert.ok(t1Row, "expected T1 row in goal_get.tasks");
+      assert.equal(workerRow.goalVersion, 1);
+      assert.equal(workerRow.staleGoalVersion, true);
+      assert.equal(t1Row.goalVersion, 2);
+      assert.equal(t1Row.staleGoalVersion, false);
+
+      const actWorker = got.activity?.tasks.find((t) => t.id === workerId);
+      assert.equal(actWorker?.goalVersion, 1);
+      assert.equal(actWorker?.lastAmendmentAction, "queued");
+    } finally {
+      releaseAll.resolve();
+      await daemon.stop();
+    }
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});

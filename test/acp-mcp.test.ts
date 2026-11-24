@@ -1312,4 +1312,178 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
       rmSync(cwd, { recursive: true, force: true });
     }
   });
+
+  it("amp steer: failed returns false and queued hands off via cancel-then-prompt (or false when disabled), never bare live true", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-harness-amp-steer-"));
+    try {
+      const ampProfile: AcpProfileConfig = {
+        id: "acp:amp",
+        kind: "acp",
+        adapter: "generic",
+        command: "npx",
+        args: ["-y", "amp-acp"],
+        billing: "subscription",
+      };
+
+      // Case 1: default local mode (AMP_ACP_CANCEL_MODE=steer) -> failed returns false;
+      // queued mid-turn triggers session/cancel + replacement session/prompt and continues the turn.
+      const seenPrompts: string[] = [];
+      let cancelCount = 0;
+      let steerCalls = 0;
+      let resolveTurn1!: (res: { stopReason: string }) => void;
+      let turn1Started!: () => void;
+      const turn1Ready = new Promise<void>((r) => {
+        turn1Started = r;
+      });
+
+      const localAgent = agent()
+        .onRequest("initialize", async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: "amp-acp", version: "0.12.0" },
+          agentCapabilities: { sessionCapabilities: {} },
+        } as never))
+        .onRequest("session/new", async () => ({
+          sessionId: "S-amp-1",
+          models: {
+            currentModelId: "anthropic/claude-opus-5-5",
+            availableModels: [{ modelId: "anthropic/claude-opus-5-5", name: "Opus" }],
+          },
+        } as never))
+        .onNotification("session/cancel", async () => {
+          cancelCount += 1;
+          resolveTurn1?.({ stopReason: "cancelled" });
+        })
+        .onRequest("session/prompt", async ({ params, client: acpClient }) => {
+          const text = ((params as { prompt?: Array<{ text?: string }> }).prompt ?? []).map((b) => b.text ?? "").join("");
+          seenPrompts.push(text);
+          if (seenPrompts.length === 1) {
+            turn1Started();
+            return (await new Promise<{ stopReason: string }>((r) => {
+              resolveTurn1 = r;
+            })) as never;
+          }
+          await acpClient.notify("session/update", {
+            sessionId: "S-amp-1",
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "steered-turn-ok" } },
+          } as never);
+          return { stopReason: "end_turn" } as never;
+        })
+        .onRequest("*", async ({ method }) => {
+          if (method === "_amp/session/steer") {
+            steerCalls += 1;
+            if (steerCalls === 1) return { outcome: "failed", reason: "Prompt queue is full" } as never;
+            return { outcome: "queued" } as never;
+          }
+          throw new Error(`Unexpected method ${method}`);
+        });
+
+      let handle: { steer: (m: string) => Promise<boolean>; cancel: (r?: string) => Promise<void> } | undefined;
+      const runner = new AcpRunner(ampProfile);
+      const runPromise = runner.run(
+        {
+          runId: "r-amp",
+          taskId: "t-amp",
+          tier: 2,
+          kind: "worker",
+          cwd,
+          toolPolicy: "read_write_workspace",
+          systemPrompt: "Worker",
+          initialPrompt: "Start initial work",
+          model: "anthropic/claude-opus-5-5",
+          maxTurns: 10,
+          tools: [],
+          executeTool: async () => ({}),
+          signal: new AbortController().signal,
+          onHandle: (h) => {
+            handle = h;
+          },
+          callbacks: {},
+        },
+        localAgent,
+      );
+
+      await turn1Ready;
+      assert.ok(handle, "expected runner handle");
+      assert.equal(await handle.steer("first steer (fails)"), false);
+      assert.equal(cancelCount, 0);
+
+      assert.equal(await handle.steer("STOP: goal amended to v2"), true);
+      const result = await runPromise;
+      assert.equal(cancelCount, 1, "queued amp steer must use cancel-then-prompt hand-off");
+      assert.equal(seenPrompts.length, 2);
+      assert.equal(seenPrompts[1], "STOP: goal amended to v2");
+      assert.equal(result.stopReason, "completed");
+      assert.ok(result.text.includes("steered-turn-ok"));
+
+      // Case 2: when cancel-then-prompt is disabled (e.g. orb executor), queued outcome returns false (never bare true).
+      let orbCancelCount = 0;
+      let finishOrbTurn!: () => void;
+      let orbTurnStarted!: () => void;
+      const orbTurnReady = new Promise<void>((r) => {
+        orbTurnStarted = r;
+      });
+      const orbAgent = agent()
+        .onRequest("initialize", async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: "amp-acp", version: "0.12.0" },
+          agentCapabilities: { sessionCapabilities: {} },
+        } as never))
+        .onRequest("session/new", async () => ({
+          sessionId: "S-amp-orb",
+          models: {
+            currentModelId: "anthropic/claude-opus-5-5",
+            availableModels: [{ modelId: "anthropic/claude-opus-5-5", name: "Opus" }],
+          },
+        } as never))
+        .onNotification("session/cancel", async () => {
+          orbCancelCount += 1;
+        })
+        .onRequest("session/prompt", async () => {
+          orbTurnStarted();
+          await new Promise<void>((r) => {
+            finishOrbTurn = r;
+          });
+          return { stopReason: "end_turn" } as never;
+        })
+        .onRequest("*", async ({ method }) => {
+          if (method === "_amp/session/steer") return { outcome: "queued" } as never;
+          throw new Error(`Unexpected method ${method}`);
+        });
+
+      let orbHandle: { steer: (m: string) => Promise<boolean>; cancel: (r?: string) => Promise<void> } | undefined;
+      const orbRunPromise = runner.run(
+        {
+          runId: "r-amp-orb",
+          taskId: "t-amp-orb",
+          tier: 2,
+          kind: "worker",
+          cwd,
+          toolPolicy: "read_write_workspace",
+          systemPrompt: "Worker",
+          initialPrompt: "Start orb work",
+          model: "anthropic/claude-opus-5-5",
+          maxTurns: 10,
+          extraEnv: { AMP_ACP_EXECUTOR: "orb" },
+          tools: [],
+          executeTool: async () => ({}),
+          signal: new AbortController().signal,
+          onHandle: (h) => {
+            orbHandle = h;
+          },
+          callbacks: {},
+        },
+        orbAgent,
+      );
+
+      await orbTurnReady;
+      assert.ok(orbHandle);
+      assert.equal(await orbHandle.steer("queued on orb"), false);
+      assert.equal(orbCancelCount, 0);
+      finishOrbTurn();
+      const orbResult = await orbRunPromise;
+      assert.equal(orbResult.stopReason, "completed");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 });

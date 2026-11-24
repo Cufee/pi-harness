@@ -19,7 +19,12 @@ import { compactTaskHandoff, toolsForTier } from "../control-plane/tools.js";
 import { findRunDossier, readRunDossier, writeCodeOutput, writeTaskDossier } from "../control-plane/dossiers.js";
 import type { AdmissionLane, QueuePositionInput } from "../control-plane/admission-queue.js";
 import type { ArtifactRecord, ControlPlaneDb, EscalationRecord, EventRecord, RunRecord } from "../control-plane/db.js";
-import { RunStartStoppedError, type CustomRunnerFactory, type HarnessOrchestrator } from "../control-plane/orchestrator.js";
+import {
+  RunStartStoppedError,
+  type CustomRunnerFactory,
+  type HarnessOrchestrator,
+  type SteerTaskResult,
+} from "../control-plane/orchestrator.js";
 import { directorTaskRunOwner } from "../control-plane/ids.js";
 import { canonicalProjectPath, type ProjectRecord } from "../control-plane/projects.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
@@ -32,6 +37,7 @@ import {
   shouldRunIndependentReview,
   type CriterionEvaluation,
   type GoalAcceptOverrideAudit,
+  type GoalAmendmentDelta,
   type GoalCriterion,
   type GoalRecord,
   type GoalReviewVerdict,
@@ -99,6 +105,61 @@ export class StaleWakeEventError extends Error {
     super(message);
     this.name = "StaleWakeEventError";
   }
+}
+
+export interface AffectedAmendmentTask {
+  taskId: string;
+  tier: 2 | 3;
+  boundVersion: number | null;
+  action: "delivered" | "queued" | "refused";
+  mode?: SteerTaskResult["mode"];
+  live?: boolean;
+  reason?: string;
+  scopeHit: string[];
+}
+
+export function formatAmendmentDelta(
+  goal: Pick<GoalRecord, "id" | "version" | "description" | "nonGoals">,
+  delta: GoalAmendmentDelta,
+  opts?: {
+    boundVersion?: number | null;
+    audience?: "orchestrator" | "worker";
+    affectedTasksSummary?: string;
+  },
+): string {
+  const audience = opts?.audience ?? "orchestrator";
+  const descCap = audience === "worker" ? 1500 : 4000;
+  const cap = (text: string, max: number) => (text.length > max ? `${text.slice(0, max)}... [truncated]` : text);
+  const header =
+    audience === "worker" && opts?.boundVersion != null
+      ? `[GOAL AMENDED: ${goal.id} v${delta.fromVersion} -> v${delta.toVersion}] You were started on v${opts.boundVersion}.`
+      : `[GOAL AMENDED: ${goal.id} v${delta.fromVersion} -> v${delta.toVersion}]`;
+
+  return [
+    header,
+    `Rationale: ${delta.rationale}`,
+    delta.descriptionMode === "append" && delta.appendedDescription
+      ? `Description extended (existing text unchanged). Appended:\n${cap(delta.appendedDescription, descCap)}`
+      : null,
+    delta.descriptionMode === "replace"
+      ? `Description REPLACED (${delta.previousDescriptionLength ?? "?"} -> ${delta.descriptionLength ?? goal.description.length} chars). New description:\n${cap(goal.description, descCap)}\nPrevious description: blackboard goal_contract_v${delta.fromVersion}.`
+      : null,
+    delta.nonGoalsChanged ? `Non-goals now: ${goal.nonGoals.length ? goal.nonGoals.join("; ") : "(none)"}` : null,
+    delta.addedCriteria.length
+      ? `Added criteria: ${delta.addedCriteria.map((c) => `${c.id}: ${c.description}`).join("; ")}`
+      : null,
+    delta.removedCriteriaIds.length ? `Removed criteria: ${delta.removedCriteriaIds.join(", ")}` : null,
+    delta.modifiedCriteria.length
+      ? `Modified criteria: ${delta.modifiedCriteria.map((c) => `${c.id}: ${c.description}`).join("; ")}`
+      : null,
+    `Full current contract: blackboard_get({ key: "goal_contract_v${goal.version}" }).`,
+    audience === "orchestrator" && opts?.affectedTasksSummary ? opts.affectedTasksSummary : null,
+    audience === "worker"
+      ? `If the amendment removes or contradicts your assigned work, stop now: commit what is useful and return_task (partial) naming what you dropped. Otherwise continue against v${goal.version}.`
+      : "Reconcile active Tier 2 Workers: KEEP unaffected workers, STEER adjustable workers, CANCEL_AND_REPLACE invalidated workers.",
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 const DIRECTOR_TOOLS: ToolDefinition[] = [
@@ -1699,6 +1760,7 @@ export class DirectorRuntime {
       // A fresh run starts on the current contract; amendments pending for an older run no longer apply.
       this.undeliveredAmendments.delete(goal.id);
       started = this.goals.linkRunAndStart(goal.id, run.id);
+      this.db.updateTask(orchestratorTaskId, { goalVersion: launchedGoal.version });
       this.bumpReviewInvalidationEpoch(goal.id);
       runId = run.id;
       launched = true;
@@ -1728,7 +1790,11 @@ export class DirectorRuntime {
       if (latestAfterLaunch && latestAfterLaunch.version > launchedGoal.version) {
         const { title: updatedTitle, objective: updatedObjective } = goalRunObjective(latestAfterLaunch);
         this.db.updateRunGoal(run.id, updatedObjective);
-        this.db.updateTask(orchestratorTaskId, { title: updatedTitle, objective: updatedObjective });
+        this.db.updateTask(orchestratorTaskId, {
+          title: updatedTitle,
+          objective: updatedObjective,
+          goalVersion: latestAfterLaunch.version,
+        });
         const latestKey = `goal_contract_v${latestAfterLaunch.version}`;
         try {
           const revisionDelta = this.goals.listRevisions(goal.id).find((r) => r.version === latestAfterLaunch.version)?.delta ?? null;
@@ -2172,6 +2238,7 @@ export class DirectorRuntime {
     goal: GoalRecord;
     delta: ReturnType<GoalEngine["amendGoal"]>["delta"];
     delivery: { delivered: boolean; via: "steer" | "resume" | "none"; reason?: string };
+    affectedTasks: AffectedAmendmentTask[];
     supersededEscalationIds: string[];
     openEscalations: Array<Pick<EscalationRecord, "id" | "severity" | "category" | "title">>;
   }> {
@@ -2179,11 +2246,11 @@ export class DirectorRuntime {
     const source = opts?.source ?? "external";
     let amendedGoal = goal;
     let delivery: { delivered: boolean; via: "steer" | "resume" | "none"; reason?: string } = { delivered: false, via: "none" };
+    const affectedTasks: AffectedAmendmentTask[] = [];
     const strand = (reason: string) => {
       delivery = { delivered: false, via: "none", reason };
       amendedGoal = this.handOffStrandedGoal(goal, reason);
     };
-    const cap = (text: string, max: number) => (text.length > max ? `${text.slice(0, max)}... [truncated]` : text);
 
     if (goal.linkedRunId) {
       // Persist updated Goal Contract text onto runs.goal and Blackboard so rollovers/resumes never see stale v1 requirements
@@ -2203,9 +2270,10 @@ export class DirectorRuntime {
 
       this.db.emitEvent(goal.linkedRunId, null, "goal.amended", { goalId: goal.id, delta, source });
       // Steer active Tier 1 Orchestrator (or relaunch in-place if settled!) with the structured vN -> vN+1 delta
-      const orch = this.db.listTasks(goal.linkedRunId).find((t) => t.tier === 1);
+      const allRunTasks = this.db.listTasks(goal.linkedRunId);
+      const orch = allRunTasks.find((t) => t.tier === 1);
       if (orch) {
-        // Refresh Tier 1's title, objective, and stored handoff goalInvariants so rollovers never replay stale v1 constraints
+        // Refresh Tier 1's title, objective, goalVersion, and stored handoff goalInvariants so rollovers never replay stale v1 constraints
         let updatedHandoffJson = orch.handoffJson;
         if (orch.handoffJson) {
           try {
@@ -2224,6 +2292,7 @@ export class DirectorRuntime {
         this.db.updateTask(orch.id, {
           title: `Goal ${goal.id} v${goal.version}: ${goal.title}`,
           objective: updatedObjective,
+          goalVersion: goal.version,
           ...(updatedHandoffJson !== orch.handoffJson ? { handoffJson: updatedHandoffJson } : {}),
         });
         try {
@@ -2249,28 +2318,77 @@ export class DirectorRuntime {
           { version: goal.version, title: goal.title, description: goal.description, criteria: goal.criteria, nonGoals: goal.nonGoals, delta },
           orch.id,
         );
-        const steerMsg = [
-          `[GOAL AMENDED: ${goal.id} v${delta.fromVersion} -> v${delta.toVersion}]`,
-          `Rationale: ${delta.rationale}`,
-          delta.descriptionMode === "append" && delta.appendedDescription
-            ? `Description extended (existing text unchanged). Appended:\n${cap(delta.appendedDescription, 4000)}`
-            : null,
-          delta.descriptionMode === "replace"
-            ? `Description REPLACED (${delta.previousDescriptionLength ?? "?"} -> ${delta.descriptionLength ?? goal.description.length} chars). New description:\n${cap(goal.description, 4000)}\nPrevious description: blackboard goal_contract_v${delta.fromVersion}.`
-            : null,
-          delta.nonGoalsChanged ? `Non-goals now: ${goal.nonGoals.length ? goal.nonGoals.join("; ") : "(none)"}` : null,
-          delta.addedCriteria.length
-            ? `Added criteria: ${delta.addedCriteria.map((c) => `${c.id}: ${c.description}`).join("; ")}`
-            : null,
-          delta.removedCriteriaIds.length ? `Removed criteria: ${delta.removedCriteriaIds.join(", ")}` : null,
-          delta.modifiedCriteria.length
-            ? `Modified criteria: ${delta.modifiedCriteria.map((c) => `${c.id}: ${c.description}`).join("; ")}`
-            : null,
-          `Full current contract: blackboard_get({ key: "goal_contract_v${goal.version}" }).`,
-          "Reconcile active Tier 2 Workers: KEEP unaffected workers, STEER adjustable workers, CANCEL_AND_REPLACE invalidated workers.",
-        ]
-          .filter(Boolean)
-          .join("\n");
+
+        // Deliver the amendment delta directly to every live tier 2/3 task bound to an older goal version.
+        const liveAmendStatuses = new Set(["running", "waiting_children", "ready", "pending", "draining"]);
+        const changedCriterionIds = [
+          ...new Set([...delta.removedCriteriaIds, ...delta.modifiedCriteria.map((c) => c.id)]),
+        ];
+        const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const candidateWorkers = allRunTasks.filter(
+          (t) =>
+            (t.tier === 2 || t.tier === 3) &&
+            liveAmendStatuses.has(t.status) &&
+            (t.goalVersion == null || t.goalVersion < delta.toVersion),
+        );
+        for (const worker of candidateWorkers) {
+          const hay = `${worker.objective}\n${worker.criteria}`;
+          const scopeHit = changedCriterionIds.filter((id) =>
+            new RegExp(`(?:^|[^A-Za-z0-9_-])${escapeRe(id)}(?:$|[^A-Za-z0-9_-])`).test(hay),
+          );
+          const workerBoundVersion = worker.goalVersion ?? null;
+          const workerMsg = formatAmendmentDelta(goal, delta, {
+            boundVersion: workerBoundVersion,
+            audience: "worker",
+          });
+          const steerRes = await this.orchestrator.steerTaskDetailed(worker.id, workerMsg);
+          let action: AffectedAmendmentTask["action"];
+          if (steerRes.steered && steerRes.live) {
+            action = "delivered";
+            this.db.updateTask(worker.id, { goalVersion: goal.version });
+          } else if (steerRes.steered) {
+            action = "queued";
+            this.orchestrator.setAmendBindOnDrain(worker.id, goal.version);
+          } else {
+            action = "refused";
+          }
+          const entry: AffectedAmendmentTask = {
+            taskId: worker.id,
+            tier: worker.tier as 2 | 3,
+            boundVersion: workerBoundVersion,
+            action,
+            mode: steerRes.mode,
+            live: steerRes.live,
+            ...(steerRes.reason ? { reason: steerRes.reason } : {}),
+            scopeHit,
+          };
+          affectedTasks.push(entry);
+          this.db.emitEvent(goal.linkedRunId, worker.id, "goal.amendment_task", {
+            goalId: goal.id,
+            fromVersion: delta.fromVersion,
+            toVersion: delta.toVersion,
+            ...entry,
+          });
+        }
+
+        const affectedTasksSummary =
+          affectedTasks.length > 0
+            ? [
+                "Affected running tasks (tier 2/3):",
+                ...affectedTasks.map(
+                  (a) =>
+                    `- ${a.taskId} (T${a.tier}, bound v${a.boundVersion ?? "?"}): ${a.action}` +
+                    ` [${a.mode}${a.live ? ", live" : ""}]` +
+                    (a.scopeHit.length ? ` scopeHit=[${a.scopeHit.join(", ")}]` : "") +
+                    (a.reason ? ` — ${a.reason}` : ""),
+                ),
+              ].join("\n")
+            : undefined;
+
+        const steerMsg = formatAmendmentDelta(goal, delta, {
+          audience: "orchestrator",
+          affectedTasksSummary,
+        });
         const isStillAmendedExecuting = () => {
           const latest = this.goals.getGoal(goal.id);
           return latest !== null && latest.version === goal.version && latest.status === "executing";
@@ -2357,7 +2475,7 @@ export class DirectorRuntime {
         // Escalations table may be absent.
       }
     }
-    return { goal: amendedGoal, delta, delivery, supersededEscalationIds, openEscalations };
+    return { goal: amendedGoal, delta, delivery, affectedTasks, supersededEscalationIds, openEscalations };
   }
 
   /**
@@ -4690,7 +4808,7 @@ export class DirectorRuntime {
       }
 
       case "report_goal_progress": {
-        const g = this.goals.reportProgress(String(args.goal_id), {
+        const { goal: g, recorded, dropped, note } = this.goals.reportProgressDetailed(String(args.goal_id), {
           summary: String(args.summary ?? "").trim() || undefined,
           phase: typeof args.phase === "string" ? args.phase.trim() || undefined : undefined,
           verificationStatus:
@@ -4710,10 +4828,15 @@ export class DirectorRuntime {
             : undefined,
           reportedByTaskId: chatSessionId,
         }, "director");
-        if (g.linkedRunId) {
+        if (recorded && g.linkedRunId) {
           this.db.emitEvent(g.linkedRunId, null, "goal.progress", { goalId: g.id, ...g.liveProgress });
         }
-        return { goal: g };
+        return {
+          goal: g,
+          recorded,
+          goalId: g.id,
+          ...(dropped.length > 0 ? { dropped, note } : {}),
+        };
       }
 
       case "goal_get": {
@@ -4724,7 +4847,11 @@ export class DirectorRuntime {
           ...detail,
           acceptOverrides: detail.reviews.filter((r) => r.source === "director_accept_override"),
           evidenceDir: goalEvidenceDirOrNull(g),
-          tasks: detail.tasks.map((t) => compactTaskHandoff(t, detail.openEscalations)),
+          tasks: detail.tasks.map((t) => ({
+            ...compactTaskHandoff(t, detail.openEscalations),
+            goalVersion: t.goalVersion ?? null,
+            staleGoalVersion: t.goalVersion != null && t.goalVersion < detail.goal.version,
+          })),
           presentation_id: offerPresentation(() => buildGoalDetailDisplay(detail)),
         };
       }

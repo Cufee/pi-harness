@@ -13,6 +13,8 @@ export interface GoalLiveProgress {
   updatedAt: number;
   /** Provenance of the last CLAIM (verificationStatus, criteriaResults, or phase "blocked"). Absent on legacy rows. */
   goalVersion?: number;
+  /** Goal version the reporting task was bound to when it made the claim. */
+  reporterGoalVersion?: number | null;
   runId?: string | null;
   reviewCycle?: number;
   /** Author of the claim; follows `verificationSource` while a verification status is stored. */
@@ -24,15 +26,106 @@ export interface GoalLiveProgress {
 
 export type GoalLiveProgressPatch = Omit<
   GoalLiveProgress,
-  "updatedAt" | "goalVersion" | "runId" | "reviewCycle" | "source" | "verificationSource" | "claimedAt"
+  "updatedAt" | "goalVersion" | "reporterGoalVersion" | "runId" | "reviewCycle" | "source" | "verificationSource" | "claimedAt"
 >;
 
 export interface GoalProgressContext {
   goalVersion: number;
+  /** Goal version the reporting task was bound to (null for Director/unlinked reporters). */
+  reporterGoalVersion?: number | null;
   runId: string | null;
   reviewCycle: number;
   source: GoalProgressSource;
   now: number;
+}
+
+export interface DroppedProgressEntry {
+  field: "criteriaResults" | "verificationStatus" | "phase";
+  value: string;
+  reason: string;
+}
+
+/**
+ * Filters out stale or unknown progress entries rather than failing the call ("inform, don't block"):
+ *  - Drops `criteriaResults` entries whose `criterionId` is absent from the current goal version.
+ *  - When the reporter is bound to an older goal version (`boundVersion < currentVersion`), drops
+ *    `verificationStatus: "passed"` and `phase: "completed"` while keeping summary and non-terminal progress.
+ */
+export function filterProgressPatch(
+  patch: GoalLiveProgressPatch,
+  opts: {
+    goalId?: string;
+    criterionIds: ReadonlySet<string>;
+    boundVersion: number | null;
+    currentVersion: number;
+  },
+): {
+  patch: GoalLiveProgressPatch;
+  dropped: DroppedProgressEntry[];
+  note?: string;
+} {
+  const dropped: DroppedProgressEntry[] = [];
+  const next: GoalLiveProgressPatch = { ...patch };
+  const goalRef = opts.goalId ? `${opts.goalId} v${opts.currentVersion}` : `goal v${opts.currentVersion}`;
+
+  if (patch.criteriaResults !== undefined) {
+    const kept: CriterionEvaluation[] = [];
+    for (const r of patch.criteriaResults) {
+      if (!opts.criterionIds.has(r.criterionId)) {
+        dropped.push({
+          field: "criteriaResults",
+          value: r.criterionId,
+          reason: `criterion ${r.criterionId} is not in goal v${opts.currentVersion}`,
+        });
+      } else {
+        kept.push(r);
+      }
+    }
+    next.criteriaResults = kept.length > 0 ? kept : undefined;
+  }
+
+  const isStaleVersion = opts.boundVersion !== null && opts.boundVersion < opts.currentVersion;
+  if (isStaleVersion) {
+    if (next.verificationStatus === "passed") {
+      dropped.push({
+        field: "verificationStatus",
+        value: "passed",
+        reason: `task bound to v${opts.boundVersion}; goal is v${opts.currentVersion}`,
+      });
+      next.verificationStatus = undefined;
+    }
+    if (next.phase?.trim().toLowerCase() === "completed") {
+      dropped.push({
+        field: "phase",
+        value: next.phase,
+        reason: `task bound to v${opts.boundVersion}; goal is v${opts.currentVersion}`,
+      });
+      next.phase = undefined;
+    }
+  }
+
+  if (dropped.length === 0) {
+    return { patch: next, dropped };
+  }
+
+  const parts: string[] = [];
+  const droppedCriteria = dropped.filter((d) => d.field === "criteriaResults").map((d) => d.value);
+  if (droppedCriteria.length > 0) {
+    parts.push(`criteria ${droppedCriteria.join(",")} are not in ${goalRef}`);
+  }
+  const droppedVer = dropped.find((d) => d.field === "verificationStatus");
+  if (droppedVer) {
+    parts.push(`verification_status ${droppedVer.value} ignored because this task was started on v${opts.boundVersion}`);
+  }
+  const droppedPhase = dropped.find((d) => d.field === "phase");
+  if (droppedPhase) {
+    parts.push(`phase ${droppedPhase.value} ignored because this task was started on v${opts.boundVersion}`);
+  }
+  const note =
+    `Dropped ${dropped.length} ${dropped.length === 1 ? "entry" : "entries"}: ${parts.join("; ")}. ` +
+    `Re-check against v${opts.currentVersion} (blackboard goal_contract_v${opts.currentVersion}) before claiming.`;
+
+  return { patch: next, dropped, note };
 }
 
 export function isBlockedPhase(phase?: string | null): boolean {
@@ -113,6 +206,11 @@ export function mergeGoalLiveProgress(
   };
   if (isClaim && !workerLocked && (!legacyClaim || migratesLegacy)) {
     next.goalVersion = ctx.goalVersion;
+    if (ctx.reporterGoalVersion != null) {
+      next.reporterGoalVersion = ctx.reporterGoalVersion;
+    } else if (base?.reporterGoalVersion != null && !setsVerification && base?.verificationStatus !== undefined) {
+      next.reporterGoalVersion = base.reporterGoalVersion;
+    }
     next.runId = ctx.runId;
     next.reviewCycle = ctx.reviewCycle;
     if (setsVerification) {
@@ -132,6 +230,7 @@ export function mergeGoalLiveProgress(
     }
   } else if (base) {
     if (base.goalVersion !== undefined) next.goalVersion = base.goalVersion;
+    if (base.reporterGoalVersion !== undefined) next.reporterGoalVersion = base.reporterGoalVersion;
     if (base.runId !== undefined) next.runId = base.runId;
     if (base.reviewCycle !== undefined) next.reviewCycle = base.reviewCycle;
     if (base.source !== undefined) next.source = base.source;
@@ -148,21 +247,22 @@ export function isCurrentClaim(
   goal: Pick<GoalRecord, "version" | "linkedRunId" | "reviewCycle">,
   lp: GoalLiveProgress | null | undefined,
 ): boolean {
-  return (
-    lp != null && lp.goalVersion === goal.version && lp.runId === goal.linkedRunId && lp.reviewCycle === goal.reviewCycle
-  );
+  if (lp == null) return false;
+  if (lp.reporterGoalVersion != null && lp.reporterGoalVersion < goal.version) return false;
+  return lp.goalVersion === goal.version && lp.runId === goal.linkedRunId && lp.reviewCycle === goal.reviewCycle;
 }
 
-/** Removes claim fields and provenance (and optionally a blocked phase); `next` is null when nothing meaningful remains. */
+/** Removes claim fields and provenance (and optionally a blocked or non-queued phase/summary); `next` is null when nothing meaningful remains. */
 export function stripStaleLiveProgress(
   lp: GoalLiveProgress | null | undefined,
-  opts?: { clearBlockedPhase?: boolean },
+  opts?: { clearBlockedPhase?: boolean; clearNonQueuedPhaseSummary?: boolean },
 ): { next: GoalLiveProgress | null; changed: boolean } {
   if (!lp) return { next: null, changed: false };
   const {
     verificationStatus,
     criteriaResults,
     goalVersion,
+    reporterGoalVersion,
     runId,
     reviewCycle,
     source,
@@ -174,6 +274,7 @@ export function stripStaleLiveProgress(
     verificationStatus,
     criteriaResults,
     goalVersion,
+    reporterGoalVersion,
     runId,
     reviewCycle,
     source,
@@ -183,7 +284,14 @@ export function stripStaleLiveProgress(
     (v) => v !== undefined,
   );
   const next: GoalLiveProgress = { ...rest };
-  if (opts?.clearBlockedPhase && isBlockedPhase(lp.phase)) {
+  if (opts?.clearNonQueuedPhaseSummary) {
+    const keepQueued = lp.phase === "queued" || lp.phase === "queue_launch_error";
+    if (!keepQueued && (next.phase !== undefined || next.summary !== undefined)) {
+      delete next.phase;
+      delete next.summary;
+      changed = true;
+    }
+  } else if (opts?.clearBlockedPhase && isBlockedPhase(lp.phase)) {
     delete next.phase;
     delete next.summary;
     changed = true;

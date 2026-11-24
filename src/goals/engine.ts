@@ -7,6 +7,8 @@ import { friendlyIdCandidates, nextFriendlyId } from "../control-plane/ids.js";
 import { type ResolvedGateEnv, resolveGateEnv, runGateCommand } from "../tools/gate-env.js";
 import { runGit } from "../worktree/manager.js";
 import {
+  type DroppedProgressEntry,
+  filterProgressPatch,
   type GoalLiveProgress,
   type GoalLiveProgressPatch,
   type GoalProgressSource,
@@ -578,11 +580,36 @@ export class GoalEngine {
     input: GoalLiveProgressPatch,
     source?: GoalProgressSource,
   ): GoalRecord {
+    return this.reportProgressDetailed(goalIdStr, input, source).goal;
+  }
+
+  /** Like `reportProgress`, also returning any dropped criterion entries and explanatory note. */
+  reportProgressDetailed(
+    goalIdStr: string,
+    input: GoalLiveProgressPatch,
+    source?: GoalProgressSource,
+  ): { goal: GoalRecord; recorded: boolean; dropped: DroppedProgressEntry[]; note?: string } {
     const g = this.getGoal(goalIdStr);
     if (!g) throw new Error(`Unknown goal ${goalIdStr}`);
+    const criterionIds = new Set(g.criteria.map((c) => c.id));
+    const filtered = filterProgressPatch(input, {
+      goalId: g.id,
+      criterionIds,
+      boundVersion: null,
+      currentVersion: g.version,
+    });
+    const hasRemaining =
+      filtered.patch.summary !== undefined ||
+      filtered.patch.phase !== undefined ||
+      filtered.patch.verificationStatus !== undefined ||
+      filtered.patch.criteriaResults !== undefined;
+    if (filtered.dropped.length > 0 && !hasRemaining) {
+      return { goal: g, recorded: false, dropped: filtered.dropped, note: filtered.note };
+    }
     const now = Date.now();
-    const next = mergeGoalLiveProgress(g.liveProgress, input, {
+    const next = mergeGoalLiveProgress(g.liveProgress, filtered.patch, {
       goalVersion: g.version,
+      reporterGoalVersion: null,
       runId: g.linkedRunId,
       reviewCycle: g.reviewCycle,
       source: source ?? "director",
@@ -591,7 +618,12 @@ export class GoalEngine {
     this.db
       .prepare("UPDATE goals SET live_progress_json = ?, updated_at = ? WHERE id = ?")
       .run(JSON.stringify(next), now, g.id);
-    return this.getGoal(g.id)!;
+    return {
+      goal: this.getGoal(g.id)!,
+      recorded: true,
+      dropped: filtered.dropped,
+      ...(filtered.note ? { note: filtered.note } : {}),
+    };
   }
 
   setStatus(goalIdStr: string, status: GoalStatus, summary?: string): GoalRecord {
@@ -769,7 +801,10 @@ export class GoalEngine {
     }
 
     const now = Date.now();
-    const clearedProgress = stripStaleLiveProgress(cur.liveProgress, { clearBlockedPhase: true });
+    const clearedProgress = stripStaleLiveProgress(cur.liveProgress, {
+      clearBlockedPhase: true,
+      clearNonQueuedPhaseSummary: true,
+    });
     const nextLiveProgressJson = clearedProgress.changed
       ? clearedProgress.next
         ? JSON.stringify(clearedProgress.next)

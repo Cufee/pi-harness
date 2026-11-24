@@ -11,6 +11,8 @@ export interface TaskActivitySnapshot {
   effort: string | null;
   profileId: string;
   generation: number;
+  goalVersion?: number | null;
+  lastAmendmentAction?: "delivered" | "queued" | "refused" | "cancelled" | null;
   /** Automatically derived from latest `agent.tool` / `task.status` / `quota.*` event (no model reporting required). */
   currentAction: string | null;
   toolCalls: number;
@@ -96,12 +98,13 @@ export function buildRunActivitySummary(db: ControlPlaneDb, runId: string, now =
   // and currentAction stay accurate across multi-hour runs without a 400-event drop.
   const toolCounts = new Map<string, number>();
   const latestActionByTask = new Map<string, string>();
+  const latestAmendmentActionByTask = new Map<string, "delivered" | "queued" | "refused" | "cancelled">();
   const seenCallIdsByTask = new Map<string, Set<string>>();
   const evRows = db.db
     .prepare(
       `SELECT task_id, type, payload_json FROM events
        WHERE run_id = ? AND task_id IS NOT NULL
-         AND type IN ('agent.tool', 'agent.timer_sleep', 'quota.agent_retrying', 'quota.agent_paused', 'agent.rollover')
+         AND type IN ('agent.tool', 'agent.timer_sleep', 'quota.agent_retrying', 'quota.agent_paused', 'agent.rollover', 'goal.amendment_task')
        ORDER BY seq DESC
        LIMIT 2000`,
     )
@@ -115,6 +118,15 @@ export function buildRunActivitySummary(db: ControlPlaneDb, runId: string, now =
       continue;
     }
     const tid = row.task_id;
+    if (row.type === "goal.amendment_task") {
+      if (!latestAmendmentActionByTask.has(tid)) {
+        const action = payload.action;
+        if (action === "delivered" || action === "queued" || action === "refused" || action === "cancelled") {
+          latestAmendmentActionByTask.set(tid, action);
+        }
+      }
+      continue;
+    }
     if (row.type === "agent.tool") {
       const callId = typeof payload.id === "string" && payload.id ? payload.id : null;
       if (callId) {
@@ -232,6 +244,8 @@ export function buildRunActivitySummary(db: ControlPlaneDb, runId: string, now =
       effort: t.effort,
       profileId: t.profileId,
       generation: t.generation,
+      goalVersion: t.goalVersion ?? null,
+      lastAmendmentAction: latestAmendmentActionByTask.get(t.id) ?? null,
       currentAction,
       toolCalls: toolCounts.get(t.id) ?? 0,
       filesEdited: editPathsByTask.get(t.id)?.size ?? 0,

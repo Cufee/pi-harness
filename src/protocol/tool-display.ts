@@ -4,7 +4,7 @@ import type { EscalationRecord, TaskRecord } from "../control-plane/db.js";
 import type { RunActivitySummary } from "../control-plane/telemetry.js";
 import type { RunnerCallbacks } from "../runners/types.js";
 import type { GoalRecord, GoalReviewVerdict } from "../goals/engine.js";
-import { isCurrentClaim, stripStaleLiveProgress } from "../goals/live-progress.js";
+import { type GoalLiveProgress, isCurrentClaim, stripStaleLiveProgress } from "../goals/live-progress.js";
 
 export function toolEventPreview(value: unknown): string | undefined {
   if (value === undefined || value === null) return undefined;
@@ -87,6 +87,8 @@ export interface GoalDetailData {
     kind?: string;
     model?: string | null;
     effort?: string | null;
+    goalVersion?: number | null;
+    staleGoalVersion?: boolean;
     currentAction?: string | null;
     toolCalls?: number;
     filesEdited?: number;
@@ -125,20 +127,41 @@ function criterionResults(goal: GoalRecord, review: GoalReviewVerdict | null): M
 }
 
 /**
- * Read-path projection: hides verification claims made for an earlier goal version, run, or review cycle.
- * Pure (never writes) and never changes `status`. Legacy progress without provenance is shown as stored.
+ * Read-path projection: hides verification claims made for an earlier goal version, run, review cycle,
+ * or reporter goal version, and filters out criteriaResults whose criterionId is not in the current goal.
+ * Pure (never writes) and never changes `status`. Legacy progress without provenance is shown as stored
+ * (with unknown criterion IDs filtered out).
  */
 export function reconcileGoalWithLiveRun(goal: GoalRecord): GoalRecord {
-  if (goal.status === "draft" || goal.status === "paused" || goal.status === "achieved" || goal.status === "cancelled") {
-    return goal;
-  }
   const lp = goal.liveProgress;
   if (!lp) return goal;
-  const hasProvenance = lp.goalVersion !== undefined || lp.runId !== undefined || lp.reviewCycle !== undefined;
-  if (!hasProvenance || isCurrentClaim(goal, lp)) return goal;
-  // A stale blocked phase (and its summary) belongs to the stale claim, so it is hidden too.
-  const liveProgress = stripStaleLiveProgress(lp, { clearBlockedPhase: true }).next;
-  return { ...goal, liveProgress };
+  const filterUnknownCriteria = (progress: GoalLiveProgress): GoalLiveProgress => {
+    if (!progress.criteriaResults?.length) return progress;
+    const ids = new Set(goal.criteria.map((c) => c.id));
+    const kept = progress.criteriaResults.filter((r) => ids.has(r.criterionId));
+    if (kept.length === progress.criteriaResults.length) return progress;
+    const next: GoalLiveProgress = { ...progress };
+    if (kept.length > 0) next.criteriaResults = kept;
+    else delete next.criteriaResults;
+    return next;
+  };
+  if (goal.status === "draft" || goal.status === "paused" || goal.status === "achieved" || goal.status === "cancelled") {
+    const filtered = filterUnknownCriteria(lp);
+    return filtered === lp ? goal : { ...goal, liveProgress: filtered };
+  }
+  const hasProvenance =
+    lp.goalVersion !== undefined ||
+    lp.runId !== undefined ||
+    lp.reviewCycle !== undefined ||
+    lp.reporterGoalVersion != null;
+  const staleReporter = lp.reporterGoalVersion != null && lp.reporterGoalVersion < goal.version;
+  if (staleReporter || (hasProvenance && !isCurrentClaim(goal, lp))) {
+    // A stale blocked phase (and its summary) belongs to the stale claim, so it is hidden too.
+    const liveProgress = stripStaleLiveProgress(lp, { clearBlockedPhase: true }).next;
+    return { ...goal, liveProgress };
+  }
+  const filtered = filterUnknownCriteria(lp);
+  return filtered === lp ? goal : { ...goal, liveProgress: filtered };
 }
 
 /** Derives a dynamic verification/review label from actual review records, live `verify` tasks, and model-reported progress. */
@@ -264,6 +287,8 @@ export function buildGoalDetailDisplay(input: {
         kind: t.kind,
         model: t.model,
         effort: t.effort,
+        goalVersion: t.goalVersion ?? null,
+        staleGoalVersion: t.goalVersion != null && t.goalVersion < goal.version,
         currentAction: snap?.currentAction ?? null,
         toolCalls: snap?.toolCalls ?? 0,
         filesEdited: snap?.filesEdited ?? 0,

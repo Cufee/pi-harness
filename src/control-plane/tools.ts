@@ -18,6 +18,7 @@ import type {
   ControlPlaneDb,
   EscalationCategory,
   EscalationSeverity,
+  RunRecord,
   TaskKind,
   TaskRecord,
 } from "./db.js";
@@ -25,7 +26,13 @@ import { findRunDossier, readRunDossier, readWorkspaceArtifact, spillSummaryOver
 import { compactTaskHandoff, isReadOnlyKind, settleTaskMinimalFallback, SUMMARY_LIMIT, validateTaskHandoff } from "./handoffs.js";
 import { expandHomePath } from "./projects.js";
 import type { AnchoredHandoff } from "./prompts.js";
-import { mergeGoalLiveProgress, type GoalLiveProgress, type GoalProgressSource } from "../goals/live-progress.js";
+import {
+  type DroppedProgressEntry,
+  filterProgressPatch,
+  mergeGoalLiveProgress,
+  type GoalLiveProgress,
+  type GoalProgressSource,
+} from "../goals/live-progress.js";
 import type { SteerTaskResult } from "./orchestrator.js";
 
 export { readRunDossier } from "./dossiers.js";
@@ -894,7 +901,7 @@ export class ControlPlaneToolExecutor {
     if (mode !== "off" && (name === CODE_EXEC_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME)) {
       const signal = this.hooks.getTaskSignal(taskId);
       const callerGeneration = task.generation;
-      return createCodeModeExecutor({
+      const res = await createCodeModeExecutor({
         ...this.config.codeExec,
         mode,
         allowedTools: () => toolsForTier(task.tier),
@@ -905,6 +912,7 @@ export class ControlPlaneToolExecutor {
         signal,
         onToolEvent: this.createCodeExecEventSink(runId, taskId, callerGeneration),
       }).execute(name, args);
+      return this.attachPendingSteers(taskId, res);
     }
 
     const allowed = new Set(toolsForTier(task.tier).map((t) => t.name));
@@ -912,6 +920,36 @@ export class ControlPlaneToolExecutor {
       throw new Error(`Tool '${name}' is not permitted for Tier ${task.tier} agent ${taskId}`);
     }
 
+    const result = await this.executeTool(runId, taskId, task, run, name, args, scriptSignal, callerSignal);
+    return this.attachPendingSteers(taskId, result);
+  }
+
+  /** Appends any queued steering messages (oldest first) onto a tool result as a universal delivery safety net. */
+  private attachPendingSteers(taskId: string, result: unknown): unknown {
+    if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+    const obj = result as Record<string, unknown>;
+    if (Array.isArray(obj.steeringMessages) && obj.steeringMessages.length > 0) return result;
+    const steeringMessages = this.hooks.drainPendingSteers?.(taskId) ?? [];
+    if (steeringMessages.length === 0) return result;
+    return {
+      ...obj,
+      steeringMessages,
+      ...(obj.hint === undefined
+        ? { hint: "Steering received (steeringMessages, oldest first). Apply it before continuing." }
+        : {}),
+    };
+  }
+
+  private async executeTool(
+    runId: string,
+    taskId: string,
+    task: TaskRecord,
+    run: RunRecord,
+    name: string,
+    args: Record<string, unknown>,
+    scriptSignal?: AbortSignal,
+    callerSignal?: AbortSignal,
+  ): Promise<unknown> {
     switch (name) {
       case "tree_view": {
         const includeSettled = args.include_settled !== false;
@@ -934,6 +972,7 @@ export class ControlPlaneToolExecutor {
             model: t.model ?? t.profileId,
             effort: t.effort,
             gen: t.generation,
+            goalVersion: t.goalVersion ?? null,
             ctxPct: t.contextSize > 0 ? Math.round((t.contextUsed / t.contextSize) * 100) : null,
             summary: compactTaskHandoff(t).summary,
           })),
@@ -1329,6 +1368,23 @@ export class ControlPlaneToolExecutor {
             if (overflowPath) {
               this.db.recordArtifact({ runId, taskId, kind: "dossier", path: overflowPath, summary: "Full task summary" });
             }
+            let staleGoalVersion: { bound: number; current: number } | undefined;
+            let amendmentNotice: string | undefined;
+            try {
+              const gRow = this.db.db
+                .prepare("SELECT id, version FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1")
+                .get(runId) as { id: string; version: number } | undefined;
+              const latestTask = this.db.getTask(taskId) ?? task;
+              if (gRow && latestTask.goalVersion != null && latestTask.goalVersion < Number(gRow.version)) {
+                const currentVersion = Number(gRow.version);
+                staleGoalVersion = { bound: latestTask.goalVersion, current: currentVersion };
+                amendmentNotice =
+                  `Goal ${gRow.id} was amended to v${currentVersion} while task ${taskId} was bound to v${latestTask.goalVersion}. ` +
+                  `Handoff accepted and recorded as answering v${latestTask.goalVersion}.`;
+              }
+            } catch {
+              // goals table may not exist in standalone ControlPlaneDb unit tests
+            }
             this.db.updateTask(taskId, {
               status: taskStatus,
               summary,
@@ -1339,6 +1395,7 @@ export class ControlPlaneToolExecutor {
                 sources,
                 artifact_paths: paths,
                 ...(summaryOverflow ? { summary_overflow: summaryOverflow } : {}),
+                ...(staleGoalVersion ? { staleGoalVersion } : {}),
                 escalationId,
                 suggestedSplits,
               }),
@@ -1359,7 +1416,12 @@ export class ControlPlaneToolExecutor {
                 "verify_task",
               );
             }
-            return { returned: true, status: taskStatus, ...(escalationId ? { escalationId } : {}) };
+            return {
+              returned: true,
+              status: taskStatus,
+              ...(escalationId ? { escalationId } : {}),
+              ...(amendmentNotice ? { amendmentNotice, staleGoalVersion } : {}),
+            };
           });
           committed = true;
           return result;
@@ -2042,14 +2104,54 @@ export class ControlPlaneToolExecutor {
       criteriaResults?: Array<{ criterionId: string; passed: boolean; evidence: string; remediation?: string }>;
     },
     source?: GoalProgressSource,
-  ): { recorded: boolean; goalId: string | null } {
+  ): { recorded: boolean; goalId: string | null; dropped?: DroppedProgressEntry[]; note?: string } {
     try {
       const row = this.db.db
         .prepare(
-          "SELECT id, version, review_cycle, live_progress_json FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1",
+          "SELECT id, version, review_cycle, criteria_json, live_progress_json FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1",
         )
-        .get(runId) as { id: string; version: number; review_cycle: number | null; live_progress_json?: string | null } | undefined;
+        .get(runId) as
+        | { id: string; version: number; review_cycle: number | null; criteria_json?: string | null; live_progress_json?: string | null }
+        | undefined;
       if (!row) return { recorded: false, goalId: null };
+
+      const criterionIds = new Set<string>();
+      if (typeof row.criteria_json === "string" && row.criteria_json.trim()) {
+        try {
+          const parsed = JSON.parse(row.criteria_json) as Array<{ id?: unknown }>;
+          if (Array.isArray(parsed)) {
+            for (const c of parsed) {
+              if (typeof c?.id === "string" && c.id) criterionIds.add(c.id);
+            }
+          }
+        } catch {
+          // ignore unparseable criteria_json
+        }
+      }
+
+      const task = this.db.getTask(taskId);
+      const boundVersion = task?.goalVersion ?? null;
+      const currentVersion = Number(row.version);
+      const filtered = filterProgressPatch(patch, {
+        goalId: row.id,
+        criterionIds,
+        boundVersion,
+        currentVersion,
+      });
+
+      const hasRemaining =
+        filtered.patch.summary !== undefined ||
+        filtered.patch.phase !== undefined ||
+        filtered.patch.verificationStatus !== undefined ||
+        filtered.patch.criteriaResults !== undefined;
+      if (filtered.dropped.length > 0 && !hasRemaining) {
+        return {
+          recorded: false,
+          goalId: row.id,
+          dropped: filtered.dropped,
+          note: filtered.note,
+        };
+      }
 
       let prev: GoalLiveProgress | null = null;
       if (typeof row.live_progress_json === "string" && row.live_progress_json.trim()) {
@@ -2060,9 +2162,10 @@ export class ControlPlaneToolExecutor {
         }
       }
       const now = Date.now();
-      const claimSource: GoalProgressSource = source ?? (this.db.getTask(taskId)?.tier === 1 ? "coordinator" : "worker");
-      const next = mergeGoalLiveProgress(prev, { ...patch, reportedByTaskId: taskId }, {
-        goalVersion: Number(row.version),
+      const claimSource: GoalProgressSource = source ?? (task?.tier === 1 ? "coordinator" : "worker");
+      const next = mergeGoalLiveProgress(prev, { ...filtered.patch, reportedByTaskId: taskId }, {
+        goalVersion: currentVersion,
+        reporterGoalVersion: boundVersion,
         runId,
         reviewCycle: Number(row.review_cycle ?? 0),
         source: claimSource,
@@ -2072,7 +2175,11 @@ export class ControlPlaneToolExecutor {
         .prepare("UPDATE goals SET live_progress_json = ?, updated_at = ? WHERE id = ?")
         .run(JSON.stringify(next), now, row.id);
       this.db.emitEvent(runId, taskId, "goal.progress", { goalId: row.id, ...next });
-      return { recorded: true, goalId: row.id };
+      return {
+        recorded: true,
+        goalId: row.id,
+        ...(filtered.dropped.length > 0 ? { dropped: filtered.dropped, note: filtered.note } : {}),
+      };
     } catch {
       return { recorded: false, goalId: null };
     }

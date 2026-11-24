@@ -116,6 +116,7 @@ export interface TaskRecord {
   summary: string | null;
   handoffJson: string | null;
   resultJson: string | null;
+  goalVersion?: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -324,6 +325,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   summary TEXT,
   handoff_json TEXT,
   result_json TEXT,
+  goal_version INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -539,6 +541,12 @@ export class ControlPlaneDb {
     );
     if (!worktreeColumns.has("creation_identity_json")) {
       this.db.exec("ALTER TABLE worktrees ADD COLUMN creation_identity_json TEXT;");
+    }
+    const taskColumns = new Set(
+      (this.db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    if (!taskColumns.has("goal_version")) {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN goal_version INTEGER;");
     }
     this.kb = new KnowledgeBaseStore(this.db);
     this.timers = new TimerManager(this.db);
@@ -977,6 +985,17 @@ export class ControlPlaneDb {
       .run(repoRoot, baseBranch, baseSha, Date.now(), runId);
   }
 
+  getLinkedGoalVersion(runId: string): number | null {
+    try {
+      const row = this.db
+        .prepare("SELECT version FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1")
+        .get(runId) as { version: number } | undefined;
+      return row?.version != null ? Number(row.version) : null;
+    } catch {
+      return null;
+    }
+  }
+
   // ---- Tasks & Write-Scope Leases ----
   createTask(input: {
     runId: string;
@@ -993,6 +1012,7 @@ export class ControlPlaneDb {
     maxTurns?: number;
     dependsOn?: string[];
     writeScopes?: string[];
+    goalVersion?: number | null;
   }): TaskRecord {
     return this.transaction(() => {
       const id = nextFriendlyId(this.db, "t", "tasks");
@@ -1064,13 +1084,14 @@ export class ControlPlaneDb {
 
       const unresolvedDeps = resolvedDeps.filter((d) => d.status !== "completed");
       const initialStatus: TaskStatus = unresolvedDeps.length > 0 ? "pending" : "ready";
+      const goalVersion = input.goalVersion !== undefined ? input.goalVersion : this.getLinkedGoalVersion(input.runId);
       this.db
         .prepare(
           `INSERT INTO tasks(
             id, run_id, parent_id, tier, kind, title, objective, criteria,
             read_only, profile_id, model, effort, status, generation, max_turns,
-            created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+            goal_version, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -1087,6 +1108,7 @@ export class ControlPlaneDb {
           input.effort ?? null,
           initialStatus,
           input.maxTurns ?? (input.tier === 3 ? 20 : 120),
+          goalVersion,
           now,
           now,
         );
@@ -1159,6 +1181,7 @@ export class ControlPlaneDb {
       summary: r.summary ? String(r.summary) : null,
       handoffJson: r.handoff_json ? String(r.handoff_json) : null,
       resultJson: r.result_json ? String(r.result_json) : null,
+      goalVersion: r.goal_version != null ? Number(r.goal_version) : null,
       createdAt: Number(r.created_at),
       updatedAt: Number(r.updated_at),
     };
@@ -1208,6 +1231,7 @@ export class ControlPlaneDb {
       summary: string | null;
       handoffJson: string | null;
       resultJson: string | null;
+      goalVersion: number | null;
     }>,
   ): TaskRecord {
     const existing = this.getTask(id);
@@ -1232,6 +1256,7 @@ export class ControlPlaneDb {
       summary: "summary",
       handoffJson: "handoff_json",
       resultJson: "result_json",
+      goalVersion: "goal_version",
     };
 
     for (const [k, col] of Object.entries(map)) {
