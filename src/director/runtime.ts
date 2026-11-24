@@ -187,6 +187,7 @@ export interface AffectedAmendmentTask {
   tier: 2 | 3;
   boundVersion: number | null;
   action: "delivered" | "queued" | "refused";
+  delivered: boolean;
   mode?: SteerTaskResult["mode"];
   live?: boolean;
   reason?: string;
@@ -199,6 +200,7 @@ export function formatAmendmentDelta(
   opts?: {
     boundVersion?: number | null;
     audience?: "orchestrator" | "worker";
+    readOnly?: boolean;
     affectedTasksSummary?: string;
   },
 ): string {
@@ -209,6 +211,10 @@ export function formatAmendmentDelta(
     audience === "worker" && opts?.boundVersion != null
       ? `[GOAL AMENDED: ${goal.id} v${delta.fromVersion} -> v${delta.toVersion}] You were started on v${opts.boundVersion}.`
       : `[GOAL AMENDED: ${goal.id} v${delta.fromVersion} -> v${delta.toVersion}]`;
+
+  const workerGuidance = opts?.readOnly
+    ? `If the amendment removes or contradicts your assigned work, stop now and call return_task({ status: "completed", partial: true, summary, sources }) naming what you dropped. Otherwise continue against v${goal.version}.`
+    : `If the amendment removes or contradicts your assigned work, stop now: commit what is useful and call return_task({ status: "completed", partial: true, summary }) naming what you dropped. Otherwise continue against v${goal.version}.`;
 
   return [
     header,
@@ -230,8 +236,8 @@ export function formatAmendmentDelta(
     `Full current contract: blackboard_get({ key: "goal_contract_v${goal.version}" }).`,
     audience === "orchestrator" && opts?.affectedTasksSummary ? opts.affectedTasksSummary : null,
     audience === "worker"
-      ? `If the amendment removes or contradicts your assigned work, stop now: commit what is useful and return_task (partial) naming what you dropped. Otherwise continue against v${goal.version}.`
-      : "Reconcile active Tier 2 Workers: KEEP unaffected workers, STEER adjustable workers, CANCEL_AND_REPLACE invalidated workers.",
+      ? workerGuidance
+      : "Reconcile active Tier 2/3 tasks: KEEP unaffected tasks, STEER adjustable tasks, or CANCEL_AND_REPLACE invalidated tasks with cancel_child (especially any marked not delivered).",
   ]
     .filter(Boolean)
     .join("\n");
@@ -1922,7 +1928,6 @@ export class DirectorRuntime {
         this.db.updateTask(orchestratorTaskId, {
           title: updatedTitle,
           objective: updatedObjective,
-          goalVersion: latestAfterLaunch.version,
         });
         const latestKey = `goal_contract_v${latestAfterLaunch.version}`;
         try {
@@ -1959,9 +1964,15 @@ export class DirectorRuntime {
             if (orch && ["completed", "failed", "cancelled", "blocked", "returned_for_rescope"].includes(orch.status)) {
               delivered = await this.orchestrator
                 .resumeTaskDetailed(orchestratorTaskId, { allowCompleted: true, note: steerMsg, validateBeforeActivate: isStillLatestExecuting })
-                .then((r) => r.outcome === "resumed" || (r.noteDelivered === true && r.noteDelivery?.mode === "native"), () => false);
+                .then(
+                  (r) => r.outcome === "resumed" || (r.noteDelivered === true && r.noteDelivery?.mode === "native" && r.noteDelivery?.live === true),
+                  () => false,
+                );
             }
-            if (delivered) this.clearUndeliveredAmendment(goal.id, latestAfterLaunch.version);
+            if (delivered) {
+              this.clearUndeliveredAmendment(goal.id, latestAfterLaunch.version);
+              tracker.bindOrchVersion();
+            }
           }
         }
         if (!delivered && res.mode !== "queued_before_handle") {
@@ -2402,7 +2413,8 @@ export class DirectorRuntime {
       const allRunTasks = this.db.listTasks(goal.linkedRunId);
       const orch = allRunTasks.find((t) => t.tier === 1);
       if (orch) {
-        // Refresh Tier 1's title, objective, goalVersion, and stored handoff goalInvariants so rollovers never replay stale v1 constraints
+        // Refresh Tier 1's title, objective, and stored handoff goalInvariants so rollovers never replay stale v1 constraints.
+        // Keep T1's bound goalVersion at its old version until live delivery or hydration of goal.version is confirmed.
         let updatedHandoffJson = orch.handoffJson;
         if (orch.handoffJson) {
           try {
@@ -2421,7 +2433,7 @@ export class DirectorRuntime {
         this.db.updateTask(orch.id, {
           title: `Goal ${goal.id} v${goal.version}: ${goal.title}`,
           objective: updatedObjective,
-          goalVersion: goal.version,
+          ...(orch.goalVersion == null ? { goalVersion: delta.fromVersion } : {}),
           ...(updatedHandoffJson !== orch.handoffJson ? { handoffJson: updatedHandoffJson } : {}),
         });
         try {
@@ -2448,7 +2460,23 @@ export class DirectorRuntime {
           orch.id,
         );
 
-        // Deliver the amendment delta directly to every live tier 2/3 task bound to an older goal version.
+        // Arm the in-flight amendment guard synchronously before the first await / worker fanout, so Tier 1 cannot
+        // settle or trigger verification against the prior contract while worker steers are awaiting.
+        const baseSteerMsg = formatAmendmentDelta(goal, delta, { audience: "orchestrator" });
+        const tracker = this.trackAmendmentDelivery(goal.id, goal.version, goal.linkedRunId, orch.id, baseSteerMsg);
+        if (goal.status === "executing") tracker.armInFlight();
+
+        const terminalStatuses = new Set(["completed", "failed", "cancelled", "blocked", "returned_for_rescope"]);
+        const isCurrentAmendment = () => {
+          const latest = this.goals.getGoal(goal.id);
+          return latest !== null && latest.version === goal.version && latest.status === goal.status;
+        };
+        const isStillAmendedExecuting = () => {
+          const latest = this.goals.getGoal(goal.id);
+          return latest !== null && latest.version === goal.version && latest.status === "executing";
+        };
+
+        // Deliver the amendment delta directly to every live tier 2/3 task bound to an older (or NULL) goal version.
         const liveAmendStatuses = new Set(["running", "waiting_children", "ready", "pending", "draining"]);
         const changedCriterionIds = [
           ...new Set([...delta.removedCriteriaIds, ...delta.modifiedCriteria.map((c) => c.id)]),
@@ -2460,106 +2488,140 @@ export class DirectorRuntime {
             liveAmendStatuses.has(t.status) &&
             (t.goalVersion == null || t.goalVersion < delta.toVersion),
         );
+        // Record an observed upper-bound version on linked workers that ran across migration with NULL goal_version
+        // before awaiting steers; tasks outside goal-linked runs are never touched and stay NULL.
         for (const worker of candidateWorkers) {
+          if (worker.goalVersion == null) {
+            this.db.updateTask(worker.id, { goalVersion: delta.fromVersion });
+          }
+        }
+        for (const worker of candidateWorkers) {
+          if (!isCurrentAmendment()) break;
+          const freshWorker = this.db.getTask(worker.id);
+          if (freshWorker && freshWorker.goalVersion != null && freshWorker.goalVersion >= delta.toVersion) continue;
+          const expectedGeneration = freshWorker?.generation ?? worker.generation;
           const hay = `${worker.objective}\n${worker.criteria}`;
           const scopeHit = changedCriterionIds.filter((id) =>
             new RegExp(`(?:^|[^A-Za-z0-9_-])${escapeRe(id)}(?:$|[^A-Za-z0-9_-])`).test(hay),
           );
-          const workerBoundVersion = worker.goalVersion ?? null;
+          const observedBoundVersion = worker.goalVersion ?? delta.fromVersion;
           const workerMsg = formatAmendmentDelta(goal, delta, {
-            boundVersion: workerBoundVersion,
+            boundVersion: worker.goalVersion ?? null,
             audience: "worker",
+            readOnly: worker.readOnly || isReadOnlyKind(worker.kind),
           });
           const steerRes = await this.orchestrator.steerTaskDetailed(worker.id, workerMsg);
+          const stillCurrent = isCurrentAmendment();
           let action: AffectedAmendmentTask["action"];
-          if (steerRes.steered && steerRes.live) {
+          if (steerRes.steered && steerRes.live === true) {
             action = "delivered";
-            this.db.updateTask(worker.id, { goalVersion: goal.version });
+            const curWorker = this.db.getTask(worker.id);
+            if (
+              stillCurrent &&
+              curWorker &&
+              !terminalStatuses.has(curWorker.status) &&
+              curWorker.generation === expectedGeneration &&
+              (curWorker.goalVersion == null || curWorker.goalVersion < goal.version)
+            ) {
+              this.db.updateTask(worker.id, { goalVersion: goal.version });
+            }
           } else if (steerRes.steered) {
             action = "queued";
-            this.orchestrator.setAmendBindOnDrain(worker.id, goal.version);
+            if (stillCurrent) this.orchestrator.setAmendBindOnDrain(worker.id, goal.version);
           } else {
             action = "refused";
           }
           const entry: AffectedAmendmentTask = {
             taskId: worker.id,
             tier: worker.tier as 2 | 3,
-            boundVersion: workerBoundVersion,
+            boundVersion: observedBoundVersion,
             action,
+            delivered: action === "delivered",
             mode: steerRes.mode,
-            live: steerRes.live,
+            live: steerRes.live === true,
             ...(steerRes.reason ? { reason: steerRes.reason } : {}),
             scopeHit,
           };
           affectedTasks.push(entry);
-          this.db.emitEvent(goal.linkedRunId, worker.id, "goal.amendment_task", {
-            goalId: goal.id,
-            fromVersion: delta.fromVersion,
-            toVersion: delta.toVersion,
-            ...entry,
-          });
+          if (stillCurrent) {
+            this.db.emitEvent(goal.linkedRunId, worker.id, "goal.amendment_task", {
+              goalId: goal.id,
+              fromVersion: delta.fromVersion,
+              toVersion: delta.toVersion,
+              ...entry,
+            });
+          }
+          if (!stillCurrent) break;
         }
 
-        const affectedTasksSummary =
-          affectedTasks.length > 0
-            ? [
-                "Affected running tasks (tier 2/3):",
-                ...affectedTasks.map(
-                  (a) =>
-                    `- ${a.taskId} (T${a.tier}, bound v${a.boundVersion ?? "?"}): ${a.action}` +
-                    ` [${a.mode}${a.live ? ", live" : ""}]` +
-                    (a.scopeHit.length ? ` scopeHit=[${a.scopeHit.join(", ")}]` : "") +
-                    (a.reason ? ` — ${a.reason}` : ""),
-                ),
-              ].join("\n")
-            : undefined;
-
-        const steerMsg = formatAmendmentDelta(goal, delta, {
-          audience: "orchestrator",
-          affectedTasksSummary,
-        });
-        const isStillAmendedExecuting = () => {
-          const latest = this.goals.getGoal(goal.id);
-          return latest !== null && latest.version === goal.version && latest.status === "executing";
-        };
-        // A Tier 1 still launching reads the updated row in its initial prompt; one spawning gets the steer queued and
-        // reports its acknowledgement later, so it is not counted as delivered here.
-        const tracker = this.trackAmendmentDelivery(goal.id, goal.version, goal.linkedRunId, orch.id, steerMsg);
-        // Armed before the await: a run settling while the steer awaits its answer must not verify the stale contract.
-        if (goal.status === "executing") tracker.armInFlight();
-        const res = await this.orchestrator
-          .deliverOrQueueLiveSteer(orch.id, steerMsg, { onOutcome: tracker.onOutcome })
-          .catch(() => ({ delivered: false, mode: "none" as const }));
-        if (res.delivered) {
-          tracker.markDelivered();
-          delivery = { delivered: true, via: "steer" };
-        } else if (res.mode === "queued_before_handle") {
-          const reason = "queued for runner handle; awaiting acknowledgement";
-          tracker.armQueued();
-          delivery = { delivered: false, via: "none", reason };
+        if (!isCurrentAmendment()) {
+          this.clearUndeliveredAmendment(goal.id, goal.version);
+          delivery = { delivered: false, via: "none", reason: "superseded before orchestrator delivery" };
+          amendedGoal = this.goals.getGoal(goal.id) ?? goal;
         } else {
-          tracker.markAnswered();
-          let delivered = false;
-          // A live Tier 1 that refused the steer is never resumed: its fallback only queues the note for a turn
-          // the stale generation may never take. Its settlement relaunches it with the amendment instead.
-          const freshOrch = this.db.getTask(orch.id);
-          if (
-            goal.status === "executing" &&
-            isStillAmendedExecuting() &&
-            freshOrch &&
-            ["completed", "failed", "cancelled", "blocked", "returned_for_rescope"].includes(freshOrch.status)
-          ) {
-            delivered = await this.orchestrator
-              .resumeTaskDetailed(orch.id, { allowCompleted: true, note: steerMsg, validateBeforeActivate: isStillAmendedExecuting })
-              // An idempotent "already active" return delivers the note only when the live session took it natively.
-              .then((r) => r.outcome === "resumed" || (r.noteDelivered === true && r.noteDelivery?.mode === "native"), () => false);
-          }
-          if (delivered) {
+          const affectedTasksSummary =
+            affectedTasks.length > 0
+              ? [
+                  "Affected running tasks (tier 2/3):",
+                  ...affectedTasks.map(
+                    (a) =>
+                      `- ${a.taskId} (T${a.tier}, bound v${a.boundVersion ?? "?"}): ${a.action}` +
+                      ` [${a.mode ?? "unknown"}, ${a.live ? "live" : "not delivered"}]` +
+                      (a.scopeHit.length ? ` scopeHit=[${a.scopeHit.join(", ")}]` : "") +
+                      (a.reason ? ` — ${a.reason}` : ""),
+                  ),
+                ].join("\n")
+              : undefined;
+
+          const steerMsg = formatAmendmentDelta(goal, delta, {
+            audience: "orchestrator",
+            affectedTasksSummary,
+          });
+          tracker.setSteerMsg(steerMsg);
+          // A Tier 1 still launching reads the updated row in its initial prompt; one spawning gets the steer queued and
+          // reports its acknowledgement later, so it is not counted as delivered here.
+          const res = await this.orchestrator
+            .deliverOrQueueLiveSteer(orch.id, steerMsg, { onOutcome: tracker.onOutcome })
+            .catch(() => ({ delivered: false, mode: "none" as const }));
+          if (!isCurrentAmendment()) {
             this.clearUndeliveredAmendment(goal.id, goal.version);
-            delivery = { delivered: true, via: "resume" };
+            delivery = { delivered: false, via: "none", reason: "superseded before orchestrator delivery" };
+            amendedGoal = this.goals.getGoal(goal.id) ?? goal;
+          } else if (res.delivered) {
+            tracker.markDelivered();
+            delivery = { delivered: true, via: "steer" };
+          } else if (res.mode === "queued_before_handle") {
+            const reason = "queued for runner handle; awaiting acknowledgement";
+            tracker.armQueued();
+            delivery = { delivered: false, via: "none", reason };
           } else {
-            tracker.markUndelivered("amendment could not be delivered to its run");
-            strand("amendment could not be delivered to its run");
+            tracker.markAnswered();
+            let delivered = false;
+            // A live Tier 1 that refused the steer is never resumed: its fallback only queues the note for a turn
+            // the stale generation may never take. Its settlement relaunches it with the amendment instead.
+            const freshOrch = this.db.getTask(orch.id);
+            if (
+              goal.status === "executing" &&
+              isStillAmendedExecuting() &&
+              freshOrch &&
+              terminalStatuses.has(freshOrch.status)
+            ) {
+              delivered = await this.orchestrator
+                .resumeTaskDetailed(orch.id, { allowCompleted: true, note: steerMsg, validateBeforeActivate: isStillAmendedExecuting })
+                // An idempotent "already active" return delivers the note only when the live session took it natively.
+                .then(
+                  (r) => r.outcome === "resumed" || (r.noteDelivered === true && r.noteDelivery?.mode === "native" && r.noteDelivery?.live === true),
+                  () => false,
+                );
+            }
+            if (delivered) {
+              this.clearUndeliveredAmendment(goal.id, goal.version);
+              tracker.bindOrchVersion();
+              delivery = { delivered: true, via: "resume" };
+            } else {
+              tracker.markUndelivered("amendment could not be delivered to its run");
+              strand("amendment could not be delivered to its run");
+            }
           }
         }
       } else {
@@ -2614,6 +2676,7 @@ export class DirectorRuntime {
    */
   private trackAmendmentDelivery(goalId: string, version: number, runId: string, orchId: string, steerMsg: string) {
     const attemptId = this.nextAmendmentAttemptId++;
+    let currentSteerMsg = steerMsg;
     let reported = false;
     /** Set once this attempt wrote the pending entry; from then on only its own still-present entry may act. */
     let armed = false;
@@ -2632,23 +2695,39 @@ export class DirectorRuntime {
       const prior = this.undeliveredAmendments.get(goalId);
       return prior?.attemptId === attemptId ? prior.deferredSettlementEvent : undefined;
     };
+    /** Advances Tier 1's bound goalVersion to `version` once delivery or hydration is confirmed. */
+    const bindOrchVersion = () => {
+      const current = this.goals.getGoal(goalId);
+      if (!current || current.version !== version) return;
+      const curOrch = this.db.getTask(orchId);
+      if (curOrch && (curOrch.goalVersion == null || curOrch.goalVersion < version)) {
+        this.db.updateTask(orchId, { goalVersion: version });
+      }
+    };
     const record = (reason: string, eventReason: string): boolean => {
       if (!owns()) return false;
       const current = this.goals.getGoal(goalId);
       if (!current || current.version !== version) return false;
       armed = true;
-      this.undeliveredAmendments.set(goalId, { attemptId, version, steerMsg, reason, inFlight: false });
+      this.undeliveredAmendments.set(goalId, { attemptId, version, steerMsg: currentSteerMsg, reason, inFlight: false });
       this.db.emitEvent(runId, orchId, "goal.amendment_undelivered", { goalId, version, reason: eventReason });
       return true;
     };
-    /** The steer (or initial prompt) carried the amendment: a settlement deferred meanwhile is handled now. */
+    /** The steer (or initial prompt) carried the amendment: bind Tier 1 and handle any settlement deferred meanwhile. */
     const markDelivered = () => {
       if (!owns()) return;
       const deferred = takeDeferred();
       if (isActive()) this.undeliveredAmendments.delete(goalId);
+      bindOrchVersion();
       if (deferred) queueMicrotask(() => this.handleControlPlaneEvent(deferred));
     };
     return {
+      /** Updates the steer payload stored for recovery once worker fanout results are known. */
+      setSteerMsg: (nextMsg: string) => {
+        currentSteerMsg = nextMsg;
+        const prior = this.undeliveredAmendments.get(goalId);
+        if (prior?.attemptId === attemptId) prior.steerMsg = nextMsg;
+      },
       onOutcome: (accepted: boolean, reason: string) => {
         reported = true;
         if (!owns()) return;
@@ -2667,12 +2746,13 @@ export class DirectorRuntime {
         this.undeliveredAmendments.set(goalId, {
           attemptId,
           version,
-          steerMsg,
+          steerMsg: currentSteerMsg,
           reason: "amendment delivery awaiting acknowledgement",
           inFlight: true,
         });
       },
       markDelivered,
+      bindOrchVersion,
       /** The live steer was refused; a settlement arriving during the fallback below is no longer deferred. */
       markAnswered: () => {
         const prior = this.undeliveredAmendments.get(goalId);
@@ -2686,7 +2766,7 @@ export class DirectorRuntime {
         this.undeliveredAmendments.set(goalId, {
           attemptId,
           version,
-          steerMsg,
+          steerMsg: currentSteerMsg,
           reason: "queued for runner handle; awaiting acknowledgement",
           inFlight: false,
           ...(deferred ? { deferredSettlementEvent: deferred } : {}),
@@ -2731,8 +2811,17 @@ export class DirectorRuntime {
               return g !== null && g.version === version && g.status === "executing";
             },
           })
-          .then((r) => r.outcome === "resumed" || (r.noteDelivered === true && r.noteDelivery?.mode === "native"), () => false)
+          .then(
+            (r) => r.outcome === "resumed" || (r.noteDelivered === true && r.noteDelivery?.mode === "native" && r.noteDelivery?.live === true),
+            () => false,
+          )
       : false;
+    if (resumed && orch && this.goals.getGoal(goalId)?.version === version) {
+      const curOrch = this.db.getTask(orch.id);
+      if (curOrch && (curOrch.goalVersion == null || curOrch.goalVersion < version)) {
+        this.db.updateTask(orch.id, { goalVersion: version });
+      }
+    }
     if (!resumed) this.handOffStrandedGoal(current, pending.reason);
   }
 
@@ -5599,7 +5688,7 @@ export class DirectorRuntime {
           tasks: detail.tasks.map((t) => ({
             ...compactTaskHandoff(t, detail.openEscalations),
             goalVersion: t.goalVersion ?? null,
-            staleGoalVersion: t.goalVersion != null && t.goalVersion < detail.goal.version,
+            staleGoalVersion: t.goalVersion != null ? t.goalVersion < detail.goal.version : detail.goal.version > 1,
           })),
           presentation_id: offerPresentation(() => buildGoalDetailDisplay(detail)),
         };
