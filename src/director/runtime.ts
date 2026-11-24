@@ -604,7 +604,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
     name: "resolve_escalation",
     description:
-      "Resolve one open or acknowledged escalation on a run owned by this chat's goals and record the reason in the audit trail. Works after the run settled or its orchestrator exited. Use it only when the finding is handled or no longer applies; it does not resume the run.",
+      "Resolve one open or acknowledged escalation on a run owned by this chat's goals and record the reason in the audit trail. Works after the run settled or its orchestrator exited. Use it only when the finding is handled or no longer applies. The reason is steered to the run's live orchestrator and to the raising task when it is live; it does not resume the run.",
     inputSchema: {
       type: "object",
       required: ["escalation_id", "reason"],
@@ -4959,20 +4959,21 @@ export class DirectorRuntime {
    * Resolves one escalation with a recorded reason, independent of run state or a live Tier 1. With a chat
    * session, only escalations on runs that chat owns in its workspace are reachable. Repeats are no-ops.
    */
-  resolveEscalation(input: {
+  async resolveEscalation(input: {
     escalationId: string;
     reason: string;
     chatSessionId?: string;
     repoRoot?: string;
     resolvedBy: "director" | "operator";
-  }): {
+  }): Promise<{
     escalation: EscalationRecord;
     alreadyResolved: boolean;
     goalId: string | null;
     goalStatus: string | null;
     runStatus: string | null;
     remainingOpen: number;
-  } {
+    deliveredTo: string[];
+  }> {
     const reason = typeof input.reason === "string" ? input.reason.trim().slice(0, 2000) : "";
     if (!reason) throw new Error("reason must be a non-empty string");
     const esc = this.db.getEscalation(input.escalationId);
@@ -4992,7 +4993,15 @@ export class DirectorRuntime {
     const runStatus = this.db.getRun(esc.runId)?.status ?? null;
     const remaining = () => this.db.listEscalations(esc.runId).filter((e) => e.status === "open" || e.status === "acked").length;
     if (esc.status === "resolved") {
-      return { escalation: esc, alreadyResolved: true, goalId, goalStatus: goal?.status ?? null, runStatus, remainingOpen: remaining() };
+      return {
+        escalation: esc,
+        alreadyResolved: true,
+        goalId,
+        goalStatus: goal?.status ?? null,
+        runStatus,
+        remainingOpen: remaining(),
+        deliveredTo: [],
+      };
     }
     // Guarded transition: a concurrent or repeated resolve loses the race without a second event or notice.
     const { escalation: updated, transitioned } = this.db.tryResolveEscalation(esc.id, reason, {
@@ -5003,7 +5012,15 @@ export class DirectorRuntime {
       runStatus,
     });
     if (!transitioned) {
-      return { escalation: updated, alreadyResolved: true, goalId, goalStatus: goal?.status ?? null, runStatus, remainingOpen: remaining() };
+      return {
+        escalation: updated,
+        alreadyResolved: true,
+        goalId,
+        goalStatus: goal?.status ?? null,
+        runStatus,
+        remainingOpen: remaining(),
+        deliveredTo: [],
+      };
     }
     const noticeSession = goal?.chatSessionId ?? input.chatSessionId;
     if (noticeSession) {
@@ -5013,7 +5030,24 @@ export class DirectorRuntime {
         `Escalation ${esc.id} [${esc.severity}/${esc.category}] on run ${esc.runId} resolved by ${input.resolvedBy}: ${reason}`,
       );
     }
-    return { escalation: updated, alreadyResolved: false, goalId, goalStatus: goal?.status ?? null, runStatus, remainingOpen: remaining() };
+    let deliveredTo: string[] = [];
+    try {
+      deliveredTo = await this.orchestrator.deliverEscalationResolution(updated, {
+        resolvedBy: input.resolvedBy,
+        resolution: reason,
+      });
+    } catch {
+      // Best-effort delivery; a delivery error must never fail a completed resolve.
+    }
+    return {
+      escalation: updated,
+      alreadyResolved: false,
+      goalId,
+      goalStatus: goal?.status ?? null,
+      runStatus,
+      remainingOpen: remaining(),
+      deliveredTo,
+    };
   }
 
   /**
@@ -6176,7 +6210,7 @@ export class DirectorRuntime {
 
       case "resolve_escalation": {
         if (typeof args.reason !== "string" || !args.reason.trim()) throw new Error("reason must be a non-empty string");
-        return this.resolveEscalation({
+        return await this.resolveEscalation({
           escalationId: String(args.escalation_id ?? ""),
           reason: args.reason,
           chatSessionId,
