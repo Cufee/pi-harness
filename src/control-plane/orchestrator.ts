@@ -6,6 +6,7 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { HarnessConfig, RunnerProfileConfig } from "../config.js";
 import type { ModelCatalogCompiler } from "../catalog/compiler.js";
 import type { QuotaClient } from "../quota/client.js";
+import { AcpProfileError } from "../runners/acp-profile-error.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { isContextOverflowError, isOverflowTurnText } from "../runners/context-overflow.js";
 import { PiRunner } from "../runners/pi-runner.js";
@@ -463,6 +464,8 @@ export class HarnessOrchestrator {
   private steerReservedBatches = new Set<string>();
   /** The note-free base message of resume results, so a joined caller never inherits the first caller's note prose. */
   private resumeBaseMessages = new WeakMap<object, string>();
+  /** Epoch ms of the most recent `__list_tools` MCP bridge call per task, for ACP tools-missing fail-fast detection. */
+  private readonly toolsListedAt = new Map<string, number>();
   readonly advisories: AdvisoryEngine;
   readonly toolExecutor: ControlPlaneToolExecutor;
 
@@ -533,6 +536,15 @@ export class HarnessOrchestrator {
         ) {
           this.db.emitEvent(runId, taskId, "agent.tool", ev);
         }
+      },
+      onToolsListed: (taskId) => {
+        this.toolsListedAt.set(taskId, Date.now());
+      },
+      profileAuthAdvisory: (profileId) => {
+        const auth = this.quota.authStatus(profileId);
+        if (!auth) return null;
+        const detail = auth.detail ? ` (${auth.detail})` : "";
+        return `Profile ${profileId} failed ACP auth${detail}; needs login and is in cooldown until ${auth.until}. Run its login command (e.g. 'amp login' / 'claude /login') or pick another model. The task was still created.`;
       },
     }, config, {
       engine: this.advisories,
@@ -627,6 +639,7 @@ export class HarnessOrchestrator {
     this.taskResumeNotes.clear();
     this.pendingRollovers.clear();
     this.cancelReasons.clear();
+    this.toolsListedAt.clear();
     this.unsubLeaseEvents();
     for (const key of [...this.leaseWaitQueue.keys()]) this.onWriteLeaseReleased(key);
   }
@@ -815,6 +828,7 @@ export class HarnessOrchestrator {
         if (timedOut && aborted && this.active.get(id) === aborted) {
           this.active.delete(id);
           this.pendingRollovers.delete(id);
+          this.toolsListedAt.delete(id);
           // The evicted entry's finally is identity-guarded and will not release task-keyed steering state.
           this.disposeSteeringState(id);
           const task = this.db.getTask(id);
@@ -1424,6 +1438,7 @@ export class HarnessOrchestrator {
       if (this.active.get(taskId) === entry) {
         this.active.delete(taskId);
         this.pendingRollovers.delete(taskId);
+        this.toolsListedAt.delete(taskId);
         if (!this.disposed) this.disposeSteeringState(taskId);
         this.advisories.settle(taskId);
       }
@@ -2660,6 +2675,9 @@ export class HarnessOrchestrator {
           }
           return this.toolExecutor.execute(run.id, task.id, name, args);
         },
+        ...(profile.kind === "acp"
+          ? { harnessToolsListedSince: (sinceMs: number) => (this.toolsListedAt.get(task.id) ?? -1) >= sinceMs }
+          : {}),
         taskGeneration: runnerGen,
         daemonInstanceNonce: this.instanceNonce,
         daemonSocketPath: this.config.socketPath,
@@ -3111,6 +3129,32 @@ export class HarnessOrchestrator {
         // If this execution was evicted or superseded while running, never touch its successor.
         const latest = this.db.getTask(task.id);
         if (!latest || this.active.get(task.id) !== exec || latest.generation !== runnerGen) return;
+        if (err instanceof AcpProfileError) {
+          this.pendingRollovers.delete(task.id);
+          const flat = msg.replace(/\s+/g, " ").trim();
+          const detail = flat.length <= 500 ? flat : `${flat.slice(0, 350)} … ${flat.slice(-147)}`;
+          const reason =
+            err.kind === "auth_required"
+              ? detail
+                ? `acp_auth_required: profile ${err.profileId} needs login; ${detail}`
+                : `acp_auth_required: profile ${err.profileId} needs login`
+              : detail
+                ? `tools_missing: profile ${err.profileId} session started without harness MCP tools; ${detail}`
+                : `tools_missing: profile ${err.profileId} session started without harness MCP tools`;
+          const baseSummary = reason;
+          if (latest.tier === 1) {
+            this.db.updateTask(task.id, { status: "failed", summary: baseSummary });
+          } else {
+            await this.settleWithoutReturn(exec, runnerGen, latest, run, wt, null, "failed", baseSummary, reason);
+          }
+          this.db.emitEvent(run.id, task.id, "agent.error", {
+            error: msg,
+            kind: err.kind,
+            profileId: err.profileId,
+            infrastructure: true,
+          });
+          return;
+        }
         // If an explicit clean rollover was scheduled or the runner threw a context overflow, route through rollOver.
         const explicitRollover = this.pendingRollovers.get(task.id);
         const overflowErr = !explicitRollover && isContextOverflowError(msg);
@@ -3171,6 +3215,7 @@ export class HarnessOrchestrator {
           }
         }
         this.advisories.generationEnded(task.id);
+        if (this.active.get(task.id) === exec) this.toolsListedAt.delete(task.id);
         // A queued steer never crosses into the next generation: its prompt is rebuilt from the amended task row.
         if (!this.disposed && (this.db.getTask(task.id)?.generation ?? runnerGen) > runnerGen && exec.pendingSteers?.length) {
           const stale = exec.pendingSteers.filter((item) => item.generation <= runnerGen);

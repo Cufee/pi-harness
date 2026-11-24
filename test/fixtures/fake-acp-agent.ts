@@ -140,6 +140,7 @@ const app = agent()
       });
       mcpClient = new Client({ name: "fake-acp-agent", version: "1.0.0" }, { capabilities: {} });
       await mcpClient.connect(transport);
+      await mcpClient.listTools();
     }
 
     mkdirSync(join(fakeDir, "pids"), { recursive: true });
