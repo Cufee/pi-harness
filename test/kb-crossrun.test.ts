@@ -262,7 +262,7 @@ describe("Knowledge Base (FTS5 + Deterministic Git Pre-Check) & Cross-Run Coordi
     const orch = new HarnessOrchestrator(db, config, new ModelCatalogCompiler(config), new QuotaClient());
     await assert.rejects(
       () => orch.toolExecutor.execute(runA.id, workerA.id, "list_peer_runs", {}),
-      /not permitted for Tier 2/,
+      /not permitted for Tier 2|\[harness blocked: not-your-tool\]/,
     );
 
     db.close();

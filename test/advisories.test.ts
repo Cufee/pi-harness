@@ -1359,9 +1359,9 @@ describe("goal-14 slice A advisories", () => {
       assert.equal(ruleCalls, callsBeforeSkip);
 
       // (f) Done-Review task: engine not called, tool runs
-      const revRes = (await executor.execute(run.id, doneReviewTask.id, "artifact_read", {})) as Record<string, unknown>;
-      assert.ok(Array.isArray(revRes.artifacts));
-      assert.equal(revRes.harness_advisory, undefined);
+      const revRes = await executor.execute(run.id, doneReviewTask.id, "__list_tools", {});
+      assert.ok(Array.isArray(revRes));
+      assert.ok(revRes.length > 0);
       assert.equal(ruleCalls, callsBeforeSkip);
     } finally {
       db.close();

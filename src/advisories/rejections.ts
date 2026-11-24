@@ -52,7 +52,7 @@ export const REJECTIONS = {
   spawnExecuteNeedsWorker(): HarnessRejection {
     return rejection(
       "spawn-execute-needs-worker",
-      "spawn_task with kind execute was rejected.",
+      "Tier 1 spawn_task only permits research, plan, and verify; kind execute was rejected.",
       "Writes need a worktree and write leases, and only a Worker holds them.",
       "Use spawn_worker with write_scopes for implementation. spawn_task accepts research, plan, and verify here.",
     );
