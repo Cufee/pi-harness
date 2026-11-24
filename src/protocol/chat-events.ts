@@ -119,6 +119,30 @@ export type ChatControlEvent =
       partial?: boolean;
     }
   | {
+      kind: "goal.gate_activity";
+      goalId: string;
+      goalVersion: number;
+      goalTitle: string;
+      runId: string;
+      /** Why the goal is gated: awaiting_human wins when both hold. */
+      gate: "awaiting_human" | "blocking_escalation";
+      /** Open or acked blocking escalations routed to the human (toTaskId null), newest first, max 5 ids. */
+      escalationIds: string[];
+      openBlockingEscalations: number;
+      activity: "worker_spawned" | "remote_push";
+      /** The spawned worker (worker_spawned) or the task whose shell pushed (remote_push). */
+      taskId: string;
+      taskTier: number;
+      /** worker_spawned: worker title (<=160 chars). */
+      title?: string;
+      /** remote_push: command text (<=200 chars), remote ("To <url>" or the remote arg), ref updates (<=5, e.g. "e38b213..a3328cf HEAD -> main"). */
+      command?: string;
+      remote?: string;
+      refs?: string[];
+      /** remote_push: true when the tool output shows a ref update; false when only the command was seen. */
+      confirmed?: boolean;
+    }
+  | {
       /** Goal lifecycle events queued during a busy Director turn, coalesced and delivered in one turn (oldest first). */
       kind: "goal.events_batch";
       events: GoalLifecycleChatEvent[];
@@ -127,7 +151,7 @@ export type ChatControlEvent =
 /** Goal and delegated-task lifecycle events that may be coalesced into one `goal.events_batch` wake. */
 export type GoalLifecycleChatEvent = Extract<
   ChatControlEvent,
-  { kind: "goal.settled" | "goal.committed" | "goal.amended" | "goal.reviewed" | "task.settled" }
+  { kind: "goal.settled" | "goal.committed" | "goal.amended" | "goal.reviewed" | "goal.gate_activity" | "task.settled" }
 >;
 
 const GOAL_LIFECYCLE_KINDS = new Set<string>([
@@ -135,6 +159,7 @@ const GOAL_LIFECYCLE_KINDS = new Set<string>([
   "goal.committed",
   "goal.amended",
   "goal.reviewed",
+  "goal.gate_activity",
   "task.settled",
 ]);
 
@@ -148,7 +173,11 @@ export function isGoalLifecycleEvent(e: ChatControlEvent): e is GoalLifecycleCha
  */
 export function coalesceGoalEvents(events: GoalLifecycleChatEvent[]): GoalLifecycleChatEvent[] {
   const keyOf = (e: GoalLifecycleChatEvent) =>
-    e.kind === "task.settled" ? `task:${e.taskId}` : `${e.goalId}\u0000${e.kind}`;
+    e.kind === "task.settled"
+      ? `task:${e.taskId}`
+      : e.kind === "goal.gate_activity"
+        ? `gate:${e.runId}:${e.activity}:${e.taskId}:${(e.refs ?? []).join(",")}:${e.command ?? ""}`
+        : `${e.goalId}\u0000${e.kind}`;
   const last = new Map<string, number>();
   const firstFrom = new Map<string, number>();
   events.forEach((e, i) => {
@@ -375,6 +404,61 @@ export function parseChatControlEvent(raw: unknown): ChatControlEvent | null {
         ...(r.partial === true ? { partial: true } : {}),
       };
     }
+    case "goal.gate_activity": {
+      const gate = r.gate;
+      const activity = r.activity;
+      if (
+        typeof r.goalId !== "string" ||
+        typeof r.goalVersion !== "number" ||
+        !Number.isFinite(r.goalVersion) ||
+        typeof r.goalTitle !== "string" ||
+        typeof r.runId !== "string" ||
+        (gate !== "awaiting_human" && gate !== "blocking_escalation") ||
+        (activity !== "worker_spawned" && activity !== "remote_push") ||
+        typeof r.taskId !== "string" ||
+        typeof r.taskTier !== "number" ||
+        !Number.isFinite(r.taskTier)
+      ) {
+        return null;
+      }
+      const escalationIds = Array.isArray(r.escalationIds)
+        ? r.escalationIds
+            .filter((x): x is string => typeof x === "string" && x.trim().length > 0)
+            .map((s) => s.trim().slice(0, 120))
+            .slice(0, 5)
+        : [];
+      const openBlockingEscalations =
+        typeof r.openBlockingEscalations === "number" && Number.isFinite(r.openBlockingEscalations)
+          ? Math.max(0, Math.floor(r.openBlockingEscalations))
+          : escalationIds.length;
+      const title = typeof r.title === "string" ? r.title.replace(/\s+/g, " ").trim().slice(0, 160) : "";
+      const command = typeof r.command === "string" ? r.command.replace(/\s+/g, " ").trim().slice(0, 200) : "";
+      const remote = typeof r.remote === "string" ? r.remote.trim().slice(0, 200) : "";
+      const refs = Array.isArray(r.refs)
+        ? r.refs
+            .filter((x): x is string => typeof x === "string" && x.trim().length > 0)
+            .map((s) => s.replace(/\s+/g, " ").trim().slice(0, 200))
+            .slice(0, 5)
+        : [];
+      return {
+        kind: "goal.gate_activity",
+        goalId: r.goalId,
+        goalVersion: r.goalVersion,
+        goalTitle: r.goalTitle,
+        runId: r.runId,
+        gate,
+        escalationIds,
+        openBlockingEscalations,
+        activity,
+        taskId: r.taskId,
+        taskTier: r.taskTier,
+        ...(title ? { title } : {}),
+        ...(command ? { command } : {}),
+        ...(remote ? { remote } : {}),
+        ...(refs.length > 0 ? { refs } : {}),
+        ...(typeof r.confirmed === "boolean" ? { confirmed: r.confirmed } : {}),
+      };
+    }
     case "goal.events_batch": {
       if (!Array.isArray(r.events)) return null;
       const events = r.events
@@ -467,6 +551,29 @@ export function formatChatEventSummary(event: ChatControlEvent, opts?: { remoteH
       const partial = event.partial ? " (partial)" : "";
       const detail = event.summary.replace(/\s+/g, " ").trim();
       return `Delegated task ${event.taskId} ("${title}") ${event.status}${partial}${detail ? `: ${detail}` : ""}.`;
+    }
+    case "goal.gate_activity": {
+      const escList = event.escalationIds.length > 0 ? event.escalationIds.join(", ") : "";
+      const gatePhrase =
+        event.gate === "awaiting_human"
+          ? event.openBlockingEscalations > 0
+            ? `is awaiting_human (${event.openBlockingEscalations} blocking escalation(s)${escList ? `: ${escList}` : ""})`
+            : "is awaiting_human"
+          : `has ${event.openBlockingEscalations || event.escalationIds.length} blocking escalation(s)${escList ? ` (${escList})` : ""}`;
+      if (event.activity === "worker_spawned") {
+        const titlePart = event.title ? ` ("${event.title.replace(/\s+/g, " ").trim()}")` : "";
+        return `Goal ${event.goalId} v${event.goalVersion} ${gatePhrase}, but run ${event.runId} spawned worker ${event.taskId}${titlePart}.`;
+      }
+      const remotePart = event.remote ? ` to ${event.remote}` : "";
+      const pushDetail =
+        event.refs && event.refs.length > 0
+          ? `: ${event.refs.join(", ")}`
+          : event.command
+            ? ` (${event.confirmed === false ? "unconfirmed: " : ""}${event.command})`
+            : event.confirmed === false
+              ? " (unconfirmed)"
+              : "";
+      return `Goal ${event.goalId} v${event.goalVersion} ${gatePhrase}, but task ${event.taskId} pushed${remotePart}${pushDetail}.`;
     }
     case "goal.events_batch":
       return `${event.events.length} goal updates: ${event.events.map((e) => formatChatEventSummary(e, opts)).join("; ")}`;
@@ -576,6 +683,11 @@ export function formatChatEventForModel(event: ChatControlEvent): string {
       return [
         summary,
         `Read its handoff with wait_tasks({ ids: ["${event.taskId}"] }) (returns immediately), open artifacts with artifact_read if needed, then answer the user or continue.`,
+      ].join("\n");
+    case "goal.gate_activity":
+      return [
+        summary,
+        `The orchestrator keeps working while the goal waits on a human. Decide whether this matches the open decision: let it continue, steer it with steer_task / steer_run, pause it with goal_pause, or tell the user. Inspect with goal_get({ goal_id: "${event.goalId}" }).`,
       ].join("\n");
     case "goal.events_batch":
       return ["Handle these goal updates together in one turn:", ...event.events.map((e) => formatChatEventForModel(e))].join("\n\n");
