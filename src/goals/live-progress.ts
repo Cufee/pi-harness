@@ -144,8 +144,23 @@ export function filterProgressPatch(
   if (droppedPhase) {
     parts.push(`phase ${droppedPhase.value} ignored because ${staleClause}`);
   }
+  const kept: string[] = [];
+  if (next.phase !== undefined && (!isStaleVersion || !isBlockedPhase(next.phase))) {
+    kept.push(`phase ${next.phase}`);
+  }
+  if (next.summary !== undefined) {
+    kept.push("summary");
+  }
+  if (next.verificationStatus !== undefined && !isStaleVersion) {
+    kept.push(`verification_status ${next.verificationStatus}`);
+  }
+  if (next.criteriaResults !== undefined && next.criteriaResults.length > 0) {
+    kept.push(`criteria ${next.criteriaResults.map((r) => r.criterionId).join(",")}`);
+  }
+  const keptSummary =
+    kept.length === 0 ? "" : ` Kept ${kept.length === 2 ? `${kept[0]} and ${kept[1]}` : kept.join(", ")}.`;
   const note =
-    `Dropped ${dropped.length} ${dropped.length === 1 ? "entry" : "entries"}: ${parts.join("; ")}. ` +
+    `Dropped ${dropped.length} ${dropped.length === 1 ? "entry" : "entries"}: ${parts.join("; ")}.${keptSummary} ` +
     `Re-check against v${opts.currentVersion} (blackboard goal_contract_v${opts.currentVersion}) before claiming.`;
 
   return { patch: next, dropped, note };
@@ -178,7 +193,8 @@ function hasProvenance(lp: GoalLiveProgress): boolean {
  * blocked phase) are stamped with the goal epoch they were made in; a claim from a different epoch or a stale
  * reporter drops the previous claim first. Evidence and completion claims from a stale reporter are dropped
  * before merging so they can never be stamped as current-version results. Summary or ordinary phase updates
- * never refresh a claim's provenance, and only a patch that sets `verificationStatus` changes who authored it.
+ * never refresh a claim's provenance (including from a stale reporter on a row holding current claims, unless
+ * either side is a blocked phase), and only a patch that sets `verificationStatus` changes who authored it.
  * Within the same epoch, a worker cannot overwrite an authoritative verification status or clear an authoritative
  * blocked phase; it may still add summary, ordinary phase and criterion results.
  */
@@ -252,9 +268,12 @@ export function mergeGoalLiveProgress(
   for (const c of effectivePatch.criteriaResults ?? []) mergedById.set(c.criterionId, c);
 
   const keepClaimAuthor = !setsVerification && (workerLocked || base?.verificationStatus !== undefined);
+  const stalePhaseLocked =
+    (staleReporterLocked || (ctxIsStaleReporter && legacyLocked)) &&
+    (isBlockedPhase(base?.phase) || isBlockedPhase(effectivePatch.phase));
   const next: GoalLiveProgress = {
     phase:
-      (authoritativeBlocked && ctx.source === "worker") || staleReporterLocked
+      (authoritativeBlocked && ctx.source === "worker") || stalePhaseLocked
         ? base?.phase
         : (effectivePatch.phase ?? base?.phase),
     summary: effectivePatch.summary ?? base?.summary,
