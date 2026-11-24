@@ -399,4 +399,120 @@ describe("ScopeNudgeMonitor", () => {
       else assert.ok(res?.includes("repeated"));
     }
   });
+
+  it("T-sn: evaluate() returns structured findings for widening, repeat, and stale, null on silent cases, and ignores observe() cadence", () => {
+    // 1. Widening with multiple topics + evaluate() continues returning after observe() cadence stops
+    {
+      const monitor = new ScopeNudgeMonitor({ workspaceRoot });
+      const topics = ["cortexsdk", "nats", "listdevices", "commissioning"];
+
+      for (let i = 0; i < 4; i++) {
+        monitor.observe({
+          name: "grep",
+          kind: "search",
+          status: "completed",
+          args: { pattern: topics[i], path: `cloud/mod${i}/handler.go` },
+        });
+        assert.equal(monitor.evaluate(), null);
+      }
+
+      for (let i = 4; i < 7; i++) {
+        monitor.observe({
+          name: "read",
+          kind: "read",
+          status: "completed",
+          args: { path: `cloud/mod${i}/service.go` },
+        });
+        assert.equal(monitor.evaluate(), null);
+      }
+
+      // 8th area: widening + 4 topics holds
+      monitor.observe({
+        name: "read",
+        kind: "read",
+        status: "completed",
+        args: { path: "cloud/mod7/service.go" },
+      });
+      const firstFinding = monitor.evaluate();
+      assert.ok(firstFinding?.widening);
+      assert.equal(firstFinding.widening.areas.length, 8);
+      assert.equal(firstFinding.widening.topics.length, 4);
+      assert.equal(firstFinding.repeated, undefined);
+      assert.equal(firstFinding.stale, undefined);
+      assert.deepEqual(monitor.marks(), { areas: 8, scoredCalls: 8 });
+
+      // Drive past observe()'s 2-nudge cap (mod8..mod20)
+      let observeAfterCap: string | null = "unexpected";
+      for (let i = 8; i <= 20; i++) {
+        observeAfterCap = monitor.observe({
+          name: "read",
+          kind: "read",
+          status: "completed",
+          args: { path: `cloud/mod${i}/service.go` },
+        });
+      }
+      assert.equal(observeAfterCap, null);
+
+      const postCapFinding = monitor.evaluate();
+      assert.ok(postCapFinding?.widening);
+      assert.equal(postCapFinding.widening.areas.length, 21);
+      assert.equal(postCapFinding.widening.topics.length, 4);
+      assert.deepEqual(monitor.marks(), { areas: 21, scoredCalls: 21 });
+    }
+
+    // 2. Repeat finding
+    {
+      const monitor = new ScopeNudgeMonitor({ workspaceRoot });
+      for (let i = 0; i < 2; i++) {
+        monitor.observe({ name: "read", status: "completed", args: { path: "src/a.ts", start_line: 1, end_line: 40 } });
+        assert.equal(monitor.evaluate(), null);
+      }
+      monitor.observe({ name: "read", status: "completed", args: { path: "src/a.ts", start_line: 1, end_line: 40 } });
+      const finding = monitor.evaluate();
+      assert.deepEqual(finding, { repeated: { tool: "read", times: 3 } });
+    }
+
+    // 3. Stale finding and resetStale()
+    {
+      const monitor = new ScopeNudgeMonitor({ workspaceRoot });
+      // Seed two seen files so alternating revisits build staleStreak without repeatStreak >= 3
+      monitor.observe({ name: "read", status: "completed", args: { path: "src/a.ts" } });
+      monitor.observe({ name: "read", status: "completed", args: { path: "src/b.ts" } });
+      for (let i = 0; i < 11; i++) {
+        monitor.observe({ name: "read", status: "completed", args: { path: i % 2 === 0 ? "src/a.ts" : "src/b.ts" } });
+        assert.equal(monitor.evaluate(), null);
+      }
+      // 12th stale read: observe() returns legacy text, AND evaluate() still reports stale until resetStale()
+      const legacyNudge = monitor.observe({ name: "read", status: "completed", args: { path: "src/b.ts" } });
+      assert.ok(legacyNudge?.includes("nothing new"));
+      assert.deepEqual(monitor.evaluate(), { stale: { reads: 12 } });
+      assert.deepEqual(monitor.marks(), { areas: 1, scoredCalls: 14 });
+
+      monitor.resetStale();
+      assert.equal(monitor.evaluate(), null);
+      assert.equal(monitor.signals().staleStreak, 0);
+    }
+
+    // 4. Silent cases: long bounded read (200 files, 2 areas, 1 topic) and single topic across 12 areas
+    {
+      const bounded = new ScopeNudgeMonitor({ workspaceRoot });
+      bounded.observe({ name: "rg", status: "completed", args: { query: "schedulerLoop", path: "src/control-plane" } });
+      for (let i = 0; i < 200; i++) {
+        const area = i % 2 === 0 ? "src/control-plane" : "src/runners";
+        bounded.observe({ name: "read", status: "completed", args: { path: `${area}/file-${i}.ts` } });
+        assert.equal(bounded.evaluate(), null);
+      }
+
+      const singleTopic = new ScopeNudgeMonitor({ workspaceRoot });
+      for (let i = 0; i < 12; i++) {
+        singleTopic.observe({
+          name: "grep",
+          kind: "search",
+          status: "completed",
+          args: { pattern: "findCallers", path: `packages/pkg${i}/index.ts` },
+        });
+        assert.equal(singleTopic.evaluate(), null);
+      }
+    }
+  });
 });

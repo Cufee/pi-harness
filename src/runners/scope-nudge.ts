@@ -1,4 +1,5 @@
 import { isAbsolute, relative, resolve } from "node:path";
+import type { ScopeFinding, ScopeSignalSource } from "../advisories/types.js";
 
 /**
  * Pure, I/O-free scope-check monitor for Tier 3 tasks.
@@ -460,7 +461,7 @@ function sampleList(items: string[], max = 5): string {
   return `${items.slice(0, max).join(", ")}, ...`;
 }
 
-export class ScopeNudgeMonitor {
+export class ScopeNudgeMonitor implements ScopeSignalSource {
   private readonly workspaceRoot: string;
   private readonly areaDepth: number;
 
@@ -473,8 +474,10 @@ export class ScopeNudgeMonitor {
   private pathCallCount = 0;
   private scoredCallCount = 0;
   private lastCallKey: string | null = null;
+  private lastToolName = "";
   private repeatStreak = 0;
   private staleStreak = 0;
+  private legacyStaleStreak = 0;
   private nudgeCount = 0;
   private areasAtFirstNudge = 0;
   private callsAtFirstNudge = 0;
@@ -553,6 +556,7 @@ export class ScopeNudgeMonitor {
       this.lastCallKey = callKey;
       this.repeatStreak = 1;
     }
+    this.lastToolName = toolName;
     this.scoredCallCount += 1;
 
     if (callAreas.length > 0) {
@@ -573,49 +577,47 @@ export class ScopeNudgeMonitor {
     if (isNewProgress) this.seenProgressKeys.add(callKey);
     if (isNewProgress || addedNewTopic) {
       this.staleStreak = 0;
+      this.legacyStaleStreak = 0;
     } else {
       this.staleStreak += 1;
+      this.legacyStaleStreak += 1;
     }
 
     if (this.nudgeCount >= MAX_NUDGES) return null;
 
-    const sig = this.signals();
-    const widening = sig.distinctAreas.length >= WIDENING_MIN_AREAS && sig.newAreasInWindow >= WIDENING_MIN_NEW_IN_WINDOW;
-    const topicSpread = sig.searchTopics.length >= TOPIC_MIN_COUNT;
-    const wideAndMultiTopic = widening && topicSpread;
+    const finding = this.evaluateWithStale(this.legacyStaleStreak);
+    if (!finding) return null;
 
-    const repeatedNow = this.repeatStreak >= REPEAT_THRESHOLD;
-    const staleNow = this.staleStreak >= STALE_THRESHOLD;
-    const spinning = repeatedNow || staleNow;
-
-    if (!wideAndMultiTopic && !spinning) return null;
+    const wideAndMultiTopic = Boolean(finding.widening);
+    const spinning = Boolean(finding.repeated || finding.stale);
+    const marks = this.marks();
 
     if (this.nudgeCount === 1) {
-      const areaGrewEnough = wideAndMultiTopic && sig.distinctAreas.length >= this.areasAtFirstNudge + SECOND_NUDGE_AREA_GROWTH;
-      const spunAgainEnough = spinning && this.scoredCallCount - this.callsAtFirstNudge >= SECOND_NUDGE_SPIN_CALLS;
+      const areaGrewEnough = wideAndMultiTopic && marks.areas >= this.areasAtFirstNudge + SECOND_NUDGE_AREA_GROWTH;
+      const spunAgainEnough = spinning && marks.scoredCalls - this.callsAtFirstNudge >= SECOND_NUDGE_SPIN_CALLS;
       if (!areaGrewEnough && !spunAgainEnough) return null;
     }
 
     const reasons: string[] = [];
-    if (wideAndMultiTopic) {
+    if (finding.widening) {
       reasons.push(
-        `you have opened ${sig.distinctAreas.length} areas (${sampleList(sig.distinctAreas)}) and searched ${sig.searchTopics.length} unrelated topics (${sampleList(sig.searchTopics)})`,
+        `you have opened ${finding.widening.areas.length} areas (${sampleList(finding.widening.areas)}) and searched ${finding.widening.topics.length} unrelated topics (${sampleList(finding.widening.topics)})`,
       );
     }
-    if (repeatedNow) {
-      reasons.push(`you repeated the same ${toolName} call ${this.repeatStreak} times`);
+    if (finding.repeated) {
+      reasons.push(`you repeated the same ${finding.repeated.tool} call ${finding.repeated.times} times`);
     }
-    if (staleNow) {
-      reasons.push(`the last ${this.staleStreak} reads found nothing new`);
+    if (finding.stale) {
+      reasons.push(`the last ${finding.stale.reads} reads found nothing new`);
     }
 
     if (this.nudgeCount === 0) {
-      this.areasAtFirstNudge = sig.distinctAreas.length;
-      this.callsAtFirstNudge = this.scoredCallCount;
+      this.areasAtFirstNudge = marks.areas;
+      this.callsAtFirstNudge = marks.scoredCalls;
     }
     this.nudgeCount += 1;
     // Require a fresh streak of stale reads before stale-spinning can trigger a second nudge.
-    if (staleNow) this.staleStreak = 0;
+    if (finding.stale) this.legacyStaleStreak = 0;
 
     return (
       `[Harness scope check] This is advisory; nothing was cancelled. ` +
@@ -625,6 +627,54 @@ export class ScopeNudgeMonitor {
       `status "scope_too_large", partial: true, a summary of what you verified, sources for it, artifact_paths, ` +
       `and suggested_splits proposing one independent task per area or deliverable still open.`
     );
+  }
+
+  evaluate(): ScopeFinding | null {
+    return this.evaluateWithStale(this.staleStreak);
+  }
+
+  marks(): { areas: number; scoredCalls: number } {
+    return {
+      areas: this.areaFirstSeenAt.size,
+      scoredCalls: this.scoredCallCount,
+    };
+  }
+
+  resetStale(): void {
+    this.staleStreak = 0;
+    this.legacyStaleStreak = 0;
+  }
+
+  private evaluateWithStale(staleStreak: number): ScopeFinding | null {
+    const sig = this.signals();
+    const widening = sig.distinctAreas.length >= WIDENING_MIN_AREAS && sig.newAreasInWindow >= WIDENING_MIN_NEW_IN_WINDOW;
+    const topicSpread = sig.searchTopics.length >= TOPIC_MIN_COUNT;
+    const wideAndMultiTopic = widening && topicSpread;
+
+    const repeatedNow = this.repeatStreak >= REPEAT_THRESHOLD;
+    const staleNow = staleStreak >= STALE_THRESHOLD;
+
+    if (!wideAndMultiTopic && !repeatedNow && !staleNow) return null;
+
+    const finding: ScopeFinding = {};
+    if (wideAndMultiTopic) {
+      finding.widening = {
+        areas: sig.distinctAreas,
+        topics: sig.searchTopics,
+      };
+    }
+    if (repeatedNow) {
+      finding.repeated = {
+        tool: this.lastToolName || "tool",
+        times: this.repeatStreak,
+      };
+    }
+    if (staleNow) {
+      finding.stale = {
+        reads: staleStreak,
+      };
+    }
+    return finding;
   }
 
   signals(): ScopeSignals {

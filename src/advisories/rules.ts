@@ -75,13 +75,8 @@ function formatScopeList(scopes: readonly string[]): string {
   return `${cleaned.slice(0, 2).join(", ")}, +${cleaned.length - 2}`;
 }
 
-function formatSampleList(items: readonly string[], compact: boolean): string {
+function formatSampleList(items: readonly string[]): string {
   const cleaned = items.map((item) => item.trim()).filter(Boolean);
-  if (compact) {
-    const tokens = cleaned.slice(0, 2).map((s) => s.replace(/\s+/g, "-"));
-    if (cleaned.length > 2) tokens.push(`+${cleaned.length - 2}`);
-    return tokens.join(",");
-  }
   const kept: string[] = [];
   let words = 0;
   for (const item of cleaned) {
@@ -276,33 +271,27 @@ const scopeTooLargeRule: AdvisoryRule<ScopeRuleState> = {
     if (finding.stale) reasonKeys.push("stale");
     if (reasonKeys.length === 0) return null;
 
-    const activeReasons = reasonKeys.slice(0, 2);
-    const compactWidening = activeReasons.length > 1;
-    const sentences: string[] = [];
-
-    for (const reason of activeReasons) {
-      if (reason === "widening" && finding.widening) {
-        const areas = formatSampleList(finding.widening.areas, compactWidening);
-        const topics = formatSampleList(finding.widening.topics, compactWidening);
-        sentences.push(
-          `You have opened ${finding.widening.areas.length} areas (${areas}) and searched ${finding.widening.topics.length} unrelated topics (${topics}).`,
-        );
-      } else if (reason === "repeated" && finding.repeated) {
-        const tool = finding.repeated.tool.trim().split(/\s+/)[0] || "tool";
-        sentences.push(`You repeated the same ${tool} call ${finding.repeated.times} times.`);
-      } else if (reason === "stale" && finding.stale) {
-        sentences.push(`Your last ${finding.stale.reads} reads found nothing new.`);
-      }
+    const primaryReason = reasonKeys[0]!;
+    let what: string;
+    if (primaryReason === "widening" && finding.widening) {
+      const areas = formatSampleList(finding.widening.areas);
+      const topics = formatSampleList(finding.widening.topics);
+      what = `You have opened ${finding.widening.areas.length} areas (${areas}) and searched ${finding.widening.topics.length} unrelated topics (${topics}).`;
+    } else if (primaryReason === "repeated" && finding.repeated) {
+      const tool = finding.repeated.tool.trim().split(/\s+/)[0] || "tool";
+      what = `You repeated the same ${tool} call ${finding.repeated.times} times.`;
+    } else {
+      what = `Your last ${finding.stale!.reads} reads found nothing new.`;
     }
 
     return {
       key: "scope",
-      what: sentences.join(" "),
-      why: "This usually means the task is larger than one bounded assignment.",
+      what,
+      why: "This usually means the task exceeds one bounded assignment.",
       alternative:
-        "If you are still answering one bounded question, continue. Otherwise save your findings with artifact_write, then call return_task with status scope_too_large and suggested_splits, one per open area.",
+        "If you are still answering one bounded question, continue. Otherwise save findings with artifact_write, then call return_task with status scope_too_large, partial: true, artifact_paths, and suggested_splits, one per open area.",
       data: {
-        reasons: activeReasons,
+        reasons: reasonKeys,
         finding,
         signals: ctx.scope.signals(),
       },

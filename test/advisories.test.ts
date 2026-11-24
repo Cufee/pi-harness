@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "bun:test";
@@ -30,6 +30,7 @@ import { loadConfig } from "../src/config.js";
 import { ControlPlaneDb, type TaskRecord } from "../src/control-plane/db.js";
 import type { ToolRuntimeHooks } from "../src/control-plane/tools.js";
 import { QuotaClient } from "../src/quota/client.js";
+import { ScopeNudgeMonitor } from "../src/runners/scope-nudge.js";
 
 const WORKSPACE = "/tmp/pi-harness-advisories-ws";
 
@@ -1551,7 +1552,7 @@ describe("goal-14 slice A advisories", () => {
     assert.equal(records[1]!.delivery, "dropped");
   });
 
-  it("T-act: activity counts paths only", () => {
+  it("T-act: activity counts paths only", async () => {
     const { engine } = makeEngine();
     const subject = buildSubject({
       task: makeTaskRecord({ id: "t-act", tier: 3, kind: "research", readOnly: true }),
@@ -1618,6 +1619,93 @@ describe("goal-14 slice A advisories", () => {
     });
 
     assert.equal(engine.activityProgress(subject.id), 4);
+
+    // A7: completed artifact_read of a workspace file adds one path once; dossier and missing path add nothing
+    const tmpDir = mkdtempSync(join(tmpdir(), "pi-harness-adv-act-"));
+    const db = new ControlPlaneDb(":memory:");
+    try {
+      mkdirSync(join(tmpDir, "src"), { recursive: true });
+      writeFileSync(join(tmpDir, "src/a.ts"), "export const a = 1;\n", "utf8");
+      const dossierDir = join(tmpDir, ".harness/artifacts/run-act/t-res");
+      mkdirSync(dossierDir, { recursive: true });
+      const dossierRel = ".harness/artifacts/run-act/t-res/dossier.md";
+      const dossierAbs = join(tmpDir, dossierRel);
+      writeFileSync(dossierAbs, "# Dossier\n", "utf8");
+
+      const run = db.createRun({
+        id: "run-act",
+        goal: "Test artifact_read activity",
+        repoRoot: tmpDir,
+        baseBranch: "main",
+        baseSha: "0000000000000000000000000000000000000000",
+      });
+      const resTask = db.createTask({
+        runId: run.id,
+        tier: 3,
+        kind: "research",
+        title: "Read artifacts",
+        objective: "Inspect files",
+        readOnly: true,
+        profileId: "pi-default",
+      });
+      db.recordArtifact({
+        runId: run.id,
+        taskId: resTask.id,
+        kind: "dossier",
+        path: dossierAbs,
+        summary: "Dossier",
+      });
+
+      const { engine: execEngine } = makeEngine();
+      const abort = new AbortController();
+      const hooks: ToolRuntimeHooks = {
+        spawnAndStartTask: async () => {
+          throw new Error("unused");
+        },
+        waitForChildren: async () => ({ children: [], wakeReason: "already_settled", inactiveTaskIds: [] }),
+        steerTask: async () => true,
+        cancelTask: async () => {},
+        scheduleRollover: async () => {},
+        getWorktreeManager: () => {
+          throw new Error("unused");
+        },
+        getMergeQueue: () => {
+          throw new Error("unused");
+        },
+        forceStartWorker: async () => [],
+        getTaskSignal: () => abort.signal,
+      };
+      const baseConfig = loadConfig(tmpDir);
+      const config = { ...baseConfig, stateDir: join(tmpDir, "state") };
+      const catalog = new ModelCatalogCompiler(config, new QuotaClient());
+      const executor = new AdvisedToolExecutor(db, () => catalog, hooks, config, {
+        engine: execEngine,
+        subjectFor: (task) =>
+          buildSubject({
+            task,
+            workspaceRoot: tmpDir,
+            writeScopes: [],
+            writableExtraRoots: [],
+          }),
+      });
+
+      // Workspace file read twice -> adds one path, once
+      await executor.execute(run.id, resTask.id, "artifact_read", { path: "src/a.ts" });
+      assert.equal(execEngine.activityProgress(resTask.id), 1);
+      await executor.execute(run.id, resTask.id, "artifact_read", { path: "src/a.ts" });
+      assert.equal(execEngine.activityProgress(resTask.id), 1);
+
+      // Dossier under .harness/artifacts/... -> adds nothing
+      await executor.execute(run.id, resTask.id, "artifact_read", { path: dossierRel });
+      assert.equal(execEngine.activityProgress(resTask.id), 1);
+
+      // Missing path -> rejects and adds nothing
+      await assert.rejects(() => executor.execute(run.id, resTask.id, "artifact_read", { path: "src/missing.ts" }));
+      assert.equal(execEngine.activityProgress(resTask.id), 1);
+    } finally {
+      db.close();
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 
   it("T6-3: rules in one place", () => {
@@ -1672,49 +1760,89 @@ describe("goal-14 slice A advisories", () => {
       checkNotice("worker-edit-outside-scope", n);
     }
 
-    // 2. scope-too-large (widening, repeated, stale, widening+repeated, widening+stale, repeated+stale)
-    const scopeFindings: Array<[string, ScopeFinding]> = [
-      [
-        "scope-too-large widening",
-        {
+    // 2. scope-too-large (A3 wording, A8 single-reason what + full data.reasons)
+    const scopeFindings: Array<{
+      label: string;
+      finding: ScopeFinding;
+      expectedWhatPrefix: string;
+      expectedReasons: string[];
+    }> = [
+      {
+        label: "scope-too-large widening",
+        finding: {
           widening: {
             areas: ["src/control-plane", "src/runners", "src/worktree", "src/director", "src/goals", "src/code-mode", "src/daemon", "src/cli"],
             topics: ["authToken", "mergeQueue", "scopeNudge", "toolRegistry"],
           },
         },
-      ],
-      ["scope-too-large repeated", { repeated: { tool: "inspect_command", times: 5 } }],
-      ["scope-too-large stale", { stale: { reads: 12 } }],
-      [
-        "scope-too-large widening+repeated",
-        {
+        expectedWhatPrefix: "You have opened 8 areas (",
+        expectedReasons: ["widening"],
+      },
+      {
+        label: "scope-too-large repeated",
+        finding: { repeated: { tool: "inspect_command", times: 5 } },
+        expectedWhatPrefix: "You repeated the same inspect_command call 5 times.",
+        expectedReasons: ["repeated"],
+      },
+      {
+        label: "scope-too-large stale",
+        finding: { stale: { reads: 12 } },
+        expectedWhatPrefix: "Your last 12 reads found nothing new.",
+        expectedReasons: ["stale"],
+      },
+      {
+        label: "scope-too-large widening+repeated",
+        finding: {
           widening: {
             areas: ["src/control-plane", "src/runners", "src/worktree", "src/director", "src/goals", "src/code-mode", "src/daemon", "src/cli"],
             topics: ["authToken", "mergeQueue", "scopeNudge", "toolRegistry"],
           },
           repeated: { tool: "inspect_command", times: 5 },
         },
-      ],
-      [
-        "scope-too-large widening+stale",
-        {
+        expectedWhatPrefix: "You have opened 8 areas (",
+        expectedReasons: ["widening", "repeated"],
+      },
+      {
+        label: "scope-too-large widening+stale",
+        finding: {
           widening: {
             areas: ["src/control-plane", "src/runners", "src/worktree", "src/director", "src/goals", "src/code-mode", "src/daemon", "src/cli"],
             topics: ["authToken", "mergeQueue", "scopeNudge", "toolRegistry"],
           },
           stale: { reads: 12 },
         },
-      ],
-      [
-        "scope-too-large repeated+stale",
-        {
+        expectedWhatPrefix: "You have opened 8 areas (",
+        expectedReasons: ["widening", "stale"],
+      },
+      {
+        label: "scope-too-large repeated+stale",
+        finding: {
           repeated: { tool: "inspect_command", times: 5 },
           stale: { reads: 12 },
         },
-      ],
+        expectedWhatPrefix: "You repeated the same inspect_command call 5 times.",
+        expectedReasons: ["repeated", "stale"],
+      },
+      {
+        label: "scope-too-large widening+repeated+stale",
+        finding: {
+          widening: {
+            areas: ["src/control-plane", "src/runners", "src/worktree", "src/director", "src/goals", "src/code-mode", "src/daemon", "src/cli"],
+            topics: ["authToken", "mergeQueue", "scopeNudge", "toolRegistry"],
+          },
+          repeated: { tool: "inspect_command", times: 5 },
+          stale: { reads: 12 },
+        },
+        expectedWhatPrefix: "You have opened 8 areas (",
+        expectedReasons: ["widening", "repeated", "stale"],
+      },
     ];
-    for (const [label, finding] of scopeFindings) {
-      const { engine } = makeEngine({ createScopeSource: () => createFakeScopeSource({ evaluate: () => finding }) });
+    for (const { label, finding, expectedWhatPrefix, expectedReasons } of scopeFindings) {
+      const records: AdvisoryRecord[] = [];
+      const { engine } = makeEngine({
+        createScopeSource: () => createFakeScopeSource({ evaluate: () => finding }),
+        records,
+      });
       const s = buildSubject({
         task: makeTaskRecord({ id: `b-${label}`, tier: 3, kind: "research", readOnly: true }),
         workspaceRoot: WORKSPACE,
@@ -1722,9 +1850,18 @@ describe("goal-14 slice A advisories", () => {
         writableExtraRoots: [],
       });
       engine.observeEvent(s, { id: "1", name: "read", kind: "read", status: "completed" });
-      const [n] = engine.take(s.id);
+      const notices = engine.take(s.id);
+      const [n] = notices;
       assert.ok(n, `expected notice for ${label}`);
       checkNotice(label, n);
+      assert.ok(n.what.startsWith(expectedWhatPrefix), `${label} unexpected what: ${n.what}`);
+      // A8: single sentence in what (no second reason appended)
+      assert.equal(n.what.split(". ").length, 1, `${label} what should carry one reason: ${n.what}`);
+      assert.equal(n.why, "This usually means the task exceeds one bounded assignment.");
+      assert.ok(n.alternative.includes("status scope_too_large, partial: true, artifact_paths, and suggested_splits"));
+      engine.delivered(s.id, notices, "tool_result");
+      assert.equal(records.length, 1);
+      assert.deepEqual((records[0]!.data as { reasons: string[] }).reasons, expectedReasons);
     }
 
     // 3. read-only-finding-escalation
@@ -1896,5 +2033,559 @@ describe("goal-14 slice A advisories", () => {
         deniedNotice({ denied: id, name: "Bash", args: { command: "rm -rf /tmp/x" }, paths: ["src/x.ts"] }, { workspaceRoot: WORKSPACE }),
       );
     }
+  });
+
+  it("T3-3r: long bounded read is silent on the real ScopeNudgeMonitor", () => {
+    const monitors = new Map<string, ScopeNudgeMonitor>();
+    const { engine } = makeEngine({
+      createScopeSource: (s) => {
+        if (!SCOPE_ROLES.has(s.role)) return null;
+        const mon = new ScopeNudgeMonitor({ workspaceRoot: s.workspaceRoot });
+        monitors.set(s.id, mon);
+        return mon;
+      },
+    });
+
+    // (a) 200 distinct files under 2 areas and one topic
+    const subA = buildSubject({
+      task: makeTaskRecord({ id: "t-real-long-a", tier: 3, kind: "research", readOnly: true }),
+      workspaceRoot: WORKSPACE,
+      writeScopes: [],
+      writableExtraRoots: [],
+    });
+    assert.equal(
+      engine.observeEvent(subA, {
+        id: "ra-search-0",
+        name: "rg",
+        kind: "search",
+        status: "completed",
+        args: JSON.stringify({ query: "schedulerLoop", path: "src/control-plane/file-0.ts" }),
+      }),
+      false,
+    );
+    for (let i = 0; i < 200; i++) {
+      const area = i % 2 === 0 ? "src/control-plane" : "src/runners";
+      const pending = engine.observeEvent(subA, {
+        id: `ra-${i}`,
+        name: "read",
+        kind: "read",
+        status: "completed",
+        args: JSON.stringify({ path: `${area}/file-${i}.ts` }),
+      });
+      assert.equal(pending, false, `unexpected notice at file ${i}: ${JSON.stringify(monitors.get(subA.id)?.signals())}`);
+    }
+    assert.equal(engine.take(subA.id).length, 0);
+    assert.equal(engine.activityProgress(subA.id), 200);
+    assert.equal(monitors.get(subA.id)?.signals().distinctAreas.length, 2);
+    assert.equal(monitors.get(subA.id)?.signals().searchTopics.length, 1);
+
+    // (b) 300 reads of one file with different line ranges
+    const subB = buildSubject({
+      task: makeTaskRecord({ id: "t-real-long-b", tier: 3, kind: "research", readOnly: true }),
+      workspaceRoot: WORKSPACE,
+      writeScopes: [],
+      writableExtraRoots: [],
+    });
+    for (let page = 0; page < 300; page++) {
+      const pending = engine.observeEvent(subB, {
+        id: `rb-${page}`,
+        name: "read",
+        kind: "read",
+        status: "completed",
+        args: JSON.stringify({
+          path: "src/runners/acp-runner.ts",
+          start_line: page * 100 + 1,
+          end_line: (page + 1) * 100,
+        }),
+      });
+      assert.equal(pending, false, `unexpected notice at page ${page}: ${JSON.stringify(monitors.get(subB.id)?.signals())}`);
+    }
+    assert.equal(engine.take(subB.id).length, 0);
+    assert.equal(engine.activityProgress(subB.id), 1);
+  });
+
+  it("T3-4c: scope-too-large cadence against the real ScopeNudgeMonitor", () => {
+    const { engine } = makeEngine({
+      createScopeSource: (s) => (SCOPE_ROLES.has(s.role) ? new ScopeNudgeMonitor({ workspaceRoot: s.workspaceRoot }) : null),
+    });
+    const subject = buildSubject({
+      task: makeTaskRecord({ id: "t-real-cadence", tier: 3, kind: "research", readOnly: true }),
+      workspaceRoot: WORKSPACE,
+      writeScopes: [],
+      writableExtraRoots: [],
+    });
+
+    const topics = ["cortexsdk", "nats", "listdevices", "commissioning"];
+    // 4 topics + 7 areas -> 0 notices
+    for (let i = 0; i < 4; i++) {
+      engine.observeEvent(subject, {
+        id: `g1-g-${i}`,
+        name: "grep",
+        kind: "search",
+        status: "completed",
+        args: JSON.stringify({ pattern: topics[i], path: `cloud/mod${i}/handler.go` }),
+      });
+    }
+    for (let i = 4; i < 7; i++) {
+      engine.observeEvent(subject, {
+        id: `g1-r-${i}`,
+        name: "read",
+        kind: "read",
+        status: "completed",
+        args: JSON.stringify({ path: `cloud/mod${i}/service.go` }),
+      });
+    }
+    assert.equal(engine.take(subject.id).length, 0);
+
+    // 8th area -> 1st notice
+    engine.observeEvent(subject, {
+      id: "g1-r-7",
+      name: "read",
+      kind: "read",
+      status: "completed",
+      args: JSON.stringify({ path: "cloud/mod7/service.go" }),
+    });
+    const first = engine.take(subject.id);
+    assert.equal(first.length, 1);
+    assert.equal(first[0]!.rule, "scope-too-large");
+
+    // Areas 9..13 (+1..+5) -> no repeat notice
+    for (let i = 8; i < 13; i++) {
+      engine.observeEvent(subject, {
+        id: `g1-r-${i}`,
+        name: "read",
+        kind: "read",
+        status: "completed",
+        args: JSON.stringify({ path: `cloud/mod${i}/service.go` }),
+      });
+    }
+    assert.equal(engine.take(subject.id).length, 0);
+
+    // 14th area (mod13 -> +6 areas since 8) -> 2nd notice
+    engine.observeEvent(subject, {
+      id: "g1-r-13",
+      name: "read",
+      kind: "read",
+      status: "completed",
+      args: JSON.stringify({ path: "cloud/mod13/service.go" }),
+    });
+    const second = engine.take(subject.id);
+    assert.equal(second.length, 1);
+    assert.equal(second[0]!.rule, "scope-too-large");
+
+    // 12 more areas and repeats -> never a 3rd in the same generation
+    for (let i = 14; i < 26; i++) {
+      engine.observeEvent(subject, {
+        id: `g1-r-${i}`,
+        name: "read",
+        kind: "read",
+        status: "completed",
+        args: JSON.stringify({ path: `cloud/mod${i}/service.go` }),
+      });
+    }
+    for (let r = 0; r < 5; r++) {
+      engine.observeEvent(subject, {
+        id: `g1-rep-${r}`,
+        name: "read",
+        kind: "read",
+        status: "completed",
+        args: JSON.stringify({ path: "cloud/mod0/handler.go" }),
+      });
+    }
+    assert.equal(engine.take(subject.id).length, 0);
+
+    // New generation may fire again
+    engine.generationEnded(subject.id);
+    for (let i = 0; i < 4; i++) {
+      engine.observeEvent(subject, {
+        id: `g2-g-${i}`,
+        name: "grep",
+        kind: "search",
+        status: "completed",
+        args: JSON.stringify({ pattern: topics[i], path: `cloud/mod${i}/handler.go` }),
+      });
+    }
+    for (let i = 4; i < 8; i++) {
+      engine.observeEvent(subject, {
+        id: `g2-r-${i}`,
+        name: "read",
+        kind: "read",
+        status: "completed",
+        args: JSON.stringify({ path: `cloud/mod${i}/service.go` }),
+      });
+    }
+    const gen2 = engine.take(subject.id);
+    assert.equal(gen2.length, 1);
+    assert.equal(gen2[0]!.rule, "scope-too-large");
+
+    // Stale cadence against the real monitor: fires at 12 stale reads, resets staleStreak, rearms only after 12 fresh stale reads
+    const staleSub = buildSubject({
+      task: makeTaskRecord({ id: "t-real-stale", tier: 3, kind: "research", readOnly: true }),
+      workspaceRoot: WORKSPACE,
+      writeScopes: [],
+      writableExtraRoots: [],
+    });
+    engine.observeEvent(staleSub, { id: "st-seed-0", name: "read", kind: "read", status: "completed", args: JSON.stringify({ path: "src/a.ts" }) });
+    engine.observeEvent(staleSub, { id: "st-seed-1", name: "read", kind: "read", status: "completed", args: JSON.stringify({ path: "src/b.ts" }) });
+    for (let i = 0; i < 11; i++) {
+      engine.observeEvent(staleSub, {
+        id: `st-1-${i}`,
+        name: "read",
+        kind: "read",
+        status: "completed",
+        args: JSON.stringify({ path: i % 2 === 0 ? "src/a.ts" : "src/b.ts" }),
+      });
+    }
+    assert.equal(engine.take(staleSub.id).length, 0);
+
+    // 12th stale read -> 1st stale notice, and fired() calls resetStale()
+    engine.observeEvent(staleSub, {
+      id: "st-1-11",
+      name: "read",
+      kind: "read",
+      status: "completed",
+      args: JSON.stringify({ path: "src/b.ts" }),
+    });
+    const staleFirst = engine.take(staleSub.id);
+    assert.equal(staleFirst.length, 1);
+    assert.ok(staleFirst[0]!.what.includes("last 12 reads found nothing new"));
+
+    // Next 11 stale reads -> 0 notices; 12th fresh stale read -> 2nd stale notice; 12 more -> 0
+    for (let i = 0; i < 11; i++) {
+      engine.observeEvent(staleSub, {
+        id: `st-2-${i}`,
+        name: "read",
+        kind: "read",
+        status: "completed",
+        args: JSON.stringify({ path: i % 2 === 0 ? "src/a.ts" : "src/b.ts" }),
+      });
+    }
+    assert.equal(engine.take(staleSub.id).length, 0);
+    engine.observeEvent(staleSub, {
+      id: "st-2-11",
+      name: "read",
+      kind: "read",
+      status: "completed",
+      args: JSON.stringify({ path: "src/b.ts" }),
+    });
+    assert.equal(engine.take(staleSub.id).length, 1);
+
+    for (let i = 0; i < 12; i++) {
+      engine.observeEvent(staleSub, {
+        id: `st-3-${i}`,
+        name: "read",
+        kind: "read",
+        status: "completed",
+        args: JSON.stringify({ path: i % 2 === 0 ? "src/a.ts" : "src/b.ts" }),
+      });
+    }
+    assert.equal(engine.take(staleSub.id).length, 0);
+  });
+
+  it("T3-8u: real ScopeNudgeMonitor widening trace produces one scope-too-large notice without blocking calls", () => {
+    const { engine } = makeEngine({
+      createScopeSource: (s) => (SCOPE_ROLES.has(s.role) ? new ScopeNudgeMonitor({ workspaceRoot: s.workspaceRoot }) : null),
+    });
+    const subject = buildSubject({
+      task: makeTaskRecord({ id: "t-real-widen", tier: 3, kind: "research", readOnly: true }),
+      workspaceRoot: WORKSPACE,
+      writeScopes: [],
+      writableExtraRoots: [],
+    });
+
+    const topics = ["cortexsdk", "nats", "listdevices", "commissioning"];
+    const events = [
+      ...topics.map((pattern, i) => ({
+        id: `w-g-${i}`,
+        name: "grep",
+        kind: "search",
+        status: "completed",
+        args: JSON.stringify({ pattern, path: `cloud/mod${i}/handler.go` }),
+      })),
+      ...Array.from({ length: 6 }, (_, j) => ({
+        id: `w-r-${j + 4}`,
+        name: "read",
+        kind: "read",
+        status: "completed",
+        args: JSON.stringify({ path: `cloud/mod${j + 4}/service.go` }),
+      })),
+    ];
+
+    const snapshotBefore = events.map((ev) => ({ ...ev }));
+    const executedIds: string[] = [];
+    for (const ev of events) {
+      executedIds.push(ev.id);
+      engine.observeEvent(subject, ev);
+    }
+
+    // Engine never alters or blocks the observed call sequence
+    assert.deepEqual(events, snapshotBefore);
+    assert.equal(executedIds.length, events.length);
+
+    const notices = engine.take(subject.id);
+    assert.equal(notices.length, 1);
+    const notice = notices[0]!;
+    assert.equal(notice.rule, "scope-too-large");
+    assert.ok(notice.what.includes("8 areas"));
+    assert.ok(notice.what.includes("4 unrelated topics"));
+    assert.equal(notice.why, "This usually means the task exceeds one bounded assignment.");
+    assert.ok(notice.alternative.includes("scope_too_large"));
+    assert.ok(notice.alternative.includes("partial: true"));
+    assert.ok(notice.alternative.includes("artifact_paths"));
+    assert.ok(notice.alternative.includes("suggested_splits"));
+    assert.ok(countWords(notice) <= WORD_BUDGET);
+    assert.match(formatNotice(notice), /^\[harness advisory: scope-too-large\] .+ Why: .+ Instead: .+$/);
+  });
+
+  it("T-a1: observeHarness evaluates rules and updates state on inScript and failed calls while deferring delivery", () => {
+    const failedFindings: string[] = [];
+    const failedObserverRule: AdvisoryRule<null> = {
+      id: "observe-failed",
+      roles: ["orchestrator"],
+      surface: "result",
+      priority: 40,
+      init: () => null,
+      observe(_state, _subject, call) {
+        if (call.status === "failed") {
+          failedFindings.push(call.tool);
+          return {
+            key: `fail:${call.tool}`,
+            what: `Call ${call.tool} failed.`,
+            why: "Verifying A1 evaluation on failed calls.",
+            alternative: "Continue.",
+          };
+        }
+        return null;
+      },
+      dedupe: { perKey: "generation" },
+    };
+
+    const { engine } = makeEngine({ rules: [...ALL_RULES, failedObserverRule] });
+    const subject = buildSubject({
+      task: makeTaskRecord({ id: "t-a1", tier: 1, kind: "orchestrator", readOnly: true }),
+      workspaceRoot: WORKSPACE,
+      writeScopes: [],
+      writableExtraRoots: [],
+    });
+
+    // 2 identical tree_view calls -> streak is 2 (no status-polling notice yet)
+    for (let i = 0; i < 2; i++) {
+      assert.deepEqual(
+        engine.observeHarness(subject, {
+          origin: "result",
+          surface: "harness",
+          tool: "tree_view",
+          status: "completed",
+          args: {},
+          paths: [],
+          result: { tasks: [] },
+          inScript: false,
+        }),
+        [],
+      );
+    }
+
+    // A failed call MUST evaluate rules (resetting status-polling streak AND queuing failedObserverRule),
+    // while returning [] and keeping findings queued.
+    const failedOut = engine.observeHarness(subject, {
+      origin: "result",
+      surface: "harness",
+      tool: "task_get",
+      status: "failed",
+      args: { task_id: "t-missing" },
+      paths: [],
+      inScript: false,
+    });
+    assert.deepEqual(failedOut, []);
+    assert.deepEqual(failedFindings, ["task_get"]);
+
+    // An inScript call also evaluates rules (queuing brief-count-limit) while returning []
+    const inScriptOut = engine.observeHarness(subject, {
+      origin: "result",
+      surface: "harness",
+      tool: "spawn_task",
+      status: "completed",
+      args: { title: "Check", objective: "Use at most 30 turns.", criteria: "" },
+      paths: [],
+      result: { spawned: "t-child-a1" },
+      inScript: true,
+    });
+    assert.deepEqual(inScriptOut, []);
+
+    // Next top-level completed tree_view call delivers both queued findings (priority order),
+    // and does NOT fire status-polling because the failed call reset its streak.
+    const delivered = engine.observeHarness(subject, {
+      origin: "result",
+      surface: "harness",
+      tool: "tree_view",
+      status: "completed",
+      args: {},
+      paths: [],
+      result: { tasks: [] },
+      inScript: false,
+    });
+    assert.deepEqual(
+      delivered.map((n) => n.rule),
+      ["brief-count-limit", "observe-failed"],
+    );
+  });
+
+  it("T-a2: firedBefore seeds only subject-scoped rules and ignores generation-scoped rules", () => {
+    const genRuleWithSubjectCap: AdvisoryRule<null> = {
+      id: "gen-scoped-test",
+      roles: ["worker"],
+      surface: "event",
+      priority: 50,
+      init: () => null,
+      observe(_state, _subject, call) {
+        if (call.status !== "completed" || call.nativeClass !== "read") return null;
+        return {
+          key: "gen-key",
+          what: "Generation-scoped finding.",
+          why: "Testing A2 firedBefore filtering.",
+          alternative: "Continue.",
+        };
+      },
+      dedupe: {
+        perKey: "generation",
+        maxPerSubject: 1,
+        maxPerGeneration: 1,
+      },
+    };
+
+    const { engine } = makeEngine({
+      rules: [...ALL_RULES, genRuleWithSubjectCap],
+      createScopeSource: () => createFakeScopeSource({ evaluate: () => ({ repeated: { tool: "read", times: 3 } }) }),
+      firedBefore: () => [
+        { rule: "worker-edit-outside-scope", key: "src/b/prior.ts" },
+        { rule: "scope-too-large", key: "scope" },
+        { rule: "gen-scoped-test", key: "gen-key" },
+      ],
+    });
+
+    // Subject-scoped W1 key IS suppressed by firedBefore, while generation-scoped gen-scoped-test is NOT suppressed
+    const worker = buildSubject({
+      task: makeTaskRecord({ id: "t-a2-worker", tier: 2, kind: "worker", readOnly: false }),
+      workspaceRoot: WORKSPACE,
+      writeScopes: ["src/a/"],
+      writableExtraRoots: [],
+    });
+    engine.observeEvent(worker, {
+      id: "w-1",
+      name: "edit_file",
+      kind: "edit",
+      status: "completed",
+      args: JSON.stringify({ path: "src/b/prior.ts" }),
+    });
+    assert.equal(engine.take(worker.id).length, 0);
+
+    engine.observeEvent(worker, {
+      id: "w-2",
+      name: "read_file",
+      kind: "read",
+      status: "completed",
+      args: JSON.stringify({ path: "src/a/ok.ts" }),
+    });
+    const genNotices = engine.take(worker.id);
+    assert.deepEqual(
+      genNotices.map((n) => n.rule),
+      ["gen-scoped-test"],
+    );
+
+    // Generation-scoped scope-too-large is also NOT suppressed by firedBefore
+    const research = buildSubject({
+      task: makeTaskRecord({ id: "t-a2-res", tier: 3, kind: "research", readOnly: true }),
+      workspaceRoot: WORKSPACE,
+      writeScopes: [],
+      writableExtraRoots: [],
+    });
+    engine.observeEvent(research, {
+      id: "r-1",
+      name: "read_file",
+      kind: "read",
+      status: "completed",
+      args: JSON.stringify({ path: "src/a/ok.ts" }),
+    });
+    const scopeNotices = engine.take(research.id);
+    assert.deepEqual(
+      scopeNotices.map((n) => n.rule),
+      ["scope-too-large"],
+    );
+  });
+
+  it("T-a5: NativeEventParser drops duplicate terminal events for up to 256 call ids per generation", () => {
+    const parser = new NativeEventParser({ workspaceRoot: WORKSPACE, harnessToolNames: HARNESS_TOOLS });
+
+    // First terminal event (denied failure) passes through; second terminal event for same id is dropped
+    const first = parser.push({
+      id: "call-dup",
+      name: "Bash",
+      kind: "execute",
+      status: "failed",
+      denied: "read-only-shell",
+      args: JSON.stringify({ command: "rm -rf /tmp/x" }),
+    });
+    assert.ok(first);
+    assert.equal(first.denied, "read-only-shell");
+
+    const duplicate = parser.push({
+      id: "call-dup",
+      name: "Bash",
+      kind: "execute",
+      status: "failed",
+      args: JSON.stringify({ command: "rm -rf /tmp/x" }),
+    });
+    assert.equal(duplicate, null);
+
+    // Late in_progress and completed for the already-terminal id are also dropped
+    assert.equal(parser.push({ id: "call-dup", name: "Bash", status: "in_progress" }), null);
+    assert.equal(parser.push({ id: "call-dup", name: "Bash", status: "completed" }), null);
+
+    // Bounded to 256 remembered terminal ids (oldest evicted on 257th)
+    for (let i = 0; i < 256; i++) {
+      const m = parser.push({ id: `fill-${i}`, name: "read_file", kind: "read", status: "completed" });
+      assert.ok(m);
+    }
+    // fill-255 is still remembered and dropped on duplicate; call-dup was evicted
+    assert.equal(parser.push({ id: "fill-255", name: "read_file", kind: "read", status: "completed" }), null);
+    assert.ok(parser.push({ id: "call-dup", name: "Bash", kind: "execute", status: "failed" }));
+
+    // In AdvisoryEngine, a denial event followed by the adapter's failed update reaches scope.observe only once
+    let observedTerminals = 0;
+    const { engine } = makeEngine({
+      createScopeSource: () =>
+        createFakeScopeSource({
+          evaluate: () => null,
+          onObserve: (c) => {
+            if (c.status === "completed" || c.status === "failed") observedTerminals += 1;
+          },
+        }),
+    });
+    const subject = buildSubject({
+      task: makeTaskRecord({ id: "t-a5", tier: 3, kind: "research", readOnly: true }),
+      workspaceRoot: WORKSPACE,
+      writeScopes: [],
+      writableExtraRoots: [],
+    });
+
+    engine.observeEvent(subject, {
+      id: "deny-1",
+      name: "Bash",
+      kind: "execute",
+      status: "failed",
+      denied: "read-only-shell",
+      args: JSON.stringify({ command: "rm -rf /tmp/x" }),
+    });
+    engine.observeEvent(subject, {
+      id: "deny-1",
+      name: "Bash",
+      kind: "execute",
+      status: "failed",
+      args: JSON.stringify({ command: "rm -rf /tmp/x" }),
+    });
+    assert.equal(observedTerminals, 1);
+    const notices = engine.take(subject.id);
+    assert.equal(notices.length, 1);
+    assert.equal(notices[0]!.rule, "read-only-shell");
   });
 });
