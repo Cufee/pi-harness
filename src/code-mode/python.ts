@@ -296,6 +296,7 @@ import _cm_bridge, _cm_guard
 ${sitePackages ? `site.addsitedir(${JSON.stringify(sitePackages)})` : ""}
 with open('script.py', encoding='utf-8') as _file:
     _source = _file.read()
+_cm_bridge._send({'kind': 'ready'})
 try:
     exec(compile(_source, 'script.py', 'exec'), {'__name__': '__main__', '__file__': 'script.py'})
 except SystemExit:

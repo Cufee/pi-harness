@@ -12,6 +12,7 @@ import { guard, pythonSandboxCommand, pythonSandboxEnv, sandboxCommand, sandboxE
 import { generatePythonDeclarations, generateSdkDeclarations, pythonTools } from "./sdk.js";
 
 export type CodeLanguage = "typescript" | "python";
+export type CodeExecPhase = "provisioning" | "preparing" | "spawned" | "ipc_connected" | "runtime_ready" | "first_call" | "exited";
 
 export interface CodeExecToolEvent {
   phase: "start" | "end"; name: string; args: Record<string, unknown>; ok?: boolean; error?: string; result?: string; via: "code_exec";
@@ -31,11 +32,19 @@ export interface CodeExecOptions {
   /** Persists oversized output. `name` is a suggested base name; the callback owns collision-free uniqueness. */
   saveOutput?: (name: string, json: string) => string | Promise<string>;
   onToolEvent?: (event: CodeExecToolEvent) => void;
+  /** Test seam: replaces the sandboxed TypeScript interpreter command. Tools cannot set it. createCodeModeExecutor never passes it. */
+  launch?: (dir: string, socket: string) => string[];
 }
 export interface CodeExecResult {
   ok: boolean; output?: unknown; preview: string; artifactPath?: string; logs: string; toolCalls: number;
   error?: string; timedOut?: boolean; cancelled?: boolean;
   steeringMessages?: string[]; hint?: string;
+  /** Set on timeout or cancel: last lifecycle phase the host observed. */
+  phase?: CodeExecPhase;
+  /** Set on timeout or cancel: ms since runCodeExec started at which each phase was first reached. */
+  phases?: Partial<Record<CodeExecPhase, number>>;
+  /** Set on timeout or cancel: the interpreter pid, which leads the process group that was killed. */
+  pid?: number;
 }
 
 export function timeoutMs(ms: number | undefined, max = 1_800_000): number {
@@ -68,6 +77,7 @@ function send(msg) {
 }
 export const call = (name,args={}) => send({name,args});
 export const output = value => { void send({kind:'output',value}) };
+export const ready = () => { void send({kind:'ready'}).catch(() => {}) };
 globalThis.output = output;
 // Reports whether the script's terminal exception came from the sandbox itself; harness tool failures never do.
 export const reportError = e => send({kind:'error',value: !!e && !(e instanceof ToolError) &&
@@ -84,7 +94,7 @@ export const reportError = e => send({kind:'error',value: !!e && !(e instanceof 
 // Bun dispatches a rejection left by the last timer only after beforeExit and may exit before the report is
 // acknowledged; the report is written before the first await, exitCode keeps the exit nonzero, and the host drains it.
 const fatalHook = `
-import { reportError } from './bridge.mjs';
+import { reportError, ready } from './bridge.mjs';
 const fatalEvents = ['uncaughtException', 'unhandledRejection'], onceRan = {};
 // Bun's process emitter keeps one registration per callback: the first one wins and off removes it.
 // A callback is registered either as itself or as one prepended once-wrapper tagged with origKey, never both;
@@ -124,6 +134,7 @@ for (const event of fatalEvents) process.on(event, async e => {
   await reportError(e).catch(() => {});
   process.exit(1);
 });
+ready();
 `;
 
 const message = (err: unknown) => err instanceof Error ? err.message : String(err);
@@ -137,6 +148,7 @@ function formatScriptError(raw: string, sandboxDenial: boolean, toolNames: Itera
   return `${raw}\n\nHint: if this failed on a direct filesystem, subprocess, or network call, code_exec runs in an OS sandbox that blocks workspace file reads, all writes, subprocesses, and network. ${guidance}`;
 }
 const IPC_BYTES = 16 * 1024 * 1024;
+const CLOSE_GRACE_MS = 2_000;
 
 export function createCodeExecIpcServer(ctx: {
   names: ReadonlySet<string>;
@@ -146,6 +158,7 @@ export function createCodeExecIpcServer(ctx: {
   onOutput: (value: unknown) => void;
   onSandboxDenial: (denial: boolean) => void;
   onToolCall: () => void;
+  onPhase?: (phase: "ipc_connected" | "runtime_ready") => void;
   onToolEvent?: (event: CodeExecToolEvent) => void;
   callTool: (name: string, args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>;
   signal: AbortSignal;
@@ -154,6 +167,7 @@ export function createCodeExecIpcServer(ctx: {
   return createServer(socket => {
     if (ctx.isStopped() || ctx.sockets.size) { socket.destroy(); return; }
     ctx.sockets.add(socket);
+    ctx.onPhase?.("ipc_connected");
     socket.on("error", () => socket.destroy());
     socket.once("close", () => ctx.sockets.delete(socket));
     let parts: Buffer[] = [], bytes = 0;
@@ -184,6 +198,7 @@ export function createCodeExecIpcServer(ctx: {
         socket.write(json);
       }
       if (!Number.isSafeInteger(id)) throw new Error("Invalid IPC request id");
+      if (kind === "ready") { ctx.onPhase?.("runtime_ready"); reply({ ok: true }); return; }
       if (kind === "output") { ctx.onOutput(value); reply({ ok: true }); return; }
       if (kind === "error") { ctx.onSandboxDenial(Boolean(value)); reply({ ok: true }); return; }
       if (typeof name !== "string" || !args || Array.isArray(args) || typeof args !== "object") throw new Error("Invalid tool call");
@@ -211,12 +226,26 @@ export function codeExecCallableNames(opts: Pick<CodeExecOptions, "tools" | "all
 
 export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult> {
   const result: CodeExecResult = { ok: false, preview: "", logs: "", toolCalls: 0 };
+  const t0 = performance.now();
+  const phases: Partial<Record<CodeExecPhase, number>> = {};
+  let phase: CodeExecPhase | undefined;
+  let stopped = false;
+  const mark = (p: CodeExecPhase) => {
+    if (stopped || phases[p] !== undefined) return;
+    phases[p] = performance.now() - t0;
+    phase = p;
+  };
   let python: PythonRuntime | undefined;
   if (opts.language === "python") {
+    mark("provisioning");
     // Provisioning happens before the script timer starts: a cold first call downloads pinned tools and wheels.
     try { python = await providePython(opts.packages ?? [], opts.pythonCacheDir, opts.signal); }
     catch (e) {
-      if (opts.signal?.aborted) result.cancelled = true;
+      if (opts.signal?.aborted) {
+        result.cancelled = true;
+        result.phase = phase;
+        result.phases = phases;
+      }
       result.error = opts.signal?.aborted
         ? "Code Mode cancelled"
         : e instanceof HarnessRejection
@@ -228,7 +257,27 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
   const names = codeExecCallableNames(opts);
   const sockets = new Set<Socket>();
   const execAbort = new AbortController();
-  let child: ChildProcess | undefined, dir: string | undefined, output: unknown, sandboxDenial = false, stopped = false;
+  let child: ChildProcess | undefined, proc: ChildProcess | undefined, dir: string | undefined, output: unknown, sandboxDenial = false;
+  let pid: number | undefined, closed = false, closeGraceExpired = false;
+  let releaseWait: (() => void) | undefined;
+  let closeGraceTimer: ReturnType<typeof setTimeout> | undefined;
+  let tail = "";
+  let timeoutDetail: string | undefined;
+  const fmtSec = (ms: number) => (Math.max(0, ms) / 1000).toFixed(1);
+  function buildTimeoutDetail(): string {
+    const now = performance.now() - t0;
+    const currentPhase = phase ?? "preparing";
+    const phaseStart = phases[currentPhase] ?? 0;
+    const timeline = (Object.entries(phases) as [CodeExecPhase, number][])
+      .map(([name, ms]) => `${name} +${fmtSec(ms)}s`)
+      .join(", ");
+    const toolsText = result.toolCalls === 0
+      ? " No harness tool ran."
+      : ` Harness tool calls before the stall: ${result.toolCalls}.`;
+    const trimmedTail = tail.trim();
+    const tailText = trimmedTail ? ` Last output: ${trimmedTail.slice(-500)}` : "";
+    return `Stalled in phase ${currentPhase} for ${fmtSec(now - phaseStart)}s (pid ${pid ?? "none"}; ${timeline}).${toolsText}${tailText}`;
+  }
   function kill() {
     if (child?.pid) try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
   }
@@ -238,15 +287,21 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     if (!execAbort.signal.aborted) execAbort.abort(new Error(reason));
     kill();
     for (const s of sockets) s.destroy();
+    if (releaseWait && !closeGraceTimer) {
+      closeGraceTimer = setTimeout(() => { releaseWait?.(); }, CLOSE_GRACE_MS);
+      closeGraceTimer.unref();
+    }
   }
   const abort = () => { if (!stopped) { result.cancelled = true; stop("Code Mode cancelled"); } };
   const effectiveTimeoutMs = timeoutMs(opts.timeoutMs);
   const timer = setTimeout(() => {
     if (!stopped) {
       result.timedOut = true;
-      stop(codeExecTimeoutError(effectiveTimeoutMs).message);
+      timeoutDetail = buildTimeoutDetail();
+      stop(`${codeExecTimeoutError(effectiveTimeoutMs).message}\n${timeoutDetail}`);
     }
   }, effectiveTimeoutMs);
+  mark("preparing");
   opts.signal?.addEventListener("abort", abort, { once: true });
   if (opts.signal?.aborted) abort();
 
@@ -257,7 +312,8 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     stop,
     onOutput: (value) => { output = value; },
     onSandboxDenial: (denial) => { sandboxDenial = denial; },
-    onToolCall: () => { result.toolCalls++; },
+    onToolCall: () => { if (result.toolCalls === 0) mark("first_call"); result.toolCalls++; },
+    onPhase: mark,
     onToolEvent: opts.onToolEvent,
     callTool: opts.callTool,
     signal: execAbort.signal,
@@ -286,7 +342,9 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
         writeFile(join(dir, "harness.py"), module), writeFile(join(dir, "harness.pyi"), stubs),
       ]);
     } else {
-      [cmd, ...args] = sandboxCommand(await realpath(process.execPath), dir, socket);
+      [cmd, ...args] = opts.launch
+        ? opts.launch(dir, socket)
+        : sandboxCommand(await realpath(process.execPath), dir, socket);
       env = sandboxEnv(dir);
       const pkg = join(dir, "node_modules/harness");
       await mkdir(pkg, { recursive: true });
@@ -302,15 +360,31 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     }
     await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socket, resolve); });
     if (stopped) return result;
-    child = spawn(cmd!, args, { cwd: dir, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
-    let tail = "";
-    for (const stream of [child.stdout!, child.stderr!]) {
+    proc = child = spawn(cmd!, args, { cwd: dir, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    pid = proc.pid;
+    mark("spawned");
+    proc.once("exit", () => mark("exited"));
+    for (const stream of [proc.stdout!, proc.stderr!]) {
       stream.setEncoding("utf8");
       stream.on("data", (s: string) => { result.logs += s.slice(0, Math.max(0, 8192 - result.logs.length)); tail = (tail + s).slice(-2048); });
     }
-    const status = await new Promise<number | null>((resolve, reject) => { child!.once("error", reject); child!.once("close", resolve); });
+    const status = await new Promise<number | null>((resolve, reject) => {
+      releaseWait = () => { if (!closed) { closeGraceExpired = true; resolve(null); } };
+      proc!.once("error", reject);
+      proc!.once("close", (c) => { closed = true; resolve(c); });
+    });
+    releaseWait = undefined;
+    clearTimeout(closeGraceTimer);
+    closeGraceTimer = undefined;
     child = undefined;
-    if (stopped) return result;
+    if (stopped) {
+      if (closeGraceExpired) {
+        const graceNote = " The process did not close within 2s of SIGKILL.";
+        if (result.error) result.error += graceNote;
+        if (timeoutDetail) timeoutDetail += graceNote;
+      }
+      return result;
+    }
     clearTimeout(timer); opts.signal?.removeEventListener("abort", abort);
     // An error report written just before exit may still be buffered on the IPC socket; read it before attributing.
     if (status !== 0 && sockets.size > 0) await Promise.race([
@@ -333,12 +407,22 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     result.ok = true;
   } catch (e) { result.error ??= message(e); }
   finally {
-    stopped = true; clearTimeout(timer); opts.signal?.removeEventListener("abort", abort);
+    stopped = true; clearTimeout(timer); clearTimeout(closeGraceTimer); opts.signal?.removeEventListener("abort", abort);
     if (!execAbort.signal.aborted) execAbort.abort();
     kill();
+    proc?.stdout?.destroy();
+    proc?.stderr?.destroy();
     for (const socket of sockets) socket.destroy();
     if (server.listening) await new Promise<void>(resolve => server.close(() => resolve()));
     if (dir) await rm(dir, { recursive: true, force: true });
+    if (result.timedOut || result.cancelled) {
+      result.phase = phase;
+      result.phases = phases;
+      if (pid !== undefined) result.pid = pid;
+    }
+    if (result.timedOut && timeoutDetail) {
+      console.error(`[harnessd ${new Date().toISOString()}] code_exec timeout: ${timeoutDetail}`);
+    }
   }
   return result;
 }
