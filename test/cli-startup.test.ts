@@ -10,6 +10,7 @@ import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import { createTheme, ModalScreen, Navigator, stripTerminalSequences } from "../src/tui/core/index.js";
 import { type FederatedProjectSummary, pickProjectTui, ProjectsScreen } from "../src/tui/projects.js";
+import { withFixtureCatalog } from "./fixtures/launch-config.js";
 
 function makeFakeTerminal(cols = 100, rows = 30) {
   let onDataCb: ((data: string) => void) | null = null;
@@ -135,9 +136,7 @@ describe("CLI startup project picker and --resume", () => {
     const subDir = join(projDir, "packages", "web");
     mkdirSync(subDir, { recursive: true });
 
-    const cfg = loadConfig(root);
-    cfg.stateDir = stateDir;
-    cfg.socketPath = sockPath;
+    const cfg = withFixtureCatalog({ ...loadConfig(root), stateDir, socketPath: sockPath });
 
     const daemon = new HarnessDaemon(cfg);
     await daemon.start();
@@ -219,9 +218,7 @@ describe("CLI startup project picker and --resume", () => {
     const root = realpathSync(mkdtempSync("/tmp/pi-startup-remote-"));
     const stateDir = join(root, "state");
     const sockPath = join(stateDir, "d.sock");
-    const cfg = loadConfig(root);
-    cfg.stateDir = stateDir;
-    cfg.socketPath = sockPath;
+    const cfg = withFixtureCatalog({ ...loadConfig(root), stateDir, socketPath: sockPath });
 
     const daemon = new HarnessDaemon(cfg);
     await daemon.start();
@@ -269,9 +266,7 @@ describe("CLI startup project picker and --resume", () => {
     const root = realpathSync(mkdtempSync("/tmp/pi-startup-mismatch-"));
     const stateDir = join(root, "state");
     const sockPath = join(stateDir, "d.sock");
-    const cfg = loadConfig(root);
-    cfg.stateDir = stateDir;
-    cfg.socketPath = sockPath;
+    const cfg = withFixtureCatalog({ ...loadConfig(root), stateDir, socketPath: sockPath });
 
     const daemon = new HarnessDaemon(cfg);
     await daemon.start();
