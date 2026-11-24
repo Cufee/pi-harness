@@ -4,7 +4,10 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.js";
+import type { TaskRecord } from "../src/control-plane/db.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
+import type { GoalRecord } from "../src/goals/engine.js";
+import { deriveGoalVerificationLabel } from "../src/protocol/tool-display.js";
 import { runGit } from "../src/worktree/manager.js";
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
 
@@ -309,5 +312,125 @@ describe("goal-6: read-only blocked-with-result settles completed without Goal P
       rmSync(repoRoot, { recursive: true, force: true });
       rmSync(stateDir, { recursive: true, force: true });
     }
+  });
+
+  it("deriveGoalVerificationLabel prioritizes verify failed over completed verify count when reviewCycle is 0", () => {
+    const baseGoal: GoalRecord = {
+      id: "goal-6",
+      chatSessionId: "chat-1",
+      repoRoot: "/tmp/repo",
+      version: 3,
+      title: "Goal 6 verify label",
+      description: "Ensure verify failed outranks completed verify count.",
+      criteria: [{ id: "c1", description: "Done", kind: "behavioral", required: true }],
+      nonGoals: [],
+      budgets: { maxReviewCycles: 10, maxNoProgressCycles: 3 },
+      verificationMode: "auto",
+      verifyRef: "main",
+      liveProgress: null,
+      status: "executing",
+      linkedRunId: "run-1",
+      reviewCycle: 0,
+      noProgressStreak: 0,
+      lastProgressFingerprint: null,
+      lastReviewSummary: null,
+      createdAt: 1_000,
+      updatedAt: 2_000,
+    };
+
+    const completedVerifyTask: TaskRecord = {
+      id: "t-verify-1",
+      runId: "run-1",
+      parentId: "t-orch-1",
+      tier: 3,
+      kind: "verify",
+      title: "Final verify",
+      objective: "Verify criteria",
+      criteria: "",
+      readOnly: true,
+      profileId: "pi:local",
+      model: null,
+      effort: null,
+      status: "completed",
+      generation: 1,
+      maxTurns: 20,
+      turnsUsed: 3,
+      contextUsed: 0,
+      contextSize: 0,
+      worktreeId: null,
+      sessionId: null,
+      summary: "Final verify: FAIL",
+      handoffJson: null,
+      resultJson: null,
+      createdAt: 1_100,
+      updatedAt: 1_900,
+    };
+
+    assert.equal(
+      deriveGoalVerificationLabel(
+        {
+          ...baseGoal,
+          liveProgress: {
+            verificationStatus: "failed",
+            updatedAt: 2_000,
+          },
+        },
+        [completedVerifyTask],
+      ),
+      "verify failed",
+    );
+
+    assert.equal(
+      deriveGoalVerificationLabel(
+        {
+          ...baseGoal,
+          liveProgress: {
+            verificationStatus: "passed",
+            updatedAt: 2_000,
+          },
+        },
+        [completedVerifyTask],
+      ),
+      "1 verified",
+    );
+
+    assert.equal(
+      deriveGoalVerificationLabel(
+        {
+          ...baseGoal,
+          liveProgress: null,
+        },
+        [completedVerifyTask],
+      ),
+      "1 verified",
+    );
+
+    assert.equal(
+      deriveGoalVerificationLabel(
+        {
+          ...baseGoal,
+          liveProgress: {
+            phase: "implementing",
+            updatedAt: 2_000,
+          },
+        },
+        [completedVerifyTask],
+      ),
+      "1 verified",
+    );
+    assert.equal(
+      deriveGoalVerificationLabel(
+        {
+          ...baseGoal,
+          reviewCycle: 1,
+          liveProgress: {
+            verificationStatus: "failed",
+            updatedAt: 2_000,
+          },
+        },
+        [completedVerifyTask],
+      ),
+      "1 rev",
+    );
   });
 });

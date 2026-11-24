@@ -205,11 +205,11 @@ export function deriveGoalVerificationLabel(
   if (goal.reviewCycle > 0) {
     return `${goal.reviewCycle} rev`;
   }
+  if (goal.liveProgress?.verificationStatus === "failed") return "verify failed";
   if (completedVerify > 0) {
     return completedVerify === 1 ? "1 verified" : `${completedVerify} verified`;
   }
   if (goal.liveProgress?.verificationStatus === "passed") return "verified";
-  if (goal.liveProgress?.verificationStatus === "failed") return "verify failed";
   if (goal.liveProgress?.verificationStatus === "not_needed" || goal.verificationMode === "none") return "skipped";
   if (activity && ["researching", "planning", "implementing", "merging", "paused_quota"].includes(activity.phase)) {
     return activity.counts.running > 0 ? `${activity.phase} (${activity.counts.running})` : activity.phase;
