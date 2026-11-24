@@ -12,11 +12,10 @@ import { isContextOverflowError, isOverflowTurnText } from "../runners/context-o
 import { PiRunner } from "../runners/pi-runner.js";
 import { formatQuotaPauseSummary } from "../runners/quota-detect.js";
 import { ScopeNudgeMonitor } from "../runners/scope-nudge.js";
-import { toolPolicyForTask } from "../runners/types.js";
+import { ACP_EXECUTOR_LOST_ERROR_CODE, MAX_STEER_CONTINUATIONS, toolPolicyForTask } from "../runners/types.js";
 import { recordCostInvocation } from "../cost/ledger.js";
 import { resolveLaunchRoute } from "./launch-route.js";
 import type { RunAgentRequest, RunAgentResult, RunnerCallbacks, RunnerExecutionHandle } from "../runners/types.js";
-import { MAX_STEER_CONTINUATIONS } from "../runners/types.js";
 import { BisectingMergeQueue, filesOutsideWriteScopes } from "../worktree/merge-queue.js";
 import { AdvisoryEngine } from "../advisories/engine.js";
 import { AdvisedToolExecutor } from "../advisories/executor.js";
@@ -2970,14 +2969,36 @@ export class HarnessOrchestrator {
           }
           return;
         }
+        if (res.errorCode === ACP_EXECUTOR_LOST_ERROR_CODE && latest.tier === 1) {
+          if (
+            await this.rollOver({
+              exec,
+              runnerGen,
+              run,
+              latest,
+              wt,
+              priorHandoff: handoff,
+              res,
+              explicit: undefined,
+              reason: "acp_executor_lost",
+            })
+          ) {
+            continue;
+          }
+          return;
+        }
         if (res.stopReason === "cancelled") {
           // Nobody cancelled this task (the harness abort was not signalled): the runner ended the session itself.
           const failures = res.toolFailures?.length ? ` Last tool failure: ${res.toolFailures[res.toolFailures.length - 1]!.slice(0, 200)}` : "";
-          const baseSummary = `Runner ended the session as cancelled without a harness cancellation.${failures}`;
+          const codeTag = res.errorCode ? ` [${res.errorCode}]` : "";
+          const baseSummary = `Runner ended the session as cancelled without a harness cancellation${codeTag}.${failures}`;
           if (latest.tier === 1) {
             this.db.updateTask(task.id, { status: "failed", summary: baseSummary });
           } else {
-            await this.settleWithoutReturn(exec, runnerGen, latest, run, wt, res, "failed", baseSummary, "runner_cancelled");
+            await this.settleWithoutReturn(
+              exec, runnerGen, latest, run, wt, res, "failed", baseSummary,
+              res.errorCode ?? "runner_cancelled",
+            );
           }
           return;
         }
@@ -2998,13 +3019,16 @@ export class HarnessOrchestrator {
 
         if (res.stopReason === "error") {
           const detail = res.text.trim().slice(-240);
-          const baseSummary = detail ? `Task runner reported an error: ${detail}` : "Task runner reported an error.";
+          const codeTag = res.errorCode ? ` [${res.errorCode}]` : "";
+          const baseSummary = detail ? `Task runner reported an error${codeTag}: ${detail}` : `Task runner reported an error${codeTag}.`;
           if (latest.tier === 1) {
             this.db.updateTask(task.id, { status: "failed", summary: baseSummary });
           } else {
             await this.settleWithoutReturn(
               exec, runnerGen, latest, run, wt, res, "failed", baseSummary,
-              detail ? `runner_error: ${detail}` : "runner_error",
+              res.errorCode
+                ? (detail ? `${res.errorCode}: ${detail}` : res.errorCode)
+                : (detail ? `runner_error: ${detail}` : "runner_error"),
             );
           }
           return;
@@ -3355,10 +3379,12 @@ export class HarnessOrchestrator {
         resultJson: JSON.stringify({
           status,
           ...(res ? { text: res.text } : {}),
+          ...(res?.errorCode ? { errorCode: res.errorCode } : {}),
           fallback: {
             reason,
             wrap_up_attempted: Boolean(res?.wrapUpAttempted),
             ...(res ? { stop_reason: res.stopReason } : {}),
+            ...(res?.errorCode ? { error_code: res.errorCode } : {}),
             partial: true,
             output_truncated: outputClipped,
             summary,
@@ -3493,11 +3519,13 @@ export class HarnessOrchestrator {
     };
 
     const activeRisks: string[] = [
-      input.result.stopReason === "error"
-        ? `Generation ${input.task.generation} ended before completing: ${input.result.text.slice(0, 300)}`
-        : input.result.stopReason === "quota_paused"
-          ? `Generation ${input.task.generation} paused on a quota or rate limit.`
-          : resetRisk(),
+      input.result.errorCode === ACP_EXECUTOR_LOST_ERROR_CODE
+        ? `Generation ${input.task.generation} lost its ACP tool executor (${ACP_EXECUTOR_LOST_ERROR_CODE}); relaunched cleanly in a fresh session from its anchored handoff.${input.result.text.trim() ? ` Detail: ${input.result.text.trim().slice(0, 240)}` : ""}`
+        : input.result.stopReason === "error"
+          ? `Generation ${input.task.generation} ended before completing: ${input.result.text.slice(0, 300)}`
+          : input.result.stopReason === "quota_paused"
+            ? `Generation ${input.task.generation} paused on a quota or rate limit.`
+            : resetRisk(),
     ];
     const nextActions: string[] = [];
 
@@ -3580,7 +3608,7 @@ export class HarnessOrchestrator {
     };
   }
 
-  /** Every rollover (explicit, context threshold, or context overflow) goes through here. Returns true when generation N+1 was scheduled. */
+  /** Every rollover (explicit, context threshold, context overflow, or ACP executor loss) goes through here. Returns true when generation N+1 was scheduled. */
   private async rollOver(a: {
     exec: ActiveTaskExecution;
     runnerGen: number;
@@ -3592,7 +3620,7 @@ export class HarnessOrchestrator {
     explicit:
       | { handoff: AnchoredHandoff; target?: { profileId?: string; model?: string; effort?: string }; restart?: boolean }
       | undefined;
-    reason: "explicit_handoff" | "context_threshold" | "context_overflow";
+    reason: "explicit_handoff" | "context_threshold" | "context_overflow" | "acp_executor_lost";
   }): Promise<boolean> {
     const { exec, runnerGen, run, latest, wt, priorHandoff, res, explicit, reason } = a;
     const taskId = latest.id;
@@ -3620,12 +3648,23 @@ export class HarnessOrchestrator {
       this.taskRolloverProgress.set(taskId, { fp: next.fp, streak, artHigh: next.artHigh, routes: next.routes });
     }
     if (streak >= 3) {
+      const codeTag = reason === "acp_executor_lost" ? ` [${ACP_EXECUTOR_LOST_ERROR_CODE}]` : "";
       const summary =
-        "Stopped: 2 context windows in a row with nothing new (no commit, file change, added dossier content, child change, or newly read file). " +
+        `Stopped${codeTag}: 2 context windows in a row with nothing new (no commit, file change, added dossier content, child change, or newly read file). ` +
         (latest.tier === 1 ? "resume_run continues it." : "resume_task with a note continues it.");
       let settled = false;
       if (!this.rolloverFenceBroken(exec, taskId, fence)) {
-        settled = await this.settleWithoutReturn(exec, runnerGen, latest, run, wt, res, "failed", summary, "zero_progress_rollover");
+        settled = await this.settleWithoutReturn(
+          exec,
+          runnerGen,
+          latest,
+          run,
+          wt,
+          res,
+          "failed",
+          summary,
+          reason === "acp_executor_lost" ? `zero_progress_rollover:${ACP_EXECUTOR_LOST_ERROR_CODE}` : "zero_progress_rollover",
+        );
       }
       if (settled) {
         let evidencePaths: string[] = [];
@@ -3921,9 +3960,14 @@ export class HarnessOrchestrator {
     return r.steered;
   }
 
+  /** True when `taskId` is currently suspended inside a blocking wait (`wait_children` or `wait_timer`). */
+  private isTaskInBlockingWait(taskId: string): boolean {
+    return (this.waitingChildrenTasks.get(taskId) ?? 0) > 0 || this.db.timers.isTaskWaitingTimer(taskId);
+  }
+
   /**
    * Steers a task and reports exactly how the message will be delivered (native session, the task's current
-   * wait_children, or its next turn) or why it was refused. The only await is the native steer; every queue and
+   * wait_children or wait_timer, or its next turn) or why it was refused. The only await is the native steer; every queue and
    * cap decision after it is synchronous, so concurrent steers never strand a message.
    */
   async steerTaskDetailed(taskId: string, message: string): Promise<SteerTaskResult> {
@@ -3971,12 +4015,12 @@ export class HarnessOrchestrator {
     if (early) return early;
     const exec = this.active.get(taskId)!;
 
-    // Phase 1 (the only await): a task blocked in wait_children gets the message through that wait instead.
+    // Phase 1 (the only await): a task blocked in wait_children or wait_timer gets the message through that wait instead.
     let native = false;
     // The generation and handle the native steer targets: a completion for an older one is never accepted.
     const sentGeneration = exec.runnerGeneration;
     const sentHandle = exec.handle;
-    if ((this.waitingChildrenTasks.get(taskId) ?? 0) === 0 && sentHandle) {
+    if (!this.isTaskInBlockingWait(taskId) && sentHandle) {
       try {
         native = await this.steerHandleChained(exec, sentHandle, message);
       } catch {
@@ -4004,9 +4048,10 @@ export class HarnessOrchestrator {
       return refuse("queue_full", `Steering was not delivered: task ${taskId} already has ${queued} undelivered steering messages queued.`,
         "Wait for the task to take the queued steering, then send again.");
     }
-    if ((this.waitingChildrenTasks.get(taskId) ?? 0) > 0) {
-      // The waiter's agent.steered listener ends its wait synchronously; costs no continuation.
+    if (this.isTaskInBlockingWait(taskId)) {
+      // The waiter's agent.steered listener (wait_children) or wakeTaskWaiters (wait_timer) ends its wait synchronously; costs no continuation.
       this.pendingSteers.set(taskId, [...queue, message]);
+      this.db.timers.wakeTaskWaiters(taskId, "steered");
       return accept("queued_wait");
     }
     const used = this.steerContinuations.get(taskId) ?? 0;
@@ -4305,7 +4350,7 @@ export class HarnessOrchestrator {
     const handle = exec?.handle;
     if (!exec || !handle || exec.abort.signal.aborted || exec.phase !== "running") return;
     if (handle.turnOpen?.() !== true) return;
-    if ((this.waitingChildrenTasks.get(taskId) ?? 0) > 0) return;
+    if (this.isTaskInBlockingWait(taskId)) return;
     const sentGen = exec.runnerGeneration;
     const notices = this.advisories.take(taskId);
     if (notices.length === 0) return;
@@ -4338,21 +4383,44 @@ export class HarnessOrchestrator {
     taskId: string,
     message: string,
     opts?: { onOutcome?: (accepted: boolean, reason: string) => void },
-  ): Promise<{ delivered: boolean; mode: "initial_prompt" | "steer" | "queued_before_handle" | "none" }> {
+  ): Promise<{ delivered: boolean; mode: "initial_prompt" | "steer" | "queued_wait" | "queued_before_handle" | "none" }> {
     if (this.describeSteerRefusal(taskId) !== null) return { delivered: false, mode: "none" };
     const exec = this.active.get(taskId);
-    if (!exec || exec.abort.signal.aborted) return { delivered: false, mode: "none" };
+    if (!exec || exec.abort.signal.aborted || exec.phase === "settling") return { delivered: false, mode: "none" };
     if (exec.promptBuilt !== true) return { delivered: true, mode: "initial_prompt" };
+    const deliverViaBlockingWait = (): { delivered: boolean; mode: "queued_wait" | "none" } => {
+      const queue = this.pendingSteers.get(taskId) ?? [];
+      if (queue.length >= MAX_PENDING_STEERS) return { delivered: false, mode: "none" };
+      this.pendingSteers.set(taskId, [...queue, message]);
+      this.db.timers.wakeTaskWaiters(taskId, "steered");
+      const task = this.db.getTask(taskId);
+      if (task) {
+        this.db.emitEvent(task.runId, taskId, "agent.steered", {
+          message,
+          accepted: true,
+          mode: "queued_wait",
+          live: true,
+        });
+      }
+      return { delivered: true, mode: "queued_wait" };
+    };
+    if (this.isTaskInBlockingWait(taskId)) {
+      return deliverViaBlockingWait();
+    }
     if (exec.handle) {
       const sentGeneration = exec.runnerGeneration;
       const sentHandle = exec.handle;
       const ok = await this.steerHandleChained(exec, sentHandle, message).catch(() => false);
       // A completion for an older session must not be recorded against (or wake) its successor.
+      const curExec = this.active.get(taskId);
       if (
-        this.active.get(taskId) !== exec || exec.abort.signal.aborted || exec.phase === "settling" ||
+        curExec !== exec || exec.abort.signal.aborted || curExec.phase === "settling" ||
         exec.runnerGeneration !== sentGeneration || exec.handle !== sentHandle
       ) {
         return { delivered: false, mode: "none" };
+      }
+      if (!ok && this.isTaskInBlockingWait(taskId)) {
+        return deliverViaBlockingWait();
       }
       const task = this.db.getTask(taskId);
       if (task) this.db.emitEvent(task.runId, taskId, "agent.steered", { message, accepted: ok });
@@ -4618,7 +4686,7 @@ export class HarnessOrchestrator {
             return;
           }
         }
-        if (ev.type === "goal.amended" || (ev.type === "agent.steered" && ev.taskId !== null && parentIds.has(ev.taskId))) {
+        if (ev.type === "agent.steered" && ev.taskId !== null && parentIds.has(ev.taskId)) {
           targets = getTargets();
           finish("steered");
           return;
