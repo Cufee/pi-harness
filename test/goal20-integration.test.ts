@@ -585,4 +585,193 @@ describe("goal-20 integration: DirectorRuntime gate-activity events and compact 
       rmSync(stateDir, { recursive: true, force: true });
     }
   });
+
+  it("goal_list returns compact summaries (<20k chars) for 30 large goals, supports status filter, and pages 120 goals via nextCursor", async () => {
+    const repoRoot = await makeTempRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-goal20-list-state-"));
+    try {
+      const baseCfg = loadConfig(repoRoot);
+      const config = withFixtureCatalog({
+        ...baseCfg,
+        codeMode: "off",
+        goals: { ...baseCfg.goals, autoVerifyOnSettle: false },
+        stateDir,
+        socketPath: join(stateDir, "d.sock"),
+      });
+      const daemon = new HarnessDaemon(config, {
+        dbPath: ":memory:",
+        customRunnerFactory: () => ({
+          run: async () => ({ text: "ok", stopReason: "completed" }),
+        }),
+      });
+      await daemon.start();
+      try {
+        const chat = await daemon.director.createChat({ repoRoot });
+        const baseSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout;
+        const bigDescription = "Large specification paragraph for compact goal_list testing. ".repeat(700).slice(0, 40_000);
+        assert.equal(bigDescription.length, 40_000);
+
+        const first30Ids: string[] = [];
+        for (let i = 1; i <= 30; i++) {
+          const g = daemon.director.goals.createGoal({
+            chatSessionId: chat.id,
+            repoRoot,
+            title: `Large goal ${i}: ` + "X".repeat(200),
+            description: bigDescription,
+            criteria: [{ id: "c1", description: "Must pass", kind: "behavioral", required: true }],
+            budgets: { maxReviewCycles: 20, maxNoProgressCycles: 20 },
+            verificationMode: "none",
+          });
+          first30Ids.push(g.id);
+          const run = daemon.db.createRun({
+            repoRoot,
+            baseBranch: "main",
+            baseSha,
+            goal: g.title,
+          });
+          const t1 = daemon.db.createTask({
+            runId: run.id,
+            tier: 1,
+            kind: "orchestrator",
+            title: `Orch ${i}`,
+            objective: "Coord",
+            profileId: "fixture",
+          });
+          daemon.director.goals.linkRunAndStart(g.id, run.id);
+
+          // Add 2 unresolved escalations (1 open + 1 acked) and 1 resolved escalation on goal 1.
+          if (i === 1) {
+            daemon.db.createEscalation({
+              runId: run.id,
+              fromTaskId: t1.id,
+              toTaskId: null,
+              severity: "P1",
+              category: "code_defect",
+              title: "Open escalation",
+              evidencePaths: ["README.md"],
+              blocking: true,
+            });
+            const acked = daemon.db.createEscalation({
+              runId: run.id,
+              fromTaskId: t1.id,
+              toTaskId: null,
+              severity: "P2",
+              category: "code_defect",
+              title: "Acked escalation",
+              evidencePaths: ["README.md"],
+              blocking: false,
+            });
+            daemon.db.ackEscalation(acked.id, "acknowledged", false);
+            const resolved = daemon.db.createEscalation({
+              runId: run.id,
+              fromTaskId: t1.id,
+              toTaskId: null,
+              severity: "P2",
+              category: "code_defect",
+              title: "Resolved escalation",
+              evidencePaths: ["README.md"],
+              blocking: false,
+            });
+            daemon.db.tryResolveEscalation(resolved.id, "fixed");
+          }
+
+          // Record 3 reviews per goal.
+          for (let c = 1; c <= 3; c++) {
+            daemon.director.goals.recordReviewVerdict(g.id, {
+              verdict: c === 3 && i % 5 === 0 ? "approved" : "changes_requested",
+              diffHash: `diff-${i}-${c}`,
+              summary: `Review ${c} for goal ${i}: `.padEnd(1_200, "r"),
+              blockingIssues: [`Blocking ${i}.${c}`],
+              criteriaResults: [{ criterionId: "c1", passed: c === 3 && i % 5 === 0, evidence: "ev".padEnd(500, "e") }],
+            });
+          }
+          if (i % 3 === 0) {
+            daemon.director.goals.setStatus(g.id, "awaiting_human");
+          }
+        }
+
+        // 1. Default goal_list on 30 large goals: < 20,000 chars, all 30 ids present with compact summary fields.
+        const list30 = (await daemon.director.executeDirectorMcpTool(chat.id, "goal_list", {})) as {
+          goals: Array<{
+            id: string;
+            version: number;
+            title: string;
+            status: string;
+            reviewCycle: number;
+            linkedRunId: string | null;
+            openEscalations: number;
+            latestReview: { verdict: string; cycle: number; goalVersion: number; createdAt: number } | null;
+            updatedAt: number;
+          }>;
+          page: { total: number; returned: number; nextCursor: string | null };
+          presentation_id: string;
+        };
+        const jsonLen30 = JSON.stringify(list30).length;
+        assert.ok(jsonLen30 < 20_000, `expected < 20,000 chars for 30 large goals, got ${jsonLen30}`);
+        assert.deepEqual(list30.page, { total: 30, returned: 30, nextCursor: null });
+        assert.deepEqual(new Set(list30.goals.map((g) => g.id)), new Set(first30Ids));
+        assert.equal(typeof list30.presentation_id, "string");
+
+        const g1Summary = list30.goals.find((g) => g.id === first30Ids[0])!;
+        assert.equal(g1Summary.openEscalations, 2); // 1 open + 1 acked, excludes resolved
+        assert.equal(g1Summary.version, 1);
+        assert.equal(g1Summary.reviewCycle, 3);
+        assert.ok(g1Summary.title.length <= 160);
+        assert.equal("description" in g1Summary, false);
+        assert.equal(g1Summary.latestReview?.cycle, 3);
+        assert.equal(g1Summary.latestReview?.goalVersion, 1);
+        assert.equal(g1Summary.latestReview?.verdict, "changes_requested");
+
+        // 2. Status filter returns only matching goals.
+        const awaiting = (await daemon.director.executeDirectorMcpTool(chat.id, "goal_list", {
+          status: "awaiting_human",
+        })) as typeof list30;
+        assert.equal(awaiting.page.total, 10);
+        assert.equal(awaiting.page.returned, 10);
+        assert.equal(awaiting.page.nextCursor, null);
+        assert.ok(awaiting.goals.every((g) => g.status === "awaiting_human"));
+
+        // 3. Add 90 more goals (120 total) and page through via nextCursor: every id returned exactly once.
+        const all120Ids = new Set(first30Ids);
+        for (let i = 31; i <= 120; i++) {
+          const g = daemon.director.goals.createGoal({
+            chatSessionId: chat.id,
+            repoRoot,
+            title: `Extra goal ${i}`,
+            description: `Description ${i}`,
+            criteria: [],
+            verificationMode: "none",
+          });
+          all120Ids.add(g.id);
+        }
+
+        const seenIds = new Set<string>();
+        let cursor: string | null = null;
+        let pageCount = 0;
+        do {
+          const res = (await daemon.director.executeDirectorMcpTool(
+            chat.id,
+            "goal_list",
+            cursor ? { cursor } : {},
+          )) as typeof list30;
+          assert.ok(JSON.stringify(res).length < 20_000, `page ${pageCount} exceeded 20,000 chars`);
+          assert.equal(res.page.total, 120);
+          for (const g of res.goals) {
+            assert.ok(!seenIds.has(g.id), `duplicate goal id ${g.id} across pages`);
+            seenIds.add(g.id);
+          }
+          cursor = res.page.nextCursor;
+          pageCount++;
+          assert.ok(pageCount <= 10, "paging 120 goals with default limit=30 should take 4 pages");
+        } while (cursor !== null);
+        assert.equal(pageCount, 4);
+        assert.deepEqual(seenIds, all120Ids);
+      } finally {
+        await daemon.stop();
+      }
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
 });
