@@ -31,7 +31,7 @@ const SINGLE_PATH_KEYS = [
 const PATCH_LINE_RE = /^\*\*\*\s+(?:Add File|Update File|Delete File|Move to):\s*(.+?)\s*$/gm;
 
 const HARNESS_TITLE_RE =
-  /(?:^|[^a-z0-9/\\])(?:mcp(?:__|_|\/|\.|:))?harness(?:__|_|\/|\.|:|\s)+([a-z][a-z0-9_]*)(?=$|[^a-z0-9_./\\])/i;
+  /^(?:mcp(?:__|_|\/|\.|:))?harness(?:__|_|\/|\.|:\s*)([a-z][a-z0-9_]*)$/i;
 
 const EDIT_WORDS = new Set(["edit", "write", "create", "patch", "replace", "delete", "move", "rename"]);
 const READ_WORDS = new Set(["read", "view", "cat", "open"]);
@@ -51,6 +51,35 @@ export function harnessToolFromTitle(title: string, names: ReadonlySet<string>):
     if (names.has(candidate)) return candidate;
   }
   return null;
+}
+
+function structuredServerName(args: Record<string, unknown> | undefined): string | null {
+  if (!args) return null;
+  if (typeof args.server === "string" && args.server.trim()) return args.server.trim();
+  if (typeof args.server_name === "string" && args.server_name.trim()) return args.server_name.trim();
+  if (typeof args.mcpServer === "string" && args.mcpServer.trim()) return args.mcpServer.trim();
+  if (
+    args.mcpServer &&
+    typeof args.mcpServer === "object" &&
+    !Array.isArray(args.mcpServer) &&
+    typeof (args.mcpServer as { name?: unknown }).name === "string" &&
+    (args.mcpServer as { name: string }).name.trim()
+  ) {
+    return (args.mcpServer as { name: string }).name.trim();
+  }
+  return null;
+}
+
+function structuredToolName(args: Record<string, unknown> | undefined): string | null {
+  if (!args) return null;
+  if (typeof args.tool === "string" && args.tool.trim()) return args.tool.trim();
+  if (typeof args.tool_name === "string" && args.tool_name.trim()) return args.tool_name.trim();
+  if (typeof args.toolName === "string" && args.toolName.trim()) return args.toolName.trim();
+  return null;
+}
+
+function hasParentTraversalComponent(relPath: string): boolean {
+  return relPath.split("/").includes("..");
 }
 
 function splitIdentifierWords(token: string): string[] {
@@ -288,7 +317,7 @@ function normalizePath(rawPath: string, absRoot: string): string | null {
   const absPath = isAbsolute(slashPath) ? resolve(slashPath) : resolve(absRoot, slashPath);
   const rel = relative(absRoot, absPath).replaceAll("\\", "/");
   if (rel === "") return ".";
-  if (!rel.startsWith("..") && !isAbsolute(rel)) {
+  if (!hasParentTraversalComponent(rel) && !isAbsolute(rel)) {
     return rel;
   }
   return absPath.replaceAll("\\", "/");
@@ -388,18 +417,27 @@ export class NativeEventParser {
       }
     }
 
-    let harnessTool =
-      harnessToolFromTitle(title, this.harnessToolNames) ??
-      harnessToolFromTitle(name, this.harnessToolNames);
-
-    if (
-      !harnessTool &&
-      mergedArgs &&
-      mergedArgs.server === "harness" &&
-      typeof mergedArgs.tool === "string" &&
-      this.harnessToolNames.has(mergedArgs.tool)
-    ) {
-      harnessTool = mergedArgs.tool;
+    const server = structuredServerName(mergedArgs);
+    const structuredTool = structuredToolName(mergedArgs);
+    let harnessTool: string | null = null;
+    if (server !== null && server.toLowerCase() === "harness") {
+      if (structuredTool !== null) {
+        const candidate = structuredTool.toLowerCase();
+        harnessTool = this.harnessToolNames.has(candidate)
+          ? candidate
+          : harnessToolFromTitle(structuredTool, this.harnessToolNames);
+      } else {
+        harnessTool =
+          harnessToolFromTitle(title, this.harnessToolNames) ??
+          harnessToolFromTitle(name, this.harnessToolNames);
+      }
+    } else if (server !== null && structuredTool !== null) {
+      // Explicit non-harness MCP server envelope.
+      harnessTool = null;
+    } else {
+      harnessTool =
+        harnessToolFromTitle(title, this.harnessToolNames) ??
+        harnessToolFromTitle(name, this.harnessToolNames);
     }
 
     const nativeClass = classifyNative(kind, title);

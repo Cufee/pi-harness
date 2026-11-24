@@ -26,12 +26,8 @@ export function attachNotices(result: unknown, notices: Notice[]): { result: unk
   if (notices.length === 0) {
     return { result, attached: false };
   }
-  const formatted = notices.map(formatNotice);
-  if (typeof result === "string") {
-    const appended = result.length > 0 ? `${result}\n\n${formatted.join("\n\n")}` : formatted.join("\n\n");
-    return { result: appended, attached: true };
-  }
   if (isPlainObject(result)) {
+    const formatted = notices.map(formatNotice);
     const existing = Array.isArray(result.harness_advisory)
       ? result.harness_advisory.filter((item): item is string => typeof item === "string")
       : [];

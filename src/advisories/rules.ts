@@ -49,13 +49,23 @@ const VOLATILE_RESULT_KEYS: ReadonlySet<string> = new Set([
   "elapsedMs",
 ]);
 
+const MAX_DISPLAY_PATH_CHARS = 48;
+const MAX_DISPLAY_SCOPE_CHARS = 32;
+const MAX_DISPLAY_SAMPLE_CHARS = 32;
+const MAX_DISPLAY_ID_CHARS = 32;
+const MAX_DISPLAY_MATCH_CHARS = 48;
+
+function hasParentTraversalComponent(p: string): boolean {
+  return p.replaceAll("\\", "/").split("/").includes("..");
+}
+
 function isOutsideWorkspacePath(p: string): boolean {
-  return !p || p === "." || p === "~" || p.startsWith("~/") || p.startsWith("..") || isAbsolute(p);
+  return !p || p === "." || p === "~" || p.startsWith("~/") || hasParentTraversalComponent(p) || isAbsolute(p);
 }
 
 function isUnderRoot(targetAbs: string, rootAbs: string): boolean {
-  const rel = relative(rootAbs, targetAbs);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  const rel = relative(rootAbs, targetAbs).replaceAll("\\", "/");
+  return rel === "" || (!hasParentTraversalComponent(rel) && !isAbsolute(rel));
 }
 
 function isUnderAnyExtraRoot(workspaceRoot: string, relPath: string, extraRoots: readonly string[]): boolean {
@@ -69,29 +79,64 @@ function isUnderAnyExtraRoot(workspaceRoot: string, relPath: string, extraRoots:
   return false;
 }
 
+function countSnippetWords(text: string): number {
+  const trimmed = text.trim();
+  return trimmed ? trimmed.split(/\s+/).length : 0;
+}
+
+function clipSnippet(raw: string, maxWords: number, maxChars: number): string {
+  const words = raw.trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return "";
+  let clipped = words.length > maxWords ? `${words.slice(0, maxWords).join(" ")}…` : words.join(" ");
+  if (clipped.length > maxChars) {
+    const budget = Math.max(1, maxChars - 1);
+    clipped = `${clipped.slice(0, budget).trimEnd()}…`;
+  }
+  return clipped;
+}
+
+function formatBoundedList(
+  items: readonly string[],
+  opts: { maxItems: number; maxWords: number; maxItemChars: number },
+): string {
+  const cleaned = items.map((s) => s.trim()).filter(Boolean);
+  if (cleaned.length === 0) return "";
+
+  const canKeepAll = cleaned.length <= opts.maxItems && cleaned.length <= opts.maxWords;
+  if (canKeepAll) {
+    const charBounded = cleaned.map((item) => clipSnippet(item, opts.maxWords, opts.maxItemChars));
+    const totalWords = charBounded.reduce((sum, s) => sum + countSnippetWords(s), 0);
+    if (totalWords <= opts.maxWords) {
+      return charBounded.join(", ");
+    }
+    const perItemWords = Math.max(1, Math.floor(opts.maxWords / cleaned.length));
+    return cleaned.map((item) => clipSnippet(item, perItemWords, opts.maxItemChars)).join(", ");
+  }
+
+  // Reserve 1 word for "+N".
+  const itemBudgetWords = Math.max(1, opts.maxWords - 1);
+  const shownCount = Math.min(cleaned.length - 1, opts.maxItems, itemBudgetWords);
+  const shown = cleaned.slice(0, shownCount);
+  const perItemWords = Math.max(1, Math.floor(itemBudgetWords / shown.length));
+  const formatted = shown.map((item) => clipSnippet(item, perItemWords, opts.maxItemChars));
+  const omitted = cleaned.length - shown.length;
+  return `${formatted.join(", ")}, +${omitted}`;
+}
+
 function formatScopeList(scopes: readonly string[]): string {
-  const cleaned = scopes.map((s) => s.trim()).filter(Boolean);
-  if (cleaned.length <= 3) return cleaned.join(", ");
-  return `${cleaned.slice(0, 2).join(", ")}, +${cleaned.length - 2}`;
+  return formatBoundedList(scopes, {
+    maxItems: 3,
+    maxWords: 3,
+    maxItemChars: MAX_DISPLAY_SCOPE_CHARS,
+  });
 }
 
 function formatSampleList(items: readonly string[]): string {
-  const cleaned = items.map((item) => item.trim()).filter(Boolean);
-  const kept: string[] = [];
-  let words = 0;
-  for (const item of cleaned) {
-    if (kept.length >= 3) break;
-    const itemWords = item.split(/\s+/).filter(Boolean);
-    const clipped = itemWords.slice(0, 2).join(" ");
-    const wCount = Math.min(itemWords.length, 2);
-    if (words + wCount > 3 && kept.length > 0) break;
-    kept.push(clipped);
-    words += wCount;
-  }
-  if (cleaned.length > kept.length) {
-    kept.push(`+${cleaned.length - kept.length}`);
-  }
-  return kept.join(", ");
+  return formatBoundedList(items, {
+    maxItems: 3,
+    maxWords: 4,
+    maxItemChars: MAX_DISPLAY_SAMPLE_CHARS,
+  });
 }
 
 function stripQuotedAndCode(text: string): string {
@@ -144,7 +189,7 @@ function normalizeWorkspaceFile(rawPath: string, workspaceRoot: string): string 
   const slashPath = trimmed.replaceAll("\\", "/");
   const absPath = isAbsolute(slashPath) ? resolve(slashPath) : resolve(absRoot, slashPath);
   const rel = relative(absRoot, absPath).replaceAll("\\", "/");
-  if (!rel || rel === "." || rel.startsWith("..") || isAbsolute(rel)) return null;
+  if (!rel || rel === "." || hasParentTraversalComponent(rel) || isAbsolute(rel)) return null;
   return rel;
 }
 
@@ -158,7 +203,7 @@ function matchesPathHints(relPath: string, hints: readonly string[], workspaceRo
     if (!hint) continue;
     if (isAbsolute(hint)) {
       const relHint = relative(absRoot, resolve(hint)).replaceAll("\\", "/");
-      if (!relHint || relHint.startsWith("..") || isAbsolute(relHint)) continue;
+      if (!relHint || hasParentTraversalComponent(relHint) || isAbsolute(relHint)) continue;
       hint = relHint;
     }
     const hintNoSlash = hint.replace(/\/+$/, "");
@@ -227,9 +272,10 @@ const workerEditOutsideScopeRule: AdvisoryRule<WorkerEditState> = {
 
     const target = outside.find((p) => !state.reported.has(p)) ?? outside[0]!;
     state.lastPath = target;
+    const displayTarget = clipSnippet(target, 2, MAX_DISPLAY_PATH_CHARS) || target;
     return {
       key: target,
-      what: `${target} is outside your write scopes (${formatScopeList(subject.writeScopes)}).`,
+      what: `${displayTarget} is outside your write scopes (${formatScopeList(subject.writeScopes)}).`,
       why: "The merge queue rejects a branch that changes files outside its scopes, and another task may own this file.",
       alternative:
         "Revert the edit if it is not needed. If the change is required, call report_issue with category interface_conflict, or return_task with status scope_too_large, so your parent can widen the scope.",
@@ -251,6 +297,13 @@ interface ScopeRuleState {
   areasAtFire: number;
   scoredCallsAtFire: number;
   lastFinding: ScopeFinding | null;
+  seenNonEditCall: boolean;
+  editIntervened: boolean;
+  sawDifferentResult: boolean;
+  lastRepeatCallSig: string | null;
+  lastRepeatResultSig: string | null;
+  sameCallStreak: number;
+  sameResultStreak: number;
 }
 
 const scopeTooLargeRule: AdvisoryRule<ScopeRuleState> = {
@@ -258,18 +311,86 @@ const scopeTooLargeRule: AdvisoryRule<ScopeRuleState> = {
   roles: ["research", "plan", "verify", "execute"],
   surface: "event",
   priority: 80,
-  init: () => ({ hasFired: false, areasAtFire: 0, scoredCallsAtFire: 0, lastFinding: null }),
-  observe(state, _subject, _call, ctx): Finding | null {
+  init: () => ({
+    hasFired: false,
+    areasAtFire: 0,
+    scoredCallsAtFire: 0,
+    lastFinding: null,
+    seenNonEditCall: false,
+    editIntervened: false,
+    sawDifferentResult: false,
+    lastRepeatCallSig: null,
+    lastRepeatResultSig: null,
+    sameCallStreak: 0,
+    sameResultStreak: 0,
+  }),
+  observe(state, _subject, call, ctx): Finding | null {
     if (!ctx.scope) return null;
-    const finding = ctx.scope.evaluate();
-    state.lastFinding = finding;
-    if (!finding) return null;
+
+    if (call.status === "completed") {
+      if (call.surface === "native" && call.nativeClass === "edit") {
+        if (state.seenNonEditCall) {
+          state.editIntervened = true;
+        }
+        state.sawDifferentResult = false;
+        state.lastRepeatCallSig = null;
+        state.lastRepeatResultSig = null;
+        state.sameCallStreak = 0;
+        state.sameResultStreak = 0;
+      } else {
+        state.seenNonEditCall = true;
+        const callSig = `${call.surface}:${call.tool.toLowerCase()}:${stableStringify(call.args ?? {})}`;
+        const resultSig = call.result !== undefined ? stableStringify(stripVolatile(call.result)) : null;
+        if (callSig === state.lastRepeatCallSig) {
+          state.sameCallStreak += 1;
+          if (state.sameCallStreak >= 3) {
+            state.editIntervened = false;
+          }
+          if (resultSig !== null) {
+            if (state.lastRepeatResultSig === null || resultSig === state.lastRepeatResultSig) {
+              state.lastRepeatResultSig = resultSig;
+              state.sameResultStreak += 1;
+              if (state.sameResultStreak >= 3) {
+                state.sawDifferentResult = false;
+              }
+            } else {
+              state.lastRepeatResultSig = resultSig;
+              state.sameResultStreak = 1;
+              state.sawDifferentResult = true;
+            }
+          }
+        } else {
+          state.lastRepeatCallSig = callSig;
+          state.sameCallStreak = 1;
+          state.lastRepeatResultSig = resultSig;
+          state.sameResultStreak = resultSig !== null ? 1 : 0;
+          state.sawDifferentResult = false;
+        }
+      }
+    }
+
+    const rawFinding = ctx.scope.evaluate();
+    if (!rawFinding) {
+      state.lastFinding = null;
+      return null;
+    }
+
+    const suppressRepeated = state.editIntervened || state.sawDifferentResult;
+    const finding: ScopeFinding = {
+      ...(rawFinding.widening ? { widening: rawFinding.widening } : {}),
+      ...(rawFinding.repeated && !suppressRepeated ? { repeated: rawFinding.repeated } : {}),
+      ...(rawFinding.stale ? { stale: rawFinding.stale } : {}),
+    };
 
     const reasonKeys: Array<"widening" | "repeated" | "stale"> = [];
     if (finding.widening) reasonKeys.push("widening");
     if (finding.repeated) reasonKeys.push("repeated");
     if (finding.stale) reasonKeys.push("stale");
-    if (reasonKeys.length === 0) return null;
+    if (reasonKeys.length === 0) {
+      state.lastFinding = null;
+      return null;
+    }
+    state.lastFinding = finding;
 
     const primaryReason = reasonKeys[0]!;
     let what: string;
@@ -278,7 +399,7 @@ const scopeTooLargeRule: AdvisoryRule<ScopeRuleState> = {
       const topics = formatSampleList(finding.widening.topics);
       what = `You have opened ${finding.widening.areas.length} areas (${areas}) and searched ${finding.widening.topics.length} unrelated topics (${topics}).`;
     } else if (primaryReason === "repeated" && finding.repeated) {
-      const tool = finding.repeated.tool.trim().split(/\s+/)[0] || "tool";
+      const tool = clipSnippet(finding.repeated.tool, 1, MAX_DISPLAY_ID_CHARS) || "tool";
       what = `You repeated the same ${tool} call ${finding.repeated.times} times.`;
     } else {
       what = `Your last ${finding.stale!.reads} reads found nothing new.`;
@@ -340,10 +461,11 @@ const readOnlyFindingEscalationRule: AdvisoryRule<null> = {
     const res = call.result as Record<string, unknown>;
     if (res.blocking !== false) return null;
     const esc = typeof res.escalationId === "string" && res.escalationId.trim() ? res.escalationId.trim() : "escalation";
+    const displayEsc = clipSnippet(esc, 1, MAX_DISPLAY_ID_CHARS) || "escalation";
 
     return {
       key: "read-only-finding-escalation",
-      what: `Your finding was recorded as non-blocking escalation ${esc} for your parent, and this task continues.`,
+      what: `Your finding was recorded as non-blocking escalation ${displayEsc} for your parent, and this task continues.`,
       why: "A read-only task delivers findings in its handoff, and its parent decides what blocks.",
       alternative:
         "Put the finding and its evidence in return_task. Pass blocking: true to report_issue only when something stops you from finishing, such as a broken environment.",
@@ -406,13 +528,14 @@ const briefCountLimitRule: AdvisoryRule<null> = {
           ? res.taskId.trim()
           : "the child";
     const steerTool = subject.role === "director" ? "steer_task" : "steer_child";
-    const matchText = compactMatchSnippet(matched);
+    const displayChildId = clipSnippet(childId, 2, MAX_DISPLAY_ID_CHARS) || "the child";
+    const matchText = clipSnippet(compactMatchSnippet(matched), 6, MAX_DISPLAY_MATCH_CHARS);
 
     return {
       key: childId,
-      what: `The brief for ${childId} states a count as a limit ("${matchText}").`,
+      what: `The brief for ${displayChildId} states a count as a limit ("${matchText}").`,
       why: "The harness never stops a task on a count, and a stated count makes a child cut bounded work short.",
-      alternative: `Tell ${childId} with ${steerTool} that the count is not a limit. In later briefs, describe the deliverable instead of a count.`,
+      alternative: `Tell ${displayChildId} with ${steerTool} that the count is not a limit. In later briefs, describe the deliverable instead of a count.`,
       data: { childId, match: matched, tool: call.tool },
     };
   },
