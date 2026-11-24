@@ -27,7 +27,7 @@ import { invalidateGateEnvCache, type GateRuntimeConfig } from "../tools/gate-en
 import { nativeToolsPathDirs, resolveExternalMcpServers } from "../tools/native-tools.js";
 import { canonicalPath, runGit, WorktreeConcurrencyLimitError, WorktreeManager } from "../worktree/manager.js";
 import type { QueuePositionInput } from "./admission-queue.js";
-import { WriteScopeConflictError, type AgentTier, type ControlPlaneDb, type RunRecord, type TaskKind, type TaskRecord, type TaskStatus, type WorktreeRecord } from "./db.js";
+import { WriteScopeConflictError, type AgentTier, type ControlPlaneDb, type EscalationRecord, type RunRecord, type TaskKind, type TaskRecord, type TaskStatus, type WorktreeRecord } from "./db.js";
 import { buildHydrationTurn, buildImmutableSystemPrompt, buildMissingReturnWrapUpPrompt, type AnchoredHandoff } from "./prompts.js";
 import { spillSummaryOverflow, writeUniqueTaskDossier } from "./dossiers.js";
 import { ControlPlaneToolExecutor, compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./tools.js";
@@ -2477,6 +2477,7 @@ export class HarnessOrchestrator {
         tasksSnapshot: this.db.listTasks(run.id),
         artifacts: task.tier === 1 ? this.db.listArtifacts(run.id, undefined, 30, "dossier") : this.db.listArtifacts(run.id, task.id, 30),
         openEscalations: this.db.listEscalations(run.id, "open"),
+        recentlyResolvedEscalations: this.db.listRecentlyResolvedEscalations(run.id, 10),
         blackboard: this.db.blackboardGet(run.id),
         scopedKbHints,
         openPeerRequests: task.tier === 1 ? this.db.listOpenPeerExchangesForRun(run.id) : [],
@@ -3797,6 +3798,51 @@ export class HarnessOrchestrator {
       this.steerReservedBatches.add(taskId);
     }
     return accept("queued_turn");
+  }
+
+  /**
+   * Delivers a human or Director escalation resolution to the run's live Tier 1 orchestrator
+   * and, when distinct and live, to the raising task. Never throws and never auto-resumes.
+   * Returns the task IDs actually reached by steering.
+   */
+  async deliverEscalationResolution(
+    esc: EscalationRecord,
+    opts: { resolvedBy: string; resolution: string },
+  ): Promise<string[]> {
+    const delivered: string[] = [];
+    try {
+      const tasks = this.db.listTasks(esc.runId);
+      const steerableStatuses = new Set<TaskStatus>(["running", "draining", "waiting_children"]);
+      const isSteerable = (t: TaskRecord | undefined): boolean => {
+        if (!t || !steerableStatuses.has(t.status)) return false;
+        const exec = this.active.get(t.id);
+        return Boolean(exec && !exec.abort.signal.aborted && exec.phase !== "settling");
+      };
+
+      const orch = tasks.find((t) => t.tier === 1 && t.profileId !== "director");
+      const raiser = tasks.find((t) => t.id === esc.fromTaskId);
+      const raiserLive = isSteerable(raiser);
+
+      const resolution = opts.resolution.trim() || esc.resolution?.trim() || "";
+      const baseText = `[ESCALATION RESOLVED: ${esc.id} by ${opts.resolvedBy}] ${esc.severity}/${esc.category} "${esc.title}": ${resolution}`;
+
+      if (orch && isSteerable(orch)) {
+        const hint =
+          raiser && raiser.id !== orch.id && !raiserLive
+            ? `\nRaiser ${raiser.id} is ${raiser.status}; use resume_task if the answer unblocks it.`
+            : "";
+        const res = await this.steerTaskDetailed(orch.id, `${baseText}${hint}`).catch(() => null);
+        if (res?.steered) delivered.push(orch.id);
+      }
+
+      if (raiser && raiserLive && raiser.id !== orch?.id) {
+        const res = await this.steerTaskDetailed(raiser.id, baseText).catch(() => null);
+        if (res?.steered) delivered.push(raiser.id);
+      }
+    } catch {
+      // Best-effort delivery; hydration carries resolved escalations on next turn/resume.
+    }
+    return delivered;
   }
 
   /** Records a goal version to bind onto `taskId` when its queued amendment steer is drained. */

@@ -813,3 +813,273 @@ describe("goal-17 runtime settlement fence, bindings, and amendment text", () =>
     }
   });
 });
+
+describe("goal-25 escalation resolution delivery and hydration", () => {
+  it("steers live Tier 1 and non-blocking raiser, ignores bulk auto-resolve, and hydrates resolved escalations", async () => {
+    const repoRoot = await makeTempRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-g25-live-"));
+    const sockPath = join(stateDir, "d.sock");
+    try {
+      const baseCfg = loadConfig(repoRoot);
+      const config = withFixtureCatalog({
+        ...baseCfg,
+        codeMode: "off",
+        goals: { ...baseCfg.goals, autoVerifyOnSettle: false },
+        stateDir,
+        socketPath: sockPath,
+      });
+
+      let t1Id = "";
+      let workerId = "";
+      const t1Steers: string[] = [];
+      const workerSteers: string[] = [];
+      const escalationFiled = Promise.withResolvers<string>();
+      const probeHydrated = Promise.withResolvers<string>();
+      const releaseAll = Promise.withResolvers<void>();
+
+      const daemon = new HarnessDaemon(config, {
+        dbPath: ":memory:",
+        customRunnerFactory: () => ({
+          run: async (req) => {
+            if (req.tier === 1) {
+              t1Id = req.taskId;
+              req.onHandle?.({
+                steer: async (msg) => {
+                  t1Steers.push(msg);
+                  return true;
+                },
+                cancel: async () => releaseAll.resolve(),
+              });
+              const spawned = (await req.executeTool("spawn_worker", {
+                title: "Live non-blocking raiser",
+                objective: "File non-blocking escalation and keep running",
+                criteria: "Escalation filed",
+                write_scopes: ["a.txt"],
+                model: "fixture/fixture",
+              })) as { spawned: string };
+              workerId = spawned.spawned;
+              await releaseAll.promise;
+              return { text: "t1 done", stopReason: "completed" };
+            }
+            if (req.tier === 2) {
+              workerId = req.taskId;
+              req.onHandle?.({
+                steer: async (msg) => {
+                  workerSteers.push(msg);
+                  return true;
+                },
+                cancel: async () => releaseAll.resolve(),
+              });
+              const reported = (await req.executeTool("report_issue", {
+                severity: "P0",
+                category: "ambiguous_spec",
+                title: "Need storage choice",
+                evidence_paths: ["file.txt"],
+                blocking: false,
+              })) as { escalationId: string };
+              escalationFiled.resolve(reported.escalationId);
+              await releaseAll.promise;
+              return { text: "worker done", stopReason: "completed" };
+            }
+            if (req.tier === 3) {
+              probeHydrated.resolve(req.initialPrompt);
+              return { text: "probe done", stopReason: "completed" };
+            }
+            return { text: "ok", stopReason: "completed" };
+          },
+        }),
+      });
+
+      await daemon.start();
+      try {
+        const goal = daemon.director.goals.createGoal({
+          repoRoot,
+          title: "Live escalation delivery",
+          description: "Verify live steer delivery, bulk no-steer, and hydration",
+          criteria: [{ id: "c1", description: "Done", kind: "behavioral", required: true }],
+          verificationMode: "none",
+        });
+        await daemon.director.commitGoal(goal.id);
+        const escId = await escalationFiled.promise;
+        const runId = daemon.director.goals.getGoal(goal.id)!.linkedRunId!;
+        assert.equal(daemon.db.getTask(workerId)?.status, "running");
+
+        // 1. Resolve in DB and deliver -> both live Tier 1 and live raiser receive the steer.
+        const { escalation, transitioned } = daemon.db.tryResolveEscalation(escId, "Use SQLite for state", {
+          resolvedBy: "operator",
+        });
+        assert.equal(transitioned, true);
+
+        const delivered = await daemon.orchestrator.deliverEscalationResolution(escalation, {
+          resolvedBy: "operator",
+          resolution: "Use SQLite for state",
+        });
+        assert.deepEqual(delivered, [t1Id, workerId]);
+        assert.equal(t1Steers.length, 1);
+        assert.equal(workerSteers.length, 1);
+        const expectedText = `[ESCALATION RESOLVED: ${escId} by operator] P0/ambiguous_spec "Need storage choice": Use SQLite for state`;
+        assert.equal(t1Steers[0], expectedText);
+        assert.equal(workerSteers[0], expectedText);
+        assert.ok(!t1Steers[0]!.includes("resume_task"));
+
+        // 2. Bulk auto-resolve in DB produces no steer.
+        daemon.db.createEscalation({
+          runId,
+          fromTaskId: workerId,
+          toTaskId: null,
+          severity: "P0",
+          category: "ambiguous_spec",
+          title: "Bulk auto-closed issue",
+          evidencePaths: ["file.txt"],
+          blocking: false,
+        });
+        const bulkResolved = daemon.db.resolveOpenEscalationsForRun(runId, "Auto-resolved on settle", {
+          resolvedBy: "goal_settled",
+        });
+        assert.equal(bulkResolved.length, 1);
+        assert.equal(t1Steers.length, 1);
+        assert.equal(workerSteers.length, 1);
+
+        // 3. Hydration turn for a task in the run includes the resolved escalation and its answer.
+        await daemon.orchestrator.toolExecutor.execute(runId, t1Id, "spawn_task", {
+          kind: "research",
+          title: "Hydration check",
+          objective: "Inspect hydrated prompt",
+          criteria: "Prompt captured",
+          model: "fixture/fixture",
+        });
+        const hydratedPrompt = await probeHydrated.promise;
+        assert.ok(
+          hydratedPrompt.includes("## Recently resolved escalations (human or Director answers)"),
+          hydratedPrompt,
+        );
+        assert.ok(hydratedPrompt.includes(escId), hydratedPrompt);
+        assert.ok(hydratedPrompt.includes("Need storage choice"), hydratedPrompt);
+        assert.ok(hydratedPrompt.includes("Use SQLite for state"), hydratedPrompt);
+      } finally {
+        releaseAll.resolve();
+        await daemon.stop();
+      }
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("steers only Tier 1 with a resume_task hint when the raiser is blocked", async () => {
+    const repoRoot = await makeTempRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-g25-blocked-"));
+    const sockPath = join(stateDir, "d.sock");
+    try {
+      const baseCfg = loadConfig(repoRoot);
+      const config = withFixtureCatalog({
+        ...baseCfg,
+        codeMode: "off",
+        goals: { ...baseCfg.goals, autoVerifyOnSettle: false },
+        stateDir,
+        socketPath: sockPath,
+      });
+
+      let t1Id = "";
+      let workerId = "";
+      const t1Steers: string[] = [];
+      const workerSteers: string[] = [];
+      const escalationFiled = Promise.withResolvers<string>();
+      const releaseT1 = Promise.withResolvers<void>();
+      const releaseWorker = Promise.withResolvers<void>();
+
+      const daemon = new HarnessDaemon(config, {
+        dbPath: ":memory:",
+        customRunnerFactory: () => ({
+          run: async (req) => {
+            if (req.tier === 1) {
+              t1Id = req.taskId;
+              req.onHandle?.({
+                steer: async (msg) => {
+                  t1Steers.push(msg);
+                  return true;
+                },
+                cancel: async () => releaseT1.resolve(),
+              });
+              const spawned = (await req.executeTool("spawn_worker", {
+                title: "Blocking raiser",
+                objective: "File blocking escalation",
+                criteria: "Blocked on escalation",
+                write_scopes: ["b.txt"],
+                model: "fixture/fixture",
+              })) as { spawned: string };
+              workerId = spawned.spawned;
+              await releaseT1.promise;
+              return { text: "t1 done", stopReason: "completed" };
+            }
+            if (req.tier === 2) {
+              workerId = req.taskId;
+              req.onHandle?.({
+                steer: async (msg) => {
+                  workerSteers.push(msg);
+                  return true;
+                },
+                cancel: async () => releaseWorker.resolve(),
+              });
+              const reported = (await req.executeTool("report_issue", {
+                severity: "P1",
+                category: "code_defect",
+                title: "Broken schema",
+                evidence_paths: ["file.txt"],
+                blocking: true,
+              })) as { escalationId: string };
+              escalationFiled.resolve(reported.escalationId);
+              await releaseWorker.promise;
+              return { text: "worker blocked", stopReason: "cancelled" };
+            }
+            return { text: "ok", stopReason: "completed" };
+          },
+        }),
+      });
+
+      await daemon.start();
+      try {
+        const goal = daemon.director.goals.createGoal({
+          repoRoot,
+          title: "Blocked raiser escalation delivery",
+          description: "Verify Tier 1 gets resume_task hint and blocked raiser is not steered or resumed",
+          criteria: [{ id: "c1", description: "Done", kind: "behavioral", required: true }],
+          verificationMode: "none",
+        });
+        await daemon.director.commitGoal(goal.id);
+        const escId = await escalationFiled.promise;
+        await waitFor(() => daemon.db.getTask(workerId)?.status === "blocked");
+
+        const { escalation, transitioned } = daemon.db.tryResolveEscalation(escId, "Apply migration v2", {
+          resolvedBy: "director",
+        });
+        assert.equal(transitioned, true);
+
+        const delivered = await daemon.orchestrator.deliverEscalationResolution(escalation, {
+          resolvedBy: "director",
+          resolution: "Apply migration v2",
+        });
+        assert.deepEqual(delivered, [t1Id]);
+        assert.equal(workerSteers.length, 0);
+        assert.equal(t1Steers.length, 1);
+        assert.ok(
+          t1Steers[0]!.includes(`[ESCALATION RESOLVED: ${escId} by director] P1/code_defect "Broken schema": Apply migration v2`),
+          t1Steers[0],
+        );
+        assert.ok(
+          t1Steers[0]!.includes(`Raiser ${workerId} is blocked; use resume_task if the answer unblocks it.`),
+          t1Steers[0],
+        );
+        // Inform, don't block: no auto-resume.
+        assert.equal(daemon.db.getTask(workerId)?.status, "blocked");
+      } finally {
+        releaseWorker.resolve();
+        releaseT1.resolve();
+        await daemon.stop();
+      }
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+});
