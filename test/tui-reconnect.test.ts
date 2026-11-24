@@ -153,7 +153,9 @@ describe("TUI auto-reconnect after daemon restart", () => {
       controllerTerm.typeText("q1");
       controllerTerm.sendInput("\r");
       await waitFor(
-        () => controllerTerm.text().includes("Queued until harnessd reconnects"),
+        () =>
+          controllerTerm.text().includes("sends when harnessd reconnects") &&
+          controllerTerm.text().includes("q1"),
         4000,
         "q1 queued while offline",
       );

@@ -6,7 +6,9 @@ import {
   matchesKey,
   type TUI,
 } from "@earendil-works/pi-tui";
+import { type ChatQueueItem, formatQueueItemState } from "../chat-queue.js";
 import type { ToolDisplayPayload } from "../tool-output/index.js";
+import { firstLine } from "./format.js";
 import { type EntityRef, type Hint, renderHintBar } from "./keymap.js";
 import { clamp, fillLineBg, fit, middleEllipsis, sanitizeLine, sanitizeText, splitRow, visibleWidth, wrap } from "./text.js";
 import { statusGlyph, statusTone, type Theme, type Tone } from "./tokens.js";
@@ -94,9 +96,30 @@ function renderTimestampDivider(label: string, width: number, theme: Theme): str
 }
 
 /**
+ * Strips an already-frozen text prefix from a full assistant turn string.
+ * Returns `{ matched: true, remainder }` when `fullText` begins with `frozenText` (exact or trimmed),
+ * or `{ matched: false, remainder: "" }` when `fullText` does not begin with `frozenText`.
+ */
+export function stripFrozenPrefix(fullText: string, frozenText: string): { matched: boolean; remainder: string } {
+  if (!frozenText) return { matched: false, remainder: fullText };
+  if (fullText.startsWith(frozenText)) {
+    return { matched: true, remainder: fullText.slice(frozenText.length) };
+  }
+  const trimmedFrozen = frozenText.trim();
+  if (trimmedFrozen.length > 0) {
+    const trimmedFullStart = fullText.trimStart();
+    if (trimmedFullStart.startsWith(trimmedFrozen)) {
+      return { matched: true, remainder: trimmedFullStart.slice(trimmedFrozen.length) };
+    }
+  }
+  return { matched: false, remainder: "" };
+}
+
+/**
  * Strictly-bottom-only streaming tail for the active assistant turn.
  * Renders only while a turn is live; when the turn finishes, its final content is frozen into
- * `ImmutableTranscript` and this tail resets to empty.
+ * `ImmutableTranscript` and this tail resets to empty. Also records any text already frozen
+ * mid-turn so settlement and reconnect resync never render the same reply twice.
  */
 export class LiveTurnTail implements Component {
   private text = "";
@@ -106,6 +129,8 @@ export class LiveTurnTail implements Component {
   private modelLabel: string | undefined;
   private textTimestampMs: number | null = null;
   private activityTimestampMs: number | null = null;
+  private frozenText = "";
+  private frozenSegmentCount = 0;
 
   constructor(
     private readonly theme: Theme,
@@ -120,6 +145,34 @@ export class LiveTurnTail implements Component {
     this.modelLabel = modelLabel;
     this.textTimestampMs = null;
     this.activityTimestampMs = null;
+    this.frozenText = "";
+    this.frozenSegmentCount = 0;
+  }
+
+  /**
+   * Resets the streaming tail on reconnect while optionally preserving already-frozen text
+   * from the same in-flight turn so previously rendered segments are stripped from `seedText`.
+   */
+  reseed(seedText: string, modelLabel?: string, preserveFrozen = false): void {
+    const prevFrozen = preserveFrozen ? this.frozenText : "";
+    const prevCount = preserveFrozen ? this.frozenSegmentCount : 0;
+    this.active = true;
+    this.text = "";
+    this.thought = "";
+    this.tools = [];
+    this.modelLabel = modelLabel;
+    this.textTimestampMs = null;
+    this.activityTimestampMs = null;
+    this.frozenText = prevFrozen;
+    this.frozenSegmentCount = prevCount;
+    if (seedText) {
+      if (this.frozenSegmentCount > 0) {
+        const stripped = stripFrozenPrefix(seedText, this.frozenText);
+        this.text = stripped.matched ? stripped.remainder : seedText;
+      } else {
+        this.text = seedText;
+      }
+    }
   }
 
   appendText(delta: string, timestampMs?: number | null): void {
@@ -147,13 +200,23 @@ export class LiveTurnTail implements Component {
     if (ts !== null) this.activityTimestampMs = ts;
   }
 
-  snapshot(): { text: string; thought: string; tools: LiveToolPill[]; modelLabel?: string; textTimestampMs: number | null } {
+  snapshot(): {
+    text: string;
+    thought: string;
+    tools: LiveToolPill[];
+    modelLabel?: string;
+    textTimestampMs: number | null;
+    frozenText: string;
+    frozenSegmentCount: number;
+  } {
     return {
       text: this.text,
       thought: this.thought,
       tools: [...this.tools],
       modelLabel: this.modelLabel,
       textTimestampMs: this.textTimestampMs,
+      frozenText: this.frozenText,
+      frozenSegmentCount: this.frozenSegmentCount,
     };
   }
 
@@ -165,6 +228,8 @@ export class LiveTurnTail implements Component {
     this.modelLabel = undefined;
     this.textTimestampMs = null;
     this.activityTimestampMs = null;
+    this.frozenText = "";
+    this.frozenSegmentCount = 0;
   }
 
   get isActive(): boolean {
@@ -218,7 +283,7 @@ export class LiveTurnTail implements Component {
     return out;
   }
 
-  /** Consumes and returns accumulated live text (preserving active state/tools/model when no text was taken). */
+  /** Consumes and returns accumulated live text, recording any non-empty frozen segment on the tail. */
   takeText(): { text: string; modelLabel: string; timestampMs: number | null } {
     const text = this.text;
     const hasText = Boolean(text.trim());
@@ -226,7 +291,11 @@ export class LiveTurnTail implements Component {
     const timestampMs = this.textTimestampMs;
     this.text = "";
     this.thought = "";
-    if (hasText) this.modelLabel = undefined;
+    if (hasText) {
+      this.modelLabel = undefined;
+      this.frozenText += text;
+      this.frozenSegmentCount += 1;
+    }
     this.textTimestampMs = null;
     this.activityTimestampMs = null;
     return { text, modelLabel, timestampMs };
@@ -235,12 +304,29 @@ export class LiveTurnTail implements Component {
   invalidate(): void {}
 }
 
+export interface AppendReceiptOptions {
+  glyph?: string;
+  tone?: Tone;
+  tag?: string;
+  text: string;
+  ref?: EntityRef;
+  timestampMs?: number | null;
+  /**
+   * Controls interaction with an active streaming live turn:
+   * - `"immediate"` (default): appends without freezing live text.
+   * - `"passive"`: held until the live turn settles so passive events never split or shift an in-flight reply.
+   * - `"freeze"`: freezes live text first so turn-ordered receipts stay in exact chronological position.
+   */
+  mode?: "immediate" | "passive" | "freeze";
+}
+
 /**
  * Append-only transcript container. Every committed turn, tool-output card, and receipt is immutable.
  */
 export class ImmutableTranscript extends Container {
   readonly liveTail: LiveTurnTail;
   private readonly frozenContainer = new Container();
+  private readonly heldPassiveReceipts: AppendReceiptOptions[] = [];
   private lastTimestampMs: number | null = null;
 
   constructor(private readonly theme: Theme) {
@@ -319,8 +405,18 @@ export class ImmutableTranscript extends Container {
     this.frozenContainer.addChild(new FrozenBlock((w) => renderTranscriptBlock(block, w, t, "expanded")));
   }
 
+  /** Starts a new live assistant turn, resetting frozen-text tracking for the turn. */
+  beginLiveTurn(modelLabel?: string): void {
+    this.liveTail.begin(modelLabel);
+  }
+
+  /** Reseeds the live turn on reconnect, preserving already-frozen text when staying on the same turn. */
+  resyncLiveTurn(opts: { modelLabel?: string; seedText?: string; preserveFrozen?: boolean }): void {
+    this.liveTail.reseed(opts.seedText ?? "", opts.modelLabel, opts.preserveFrozen ?? false);
+  }
+
   /**
-   * Freezes any streamed live text into an immutable AssistantCard before appending a mid-turn card or receipt,
+   * Freezes any streamed live text into an immutable AssistantCard before appending a mid-turn card or steer,
    * preserving exact chronological order and avoiding scrollback wipes.
    */
   freezeLiveText(fallbackTimestampMs?: number | null): boolean {
@@ -329,6 +425,57 @@ export class ImmutableTranscript extends Container {
     if (!text.trim()) return false;
     this.appendAssistantTurn(text, modelLabel || undefined, timestampMs ?? fallbackTimestampMs);
     return true;
+  }
+
+  /**
+   * Settles the active live turn using the daemon's final reply text.
+   * Appends only the portion not already frozen during this turn (finalText minus the already-frozen prefix,
+   * or only what remains in the live tail when finalText does not begin with the frozen prefix).
+   */
+  settleLiveTurn(opts?: {
+    finalText?: string;
+    modelLabel?: string;
+    timestampMs?: number | null;
+    discardLiveText?: boolean;
+    flushHeld?: boolean;
+  }): { tools: LiveToolPill[]; appendedText: string; textTimestampMs: number | null } {
+    const snap = this.liveTail.snapshot();
+    let toAppend = "";
+    if (!opts?.discardLiveText) {
+      if (snap.frozenSegmentCount === 0) {
+        toAppend = opts?.finalText ?? snap.text;
+      } else if (typeof opts?.finalText === "string") {
+        const stripped = stripFrozenPrefix(opts.finalText, snap.frozenText);
+        toAppend = stripped.matched ? stripped.remainder : snap.text;
+      } else {
+        toAppend = snap.text;
+      }
+    }
+
+    this.liveTail.clear();
+
+    const assistantTs = snap.textTimestampMs ?? opts?.timestampMs;
+    if (toAppend.trim()) {
+      this.appendAssistantTurn(toAppend, snap.modelLabel ?? opts?.modelLabel, assistantTs);
+    }
+
+    if (opts?.flushHeld !== false) {
+      this.flushHeldReceipts();
+    }
+
+    return {
+      tools: snap.tools,
+      appendedText: toAppend,
+      textTimestampMs: snap.textTimestampMs,
+    };
+  }
+
+  /** Flushes passive receipts that were held while an assistant turn was streaming. */
+  flushHeldReceipts(): void {
+    if (this.heldPassiveReceipts.length === 0) return;
+    for (const receipt of this.heldPassiveReceipts.splice(0)) {
+      this.appendReceiptBlock(receipt);
+    }
   }
 
   /**
@@ -351,21 +498,20 @@ export class ImmutableTranscript extends Container {
     this.frozenContainer.addChild(new FrozenBlock((w) => renderTranscriptBlock(block, w, t)));
   }
 
-  /**
-   * Appends a single-line immutable receipt for an event, tool summary, or entity notification.
-   * Never mutates later; users open full details in the Inspector via `Ctrl+X` or `Ctrl+G`.
-   */
-  appendReceipt(opts: {
-    glyph?: string;
-    tone?: Tone;
-    tag?: string;
-    text: string;
-    ref?: EntityRef;
-    timestampMs?: number | null;
-  }): void {
-    this.freezeLiveText(opts.timestampMs);
+  private appendReceiptBlock(opts: AppendReceiptOptions): void {
     this.maybeAppendTimestampDivider(opts.timestampMs);
     const t = this.theme;
+    const g = t.glyphs;
+    if (opts.tone === "dim") {
+      const glyph = opts.glyph ?? g.bullet;
+      const cleanText = sanitizeLine(opts.text);
+      const tagPart = opts.tag ? `[${sanitizeLine(opts.tag)}] ` : "";
+      const hintPart = opts.ref ? t.dim("  (Ctrl+X inspect)") : "";
+      this.frozenContainer.addChild(
+        new FrozenBlock((w) => [splitRow(`  ${t.dim(`${glyph} ${tagPart}${cleanText}`)}`, hintPart, w)]),
+      );
+      return;
+    }
     const block: TranscriptBlock = {
       kind: "receipt",
       glyph: opts.glyph,
@@ -377,9 +523,25 @@ export class ImmutableTranscript extends Container {
     this.frozenContainer.addChild(new FrozenBlock((w) => renderTranscriptBlock(block, w, t)));
   }
 
+  /**
+   * Appends a single-line immutable receipt for an event, tool summary, or entity notification.
+   * Never mutates later; users open full details in the Inspector via `Ctrl+X` or `Ctrl+G`.
+   */
+  appendReceipt(opts: AppendReceiptOptions): void {
+    if (opts.mode === "passive" && this.liveTail.isActive) {
+      this.heldPassiveReceipts.push({ ...opts });
+      return;
+    }
+    if (opts.mode === "freeze") {
+      this.freezeLiveText(opts.timestampMs);
+    }
+    this.appendReceiptBlock(opts);
+  }
+
   clearAll(): void {
     this.frozenContainer.clear();
     this.liveTail.clear();
+    this.heldPassiveReceipts.length = 0;
     this.lastTimestampMs = null;
   }
 }
@@ -447,6 +609,8 @@ export interface DockState {
   transientHint?: string | null;
   rightStatus: string;
   queuedCount: number;
+  /** Pinned pending/sending user messages rendered directly above the composer. */
+  queuedItems?: readonly ChatQueueItem[];
   /** Bottom hint strip (always 1 line). */
   hints: Hint[];
 }
@@ -786,6 +950,55 @@ export class FixedDock implements Component {
     return compose(left);
   }
 
+  private queueStripCap(): number {
+    const rows = this.tuiRef.terminal?.rows ?? 30;
+    if (rows < 18) return 1;
+    if (rows < 24) return 3;
+    return 5;
+  }
+
+  private renderQueueStripRows(width: number): string[] {
+    const items = this.state.queuedItems;
+    if (!items || items.length === 0) return [];
+    const t = this.theme;
+    const g = t.glyphs;
+    const cap = this.queueStripCap();
+    const shown = items.slice(0, cap);
+    const hidden = Math.max(0, items.length - shown.length);
+    const keyHint = width >= 72 ? `${t.dim("Ctrl+R edit · Alt+Q drop")} ` : width >= 48 ? `${t.dim("Ctrl+R · Alt+Q")} ` : "";
+    const out: string[] = [];
+
+    for (let i = 0; i < shown.length; i += 1) {
+      const item = shown[i]!;
+      const glyph = item.state === "sending" ? g.running : g.ascii ? "~" : "⧗";
+      const tone: Tone = item.state === "sending" ? "accent" : "warn";
+      const statusText = formatQueueItemState(item);
+      const preview = firstLine(sanitizeLine(item.text), Math.max(20, width));
+      const prefix = ` ${t.paint(tone, `${glyph} ${i + 1} ${statusText}`)} ${t.dim(g.sep)} `;
+      const isLastRow = i === shown.length - 1 && hidden === 0;
+      const right = isLastRow ? keyHint : "";
+      if (right) {
+        const prefixW = visibleWidth(prefix);
+        const rightW = visibleWidth(right);
+        const availForPreview = width - prefixW - rightW - 2;
+        if (availForPreview >= 16) {
+          const left = `${prefix}${clamp(preview, availForPreview)}`;
+          out.push(splitRow(left, right, width));
+          continue;
+        }
+      }
+      out.push(fit(`${prefix}${preview}`, width));
+    }
+
+    if (hidden > 0) {
+      const left = `  ${t.muted(`+${hidden} more queued`)}`;
+      const right = keyHint || `${t.dim("/drop")} `;
+      out.push(visibleWidth(left) + 2 + visibleWidth(right) <= width ? splitRow(left, right, width) : fit(left, width));
+    }
+
+    return out;
+  }
+
   private lastRenderedHeight = 9;
 
   /** Last rendered row count of the FixedDock (used to anchor floating slash-autocomplete above the dock). */
@@ -796,11 +1009,13 @@ export class FixedDock implements Component {
   render(width: number): string[] {
     const w = Math.max(12, Math.floor(width));
     const hudRows = this.renderHudRows(w, this.hudRowCount());
+    const queueRows = this.renderQueueStripRows(w);
     const lines: string[] = [
       this.theme.border(this.theme.glyphs.barH.repeat(w)),
       ...hudRows,
       this.renderAgentCountsRow(w),
       this.renderStatusRow(w),
+      ...queueRows,
       ...this.editor.render(w).map((l) => clamp(l, w)),
       fit(` ${renderHintBar(this.state.hints, Math.max(1, w - 2), this.theme)}`, w),
     ];
