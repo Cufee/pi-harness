@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -93,12 +94,13 @@ export interface GoalCriterion {
   kind: CriterionKind;
   /**
    * Runnable shell command for `deterministic` criteria (executed at $0 LLM cost).
-   * Runs in a detached `_verify` git worktree that the harness creates and removes. Checks out `verifyRef` when set,
+   * Runs in a detached `_verify` git worktree that the harness creates and cleans up. Checks out `verifyRef` when set,
    * otherwise the linked run's base branch (preferring the run's recorded merge commit when applicable); without a run
-   * or base branch, runs in the primary checkout (`goal.repoRoot`), and results say so. The primary checkout is never
-   * modified. Receives `HARNESS_REPO_ROOT` (primary checkout path), `HARNESS_VERIFY_REF`, `HARNESS_VERIFY_SHA`,
-   * `HARNESS_GOAL_ID`, and `HARNESS_GOAL_EVIDENCE_DIR` (when the evidence directory is valid). Each gate result records
-   * the `cwd`, `ref`, and `sha` it ran at (`CriterionEvaluation.gate`).
+   * or resolvable base branch, commands run in the primary checkout (`goal.repoRoot`), and results say so; the harness
+   * never switches the primary checkout's branch or modifies it itself. Receives `HARNESS_REPO_ROOT` (primary checkout
+   * path), `HARNESS_VERIFY_REF`, `HARNESS_VERIFY_SHA`, `HARNESS_GOAL_ID`, and `HARNESS_GOAL_EVIDENCE_DIR` (when the
+   * evidence directory is valid). Each gate result records the `cwd`, `ref`, and `sha` it ran at
+   * (`CriterionEvaluation.gate`).
    */
   command?: string;
   required: boolean;
@@ -108,6 +110,49 @@ export interface GoalCriterion {
 export type GoalCriterionPatch = Partial<Omit<GoalCriterion, "id">> & { id: string };
 
 const CRITERION_KINDS: readonly CriterionKind[] = ["deterministic", "behavioral", "architectural"];
+const HEX_SHA_RE = /^[0-9a-fA-F]{4,64}$/;
+
+/**
+ * Validates a single-ref `verify_ref` value (branch, tag, `origin/<ref>`, or hex SHA).
+ * Rejects destination-bearing refspecs (`:`), whitespace, leading `-`/`+` (including after `origin/`),
+ * and names failing `git check-ref-format --allow-onelevel`. Returns `null` for empty/null input.
+ */
+export function validateVerifyRef(raw: string | null | undefined): string | null {
+  if (raw === null || raw === undefined || raw === "") return null;
+  if (typeof raw !== "string") {
+    throw new Error("Invalid verify_ref: expected a string or null.");
+  }
+  if (raw.includes("\0") || /\s/.test(raw)) {
+    throw new Error(`Invalid verify_ref '${raw}': must not contain whitespace.`);
+  }
+  if (raw.includes(":")) {
+    throw new Error(`Invalid verify_ref '${raw}': must not contain ':' (destination refspecs are not allowed).`);
+  }
+  if (raw.startsWith("-") || raw.startsWith("+")) {
+    throw new Error(`Invalid verify_ref '${raw}': must not start with '-' or '+'.`);
+  }
+  if (raw.startsWith("origin/")) {
+    const remoteRef = raw.slice("origin/".length);
+    if (!remoteRef) {
+      throw new Error(`Invalid verify_ref '${raw}': missing ref name after 'origin/'.`);
+    }
+    if (remoteRef.startsWith("-") || remoteRef.startsWith("+")) {
+      throw new Error(`Invalid verify_ref '${raw}': ref after 'origin/' must not start with '-' or '+'.`);
+    }
+  }
+  if (HEX_SHA_RE.test(raw)) return raw;
+  const check = spawnSync("git", ["check-ref-format", "--allow-onelevel", raw], {
+    encoding: "utf8",
+    timeout: 5_000,
+  });
+  if (check.error) {
+    throw new Error(`Invalid verify_ref '${raw}': failed to validate ref format (${check.error.message}).`);
+  }
+  if (check.status !== 0) {
+    throw new Error(`Invalid verify_ref '${raw}': not a valid git ref name or commit SHA.`);
+  }
+  return raw;
+}
 
 /** Validates untrusted criterion patches (tool or RPC input), dropping unknown keys. */
 export function parseGoalCriterionPatches(raw: unknown, field = "updateCriteria"): GoalCriterionPatch[] | undefined {
@@ -559,7 +604,7 @@ export class GoalEngine {
       maxWallClockMin: input.budgets?.maxWallClockMin,
       maxApiEquivUsd: input.budgets?.maxApiEquivUsd,
     };
-    const verifyRef = typeof input.verifyRef === "string" && input.verifyRef.trim() ? input.verifyRef.trim() : null;
+    const verifyRef = validateVerifyRef(input.verifyRef);
 
     this.db
       .prepare(
@@ -740,10 +785,13 @@ export class GoalEngine {
     const g = this.getGoal(goalIdStr);
     if (!g) throw new Error(`Unknown goal ${goalIdStr}`);
     if (g.status === "cancelled") throw new Error("Cannot amend a cancelled goal");
-    const normalized = typeof ref === "string" && ref.trim() ? ref.trim() : null;
+    const normalized = validateVerifyRef(ref);
     this.db
       .prepare("UPDATE goals SET verify_ref = ?, updated_at = ? WHERE id = ?")
       .run(normalized, Date.now(), g.id);
+    if (normalized !== g.verifyRef) {
+      this.onReviewInvalidated?.(g.id);
+    }
     return this.getGoal(g.id)!;
   }
 

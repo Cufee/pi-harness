@@ -976,6 +976,7 @@ it("goal_get shows task goalVersion and staleGoalVersion", async () => {
 
 it("verifies deterministic gates at verify_ref without touching primary checkout, reports GateLocation, handles remote-only/unknown refs, and supports metadata-only goal_amend verify_ref", async () => {
   const repoRoot = await makeTempRepo();
+  const originDir = mkdtempSync(join(tmpdir(), "pi-harness-verify-origin-"));
   const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-verify-ref-state-"));
   const sockPath = join(stateDir, "d.sock");
   try {
@@ -986,6 +987,10 @@ it("verifies deterministic gates at verify_ref without touching primary checkout
     await runGit(repoRoot, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "feat: branch work"]);
     const featureSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout;
     await runGit(repoRoot, ["checkout", "main"]);
+    await runGit(originDir, ["init", "--bare", "-b", "main"]);
+    await runGit(repoRoot, ["remote", "add", "origin", originDir]);
+    await runGit(repoRoot, ["push", "origin", "main"]);
+    await runGit(repoRoot, ["push", "origin", `${featureSha}:refs/tags/v1.0-remote`]);
 
     const baseCfg = loadConfig(repoRoot);
     const config = withFixtureCatalog({
@@ -1029,6 +1034,24 @@ it("verifies deterministic gates at verify_ref without touching primary checkout
         assert.ok(createTool?.description.includes("HARNESS_VERIFY_REF"));
         assert.ok(createTool?.description.includes("HARNESS_VERIFY_SHA"));
         assert.ok(createTool?.description.includes("criteriaResults[].gate"));
+        assert.equal(createTool?.description.includes("The primary checkout is never modified."), false);
+        assert.ok(createTool?.description.includes("primary checkout"));
+
+        // Invalid verify_ref values (destination refspecs, leading -/+, whitespace, bad ref format) are rejected.
+        for (const badRef of ["a:b", "+x:refs/heads/main", "-foo", "+main", "foo bar", "foo..bar", "origin/-x", "origin/+x"]) {
+          await assert.rejects(
+            () =>
+              executeTool("goal_create", {
+                title: "Bad verify_ref",
+                description: "Should fail validation",
+                verify_ref: badRef,
+                verification_mode: "deterministic",
+                criteria: [{ id: "c1", description: "t", kind: "deterministic", command: "true", required: true }],
+              }),
+            /Invalid verify_ref/,
+            `expected goal_create to reject '${badRef}'`,
+          );
+        }
 
         gFeature = (await executeTool("goal_create", {
           title: "Verify feature branch",
@@ -1154,7 +1177,120 @@ it("verifies deterministic gates at verify_ref without touching primary checkout
       assert.equal(clearRes.goal.status, beforeClear.status);
       assert.equal(clearRes.goal.verifyRef, null);
 
-      // Unknown verify_ref fails closed with "does not resolve" and parks awaiting_human.
+      // Invalid verify_ref on goal_amend (metadata-only or mixed) is rejected without bumping version.
+      const beforeBadAmend = daemon.director.goals.getGoal(gControl.id)!;
+      nextChatAction = async (executeTool) => {
+        await assert.rejects(
+          () =>
+            executeTool("goal_amend", {
+              goal_id: gControl.id,
+              rationale: "Bad refspec",
+              verify_ref: "+x:refs/heads/main",
+            }),
+          /Invalid verify_ref/,
+        );
+        await assert.rejects(
+          () =>
+            executeTool("goal_amend", {
+              goal_id: gControl.id,
+              rationale: "Mixed amend with bad refspec",
+              append_description: "Should not apply",
+              verify_ref: "a:b",
+            }),
+          /Invalid verify_ref/,
+        );
+      };
+      await daemon.director.sendChatMessage(chat.id, "reject bad verify_ref on amend");
+      assert.equal(daemon.director.goals.getGoal(gControl.id)!.version, beforeBadAmend.version);
+
+      // Remote-only tag fetched via source-only `git fetch --no-tags origin -- <ref>` resolves from FETCH_HEAD
+      // without creating refs/heads/* or local tags or touching HEAD/index.
+      const headsBeforeFetch = (await runGit(repoRoot, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"])).stdout;
+      const gRemoteTag = daemon.director.goals.createGoal({
+        chatSessionId: chat.id,
+        repoRoot,
+        title: "Verify remote tag via FETCH_HEAD",
+        description: "Fetches tag with --no-tags and resolves via FETCH_HEAD",
+        verifyRef: "v1.0-remote",
+        verificationMode: "deterministic",
+        criteria: [
+          {
+            id: "c1",
+            description: "only-on-feature.txt exists at tag commit",
+            kind: "deterministic",
+            command: 'test -f only-on-feature.txt && test "$(git rev-parse HEAD)" = "$HARNESS_VERIFY_SHA"',
+            required: true,
+          },
+        ],
+      });
+      const remoteTagRes = await daemon.director.verifyAndReviewGoal(gRemoteTag.id);
+      assert.equal(remoteTagRes.review.verdict, "approved");
+      const remoteTagGate = remoteTagRes.review.criteriaResults[0]?.gate;
+      assert.equal(remoteTagGate?.ref, "v1.0-remote");
+      assert.equal(remoteTagGate?.sha, featureSha);
+      assert.equal(remoteTagGate?.isolated, true);
+      assert.equal(remoteTagGate?.source, "verify_ref");
+      assert.equal(
+        (await runGit(repoRoot, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"])).stdout,
+        headsBeforeFetch,
+        "fetch must not write refs/heads/*",
+      );
+      assert.equal(
+        await runGit(repoRoot, ["rev-parse", "--verify", "refs/tags/v1.0-remote"]).then(() => true).catch(() => false),
+        false,
+        "fetch --no-tags must not write local tags",
+      );
+      assert.equal((await runGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])).stdout, "main");
+      assert.equal((await runGit(repoRoot, ["status", "--porcelain"])).stdout, "");
+
+      // Changing verify_ref mid-review invalidates the in-flight review so gates from the old ref cannot approve.
+      const markerPath = join(stateDir, "inflight-gate-started");
+      const releasePath = join(stateDir, "inflight-gate-release");
+      const gInFlight = daemon.director.goals.createGoal({
+        chatSessionId: chat.id,
+        repoRoot,
+        title: "Stale verify_ref in flight",
+        description: "Changing verify_ref during review must prevent approval from old ref",
+        verifyRef: "feature",
+        verificationMode: "deterministic",
+        criteria: [
+          {
+            id: "c1",
+            description: "only-on-feature.txt exists after barrier",
+            kind: "deterministic",
+            command: `touch "${markerPath}" && i=0; while [ ! -f "${releasePath}" ] && [ "$i" -lt 250 ]; do sleep 0.02; i=$((i+1)); done; test -f only-on-feature.txt`,
+            required: true,
+          },
+        ],
+      });
+      daemon.director.goals.setStatus(gInFlight.id, "executing");
+      const inflightReview = daemon.director.verifyAndReviewGoal(gInFlight.id);
+      const waitDeadline = Date.now() + 5_000;
+      while (!existsSync(markerPath) && Date.now() < waitDeadline) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      assert.equal(existsSync(markerPath), true, "expected in-flight gate to start");
+      let midAmendRes!: { goal: GoalRecord; metadataOnly?: boolean };
+      nextChatAction = async (executeTool) => {
+        midAmendRes = (await executeTool("goal_amend", {
+          goal_id: gInFlight.id,
+          rationale: "Switch verify_ref to main while review is in flight",
+          verify_ref: "main",
+        })) as { goal: GoalRecord; metadataOnly?: boolean };
+      };
+      await daemon.director.sendChatMessage(chat.id, "switch verify_ref mid-review");
+      writeFileSync(releasePath, "go\n", "utf8");
+      await assert.rejects(() => inflightReview);
+      assert.equal(midAmendRes.metadataOnly, true);
+      assert.equal(midAmendRes.goal.version, gInFlight.version, "mid-review verify_ref change must not bump version");
+      const afterAbort = daemon.director.goals.getGoal(gInFlight.id)!;
+      assert.equal(afterAbort.status, "executing", "aborted old-ref review must neither approve nor strand verifying status");
+      assert.equal(afterAbort.verifyRef, "main");
+      const freshMainReview = await daemon.director.verifyAndReviewGoal(gInFlight.id);
+      assert.equal(freshMainReview.review.verdict, "changes_requested");
+      assert.equal(freshMainReview.review.criteriaResults[0]?.gate?.ref, "main");
+
+      // Unknown verify_ref fails closed with "does not resolve" (even after a prior FETCH_HEAD exists) and parks awaiting_human.
       const gUnknown = daemon.director.goals.createGoal({
         chatSessionId: chat.id,
         repoRoot,
@@ -1174,6 +1310,7 @@ it("verifies deterministic gates at verify_ref without touching primary checkout
     }
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(originDir, { recursive: true, force: true });
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
@@ -1214,12 +1351,24 @@ it("reports Blocked on verification settlement wording when a failed run's worke
             await req.executeTool("wait_children", { ids: [spawned.spawned], timeout_s: 10 });
             return { text: "orchestrator failed after worker finished", stopReason: "error" };
           }
-          await req.executeTool("return_task", {
-            status: "completed",
-            summary: "Committed on separate branch",
-            sources: [],
-          });
-          return { text: "worker completed", stopReason: "completed" };
+          if (req.tier === 2) {
+            // Spawn a Tier 3 read-only execute child that fails; it must not affect Tier 2 worker completion count.
+            const child = (await req.executeTool("spawn_task", {
+              kind: "execute",
+              read_only: true,
+              title: "Tier 3 execute helper",
+              objective: "Fail as a Tier 3 child",
+              model: "fixture/fixture",
+            })) as { spawned: string };
+            await req.executeTool("wait_children", { ids: [child.spawned], timeout_s: 10 });
+            await req.executeTool("return_task", {
+              status: "completed",
+              summary: "Committed on separate branch",
+              sources: [],
+            });
+            return { text: "worker completed", stopReason: "completed" };
+          }
+          return { text: "tier 3 execute child failed", stopReason: "error" };
         },
       }),
     });
@@ -1256,6 +1405,11 @@ it("reports Blocked on verification settlement wording when a failed run's worke
       const finalGoal = daemon.director.goals.getGoal(goal.id)!;
       const sha7 = mainSha.slice(0, 7);
 
+      const runTasks = daemon.db.listTasks(finalGoal.linkedRunId!);
+      assert.ok(
+        runTasks.some((t) => t.tier === 3 && t.kind === "execute" && t.readOnly && t.status === "failed"),
+        "expected failed Tier 3 execute child task to exist and be excluded from worker count",
+      );
       assert.equal(finalGoal.status, "awaiting_human");
       assert.ok(
         finalGoal.lastReviewSummary?.startsWith("Blocked on verification:"),
@@ -1264,6 +1418,15 @@ it("reports Blocked on verification settlement wording when a failed run's worke
       assert.ok(
         finalGoal.lastReviewSummary?.includes(`main@${sha7}`),
         `expected main@${sha7}, got: ${finalGoal.lastReviewSummary}`,
+      );
+      assert.ok(
+        finalGoal.lastReviewSummary?.includes("/_verify/"),
+        `expected actual _verify cwd in summary, got: ${finalGoal.lastReviewSummary}`,
+      );
+      assert.equal(
+        finalGoal.lastReviewSummary?.includes("removed"),
+        false,
+        `must not claim worktree was removed in summary: ${finalGoal.lastReviewSummary}`,
       );
       assert.ok(
         finalGoal.lastReviewSummary?.includes("All 1 worker task(s) completed"),
