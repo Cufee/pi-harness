@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { HarnessRejection, REJECTIONS } from "../advisories/rejections.js";
 import { writeUniqueFile } from "../control-plane/ids.js";
 import { toolEventPreview } from "../protocol/tool-display.js";
 import type { ToolDefinition } from "../runners/types.js";
@@ -36,6 +37,10 @@ export interface CodeExecResult {
 
 export function timeoutMs(ms: number | undefined, max = 1_800_000): number {
   return Math.max(1, Math.min(Number.isFinite(ms) ? ms! : 300_000, max, 1_800_000));
+}
+
+export function codeExecTimeoutError(ms: number | undefined): HarnessRejection {
+  return REJECTIONS.codeExecTimeout(Math.max(1, Math.round(timeoutMs(ms) / 1000)), 1800);
 }
 
 // A referenced socket keeps Bun alive until all pending requests (including synchronous output()) are acknowledged.
@@ -130,6 +135,73 @@ function formatScriptError(raw: string, sandboxDenial: boolean, toolNames: Itera
 }
 const IPC_BYTES = 16 * 1024 * 1024;
 
+export function createCodeExecIpcServer(ctx: {
+  names: ReadonlySet<string>;
+  sockets: Set<Socket>;
+  isStopped: () => boolean;
+  stop: (reason: string) => void;
+  onOutput: (value: unknown) => void;
+  onSandboxDenial: (denial: boolean) => void;
+  onToolCall: () => void;
+  onToolEvent?: (event: CodeExecToolEvent) => void;
+  callTool: (name: string, args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>;
+  signal: AbortSignal;
+}) {
+  let pending = 0, pendingBytes = 0;
+  return createServer(socket => {
+    if (ctx.isStopped() || ctx.sockets.size) { socket.destroy(); return; }
+    ctx.sockets.add(socket);
+    socket.on("error", () => socket.destroy());
+    socket.once("close", () => ctx.sockets.delete(socket));
+    let parts: Buffer[] = [], bytes = 0;
+    socket.on("data", (chunk: Buffer) => {
+      let start = 0;
+      while (start < chunk.length && !ctx.isStopped()) {
+        const end = chunk.indexOf(10, start);
+        const part = chunk.subarray(start, end < 0 ? chunk.length : end);
+        bytes += part.length;
+        if (bytes > IPC_BYTES) { ctx.stop(REJECTIONS.codeExecIpc().message); return; }
+        parts.push(part);
+        if (end < 0) return;
+        const size = bytes;
+        if (pending >= 64 || pendingBytes + size > IPC_BYTES) { ctx.stop("Too many outstanding Code Mode requests"); return; }
+        pending++; pendingBytes += size;
+        void dispatch(Buffer.concat(parts, bytes).toString()).catch(e => ctx.stop(message(e)))
+          .finally(() => { pending--; pendingBytes -= size; });
+        parts = []; bytes = 0; start = end + 1;
+      }
+    });
+
+    async function dispatch(line: string) {
+      const { id, name, args, kind, value } = JSON.parse(line);
+      function reply(payload: Record<string, unknown>) {
+        if (ctx.isStopped() || socket.destroyed) return;
+        const json = JSON.stringify({ id, ...payload }) + "\n";
+        if (Buffer.byteLength(json) + socket.writableLength > IPC_BYTES) throw REJECTIONS.codeExecIpc();
+        socket.write(json);
+      }
+      if (!Number.isSafeInteger(id)) throw new Error("Invalid IPC request id");
+      if (kind === "output") { ctx.onOutput(value); reply({ ok: true }); return; }
+      if (kind === "error") { ctx.onSandboxDenial(Boolean(value)); reply({ ok: true }); return; }
+      if (typeof name !== "string" || !args || Array.isArray(args) || typeof args !== "object") throw new Error("Invalid tool call");
+      const event = { name, args, via: "code_exec" as const };
+      ctx.onToolCall();
+      ctx.onToolEvent?.({ ...event, phase: "start" });
+      try {
+        if (name === "code_exec" || name === "tool_search") throw new Error(`Recursive ${name} calls are not allowed inside code_exec`);
+        if (!ctx.names.has(name)) throw REJECTIONS.notYourTool(name, "code_exec");
+        const out = await ctx.callTool(name, args, ctx.signal);
+        reply({ ok: true, value: out });
+        ctx.onToolEvent?.({ ...event, phase: "end", ok: true, result: toolEventPreview(out) });
+      } catch (e) {
+        const error = message(e);
+        ctx.onToolEvent?.({ ...event, phase: "end", ok: false, error });
+        reply({ ok: false, error });
+      }
+    }
+  });
+}
+
 export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult> {
   const result: CodeExecResult = { ok: false, preview: "", logs: "", toolCalls: 0 };
   let python: PythonRuntime | undefined;
@@ -138,14 +210,17 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     try { python = await providePython(opts.packages ?? [], opts.pythonCacheDir, opts.signal); }
     catch (e) {
       if (opts.signal?.aborted) result.cancelled = true;
-      result.error = opts.signal?.aborted ? "Code Mode cancelled" : `Python provisioning failed: ${message(e)}`;
+      result.error = opts.signal?.aborted
+        ? "Code Mode cancelled"
+        : e instanceof HarnessRejection
+          ? e.message
+          : `Python provisioning failed: ${message(e)}`;
       return result;
     }
   }
   const names = new Set(opts.tools.map(t => t.name));
   const sockets = new Set<Socket>();
   const execAbort = new AbortController();
-  let pending = 0, pendingBytes = 0;
   let child: ChildProcess | undefined, dir: string | undefined, output: unknown, sandboxDenial = false, stopped = false;
   function kill() {
     if (child?.pid) try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
@@ -158,61 +233,27 @@ export async function runCodeExec(opts: CodeExecOptions): Promise<CodeExecResult
     for (const s of sockets) s.destroy();
   }
   const abort = () => { if (!stopped) { result.cancelled = true; stop("Code Mode cancelled"); } };
-  const timer = setTimeout(() => { if (!stopped) { result.timedOut = true; stop("Code Mode timed out"); } }, timeoutMs(opts.timeoutMs));
+  const effectiveTimeoutMs = timeoutMs(opts.timeoutMs);
+  const timer = setTimeout(() => {
+    if (!stopped) {
+      result.timedOut = true;
+      stop(codeExecTimeoutError(effectiveTimeoutMs).message);
+    }
+  }, effectiveTimeoutMs);
   opts.signal?.addEventListener("abort", abort, { once: true });
   if (opts.signal?.aborted) abort();
 
-  const server = createServer(socket => {
-    if (stopped || sockets.size) { socket.destroy(); return; }
-    sockets.add(socket);
-    socket.on("error", () => socket.destroy());
-    socket.once("close", () => sockets.delete(socket));
-    let parts: Buffer[] = [], bytes = 0;
-    socket.on("data", (chunk: Buffer) => {
-      let start = 0;
-      while (start < chunk.length && !stopped) {
-        const end = chunk.indexOf(10, start);
-        const part = chunk.subarray(start, end < 0 ? chunk.length : end);
-        bytes += part.length;
-        if (bytes > IPC_BYTES) { stop("Code Mode IPC message exceeds 16 MiB"); return; }
-        parts.push(part);
-        if (end < 0) return;
-        const size = bytes;
-        if (pending >= 64 || pendingBytes + size > IPC_BYTES) { stop("Too many outstanding Code Mode requests"); return; }
-        pending++; pendingBytes += size;
-        void dispatch(Buffer.concat(parts, bytes).toString()).catch(e => stop(message(e)))
-          .finally(() => { pending--; pendingBytes -= size; });
-        parts = []; bytes = 0; start = end + 1;
-      }
-    });
-
-    async function dispatch(line: string) {
-      const { id, name, args, kind, value } = JSON.parse(line);
-      function reply(payload: Record<string, unknown>) {
-        if (stopped || socket.destroyed) return;
-        const json = JSON.stringify({ id, ...payload }) + "\n";
-        if (Buffer.byteLength(json) + socket.writableLength > IPC_BYTES) throw new Error("Code Mode IPC reply exceeds 16 MiB buffer");
-        socket.write(json);
-      }
-      if (!Number.isSafeInteger(id)) throw new Error("Invalid IPC request id");
-      if (kind === "output") { output = value; reply({ ok: true }); return; }
-      if (kind === "error") { sandboxDenial = Boolean(value); reply({ ok: true }); return; }
-      if (typeof name !== "string" || !args || Array.isArray(args) || typeof args !== "object") throw new Error("Invalid tool call");
-      const event = { name, args, via: "code_exec" as const };
-      result.toolCalls++;
-      opts.onToolEvent?.({ ...event, phase: "start" });
-      try {
-        if (name === "code_exec" || name === "tool_search") throw new Error(`Recursive ${name} calls are not allowed inside code_exec`);
-        if (!names.has(name)) throw new Error(`Tool not allowed: ${name}`);
-        const value = await opts.callTool(name, args, execAbort.signal);
-        reply({ ok: true, value });
-        opts.onToolEvent?.({ ...event, phase: "end", ok: true, result: toolEventPreview(value) });
-      } catch (e) {
-        const error = message(e);
-        opts.onToolEvent?.({ ...event, phase: "end", ok: false, error });
-        reply({ ok: false, error });
-      }
-    }
+  const server = createCodeExecIpcServer({
+    names,
+    sockets,
+    isStopped: () => stopped,
+    stop,
+    onOutput: (value) => { output = value; },
+    onSandboxDenial: (denial) => { sandboxDenial = denial; },
+    onToolCall: () => { result.toolCalls++; },
+    onToolEvent: opts.onToolEvent,
+    callTool: opts.callTool,
+    signal: execAbort.signal,
   });
 
   try {

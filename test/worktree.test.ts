@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, it } from "bun:test";
 import { ControlPlaneDb } from "../src/control-plane/db.js";
 import { canonicalPath, runGit, WorktreeManager } from "../src/worktree/manager.js";
-import { BisectingMergeQueue, checkTestIntegrity } from "../src/worktree/merge-queue.js";
+import { BisectingMergeQueue, checkTestIntegrity, filesOutsideWriteScopes } from "../src/worktree/merge-queue.js";
 
 async function initTempRepo(): Promise<string> {
   const dir = mkdtempSync(join(tmpdir(), "pi-harness-wt-"));
@@ -772,6 +772,77 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
       const bareLockedBlock = findBlock(await porcelainBlocks(repo), wt.path);
       assert.ok(bareLockedBlock?.split(/\r?\n/).includes("locked"));
       assert.equal(db.getWorktree(wt.id)?.cleanedAt, null);
+      db.close();
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("T-mq: filesOutsideWriteScopes agrees with checkWriteScopes across scope table and bounced merge uses blocked shape", async () => {
+    const BLOCKED_SHAPE = /^\[harness blocked: [\w-]+\] .+ Why: .+ Allowed: .+/;
+    const cases: Array<{ name: string; file: string; scopes: string[]; expectedOutside: string[] }> = [
+      { name: "in scope", file: "src/a/in.ts", scopes: ["src/a/**"], expectedOutside: [] },
+      { name: "out of scope", file: "src/b/out.ts", scopes: ["src/a/**"], expectedOutside: ["src/b/out.ts"] },
+      { name: "prefix path match", file: "src/prefix/sub/ok.ts", scopes: ["src/prefix"], expectedOutside: [] },
+      { name: "prefix path boundary", file: "src/prefix2/bad.ts", scopes: ["src/prefix"], expectedOutside: ["src/prefix2/bad.ts"] },
+      { name: "trailing-slash subtree match", file: "src/tree/deep/ok.ts", scopes: ["src/tree/"], expectedOutside: [] },
+      { name: "trailing-slash subtree miss", file: "src/other/bad.ts", scopes: ["src/tree/"], expectedOutside: ["src/other/bad.ts"] },
+      { name: "shared metadata file", file: "package.json", scopes: ["src/a/**"], expectedOutside: [] },
+      { name: "empty scopes", file: "anywhere/ok.ts", scopes: [], expectedOutside: [] },
+      { name: "wildcard scope", file: "anywhere/wild.ts", scopes: ["**"], expectedOutside: [] },
+    ];
+
+    for (const row of cases) {
+      assert.deepEqual(
+        filesOutsideWriteScopes([row.file], row.scopes),
+        row.expectedOutside,
+        `filesOutsideWriteScopes mismatch on case "${row.name}"`,
+      );
+    }
+
+    const repo = await initTempRepo();
+    try {
+      const db = new ControlPlaneDb(":memory:");
+      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 16 });
+      const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
+      const run = db.createRun({ goal: "T-mq write scope table", repoRoot: repo, baseBranch, baseSha });
+      const mq = new BisectingMergeQueue(db, mgr, repo, {});
+
+      let sawBlockedBounce = false;
+      for (const [idx, row] of cases.entries()) {
+        const task = db.createTask({
+          runId: run.id,
+          tier: 2,
+          kind: "worker",
+          title: `T-mq ${row.name}`,
+          objective: row.name,
+          profileId: "acp:claude",
+          writeScopes: row.scopes,
+        });
+        const wt = await mgr.createForWorker(run.id, task.id, baseSha);
+        const target = join(wt.path, row.file);
+        mkdirSync(join(target, ".."), { recursive: true });
+        writeFileSync(target, `// case ${idx}: ${row.name}\n`, "utf8");
+        await runGit(wt.path, ["add", row.file]);
+        await runGit(wt.path, ["-c", "user.name=w", "-c", "user.email=w@local", "commit", "-m", row.name]);
+
+        const item = db.enqueueMerge({ runId: run.id, taskId: task.id, worktreeId: wt.id, branch: wt.branch });
+        const outcome = await mq.submitAndDrain(run.id, item.id);
+
+        if (row.expectedOutside.length === 0) {
+          assert.equal(outcome.item.status, "merged", `expected merged for "${row.name}", got ${outcome.bouncedReason}`);
+        } else {
+          sawBlockedBounce = true;
+          assert.equal(outcome.item.status, "ci_failed", `expected bounce for "${row.name}"`);
+          assert.match(outcome.bouncedReason ?? "", BLOCKED_SHAPE);
+          assert.match(outcome.bouncedReason ?? "", /^\[harness blocked: write-scope-merge\] /);
+          assert.ok((outcome.bouncedReason ?? "").includes(row.file));
+          await mgr.teardown(wt.id);
+        }
+        db.updateTask(task.id, { status: "completed" });
+      }
+
+      assert.equal(sawBlockedBounce, true);
       db.close();
     } finally {
       rmSync(repo, { recursive: true, force: true });

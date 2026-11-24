@@ -3,6 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { REJECTIONS } from "../advisories/rejections.js";
 import { defaultStateDir } from "../config.js";
 
 // Supply chain: every executable we run unsandboxed is downloaded from upstream over HTTPS and
@@ -44,7 +45,7 @@ const PACKAGE_PIN = /^([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)==([0-9A-Za-z]
 
 // Only exact `name==version` pins: no URLs, extras, ranges or wildcards.
 function normalizePackages(packages: string[]): string[] {
-  if (packages.length > MAX_PACKAGES) throw new Error(`At most ${MAX_PACKAGES} packages are allowed`);
+  if (packages.length > MAX_PACKAGES) throw REJECTIONS.pythonPackages(packages.length);
   const pins = new Map<string, string>();
   for (const spec of packages) {
     const match = PACKAGE_PIN.exec(spec.trim());

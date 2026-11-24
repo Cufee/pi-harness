@@ -1,3 +1,5 @@
+import { formatNotice } from "../advisories/message.js";
+import { deniedNotice, HarnessRejection, REJECTIONS } from "../advisories/rejections.js";
 import { toolEventPreview } from "../protocol/tool-display.js";
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -117,7 +119,7 @@ function withTimeout<T>(
 function requireWorkspacePath(root: string, path: string): void {
   const rel = relative(root, path);
   if (isAbsolute(rel) || rel === ".." || rel.startsWith(`..${sep}`)) {
-    throw new Error("ACP filesystem path is outside the task workspace");
+    throw REJECTIONS.outsideRoots(path, root);
   }
 }
 
@@ -153,7 +155,7 @@ async function workspaceTarget(root: string, requested: string, allowNew: boolea
     }
     const parent = dirname(cursor);
     if (parent === cursor) {
-      throw new Error("ACP filesystem path is outside the task workspace");
+      throw REJECTIONS.outsideRoots(requested, realRoot);
     }
     missingSegments.unshift(basename(cursor));
     cursor = parent;
@@ -203,8 +205,8 @@ async function resolveAllowedTarget(
     const readProtected = protectReads === "all" || (protectReads === "extra" && root !== primaryRoot);
     // Refuse protected targets before any side effect, checking the lexical path first and the canonical
     // path once resolved. A protected hit is final and never falls through to later roots.
-    if (protectWrites && isProtectedWritePath(root, requested)) throw PROTECTED_WRITE_ERROR();
-    if (readProtected && isProtectedWritePath(root, requested)) throw PROTECTED_READ_ERROR();
+    if (protectWrites && isProtectedWritePath(root, requested)) throw PROTECTED_WRITE_ERROR(requested, root);
+    if (readProtected && isProtectedWritePath(root, requested)) throw PROTECTED_READ_ERROR(requested, root);
     let target: { path: string; exists: boolean };
     try {
       target = await workspaceTarget(root, requested, allowNew);
@@ -212,15 +214,15 @@ async function resolveAllowedTarget(
       if (!firstErr) firstErr = err;
       continue;
     }
-    if (protectWrites && isProtectedWritePath(root, target.path)) throw PROTECTED_WRITE_ERROR();
-    if (readProtected && isProtectedWritePath(root, target.path)) throw PROTECTED_READ_ERROR();
+    if (protectWrites && isProtectedWritePath(root, target.path)) throw PROTECTED_WRITE_ERROR(target.path, root);
+    if (readProtected && isProtectedWritePath(root, target.path)) throw PROTECTED_READ_ERROR(target.path, root);
     return { ...target, root };
   }
-  throw firstErr ?? new Error("ACP filesystem path is outside allowed roots");
+  throw firstErr ?? REJECTIONS.outsideRoots(requested, primaryRoot);
 }
 
-const PROTECTED_WRITE_ERROR = () => new Error("ACP filesystem write target is protected (.git or .harness/worktrees)");
-const PROTECTED_READ_ERROR = () => new Error("ACP filesystem read target is protected (.git or .harness/worktrees)");
+const PROTECTED_WRITE_ERROR = (path: string, root: string) => REJECTIONS.protectedPath(path, root);
+const PROTECTED_READ_ERROR = (path: string, root: string) => REJECTIONS.protectedPath(path, root);
 
 /**
  * Read protection for a policy: writers keep unrestricted reads; read-only agents never read `.git` or
@@ -253,9 +255,9 @@ async function openWorkspaceFile(
   try {
     const actual = await realpath(target);
     requireWorkspacePath(root, actual);
-    if (write && isProtectedWritePath(root, actual)) throw PROTECTED_WRITE_ERROR();
+    if (write && isProtectedWritePath(root, actual)) throw PROTECTED_WRITE_ERROR(actual, root);
     if (!write && (protectReads === "all" || (protectReads === "extra" && root !== primaryRoot)) &&
-        isProtectedWritePath(root, actual)) throw PROTECTED_READ_ERROR();
+        isProtectedWritePath(root, actual)) throw PROTECTED_READ_ERROR(actual, root);
     const opened = await file.stat();
     const current = await stat(actual);
     if (!opened.isFile() || (write && opened.nlink !== 1) || opened.dev !== current.dev || opened.ino !== current.ino) {
@@ -1101,6 +1103,7 @@ export class AcpRunner {
         const externalMcpAllowed =
           !controlOnly && (claudeExternalMcp || codexExternalMcp || geminiExternalMcp || genericExternalMcp);
 
+        let readDenialRule: "protected-path" | "outside-roots" | undefined;
         const validateReadLocations = async (): Promise<boolean> => {
           const paths: string[] = [];
           for (const loc of p.toolCall?.locations ?? []) {
@@ -1131,7 +1134,10 @@ export class AcpRunner {
             if (hasGlob(rawPath) && /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(rawPath)) return false;
             try {
               await resolveAllowedTarget(workspace, extraReadRoots, bindToWorkspace(extractGlobPrefix(rawPath)), true, false, readProtection);
-            } catch {
+            } catch (err) {
+              if (err instanceof HarnessRejection && err.notice.rule === "protected-path") {
+                readDenialRule = "protected-path";
+              }
               return false;
             }
           }
@@ -1175,7 +1181,10 @@ export class AcpRunner {
                 false,
                 readProtection,
               );
-            } catch {
+            } catch (err) {
+              if (err instanceof HarnessRejection && err.notice.rule === "protected-path") {
+                readDenialRule = "protected-path";
+              }
               return false;
             }
           }
@@ -1226,6 +1235,7 @@ export class AcpRunner {
         const isWrite = toolKind === "edit" || toolKind === "delete" || toolKind === "move";
         const isExecute = toolKind === "execute";
         let workspaceCall = false;
+        let writeDenialRule: "protected-path" | "outside-roots" | undefined;
         // Allow native workspace reads/searches, read-only shell inspection commands, writes (when canWrite),
         // and full shell commands (when allowShell) for non-control-plane agents.
         if (!controlOnly && !claude?.mcpServer && !p._meta?.is_mcp_tool_approval && !geminiMcp) {
@@ -1244,7 +1254,10 @@ export class AcpRunner {
                 await resolveAllowedTarget(workspace, extraWriteRoots, target, toolKind === "edit" || toolKind === "move", true);
               }
               workspaceCall = targets.length > 0;
-            } catch {
+            } catch (err) {
+              if (err instanceof HarnessRejection && (err.notice.rule === "protected-path" || err.notice.rule === "outside-roots")) {
+                writeDenialRule = err.notice.rule;
+              }
               workspaceCall = false;
             }
           } else if (isExecute) {
@@ -1272,8 +1285,55 @@ export class AcpRunner {
         }
         if (!sessionId || params.sessionId !== sessionId || !(workspaceCall || claudeToolSearch || harnessMcpAllowed || externalMcpAllowed)) {
           const deniedLabel = title || toolKind || "native tool";
-          turnDeniedTools.push(deniedLabel);
-          allToolFailures.push(`${deniedLabel} (blocked by ${policyModeDesc})`);
+          const deniedPaths = (p.toolCall?.locations ?? [])
+            .map((loc) => loc?.path)
+            .filter((locPath): locPath is string => typeof locPath === "string" && locPath.trim().length > 0);
+          const deniedExternalMcp: { server: string; tool: string } | null =
+            !controlOnly
+              ? this.profile.adapter === "claude" &&
+                claude?.mcpServer?.name !== undefined &&
+                !claudeUntrustedSource &&
+                externalMcpNames.has(claude.mcpServer.name)
+                ? { server: claude.mcpServer.name, tool: claudeExtParsed?.tool ?? claudeToolName ?? deniedLabel }
+                : this.profile.adapter === "codex" && codexRawServer && codexRawTool && externalMcpNames.has(codexRawServer)
+                  ? { server: codexRawServer, tool: codexRawTool }
+                  : this.profile.adapter === "gemini" &&
+                      geminiMcp?.server_name !== undefined &&
+                      externalMcpNames.has(geminiMcp.server_name)
+                    ? { server: geminiMcp.server_name, tool: geminiMcp.tool_name ?? deniedLabel }
+                    : normalizedExt
+              : null;
+          let deniedRule: string;
+          let deniedArgs: Record<string, unknown> = { ...(rawInput ?? {}) };
+          if (deniedExternalMcp) {
+            deniedRule = "read-only-mcp";
+            deniedArgs = { ...deniedArgs, server: deniedExternalMcp.server, tool: deniedExternalMcp.tool };
+          } else if (!controlOnly && !claude?.mcpServer && !p._meta?.is_mcp_tool_approval && !geminiMcp && isExecute) {
+            deniedRule = "read-only-shell";
+            const shellCmd = extractShellCommand();
+            if (shellCmd) deniedArgs = { ...deniedArgs, command: shellCmd };
+          } else if (!controlOnly && !claude?.mcpServer && !p._meta?.is_mcp_tool_approval && !geminiMcp && isWrite) {
+            deniedRule = canWrite ? (writeDenialRule ?? "protected-path") : "read-only-write";
+          } else if (
+            !controlOnly &&
+            !claude?.mcpServer &&
+            !p._meta?.is_mcp_tool_approval &&
+            !geminiMcp &&
+            (isRead || ((toolKind === "other" || toolKind === undefined) && READ_ONLY_OTHER_TOOL_RE.test(rawCandidateName.trim())))
+          ) {
+            deniedRule = readDenialRule ?? "outside-roots";
+          } else {
+            deniedRule = "tool-policy";
+            deniedArgs = { ...deniedArgs, mode: req.toolPolicy };
+          }
+          const deniedText = formatNotice(
+            deniedNotice(
+              { denied: deniedRule, name: deniedLabel, args: deniedArgs, paths: deniedPaths },
+              { workspaceRoot: workspace },
+            ),
+          );
+          turnDeniedTools.push(deniedText);
+          allToolFailures.push(deniedText);
           return (
             denyOpt
               ? { outcome: { outcome: "selected", optionId: denyOpt.optionId } }
@@ -1316,10 +1376,10 @@ export class AcpRunner {
       })
       .onRequest("fs/write_text_file", async ({ params }) => {
         if (sessionId && params.sessionId === sessionId) resetIdleWatchdog();
-        if (!sessionId || params.sessionId !== sessionId || !canWrite) {
-          throw new Error(`Write denied: agent is running in ${policyModeDesc} mode`);
-        }
         const p = params as unknown as { path: string; content: string };
+        if (!sessionId || params.sessionId !== sessionId || !canWrite) {
+          throw REJECTIONS.readOnlyWrite(typeof p?.path === "string" && p.path.trim() ? p.path : workspace);
+        }
         const file = await openWorkspaceFile(workspace, extraWriteRoots, p.path, true);
         try {
           await file.truncate(0);
@@ -1790,11 +1850,7 @@ export class AcpRunner {
           consecutiveSilentRecoveries += 1;
           const failureSummary = [
             ...turnFailedTools.map((f) => `- Tool "${f.title}" failed${f.detail ? `: ${f.detail}` : ""}`),
-            ...turnDeniedTools.map((d) =>
-              canWrite
-                ? `- Tool "${d}" was blocked: execution permission denied by harness policy (${policyModeDesc})`
-                : `- Tool "${d}" was blocked by harness policy (${policyModeDesc})`,
-            ),
+            ...turnDeniedTools.map((d) => `- ${d}`),
           ].join("\n");
           nextPromptText = [
             "Your previous tool call did not succeed and your turn ended before you finished responding:",
