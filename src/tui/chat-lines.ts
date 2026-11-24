@@ -5,6 +5,7 @@ import type {
   RunRecord,
 } from "../control-plane/db.js";
 import type { ChatTurnRecord } from "../director/session.js";
+import type { GoalStatus } from "../goals/engine.js";
 import {
   type ChatControlEvent,
   formatChatEventSummary,
@@ -71,6 +72,12 @@ const ESCALATION_CATEGORIES = new Set<EscalationCategory>([
   "budget_exhausted",
   "env_failure",
   "security_risk",
+]);
+
+const HUMAN_REVIEW_GOAL_STATUSES: ReadonlySet<string> = new Set<GoalStatus>([
+  "achieved",
+  "awaiting_human",
+  "cancelled",
 ]);
 
 export type LiveAttentionInput =
@@ -211,6 +218,24 @@ function humanizeVerdict(verdict: string, status: string): string {
   return "Review recorded";
 }
 
+function isHumanGoalReview(status: string, source?: string): boolean {
+  if (source === "user") return true;
+  const normalized = status.trim().toLowerCase();
+  return normalized.length > 0 && HUMAN_REVIEW_GOAL_STATUSES.has(normalized);
+}
+
+function formatPersistedEscalationNotice(raw: string): string {
+  const stripped = raw.replace(/\s*\(close with resolve_escalation\)\.?\s*$/i, "").trim();
+  const match = stripped.match(/^Escalation\s+(\S+)\s+\[([^\]/]+)(?:\/([^\]]+))?\]([\s\S]*)$/i);
+  if (!match) return stripped;
+  const [, escId, rawSeverity, rawCategory, rest] = match;
+  const sev = sanitizeLine(rawSeverity!).toUpperCase();
+  const cat = rawCategory ? humanizeTokens(rawCategory.trim().toLowerCase().replace(/_/g, " ")) : "";
+  const meta = sev && cat ? `(${sev}, ${cat})` : sev ? `(${sev})` : cat ? `(${cat})` : "";
+  const tail = rest ?? "";
+  return meta ? `Escalation ${escId} ${meta}${tail}` : `Escalation ${escId}${tail}`;
+}
+
 function ensureSafeTag(rawTag: string, fallback: string, forbiddenType?: string): string {
   const cleaned = sanitizeLine(rawTag);
   if (!cleaned) return fallback;
@@ -260,12 +285,13 @@ export function classifyControlEvent(
     }
 
     case "goal.escalated": {
+      // Director wake record for P0s carrying no addressee; human-addressed escalations arrive via escalation.created and Inbox.
       const title = ensureSafeText(event.title, "Escalation raised", event.kind);
       return {
-        audience: "human",
+        audience: "internal",
         tag: ensureSafeTag(event.goalId, "escalation", event.kind),
         text: `${event.severity} escalation ${event.escalationId}: ${title}`,
-        tone: "danger",
+        tone: "dim",
         glyph: "warn",
         ref: {
           kind: "escalation",
@@ -309,10 +335,12 @@ export function classifyControlEvent(
     }
 
     case "goal.reviewed": {
+      const isHuman = isHumanGoalReview(event.status, event.source);
       const verdictText = humanizeVerdict(event.verdict, event.status);
       const summary = ensureSafeText(event.summary, "", event.kind);
-      const tone: Tone =
-        event.status === "achieved" || event.verdict.toLowerCase() === "approve"
+      const tone: Tone = !isHuman
+        ? "dim"
+        : event.status === "achieved" || event.verdict.toLowerCase() === "approve"
           ? "ok"
           : event.verdict.toLowerCase() === "changes_requested" || event.verdict.toLowerCase() === "rejected"
             ? "warn"
@@ -323,7 +351,7 @@ export function classifyControlEvent(
           : `${verdictText} (review #${event.cycle}): ${summary}`
         : `${verdictText} (review #${event.cycle})`;
       return {
-        audience: "human",
+        audience: isHuman ? "human" : "internal",
         tag: ensureSafeTag(event.goalId, "goal", event.kind),
         text,
         tone,
@@ -466,27 +494,29 @@ function classifyLiveGoalEvent(
     case "goal.reviewed": {
       const verdict = asString(p.verdict);
       const status = asString(p.status);
+      const source = asString(p.source);
       const cycle = asNumber(p.cycle);
       const summary = ensureSafeText(asString(p.summary), "", ev.type);
       const verdictLabel = humanizeVerdict(verdict, status);
       const cyclePart = cycle !== null ? ` (review #${cycle})` : "";
-      const hasContent = Boolean(verdict || status || summary);
+      const isHuman = isHumanGoalReview(status, source);
       const text = summary
         ? summary.toLowerCase().startsWith(verdictLabel.toLowerCase())
           ? summary
           : `${verdictLabel}${cyclePart}: ${summary}`
         : `${verdictLabel}${cyclePart}`;
-      const tone: Tone =
-        status === "achieved" || verdict.toLowerCase() === "approve"
+      const tone: Tone = !isHuman
+        ? "dim"
+        : status === "achieved" || verdict.toLowerCase() === "approve"
           ? "ok"
           : verdict.toLowerCase() === "changes_requested" || verdict.toLowerCase() === "rejected"
             ? "warn"
             : "info";
       return {
-        audience: hasContent ? "human" : "internal",
+        audience: isHuman ? "human" : "internal",
         tag,
         text: ensureSafeText(text, "Review recorded", ev.type),
-        tone: hasContent ? tone : "dim",
+        tone,
         glyph: "diamond",
         ref,
       };
@@ -543,10 +573,10 @@ function classifyLiveGoalEvent(
           : title
         : "Escalation raised";
       return {
-        audience: title ? "human" : "internal",
+        audience: "internal",
         tag,
         text: ensureSafeText(text, "Escalation raised", ev.type),
-        tone: title ? "danger" : "dim",
+        tone: "dim",
         glyph: "warn",
         ref,
       };
@@ -796,25 +826,25 @@ function classifyPlainSystemNotice(rawContent: string): ClassifiedChatLine | nul
   }
 
   // Bucket escalation notice for Director
-  if (/^Escalation\s+\S+.*\(close with resolve_escalation\)\.?$/i.test(content)) {
+  if (/^Escalation\s+\S+.*\(close with resolve_escalation\)\.?$/is.test(content)) {
     return {
       audience: "internal",
       tag: "escalation",
-      text: ensureSafeText(content, "Escalation notice"),
+      text: ensureSafeText(formatPersistedEscalationNotice(content), "Escalation notice"),
       tone: "dim",
       glyph: "bullet",
     };
   }
 
   // Escalation resolved notice: hide when resolved by director, show human confirmation otherwise.
-  const resolvedMatch = content.match(/^Escalation\s+\S+.*\bresolved by\s+([^:]+):/i);
+  const resolvedMatch = content.match(/^Escalation\s+\S+.*\bresolved by\s+([^:]+):/is);
   if (resolvedMatch) {
     const resolver = resolvedMatch[1]!.trim().toLowerCase();
     const isDirector = resolver === "director" || resolver.startsWith("director ");
     return {
       audience: isDirector ? "internal" : "human",
       tag: "escalation",
-      text: ensureSafeText(content, "Escalation resolved"),
+      text: ensureSafeText(formatPersistedEscalationNotice(content), "Escalation resolved"),
       tone: isDirector ? "dim" : "ok",
       glyph: "bullet",
     };

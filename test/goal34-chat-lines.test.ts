@@ -243,7 +243,7 @@ describe("goal-34 c4: classifyChatLine pure unit tests", () => {
           title: "Need key approval",
           openEscalations: 1,
         },
-        expectedAudience: "human",
+        expectedAudience: "internal",
       },
       {
         ev: {
@@ -288,7 +288,7 @@ describe("goal-34 c4: classifyChatLine pure unit tests", () => {
           status: "executing",
           summary: "changes_requested on local main",
         },
-        expectedAudience: "human",
+        expectedAudience: "internal",
       },
       {
         ev: {
@@ -536,6 +536,220 @@ describe("goal-34 c4: classifyChatLine pure unit tests", () => {
     });
     assert.equal(interrupted?.audience, "human");
     assert.equal(interrupted?.text.includes("Tools in flight"), false);
+  });
+
+  it("classifies goal.reviewed by goal status and user source on both replay and live paths", () => {
+    const cases: Array<{
+      label: string;
+      status: string;
+      verdict: string;
+      source?: "director" | "user" | "system";
+      summary: string;
+      expectedAudience: "human" | "internal";
+      expectedTone: "ok" | "warn" | "info" | "dim";
+    }> = [
+      {
+        label: "executing changes_requested",
+        status: "executing",
+        verdict: "changes_requested",
+        summary: "changes_requested on local main",
+        expectedAudience: "internal",
+        expectedTone: "dim",
+      },
+      {
+        label: "verifying rejected",
+        status: "verifying",
+        verdict: "rejected",
+        summary: "Retrying verification gates",
+        expectedAudience: "internal",
+        expectedTone: "dim",
+      },
+      {
+        label: "awaiting_human changes_requested",
+        status: "awaiting_human",
+        verdict: "changes_requested",
+        summary: "Circuit breaker tripped; needs human review",
+        expectedAudience: "human",
+        expectedTone: "warn",
+      },
+      {
+        label: "achieved approve",
+        status: "achieved",
+        verdict: "approve",
+        summary: "All criteria passed",
+        expectedAudience: "human",
+        expectedTone: "ok",
+      },
+      {
+        label: "cancelled rejected",
+        status: "cancelled",
+        verdict: "rejected",
+        summary: "Goal cancelled",
+        expectedAudience: "human",
+        expectedTone: "warn",
+      },
+      {
+        label: "user-sourced accept (achieved)",
+        status: "achieved",
+        verdict: "approve",
+        source: "user",
+        summary: "Accepted by user",
+        expectedAudience: "human",
+        expectedTone: "ok",
+      },
+      {
+        label: "user-sourced accept (non-terminal status)",
+        status: "executing",
+        verdict: "approve",
+        source: "user",
+        summary: "Accepted by user",
+        expectedAudience: "human",
+        expectedTone: "ok",
+      },
+    ];
+
+    for (const tc of cases) {
+      const replayEvent: ChatControlEvent = {
+        kind: "goal.reviewed",
+        goalId: "goal-34",
+        goalVersion: 1,
+        cycle: 1,
+        verdict: tc.verdict,
+        status: tc.status,
+        summary: tc.summary,
+        ...(tc.source ? { source: tc.source } : {}),
+      };
+      const replayed = classifyChatLine({
+        source: "replay",
+        turn: { content: "goal.reviewed", event: replayEvent, createdAt: Date.now() },
+      });
+      assertNoRawEventLeak(replayed, "goal.reviewed", `replay:${tc.label}`);
+      assert.equal(replayed?.audience, tc.expectedAudience, `replay:${tc.label} audience`);
+      assert.equal(replayed?.tone, tc.expectedTone, `replay:${tc.label} tone`);
+
+      const live = classifyChatLine({
+        source: "live",
+        event: frame("goal.reviewed", {
+          goalId: "goal-34",
+          version: 1,
+          cycle: 1,
+          verdict: tc.verdict,
+          status: tc.status,
+          summary: tc.summary,
+          ...(tc.source ? { source: tc.source } : {}),
+        }),
+      });
+      assertNoRawEventLeak(live, "goal.reviewed", `live:${tc.label}`);
+      assert.equal(live?.audience, tc.expectedAudience, `live:${tc.label} audience`);
+      assert.equal(live?.tone, tc.expectedTone, `live:${tc.label} tone`);
+    }
+
+    // Live frame without status must classify as internal with dim tone
+    const liveNoStatus = classifyChatLine({
+      source: "live",
+      event: frame("goal.reviewed", {
+        goalId: "goal-34",
+        cycle: 1,
+        verdict: "approve",
+        summary: "Missing status field",
+      }),
+    });
+    assertNoRawEventLeak(liveNoStatus, "goal.reviewed", "live:no-status");
+    assert.equal(liveNoStatus?.audience, "internal", "live goal.reviewed without status must be internal");
+    assert.equal(liveNoStatus?.tone, "dim", "live goal.reviewed without status must use dim tone");
+  });
+
+  it("classifies goal.escalated as internal on both replay and live paths", () => {
+    const replayEvent: ChatControlEvent = {
+      kind: "goal.escalated",
+      goalId: "goal-2",
+      goalVersion: 1,
+      goalTitle: "Fix auth",
+      runId: "run-2",
+      runStatus: "active",
+      escalationId: "esc-9",
+      severity: "P0",
+      title: "Need key approval",
+      openEscalations: 1,
+    };
+    const replayed = classifyChatLine({
+      source: "replay",
+      turn: { content: "goal.escalated", event: replayEvent, createdAt: Date.now() },
+    });
+    assertNoRawEventLeak(replayed, "goal.escalated", "replay:goal.escalated");
+    assert.equal(replayed?.audience, "internal", "replayed goal.escalated must be internal");
+    assert.equal(replayed?.tone, "dim", "replayed goal.escalated must use dim tone");
+
+    const live = classifyChatLine({
+      source: "live",
+      event: frame("goal.escalated", {
+        goalId: "goal-2",
+        escalationId: "esc-9",
+        severity: "P0",
+        title: "Need key approval",
+      }),
+    });
+    assertNoRawEventLeak(live, "goal.escalated", "live:goal.escalated");
+    assert.equal(live?.audience, "internal", "live goal.escalated must be internal");
+    assert.equal(live?.tone, "dim", "live goal.escalated must use dim tone");
+  });
+
+  it("formats persisted escalation notices without raw category enums or tool hints", () => {
+    const raised = classifyChatLine({
+      source: "replay",
+      turn: {
+        content: "Escalation esc-42 [P1/code_defect] from t-7: Null deref in parser (close with resolve_escalation).",
+        createdAt: Date.now(),
+      },
+    });
+    assertNoRawEventLeak(raised, "escalation.created", "persisted:raised");
+    assert.equal(raised?.audience, "internal");
+    assert.equal(raised?.tone, "dim");
+    assert.equal(raised?.text.includes("[P1/code_defect]"), false, `raw bracket leaked in "${raised?.text}"`);
+    assert.equal(raised?.text.includes("code_defect"), false, `raw category enum leaked in "${raised?.text}"`);
+    assert.equal(raised?.text.includes("resolve_escalation"), false, `tool hint leaked in "${raised?.text}"`);
+    assert.equal(raised?.text.includes("P1, code defect"), true, `expected formatted severity/category in "${raised?.text}"`);
+
+    const resolvedByUser = classifyChatLine({
+      source: "replay",
+      turn: {
+        content: "Escalation esc-42 [P1/code_defect] on run run-5 resolved by user: Fixed parser check",
+        createdAt: Date.now(),
+      },
+    });
+    assertNoRawEventLeak(resolvedByUser, "escalation.resolved", "persisted:resolved-user");
+    assert.equal(resolvedByUser?.audience, "human");
+    assert.equal(resolvedByUser?.tone, "ok");
+    assert.equal(resolvedByUser?.text.includes("[P1/code_defect]"), false, `raw bracket leaked in "${resolvedByUser?.text}"`);
+    assert.equal(resolvedByUser?.text.includes("code_defect"), false, `raw category enum leaked in "${resolvedByUser?.text}"`);
+    assert.equal(resolvedByUser?.text.includes("resolve_escalation"), false, `tool hint leaked in "${resolvedByUser?.text}"`);
+    assert.equal(
+      resolvedByUser?.text.includes("P1, code defect"),
+      true,
+      `expected formatted severity/category in "${resolvedByUser?.text}"`,
+    );
+
+    const resolvedByDirector = classifyChatLine({
+      source: "replay",
+      turn: {
+        content: "Escalation esc-42 [P1/code_defect] on run run-5 resolved by director: Handled automatically",
+        createdAt: Date.now(),
+      },
+    });
+    assertNoRawEventLeak(resolvedByDirector, "escalation.resolved", "persisted:resolved-director");
+    assert.equal(resolvedByDirector?.audience, "internal");
+    assert.equal(resolvedByDirector?.tone, "dim");
+    assert.equal(
+      resolvedByDirector?.text.includes("[P1/code_defect]"),
+      false,
+      `raw bracket leaked in "${resolvedByDirector?.text}"`,
+    );
+    assert.equal(resolvedByDirector?.text.includes("code_defect"), false, `raw category enum leaked in "${resolvedByDirector?.text}"`);
+    assert.equal(
+      resolvedByDirector?.text.includes("P1, code defect"),
+      true,
+      `expected formatted severity/category in "${resolvedByDirector?.text}"`,
+    );
   });
 });
 
