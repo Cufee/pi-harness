@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import type { HarnessConfig, RunnerProfileConfig } from "../config.js";
 import type { ModelCatalogCompiler } from "../catalog/compiler.js";
 import type { QuotaClient } from "../quota/client.js";
 import { AcpRunner } from "../runners/acp-runner.js";
+import { isContextOverflowError, isOverflowTurnText } from "../runners/context-overflow.js";
 import { PiRunner } from "../runners/pi-runner.js";
 import { formatQuotaPauseSummary } from "../runners/quota-detect.js";
 import { ScopeNudgeMonitor } from "../runners/scope-nudge.js";
@@ -280,6 +281,32 @@ export interface ResumeRunResult {
   reason?: "already_running" | "no_resumable_tasks" | "blocked_on_escalation" | "already_completed";
 }
 
+interface RolloverProgress {
+  fp: string;
+  streak: number;
+  artHigh: number;
+  routes: string[];
+}
+
+/** Total bytes over distinct contents (sha256) of the files. Missing or unreadable files add nothing. */
+function distinctContentBytes(paths: string[], repoRoot?: string): number {
+  const seen = new Set<string>();
+  let total = 0;
+  for (const p of paths) {
+    try {
+      const full = repoRoot ? resolve(repoRoot, p) : p;
+      const buf = readFileSync(full);
+      const digest = createHash("sha256").update(buf).digest("hex");
+      if (seen.has(digest)) continue;
+      seen.add(digest);
+      total += buf.byteLength;
+    } catch {
+      // Missing or unreadable file adds nothing.
+    }
+  }
+  return total;
+}
+
 export class HarnessOrchestrator {
   private active = new Map<string, ActiveTaskExecution>();
   private allocatingWorktrees = new Set<string>();
@@ -293,7 +320,7 @@ export class HarnessOrchestrator {
   private taskResumeNotes = new Map<string, { kind?: "quota" | "resume"; reason?: string; userMessage?: string | null }>();
   private runQuotaStates = new Map<string, InternalRunQuotaState>();
   private runConsecutiveQuotaPauses = new Map<string, number>();
-  private taskAutoRolloverProgress = new Map<string, { fp: string; streak: number }>();
+  private taskRolloverProgress = new Map<string, RolloverProgress>();
   private quiescenceCheckPending = new Set<string>();
   /** Runs with a stopRun in progress (a resume issued after a stop waits for it). */
   private stoppingRuns = new Map<string, Promise<void>>();
@@ -1996,7 +2023,7 @@ export class HarnessOrchestrator {
     this.clearRunQuotaTimers(run.id);
     this.runQuotaStates.delete(run.id);
     this.runConsecutiveQuotaPauses.delete(run.id);
-    this.taskAutoRolloverProgress.delete(task.id);
+    this.taskRolloverProgress.delete(task.id);
     this.taskQuotaHints.delete(task.id);
     this.taskResumeNotes.set(task.id, {
       kind: "resume",
@@ -2471,7 +2498,6 @@ export class HarnessOrchestrator {
       const bridgeExt = import.meta.url.endsWith(".js") ? "mcp-bridge.js" : "mcp-bridge.ts";
       const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", bridgeExt);
       const catalogEntry = this.catalog.loadCached()?.models.find((m) => m.id === model);
-      const maxGenerations = this.config.rollover.maxGenerations ?? 12;
 
       let genToolEvents = 0;
       const subject = this.advisorySubject(hydratedTask);
@@ -2658,7 +2684,7 @@ export class HarnessOrchestrator {
         if (["completed", "returned_for_rescope", "blocked", "cancelled"].includes(latest.status)) {
           this.pendingRollovers.delete(task.id);
           this.runConsecutiveQuotaPauses.delete(run.id);
-          this.taskAutoRolloverProgress.delete(task.id);
+          this.taskRolloverProgress.delete(task.id);
           if (isReadOnlyKind(latest.kind) && latest.status === "completed") {
             try {
               validateTaskHandoff(latest.kind, JSON.parse(latest.resultJson ?? "{}"));
@@ -2685,99 +2711,31 @@ export class HarnessOrchestrator {
           return;
         }
 
-        // Clean rollover requested either via explicit `request_rollover` or the context threshold.
-        // Turn counts never force a rollover or stop a task.
+        // Clean rollover requested via explicit `request_rollover`, the context threshold, or a provider context overflow.
+        // Turn and generation counts never force a rollover or stop a task.
         const explicitRollover = this.pendingRollovers.get(task.id);
-        if (explicitRollover || res.stopReason === "rollover_requested") {
-          this.pendingRollovers.delete(task.id);
-          const nextGen = explicitRollover?.restart ? latest.generation : latest.generation + 1;
-          // A stop or cancel during the awaits below wins: the stale continuation writes nothing and launches nothing.
-          const fence = this.rolloverFence(latest);
-          // Fail fast after 2 consecutive zero-progress automatic context-threshold rollovers
-          if (!explicitRollover && res.stopReason === "rollover_requested") {
-            const fp = await this.computeAutoRolloverFingerprint(run.id, task.id, wt?.path ?? null);
-            if (this.rolloverFenceBroken(exec, task.id, fence)) return;
-            const prev = this.taskAutoRolloverProgress.get(task.id);
-            const streak = prev && prev.fp === fp ? prev.streak + 1 : 1;
-            this.taskAutoRolloverProgress.set(task.id, { fp, streak });
-            if (streak >= 2) {
-              const summary = `Aborted after ${streak} consecutive zero-progress automatic rollovers (no commits, worktree edits, artifacts, or child tasks).`;
-              let settled = false;
-              if (task.tier === 1) {
-                if (this.active.get(task.id) === exec && !this.rolloverFenceBroken(exec, task.id, fence)) {
-                  this.db.updateTask(task.id, { status: "failed", summary });
-                  settled = true;
-                }
-              } else {
-                settled = await this.settleWithoutReturn(exec, runnerGen, latest, run, wt, res, "failed", summary, "zero_progress_rollover");
-              }
-              if (settled) {
-                this.db.createEscalation({
-                  runId: run.id,
-                  fromTaskId: task.id,
-                  toTaskId: task.parentId,
-                  severity: task.tier === 1 ? "P0" : "P1",
-                  category: "budget_exhausted",
-                  title: `Task ${task.id} looped ${streak}x on auto-rollover with zero progress`,
-                  evidencePaths: [],
-                  blocking: true,
-                });
-              }
-              return;
-            }
-          } else {
-            this.taskAutoRolloverProgress.delete(task.id);
+        const overflow =
+          !explicitRollover &&
+          !exec.abort.signal.aborted &&
+          ((res.stopReason === "error" && isContextOverflowError(res.text.slice(-2000))) ||
+            (res.stopReason === "completed" && isOverflowTurnText(res.text)));
+        if (explicitRollover || res.stopReason === "rollover_requested" || overflow) {
+          if (
+            await this.rollOver({
+              exec,
+              runnerGen,
+              run,
+              latest,
+              wt,
+              priorHandoff: handoff,
+              res,
+              explicit: explicitRollover,
+              reason: explicitRollover ? "explicit_handoff" : overflow ? "context_overflow" : "context_threshold",
+            })
+          ) {
+            continue;
           }
-          if (nextGen > maxGenerations) {
-            const summary = `Exceeded max rollover generations (${maxGenerations}); escalating to prevent infinite rollover loop.`;
-            let settled = false;
-            if (task.tier === 1) {
-              if (this.active.get(task.id) === exec && !this.rolloverFenceBroken(exec, task.id, fence)) {
-                this.db.updateTask(task.id, { status: "failed", summary });
-                settled = true;
-              }
-            } else {
-              settled = await this.settleWithoutReturn(exec, runnerGen, latest, run, wt, res, "failed", summary, "max_generations");
-            }
-            if (settled) {
-              this.db.createEscalation({
-                runId: run.id,
-                fromTaskId: task.id,
-                toTaskId: task.parentId,
-                severity: task.tier === 1 ? "P0" : "P1",
-                category: "budget_exhausted",
-                title: `Task ${task.id} hit max rollover generations (${maxGenerations})`,
-                evidencePaths: [],
-                blocking: true,
-              });
-            }
-            return;
-          }
-          const nextHandoff = await this.buildCleanRolloverHandoff({
-            runId: run.id,
-            task: latest,
-            priorHandoff: handoff,
-            explicitHandoff: explicitRollover?.handoff ?? null,
-            worktreePath: wt?.path ?? null,
-            result: res,
-          });
-          if (this.rolloverFenceBroken(exec, task.id, fence)) return;
-          this.db.updateTask(task.id, {
-            status: "ready",
-            generation: nextGen,
-            contextUsed: 0,
-            sessionId: null,
-            profileId: explicitRollover?.target?.profileId ?? latest.profileId,
-            model: explicitRollover?.target?.model ?? latest.model,
-            effort: explicitRollover?.target?.effort ?? latest.effort,
-            handoffJson: JSON.stringify(nextHandoff),
-          });
-          this.db.emitEvent(run.id, task.id, "agent.rollover", {
-            fromGen: latest.generation,
-            toGen: nextGen,
-            reason: explicitRollover ? "explicit_handoff" : "context_threshold",
-          });
-          continue; // Immediately boot generation N+1 cleanly!
+          return;
         }
 
         // Agent stopped early due to quota / rate-limit timeout: preserve worktree, WIP & handoff, do NOT fail!
@@ -2953,7 +2911,7 @@ export class HarnessOrchestrator {
         }
 
         this.runConsecutiveQuotaPauses.delete(run.id);
-        this.taskAutoRolloverProgress.delete(task.id);
+        this.taskRolloverProgress.delete(task.id);
         // Agent finished its turn naturally without calling `return_task`
         if (latest.tier !== 1) {
           await this.settleWithoutReturn(exec, runnerGen, latest, run, wt, res, "completed", res.text.slice(0, 1000) || "Completed");
@@ -3037,37 +2995,30 @@ export class HarnessOrchestrator {
         // If this execution was evicted or superseded while running, never touch its successor.
         const latest = this.db.getTask(task.id);
         if (!latest || this.active.get(task.id) !== exec || latest.generation !== runnerGen) return;
-        // If an explicit clean rollover was scheduled right before the runner rejected on cancel, proceed with rollover!
+        // If an explicit clean rollover was scheduled or the runner threw a context overflow, route through rollOver.
         const explicitRollover = this.pendingRollovers.get(task.id);
-        if (explicitRollover && (explicitRollover.restart || latest.generation + 1 <= maxGenerations)) {
-          this.pendingRollovers.delete(task.id);
-          const nextGen = explicitRollover.restart ? latest.generation : latest.generation + 1;
-          const fence = this.rolloverFence(latest);
-          const nextHandoff = await this.buildCleanRolloverHandoff({
-            runId: run.id,
-            task: latest,
-            priorHandoff: handoff,
-            explicitHandoff: explicitRollover.handoff,
-            worktreePath: wt?.path ?? null,
-            result: { text: "", stopReason: "rollover_requested" },
-          });
-          if (this.rolloverFenceBroken(exec, task.id, fence)) return;
-          this.db.updateTask(task.id, {
-            status: "ready",
-            generation: nextGen,
-            contextUsed: 0,
-            sessionId: null,
-            profileId: explicitRollover.target?.profileId ?? latest.profileId,
-            model: explicitRollover.target?.model ?? latest.model,
-            effort: explicitRollover.target?.effort ?? latest.effort,
-            handoffJson: JSON.stringify(nextHandoff),
-          });
-          this.db.emitEvent(run.id, task.id, "agent.rollover", {
-            fromGen: latest.generation,
-            toGen: nextGen,
-            reason: "explicit_handoff",
-          });
-          continue;
+        const overflowErr = !explicitRollover && isContextOverflowError(msg);
+        if (explicitRollover || overflowErr) {
+          try {
+            if (
+              await this.rollOver({
+                exec,
+                runnerGen,
+                run,
+                latest,
+                wt,
+                priorHandoff: handoff,
+                res: { text: "", stopReason: "rollover_requested" },
+                explicit: explicitRollover,
+                reason: explicitRollover ? "explicit_handoff" : "context_overflow",
+              })
+            ) {
+              continue;
+            }
+            return;
+          } catch {
+            // Fall through to standard runner-failure settlement so rollOver never escapes the catch path.
+          }
         }
         this.pendingRollovers.delete(task.id);
         const flat = msg.replace(/\s+/g, " ").trim();
@@ -3136,7 +3087,7 @@ export class HarnessOrchestrator {
   /**
    * Writes a non-empty partial fallback handoff (`resultJson.fallback` with `partial: true`, inline
    * artifact list, git summary, and output excerpt/dossier) for any non-Tier-1 task ending without
-   * `return_task` (read-only natural end, error, cancel, throw, zero-progress abort, maxGenerations).
+   * `return_task` (read-only natural end, error, cancel, throw, zero-progress abort).
    * Returns true iff this execution and generation won the post-await race gate and committed.
    */
   private async writeFallbackHandoff(
@@ -3337,12 +3288,43 @@ export class HarnessOrchestrator {
       };
     }
 
+    const listNewestAgentDossierPaths = (): string[] => {
+      const agentPathSet = new Set(this.db.listAgentDossierPaths(input.runId, input.task.id));
+      if (agentPathSet.size === 0) return [];
+      const ordered: string[] = [];
+      const seen = new Set<string>();
+      for (const a of this.db.listArtifacts(input.runId, input.task.id, 200, "dossier")) {
+        if (a.origin === "agent" && agentPathSet.has(a.path) && !seen.has(a.path)) {
+          seen.add(a.path);
+          ordered.push(a.path);
+          if (ordered.length >= 8) return ordered;
+        }
+      }
+      for (const p of agentPathSet) {
+        if (!seen.has(p)) {
+          seen.add(p);
+          ordered.push(p);
+          if (ordered.length >= 8) break;
+        }
+      }
+      return ordered;
+    };
+
+    const resetRisk = (): string => {
+      const dossierPaths = listNewestAgentDossierPaths();
+      const tail =
+        dossierPaths.length > 0
+          ? `Your saved dossiers: ${dossierPaths.join(", ")}. Read them with artifact_read before repeating work.`
+          : "No dossier was saved. Save findings with artifact_write as you go.";
+      return `Context was reset: the harness started this fresh session at the context limit (or after a context overflow), so nothing you read earlier is in your context. ${tail}`;
+    };
+
     const activeRisks: string[] = [
       input.result.stopReason === "error"
         ? `Generation ${input.task.generation} ended before completing: ${input.result.text.slice(0, 300)}`
         : input.result.stopReason === "quota_paused"
           ? `Generation ${input.task.generation} paused on a quota or rate limit.`
-          : `Auto-rollover triggered at context threshold during generation ${input.task.generation} (no explicit request_rollover submitted).`,
+          : resetRisk(),
     ];
     const nextActions: string[] = [];
 
@@ -3425,9 +3407,128 @@ export class HarnessOrchestrator {
     };
   }
 
-  private async computeAutoRolloverFingerprint(runId: string, taskId: string, worktreePath: string | null): Promise<string> {
-    let gitState = "no-wt";
-    if (worktreePath && existsSync(worktreePath)) {
+  /** Every rollover (explicit, context threshold, or context overflow) goes through here. Returns true when generation N+1 was scheduled. */
+  private async rollOver(a: {
+    exec: ActiveTaskExecution;
+    runnerGen: number;
+    run: RunRecord;
+    latest: TaskRecord;
+    wt: WorktreeRecord | null;
+    priorHandoff: AnchoredHandoff | null;
+    res: RunAgentResult | null;
+    explicit:
+      | { handoff: AnchoredHandoff; target?: { profileId?: string; model?: string; effort?: string }; restart?: boolean }
+      | undefined;
+    reason: "explicit_handoff" | "context_threshold" | "context_overflow";
+  }): Promise<boolean> {
+    const { exec, runnerGen, run, latest, wt, priorHandoff, res, explicit, reason } = a;
+    const taskId = latest.id;
+    this.pendingRollovers.delete(taskId);
+    const nextGen = explicit?.restart ? latest.generation : latest.generation + 1;
+    // A stop or cancel during the awaits below wins: the stale continuation writes nothing and launches nothing.
+    const fence = this.rolloverFence(latest);
+    const nextRoute = {
+      profileId: explicit?.target?.profileId ?? latest.profileId,
+      model: explicit?.target?.model ?? latest.model,
+      effort: explicit?.target?.effort ?? latest.effort,
+    };
+    const prev = this.taskRolloverProgress.get(taskId);
+    const next = await this.computeRolloverFingerprint({
+      run,
+      task: latest,
+      worktreePath: wt?.path ?? null,
+      nextRoute,
+      prev,
+    });
+    if (this.rolloverFenceBroken(exec, taskId, fence)) return false;
+    const streak = prev && prev.fp === next.fp ? prev.streak + 1 : 1;
+    this.taskRolloverProgress.set(taskId, { fp: next.fp, streak, artHigh: next.artHigh, routes: next.routes });
+    if (streak >= 3) {
+      const summary =
+        "Stopped: 2 context windows in a row with nothing new (no commit, file change, added dossier content, child change, or newly read file). " +
+        (latest.tier === 1 ? "resume_run continues it." : "resume_task with a note continues it.");
+      let settled = false;
+      if (latest.tier === 1) {
+        if (this.active.get(taskId) === exec && !this.rolloverFenceBroken(exec, taskId, fence)) {
+          this.db.updateTask(taskId, { status: "failed", summary });
+          settled = true;
+        }
+      } else {
+        settled = await this.settleWithoutReturn(exec, runnerGen, latest, run, wt, res, "failed", summary, "zero_progress_rollover");
+      }
+      if (settled) {
+        let evidencePaths: string[] = [];
+        try {
+          evidencePaths = Array.from(
+            new Set(this.db.listArtifacts(run.id, taskId, 20, "dossier").map((art) => art.path)),
+          );
+        } catch {
+          evidencePaths = [];
+        }
+        if (evidencePaths.length === 0) {
+          evidencePaths = [wt?.path ?? run.repoRoot];
+        }
+        try {
+          this.db.createEscalation({
+            runId: run.id,
+            fromTaskId: taskId,
+            toTaskId: latest.parentId,
+            severity: latest.tier === 1 ? "P0" : "P1",
+            category: "budget_exhausted",
+            title: `Task ${taskId} had 2 context windows in a row with nothing new`,
+            evidencePaths,
+            blocking: true,
+          });
+        } catch {
+          // Never allow escalation creation failure to escape rollOver.
+        }
+      }
+      return false;
+    }
+
+    const handoffResult: RunAgentResult =
+      reason === "context_overflow"
+        ? { ...(res ?? { text: "" }), stopReason: "rollover_requested" }
+        : (res ?? { text: "", stopReason: "rollover_requested" });
+    const nextHandoff = await this.buildCleanRolloverHandoff({
+      runId: run.id,
+      task: latest,
+      priorHandoff,
+      explicitHandoff: explicit?.handoff ?? null,
+      worktreePath: wt?.path ?? null,
+      result: handoffResult,
+    });
+    if (this.rolloverFenceBroken(exec, taskId, fence)) return false;
+    this.db.updateTask(taskId, {
+      status: "ready",
+      generation: nextGen,
+      contextUsed: 0,
+      sessionId: null,
+      profileId: nextRoute.profileId,
+      model: nextRoute.model,
+      effort: nextRoute.effort,
+      handoffJson: JSON.stringify(nextHandoff),
+    });
+    this.db.emitEvent(run.id, taskId, "agent.rollover", {
+      fromGen: latest.generation,
+      toGen: nextGen,
+      reason,
+    });
+    return true;
+  }
+
+  /** Pure with respect to the progress map: reads prev and returns the next entry fields. */
+  private async computeRolloverFingerprint(input: {
+    run: RunRecord;
+    task: TaskRecord;
+    worktreePath: string | null;
+    nextRoute: { profileId: string | null; model: string | null; effort: string | null };
+    prev: RolloverProgress | undefined;
+  }): Promise<{ fp: string; artHigh: number; routes: string[] }> {
+    const { run, task, worktreePath, nextRoute, prev } = input;
+    const canWrite = !task.readOnly && !isReadOnlyKind(task.kind);
+    let gitState = !canWrite ? "ro" : "no-wt";
+    if (canWrite && worktreePath && existsSync(worktreePath)) {
       const [head, status, diff] = await Promise.all([
         runGit(worktreePath, ["rev-parse", "HEAD"]).then((r) => r.stdout).catch(() => ""),
         runGit(worktreePath, ["status", "--porcelain"]).then((r) => r.stdout).catch(() => ""),
@@ -3436,12 +3537,58 @@ export class HarnessOrchestrator {
       const diffHash = createHash("sha256").update(diff).digest("hex").slice(0, 16);
       gitState = `${head}|${status}|${diffHash}`;
     }
-    const artCount = this.db.listArtifacts(runId, taskId, 200).length;
-    const kids = this.db.listTasks(runId, { parentId: taskId });
+
+    const agentDossierPaths = this.db.listAgentDossierPaths(run.id, task.id);
+    const artHigh = Math.max(prev?.artHigh ?? 0, distinctContentBytes(agentDossierPaths, run.repoRoot));
+
+    const kids = this.db.listTasks(run.id, { parentId: task.id });
     const kidSig = kids.map((k) => `${k.id}:${k.status}:${k.generation}:${k.updatedAt}`).join(",");
-    const bbKeys = Object.keys(this.db.blackboardGet(runId)).sort().join(",");
-    const openEsc = this.db.listEscalations(runId, "open").map((e) => e.id).join(",");
-    return `${gitState}::art=${artCount}::kids=${kidSig}::bb=${bbKeys}::esc=${openEsc}`;
+
+    const allBb = this.db.blackboardGet(run.id);
+    const bbSig = Object.entries(allBb)
+      .filter(([, entry]) => entry.authorTaskId === task.id)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, entry]) => {
+        const valHash = createHash("sha256").update(JSON.stringify(entry.value) ?? "").digest("hex").slice(0, 16);
+        return `${key}#${valHash}`;
+      })
+      .join(",");
+
+    const escSig = Array.from(
+      new Set(
+        this.db
+          .listEscalations(run.id)
+          .filter((e) => e.fromTaskId === task.id || e.toTaskId === task.id)
+          .map((e) => `${e.category}:${e.title.trim().toLowerCase()}:${e.status}`),
+      ),
+    )
+      .sort()
+      .join(",");
+
+    const act = this.advisories.activityProgress(task.id);
+
+    const cachedModels = this.catalog.loadCached()?.models ?? [];
+    const routeKey = (r: { profileId: string | null; model: string | null; effort: string | null }): string => {
+      const prof = r.profileId ?? "";
+      const mod = r.model ?? "";
+      const rawEffort = r.effort?.trim().toLowerCase() ?? "";
+      let canonEffort = "";
+      if (rawEffort && mod) {
+        const entry = cachedModels.find((m) => m.id === mod);
+        const allowed = entry?.efforts?.map((e) => e.trim().toLowerCase()) ?? [];
+        if (allowed.includes(rawEffort)) canonEffort = rawEffort;
+      }
+      return `${prof}|${mod}|${canonEffort}`;
+    };
+    const routes = Array.from(
+      new Set([
+        ...(prev?.routes ?? [routeKey({ profileId: task.profileId, model: task.model, effort: task.effort })]),
+        routeKey(nextRoute),
+      ]),
+    ).sort();
+
+    const fp = `${gitState}::art=${artHigh}::kids=${kidSig}::bb=${bbSig}::esc=${escSig}::act=${act}::rt=${routes.join(",")}`;
+    return { fp, artHigh, routes };
   }
 
   private waitForWorktreeSlot(repoRoot: string, signal: AbortSignal): Promise<void> {
