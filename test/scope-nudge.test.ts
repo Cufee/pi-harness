@@ -261,6 +261,90 @@ describe("ScopeNudgeMonitor", () => {
     assert.match(nudge!, /repeated.*3 times/i);
   });
 
+  it("preserves verbatim whitespace in Grep patterns and Bash commands for repeat/progress identity while normalizing topic clusters", () => {
+    const grepMonitor = new ScopeNudgeMonitor({ workspaceRoot });
+
+    for (const pattern of ["a b", "a  b", "a   b", " = ", " =", "= "]) {
+      const res = grepMonitor.observe({
+        name: "Grep",
+        kind: "search",
+        status: "completed",
+        args: { path: "src", pattern },
+      });
+      assert.equal(res, null);
+      assert.equal(grepMonitor.signals().repeatStreak, 1);
+      assert.equal(grepMonitor.signals().staleStreak, 0);
+    }
+
+    // Truly identical repeated Grep calls still count as repeats and nudge on the 3rd.
+    assert.equal(
+      grepMonitor.observe({ name: "Grep", kind: "search", status: "completed", args: { path: "src", pattern: "a  b" } }),
+      null,
+    );
+    assert.equal(grepMonitor.signals().repeatStreak, 1);
+    assert.equal(
+      grepMonitor.observe({ name: "Grep", kind: "search", status: "completed", args: { path: "src", pattern: "a  b" } }),
+      null,
+    );
+    assert.equal(grepMonitor.signals().repeatStreak, 2);
+    const grepNudge = grepMonitor.observe({
+      name: "Grep",
+      kind: "search",
+      status: "completed",
+      args: { path: "src", pattern: "a  b" },
+    });
+    assert.equal(grepMonitor.signals().repeatStreak, 3);
+    assert.ok(grepNudge?.includes("[Harness scope check]"));
+    assert.match(grepNudge!, /repeated.*Grep.*3 times/i);
+
+    // Bash command strings with distinct quoted whitespace must not collide.
+    const bashMonitor = new ScopeNudgeMonitor({ workspaceRoot });
+    for (const command of ['rg -F "a b" src', 'rg -F "a  b" src', 'rg -F "a   b" src']) {
+      const res = bashMonitor.observe({
+        name: "Bash",
+        status: "completed",
+        args: { command },
+      });
+      assert.equal(res, null);
+      assert.equal(bashMonitor.signals().repeatStreak, 1);
+      assert.equal(bashMonitor.signals().staleStreak, 0);
+    }
+
+    // Truly identical repeated Bash commands still nudge on the 3rd call.
+    assert.equal(
+      bashMonitor.observe({ name: "Bash", status: "completed", args: { command: 'rg -F "a  b" src' } }),
+      null,
+    );
+    assert.equal(
+      bashMonitor.observe({ name: "Bash", status: "completed", args: { command: 'rg -F "a  b" src' } }),
+      null,
+    );
+    const bashNudge = bashMonitor.observe({
+      name: "Bash",
+      status: "completed",
+      args: { command: 'rg -F "a  b" src' },
+    });
+    assert.equal(bashMonitor.signals().repeatStreak, 3);
+    assert.ok(bashNudge?.includes("[Harness scope check]"));
+    assert.match(bashNudge!, /repeated.*Bash.*3 times/i);
+
+    // Topic clustering still normalizes case and whitespace across variants of the same token.
+    const topicMonitor = new ScopeNudgeMonitor({ workspaceRoot });
+    for (const [i, pattern] of ["findCallers", "  FINDCALLERS  ", "findcallers  "].entries()) {
+      assert.equal(
+        topicMonitor.observe({
+          name: "Grep",
+          kind: "search",
+          status: "completed",
+          args: { path: `packages/pkg${i}/index.ts`, pattern },
+        }),
+        null,
+      );
+      assert.equal(topicMonitor.signals().repeatStreak, 1);
+    }
+    assert.equal(topicMonitor.signals().searchTopics.length, 1);
+  });
+
   it("skips scoring when inputs cannot distinguish operations (cwd alone, truncated argv, outer code_exec)", () => {
     const monitor = new ScopeNudgeMonitor({ workspaceRoot });
 

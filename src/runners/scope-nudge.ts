@@ -31,12 +31,14 @@ import { isAbsolute, relative, resolve } from "node:path";
  * - **W (widening)**: `distinctAreas.length >= 8` AND at least `6` of the last `12` path-bearing
  *   calls entered an area first seen within that 12-call window (`newAreasInWindow >= 6`).
  * - **T (topic spread)**: `searchTopics.length >= 4` distinct search topic clusters.
- * - **S (spinning / no progress)**: the same normalized `(tool + path + range + query + argv/op)`
+ * - **S (spinning / no progress)**: the same `(tool + path + range + verbatim query + verbatim argv/op)`
  *   call completed `3` or more times consecutively (`repeatStreak >= 3`), OR `12` consecutive
- *   scored calls added no new `(tool + path + range + query + argv/op)` key and no new search
- *   topic (`staleStreak >= 12`). Calls whose inputs cannot distinguish operations (for example
- *   `cwd` alone without a path, query, or complete `argv`/`command`, or truncated distinguishing
- *   inputs) are skipped rather than scored as repeats or lack of progress.
+ *   scored calls added no new `(tool + path + range + verbatim query + verbatim argv/op)` key and no
+ *   new search topic (`staleStreak >= 12`). Literal query/pattern and command/argv strings stay
+ *   verbatim for repeat and progress identity; queries are normalized only for topic clustering.
+ *   Calls whose inputs cannot distinguish operations (for example `cwd` alone without a path, query,
+ *   or complete `argv`/`command`, or truncated distinguishing inputs) are skipped rather than scored
+ *   as repeats or lack of progress.
  *
  * ## Fire rule and cadence
  * - Fires when `(W && T) || S`. `W` alone never fires, so a bounded single-topic search across
@@ -344,38 +346,56 @@ function extractPaths(
   return results;
 }
 
-function extractQuery(call: ScopeToolCall, kind: string | undefined, args: Record<string, unknown>): string | null {
+interface ExtractedQuery {
+  identityKey: string;
+  topicText: string;
+}
+
+function extractQuery(
+  call: ScopeToolCall,
+  kind: string | undefined,
+  args: Record<string, unknown>,
+): ExtractedQuery | null {
   const isWriteTool = WRITE_NAME_RE.test(call.name) || WRITE_NAME_RE.test(kind ?? "");
   const isSearchTool = SEARCH_NAME_RE.test(call.name) || SEARCH_NAME_RE.test(kind ?? "");
   const isGlobTool = GLOB_NAME_RE.test(call.name) || GLOB_NAME_RE.test(kind ?? "");
 
-  const candidates: string[] = [];
-  const pushStr = (v: unknown) => {
-    if (typeof v === "string" && v.trim()) candidates.push(v.trim());
+  const identityEntries: Array<[string, string]> = [];
+  const topicCandidates: string[] = [];
+  const pushStr = (key: string, v: unknown) => {
+    if (typeof v === "string" && v.length > 0) {
+      identityEntries.push([key, v]);
+      if (v.trim()) topicCandidates.push(v.trim());
+    }
   };
 
-  pushStr(args.query);
-  pushStr(args.regex);
-  pushStr(args.symbol);
-  pushStr(args.term);
-  pushStr(args.q);
-  pushStr(args.search);
+  pushStr("query", args.query);
+  pushStr("regex", args.regex);
+  pushStr("symbol", args.symbol);
+  pushStr("term", args.term);
+  pushStr("q", args.q);
+  pushStr("search", args.search);
   if (!isWriteTool) {
-    pushStr(args.content);
+    pushStr("content", args.content);
   }
-  if (typeof args.pattern === "string" && args.pattern.trim()) {
+  if (typeof args.pattern === "string" && args.pattern.length > 0) {
     const p = args.pattern.trim();
     if (isGlobTool && p.includes("/") && GLOB_META_RE.test(p)) {
+      identityEntries.push(["pattern", args.pattern]);
       // Only tokenize the filename portion of a path glob so directory names do not invent fake topics.
       const base = p.replaceAll("\\", "/").split("/").pop() ?? "";
-      if (base) candidates.push(base);
+      if (base) topicCandidates.push(base);
     } else if (!isWriteTool || isSearchTool) {
-      candidates.push(p);
+      identityEntries.push(["pattern", args.pattern]);
+      if (p) topicCandidates.push(p);
     }
   }
 
-  if (candidates.length === 0) return null;
-  return candidates.join(" ");
+  if (identityEntries.length === 0) return null;
+  return {
+    identityKey: JSON.stringify(identityEntries),
+    topicText: topicCandidates.join(" "),
+  };
 }
 
 function extractTopicTokens(query: string): string[] {
@@ -405,20 +425,19 @@ function extractRangeKey(args: Record<string, unknown>, lineSuffixes: string[]):
 }
 
 function extractOperationKey(args: Record<string, unknown>): string {
-  const parts: string[] = [];
+  const entries: Array<[string, unknown]> = [];
   if (Array.isArray(args.argv) && args.argv.length > 0) {
     const verbatim = args.argv
       .filter((item) => typeof item === "string" || typeof item === "number" || typeof item === "boolean")
       .map((item) => String(item));
     if (verbatim.length === args.argv.length) {
-      parts.push(`argv=${JSON.stringify(verbatim)}`);
+      entries.push(["argv", verbatim]);
     }
   }
   for (const key of DISTINGUISHING_STRING_KEYS) {
     const v = args[key];
-    if (typeof v === "string" && v.trim()) {
-      const normalized = key === "command" || key === "cmd" ? v.trim().replace(/\s+/g, " ") : v.trim();
-      parts.push(`${key}=${normalized}`);
+    if (typeof v === "string" && v.length > 0) {
+      entries.push([key, v]);
     }
   }
   for (const key of DISTINGUISHING_ARRAY_KEYS) {
@@ -426,14 +445,14 @@ function extractOperationKey(args: Record<string, unknown>): string {
     if (Array.isArray(v) && v.length > 0) {
       const normalized = v
         .filter((item) => typeof item === "string" || typeof item === "number")
-        .map((item) => String(item).trim())
+        .map((item) => String(item))
         .sort();
       if (normalized.length > 0) {
-        parts.push(`${key}=${JSON.stringify(normalized)}`);
+        entries.push([key, normalized]);
       }
     }
   }
-  return parts.join("&");
+  return entries.length > 0 ? JSON.stringify(entries) : "";
 }
 
 function sampleList(items: string[], max = 5): string {
@@ -497,7 +516,7 @@ export class ScopeNudgeMonitor {
 
     const extractedPaths = extractPaths(call, kind, parsedArgs);
     const query = extractQuery(call, kind, parsedArgs);
-    const topicTokens = query ? extractTopicTokens(query) : [];
+    const topicTokens = query?.topicText ? extractTopicTokens(query.topicText) : [];
     const opKey = extractOperationKey(parsedArgs);
     const hasNonCwdPath = extractedPaths.some((p) => !p.fromCwd);
 
@@ -525,9 +544,9 @@ export class ScopeNudgeMonitor {
     const toolKey = toolName.toLowerCase();
     const pathKey = [...normalizedPaths].sort().join("|");
     const rangeKey = extractRangeKey(parsedArgs, lineSuffixes);
-    const queryKey = query ? query.toLowerCase().replace(/\s+/g, " ").trim() : "";
+    const queryKey = query ? query.identityKey : "";
 
-    const callKey = `${toolKey}::${pathKey}::${rangeKey}::${queryKey}::${opKey}`;
+    const callKey = JSON.stringify([toolKey, pathKey, rangeKey, queryKey, opKey]);
     if (this.lastCallKey === callKey) {
       this.repeatStreak += 1;
     } else {
