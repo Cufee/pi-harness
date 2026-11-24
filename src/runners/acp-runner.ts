@@ -1,7 +1,6 @@
 import { contextWarningText, formatNotice } from "../advisories/message.js";
 import { deniedNotice, HarnessRejection, REJECTIONS } from "../advisories/rejections.js";
 import { toolEventPreview } from "../protocol/tool-display.js";
-import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, realpath, stat } from "node:fs/promises";
@@ -378,9 +377,17 @@ const IDENTICAL_FAILURE_BREAKER = 6;
 const DEFAULT_QUOTA_RETRY_TIMEOUT_MS = 45_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 45_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 600_000;
+const DEFAULT_STEER_ACK_TIMEOUT_MS = 15_000;
+
+export interface AcpRunnerOptions {
+  steerAckTimeoutMs?: number;
+}
 
 export class AcpRunner {
-  constructor(private readonly profile: AcpProfileConfig) {}
+  constructor(
+    private readonly profile: AcpProfileConfig,
+    private readonly opts?: AcpRunnerOptions,
+  ) {}
 
   /**
    * Executes an agent turn over ACP v1 (with unstable extensions for usage_update,
@@ -417,12 +424,17 @@ export class AcpRunner {
     for (const [key, value] of Object.entries(req.extraEnv ?? {})) {
       if (typeof value === "string" && !/^path$/i.test(key)) prepared.env[key] = value;
     }
-    const isAmpProfileEarly = isAmpAcpProfile(this.profile);
-    if (isAmpProfileEarly && prepared.env.AMP_ACP_CANCEL_MODE === undefined && prepared.env.AMP_ACP_EXECUTOR !== "orb") {
+    const isAmpProfile = isAmpAcpProfile(this.profile);
+    const ampExecutorIsOrb = prepared.env.AMP_ACP_EXECUTOR?.trim().toLowerCase() === "orb";
+    const ampTransportIsSdk = prepared.env.AMP_ACP_TRANSPORT?.trim().toLowerCase() === "sdk";
+    if (isAmpProfile && prepared.env.AMP_ACP_CANCEL_MODE === undefined && !ampExecutorIsOrb && !ampTransportIsSdk) {
       prepared.env.AMP_ACP_CANCEL_MODE = "steer";
     }
     const ampCancelSteerEnabled =
-      isAmpProfileEarly && prepared.env.AMP_ACP_CANCEL_MODE === "steer" && prepared.env.AMP_ACP_EXECUTOR !== "orb";
+      isAmpProfile &&
+      prepared.env.AMP_ACP_CANCEL_MODE === "steer" &&
+      !ampExecutorIsOrb &&
+      !ampTransportIsSdk;
 
     const child = testAgent
       ? null
@@ -492,15 +504,53 @@ export class AcpRunner {
     let rolloverTriggered = false;
     let rolloverWarningSent = false;
     let wrapUpAttempted = false;
+    let wrapUpTimedOut = false;
     let wrapUpTimer: ReturnType<typeof setTimeout> | null = null;
     let turnsUsed = 0;
     let completedToolInWave = false;
     const inFlightToolCalls = new Set<string>();
     let sessionId: string | undefined;
     let steeringSupported = false;
-    const isAmpProfile = isAmpAcpProfile(this.profile);
     let activeConnection: ClientConnection | null = null;
     const toolTitlesById = new Map<string, string>();
+
+    type SteerHandoffState = {
+      turnPromise: Promise<Record<string, unknown>>;
+      priorTurnSettled: boolean;
+      abortedBeforeSend: boolean;
+      replacementSent: boolean;
+      ackSettled: boolean;
+      ackLive: boolean;
+      message: string;
+      userEchoText: string;
+      settleAck: (live: boolean) => void;
+    };
+    const steerHandoff: {
+      pending: SteerHandoffState | null;
+      ack: SteerHandoffState | null;
+      cancelIssuedForTurn: boolean;
+    } = {
+      pending: null,
+      ack: null,
+      cancelIssuedForTurn: false,
+    };
+    const extractUpdateText = (content: unknown): string => {
+      if (typeof content === "string") return content;
+      if (Array.isArray(content)) {
+        return content
+          .map((b) =>
+            b && typeof b === "object" && (b as { type?: unknown }).type === "text" && typeof (b as { text?: unknown }).text === "string"
+              ? (b as { text: string }).text
+              : "",
+          )
+          .join("");
+      }
+      if (content && typeof content === "object") {
+        const c = content as { type?: unknown; text?: unknown };
+        if (c.type === "text" && typeof c.text === "string") return c.text;
+      }
+      return "";
+    };
 
     // Inactivity watchdog + bounded cancellation grace timer for active `session/prompt` calls
     let idleTimedOut = false;
@@ -537,6 +587,7 @@ export class AcpRunner {
       `ACP agent process exited during an active turn (code=${code ?? "null"}, signal=${signal ?? "null"})`;
     const onChildGone = (code: number | null, signal: NodeJS.Signals | null) => {
       if (!childExitInfo && (code !== null || signal !== null)) childExitInfo = { code, signal };
+      steerHandoff.ack?.settleAck(false);
       // Abort, rollover, idle timeout, and cancel grace terminate the child on purpose.
       if (req.signal.aborted || rolloverTriggered || idleTimedOut || cancelGraceTimer) return;
       if (!rejectActivePromptOnChildExit) return;
@@ -599,6 +650,7 @@ export class AcpRunner {
         idleTimer = null;
         if (quotaWatchdogTriggered || rolloverTriggered || req.signal.aborted) return;
         idleTimedOut = true;
+        steerHandoff.ack?.settleAck(false);
         const cb = rejectActivePromptOnIdle;
         clearIdleWatchdog();
         if (sessionId && activeConnection) {
@@ -610,16 +662,12 @@ export class AcpRunner {
       idleTimer.unref?.();
     };
 
-    // Fire-and-forget steering into the live session; adapters without a steering channel get nothing.
+    // Fire-and-forget steering into the live session; only adapters with live mid-turn _session/steering get it.
     const sendSteeringText = (text: string) => {
       if (!sessionId || !activeConnection) return;
       if (steeringSupported) {
         void activeConnection.agent
           .request("_session/steering", { sessionId, prompt: [{ type: "text", text }] })
-          .catch(() => {});
-      } else if (isAmpProfile) {
-        void activeConnection.agent
-          .request("_amp/session/steer", { sessionId, steerId: randomUUID(), prompt: [{ type: "text", text }] })
           .catch(() => {});
       }
     };
@@ -693,6 +741,7 @@ export class AcpRunner {
           quotaWatchdogTimer = null;
           if (rolloverTriggered || req.signal.aborted) return;
           quotaWatchdogTriggered = true;
+          steerHandoff.ack?.settleAck(false);
           if (sessionId && activeConnection) {
             void activeConnection.agent.notify("session/cancel", { sessionId }).catch(() => {});
           }
@@ -769,11 +818,43 @@ export class AcpRunner {
         if (params.sessionId !== sessionId || !update || typeof update !== "object") return;
         resetIdleWatchdog();
         const kind = String(update.sessionUpdate ?? "");
+        const canAckReplacement = () =>
+          Boolean(
+            steerHandoff.ack &&
+              steerHandoff.ack.replacementSent &&
+              !steerHandoff.ack.ackSettled &&
+              !req.signal.aborted &&
+              !rolloverTriggered &&
+              !quotaWatchdogTriggered &&
+              !quotaRejected &&
+              !idleTimedOut &&
+              !req.isTaskSettled?.(),
+          );
 
-        if (kind === "agent_message_chunk") {
+        if (kind === "user_message_chunk" || kind === "user_message") {
+          if (canAckReplacement() && steerHandoff.ack) {
+            const echoedChunk = extractUpdateText(update.content);
+            if (echoedChunk) {
+              steerHandoff.ack.userEchoText += echoedChunk;
+              const expected = steerHandoff.ack.message.trim();
+              const echoed = steerHandoff.ack.userEchoText.trim();
+              if (expected.length > 0 && (echoed === expected || echoed.includes(expected))) {
+                steerHandoff.ack.settleAck(true);
+              }
+            }
+          }
+        } else if (kind === "agent_message_chunk") {
           advanceTurnWaveIfNeeded();
           const content = update.content as { type?: string; text?: string } | undefined;
           if (content?.type === "text" && typeof content.text === "string") {
+            if (
+              canAckReplacement() &&
+              steerHandoff.ack?.priorTurnSettled &&
+              content.text.trim().length > 0 &&
+              !/^Error:\s/i.test(content.text.trim())
+            ) {
+              steerHandoff.ack.settleAck(true);
+            }
             if (quotaRejected) {
               textSinceQuotaRejection += content.text;
             }
@@ -798,6 +879,9 @@ export class AcpRunner {
           advanceTurnWaveIfNeeded();
           const content = update.content as { type?: string; text?: string } | undefined;
           if (content?.type === "text" && typeof content.text === "string") {
+            if (canAckReplacement() && steerHandoff.ack?.priorTurnSettled && content.text.trim().length > 0) {
+              steerHandoff.ack.settleAck(true);
+            }
             req.callbacks.onThoughtDelta?.(content.text);
           }
         } else if (kind === "usage_update") {
@@ -864,7 +948,7 @@ export class AcpRunner {
             ratio < rolloverThreshold &&
             sessionId &&
             activeConnection &&
-            (steeringSupported || isAmpProfile)
+            steeringSupported
           ) {
             rolloverWarningSent = true;
             const pct = Math.round(ratio * 100);
@@ -881,10 +965,14 @@ export class AcpRunner {
             activeConnection
           ) {
             rolloverTriggered = true;
+            steerHandoff.ack?.settleAck(false);
             void activeConnection.agent.notify("session/cancel", { sessionId }).catch(() => {});
             armCancelGraceTimer("cancelled");
           }
         } else if (kind === "tool_call" || kind === "tool_call_update") {
+          if (canAckReplacement() && steerHandoff.ack?.priorTurnSettled) {
+            steerHandoff.ack.settleAck(true);
+          }
           if (accumulatedText.length > 0) needsParagraphBreak = true;
           textSinceLastTool = "";
           const callId = update.toolCallId ? String(update.toolCallId) : update.id ? String(update.id) : undefined;
@@ -1435,6 +1523,7 @@ export class AcpRunner {
     activeConnection = conn;
 
     const onAbort = () => {
+      steerHandoff.ack?.settleAck(false);
       if (sessionId) {
         void conn.agent.notify("session/cancel", { sessionId }).catch(() => {});
       }
@@ -1540,83 +1629,177 @@ export class AcpRunner {
       }
 
       let promptInFlight = false;
-      let steerHandoffPromise: Promise<Record<string, unknown>> | null = null;
+      const canStartSteerHandoff = () =>
+        Boolean(sessionId) &&
+        activeConnection === conn &&
+        !req.signal.aborted &&
+        !rolloverTriggered &&
+        !quotaWatchdogTriggered &&
+        !quotaRejected &&
+        !idleTimedOut &&
+        !wrapUpAttempted &&
+        !wrapUpTimedOut &&
+        !childGoneError &&
+        !(child && (child.exitCode !== null || child.signalCode !== null)) &&
+        !req.isTaskSettled?.();
 
       req.onHandle?.({
         steer: async (message: string) => {
           if (!sessionId) return false;
           if (steeringSupported) {
+            if (req.signal.aborted || rolloverTriggered || quotaWatchdogTriggered || idleTimedOut || req.isTaskSettled?.()) {
+              return false;
+            }
             try {
               await conn.agent.request("_session/steering", {
                 sessionId,
                 prompt: [{ type: "text", text: message }],
               });
-              return true;
+              return !req.signal.aborted && !rolloverTriggered && !quotaWatchdogTriggered && !idleTimedOut && !req.isTaskSettled?.();
             } catch {
               return false;
             }
           }
           if (isAmpProfile) {
-            try {
-              const steerRes = (await conn.agent.request("_amp/session/steer", {
-                sessionId,
-                steerId: randomUUID(),
-                prompt: [{ type: "text", text: message }],
-              })) as { outcome?: unknown; reason?: unknown } | null | undefined;
-              const outcome = typeof steerRes?.outcome === "string" ? steerRes.outcome : undefined;
-              if (outcome === "startedNewTurn") return true;
-              if (outcome === "failed") return false;
-              if (outcome === "queued") {
-                // amp-acp's _amp/session/steer queues mid-turn messages for the next turn, which never runs for
-                // one-turn workers. With AMP_ACP_CANCEL_MODE=steer on a local session, hand off via session/cancel
-                // followed by session/prompt so amp-acp writes {"steer":true} to the still-running Amp process.
-                if (
-                  ampCancelSteerEnabled &&
-                  promptInFlight &&
-                  !steerHandoffPromise &&
-                  !req.signal.aborted &&
-                  !rolloverTriggered &&
-                  !idleTimedOut &&
-                  !wrapUpTimedOut &&
-                  !wrapUpAttempted
-                ) {
-                  let resolveDispatched!: (ok: boolean) => void;
-                  const dispatched = new Promise<boolean>((resolveDispatch) => {
-                    resolveDispatched = resolveDispatch;
-                  });
-                  const handoff = (async () => {
-                    try {
-                      await conn.agent.notify("session/cancel", { sessionId });
-                      const nextPrompt = conn.agent.request("session/prompt", {
-                        sessionId,
-                        prompt: [{ type: "text", text: message }],
-                      } as never) as unknown as Promise<Record<string, unknown>>;
-                      resolveDispatched(true);
-                      return await nextPrompt;
-                    } catch (err) {
-                      resolveDispatched(false);
-                      throw err;
-                    }
-                  })();
-                  handoff.catch(() => {});
-                  steerHandoffPromise = handoff;
-                  const ok = await dispatched;
-                  if (!ok) {
-                    if (steerHandoffPromise === handoff) steerHandoffPromise = null;
-                    return false;
-                  }
-                  return true;
-                }
-                return false;
-              }
-              return false;
-            } catch {
+            // Pick one delivery owner before sending: never probe the mutating _amp/session/steer next-turn queue.
+            // On local CLI sessions with AMP_ACP_CANCEL_MODE=steer, hand off one mid-turn steer via session/cancel
+            // followed by replacement session/prompt and confirm live delivery only on a model-visible signal.
+            // Otherwise return false immediately so the harness queue owns delivery without duplication.
+            if (
+              !ampCancelSteerEnabled ||
+              !promptInFlight ||
+              steerHandoff.pending !== null ||
+              steerHandoff.ack !== null ||
+              !canStartSteerHandoff()
+            ) {
               return false;
             }
+
+            let resolveTurn!: (res: Record<string, unknown>) => void;
+            let rejectTurn!: (err: unknown) => void;
+            const turnPromise = new Promise<Record<string, unknown>>((resolve, reject) => {
+              resolveTurn = resolve;
+              rejectTurn = reject;
+            });
+            turnPromise.catch(() => {});
+
+            let resolveAck!: (live: boolean) => void;
+            const ackPromise = new Promise<boolean>((resolve) => {
+              resolveAck = resolve;
+            });
+            let ackTimer: ReturnType<typeof setTimeout> | null = null;
+            const onAckAbort = () => state.settleAck(false);
+
+            const state: SteerHandoffState = {
+              turnPromise,
+              priorTurnSettled: false,
+              abortedBeforeSend: false,
+              replacementSent: false,
+              ackSettled: false,
+              ackLive: false,
+              message,
+              userEchoText: "",
+              settleAck: (live: boolean) => {
+                if (state.ackSettled) return;
+                state.ackSettled = true;
+                state.ackLive = live;
+                if (ackTimer) {
+                  clearTimeout(ackTimer);
+                  ackTimer = null;
+                }
+                req.signal.removeEventListener("abort", onAckAbort);
+                if (steerHandoff.ack === state) steerHandoff.ack = null;
+                resolveAck(live);
+              },
+            };
+
+            steerHandoff.pending = state;
+            steerHandoff.ack = state;
+            steerHandoff.cancelIssuedForTurn = true;
+            req.signal.addEventListener("abort", onAckAbort, { once: true });
+
+            try {
+              await conn.agent.notify("session/cancel", { sessionId });
+            } catch {
+              state.abortedBeforeSend = true;
+              state.settleAck(false);
+              resolveTurn({ stopReason: "cancelled" });
+              if (steerHandoff.pending === state) steerHandoff.pending = null;
+              return false;
+            }
+
+            // Re-check abort, rollover, quota, child exit, and task settlement after awaiting cancel.
+            if (!canStartSteerHandoff()) {
+              state.abortedBeforeSend = true;
+              state.settleAck(false);
+              resolveTurn({ stopReason: "cancelled" });
+              if (steerHandoff.pending === state) steerHandoff.pending = null;
+              return false;
+            }
+
+            const ackTimeoutMs = Math.max(0, this.opts?.steerAckTimeoutMs ?? DEFAULT_STEER_ACK_TIMEOUT_MS);
+            if (ackTimeoutMs > 0) {
+              ackTimer = setTimeout(() => {
+                ackTimer = null;
+                if (state.ackSettled) return;
+                // Cancel the unacknowledged replacement so it cannot deliver later alongside harness fallback.
+                if (sessionId && activeConnection === conn) {
+                  void conn.agent.notify("session/cancel", { sessionId }).catch(() => {});
+                  armCancelGraceTimer("cancelled");
+                }
+                state.settleAck(false);
+              }, ackTimeoutMs);
+              ackTimer.unref?.();
+            }
+
+            state.replacementSent = true;
+            let nextPrompt: Promise<Record<string, unknown>>;
+            try {
+              nextPrompt = conn.agent.request("session/prompt", {
+                sessionId,
+                prompt: [{ type: "text", text: message }],
+              } as never) as unknown as Promise<Record<string, unknown>>;
+            } catch (err) {
+              state.settleAck(false);
+              rejectTurn(err);
+              return false;
+            }
+
+            nextPrompt.then(
+              (res) => {
+                const stop = String(res?.stopReason ?? "end_turn");
+                const resMeta = (res?._meta ?? {}) as Record<string, unknown>;
+                const hasAirFailure = Boolean(
+                  ((resMeta.jetbrains as Record<string, unknown> | undefined)?.air as Record<string, unknown> | undefined)
+                    ?.sessionFailure,
+                );
+                if (!state.ackSettled) {
+                  const accepted =
+                    stop !== "cancelled" &&
+                    stop !== "refusal" &&
+                    !hasAirFailure &&
+                    !req.signal.aborted &&
+                    !rolloverTriggered &&
+                    !quotaWatchdogTriggered &&
+                    !quotaRejected &&
+                    !idleTimedOut &&
+                    !req.isTaskSettled?.();
+                  state.settleAck(accepted);
+                }
+                resolveTurn(res);
+              },
+              (err) => {
+                state.settleAck(false);
+                rejectTurn(err);
+              },
+            );
+
+            return await ackPromise;
           }
           return false;
         },
         cancel: async (reason?: string) => {
+          steerHandoff.ack?.settleAck(false);
           if (reason === "clean_rollover") {
             rolloverTriggered = true;
           }
@@ -1645,8 +1828,6 @@ export class AcpRunner {
       // Upstream adapter request limit (rawStop "max_turn_requests"): the harness has no turn limit, so a
       // productive turn is re-prompted on the same session; a limit hit with zero progress ends with an error.
       let upstreamLimitStalled = false;
-      // One bounded wrap-up turn when the agent ends naturally without settling its task (no return_task).
-      let wrapUpTimedOut = false;
       let steerContinuations = 0;
       let pendingSteerTurnPromise: Promise<Record<string, unknown>> | null = null;
 
@@ -1659,6 +1840,7 @@ export class AcpRunner {
         turnDeniedTools = [];
         turnSucceededTools = 0;
         textSinceLastTool = "";
+        steerHandoff.cancelIssuedForTurn = false;
 
         promptInFlight = true;
         try {
@@ -1676,7 +1858,8 @@ export class AcpRunner {
             // steering), an adapter that answers session/cancel by rejecting the pending prompt ("Request cancelled")
             // ends that turn cleanly. Abort, rollover, idle timeout, child death, quota and other RPC errors still reject.
             const rejectPrompt = (err: unknown) => {
-              const expectedCancel = wrapUpTimedOut || steerHandoffPromise !== null;
+              const steerCancelled = steerHandoff.pending !== null || steerHandoff.cancelIssuedForTurn;
+              const expectedCancel = wrapUpTimedOut || steerCancelled;
               if (expectedCancel && !req.signal.aborted && !rolloverTriggered && !idleTimedOut && !(childGoneError && err === childGoneError)) {
                 const detail = `${err instanceof Error ? err.message : String(err)} ${acpErrorDetail(err)}`;
                 const code = (err as { code?: unknown } | null)?.code;
@@ -1696,7 +1879,7 @@ export class AcpRunner {
                   (nested === undefined && code === -32603 && explicitCancel) ||
                   (nested === undefined && typeof code !== "number" && (name === "AbortError" || explicitCancel));
                 if (isCancelled && !detectQuotaErrorText(detail).isQuota) {
-                  resolvePrompt({ stopReason: steerHandoffPromise !== null ? "cancelled" : "end_turn" });
+                  resolvePrompt({ stopReason: steerCancelled ? "cancelled" : "end_turn" });
                   return;
                 }
               }
@@ -1728,6 +1911,8 @@ export class AcpRunner {
           });
         } finally {
           promptInFlight = false;
+          if (steerHandoff.pending) steerHandoff.pending.priorTurnSettled = true;
+          if (steerHandoff.ack) steerHandoff.ack.priorTurnSettled = true;
         }
 
         // Harvest passive quota & terminal sessionFailure signals
@@ -1809,22 +1994,30 @@ export class AcpRunner {
           req.signal.aborted ||
           ["quota_exhausted", "rate_limited", "budget_exhausted"].includes(airFailureCode)
         ) {
-          steerHandoffPromise = null;
+          if (steerHandoff.pending) {
+            steerHandoff.pending.settleAck(false);
+            steerHandoff.pending = null;
+          }
           break;
         }
 
         // A cancel-then-prompt steer hand-off replaced this turn: continue by awaiting the replacement prompt.
-        if (steerHandoffPromise) {
-          const handoff = steerHandoffPromise;
-          steerHandoffPromise = null;
-          if (req.isTaskSettled?.()) {
-            if (sessionId) void conn.agent.notify("session/cancel", { sessionId }).catch(() => {});
+        if (steerHandoff.pending) {
+          const handoff = steerHandoff.pending;
+          steerHandoff.pending = null;
+          if (handoff.abortedBeforeSend || req.isTaskSettled?.()) {
+            handoff.settleAck(false);
+            if (req.isTaskSettled?.() && sessionId) {
+              void conn.agent.notify("session/cancel", { sessionId }).catch(() => {});
+            }
             break;
           }
-          pendingSteerTurnPromise = handoff;
-          if (accumulatedText.length > 0) needsParagraphBreak = true;
-          recoveryAttempt -= 1;
-          continue;
+          if (!(handoff.ackSettled && !handoff.ackLive && rawStop !== "cancelled")) {
+            pendingSteerTurnPromise = handoff.turnPromise;
+            if (accumulatedText.length > 0) needsParagraphBreak = true;
+            recoveryAttempt -= 1;
+            continue;
+          }
         }
 
         // The wrap-up turn is final: no breaker, silent-recovery or adapter-limit continuation after it.
@@ -2144,6 +2337,9 @@ export class AcpRunner {
       }
       throw new Error(`ACP runner (${this.profile.id}) failed: ${errMsg}${detail}`);
     } finally {
+      steerHandoff.ack?.settleAck(false);
+      steerHandoff.pending?.settleAck(false);
+      steerHandoff.pending = null;
       flushCost();
       clearIdleWatchdog();
       if (livenessTimer) clearInterval(livenessTimer);

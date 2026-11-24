@@ -1315,7 +1315,7 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
     }
   });
 
-  it("amp steer: failed returns false and queued hands off via cancel-then-prompt (or false when disabled), never bare live true", async () => {
+  it("amp steer: hands off directly via cancel-then-prompt on local CLI (or returns false when disabled) without probing _amp/session/steer", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "pi-harness-amp-steer-"));
     try {
       const ampProfile: AcpProfileConfig = {
@@ -1327,8 +1327,9 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
         billing: "subscription",
       };
 
-      // Case 1: default local mode (AMP_ACP_CANCEL_MODE=steer) -> failed returns false;
-      // queued mid-turn triggers session/cancel + replacement session/prompt and continues the turn.
+      // Case 1: default local CLI mode (AMP_ACP_CANCEL_MODE=steer) hands off directly via session/cancel +
+      // replacement session/prompt without probing the mutating _amp/session/steer extension, and resolves live
+      // once the replacement turn emits a model-visible signal.
       const seenPrompts: string[] = [];
       let cancelCount = 0;
       let steerCalls = 0;
@@ -1373,7 +1374,6 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
         .onRequest("*", async ({ method }) => {
           if (method === "_amp/session/steer") {
             steerCalls += 1;
-            if (steerCalls === 1) return { outcome: "failed", reason: "Prompt queue is full" } as never;
             return { outcome: "queued" } as never;
           }
           throw new Error(`Unexpected method ${method}`);
@@ -1406,19 +1406,19 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
 
       await turn1Ready;
       assert.ok(handle, "expected runner handle");
-      assert.equal(await handle.steer("first steer (fails)"), false);
-      assert.equal(cancelCount, 0);
-
       assert.equal(await handle.steer("STOP: goal amended to v2"), true);
       const result = await runPromise;
-      assert.equal(cancelCount, 1, "queued amp steer must use cancel-then-prompt hand-off");
+      assert.equal(steerCalls, 0, "mid-turn steer must not probe the mutating _amp/session/steer extension");
+      assert.equal(cancelCount, 1, "local CLI amp steer must use cancel-then-prompt hand-off");
       assert.equal(seenPrompts.length, 2);
       assert.equal(seenPrompts[1], "STOP: goal amended to v2");
       assert.equal(result.stopReason, "completed");
       assert.ok(result.text.includes("steered-turn-ok"));
 
-      // Case 2: when cancel-then-prompt is disabled (e.g. orb executor), queued outcome returns false (never bare true).
+      // Case 2: when cancel-then-prompt is disabled (e.g. orb executor), steer returns false immediately
+      // without probing _amp/session/steer so only the harness fallback queue owns delivery.
       let orbCancelCount = 0;
+      let orbSteerCalls = 0;
       let finishOrbTurn!: () => void;
       let orbTurnStarted!: () => void;
       const orbTurnReady = new Promise<void>((r) => {
@@ -1448,7 +1448,10 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
           return { stopReason: "end_turn" } as never;
         })
         .onRequest("*", async ({ method }) => {
-          if (method === "_amp/session/steer") return { outcome: "queued" } as never;
+          if (method === "_amp/session/steer") {
+            orbSteerCalls += 1;
+            return { outcome: "queued" } as never;
+          }
           throw new Error(`Unexpected method ${method}`);
         });
 
@@ -1481,6 +1484,7 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
       assert.ok(orbHandle);
       assert.equal(await orbHandle.steer("queued on orb"), false);
       assert.equal(orbCancelCount, 0);
+      assert.equal(orbSteerCalls, 0);
       finishOrbTurn();
       const orbResult = await orbRunPromise;
       assert.equal(orbResult.stopReason, "completed");

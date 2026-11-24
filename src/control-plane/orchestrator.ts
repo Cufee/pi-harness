@@ -352,6 +352,8 @@ export class HarnessOrchestrator {
   private pendingSteers = new Map<string, string[]>();
   /** Goal version to bind onto a task once its queued amendment steer is actually drained. */
   private amendBindOnDrain = new Map<string, number>();
+  /** Authoritative reason passed to cancelTask, consumed when task.status transitions to cancelled. */
+  private cancelReasons = new Map<string, string>();
   /** In-flight waitForChildrenEventDriven calls per waiting task. */
   private waitingChildrenTasks = new Map<string, number>();
   /** Steering continuation turns reserved by the current execution of a task. */
@@ -435,8 +437,10 @@ export class HarnessOrchestrator {
       engine: this.advisories,
       subjectFor: (task) => this.advisorySubject(task),
     });
-    // Wakes deferred activations waiting on a write lease whenever a holder can no longer write.
+    // Wakes deferred activations waiting on a write lease whenever a holder can no longer write,
+    // and emits goal.amendment_task cancelled once on any authoritative task cancellation transition.
     this.unsubLeaseEvents = db.onEvent((ev) => {
+      this.maybeEmitAmendmentCancelled(ev);
       if (this.leaseWaitQueue.size === 0) return;
       const p = ev.payload as { to?: string; status?: string } | null;
       const released =
@@ -521,6 +525,7 @@ export class HarnessOrchestrator {
     this.taskQuotaHints.clear();
     this.taskResumeNotes.clear();
     this.pendingRollovers.clear();
+    this.cancelReasons.clear();
     this.unsubLeaseEvents();
     for (const key of [...this.leaseWaitQueue.keys()]) this.onWriteLeaseReleased(key);
   }
@@ -3822,10 +3827,103 @@ export class HarnessOrchestrator {
         ? ["completed", "cancelled", "failed", "blocked", "returned_for_rescope"].includes(cur.status)
         : true;
       if (cur && !isTerminal && (cur.goalVersion == null || cur.goalVersion < pendingGoalVersion)) {
+        const priorBoundVersion = cur.goalVersion;
         this.db.updateTask(taskId, { goalVersion: pendingGoalVersion });
+        const linkedGoal = this.getLinkedGoalMeta(cur.runId);
+        const latestAmend = this.getLatestAmendmentTaskEvent(cur.runId, cur.id);
+        const matchingAmend = latestAmend && latestAmend.toVersion === pendingGoalVersion ? latestAmend : null;
+        const boundVersion =
+          matchingAmend && (typeof matchingAmend.boundVersion === "number" || matchingAmend.boundVersion === null)
+            ? (matchingAmend.boundVersion as number | null)
+            : priorBoundVersion;
+        this.db.emitEvent(cur.runId, cur.id, "goal.amendment_task", {
+          ...(linkedGoal ? { goalId: linkedGoal.id } : {}),
+          ...(typeof matchingAmend?.fromVersion === "number" ? { fromVersion: matchingAmend.fromVersion } : {}),
+          toVersion: pendingGoalVersion,
+          taskId: cur.id,
+          tier: cur.tier,
+          boundVersion,
+          action: "delivered",
+          delivered: true,
+          mode: opts?.viaWait ? "tool_drain" : "next_turn_drain",
+          live: true,
+          ...(Array.isArray(matchingAmend?.scopeHit) ? { scopeHit: matchingAmend.scopeHit } : {}),
+        });
       }
     }
     return q;
+  }
+
+  private getLinkedGoalMeta(runId: string): { id: string; version: number } | null {
+    try {
+      const row = this.db.db
+        .prepare("SELECT id, version FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1")
+        .get(runId) as { id: string; version: number } | undefined;
+      return row && typeof row.id === "string" && row.version != null
+        ? { id: row.id, version: Number(row.version) }
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private getLatestAmendmentTaskEvent(runId: string, taskId: string): Record<string, unknown> | null {
+    try {
+      const row = this.db.db
+        .prepare(
+          "SELECT payload_json FROM events WHERE run_id = ? AND task_id = ? AND type = 'goal.amendment_task' ORDER BY seq DESC LIMIT 1",
+        )
+        .get(runId, taskId) as { payload_json: string } | undefined;
+      if (!row) return null;
+      const parsed = JSON.parse(row.payload_json) as unknown;
+      return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private maybeEmitAmendmentCancelled(ev: { runId: string; taskId: string | null; type: string; payload: unknown }): void {
+    if (this.disposed || ev.type !== "task.status" || !ev.taskId) return;
+    const p = ev.payload as { from?: string; to?: string; summary?: string } | null;
+    const recordedReason = this.cancelReasons.get(ev.taskId);
+    if (p?.to && ["completed", "failed", "cancelled", "returned_for_rescope", "blocked"].includes(p.to)) {
+      this.cancelReasons.delete(ev.taskId);
+    }
+    if (p?.to !== "cancelled" || p?.from === "cancelled") return;
+    const task = this.db.getTask(ev.taskId);
+    if (!task || task.profileId === "director") return;
+    const linkedGoal = this.getLinkedGoalMeta(ev.runId);
+    if (!linkedGoal) return;
+    const latestAmend = this.getLatestAmendmentTaskEvent(ev.runId, task.id);
+    const latestToVersion = typeof latestAmend?.toVersion === "number" ? latestAmend.toVersion : null;
+    const latestAction = typeof latestAmend?.action === "string" ? latestAmend.action : null;
+    if (latestAction === "cancelled" && latestToVersion === linkedGoal.version) return;
+
+    const taskGoalVersion = task.goalVersion ?? null;
+    const recordedAffected = latestToVersion === linkedGoal.version;
+    const staleBound = taskGoalVersion !== null && taskGoalVersion < linkedGoal.version;
+    const nullBoundMigrated = taskGoalVersion === null && linkedGoal.version > 1;
+    if (!recordedAffected && !staleBound && !nullBoundMigrated) return;
+
+    const boundVersion =
+      recordedAffected && (typeof latestAmend?.boundVersion === "number" || latestAmend?.boundVersion === null)
+        ? (latestAmend.boundVersion as number | null)
+        : taskGoalVersion;
+    const summaryReason =
+      typeof p.summary === "string" && p.summary.trim()
+        ? p.summary.trim().replace(/^Cancelled:\s*/i, "")
+        : "";
+    const reason = recordedReason || summaryReason || "cancelled";
+    this.db.emitEvent(ev.runId, task.id, "goal.amendment_task", {
+      goalId: linkedGoal.id,
+      ...(typeof latestAmend?.fromVersion === "number" ? { fromVersion: latestAmend.fromVersion } : {}),
+      taskId: task.id,
+      tier: task.tier,
+      boundVersion,
+      toVersion: linkedGoal.version,
+      action: "cancelled",
+      reason,
+    });
   }
 
   /**
@@ -4043,8 +4141,11 @@ export class HarnessOrchestrator {
     if (!opts?.internalStopSweep) this.explicitCancelEpoch.set(taskId, (this.explicitCancelEpoch.get(taskId) ?? 0) + 1);
     this.db.admissionQueue.remove("worker", taskId);
     const exec = this.active.get(taskId);
-    if (exec) exec.abort.abort(new Error(reason));
     const before = this.db.getTask(taskId);
+    if (before && !["completed", "cancelled", "failed", "blocked", "returned_for_rescope"].includes(before.status)) {
+      this.cancelReasons.set(taskId, reason);
+    }
+    if (exec) exec.abort.abort(new Error(reason));
     const cancelled = exec?.handle ? exec.handle.cancel(reason).catch(() => {}) : Promise.resolve();
     // Queued on the task's worktree chain now (synchronously), after any in-flight allocation: a worktree allocated
     // mid-cancel is torn down once it exists, and a later resume waits for this teardown before touching the worktree.
@@ -4084,19 +4185,11 @@ export class HarnessOrchestrator {
     if (!["completed", "cancelled", "failed", "blocked", "returned_for_rescope"].includes(task.status)) {
       const baseSummary = `Cancelled: ${reason}`;
       settleTaskMinimalFallback(this.db, task, "cancelled", baseSummary, reason ? `cancelled: ${reason}` : "cancelled");
-      const linkedGoalVersion = this.db.getLinkedGoalVersion(task.runId);
-      if (linkedGoalVersion !== null && task.goalVersion != null && task.goalVersion < linkedGoalVersion) {
-        this.db.emitEvent(task.runId, task.id, "goal.amendment_task", {
-          taskId: task.id,
-          tier: task.tier,
-          boundVersion: task.goalVersion,
-          toVersion: linkedGoalVersion,
-          action: "cancelled",
-          reason,
-        });
-      }
       // No runner loop will exit for a queued or never-launched task, so settle its run here (a stop sweep does that itself).
       if (!exec && !opts?.bulk) this.afterTaskInactiveInRun(task.runId);
+    }
+    if (this.cancelReasons.get(taskId) === reason) {
+      this.cancelReasons.delete(taskId);
     }
   }
 
