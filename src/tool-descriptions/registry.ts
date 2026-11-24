@@ -583,20 +583,14 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
       blockingDefault: {
         default: "P0 and P1 end your task when the call returns unless you pass blocking: false.",
         research:
-          "A finding (verification_failed, code_defect, or broken_test) is recorded for your parent as non-blocking and you keep working; any other P0 or P1 issue ends your task unless you pass blocking: false.",
+          "For read-only tasks, report_issue never blocks and your task keeps running regardless of severity or blocking flag; put findings in your return_task handoff (or call return_task with status blocked if you cannot produce a result).",
         plan:
-          "A finding (verification_failed, code_defect, or broken_test) is recorded for your parent as non-blocking and you keep working; any other P0 or P1 issue ends your task unless you pass blocking: false.",
+          "For read-only tasks, report_issue never blocks and your task keeps running regardless of severity or blocking flag; put findings in your return_task handoff (or call return_task with status blocked if you cannot produce a result).",
         verify:
-          "A finding (verification_failed, code_defect, or broken_test) is recorded for your parent as non-blocking and you keep working; any other P0 or P1 issue ends your task unless you pass blocking: false.",
+          "For read-only tasks, report_issue never blocks and your task keeps running regardless of severity or blocking flag; put findings in your return_task handoff (or call return_task with status blocked if you cannot produce a result).",
       },
       routing: {
         default: "P0 goes to the human, P1 and P2 to your parent.",
-        research:
-          "A finding (verification_failed, code_defect, broken_test) goes to your parent unless you pass blocking: true; any other P0 goes to the human, and P1 and P2 to your parent.",
-        plan:
-          "A finding (verification_failed, code_defect, broken_test) goes to your parent unless you pass blocking: true; any other P0 goes to the human, and P1 and P2 to your parent.",
-        verify:
-          "A finding (verification_failed, code_defect, broken_test) goes to your parent unless you pass blocking: true; any other P0 goes to the human, and P1 and P2 to your parent.",
       },
     },
     description: {

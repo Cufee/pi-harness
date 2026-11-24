@@ -304,13 +304,18 @@ export class EscalationInspectorScreen implements Screen {
         label: "Acknowledge note (stays unresolved)",
         initialValue: "Acknowledged by user",
         onSubmit: async (note) => {
-          await this.deps.client.request("escalation.ack", {
-            escalationId: esc.id,
-            resolution: note,
-            resolve: false,
-          });
-          this.frame.setNotice(`Acknowledged ${esc.id}`, "info");
-          await Promise.all([this.load(ctx), this.deps.store.refresh()]);
+          try {
+            await this.deps.client.request("escalation.ack", {
+              escalationId: esc.id,
+              resolution: note,
+              resolve: false,
+            });
+            this.frame.setNotice(`Acknowledged ${esc.id}`, "info");
+            await Promise.all([this.load(ctx), this.deps.store.refresh()]);
+          } catch (err) {
+            this.frame.setNotice(`Acknowledge failed: ${err instanceof Error ? err.message : String(err)}`, "danger");
+            ctx.requestRender();
+          }
         },
       });
       ctx.requestRender();
