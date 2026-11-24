@@ -1721,7 +1721,7 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     roles: ["director"],
     description: {
       default:
-        "Resolve one open or acknowledged escalation on a run owned by this chat's goals and record the reason in the audit trail. Works after the run settled or its orchestrator exited. Use it only when the finding is handled or no longer applies; it does not resume the run.",
+        "Resolve one open or acknowledged escalation on a run owned by this chat's goals and record the reason in the audit trail. Works after the run settled or its orchestrator exited. Use it only when the finding is handled or no longer applies. The reason is steered to the run's live orchestrator and to the raising task when it is live; it does not resume the run.",
     },
     inputSchema: {
       default: {

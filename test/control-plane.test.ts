@@ -5,7 +5,14 @@ import { join } from "node:path";
 import { describe, it } from "bun:test";
 import { ModelCatalogCompiler } from "../src/catalog/compiler.js";
 import { loadConfig } from "../src/config.js";
-import { ControlPlaneDb, type MessageRecord, type PeerExchangeRecord, type TaskRecord } from "../src/control-plane/db.js";
+import {
+  ControlPlaneDb,
+  type EscalationRecord,
+  type MessageRecord,
+  type PeerExchangeRecord,
+  type RecentlyResolvedEscalation,
+  type TaskRecord,
+} from "../src/control-plane/db.js";
 import { HarnessOrchestrator } from "../src/control-plane/orchestrator.js";
 import { buildHydrationTurn, buildImmutableSystemPrompt } from "../src/control-plane/prompts.js";
 import { buildRunActivitySummary } from "../src/control-plane/telemetry.js";
@@ -552,6 +559,73 @@ describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () =>
     assert.ok(prompt.includes("preq-1"));
     assert.match(prompt, /Answered Peer Messages/);
     assert.ok(prompt.includes("msg-1"));
+    assert.ok(!prompt.includes("Recently resolved escalations (human or Director answers)"));
+
+    // Recently resolved escalations render next to open escalations without disturbing them
+    const openEsc: EscalationRecord = {
+      id: "esc-open-1",
+      runId: "run-1",
+      fromTaskId: "t-block",
+      toTaskId: "t-1",
+      severity: "P1",
+      category: "blocked_dependency",
+      title: "Waiting on API key",
+      evidencePaths: ["src/api.ts"],
+      attempted: [],
+      suggestedSplits: [],
+      blocking: true,
+      status: "open",
+      resolution: null,
+      createdAt: 410,
+      ackedAt: null,
+    };
+    const longAnswer = "A".repeat(600);
+    const resolvedEscs: Array<RecentlyResolvedEscalation | EscalationRecord> = [
+      {
+        id: "esc-42",
+        fromTaskId: "t-live",
+        severity: "P0",
+        category: "ambiguous_spec",
+        title: "Need DB choice",
+        resolution: "Use SQLite for local state.",
+        resolvedAt: 520,
+      },
+      {
+        id: "esc-43",
+        fromTaskId: "t-live",
+        severity: "P2",
+        category: "code_defect",
+        title: "Long guidance",
+        resolution: longAnswer,
+        resolvedAt: 510,
+      },
+      {
+        ...openEsc,
+        id: "esc-blank",
+        status: "resolved",
+        resolution: null,
+        ackedAt: 505,
+      },
+    ];
+    const promptWithEscalations = buildHydrationTurn({
+      task: orchTask,
+      tasksSnapshot: [orchTask, activeRunning],
+      artifacts: [],
+      openEscalations: [openEsc],
+      recentlyResolvedEscalations: resolvedEscs,
+      blackboard: {},
+    });
+    const openIdx = promptWithEscalations.indexOf("## Open Escalations / Scope Send-Backs");
+    const resolvedIdx = promptWithEscalations.indexOf("## Recently resolved escalations (human or Director answers)");
+    assert.ok(openIdx >= 0, "expected open escalations heading");
+    assert.ok(resolvedIdx > openIdx, "expected recently resolved section right after open escalations");
+    assert.ok(promptWithEscalations.includes("- [P1/blocked_dependency] esc-open-1 from t-block: Waiting on API key"));
+    assert.ok(
+      promptWithEscalations.includes("- [P0/ambiguous_spec] esc-42 from t-live: Need DB choice -> Use SQLite for local state."),
+    );
+    assert.ok(promptWithEscalations.includes(`- [P2/code_defect] esc-43 from t-live: Long guidance -> ${"A".repeat(500)}`));
+    assert.ok(!promptWithEscalations.includes(longAnswer), "resolution text over 500 chars must be truncated");
+    assert.ok(!promptWithEscalations.includes("esc-blank"), "resolved escalation without resolution text must be omitted");
   });
 
   it("wires tree_view inbox, repo-scoped KB lifecycle tools with HEAD SHA, and multi-hour telemetry past 400 events", async () => {
@@ -585,12 +659,142 @@ describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () =>
       db.replyMessage(msg.id, "Yes, v2");
       db.createPeerRequest({ fromRunId: peerRun.id, toRunId: run.id, topicKey: "schema", message: "Align v2?" });
       const tv = (await orch.toolExecutor.execute(run.id, t1.id, "tree_view", {})) as {
+        openEscalations: EscalationRecord[];
+        recentlyResolvedEscalations?: RecentlyResolvedEscalation[];
         answeredMessages?: MessageRecord[];
         openPeerRequests?: PeerExchangeRecord[];
       };
       assert.equal(tv.answeredMessages?.length, 1);
       assert.equal(tv.answeredMessages?.[0]?.id, msg.id);
       assert.equal(tv.openPeerRequests?.length, 1);
+      assert.equal(tv.recentlyResolvedEscalations, undefined);
+
+      // Recently resolved escalations: newest-first by acked_at, limit enforced, open/acked/empty-resolution excluded
+      const escA = db.createEscalation({
+        runId: run.id,
+        fromTaskId: t2.id,
+        toTaskId: null,
+        severity: "P0",
+        category: "ambiguous_spec",
+        title: "Storage backend",
+        evidencePaths: ["src/db.ts"],
+      });
+      const escB = db.createEscalation({
+        runId: run.id,
+        fromTaskId: t2.id,
+        toTaskId: t1.id,
+        severity: "P1",
+        category: "interface_conflict",
+        title: "RPC payload",
+        evidencePaths: ["src/rpc.ts"],
+      });
+      const escC = db.createEscalation({
+        runId: run.id,
+        fromTaskId: t2.id,
+        toTaskId: t1.id,
+        severity: "P2",
+        category: "code_defect",
+        title: "Retry backoff",
+        evidencePaths: ["src/retry.ts"],
+      });
+      const escEmpty = db.createEscalation({
+        runId: run.id,
+        fromTaskId: t2.id,
+        toTaskId: t1.id,
+        severity: "P2",
+        category: "code_defect",
+        title: "Blank auto-resolved",
+        evidencePaths: ["src/a.ts"],
+      });
+      const escNull = db.createEscalation({
+        runId: run.id,
+        fromTaskId: t2.id,
+        toTaskId: t1.id,
+        severity: "P2",
+        category: "code_defect",
+        title: "Null auto-resolved",
+        evidencePaths: ["src/b.ts"],
+      });
+      const escAcked = db.createEscalation({
+        runId: run.id,
+        fromTaskId: t2.id,
+        toTaskId: t1.id,
+        severity: "P1",
+        category: "blocked_dependency",
+        title: "Still acked only",
+        evidencePaths: ["src/c.ts"],
+      });
+      const escOpen = db.createEscalation({
+        runId: run.id,
+        fromTaskId: t2.id,
+        toTaskId: t1.id,
+        severity: "P1",
+        category: "broken_test",
+        title: "Still open",
+        evidencePaths: ["test/x.test.ts"],
+      });
+      // Another run's resolved escalation must not leak into this run
+      const peerT1 = db.createTask({
+        runId: peerRun.id,
+        tier: 1,
+        kind: "orchestrator",
+        title: "Peer Orch",
+        objective: "Coord",
+        readOnly: true,
+        profileId: "acp:claude",
+      });
+      const peerEsc = db.createEscalation({
+        runId: peerRun.id,
+        fromTaskId: peerT1.id,
+        toTaskId: null,
+        severity: "P0",
+        category: "ambiguous_spec",
+        title: "Peer decision",
+        evidencePaths: ["README.md"],
+      });
+      db.tryResolveEscalation(peerEsc.id, "Peer answer");
+
+      db.tryResolveEscalation(escB.id, "Use v2 payload");
+      db.tryResolveEscalation(escC.id, "Cap backoff at 5s");
+      db.tryResolveEscalation(escA.id, "Use SQLite");
+      db.tryResolveEscalation(escEmpty.id, "   ");
+      db.db.prepare("UPDATE escalations SET status = 'resolved', resolution = NULL, acked_at = 4000 WHERE id = ?").run(escNull.id);
+      db.db.prepare("UPDATE escalations SET acked_at = 1000 WHERE id = ?").run(escB.id);
+      db.db.prepare("UPDATE escalations SET acked_at = 2000 WHERE id = ?").run(escC.id);
+      db.db.prepare("UPDATE escalations SET acked_at = 3000 WHERE id = ?").run(escA.id);
+      db.ackEscalation(escAcked.id, "Acknowledged, investigating", false);
+
+      assert.deepEqual(db.listRecentlyResolvedEscalations(run.id, 0), []);
+      const limited = db.listRecentlyResolvedEscalations(run.id, 2);
+      assert.deepEqual(limited, [
+        {
+          id: escA.id,
+          fromTaskId: t2.id,
+          severity: "P0",
+          category: "ambiguous_spec",
+          title: "Storage backend",
+          resolution: "Use SQLite",
+          resolvedAt: 3000,
+        },
+        {
+          id: escC.id,
+          fromTaskId: t2.id,
+          severity: "P2",
+          category: "code_defect",
+          title: "Retry backoff",
+          resolution: "Cap backoff at 5s",
+          resolvedAt: 2000,
+        },
+      ]);
+
+      const tvWithResolved = (await orch.toolExecutor.execute(run.id, t1.id, "tree_view", {})) as {
+        openEscalations: EscalationRecord[];
+        recentlyResolvedEscalations?: RecentlyResolvedEscalation[];
+      };
+      assert.deepEqual(tvWithResolved.openEscalations.map((e) => e.id), [escOpen.id]);
+      assert.deepEqual(tvWithResolved.recentlyResolvedEscalations?.map((e) => e.id), [escA.id, escC.id, escB.id]);
+      assert.equal(tvWithResolved.recentlyResolvedEscalations?.[0]?.resolution, "Use SQLite");
+      assert.equal(tvWithResolved.recentlyResolvedEscalations?.[0]?.resolvedAt, 3000);
 
       // KB propose resolves current HEAD SHA instead of stale baseSha
       const proposed = (await orch.toolExecutor.execute(run.id, t1.id, "kb_propose", {
