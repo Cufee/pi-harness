@@ -460,13 +460,26 @@ export class WorkNavigatorScreen implements Screen {
           label: `Resolve ${escId}`,
           initialValue: "Resolved by user",
           onSubmit: async (note) => {
-            await this.deps.client.request("escalation.ack", {
-              escalationId: escId,
-              resolution: note,
-              resolve: true,
-            });
-            this.frame.setNotice(`Resolved ${escId}`, "ok");
-            await this.deps.store.refresh();
+            try {
+              const res = await this.deps.client.request<{ alreadyResolved?: boolean; deliveredTo?: string[] }>(
+                "escalation.resolve",
+                {
+                  escalationId: escId,
+                  reason: note,
+                },
+              );
+              if (res?.alreadyResolved) {
+                this.frame.setNotice(`${escId} was already resolved`, "info");
+              } else {
+                const delivered = res?.deliveredTo?.length ? ` (sent to ${res.deliveredTo.join(", ")})` : "";
+                this.frame.setNotice(`Resolved ${escId}${delivered}`, "ok");
+              }
+              await this.deps.store.refresh();
+              ctx.requestRender();
+            } catch (err) {
+              this.frame.setNotice(`Resolve failed: ${err instanceof Error ? err.message : String(err)}`, "danger");
+              ctx.requestRender();
+            }
           },
         });
         ctx.requestRender();
