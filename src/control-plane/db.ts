@@ -1725,9 +1725,6 @@ export class ControlPlaneDb {
     if (input.category !== "scope_too_large" && input.evidencePaths.length === 0) {
       throw REJECTIONS.escalationEvidence(input.tool ?? "report_issue");
     }
-    if (input.category === "scope_too_large" && (input.suggestedSplits?.length ?? 0) < 2) {
-      throw new Error("scope_too_large requires at least 2 concrete suggested_splits so parent can re-scope cleanly");
-    }
     const id = nextFriendlyId(this.db, "esc", "escalations");
     const now = Date.now();
     const { title } = deriveTitle(

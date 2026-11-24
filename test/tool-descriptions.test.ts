@@ -1,9 +1,19 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "bun:test";
 import { HarnessRejection } from "../src/advisories/rejections.js";
 import { HARNESS_TEXT_COUNT_PATTERN } from "../src/advisories/rules.js";
 import type { Role } from "../src/advisories/types.js";
-import { toolsForTier } from "../src/control-plane/tools.js";
+import { ModelCatalogCompiler } from "../src/catalog/compiler.js";
+import { loadConfig } from "../src/config.js";
+import { ControlPlaneDb } from "../src/control-plane/db.js";
+import { HarnessOrchestrator } from "../src/control-plane/orchestrator.js";
+import { buildImmutableSystemPrompt, PROMPT_FACT_USES as TASK_PROMPT_FACT_USES } from "../src/control-plane/prompts.js";
+import { toolsForTask } from "../src/control-plane/tools.js";
+import { buildDirectorSystemPrompt, DIRECTOR_PROMPT_FACT_USES } from "../src/director/session.js";
+import { QuotaClient } from "../src/quota/client.js";
 import {
   ALL_ROLES,
   DIRECTOR_ONLY_PHRASES,
@@ -20,9 +30,11 @@ import {
   toolsForRole,
   type ToolEntry,
 } from "../src/tool-descriptions/index.js";
+import { runGit } from "../src/worktree/manager.js";
+import { withFixtureCatalog } from "./fixtures/launch-config.js";
 
-// Today's tool-name lists as read from commit 075f67b54165c6a8f6ff61d785e8ee7bbfeb26a2
-// (ALL_TOOL_DEFS in src/control-plane/tools.ts; DIRECTOR_TOOLS and submit_review_verdict in src/director/runtime.ts).
+// Today's tool-name lists re-verified against base commit a9d480d
+// (ALL_TOOL_DEFS deleted from src/control-plane/tools.ts; DIRECTOR_TOOLS, GOAL_GET_TOOL, and submit_review_verdict in src/director/).
 const DIRECTOR_EXPECTED = [
   "goal_create",
   "goal_commit",
@@ -198,6 +210,37 @@ function registryByName(): Map<string, ToolEntry> {
 }
 
 describe("tool-descriptions registry", () => {
+  it("T4-1 single registry", () => {
+    const toolsSrc = readFileSync(join(import.meta.dir, "../src/control-plane/tools.ts"), "utf8");
+    assert.ok(!toolsSrc.includes("ALL_TOOL_DEFS"), "src/control-plane/tools.ts must not contain ALL_TOOL_DEFS");
+
+    const base = { runId: "run-1", profileId: "acp:claude", title: "Task" };
+    assert.deepEqual(
+      toolsForTask({ ...base, tier: 1, kind: "orchestrator", readOnly: true }),
+      toolsForRole("orchestrator"),
+    );
+    assert.deepEqual(
+      toolsForTask({ ...base, tier: 2, kind: "worker", readOnly: false }),
+      toolsForRole("worker"),
+    );
+    assert.deepEqual(
+      toolsForTask({ ...base, tier: 3, kind: "research", readOnly: true }),
+      toolsForRole("research", { readOnly: true }),
+    );
+    assert.deepEqual(
+      toolsForTask({ ...base, tier: 3, kind: "verify", readOnly: true }),
+      toolsForRole("verify", { readOnly: true }),
+    );
+    assert.deepEqual(
+      toolsForTask({ ...base, tier: 3, kind: "execute", readOnly: false }),
+      toolsForRole("execute", { readOnly: false }),
+    );
+    assert.deepEqual(
+      toolsForTask({ ...base, tier: 3, kind: "execute", readOnly: true }),
+      toolsForRole("execute", { readOnly: true }),
+    );
+  });
+
   it("T4-1r registry integrity", () => {
     const seen = new Set<string>();
     const allNames = allToolNames();
@@ -267,30 +310,6 @@ describe("tool-descriptions registry", () => {
     assert.deepEqual(sorted(toolsForRole("execute", { readOnly: false }).map((t) => t.name)), sorted(expectedWritableExecute));
     assert.ok(allowedToolNames("execute").has("inspect_command"));
     assert.deepEqual(sorted(allowedToolNames("execute")), sorted(TIER3_EXPECTED));
-  });
-
-  // slice C1 removes this test when ALL_TOOL_DEFS is deleted
-  it("T4-2s schemas preserved", () => {
-    const t1Schemas = new Map(toolsForTier(1).map((t) => [t.name, t.inputSchema]));
-    const t2Schemas = new Map(toolsForTier(2).map((t) => [t.name, t.inputSchema]));
-    const t3Schemas = new Map(toolsForTier(3).map((t) => [t.name, t.inputSchema]));
-
-    const checks: Array<{ role: Role; ctx?: { readOnly: boolean }; expected: Map<string, Record<string, unknown>> }> = [
-      { role: "orchestrator", expected: t1Schemas },
-      { role: "worker", expected: t2Schemas },
-      { role: "research", expected: t3Schemas },
-      { role: "plan", expected: t3Schemas },
-      { role: "verify", expected: t3Schemas },
-      { role: "execute", ctx: { readOnly: true }, expected: t3Schemas },
-      { role: "execute", ctx: { readOnly: false }, expected: t3Schemas },
-    ];
-
-    for (const { role, ctx, expected } of checks) {
-      for (const tool of toolsForRole(role, ctx)) {
-        assert.ok(expected.has(tool.name), `unexpected tool ${tool.name} for role ${role}`);
-        assert.deepEqual(tool.inputSchema, expected.get(tool.name), `schema drift for ${role}.${tool.name}`);
-      }
-    }
   });
 
   it("T4-3d derived role separation", () => {
@@ -381,16 +400,260 @@ describe("tool-descriptions registry", () => {
     }
   });
 
+  it("T4-3p derived role separation on prompts", () => {
+    const allNames = [...allToolNames()];
+    const promptsByRole: Array<{ role: Role; prompt: string }> = [
+      { role: "director", prompt: buildDirectorSystemPrompt("off") },
+      { role: "orchestrator", prompt: buildImmutableSystemPrompt(1, "orchestrator", "off") },
+      { role: "worker", prompt: buildImmutableSystemPrompt(2, "worker", "off") },
+      { role: "research", prompt: buildImmutableSystemPrompt(3, "research", "off") },
+      { role: "plan", prompt: buildImmutableSystemPrompt(3, "plan", "off") },
+      { role: "verify", prompt: buildImmutableSystemPrompt(3, "verify", "off") },
+      { role: "execute", prompt: buildImmutableSystemPrompt(3, "execute", "off") },
+    ];
+
+    for (const { role, prompt } of promptsByRole) {
+      const allowed = allowedToolNames(role);
+      const lacking = allNames.filter((name) => !allowed.has(name));
+      const lackingSet = new Set(lacking);
+      const mentions = promptMentions(role);
+      const allowedMentions = new Set(mentions.map((m) => m.tool));
+
+      for (const missingTool of lacking) {
+        if (allowedMentions.has(missingTool)) continue;
+        assert.ok(
+          !wholeWordToolPattern(missingTool).test(prompt),
+          `${role} system prompt mentions lacking tool "${missingTool}" without mentionRef`,
+        );
+      }
+
+      for (const mention of mentions) {
+        assert.ok(
+          lackingSet.has(mention.tool),
+          `${role} prompt mentions "${mention.tool}", which role "${role}" already owns`,
+        );
+        assert.ok(
+          wholeWordToolPattern(mention.tool).test(prompt),
+          `${role} prompt declares unused mentionRef "${mention.tool}"`,
+        );
+      }
+    }
+  });
+
+  it("T4-4p phrase lists on prompts", () => {
+    const forbiddenByRole: Record<Exclude<Role, "reviewer">, readonly string[]> = {
+      research: [...DIRECTOR_ONLY_PHRASES, ...WORKER_ONLY_PHRASES],
+      plan: [...DIRECTOR_ONLY_PHRASES, ...WORKER_ONLY_PHRASES],
+      verify: [...DIRECTOR_ONLY_PHRASES, ...WORKER_ONLY_PHRASES],
+      execute: [...DIRECTOR_ONLY_PHRASES],
+      worker: [...DIRECTOR_ONLY_PHRASES],
+      orchestrator: [...DIRECTOR_ONLY_PHRASES],
+      director: [...WORKER_ONLY_PHRASES],
+    };
+
+    const promptsByRole: Array<{ role: Exclude<Role, "reviewer">; prompt: string }> = [
+      { role: "director", prompt: buildDirectorSystemPrompt("off") },
+      { role: "orchestrator", prompt: buildImmutableSystemPrompt(1, "orchestrator", "off") },
+      { role: "worker", prompt: buildImmutableSystemPrompt(2, "worker", "off") },
+      { role: "research", prompt: buildImmutableSystemPrompt(3, "research", "off") },
+      { role: "plan", prompt: buildImmutableSystemPrompt(3, "plan", "off") },
+      { role: "verify", prompt: buildImmutableSystemPrompt(3, "verify", "off") },
+      { role: "execute", prompt: buildImmutableSystemPrompt(3, "execute", "off") },
+    ];
+
+    for (const { role, prompt } of promptsByRole) {
+      for (const phrase of forbiddenByRole[role]) {
+        assert.ok(
+          !phrasePattern(phrase).test(prompt),
+          `${role} system prompt contains forbidden phrase "${phrase}"`,
+        );
+      }
+    }
+  });
+
   it("T4-5 prompt references", () => {
     assert.throws(() => toolRef("research", "spawn_task"));
     assert.throws(() => toolFact("research", "spawn_task", "noCounts"));
     assert.throws(() => mentionRef("research", "no_such_tool", "parent"));
     assert.equal(toolRef("orchestrator", "spawn_task"), "`spawn_task`");
 
+    // Prompts build cleanly in collapsed Code Mode (toolRef/toolFact check the registry set, not collapsed surface).
+    assert.ok(buildDirectorSystemPrompt("collapsed").length > 0);
+    assert.ok(buildImmutableSystemPrompt(1, "orchestrator", "collapsed").length > 0);
+    assert.ok(buildImmutableSystemPrompt(2, "worker", "collapsed").length > 0);
+    for (const kind of ["research", "plan", "verify", "execute"] as const) {
+      assert.ok(buildImmutableSystemPrompt(3, kind, "collapsed").length > 0);
+    }
+
     const ref = mentionRef("research", "wait_children", "parent");
     assert.equal(ref, "`wait_children`");
     const recorded = promptMentions("research");
     assert.ok(recorded.some((m) => m.tool === "wait_children" && m.as === "parent"));
+  });
+
+  it("T4-6 facts agree", () => {
+    const promptsByRole: Record<Exclude<Role, "reviewer">, string> = {
+      director: buildDirectorSystemPrompt("off"),
+      orchestrator: buildImmutableSystemPrompt(1, "orchestrator", "off"),
+      worker: buildImmutableSystemPrompt(2, "worker", "off"),
+      research: buildImmutableSystemPrompt(3, "research", "off"),
+      plan: buildImmutableSystemPrompt(3, "plan", "off"),
+      verify: buildImmutableSystemPrompt(3, "verify", "off"),
+      execute: buildImmutableSystemPrompt(3, "execute", "off"),
+    };
+
+    const allUses = [...TASK_PROMPT_FACT_USES, ...DIRECTOR_PROMPT_FACT_USES];
+    assert.ok(allUses.length > 0);
+
+    // 1. Every PROMPT_FACT_USES entry appears verbatim in both the role's prompt and describeTool.
+    for (const { role, tool, key } of allUses) {
+      const fact = toolFact(role, tool, key);
+      assert.ok(role !== "reviewer", `unexpected reviewer entry in C1 PROMPT_FACT_USES`);
+      const prompt = promptsByRole[role];
+      const desc = describeTool(tool, role);
+      assert.ok(prompt.includes(fact), `${role} prompt missing verbatim fact ${tool}.${key}: ${fact}`);
+      assert.ok(desc.includes(fact), `${role} describeTool(${tool}) missing verbatim fact ${tool}.${key}: ${fact}`);
+    }
+
+    // 2. Hot-spot literals: after removing every fact string from a role's prompt, none of these may remain.
+    const hotSpotLiterals = ["2,000 characters", "blocking: false", "72%", "78%"] as const;
+    for (const [role, prompt] of Object.entries(promptsByRole) as Array<[Exclude<Role, "reviewer">, string]>) {
+      let stripped = prompt;
+      for (const use of allUses) {
+        if (use.role !== role) continue;
+        stripped = stripped.replaceAll(toolFact(role, use.tool, use.key), "");
+      }
+      for (const literal of hotSpotLiterals) {
+        assert.ok(
+          !stripped.includes(literal),
+          `${role} prompt still contains hot-spot literal "${literal}" outside toolFact`,
+        );
+      }
+    }
+  });
+
+  it("T4-7 allowed set by role", async () => {
+    const repoRoot = mkdtempSync(join(tmpdir(), "pi-harness-t47-"));
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-t47-state-"));
+    try {
+      await runGit(repoRoot, ["init", "-b", "main"]);
+      writeFileSync(join(repoRoot, "README.md"), "hello\n", "utf8");
+      await runGit(repoRoot, ["add", "README.md"]);
+      await runGit(repoRoot, ["-c", "user.name=test", "-c", "user.email=test@local", "commit", "-m", "init"]);
+
+      const db = new ControlPlaneDb(":memory:");
+      const config = withFixtureCatalog({ ...loadConfig(repoRoot), stateDir, codeMode: "off" });
+      const quota = new QuotaClient();
+      const catalog = new ModelCatalogCompiler(config, quota);
+      const orch = new HarnessOrchestrator(db, config, catalog, quota, () => ({
+        run: async (req) => {
+          const art = (await req.executeTool("artifact_write", {
+            name: "note.md",
+            content: "director child artifact",
+            summary: "Note",
+          })) as { path: string };
+          await req.executeTool("return_task", {
+            status: "completed",
+            summary: "Done",
+            sources: [{ path: "README.md", lines: "1" }],
+            artifact_paths: [art.path],
+          });
+          return { text: "", stopReason: "completed" };
+        },
+      }));
+
+      // 1. Research task calling spawn_task gets [harness blocked: not-your-tool] with its whenDenied text and nothing is spawned.
+      const run = db.createRun({ goal: "Allowed set test", repoRoot, baseBranch: "main", baseSha: "abc" });
+      const research = db.createTask({
+        runId: run.id,
+        tier: 3,
+        kind: "research",
+        title: "Scout",
+        objective: "Explore",
+        readOnly: true,
+        profileId: "pi:local",
+      });
+      db.updateTask(research.id, { status: "running" });
+
+      const expectedDenied = notYourTool("spawn_task", "research");
+      await assert.rejects(
+        () =>
+          orch.toolExecutor.execute(run.id, research.id, "spawn_task", {
+            kind: "research",
+            objective: "Should be denied",
+            model: "fixture/fixture",
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof HarnessRejection);
+          assert.ok(err.message.startsWith("[harness blocked: not-your-tool]"));
+          assert.ok(err.message.includes(expectedDenied.notice.why));
+          assert.ok(err.message.includes(expectedDenied.notice.alternative));
+          return true;
+        },
+      );
+      assert.deepEqual(db.listTasks(run.id, { parentId: research.id }), []);
+
+      // 2. Writable execute task calling inspect_command runs (L20).
+      const execTask = db.createTask({
+        runId: run.id,
+        tier: 3,
+        kind: "execute",
+        title: "Writable exec",
+        objective: "Edit files",
+        readOnly: false,
+        profileId: "pi:local",
+      });
+      db.updateTask(execTask.id, { status: "running" });
+      const inspectRes = (await orch.toolExecutor.execute(run.id, execTask.id, "inspect_command", {
+        argv: ["cat", "README.md"],
+      })) as { exit_code: number; stdout: string };
+      assert.equal(inspectRes.exit_code, 0);
+      assert.equal(inspectRes.stdout, "hello\n");
+
+      // 3. Synthetic Director owner's spawn_task, wait_tasks, artifact_read, cancel_task pass the allowed-set check.
+      const spawned = (await orch.executeDirectorTaskTool("chat-1", repoRoot, "spawn_task", {
+        kind: "research",
+        title: "Dir scout",
+        objective: "Read README",
+        model: "fixture/fixture",
+      })) as { spawned: string };
+      assert.ok(spawned.spawned);
+      const waited = (await orch.executeDirectorTaskTool("chat-1", repoRoot, "wait_tasks", {
+        ids: [spawned.spawned],
+        timeout_s: 5,
+      })) as { children: Array<{ artifact_paths: string[] }> };
+      const artPath = waited.children[0]?.artifact_paths[0];
+      assert.ok(artPath);
+      const readRes = (await orch.executeDirectorTaskTool("chat-1", repoRoot, "artifact_read", {
+        path: artPath,
+      })) as { content: string };
+      assert.equal(readRes.content, "director child artifact");
+
+      // cancel_task on a live Director child passes the allowed-set check and cancels it.
+      const dirRun = orch.listDirectorTaskRuns("chat-1")[0]!;
+      const owner = db.listTasks(dirRun.id).find((t) => t.tier === 1 && t.profileId === "director")!;
+      const liveChild = db.createTask({
+        runId: dirRun.id,
+        parentId: owner.id,
+        tier: 3,
+        kind: "research",
+        title: "Live dir child",
+        objective: "Wait",
+        readOnly: true,
+        profileId: "pi:local",
+      });
+      db.updateTask(liveChild.id, { status: "running" });
+      const cancelled = (await orch.executeDirectorTaskTool("chat-1", repoRoot, "cancel_task", {
+        task_id: liveChild.id,
+        reason: "No longer needed",
+      })) as { cancelled: string };
+      assert.equal(cancelled.cancelled, liveChild.id);
+
+      db.close();
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
   });
 
   it("T4-8 no counts", () => {
