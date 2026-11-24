@@ -222,12 +222,14 @@ export class DaemonClient {
     if (!transport || transport !== this.writable) return;
     if (epoch !== undefined && this._connectionEpoch !== epoch) return;
     this._connectionEpoch += 1;
+    const sock = this.socket;
     this.writable = null;
     this.readable = null;
     this.socket = null;
     this.sshProc = null;
     this.detachReader?.();
     this.detachReader = null;
+    sock?.destroy();
     for (const p of this.pending.values()) {
       p.reject(new Error("Disconnected from harnessd"));
     }

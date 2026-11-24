@@ -1437,7 +1437,7 @@ describe("hot-update controller, supervisor, and config unit checks", () => {
         `expected conflict error in stderr:\n${res.stderr}`,
       );
       assert.equal(existsSync(join(dirname(socketPath), "reload-fallback.txt")), false, "must not write supervisor fallback");
-      assert.equal(existsSync(join(homeDir, "daemon.log")), false, "must not start supervisor daemon log");
+      assert.equal(existsSync(join(dirname(socketPath), "daemon.log")), false, "must not start supervisor daemon log");
     },
     20_000,
   );

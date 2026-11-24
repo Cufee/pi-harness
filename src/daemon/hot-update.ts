@@ -429,12 +429,12 @@ type ProbePingResult =
   | { kind: "inconclusive"; error: string };
 
 async function probePingClient(socketPath: string, timeoutMs = 2000): Promise<ProbePingClientResult> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = performance.now() + timeoutMs;
   const client = new DaemonClient(socketPath);
   let timer: ReturnType<typeof setTimeout> | null = null;
   let keepOpen = false;
   try {
-    const connectBudgetMs = Math.max(0, deadline - Date.now());
+    const connectBudgetMs = Math.max(0, deadline - performance.now());
     try {
       await Promise.race([
         client.connect(),
@@ -455,7 +455,7 @@ async function probePingClient(socketPath: string, timeoutMs = 2000): Promise<Pr
         timer = null;
       }
     }
-    const remainingMs = deadline - Date.now();
+    const remainingMs = deadline - performance.now();
     if (remainingMs <= 0) {
       return { kind: "inconclusive", error: "ping timeout" };
     }
