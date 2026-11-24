@@ -21,12 +21,14 @@ export class DaemonClient {
   private readable: Readable | null = null;
   private writable: Writable | null = null;
   private socket: Socket | null = null;
+  private connectingSocket: Socket | null = null;
   private sshProc: ChildProcess | null = null;
   private detachReader: (() => void) | null = null;
   private pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   private eventListeners = new Set<(ev: DaemonEventFrame) => void>();
   private closeListeners = new Set<() => void>();
   private _closedByUser = false;
+  private _connectionEpoch = 0;
 
   constructor(
     private readonly target: string,
@@ -35,6 +37,15 @@ export class DaemonClient {
 
   get isRemote(): boolean {
     return this.target.startsWith("ssh://");
+  }
+
+  get remoteHost(): string | null {
+    if (!this.isRemote) return null;
+    try {
+      return parseValidatedSshTarget(this.target, this.bridgeCommand).host;
+    } catch {
+      return this.target.replace(/^ssh:\/\//, "");
+    }
   }
 
   get localSocketPath(): string | null {
@@ -49,6 +60,10 @@ export class DaemonClient {
     return this._closedByUser;
   }
 
+  get connectionEpoch(): number {
+    return this._connectionEpoch;
+  }
+
   onEvent(fn: (ev: DaemonEventFrame) => void): () => void {
     this.eventListeners.add(fn);
     return () => this.eventListeners.delete(fn);
@@ -60,7 +75,12 @@ export class DaemonClient {
   }
 
   async connect(): Promise<void> {
+    if (this.writable || this.socket || this.connectingSocket || this.sshProc) {
+      this.teardown();
+    }
     this._closedByUser = false;
+    const epoch = ++this._connectionEpoch;
+
     if (this.target.startsWith("ssh://")) {
       const { host, port, remoteCmd } = parseValidatedSshTarget(this.target, this.bridgeCommand);
       const args = ["-T", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"];
@@ -77,56 +97,102 @@ export class DaemonClient {
       });
       const spawnErr = new Promise<never>((_, reject) => {
         proc.once("error", (err) => {
-          this.handleDisconnect(proc.stdin!);
+          this.handleDisconnect(proc.stdin!, epoch);
           reject(new Error(`SSH spawn failed: ${err.message}`));
         });
       });
       // "close" fires after stdout ends and stderr is drained, so a failed bridge reports its stderr.
+      // Guard on transport epoch so a late close from a superseded child never rejects current pending requests.
       proc.once("close", (code) => {
+        if (this._connectionEpoch !== epoch || this.writable !== proc.stdin) return;
         if (code && code !== 0 && stderrBuf.trim()) {
           for (const p of this.pending.values()) {
             p.reject(new Error(`SSH bridge exited (${code}): ${stderrBuf.trim()}`));
           }
           this.pending.clear();
         }
-        this.handleDisconnect(proc.stdin!);
+        this.handleDisconnect(proc.stdin!, epoch);
       });
       // Before the ping succeeds, stdout end waits for "close" so a failed bridge reports its stderr.
       let connected = false;
-      this.attachTransportReader(proc.stdin!, () => connected);
-      await Promise.race([
-        this.request("ping"),
-        spawnErr,
-        new Promise<never>((_, reject) => {
-          const t = setTimeout(() => reject(new Error(`Timed out connecting over SSH to ${host}`)), 15_000);
-          t.unref?.();
-        }),
-      ]).catch((err) => {
-        this.teardown();
+      this.attachTransportReader(proc.stdin!, epoch, () => connected);
+      let connectTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          this.request("ping"),
+          spawnErr,
+          new Promise<never>((_, reject) => {
+            connectTimer = setTimeout(() => reject(new Error(`Timed out connecting over SSH to ${host}`)), 15_000);
+            connectTimer.unref?.();
+          }),
+        ]);
+      } catch (err) {
+        if (this._connectionEpoch === epoch) this.teardown();
+        else proc.kill("SIGTERM");
         throw err;
-      });
+      } finally {
+        if (connectTimer) clearTimeout(connectTimer);
+      }
+      if (this._closedByUser || this._connectionEpoch !== epoch) {
+        proc.kill("SIGTERM");
+        throw new Error("Connection closed during handshake");
+      }
       connected = true;
       stderrBuf = "";
       return;
     } else {
       const sock = createConnection(this.target);
-      await new Promise<void>((resolve, reject) => {
-        sock.once("connect", resolve);
-        sock.once("error", reject);
-      });
+      this.connectingSocket = sock;
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const cleanup = () => {
+            sock.off("connect", onConnect);
+            sock.off("error", onError);
+            sock.off("close", onClose);
+          };
+          const onConnect = () => {
+            cleanup();
+            resolve();
+          };
+          const onError = (err: Error) => {
+            cleanup();
+            reject(err);
+          };
+          const onClose = () => {
+            cleanup();
+            reject(new Error("Connection closed during handshake"));
+          };
+          sock.once("connect", onConnect);
+          sock.once("error", onError);
+          sock.once("close", onClose);
+        });
+      } catch (err) {
+        if (this.connectingSocket === sock) this.connectingSocket = null;
+        sock.destroy();
+        throw err;
+      }
+      if (this.connectingSocket === sock) this.connectingSocket = null;
+      if (this._closedByUser || this._connectionEpoch !== epoch) {
+        sock.destroy();
+        throw new Error("Connection closed during handshake");
+      }
       this.socket = sock;
       this.readable = sock;
       this.writable = sock;
-      sock.once("close", () => this.handleDisconnect(sock));
+      sock.once("close", () => this.handleDisconnect(sock, epoch));
+      this.attachTransportReader(sock, epoch);
     }
-
-    this.attachTransportReader(this.writable);
   }
 
-  private attachTransportReader(transport: Writable | null, disconnectOnEnd: () => boolean = () => true): void {
+  private attachTransportReader(
+    transport: Writable | null,
+    epoch: number,
+    disconnectOnEnd: () => boolean = () => true,
+  ): void {
     if (!this.readable) return;
     this.detachReader = attachDaemonReader(this.readable, {
       onMessage: (raw) => {
+        if (this._connectionEpoch !== epoch || this.writable !== transport) return;
         const frame = raw as RpcResponse | DaemonEventFrame;
         if (frame.kind === "res") {
           const p = this.pending.get(frame.id);
@@ -145,15 +211,17 @@ export class DaemonClient {
           }
         }
       },
-      onError: () => this.handleDisconnect(transport),
+      onError: () => this.handleDisconnect(transport, epoch),
       onEnd: () => {
-        if (disconnectOnEnd()) this.handleDisconnect(transport);
+        if (disconnectOnEnd()) this.handleDisconnect(transport, epoch);
       },
     });
   }
 
-  private handleDisconnect(transport: Writable | null): void {
+  private handleDisconnect(transport: Writable | null, epoch?: number): void {
     if (!transport || transport !== this.writable) return;
+    if (epoch !== undefined && this._connectionEpoch !== epoch) return;
+    this._connectionEpoch += 1;
     this.writable = null;
     this.readable = null;
     this.socket = null;
@@ -181,13 +249,26 @@ export class DaemonClient {
   }
 
   private teardown(): void {
+    const connecting = this.connectingSocket;
     const sock = this.socket;
     const proc = this.sshProc;
+    const writable = this.writable;
+    this.connectingSocket = null;
     this.socket = null;
     this.sshProc = null;
+    connecting?.destroy();
     sock?.end();
     proc?.kill("SIGTERM");
-    this.handleDisconnect(this.writable);
+    if (writable) {
+      this.handleDisconnect(writable);
+    } else {
+      this._connectionEpoch += 1;
+    }
+  }
+
+  /** Tears down the active transport without setting closedByUser (used when resetting an unresponsive peer). */
+  disconnect(): void {
+    this.teardown();
   }
 
   close(): void {

@@ -1235,7 +1235,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
 
   const settleTurn = (
     turnId: string | null,
-    optsSettle: { finalText?: string; error?: string; cancelled?: boolean; timestampMs?: number | null },
+    optsSettle: { finalText?: string; error?: string; cancelled?: boolean; timestampMs?: number | null; skipDrain?: boolean },
   ) => {
     if (turnId) {
       if (settledTurns.has(turnId)) return;
@@ -1310,7 +1310,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     activeTurnId = null;
     shell.setStatus(false, "Ready");
     void shell.store.refresh();
-    drainQueue();
+    if (!optsSettle.skipDrain) drainQueue();
   };
 
   const dispatchPrompt = async (text: string): Promise<void> => {
@@ -1350,8 +1350,45 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
             shell.session.tui.requestRender();
             return;
           }
-        } catch {
-          // Fall through to queueing if steer fails
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.startsWith("DAEMON_RELOADING: ")) {
+            reloadingBlocked = true;
+            shell.queuedMessages.push(text);
+            shell.transcript.appendReceipt({
+              glyph: shell.theme.glyphs.cross,
+              tone: "danger",
+              tag: "error",
+              text: "Not sent: harnessd is restarting. Queued for resend.",
+              timestampMs: Date.now(),
+            });
+            shell.syncDock();
+            return;
+          }
+          if (isTransportLossError(msg)) {
+            uncertainSendText = text;
+            shell.transcript.appendReceipt({
+              glyph: shell.theme.glyphs.cross,
+              tone: "danger",
+              tag: "error",
+              text: "Connection to harnessd was lost while sending. The message may not have been delivered.",
+              timestampMs: Date.now(),
+            });
+            shell.session.tui.requestRender();
+            return;
+          }
+          if (isReadOnlyRejection(msg)) {
+            shell.queuedMessages.push(text);
+            shell.transcript.appendReceipt({
+              tone: "warn",
+              tag: "control",
+              text: msg,
+              timestampMs: Date.now(),
+            });
+            shell.syncDock();
+            return;
+          }
+          // Non-transport / pre-write rejection (e.g. client not connected): fall through to queueing
         }
       }
       shell.queuedMessages.push(text);
@@ -1390,14 +1427,25 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         settleTurn(turnId, {
           error: "Not sent: harnessd is restarting. Queued for resend.",
           timestampMs: Date.now(),
+          skipDrain: true,
         });
         return;
       }
-      if (msg.includes("Disconnected from harnessd")) {
+      if (isReadOnlyRejection(msg)) {
+        shell.queuedMessages.unshift(text);
+        settleTurn(turnId, {
+          error: msg,
+          timestampMs: Date.now(),
+          skipDrain: true,
+        });
+        return;
+      }
+      if (isTransportLossError(msg)) {
         uncertainSendText = text;
         settleTurn(turnId, {
           error: "Connection to harnessd was lost while sending. The message may not have been delivered.",
           timestampMs: Date.now(),
+          skipDrain: true,
         });
         return;
       }
@@ -1777,6 +1825,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
 
   const resyncChat = async (ping: ReconnectPing) => {
     const hadControl = shell.hasControl();
+    const resyncEpoch = opts.client.connectionEpoch;
     buffering = true;
     earlyBuffer.length = 0;
     try {
@@ -1784,16 +1833,13 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         chatSessionId: chatSession.id,
         control: hadControl ? "take" : "view",
       });
-      chatSession = reopened.session;
-      activeProject = reopened.project ?? activeProject;
-      shell.resetControl(reopened.control);
 
       const fetchedRows: ChatTurnRecord[] = [];
       const throughSeq = reopened.historyThrough ?? syncedThroughSeq;
       let afterSeq: number | null = syncedThroughSeq;
       while (afterSeq !== null && afterSeq < throughSeq) {
         const page: { history: ChatTurnRecord[]; historyNext?: number | null } = await opts.client.request("chat.history", {
-          chatSessionId: chatSession.id,
+          chatSessionId: reopened.session.id,
           afterSeq,
           throughSeq,
         });
@@ -1804,6 +1850,16 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         if (next === null || next <= afterSeq) break;
         afterSeq = next;
       }
+
+      if (stopped) return;
+      if (opts.client.connected === false || opts.client.connectionEpoch !== resyncEpoch) {
+        throw new Error("Disconnected from harnessd");
+      }
+
+      chatSession = reopened.session;
+      activeProject = reopened.project ?? activeProject;
+      shell.resetControl(reopened.control);
+
       if (fetchedRows.length > 0) {
         renderHistoryRows(fetchedRows);
       }
@@ -1850,6 +1906,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
 
   reconnect = installAutoReconnect({
     client: opts.client,
+    remoteHost: opts.remoteHost,
     isStopped: () => stopped,
     resync: resyncChat,
     onStatus: (s) => {
@@ -1924,12 +1981,121 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
   const repoRoot = attached.run?.repoRoot ?? process.cwd();
   let lastEventSeq = 0;
   let reloadingBlocked = false;
+  let runQueueDraining = false;
   let incompatibleMessage: string | null = null;
   let incompatibleDraft = "";
   const selfReleaseId = currentRelease().releaseId;
   const notedMismatchReleases = new Set<string>();
   let shell!: ReturnType<typeof createSharedShell>;
   let reconnect!: AutoReconnectHandle;
+
+  const sendRunMessage = async (text: string): Promise<"accepted" | "requeue" | "failed"> => {
+    try {
+      if (boundTaskId) {
+        const res = await opts.client.request<{ steered?: boolean }>("task.steer", {
+          taskId: boundTaskId,
+          message: text,
+        });
+        shell.transcript.appendUserTurn(text);
+        shell.transcript.appendReceipt({
+          tone: res?.steered ? "ok" : "warn",
+          tag: "steered",
+          text: res?.steered ? `Sent to ${boundTaskId}` : `${boundTaskId} is not actively running`,
+        });
+      } else {
+        const res = await opts.client.request<{ resumed?: boolean; outcome?: string; message?: string; noteDelivered?: boolean } | null>(
+          "run.resume",
+          { runId, message: text },
+        );
+        shell.transcript.appendUserTurn(text);
+        // Report what the daemon did: an already-completed or no-op resume does not deliver the guidance.
+        if (res?.resumed || res?.outcome === "resumed" || res?.noteDelivered) {
+          shell.transcript.appendReceipt({ tone: "ok", tag: "run", text: `Sent guidance to ${runId}` });
+        } else {
+          const receipt = resumeReceipt(res, runId, opts.remoteSelector ?? opts.remoteHost);
+          shell.transcript.appendReceipt({ ...receipt, tag: "run", text: `Guidance not delivered: ${receipt.text}` });
+        }
+      }
+      shell.session.tui.requestRender();
+      return "accepted";
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.startsWith("DAEMON_RELOADING: ")) {
+        reloadingBlocked = true;
+        shell.transcript.appendReceipt({
+          glyph: shell.theme.glyphs.cross,
+          tone: "danger",
+          tag: "error",
+          text: "Not sent: harnessd is restarting. Queued for resend.",
+        });
+        shell.session.tui.requestRender();
+        return "requeue";
+      }
+      if (isReadOnlyRejection(msg)) {
+        shell.transcript.appendReceipt({
+          tone: "warn",
+          tag: "control",
+          text: msg,
+        });
+        shell.session.tui.requestRender();
+        return "requeue";
+      }
+      shell.transcript.appendUserTurn(text);
+      shell.transcript.appendReceipt({
+        glyph: shell.theme.glyphs.cross,
+        tone: "danger",
+        tag: "error",
+        text: isTransportLossError(msg)
+          ? "Connection to harnessd was lost while sending. The message may not have been delivered."
+          : msg,
+      });
+      shell.session.tui.requestRender();
+      return "failed";
+    }
+  };
+
+  const drainRunQueue = () => {
+    if (
+      runQueueDraining ||
+      !shell.hasControl() ||
+      reconnect?.offline ||
+      reconnect?.expectingRestart ||
+      reloadingBlocked ||
+      shell.queuedMessages.length === 0
+    ) {
+      return;
+    }
+    runQueueDraining = true;
+    void (async () => {
+      try {
+        while (
+          shell.hasControl() &&
+          !reconnect?.offline &&
+          !reconnect?.expectingRestart &&
+          !reloadingBlocked &&
+          shell.queuedMessages.length > 0
+        ) {
+          // Leave unattempted items in original FIFO order; remove only the item being sent.
+          const next = shell.queuedMessages.shift()!;
+          shell.syncDock();
+          const outcome = await sendRunMessage(next);
+          if (outcome === "requeue") {
+            shell.queuedMessages.unshift(next);
+            shell.syncDock();
+            break;
+          }
+          if (
+            outcome === "failed" &&
+            (!shell.hasControl() || reconnect?.offline || reconnect?.expectingRestart || reloadingBlocked)
+          ) {
+            break;
+          }
+        }
+      } finally {
+        runQueueDraining = false;
+      }
+    })();
+  };
 
   const dispatchRunSubmit = async (text: string): Promise<void> => {
     if (reconnect?.offline || reconnect?.expectingRestart || reloadingBlocked) {
@@ -1942,74 +2108,22 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
       shell.syncDock();
       return;
     }
-
-    shell.transcript.appendUserTurn(text);
-    try {
-      if (boundTaskId) {
-        const res = await opts.client.request<{ steered?: boolean }>("task.steer", {
-          taskId: boundTaskId,
-          message: text,
-        });
-        shell.transcript.appendReceipt({
-          tone: res?.steered ? "ok" : "warn",
-          tag: "steered",
-          text: res?.steered ? `Sent to ${boundTaskId}` : `${boundTaskId} is not actively running`,
-        });
-      } else {
-        const res = await opts.client.request<{ resumed?: boolean; outcome?: string; message?: string; noteDelivered?: boolean } | null>(
-          "run.resume",
-          { runId, message: text },
-        );
-        // Report what the daemon did: an already-completed or no-op resume does not deliver the guidance.
-        if (res?.resumed || res?.outcome === "resumed" || res?.noteDelivered) {
-          shell.transcript.appendReceipt({ tone: "ok", tag: "run", text: `Sent guidance to ${runId}` });
-        } else {
-          const receipt = resumeReceipt(res, runId, opts.remoteSelector ?? opts.remoteHost);
-          shell.transcript.appendReceipt({ ...receipt, tag: "run", text: `Guidance not delivered: ${receipt.text}` });
-        }
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.startsWith("DAEMON_RELOADING: ")) {
-        reloadingBlocked = true;
-        shell.queuedMessages.unshift(text);
-        shell.transcript.appendReceipt({
-          glyph: shell.theme.glyphs.cross,
-          tone: "danger",
-          tag: "error",
-          text: "Not sent: harnessd is restarting. Queued for resend.",
-        });
-        shell.syncDock();
-        return;
-      }
-      throw err;
+    if (runQueueDraining || shell.queuedMessages.length > 0) {
+      shell.queuedMessages.push(text);
+      shell.transcript.appendReceipt({
+        tone: "info",
+        tag: "queued",
+        text: `Queued (${shell.queuedMessages.length}): ${firstLine(text, 80)}`,
+      });
+      shell.syncDock();
+      drainRunQueue();
+      return;
     }
-    shell.session.tui.requestRender();
-  };
-
-  const drainRunQueue = () => {
-    if (!shell.hasControl() || reconnect?.offline || reconnect?.expectingRestart || reloadingBlocked || shell.queuedMessages.length === 0) return;
-    const pending = shell.queuedMessages.splice(0);
-    shell.syncDock();
-    void (async () => {
-      for (const next of pending) {
-        if (!shell.hasControl() || reconnect?.offline || reconnect?.expectingRestart || reloadingBlocked) {
-          shell.queuedMessages.unshift(next);
-          shell.syncDock();
-          break;
-        }
-        try {
-          await dispatchRunSubmit(next);
-        } catch (err) {
-          shell.transcript.appendReceipt({
-            tone: "danger",
-            tag: "error",
-            text: err instanceof Error ? err.message : String(err),
-          });
-          shell.session.tui.requestRender();
-        }
-      }
-    })();
+    const outcome = await sendRunMessage(text);
+    if (outcome === "requeue") {
+      shell.queuedMessages.unshift(text);
+      shell.syncDock();
+    }
   };
 
   shell = createSharedShell({
@@ -2193,6 +2307,7 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
 
   const resyncRun = async (ping: ReconnectPing) => {
     const hadControl = shell.hasControl();
+    const resyncEpoch = opts.client.connectionEpoch;
     buffering = true;
     earlyBuffer.length = 0;
     try {
@@ -2212,7 +2327,7 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
         () => closed,
       );
       if (closed) return;
-      if (opts.client.connected === false) {
+      if (opts.client.connected === false || opts.client.connectionEpoch !== resyncEpoch) {
         throw new Error("Disconnected from harnessd");
       }
       liveHandler = handleRunEvent;
@@ -2229,6 +2344,7 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
 
   reconnect = installAutoReconnect({
     client: opts.client,
+    remoteHost: opts.remoteHost,
     isStopped: () => closed,
     resync: resyncRun,
     onStatus: (s) => {
@@ -2286,6 +2402,14 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
     detachEvents();
     reconnect.dispose();
   }
+}
+
+function isTransportLossError(msg: string): boolean {
+  return msg.includes("Disconnected from harnessd") || msg.startsWith("SSH bridge exited (");
+}
+
+function isReadOnlyRejection(msg: string): boolean {
+  return msg.includes("Session is read-only");
 }
 
 function handleDaemonLifecycleEvent(

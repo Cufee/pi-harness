@@ -17,6 +17,7 @@ export interface ReconnectStatus {
 
 export interface AutoReconnectOptions {
   client: DaemonClient;
+  remoteHost?: string | null;
   isStopped: () => boolean;
   resync: (ping: ReconnectPing) => Promise<void>;
   onStatus: (s: ReconnectStatus) => void;
@@ -24,6 +25,7 @@ export interface AutoReconnectOptions {
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   random?: () => number;
+  pingTimeoutMs?: number;
 }
 
 export interface AutoReconnectHandle {
@@ -40,6 +42,7 @@ const DEFAULT_SPAWN_AFTER_MS = 20_000;
 const RESTART_SPAWN_AFTER_MS = 30_000;
 const SPAWN_REPEAT_INTERVAL_MS = 30_000;
 const MAX_LIVE_RESYNC_FAILURES = 3;
+const DEFAULT_PING_TIMEOUT_MS = 5_000;
 
 function nextDelayMs(attempt: number, offlineMs: number, random: () => number): number {
   const base =
@@ -59,10 +62,12 @@ export function installAutoReconnect(o: AutoReconnectOptions): AutoReconnectHand
   let explicitStop = false;
   let restartStopping = false;
   let reloadDeadlineAt: number | null = null;
+  let closeEpoch = 0;
   let wakeSleep: (() => void) | null = null;
 
   const now = o.now ?? (() => Date.now());
   const random = o.random ?? (() => Math.random());
+  const pingTimeoutMs = o.pingTimeoutMs ?? DEFAULT_PING_TIMEOUT_MS;
   const sleep =
     o.sleep ??
     ((ms: number) =>
@@ -86,8 +91,55 @@ export function installAutoReconnect(o: AutoReconnectOptions): AutoReconnectHand
       if (sock) spawnDaemonDetached(installedCurrent() ?? currentRelease(), sock);
     });
 
+  const emitRemoteStopped = (attempt: number) => {
+    disposed = true;
+    offline = true;
+    detachClose();
+    const hostLabel = o.remoteHost || o.client.remoteHost || "remote host";
+    o.onStatus({
+      phase: "incompatible",
+      attempt,
+      message: `harnessd on ${hostLabel} was stopped. Start pi-harness again to reconnect.`,
+    });
+  };
+
+  const captureConnEpoch = () => ({
+    closeEpoch,
+    clientEpoch: o.client.connectionEpoch ?? 0,
+  });
+
+  const isSameConnection = (snap: { closeEpoch: number; clientEpoch: number }) =>
+    o.client.connected && closeEpoch === snap.closeEpoch && (o.client.connectionEpoch ?? 0) === snap.clientEpoch;
+
+  const pingWithTimeout = async (): Promise<ReconnectPing> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        o.client.request<ReconnectPing>("ping"),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Reconnect ping timed out")), pingTimeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+    } catch (err) {
+      if (err instanceof Error && err.message === "Reconnect ping timed out" && o.client.connected) {
+        o.client.disconnect?.();
+      }
+      throw err;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
   const detachClose = o.client.onClose(() => {
-    if (shouldStop() || loopRunning) return;
+    closeEpoch += 1;
+    if (shouldStop()) return;
+    // Remote SSH bridges auto-start the remote daemon on connect(), so an explicit stop must exit instead of reconnecting.
+    if (explicitStop && o.client.isRemote) {
+      emitRemoteStopped(0);
+      return;
+    }
+    if (loopRunning) return;
     offline = true;
     loopRunning = true;
     void runLoop();
@@ -107,6 +159,10 @@ export function installAutoReconnect(o: AutoReconnectOptions): AutoReconnectHand
 
     try {
       while (!shouldStop()) {
+        if (explicitStop && o.client.isRemote) {
+          emitRemoteStopped(attempt);
+          return;
+        }
         attempt += 1;
         o.onStatus(
           explicitStop
@@ -125,6 +181,10 @@ export function installAutoReconnect(o: AutoReconnectOptions): AutoReconnectHand
         const delayMs = nextDelayMs(attempt, Math.max(0, now() - closedAt), random);
         await sleep(delayMs);
         if (shouldStop()) return;
+        if (explicitStop && o.client.isRemote) {
+          emitRemoteStopped(attempt);
+          return;
+        }
 
         const currentNow = now();
         if (canSpawnLocal && !explicitStop && currentNow >= nextSpawnAt) {
@@ -140,10 +200,18 @@ export function installAutoReconnect(o: AutoReconnectOptions): AutoReconnectHand
           if (!o.client.connected) {
             await o.client.connect();
           }
-          if (shouldStop()) return;
+          if (shouldStop()) {
+            if (o.client.connected) o.client.disconnect?.();
+            return;
+          }
 
-          const ping = await o.client.request<ReconnectPing>("ping");
+          const connSnap = captureConnEpoch();
+          const ping = await pingWithTimeout();
           if (shouldStop()) return;
+          if (!isSameConnection(connSnap)) {
+            liveResyncFailures = 0;
+            continue;
+          }
 
           if (ping?.protocolRev !== DAEMON_PROTOCOL_REV) {
             disposed = true;
@@ -161,7 +229,7 @@ export function installAutoReconnect(o: AutoReconnectOptions): AutoReconnectHand
             await o.resync(ping);
           } catch (resyncErr) {
             if (shouldStop()) return;
-            if (!o.client.connected) {
+            if (!isSameConnection(connSnap)) {
               liveResyncFailures = 0;
               continue;
             }
@@ -181,6 +249,11 @@ export function installAutoReconnect(o: AutoReconnectOptions): AutoReconnectHand
           }
 
           if (shouldStop()) return;
+          if (!isSameConnection(connSnap)) {
+            liveResyncFailures = 0;
+            continue;
+          }
+
           offline = false;
           expectingRestart = false;
           explicitStop = false;

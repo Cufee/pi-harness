@@ -1,8 +1,8 @@
 import { existsSync } from "node:fs";
 import type { Database } from "bun:sqlite";
-import type { ControlPlaneDb, TaskRecord } from "./db.js";
+import type { AgentTier, ControlPlaneDb, TaskKind, TaskRecord } from "./db.js";
 import { settleTaskMinimalFallback } from "./handoffs.js";
-import { isDirectorTaskContainer } from "./ids.js";
+import { directorTaskRunOwner, isDirectorTaskContainer } from "./ids.js";
 import type { AnchoredHandoff } from "./prompts.js";
 import { toolPolicyForTask } from "../runners/types.js";
 import type { WorktreeManager } from "../worktree/manager.js";
@@ -11,6 +11,9 @@ export const DRAIN_STEER_MARKER = "[harness:daemon-restart]";
 
 const LIVE_STATUSES = new Set(["running", "draining", "waiting_children", "merging"]);
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const DONE_REVIEW_OBJECTIVE_PREFIX = "# Independent Skeptical Done-Review (Goal ";
+
+export type WorktreeRecoveryAction = "in_place" | "recreate" | "fallback_repo_root";
 
 export interface PlannedTask {
   id: string;
@@ -23,10 +26,14 @@ export interface PlannedTask {
   generation: number;
   createdAt: number;
   parentId: string | null;
+  readOnly: boolean;
   worktreeId: string | null;
+  worktreeTaskId: string | null;
+  worktreeRunId: string | null;
   worktreeStatus: string | null;
   worktreePath: string | null;
   worktreeExists: boolean;
+  worktreeAction: WorktreeRecoveryAction;
 }
 
 export interface RecoveryPlan {
@@ -62,23 +69,184 @@ export interface RecoveryHost {
   isStopping(): boolean;
 }
 
-function isDoneReviewTask(t: { tier: number; kind: string; title: string }): boolean {
-  return t.tier === 3 && t.kind === "verify" && t.title.startsWith("Done-Review:");
+interface ReviewingGoalMeta {
+  id: string;
+  title: string;
+  reviewCycle: number;
+  linkedRunId: string | null;
+  chatSessionId: string | null;
 }
 
-function parseHandoff(raw: string | null): AnchoredHandoff | null {
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw) as Partial<AnchoredHandoff>;
-    return {
-      goalInvariants: Array.isArray(parsed.goalInvariants) ? parsed.goalInvariants.map(String) : [],
-      architecturalDecisions: Array.isArray(parsed.architecturalDecisions) ? parsed.architecturalDecisions : [],
-      activeRisks: Array.isArray(parsed.activeRisks) ? parsed.activeRisks.map(String) : [],
-      nextActions: Array.isArray(parsed.nextActions) ? parsed.nextActions.map(String) : [],
-    };
-  } catch {
-    return null;
+function ownsWritableWorktree(t: {
+  id: string;
+  tier: number;
+  kind: string;
+  readOnly: boolean;
+  worktreeId: string | null;
+  worktreeTaskId: string | null;
+}): boolean {
+  if (!t.worktreeId) return false;
+  if (toolPolicyForTask(t.tier as AgentTier, t.kind as TaskKind, t.readOnly) !== "read_write_workspace") return false;
+  return t.worktreeTaskId === null || t.worktreeTaskId === t.id;
+}
+
+function classifyWorktreeAction(t: {
+  id: string;
+  tier: number;
+  kind: string;
+  readOnly: boolean;
+  worktreeId: string | null;
+  worktreeTaskId: string | null;
+  worktreeExists: boolean;
+}): WorktreeRecoveryAction {
+  if (!t.worktreeId || t.worktreeExists) return "in_place";
+  return ownsWritableWorktree(t) ? "recreate" : "fallback_repo_root";
+}
+
+function isDirectorDoneReviewTask(
+  t: {
+    id: string;
+    runId: string;
+    parentId: string | null;
+    tier: number;
+    kind: string;
+    readOnly: boolean;
+    title: string;
+    objective: string;
+  },
+  ctx: {
+    doneReviewCostTaskIds: Set<string>;
+    reviewingGoals: ReviewingGoalMeta[];
+    tier1ByRun: Map<string, Set<string>>;
+  },
+): boolean {
+  if (t.tier !== 3 || t.kind !== "verify" || !t.readOnly || !t.title.startsWith("Done-Review:")) {
+    return false;
   }
+  if (ctx.doneReviewCostTaskIds.has(t.id)) {
+    return true;
+  }
+  const containerOwner = directorTaskRunOwner(t.runId);
+  const runTier1Ids = ctx.tier1ByRun.get(t.runId);
+  const parentMatches = t.parentId === null || Boolean(runTier1Ids?.has(t.parentId));
+  if (!parentMatches) return false;
+
+  return ctx.reviewingGoals.some((g) => {
+    const runMatches =
+      g.linkedRunId === t.runId ||
+      (containerOwner !== null && (containerOwner === g.chatSessionId || containerOwner === g.id));
+    if (!runMatches) return false;
+    const expectedTitle = `Done-Review: ${g.title} (cycle ${g.reviewCycle + 1})`;
+    if (t.title !== expectedTitle) return false;
+    return t.objective.startsWith(`${DONE_REVIEW_OBJECTIVE_PREFIX}${g.id} `);
+  });
+}
+
+function normalizeHandoff(raw: unknown): { handoff: AnchoredHandoff; malformed: boolean; reason: string | null } {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {
+      handoff: { goalInvariants: [], architecturalDecisions: [], activeRisks: [], nextActions: [] },
+      malformed: true,
+      reason: "stored handoff is not an object",
+    };
+  }
+  const obj = raw as Record<string, unknown>;
+  let malformed = false;
+  const reasons: string[] = [];
+
+  const cleanStringList = (field: string, value: unknown): string[] => {
+    if (value === undefined) return [];
+    if (!Array.isArray(value)) {
+      malformed = true;
+      reasons.push(`${field} is not an array`);
+      return [];
+    }
+    const out: string[] = [];
+    for (const item of value) {
+      if (typeof item === "string") {
+        out.push(item);
+      } else {
+        malformed = true;
+        if (!reasons.includes(`${field} contains non-string entry`)) {
+          reasons.push(`${field} contains non-string entry`);
+        }
+      }
+    }
+    return out;
+  };
+
+  const decisions: Array<{ decision: string; rationale: string }> = [];
+  if (obj.architecturalDecisions !== undefined) {
+    if (!Array.isArray(obj.architecturalDecisions)) {
+      malformed = true;
+      reasons.push("architecturalDecisions is not an array");
+    } else {
+      for (const entry of obj.architecturalDecisions) {
+        if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+          const rec = entry as Record<string, unknown>;
+          if (typeof rec.decision === "string") {
+            const rationale = typeof rec.rationale === "string" ? rec.rationale : "";
+            if (rec.rationale !== undefined && typeof rec.rationale !== "string") {
+              malformed = true;
+              if (!reasons.includes("architecturalDecisions entry has non-string rationale")) {
+                reasons.push("architecturalDecisions entry has non-string rationale");
+              }
+            }
+            decisions.push({ decision: rec.decision, rationale });
+            continue;
+          }
+        }
+        malformed = true;
+        if (!reasons.includes("architecturalDecisions entry missing string decision")) {
+          reasons.push("architecturalDecisions entry missing string decision");
+        }
+      }
+    }
+  }
+
+  return {
+    handoff: {
+      goalInvariants: cleanStringList("goalInvariants", obj.goalInvariants),
+      architecturalDecisions: decisions,
+      activeRisks: cleanStringList("activeRisks", obj.activeRisks),
+      nextActions: cleanStringList("nextActions", obj.nextActions),
+    },
+    malformed,
+    reason: reasons.length > 0 ? reasons.join("; ") : null,
+  };
+}
+
+function parseHandoffWithStatus(raw: string | null): {
+  handoff: AnchoredHandoff | null;
+  malformed: boolean;
+  reason: string | null;
+} {
+  if (!raw) return { handoff: null, malformed: false, reason: null };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { handoff: null, malformed: true, reason: `invalid JSON (${msg})` };
+  }
+  const normalized = normalizeHandoff(parsed);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { handoff: null, malformed: true, reason: normalized.reason };
+  }
+  return normalized;
+}
+
+function minimalRecoveryHandoff(generation: number, reason: string): AnchoredHandoff {
+  return {
+    goalInvariants: [],
+    architecturalDecisions: [],
+    activeRisks: [`Generation ${generation} recovered with minimal handoff: ${reason.slice(0, 300)}`],
+    nextActions: [],
+  };
+}
+
+function isRunStoppedForRecovery(run: { id: string; status: string }): boolean {
+  return !isDirectorTaskContainer(run.id) && run.status === "stopped";
 }
 
 export function listInterruptedReviewGoals(raw: Database): { goalId: string; runId: string }[] {
@@ -108,8 +276,9 @@ export function classifyInterruptedTasks(raw: Database, opts?: { legacyStopAt?: 
   const taskRows = raw
     .prepare(
       `SELECT
-        t.id, t.run_id, r.status AS run_status, t.tier, t.kind, t.title, t.status,
-        t.generation, t.created_at, t.parent_id, t.profile_id, t.worktree_id,
+        t.id, t.run_id, r.status AS run_status, t.tier, t.kind, t.title, t.objective, t.status,
+        t.generation, t.created_at, t.parent_id, t.profile_id, t.read_only, t.worktree_id,
+        w.task_id AS worktree_task_id, w.run_id AS worktree_run_id,
         w.status AS worktree_status, w.path AS worktree_path
        FROM tasks t
        JOIN runs r ON r.id = t.run_id
@@ -124,33 +293,110 @@ export function classifyInterruptedTasks(raw: Database, opts?: { legacyStopAt?: 
     tier: number;
     kind: string;
     title: string;
+    objective: string;
     status: string;
     generation: number;
     created_at: number;
     parent_id: string | null;
     profile_id: string;
+    read_only: number;
     worktree_id: string | null;
+    worktree_task_id: string | null;
+    worktree_run_id: string | null;
     worktree_status: string | null;
     worktree_path: string | null;
   }>;
 
+  const doneReviewCostTaskIds = new Set<string>();
+  try {
+    const costRows = raw
+      .prepare("SELECT DISTINCT task_id FROM cost_invocations WHERE activity = 'done_review' AND task_id IS NOT NULL")
+      .all() as Array<{ task_id: string }>;
+    for (const r of costRows) doneReviewCostTaskIds.add(String(r.task_id));
+  } catch {
+    // cost_invocations table may not exist in minimal databases
+  }
+
+  const reviewingGoals: ReviewingGoalMeta[] = [];
+  try {
+    const gRows = raw
+      .prepare("SELECT id, title, review_cycle, linked_run_id, chat_session_id FROM goals WHERE status IN ('reviewing', 'verifying')")
+      .all() as Array<{
+      id: string;
+      title: string;
+      review_cycle: number;
+      linked_run_id: string | null;
+      chat_session_id: string | null;
+    }>;
+    for (const g of gRows) {
+      reviewingGoals.push({
+        id: String(g.id),
+        title: String(g.title),
+        reviewCycle: Number(g.review_cycle),
+        linkedRunId: g.linked_run_id ? String(g.linked_run_id) : null,
+        chatSessionId: g.chat_session_id ? String(g.chat_session_id) : null,
+      });
+    }
+  } catch {
+    // goals table may not exist in minimal databases
+  }
+
+  const tier1ByRun = new Map<string, Set<string>>();
+  try {
+    const t1Rows = raw.prepare("SELECT id, run_id FROM tasks WHERE tier = 1").all() as Array<{ id: string; run_id: string }>;
+    for (const t1 of t1Rows) {
+      const rid = String(t1.run_id);
+      let set = tier1ByRun.get(rid);
+      if (!set) {
+        set = new Set<string>();
+        tier1ByRun.set(rid, set);
+      }
+      set.add(String(t1.id));
+    }
+  } catch {
+    // ignore
+  }
+
+  const reviewCtx = { doneReviewCostTaskIds, reviewingGoals, tier1ByRun };
+
   const toPlanned = (r: (typeof taskRows)[number]): PlannedTask => {
+    const runId = String(r.run_id);
+    const id = String(r.id);
+    const tier = Number(r.tier);
+    const kind = String(r.kind);
+    const readOnly = Boolean(r.read_only);
+    const worktreeId = r.worktree_id ? String(r.worktree_id) : null;
+    const worktreeTaskId = r.worktree_task_id ? String(r.worktree_task_id) : null;
+    const worktreeRunId = r.worktree_run_id ? String(r.worktree_run_id) : null;
     const wtPath = r.worktree_path ? String(r.worktree_path) : null;
+    const worktreeExists = wtPath !== null && worktreeRunId === runId && existsSync(wtPath);
     return {
-      id: String(r.id),
-      runId: String(r.run_id),
+      id,
+      runId,
       runStatus: String(r.run_status),
-      tier: Number(r.tier),
-      kind: String(r.kind),
+      tier,
+      kind,
       title: String(r.title),
       status: String(r.status),
       generation: Number(r.generation),
       createdAt: Number(r.created_at),
       parentId: r.parent_id ? String(r.parent_id) : null,
-      worktreeId: r.worktree_id ? String(r.worktree_id) : null,
+      readOnly,
+      worktreeId,
+      worktreeTaskId,
+      worktreeRunId,
       worktreeStatus: r.worktree_status ? String(r.worktree_status) : null,
       worktreePath: wtPath,
-      worktreeExists: wtPath !== null && existsSync(wtPath),
+      worktreeExists,
+      worktreeAction: classifyWorktreeAction({
+        id,
+        tier,
+        kind,
+        readOnly,
+        worktreeId,
+        worktreeTaskId,
+        worktreeExists,
+      }),
     };
   };
 
@@ -160,8 +406,20 @@ export function classifyInterruptedTasks(raw: Database, opts?: { legacyStopAt?: 
   for (const row of taskRows) {
     const status = String(row.status);
     if (
-      isDoneReviewTask({ tier: Number(row.tier), kind: String(row.kind), title: String(row.title) }) &&
-      (LIVE_STATUSES.has(status) || status === "ready" || status === "pending")
+      (LIVE_STATUSES.has(status) || status === "ready" || status === "pending") &&
+      isDirectorDoneReviewTask(
+        {
+          id: String(row.id),
+          runId: String(row.run_id),
+          parentId: row.parent_id ? String(row.parent_id) : null,
+          tier: Number(row.tier),
+          kind: String(row.kind),
+          readOnly: Boolean(row.read_only),
+          title: String(row.title),
+          objective: String(row.objective ?? ""),
+        },
+        reviewCtx,
+      )
     ) {
       cancelReviews.push(toPlanned(row));
       continue;
@@ -300,8 +558,9 @@ function formatTaskLine(t: PlannedTask): string {
 }
 
 export function formatRecoveryPlan(plan: RecoveryPlan): string {
-  const inPlace = plan.relaunch.filter((t) => !t.worktreeId || t.worktreeExists);
-  const recreated = plan.relaunch.filter((t) => t.worktreeId && !t.worktreeExists);
+  const inPlace = plan.relaunch.filter((t) => t.worktreeAction === "in_place");
+  const recreated = plan.relaunch.filter((t) => t.worktreeAction === "recreate");
+  const fallbackRepoRoot = plan.relaunch.filter((t) => t.worktreeAction === "fallback_repo_root");
   const lines: string[] = [];
 
   lines.push(`1. Relaunched in place (${inPlace.length}):`);
@@ -310,7 +569,10 @@ export function formatRecoveryPlan(plan: RecoveryPlan): string {
   lines.push(`2. Relaunched with a recreated worktree (${recreated.length}):`);
   for (const t of recreated) lines.push(formatTaskLine(t));
 
-  lines.push(`3. Failed by the legacy rule (${plan.legacyFail.length}):`);
+  lines.push(`3. Inherited read-only reference missing, falls back to repo root (${fallbackRepoRoot.length}):`);
+  for (const t of fallbackRepoRoot) lines.push(formatTaskLine(t));
+
+  lines.push(`4. Failed by the legacy rule (${plan.legacyFail.length}):`);
   const legacyByRun = new Map<string, { runStatus: string; tasks: PlannedTask[] }>();
   for (const t of plan.legacyFail) {
     let group = legacyByRun.get(t.runId);
@@ -325,24 +587,24 @@ export function formatRecoveryPlan(plan: RecoveryPlan): string {
     for (const t of group.tasks) lines.push(`  ${formatTaskLine(t)}`);
   }
 
-  lines.push(`4. Left alone: pending, paused_quota (${plan.untouched.length}):`);
+  lines.push(`5. Left alone: pending, paused_quota (${plan.untouched.length}):`);
   for (const t of plan.untouched) lines.push(formatTaskLine(t));
 
-  lines.push(`5. Done-Review rows cancelled and re-run (${plan.cancelReviews.length}):`);
+  lines.push(`6. Done-Review rows cancelled and re-run (${plan.cancelReviews.length}):`);
   for (const t of plan.cancelReviews) lines.push(formatTaskLine(t));
 
-  lines.push(`6. Pending timers (${plan.pendingTimers.length}):`);
+  lines.push(`7. Pending timers (${plan.pendingTimers.length}):`);
   for (const tm of plan.pendingTimers) {
     const kind = tm.viaWaitTimer ? "wait_timer" : "schedule_timer";
     lines.push(`  ${tm.id} ${tm.ownerKind}:${tm.ownerId} due=${new Date(tm.wakeAt).toISOString()} ${kind} "${tm.reason}"`);
   }
 
-  lines.push(`7. Merge rows closed as ci_failed (${plan.staleMerges.length}):`);
+  lines.push(`8. Merge rows closed as ci_failed (${plan.staleMerges.length}):`);
   for (const m of plan.staleMerges) {
     lines.push(`  ${m.id} task=${m.taskId} run=${m.runId} status=${m.status}`);
   }
 
-  lines.push(`8. Goals whose review is replayed (${plan.reviewGoals.length}):`);
+  lines.push(`9. Goals whose review is replayed (${plan.reviewGoals.length}):`);
   for (const g of plan.reviewGoals) {
     lines.push(`  ${g.goalId} run=${g.runId}`);
   }
@@ -368,7 +630,12 @@ export function applyRecoveryPhaseA(db: ControlPlaneDb, plan: RecoveryPlan, host
   }
 
   for (const t of plan.relaunch) {
-    if (t.worktreeId && (t.worktreeStatus === "queued" || t.worktreeStatus === "bounced")) {
+    if (
+      ownsWritableWorktree(t) &&
+      t.worktreeId &&
+      t.worktreeExists &&
+      (t.worktreeStatus === "queued" || t.worktreeStatus === "bounced")
+    ) {
       db.updateWorktree(t.worktreeId, { status: "active", cleanedAt: null });
     }
   }
@@ -416,9 +683,10 @@ export function applyRecoveryPhaseA(db: ControlPlaneDb, plan: RecoveryPlan, host
 
 export function sanitizeRestartHandoff(h: AnchoredHandoff): AnchoredHandoff {
   const drainPrefix = `Steered update: ${DRAIN_STEER_MARKER}`;
+  const { handoff } = normalizeHandoff(h);
   return {
-    ...h,
-    nextActions: h.nextActions.filter((entry) => !entry.startsWith(drainPrefix)),
+    ...handoff,
+    nextActions: handoff.nextActions.filter((entry) => !entry.startsWith(drainPrefix)),
   };
 }
 
@@ -460,202 +728,255 @@ function latestMergeRowForTask(
 export async function relaunchInterruptedTasks(
   host: RecoveryHost,
   taskIds: string[],
-  opts: { reason: string; staggerMs: number },
+  opts: { reason: string; staggerMs: number; onFailed?: (failure: { id: string; error: string }) => void },
 ): Promise<string[]> {
   const launched: string[] = [];
+  const failed: { id: string; error: string }[] = [];
   if (taskIds.length === 0) return launched;
   console.error(`[harnessd ${new Date().toISOString()}] recovery: starting phase B for ${taskIds.length} task(s)`);
 
   for (let i = 0; i < taskIds.length; i++) {
     const taskId = taskIds[i]!;
     if (host.isStopping()) break;
-    if (host.isActive?.(taskId)) {
-      host.release(taskId);
-      continue;
-    }
 
-    const task = host.db.getTask(taskId);
-    const run = task ? host.db.getRun(task.runId) : null;
-    if (!task || !run || (!LIVE_STATUSES.has(task.status) && task.status !== "ready") || run.status === "stopped") {
-      console.error(
-        `[harnessd ${new Date().toISOString()}] recovery: skipped ${taskId} (task=${task?.status ?? "missing"}, run=${run?.status ?? "missing"})`,
-      );
-      host.release(taskId);
-      continue;
-    }
+    try {
+      if (host.isActive?.(taskId)) {
+        host.release(taskId);
+        continue;
+      }
 
-    const fromStatus = task.status;
-    const wasLive = LIVE_STATUSES.has(fromStatus);
-    let wt = task.worktreeId ? host.db.getWorktree(task.worktreeId) : null;
-    let mergedWorktreeNote: string | null = null;
-    let archiveWorktreeNote: string | null = null;
-    const policy = toolPolicyForTask(task.tier, task.kind, task.readOnly);
+      const task = host.db.getTask(taskId);
+      const run = task ? host.db.getRun(task.runId) : null;
+      if (!task || !run || (!LIVE_STATUSES.has(task.status) && task.status !== "ready") || isRunStoppedForRecovery(run)) {
+        console.error(
+          `[harnessd ${new Date().toISOString()}] recovery: ${taskId} skipped (task=${task?.status ?? "missing"}, run=${run?.status ?? "missing"})`,
+        );
+        host.release(taskId);
+        continue;
+      }
 
-    if (task.worktreeId) {
-      if (policy === "read_write_workspace" && (!wt || wt.taskId === task.id)) {
-        if (wt && wt.runId === task.runId && existsSync(wt.path)) {
-          if (wt.status !== "active" && wt.status !== "merged") {
-            host.db.updateWorktree(wt.id, { status: "active", cleanedAt: null });
-            wt = host.db.getWorktree(wt.id);
-          } else if (wt.status === "merged") {
-            mergedWorktreeNote = `Your branch ${wt.branch} is already merged. Do not edit or resubmit. Call return_task with your summary.`;
-          }
-        } else {
-          const prevWt = wt;
-          const mgr = host.worktrees(run.repoRoot);
-          try {
-            if (await mgr.isGitRepo()) {
-              wt = await mgr.createForWorker(run.id, task.id, undefined, { force: true });
-              const prevId = prevWt?.id ?? task.worktreeId;
-              const branchHint = prevWt?.branch ? ` (previous branch ${prevWt.branch})` : "";
-              archiveWorktreeNote =
-                `The previous worktree ${prevId}${branchHint} was archived before the daemon restart; this generation starts on a fresh worktree from base branch ${run.baseBranch || "HEAD"}` +
-                (prevWt?.archiveRef
-                  ? ` and the archived work is at ${prevWt.archiveRef} (inspect it with \`git log ${prevWt.archiveRef}\` and cherry-pick what is still needed).`
-                  : prevWt?.branch
-                    ? ` (nothing unmerged was archived; check \`git log ${prevWt.branch}\` if any commits remain on the previous branch).`
-                    : " (nothing unmerged was archived).");
+      const fromStatus = task.status;
+      const wasLive = LIVE_STATUSES.has(fromStatus);
+      let wt = task.worktreeId ? host.db.getWorktree(task.worktreeId) : null;
+      let mergedWorktreeNote: string | null = null;
+      let archiveWorktreeNote: string | null = null;
+
+      if (task.worktreeId) {
+        const ownsWritable = ownsWritableWorktree({
+          id: task.id,
+          tier: task.tier,
+          kind: task.kind,
+          readOnly: task.readOnly,
+          worktreeId: task.worktreeId,
+          worktreeTaskId: wt?.taskId ?? null,
+        });
+        if (ownsWritable) {
+          if (wt && wt.runId === task.runId && existsSync(wt.path)) {
+            if (wt.status !== "active" && wt.status !== "merged") {
+              host.db.updateWorktree(wt.id, { status: "active", cleanedAt: null });
+              wt = host.db.getWorktree(wt.id);
+            } else if (wt.status === "merged") {
+              mergedWorktreeNote = `Your branch ${wt.branch} is already merged. Do not edit or resubmit. Call return_task with your summary.`;
             }
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            console.error(`[harnessd ${new Date().toISOString()}] recovery: skipped ${taskId} (worktree recreation failed: ${msg})`);
-            host.db.emitEvent(run.id, task.id, "agent.error", {
-              error: `Recovery worktree recreation failed: ${msg}`,
-            });
-            host.release(task.id);
-            continue;
-          }
-        }
-      } else if (!wt || wt.runId !== task.runId || !existsSync(wt.path)) {
-        // Read-only / inherited worktree whose checkout is gone: clear worktreeId so the runner falls back to run.repoRoot.
-        host.db.updateTask(task.id, { worktreeId: null });
-        wt = null;
-      }
-    }
-
-    if (host.isStopping()) break;
-
-    let handoff: AnchoredHandoff | null = null;
-    if (wasLive && fromStatus !== "draining") {
-      handoff = await host.buildHandoff(task, wt?.path ?? null, opts.reason, null);
-    } else if (fromStatus === "draining") {
-      handoff = await host.buildHandoff(task, wt?.path ?? null, opts.reason, parseHandoff(task.handoffJson));
-    } else {
-      handoff = parseHandoff(task.handoffJson);
-    }
-
-    if (host.isStopping()) break;
-
-    const latestTask = host.db.getTask(taskId);
-    const latestRun = latestTask ? host.db.getRun(latestTask.runId) : null;
-    if (
-      !latestTask ||
-      !latestRun ||
-      (!LIVE_STATUSES.has(latestTask.status) && latestTask.status !== "ready") ||
-      latestRun.status === "stopped"
-    ) {
-      console.error(
-        `[harnessd ${new Date().toISOString()}] recovery: skipped ${taskId} after handoff (task=${latestTask?.status ?? "missing"}, run=${latestRun?.status ?? "missing"})`,
-      );
-      host.release(taskId);
-      continue;
-    }
-
-    if (handoff !== null) {
-      handoff = sanitizeRestartHandoff(handoff);
-      const prefix: string[] = [];
-
-      if (wasLive) {
-        prefix.push(
-          `The daemon restarted (${opts.reason}). Your previous session ended mid-turn. Anything you had not written to the worktree, an artifact or a tool call is lost. Worktree edits and commits are preserved. Inspect the worktree before continuing.`,
-        );
-      }
-
-      if (task.tier === 1 || task.tier === 2) {
-        prefix.push(
-          "Your child tasks already exist. Call tree_view with include_settled true before spawning anything. Never spawn a task that already exists. Use wait_children or resume_task.",
-        );
-      }
-
-      const taskTimers = host.db.timers.list({ ownerKind: "task", ownerId: task.id, status: "pending" });
-      if (taskTimers.length > 0) {
-        const waitTimerIds = getWaitTimerIdsForTask(host.db, run.id, task.id);
-        for (const tm of taskTimers) {
-          const due = new Date(tm.wakeAt).toISOString();
-          if (waitTimerIds.has(tm.id)) {
-            prefix.push(
-              `You were blocked in wait_timer on ${tm.id} ("${tm.reason}", due ${due}) when the daemon restarted. The timer is still scheduled and fires once as the steering message "[SCHEDULED TIMER ${tm.id} FIRED]". Do not create a replacement. If you have nothing to do until then, call wait_children when you have unsettled children (the steering message wakes it). With no unsettled children, call cancel_timer for ${tm.id} and then wait_timer for the remaining time.`,
-            );
           } else {
-            prefix.push(
-              `Timer ${tm.id} ("${tm.reason}", due ${due}) is still scheduled. It fires once and steers you. Do not schedule it again.`,
-            );
+            const prevWt = wt;
+            const mgr = host.worktrees(run.repoRoot);
+            try {
+              if (await mgr.isGitRepo()) {
+                wt = await mgr.createForWorker(run.id, task.id, undefined, { force: true });
+                const prevId = prevWt?.id ?? task.worktreeId;
+                const branchHint = prevWt?.branch ? ` (previous branch ${prevWt.branch})` : "";
+                archiveWorktreeNote =
+                  `The previous worktree ${prevId}${branchHint} was archived before the daemon restart; this generation starts on a fresh worktree from base branch ${run.baseBranch || "HEAD"}` +
+                  (prevWt?.archiveRef
+                    ? ` and the archived work is at ${prevWt.archiveRef} (inspect it with \`git log ${prevWt.archiveRef}\` and cherry-pick what is still needed).`
+                    : prevWt?.branch
+                      ? ` (nothing unmerged was archived; check \`git log ${prevWt.branch}\` if any commits remain on the previous branch).`
+                      : " (nothing unmerged was archived).");
+              }
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              const failure = { id: taskId, error: `worktree recreation failed: ${msg}` };
+              failed.push(failure);
+              opts.onFailed?.(failure);
+              console.error(`[harnessd ${new Date().toISOString()}] recovery: ${taskId} skipped (worktree recreation failed: ${msg})`);
+              host.db.emitEvent(run.id, task.id, "agent.error", {
+                error: `Recovery worktree recreation failed: ${msg}`,
+              });
+              host.release(task.id);
+              continue;
+            }
           }
+        } else if (!wt || wt.runId !== task.runId || !existsSync(wt.path)) {
+          // Read-only / inherited worktree whose checkout is gone: clear worktreeId so the runner falls back to run.repoRoot.
+          host.db.updateTask(task.id, { worktreeId: null });
+          wt = null;
         }
       }
 
-      const lastMerge = latestMergeRowForTask(host.db, task.id);
-      const mergeInterrupted =
-        fromStatus === "merging" ||
-        (lastMerge?.status === "ci_failed" &&
-          Boolean(
-            lastMerge.log &&
-              (lastMerge.log.startsWith("Merge aborted") || lastMerge.log === "Interrupted by daemon restart"),
-          ));
-      if (mergeInterrupted) {
-        const branch = wt?.branch ?? lastMerge?.branch ?? "your branch";
-        const base = run.baseBranch || "main";
-        prefix.push(
-          `Your submit_for_merge was interrupted by the daemon restart. Run git merge-base --is-ancestor ${branch} ${base} first. If it succeeds your branch is merged: call return_task. Otherwise call submit_for_merge again.`,
+      if (host.isStopping()) break;
+
+      let handoff: AnchoredHandoff | null = null;
+      try {
+        const parsedStored = parseHandoffWithStatus(task.handoffJson);
+        if (parsedStored.malformed) {
+          console.error(
+            `[harnessd ${new Date().toISOString()}] recovery: ${taskId} malformed stored handoff (${parsedStored.reason ?? "invalid shape"}); using sanitized/minimal handoff`,
+          );
+        }
+        const taskForHandoff: TaskRecord =
+          parsedStored.malformed || (task.handoffJson && parsedStored.handoff === null)
+            ? { ...task, handoffJson: parsedStored.handoff ? JSON.stringify(parsedStored.handoff) : null }
+            : task;
+        if (wasLive && fromStatus !== "draining") {
+          handoff = await host.buildHandoff(taskForHandoff, wt?.path ?? null, opts.reason, null);
+        } else if (fromStatus === "draining") {
+          handoff = await host.buildHandoff(taskForHandoff, wt?.path ?? null, opts.reason, parsedStored.handoff);
+        } else if (parsedStored.handoff !== null) {
+          handoff = parsedStored.handoff;
+        } else if (parsedStored.malformed) {
+          handoff = minimalRecoveryHandoff(task.generation, parsedStored.reason ?? "malformed stored handoff");
+        }
+        if (handoff !== null) {
+          handoff = sanitizeRestartHandoff(handoff);
+        }
+      } catch (handoffErr) {
+        const msg = handoffErr instanceof Error ? handoffErr.message : String(handoffErr);
+        console.error(
+          `[harnessd ${new Date().toISOString()}] recovery: ${taskId} handoff failed (${msg}); falling back to minimal recovery handoff`,
         );
+        handoff = minimalRecoveryHandoff(task.generation, msg);
       }
 
-      if (mergedWorktreeNote) prefix.push(mergedWorktreeNote);
-      if (archiveWorktreeNote) prefix.push(archiveWorktreeNote);
+      if (host.isStopping()) break;
 
-      const existingSet = new Set(handoff.nextActions);
-      const toPrepend = prefix.filter((line) => !existingSet.has(line));
-      if (toPrepend.length > 0) {
-        handoff = { ...handoff, nextActions: [...toPrepend, ...handoff.nextActions] };
+      const latestTask = host.db.getTask(taskId);
+      const latestRun = latestTask ? host.db.getRun(latestTask.runId) : null;
+      if (
+        !latestTask ||
+        !latestRun ||
+        (!LIVE_STATUSES.has(latestTask.status) && latestTask.status !== "ready") ||
+        isRunStoppedForRecovery(latestRun)
+      ) {
+        console.error(
+          `[harnessd ${new Date().toISOString()}] recovery: ${taskId} skipped after handoff (task=${latestTask?.status ?? "missing"}, run=${latestRun?.status ?? "missing"})`,
+        );
+        host.release(taskId);
+        continue;
       }
 
-      const nextJson = JSON.stringify(handoff);
-      if (wasLive) {
-        host.db.updateTask(task.id, {
-          status: "ready",
-          sessionId: null,
-          contextUsed: 0,
-          summary: null,
-          handoffJson: nextJson,
-        });
-        host.setResumeNote(task.id, {
-          kind: "resume",
-          reason: opts.reason,
-          userMessage: "Continue from the preserved worktree and artifacts without redoing completed steps.",
-        });
-        host.db.emitEvent(run.id, task.id, "task.resumed", {
-          taskId: task.id,
-          fromStatus,
-          generation: task.generation,
-          model: task.model,
-          effort: task.effort,
-          note: "daemon_restart",
-        });
-      } else if (nextJson !== latestTask.handoffJson) {
-        host.db.updateTask(task.id, { handoffJson: nextJson });
+      if (handoff !== null) {
+        const prefix: string[] = [];
+
+        if (wasLive) {
+          prefix.push(
+            `The daemon restarted (${opts.reason}). Your previous session ended mid-turn. Anything you had not written to the worktree, an artifact or a tool call is lost. Worktree edits and commits are preserved. Inspect the worktree before continuing.`,
+          );
+        }
+
+        if (task.tier === 1 || task.tier === 2) {
+          prefix.push(
+            "Your child tasks already exist. Call tree_view with include_settled true before spawning anything. Never spawn a task that already exists. Use wait_children or resume_task.",
+          );
+        }
+
+        const taskTimers = host.db.timers.list({ ownerKind: "task", ownerId: task.id, status: "pending" });
+        if (taskTimers.length > 0) {
+          const waitTimerIds = getWaitTimerIdsForTask(host.db, run.id, task.id);
+          for (const tm of taskTimers) {
+            const due = new Date(tm.wakeAt).toISOString();
+            if (waitTimerIds.has(tm.id)) {
+              prefix.push(
+                `You were blocked in wait_timer on ${tm.id} ("${tm.reason}", due ${due}) when the daemon restarted. The timer is still scheduled and fires once as the steering message "[SCHEDULED TIMER ${tm.id} FIRED]". Do not create a replacement. If you have nothing to do until then, call wait_children when you have unsettled children (the steering message wakes it). With no unsettled children, call cancel_timer for ${tm.id} and then wait_timer for the remaining time.`,
+              );
+            } else {
+              prefix.push(
+                `Timer ${tm.id} ("${tm.reason}", due ${due}) is still scheduled. It fires once and steers you. Do not schedule it again.`,
+              );
+            }
+          }
+        }
+
+        const lastMerge = latestMergeRowForTask(host.db, task.id);
+        const mergeInterrupted =
+          fromStatus === "merging" ||
+          (lastMerge?.status === "ci_failed" &&
+            Boolean(
+              lastMerge.log &&
+                (lastMerge.log.startsWith("Merge aborted") || lastMerge.log === "Interrupted by daemon restart"),
+            ));
+        if (mergeInterrupted) {
+          const branch = wt?.branch ?? lastMerge?.branch ?? "your branch";
+          const base = run.baseBranch || "main";
+          prefix.push(
+            `Your submit_for_merge was interrupted by the daemon restart. Run git merge-base --is-ancestor ${branch} ${base} first. If it succeeds your branch is merged: call return_task. Otherwise call submit_for_merge again.`,
+          );
+        }
+
+        if (mergedWorktreeNote) prefix.push(mergedWorktreeNote);
+        if (archiveWorktreeNote) prefix.push(archiveWorktreeNote);
+
+        const existingSet = new Set(handoff.nextActions);
+        const toPrepend = prefix.filter((line) => !existingSet.has(line));
+        if (toPrepend.length > 0) {
+          handoff = { ...handoff, nextActions: [...toPrepend, ...handoff.nextActions] };
+        }
+
+        const nextJson = JSON.stringify(handoff);
+        if (wasLive) {
+          host.db.updateTask(task.id, {
+            status: "ready",
+            sessionId: null,
+            contextUsed: 0,
+            summary: null,
+            handoffJson: nextJson,
+          });
+          host.setResumeNote(task.id, {
+            kind: "resume",
+            reason: opts.reason,
+            userMessage: "Continue from the preserved worktree and artifacts without redoing completed steps.",
+          });
+          host.db.emitEvent(run.id, task.id, "task.resumed", {
+            taskId: task.id,
+            fromStatus,
+            generation: task.generation,
+            model: task.model,
+            effort: task.effort,
+            note: "daemon_restart",
+          });
+        } else if (nextJson !== latestTask.handoffJson) {
+          host.db.updateTask(task.id, { handoffJson: nextJson });
+        }
+      }
+
+      host.release(task.id);
+      host.launch(task.id);
+      launched.push(task.id);
+      console.error(
+        `[harnessd ${new Date().toISOString()}] recovery: ${task.id} relaunched (T${task.tier} ${task.kind}, from=${fromStatus}, gen=${task.generation})`,
+      );
+
+      if (opts.staggerMs > 0 && i < taskIds.length - 1 && !host.isStopping()) {
+        await new Promise((r) => setTimeout(r, opts.staggerMs));
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const failure = { id: taskId, error: msg };
+      failed.push(failure);
+      opts.onFailed?.(failure);
+      console.error(`[harnessd ${new Date().toISOString()}] recovery: ${taskId} failed to relaunch (${msg}); releasing hold`);
+      try {
+        host.release(taskId);
+      } catch {
+        // best-effort release
       }
     }
+  }
 
-    host.release(task.id);
-    host.launch(task.id);
-    launched.push(task.id);
+  if (failed.length > 0) {
     console.error(
-      `[harnessd ${new Date().toISOString()}] recovery: relaunched ${task.id} (T${task.tier} ${task.kind}, from=${fromStatus}, gen=${task.generation})`,
+      `[harnessd ${new Date().toISOString()}] recovery: degraded phase B (${launched.length} launched, ${failed.length} failed: ${failed.map((f) => f.id).join(", ")})`,
     );
-
-    if (opts.staggerMs > 0 && i < taskIds.length - 1 && !host.isStopping()) {
-      await new Promise((r) => setTimeout(r, opts.staggerMs));
-    }
   }
 
   return launched;
