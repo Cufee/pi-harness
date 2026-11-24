@@ -1,6 +1,6 @@
 import { realpathSync, rmSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { recommendModelsByTaskKind, type ModelCatalogCompiler } from "../catalog/compiler.js";
+import { recommendModelsByTaskKind, routingSkips, type ModelCatalogCompiler } from "../catalog/compiler.js";
 import { CODE_EXEC_TOOL_NAME, TOOL_SEARCH_TOOL_NAME, createCodeModeExecutor, effectiveCodeMode, exposedTools } from "../code-mode/index.js";
 import type { HarnessConfig } from "../config.js";
 import { codeExecEventSink } from "../protocol/tool-display.js";
@@ -125,6 +125,15 @@ export interface ToolRuntimeHooks {
     expectedGeneration: number,
     ev: Parameters<NonNullable<RunnerCallbacks["onToolEvent"]>>[0],
   ) => void;
+  /** Called when an ACP session's MCP bridge requests this task's tool list via `__list_tools`. */
+  onToolsListed?: (taskId: string) => void;
+  /** Returns an auth warning advisory when the spawned profile recently failed authentication, or null. */
+  profileAuthAdvisory?: (profileId: string) => string | null;
+}
+
+function mergeWarnings(...items: Array<string | null | undefined>): string | null {
+  const parts = items.filter((w): w is string => typeof w === "string" && w.trim().length > 0);
+  return parts.length > 0 ? parts.join(" ") : null;
 }
 
 function requiredModel(args: Record<string, unknown>) {
@@ -232,6 +241,7 @@ export class ControlPlaneToolExecutor {
     if (!run) throw new Error(`Run ${runId} not found`);
 
     if (name === "__list_tools") {
+      this.hooks.onToolsListed?.(taskId);
       return this.tools(task);
     }
     if (mode !== "off" && (name === CODE_EXEC_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME)) {
@@ -367,6 +377,7 @@ export class ControlPlaneToolExecutor {
           sources: compiled.sources,
           sessionModelContext: this.resolveSessionModelContext(runId),
           recommendedByKind: recommendModelsByTaskKind(compiled.models, { avoidModelId: task.model }),
+          skippedForRouting: routingSkips(compiled.models),
           models: compiled.models.map((m) => ({
             id: m.id,
             family: m.family,
@@ -388,6 +399,8 @@ export class ControlPlaneToolExecutor {
                     m.quota.effectiveRemainingRatio === null ? null : Math.round(m.quota.effectiveRemainingRatio * 100),
                   bucket: m.quota.bindingBucketId,
                   nextAvailableAt: m.quota.nextAvailableAt,
+                  reason: m.quota.reason ?? null,
+                  ...(m.quota.unavailableReason ? { unavailableReason: m.quota.unavailableReason } : {}),
                 }
               : null,
             recommendedFor: m.recommendedFor,
@@ -445,7 +458,10 @@ export class ControlPlaneToolExecutor {
           signal: callerSignal ?? scriptSignal ?? this.hooks.getTaskCancelSignal?.(taskId),
         });
         const qEntry = this.db.admissionQueue.get("worker", created.id);
-        const warning = spawnDuplicateAdvisory(this.db, task, created.id, created.title);
+        const warning = mergeWarnings(
+          spawnDuplicateAdvisory(this.db, task, created.id, created.title),
+          created.profileId ? this.hooks.profileAuthAdvisory?.(created.profileId) : null,
+        );
         return {
           spawned: created.id,
           status: created.status,
@@ -520,7 +536,10 @@ export class ControlPlaneToolExecutor {
           dependsOn: Array.isArray(args.depends_on) ? (args.depends_on as string[]) : [],
           signal: callerSignal ?? scriptSignal ?? this.hooks.getTaskCancelSignal?.(taskId),
         });
-        const warning = spawnDuplicateAdvisory(this.db, task, created.id, created.title);
+        const warning = mergeWarnings(
+          spawnDuplicateAdvisory(this.db, task, created.id, created.title),
+          created.profileId ? this.hooks.profileAuthAdvisory?.(created.profileId) : null,
+        );
         return {
           spawned: created.id,
           kind: created.kind,
