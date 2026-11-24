@@ -67,6 +67,7 @@ import { isProtectedWritePath } from "../runners/protected-paths.js";
 import type { RunnerCallbacks, RunnerExecutionHandle, ToolDefinition } from "../runners/types.js";
 import { nativeToolsPathDirs, resolveExternalMcpServers } from "../tools/native-tools.js";
 import { runGit } from "../worktree/manager.js";
+import { runMergedRef } from "../worktree/merge-queue.js";
 import {
   buildDirectorSystemPrompt,
   DIRECTOR_DIRECT_TOOLS,
@@ -88,6 +89,20 @@ class FailedRunGatesError extends Error {
   ) {
     super(`required deterministic gate(s) still fail after the run failed (${failedIds.join(", ")})${evidenceTail ? `: ${evidenceTail}` : ""}`);
     this.name = "FailedRunGatesError";
+  }
+}
+
+/** Thrown when the independent Done-Reviewer exhausts its attempts without a structured verdict; no review cycle is consumed. */
+export class ReviewerFailedError extends Error {
+  constructor(
+    readonly attempts: number,
+    readonly detail: string,
+    readonly attemptFailures: string[] = [],
+  ) {
+    super(
+      `Reviewer failed to return a structured verdict after ${attempts} ${attempts === 1 ? "attempt" : "attempts"}; review cycle not consumed${detail ? `: ${detail}` : ""}`,
+    );
+    this.name = "ReviewerFailedError";
   }
 }
 
@@ -1341,6 +1356,7 @@ export class DirectorRuntime {
       return; // DB may be closing
     }
     const gates = err instanceof FailedRunGatesError;
+    const reviewerFailed = err instanceof ReviewerFailedError;
     const msg = err instanceof Error ? err.message : String(err);
     this.wakeHandler?.(goal.chatSessionId, {
       kind: "goal.settled",
@@ -1351,7 +1367,7 @@ export class DirectorRuntime {
       runStatus,
       openEscalations: openEscCount,
       cause: gates ? "gates_failed" : "verification_error",
-      detail: (gates ? "deterministic_gates_failed: " : "verification_error: ") + msg.slice(0, 240),
+      detail: (gates ? "deterministic_gates_failed: " : reviewerFailed ? "reviewer_failed: " : "verification_error: ") + msg.slice(0, 240),
     });
   }
 
@@ -2720,8 +2736,14 @@ export class DirectorRuntime {
   }
 
   /**
-   * Creates the detached `_verify` worktree at the run's base branch tip (gates and reviewers test the real
-   * target branch without touching the host checkout). Without a base branch, verification runs in the repo.
+   * Creates the detached `_verify` worktree for verification gates and Done-Review without touching the host
+   * checkout. Prefers this run's recorded merge commit (`refs/harness/merged/<runId>`) when it exists and is an
+   * ancestor of the base branch tip, falling back to the base branch tip otherwise. Without a base branch,
+   * verification runs in the repo.
+   *
+   * Checking out the local base tip includes sibling goals' unpushed merges, so a shipped gate running
+   * `git merge-base --is-ancestor HEAD origin/main` fails even when this goal's own merge was pushed. Checking
+   * out this run's recorded merge commit evaluates the goal itself without auto-pushing.
    */
   private async prepareVerifyCheckout(
     goal: GoalRecord,
@@ -2736,10 +2758,20 @@ export class DirectorRuntime {
       await scratch?.remove();
     };
     if (run?.baseBranch) {
-      const targetSha = await runGit(goal.repoRoot, ["rev-parse", "--verify", `${run.baseBranch}^{commit}`])
+      const baseTipSha = await runGit(goal.repoRoot, ["rev-parse", "--verify", `${run.baseBranch}^{commit}`])
         .then((r) => r.stdout)
         .catch(() => null);
-      if (targetSha) {
+      if (baseTipSha) {
+        let targetSha = baseTipSha;
+        const mergedRefSha = await runGit(goal.repoRoot, ["rev-parse", "--verify", `${runMergedRef(run.id)}^{commit}`])
+          .then((r) => r.stdout)
+          .catch(() => null);
+        if (mergedRefSha) {
+          const isAncestor = await runGit(goal.repoRoot, ["merge-base", "--is-ancestor", mergedRefSha, baseTipSha])
+            .then(() => true)
+            .catch(() => false);
+          if (isAncestor) targetSha = mergedRefSha;
+        }
         const wtMgr = this.orchestrator.getWorktreeManager(goal.repoRoot);
         const scratch = await wtMgr.addScratchWorktree("_verify", `${goal.id}-${randomUUID().slice(0, 8)}`, targetSha);
         verifyScratch = scratch;
@@ -3044,7 +3076,9 @@ export class DirectorRuntime {
                 "awaiting_human",
                 error instanceof FailedRunGatesError
                   ? `Linked run ${current.linkedRunId ?? "unknown"} failed and required deterministic gate(s) still fail (${error.failedIds.join(", ")}); resume or review.`
-                  : `Verification failed: ${msg.slice(0, 240)}`,
+                  : error instanceof ReviewerFailedError
+                    ? `Reviewer failed to return a structured verdict after ${error.attempts} ${error.attempts === 1 ? "attempt" : "attempts"}; review cycle not consumed${error.detail ? `: ${error.detail.slice(0, 240)}` : ""}`
+                    : `Verification failed: ${msg.slice(0, 240)}`,
               );
             }
           }
@@ -3383,14 +3417,19 @@ export class DirectorRuntime {
       };
 
       const failedSummary = "Independent reviewer failed before completing verification.";
-      const failReviewer = (msg: string) => {
+      const failReviewer = (msg: string, result?: Record<string, unknown>) => {
         if (this.db.getTask(reviewerTask.id)?.status !== "running") return;
         if (reviewerSignal.aborted && !(timedOut && !signal.aborted)) {
           this.db.updateTask(reviewerTask.id, { status: "cancelled", summary: "Reviewer cancelled" });
           return;
         }
         emit("agent.error", { error: msg });
-        this.db.updateTask(reviewerTask.id, { status: "failed", summary: failedSummary });
+        const summary = typeof result?.summary === "string" ? result.summary.slice(0, 2000) : failedSummary;
+        this.db.updateTask(reviewerTask.id, {
+          status: "failed",
+          summary,
+          ...(result ? { resultJson: JSON.stringify(result) } : {}),
+        });
       };
 
       let outcome: ReturnType<GoalEngine["recordReviewVerdict"]>;
@@ -3402,15 +3441,24 @@ export class DirectorRuntime {
       const mcpBridgeEntrypoint = join(dirname(fileURLToPath(import.meta.url)), "..", "runners", bridgeExt);
       // Each reviewer session gets its own executor; one from an ended session can never fill the verdict.
       let activeAttempt = 0;
+      let currentAttempt = 0;
+      let submitCallsThisAttempt = 0;
+      let lastSubmitError: string | null = null;
+      let lastAttemptFailure: string | null = null;
+      const attemptFailures: string[] = [];
       const makeReviewerExecuteTool = (attempt: number) => async (name: string, args: Record<string, unknown>) => {
         if (name === "submit_review_verdict") {
           if (attempt !== activeAttempt) throw new Error("submit_review_verdict: this reviewer session has ended");
+          submitCallsThisAttempt += 1;
           const v = normalizeReviewerVerdict<Partial<SubmittedVerdict>>(args);
           if (!v) {
+            const reason = describeReviewerVerdictError(args);
+            lastSubmitError = reason;
             throw new Error(
-              "submit_review_verdict: verdict must be approved | changes_requested | escalate_human, with criteriaResults[{criterionId, passed, evidence}]",
+              `submit_review_verdict: ${reason}; expected verdict (approved | changes_requested | escalate_human) and criteriaResults[{criterionId, passed, evidence}]`,
             );
           }
+          lastSubmitError = null;
           verdictBox.value = {
             verdict: v.verdict as SubmittedVerdict["verdict"],
             criteriaResults: v.criteriaResults ?? [],
@@ -3431,10 +3479,12 @@ export class DirectorRuntime {
         }, 600_000);
         reviewerTimeout.unref?.();
       };
-      const retryNote =
-        "RETRY: an earlier reviewer session for this exact review ended without a usable verdict (no accepted submit_review_verdict call and no parseable JSON verdict in its final message). " +
-        "Verify independently again, then call submit_review_verdict exactly once before you end your turn; if the tool is unavailable, end with one fenced json verdict object. " +
-        "Ending without a verdict fails this review.";
+      const missingVerdictWrapUpPrompt =
+        "You ended your turn without calling `submit_review_verdict`. Call `submit_review_verdict` now with " +
+        "`verdict` (`approved`, `changes_requested`, or `escalate_human`), `criteriaResults` " +
+        "(`[{criterionId, passed, evidence, remediation?}]`) for every required criterion with concrete evidence, " +
+        "`blockingIssues`, and `summary`. Partial evidence with `changes_requested` is fine; do not end your turn without submitting a verdict. " +
+        "If `submit_review_verdict` is unavailable, end with one fenced json verdict object matching that schema.";
       try {
         if (this.db.getTask(reviewerTask.id)?.status === "cancelled") abort.abort(new Error("Reviewer cancelled"));
         this.db.updateTask(reviewerTask.id, { status: reviewerSignal.aborted ? "cancelled" : "running" });
@@ -3445,10 +3495,21 @@ export class DirectorRuntime {
             reviewerSignal.throwIfAborted();
             if (this.db.getTask(reviewerTask.id)?.status !== "running") throw new Error("Reviewer cancelled");
           }
+          currentAttempt = attempt;
           activeAttempt = attempt;
           verdictBox.value = null;
           turnsUsed = 0;
+          submitCallsThisAttempt = 0;
+          lastSubmitError = null;
           armReviewerTimeout();
+          const retryNote: string =
+            `RETRY (attempt ${attempt}/${REVIEWER_VERDICT_ATTEMPTS}): attempt ${attempt - 1} for this exact review ended without a usable verdict. ` +
+            `Concrete failure from attempt ${attempt - 1}: ${lastAttemptFailure ?? "unknown"}. ` +
+            "Fix that issue: verify independently, then call submit_review_verdict once before ending your turn with " +
+            "verdict (approved | changes_requested | escalate_human), criteriaResults[{criterionId, passed, evidence, remediation?}] " +
+            "for every required criterion with concrete evidence, blockingIssues, and summary (partial evidence -> changes_requested is fine). " +
+            "If submit_review_verdict is unavailable, end with one fenced json verdict object matching that schema. " +
+            "Ending without a valid verdict fails this review as a reviewer failure.";
           const executeTool = makeReviewerExecuteTool(attempt);
           this.activeReviewerTools.set(reviewerTask.id, { tools: [submitTool], execute: executeTool });
           const runner = makeRunner();
@@ -3480,6 +3541,8 @@ export class DirectorRuntime {
               maxTurns: reviewerMaxTurns,
               tools: [submitTool],
               executeTool,
+              isTaskSettled: () => verdictBox.value !== null,
+              missingReturnWrapUpPrompt: missingVerdictWrapUpPrompt,
               daemonSocketPath: this.config.socketPath,
               mcpBridgeEntrypoint,
               externalMcpServers: resolveExternalMcpServers(this.config.stateDir, this.config.externalMcpServers),
@@ -3545,16 +3608,42 @@ export class DirectorRuntime {
           }
           if (verdictBox.value) break;
 
-          // A completed session without a usable verdict is retried in a fresh session; nothing is recorded for it.
-          const noVerdict =
-            `Reviewer returned no usable verdict (attempt ${attempt}/${REVIEWER_VERDICT_ATTEMPTS}, stopReason=${res?.stopReason ?? "unknown"}, ` +
-            `turnsUsed=${turnsUsed}, reviewerMaxTurns=${reviewerMaxTurns} advisory). Output tail: ${(res?.text ?? "").slice(-300)}`;
-          if (attempt >= REVIEWER_VERDICT_ATTEMPTS) throw new Error(noVerdict);
-          emit("agent.error", { error: `${noVerdict} Retrying in a fresh reviewer session.` });
+          // A completed session without a usable verdict is retried once in a fresh session with the concrete error;
+          // nothing is recorded in goal_reviews and no review cycle is consumed.
+          const text = res?.text ?? "";
+          const textParseError = text ? describeReviewerTextParseError(text) : null;
+          const errorParts = [
+            lastSubmitError ? `submit_review_verdict rejected: ${lastSubmitError}` : null,
+            textParseError ? `final text parse failed: ${textParseError}` : null,
+          ].filter((part): part is string => part !== null);
+          const submitSummary =
+            submitCallsThisAttempt > 0 ? `called (${submitCallsThisAttempt}x, rejected)` : "not called";
+          const outputTail = text.trim().slice(-300) || "(empty)";
+          const attemptDetail: string = [
+            `attempt ${attempt}/${REVIEWER_VERDICT_ATTEMPTS}`,
+            `stopReason=${res?.stopReason ?? "unknown"}`,
+            `submit_review_verdict=${submitSummary}`,
+            errorParts.length > 0 ? errorParts.join("; ") : "no parseable JSON verdict in final text",
+            `turnsUsed=${turnsUsed}`,
+            `reviewerMaxTurns=${reviewerMaxTurns} advisory`,
+            `outputTail=${JSON.stringify(outputTail)}`,
+          ].join(", ");
+          lastAttemptFailure = attemptDetail;
+          attemptFailures.push(attemptDetail);
+          if (attempt >= REVIEWER_VERDICT_ATTEMPTS) {
+            throw new ReviewerFailedError(attempt, attemptFailures.join(" | "), attemptFailures);
+          }
+          emit("agent.error", { error: `Reviewer returned no usable verdict (${attemptDetail}). Retrying in a fresh reviewer session.` });
         }
 
         const submittedVerdict = verdictBox.value;
-        if (!submittedVerdict) throw new Error("Reviewer returned no usable verdict");
+        if (!submittedVerdict) {
+          throw new ReviewerFailedError(
+            Math.max(currentAttempt, 1),
+            attemptFailures.join(" | ") || "Reviewer returned no usable verdict",
+            attemptFailures,
+          );
+        }
 
         // Merge deterministic gate pass results with reviewer evaluations so deterministic criteria stay evidenced
         const mergedResults: CriterionEvaluation[] = [...gateResult.results];
@@ -3628,15 +3717,40 @@ export class DirectorRuntime {
           return recorded;
         });
       } catch (err) {
+        if (err instanceof ReviewerFailedError) {
+          failReviewer(err.message, {
+            reviewerFailed: true,
+            attempts: err.attempts,
+            attemptFailures: err.attemptFailures,
+            summary: err.message,
+          });
+          throw err;
+        }
         const detail = err instanceof Error ? err.message : String(err);
-        failReviewer(detail);
         // A wall-clock timeout without a verdict is a reviewer failure with the full diagnostic, not a bare abort.
         if (timedOut && !signal.aborted) {
-          throw new Error(
-            `${failedSummary} (Reviewer did not return a structured verdict before the 10-minute wall-clock limit: ` +
-              `stopReason=timeout, turnsUsed=${turnsUsed}, reviewerMaxTurns=${reviewerMaxTurns} advisory; ${detail})`,
-          );
+          const timeoutDetail =
+            `attempt ${Math.max(currentAttempt, 1)}/${REVIEWER_VERDICT_ATTEMPTS}, stopReason=timeout, ` +
+            `submit_review_verdict=${submitCallsThisAttempt > 0 ? `called (${submitCallsThisAttempt}x, rejected)` : "not called"}, ` +
+            `turnsUsed=${turnsUsed}, reviewerMaxTurns=${reviewerMaxTurns} advisory` +
+            (lastSubmitError ? `, submit_review_verdict rejected: ${lastSubmitError}` : "") +
+            `; ${detail}`;
+          const failures = [...attemptFailures, timeoutDetail];
+          const timeoutErr = new ReviewerFailedError(Math.max(currentAttempt, 1), failures.join(" | "), failures);
+          failReviewer(timeoutErr.message, {
+            reviewerFailed: true,
+            attempts: timeoutErr.attempts,
+            attemptFailures: failures,
+            summary: timeoutErr.message,
+          });
+          throw timeoutErr;
         }
+        failReviewer(detail, {
+          reviewerFailed: true,
+          attempts: Math.max(currentAttempt, 1),
+          attemptFailures,
+          summary: `${failedSummary} (${detail}; turns=${turnsUsed})`,
+        });
         reviewerSignal.throwIfAborted();
         throw new Error(`${failedSummary} (${detail}; turns=${turnsUsed})`);
       } finally {
@@ -5529,6 +5643,60 @@ function balancedObjectEnd(text: string, start: number): number {
     }
   }
   return -1;
+}
+
+/** Explains why `normalizeReviewerVerdict` rejected a value, for tool errors and retry diagnostics. */
+export function describeReviewerVerdictError(raw: unknown): string {
+  if (!isPlainObject(raw)) {
+    return `verdict payload must be a JSON object (got ${raw === null ? "null" : Array.isArray(raw) ? "array" : typeof raw})`;
+  }
+  let obj = raw;
+  if (typeof obj.verdict !== "string") {
+    const inner = isPlainObject(obj.review) ? obj.review : isPlainObject(obj.result) ? obj.result : null;
+    if (!inner) {
+      return 'missing string field "verdict" (expected approved | changes_requested | escalate_human)';
+    }
+    obj = inner;
+  }
+  const verdict = typeof obj.verdict === "string" ? obj.verdict.trim() : "";
+  if (!REVIEWER_VERDICTS.includes(verdict)) {
+    return `invalid verdict ${JSON.stringify(verdict)} (expected approved | changes_requested | escalate_human)`;
+  }
+  return "verdict must be approved | changes_requested | escalate_human, with criteriaResults[{criterionId, passed, evidence}]";
+}
+
+/** Explains why `parseReviewerVerdictJson` could not extract a valid verdict from reviewer text. */
+function describeReviewerTextParseError(text: string): string | null {
+  const fences = [...text.matchAll(/```(?:json)?[ \t]*\r?\n?([\s\S]*?)```/gi)];
+  let lastErr: string | null = null;
+  for (let i = fences.length - 1; i >= 0; i--) {
+    try {
+      const parsed = JSON.parse(fences[i]![1]!.trim());
+      if (!normalizeReviewerVerdict(parsed)) {
+        return `fenced JSON rejected: ${describeReviewerVerdictError(parsed)}`;
+      }
+    } catch (e) {
+      lastErr ??= `fenced JSON syntax error: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  }
+  if (lastErr) return lastErr;
+
+  const tail = text.length > VERDICT_SCAN_BYTES ? text.slice(-VERDICT_SCAN_BYTES) : text;
+  const lastVerdict = tail.lastIndexOf('"verdict"');
+  if (lastVerdict === -1) return null;
+  const start = tail.lastIndexOf("{", lastVerdict);
+  if (start < 0) return 'found "verdict" without an enclosing JSON object';
+  const end = balancedObjectEnd(tail, start);
+  if (end < 0) return 'unterminated JSON object containing "verdict"';
+  try {
+    const parsed = JSON.parse(tail.slice(start, end + 1));
+    if (!normalizeReviewerVerdict(parsed)) {
+      return `inline JSON rejected: ${describeReviewerVerdictError(parsed)}`;
+    }
+  } catch (e) {
+    return `inline JSON syntax error: ${e instanceof Error ? e.message : String(e)}`;
+  }
+  return null;
 }
 
 /**

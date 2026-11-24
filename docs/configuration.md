@@ -86,7 +86,7 @@ Every other key can come from `.pi-harness.json`, including `profiles`, `externa
 | `rollover.orchestratorMaxTurns` | `200` | Deprecated, no effect: tasks are never stopped or reminded by turn count. |
 | `rollover.workerMaxTurns` | `120` | Deprecated, no effect: tasks are never stopped or reminded by turn count. |
 | `rollover.taskMaxTurns` | `40` | Deprecated, no effect: tasks are never stopped or reminded by turn count. |
-| `rollover.reviewerMaxTurns` | `30` | Deprecated, no effect: tasks are never stopped or reminded by turn count. |
+| `rollover.reviewerMaxTurns` | `30` | Advisory only: Done-Reviewer prompts mention this turn count as a progress check-in, and runners never stop a reviewer by turn count. |
 | `rollover.externalizeBytes` | `2048` | Validated (positive integer) but read by no runtime component; Code Mode spilling uses `codeExec.maxOutputChars`. |
 | `rollover.maxGenerations` | `12` | Generation cap per task to stop unbounded rollover loops (positive integer). |
 
@@ -121,6 +121,14 @@ Instead of turn caps, the harness runs an advisory scope check on Tier 3 tasks (
 | `goals.maxConcurrentGoals` | `4` | Active goals per repository (positive integer); further committed goals wait in the admission queue. |
 | `goals.gateShell` | `/bin/sh` | Global-only; absolute path of an executable invoked with `-c`. A syntactically invalid live edit is rejected on reload and the previous valid settings stay active. An invalid value at startup, or an accepted absolute path that is not executable, makes gates fail at execution instead of falling back to another shell. Used for goal criteria gates, merge-queue CI commands, and `worktree.setupCommand`. |
 | `goals.gateEnv` | Unset | Global-only map of string values. `PATH` is prepended to the resolved gate `PATH` (never a replacement) and must contain absolute directories. Names starting with `HARNESS_` are rejected. A syntactically invalid live edit is rejected on reload; an invalid value at startup makes gates fail at execution. Remove the key from `config.json` to clear it. |
+
+#### Done-Review reliability and verification checkouts
+
+- **Advisory turn budget and wrap-up nudge:** `rollover.reviewerMaxTurns` is advisory only; Done-Reviewers are never cancelled by turn count (each reviewer session has a 10-minute wall-clock limit). When a reviewer ends its turn without a valid `submit_review_verdict` call, the runner's wrap-up hook (`isTaskSettled` and `missingReturnWrapUpPrompt`) sends one in-session nudge instructing it to call `submit_review_verdict` now (or return one fenced JSON verdict if the tool is unavailable; partial evidence with `changes_requested` is accepted).
+- **Single retry with concrete failure:** If attempt 1 still finishes without a usable verdict, the harness retries once in a fresh reviewer session (2 attempts total). The retry prompt includes the concrete failure from attempt 1: `stopReason`, whether `submit_review_verdict` was called, the normalizer or JSON parse error when malformed, and a short tail of the final output.
+- **Reviewer failure does not consume a cycle:** If both attempts fail without a structured verdict, the reviewer task is marked `failed` with a structured failure result and the goal moves to `awaiting_human` with a reviewer-failure status message. No `goal_reviews` row is inserted, `reviewCycle` is not incremented, and the no-progress breaker is not fed. Missing verdicts never default to `changes_requested`.
+- **Verification checkout at the goal's merge commit:** When the merge queue merges a run onto the target branch, it updates `refs/harness/merged/<runId>` to the merged commit without pushing to `origin`. `prepareVerifyCheckout` creates the `_verify` worktree at that ref when it exists and is an ancestor of the local base branch tip, falling back to the base tip otherwise. Sibling goals' unpushed merges on the local base branch therefore do not break a goal's `shipped` gate (`git merge-base --is-ancestor HEAD origin/main`) once that goal's own merge commit has been pushed.
+- **Goal-7 root cause:** Goal-7 reviewer tasks `t-75` and `t-84` burned review cycles because the running daemon had not been restarted off release `f485271a6b21`, where `reviewerMaxTurns=12` was a hard turn cap that cancelled ACP sessions mid-investigation and the old runtime accepted `max_turns` and recorded a defaulted `changes_requested` review.
 
 ### `events`, `catalog`, and `quotaRetry`
 
