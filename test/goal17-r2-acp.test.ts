@@ -79,6 +79,7 @@ describe("goal-17 r2 ACP: correlated steer receipt and Amp soft rollover warning
             systemPrompt: "Worker",
             initialPrompt: "Initial work",
             model: "anthropic/claude-opus-5-5",
+            extraEnv: { AMP_ACP_CANCEL_MODE: "steer" },
             tools: [],
             executeTool: async () => ({}),
             signal: new AbortController().signal,
@@ -127,6 +128,10 @@ describe("goal-17 r2 ACP: correlated steer receipt and Amp soft rollover warning
                 sessionId: "S-r2-tc-update",
                 update: { sessionUpdate: "tool_call", toolCallId: "tc-1", title: "shell", status: "in_progress" },
               } as never);
+              await acpClient.notify("session/update", {
+                sessionId: "S-r2-tc-update",
+                update: { sessionUpdate: "tool_call_update", toolCallId: "tc-1", status: "completed" },
+              } as never);
               turn1Ready.resolve();
               return (await new Promise<{ stopReason: string }>((r) => {
                 resolveTurn1 = r;
@@ -154,6 +159,7 @@ describe("goal-17 r2 ACP: correlated steer receipt and Amp soft rollover warning
             systemPrompt: "Worker",
             initialPrompt: "Initial work",
             model: "anthropic/claude-opus-5-5",
+            extraEnv: { AMP_ACP_CANCEL_MODE: "steer" },
             tools: [],
             executeTool: async () => ({}),
             signal: new AbortController().signal,
@@ -241,6 +247,7 @@ describe("goal-17 r2 ACP: correlated steer receipt and Amp soft rollover warning
             systemPrompt: "Worker",
             initialPrompt: "Initial work",
             model: "anthropic/claude-opus-5-5",
+            extraEnv: { AMP_ACP_CANCEL_MODE: "steer" },
             tools: [],
             executeTool: async () => ({}),
             signal: new AbortController().signal,
@@ -338,6 +345,7 @@ describe("goal-17 r2 ACP: correlated steer receipt and Amp soft rollover warning
             systemPrompt: "Worker",
             initialPrompt: "Initial work",
             model: "anthropic/claude-opus-5-5",
+            extraEnv: { AMP_ACP_CANCEL_MODE: "steer" },
             tools: [],
             executeTool: async () => ({}),
             signal: new AbortController().signal,
@@ -475,16 +483,24 @@ describe("goal-17 r2 ACP: correlated steer receipt and Amp soft rollover warning
         return { res, seenPrompts, cancelCount, ampSteerRpcCalls };
       };
 
-      // Case A: Local CLI Amp T2 worker delivers soft rollover warning mid-turn via cancel-then-prompt, never _amp/session/steer.
-      const t2Local = await runAmpSoftWarning({ tier: 2, kind: "worker" });
+      // Case A: Local CLI Amp T2 worker with explicit AMP_ACP_CANCEL_MODE=steer delivers soft rollover warning mid-turn via cancel-then-prompt, never _amp/session/steer.
+      const t2Local = await runAmpSoftWarning({
+        tier: 2,
+        kind: "worker",
+        extraEnv: { AMP_ACP_CANCEL_MODE: "steer" },
+      });
       assert.equal(t2Local.res.stopReason, "completed");
       assert.equal(t2Local.ampSteerRpcCalls, 0, "must never probe mutating _amp/session/steer");
-      assert.equal(t2Local.cancelCount, 1, "local CLI Amp should deliver soft warning via cancel-then-prompt steer");
+      assert.equal(t2Local.cancelCount, 1, "local CLI Amp with AMP_ACP_CANCEL_MODE=steer should deliver soft warning via cancel-then-prompt steer");
       assert.equal(t2Local.seenPrompts.length, 2, "warning should fire exactly once");
       assert.equal(t2Local.seenPrompts[1], contextWarningText(2, 70, 78));
 
-      // Case B: Local CLI Amp T1 orchestrator delivers T1 soft rollover warning without _amp/session/steer.
-      const t1Local = await runAmpSoftWarning({ tier: 1, kind: "orchestrator" });
+      // Case B: Local CLI Amp T1 orchestrator with explicit AMP_ACP_CANCEL_MODE=steer delivers T1 soft rollover warning without _amp/session/steer.
+      const t1Local = await runAmpSoftWarning({
+        tier: 1,
+        kind: "orchestrator",
+        extraEnv: { AMP_ACP_CANCEL_MODE: "steer" },
+      });
       assert.equal(t1Local.res.stopReason, "completed");
       assert.equal(t1Local.ampSteerRpcCalls, 0, "must never probe mutating _amp/session/steer");
       assert.equal(t1Local.cancelCount, 1);

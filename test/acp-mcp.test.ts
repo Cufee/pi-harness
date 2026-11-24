@@ -1327,8 +1327,8 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
         billing: "subscription",
       };
 
-      // Case 1: default local CLI mode (AMP_ACP_CANCEL_MODE=steer) hands off directly via session/cancel +
-      // replacement session/prompt without probing the mutating _amp/session/steer extension, and resolves live
+      // Case 1: explicit opt-in local CLI mode (AMP_ACP_CANCEL_MODE=steer) hands off directly via session/cancel +
+      // replacement session/prompt when no tool is in flight without probing _amp/session/steer, and resolves live
       // once the replacement turn emits a model-visible signal.
       const seenPrompts: string[] = [];
       let cancelCount = 0;
@@ -1393,6 +1393,7 @@ describe("ACP Shims, Live Rollover/Artifact Telemetry & Daemon Attach/Detach", (
           initialPrompt: "Start initial work",
           model: "anthropic/claude-opus-5-5",
           maxTurns: 10,
+          extraEnv: { AMP_ACP_CANCEL_MODE: "steer" },
           tools: [],
           executeTool: async () => ({}),
           signal: new AbortController().signal,

@@ -98,6 +98,7 @@ describe("goal-17 ACP steer ack, single delivery path, and cancel/drain events",
           initialPrompt: "Initial work",
           model: "anthropic/claude-opus-5-5",
           maxTurns: 10,
+          extraEnv: { AMP_ACP_CANCEL_MODE: "steer" },
           tools: [],
           executeTool: async () => ({}),
           signal: new AbortController().signal,
@@ -187,6 +188,7 @@ describe("goal-17 ACP steer ack, single delivery path, and cancel/drain events",
           initialPrompt: "Initial work",
           model: "anthropic/claude-opus-5-5",
           maxTurns: 10,
+          extraEnv: { AMP_ACP_CANCEL_MODE: "steer" },
           tools: [],
           executeTool: async () => ({}),
           signal: new AbortController().signal,
@@ -266,6 +268,7 @@ describe("goal-17 ACP steer ack, single delivery path, and cancel/drain events",
           initialPrompt: "Initial work",
           model: "anthropic/claude-opus-5-5",
           maxTurns: 10,
+          extraEnv: { AMP_ACP_CANCEL_MODE: "steer" },
           tools: [],
           executeTool: async () => ({}),
           signal: new AbortController().signal,
@@ -433,7 +436,7 @@ describe("goal-17 ACP steer ack, single delivery path, and cancel/drain events",
       );
 
       // Case B: SDK transport must not be forced into CLI-only cancel-then-prompt steering, and must not double-deliver.
-      const sdkCase = await runScenario({ extraEnv: { AMP_ACP_TRANSPORT: "sdk" } });
+      const sdkCase = await runScenario({ extraEnv: { AMP_ACP_TRANSPORT: "sdk", AMP_ACP_CANCEL_MODE: "steer" } });
       assert.equal(sdkCase.steerRpcCalls, 0, "SDK transport must not probe mutating _amp/session/steer");
       assert.equal(sdkCase.cancelCount, 0, "SDK transport must not trigger CLI-only cancel-then-prompt");
       assert.equal(
@@ -443,7 +446,7 @@ describe("goal-17 ACP steer ack, single delivery path, and cancel/drain events",
       );
 
       // Case C: second steer while an earlier replacement handoff is still outstanding -> no _amp/session/steer probe, single delivery each.
-      const overlapCase = await runScenario({ steerCount: 2 });
+      const overlapCase = await runScenario({ steerCount: 2, extraEnv: { AMP_ACP_CANCEL_MODE: "steer" } });
       assert.equal(overlapCase.steerRpcCalls, 0, "must not probe _amp/session/steer while replacement handoff is in flight");
       assert.equal(overlapCase.cancelCount, 1);
       assert.equal(overlapCase.deliveredTexts.filter((t) => t.includes("AMEND_ONE")).length, 1);
@@ -513,6 +516,7 @@ describe("goal-17 ACP steer ack, single delivery path, and cancel/drain events",
             initialPrompt: "Initial work",
             model: "anthropic/claude-opus-5-5",
             maxTurns: 10,
+            extraEnv: { AMP_ACP_CANCEL_MODE: "steer" },
             tools: [],
             executeTool: async () => ({}),
             isTaskSettled: () => settled,
