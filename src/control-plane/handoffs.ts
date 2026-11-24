@@ -18,6 +18,17 @@ export function isReadOnlyKind(kind: string): kind is "research" | "plan" | "ver
 
 type TaskSource = { path: string; lines?: string; symbol?: string; note?: string };
 
+export interface ExternalDeliverableInput {
+  ref: string;
+  sha?: string;
+  note?: string;
+}
+
+export interface ExternalDeliverableRecord extends ExternalDeliverableInput {
+  worktree_head: string | null;
+  unmerged_commits: string[];
+}
+
 /**
  * Synchronously settles a task to a terminal status. For non-Tier-1 tasks, writes a minimal
  * partial fallback payload (`partial: true`, reason, and already-indexed artifact paths) in the
@@ -80,7 +91,38 @@ export function validateTaskHandoff(kind: TaskKind, args: Record<string, unknown
     }
     return { path, lines, symbol, note };
   });
-  return { summary: fullSummary, sources, artifactPaths, partial };
+  let externalDeliverable: ExternalDeliverableInput | undefined;
+  if (args.external_deliverable !== undefined) {
+    if (kind !== "worker") {
+      throw new Error("return_task external_deliverable is only supported for Tier 2 workers.");
+    }
+    const raw = args.external_deliverable;
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new Error("return_task external_deliverable must be an object with a non-empty string ref");
+    }
+    const { ref, sha, note } = raw as Record<string, unknown>;
+    if (typeof ref !== "string" || !ref.trim()) {
+      throw new Error("return_task external_deliverable requires a non-empty string ref");
+    }
+    if (sha !== undefined && typeof sha !== "string") {
+      throw new Error("return_task external_deliverable sha must be a string when provided");
+    }
+    if (note !== undefined && typeof note !== "string") {
+      throw new Error("return_task external_deliverable note must be a string when provided");
+    }
+    externalDeliverable = {
+      ref,
+      ...(sha !== undefined ? { sha } : {}),
+      ...(note !== undefined ? { note } : {}),
+    };
+  }
+  return {
+    summary: fullSummary,
+    sources,
+    artifactPaths,
+    partial,
+    ...(externalDeliverable ? { externalDeliverable } : {}),
+  };
 }
 
 function matchRecordedArtifactPath(pointerPath: string, artifactPaths: unknown): string | null {
@@ -147,6 +189,14 @@ export function compactTaskHandoff(task: TaskRecord, escalations: EscalationReco
       if (matched) overflow = { path: matched, next_offset: 0 };
     }
   }
+  const externalDeliverable =
+    !paused &&
+    result?.external_deliverable &&
+    typeof result.external_deliverable === "object" &&
+    !Array.isArray(result.external_deliverable) &&
+    typeof result.external_deliverable.ref === "string"
+      ? (result.external_deliverable as ExternalDeliverableRecord)
+      : undefined;
   return {
     id: task.id,
     title: task.title,
@@ -168,6 +218,7 @@ export function compactTaskHandoff(task: TaskRecord, escalations: EscalationReco
       : {}),
     sources: paused ? [] : result?.sources ?? [],
     artifact_paths: artifactPaths,
+    ...(externalDeliverable ? { external_deliverable: externalDeliverable } : {}),
     escalations: escalations.filter((entry) => entry.fromTaskId === task.id),
   };
 }

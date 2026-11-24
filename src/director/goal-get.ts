@@ -939,6 +939,7 @@ export function buildGoalGetResult(
           summary: handoff.summary != null ? clip(handoff.summary, state.taskSummary) : null,
           ...(artifactPaths ? { artifactPaths } : {}),
           ...(handoff.partial ? { partial: true } : {}),
+          ...(handoff.external_deliverable ? { externalDeliverable: handoff.external_deliverable } : {}),
         };
       });
       out.tasksPage = {

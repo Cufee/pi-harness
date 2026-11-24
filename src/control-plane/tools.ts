@@ -24,7 +24,14 @@ import {
   type TaskRecord,
 } from "./db.js";
 import { findRunDossier, readRunDossier, readWorkspaceArtifact, spillSummaryOverflow, writeCodeOutput, writeTaskDossier, writeUniqueTaskDossier } from "./dossiers.js";
-import { compactTaskHandoff, isReadOnlyKind, settleTaskMinimalFallback, SUMMARY_LIMIT, validateTaskHandoff } from "./handoffs.js";
+import {
+  compactTaskHandoff,
+  isReadOnlyKind,
+  settleTaskMinimalFallback,
+  SUMMARY_LIMIT,
+  validateTaskHandoff,
+  type ExternalDeliverableRecord,
+} from "./handoffs.js";
 import { expandHomePath } from "./projects.js";
 import type { AnchoredHandoff } from "./prompts.js";
 import { spawnDuplicateAdvisory } from "./restart-recovery.js";
@@ -649,10 +656,16 @@ export class ControlPlaneToolExecutor {
           }
         };
 
-        const { summary: fullSummary, sources, artifactPaths, partial } = validateTaskHandoff(task.kind, args);
+        if (args.external_deliverable !== undefined && (task.tier !== 2 || task.kind !== "worker")) {
+          throw new Error("return_task external_deliverable is only supported for Tier 2 workers.");
+        }
+        const { summary: fullSummary, sources, artifactPaths, partial, externalDeliverable } = validateTaskHandoff(task.kind, args);
         let summary = partial && !fullSummary.startsWith("[Partial]") ? `[Partial] ${fullSummary}` : fullSummary;
 
         assertReturnStillValid();
+
+        const MAX_EXTERNAL_UNMERGED_COMMITS = 50;
+        let recordedExternalDeliverable: ExternalDeliverableRecord | undefined;
 
         if (status === "completed") {
           const activeKids = this.db
@@ -671,13 +684,47 @@ export class ControlPlaneToolExecutor {
               if (await wtMgr.isDirty(wt.path)) {
                 throw REJECTIONS.settlementDirtyWorktree();
               }
-              if (wt.status === "queued" || wt.status === "bounced") {
+              const activeMerge = this.db
+                .listMergeQueue({ runId })
+                .find((m) => (m.taskId === taskId || m.worktreeId === wt.id) && (m.status === "queued" || m.status === "running"));
+              if (wt.status === "queued" || activeMerge) {
+                throw REJECTIONS.settlementUnmerged(
+                  `worktree merge status is '${activeMerge?.status ?? wt.status}'`,
+                  run.baseBranch,
+                );
+              }
+              if (!externalDeliverable && wt.status === "bounced") {
                 throw REJECTIONS.settlementUnmerged(`worktree merge status is '${wt.status}'`, run.baseBranch);
               }
-              // Verify any commits on the worker's HEAD are actually contained in targetBranch (catches unmerged commits
-              // AND post-merge commits added after an earlier submit_for_merge!).
               const wtHead = await runGit(wt.path, ["rev-parse", "HEAD"]).then((r) => r.stdout).catch(() => null);
-              if (wtHead && wtHead !== wt.baseSha) {
+              if (externalDeliverable) {
+                let unmergedCommits: string[] = [];
+                if (wtHead) {
+                  const revListRaw = await runGit(run.repoRoot, [
+                    "rev-list",
+                    `--max-count=${MAX_EXTERNAL_UNMERGED_COMMITS}`,
+                    `${run.baseBranch}..${wtHead}`,
+                  ])
+                    .then((r) => r.stdout)
+                    .catch(async () =>
+                      runGit(wt.path, [
+                        "rev-list",
+                        `--max-count=${MAX_EXTERNAL_UNMERGED_COMMITS}`,
+                        `${wt.baseSha}..${wtHead}`,
+                      ])
+                        .then((r) => r.stdout)
+                        .catch(() => ""),
+                    );
+                  unmergedCommits = revListRaw ? revListRaw.split(/\r?\n/).filter(Boolean) : [];
+                }
+                recordedExternalDeliverable = {
+                  ...externalDeliverable,
+                  worktree_head: wtHead,
+                  unmerged_commits: unmergedCommits,
+                };
+              } else if (wtHead && wtHead !== wt.baseSha) {
+                // Verify any commits on the worker's HEAD are actually contained in targetBranch (catches unmerged commits
+                // AND post-merge commits added after an earlier submit_for_merge!).
                 const contained = await runGit(run.repoRoot, ["merge-base", "--is-ancestor", wtHead, run.baseBranch]).then(
                   () => true,
                   () => false,
@@ -691,6 +738,13 @@ export class ControlPlaneToolExecutor {
               }
             }
           }
+        }
+        if (externalDeliverable && !recordedExternalDeliverable) {
+          recordedExternalDeliverable = {
+            ...externalDeliverable,
+            worktree_head: null,
+            unmerged_commits: [],
+          };
         }
 
         // Revalidate caller generation, live status, and cancellation after awaited worktree checks
@@ -773,6 +827,7 @@ export class ControlPlaneToolExecutor {
                 ...(partial ? { partial: true } : {}),
                 sources,
                 artifact_paths: paths,
+                ...(recordedExternalDeliverable ? { external_deliverable: recordedExternalDeliverable } : {}),
                 ...(summaryOverflow ? { summary_overflow: summaryOverflow } : {}),
                 ...(staleGoalVersion ? { staleGoalVersion } : {}),
                 escalationId,

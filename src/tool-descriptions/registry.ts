@@ -52,31 +52,57 @@ const RETURN_TASK_SOURCES_DEFAULT_FACT =
 const RETURN_TASK_SOURCES_READ_ONLY_FACT =
   "List the files and lines you relied on; a handoff without sources is rejected unless you pass partial: true with artifact_paths.";
 
-function returnTaskInputSchema(sourcesDescription: string): Schema {
+function returnTaskInputSchema(
+  sourcesDescription: string,
+  options?: { includeExternalDeliverable?: boolean },
+): Schema {
+  const properties: Record<string, unknown> = {
+    status: { type: "string", enum: ["completed", "scope_too_large", "blocked"] },
+    summary: { type: "string", description: "Compact handoff (up to 2,000 characters; longer summaries are saved as artifacts)." },
+    partial: {
+      type: "boolean",
+      description:
+        "Set true when handing back incomplete work, for example after a [harness advisory: scope-too-large] advisory. Summarize what is done, cite what you verified, list what remains.",
+    },
+    sources: {
+      type: "array",
+      description: sourcesDescription,
+      items: {
+        type: "object",
+        required: ["path"],
+        properties: { path: { type: "string" }, lines: { type: "string" }, symbol: { type: "string" }, note: { type: "string" } },
+      },
+    },
+    artifact_paths: { type: "array", items: { type: "string" } },
+    evidence_paths: { type: "array", items: { type: "string" } },
+    suggested_splits: { type: "array", items: { type: "string" } },
+  };
+  if (options?.includeExternalDeliverable) {
+    properties.external_deliverable = {
+      type: "object",
+      required: ["ref"],
+      description:
+        "Worker-only; use when the deliverable is not meant for local main (pushed to another remote/branch, a PR URL, or an artifact/report). Completes without submit_for_merge.",
+      properties: {
+        ref: {
+          type: "string",
+          description: "Required; recorded verbatim: remote/branch, PR URL, or artifact path.",
+        },
+        sha: {
+          type: "string",
+          description: "Optional commit SHA pushed or produced, if any.",
+        },
+        note: {
+          type: "string",
+          description: "Optional note explaining why this deliverable is not merged into the base branch.",
+        },
+      },
+    };
+  }
   return {
     type: "object",
     required: ["status", "summary"],
-    properties: {
-      status: { type: "string", enum: ["completed", "scope_too_large", "blocked"] },
-      summary: { type: "string", description: "Compact handoff (up to 2,000 characters; longer summaries are saved as artifacts)." },
-      partial: {
-        type: "boolean",
-        description:
-          "Set true when handing back incomplete work, for example after a [harness advisory: scope-too-large] advisory. Summarize what is done, cite what you verified, list what remains.",
-      },
-      sources: {
-        type: "array",
-        description: sourcesDescription,
-        items: {
-          type: "object",
-          required: ["path"],
-          properties: { path: { type: "string" }, lines: { type: "string" }, symbol: { type: "string" }, note: { type: "string" } },
-        },
-      },
-      artifact_paths: { type: "array", items: { type: "string" } },
-      evidence_paths: { type: "array", items: { type: "string" } },
-      suggested_splits: { type: "array", items: { type: "string" } },
-    },
+    properties,
   };
 }
 
@@ -564,14 +590,21 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
         verify:
           "Status scope_too_large sends the task back for re-scoping; pass sources, or partial: true with artifact_paths, and add suggested_splits, one per open area, when you can.",
       },
+      externalDeliverable: {
+        default:
+          "When the deliverable is not meant for local main (pushed elsewhere or a report), pass external_deliverable {ref} instead of calling submit_for_merge.",
+      },
     },
     description: {
       default: "Finish this task or send it back for re-scoping. {fact:scopeSendBack} Summary limit: {fact:summaryLimit} Sources: {fact:sources}",
+      worker:
+        "Finish this task or send it back for re-scoping. {fact:scopeSendBack} Summary limit: {fact:summaryLimit} Sources: {fact:sources} {fact:externalDeliverable}",
       verify:
         "Finish this task or send it back for re-scoping. {fact:scopeSendBack} Summary limit: {fact:summaryLimit} Sources: {fact:sources} {fact:verifyVerdict}",
     },
     inputSchema: {
       default: returnTaskInputSchema(RETURN_TASK_SOURCES_DEFAULT_FACT),
+      worker: returnTaskInputSchema(RETURN_TASK_SOURCES_DEFAULT_FACT, { includeExternalDeliverable: true }),
       research: returnTaskInputSchema(RETURN_TASK_SOURCES_READ_ONLY_FACT),
       plan: returnTaskInputSchema(RETURN_TASK_SOURCES_READ_ONLY_FACT),
       verify: returnTaskInputSchema(RETURN_TASK_SOURCES_READ_ONLY_FACT),

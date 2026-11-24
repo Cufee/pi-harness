@@ -109,7 +109,7 @@ export const REJECTIONS = {
       "settlement-unmerged",
       `return_task completed was rejected: ${stripTrailingDot(compactWords(detail, 12))}.`,
       `Completing now would leave your commits outside ${branch}.`,
-      "Call submit_for_merge and wait for the merge, or return_task with status blocked.",
+      `Call submit_for_merge for ${branch} changes, or return_task with external_deliverable {ref} when pushed elsewhere or a report, or status blocked.`,
     );
   },
 

@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "bun:test";
+import { HarnessRejection } from "../src/advisories/rejections.js";
 import { ModelCatalogCompiler } from "../src/catalog/compiler.js";
 import { loadConfig } from "../src/config.js";
 import {
@@ -13,13 +14,16 @@ import {
   type RecentlyResolvedEscalation,
   type TaskRecord,
 } from "../src/control-plane/db.js";
+import { compactTaskHandoff } from "../src/control-plane/handoffs.js";
 import { HarnessOrchestrator } from "../src/control-plane/orchestrator.js";
 import { buildHydrationTurn, buildImmutableSystemPrompt } from "../src/control-plane/prompts.js";
 import { buildRunActivitySummary } from "../src/control-plane/telemetry.js";
+import { buildGoalGetResult, parseGoalGetOptions } from "../src/director/goal-get.js";
 import { DirectorRuntime } from "../src/director/runtime.js";
 import { buildDirectorSystemPrompt } from "../src/director/session.js";
 import { QuotaClient } from "../src/quota/client.js";
 import { toolPolicyForTask, validateRunPolicy } from "../src/runners/types.js";
+import { toolsForRole } from "../src/tool-descriptions/index.js";
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
 import { runGit } from "../src/worktree/manager.js";
 
@@ -840,6 +844,254 @@ describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () =>
       db.close();
       rmSync(repoRoot, { recursive: true, force: true });
       rmSync(otherRepo, { recursive: true, force: true });
+    }
+  });
+
+  it("settles Tier 2 worker with external_deliverable without merging into base branch while preserving safety gates", async () => {
+    const repoRoot = await makeTempGitRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-ext-deliv-"));
+    const db = new ControlPlaneDb(":memory:");
+    try {
+      const baseSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout;
+      const config = withFixtureCatalog({ ...loadConfig(repoRoot), stateDir, codeMode: "off" });
+      const quota = new QuotaClient();
+      const catalog = new ModelCatalogCompiler(config, quota);
+      const orch = new HarnessOrchestrator(db, config, catalog, quota, () => ({
+        run: async () => ({ text: "ok", stopReason: "completed" }),
+      }));
+
+      // Tool schema exposes external_deliverable only to workers.
+      const workerReturnTool = toolsForRole("worker").find((t) => t.name === "return_task");
+      assert.ok(
+        (workerReturnTool?.inputSchema as { properties?: Record<string, unknown> })?.properties?.external_deliverable,
+        "worker return_task schema must expose external_deliverable",
+      );
+      for (const role of ["execute", "research", "plan", "verify"] as const) {
+        const tool = toolsForRole(role).find((t) => t.name === "return_task");
+        assert.equal(
+          (tool?.inputSchema as { properties?: Record<string, unknown> })?.properties?.external_deliverable,
+          undefined,
+          `${role} return_task schema must not expose external_deliverable`,
+        );
+      }
+
+      const run = db.createRun({ goal: "External deliverable settlement", repoRoot, baseBranch: "main", baseSha });
+      const orchTask = db.createTask({
+        runId: run.id,
+        tier: 1,
+        kind: "orchestrator",
+        title: "Orch",
+        objective: "Coordinate",
+        profileId: "pi:local",
+      });
+      const worker = db.createTask({
+        runId: run.id,
+        parentId: orchTask.id,
+        tier: 2,
+        kind: "worker",
+        title: "External worker",
+        objective: "Push report to external remote",
+        readOnly: false,
+        writeScopes: ["report.md"],
+        profileId: "pi:local",
+      });
+      db.updateTask(worker.id, { status: "running" });
+
+      const wtMgr = orch.getWorktreeManager(repoRoot);
+      const wt = await wtMgr.createForWorker(run.id, worker.id, baseSha);
+      db.updateTask(worker.id, { worktreeId: wt.id });
+
+      // Commit work in the worker worktree without merging into base branch.
+      writeFileSync(join(wt.path, "report.md"), "# Report v1\n", "utf8");
+      await runGit(wt.path, ["add", "report.md"]);
+      await runGit(wt.path, ["-c", "user.name=test", "-c", "user.email=test@local", "commit", "-m", "Add report v1"]);
+      const commit1 = (await runGit(wt.path, ["rev-parse", "HEAD"])).stdout;
+
+      writeFileSync(join(wt.path, "report.md"), "# Report v2\n", "utf8");
+      await runGit(wt.path, ["add", "report.md"]);
+      await runGit(wt.path, ["-c", "user.name=test", "-c", "user.email=test@local", "commit", "-m", "Refine report v2"]);
+      const commit2 = (await runGit(wt.path, ["rev-parse", "HEAD"])).stdout;
+
+      // 1. Without external_deliverable: still rejected with settlement-unmerged and rejection text mentions external_deliverable.
+      await assert.rejects(
+        () => orch.toolExecutor.execute(run.id, worker.id, "return_task", { status: "completed", summary: "Done" }),
+        (err: unknown) => {
+          assert.ok(err instanceof HarnessRejection, `expected HarnessRejection, got ${String(err)}`);
+          assert.equal(err.notice.rule, "settlement-unmerged");
+          assert.ok(
+            err.message.includes("external_deliverable"),
+            `settlement-unmerged message should mention external_deliverable: ${err.message}`,
+          );
+          return true;
+        },
+      );
+      assert.equal(db.getTask(worker.id)?.status, "running");
+
+      // 2. Dirty worktree with external_deliverable: still rejected with settlement-dirty-worktree.
+      writeFileSync(join(wt.path, "report.md"), "# Report dirty\n", "utf8");
+      await assert.rejects(
+        () =>
+          orch.toolExecutor.execute(run.id, worker.id, "return_task", {
+            status: "completed",
+            summary: "Done",
+            external_deliverable: { ref: "origin-ext/feature-x" },
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof HarnessRejection);
+          assert.equal(err.notice.rule, "settlement-dirty-worktree");
+          return true;
+        },
+      );
+      assert.equal(db.getTask(worker.id)?.status, "running");
+      await runGit(wt.path, ["checkout", "--", "report.md"]);
+
+      // 3. Blank ref or non-worker callers are rejected with informative errors.
+      await assert.rejects(
+        () =>
+          orch.toolExecutor.execute(run.id, worker.id, "return_task", {
+            status: "completed",
+            summary: "Done",
+            external_deliverable: { ref: "   " },
+          }),
+        /non-empty string ref/,
+      );
+      const t3 = db.createTask({
+        runId: run.id,
+        parentId: worker.id,
+        tier: 3,
+        kind: "execute",
+        title: "Subtask",
+        objective: "Helper",
+        readOnly: false,
+        profileId: "pi:local",
+      });
+      db.updateTask(t3.id, { status: "running" });
+      await assert.rejects(
+        () =>
+          orch.toolExecutor.execute(run.id, t3.id, "return_task", {
+            status: "completed",
+            summary: "Subtask done",
+            external_deliverable: { ref: "origin-ext/feature-x" },
+          }),
+        /only supported for Tier 2 workers/,
+      );
+      db.updateTask(t3.id, { status: "completed" });
+
+      // 4. Queued/in-flight merge-queue item still rejects even with external_deliverable.
+      const queuedWorker = db.createTask({
+        runId: run.id,
+        parentId: orchTask.id,
+        tier: 2,
+        kind: "worker",
+        title: "Queued worker",
+        objective: "Queued merge",
+        readOnly: false,
+        writeScopes: ["other.md"],
+        profileId: "pi:local",
+      });
+      db.updateTask(queuedWorker.id, { status: "running" });
+      const queuedWt = await wtMgr.createForWorker(run.id, queuedWorker.id, baseSha);
+      db.updateTask(queuedWorker.id, { worktreeId: queuedWt.id });
+      const mqItem = db.enqueueMerge({ runId: run.id, taskId: queuedWorker.id, worktreeId: queuedWt.id, branch: queuedWt.branch });
+      db.updateTask(queuedWorker.id, { status: "running" });
+      await assert.rejects(
+        () =>
+          orch.toolExecutor.execute(run.id, queuedWorker.id, "return_task", {
+            status: "completed",
+            summary: "Try external while queued",
+            external_deliverable: { ref: "origin-ext/queued" },
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof HarnessRejection);
+          assert.equal(err.notice.rule, "settlement-unmerged");
+          return true;
+        },
+      );
+      // Clean up the queued worker's merge item from this run before testing clean empty merge queue on main worker.
+      db.db.prepare("DELETE FROM merge_queue WHERE id = ?").run(mqItem.id);
+      db.updateTask(queuedWorker.id, { status: "cancelled" });
+
+      // 5. Bounced worktree status is allowed with external_deliverable; settle the worker with external_deliverable.
+      db.updateWorktree(wt.id, { status: "bounced" });
+      const res = (await orch.toolExecutor.execute(run.id, worker.id, "return_task", {
+        status: "completed",
+        summary: "Pushed feature branch to external remote",
+        external_deliverable: {
+          ref: "origin-ext/feature-x",
+          sha: commit2,
+          note: "Fork-only report branch",
+        },
+      })) as { returned: boolean; status: string };
+
+      assert.equal(res.returned, true);
+      assert.equal(res.status, "completed");
+
+      const settledWorker = db.getTask(worker.id)!;
+      assert.equal(settledWorker.status, "completed");
+      const parsedResult = JSON.parse(settledWorker.resultJson ?? "{}") as {
+        external_deliverable?: {
+          ref: string;
+          sha?: string;
+          note?: string;
+          worktree_head: string | null;
+          unmerged_commits: string[];
+        };
+      };
+      assert.deepEqual(parsedResult.external_deliverable, {
+        ref: "origin-ext/feature-x",
+        sha: commit2,
+        note: "Fork-only report branch",
+        worktree_head: commit2,
+        unmerged_commits: [commit2, commit1],
+      });
+
+      // Base branch is untouched, merge queue is empty, and unmerged worktree is kept (not torn down).
+      const mainAfter = (await runGit(repoRoot, ["rev-parse", "main"])).stdout;
+      assert.equal(mainAfter, baseSha);
+      assert.equal(db.listMergeQueue({ runId: run.id }).length, 0);
+      assert.equal(db.getWorktree(wt.id)?.cleanedAt, null);
+
+      // Compact handoff and goal_get task rows both expose external_deliverable / externalDeliverable.
+      const handoff = compactTaskHandoff(settledWorker);
+      assert.deepEqual(handoff.external_deliverable, parsedResult.external_deliverable);
+
+      const goalGet = buildGoalGetResult(
+        {
+          goal: {
+            id: "goal-29",
+            chatSessionId: "chat-1",
+            repoRoot,
+            version: 1,
+            title: "External deliverable",
+            description: "Deliver to external remote",
+            criteria: [],
+            nonGoals: [],
+            budgets: { maxReviewCycles: 5, maxNoProgressCycles: 3 },
+            verificationMode: "auto",
+            verifyRef: "main",
+            liveProgress: null,
+            status: "executing",
+            linkedRunId: run.id,
+            reviewCycle: 0,
+            noProgressStreak: 0,
+            lastProgressFingerprint: null,
+            lastReviewSummary: null,
+            createdAt: 1_000,
+            updatedAt: 2_000,
+          },
+          reviews: [],
+          tasks: [settledWorker],
+          openEscalations: [],
+          activity: null,
+        },
+        parseGoalGetOptions({ sections: ["run"] }),
+        { evidenceDir: null, repoRoot },
+      ) as { tasks?: Array<{ id: string; externalDeliverable?: unknown }> };
+      assert.deepEqual(goalGet.tasks?.[0]?.externalDeliverable, parsedResult.external_deliverable);
+    } finally {
+      db.close();
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
     }
   });
 });

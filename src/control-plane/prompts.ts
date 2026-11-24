@@ -36,6 +36,7 @@ export const PROMPT_FACT_USES: ReadonlyArray<{ role: Role; tool: string; key: st
   { role: "worker", tool: "return_task", key: "summaryLimit" },
   { role: "worker", tool: "return_task", key: "sources" },
   { role: "worker", tool: "return_task", key: "scopeSendBack" },
+  { role: "worker", tool: "return_task", key: "externalDeliverable" },
   { role: "worker", tool: "report_issue", key: "routing" },
   { role: "worker", tool: "report_issue", key: "blockingDefault" },
   { role: "worker", tool: "request_rollover", key: "progress" },
@@ -101,7 +102,7 @@ function tierInstructions(tier: 1 | 2 | 3, kind: TaskRecord["kind"]): string {
       `5. CONTEXT HYGIENE: When the harness warns that context is nearly full or you need a different model, commit clean WIP to your worktree branch and call ${toolRef(r, "request_rollover")} with an anchored handoff summarizing state and next actions. ${toolFact(r, "request_rollover", "progress")}`,
       `6. Rely on ${toolRef(r, "wait_children")} (${toolFact(r, "wait_children", "eventDriven")} Long default fallback interval) rather than token-polling child status. Read child handoffs first with ${toolRef(r, "wait_children")}: compact summaries, sources (required for research, plan, and verify), and \`artifact_paths\`. Use ${toolRef(r, "artifact_read")} only when you need more detail. If a read-only child exits without a sourced handoff, inspect any output the harness saved for it with ${toolRef(r, "artifact_read")} (\`{ task_id }\`).`,
       `7. KNOWLEDGE BASE & TOOLS: Consult ${toolRef(r, "kb_search")} / ${toolRef(r, "kb_get")} for non-obvious repo invariants or gotchas, record verified discoveries with ${toolRef(r, "kb_propose")}, and flag outdated entries via ${toolRef(r, "kb_flag_stale")}. Use native targeted edit tools for small changes, \`rg\` for text search, and \`sg\` (\`ast-grep\`) or configured MCP tools when syntax-aware matching helps; inspect the resulting diff.`,
-      `8. COMPLETION: Commit any repository changes you made, run the verification checks appropriate to your task's scope and risk, call ${toolRef(r, "report_goal_progress")} if you verified goal criteria, call ${toolRef(r, "submit_for_merge")} if you modified the repo, then call ${toolRef(r, "return_task")} (summary limit: ${toolFact(r, "return_task", "summaryLimit")} ${toolFact(r, "return_task", "sources")}) and any \`artifact_paths\`.`,
+      `8. COMPLETION: Commit any repository changes you made, run the verification checks appropriate to your task's scope and risk, call ${toolRef(r, "report_goal_progress")} if you verified goal criteria, call ${toolRef(r, "submit_for_merge")} if you modified the repo for the base branch, then call ${toolRef(r, "return_task")} (summary limit: ${toolFact(r, "return_task", "summaryLimit")} ${toolFact(r, "return_task", "sources")}) and any \`artifact_paths\`. ${toolFact(r, "return_task", "externalDeliverable")}`,
     ].join("\n");
   }
 
@@ -138,7 +139,11 @@ export function buildMissingReturnWrapUpPrompt(tier: 1 | 2 | 3, kind: TaskRecord
     `Your turn ended without calling ${toolRef(role, "return_task")}, so the harness has no handoff for this task yet.`,
     "Do not start any new work.",
   ];
-  if (tier === 2) lines.push(`If you changed files: commit them and call ${toolRef("worker", "submit_for_merge")} first.`);
+  if (tier === 2) {
+    lines.push(
+      `If you changed files for the base branch: commit them and call ${toolRef("worker", "submit_for_merge")} first. ${toolFact("worker", "return_task", "externalDeliverable")}`,
+    );
+  }
   lines.push(
     `Call ${toolRef(role, "return_task")} now with status, a summary (limit: ${toolFact(role, "return_task", "summaryLimit")}), ${toolFact(role, "return_task", "sources")} Include any \`artifact_paths\`.`,
   );
