@@ -5,8 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
+import { GOAL_GET_LIMITS, GOAL_GET_SECTIONS } from "../src/director/goal-get.js";
 import type { GoalCriterion } from "../src/goals/engine.js";
 import type { ChatControlEvent } from "../src/protocol/chat-events.js";
+import type { GoalsTableData, ToolDisplayPayload } from "../src/protocol/tool-display.js";
 import { serializeToolResult } from "../src/runners/mcp-bridge.js";
 import { runGit } from "../src/worktree/manager.js";
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
@@ -796,6 +798,316 @@ describe("goal-20 integration: DirectorRuntime gate-activity events and compact 
         } while (cursor !== null);
         assert.equal(pageCount, 4);
         assert.deepEqual(seenIds, all120Ids);
+      } finally {
+        await daemon.stop();
+      }
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("goal_list limit:1 presentation table matches the returned page and unresolved escalation count", async () => {
+    const repoRoot = await makeTempRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-goal20-state-"));
+    try {
+      const baseCfg = loadConfig(repoRoot);
+      const config = withFixtureCatalog({
+        ...baseCfg,
+        codeMode: "off",
+        goals: { ...baseCfg.goals, autoVerifyOnSettle: false },
+        stateDir,
+        socketPath: join(stateDir, "d.sock"),
+      });
+      type ListRes = {
+        goals: Array<{ id: string; openEscalations: number }>;
+        page: { total: number; returned: number; nextCursor: string | null };
+        presentation_id: string;
+      };
+      const pageResults: ListRes[] = [];
+      const daemon = new HarnessDaemon(config, {
+        dbPath: ":memory:",
+        customRunnerFactory: () => ({
+          run: async (req) => {
+            const p1 = (await req.executeTool("goal_list", { limit: 1 })) as ListRes;
+            pageResults.push(p1);
+            await req.executeTool("present_result", { presentation_id: p1.presentation_id });
+            const p2 = (await req.executeTool("goal_list", {
+              limit: 1,
+              cursor: p1.page.nextCursor,
+            })) as ListRes;
+            pageResults.push(p2);
+            await req.executeTool("present_result", { presentation_id: p2.presentation_id });
+            return { text: "presented", stopReason: "completed" };
+          },
+        }),
+      });
+      await daemon.start();
+
+      try {
+        const chat = await daemon.director.createChat({ repoRoot });
+        const baseSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout;
+        const g1 = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Goal one",
+          description: "First goal",
+          criteria: [],
+          verificationMode: "none",
+        });
+        const g2 = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Goal two",
+          description: "Second goal",
+          criteria: [],
+          verificationMode: "none",
+        });
+        const g3 = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Goal three (unresolved escalations)",
+          description: "Newest goal with open + acked + resolved escalations",
+          criteria: [],
+          verificationMode: "none",
+        });
+        const run = daemon.db.createRun({ repoRoot, baseBranch: "main", baseSha, goal: g3.title });
+        const t1 = daemon.db.createTask({
+          runId: run.id,
+          tier: 1,
+          kind: "orchestrator",
+          title: "Orch",
+          objective: "Coordinate",
+          profileId: "fixture",
+        });
+        daemon.director.goals.linkRunAndStart(g3.id, run.id);
+        // 1 open + 1 acked = 2 unresolved; plus 1 resolved that must be excluded.
+        daemon.db.createEscalation({
+          runId: run.id,
+          fromTaskId: t1.id,
+          toTaskId: null,
+          severity: "P1",
+          category: "code_defect",
+          title: "Open escalation",
+          evidencePaths: ["README.md"],
+          blocking: true,
+        });
+        const acked = daemon.db.createEscalation({
+          runId: run.id,
+          fromTaskId: t1.id,
+          toTaskId: null,
+          severity: "P2",
+          category: "code_defect",
+          title: "Acked escalation",
+          evidencePaths: ["README.md"],
+          blocking: false,
+        });
+        daemon.db.ackEscalation(acked.id, "acknowledged", false);
+        const resolved = daemon.db.createEscalation({
+          runId: run.id,
+          fromTaskId: t1.id,
+          toTaskId: null,
+          severity: "P2",
+          category: "code_defect",
+          title: "Resolved escalation",
+          evidencePaths: ["README.md"],
+          blocking: false,
+        });
+        daemon.db.tryResolveEscalation(resolved.id, "already fixed");
+
+        const displays: ToolDisplayPayload[] = [];
+        await daemon.director.sendChatMessage(chat.id, "list goals page by page", undefined, (ev) => {
+          if (ev.display) displays.push(ev.display);
+        });
+
+        assert.equal(pageResults.length, 2);
+        assert.equal(displays.length, 2);
+
+        // Page 1 summary and presentation card match the single newest goal (g3) and unresolved count = 2.
+        const [p1, p2] = pageResults;
+        assert.deepEqual(p1!.page, { total: 3, returned: 1, nextCursor: g3.id });
+        assert.equal(p1!.goals.length, 1);
+        assert.equal(p1!.goals[0]!.id, g3.id);
+        assert.equal(p1!.goals[0]!.openEscalations, 2);
+
+        assert.equal(displays[0]!.kind, "goals_table");
+        const table1 = (displays[0]!.data as GoalsTableData).goals;
+        assert.equal(table1.length, 1);
+        assert.equal(table1[0]!.id, g3.id);
+        assert.equal(table1[0]!.openEscalations, 2);
+
+        // Page 2 summary and presentation card advance to g2 instead of repeating all 3 goals.
+        assert.deepEqual(p2!.page, { total: 3, returned: 1, nextCursor: g2.id });
+        assert.equal(p2!.goals.length, 1);
+        assert.equal(p2!.goals[0]!.id, g2.id);
+        assert.notEqual(p2!.goals[0]!.id, g1.id);
+
+        assert.equal(displays[1]!.kind, "goals_table");
+        const table2 = (displays[1]!.data as GoalsTableData).goals;
+        assert.equal(table2.length, 1);
+        assert.equal(table2[0]!.id, g2.id);
+        assert.equal(table2[0]!.openEscalations, 0);
+      } finally {
+        await daemon.stop();
+      }
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("goal_get (default compact and full) returns recentlyResolvedEscalations with status, resolution, resolvedAt, and omitted count after escalation resolution and goal_accept", async () => {
+    const repoRoot = await makeTempRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-goal20-state-"));
+    try {
+      const baseCfg = loadConfig(repoRoot);
+      const config = withFixtureCatalog({
+        ...baseCfg,
+        codeMode: "off",
+        goals: { ...baseCfg.goals, autoVerifyOnSettle: false },
+        stateDir,
+        socketPath: join(stateDir, "d.sock"),
+      });
+      const daemon = new HarnessDaemon(config, {
+        dbPath: ":memory:",
+        customRunnerFactory: () => ({
+          run: async () => ({ text: "ok", stopReason: "completed" }),
+        }),
+      });
+      await daemon.start();
+
+      try {
+        const chat = await daemon.director.createChat({ repoRoot });
+        const baseSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout;
+        const goal = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Escalation history visibility",
+          description: "Ensure resolved escalations remain visible in goal_get after resolution and goal_accept",
+          criteria: [{ id: "c1", description: "Accepted", kind: "behavioral", required: true }],
+          verificationMode: "none",
+        });
+        const run = daemon.db.createRun({ repoRoot, baseBranch: "main", baseSha, goal: goal.title });
+        const t1 = daemon.db.createTask({
+          runId: run.id,
+          tier: 1,
+          kind: "orchestrator",
+          title: "Orchestrator",
+          objective: "Coordinate",
+          profileId: "fixture",
+        });
+        daemon.director.goals.linkRunAndStart(goal.id, run.id);
+
+        // Seed 11 resolved escalations (10 older + 1 with a long resolution) so total with the
+        // goal_accept auto-resolved escalation is 12 -> 10 returned, 2 omitted.
+        const longResolution = "Manual resolution with full audit details: ".padEnd(360, "r");
+        let longResolvedId = "";
+        for (let i = 1; i <= 11; i++) {
+          const esc = daemon.db.createEscalation({
+            runId: run.id,
+            fromTaskId: t1.id,
+            toTaskId: null,
+            severity: i % 2 === 0 ? "P1" : "P2",
+            category: "code_defect",
+            title: `Historical escalation ${i}`,
+            evidencePaths: ["README.md"],
+            blocking: false,
+          });
+          daemon.db.tryResolveEscalation(esc.id, i === 11 ? longResolution : `Resolved item ${i}`);
+          if (i === 11) longResolvedId = esc.id;
+        }
+        // Also seed a resolved escalation with whitespace-only resolution; it must not be returned or counted.
+        const emptyEsc = daemon.db.createEscalation({
+          runId: run.id,
+          fromTaskId: t1.id,
+          toTaskId: null,
+          severity: "P2",
+          category: "code_defect",
+          title: "Whitespace resolution",
+          evidencePaths: ["README.md"],
+          blocking: false,
+        });
+        daemon.db.tryResolveEscalation(emptyEsc.id, "   ");
+
+        // Leave one open escalation that goal_accept auto-resolves.
+        const acceptedEsc = daemon.db.createEscalation({
+          runId: run.id,
+          fromTaskId: t1.id,
+          toTaskId: null,
+          severity: "P1",
+          category: "verification_failed",
+          title: "Pending blocker resolved on accept",
+          evidencePaths: ["README.md"],
+          blocking: true,
+        });
+
+        await daemon.director.executeDirectorMcpTool(chat.id, "goal_accept", {
+          goal_id: goal.id,
+          reason: "Verified end-to-end",
+          evidence_paths: ["README.md"],
+        });
+
+        type ResolvedItem = {
+          id: string;
+          status: string;
+          resolution: string;
+          resolvedAt: number | null;
+        };
+        type GoalGetEscalationResult = {
+          openEscalations: unknown[];
+          recentlyResolvedEscalations: ResolvedItem[];
+          recentlyResolvedEscalationsPage: { total: number; returned: number; omitted: number };
+        };
+
+        // 1. Default compact goal_get.
+        const compact = (await daemon.director.executeDirectorMcpTool(chat.id, "goal_get", {
+          goal_id: goal.id,
+        })) as GoalGetEscalationResult;
+        assert.ok(serializeToolResult(compact).length <= GOAL_GET_LIMITS.budgetChars);
+        assert.deepEqual(compact.openEscalations, []);
+        assert.equal(compact.recentlyResolvedEscalations.length, GOAL_GET_LIMITS.recentEscalationsMax);
+        assert.deepEqual(compact.recentlyResolvedEscalationsPage, { total: 12, returned: 10, omitted: 2 });
+
+        const compactAccepted = compact.recentlyResolvedEscalations.find((e) => e.id === acceptedEsc.id);
+        assert.ok(compactAccepted, "goal_accept auto-resolved escalation must appear in compact goal_get");
+        assert.equal(compactAccepted.status, "resolved");
+        assert.equal(compactAccepted.resolution, `Auto-resolved: goal ${goal.id} achieved`);
+        assert.equal(typeof compactAccepted.resolvedAt, "number");
+
+        const compactLong = compact.recentlyResolvedEscalations.find((e) => e.id === longResolvedId);
+        assert.ok(compactLong, "manually resolved escalation must appear in compact goal_get");
+        assert.equal(compactLong.status, "resolved");
+        assert.equal(typeof compactLong.resolvedAt, "number");
+        assert.ok(compactLong.resolution.length <= GOAL_GET_LIMITS.escalationResolution);
+        assert.equal(
+          compact.recentlyResolvedEscalations.some((e) => e.id === emptyEsc.id),
+          false,
+          "whitespace-only resolved escalation must be excluded",
+        );
+
+        // 2. Full goal_get (all sections) and narrow escalations section (unclipped resolution).
+        const full = (await daemon.director.executeDirectorMcpTool(chat.id, "goal_get", {
+          goal_id: goal.id,
+          sections: [...GOAL_GET_SECTIONS],
+        })) as GoalGetEscalationResult;
+        assert.ok(serializeToolResult(full).length <= GOAL_GET_LIMITS.budgetChars);
+        assert.deepEqual(full.openEscalations, []);
+        assert.equal(full.recentlyResolvedEscalations.length, GOAL_GET_LIMITS.recentEscalationsMax);
+        assert.deepEqual(full.recentlyResolvedEscalationsPage, { total: 12, returned: 10, omitted: 2 });
+        const fullAccepted = full.recentlyResolvedEscalations.find((e) => e.id === acceptedEsc.id);
+        assert.ok(fullAccepted, "goal_accept auto-resolved escalation must appear in full goal_get");
+        assert.equal(fullAccepted.status, "resolved");
+        assert.equal(fullAccepted.resolution, `Auto-resolved: goal ${goal.id} achieved`);
+        assert.equal(typeof fullAccepted.resolvedAt, "number");
+
+        const escalationsOnly = (await daemon.director.executeDirectorMcpTool(chat.id, "goal_get", {
+          goal_id: goal.id,
+          sections: ["escalations"],
+        })) as GoalGetEscalationResult;
+        assert.deepEqual(escalationsOnly.recentlyResolvedEscalationsPage, { total: 12, returned: 10, omitted: 2 });
+        const unclippedLong = escalationsOnly.recentlyResolvedEscalations.find((e) => e.id === longResolvedId);
+        assert.ok(unclippedLong);
+        assert.equal(unclippedLong.resolution, longResolution);
       } finally {
         await daemon.stop();
       }

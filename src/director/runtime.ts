@@ -88,6 +88,7 @@ import {
 import {
   buildGoalGetResult,
   buildGoalListResult,
+  GOAL_GET_LIMITS,
   GOAL_GET_TOOL,
   GOAL_LIST_TOOL,
   parseGoalGetOptions,
@@ -5551,7 +5552,15 @@ export class DirectorRuntime {
       goal,
       reviews: this.goals.listReviews(goal.id),
       tasks: runId ? this.db.listTasks(runId) : [],
-      openEscalations: runId ? this.db.listEscalations(runId, "open") : [],
+      openEscalations: runId ? this.db.listEscalations(runId, "unresolved") : [],
+      recentlyResolvedEscalations: runId
+        ? this.db.listRecentlyResolvedEscalations(runId, GOAL_GET_LIMITS.recentEscalationsMax)
+        : [],
+      resolvedEscalationsTotal: runId
+        ? this.db
+            .listEscalations(runId, "resolved")
+            .filter((e) => e.resolution != null && e.resolution.trim() !== "").length
+        : 0,
       activity: runId ? buildRunActivitySummary(this.db, runId) : null,
     };
   }
@@ -5954,13 +5963,19 @@ export class DirectorRuntime {
           ? { ...(opts.status ? { status: opts.status } : {}) }
           : { repoRoot, chatSessionId, ...(opts.status ? { status: opts.status } : {}) };
         const goals = this.goals.listGoals(listFilter).map(reconcileGoalWithLiveRun);
+        const goalsById = new Map(goals.map((g) => [g.id, g]));
         const summaries = goals.map((goal) => ({
           goal,
           openEscalations: goal.linkedRunId ? this.db.listEscalations(goal.linkedRunId, "unresolved").length : 0,
           reviews: this.goals.listReviews(goal.id),
         }));
         const result = buildGoalListResult(summaries, opts, { reserveChars: 120 });
-        const presentation_id = offerPresentation(() => buildGoalsTableDisplay(goals.map((goal) => this.goalDisplayData(goal))));
+        const pagedGoals = result.goals
+          .map((item) => goalsById.get(item.id))
+          .filter((goal): goal is GoalRecord => goal !== undefined);
+        const presentation_id = offerPresentation(() =>
+          buildGoalsTableDisplay(pagedGoals.map((goal) => this.goalDisplayData(goal))),
+        );
         return { ...result, presentation_id };
       }
 
