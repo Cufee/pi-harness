@@ -266,7 +266,8 @@ describe("HarnessOrchestrator ACP auth readiness and tools-missing wiring", () =
       assert.ok(retrySpawn.warning);
       assert.match(retrySpawn.warning, /acp:fake/);
       assert.match(retrySpawn.warning, /cooldown until/i);
-      assert.match(retrySpawn.warning, /login/i);
+      assert.match(retrySpawn.warning, /Log in to its agent/i);
+      assert.doesNotMatch(retrySpawn.warning, /\bnpx\b/i);
 
       await waitUntil(() => db.getTask(retrySpawn.spawned)?.status === "completed", 4000, "retry task completed");
 

@@ -12,6 +12,9 @@ if (!fakeDir) {
   process.exit(1);
 }
 
+const listToolsMode = (process.env.FAKE_ACP_LIST_TOOLS ?? "eager").trim().toLowerCase();
+const promptDelayMs = Math.max(0, Number(process.env.FAKE_ACP_PROMPT_DELAY_MS ?? "0") || 0);
+
 interface McpServerSpec {
   name?: string;
   command?: string;
@@ -20,8 +23,31 @@ interface McpServerSpec {
 }
 
 let mcpClient: Client | null = null;
+let pendingHarnessServer: McpServerSpec | null = null;
 let taskIdToken = "unknown";
 let ownTaskId = "unknown";
+
+async function connectHarnessMcp(harnessServer: McpServerSpec, listTools: boolean): Promise<void> {
+  if (mcpClient || !harnessServer.command) return;
+  const serverEnv: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (typeof v === "string") serverEnv[k] = v;
+  }
+  for (const entry of harnessServer.env ?? []) {
+    serverEnv[entry.name] = entry.value;
+  }
+  const transport = new StdioClientTransport({
+    command: harnessServer.command,
+    args: harnessServer.args ?? [],
+    env: serverEnv,
+    stderr: "ignore",
+  });
+  mcpClient = new Client({ name: "fake-acp-agent", version: "1.0.0" }, { capabilities: {} });
+  await mcpClient.connect(transport);
+  if (listTools) {
+    await mcpClient.listTools();
+  }
+}
 let sawRestartSteer = false;
 let cancelled = false;
 let currentRole = "unknown";
@@ -121,26 +147,17 @@ const app = agent()
     const rawServers = (params as { mcpServers?: McpServerSpec[] }).mcpServers ?? [];
     const harnessServer = rawServers.find((s) => s.name === "harness");
     if (harnessServer && harnessServer.command) {
-      const serverEnv: Record<string, string> = {};
-      for (const [k, v] of Object.entries(process.env)) {
-        if (typeof v === "string") serverEnv[k] = v;
-      }
-      for (const entry of harnessServer.env ?? []) {
-        serverEnv[entry.name] = entry.value;
-      }
-      if (serverEnv.PI_HARNESS_TASK_ID) {
-        taskIdToken = serverEnv.PI_HARNESS_TASK_ID;
+      const taskEntry = (harnessServer.env ?? []).find((entry) => entry.name === "PI_HARNESS_TASK_ID");
+      const rawTaskId = taskEntry?.value ?? process.env.PI_HARNESS_TASK_ID;
+      if (rawTaskId) {
+        taskIdToken = rawTaskId;
         ownTaskId = taskIdToken.split("@")[0] ?? taskIdToken;
       }
-      const transport = new StdioClientTransport({
-        command: harnessServer.command,
-        args: harnessServer.args ?? [],
-        env: serverEnv,
-        stderr: "ignore",
-      });
-      mcpClient = new Client({ name: "fake-acp-agent", version: "1.0.0" }, { capabilities: {} });
-      await mcpClient.connect(transport);
-      await mcpClient.listTools();
+      if (listToolsMode === "eager") {
+        await connectHarnessMcp(harnessServer, true);
+      } else if (listToolsMode === "on_prompt") {
+        pendingHarnessServer = harnessServer;
+      }
     }
 
     mkdirSync(join(fakeDir, "pids"), { recursive: true });
@@ -174,6 +191,9 @@ const app = agent()
     }
 
     try {
+      if (listToolsMode === "on_prompt" && pendingHarnessServer && !mcpClient) {
+        await connectHarnessMcp(pendingHarnessServer, true);
+      }
       if (currentRole === "orchestrator") {
         let childIds: string[] = [];
 
@@ -286,6 +306,10 @@ const app = agent()
         return { stopReason: "end_turn" };
       }
 
+      if (promptDelayMs > 0) {
+        await sleepWakeable(promptDelayMs);
+        if (cancelled) return { stopReason: "cancelled" };
+      }
       await client.notify("session/update", {
         sessionId,
         update: {

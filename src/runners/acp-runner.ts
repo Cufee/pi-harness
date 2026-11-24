@@ -24,8 +24,23 @@ import {
   type AcpConfigOption,
   type AcpMcpServerEntry,
 } from "./acp-shims.js";
-import { ACP_AUTH_TEXT_RE, AcpProfileError, isAcpAuthError } from "./acp-profile-error.js";
-export { ACP_AUTH_TEXT_RE, AcpProfileError, isAcpAuthError, type AcpProfileErrorKind } from "./acp-profile-error.js";
+import {
+  ACP_AUTH_TEXT_RE,
+  AcpProfileError,
+  acpProfileLoginHint,
+  isAcpAuthError,
+  isStandaloneAcpAuthDiagnostic,
+  isStructuredAuthFailureCode,
+} from "./acp-profile-error.js";
+export {
+  ACP_AUTH_TEXT_RE,
+  AcpProfileError,
+  acpProfileLoginHint,
+  isAcpAuthError,
+  isStandaloneAcpAuthDiagnostic,
+  isStructuredAuthFailureCode,
+  type AcpProfileErrorKind,
+} from "./acp-profile-error.js";
 import { isProtectedWritePath } from "./protected-paths.js";
 import { detectQuotaErrorText } from "./quota-detect.js";
 import { MAX_RUNNER_STEER_CONTINUATIONS, validateRunPolicy } from "./types.js";
@@ -382,6 +397,9 @@ const DEFAULT_IDLE_TIMEOUT_MS = 600_000;
 const DEFAULT_STEER_ACK_TIMEOUT_MS = 15_000;
 const DEFAULT_TOOLS_GRACE_MS = 20_000;
 const TOOLS_POLL_INTERVAL_MS = 100;
+const HARNESS_PREFIXED_TOOL_RE =
+  /^(?:mcp(?:__|_|\/|\.|:))?harness(?:__|_|\/|\.|:\s*)([a-z][a-z0-9_]*)$/i;
+const AMBIGUOUS_NATIVE_TOOL_NAMES = new Set(["code_exec", "tool_search", "read_file", "write_note"]);
 const ACCEPTED_STEER_STOP_REASONS = new Set(["end_turn", "max_tokens", "max_turn_requests"]);
 
 function resolveToolsGraceMs(override?: number): number {
@@ -877,11 +895,178 @@ export class AcpRunner {
     let turnFailedTools: Array<{ title: string; detail?: string }> = [];
     let turnDeniedTools: string[] = [];
     let turnSucceededTools = 0;
+    let turnToolCalls = 0;
+    let totalToolCalls = 0;
     let totalSucceededTools = 0;
     const allToolFailures: string[] = [];
     let authOkSent = false;
+    let authFailed = false;
+    let sessionStartMs = 0;
+    const toolsGraceMs = resolveToolsGraceMs(req.harnessToolsGraceMs);
+    const toolsCheckEnabled = hasHarnessBridge && Boolean(req.harnessToolsListedSince) && toolsGraceMs > 0;
+    let toolsCheckPassed = !toolsCheckEnabled;
+    let harnessToolCallObserved = false;
+    const harnessToolCallIds = new Set<string>();
+    let toolsMissingError: AcpProfileError | null = null;
+    let toolsGraceTimer: ReturnType<typeof setTimeout> | null = null;
+    let toolsPollTimer: ReturnType<typeof setInterval> | null = null;
+    let toolsCancelGraceTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const clearToolsWatchers = () => {
+      if (toolsGraceTimer) {
+        clearTimeout(toolsGraceTimer);
+        toolsGraceTimer = null;
+      }
+      if (toolsPollTimer) {
+        clearInterval(toolsPollTimer);
+        toolsPollTimer = null;
+      }
+      if (toolsCancelGraceTimer) {
+        clearTimeout(toolsCancelGraceTimer);
+        toolsCancelGraceTimer = null;
+      }
+    };
+    const makeToolsMissingError = (reason: "timeout" | "turn_ended"): AcpProfileError =>
+      new AcpProfileError(
+        "tools_missing",
+        this.profile.id,
+        reason === "timeout"
+          ? `ACP profile ${this.profile.id} started a session without the harness MCP tools: ` +
+            `the harness bridge was never asked for its tool list within ${toolsGraceMs} ms of the first prompt, ` +
+            `so return_task and spawn_task are unavailable. Check that the profile's CLI supports and loads MCP servers; ` +
+            `respawn or retry on another profile.`
+          : `ACP profile ${this.profile.id} completed its first turn without the harness MCP tools: ` +
+            `the harness bridge was never asked for its tool list and no harness tool call was observed, ` +
+            `so return_task and spawn_task are unavailable. Check that the profile's CLI supports and loads MCP servers; ` +
+            `respawn or retry on another profile.`,
+      );
+    const checkHarnessToolsReady = (): boolean => {
+      if (toolsCheckPassed) return true;
+      if (harnessToolCallObserved || (sessionStartMs > 0 && req.harnessToolsListedSince?.(sessionStartMs))) {
+        toolsCheckPassed = true;
+        clearToolsWatchers();
+        return true;
+      }
+      return false;
+    };
+    const markHarnessToolObserved = () => {
+      harnessToolCallObserved = true;
+      if (!toolsCheckPassed) {
+        toolsCheckPassed = true;
+        clearToolsWatchers();
+      }
+    };
+    const isHarnessToolUpdate = (
+      update: Record<string, unknown>,
+      resolvedTitle: string,
+      callId: string | undefined,
+    ): boolean => {
+      if (callId && (harnessToolCallIds.has(callId) || codexHarnessCalls.has(callId))) {
+        return true;
+      }
+      const meta = update._meta as
+        | {
+            claudeCode?: { toolName?: string; mcpServer?: { name?: string } };
+            "gemini-cli"?: { mcp?: { server_name?: string; tool_name?: string } };
+          }
+        | undefined;
+      const claudeMeta = meta?.claudeCode;
+      if (
+        claudeMeta &&
+        (claudeMeta.mcpServer?.name === "harness" ||
+          (typeof claudeMeta.toolName === "string" && claudeToolNames.has(claudeMeta.toolName)))
+      ) {
+        return true;
+      }
+      const geminiMcp = meta?.["gemini-cli"]?.mcp;
+      if (geminiMcp?.server_name === "harness" && geminiMcp.tool_name && harnessToolNames.has(geminiMcp.tool_name)) {
+        return true;
+      }
+      const rawInput = update.rawInput as { server?: unknown; tool?: unknown } | undefined;
+      if (
+        rawInput &&
+        rawInput.server === "harness" &&
+        typeof rawInput.tool === "string" &&
+        harnessToolNames.has(rawInput.tool)
+      ) {
+        return true;
+      }
+      const candidates = [
+        resolvedTitle,
+        typeof update.title === "string" ? update.title : "",
+        typeof update.name === "string" ? update.name : "",
+      ];
+      for (const raw of candidates) {
+        const token = raw.trim().split(/\s+/)[0] ?? "";
+        if (!token) continue;
+        const prefixed = HARNESS_PREFIXED_TOOL_RE.exec(token);
+        if (prefixed?.[1] && harnessToolNames.has(prefixed[1].toLowerCase())) {
+          return true;
+        }
+        const lower = token.toLowerCase();
+        if (harnessToolNames.has(lower) && !AMBIGUOUS_NATIVE_TOOL_NAMES.has(lower)) {
+          return true;
+        }
+      }
+      return false;
+    };
+    const startToolsGraceWatch = () => {
+      if (!toolsCheckEnabled || toolsCheckPassed || toolsGraceTimer) return;
+      if (checkHarnessToolsReady()) return;
+
+      toolsPollTimer = setInterval(() => {
+        if (
+          req.signal.aborted ||
+          rolloverTriggered ||
+          quotaWatchdogTriggered ||
+          idleTimedOut ||
+          childGoneError ||
+          authFailed
+        ) {
+          clearToolsWatchers();
+          return;
+        }
+        checkHarnessToolsReady();
+      }, TOOLS_POLL_INTERVAL_MS);
+      toolsPollTimer.unref?.();
+
+      toolsGraceTimer = setTimeout(() => {
+        toolsGraceTimer = null;
+        if (toolsPollTimer) {
+          clearInterval(toolsPollTimer);
+          toolsPollTimer = null;
+        }
+        if (
+          req.signal.aborted ||
+          rolloverTriggered ||
+          quotaWatchdogTriggered ||
+          idleTimedOut ||
+          childGoneError ||
+          authFailed
+        ) {
+          return;
+        }
+        if (checkHarnessToolsReady()) return;
+
+        toolsMissingError = makeToolsMissingError("timeout");
+        steerHandoff.ack?.settleAck(false);
+        if (sessionId && activeConnection) {
+          void activeConnection.agent.notify("session/cancel", { sessionId }).catch(() => {});
+        }
+        const cancelGraceMs = Math.min(1_000, Math.max(100, toolsGraceMs));
+        toolsCancelGraceTimer = setTimeout(() => {
+          toolsCancelGraceTimer = null;
+          const cb = resolveActivePromptOnGrace;
+          clearIdleWatchdog();
+          cb?.({ stopReason: "cancelled" });
+          terminateChild(child);
+        }, cancelGraceMs);
+        toolsCancelGraceTimer.unref?.();
+      }, toolsGraceMs);
+      toolsGraceTimer.unref?.();
+    };
     const emitAuthOk = () => {
-      if (authOkSent) return;
+      if (authOkSent || authFailed) return;
       authOkSent = true;
       req.callbacks.onPassiveQuota?.({
         profileId: this.profile.id,
@@ -891,7 +1076,14 @@ export class AcpRunner {
       });
     };
     const failAuthRequired = (detailText: string): never => {
+      authFailed = true;
+      authOkSent = true;
+      clearToolsWatchers();
       const detail = detailText.trim();
+      const loginHint = acpProfileLoginHint(this.profile.id, {
+        adapter: this.profile.adapter,
+        isAmp: isAmpProfile,
+      });
       req.callbacks.onPassiveQuota?.({
         profileId: this.profile.id,
         model: null,
@@ -902,14 +1094,14 @@ export class AcpRunner {
         "auth_required",
         this.profile.id,
         `ACP profile ${this.profile.id} is not authenticated (${detail.slice(0, 200)}). ` +
-          `Log in with the profile's CLI (${basename(this.profile.command)}) and retry, or choose another model. ` +
+          `To re-authenticate ${this.profile.id}, ${loginHint} and retry, or choose another model. ` +
           `The harness skips this profile when it recommends or auto-routes models until a cooldown expires or a session succeeds.`,
       );
     };
-    const matchesAuthTextHeuristic = (): boolean => {
-      if (totalSucceededTools !== 0 || allToolFailures.length > 0) return false;
-      const trimmed = accumulatedText.trim();
-      return trimmed.length > 0 && trimmed.length < 400 && ACP_AUTH_TEXT_RE.test(trimmed);
+    const matchesAuthTextHeuristic = (sessionFailed = false): boolean => {
+      if (totalSucceededTools !== 0 || harnessToolCallObserved) return false;
+      if (!sessionFailed && (allToolFailures.length > 0 || totalToolCalls > 0 || turnToolCalls > 0)) return false;
+      return isStandaloneAcpAuthDiagnostic(accumulatedText);
     };
     let lastIdenticalFailureKey = "";
     let identicalFailureStreak = 0;
@@ -1190,6 +1382,8 @@ export class AcpRunner {
             armCancelGraceTimer("cancelled");
           }
         } else if (kind === "tool_call" || kind === "tool_call_update") {
+          turnToolCalls += 1;
+          totalToolCalls += 1;
           if (accumulatedText.length > 0) needsParagraphBreak = true;
           textSinceLastTool = "";
           const callId = update.toolCallId ? String(update.toolCallId) : update.id ? String(update.id) : undefined;
@@ -1206,40 +1400,49 @@ export class AcpRunner {
             steerHandoff.ack.settleAck(true);
           }
           if (kind === "tool_call") {
-            emitAuthOk();
             advanceTurnWaveIfNeeded();
-            if (callId && status !== "completed" && status !== "failed") {
+            if (callId && status !== "completed" && status !== "failed" && status !== "cancelled") {
               inFlightToolCalls.add(callId);
             }
           } else if (callId && (status === "in_progress" || status === "pending")) {
             inFlightToolCalls.add(callId);
-          }
-          if (this.profile.adapter === "codex" && callId) {
-            const meta = update._meta as { is_mcp_tool_call?: boolean } | undefined;
-            const input = update.rawInput as { server?: string; tool?: string } | undefined;
-            if (kind === "tool_call") {
-              codexHarnessCalls.delete(callId);
-              codexExternalCalls.delete(callId);
-              if (update.kind === "execute" && meta?.is_mcp_tool_call === true && input?.server && input.tool) {
-                if (input.server === "harness" && harnessToolNames.has(input.tool)) {
-                  codexHarnessCalls.add(callId);
-                } else if (externalMcpNames.has(input.server) && (canWrite || isReadOnlyExternalMcpTool(input.server, input.tool))) {
-                  codexExternalCalls.add(callId);
-                }
-              }
-            }
-            if (update.status === "completed" || update.status === "failed") {
-              codexHarnessCalls.delete(callId);
-              codexExternalCalls.delete(callId);
-            }
           }
           const rawTitle = update.title ? String(update.title) : update.name ? String(update.name) : undefined;
           if (callId && rawTitle) {
             toolTitlesById.set(callId, rawTitle);
           }
           const resolvedTitle = rawTitle ?? (callId ? toolTitlesById.get(callId) : undefined) ?? "tool";
+          if (this.profile.adapter === "codex" && callId && kind === "tool_call") {
+            const meta = update._meta as { is_mcp_tool_call?: boolean } | undefined;
+            const input = update.rawInput as { server?: string; tool?: string } | undefined;
+            codexHarnessCalls.delete(callId);
+            codexExternalCalls.delete(callId);
+            if (update.kind === "execute" && meta?.is_mcp_tool_call === true && input?.server && input.tool) {
+              if (input.server === "harness" && harnessToolNames.has(input.tool)) {
+                codexHarnessCalls.add(callId);
+              } else if (externalMcpNames.has(input.server) && (canWrite || isReadOnlyExternalMcpTool(input.server, input.tool))) {
+                codexExternalCalls.add(callId);
+              }
+            }
+          }
+          const isHarnessCall = isHarnessToolUpdate(update, resolvedTitle, callId);
+          if (callId && isHarnessCall) {
+            harnessToolCallIds.add(callId);
+          }
+          if (
+            this.profile.adapter === "codex" &&
+            callId &&
+            (update.status === "completed" || update.status === "failed" || update.status === "cancelled")
+          ) {
+            codexHarnessCalls.delete(callId);
+            codexExternalCalls.delete(callId);
+          }
+          const wasInFlight = Boolean(callId && inFlightToolCalls.has(callId));
           if (status === "completed") {
-            if (callId) inFlightToolCalls.delete(callId);
+            if (callId) {
+              inFlightToolCalls.delete(callId);
+              harnessToolCallIds.delete(callId);
+            }
             resetIdleWatchdog();
             completedToolInWave = true;
             quotaRejected = false;
@@ -1247,11 +1450,20 @@ export class AcpRunner {
             disarmQuotaWatchdog(true);
             turnSucceededTools += 1;
             totalSucceededTools += 1;
+            if (kind === "tool_call" || wasInFlight) {
+              emitAuthOk();
+            }
+            if (isHarnessCall) {
+              markHarnessToolObserved();
+            }
             // Any successful tool call resets the identical-failure streak so exploratory debugging never trips the breaker
             identicalFailureStreak = 0;
             lastIdenticalFailureKey = "";
           } else if (status === "failed") {
-            if (callId) inFlightToolCalls.delete(callId);
+            if (callId) {
+              inFlightToolCalls.delete(callId);
+              harnessToolCallIds.delete(callId);
+            }
             resetIdleWatchdog();
             completedToolInWave = true;
             const detail = extractToolErrorSnippet(update);
@@ -1267,6 +1479,11 @@ export class AcpRunner {
             if (identicalFailureStreak >= IDENTICAL_FAILURE_BREAKER && !identicalFailureBreakerTripped && sessionId && activeConnection) {
               identicalFailureBreakerTripped = true;
               void activeConnection.agent.notify("session/cancel", { sessionId }).catch(() => {});
+            }
+          } else if (status === "cancelled") {
+            if (callId) {
+              inFlightToolCalls.delete(callId);
+              harnessToolCallIds.delete(callId);
             }
           }
           const eventPaths = Array.isArray(update.locations)
@@ -1753,6 +1970,7 @@ export class AcpRunner {
     activeConnection = conn;
 
     const onAbort = () => {
+      clearToolsWatchers();
       steerHandoff.ack?.settleAck(false);
       if (sessionId) {
         void conn.agent.notify("session/cancel", { sessionId }).catch(() => {});
@@ -1816,7 +2034,7 @@ export class AcpRunner {
         additionalDirectories: [...new Set([...extraReadRoots, ...extraWriteRoots])],
       });
 
-      const sessionStartMs = Date.now();
+      sessionStartMs = Date.now();
       const newSessionRes = (await withTimeout(
         conn.agent.request("session/new", newSessionParams as never),
         startupTimeoutMs,
@@ -1856,52 +2074,6 @@ export class AcpRunner {
           if (!reportedModelSatisfies(this.profile.adapter, reply, current, req.model, newSessionRes)) {
             throw new Error(`Could not select model ${req.model}: ${action.method} reported ${current}`);
           }
-        }
-      }
-
-      const toolsGraceMs = resolveToolsGraceMs(req.harnessToolsGraceMs);
-      if (hasHarnessBridge && req.harnessToolsListedSince && toolsGraceMs > 0) {
-        const deadline = Date.now() + toolsGraceMs;
-        let listed = req.harnessToolsListedSince(sessionStartMs);
-        while (!listed && !req.signal.aborted) {
-          if (child && (child.exitCode !== null || child.signalCode !== null)) {
-            childGoneError ??= new Error(childExitMessage(child.exitCode, child.signalCode));
-            throw childGoneError;
-          }
-          const remaining = deadline - Date.now();
-          if (remaining <= 0) break;
-          await new Promise<void>((resolveSleep) => {
-            const onPollAbort = () => {
-              clearTimeout(timer);
-              resolveSleep();
-            };
-            const timer = setTimeout(() => {
-              req.signal.removeEventListener("abort", onPollAbort);
-              resolveSleep();
-            }, Math.min(TOOLS_POLL_INTERVAL_MS, remaining));
-            timer.unref?.();
-            req.signal.addEventListener("abort", onPollAbort, { once: true });
-          });
-          if (req.signal.aborted) break;
-          listed = req.harnessToolsListedSince(sessionStartMs);
-        }
-        if (req.signal.aborted) {
-          return {
-            text: accumulatedText,
-            stopReason: "cancelled",
-            usage: lastUsage,
-            sessionId,
-          };
-        }
-        if (!listed) {
-          throw new AcpProfileError(
-            "tools_missing",
-            this.profile.id,
-            `ACP profile ${this.profile.id} started a session without the harness MCP tools: ` +
-              `the harness bridge was never asked for its tool list within ${toolsGraceMs} ms, ` +
-              `so return_task and spawn_task are unavailable. Check that the profile's CLI supports and loads MCP servers; ` +
-              `respawn or retry on another profile.`,
-          );
         }
       }
 
@@ -1972,6 +2144,7 @@ export class AcpRunner {
         turnFailedTools = [];
         turnDeniedTools = [];
         turnSucceededTools = 0;
+        turnToolCalls = 0;
         textSinceLastTool = "";
         steerHandoff.cancelIssuedForTurn = false;
 
@@ -1984,15 +2157,20 @@ export class AcpRunner {
               prompt: [{ type: "text", text: nextPromptText }],
             } as never) as unknown as Promise<Record<string, unknown>>);
           pendingSteerTurnPromise = null;
+          if (turnsUsed === 1) {
+            startToolsGraceWatch();
+          }
 
           promptRes = await new Promise<Record<string, unknown>>((resolvePrompt, rejectPromptRaw) => {
             resolveActivePromptOnGrace = resolvePrompt;
             // When the harness cut the wrap-up turn off at its time cap (or handed off via cancel-then-prompt
-            // steering), an adapter that answers session/cancel by rejecting the pending prompt ("Request cancelled")
-            // ends that turn cleanly. Abort, rollover, idle timeout, child death, quota and other RPC errors still reject.
+            // steering, or cancelled turn 1 on tools_missing grace expiry), an adapter that answers session/cancel
+            // by rejecting the pending prompt ("Request cancelled") ends that turn cleanly. Abort, rollover, idle
+            // timeout, child death, auth, quota and other RPC errors still reject.
             const rejectPrompt = (err: unknown) => {
               const steerCancelled = steerHandoff.pending !== null || steerHandoff.cancelIssuedForTurn;
-              const expectedCancel = wrapUpTimedOut || steerCancelled;
+              const toolsCancelled = toolsMissingError !== null;
+              const expectedCancel = wrapUpTimedOut || steerCancelled || toolsCancelled;
               if (expectedCancel && !req.signal.aborted && !rolloverTriggered && !idleTimedOut && !(childGoneError && err === childGoneError)) {
                 const detail = `${err instanceof Error ? err.message : String(err)} ${acpErrorDetail(err)}`;
                 const code = (err as { code?: unknown } | null)?.code;
@@ -2011,8 +2189,8 @@ export class AcpRunner {
                   (typeof nested === "number" && nested === -32800) ||
                   (nested === undefined && code === -32603 && explicitCancel) ||
                   (nested === undefined && typeof code !== "number" && (name === "AbortError" || explicitCancel));
-                if (isCancelled && !detectQuotaErrorText(detail).isQuota) {
-                  resolvePrompt({ stopReason: steerCancelled ? "cancelled" : "end_turn" });
+                if (isCancelled && !detectQuotaErrorText(detail).isQuota && !isAcpAuthError(err, detail)) {
+                  resolvePrompt({ stopReason: steerCancelled || toolsCancelled ? "cancelled" : "end_turn" });
                   return;
                 }
               }
@@ -2044,18 +2222,30 @@ export class AcpRunner {
           });
         } finally {
           promptInFlight = false;
+          if (toolsCancelGraceTimer) {
+            clearTimeout(toolsCancelGraceTimer);
+            toolsCancelGraceTimer = null;
+          }
           if (steerHandoff.pending) steerHandoff.pending.priorTurnSettled = true;
           if (steerHandoff.ack) steerHandoff.ack.priorTurnSettled = true;
         }
 
         // Harvest passive quota & terminal sessionFailure signals
         const promptMeta = (promptRes._meta ?? {}) as Record<string, unknown>;
-        const airFailure = ((promptMeta.jetbrains as Record<string, unknown> | undefined)?.air as Record<string, unknown> | undefined)
-          ?.sessionFailure as Record<string, unknown> | string | undefined;
+        const airFailure = (((promptMeta.jetbrains as Record<string, unknown> | undefined)?.air as Record<string, unknown> | undefined)
+          ?.sessionFailure ??
+          promptMeta.sessionFailure) as Record<string, unknown> | string | undefined;
         if (airFailure) {
           const code = typeof airFailure === "string" ? airFailure : String(airFailure.code ?? airFailure.reason ?? "");
           if (code) {
             airFailureCode = code;
+            if (isStructuredAuthFailureCode(code)) {
+              const detailMsg =
+                typeof airFailure === "object" && airFailure !== null
+                  ? String(airFailure.message ?? airFailure.detail ?? airFailure.reason ?? code)
+                  : code;
+              failAuthRequired(detailMsg.trim() || code);
+            }
             req.callbacks.onPassiveQuota?.({
               profileId: this.profile.id,
               model: req.model,
@@ -2127,6 +2317,7 @@ export class AcpRunner {
           req.signal.aborted ||
           ["quota_exhausted", "rate_limited", "budget_exhausted"].includes(airFailureCode)
         ) {
+          clearToolsWatchers();
           if (steerHandoff.pending) {
             steerHandoff.pending.settleAck(false);
             steerHandoff.pending = null;
@@ -2134,11 +2325,25 @@ export class AcpRunner {
           break;
         }
 
-        if (matchesAuthTextHeuristic()) {
+        if (matchesAuthTextHeuristic(Boolean(toolsMissingError))) {
           failAuthRequired(accumulatedText);
         }
-        if (rawStop !== "cancelled") {
-          emitAuthOk();
+        if (toolsMissingError) {
+          clearToolsWatchers();
+          throw toolsMissingError;
+        }
+        if (toolsCheckEnabled && !checkHarnessToolsReady() && !steerHandoff.pending && rawStop !== "cancelled") {
+          clearToolsWatchers();
+          throw makeToolsMissingError("turn_ended");
+        }
+        if (rawStop !== "cancelled" && !airFailureCode) {
+          const hasSuccessSignal =
+            turnSucceededTools > 0 ||
+            accumulatedText.trim().length > 0 ||
+            (turnFailedTools.length === 0 && turnDeniedTools.length === 0 && turnToolCalls === 0);
+          if (hasSuccessSignal) {
+            emitAuthOk();
+          }
         }
 
         // A cancel-then-prompt steer hand-off replaced this turn: continue by awaiting the replacement prompt.
@@ -2412,6 +2617,9 @@ export class AcpRunner {
       if (isAcpAuthError(primary, errMsg)) {
         failAuthRequired(errMsg);
       }
+      if (matchesAuthTextHeuristic(true)) {
+        failAuthRequired(accumulatedText);
+      }
       // Harvest structured `rateLimit` info from ACP JSON-RPC error data (e.g. Claude `turnErrorData` when refused before first usage)
       const rawData =
         (primary as { data?: unknown } | null)?.data ?? (primary as { cause?: { data?: unknown } } | null)?.cause?.data;
@@ -2478,6 +2686,10 @@ export class AcpRunner {
         };
       }
 
+      if (toolsMissingError) {
+        throw toolsMissingError;
+      }
+
       const tail = stderrTail(stderrBuf);
       const detail = tail ? ` (stderr: ${tail})` : "";
       if (this.profile.adapter === "codex") {
@@ -2493,6 +2705,7 @@ export class AcpRunner {
       steerHandoff.pending?.settleAck(false);
       steerHandoff.pending = null;
       flushCost();
+      clearToolsWatchers();
       clearIdleWatchdog();
       if (livenessTimer) clearInterval(livenessTimer);
       if (wrapUpTimer) clearTimeout(wrapUpTimer);

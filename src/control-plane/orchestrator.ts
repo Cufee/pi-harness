@@ -544,7 +544,19 @@ export class HarnessOrchestrator {
         const auth = this.quota.authStatus(profileId);
         if (!auth) return null;
         const detail = auth.detail ? ` (${auth.detail})` : "";
-        return `Profile ${profileId} failed ACP auth${detail}; needs login and is in cooldown until ${auth.until}. Run its login command (e.g. 'amp login' / 'claude /login') or pick another model. The task was still created.`;
+        const profile = this.config.profiles.find((p) => p.id === profileId);
+        const isAmp =
+          profile?.kind === "acp" &&
+          (profile.id === "acp:amp" ||
+            profile.command.includes("amp-acp") ||
+            (profile.args ?? []).some((arg) => arg.includes("amp-acp")));
+        const actionHint =
+          profileId === "acp:amp" || isAmp
+            ? "Run 'amp login'"
+            : profileId === "acp:claude" || (profile?.kind === "acp" && profile.adapter === "claude")
+              ? "Run 'claude' then /login"
+              : "Log in to its agent";
+        return `Profile ${profileId} failed ACP auth${detail}; needs login and is in cooldown until ${auth.until}. ${actionHint} or pick another model. The task was still created.`;
       },
     }, config, {
       engine: this.advisories,
