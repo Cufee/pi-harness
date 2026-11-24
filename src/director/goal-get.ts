@@ -697,10 +697,16 @@ export function buildGoalGetResult(
     return b.updatedAt - a.updatedAt || b.createdAt - a.createdAt;
   });
 
-  // Escalations ordered newest-first.
-  const sortedEscalations = [...detail.openEscalations].sort(
-    (a, b) => b.createdAt - a.createdAt || (b.id < a.id ? -1 : b.id > a.id ? 1 : 0),
-  );
+  // Unresolved escalations ordered newest-first by latest activity (max of ackedAt and createdAt), then id.
+  const sortedEscalations = [...detail.openEscalations].sort((a, b) => {
+    const aActivity = a.ackedAt != null ? Math.max(a.ackedAt, a.createdAt) : a.createdAt;
+    const bActivity = b.ackedAt != null ? Math.max(b.ackedAt, b.createdAt) : b.createdAt;
+    if (bActivity !== aActivity) return bActivity - aActivity;
+    const aAckedAtActivity = a.ackedAt != null && a.ackedAt >= a.createdAt ? 1 : 0;
+    const bAckedAtActivity = b.ackedAt != null && b.ackedAt >= b.createdAt ? 1 : 0;
+    if (bAckedAtActivity !== aAckedAtActivity) return bAckedAtActivity - aAckedAtActivity;
+    return b.id < a.id ? -1 : b.id > a.id ? 1 : 0;
+  });
   // Resolved escalation history ordered newest-first by resolvedAt (preserving input order on ties).
   const sortedResolvedEscalations = [...(detail.recentlyResolvedEscalations ?? [])].sort(
     (a, b) => (b.resolvedAt ?? 0) - (a.resolvedAt ?? 0),

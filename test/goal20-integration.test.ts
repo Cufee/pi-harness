@@ -1116,4 +1116,122 @@ describe("goal-20 integration: DirectorRuntime gate-activity events and compact 
       rmSync(stateDir, { recursive: true, force: true });
     }
   });
+
+  it("goal_get (default compact and full) retains a recently acknowledged escalation when 21+ newer open escalations exist", async () => {
+    const repoRoot = await makeTempRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-goal20-state-"));
+    try {
+      const baseCfg = loadConfig(repoRoot);
+      const config = withFixtureCatalog({
+        ...baseCfg,
+        codeMode: "off",
+        goals: { ...baseCfg.goals, autoVerifyOnSettle: false },
+        stateDir,
+        socketPath: join(stateDir, "d.sock"),
+      });
+      const daemon = new HarnessDaemon(config, {
+        dbPath: ":memory:",
+        customRunnerFactory: () => ({
+          run: async () => ({ text: "ok", stopReason: "completed" }),
+        }),
+      });
+      await daemon.start();
+
+      try {
+        const chat = await daemon.director.createChat({ repoRoot });
+        const baseSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout;
+        const goal = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Recent ack survives escalation cap",
+          description: "Ensure a recently acked escalation survives the 20-row openEscalations cap",
+          criteria: [{ id: "c1", description: "Visible", kind: "behavioral", required: true }],
+          verificationMode: "none",
+        });
+        const run = daemon.db.createRun({ repoRoot, baseBranch: "main", baseSha, goal: goal.title });
+        const t1 = daemon.db.createTask({
+          runId: run.id,
+          tier: 1,
+          kind: "orchestrator",
+          title: "Orchestrator",
+          objective: "Coordinate",
+          profileId: "fixture",
+        });
+        daemon.director.goals.linkRunAndStart(goal.id, run.id);
+
+        // Create 1 older escalation, then 21 newer open escalations, then ack the first last (resolve=false).
+        const firstEsc = daemon.db.createEscalation({
+          runId: run.id,
+          fromTaskId: t1.id,
+          toTaskId: null,
+          severity: "P1",
+          category: "code_defect",
+          title: "Older escalation acknowledged last",
+          evidencePaths: ["README.md"],
+          blocking: false,
+        });
+        await Bun.sleep(5);
+
+        let latestNewerCreatedAt = 0;
+        for (let i = 1; i <= 21; i++) {
+          const esc = daemon.db.createEscalation({
+            runId: run.id,
+            fromTaskId: t1.id,
+            toTaskId: null,
+            severity: "P2",
+            category: "code_defect",
+            title: `Newer open escalation ${i}`,
+            evidencePaths: ["README.md"],
+            blocking: false,
+          });
+          latestNewerCreatedAt = Math.max(latestNewerCreatedAt, esc.createdAt);
+        }
+        await Bun.sleep(5);
+
+        const acked = daemon.db.ackEscalation(firstEsc.id, "acknowledged now", false);
+        assert.equal(acked.status, "acked");
+        assert.equal(typeof acked.ackedAt, "number");
+        assert.ok(acked.ackedAt! > latestNewerCreatedAt);
+
+        type OpenEscalationItem = {
+          id: string;
+          status: string;
+          resolution?: string;
+          ackedAt?: number;
+        };
+        type GoalGetAckResult = {
+          openEscalations: OpenEscalationItem[];
+          escalationsPage: { total: number; returned: number; omitted: number };
+        };
+
+        const checkResult = (res: GoalGetAckResult, label: string) => {
+          assert.ok(serializeToolResult(res).length <= GOAL_GET_LIMITS.budgetChars, `${label} within budget`);
+          assert.equal(res.openEscalations.length, GOAL_GET_LIMITS.escalationsMax, `${label} capped at 20`);
+          assert.deepEqual(res.escalationsPage, { total: 22, returned: 20, omitted: 2 }, `${label} page counts`);
+          const found = res.openEscalations.find((e) => e.id === firstEsc.id);
+          assert.ok(found, `${label} must include recently acked escalation ${firstEsc.id}`);
+          assert.equal(res.openEscalations[0]!.id, firstEsc.id, `${label} orders most recent ack first`);
+          assert.equal(found.status, "acked");
+          assert.equal(found.resolution, "acknowledged now");
+          assert.equal(found.ackedAt, acked.ackedAt);
+        };
+
+        const compact = (await daemon.director.executeDirectorMcpTool(chat.id, "goal_get", {
+          goal_id: goal.id,
+        })) as GoalGetAckResult;
+        checkResult(compact, "compact goal_get");
+
+        const full = (await daemon.director.executeDirectorMcpTool(chat.id, "goal_get", {
+          goal_id: goal.id,
+          sections: [...GOAL_GET_SECTIONS],
+        })) as GoalGetAckResult;
+        checkResult(full, "full goal_get");
+      } finally {
+        await daemon.stop();
+      }
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
 });
