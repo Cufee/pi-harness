@@ -42,19 +42,13 @@ export const PROMPT_FACT_USES: ReadonlyArray<{ role: Role; tool: string; key: st
   { role: "research", tool: "return_task", key: "summaryLimit" },
   { role: "research", tool: "return_task", key: "sources" },
   { role: "research", tool: "return_task", key: "scopeSendBack" },
-  { role: "research", tool: "report_issue", key: "routing" },
-  { role: "research", tool: "report_issue", key: "blockingDefault" },
   { role: "plan", tool: "return_task", key: "summaryLimit" },
   { role: "plan", tool: "return_task", key: "sources" },
   { role: "plan", tool: "return_task", key: "scopeSendBack" },
-  { role: "plan", tool: "report_issue", key: "routing" },
-  { role: "plan", tool: "report_issue", key: "blockingDefault" },
   { role: "verify", tool: "return_task", key: "summaryLimit" },
   { role: "verify", tool: "return_task", key: "sources" },
   { role: "verify", tool: "return_task", key: "verifyVerdict" },
   { role: "verify", tool: "return_task", key: "scopeSendBack" },
-  { role: "verify", tool: "report_issue", key: "routing" },
-  { role: "verify", tool: "report_issue", key: "blockingDefault" },
   { role: "execute", tool: "return_task", key: "summaryLimit" },
   { role: "execute", tool: "return_task", key: "sources" },
   { role: "execute", tool: "return_task", key: "scopeSendBack" },
@@ -127,7 +121,9 @@ function tierInstructions(tier: 1 | 2 | 3, kind: TaskRecord["kind"]): string {
       : "1. Execute only the assigned change inside the task workspace and respect any read-only restriction.",
     `2. Call ${toolRef(r, "return_task")} with a summary (limit: ${toolFact(r, "return_task", "summaryLimit")}). ${toolFact(r, "return_task", "sources")}${r === "verify" ? ` ${toolFact("verify", "return_task", "verifyVerdict")}` : ""} Save details with ${toolRef(r, "artifact_write")} and pass their paths as \`artifact_paths\` rather than returning transcripts or tool logs.`,
     `3. SCOPE SEND-BACK: If the work turns out to be several deliverables or exceeds your assigned scope, use ${toolRef(r, "return_task")}. ${toolFact(r, "return_task", "scopeSendBack")}`,
-    `4. ISSUE REPORTING: Report discovered defects, broken tests, or assumption-invalidating ambiguities via ${toolRef(r, "report_issue")}. ${toolFact(r, "report_issue", "routing")} ${toolFact(r, "report_issue", "blockingDefault")}`,
+    isReadOnlyKind(kind)
+      ? `4. ISSUE REPORTING: Put discovered defects, broken tests, conflicts, and ambiguities in your ${toolRef(r, "return_task")} handoff. Calls to ${toolRef(r, "report_issue")} from a read-only task are always non-blocking and you keep working (P0 goes to the human, P1 and P2 to your parent). If you cannot produce a result, call ${toolRef(r, "return_task")} with status \`blocked\` and say what is missing.`
+      : `4. ISSUE REPORTING: Report discovered defects, broken tests, or assumption-invalidating ambiguities via ${toolRef(r, "report_issue")}. ${toolFact(r, "report_issue", "routing")} ${toolFact(r, "report_issue", "blockingDefault")}`,
     `5. Never attempt to spawn subagents or bypass your tool/write boundaries. Use the catalog model assigned by your parent.${toolGuidance}`,
   ].join("\n");
 }
