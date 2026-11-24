@@ -249,7 +249,7 @@ const ALL_TOOL_DEFS: Array<ToolDefinition & { tiers: AgentTier[] }> = [
     name: "spawn_task",
     tiers: [2],
     description:
-      "Spawn a small, zero-compaction Tier 3 Task Agent (research, plan, execute, or verify) inside this Worker's worktree.",
+      "Spawn a Tier 3 research, plan, execute, or verify task inside this Worker's worktree. Read its handoff with wait_children. Tasks have no turn limit and compact context in place on Pi and Claude runners so long single-question reads continue; a task whose scope keeps widening may be nudged to return a partial handoff (partial: true or scope_too_large with suggested_splits), and one that ends without return_task still leaves a partial handoff.",
     inputSchema: {
       type: "object",
       required: ["kind", "objective", "model"],
