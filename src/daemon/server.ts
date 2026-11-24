@@ -4060,22 +4060,25 @@ export class HarnessDaemon {
             });
           }
         }
-        for (const e of escalations) {
-          // Only escalations a human must act on reach the inbox: open, human-addressed, and P0 or blocking.
-          if (e.status !== "open" || e.toTaskId !== null || !(e.severity === "P0" || e.blocking)) continue;
-          const owningGoal = goalByRunId.get(e.runId);
-          inbox.push({
-            id: `inbox:esc:${e.id}`,
-            severity: e.severity,
-            kind: "escalation",
-            title: `[${e.severity}/${e.category}] ${e.title}`,
-            detail: `from ${e.fromTaskId} in ${e.runId}${e.blocking ? " · blocking" : ""}`,
-            ref: { kind: "escalation", id: e.id, runId: e.runId, goalId: owningGoal?.id, label: `${e.id} ${e.title}` },
-            goalId: owningGoal?.id ?? null,
-            runId: e.runId,
-            taskId: e.fromTaskId,
-            createdAt: e.createdAt,
-          });
+        for (const re of runEntries) {
+          for (const e of re.escalations) {
+            // Only escalations a human must act on reach the inbox: open, human-addressed, and P0 or blocking.
+            // Filter from each run's full escalation list before the snapshot-level 500-row cap can hide older items.
+            if (e.status !== "open" || e.toTaskId !== null || !(e.severity === "P0" || e.blocking)) continue;
+            const owningGoal = goalByRunId.get(e.runId);
+            inbox.push({
+              id: `inbox:esc:${e.id}`,
+              severity: e.severity,
+              kind: "escalation",
+              title: `[${e.severity}/${e.category}] ${e.title}`,
+              detail: `from ${e.fromTaskId} in ${e.runId}${e.blocking ? " · blocking" : ""}`,
+              ref: { kind: "escalation", id: e.id, runId: e.runId, goalId: owningGoal?.id, label: `${e.id} ${e.title}` },
+              goalId: owningGoal?.id ?? null,
+              runId: e.runId,
+              taskId: e.fromTaskId,
+              createdAt: e.createdAt,
+            });
+          }
         }
         for (const re of runEntries) {
           if (re.run.status === "paused_quota") {
@@ -4253,7 +4256,7 @@ export class HarnessDaemon {
       }
 
       case "escalation.ack": {
-        const resolveFlag = p.resolve === undefined ? true : Boolean(p.resolve);
+        const resolveFlag = p.resolve === undefined ? false : Boolean(p.resolve);
         const resolution = String(p.resolution ?? (resolveFlag ? "Resolved" : "Acknowledged"));
         return this.db.ackEscalation(String(p.escalationId), resolution, resolveFlag);
       }

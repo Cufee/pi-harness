@@ -1513,4 +1513,82 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
       rmSync(stateDir, { recursive: true, force: true });
     }
   });
+
+  it("keeps human-addressed P0 escalations in work.snapshot inbox when >500 agent-addressed escalations are open, and defaults escalation.ack resolve to false", async () => {
+    const repoDir = initTempGitRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-tuiv2-inbox-limit-"));
+    const sockPath = join(stateDir, "d.sock");
+    const cfg = withFixtureCatalog({
+      ...loadConfig(repoDir),
+      stateDir,
+      socketPath: sockPath,
+    });
+
+    const daemon = new HarnessDaemon(cfg);
+    await daemon.start();
+    const client = new DaemonClient(sockPath);
+    await client.connect();
+
+    try {
+      const chat = await client.request<{ session: { id: string } }>("chat.create", {
+        repoRoot: repoDir,
+        title: "Inbox Limit Test Chat",
+      });
+      const goal = daemon.director.goals.createGoal({
+        repoRoot: repoDir,
+        chatSessionId: chat.session.id,
+        title: "Inbox survives >500 open agent escalations",
+        description: "Verify inbox filter runs before 500-row escalation cap",
+        criteria: [{ id: "c1", kind: "deterministic", description: "Pass", command: "true" }],
+      });
+      const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+      const run = daemon.db.createRun({ goal: goal.title, repoRoot: repoDir, baseBranch: "main", baseSha });
+      daemon.director.goals.linkRunAndStart(goal.id, run.id);
+
+      const worker = daemon.db.createTask({
+        runId: run.id, tier: 2, kind: "worker", title: "Worker", objective: "Work", profileId: "acp:codex",
+      });
+      const child = daemon.db.createTask({
+        runId: run.id, parentId: worker.id, tier: 3, kind: "execute", title: "Child", objective: "Subwork", profileId: "acp:codex",
+      });
+
+      const humanP0 = daemon.db.createEscalation({
+        runId: run.id, fromTaskId: worker.id, toTaskId: null, severity: "P0", category: "security_risk",
+        title: "Older human P0", evidencePaths: ["p0.ts"], blocking: true,
+      });
+      // Ensure strictly older timestamp so a 500-row ORDER BY created_at DESC cap would drop humanP0.
+      daemon.db.db.prepare("UPDATE escalations SET created_at = ? WHERE id = ?").run(humanP0.createdAt - 10_000, humanP0.id);
+
+      const agentEscIds = new Set<string>();
+      daemon.db.db.transaction(() => {
+        for (let i = 0; i < 501; i++) {
+          const agentEsc = daemon.db.createEscalation({
+            runId: run.id, fromTaskId: child.id, toTaskId: worker.id, severity: "P2", category: "code_defect",
+            title: `Agent finding ${i}`, evidencePaths: [`f${i}.ts`], blocking: false,
+          });
+          agentEscIds.add(agentEsc.id);
+        }
+      })();
+
+      const snap = await client.request<WorkSnapshot>("work.snapshot", {
+        chatSessionId: chat.session.id,
+        repoRoot: repoDir,
+      });
+      const inboxEscIds = snap.inbox
+        .filter((i) => i.kind === "escalation")
+        .map((i) => i.ref.id);
+      assert.deepEqual(inboxEscIds, [humanP0.id]);
+      assert.equal(inboxEscIds.some((id) => agentEscIds.has(id)), false);
+      assert.equal(snap.escalations.some((e) => e.id === humanP0.id), false);
+
+      // Verify escalation.ack defaults resolve to false when omitted.
+      await client.request("escalation.ack", { escalationId: humanP0.id, resolution: "Reviewing" });
+      assert.equal(daemon.db.getEscalation(humanP0.id)?.status, "acked");
+    } finally {
+      client.close();
+      await daemon.stop();
+      rmSync(repoDir, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
 });
