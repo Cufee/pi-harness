@@ -396,6 +396,7 @@ const DEFAULT_STARTUP_TIMEOUT_MS = 45_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 600_000;
 const DEFAULT_STEER_ACK_TIMEOUT_MS = 15_000;
 const DEFAULT_TOOLS_GRACE_MS = 20_000;
+const DEFAULT_TOOLS_CEILING_MS = 120_000;
 const TOOLS_POLL_INTERVAL_MS = 100;
 const HARNESS_PREFIXED_TOOL_RE =
   /^(?:mcp(?:__|_|\/|\.|:))?harness(?:__|_|\/|\.|:\s*)([a-z][a-z0-9_]*)$/i;
@@ -412,6 +413,17 @@ function resolveToolsGraceMs(override?: number): number {
     if (Number.isFinite(parsed) && parsed >= 0) return parsed;
   }
   return DEFAULT_TOOLS_GRACE_MS;
+}
+
+function resolveToolsCeilingMs(toolsGraceMs: number): number {
+  const rawEnv = process.env.PI_HARNESS_TOOLS_CEILING_MS?.trim();
+  if (rawEnv !== undefined && rawEnv !== "") {
+    const parsed = Number(rawEnv);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return parsed === 0 ? 0 : Math.max(parsed, toolsGraceMs);
+    }
+  }
+  return Math.max(DEFAULT_TOOLS_CEILING_MS, toolsGraceMs);
 }
 
 export interface AcpRunnerOptions {
@@ -902,13 +914,17 @@ export class AcpRunner {
     let authOkSent = false;
     let authFailed = false;
     let sessionStartMs = 0;
+    let firstPromptStartMs = 0;
     const toolsGraceMs = resolveToolsGraceMs(req.harnessToolsGraceMs);
+    const toolsCeilingMs = resolveToolsCeilingMs(toolsGraceMs);
     const toolsCheckEnabled = hasHarnessBridge && Boolean(req.harnessToolsListedSince) && toolsGraceMs > 0;
     let toolsCheckPassed = !toolsCheckEnabled;
+    let toolsNotYetListed = false;
     let harnessToolCallObserved = false;
     const harnessToolCallIds = new Set<string>();
     let toolsMissingError: AcpProfileError | null = null;
     let toolsGraceTimer: ReturnType<typeof setTimeout> | null = null;
+    let toolsCeilingTimer: ReturnType<typeof setTimeout> | null = null;
     let toolsPollTimer: ReturnType<typeof setInterval> | null = null;
     let toolsCancelGraceTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -916,6 +932,10 @@ export class AcpRunner {
       if (toolsGraceTimer) {
         clearTimeout(toolsGraceTimer);
         toolsGraceTimer = null;
+      }
+      if (toolsCeilingTimer) {
+        clearTimeout(toolsCeilingTimer);
+        toolsCeilingTimer = null;
       }
       if (toolsPollTimer) {
         clearInterval(toolsPollTimer);
@@ -932,10 +952,10 @@ export class AcpRunner {
         this.profile.id,
         reason === "timeout"
           ? `ACP profile ${this.profile.id} started a session without the harness MCP tools: ` +
-            `the harness bridge was never asked for its tool list within ${toolsGraceMs} ms of the first prompt, ` +
+            `the harness bridge was never asked for its tool list within ${toolsCeilingMs} ms of the first prompt, ` +
             `so return_task and spawn_task are unavailable. Check that the profile's CLI supports and loads MCP servers; ` +
             `respawn or retry on another profile.`
-          : `ACP profile ${this.profile.id} completed its first turn without the harness MCP tools: ` +
+          : `ACP profile ${this.profile.id} completed its ${wrapUpAttempted ? "wrap-up turn" : "first turn"} without the harness MCP tools: ` +
             `the harness bridge was never asked for its tool list and no harness tool call was observed, ` +
             `so return_task and spawn_task are unavailable. Check that the profile's CLI supports and loads MCP servers; ` +
             `respawn or retry on another profile.`,
@@ -944,6 +964,8 @@ export class AcpRunner {
       if (toolsCheckPassed) return true;
       if (harnessToolCallObserved || (sessionStartMs > 0 && req.harnessToolsListedSince?.(sessionStartMs))) {
         toolsCheckPassed = true;
+        toolsNotYetListed = false;
+        toolsMissingError = null;
         clearToolsWatchers();
         return true;
       }
@@ -951,6 +973,8 @@ export class AcpRunner {
     };
     const markHarnessToolObserved = () => {
       harnessToolCallObserved = true;
+      toolsNotYetListed = false;
+      toolsMissingError = null;
       if (!toolsCheckPassed) {
         toolsCheckPassed = true;
         clearToolsWatchers();
@@ -1010,19 +1034,20 @@ export class AcpRunner {
       }
       return false;
     };
+    const shouldStopToolsWatch = (): boolean =>
+      req.signal.aborted ||
+      rolloverTriggered ||
+      quotaWatchdogTriggered ||
+      idleTimedOut ||
+      Boolean(childGoneError) ||
+      authFailed;
     const startToolsGraceWatch = () => {
-      if (!toolsCheckEnabled || toolsCheckPassed || toolsGraceTimer) return;
+      if (!toolsCheckEnabled || toolsCheckPassed || firstPromptStartMs > 0) return;
+      firstPromptStartMs = Date.now();
       if (checkHarnessToolsReady()) return;
 
       toolsPollTimer = setInterval(() => {
-        if (
-          req.signal.aborted ||
-          rolloverTriggered ||
-          quotaWatchdogTriggered ||
-          idleTimedOut ||
-          childGoneError ||
-          authFailed
-        ) {
+        if (shouldStopToolsWatch()) {
           clearToolsWatchers();
           return;
         }
@@ -1032,38 +1057,46 @@ export class AcpRunner {
 
       toolsGraceTimer = setTimeout(() => {
         toolsGraceTimer = null;
-        if (toolsPollTimer) {
-          clearInterval(toolsPollTimer);
-          toolsPollTimer = null;
-        }
-        if (
-          req.signal.aborted ||
-          rolloverTriggered ||
-          quotaWatchdogTriggered ||
-          idleTimedOut ||
-          childGoneError ||
-          authFailed
-        ) {
+        if (shouldStopToolsWatch()) {
+          clearToolsWatchers();
           return;
         }
         if (checkHarnessToolsReady()) return;
-
-        toolsMissingError = makeToolsMissingError("timeout");
-        steerHandoff.ack?.settleAck(false);
-        if (sessionId && activeConnection) {
-          void activeConnection.agent.notify("session/cancel", { sessionId }).catch(() => {});
+        toolsNotYetListed = true;
+        if (toolsCeilingMs <= 0 && toolsPollTimer) {
+          clearInterval(toolsPollTimer);
+          toolsPollTimer = null;
         }
-        const cancelGraceMs = Math.min(1_000, Math.max(100, toolsGraceMs));
-        toolsCancelGraceTimer = setTimeout(() => {
-          toolsCancelGraceTimer = null;
-          const cb = resolveActivePromptOnGrace;
-          clearIdleWatchdog();
-          cb?.({ stopReason: "cancelled" });
-          terminateChild(child);
-        }, cancelGraceMs);
-        toolsCancelGraceTimer.unref?.();
       }, toolsGraceMs);
       toolsGraceTimer.unref?.();
+
+      if (toolsCeilingMs > 0) {
+        toolsCeilingTimer = setTimeout(() => {
+          toolsCeilingTimer = null;
+          if (toolsPollTimer) {
+            clearInterval(toolsPollTimer);
+            toolsPollTimer = null;
+          }
+          if (shouldStopToolsWatch()) return;
+          if (checkHarnessToolsReady()) return;
+
+          toolsMissingError = makeToolsMissingError("timeout");
+          steerHandoff.ack?.settleAck(false);
+          if (sessionId && activeConnection) {
+            void activeConnection.agent.notify("session/cancel", { sessionId }).catch(() => {});
+          }
+          const cancelGraceMs = Math.min(1_000, Math.max(100, toolsCeilingMs));
+          toolsCancelGraceTimer = setTimeout(() => {
+            toolsCancelGraceTimer = null;
+            const cb = resolveActivePromptOnGrace;
+            clearIdleWatchdog();
+            cb?.({ stopReason: "cancelled" });
+            terminateChild(child);
+          }, cancelGraceMs);
+          toolsCancelGraceTimer.unref?.();
+        }, toolsCeilingMs);
+        toolsCeilingTimer.unref?.();
+      }
     };
     const emitAuthOk = () => {
       if (authOkSent || authFailed) return;
@@ -2328,15 +2361,12 @@ export class AcpRunner {
         if (matchesAuthTextHeuristic(Boolean(toolsMissingError))) {
           failAuthRequired(accumulatedText);
         }
-        if (toolsMissingError) {
+        if (toolsMissingError && !checkHarnessToolsReady()) {
           clearToolsWatchers();
           throw toolsMissingError;
         }
-        if (toolsCheckEnabled && !checkHarnessToolsReady() && !steerHandoff.pending && rawStop !== "cancelled") {
-          clearToolsWatchers();
-          throw makeToolsMissingError("turn_ended");
-        }
-        if (rawStop !== "cancelled" && !airFailureCode) {
+        const toolsReadyNow = !toolsCheckEnabled || checkHarnessToolsReady();
+        if (rawStop !== "cancelled" && !airFailureCode && toolsReadyNow) {
           const hasSuccessSignal =
             turnSucceededTools > 0 ||
             accumulatedText.trim().length > 0 ||
@@ -2549,6 +2579,40 @@ export class AcpRunner {
         };
       }
 
+      if (
+        toolsCheckEnabled &&
+        !checkHarnessToolsReady() &&
+        !rolloverTriggered &&
+        !req.signal.aborted &&
+        rawStop !== "cancelled"
+      ) {
+        clearToolsWatchers();
+        if (!wrapUpAttempted && !toolsNotYetListed && firstPromptStartMs > 0) {
+          const deadline = firstPromptStartMs + toolsGraceMs;
+          while (
+            !checkHarnessToolsReady() &&
+            !req.signal.aborted &&
+            !rolloverTriggered &&
+            Date.now() < deadline
+          ) {
+            const remaining = deadline - Date.now();
+            await new Promise<void>((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, remaining))));
+          }
+        }
+        if (!checkHarnessToolsReady() && !rolloverTriggered && !req.signal.aborted) {
+          throw makeToolsMissingError("turn_ended");
+        }
+        if (checkHarnessToolsReady() && !airFailureCode) {
+          const hasSuccessSignal =
+            turnSucceededTools > 0 ||
+            accumulatedText.trim().length > 0 ||
+            (turnFailedTools.length === 0 && turnDeniedTools.length === 0 && turnToolCalls === 0);
+          if (hasSuccessSignal) {
+            emitAuthOk();
+          }
+        }
+      }
+
       const stopReason: RunAgentResult["stopReason"] = rolloverTriggered
         ? "rollover_requested"
         : rawStop === "cancelled" || req.signal.aborted
@@ -2686,7 +2750,7 @@ export class AcpRunner {
         };
       }
 
-      if (toolsMissingError) {
+      if (toolsMissingError && !checkHarnessToolsReady()) {
         throw toolsMissingError;
       }
 

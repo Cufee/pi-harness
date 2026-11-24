@@ -7,20 +7,39 @@ export type AcpProfileErrorKind = "auth_required" | "tools_missing";
 export const ACP_AUTH_TEXT_RE =
   /authentication required|auth_required|not (?:logged|signed) in|please (?:run )?\/?login|invalid api key|unauthenticated|login required/i;
 
+const AUTH_STATUS_PREFIX =
+  "(?:authentication\\s+(?:required|failed)|auth_required|login\\s+(?:required|expired)|session\\s+expired|invalid(?:\\s+or\\s+missing)?\\s+api\\s+key|no\\s+api\\s+key\\s+found|unauthenticated|unauthorized|(?:you\\s+are\\s+)?not\\s+(?:logged|signed)\\s+in)";
+
+const STANDALONE_AUTH_STATUS =
+  "(?:authentication\\s+(?:required|failed)|auth_required|login\\s+(?:required|expired)|invalid(?:\\s+or\\s+missing)?\\s+api\\s+key|no\\s+api\\s+key\\s+found|unauthenticated|(?:you\\s+are\\s+)?not\\s+(?:logged|signed)\\s+in)";
+
+const LOGIN_CMD = "[`'\"]?(?:\\/login|amp\\s+login)[`'\"]?";
+
+const SHORT_AUTH_SUFFIX =
+  "(?:\\s+(?:first|again|to\\s+(?:continue|proceed|sign\\s*in|log\\s*in|authenticate|re-?authenticate)))?(?:\\s+and\\s+(?:try\\s+again|retry))?";
+
+const LOGIN_REMEDIATION =
+  `(?:(?:please\\s+)?run\\s+${LOGIN_CMD}|(?:please\\s+)?(?:log\\s*in|sign\\s*in)(?:\\s+(?:with|using)\\s+${LOGIN_CMD})?|(?:please\\s+)?(?:authenticate|re-?authenticate)|fix\\s+external\\s+api\\s+key)${SHORT_AUTH_SUFFIX}`;
+
+const STANDALONE_LOGIN_REMEDIATION =
+  `(?:(?:please\\s+)?run\\s+${LOGIN_CMD}|(?:please\\s+)?(?:log\\s*in|sign\\s*in)\\s+(?:with|using)\\s+${LOGIN_CMD})${SHORT_AUTH_SUFFIX}`;
+
+const AUTH_DIAG_SEP = "\\s*[·:\\-.–—\\n]\\s*";
+const AUTH_DIAG_END = "\\s*[.!]?$";
+
 const STANDALONE_AUTH_DIAGNOSTIC_PATTERNS: readonly RegExp[] = [
-  // Claude CLI /login diagnostics (e.g. "Invalid API key · Please run /login",
-  // "Not logged in · Please run /login", "Please run /login").
-  /^(?:error:\s*)?(?:(?:invalid\s+api\s+key|not\s+(?:logged|signed)\s+in|session\s+expired|login\s+expired|authentication\s+(?:required|failed)|unauthorized|unauthenticated)\s*[·:\-.–—\n]\s*)?(?:please\s+)?run\s+[`'"]?\/login[`'"]?(?:\b|$)/i,
-  // Amp CLI login diagnostics (e.g. "Invalid or missing API key. Run 'amp login'", "No API key found").
-  /^(?:error:\s*)?(?:(?:invalid\s+or\s+missing\s+api\s+key|no\s+api\s+key\s+found|not\s+(?:logged|signed)\s+in|authentication\s+(?:required|failed)|login\s+required|unauthorized|unauthenticated)\s*[·:\-.–—\n]\s*)?(?:please\s+)?run\s+[`'"]?amp\s+login[`'"]?(?:\b|$)/i,
-  /^(?:error:\s*)?(?:invalid\s+or\s+missing\s+api\s+key|no\s+api\s+key\s+found)(?:\s*[.:·\-–—!\n]|$)/i,
-  /^(?:error:\s*)?(?:please\s+)?(?:log\s*in|sign\s*in)\s+(?:with|using)\s+[`'"]?amp\s+login[`'"]?(?:\b|$)/i,
-  /^(?:error:\s*)?you\s+must\s+(?:be\s+logged\s+in|log\s+in)\b.*\bamp\s+login\b/i,
-  // Standalone start-anchored auth failure diagnostics (whole short message or followed by login remediation, never prose).
-  /^(?:error:\s*)?(?:authentication\s+(?:required|failed)|auth_required|login\s+required|invalid\s+api\s+key|unauthenticated)\s*(?:[.!]|$)/i,
-  /^(?:error:\s*)?(?:authentication\s+(?:required|failed)|auth_required|login\s+required|invalid\s+api\s+key|unauthenticated)\s*[·:\-.–—\n]\s*(?:please\s+)?(?:run\s+[`'"]?(?:\/login|amp\s+login|claude|codex|gemini)[`'"]?|log\s*in|sign\s*in|authenticate|re-?authenticate|fix\b|set\b|check\b|invalid\b|missing\b|expired\b|no\s+api\s+key\b)/i,
-  /^(?:error:\s*)?(?:you\s+are\s+)?not\s+(?:logged|signed)\s+in\s*(?:[.!]|$)/i,
-  /^(?:error:\s*)?(?:you\s+are\s+)?not\s+(?:logged|signed)\s+in\s*[·:\-.–—\n]\s*(?:please\s+)?(?:run\s+[`'"]?(?:\/login|amp\s+login|claude|codex|gemini)[`'"]?|log\s*in|sign\s*in|authenticate)\b/i,
+  // Status prefix + separator + known login remediation (e.g. "Invalid API key · Please run /login",
+  // "Not logged in · Please run /login", "Not logged in. Run 'amp login' to sign in.").
+  new RegExp(`^(?:error:\\s*)?${AUTH_STATUS_PREFIX}${AUTH_DIAG_SEP}${LOGIN_REMEDIATION}${AUTH_DIAG_END}`, "i"),
+  // Standalone login command diagnostic (e.g. "Please run /login", "Run 'amp login' to continue.").
+  new RegExp(`^(?:error:\\s*)?${STANDALONE_LOGIN_REMEDIATION}${AUTH_DIAG_END}`, "i"),
+  // Standalone auth status diagnostic (e.g. "Authentication required.", "Not logged in", "No API key found.").
+  new RegExp(`^(?:error:\\s*)?${STANDALONE_AUTH_STATUS}${SHORT_AUTH_SUFFIX}${AUTH_DIAG_END}`, "i"),
+  // Explicit Amp login requirement (e.g. "You must be logged in to use Amp. Run 'amp login'.").
+  new RegExp(
+    `^(?:error:\\s*)?you\\s+must\\s+(?:be\\s+logged\\s+in|log\\s+in)(?:\\s+(?:first|to\\s+(?:continue|proceed|use\\s+amp)))?(?:${AUTH_DIAG_SEP}(?:please\\s+)?run\\s+[\`'"]?amp\\s+login[\`'"]?|\\s+(?:with|using)\\s+[\`'"]?amp\\s+login[\`'"]?)${SHORT_AUTH_SUFFIX}${AUTH_DIAG_END}`,
+    "i",
+  ),
 ];
 
 const STRUCTURED_AUTH_FAILURE_CODES = new Set([
@@ -34,8 +53,8 @@ const STRUCTURED_AUTH_FAILURE_CODES = new Set([
 ]);
 
 /**
- * Matches only standalone, start-anchored adapter login diagnostics emitted as plain
- * assistant text (never substrings inside ordinary prose).
+ * Matches only whole standalone adapter login diagnostics emitted as plain assistant
+ * text (with optional trailing punctuation and recognized short suffixes, never prose).
  */
 export function isStandaloneAcpAuthDiagnostic(text: string): boolean {
   const trimmed = text.trim();

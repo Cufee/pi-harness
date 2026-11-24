@@ -184,6 +184,9 @@ describe("AcpRunner auth classification, authOk, and tools-missing fail-fast", (
   it("classifies standalone Amp and Claude login diagnostics on tool-free turns", async () => {
     const diagnostics = [
       "Please run /login",
+      "Run /login to continue.",
+      "Please run /login first.",
+      "Run /login and try again.",
       "Not logged in · Please run /login",
       "Not logged in. Run 'amp login' to sign in.",
       "Invalid or missing API key. Run 'amp login'",
@@ -229,45 +232,61 @@ describe("AcpRunner auth classification, authOk, and tools-missing fail-fast", (
   });
 
   it("completes short legitimate prose mentioning login without auth_required or cooldown", async () => {
-    const quota = new QuotaClient();
-    const signals: PassiveQuotaSignal[] = [];
-    const shortProse = "The client should show a login form when the user is not logged in.";
+    const proseCases = [
+      "The client should show a login form when the user is not logged in.",
+      "Run /login only if the user asks to switch accounts.",
+      "Authentication required. We added middleware to return 401 on that route.",
+      "Not logged in. That is the expected initial state before sign-in.",
+    ];
 
-    const mockAgent = agent()
-      .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
-      .onRequest("session/new", async () => ({
-        sessionId: "sess-short-prose",
-        models: { currentModelId: "fixture", availableModels: [{ modelId: "fixture", name: "Fixture" }] },
-      } as never))
-      .onRequest("session/prompt", async ({ client: acpClient }) => {
-        await acpClient.notify("session/update", {
+    for (const shortProse of proseCases) {
+      const quota = new QuotaClient();
+      const signals: PassiveQuotaSignal[] = [];
+
+      const mockAgent = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
+        .onRequest("session/new", async () => ({
           sessionId: "sess-short-prose",
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: shortProse },
-          },
-        } as never);
-        return { stopReason: "end_turn" } as never;
-      });
+          models: { currentModelId: "fixture", availableModels: [{ modelId: "fixture", name: "Fixture" }] },
+        } as never))
+        .onRequest("session/prompt", async ({ client: acpClient }) => {
+          await acpClient.notify("session/update", {
+            sessionId: "sess-short-prose",
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: shortProse },
+            },
+          } as never);
+          return { stopReason: "end_turn" } as never;
+        });
 
-    const runner = new AcpRunner(makeProfile({ id: "acp:amp", adapter: "generic", command: "npx", args: ["-y", "amp-acp"] }));
-    const res = await runner.run(
-      makeRequest({
-        callbacks: {
-          onPassiveQuota: (sig) => {
-            signals.push(sig);
-            quota.ingestPassiveSignal(sig);
+      const runner = new AcpRunner(makeProfile({ id: "acp:amp", adapter: "generic", command: "npx", args: ["-y", "amp-acp"] }));
+      const res = await runner.run(
+        makeRequest({
+          daemonSocketPath: "/tmp/dummy-harness.sock",
+          mcpBridgeEntrypoint: "/tmp/dummy-mcp-bridge.js",
+          harnessToolsListedSince: () => true,
+          harnessToolsGraceMs: 200,
+          callbacks: {
+            onPassiveQuota: (sig) => {
+              signals.push(sig);
+              quota.ingestPassiveSignal(sig);
+            },
           },
-        },
-      }),
-      mockAgent,
-    );
+        }),
+        mockAgent,
+      );
 
-    assert.equal(res.stopReason, "completed");
-    assert.equal(res.text, shortProse);
-    assert.equal(quota.authStatus("acp:amp"), null);
-    assert.equal(signals.some((s) => s.raw.sessionFailure === "auth_required"), false);
-    assert.equal(signals.filter((s) => s.raw.authOk === true).length, 1);
+      assert.equal(res.stopReason, "completed", `expected completed for "${shortProse}"`);
+      assert.equal(res.text, shortProse);
+      assert.equal(quota.authStatus("acp:amp"), null, `expected no cooldown for "${shortProse}"`);
+      assert.equal(
+        signals.some((s) => s.raw.sessionFailure !== undefined),
+        false,
+        `expected no sessionFailure signal for "${shortProse}"`,
+      );
+      assert.equal(signals.filter((s) => s.raw.authOk === true).length, 1);
+    }
   });
 
   it("settles structured _meta.jetbrains.air.sessionFailure.code=auth_required once without authOk, wrap-up, or completion", async () => {
@@ -568,11 +587,13 @@ describe("AcpRunner auth classification, authOk, and tools-missing fail-fast", (
     assert.equal(authOkSignals[0]!.model, null);
   });
 
-  it("dispatches first prompt immediately, cancels on tools grace timeout, and throws tools_missing naming the profile", async () => {
+  it("does not cancel on grace expiry, but cancels on tools ceiling timeout and throws tools_missing naming the profile", async () => {
     let promptCalls = 0;
     let cancelCalls = 0;
+    let cancelElapsedMs = 0;
     const seenSinceMs: number[] = [];
     const signals: PassiveQuotaSignal[] = [];
+    let promptStartedAt = 0;
 
     const mockAgent = agent()
       .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
@@ -582,51 +603,228 @@ describe("AcpRunner auth classification, authOk, and tools-missing fail-fast", (
       } as never))
       .onNotification("session/cancel", async () => {
         cancelCalls++;
+        cancelElapsedMs = Date.now() - promptStartedAt;
       })
       .onRequest("session/prompt", async () => {
         promptCalls++;
-        // Hold the turn open longer than harnessToolsGraceMs so the grace timer expires and sends session/cancel.
+        promptStartedAt = Date.now();
+        // Hold the turn open longer than PI_HARNESS_TOOLS_CEILING_MS so the ceiling timer cancels it.
         await new Promise((r) => setTimeout(r, 1_500));
         return { stopReason: cancelCalls > 0 ? "cancelled" : "end_turn" } as never;
       });
 
-    const runner = new AcpRunner(makeProfile({ id: "acp:gemini" }));
-    const beforeMs = Date.now();
-    let caught: unknown;
+    const prevCeiling = process.env.PI_HARNESS_TOOLS_CEILING_MS;
+    process.env.PI_HARNESS_TOOLS_CEILING_MS = "320";
     try {
-      await runner.run(
+      const runner = new AcpRunner(makeProfile({ id: "acp:gemini" }));
+      const beforeMs = Date.now();
+      let caught: unknown;
+      try {
+        await runner.run(
+          makeRequest({
+            daemonSocketPath: "/tmp/dummy-harness.sock",
+            mcpBridgeEntrypoint: "/tmp/dummy-mcp-bridge.js",
+            harnessToolsListedSince: (sinceMs) => {
+              seenSinceMs.push(sinceMs);
+              return false;
+            },
+            harnessToolsGraceMs: 100,
+            callbacks: {
+              onPassiveQuota: (sig) => signals.push(sig),
+            },
+          }),
+          mockAgent,
+        );
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.equal(promptCalls, 1);
+      assert.ok(cancelCalls >= 1, `expected session/cancel on ceiling expiry, got ${cancelCalls}`);
+      assert.ok(cancelElapsedMs >= 250, `expected cancel after ceiling (320 ms), not grace (100 ms); got ${cancelElapsedMs} ms`);
+      assert.ok(seenSinceMs.length >= 2, `expected multiple polls, saw ${seenSinceMs.length}`);
+      assert.ok(seenSinceMs[0]! >= beforeMs);
+      assert.ok(caught instanceof AcpProfileError, `expected AcpProfileError, got ${String(caught)}`);
+      assert.equal(caught.kind, "tools_missing");
+      assert.equal(caught.profileId, "acp:gemini");
+      assert.match(caught.message, /acp:gemini/);
+      assert.match(caught.message, /320 ms/);
+      assert.match(caught.message, /return_task/);
+      assert.equal(signals.length, 0);
+    } finally {
+      if (prevCeiling === undefined) delete process.env.PI_HARNESS_TOOLS_CEILING_MS;
+      else process.env.PI_HARNESS_TOOLS_CEILING_MS = prevCeiling;
+    }
+  });
+
+  it("handles lazy tool discovery across eager, wrap-up/grace, and post-grace turns without false tools_missing", async () => {
+    // Case 1: listed before 10 ms answer -> completed, no cancel
+    {
+      let cancelCalls = 0;
+      const mockAgent = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
+        .onRequest("session/new", async () => ({
+          sessionId: "sess-lazy-1",
+          models: { currentModelId: "fixture", availableModels: [{ modelId: "fixture", name: "Fixture" }] },
+        } as never))
+        .onNotification("session/cancel", async () => {
+          cancelCalls++;
+        })
+        .onRequest("session/prompt", async ({ client: acpClient }) => {
+          await new Promise((r) => setTimeout(r, 10));
+          await acpClient.notify("session/update", {
+            sessionId: "sess-lazy-1",
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Quick answer." } },
+          } as never);
+          return { stopReason: "end_turn" } as never;
+        });
+
+      const runner = new AcpRunner(makeProfile({ id: "acp:amp", adapter: "generic", command: "npx", args: ["-y", "amp-acp"] }));
+      const res = await runner.run(
         makeRequest({
           daemonSocketPath: "/tmp/dummy-harness.sock",
           mcpBridgeEntrypoint: "/tmp/dummy-mcp-bridge.js",
-          harnessToolsListedSince: (sinceMs) => {
-            seenSinceMs.push(sinceMs);
-            return false;
-          },
-          harnessToolsGraceMs: 200,
-          callbacks: {
-            onPassiveQuota: (sig) => signals.push(sig),
-          },
+          harnessToolsListedSince: () => true,
+          harnessToolsGraceMs: 100,
         }),
         mockAgent,
       );
-    } catch (err) {
-      caught = err;
+      assert.equal(res.stopReason, "completed");
+      assert.equal(cancelCalls, 0);
     }
 
-    assert.equal(promptCalls, 1);
-    assert.ok(cancelCalls >= 1, `expected session/cancel on grace expiry, got ${cancelCalls}`);
-    assert.ok(seenSinceMs.length >= 2, `expected multiple polls, saw ${seenSinceMs.length}`);
-    assert.ok(seenSinceMs[0]! >= beforeMs);
-    assert.ok(caught instanceof AcpProfileError, `expected AcpProfileError, got ${String(caught)}`);
-    assert.equal(caught.kind, "tools_missing");
-    assert.equal(caught.profileId, "acp:gemini");
-    assert.match(caught.message, /acp:gemini/);
-    assert.match(caught.message, /200 ms/);
-    assert.match(caught.message, /return_task/);
-    assert.equal(signals.length, 0);
+    // Case 2a: answer at 10 ms, lazy client lists on wrap-up prompt at ~90 ms -> completed, not tools_missing
+    {
+      let promptCalls = 0;
+      let cancelCalls = 0;
+      let listedAt = 0;
+      let startedAt = 0;
+      const mockAgent = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
+        .onRequest("session/new", async () => ({
+          sessionId: "sess-lazy-2a",
+          models: { currentModelId: "fixture", availableModels: [{ modelId: "fixture", name: "Fixture" }] },
+        } as never))
+        .onNotification("session/cancel", async () => {
+          cancelCalls++;
+        })
+        .onRequest("session/prompt", async ({ client: acpClient }) => {
+          promptCalls++;
+          if (promptCalls === 1) {
+            startedAt = Date.now();
+            await new Promise((r) => setTimeout(r, 10));
+            await acpClient.notify("session/update", {
+              sessionId: "sess-lazy-2a",
+              update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Turn 1 prose." } },
+            } as never);
+            return { stopReason: "end_turn" } as never;
+          }
+          const remainingTo90 = Math.max(0, 90 - (Date.now() - startedAt));
+          if (remainingTo90 > 0) await new Promise((r) => setTimeout(r, remainingTo90));
+          listedAt = Date.now();
+          await acpClient.notify("session/update", {
+            sessionId: "sess-lazy-2a",
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Wrap-up listed tools." } },
+          } as never);
+          return { stopReason: "end_turn" } as never;
+        });
+
+      const runner = new AcpRunner(makeProfile({ id: "acp:amp", adapter: "generic", command: "npx", args: ["-y", "amp-acp"] }));
+      const res = await runner.run(
+        makeRequest({
+          daemonSocketPath: "/tmp/dummy-harness.sock",
+          mcpBridgeEntrypoint: "/tmp/dummy-mcp-bridge.js",
+          harnessToolsListedSince: (sinceMs) => listedAt >= sinceMs,
+          harnessToolsGraceMs: 100,
+          missingReturnWrapUpPrompt: "Please call return_task",
+        }),
+        mockAgent,
+      );
+      assert.equal(promptCalls, 2);
+      assert.equal(cancelCalls, 0);
+      assert.equal(res.stopReason, "completed");
+    }
+
+    // Case 2b: answer at 10 ms without wrap-up prompt, time-based list becomes available at 90 ms (< 100 ms grace) -> completed
+    {
+      let cancelCalls = 0;
+      let listedAt = 0;
+      const mockAgent = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
+        .onRequest("session/new", async () => ({
+          sessionId: "sess-lazy-2b",
+          models: { currentModelId: "fixture", availableModels: [{ modelId: "fixture", name: "Fixture" }] },
+        } as never))
+        .onNotification("session/cancel", async () => {
+          cancelCalls++;
+        })
+        .onRequest("session/prompt", async ({ client: acpClient }) => {
+          setTimeout(() => {
+            listedAt = Date.now();
+          }, 90).unref?.();
+          await new Promise((r) => setTimeout(r, 10));
+          await acpClient.notify("session/update", {
+            sessionId: "sess-lazy-2b",
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Fast answer." } },
+          } as never);
+          return { stopReason: "end_turn" } as never;
+        });
+
+      const runner = new AcpRunner(makeProfile({ id: "acp:amp", adapter: "generic", command: "npx", args: ["-y", "amp-acp"] }));
+      const res = await runner.run(
+        makeRequest({
+          daemonSocketPath: "/tmp/dummy-harness.sock",
+          mcpBridgeEntrypoint: "/tmp/dummy-mcp-bridge.js",
+          harnessToolsListedSince: (sinceMs) => listedAt >= sinceMs,
+          harnessToolsGraceMs: 100,
+        }),
+        mockAgent,
+      );
+      assert.equal(cancelCalls, 0);
+      assert.equal(res.stopReason, "completed");
+    }
+
+    // Case 3: 180 ms turn with list at 150 ms and grace 100 ms -> no cancel, completed
+    {
+      let cancelCalls = 0;
+      let listedAt = 0;
+      const mockAgent = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1 } as never))
+        .onRequest("session/new", async () => ({
+          sessionId: "sess-lazy-3",
+          models: { currentModelId: "fixture", availableModels: [{ modelId: "fixture", name: "Fixture" }] },
+        } as never))
+        .onNotification("session/cancel", async () => {
+          cancelCalls++;
+        })
+        .onRequest("session/prompt", async ({ client: acpClient }) => {
+          await new Promise((r) => setTimeout(r, 150));
+          listedAt = Date.now();
+          await new Promise((r) => setTimeout(r, 30));
+          await acpClient.notify("session/update", {
+            sessionId: "sess-lazy-3",
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Late list succeeded." } },
+          } as never);
+          return { stopReason: "end_turn" } as never;
+        });
+
+      const runner = new AcpRunner(makeProfile({ id: "acp:amp", adapter: "generic", command: "npx", args: ["-y", "amp-acp"] }));
+      const res = await runner.run(
+        makeRequest({
+          daemonSocketPath: "/tmp/dummy-harness.sock",
+          mcpBridgeEntrypoint: "/tmp/dummy-mcp-bridge.js",
+          harnessToolsListedSince: (sinceMs) => listedAt >= sinceMs,
+          harnessToolsGraceMs: 100,
+        }),
+        mockAgent,
+      );
+      assert.equal(cancelCalls, 0);
+      assert.equal(res.stopReason, "completed");
+      assert.equal(res.text, "Late list succeeded.");
+    }
   });
 
-  it("fails tools_missing when turn 1 ends normally without listing or calling a harness tool", async () => {
+  it("lets wrap-up run after tool-free turn 1 and fails tools_missing only if wrap-up also ends without tools", async () => {
     let promptCalls = 0;
     const signals: PassiveQuotaSignal[] = [];
 
@@ -666,7 +864,7 @@ describe("AcpRunner auth classification, authOk, and tools-missing fail-fast", (
       caught = err;
     }
 
-    assert.equal(promptCalls, 1);
+    assert.equal(promptCalls, 2);
     assert.ok(caught instanceof AcpProfileError, `expected AcpProfileError, got ${String(caught)}`);
     assert.equal(caught.kind, "tools_missing");
     assert.equal(caught.profileId, "acp:amp");
@@ -941,12 +1139,21 @@ describe("AcpRunner auth classification, authOk, and tools-missing fail-fast", (
     assert.ok(elapsedMs < 1_500, `expected early abort, took ${elapsedMs}ms`);
   });
 
-  it("handles FAKE_ACP_LIST_TOOLS=eager, on_prompt, and never end-to-end via fake-acp-agent + mcp-bridge", async () => {
+  it("handles FAKE_ACP_LIST_TOOLS=eager, on_prompt, on_wrap_up, and never end-to-end via fake-acp-agent + mcp-bridge", async () => {
     const repoRoot = resolve(import.meta.dir, "..");
     const fakeAgentPath = resolve(repoRoot, "test", "fixtures", "fake-acp-agent.ts");
     const mcpBridgePath = resolve(repoRoot, "src", "runners", "mcp-bridge.ts");
 
-    async function runFakeAgentMode(mode: "eager" | "on_prompt" | "never", promptDelayMs = 0) {
+    async function runFakeAgentMode(
+      mode: "eager" | "on_prompt" | "on_wrap_up" | "never",
+      opts: {
+        promptDelayMs?: number;
+        listDelayMs?: number;
+        graceMs?: number;
+        ceilingMs?: number;
+        missingReturnWrapUpPrompt?: string;
+      } = {},
+    ) {
       const dir = mkdtempSync(join(tmpdir(), `pi-acp-list-${mode}-`));
       const socketPath = join(dir, "daemon.sock");
       let listedAt = 0;
@@ -973,6 +1180,10 @@ describe("AcpRunner auth classification, authOk, and tools-missing fail-fast", (
         });
       });
 
+      const prevCeiling = process.env.PI_HARNESS_TOOLS_CEILING_MS;
+      if (opts.ceilingMs !== undefined) {
+        process.env.PI_HARNESS_TOOLS_CEILING_MS = String(opts.ceilingMs);
+      }
       await new Promise<void>((r) => server.listen(socketPath, r));
       try {
         const runner = new AcpRunner(
@@ -984,7 +1195,8 @@ describe("AcpRunner auth classification, authOk, and tools-missing fail-fast", (
             env: {
               FAKE_DIR: dir,
               FAKE_ACP_LIST_TOOLS: mode,
-              ...(promptDelayMs > 0 ? { FAKE_ACP_PROMPT_DELAY_MS: String(promptDelayMs) } : {}),
+              ...(opts.promptDelayMs && opts.promptDelayMs > 0 ? { FAKE_ACP_PROMPT_DELAY_MS: String(opts.promptDelayMs) } : {}),
+              ...(opts.listDelayMs && opts.listDelayMs > 0 ? { FAKE_ACP_LIST_DELAY_MS: String(opts.listDelayMs) } : {}),
             },
           }),
         );
@@ -994,10 +1206,15 @@ describe("AcpRunner auth classification, authOk, and tools-missing fail-fast", (
             daemonSocketPath: socketPath,
             mcpBridgeEntrypoint: mcpBridgePath,
             harnessToolsListedSince: (sinceMs) => listedAt >= sinceMs,
-            harnessToolsGraceMs: 1_200,
+            harnessToolsGraceMs: opts.graceMs ?? 1_200,
+            missingReturnWrapUpPrompt: opts.missingReturnWrapUpPrompt,
           }),
         );
       } finally {
+        if (opts.ceilingMs !== undefined) {
+          if (prevCeiling === undefined) delete process.env.PI_HARNESS_TOOLS_CEILING_MS;
+          else process.env.PI_HARNESS_TOOLS_CEILING_MS = prevCeiling;
+        }
         await new Promise<void>((r) => server.close(() => r()));
         rmSync(dir, { recursive: true, force: true });
       }
@@ -1007,14 +1224,30 @@ describe("AcpRunner auth classification, authOk, and tools-missing fail-fast", (
     const eagerRes = await runFakeAgentMode("eager");
     assert.equal(eagerRes.stopReason, "completed");
 
-    // on_prompt: lists only when session/prompt arrives -> survives past grace window and completes cleanly
-    const onPromptRes = await runFakeAgentMode("on_prompt", 1_600);
+    // on_prompt: lists after grace expires during a longer turn -> no cancel, completes cleanly
+    const onPromptRes = await runFakeAgentMode("on_prompt", {
+      graceMs: 100,
+      listDelayMs: 250,
+      promptDelayMs: 400,
+    });
     assert.equal(onPromptRes.stopReason, "completed");
 
-    // never (delayed): grace expires -> cancels and fails tools_missing naming the profile
+    // on_wrap_up: turn 1 answers quickly without listing, wrap-up prompt triggers list -> completes cleanly
+    const onWrapUpRes = await runFakeAgentMode("on_wrap_up", {
+      graceMs: 100,
+      promptDelayMs: 10,
+      missingReturnWrapUpPrompt: "Please call return_task",
+    });
+    assert.equal(onWrapUpRes.stopReason, "completed");
+
+    // never (delayed): ceiling expires -> cancels and fails tools_missing naming the profile
     let caughtDelayed: unknown;
     try {
-      await runFakeAgentMode("never", 5_000);
+      await runFakeAgentMode("never", {
+        promptDelayMs: 5_000,
+        graceMs: 200,
+        ceilingMs: 800,
+      });
     } catch (err) {
       caughtDelayed = err;
     }
@@ -1023,10 +1256,14 @@ describe("AcpRunner auth classification, authOk, and tools-missing fail-fast", (
     assert.equal(caughtDelayed.profileId, "acp:fake-never");
     assert.match(caughtDelayed.message, /acp:fake-never/);
 
-    // never (fast end_turn): first turn ends without listing -> also fails tools_missing naming the profile
+    // never (fast end_turn with wrap-up): both turn 1 and wrap-up end without listing -> fails tools_missing
     let caughtFast: unknown;
     try {
-      await runFakeAgentMode("never", 0);
+      await runFakeAgentMode("never", {
+        promptDelayMs: 0,
+        graceMs: 1_200,
+        missingReturnWrapUpPrompt: "Please call return_task",
+      });
     } catch (err) {
       caughtFast = err;
     }
@@ -1034,5 +1271,5 @@ describe("AcpRunner auth classification, authOk, and tools-missing fail-fast", (
     assert.equal(caughtFast.kind, "tools_missing");
     assert.equal(caughtFast.profileId, "acp:fake-never");
     assert.match(caughtFast.message, /acp:fake-never/);
-  }, 20_000);
+  }, 30_000);
 });

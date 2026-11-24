@@ -14,6 +14,7 @@ if (!fakeDir) {
 
 const listToolsMode = (process.env.FAKE_ACP_LIST_TOOLS ?? "eager").trim().toLowerCase();
 const promptDelayMs = Math.max(0, Number(process.env.FAKE_ACP_PROMPT_DELAY_MS ?? "0") || 0);
+const listDelayMs = Math.max(0, Number(process.env.FAKE_ACP_LIST_DELAY_MS ?? "0") || 0);
 
 interface McpServerSpec {
   name?: string;
@@ -24,6 +25,7 @@ interface McpServerSpec {
 
 let mcpClient: Client | null = null;
 let pendingHarnessServer: McpServerSpec | null = null;
+let promptCount = 0;
 let taskIdToken = "unknown";
 let ownTaskId = "unknown";
 
@@ -155,7 +157,7 @@ const app = agent()
       }
       if (listToolsMode === "eager") {
         await connectHarnessMcp(harnessServer, true);
-      } else if (listToolsMode === "on_prompt") {
+      } else if (listToolsMode === "on_prompt" || listToolsMode === "on_wrap_up") {
         pendingHarnessServer = harnessServer;
       }
     }
@@ -190,8 +192,18 @@ const app = agent()
       currentRole = "unknown";
     }
 
+    promptCount += 1;
+    let elapsedDelayMs = 0;
     try {
-      if (listToolsMode === "on_prompt" && pendingHarnessServer && !mcpClient) {
+      const shouldListOnThisPrompt =
+        (listToolsMode === "on_prompt" && promptCount === 1) ||
+        (listToolsMode === "on_wrap_up" && promptCount >= 2);
+      if (shouldListOnThisPrompt && pendingHarnessServer && !mcpClient) {
+        if (listDelayMs > 0) {
+          await sleepWakeable(listDelayMs);
+          elapsedDelayMs += listDelayMs;
+          if (cancelled) return { stopReason: "cancelled" };
+        }
         await connectHarnessMcp(pendingHarnessServer, true);
       }
       if (currentRole === "orchestrator") {
@@ -306,8 +318,9 @@ const app = agent()
         return { stopReason: "end_turn" };
       }
 
-      if (promptDelayMs > 0) {
-        await sleepWakeable(promptDelayMs);
+      const remainingPromptDelayMs = Math.max(0, promptDelayMs - elapsedDelayMs);
+      if (remainingPromptDelayMs > 0) {
+        await sleepWakeable(remainingPromptDelayMs);
         if (cancelled) return { stopReason: "cancelled" };
       }
       await client.notify("session/update", {
