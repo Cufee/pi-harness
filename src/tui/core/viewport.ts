@@ -57,6 +57,48 @@ export function parseMouseWheel(data: string): { delta: number; hadMouse: boolea
   return { delta, hadMouse };
 }
 
+export interface ScrollbarRowRange {
+  /** Exact rendered array whose rows include the scrollbar slice. */
+  lines: readonly string[];
+  /** Start row offset within `lines` where scrollbar-bearing rows begin. */
+  start: number;
+  /** Number of consecutive rows from `start` that have a trailing scrollbar gutter. */
+  count: number;
+  /** Selectable content width for those rows (excluding the trailing scrollbar gutter). */
+  contentWidth: number;
+}
+
+const scrollbarCaptureStack: ScrollbarRowRange[][] = [];
+
+/** Begins capturing rendered scrollbar row geometry during a synchronous `Frame` body render. */
+export function beginScrollbarCapture(): void {
+  scrollbarCaptureStack.push([]);
+}
+
+/** Ends scrollbar geometry capture and returns the captured ranges for the current render. */
+export function endScrollbarCapture(): ScrollbarRowRange[] {
+  return scrollbarCaptureStack.pop() ?? [];
+}
+
+/** Records a scrollbar-bearing row range during an active capture. */
+export function recordScrollbarRange(range: ScrollbarRowRange): void {
+  const current = scrollbarCaptureStack[scrollbarCaptureStack.length - 1];
+  if (current) current.push(range);
+}
+
+/** Replaces a previously recorded range (by rendered array identity) when wrapped by a container such as `ListView`. */
+export function replaceScrollbarRange(prevLines: readonly string[], nextRange: ScrollbarRowRange): void {
+  const current = scrollbarCaptureStack[scrollbarCaptureStack.length - 1];
+  if (!current) return;
+  for (let i = current.length - 1; i >= 0; i--) {
+    if (current[i]!.lines === prevLines) {
+      current[i] = nextRange;
+      return;
+    }
+  }
+  current.push(nextRange);
+}
+
 /**
  * Reusable scrollable viewport state for overlays, inspectors, lists, and transcripts.
  * Works natively on `TuiMainScreen` (no alt-screen required), supports follow mode,
@@ -67,6 +109,10 @@ export class Viewport {
   follow = false;
   lastHeight = 10;
   lastTotal = 0;
+  /** Width of the scrollbar gutter drawn on the most recent `render()` (`2` when shown, `0` otherwise). */
+  lastScrollbarWidth = 0;
+  /** Selectable content width from the most recent `render()` (excluding any scrollbar gutter). */
+  lastBodyWidth = 0;
 
   constructor(opts?: { follow?: boolean }) {
     this.follow = Boolean(opts?.follow);
@@ -132,6 +178,8 @@ export class Viewport {
 
     const needsScrollbar = lines.length > h && w >= 6;
     const bodyWidth = needsScrollbar ? w - 2 : w;
+    this.lastScrollbarWidth = needsScrollbar ? 2 : 0;
+    this.lastBodyWidth = bodyWidth;
     const slice = lines.slice(this.offset, this.offset + h);
 
     if (!needsScrollbar) {
@@ -149,6 +197,7 @@ export class Viewport {
       const bar = isThumb ? theme.accent(theme.glyphs.scrollThumb) : theme.muted(theme.glyphs.scrollTrack);
       out.push(`${content} ${bar}`);
     }
+    recordScrollbarRange({ lines: out, start: 0, count: out.length, contentWidth: bodyWidth });
     return out;
   }
 

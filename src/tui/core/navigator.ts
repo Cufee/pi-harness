@@ -150,6 +150,20 @@ export function isPopKey(data: string, ctx: ScreenContext, opts?: { allowQ?: boo
   return false;
 }
 
+interface SelectionRowSnapshot {
+  row: number;
+  lineIdx: number;
+  rowWidth: number;
+  plain: string;
+}
+
+interface SelectionSnapshot {
+  frame: Frame;
+  col: number;
+  width: number;
+  rows: SelectionRowSnapshot[];
+}
+
 interface OverlaySelectionState {
   anchor: CellPoint | null;
   head: CellPoint | null;
@@ -158,6 +172,9 @@ interface OverlaySelectionState {
   lines: string[];
   frame: Frame | null;
   width: number;
+  termRows: number;
+  termCols: number;
+  snapshot: SelectionSnapshot | null;
 }
 
 function nearestTextRowIndex(rows: readonly number[], y: number): number {
@@ -173,44 +190,22 @@ function nearestTextRowIndex(rows: readonly number[], y: number): number {
   return bestIdx;
 }
 
-function hasScrollbarCell(line: string, col: number, width: number, theme: Theme): boolean {
-  if (width < 6) return false;
-  const tail = stripTerminalSequences(sliceByColumn(line, col + width - 2, 2, true));
-  if (tail.length !== 2 || tail[0] !== " ") return false;
-  const ch = tail[1]!;
-  return ch === theme.glyphs.scrollThumb || ch === theme.glyphs.scrollTrack;
-}
-
-function detectScrollbarRows(
-  lines: readonly string[],
-  region: FrameTextRegion,
-  theme: Theme,
-): Set<number> {
-  const out = new Set<number>();
-  if (region.width < 6 || region.bodyRows.length === 0) return out;
-  const suffix: number[] = [];
-  for (let i = region.bodyRows.length - 1; i >= 0; i--) {
-    const lineIdx = region.bodyRows[i]!;
-    const line = lines[lineIdx] ?? "";
-    if (!hasScrollbarCell(line, region.col, region.width, theme)) break;
-    suffix.push(lineIdx);
-  }
-  if (suffix.length >= 2 || (suffix.length === 1 && region.bodyRows.length === 1)) {
-    for (const r of suffix) out.add(r);
-  }
-  return out;
+function selectableRowWidth(region: FrameTextRegion, lineIdx: number): number {
+  const override = region.rowWidths?.get(lineIdx);
+  return override !== undefined ? Math.max(1, Math.min(region.width, override)) : region.width;
 }
 
 function computeOverlayHeight(termRows: number, isDialog: boolean): number {
-  const rows = Math.max(8, Math.floor(termRows || 30));
-  const maxByMargin = Math.max(6, rows - 2);
+  const rows = Math.max(1, Math.floor(termRows || 30));
+  const avail = Math.max(1, rows - 2);
   const desired = isDialog ? Math.min(26, Math.floor(rows * 0.78)) : Math.floor(rows * 0.88);
-  return Math.max(6, Math.min(maxByMargin, desired));
+  return Math.min(avail, Math.max(6, desired));
 }
 export class Navigator {
   private stack: Screen[] = [];
   private handle: OverlayHandle | null = null;
   private mouseEnabled = false;
+  private mouseGestureOwner: "custom" | "default" | null = null;
   private readonly hostComponent: Component;
   private readonly onChange?: () => void;
   private readonly overlaySel: OverlaySelectionState = {
@@ -221,6 +216,9 @@ export class Navigator {
     lines: [],
     frame: null,
     width: 0,
+    termRows: 0,
+    termCols: 0,
+    snapshot: null,
   };
 
   constructor(
@@ -234,10 +232,16 @@ export class Navigator {
       render: (width: number) => {
         const top = this.current;
         if (!top) return [];
-        if (this.overlaySel.width !== 0 && this.overlaySel.width !== width) {
+        const termRows = this.terminal.rows || 30;
+        const termCols = this.terminal.columns || width;
+        if (
+          (this.overlaySel.width !== 0 && this.overlaySel.width !== width) ||
+          (this.overlaySel.termRows !== 0 && this.overlaySel.termRows !== termRows) ||
+          (this.overlaySel.termCols !== 0 && this.overlaySel.termCols !== termCols)
+        ) {
           this.clearOverlaySelection();
         }
-        const maxH = computeOverlayHeight(this.terminal.rows || 30, top.variant === "dialog");
+        const maxH = computeOverlayHeight(termRows, top.variant === "dialog");
         beginFrameCapture();
         let rawLines: string[];
         let capturedFrame: Frame | null = null;
@@ -246,9 +250,14 @@ export class Navigator {
         } finally {
           capturedFrame = endFrameCapture();
         }
+        if (this.overlaySel.anchor !== null && !this.matchesSelectionSnapshot(capturedFrame, rawLines)) {
+          this.clearOverlaySelection();
+        }
         this.overlaySel.lines = rawLines;
         this.overlaySel.frame = capturedFrame;
         this.overlaySel.width = width;
+        this.overlaySel.termRows = termRows;
+        this.overlaySel.termCols = termCols;
 
         if (!this.hasActiveSelection || !this.theme.color) {
           return rawLines;
@@ -257,18 +266,17 @@ export class Navigator {
         if (!region || region.rows.length === 0 || region.width <= 0) {
           return rawLines;
         }
+        const visibleRows = region.rows.filter((r) => r >= 0 && r < rawLines.length);
         const sel = normalizeSelection("cell", this.overlaySel.anchor!, this.overlaySel.head!);
-        if (sel.startRow >= region.rows.length) {
+        if (sel.startRow >= visibleRows.length) {
           return rawLines;
         }
-        const scrollbarRows = detectScrollbarRows(rawLines, region, this.theme);
         const out = [...rawLines];
-        const lastRow = Math.min(sel.endRow, region.rows.length - 1);
+        const lastRow = Math.min(sel.endRow, visibleRows.length - 1);
         for (let r = sel.startRow; r <= lastRow; r++) {
-          const lineIdx = region.rows[r]!;
-          if (lineIdx < 0 || lineIdx >= out.length) continue;
+          const lineIdx = visibleRows[r]!;
           const line = out[lineIdx]!;
-          const rowW = scrollbarRows.has(lineIdx) ? Math.max(1, region.width - 2) : region.width;
+          const rowW = selectableRowWidth(region, lineIdx);
           const inner = sliceByColumn(line, region.col, rowW, true);
           const { c0, c1 } = rowSelectionCols(inner, r, sel, region.width);
           if (c0 >= rowW) continue;
@@ -292,16 +300,16 @@ export class Navigator {
             let needsRender = false;
             for (const ev of mouseEvents) {
               const localEv = bounds ? { ...ev, x: ev.x - bounds.col, y: ev.y - bounds.row } : null;
-              if (top.handleMouse) {
-                if (!localEv) return;
-                const res = top.handleMouse(localEv, ctx);
-                if (res !== false) {
-                  if (this.hasActiveSelection) this.clearOverlaySelection();
-                  needsRender = true;
-                  continue;
-                }
-              }
               if (ev.type === "wheel") {
+                if (top.handleMouse) {
+                  if (!localEv) return;
+                  const res = top.handleMouse(localEv, ctx);
+                  if (res !== false) {
+                    if (this.hasActiveSelection) this.clearOverlaySelection();
+                    needsRender = true;
+                    continue;
+                  }
+                }
                 if (this.hasActiveSelection) {
                   this.clearOverlaySelection();
                   needsRender = true;
@@ -309,7 +317,46 @@ export class Navigator {
                 hasUnhandledWheel = true;
                 continue;
               }
-              if (localEv && this.handleDefaultMouse(localEv, ctx)) {
+
+              if (!localEv || !bounds) return;
+
+              if (ev.type === "press") {
+                this.mouseGestureOwner = null;
+                if (top.handleMouse) {
+                  const res = top.handleMouse(localEv, ctx);
+                  if (res !== false) {
+                    this.mouseGestureOwner = "custom";
+                    if (this.hasActiveSelection || this.overlaySel.dragging) this.clearOverlaySelection();
+                    needsRender = true;
+                    continue;
+                  }
+                }
+                this.mouseGestureOwner = "default";
+                if (this.handleDefaultMouse(localEv, ctx, bounds)) {
+                  needsRender = true;
+                }
+                continue;
+              }
+
+              const owner = this.mouseGestureOwner;
+              if (ev.type === "release") {
+                this.mouseGestureOwner = null;
+              }
+
+              if (owner === "default" || !top.handleMouse) {
+                if (this.handleDefaultMouse(localEv, ctx, bounds)) {
+                  needsRender = true;
+                }
+                continue;
+              }
+
+              const res = top.handleMouse(localEv, ctx);
+              if (res !== false) {
+                if (this.hasActiveSelection) this.clearOverlaySelection();
+                needsRender = true;
+                continue;
+              }
+              if (owner !== "custom" && this.handleDefaultMouse(localEv, ctx, bounds)) {
                 needsRender = true;
               }
             }
@@ -324,6 +371,7 @@ export class Navigator {
             return;
           }
         }
+        this.mouseGestureOwner = null;
         if (this.hasActiveSelection) {
           this.clearOverlaySelection();
           if (matchesKey(data, "escape")) {
@@ -348,21 +396,83 @@ export class Navigator {
     this.overlaySel.head = null;
     this.overlaySel.dragging = false;
     this.overlaySel.moved = false;
+    this.overlaySel.snapshot = null;
     if (clearCache) {
+      this.mouseGestureOwner = null;
       this.overlaySel.lines = [];
       this.overlaySel.frame = null;
       this.overlaySel.width = 0;
+      this.overlaySel.termRows = 0;
+      this.overlaySel.termCols = 0;
     }
   }
 
-  private handleDefaultMouse(ev: OverlayMouseEvent, ctx: ScreenContext): boolean {
+  private captureSelectionSnapshot(frame: Frame, region: FrameTextRegion, visibleRows: readonly number[]): void {
+    if (!this.overlaySel.anchor || !this.overlaySel.head) {
+      this.overlaySel.snapshot = null;
+      return;
+    }
+    const sel = normalizeSelection("cell", this.overlaySel.anchor, this.overlaySel.head);
+    const lines = this.overlaySel.lines;
+    const rows: SelectionRowSnapshot[] = [];
+    const lastRow = Math.min(sel.endRow, visibleRows.length - 1);
+    for (let r = sel.startRow; r <= lastRow; r++) {
+      const lineIdx = visibleRows[r];
+      if (lineIdx === undefined || lineIdx < 0 || lineIdx >= lines.length) continue;
+      const rowWidth = selectableRowWidth(region, lineIdx);
+      const plain = stripTerminalSequences(sliceByColumn(lines[lineIdx]!, region.col, rowWidth, true));
+      rows.push({ row: r, lineIdx, rowWidth, plain });
+    }
+    this.overlaySel.snapshot = {
+      frame,
+      col: region.col,
+      width: region.width,
+      rows,
+    };
+  }
+
+  private matchesSelectionSnapshot(capturedFrame: Frame | null, rawLines: readonly string[]): boolean {
+    const snap = this.overlaySel.snapshot;
+    if (!snap || !capturedFrame || capturedFrame !== snap.frame) return false;
+    const region = capturedFrame.textRegion;
+    if (!region || region.col !== snap.col || region.width !== snap.width) return false;
+    if (snap.rows.length === 0) return false;
+    for (const entry of snap.rows) {
+      if (entry.row >= region.rows.length) return false;
+      const lineIdx = region.rows[entry.row]!;
+      if (lineIdx !== entry.lineIdx || lineIdx < 0 || lineIdx >= rawLines.length) return false;
+      const rowWidth = selectableRowWidth(region, lineIdx);
+      if (rowWidth !== entry.rowWidth) return false;
+      const plain = stripTerminalSequences(sliceByColumn(rawLines[lineIdx]!, region.col, rowWidth, true));
+      if (plain !== entry.plain) return false;
+    }
+    return true;
+  }
+
+  private handleDefaultMouse(
+    ev: OverlayMouseEvent,
+    ctx: ScreenContext,
+    bounds: { height: number },
+  ): boolean {
+    const termRows = this.terminal.rows || 30;
+    const termCols = this.terminal.columns || this.overlaySel.termCols;
+    if (
+      (this.overlaySel.termRows !== 0 && this.overlaySel.termRows !== termRows) ||
+      (this.overlaySel.termCols !== 0 && this.overlaySel.termCols !== termCols)
+    ) {
+      this.clearOverlaySelection();
+      return false;
+    }
     const frame = this.overlaySel.frame;
     const region = frame?.textRegion;
-    if (!region || region.rows.length === 0 || region.width <= 0) return false;
+    if (!frame || !region || region.rows.length === 0 || region.width <= 0) return false;
+    const visibleHeight = Math.min(this.overlaySel.lines.length, Math.max(0, bounds.height));
+    const visibleRows = region.rows.filter((r) => r >= 0 && r < visibleHeight);
+    if (visibleRows.length === 0) return false;
 
     if (ev.type === "press") {
       if (ev.button !== "left") return false;
-      const rowIdx = region.rows.indexOf(ev.y);
+      const rowIdx = visibleRows.indexOf(ev.y);
       const inCols = ev.x >= region.col && ev.x < region.col + region.width;
       if (rowIdx < 0 || !inCols) {
         if (this.hasActiveSelection) {
@@ -377,19 +487,21 @@ export class Navigator {
       this.overlaySel.head = pt;
       this.overlaySel.dragging = true;
       this.overlaySel.moved = false;
+      this.captureSelectionSnapshot(frame, region, visibleRows);
       return hadActive;
     }
 
     if (ev.type === "drag") {
       if (ev.button !== "left" || !this.overlaySel.dragging || !this.overlaySel.anchor) return false;
       const col = Math.max(0, Math.min(region.width - 1, ev.x - region.col));
-      const rowIdx = nearestTextRowIndex(region.rows, ev.y);
+      const rowIdx = nearestTextRowIndex(visibleRows, ev.y);
       const prevHead = this.overlaySel.head;
       const changed = !prevHead || prevHead.row !== rowIdx || prevHead.col !== col;
       this.overlaySel.head = { row: rowIdx, col };
       if (rowIdx !== this.overlaySel.anchor.row || col !== this.overlaySel.anchor.col) {
         this.overlaySel.moved = true;
       }
+      this.captureSelectionSnapshot(frame, region, visibleRows);
       return changed;
     }
 
@@ -397,7 +509,7 @@ export class Navigator {
       if (ev.button !== "left" || !this.overlaySel.dragging || !this.overlaySel.anchor) return false;
       this.overlaySel.dragging = false;
       const col = Math.max(0, Math.min(region.width - 1, ev.x - region.col));
-      const rowIdx = nearestTextRowIndex(region.rows, ev.y);
+      const rowIdx = nearestTextRowIndex(visibleRows, ev.y);
       this.overlaySel.head = { row: rowIdx, col };
       if (rowIdx !== this.overlaySel.anchor.row || col !== this.overlaySel.anchor.col) {
         this.overlaySel.moved = true;
@@ -406,23 +518,23 @@ export class Navigator {
         this.clearOverlaySelection();
         return false;
       }
+      this.captureSelectionSnapshot(frame, region, visibleRows);
       const sel = normalizeSelection("cell", this.overlaySel.anchor, this.overlaySel.head);
       const lines = this.overlaySel.lines;
-      const scrollbarRows = detectScrollbarRows(lines, region, this.theme);
       const text = extractSelectionText(
         sel,
         (i) => {
-          const lineIdx = region.rows[i];
+          const lineIdx = visibleRows[i];
           if (lineIdx === undefined) return "";
           const line = lines[lineIdx] ?? "";
-          const rowW = scrollbarRows.has(lineIdx) ? Math.max(1, region.width - 2) : region.width;
+          const rowW = selectableRowWidth(region, lineIdx);
           return sliceByColumn(line, region.col, rowW, true);
         },
         region.width,
       );
       if (text) {
         yankText(text, ctx.writeTerminal);
-        frame?.setNotice(`Copied ${text.length} char${text.length === 1 ? "" : "s"}`, "ok");
+        frame.setNotice(`Copied ${text.length} char${text.length === 1 ? "" : "s"}`, "ok");
       }
       return true;
     }
@@ -495,7 +607,7 @@ export class Navigator {
     }
 
     const isDialog = top.variant === "dialog";
-    const maxH = computeOverlayHeight(this.terminal.rows || 30, isDialog);
+    const terminal = this.terminal;
     if (this.handle) {
       this.handle.hide();
       this.handle = null;
@@ -504,7 +616,9 @@ export class Navigator {
       anchor: isDialog ? "center" : "bottom-center",
       width: isDialog ? "80%" : "96%",
       minWidth: isDialog ? 46 : 54,
-      maxHeight: maxH,
+      get maxHeight() {
+        return computeOverlayHeight(terminal.rows || 30, isDialog);
+      },
       margin: { top: 1, bottom: 1, left: 1, right: 1 },
     });
     this.onChange?.();

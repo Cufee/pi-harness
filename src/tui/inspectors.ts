@@ -1504,7 +1504,9 @@ class ArtifactInspectorScreen implements Screen {
     if (!rect || this.frame.hasInlineModal || !this.showingView) return false;
     const localX = ev.x - rect.col;
     const localY = ev.y - rect.row;
-    if (ev.type === "press" && (localX < 0 || localX >= rect.width || localY < 0 || localY >= rect.height)) return;
+    if (ev.type === "press" && (localX < 0 || localX >= rect.width || localY < 0 || localY >= rect.height)) {
+      return false;
+    }
     this.view.handleMouse({ ...ev, x: localX, y: localY }, ctx);
   }
 
@@ -1920,13 +1922,15 @@ export class LiveTranscriptScreen implements Screen {
     });
   }
 
-  handleMouse(ev: OverlayMouseEvent, ctx: ScreenContext): void {
+  handleMouse(ev: OverlayMouseEvent, ctx: ScreenContext): void | boolean {
     this.lastCtx = ctx;
     const rect = this.frame.bodyRect;
-    if (!rect) return;
+    if (!rect || this.frame.hasInlineModal) return false;
     const localX = ev.x - rect.col;
     const localY = ev.y - rect.row;
-    if (ev.type === "press" && (localX < 0 || localX >= rect.width || localY < 0 || localY >= rect.height)) return;
+    if (ev.type === "press" && (localX < 0 || localX >= rect.width || localY < 0 || localY >= rect.height)) {
+      return false;
+    }
     this.view.handleMouse({ ...ev, x: localX, y: localY }, ctx);
   }
 
@@ -2014,12 +2018,14 @@ class GenericDetailScreen implements Screen {
     });
   }
 
-  handleMouse(ev: OverlayMouseEvent, ctx: ScreenContext): void {
+  handleMouse(ev: OverlayMouseEvent, ctx: ScreenContext): void | boolean {
     const rect = this.frame.bodyRect;
-    if (!rect) return;
+    if (!rect || this.frame.hasInlineModal) return false;
     const localX = ev.x - rect.col;
     const localY = ev.y - rect.row;
-    if (ev.type === "press" && (localX < 0 || localX >= rect.width || localY < 0 || localY >= rect.height)) return;
+    if (ev.type === "press" && (localX < 0 || localX >= rect.width || localY < 0 || localY >= rect.height)) {
+      return false;
+    }
     this.view.handleMouse({ ...ev, x: localX, y: localY }, ctx);
   }
 

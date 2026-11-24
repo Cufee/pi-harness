@@ -2,6 +2,7 @@ import { Input, matchesKey } from "@earendil-works/pi-tui";
 import { type Hint, renderHintBar } from "./keymap.js";
 import { clamp, fillLineBg, fit, sanitizeLine, splitRow, visibleWidth } from "./text.js";
 import type { Theme, Tone } from "./tokens.js";
+import { beginScrollbarCapture, endScrollbarCapture, type ScrollbarRowRange } from "./viewport.js";
 
 export interface FrameTab {
   id: string;
@@ -84,6 +85,20 @@ export interface FrameTextRegion {
   width: number;
   rows: number[];
   bodyRows: number[];
+  /** Per-line selectable width overrides derived from rendered Viewport/ListView scrollbar geometry. */
+  rowWidths?: ReadonlyMap<number, number>;
+}
+
+function findLastSubsequence(haystack: readonly string[], needle: readonly string[], endExclusive: number): number {
+  const len = needle.length;
+  if (len === 0 || len > endExclusive) return -1;
+  outer: for (let i = endExclusive - len; i >= 0; i--) {
+    for (let j = 0; j < len; j++) {
+      if (haystack[i + j] !== needle[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
 }
 
 let capturedFrame: Frame | null = null;
@@ -275,7 +290,15 @@ export class Frame {
     if (padY) out.push(boxRow(""));
 
     const bodyRow = out.length;
-    const bodyLines = opts.renderBody(innerW, availBody).slice(0, availBody);
+    beginScrollbarCapture();
+    let rawBodyLines: string[];
+    let scrollbarRanges: ScrollbarRowRange[];
+    try {
+      rawBodyLines = opts.renderBody(innerW, availBody);
+    } finally {
+      scrollbarRanges = endScrollbarCapture();
+    }
+    const bodyLines = rawBodyLines.slice(0, availBody);
     const bodyRows: number[] = [];
     for (const line of bodyLines) {
       const idx = out.length;
@@ -284,6 +307,24 @@ export class Frame {
       bodyRows.push(idx);
     }
     if (bodyLines.length === 0) out.push(boxRow(""));
+
+    const rowWidths = new Map<number, number>();
+    let searchEnd = rawBodyLines.length;
+    for (let k = scrollbarRanges.length - 1; k >= 0; k--) {
+      const range = scrollbarRanges[k]!;
+      const matchIdx =
+        range.lines === rawBodyLines ? 0 : findLastSubsequence(rawBodyLines, range.lines, searchEnd);
+      if (matchIdx < 0) continue;
+      searchEnd = matchIdx;
+      const clampedW = Math.max(1, Math.min(innerW, range.contentWidth));
+      for (let i = 0; i < range.count; i++) {
+        const bodyIdx = matchIdx + range.start + i;
+        if (bodyIdx >= 0 && bodyIdx < bodyLines.length) {
+          rowWidths.set(bodyRow + bodyIdx, clampedW);
+        }
+      }
+    }
+
     this.bodyRect = {
       row: bodyRow,
       col: 1 + padX,
@@ -327,14 +368,32 @@ export class Frame {
           ]
         : opts.hints;
 
-    out.push(boxRow(renderHintBar(footerHints, innerW, theme)));
+    const inlineNotice =
+      (this.confirmState || this.promptState) && this.notice
+        ? clamp(theme.paint(this.notice.tone, this.notice.text), Math.max(1, innerW))
+        : "";
+    if (inlineNotice) {
+      const hintsW = innerW - visibleWidth(inlineNotice) - 2;
+      const footerLine =
+        hintsW >= 4
+          ? splitRow(renderHintBar(footerHints, hintsW, theme), inlineNotice, innerW, 2)
+          : inlineNotice;
+      out.push(boxRow(footerLine));
+    } else {
+      out.push(boxRow(renderHintBar(footerHints, innerW, theme)));
+    }
     out.push(botBorder);
     const rendered = out.slice(0, maxH);
+    const visibleRowWidths = new Map<number, number>();
+    for (const [lineIdx, wOverride] of rowWidths) {
+      if (lineIdx < rendered.length) visibleRowWidths.set(lineIdx, wOverride);
+    }
     this.textRegion = {
       col: 1 + padX,
       width: innerW,
       rows: textRows.filter((r) => r < rendered.length),
       bodyRows: bodyRows.filter((r) => r < rendered.length),
+      ...(visibleRowWidths.size > 0 ? { rowWidths: visibleRowWidths } : {}),
     };
     if (capturingFrame) {
       capturedFrame = this;

@@ -23,16 +23,24 @@ import {
 import {
   EscalationInspectorScreen,
   type InspectorDeps,
+  openEntityInspector,
   TaskInspectorScreen,
 } from "../src/tui/inspectors.js";
+import { KbDetailScreen } from "../src/tui/pickers.js";
 import type { WorkStore } from "../src/tui/store.js";
 
 function makeFakeTerminal(cols = 100, rows = 26) {
   const writes: string[] = [];
   let onDataCb: ((data: string) => void) | null = null;
+  let curCols = cols;
+  let curRows = rows;
   const terminal: Terminal = {
-    columns: cols,
-    rows,
+    get columns() {
+      return curCols;
+    },
+    get rows() {
+      return curRows;
+    },
     kittyProtocolActive: false,
     start(onData) {
       onDataCb = onData;
@@ -58,6 +66,10 @@ function makeFakeTerminal(cols = 100, rows = 26) {
     terminal,
     writes,
     sendInput: (data: string) => onDataCb?.(data),
+    setSize: (nextCols: number, nextRows: number) => {
+      curCols = nextCols;
+      curRows = nextRows;
+    },
   };
 }
 
@@ -528,6 +540,443 @@ describe("Shared Navigator overlay text selection", () => {
 
     const afterPlain = compositeVisible(tui, terminal).map((l) => stripTerminalSequences(l)).join("\n");
     assert.ok(afterPlain.includes("Copied 6 chars"), `Expected "Copied 6 chars" notice in:\n${afterPlain}`);
+
+    nav.closeAll();
+    tui.stop();
+  });
+
+  it("uses live height on height-only grow, cancels selection on height resize, and bounds copy to visible rows", () => {
+    const theme = createTheme({ color: true, ascii: false });
+    const { terminal, writes, sendInput, setSize } = makeFakeTerminal(80, 16);
+    const tui = new ModalScreen(terminal);
+    const nav = new Navigator(tui, terminal, theme);
+    const frame = new Frame();
+    const viewport = new Viewport();
+    const bodyLines = Array.from({ length: 40 }, (_, i) => `row${String(i).padStart(2, "0")} item`);
+
+    const screen: Screen = {
+      title: "ResizeSheet",
+      variant: "sheet",
+      render(width, maxHeight, t) {
+        return frame.render({
+          width,
+          maxHeight,
+          theme: t,
+          breadcrumbs: ["ResizeSheet"],
+          hints: [{ key: "Esc", label: "close" }],
+          renderBody: (innerW, bodyH) => viewport.render(bodyLines, innerW, bodyH, t),
+        });
+      },
+      handleInput(data, ctx) {
+        if (isPopKey(data, ctx)) ctx.navigator.pop();
+      },
+    };
+
+    tui.start();
+    nav.push(screen);
+    const initial = compositeVisible(tui, terminal);
+    const row0Y = initial.findIndex((l) => stripTerminalSequences(l).includes("row00 item"));
+    assert.ok(row0Y >= 0);
+    const row0X = colOf(stripTerminalSequences(initial[row0Y]!), "row00");
+
+    // Select row00 before resizing height.
+    dragCells(sendInput, row0X, row0Y, row0X + 4, row0Y);
+    assert.ok(
+      compositeVisible(tui, terminal).some((l) => l.includes(theme.badgeBg("row00"))),
+      "row00 must be highlighted before height resize",
+    );
+
+    // Grow terminal height only (80x16 -> 80x28): selection must clear and compositor must show newly fitting rows.
+    setSize(80, 28);
+    const grown = compositeVisible(tui, terminal);
+    assert.equal(
+      grown.some((l) => l.includes(theme.badgeBg("row00"))),
+      false,
+      "height-only resize must cancel active selection",
+    );
+
+    // At rows=28, computeOverlayHeight(28, false) = floor(28 * 0.88) = 24.
+    // With the notice row present: chrome = 6 + 1 (notice) + 2 (padY) = 9 -> 15 body rows (row00..row14).
+    const plainGrown = grown.map((l) => stripTerminalSequences(l));
+    assert.ok(
+      plainGrown.some((l) => l.includes("row14 item")),
+      "compositor must use live height after height-only grow so row14 becomes visible",
+    );
+    assert.equal(
+      plainGrown.some((l) => l.includes("row15 item")),
+      false,
+      "row15 must remain scrolled off while notice occupies 1 row",
+    );
+
+    // Clear notice so body holds 16 rows (row00..row15), then drag from row15 past the bottom of the terminal.
+    frame.setNotice("");
+    const plainNoNotice = compositeVisible(tui, terminal).map((l) => stripTerminalSequences(l));
+    assert.ok(plainNoNotice.some((l) => l.includes("row15 item")));
+    assert.equal(plainNoNotice.some((l) => l.includes("row16 item")), false);
+    const lastVisibleTag = "row15 item";
+    const lastVisibleY = plainNoNotice.findIndex((l) => l.includes(lastVisibleTag));
+    const startX = colOf(plainNoNotice[lastVisibleY]!, lastVisibleTag);
+
+    // Drag from the last visible row all the way past the bottom of the terminal: must copy only that visible row.
+    writes.length = 0;
+    dragCells(sendInput, startX, lastVisibleY, startX + lastVisibleTag.length - 1, terminal.rows - 1);
+    assert.deepEqual(extractOsc52Payloads(writes), [lastVisibleTag]);
+
+    nav.closeAll();
+    tui.stop();
+  });
+
+  it("invalidates selection when selected row text changes or captured frame disappears, while keeping unrelated repaints", () => {
+    const theme = createTheme({ color: true, ascii: false });
+    const { terminal, writes, sendInput } = makeFakeTerminal(80, 18);
+    const tui = new ModalScreen(terminal);
+    const nav = new Navigator(tui, terminal, theme);
+    const frame = new Frame();
+    let rows = ["row00 alpha", "row01 beta"];
+    let useFrame = true;
+
+    const screen: Screen = {
+      title: "RefreshSheet",
+      variant: "sheet",
+      render(width, maxHeight, t) {
+        if (!useFrame) return rows.slice(0, maxHeight);
+        return frame.render({
+          width,
+          maxHeight,
+          theme: t,
+          breadcrumbs: ["RefreshSheet"],
+          hints: [{ key: "Esc", label: "close" }],
+          renderBody: () => rows,
+        });
+      },
+      handleInput(data, ctx) {
+        if (isPopKey(data, ctx)) ctx.navigator.pop();
+      },
+    };
+
+    tui.start();
+    nav.push(screen);
+    const visible = compositeVisible(tui, terminal);
+    const row0Y = visible.findIndex((l) => stripTerminalSequences(l).includes("row00 alpha"));
+    assert.ok(row0Y >= 0);
+    const row0X = colOf(stripTerminalSequences(visible[row0Y]!), "row00");
+
+    writes.length = 0;
+    dragCells(sendInput, row0X, row0Y, row0X + 4, row0Y);
+    assert.deepEqual(extractOsc52Payloads(writes), ["row00"]);
+
+    // Unrelated row update preserves highlight.
+    rows = ["row00 alpha", "row01 changed"];
+    assert.ok(
+      compositeVisible(tui, terminal).some((l) => l.includes(theme.badgeBg("row00"))),
+      "unrelated repaint must preserve selection highlight",
+    );
+
+    // Changing selected row's text invalidates highlight and stops stale state from consuming Esc.
+    rows = ["new00 alpha", "row01 changed"];
+    const afterRefresh = compositeVisible(tui, terminal);
+    assert.equal(
+      afterRefresh.some((l) => l.includes(theme.badgeBg("new00"))),
+      false,
+      "refreshed text on selected row must not inherit stale highlight",
+    );
+    sendInput("\x1b");
+    assert.equal(nav.isOpen, false, "Esc must pop immediately after selection was invalidated by refresh");
+
+    // Re-open, select, then drop Frame capture: stale selection must not consume Esc.
+    nav.push(screen);
+    const visible2 = compositeVisible(tui, terminal);
+    const new0Y = visible2.findIndex((l) => stripTerminalSequences(l).includes("new00 alpha"));
+    const new0X = colOf(stripTerminalSequences(visible2[new0Y]!), "new00");
+    dragCells(sendInput, new0X, new0Y, new0X + 4, new0Y);
+    useFrame = false;
+    compositeVisible(tui, terminal);
+    sendInput("\x1b");
+    assert.equal(nav.isOpen, false, "Esc must pop when captured frame disappears");
+
+    nav.closeAll();
+    tui.stop();
+  });
+
+  it("lets default overlay selection drag subtitles on loaded ArtifactInspectorScreen and KbDetailScreen while keeping body drags on TranscriptView", async () => {
+    const theme = createTheme({ color: true, ascii: false });
+    const { terminal, writes, sendInput } = makeFakeTerminal(100, 24);
+    const tui = new ModalScreen(terminal);
+    const nav = new Navigator(tui, terminal, theme);
+
+    const artifactDeps: InspectorDeps = {
+      repoRoot: "/tmp/repo",
+      store: {} as unknown as WorkStore,
+      client: {
+        async request(method: string) {
+          assert.equal(method, "artifact.read");
+          return {
+            content: "Artifact body first line\nArtifact body second line",
+            totalChars: 50,
+            hasMore: false,
+          };
+        },
+      } as unknown as DaemonClient,
+    };
+
+    tui.start();
+    openEntityInspector(
+      { kind: "artifact", id: "artifacts/report.md", label: "report.md", runId: "run-34" },
+      artifactDeps,
+      {
+        navigator: nav,
+        theme,
+        requestRender: () => nav.requestRender(),
+        writeTerminal: (seq) => terminal.write(seq),
+      },
+    );
+    await new Promise((r) => setTimeout(r, 0));
+
+    const artVisible = compositeVisible(tui, terminal);
+    const artSubY = artVisible.findIndex((l) => stripTerminalSequences(l).includes("artifacts/report.md"));
+    assert.ok(artSubY >= 0, "ArtifactInspectorScreen subtitle must be visible");
+    const artSubPlain = stripTerminalSequences(artVisible[artSubY]!);
+    const artX0 = colOf(artSubPlain, "artifacts/report.md");
+    const artX1 = artX0 + "artifacts/report.md".length - 1;
+
+    writes.length = 0;
+    dragCells(sendInput, artX0, artSubY, artX1, artSubY);
+    assert.deepEqual(extractOsc52Payloads(writes), ["artifacts/report.md"]);
+
+    // Body drag starting inside TranscriptView and dragging up onto subtitle stays owned by TranscriptView.
+    const artBodyY = artVisible.findIndex((l) => stripTerminalSequences(l).includes("Artifact body first line"));
+    assert.ok(artBodyY > artSubY);
+    const artBodyPlain = stripTerminalSequences(artVisible[artBodyY]!);
+    const bodyX0 = colOf(artBodyPlain, "Artifact");
+    writes.length = 0;
+    dragCells(sendInput, bodyX0 + 7, artBodyY, bodyX0, artSubY);
+    assert.deepEqual(extractOsc52Payloads(writes), ["Artifact"]);
+
+    nav.pop();
+
+    // KbDetailScreen loaded subtitle drag.
+    const kbClient = {
+      async request(method: string) {
+        assert.equal(method, "kb.get");
+        return [
+          {
+            id: "kb-7",
+            kind: "invariant",
+            title: "Gateway timeout fix",
+            summary: "Retry on transient 504.",
+            contextMd: "Details about gateway timeouts.",
+            status: "active",
+            confidence: "verified",
+            tags: ["net"],
+            pathGlobs: ["src/**"],
+            hitCount: 3,
+            evidencePaths: [],
+          },
+        ];
+      },
+    } as unknown as DaemonClient;
+    const kbScreen = new KbDetailScreen(kbClient, {
+      id: "kb-7",
+      kind: "invariant",
+      title: "Gateway timeout fix",
+      summary: "Retry on transient 504.",
+      status: "active",
+      confidence: "verified",
+      tags: ["net"],
+      pathGlobs: ["src/**"],
+      hitCount: 3,
+      repoScope: "repo",
+      verifiedSha: null,
+    });
+    nav.push(kbScreen);
+    await new Promise((r) => setTimeout(r, 0));
+
+    const kbVisible = compositeVisible(tui, terminal);
+    const kbSubY = kbVisible.findIndex((l) => stripTerminalSequences(l).includes("Gateway timeout fix"));
+    assert.ok(kbSubY >= 0, "KbDetailScreen subtitle must be visible");
+    const kbSubPlain = stripTerminalSequences(kbVisible[kbSubY]!);
+    const kbX0 = colOf(kbSubPlain, "Gateway timeout fix");
+    const kbX1 = kbX0 + "Gateway timeout fix".length - 1;
+
+    writes.length = 0;
+    dragCells(sendInput, kbX0, kbSubY, kbX1, kbSubY);
+    assert.deepEqual(extractOsc52Payloads(writes), ["Gateway timeout fix"]);
+
+    nav.closeAll();
+    tui.stop();
+  });
+
+  it("uses rendered Viewport geometry for scrollbars: keeps literal ASCII #/: suffixes and strips 1-row overflowing scrollbars", () => {
+    const theme = createTheme({ color: true, ascii: true });
+    const { terminal, writes, sendInput } = makeFakeTerminal(70, 16);
+    const tui = new ModalScreen(terminal);
+    const nav = new Navigator(tui, terminal, theme);
+    const frame = new Frame();
+
+    // 1) Non-scrolling ASCII lines whose last two columns are literally " #" and " :" must NOT be stripped.
+    const literalScreen: Screen = {
+      title: "AsciiLiteral",
+      variant: "dialog",
+      render(width, maxHeight, t) {
+        return frame.render({
+          width,
+          maxHeight,
+          theme: t,
+          breadcrumbs: ["AsciiLiteral"],
+          hints: [{ key: "Esc", label: "close" }],
+          renderBody: (innerW) => [
+            `${"alpha".padEnd(innerW - 2)} #`,
+            `${"beta".padEnd(innerW - 2)} :`,
+          ],
+        });
+      },
+      handleInput(data, ctx) {
+        if (isPopKey(data, ctx)) ctx.navigator.pop();
+      },
+    };
+
+    tui.start();
+    nav.push(literalScreen);
+    const litVisible = compositeVisible(tui, terminal);
+    const aY = litVisible.findIndex((l) => stripTerminalSequences(l).includes("alpha"));
+    const bY = litVisible.findIndex((l) => stripTerminalSequences(l).includes("beta"));
+    assert.ok(aY >= 0 && bY === aY + 1);
+    const plainA = stripTerminalSequences(litVisible[aY]!);
+    const plainB = stripTerminalSequences(litVisible[bY]!);
+    const startX = colOf(plainA, "alpha");
+    const endX = visibleWidth(plainB.slice(0, plainB.lastIndexOf(":")));
+
+    writes.length = 0;
+    dragCells(sendInput, startX, aY, endX, bY);
+    const copiedLit = extractOsc52Payloads(writes);
+    assert.equal(copiedLit.length, 1);
+    assert.equal(copiedLit[0]!.split("\n")[0]!.endsWith(" #"), true, `Expected trailing " #" preserved, got ${JSON.stringify(copiedLit[0])}`);
+    assert.equal(copiedLit[0]!.split("\n")[1]!.endsWith(" :"), true, `Expected trailing " :" preserved, got ${JSON.stringify(copiedLit[0])}`);
+
+    nav.pop();
+
+    // 2) Banner + 1-row overflowing Viewport in ASCII must strip the scrollbar "#" on the viewport row.
+    const viewport = new Viewport();
+    const oneRowScreen: Screen = {
+      title: "BannerOneRow",
+      variant: "dialog",
+      render(width, maxHeight, t) {
+        return frame.render({
+          width,
+          maxHeight,
+          theme: t,
+          breadcrumbs: ["BannerOneRow"],
+          hints: [{ key: "Esc", label: "close" }],
+          renderBody: (innerW) => [
+            "Banner header",
+            ...viewport.render(["item-one", "item-two", "item-three"], innerW, 1, t),
+          ],
+        });
+      },
+      handleInput(data, ctx) {
+        if (isPopKey(data, ctx)) ctx.navigator.pop();
+      },
+    };
+
+    nav.push(oneRowScreen);
+    const oneVisible = compositeVisible(tui, terminal);
+    const banY = oneVisible.findIndex((l) => stripTerminalSequences(l).includes("Banner header"));
+    const itemY = oneVisible.findIndex((l) => stripTerminalSequences(l).includes("item-one"));
+    assert.ok(banY >= 0 && itemY === banY + 1);
+    const plainBan = stripTerminalSequences(oneVisible[banY]!);
+    const plainItem = stripTerminalSequences(oneVisible[itemY]!);
+    assert.ok(plainItem.includes("#"), "1-row overflowing ASCII viewport must render '#' thumb");
+    const bStartX = colOf(plainBan, "Banner");
+    const hashX = visibleWidth(plainItem.slice(0, plainItem.lastIndexOf("#")));
+
+    writes.length = 0;
+    dragCells(sendInput, bStartX, banY, hashX, itemY);
+    assert.deepEqual(extractOsc52Payloads(writes), ["Banner header\nitem-one"]);
+
+    nav.closeAll();
+    tui.stop();
+  });
+
+  it("shows copy notice alongside active inline confirm and prompt without breaking confirmation or input", () => {
+    const theme = createTheme({ color: false, ascii: false });
+    const { terminal, writes, sendInput } = makeFakeTerminal(90, 18);
+    const tui = new ModalScreen(terminal);
+    const nav = new Navigator(tui, terminal, theme);
+    const frame = new Frame();
+    let confirmed = false;
+    let submitted: string | null = null;
+
+    const screen: Screen = {
+      title: "InlineNotice",
+      variant: "dialog",
+      render(width, maxHeight, t) {
+        return frame.render({
+          width,
+          maxHeight,
+          theme: t,
+          breadcrumbs: ["InlineNotice"],
+          hints: [{ key: "Esc", label: "close" }],
+          renderBody: () => ["Body copyable line"],
+        });
+      },
+      handleInput(data, ctx) {
+        if (frame.handleInlineInput(data, ctx.requestRender)) return;
+        if (isPopKey(data, ctx)) ctx.navigator.pop();
+      },
+    };
+
+    tui.start();
+    nav.push(screen);
+
+    // 1) Active confirm: dragging confirm label copies and renders "Copied 4 chars" alongside confirm; 'y' still confirms.
+    frame.askConfirm({
+      message: "Delete worker t-99?",
+      onConfirm: () => {
+        confirmed = true;
+      },
+    });
+    const confirmVisible = compositeVisible(tui, terminal);
+    const confirmY = confirmVisible.findIndex((l) => stripTerminalSequences(l).includes("Delete worker t-99?"));
+    assert.ok(confirmY >= 0);
+    const confirmX0 = colOf(stripTerminalSequences(confirmVisible[confirmY]!), "t-99");
+
+    writes.length = 0;
+    dragCells(sendInput, confirmX0, confirmY, confirmX0 + 3, confirmY);
+    assert.deepEqual(extractOsc52Payloads(writes), ["t-99"]);
+
+    const afterConfirmCopy = compositeVisible(tui, terminal).map((l) => stripTerminalSequences(l)).join("\n");
+    assert.ok(afterConfirmCopy.includes("Delete worker t-99?"), "confirm message must remain visible");
+    assert.ok(afterConfirmCopy.includes("Copied 4 chars"), `Expected "Copied 4 chars" alongside confirm in:\n${afterConfirmCopy}`);
+
+    sendInput("y");
+    assert.equal(confirmed, true, "'y' must still confirm after copying");
+    assert.equal(frame.hasInlineModal, false);
+
+    // 2) Active prompt: dragging body text copies and renders notice alongside prompt; typing + Enter still submits.
+    frame.askPrompt({
+      label: "Reason",
+      onSubmit: (v) => {
+        submitted = v;
+      },
+    });
+    const promptVisible = compositeVisible(tui, terminal);
+    const bodyY = promptVisible.findIndex((l) => stripTerminalSequences(l).includes("Body copyable line"));
+    assert.ok(bodyY >= 0);
+    const bodyX0 = colOf(stripTerminalSequences(promptVisible[bodyY]!), "copyable");
+
+    writes.length = 0;
+    dragCells(sendInput, bodyX0, bodyY, bodyX0 + "copyable".length - 1, bodyY);
+    assert.deepEqual(extractOsc52Payloads(writes), ["copyable"]);
+
+    const afterPromptCopy = compositeVisible(tui, terminal).map((l) => stripTerminalSequences(l)).join("\n");
+    assert.ok(afterPromptCopy.includes("Reason:"), "prompt must remain visible");
+    assert.ok(afterPromptCopy.includes("Copied 8 chars"), `Expected "Copied 8 chars" alongside prompt in:\n${afterPromptCopy}`);
+
+    sendInput("o");
+    sendInput("k");
+    sendInput("\r");
+    assert.equal(submitted, "ok", "typing and Enter must still submit prompt after copying");
+    assert.equal(frame.hasInlineModal, false);
 
     nav.closeAll();
     tui.stop();
