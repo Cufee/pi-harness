@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "bun:test";
@@ -67,6 +67,195 @@ function waitForAbort(signal: AbortSignal): Promise<void> {
 }
 
 describe("restart-recovery", () => {
+  it("relaunches interrupted tasks in place", async () => {
+    const repoDir = initTempGitRepo();
+    const stateDir = join(repoDir, ".state");
+    const dbPath = join(stateDir, "control-plane.sqlite");
+    const cfgA = makeTestConfig(repoDir, stateDir);
+
+    let orchId = "";
+    let childT3Id = "";
+    let workerId = "";
+    let readyTaskId = "";
+    let pendingTaskId = "";
+    let workerRunning = false;
+    let childT3Running = false;
+
+    const runnerA: CustomRunnerFactory = () => ({
+      run: async (req: RunAgentRequest): Promise<RunAgentResult> => {
+        if (req.tier === 1) {
+          orchId = req.taskId;
+          const t3 = (await req.executeTool("spawn_task", {
+            kind: "research",
+            title: "Active scout",
+            objective: "Scout running during restart",
+            profile_id: "pi:local",
+            model: "fixture",
+          })) as { spawned: string };
+          childT3Id = t3.spawned;
+
+          const w = (await req.executeTool("spawn_worker", {
+            title: "Leased worker",
+            objective: "Worker with active write leases",
+            write_scopes: ["src/leased/**"],
+            profile_id: "pi:local",
+            model: "fixture",
+          })) as { spawned: string };
+          workerId = w.spawned;
+
+          const dep = (await req.executeTool("spawn_task", {
+            kind: "research",
+            title: "Dependent scout",
+            objective: "Waits for Active scout",
+            depends_on: [childT3Id],
+            profile_id: "pi:local",
+            model: "fixture",
+          })) as { spawned: string };
+          pendingTaskId = dep.spawned;
+
+          await req.executeTool("wait_children", { ids: [childT3Id, workerId], mode: "all", fallback_interval_s: 60 });
+          await waitForAbort(req.signal);
+          return { text: "interrupted", stopReason: "cancelled" };
+        }
+        if (req.taskId === childT3Id) {
+          childT3Running = true;
+          await waitForAbort(req.signal);
+          return { text: "interrupted", stopReason: "cancelled" };
+        }
+        if (req.taskId === workerId) {
+          workerRunning = true;
+          await waitForAbort(req.signal);
+          return { text: "interrupted", stopReason: "cancelled" };
+        }
+        await waitForAbort(req.signal);
+        return { text: "interrupted", stopReason: "cancelled" };
+      },
+    });
+
+    const a = new HarnessDaemon(cfgA, { dbPath, customRunnerFactory: runnerA });
+    await a.start();
+    let runId = "";
+    let statusesBeforeStop = new Map<string, string>();
+    let gensBeforeStop = new Map<string, number>();
+    let taskIdsBeforeStop: string[] = [];
+
+    try {
+      const started = await a.orchestrator.startRun({
+        goal: "In-place restart recovery",
+        repoRoot: repoDir,
+        profileId: "pi:local",
+        model: "fixture",
+      });
+      runId = started.run.id;
+
+      await waitUntil(
+        () =>
+          Boolean(orchId && childT3Id && workerId && pendingTaskId) &&
+          workerRunning &&
+          childT3Running &&
+          a.db.getTask(orchId)?.status === "waiting_children",
+      );
+
+      // Insert an unlaunched `ready` task into the active run before stopping.
+      const readyRec = a.db.createTask({
+        runId,
+        parentId: orchId,
+        tier: 3,
+        kind: "research",
+        title: "Unlaunched ready scout",
+        objective: "Never started before stop",
+        readOnly: true,
+        profileId: "pi:local",
+        model: "fixture",
+      });
+      readyTaskId = readyRec.id;
+
+      const beforeTasks = a.db.listTasks(runId);
+      taskIdsBeforeStop = beforeTasks.map((t) => t.id).sort();
+      statusesBeforeStop = new Map(beforeTasks.map((t) => [t.id, t.status]));
+      gensBeforeStop = new Map(beforeTasks.map((t) => [t.id, t.generation]));
+
+      assert.equal(statusesBeforeStop.get(orchId), "waiting_children");
+      assert.equal(statusesBeforeStop.get(childT3Id), "running");
+      assert.equal(statusesBeforeStop.get(workerId), "running");
+      assert.equal(statusesBeforeStop.get(readyTaskId), "ready");
+      assert.equal(statusesBeforeStop.get(pendingTaskId), "pending");
+
+      await a.stop();
+    } finally {
+      await a.stop().catch(() => {});
+    }
+
+    const runCountsB = new Map<string, number>();
+    const promptsB = new Map<string, string>();
+    const runnerB: CustomRunnerFactory = () => ({
+      run: async (req: RunAgentRequest): Promise<RunAgentResult> => {
+        runCountsB.set(req.taskId, (runCountsB.get(req.taskId) ?? 0) + 1);
+        promptsB.set(req.taskId, req.initialPrompt);
+        await waitForAbort(req.signal);
+        return { text: "stopped", stopReason: "cancelled" };
+      },
+    });
+
+    const b = new HarnessDaemon(makeTestConfig(repoDir, stateDir), {
+      dbPath,
+      customRunnerFactory: runnerB,
+      recoveryStaggerMs: 25,
+    });
+    try {
+      // Verify a.stop() did not rewrite any task status in SQLite.
+      for (const [id, status] of statusesBeforeStop) {
+        assert.equal(b.db.getTask(id)?.status, status, `Task ${id} status must be unchanged after stop`);
+      }
+
+      await b.start();
+      // Between phase A and phase B completion, getEffectiveRun must stay active.
+      assert.equal(b.orchestrator.getEffectiveRun(runId)?.status, "active");
+      await b.recovered;
+      await waitUntil(
+        () =>
+          runCountsB.get(orchId) === 1 &&
+          runCountsB.get(childT3Id) === 1 &&
+          runCountsB.get(workerId) === 1 &&
+          runCountsB.get(readyTaskId) === 1,
+      );
+
+      const afterTasks = b.db.listTasks(runId);
+      assert.deepEqual(
+        afterTasks.map((t) => t.id).sort(),
+        taskIdsBeforeStop,
+        "Task ID set must be unchanged",
+      );
+
+      const statusEvents = b.db.db
+        .prepare("SELECT payload_json FROM events WHERE run_id = ? AND type = 'task.status'")
+        .all(runId) as Array<{ payload_json: string }>;
+      for (const ev of statusEvents) {
+        const p = JSON.parse(ev.payload_json) as { to?: string };
+        assert.ok(p.to !== "failed" && p.to !== "cancelled", `Unexpected failed/cancelled task.status event: ${ev.payload_json}`);
+      }
+
+      for (const [id, gen] of gensBeforeStop) {
+        assert.equal(b.db.getTask(id)?.generation, gen, `Task ${id} generation must be unchanged`);
+      }
+
+      assert.deepEqual(b.db.listActiveWriteScopes(runId, workerId), ["src/leased/**"], "Worker leases must stay active");
+      assert.equal(runCountsB.get(orchId), 1);
+      assert.equal(runCountsB.get(childT3Id), 1);
+      assert.equal(runCountsB.get(workerId), 1);
+      assert.equal(runCountsB.get(readyTaskId), 1);
+      assert.equal(runCountsB.get(pendingTaskId) ?? 0, 0);
+      assert.equal(b.db.getTask(pendingTaskId)?.status, "pending");
+
+      const orchPrompt = promptsB.get(orchId) ?? "";
+      assert.ok(orchPrompt.includes(childT3Id), "Orchestrator prompt must contain child ID");
+      assert.ok(orchPrompt.includes("tree_view"), "Orchestrator prompt must mention tree_view");
+    } finally {
+      await b.stop();
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
   it("wait_timer and schedule_timer rows survive a stop", async () => {
     const repoDir = initTempGitRepo();
     const stateDir = join(repoDir, ".state");
@@ -75,10 +264,14 @@ describe("restart-recovery", () => {
 
     let waitTimerId = "";
     let schedTimerId = "";
+    let runId = "";
+    let taskId = "";
     let waitingNow = false;
 
     const runnerA: CustomRunnerFactory = () => ({
       run: async (req: RunAgentRequest): Promise<RunAgentResult> => {
+        runId = req.runId;
+        taskId = req.taskId;
         const sched = (await req.executeTool("schedule_timer", {
           delay_seconds: 0.6,
           reason: "scheduled check",
@@ -112,10 +305,16 @@ describe("restart-recovery", () => {
 
       await a.stop();
 
+      let relaunchPrompt = "";
       const b = new HarnessDaemon(makeTestConfig(repoDir, stateDir), {
         dbPath,
         customRunnerFactory: () => ({
           run: async (req) => {
+            relaunchPrompt = req.initialPrompt;
+            req.onHandle?.({
+              steer: async () => true,
+              cancel: async () => {},
+            });
             await waitForAbort(req.signal);
             return { text: "", stopReason: "cancelled" };
           },
@@ -131,11 +330,301 @@ describe("restart-recovery", () => {
           () => b.db.timers.get(waitTimerId)?.status === "fired" && b.db.timers.get(schedTimerId)?.status === "fired",
           4000,
         );
+        await waitUntil(() => relaunchPrompt.length > 0);
+        assert.ok(relaunchPrompt.includes(waitTimerId), `Relaunch prompt must name wait_timer ${waitTimerId}`);
+        assert.ok(relaunchPrompt.includes(schedTimerId), `Relaunch prompt must name schedule_timer ${schedTimerId}`);
+
+        const steeredEvents = b.db.db
+          .prepare("SELECT payload_json FROM events WHERE run_id = ? AND task_id = ? AND type = 'agent.steered'")
+          .all(runId, taskId) as Array<{ payload_json: string }>;
+        const accepted = steeredEvents
+          .map((e) => JSON.parse(e.payload_json) as { accepted?: boolean; message?: string })
+          .filter((p) => p.accepted === true && typeof p.message === "string");
+        assert.equal(
+          accepted.filter((p) => p.message!.includes(waitTimerId)).length,
+          1,
+          "Expected exactly one accepted steer for wait_timer",
+        );
+        assert.equal(
+          accepted.filter((p) => p.message!.includes(schedTimerId)).length,
+          1,
+          "Expected exactly one accepted steer for schedule_timer",
+        );
       } finally {
         await b.stop();
       }
     } finally {
       await a.stop().catch(() => {});
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it("only active runs are recovered", async () => {
+    const repoDir = initTempGitRepo();
+    const stateDir = join(repoDir, ".state");
+    const dbPath = join(stateDir, "control-plane.sqlite");
+
+    const a = new HarnessDaemon(makeTestConfig(repoDir, stateDir), {
+      dbPath,
+      customRunnerFactory: () => ({
+        run: async () => ({ text: "ok", stopReason: "completed" }),
+      }),
+    });
+    const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    const stoppedRun = a.db.createRun({ goal: "Stopped run", repoRoot: repoDir, baseBranch: "main", baseSha });
+    const stoppedTask = a.db.createTask({
+      runId: stoppedRun.id,
+      tier: 1,
+      kind: "orchestrator",
+      title: "Stopped running task",
+      objective: "Should fail via legacy rule",
+      profileId: "pi:local",
+      model: "fixture",
+    });
+    a.db.updateTask(stoppedTask.id, { status: "running" });
+    a.db.updateRunStatus(stoppedRun.id, "stopped");
+
+    const completedRun = a.db.createRun({ goal: "Completed run", repoRoot: repoDir, baseBranch: "main", baseSha });
+    const completedTask = a.db.createTask({
+      runId: completedRun.id,
+      tier: 1,
+      kind: "orchestrator",
+      title: "Finished orch",
+      objective: "Done",
+      profileId: "pi:local",
+      model: "fixture",
+    });
+    a.db.updateTask(completedTask.id, { status: "completed", summary: "Done" });
+    const orphanReady = a.db.createTask({
+      runId: completedRun.id,
+      parentId: completedTask.id,
+      tier: 3,
+      kind: "research",
+      title: "Orphan ready child",
+      objective: "Should fail via legacy rule",
+      readOnly: true,
+      profileId: "pi:local",
+      model: "fixture",
+    });
+    a.db.updateRunStatus(completedRun.id, "completed");
+    await a.stop();
+
+    const ranInB: string[] = [];
+    const b = new HarnessDaemon(makeTestConfig(repoDir, stateDir), {
+      dbPath,
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          ranInB.push(req.taskId);
+          return { text: "should not run", stopReason: "completed" };
+        },
+      }),
+    });
+    try {
+      await b.start();
+      await b.recovered;
+
+      const tStopped = b.db.getTask(stoppedTask.id)!;
+      const tOrphan = b.db.getTask(orphanReady.id)!;
+      assert.equal(tStopped.status, "failed");
+      assert.ok(tStopped.summary?.includes("Interrupted by daemon restart"));
+      assert.equal(tOrphan.status, "failed");
+      assert.ok(tOrphan.summary?.includes("Interrupted by daemon restart"));
+      assert.deepEqual(ranInB, []);
+    } finally {
+      await b.stop();
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it("missing worktree is recreated and a merged worktree survives the sweep", async () => {
+    const repoDir = initTempGitRepo();
+    const stateDir = join(repoDir, ".state");
+    const dbPath = join(stateDir, "control-plane.sqlite");
+
+    const a = new HarnessDaemon(makeTestConfig(repoDir, stateDir), {
+      dbPath,
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          await waitForAbort(req.signal);
+          return { text: "stopped", stopReason: "cancelled" };
+        },
+      }),
+    });
+    const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    const run = a.db.createRun({ goal: "Worktree recovery", repoRoot: repoDir, baseBranch: "main", baseSha });
+    const orch = a.db.createTask({
+      runId: run.id,
+      tier: 1,
+      kind: "orchestrator",
+      title: "Orch",
+      objective: "Coordinate",
+      profileId: "pi:local",
+      model: "fixture",
+    });
+    a.db.updateTask(orch.id, { status: "completed", summary: "Done" });
+
+    const missingWtWorker = a.db.createTask({
+      runId: run.id,
+      parentId: orch.id,
+      tier: 2,
+      kind: "worker",
+      title: "Worker with missing checkout",
+      objective: "Continue after worktree recreated",
+      readOnly: false,
+      profileId: "pi:local",
+      model: "fixture",
+      writeScopes: ["src/missing/**"],
+    });
+    const mgrA = a.orchestrator.getWorktreeManager(repoDir);
+    const createdMissingWt = await mgrA.createForWorker(run.id, missingWtWorker.id);
+    a.db.updateTask(missingWtWorker.id, { status: "running" });
+
+    const mergedWtWorker = a.db.createTask({
+      runId: run.id,
+      parentId: orch.id,
+      tier: 2,
+      kind: "worker",
+      title: "Ready worker with merged worktree",
+      objective: "Return after merge",
+      readOnly: false,
+      profileId: "pi:local",
+      model: "fixture",
+      writeScopes: ["src/merged/**"],
+    });
+    const createdMergedWt = await mgrA.createForWorker(run.id, mergedWtWorker.id);
+    a.db.updateWorktree(createdMergedWt.id, { status: "merged" });
+    // Keep mergedWtWorker in `ready` status.
+    assert.equal(a.db.getTask(mergedWtWorker.id)?.status, "ready");
+
+    // Verify sweep keeps the merged worktree while its task is `ready`.
+    await mgrA.sweep();
+    assert.ok(existsSync(createdMergedWt.path), "Merged worktree of ready task must survive sweep");
+
+    await a.stop();
+
+    // Delete the first worker's checkout directory while the daemon is down.
+    rmSync(createdMissingWt.path, { recursive: true, force: true });
+    assert.equal(existsSync(createdMissingWt.path), false);
+
+    let recreatedCwd = "";
+    let recreatedPrompt = "";
+    const b = new HarnessDaemon(makeTestConfig(repoDir, stateDir), {
+      dbPath,
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          if (req.taskId === missingWtWorker.id) {
+            recreatedCwd = req.cwd;
+            recreatedPrompt = req.initialPrompt;
+          }
+          await waitForAbort(req.signal);
+          return { text: "stopped", stopReason: "cancelled" };
+        },
+      }),
+    });
+    try {
+      await b.start();
+      await b.recovered;
+      await waitUntil(() => recreatedCwd.length > 0);
+
+      assert.ok(existsSync(recreatedCwd), `Recreated worktree cwd must exist: ${recreatedCwd}`);
+      assert.ok(
+        recreatedPrompt.includes("archived before the daemon restart"),
+        `Prompt must contain archive note, got: ${recreatedPrompt}`,
+      );
+      assert.notEqual(b.db.getTask(missingWtWorker.id)?.status, "failed");
+
+      // Also verify sweep on daemon B keeps the merged worktree while its task is active/ready.
+      await b.orchestrator.getWorktreeManager(repoDir).sweep();
+      assert.ok(existsSync(createdMergedWt.path), "Merged worktree must still exist after sweep");
+    } finally {
+      await b.stop();
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it("stale bridge token is refused", async () => {
+    const repoDir = initTempGitRepo();
+    const stateDir = join(repoDir, ".state");
+    const dbPath = join(stateDir, "control-plane.sqlite");
+
+    const a = new HarnessDaemon(makeTestConfig(repoDir, stateDir), {
+      dbPath,
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          await waitForAbort(req.signal);
+          return { text: "stopped", stopReason: "cancelled" };
+        },
+      }),
+    });
+    const nonceA = a.instanceNonce;
+    await a.start();
+    let runId = "";
+    let taskId = "";
+    try {
+      const started = await a.orchestrator.startRun({
+        goal: "Bridge token nonce check",
+        repoRoot: repoDir,
+        profileId: "pi:local",
+        model: "fixture",
+      });
+      runId = started.run.id;
+      await waitUntil(() => a.db.listTasks(runId).some((t) => t.status === "running"));
+      taskId = a.db.listTasks(runId)[0]!.id;
+      await a.stop();
+    } finally {
+      await a.stop().catch(() => {});
+    }
+
+    const cfgB = makeTestConfig(repoDir, stateDir);
+    const b = new HarnessDaemon(cfgB, {
+      dbPath,
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          await waitForAbort(req.signal);
+          return { text: "stopped", stopReason: "cancelled" };
+        },
+      }),
+    });
+    await b.start();
+    await b.recovered;
+    const client = new DaemonClient(cfgB.socketPath);
+    await client.connect();
+    try {
+      await waitUntil(() => b.db.getTask(taskId)?.status === "running");
+      const gen = b.db.getTask(taskId)!.generation;
+
+      await assert.rejects(
+        () =>
+          client.request("tool.call", {
+            runId,
+            taskId: `${taskId}@g${gen}@${nonceA}`,
+            name: "__list_tools",
+            args: {},
+          }),
+        /previous harnessd process/,
+      );
+
+      await assert.rejects(
+        () =>
+          client.request("tool.call", {
+            runId,
+            taskId: `${taskId}@g${gen}`,
+            name: "__list_tools",
+            args: {},
+          }),
+        /previous harnessd process/,
+      );
+
+      const tools = await client.request<Array<{ name: string }>>("tool.call", {
+        runId,
+        taskId: `${taskId}@g${gen}@${b.instanceNonce}`,
+        name: "__list_tools",
+        args: {},
+      });
+      assert.ok(Array.isArray(tools) && tools.length > 0, "Current daemon nonce must allow __list_tools");
+    } finally {
+      client.close();
+      await b.stop();
       rmSync(repoDir, { recursive: true, force: true });
     }
   });
@@ -194,7 +683,6 @@ describe("restart-recovery", () => {
       });
       chatId = opened.session.id;
 
-      // Start the Director turn in the background and wait until spawn_task completes and it blocks.
       const sendPromise = clientA
         .request("chat.send", { chatSessionId: chatId, text: "Delegate a scout" })
         .catch(() => {});
@@ -298,7 +786,6 @@ describe("restart-recovery", () => {
         .catch(() => {});
       await waitUntil(() => inFlight);
 
-      // Queue one timer.fired chat event behind the active Director turn.
       const wakeEvent = {
         kind: "timer.fired" as const,
         timerId: "timer-99",
@@ -345,11 +832,111 @@ describe("restart-recovery", () => {
       assert.equal(remaining.n, 0, "pending_wakeups must be empty after recovery");
       assert.ok(receivedPrompts[0]!.includes("Your previous turn was interrupted by a daemon restart"));
       assert.ok(receivedPrompts[1]!.includes("timer-99"), `Expected timer-99 wake turn, got: ${receivedPrompts[1]}`);
-      // Give a brief tick to verify no duplicate delivery occurs.
       await new Promise((r) => setTimeout(r, 80));
       assert.equal(receivedPrompts.length, 2);
     } finally {
       await b.stop();
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a stop during recovery is recovered by the next start", async () => {
+    const repoDir = initTempGitRepo();
+    const stateDir = join(repoDir, ".state");
+    const dbPath = join(stateDir, "control-plane.sqlite");
+
+    const a = new HarnessDaemon(makeTestConfig(repoDir, stateDir), {
+      dbPath,
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          await waitForAbort(req.signal);
+          return { text: "stopped", stopReason: "cancelled" };
+        },
+      }),
+    });
+    const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    const run = a.db.createRun({ goal: "Mid-recovery stop", repoRoot: repoDir, baseBranch: "main", baseSha });
+    const t1 = a.db.createTask({
+      runId: run.id,
+      tier: 1,
+      kind: "orchestrator",
+      title: "Orch",
+      objective: "Lead",
+      profileId: "pi:local",
+      model: "fixture",
+    });
+    const t2 = a.db.createTask({
+      runId: run.id,
+      parentId: t1.id,
+      tier: 3,
+      kind: "research",
+      title: "Scout A",
+      objective: "Research A",
+      readOnly: true,
+      profileId: "pi:local",
+      model: "fixture",
+    });
+    const t3 = a.db.createTask({
+      runId: run.id,
+      parentId: t1.id,
+      tier: 3,
+      kind: "research",
+      title: "Scout B",
+      objective: "Research B",
+      readOnly: true,
+      profileId: "pi:local",
+      model: "fixture",
+    });
+    a.db.updateTask(t1.id, { status: "running" });
+    a.db.updateTask(t2.id, { status: "running" });
+    a.db.updateTask(t3.id, { status: "running" });
+    await a.stop();
+
+    const launchedInB: string[] = [];
+    const b = new HarnessDaemon(makeTestConfig(repoDir, stateDir), {
+      dbPath,
+      recoveryStaggerMs: 50,
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          launchedInB.push(req.taskId);
+          await waitForAbort(req.signal);
+          return { text: "stopped in B", stopReason: "cancelled" };
+        },
+      }),
+    });
+    await b.start();
+    try {
+      await waitUntil(() => launchedInB.length >= 1);
+      await b.stop();
+      await b.recovered;
+    } finally {
+      await b.stop().catch(() => {});
+    }
+
+    const countsInC = new Map<string, number>();
+    const c = new HarnessDaemon(makeTestConfig(repoDir, stateDir), {
+      dbPath,
+      customRunnerFactory: () => ({
+        run: async (req) => {
+          countsInC.set(req.taskId, (countsInC.get(req.taskId) ?? 0) + 1);
+          await waitForAbort(req.signal);
+          return { text: "stopped in C", stopReason: "cancelled" };
+        },
+      }),
+    });
+    try {
+      await c.start();
+      await c.recovered;
+      await waitUntil(() => countsInC.get(t1.id) === 1 && countsInC.get(t2.id) === 1 && countsInC.get(t3.id) === 1);
+
+      const executing = new Set(c.orchestrator.executingTaskIds());
+      for (const id of [t1.id, t2.id, t3.id]) {
+        assert.equal(countsInC.get(id), 1, `Task ${id} must run once in C`);
+        assert.notEqual(c.db.getTask(id)?.status, "failed", `Task ${id} must not be failed`);
+        assert.ok(executing.has(id), `Task ${id} must have a live execution in C`);
+      }
+    } finally {
+      await c.stop();
       rmSync(repoDir, { recursive: true, force: true });
     }
   });

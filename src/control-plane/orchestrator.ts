@@ -23,6 +23,7 @@ import { buildHydrationTurn, buildImmutableSystemPrompt, buildMissingReturnWrapU
 import { spillSummaryOverflow, writeUniqueTaskDossier } from "./dossiers.js";
 import { ControlPlaneToolExecutor, compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./tools.js";
 import { formatFallbackSummary, settleTaskMinimalFallback, SUMMARY_LIMIT } from "./handoffs.js";
+import { applyRecoveryPhaseA, classifyInterruptedTasks, relaunchInterruptedTasks } from "./restart-recovery.js";
 import { directorTaskRunId, directorTaskRunOwner, isDirectorTaskContainer } from "./ids.js";
 import { canonicalProjectPath } from "./projects.js";
 import { ensureGoalEvidenceDir } from "../goals/engine.js";
@@ -273,7 +274,7 @@ export class HarnessOrchestrator {
   private mergeQueues = new Map<string, BisectingMergeQueue>();
   private pendingRollovers = new Map<
     string,
-    { handoff: AnchoredHandoff; target?: { profileId?: string; model?: string; effort?: string } }
+    { handoff: AnchoredHandoff; target?: { profileId?: string; model?: string; effort?: string }; restart?: boolean }
   >();
   private taskQuotaHints = new Map<string, TaskQuotaPauseMeta>();
   private taskResumeNotes = new Map<string, { kind?: "quota" | "resume"; reason?: string; userMessage?: string | null }>();
@@ -304,6 +305,9 @@ export class HarnessOrchestrator {
   private leaseWaitQueue = new Map<string, Set<() => void>>();
   private unsubLeaseEvents: () => void;
   private disposed = false;
+  private quiescing = false;
+  private recoveringTasks = new Set<string>();
+  private instanceNonce: string | undefined;
   /** Accepted steering not yet delivered (FIFO per task, at most MAX_PENDING_STEERS). */
   private pendingSteers = new Map<string, string[]>();
   /** Goal version to bind onto a task once its queued amendment steer is actually drained. */
@@ -346,7 +350,7 @@ export class HarnessOrchestrator {
         const route = await this.taskRoute(task, run.repoRoot, target);
         if (this.db.getTask(taskId)?.status !== "running") throw new Error("Task is no longer running.");
         this.db.updateTask(taskId, { status: "draining", handoffJson: JSON.stringify(handoff) });
-        this.pendingRollovers.set(taskId, { handoff, target: { ...target, profileId: route.profile.id, model: route.model } });
+        this.pendingRollovers.set(taskId, { handoff, target: { ...target, profileId: route.profile.id, model: route.model }, restart: this.quiescing });
         const exec = this.active.get(taskId);
         if (exec?.handle) {
           void exec.handle.cancel("clean_rollover").catch(() => {});
@@ -413,7 +417,7 @@ export class HarnessOrchestrator {
   }
 
   activeTaskCount(): number {
-    return this.active.size;
+    return this.active.size + this.recoveringTasks.size;
   }
 
   /** Number of runs currently holding an armed auto-resume or user-scheduled quota timer. */
@@ -467,6 +471,73 @@ export class HarnessOrchestrator {
     this.pendingRollovers.clear();
     this.unsubLeaseEvents();
     for (const key of [...this.leaseWaitQueue.keys()]) this.onWriteLeaseReleased(key);
+  }
+
+  beginQuiesce(): void {
+    this.quiescing = true;
+  }
+
+  isQuiescing(): boolean {
+    return this.quiescing;
+  }
+
+  executingTaskIds(): string[] {
+    return [...this.active.keys()];
+  }
+
+  setInstanceNonce(nonce: string): void {
+    this.instanceNonce = nonce;
+  }
+
+  async shutdownAndWait(timeoutMs: number): Promise<void> {
+    const promises = [...this.active.values()].map((e) => e.promise.catch(() => {}));
+    this.dispose();
+    if (promises.length === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        Promise.allSettled(promises),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, timeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  recoverInterruptedTasks(taskIds: string[], reason: string, staggerMs = 300): Promise<string[]> {
+    return relaunchInterruptedTasks(
+      {
+        db: this.db,
+        worktrees: (repoRoot) => this.getWorktreeManager(repoRoot),
+        buildHandoff: (task, worktreePath, handoffReason, explicit) => {
+          let priorHandoff: AnchoredHandoff | null = null;
+          if (!explicit && task.handoffJson) {
+            try {
+              priorHandoff = JSON.parse(task.handoffJson) as AnchoredHandoff;
+            } catch {
+              priorHandoff = null;
+            }
+          }
+          return this.buildCleanRolloverHandoff({
+            runId: task.runId,
+            task,
+            priorHandoff,
+            explicitHandoff: explicit,
+            worktreePath,
+            result: { text: handoffReason, stopReason: "error" },
+          });
+        },
+        setResumeNote: (taskId, note) => this.taskResumeNotes.set(taskId, note),
+        release: (taskId) => this.recoveringTasks.delete(taskId),
+        launch: (taskId) => this.launchTaskLoop(taskId),
+        isStopping: () => this.quiescing || this.disposed,
+      },
+      taskIds,
+      { reason, staggerMs },
+    );
   }
 
   private clearRunQuotaTimers(runId: string): void {
@@ -688,7 +759,7 @@ export class HarnessOrchestrator {
   /** Runs that have a task live (or allocating its worktree) in memory, whatever their stored status. */
   liveRunIds(): string[] {
     const ids = new Set<string>();
-    for (const taskId of [...this.active.keys(), ...this.allocatingWorktrees]) {
+    for (const taskId of [...this.active.keys(), ...this.allocatingWorktrees, ...this.recoveringTasks]) {
       const t = this.db.getTask(taskId);
       if (t) ids.add(t.runId);
     }
@@ -701,6 +772,10 @@ export class HarnessOrchestrator {
       if (t?.runId === runId) return true;
     }
     for (const taskId of this.allocatingWorktrees) {
+      const t = this.db.getTask(taskId);
+      if (t?.runId === runId) return true;
+    }
+    for (const taskId of this.recoveringTasks) {
       const t = this.db.getTask(taskId);
       if (t?.runId === runId) return true;
     }
@@ -742,14 +817,21 @@ export class HarnessOrchestrator {
    *  - Fails orphaned in-flight / unlaunched tasks from a previous crashed daemon, clears stale merges & leases.
    *  - Re-arms quota quiescence timers for runs that were cleanly paused on quota before the restart.
    */
-  reconcileStaleRunsOnStartup(): void {
-    if (this.active.size > 0 || this.allocatingWorktrees.size > 0) return;
+  reconcileStaleRunsOnStartup(opts?: { legacyStopAt?: number }): string[] {
+    if (this.active.size > 0 || this.allocatingWorktrees.size > 0) return [];
+    const plan = classifyInterruptedTasks(this.db.db, opts);
+    const held = applyRecoveryPhaseA(this.db, plan, {
+      hold: (id) => this.recoveringTasks.add(id),
+      checkQuota: (runId) => void this.checkRunQuotaQuiescence(runId).catch(() => {}),
+    });
+    const recoverable = new Set(plan.recoverableRunIds);
     const pageSize = 200;
     let cursor: { createdAt: number; id: string } | undefined;
     for (;;) {
       const runs = this.db.listRuns(pageSize, cursor);
       if (runs.length === 0) break;
       for (const run of runs) {
+        if (recoverable.has(run.id)) continue;
         const tasks = this.db.listTasks(run.id);
         let mutated = false;
         let interrupted = false;
@@ -793,8 +875,7 @@ export class HarnessOrchestrator {
       const last = runs[runs.length - 1]!;
       cursor = { createdAt: last.createdAt, id: last.id };
     }
-    // Purge any remaining stale write leases; quota-paused task leases survive for resume.
-    this.db.purgeStaleWriteLeasesOnStartup();
+    return held;
   }
 
   private gateRuntimeConfig(): GateRuntimeConfig {
@@ -1136,6 +1217,7 @@ export class HarnessOrchestrator {
 
   launchTaskLoop(taskId: string): void {
     if (this.active.has(taskId) || this.allocatingWorktrees.has(taskId)) return;
+    if (this.quiescing) { this.recoveringTasks.add(taskId); return; }
     const abort = new AbortController();
     const entry: ActiveTaskExecution = {
       taskId,
@@ -1194,6 +1276,7 @@ export class HarnessOrchestrator {
    * the run's terminal status.
    */
   private afterTaskInactiveInRun(runId: string): void {
+    if (this.quiescing) return;
     const runHalted =
       !isDirectorTaskContainer(runId) && (this.stoppingRuns.has(runId) || this.db.getRun(runId)?.status === "stopped");
     const readyTasks = runHalted ? [] : this.db.listTasks(runId, { status: "ready" });
@@ -2206,6 +2289,7 @@ export class HarnessOrchestrator {
 
   private async runTaskWithRollovers(taskId: string, exec: ActiveTaskExecution): Promise<void> {
     while (!exec.abort.signal.aborted) {
+      if (this.quiescing) { this.recoveringTasks.add(taskId); return; }
       exec.promptBuilt = false;
       exec.handle = undefined;
       exec.steerChain = undefined;
@@ -2430,6 +2514,7 @@ export class HarnessOrchestrator {
           return this.toolExecutor.execute(run.id, task.id, name, args);
         },
         taskGeneration: runnerGen,
+        daemonInstanceNonce: this.instanceNonce,
         daemonSocketPath: this.config.socketPath,
         mcpBridgeEntrypoint,
         externalMcpServers: resolveExternalMcpServers(this.config.stateDir, this.config.externalMcpServers),
@@ -2591,7 +2676,7 @@ export class HarnessOrchestrator {
         const explicitRollover = this.pendingRollovers.get(task.id);
         if (explicitRollover || res.stopReason === "rollover_requested") {
           this.pendingRollovers.delete(task.id);
-          const nextGen = latest.generation + 1;
+          const nextGen = explicitRollover?.restart ? latest.generation : latest.generation + 1;
           // A stop or cancel during the awaits below wins: the stale continuation writes nothing and launches nothing.
           const fence = this.rolloverFence(latest);
           // Fail fast after 2 consecutive zero-progress automatic context-threshold rollovers
@@ -2912,9 +2997,9 @@ export class HarnessOrchestrator {
         if (!latest || this.active.get(task.id) !== exec || latest.generation !== runnerGen) return;
         // If an explicit clean rollover was scheduled right before the runner rejected on cancel, proceed with rollover!
         const explicitRollover = this.pendingRollovers.get(task.id);
-        if (explicitRollover && latest.generation + 1 <= maxGenerations) {
+        if (explicitRollover && (explicitRollover.restart || latest.generation + 1 <= maxGenerations)) {
           this.pendingRollovers.delete(task.id);
-          const nextGen = latest.generation + 1;
+          const nextGen = explicitRollover.restart ? latest.generation : latest.generation + 1;
           const fence = this.rolloverFence(latest);
           const nextHandoff = await this.buildCleanRolloverHandoff({
             runId: run.id,
@@ -3788,7 +3873,7 @@ export class HarnessOrchestrator {
 
     const findInactiveLiveChildren = (targets: TaskRecord[]) =>
       targets
-        .filter((t) => LIVE_TASK_STATUSES.has(t.status) && !this.active.has(t.id) && !this.allocatingWorktrees.has(t.id))
+        .filter((t) => LIVE_TASK_STATUSES.has(t.status) && !this.active.has(t.id) && !this.allocatingWorktrees.has(t.id) && !this.recoveringTasks.has(t.id))
         .map((t) => t.id);
 
     let targets = getTargets();
@@ -3817,7 +3902,7 @@ export class HarnessOrchestrator {
         unsub();
         clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);
-        if (parent.status === "running" && this.db.getTask(parentId)?.status === "waiting_children") {
+        if (!this.disposed && parent.status === "running" && this.db.getTask(parentId)?.status === "waiting_children") {
           this.db.updateTask(parentId, { status: "running" });
         }
         if (signal?.aborted) reject(signal.reason);

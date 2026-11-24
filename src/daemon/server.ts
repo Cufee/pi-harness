@@ -27,6 +27,7 @@ import { directorTaskRunOwner } from "../control-plane/ids.js";
 import { canonicalProjectPath, type ProjectRecord } from "../control-plane/projects.js";
 import type { ChatSessionRecord } from "../director/session.js";
 import { deriveRunStatus, HarnessOrchestrator, isDirectorTaskContainer, type CustomRunnerFactory } from "../control-plane/orchestrator.js";
+import { listInterruptedReviewGoals, replayInterruptedReviews } from "../control-plane/restart-recovery.js";
 import { loadOrCreateNodeId, parseSessionAddress, type SessionMessageRecord } from "../control-plane/session-messages.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { summarizeCost } from "../cost/ledger.js";
@@ -328,6 +329,7 @@ export class HarnessDaemon {
   private restartExpected = false;
   private stopPromise: Promise<void> | null = null;
   private reapChildrenOnStop = false;
+  private recoveryStaggerMs = 300;
   private wakeups: WakeupStore;
   private allSockets = new Set<Socket>();
   private clientIds = new WeakMap<Socket, string>();
@@ -379,6 +381,7 @@ export class HarnessDaemon {
       hostName?: string;
       repoRoot?: string;
       reapChildrenOnStop?: boolean;
+      recoveryStaggerMs?: number;
     },
   ) {
     this.repoOverlay = readRepoConfig(opts?.repoRoot);
@@ -391,6 +394,7 @@ export class HarnessDaemon {
     this.autoQuitWhenIdle = Boolean(opts?.autoQuitWhenIdle);
     this.hasCustomRunner = Boolean(opts?.customRunnerFactory);
     this.reapChildrenOnStop = Boolean(opts?.reapChildrenOnStop);
+    this.recoveryStaggerMs = opts?.recoveryStaggerMs ?? (this.hasCustomRunner ? 0 : 300);
     const dbPath = opts?.dbPath ?? join(config.stateDir, "control-plane.sqlite");
     this.db = new ControlPlaneDb(dbPath);
     this.wakeups = new WakeupStore(this.db.db);
@@ -398,6 +402,7 @@ export class HarnessDaemon {
     this.quota = new QuotaClient(config.quotaEndpoint);
     this.catalog = new ModelCatalogCompiler(config, this.quota);
     this.orchestrator = new HarnessOrchestrator(this.db, config, this.catalog, this.quota, opts?.customRunnerFactory);
+    this.orchestrator.setInstanceNonce(this.instanceNonce);
     this.director = new DirectorRuntime(this.db, config, this.catalog, this.quota, this.orchestrator, opts?.customRunnerFactory);
     this.peers = new PeerManager(
       this.nodeId,
@@ -429,6 +434,7 @@ export class HarnessDaemon {
     if (this.lifecycle !== "stopping") {
       this.lifecycle = phase;
     }
+    this.orchestrator.beginQuiesce();
     this.wakesGated = true;
     this.db.timers.suspend();
   }
@@ -903,7 +909,12 @@ export class HarnessDaemon {
 
     // Reconcile stale runs/goals AFTER the daemon socket is bound,
     // so immediate wakeups / MCP bridges can connect without racing socket creation!
-    this.orchestrator.reconcileStaleRunsOnStartup();
+    const interruptedReviewGoals = listInterruptedReviewGoals(this.db.db);
+    const legacyStopAtRaw = Number(process.env.PI_HARNESS_LEGACY_STOP_AT);
+    const legacyStopAt = Number.isFinite(legacyStopAtRaw) && legacyStopAtRaw > 0 ? legacyStopAtRaw : undefined;
+    const heldTaskIds = this.orchestrator.reconcileStaleRunsOnStartup(
+      legacyStopAt !== undefined ? { legacyStopAt } : undefined,
+    );
     this.director.goals.reconcileStaleGoalsOnStartup();
     try {
       // Escalations left open on runs whose goals all settled (achieved/cancelled) are resolved once at startup.
@@ -911,6 +922,7 @@ export class HarnessDaemon {
     } catch {
       // Best effort; the escalations stay listable and resolvable.
     }
+    replayInterruptedReviews(this.db, this.director.goals, interruptedReviewGoals);
 
     // Non-blocking startup orphan worktree sweep + periodic hourly sweep across known repos
     void this.sweepAllKnownRepos().catch(() => {});
@@ -941,7 +953,7 @@ export class HarnessDaemon {
       console.error(`[harnessd ${new Date().toISOString()}] config warning: ${w}`);
     }
 
-    this.recovered = this.finishRecovery([]).catch((err) => {
+    this.recovered = this.finishRecovery(heldTaskIds).catch((err) => {
       console.error(
         `[harnessd ${new Date().toISOString()}] recovery failed: ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -950,7 +962,13 @@ export class HarnessDaemon {
     return sockPath;
   }
 
-  private async finishRecovery(_heldTaskIds: string[]): Promise<void> {
+  private async finishRecovery(heldTaskIds: string[]): Promise<void> {
+    if (heldTaskIds.length > 0) {
+      const reason = process.env.PI_HARNESS_RELOAD_FROM
+        ? `update to release ${currentRelease().releaseId}`
+        : "daemon restart";
+      await this.orchestrator.recoverInterruptedTasks(heldTaskIds, reason, this.recoveryStaggerMs);
+    }
     if (this.lifecycle !== "serving") return;
 
     const savedWakeups = this.wakeups.takeAll();
@@ -1062,7 +1080,7 @@ export class HarnessDaemon {
       // ignore if DB already closed
     }
 
-    this.orchestrator.dispose();
+    await this.orchestrator.shutdownAndWait(10_000);
     this.director.dispose();
     this.unsubEvents?.();
     this.ptyHost.closeAll();
@@ -4048,9 +4066,15 @@ export class HarnessDaemon {
         return { ok: true };
 
       case "tool.call": {
-        // An orchestrator task's bridge sends `<taskId>@g<generation>` (see AcpRunner); callers may also pass expectedGeneration.
-        const token = /^(.+)@g(\d+)$/.exec(String(p.taskId));
-        const taskId = token ? token[1]! : String(p.taskId);
+        // An orchestrator task's bridge sends `<taskId>@g<generation>@<nonce>` (see AcpRunner).
+        const rawTaskId = String(p.taskId);
+        const token = /^(.+?)@g(\d+)(?:@([0-9a-f]+))?$/.exec(rawTaskId);
+        if (token && token[3] !== this.instanceNonce) {
+          throw new Error(
+            `Stale tool call for task ${token[1]}: this agent session belongs to a previous harnessd process (the daemon restarted). Nothing was executed. The task continues in a new session. End this session.`,
+          );
+        }
+        const taskId = token ? token[1]! : rawTaskId;
         const expectedGeneration = p.expectedGeneration ?? (token ? Number(token[2]) : undefined);
         const name = String(p.name);
         const args = (p.args ?? {}) as Record<string, unknown>;

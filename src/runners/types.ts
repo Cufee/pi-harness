@@ -119,6 +119,8 @@ export interface RunAgentRequest {
   executeTool: (name: string, args: Record<string, unknown>) => Promise<unknown>;
   /** Task generation this request runs; carried in the MCP bridge's task ID so the daemon rejects a stale runner's tool calls. */
   taskGeneration?: number;
+  /** Per-daemon-instance nonce carried in the MCP bridge's task ID so agents from an earlier daemon process are fenced. */
+  daemonInstanceNonce?: string;
   /** Daemon Unix socket path + auth token for ACP stdio MCP bridge subprocesses */
   daemonSocketPath?: string;
   mcpBridgeEntrypoint?: string;
