@@ -12,6 +12,7 @@ import {
   compareSemanticVersions,
   parseClaudeFamilyVersion,
   recommendModelsByTaskKind,
+  routingSkips,
   type CompiledModelEntry,
   type ModelCatalogCompiler,
 } from "../catalog/compiler.js";
@@ -106,6 +107,74 @@ const READ_FILE_DEFAULT_PAGE_BYTES = 32 * 1024;
 // One page must fit a 16 MiB code_exec IPC frame even if JSON escaping expands every byte sixfold.
 const READ_FILE_MAX_PAGE_BYTES = 2 * 1024 * 1024;
 const READ_FILE_SCAN_BYTES = 1024 * 1024;
+
+function resolvedExtraWriteRoots(config: HarnessConfig): string[] {
+  const seen = new Set<string>();
+  const resolved: string[] = [];
+  for (const raw of config.worktree.extraWriteRoots ?? []) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    const expanded =
+      trimmed === "~"
+        ? homedir()
+        : trimmed.startsWith("~/")
+          ? resolve(homedir(), trimmed.slice(2))
+          : resolve(trimmed);
+    const canonical = existsSync(expanded) ? realpathSync(expanded) : expanded;
+    if (!seen.has(canonical)) {
+      seen.add(canonical);
+      resolved.push(canonical);
+    }
+  }
+  return resolved;
+}
+
+function directorNoteRoots(repoRoot: string, config: HarnessConfig): { root: string; allowedWriteRoots: string[] } {
+  const root = realpathSync(repoRoot);
+  return {
+    root,
+    allowedWriteRoots: [
+      join(root, ".harness", "goals"),
+      join(root, ".harness", "notes"),
+      ...resolvedExtraWriteRoots(config),
+    ],
+  };
+}
+
+function writeNoteToolWithRoots(tool: ToolDefinition, extraRoots: string[]): ToolDefinition {
+  const hasRoots = extraRoots.length > 0;
+  const extraText = hasRoots
+    ? `or these configured extraWriteRoots: ${extraRoots.join(", ")}`
+    : "no extraWriteRoots configured";
+  const schema = tool.inputSchema as { properties?: Record<string, Record<string, unknown>> };
+  const pathProp = schema.properties?.path;
+  return {
+    ...tool,
+    description: hasRoots
+      ? `Logged Director note/report writer scoped strictly to \`.harness/goals/\`, \`.harness/notes/\`, ${extraText} (never writes tracked repository source code).`
+      : `Logged Director note/report writer scoped strictly to \`.harness/goals/\`, \`.harness/notes/\` (${extraText}; never writes tracked repository source code).`,
+    inputSchema: {
+      ...tool.inputSchema,
+      ...(schema.properties
+        ? {
+            properties: {
+              ...schema.properties,
+              ...(pathProp
+                ? {
+                    path: {
+                      ...pathProp,
+                      description: hasRoots
+                        ? `Destination file under .harness/goals/, .harness/notes/, ${extraText}.`
+                        : `Destination file under .harness/goals/, .harness/notes/ (${extraText}).`,
+                    },
+                  }
+                : {}),
+            },
+          }
+        : {}),
+    },
+  };
+}
 
 function formatGateRefSha(location: GateLocation): string {
   const sha7 = location.sha ? location.sha.slice(0, 7) : "unknown";
@@ -5215,7 +5284,12 @@ export class DirectorRuntime {
     const base = createCodeModeExecutor({
       ...this.config.codeExec,
       mode: effectiveCodeMode(this.config.codeMode),
-      allowedTools: () => DIRECTOR_TOOLS,
+      allowedTools: () => {
+        const extraRoots = resolvedExtraWriteRoots(this.config);
+        return DIRECTOR_TOOLS.map((tool) =>
+          tool.name === "write_note" ? writeNoteToolWithRoots(tool, extraRoots) : tool,
+        );
+      },
       directTools: DIRECTOR_DIRECT_TOOLS,
       execute: async (name, args, execSignal) => {
         const effectiveSignal = execSignal ?? signal;
@@ -5515,7 +5589,7 @@ export class DirectorRuntime {
           kind: "orchestrator",
           cwd: session.repoRoot,
           toolPolicy: "control_plane_only",
-          systemPrompt: buildDirectorSystemPrompt(mode, this.config.codeExec),
+          systemPrompt: buildDirectorSystemPrompt(mode, this.config.codeExec, resolvedExtraWriteRoots(this.config)),
           initialPrompt: prompt,
           model: wireModel,
           effort: session.effort,
@@ -5756,8 +5830,27 @@ export class DirectorRuntime {
           active.waitInterrupts.delete(onInterrupt);
         }
       }
-      case "spawn_task":
-        return this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, name, args, signal);
+      case "spawn_task": {
+        const result = await this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, name, args, signal);
+        const spawnedId = isPlainObject(result) && typeof result.spawned === "string" ? result.spawned : null;
+        const spawnedTask = spawnedId ? this.db.getTask(spawnedId) : null;
+        const profileId = spawnedTask?.profileId;
+        const auth = profileId ? this.quota.authStatus(profileId) : null;
+        if (auth && profileId && isPlainObject(result)) {
+          const existingWarning = typeof result.warning === "string" ? result.warning.trim() : "";
+          const hasAuthWarning =
+            existingWarning.includes(profileId) &&
+            /failed (?:ACP )?auth|needs login/i.test(existingWarning);
+          if (!hasAuthWarning) {
+            const authWarning = `Profile ${profileId} failed ACP authentication recently (needs login until ${auth.until}); this task may fail immediately. Log in first or prefer recommendedByKind.`;
+            return {
+              ...result,
+              warning: existingWarning ? `${existingWarning} ${authWarning}` : authWarning,
+            };
+          }
+        }
+        return result;
+      }
       case "artifact_read":
         return this.readDirectorArtifact(chatSessionId, repoRoot, args, signal);
       case "cancel_task": {
@@ -5808,17 +5901,7 @@ export class DirectorRuntime {
         const content = String(args.content ?? "");
         const reason = String(args.reason ?? "").trim();
         if (!rawPath || !reason) throw new Error("write_note requires path and reason");
-        const root = realpathSync(repoRoot);
-        const expandRoot = (r: string) => {
-          const t = r.trim();
-          const exp = t === "~" ? homedir() : t.startsWith("~/") ? resolve(homedir(), t.slice(2)) : resolve(t);
-          return existsSync(exp) ? realpathSync(exp) : exp;
-        };
-        const allowedWriteRoots = [
-          join(root, ".harness", "goals"),
-          join(root, ".harness", "notes"),
-          ...(this.config.worktree.extraWriteRoots ?? []).map(expandRoot),
-        ];
+        const { root, allowedWriteRoots } = directorNoteRoots(repoRoot, this.config);
         const expandedTarget = rawPath.startsWith("~/") ? resolve(homedir(), rawPath.slice(2)) : resolve(root, rawPath);
         const matchedRoot = allowedWriteRoots.find((allowed) => {
           const rel = relative(allowed, expandedTarget);
@@ -6454,6 +6537,7 @@ export class DirectorRuntime {
           ...catalog,
           sessionModelContext: session?.modelSelectionContext ?? null,
           recommendedByKind: recommendModelsByTaskKind(catalog.models, { avoidModelId: session?.model }),
+          skippedForRouting: routingSkips(catalog.models),
         };
       }
 
