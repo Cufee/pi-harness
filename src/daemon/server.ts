@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, watch, type FSWatcher } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, watch, type FSWatcher } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { ModelCatalogCompiler } from "../catalog/compiler.js";
@@ -45,7 +45,9 @@ import {
   type DaemonEventFrame,
   type DaemonLifecycle,
   type DaemonOp,
+  type DaemonReloadParams,
   type InboxItem,
+  type ReloadStatus,
   type RpcRequest,
   type RpcResponse,
   type SessionAttachControl,
@@ -61,11 +63,13 @@ import { ensureOctofs, resolveExternalMcpServers, shouldStageOctofs } from "../t
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
 import { canonicalPath, runGit } from "../worktree/manager.js";
+import { HotUpdateController } from "./hot-update.js";
 import { parseValidatedSshTarget, PeerManager, type PeerIdentity, type PeerLink, type RemoteHostStatus } from "./peer.js";
 import { PtyHost } from "./pty-host.js";
 import { reapChildProcessGroups } from "./reap.js";
-import { currentRelease } from "./release.js";
+import { currentRelease, type ReleaseTarget } from "./release.js";
 import { acquireStartLock } from "./start-lock.js";
+import { spawnSupervisorDetached } from "./supervise.js";
 import { WakeupStore, type PendingWake } from "./wakeup-store.js";
 
 export { DAEMON_PROTOCOL_REV };
@@ -238,6 +242,7 @@ const CONFIG_UPDATE_FIELDS: ReadonlySet<string> = new Set([
   "catalog",
   "quotaRetry",
   "quotaEndpoint",
+  "hotUpdate",
 ]);
 
 /** Warning lines for known config keys found at unsupported locations; built from schema names only, never values. */
@@ -325,12 +330,20 @@ export class HarnessDaemon {
   recovered: Promise<void> = Promise.resolve();
 
   private server: Server | null = null;
+  private boundSocketIno: number | null = null;
   private lifecycle: DaemonLifecycle = "serving";
   private wakesGated = true;
   private restartExpected = false;
   private stopPromise: Promise<void> | null = null;
+  private handoverPromise: Promise<void> | null = null;
   private reapChildrenOnStop = false;
   private recoveryStaggerMs = 300;
+  private readonly overlayRoot: string | undefined;
+  private readonly disableReloadRpc: boolean;
+  private readonly onExit: (code: number) => void;
+  private readonly hotUpdate: HotUpdateController;
+  private reloadFrom: string | undefined;
+  private reloadLastError: { targetReleaseId: string; error: string } | undefined;
   private wakeups: WakeupStore;
   private allSockets = new Set<Socket>();
   private clientIds = new WeakMap<Socket, string>();
@@ -381,10 +394,16 @@ export class HarnessDaemon {
       autoQuitWhenIdle?: boolean;
       hostName?: string;
       repoRoot?: string;
+      overlayRoot?: string;
       reapChildrenOnStop?: boolean;
       recoveryStaggerMs?: number;
+      disableReloadRpc?: boolean;
+      onExit?: (code: number) => void;
     },
   ) {
+    this.overlayRoot = opts?.overlayRoot ?? opts?.repoRoot;
+    this.disableReloadRpc = Boolean(opts?.disableReloadRpc);
+    this.onExit = opts?.onExit ?? ((code) => process.exit(code));
     this.repoOverlay = readRepoConfig(opts?.repoRoot);
     this.repoConfigWarnings = formatMisplacedConfigWarnings(
       ".pi-harness.json",
@@ -424,6 +443,31 @@ export class HarnessDaemon {
       createSession: (input) => this.createSessionOnHost(input),
       sendMessage: (input) => this.sendSessionMessage(input),
       readSession: (input) => this.readSessionOnHost(input),
+    });
+    this.hotUpdate = new HotUpdateController({
+      config: () => this.config.hotUpdate,
+      startedAt: this.startedAt,
+      self: currentRelease(),
+      liveAgents: () => this.getHotUpdateLiveAgents(),
+      liveWorkDescription: () => this.getLiveWorkSummary().description,
+      enterDraining: () => this.enterQuiesce("draining"),
+      steerTask: async (taskId, text) => {
+        try {
+          return await this.orchestrator.steerTaskDetailed(taskId, text);
+        } catch {
+          return null;
+        }
+      },
+      steerChat: async (chatId, text) => {
+        try {
+          return await this.director.steerChat(chatId, text, { role: "system_notice" });
+        } catch {
+          return false;
+        }
+      },
+      broadcast: (payload) => this.broadcastDaemonEvent("daemon.reload", payload),
+      stopAndHandOver: (target) => this.stopAndHandOver(target),
+      log: (line) => console.error(`[harnessd ${new Date().toISOString()}] ${line}`),
     });
   }
 
@@ -901,6 +945,11 @@ export class HarnessDaemon {
           } catch {
             // ignore on unsupported filesystems
           }
+          try {
+            this.boundSocketIno = statSync(sockPath).ino;
+          } catch {
+            this.boundSocketIno = null;
+          }
           resolve();
         });
       });
@@ -916,6 +965,20 @@ export class HarnessDaemon {
     const legacyStopAt = Number.isFinite(legacyStopAtRaw) && legacyStopAtRaw > 0 ? legacyStopAtRaw : undefined;
     const reloadFrom = process.env.PI_HARNESS_RELOAD_FROM;
     delete process.env.PI_HARNESS_RELOAD_FROM;
+    this.reloadFrom = reloadFrom && reloadFrom.trim() ? reloadFrom.trim() : undefined;
+    const reloadFailedRaw = process.env.PI_HARNESS_RELOAD_FAILED;
+    delete process.env.PI_HARNESS_RELOAD_FAILED;
+    delete process.env.PI_HARNESS_OVERLAY_ROOT;
+    if (reloadFailedRaw) {
+      try {
+        const parsed = JSON.parse(reloadFailedRaw) as { targetReleaseId?: unknown; error?: unknown };
+        if (typeof parsed?.targetReleaseId === "string" && typeof parsed?.error === "string") {
+          this.reloadLastError = { targetReleaseId: parsed.targetReleaseId, error: parsed.error };
+        }
+      } catch {
+        // Ignore malformed reload-failed payload
+      }
+    }
     const heldTaskIds = this.orchestrator.reconcileStaleRunsOnStartup(
       legacyStopAt !== undefined ? { legacyStopAt } : undefined,
     );
@@ -1027,12 +1090,117 @@ export class HarnessDaemon {
     }
   }
 
+  private getHotUpdateLiveAgents(): { tier12: string[]; other: string[]; chats: string[]; reviews: number } {
+    const tier12: string[] = [];
+    const other: string[] = [];
+    for (const id of this.orchestrator.executingTaskIds()) {
+      const task = this.db.getTask(id);
+      // Tier 1/2 tasks still in `ready` are waiting on admission/lease/routing (not running a session yet)
+      // and cannot answer request_rollover. Keep them in `other` so rate-limiting still counts them as live.
+      if (task && (task.tier === 1 || task.tier === 2) && task.status !== "ready") {
+        tier12.push(id);
+      } else {
+        other.push(id);
+      }
+    }
+    return {
+      tier12,
+      other,
+      chats: [...this.chatTurns.keys()],
+      reviews: this.director.activeReviewCount(),
+    };
+  }
+
+  private getReloadStatus(): ReloadStatus {
+    const base = this.hotUpdate.status();
+    return {
+      ...base,
+      ...(this.reloadFrom ? { previousReleaseId: this.reloadFrom } : {}),
+      ...(this.reloadLastError ? { lastError: this.reloadLastError } : {}),
+    };
+  }
+
+  /**
+   * Single exit owner for daemon.shutdown, SIGTERM/SIGINT, and idle auto-quit (A11).
+   * If a hot-update handover is already in progress, awaits handover so the supervisor
+   * is always spawned before process exit.
+   */
+  async shutdownAndExit(opts?: { reason?: string }): Promise<void> {
+    if (this.handoverPromise) {
+      await this.handoverPromise;
+      return;
+    }
+    try {
+      await this.stop(opts);
+    } finally {
+      if (this.handoverPromise) {
+        await this.handoverPromise;
+      } else {
+        this.onExit(0);
+      }
+    }
+  }
+
+  stopAndHandOver(target: ReleaseTarget): Promise<void> {
+    return (this.handoverPromise ??= this.stopAndHandOverInner(target));
+  }
+
+  private async stopAndHandOverInner(target: ReleaseTarget): Promise<void> {
+    this.restartExpected = true;
+    const self = currentRelease();
+    let cwd = this.config.stateDir;
+    try {
+      const currentCwd = process.cwd();
+      if (existsSync(currentCwd)) cwd = currentCwd;
+    } catch {
+      // fall back to stateDir when cwd was removed
+    }
+    let supervisorSpawned = false;
+    const spawnOnce = () => {
+      if (supervisorSpawned) return;
+      supervisorSpawned = true;
+      console.error(`[harnessd ${new Date().toISOString()}] reload: spawning supervisor for ${target.releaseId}`);
+      spawnSupervisorDetached(
+        self,
+        {
+          socketPath: this.config.socketPath,
+          target,
+          previous: self,
+          waitPid: process.pid,
+          overlayRoot: this.overlayRoot,
+          fromReleaseId: self.releaseId,
+        },
+        cwd,
+      );
+    };
+
+    const watchdog = setTimeout(() => {
+      console.error(`[harnessd ${new Date().toISOString()}] reload: stop watchdog (45s) expired; forcing supervisor handover`);
+      spawnOnce();
+      this.onExit(1);
+    }, 45_000);
+    watchdog.unref?.();
+
+    try {
+      await this.stop({ reason: `reload:${target.releaseId}` });
+    } catch (err) {
+      console.error(
+        `[harnessd ${new Date().toISOString()}] reload: stop error during handover: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      clearTimeout(watchdog);
+      spawnOnce();
+    }
+    this.onExit(0);
+  }
+
   stop(opts?: { reason?: string }): Promise<void> {
     return (this.stopPromise ??= this.stopInner(opts));
   }
 
   private async stopInner(_opts?: { reason?: string }): Promise<void> {
     this.enterQuiesce("stopping");
+    this.hotUpdate.dispose();
     await Promise.race([
       this.recovered.catch(() => {}),
       new Promise<void>((r) => setTimeout(r, 5000)),
@@ -1110,6 +1278,21 @@ export class HarnessDaemon {
     }
 
     this.broadcastDaemonEvent("daemon.stopping", { restart: this.restartExpected });
+
+    // Close the listener BEFORE snapshotting sockets so reconnecting TUIs cannot be accepted
+    // after the snapshot and hang server.close() indefinitely.
+    const srv = this.server;
+    this.server = null;
+    const serverClosePromise = srv
+      ? new Promise<void>((resolve) => {
+          try {
+            srv.close(() => resolve());
+          } catch {
+            resolve();
+          }
+        })
+      : null;
+
     const openSockets = [...this.allSockets].filter((s) => !s.destroyed);
     if (openSockets.length > 0) {
       await new Promise<void>((resolve) => {
@@ -1141,6 +1324,10 @@ export class HarnessDaemon {
         }
       });
     }
+    // Destroy any socket still tracked in allSockets so server.close() always settles.
+    for (const s of this.allSockets) {
+      if (!s.destroyed) s.destroy();
+    }
     this.allSockets.clear();
     this.attachments.clear();
     this.chatBindings.clear();
@@ -1150,17 +1337,19 @@ export class HarnessDaemon {
     this.chatSubscribers.clear();
     this.tuiSockets.clear();
     this.watches.clear();
-    if (this.server) {
-      await new Promise<void>((resolve) => this.server!.close(() => resolve()));
-      this.server = null;
+    if (serverClosePromise) {
+      await Promise.race([serverClosePromise, new Promise<void>((r) => setTimeout(r, 1000))]);
     }
-    if (existsSync(this.config.socketPath)) {
+    if (this.boundSocketIno !== null && existsSync(this.config.socketPath)) {
       try {
-        unlinkSync(this.config.socketPath);
+        if (statSync(this.config.socketPath).ino === this.boundSocketIno) {
+          unlinkSync(this.config.socketPath);
+        }
       } catch {
         // ignore
       }
     }
+    this.boundSocketIno = null;
     this.db.close();
   }
 
@@ -1666,6 +1855,10 @@ export class HarnessDaemon {
   }
 
   private handleConnection(socket: Socket): void {
+    if (this.lifecycle === "stopping") {
+      socket.destroy();
+      return;
+    }
     this.allSockets.add(socket);
     this.clientIds.set(socket, `cli-${randomBytes(4).toString("hex")}`);
     this.cancelIdleShutdown();
@@ -1739,7 +1932,7 @@ export class HarnessDaemon {
         this.idleShutdownTimer = setTimeout(() => {
           this.idleShutdownTimer = null;
           if (this.lifecycle === "serving" && !this.getLiveWorkSummary().running) {
-            void this.stop().finally(() => process.exit(0));
+            void this.shutdownAndExit({ reason: "idle_disconnect" });
           }
         }, 1200);
         this.idleShutdownTimer.unref();
@@ -2464,6 +2657,7 @@ export class HarnessDaemon {
           releaseDir: release.releaseDir,
           lifecycle: this.lifecycle,
           restartSafe: true,
+          ...(this.disableReloadRpc ? {} : { reload: this.getReloadStatus() }),
           running: live.running,
           liveWork: live.description,
           remotes: this.listRemoteStatuses(),
@@ -2473,9 +2667,15 @@ export class HarnessDaemon {
       case "daemon.shutdown":
         if (p.restart === true) this.restartExpected = true;
         setTimeout(() => {
-          void this.stop().finally(() => process.exit(0));
+          void this.shutdownAndExit({ reason: "daemon.shutdown" });
         }, 25).unref();
         return { shuttingDown: true, pid: process.pid };
+
+      case "daemon.reload":
+        if (this.disableReloadRpc) {
+          throw new Error(`Unknown daemon op: ${req.op}`);
+        }
+        return this.hotUpdate.request(p as unknown as DaemonReloadParams);
 
       case "status": {
         const release = currentRelease();
@@ -2489,6 +2689,7 @@ export class HarnessDaemon {
           releaseDir: release.releaseDir,
           lifecycle: this.lifecycle,
           restartSafe: true,
+          ...(this.disableReloadRpc ? {} : { reload: this.getReloadStatus() }),
           socketPath: this.config.socketPath,
           configPath: join(this.config.stateDir, "config.json"),
           configWarnings: [...this.globalConfigWarnings, ...this.repoConfigWarnings],
@@ -2669,6 +2870,9 @@ export class HarnessDaemon {
           ...(patch.catalog ? { catalog: { ...this.config.catalog, ...(patch.catalog as HarnessConfig["catalog"]) } } : {}),
           ...(patch.quotaRetry
             ? { quotaRetry: { ...this.config.quotaRetry, ...(patch.quotaRetry as HarnessConfig["quotaRetry"]) } }
+            : {}),
+          ...(patch.hotUpdate
+            ? { hotUpdate: { ...this.config.hotUpdate, ...(patch.hotUpdate as HarnessConfig["hotUpdate"]) } }
             : {}),
           ...("quotaEndpoint" in patch
             ? { quotaEndpoint: (patch.quotaEndpoint as HarnessConfig["quotaEndpoint"] | null) ?? undefined }
@@ -2968,12 +3172,12 @@ export class HarnessDaemon {
         this.unbindSocketSession(socket);
         this.chatSubscribers.delete(socket);
         const work = this.getLiveWorkSummary();
-        const daemonWillQuit = this.autoQuitWhenIdle && !work.running;
+        const daemonWillQuit = this.autoQuitWhenIdle && this.lifecycle === "serving" && !work.running;
         if (daemonWillQuit) {
           this.cancelIdleShutdown();
           setTimeout(() => {
-            if (!this.getLiveWorkSummary().running) {
-              void this.stop().finally(() => process.exit(0));
+            if (this.lifecycle === "serving" && !this.getLiveWorkSummary().running) {
+              void this.shutdownAndExit({ reason: "session.leave" });
             }
           }, 35).unref();
         }
