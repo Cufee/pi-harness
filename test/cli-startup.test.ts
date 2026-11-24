@@ -77,6 +77,14 @@ describe("CLI startup project picker and --resume", () => {
     assert.deepEqual(withProject.positional, ["chat"]);
   });
 
+  it("parses boolean long flags with =true/=false/=1/=0 and rejects other values", () => {
+    assert.equal(parseArgs(["daemon", "reload", "--check=true"]).flags.check, true);
+    assert.equal(parseArgs(["daemon", "reload", "--check=1"]).flags.check, true);
+    assert.equal(parseArgs(["daemon", "reload", "--check=false"]).flags.check, false);
+    assert.equal(parseArgs(["daemon", "reload", "--check=0"]).flags.check, false);
+    assert.throws(() => parseArgs(["daemon", "reload", "--check=maybe"]), /--check takes no value \(got "maybe"\)/);
+  });
+
   it("finds the deepest registered project containing a canonical path", () => {
     const projects = [
       { id: "proj-1", rootPath: "/w/mono" },

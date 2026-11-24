@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import { afterEach, describe, it } from "bun:test";
 import { resolveConfig, validateConfigRaw } from "../src/config.js";
 import {
+  formatLegacyBootstrapNotice,
   HotUpdateController,
   tryReloadForDaemonRestart,
   waitForDaemonReload,
@@ -458,7 +459,14 @@ describe("daemon hot-update subprocess e2e", () => {
 
       const reloadRes = await runCli(relB, ["daemon", "reload", "--from-install", "--target", relB.releaseDir], env);
       assert.equal(reloadRes.code, 0, `expected exit 0 notice, got ${reloadRes.code}: stderr=${reloadRes.stderr}`);
-      assert.ok(reloadRes.stdout.includes("daemon reload --legacy"), `expected --legacy notice in stdout:\n${reloadRes.stdout}`);
+      assert.ok(
+        reloadRes.stdout.includes(`Requested target is release rel-b (${relB.releaseDir}).`),
+        `expected explicit target line in stdout:\n${reloadRes.stdout}`,
+      );
+      assert.ok(
+        reloadRes.stdout.includes(`daemon reload --legacy --target '${relB.releaseDir}'`),
+        `expected --legacy --target command in stdout:\n${reloadRes.stdout}`,
+      );
       assert.ok(
         reloadRes.stdout.includes(`harnessd (pid ${pidA}, release rel-a,`) &&
           reloadRes.stdout.includes("does not support hot update"),
@@ -1228,5 +1236,122 @@ describe("hot-update controller, supervisor, and config unit checks", () => {
       assert.ok(validateConfigRaw({ hotUpdate: { minIntervalSec: 86_401 } }).some((e) => e.includes("hotUpdate.minIntervalSec")));
     },
     10_000,
+  );
+
+  it(
+    "slice U fix: daemon reload --check bounds hung listener probe and avoids node-id creation",
+    async () => {
+      const { homeDir, releasesDir, fakeDir, socketPath, env } = createSandbox("hu-u-hung-");
+      const relB = buildReleaseDir(releasesDir, "rel-b");
+      writeHarnessHome(homeDir, { socketPath, fakeDir });
+
+      const sockets = new Set<Socket>();
+      const server = createServer((sock) => {
+        sockets.add(sock);
+        sock.once("close", () => sockets.delete(sock));
+        // Accept connections and intentionally never reply.
+      });
+      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+      try {
+        const startedAt = Date.now();
+        const res = await runCli(relB, ["daemon", "reload", "--check", "--target", relB.releaseDir], env);
+        const elapsedMs = Date.now() - startedAt;
+        assert.equal(res.code, 1, `expected exit 1 on hung listener, got ${res.code}: stdout=${res.stdout} stderr=${res.stderr}`);
+        assert.ok(elapsedMs < 15_000, `expected bounded check under 15s, took ${elapsedMs}ms`);
+        assert.ok(
+          res.stderr.includes("could not determine harnessd state"),
+          `expected inconclusive diagnostic in stderr:\n${res.stderr}`,
+        );
+        assert.equal(existsSync(join(homeDir, "node-id")), false, "daemon reload --check must not create node-id");
+      } finally {
+        for (const s of sockets) s.destroy();
+        await new Promise<void>((r) => server.close(() => r()));
+        rmSync(socketPath, { force: true });
+      }
+    },
+    20_000,
+  );
+
+  it(
+    "slice U fix: daemon reload --check reports explicit target, separate reload pending line, and unknown legacy release",
+    async () => {
+      const { homeDir, releasesDir, fakeDir, socketPath, env } = createSandbox("hu-u-check-");
+      const relA = buildReleaseDir(releasesDir, "rel-a");
+      const relB = buildReleaseDir(releasesDir, "rel-b");
+      writeHarnessHome(homeDir, { socketPath, fakeDir });
+
+      const dueAt = Date.UTC(2026, 10, 24, 18, 0, 0);
+      const dueIso = new Date(dueAt).toISOString();
+      let sawReloadRpc = false;
+      const sockets = new Set<Socket>();
+      const server = createServer((sock) => {
+        sockets.add(sock);
+        sock.once("close", () => sockets.delete(sock));
+        attachDaemonReader(sock, {
+          onMessage: (msg) => {
+            const req = msg as { id?: string; op?: string };
+            if (req.op === "ping") {
+              writeDaemonMessage(sock, {
+                kind: "res",
+                id: req.id ?? "1",
+                ok: true,
+                result: {
+                  pong: true,
+                  pid: 4242,
+                  releaseId: "rel-a",
+                  restartSafe: true,
+                  reload: {
+                    state: "scheduled",
+                    targetReleaseId: "rel-c",
+                    dueAt,
+                  },
+                },
+              });
+            } else if (req.op === "daemon.reload") {
+              sawReloadRpc = true;
+            }
+          },
+        });
+      });
+      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+      try {
+        // Explicit --target mismatch + --check=true + separate pending line.
+        const mismatch = await runCli(relB, ["daemon", "reload", "--check=true", "--target", relB.releaseDir], env);
+        assert.equal(mismatch.code, 0, `expected exit 0, got ${mismatch.code}: stderr=${mismatch.stderr}`);
+        assert.equal(sawReloadRpc, false, "--check=true must never send daemon.reload");
+        assert.ok(
+          mismatch.stdout.includes(
+            `harnessd (pid 4242) is still running release rel-a; requested target is release rel-b (${relB.releaseDir}). Run: pi-harness daemon reload --target '${relB.releaseDir}'`,
+          ),
+          `unexpected mismatch stdout:\n${mismatch.stdout}`,
+        );
+        assert.equal(mismatch.stdout.includes("(reload scheduled)"), false, "must not append legacy suffix");
+        assert.ok(
+          mismatch.stdout.includes(`reload pending: scheduled to release rel-c (due ${dueIso})`),
+          `expected separate pending line:\n${mismatch.stdout}`,
+        );
+
+        // Same-release check must still report the pending reload to another release.
+        const same = await runCli(relA, ["daemon", "reload", "--check", "--target", relA.releaseDir], env);
+        assert.equal(same.code, 0, `expected exit 0, got ${same.code}: stderr=${same.stderr}`);
+        assert.ok(same.stdout.includes("already running release rel-a"), `unexpected same-release stdout:\n${same.stdout}`);
+        assert.ok(
+          same.stdout.includes(`reload pending: scheduled to release rel-c (due ${dueIso})`),
+          `expected pending line in same-release check:\n${same.stdout}`,
+        );
+
+        // Legacy notice with unreported releaseId names "release unknown".
+        const unknownLegacy = formatLegacyBootstrapNotice({ pid: 77, running: false }, "rel-b");
+        assert.ok(
+          unknownLegacy.startsWith("harnessd (pid 77, release unknown, idle) does not support hot update and was not restarted."),
+          `unexpected unknown legacy notice:\n${unknownLegacy}`,
+        );
+      } finally {
+        for (const s of sockets) s.destroy();
+        await new Promise<void>((r) => server.close(() => r()));
+        rmSync(socketPath, { force: true });
+      }
+    },
+    20_000,
   );
 });

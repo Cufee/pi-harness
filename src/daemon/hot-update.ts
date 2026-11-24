@@ -20,6 +20,33 @@ const STOP_BUDGET_MS = 45_000;
 const WAIT_SLACK_MS = 10_000;
 const DRAIN_POLL_MS = 250;
 const REPLY_FLUSH_MS = 25;
+const CHECK_PROBE_TIMEOUT_MS = 5_000;
+const RELOAD_RPC_TIMEOUT_MS = 30_000;
+
+class ReloadRpcTimeoutError extends Error {
+  constructor() {
+    super("reload rpc timeout");
+  }
+}
+
+async function withDeadline<T>(work: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new ReloadRpcTimeoutError()), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function quotePosixShellArg(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
 
 export interface HotUpdateHost {
   config(): HotUpdateConfig;
@@ -495,20 +522,37 @@ async function waitForPidExit(pid: number, timeoutMs: number): Promise<boolean> 
   return !isPidAlive(pid);
 }
 
-export function formatReleaseMismatchNotice(info: DaemonPingInfo, targetReleaseId: string): string {
+export function formatReleaseMismatchNotice(
+  info: DaemonPingInfo,
+  targetReleaseId: string,
+  explicitTargetDir?: string,
+): string {
   const runningRelease = typeof info.releaseId === "string" && info.releaseId.length > 0 ? info.releaseId : "unknown";
+  if (explicitTargetDir) {
+    return `harnessd (pid ${info.pid ?? "?"}) is still running release ${runningRelease}; requested target is release ${targetReleaseId} (${explicitTargetDir}). Run: pi-harness daemon reload --target ${quotePosixShellArg(explicitTargetDir)}`;
+  }
   return `harnessd (pid ${info.pid ?? "?"}) is still running release ${runningRelease}; release ${targetReleaseId} is installed. Run: pi-harness daemon reload`;
 }
 
-export function formatLegacyBootstrapNotice(info: DaemonPingInfo, targetReleaseId: string): string {
+export function formatLegacyBootstrapNotice(
+  info: DaemonPingInfo,
+  targetReleaseId: string,
+  explicitTargetDir?: string,
+): string {
   const workLabel = info.liveWork || (info.running === false ? "idle" : "active work");
-  const releasePart = typeof info.releaseId === "string" && info.releaseId.length > 0 ? `, release ${info.releaseId}` : "";
+  const runningRelease = typeof info.releaseId === "string" && info.releaseId.length > 0 ? info.releaseId : "unknown";
+  const targetLine = explicitTargetDir
+    ? `Requested target is release ${targetReleaseId} (${explicitTargetDir}).`
+    : `Release ${targetReleaseId} is installed and is used on the next daemon start.`;
+  const reloadCmd = explicitTargetDir
+    ? `  pi-harness daemon reload --legacy --target ${quotePosixShellArg(explicitTargetDir)}`
+    : `  pi-harness daemon reload --legacy`;
   return [
-    `harnessd (pid ${info.pid ?? "?"}${releasePart}, ${workLabel}) does not support hot update and was not restarted.`,
-    `Release ${targetReleaseId} is installed and is used on the next daemon start.`,
+    `harnessd (pid ${info.pid ?? "?"}, release ${runningRelease}, ${workLabel}) does not support hot update and was not restarted.`,
+    targetLine,
     `To restart it now and resume its work in place, run from a terminal (not from an agent):`,
     `  pi-harness daemon recover --dry-run`,
-    `  pi-harness daemon reload --legacy`,
+    reloadCmd,
   ].join("\n");
 }
 
@@ -952,55 +996,97 @@ export async function runDaemonReloadCli(opts: DaemonReloadCliOptions): Promise<
     allowCheckout = false;
   }
 
-  const client = new DaemonClient(opts.socketPath);
-  try {
-    await client.connect();
-  } catch {
-    client.close();
+  const explicitTargetDir = opts.targetDir ? resolve(opts.targetDir) : undefined;
+  const probe = await probePingDetailed(opts.socketPath, opts.check ? CHECK_PROBE_TIMEOUT_MS : RELOAD_RPC_TIMEOUT_MS);
+  if (probe.kind === "no_listener") {
     console.log(`harnessd is not running. Release ${target.releaseId} is used on next start.`);
     return 0;
   }
+  if (probe.kind === "inconclusive") {
+    if (opts.check) {
+      console.error(
+        `could not determine harnessd state (${probe.error}). Release ${target.releaseId} is the target. Run: pi-harness daemon reload --check`,
+      );
+    } else {
+      console.error(
+        `harnessd did not answer ping (${probe.error}) and was not reloaded. Release ${target.releaseId} is the target. Run: pi-harness daemon reload`,
+      );
+    }
+    return 1;
+  }
 
-  let info: DaemonPingInfo;
+  const info = probe.info;
+  if (opts.check) {
+    if (info.releaseId === target.releaseId) {
+      console.log(`already running release ${target.releaseId}`);
+    } else if (info.reload === undefined) {
+      console.log(formatLegacyBootstrapNotice(info, target.releaseId, explicitTargetDir));
+    } else {
+      console.log(formatReleaseMismatchNotice(info, target.releaseId, explicitTargetDir));
+    }
+    if (info.reload && (info.reload.state === "scheduled" || info.reload.state === "draining")) {
+      const pendingTarget =
+        typeof info.reload.targetReleaseId === "string" && info.reload.targetReleaseId.length > 0
+          ? info.reload.targetReleaseId
+          : "unknown";
+      const duePart =
+        typeof info.reload.dueAt === "number" && Number.isFinite(info.reload.dueAt)
+          ? ` (due ${new Date(info.reload.dueAt).toISOString()})`
+          : "";
+      console.log(`reload pending: ${info.reload.state} to release ${pendingTarget}${duePart}`);
+    }
+    return 0;
+  }
+  if (opts.legacy) {
+    return await runLegacyReloadCli({ opts, self, target, allowCheckout, info });
+  }
+  if (info.releaseId === target.releaseId && !opts.force && info.reload?.state !== "scheduled") {
+    console.log(`already running release ${target.releaseId}`);
+    return 0;
+  }
+  if (info.reload === undefined) {
+    console.log(formatLegacyBootstrapNotice(info, target.releaseId, explicitTargetDir));
+    return 0;
+  }
+
+  const source: "install" | "cli" = opts.fromInstall ? "install" : "cli";
+  const params: DaemonReloadParams = {
+    target,
+    allowCheckout,
+    source,
+    ...(opts.now ? { now: true } : {}),
+    ...(opts.force ? { force: true } : {}),
+  };
+
+  const client = new DaemonClient(opts.socketPath);
   let reply: DaemonReloadReply;
   try {
-    info = await client.request<DaemonPingInfo>("ping");
-    if (opts.check) {
-      if (info.releaseId === target.releaseId) {
-        console.log(`already running release ${target.releaseId}`);
-      } else if (info.reload === undefined) {
-        console.log(formatLegacyBootstrapNotice(info, target.releaseId));
-      } else {
-        const suffix =
-          info.reload.state === "scheduled" || info.reload.state === "draining"
-            ? ` (reload ${info.reload.state})`
-            : "";
-        console.log(`${formatReleaseMismatchNotice(info, target.releaseId)}${suffix}`);
+    let connectNoListener = false;
+    const reloadOp = (async () => {
+      try {
+        await client.connect();
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException)?.code;
+        if (code === "ENOENT" || code === "ECONNREFUSED") {
+          connectNoListener = true;
+          return null;
+        }
+        throw err;
       }
+      return await client.request<DaemonReloadReply>("daemon.reload", params as unknown as Record<string, unknown>);
+    })();
+    const res = await withDeadline(reloadOp, RELOAD_RPC_TIMEOUT_MS);
+    if (connectNoListener || res === null) {
+      console.log(`harnessd is not running. Release ${target.releaseId} is used on next start.`);
       return 0;
     }
-    if (opts.legacy) {
-      // Close the probe socket before running dry-run / prompt / supervisor stop.
-      client.close();
-      return await runLegacyReloadCli({ opts, self, target, allowCheckout, info });
+    reply = res;
+  } catch (err) {
+    if (err instanceof ReloadRpcTimeoutError) {
+      console.error("harnessd did not answer daemon.reload within 30s. Run: pi-harness daemon reload");
+      return 1;
     }
-    if (info.releaseId === target.releaseId && !opts.force && info.reload?.state !== "scheduled") {
-      console.log(`already running release ${target.releaseId}`);
-      return 0;
-    }
-    if (info.reload === undefined) {
-      console.log(formatLegacyBootstrapNotice(info, target.releaseId));
-      return 0;
-    }
-    const source: "install" | "cli" = opts.fromInstall ? "install" : "cli";
-    const params: DaemonReloadParams = {
-      target,
-      allowCheckout,
-      source,
-      ...(opts.now ? { now: true } : {}),
-      ...(opts.force ? { force: true } : {}),
-    };
-    reply = await client.request<DaemonReloadReply>("daemon.reload", params as unknown as Record<string, unknown>);
+    throw err;
   } finally {
     client.close();
   }
@@ -1011,7 +1097,7 @@ export async function runDaemonReloadCli(opts: DaemonReloadCliOptions): Promise<
       return 0;
     case "skipped":
       console.log(`reload skipped (${reply.reason}).`);
-      console.log(formatReleaseMismatchNotice(info, target.releaseId));
+      console.log(formatReleaseMismatchNotice(info, target.releaseId, explicitTargetDir));
       return 0;
     case "scheduled":
       console.log(

@@ -69,7 +69,19 @@ export function parseArgs(argv: string[]): ParsedArgs {
     if (arg.startsWith("--") && arg.length > 2) {
       const eq = arg.indexOf("=");
       if (eq !== -1) {
-        flags[arg.slice(2, eq)] = arg.slice(eq + 1);
+        const key = arg.slice(2, eq);
+        const value = arg.slice(eq + 1);
+        if (BOOLEAN_LONG_FLAGS.has(key)) {
+          if (value === "true" || value === "1") {
+            flags[key] = true;
+          } else if (value === "false" || value === "0") {
+            flags[key] = false;
+          } else {
+            throw new Error(`--${key} takes no value (got "${value}")`);
+          }
+        } else {
+          flags[key] = value;
+        }
       } else {
         const key = arg.slice(2);
         const next = argv[i + 1];
@@ -608,9 +620,12 @@ async function main(): Promise<void> {
   }
   const config = loadConfig(repoRoot, socketPathEnv ? { socketPath: resolve(socketPathEnv) } : undefined);
   const remoteSpec = resolveRemoteSpec(rawRemote, config.remotes);
+  let cachedLocalNodeId: string | undefined;
   const hostCtx = {
     localSocketPath: config.socketPath,
-    localNodeId: loadOrCreateNodeId(config.stateDir),
+    get localNodeId(): string {
+      return (cachedLocalNodeId ??= loadOrCreateNodeId(config.stateDir));
+    },
     remoteHost: remoteSpec.hostLabel,
     remoteSelector: remoteSpec.selector,
     getRemotes: () => loadConfig(repoRoot).remotes,
