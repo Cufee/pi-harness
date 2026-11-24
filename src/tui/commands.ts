@@ -36,6 +36,7 @@ export const COMMAND_SPECS: CommandSpec[] = [
   { name: "resume", usage: "/resume [in <dur> | msg]", description: "Resume paused run now or schedule delayed resume (e.g. /resume in 15m)", modes: ["run"] },
   { name: "steer", usage: "/steer <task-id> <msg>", description: "Steer a specific running task", modes: ["chat", "run"] },
   { name: "now", usage: "/now [n]", description: "Steer a queued message into the live turn now (default: 1, or Alt+S)", modes: ["chat"] },
+  { name: "queue", usage: "/queue", description: "List all queued, sending, and unconfirmed messages with position and state", modes: ["chat", "run"] },
   { name: "drop", aliases: ["unqueue"], usage: "/drop [n|all]", description: "Drop a queued message without sending it (default: latest)", modes: ["chat", "run"] },
   { name: "internal", usage: "/internal", description: "Toggle showing internal harness lines in the chat transcript", modes: ["chat"] },
   { name: "clear", usage: "/clear", description: "Clear the local transcript view", modes: ["chat", "run"] },

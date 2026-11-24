@@ -1,10 +1,10 @@
 /**
  * Pure in-memory queue model for pending user messages in the TUI.
- * Holds delivery order, per-item state (`sending` vs `queued`), and delivery timing reason
- * with no terminal or daemon client dependencies.
+ * Holds delivery order, per-item state (`sending`, `queued`, or `unconfirmed`), and delivery
+ * timing reason with no terminal or daemon client dependencies.
  */
 
-export type ChatQueueItemState = "sending" | "queued";
+export type ChatQueueItemState = "sending" | "queued" | "unconfirmed";
 
 export type ChatQueueReason = "after_turn" | "reconnect" | "restart" | "control";
 
@@ -30,6 +30,7 @@ export function formatQueueReason(reason: ChatQueueReason): string {
 
 export function formatQueueItemState(item: Pick<ChatQueueItem, "state" | "reason">): string {
   if (item.state === "sending") return "sending";
+  if (item.state === "unconfirmed") return "may not have been delivered";
   return `queued · ${formatQueueReason(item.reason)}`;
 }
 
@@ -41,10 +42,20 @@ export class ChatQueueModel {
     return this.items.length;
   }
 
+  /** Number of items eligible for automatic delivery (`queued` state only; excludes `sending` and `unconfirmed`). */
   get queuedLength(): number {
     let count = 0;
     for (const item of this.items) {
       if (item.state === "queued") count += 1;
+    }
+    return count;
+  }
+
+  /** Number of items the user can recall or drop (`queued` and `unconfirmed`, excluding in-flight `sending`). */
+  get removableLength(): number {
+    let count = 0;
+    for (const item of this.items) {
+      if (item.state !== "sending") count += 1;
     }
     return count;
   }
@@ -89,6 +100,15 @@ export class ChatQueueModel {
     return { ...updated };
   }
 
+  /** Marks an item whose transport dropped mid-send as `unconfirmed` so it is never resent automatically. */
+  markUnconfirmed(id: string): ChatQueueItem | null {
+    const idx = this.items.findIndex((item) => item.id === id);
+    if (idx < 0) return null;
+    const updated: ChatQueueItem = { ...this.items[idx]!, state: "unconfirmed" };
+    this.items[idx] = updated;
+    return { ...updated };
+  }
+
   /** Removes and returns the next item ready for delivery (first item in `queued` state). */
   takeNext(): ChatQueueItem | null {
     const idx = this.items.findIndex((item) => item.state === "queued");
@@ -117,10 +137,10 @@ export class ChatQueueModel {
     return removed ? { ...removed } : null;
   }
 
-  /** Removes and returns the most recently queued item (skipping in-flight `sending` items) for editing or dropping. */
+  /** Removes and returns the most recent removable item (`queued` or `unconfirmed`, skipping in-flight `sending`). */
   popLatest(): ChatQueueItem | null {
     for (let i = this.items.length - 1; i >= 0; i -= 1) {
-      if (this.items[i]!.state === "queued") {
+      if (this.items[i]!.state !== "sending") {
         const [removed] = this.items.splice(i, 1);
         return removed ? { ...removed } : null;
       }
@@ -128,11 +148,11 @@ export class ChatQueueModel {
     return null;
   }
 
-  /** Removes all items currently in `queued` state (leaving any in-flight `sending` items untouched). */
+  /** Removes all removable items (`queued` and `unconfirmed`), leaving any in-flight `sending` items untouched. */
   clearQueued(): ChatQueueItem[] {
     const removed: ChatQueueItem[] = [];
     this.items = this.items.filter((item) => {
-      if (item.state === "queued") {
+      if (item.state !== "sending") {
         removed.push({ ...item });
         return false;
       }

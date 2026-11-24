@@ -96,30 +96,10 @@ function renderTimestampDivider(label: string, width: number, theme: Theme): str
 }
 
 /**
- * Strips an already-frozen text prefix from a full assistant turn string.
- * Returns `{ matched: true, remainder }` when `fullText` begins with `frozenText` (exact or trimmed),
- * or `{ matched: false, remainder: "" }` when `fullText` does not begin with `frozenText`.
- */
-export function stripFrozenPrefix(fullText: string, frozenText: string): { matched: boolean; remainder: string } {
-  if (!frozenText) return { matched: false, remainder: fullText };
-  if (fullText.startsWith(frozenText)) {
-    return { matched: true, remainder: fullText.slice(frozenText.length) };
-  }
-  const trimmedFrozen = frozenText.trim();
-  if (trimmedFrozen.length > 0) {
-    const trimmedFullStart = fullText.trimStart();
-    if (trimmedFullStart.startsWith(trimmedFrozen)) {
-      return { matched: true, remainder: trimmedFullStart.slice(trimmedFrozen.length) };
-    }
-  }
-  return { matched: false, remainder: "" };
-}
-
-/**
  * Strictly-bottom-only streaming tail for the active assistant turn.
  * Renders only while a turn is live; when the turn finishes, its final content is frozen into
  * `ImmutableTranscript` and this tail resets to empty. Also records any text already frozen
- * mid-turn so settlement and reconnect resync never render the same reply twice.
+ * mid-turn so settlement and reconnect resync never render the exact same segment twice.
  */
 export class LiveTurnTail implements Component {
   private text = "";
@@ -151,11 +131,24 @@ export class LiveTurnTail implements Component {
 
   /**
    * Resets the streaming tail on reconnect while optionally preserving already-frozen text
-   * from the same in-flight turn so previously rendered segments are stripped from `seedText`.
+   * from the same in-flight turn. `seedText` is the daemon's post-flush `activePartial`, so it is
+   * kept intact unless it equals the already-frozen text of this turn (after trim).
    */
-  reseed(seedText: string, modelLabel?: string, preserveFrozen = false): void {
-    const prevFrozen = preserveFrozen ? this.frozenText : "";
-    const prevCount = preserveFrozen ? this.frozenSegmentCount : 0;
+  reseed(seedText: string, modelLabel?: string, preserveFrozen = false, frozenTextOverride?: string): void {
+    const prevFrozen =
+      typeof frozenTextOverride === "string"
+        ? frozenTextOverride
+        : preserveFrozen
+          ? this.frozenText
+          : "";
+    const prevCount =
+      typeof frozenTextOverride === "string"
+        ? frozenTextOverride.trim()
+          ? Math.max(1, this.frozenSegmentCount)
+          : 0
+        : preserveFrozen
+          ? this.frozenSegmentCount
+          : 0;
     this.active = true;
     this.text = "";
     this.thought = "";
@@ -166,9 +159,8 @@ export class LiveTurnTail implements Component {
     this.frozenText = prevFrozen;
     this.frozenSegmentCount = prevCount;
     if (seedText) {
-      if (this.frozenSegmentCount > 0) {
-        const stripped = stripFrozenPrefix(seedText, this.frozenText);
-        this.text = stripped.matched ? stripped.remainder : seedText;
+      if (this.frozenSegmentCount > 0 && seedText.trim() === this.frozenText.trim()) {
+        this.text = "";
       } else {
         this.text = seedText;
       }
@@ -311,13 +303,6 @@ export interface AppendReceiptOptions {
   text: string;
   ref?: EntityRef;
   timestampMs?: number | null;
-  /**
-   * Controls interaction with an active streaming live turn:
-   * - `"immediate"` (default): appends without freezing live text.
-   * - `"passive"`: held until the live turn settles so passive events never split or shift an in-flight reply.
-   * - `"freeze"`: freezes live text first so turn-ordered receipts stay in exact chronological position.
-   */
-  mode?: "immediate" | "passive" | "freeze";
 }
 
 /**
@@ -326,7 +311,6 @@ export interface AppendReceiptOptions {
 export class ImmutableTranscript extends Container {
   readonly liveTail: LiveTurnTail;
   private readonly frozenContainer = new Container();
-  private readonly heldPassiveReceipts: AppendReceiptOptions[] = [];
   private lastTimestampMs: number | null = null;
 
   constructor(private readonly theme: Theme) {
@@ -411,42 +395,48 @@ export class ImmutableTranscript extends Container {
   }
 
   /** Reseeds the live turn on reconnect, preserving already-frozen text when staying on the same turn. */
-  resyncLiveTurn(opts: { modelLabel?: string; seedText?: string; preserveFrozen?: boolean }): void {
-    this.liveTail.reseed(opts.seedText ?? "", opts.modelLabel, opts.preserveFrozen ?? false);
+  resyncLiveTurn(opts: {
+    modelLabel?: string;
+    seedText?: string;
+    preserveFrozen?: boolean;
+    frozenText?: string;
+  }): void {
+    this.liveTail.reseed(opts.seedText ?? "", opts.modelLabel, opts.preserveFrozen ?? false, opts.frozenText);
   }
 
   /**
-   * Freezes any streamed live text into an immutable AssistantCard before appending a mid-turn card or steer,
-   * preserving exact chronological order and avoiding scrollback wipes.
+   * Freezes any streamed live text into an immutable AssistantCard before a daemon flush point
+   * (mid-turn tool card or accepted steer). Returns the frozen text when non-empty, else `null`.
    */
-  freezeLiveText(fallbackTimestampMs?: number | null): boolean {
-    if (!this.liveTail.isActive) return false;
+  freezeLiveText(fallbackTimestampMs?: number | null): string | null {
+    if (!this.liveTail.isActive) return null;
     const { text, modelLabel, timestampMs } = this.liveTail.takeText();
-    if (!text.trim()) return false;
+    if (!text.trim()) return null;
     this.appendAssistantTurn(text, modelLabel || undefined, timestampMs ?? fallbackTimestampMs);
-    return true;
+    return text;
   }
 
   /**
-   * Settles the active live turn using the daemon's final reply text.
-   * Appends only the portion not already frozen during this turn (finalText minus the already-frozen prefix,
-   * or only what remains in the live tail when finalText does not begin with the frozen prefix).
+   * Settles the active live turn using the daemon's final persisted assistant segment.
+   * Because every mid-turn TUI freeze coincides with a daemon flush, `finalText` is the final
+   * segment (not cumulative) and replaces the unfrozen live text when present. Only when
+   * `finalText` equals this turn's already-frozen text (after trim) is it skipped as a duplicate.
    */
   settleLiveTurn(opts?: {
     finalText?: string;
     modelLabel?: string;
     timestampMs?: number | null;
     discardLiveText?: boolean;
-    flushHeld?: boolean;
   }): { tools: LiveToolPill[]; appendedText: string; textTimestampMs: number | null } {
     const snap = this.liveTail.snapshot();
     let toAppend = "";
     if (!opts?.discardLiveText) {
-      if (snap.frozenSegmentCount === 0) {
-        toAppend = opts?.finalText ?? snap.text;
-      } else if (typeof opts?.finalText === "string") {
-        const stripped = stripFrozenPrefix(opts.finalText, snap.frozenText);
-        toAppend = stripped.matched ? stripped.remainder : snap.text;
+      if (typeof opts?.finalText === "string") {
+        if (snap.frozenSegmentCount > 0 && opts.finalText.trim() === snap.frozenText.trim()) {
+          toAppend = "";
+        } else {
+          toAppend = opts.finalText;
+        }
       } else {
         toAppend = snap.text;
       }
@@ -459,10 +449,6 @@ export class ImmutableTranscript extends Container {
       this.appendAssistantTurn(toAppend, snap.modelLabel ?? opts?.modelLabel, assistantTs);
     }
 
-    if (opts?.flushHeld !== false) {
-      this.flushHeldReceipts();
-    }
-
     return {
       tools: snap.tools,
       appendedText: toAppend,
@@ -470,20 +456,15 @@ export class ImmutableTranscript extends Container {
     };
   }
 
-  /** Flushes passive receipts that were held while an assistant turn was streaming. */
-  flushHeldReceipts(): void {
-    if (this.heldPassiveReceipts.length === 0) return;
-    for (const receipt of this.heldPassiveReceipts.splice(0)) {
-      this.appendReceiptBlock(receipt);
-    }
-  }
-
   /**
    * Immutable structured Tool-Output Card (`goals_table`, `goal_detail`, `run_activity`).
    * Identical layout both live (from `chat.tool`) and replayed (from `turn.role === "tool_output"`).
+   * Pass `{ freeze: false }` when replaying persisted history so live tail state is untouched.
    */
-  appendToolOutput(display: ToolDisplayPayload, timestampMs?: number | null): void {
-    this.freezeLiveText(timestampMs);
+  appendToolOutput(display: ToolDisplayPayload, timestampMs?: number | null, opts?: { freeze?: boolean }): void {
+    if (opts?.freeze !== false) {
+      this.freezeLiveText(timestampMs);
+    }
     this.maybeAppendTimestampDivider(timestampMs);
     const t = this.theme;
     const block: TranscriptBlock = { kind: "tool_output", display };
@@ -498,7 +479,11 @@ export class ImmutableTranscript extends Container {
     this.frozenContainer.addChild(new FrozenBlock((w) => renderTranscriptBlock(block, w, t)));
   }
 
-  private appendReceiptBlock(opts: AppendReceiptOptions): void {
+  /**
+   * Appends a single-line immutable receipt immediately above any streaming live tail without
+   * freezing live text. Never mutates later; users open full details via `Ctrl+X` or `Ctrl+G`.
+   */
+  appendReceipt(opts: AppendReceiptOptions): void {
     this.maybeAppendTimestampDivider(opts.timestampMs);
     const t = this.theme;
     const g = t.glyphs;
@@ -523,25 +508,9 @@ export class ImmutableTranscript extends Container {
     this.frozenContainer.addChild(new FrozenBlock((w) => renderTranscriptBlock(block, w, t)));
   }
 
-  /**
-   * Appends a single-line immutable receipt for an event, tool summary, or entity notification.
-   * Never mutates later; users open full details in the Inspector via `Ctrl+X` or `Ctrl+G`.
-   */
-  appendReceipt(opts: AppendReceiptOptions): void {
-    if (opts.mode === "passive" && this.liveTail.isActive) {
-      this.heldPassiveReceipts.push({ ...opts });
-      return;
-    }
-    if (opts.mode === "freeze") {
-      this.freezeLiveText(opts.timestampMs);
-    }
-    this.appendReceiptBlock(opts);
-  }
-
   clearAll(): void {
     this.frozenContainer.clear();
     this.liveTail.clear();
-    this.heldPassiveReceipts.length = 0;
     this.lastTimestampMs = null;
   }
 }
@@ -952,11 +921,11 @@ export class FixedDock implements Component {
     return compose(left);
   }
 
-  private queueStripCap(): number {
+  /** Uses available terminal rows above the baseline dock while reserving space for the transcript. */
+  private queueStripMaxRows(): number {
     const rows = this.tuiRef.terminal?.rows ?? 30;
-    if (rows < 18) return 1;
-    if (rows < 24) return 3;
-    return 5;
+    const baseDockRows = this.hudRowCount() + 7;
+    return Math.max(1, rows - baseDockRows - 6);
   }
 
   private renderQueueStripRows(width: number): string[] {
@@ -964,8 +933,9 @@ export class FixedDock implements Component {
     if (!items || items.length === 0) return [];
     const t = this.theme;
     const g = t.glyphs;
-    const cap = this.queueStripCap();
-    const shown = items.slice(0, cap);
+    const maxRows = this.queueStripMaxRows();
+    const visibleCap = items.length <= maxRows ? items.length : Math.max(1, maxRows - 1);
+    const shown = items.slice(0, visibleCap);
     const hidden = Math.max(0, items.length - shown.length);
     const canSteer = this.state.canSteerQueued !== false;
     const keyHint = canSteer
@@ -985,8 +955,9 @@ export class FixedDock implements Component {
 
     for (let i = 0; i < shown.length; i += 1) {
       const item = shown[i]!;
-      const glyph = item.state === "sending" ? g.running : g.ascii ? "~" : "⧗";
-      const tone: Tone = item.state === "sending" ? "accent" : "warn";
+      const glyph =
+        item.state === "sending" ? g.running : item.state === "unconfirmed" ? g.warn : g.ascii ? "~" : "⧗";
+      const tone: Tone = item.state === "sending" ? "accent" : item.state === "unconfirmed" ? "danger" : "warn";
       const statusText = formatQueueItemState(item);
       const preview = firstLine(sanitizeLine(item.text), Math.max(20, width));
       const prefix = ` ${t.paint(tone, `${glyph} ${i + 1} ${statusText}`)} ${t.dim(g.sep)} `;
@@ -1006,8 +977,8 @@ export class FixedDock implements Component {
     }
 
     if (hidden > 0) {
-      const left = `  ${t.muted(`+${hidden} more queued`)}`;
-      const right = keyHint || `${t.dim("/drop")} `;
+      const left = `  ${t.muted(`+${hidden} more · /queue`)}`;
+      const right = keyHint || `${t.dim("/queue")} `;
       out.push(visibleWidth(left) + 2 + visibleWidth(right) <= width ? splitRow(left, right, width) : fit(left, width));
     }
 

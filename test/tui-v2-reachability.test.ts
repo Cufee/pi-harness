@@ -1029,14 +1029,16 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
       const afterTurn1End = writes.slice(writesBeforeTurn1End).map(stripTerminalSequences).join("\n");
       assert.ok(writes.map(stripTerminalSequences).join("\n").includes("run-77"), "Live present_result card must render");
 
-      // After turn 1 ends, the queued message drains as chat.send and renders once as a user turn
+      // After turn 1 ends, the queued message drains as chat.send and stays in `sending` state
+      // while unconfirmed (no premature user card before daemon acceptance).
       const sendCalls = mock.calls.filter((c) => c.op === "chat.send");
       assert.equal(sendCalls.length, 2, "Queued message must drain via chat.send after turn end");
       assert.equal(sendCalls[1]?.params.text, "Focus on tests");
+      assert.ok(afterTurn1End.includes("sending"), "Drained unconfirmed message must stay in sending state");
       assert.equal(
         (afterTurn1End.match(/[›>] Focus on tests/g) ?? []).length,
-        1,
-        "Drained message must render once as a user turn",
+        0,
+        "Unconfirmed chat.send must not prematurely append a user card before daemon acceptance",
       );
       const turn2Id = String(sendCalls[1]?.params.turnId);
 
@@ -1063,6 +1065,12 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
       });
       resolveSecondSend();
       await new Promise((r) => setTimeout(r, 25));
+      const fullAfterTurn2 = writes.slice(writesBeforeTurn1End).map(stripTerminalSequences).join("\n");
+      assert.equal(
+        (fullAfterTurn2.match(/[›>] Focus on tests/g) ?? []).length,
+        1,
+        "Confirmed drained message must render once as a user turn",
+      );
 
       // Clean exit via Ctrl+] -> calls session.leave!
       sendInput("\x1d");

@@ -805,4 +805,153 @@ describe("TUI auto-reconnect after daemon restart", () => {
       "harnessd on buildbox was stopped. Start pi-harness again to reconnect.",
     );
   }, 5_000);
+
+  it("undelivered chat.steer lost in disconnect stays visible as unconfirmed even when composer is occupied and can be recalled with Ctrl+R", async () => {
+    const stateDir = realpathSync(mkdtempSync(join(tmpdir(), "pi-harness-tui-reconn-unconf-")));
+    const sockPath = join(stateDir, "d.sock");
+    const sockets = new Set<import("node:net").Socket>();
+    const receivedSends: string[] = [];
+    const receivedSteers: string[] = [];
+    const history: Array<{ seq: number; role: string; content: string; createdAt: number }> = [];
+    let clientIdSeq = 0;
+
+    const fakeServer = createServer((socket) => {
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+      const cid = `client-${++clientIdSeq}`;
+      attachDaemonReader(socket, {
+        onMessage: (raw) => {
+          const req = raw as { kind?: string; id?: string; op?: string; params?: Record<string, unknown> };
+          if (req?.kind !== "req" || !req.id) return;
+          const ok = (result: unknown) => writeDaemonMessage(socket, { kind: "res", id: req.id!, ok: true, result });
+
+          if (req.op === "ping") {
+            ok({ pong: true, pid: process.pid, protocolRev: DAEMON_PROTOCOL_REV, releaseId: "rel-test" });
+            return;
+          }
+          if (req.op === "chat.open") {
+            const through = history.length > 0 ? history[history.length - 1]!.seq : 0;
+            ok({
+              session: { id: "chat-u1", title: "Unconfirmed test", repoRoot: stateDir, projectId: null, profileId: "director", model: "fixture", effort: null },
+              project: null,
+              history: [],
+              historyNext: null,
+              historyThrough: through,
+              busy: false,
+              activeTurnId: null,
+              activeText: "",
+              activePartial: "",
+              control: { sessionId: "chat-u1", clientId: cid, controllerClientId: cid, hasControl: true, controlSeq: 1 },
+            });
+            return;
+          }
+          if (req.op === "chat.history") {
+            const afterSeq = Number(req.params?.afterSeq ?? 0);
+            const throughSeq = Number(req.params?.throughSeq ?? Number.MAX_SAFE_INTEGER);
+            const rows = history.filter((r) => r.seq > afterSeq && r.seq <= throughSeq);
+            ok({ history: rows, historyNext: null });
+            return;
+          }
+          if (req.op === "chat.send") {
+            const text = String(req.params?.text ?? "");
+            receivedSends.push(text);
+            history.push({ seq: history.length + 1, role: "user", content: text, createdAt: Date.now() });
+            ok({ started: true });
+            return;
+          }
+          if (req.op === "chat.steer") {
+            const message = String(req.params?.message ?? "");
+            receivedSteers.push(message);
+            // Server drops BEFORE persisting the steer (absent delivery).
+            socket.destroy();
+            return;
+          }
+          if (req.op === "session.leave") {
+            ok({ ok: true });
+            return;
+          }
+          if (req.op === "work.snapshot") {
+            ok(null);
+            return;
+          }
+          ok([]);
+        },
+        onError: () => {},
+        onEnd: () => {},
+      });
+    });
+
+    await new Promise<void>((resolve) => fakeServer.listen(sockPath, resolve));
+    const client = new DaemonClient(sockPath);
+    const term = makeFakeTerminal(120, 30);
+    let tuiPromise: Promise<{ kind: string }> | null = null;
+    try {
+      await client.connect();
+      tuiPromise = runDirectorChatTui({
+        client,
+        repoRoot: stateDir,
+        terminal: term.terminal,
+      });
+
+      await waitFor(() => term.text().includes("chat-u1"), 4000, "initial render");
+
+      // Start an active turn
+      term.typeText("turn-one");
+      term.sendInput("\r");
+      await waitFor(() => receivedSends.includes("turn-one"), 4000, "turn-one sent");
+
+      // Queue follow-up and invoke /now; server drops WITHOUT persisting the steer
+      term.typeText("UNDELIVERED-STEER");
+      term.sendInput("\r");
+      await waitFor(() => term.text().includes("UNDELIVERED-STEER"), 4000, "queued");
+      term.typeText("/now");
+      term.sendInput("\r");
+      await waitFor(() => receivedSteers.includes("UNDELIVERED-STEER"), 4000, "steer sent");
+
+      // Occupy the composer before reconnect finishes
+      term.typeText("KEEP-MY-DRAFT");
+
+      await waitFor(
+        () => term.text().includes("Reconnected to harnessd"),
+        8000,
+        "reconnected after absent steer delivery",
+      );
+
+      // Verify /queue shows UNDELIVERED-STEER as unconfirmed (not lost, not auto-resent)
+      const markBeforeQueueCmd = term.writes.length;
+      // Clear draft so we can run /queue cleanly
+      for (let i = 0; i < 20; i += 1) term.sendInput("\x7f");
+      term.typeText("/queue");
+      term.sendInput("\r");
+      await waitFor(
+        () =>
+          stripTerminalSequences(term.writes.slice(markBeforeQueueCmd).join("")).includes(
+            "1. [may not have been delivered] UNDELIVERED-STEER",
+          ),
+        4000,
+        "/queue lists undelivered unconfirmed item",
+      );
+      assert.deepEqual(receivedSends, ["turn-one"], "undelivered unconfirmed steer must never be resent automatically");
+
+      // Recall with Ctrl+R into composer and submit manually -> now it IS sent!
+      term.sendInput("\x12");
+      await new Promise((r) => setTimeout(r, 40));
+      term.sendInput("\r");
+      await waitFor(() => receivedSends.includes("UNDELIVERED-STEER"), 4000, "recalled unconfirmed item sent manually");
+
+      term.sendInput("\x1d");
+      const action = await tuiPromise;
+      tuiPromise = null;
+      assert.equal(action.kind, "exit");
+    } finally {
+      if (tuiPromise) {
+        term.sendInput("\x1d");
+        await tuiPromise.catch(() => {});
+      }
+      client.close();
+      for (const s of [...sockets]) s.destroy();
+      await new Promise<void>((resolve) => fakeServer.close(() => resolve()));
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  }, 15_000);
 });
