@@ -13,6 +13,8 @@ From a checkout with Bun on `PATH`, `bun run install` runs the same script. A pl
 | --- | --- | --- |
 | `PI_HARNESS_INSTALL_DIR` | `~/.pi-harness/install` | Staged Bun, releases and caches |
 | `PI_HARNESS_BIN_DIR` | `~/.local/bin` | Where `pi-harness` and `harness` are written |
+| `PI_HARNESS_NO_RELOAD` | `0` | Set to `1` to skip reloading a running daemon after activation |
+| `PI_HARNESS_RELOAD_WAIT` | terminal-dependent | Set to `1` to wait for reload completion, `0` to return immediately (defaults to waiting when stdout is a terminal) |
 
 State (`config.json`, the SQLite database, daemon socket) is untouched. Its locations are configured independently of the install: the state directory is `$PI_HARNESS_HOME` (default `~/.pi-harness`, one level above the default install directory), and the daemon socket can live elsewhere (see `socketPath` in [configuration.md](./configuration.md)). Each run that reaches activation, including unchanged re-runs, attempts to append one line (UTC time, user, pid, release id, source path) to `$PI_HARNESS_HOME/install-audit.log`; the append is best-effort and write errors are ignored, so exit status 0 does not guarantee an audit line was written. `pi-harness` has no `--version` flag; `--help` is the smoke test.
 
@@ -22,14 +24,14 @@ State (`config.json`, the SQLite database, daemon socket) is untouched. Its loca
 $PI_HARNESS_INSTALL_DIR/
   bun/<version>-<target>/bin/bun   staged upstream Bun
   tools/octofs/<version>-<triple>/bin/octofs   staged octofs (file tools for agents over MCP)
-  releases/<id>/                   src, proto, package.json, bun.lock, tsconfig.json, node_modules, .bun -> staged Bun
+  releases/<id>/                   src, proto, package.json, bun.lock, tsconfig.json, node_modules, .bun -> staged Bun, release.json
   current -> releases/<id>         active release (symlink swapped atomically)
   cache/downloads/                 verified Bun and octofs archives
   cache/bun/                       Bun package cache (BUN_INSTALL_CACHE_DIR, not ~/.bun)
 $PI_HARNESS_BIN_DIR/pi-harness     launcher; harness -> pi-harness
 ```
 
-`<id>` is the first 12 hex digits of a hash of the runtime files, so the same source always maps to the same release and an unchanged re-run reuses the existing release and its dependencies (it still swaps `current`, rewrites the launcher, and attempts the audit append). A release is built in a staging directory and moved into place only after `bun install` succeeds; an interrupted install leaves the previous `current` and launcher working. Old releases are kept (running daemons keep executing from theirs); delete unwanted directories under `releases/` by hand.
+`<id>` is the first 12 hex digits of a SHA-256 hash of the runtime files, so the same source always maps to the same release and an unchanged re-run reuses the existing release and its dependencies (it still swaps `current`, rewrites the launcher, and attempts the audit append). `release.json` records `{"id":"<id>","bunVersion":"<version>"}` and is the build identity reported by the daemon and CLI: installed releases report `<id>` from `release.json`, and a source checkout without `release.json` reports `dev-<hash>` derived from its canonical path (no file-mtime heuristics). A release is built in a staging directory and moved into place only after `bun install` succeeds; an interrupted install leaves the previous `current` and launcher working. Old releases are kept (running daemons keep executing from theirs); delete unwanted directories under `releases/` by hand.
 
 The launcher is `exec "$release/.bun" "$release/src/cli.ts" "$@"`: the staged Bun by default. `BUN_BIN=/path/to/bun` overrides it for debugging only. Code Mode uses `process.execPath`, so it runs under whichever Bun started the CLI.
 
@@ -39,7 +41,8 @@ The launcher is `exec "$release/.bun" "$release/src/cli.ts" "$@"`: the staged Bu
 2. Downloads `https://github.com/oven-sh/bun/releases/download/bun-v$BUN_VERSION/bun-$target.zip` and checks it against the SHA-256 pinned in `install.sh`, before unzipping. A cached archive that fails the check is deleted and fetched again.
 3. On the four targets with a pin (macOS and Linux, arm64 and x64), downloads `octofs` `0.26.0` from its GitHub release and checks the pinned SHA-256 before unpacking; the daemon offers it to agents as an MCP server (opt-out and the on-demand fallback are in [configuration.md](./configuration.md)).
 4. Copies the runtime files into a release directory and runs `bun install --frozen-lockfile --production`. The frozen lockfile fails on any drift from `bun.lock` instead of re-resolving; `bun.lock` carries integrity hashes. Dev dependencies (`tsc`, `protoc-gen-es`) are not installed; `src/gen` is committed.
-5. Swaps `current`, then rewrites the launcher.
+5. Writes `release.json`, swaps `current`, and rewrites the launcher.
+6. Releases `.lock` and removes its staging directory, then invokes `daemon reload --from-install` from the new release unless `PI_HARNESS_NO_RELOAD=1` (never starting a daemon if none is running).
 
 A `.lock` directory prevents concurrent installs; remove it if a killed install left it behind.
 
@@ -71,12 +74,95 @@ Python for Code Mode is provisioned separately (uv, CPython, wheels); see [code-
 
 ## Updating
 
-- **Harness source or JS dependencies**: pull, then `sh install.sh`. Changed `src/` or `bun.lock` yields a new release and an atomic switch; restart the daemon (`pi-harness daemon restart`) to use it.
+- **Harness source or JS dependencies**: pull, then `sh install.sh` (or `bun run install`). Changed `src/` or `bun.lock` yields a new release, swaps `current` atomically, and triggers a hot update of the running daemon (see [Hot update](#hot-update)).
 - **Bun**: edit `BUN_VERSION` and `BUN_PINS` in `install.sh`, then re-run. Take the digests from `https://github.com/oven-sh/bun/releases/download/bun-v<version>/SHASUMS256.txt` (the `bun-<target>.zip` lines, not `-profile`), and run the Code Mode tests and the Code Mode sandbox probe under the new Bun before committing. A newer Bun than the one the sandbox was verified with can change probe behaviour (1.4.5 needs the probe to `destroy()` its socket rather than `end()`).
 - **JS dependencies**: `bun update` in a checkout, commit `bun.lock`, re-run.
 - **OS utilities**: the OS vendor.
 
 The pinned version is Bun 1.4.5 (published 2026-11-19, the latest release when this was written); its SHA-256 pins were compared against `SHASUMS256.txt` for all nine targets in the installer.
+
+## Hot update
+
+After activating a release and appending to `install-audit.log`, `install.sh` removes its staging directory and `.lock`, clears its exit trap, and runs `"$BUN" "$REL/src/cli.ts" daemon reload --from-install` from the newly installed release. Releasing `.lock` first ensures a waiting reload does not block another install. `install.sh` never starts a daemon when none is running.
+
+When stdout is a terminal, or when `PI_HARNESS_RELOAD_WAIT=1`, `install.sh` passes `--wait` so the CLI waits for a draining reload to finish. Set `PI_HARNESS_RELOAD_WAIT=0` to return immediately after the daemon accepts the request, or `PI_HARNESS_NO_RELOAD=1` to skip the reload step for one install. To disable automatic reloads for all installs, set `hotUpdate.mode` to `"manual"` in global `config.json` (see [configuration.md](./configuration.md#hotupdate)).
+
+### Output and exit status
+
+`daemon reload --from-install` prints one of the following outcomes:
+
+- No daemon listening: `harnessd is not running. Release <id> is used on next start.` (exit `0`).
+- Already on the target release: `already running release <id>` (exit `0`).
+- Draining: `reload: harnessd pid <P> release <A> -> <B>, draining up to <N>s (<liveWork>)`, followed when `--wait` is active by `reloaded harnessd to release <B> (pid <P2>).` (exit `0`).
+- Rate-limited: `reload scheduled for <ISO UTC> (rate limit). Run "pi-harness daemon reload" to apply now.` (exit `0`; `--wait` does not block on a `scheduled` reply).
+- Manual mode: `reload skipped (mode_manual). Run "pi-harness daemon reload" to apply manually.` (exit `0`).
+- Daemon predates hot-update support: prints the bootstrap notice and exits `0` without restarting it (see [First activation](#first-activation)).
+
+`pi-harness daemon reload` uses these exit codes:
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Reloaded, accepted, scheduled, skipped, bootstrap notice printed, or no daemon running |
+| `1` | Other error (invalid target, checkout without `--target`, dry-run failure, or supervisor error) |
+| `2` | Confirmation missing for `daemon reload --legacy` without a terminal or `--yes` |
+| `3` | Target release failed to boot and the daemon is back on the previous release |
+| `4` | Timed out waiting for the new release to serve (`--wait`) |
+
+`install.sh` maps CLI exit `0` to `0`, maps exit `3` to `1` after noting that the install succeeded and `current` still points to the new release, and maps any other non-zero exit code to a warning recommending `pi-harness daemon reload` with exit `0`.
+
+### Drain and in-place resume
+
+1. **Drain**: when the daemon begins draining, its lifecycle moves to `"draining"`, work-starting RPCs are rejected with `DAEMON_RELOADING: ...`, and timers are suspended without cancelling them. Live Tier 1 orchestrators and Tier 2 workers that are running a session receive a steer asking them to call `request_rollover` within `hotUpdate.drainTimeoutSec` (default `90` seconds). Live Director chat turns receive one `system_notice` asking them to end the turn before the deadline; at the deadline, `stop()` cancels them with buffered text flushed and records their tool calls so a continuation turn runs on startup. Tier 3 task agents, Done-Reviews, verification gates, merges, and `code_exec` scripts are not steered and not waited for; they stop when the drain ends. When no Tier 1/2 agent or Director turn is running, the drain finishes immediately.
+2. **Handover**: the old daemon stops, reaps its child agent process groups, spawns a detached handover supervisor, and exits. The supervisor waits for the old PID to exit and starts the target release.
+3. **In-place resume**: the new daemon recovers interrupted tasks of `active` and `paused_quota` runs (plus children of Director containers) in place, keeping the same task IDs, worktrees, write leases, and generation counts without marking tasks `failed` or `cancelled`. Pending timers (`wait_timer` and `schedule_timer`) stay `pending` and fire once into the resumed task. Queued Director wakeups captured at stop are replayed once. Tasks in runs whose stored status is not `active` or `paused_quota` keep the legacy failure behavior.
+4. **What is redone and cost**: interrupted merges are closed as `ci_failed` and re-run CI when the worker resumes; interrupted Done-Reviews are cancelled and replayed (re-running verification gates and the reviewer); active PTYs, `code_exec` scripts, and in-memory quota `--in` timers do not survive a restart. Each live Tier 1/2 agent spends one extra model turn on cached context to write its rollover handoff, and each resumed agent hydrates fresh context and re-reads working files (expect roughly 1 to 5 minutes per active agent to return to steady state).
+
+### Rate limit
+
+While agents are live, install-triggered reloads are rate-limited to at most once every `hotUpdate.minIntervalSec` seconds (default `900`, 15 minutes) since the daemon started. An idle daemon reloads immediately. An install inside the cooldown window receives a `scheduled` reply naming the UTC due time and exits `0` immediately even with `--wait`; later installs during the window coalesce to the newest target release while keeping the original due time. Running `pi-harness daemon reload` directly (or with `--now`) bypasses the rate limit and drains immediately.
+
+### Fallback on boot failure
+
+The supervisor waits up to 20 seconds for the target release to answer `ping` with the expected `releaseId`. If the target exits early or times out, the supervisor restarts the previous release with `reload.lastError` set to `{ targetReleaseId, error }`, and that release's startup recovery resumes active work. `current` is left pointing to the newly installed release so you can inspect or fix it without the installer reverting symlinks. Callers waiting with `--wait` exit `3`, `install.sh` exits `1`, and `pi-harness daemon status` shows `reload.lastError`.
+
+### TUI reconnect
+
+Attached chat and run TUIs stay open across a hot update. On socket close, the TUI reconnects on the same `DaemonClient` with exponential backoff, restores its previous controller or viewer role, fetches only missed chat history or run events without duplicates, and preserves the composer draft and queued messages.
+
+- An older-release TUI speaking the same `protocolRev` reconnects normally and appends `harnessd runs release <B>. This terminal still runs <A>. Restart it to load the new UI.`
+- If `protocolRev` changes, the TUI prints the incompatibility message (along with any unsent draft) and exits.
+- After an explicit `pi-harness daemon stop`, local TUIs show `harnessd was stopped. Waiting for it to start · Ctrl+C quit` and do not respawn the daemon; remote SSH TUIs exit.
+- The project picker does not reconnect.
+
+### Inspecting status and dry-run recovery
+
+`pi-harness daemon status` includes the hot-update fields:
+
+- `releaseId`: build identity of the running daemon (`<id>` from `release.json`, or `dev-<hash>` for a checkout).
+- `releaseDir`: directory the daemon is executing from.
+- `lifecycle`: `"serving"`, `"draining"`, or `"stopping"`.
+- `restartSafe`: `true` on restart-safe builds.
+- `reload`: `{ state, targetReleaseId?, dueAt?, deadlineAt?, previousReleaseId?, lastError? }`, where `state` is `"idle"`, `"scheduled"`, or `"draining"`.
+
+Run `pi-harness daemon recover --dry-run [--db <path>] [--json]` at any time to inspect what startup recovery would do without modifying the database. It opens `<stateDir>/control-plane.sqlite` (or `--db`) read-only and lists tasks that would be relaunched in place, tasks whose missing worktree would be recreated, read-only tasks falling back to the repo root, tasks failed by the legacy rule, untouched `pending`/`paused_quota` tasks, Done-Review rows to cancel, pending timers, stale merges, and goal reviews to replay.
+
+### First activation
+
+A daemon started from a build that predates hot-update support omits `reload` from `ping`. Running `install.sh` or `pi-harness daemon reload` against it activates the new release on disk, prints the bootstrap notice, and exits `0` without touching the running daemon.
+
+Never run `pi-harness daemon stop` or `pi-harness daemon restart` against a pre-feature daemon while runs are active. Those commands skip child process-group reaping and `wait_timer` revival, which leaves old agents running beside resumed copies and leaves cancelled `wait_timer` rows cancelled.
+
+`pi-harness daemon reload --legacy` is the only supported first-activation path. Run it from an interactive terminal, never from inside an agent (stopping the old daemon kills agent process groups, which would terminate the command mid-handover):
+
+```sh
+pi-harness daemon recover --dry-run
+pi-harness daemon reload --legacy --wait
+```
+
+1. Review the dry-run report: confirm every task of an active run appears under relaunched and nothing unexpected appears under legacy-failed.
+2. Run `pi-harness daemon reload --legacy --wait`. It repeats the dry run, displays the running PID, running release, target release, and resolved fallback release (override with `--previous <dir>`, `--target <dir>`, or `--db <path>`), and asks for confirmation (pass `--yes` in non-interactive shells; without confirmation it exits `2`).
+3. On the first activation against a pre-feature daemon, the following are not preserved: attached old-release TUIs exit; an in-flight Director turn is aborted and its unflushed tail is lost without a tool list or continuation turn; queued Director wakeups are lost; agents write no rollover handoffs and resume from harness-built recovery handoffs; in-flight merges, reviews, and gates run again; PTYs, `code_exec` runs, and quota `--in` timers are lost. `wait_timer` rows cancelled by the old daemon during shutdown are revived to `pending` by the new daemon.
+4. If the command exits `3`, the supervisor fell back to the pre-feature daemon, which marks interrupted tasks `failed` as before. The supervisor writes `pi-harness resume <run>` commands for every affected run to `daemon.log` and `<sockDir>/reload-fallback.txt`. Run those commands to resume the runs, then inspect `daemon.log` for the boot error.
 
 ## Why not Nix, mise or pixi
 
