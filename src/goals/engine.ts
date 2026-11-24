@@ -251,7 +251,7 @@ export interface GateLocation {
   ref: string;
   sha: string;
   isolated: boolean;
-  source: "verify_ref" | "run_base_branch" | "repo_root";
+  source: "verify_ref" | "run_base_branch" | "merged_commit" | "repo_root";
   note?: string;
 }
 
@@ -274,6 +274,7 @@ export interface GoalAcceptOverrideAudit {
   evidence: Array<{ input: string; canonicalPath: string; kind: "file" | "directory"; sizeBytes?: number; mtimeMs: number }>;
   overrideDeterministic: boolean;
   failedDeterministicCriteria: string[];
+  gatesNotRun?: string | null;
   prevStatus: GoalStatus;
   goalVersion: number;
   verifyRef: string | null;
