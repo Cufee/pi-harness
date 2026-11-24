@@ -1270,7 +1270,7 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
       default:
         "Resume a failed, crashed, blocked, or cancelled child task in-place with a recovery handoff instead of spawning a duplicate task. A Worker keeps its worktree and WIP commits when the worktree still exists; a cancelled Worker's worktree was archived, so it restarts in a fresh worktree from the base branch. Safe to repeat: when the task is already running, queued, waiting, or completed it returns its current state (outcome + message) without restarting anything.",
       director:
-        "Resume a failed, crashed, cancelled, or stopped task in-place (same task ID, artifacts, and a deterministic recovery handoff) instead of spawning a new duplicate task. A Worker keeps its worktree and WIP commits while that worktree still exists; a cancelled Worker's worktree was archived, so it restarts on a fresh worktree from the base branch and the result message names the archived ref. Safe to repeat: a task that is already running, queued or completed returns its current state (`outcome`) and nothing is restarted. Resuming does not reset or impose any turn limit.",
+        "Resume a failed, crashed, cancelled, or stopped task in-place (same task ID, artifacts, and a deterministic recovery handoff) instead of spawning a new duplicate task. A Worker keeps its worktree and WIP commits while that worktree still exists; a cancelled Worker's worktree was archived, so it restarts on a fresh worktree from the base branch and the result message names the archived ref. When the task belongs to a goal that does not hold a slot and no goal slot is free, it queues in the goal admission queue instead of bypassing the cap (returning a queued outcome with `queuePosition`; `queue_force_start` is the only bypass). Safe to repeat: a task that is already running, queued or completed returns its current state (`outcome`) and nothing is restarted. Resuming does not reset or impose any turn limit.",
     },
     inputSchema: {
       default: {
@@ -1527,7 +1527,7 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     roles: ["director"],
     description: {
       default:
-        "Amend an active or draft Goal Contract (vN -> vN+1), invalidating stale reviews and notifying the running Tier 1 Orchestrator with the exact delta. description REPLACES the entire description; use append_description to add instructions while keeping the existing text. add_criteria adds, update_criteria merges by id, remove_criteria_ids removes. Amending supersedes this goal's open verification_failed escalations only; other escalations stay open. Updating only verify_ref is a metadata change (does not bump version, change status, or steer running tasks); call goal_trigger_review to re-run gates.",
+        "Amend an active or draft Goal Contract (vN -> vN+1), invalidating stale reviews and notifying the running Tier 1 Orchestrator with the exact delta. description REPLACES the entire description; use append_description to add instructions while keeping the existing text. add_criteria adds, update_criteria merges by id, remove_criteria_ids removes. Amending supersedes this goal's open verification_failed escalations only; other escalations stay open. Updating only verify_ref is a metadata change (does not bump version, change status, or steer running tasks); call goal_trigger_review to re-run gates. Budget-only changes (max_review_cycles / max_no_progress_cycles) do not bump the version or reset the review cycle; raising a budget answers an open max-cycles or no-progress escalation and continues the goal.",
     },
     inputSchema: {
       default: {
@@ -1571,6 +1571,16 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
           verify_ref: {
             type: "string",
             description: `${VERIFY_REF_DESC} Pass "" to clear verify_ref and fall back to the run's base branch.`,
+          },
+          max_review_cycles: {
+            type: "number",
+            description:
+              "Update max Done-Review cycles (non-negative integer). Budget-only changes do not bump version or reset review_cycle; raising above the current cycle answers an open max-cycles escalation and continues an awaiting_human goal.",
+          },
+          max_no_progress_cycles: {
+            type: "number",
+            description:
+              "Update the no-progress circuit-breaker threshold (positive integer). Budget-only changes do not bump version or reset no_progress_streak; raising above the current streak answers an open no-progress escalation and continues an awaiting_human goal.",
           },
         },
       },
@@ -1874,7 +1884,7 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     roles: ["director"],
     description: {
       default:
-        "Resume a failed, crashed, stopped, or quota-paused run (or Goal's linked run) in-place, restarting the orchestrator and interrupted tasks with their preserved worktrees/handoffs while keeping completed work untouched. Tasks cancelled by a stop are not revived. Safe to repeat: an already running run returns its current state (`outcome`).",
+        "Resume a failed, crashed, stopped, quota-paused, or awaiting_human run (or Goal's linked run) in-place, restarting the orchestrator and interrupted tasks with their preserved worktrees/handoffs while keeping completed work untouched. Tasks cancelled by a stop are not revived. When resuming a Goal whose run does not hold a slot and no goal slot is free, it waits in the goal admission queue and returns `outcome: 'queued'` with `queuePosition` (`queue_force_start` is the only bypass). Safe to repeat: an already running run returns its current state (`outcome`).",
     },
     inputSchema: {
       default: {

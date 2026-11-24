@@ -10,6 +10,7 @@ import type {
 import type { RunActivitySummary, TaskActivitySnapshot } from "../control-plane/telemetry.js";
 import type { TimerRecord } from "../control-plane/timers.js";
 import type { DaemonClient } from "../daemon/remote.js";
+import type { GoalActiveVerification } from "../director/goal-get.js";
 import type { GoalRecord, GoalReviewVerdict, GoalRevisionRecord } from "../goals/engine.js";
 import type { DaemonEventFrame, InboxItem, SnapshotWorktreeEntry } from "../protocol/daemon-rpc.js";
 import type { AgentStateCounts, AttentionSlot, LiveHudItem, TuiEntityRef as EntityRef } from "./core/index.js";
@@ -39,6 +40,7 @@ export interface SnapshotGoalEntry {
   goal: GoalRecord;
   reviews: GoalReviewVerdict[];
   revisions: GoalRevisionRecord[];
+  activeVerification?: GoalActiveVerification | null;
 }
 
 export interface SnapshotRunEntry {
@@ -745,4 +747,4 @@ export class WorkStore {
   }
 }
 
-export type { ArtifactRecord, EscalationRecord, GoalRecord, MergeQueueRecord, MessageRecord, RunRecord, TaskRecord, TimerRecord, WorktreeRecord };
+export type { ArtifactRecord, EscalationRecord, GoalActiveVerification, GoalRecord, MergeQueueRecord, MessageRecord, RunRecord, TaskRecord, TimerRecord, WorktreeRecord };

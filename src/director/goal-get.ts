@@ -104,6 +104,30 @@ export interface GoalGetDetailInput {
   activity: RunActivitySummary | null;
 }
 
+export interface GoalActiveVerification {
+  inflightId: string;
+  kind: "review" | "accept";
+  phase: "gates" | "reviewer";
+  goalVersion: number;
+  /** 1-based cycle being verified (`reviewCycle + 1`, so `1` when `reviewCycle` is `0`). */
+  cycle: number;
+  /** Done-Review task ID once spawned; `null` during the `gates` phase. */
+  reviewerTaskId: string | null;
+  /** Review run ID (the goal's linked run, or the Director container run). */
+  runId: string | null;
+  startedAt: number;
+  elapsedMs: number;
+  /** Review-invalidation epoch when this verification started. */
+  reviewEpoch: number;
+  /** Goal's current review-invalidation epoch. */
+  currentEpoch: number;
+  /** True when the verification is invalidated (`reviewEpoch !== currentEpoch || goalVersion < goal.version`). */
+  stale: boolean;
+}
+
+export const GOAL_VERIFICATION_IDLE_NOTE =
+  "No verification is running for this goal in this daemon; goal_trigger_review restarts it.";
+
 export interface GoalGetContext {
   evidenceDir: string | null;
   repoRoot?: string | null;
@@ -113,6 +137,8 @@ export interface GoalGetContext {
   lastReviewerFailure?: ReviewerDiagnostics | null;
   /** Optional goal-18 per-review diagnostics overrides keyed by review id; defaults to each review's `.diagnostics`. */
   reviewDiagnostics?: ReadonlyMap<string, ReviewerDiagnostics | null>;
+  /** Optional live verification state for this goal from the daemon (`DirectorRuntime.getActiveVerification`). */
+  activeVerification?: GoalActiveVerification | null;
   /** Optional wire overhead (e.g. `presentation_id`) reserved inside `budgetChars`. */
   reserveChars?: number;
 }
@@ -727,6 +753,11 @@ export function buildGoalGetResult(
     ctx.lastReviewerFailure !== undefined ? ctx.lastReviewerFailure : (goal.lastReviewerFailure ?? null);
   const getReviewDiagnostics = (r: GoalReviewVerdict): ReviewerDiagnostics | null | undefined =>
     ctx.reviewDiagnostics?.has(r.id) ? ctx.reviewDiagnostics.get(r.id) : r.diagnostics;
+  const activeVerification: GoalActiveVerification | null = ctx.activeVerification ?? null;
+  const verificationNote =
+    (goal.status === "verifying" || goal.status === "reviewing") && activeVerification === null
+      ? GOAL_VERIFICATION_IDLE_NOTE
+      : undefined;
 
   const render = (state: ShrinkState, truncated: string[]): Record<string, unknown> => {
     const out: Record<string, unknown> = {};
@@ -757,6 +788,8 @@ export function buildGoalGetResult(
             ? clip(goal.lastReviewSummary, state.goalLastReviewSummary)
             : null,
         lastReviewerFailure: renderDiagnostics(rawLastReviewerFailure, state.diagnosticsMode) ?? null,
+        activeVerification,
+        ...(verificationNote !== undefined ? { verificationNote } : {}),
         nonGoals: goal.nonGoals.slice(0, state.nonGoalsMax).map((ng) => clip(ng, GOAL_GET_LIMITS.nonGoal)),
         liveProgress: lp,
         createdAt: goal.createdAt,
