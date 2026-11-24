@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { basename, dirname, relative } from "node:path";
 import { Database } from "bun:sqlite";
 import { AdmissionQueue } from "./admission-queue.js";
+import { isReadOnlyKind } from "./handoffs.js";
 import { advanceSequenceFloor, friendlyIdCandidates, nextFriendlyId, nextSequenceValue } from "./ids.js";
 import { ProjectStore } from "./projects.js";
 import { SessionMessageStore } from "./session-messages.js";
@@ -1408,6 +1409,21 @@ export class ControlPlaneDb {
       this.unblockDependents(existing.runId, id);
     } else if (patch.status && ["failed", "cancelled", "returned_for_rescope"].includes(patch.status)) {
       this.cascadeDependencyFailure(existing.runId, id, patch.status);
+    }
+
+    // Completing disproves a task's own blocker, a cancelled task has nothing left to unblock, and a read-only task's
+    // findings live in its handoff, so those agent-addressed escalations close here.
+    if (patch.status !== existing.status && (patch.status === "completed" || patch.status === "cancelled")) {
+      const sql = isReadOnlyKind(existing.kind)
+        ? "SELECT id FROM escalations WHERE from_task_id = ? AND status IN ('open', 'acked') AND to_task_id IS NOT NULL ORDER BY created_at ASC"
+        : "SELECT id FROM escalations WHERE from_task_id = ? AND status IN ('open', 'acked') AND blocking = 1 AND to_task_id IS NOT NULL ORDER BY created_at ASC";
+      const rows = this.db.prepare(sql).all(existing.id) as Array<{ id: string }>;
+      for (const row of rows) {
+        this.ackEscalation(row.id, `Auto-resolved: raising task ${existing.id} ${patch.status}`, true, {
+          resolvedBy: "task_settled",
+          taskStatus: patch.status,
+        });
+      }
     }
 
     const updated = this.getTask(id)!;

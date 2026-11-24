@@ -858,10 +858,12 @@ export class ControlPlaneToolExecutor {
           settleTaskMinimalFallback(this.db, task, "blocked", blockedSummary, `blocked: ${esc.id} (${esc.title.slice(0, 160)})`);
           this.hooks.stopTaskForBlockingIssue?.(taskId, blockedSummary);
         }
+        const directorOwner = toTaskId && this.db.getTask(toTaskId)?.parentId === null ? directorTaskRunOwner(runId) : null;
+        const routedTo = toTaskId === null ? "human" : directorOwner ? `director:${directorOwner}` : toTaskId;
         return {
           escalationId: esc.id,
           severity: esc.severity,
-          routedTo: toTaskId ?? "human",
+          routedTo,
           blocking,
           ...(derived ? { note: derivedTitleNote(esc.title) } : {}),
         };

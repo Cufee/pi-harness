@@ -336,7 +336,8 @@ export class WorkStore {
         .filter((r) => r.run.status === "active" || r.run.status === "paused_quota")
         .map((r) => r.run.id),
     );
-    const openEscalations = this.snapshot.escalations.filter((e) => e.status === "open").length;
+    // Count only the escalations the server surfaced in the human inbox.
+    const openEscalations = this.snapshot.inbox.filter((i) => i.kind === "escalation").length;
     let activeMerges = 0;
     let bouncedMerges = 0;
     for (const m of this.snapshot.merges) {

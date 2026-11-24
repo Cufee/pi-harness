@@ -1399,4 +1399,118 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
 
     store.dispose();
   });
+
+  it("shows only human-addressed blocking or P0 escalations in the inbox and records bucket notices on the Director chat", async () => {
+    const repoDir = initTempGitRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-tuiv2-inbox-"));
+    const sockPath = join(stateDir, "d.sock");
+    const cfg = withFixtureCatalog({
+      ...loadConfig(repoDir),
+      stateDir,
+      socketPath: sockPath,
+    });
+
+    const daemon = new HarnessDaemon(cfg);
+    await daemon.start();
+    const client = new DaemonClient(sockPath);
+    await client.connect();
+
+    try {
+      const chat = await client.request<{ session: { id: string } }>("chat.create", {
+        repoRoot: repoDir,
+        title: "Inbox Filter Test Chat",
+      });
+      const goal = daemon.director.goals.createGoal({
+        repoRoot: repoDir,
+        chatSessionId: chat.session.id,
+        title: "Filter inbox noise",
+        description: "Verify escalation inbox filter",
+        criteria: [{ id: "c1", kind: "deterministic", description: "Pass", command: "true" }],
+      });
+      const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+      const run = daemon.db.createRun({ goal: goal.title, repoRoot: repoDir, baseBranch: "main", baseSha });
+      daemon.director.goals.linkRunAndStart(goal.id, run.id);
+
+      const task = daemon.db.createTask({
+        runId: run.id, tier: 2, kind: "worker", title: "Worker", objective: "Work", profileId: "acp:codex",
+      });
+      const child = daemon.db.createTask({
+        runId: run.id, parentId: task.id, tier: 3, kind: "execute", title: "Child", objective: "Subwork", profileId: "acp:codex",
+      });
+
+      const escA = daemon.db.createEscalation({
+        runId: run.id, fromTaskId: task.id, toTaskId: null, severity: "P0", category: "security_risk",
+        title: "Human P0 blocking", evidencePaths: ["a.ts"], blocking: true,
+      });
+      const escB = daemon.db.createEscalation({
+        runId: run.id, fromTaskId: task.id, toTaskId: null, severity: "P1", category: "blocked_dependency",
+        title: "Human P1 blocking", evidencePaths: ["b.ts"], blocking: true,
+      });
+      const escC = daemon.db.createEscalation({
+        runId: run.id, fromTaskId: task.id, toTaskId: null, severity: "P1", category: "code_defect",
+        title: "Human P1 non-blocking", evidencePaths: ["c.ts"], blocking: false,
+      });
+      const escD = daemon.db.createEscalation({
+        runId: run.id, fromTaskId: child.id, toTaskId: task.id, severity: "P1", category: "broken_test",
+        title: "Agent P1 blocking", evidencePaths: ["d.ts"], blocking: true,
+      });
+      const escE = daemon.db.createEscalation({
+        runId: run.id, fromTaskId: child.id, toTaskId: task.id, severity: "P2", category: "code_defect",
+        title: "Agent P2 non-blocking", evidencePaths: ["e.ts"], blocking: false,
+      });
+
+      const bucket = await daemon.orchestrator.ensureDirectorTaskRun(chat.session.id, repoDir);
+      const [owner] = daemon.db.listTasks(bucket.id, { parentId: null });
+      assert.ok(owner);
+      const bucketTask = daemon.db.createTask({
+        runId: bucket.id, parentId: owner.id, tier: 3, kind: "verify", title: "Bucket verify", objective: "Verify", profileId: "acp:codex",
+      });
+      daemon.db.updateTask(bucketTask.id, { status: "blocked" });
+      const escF = daemon.db.createEscalation({
+        runId: bucket.id, fromTaskId: bucketTask.id, toTaskId: owner.id, severity: "P2", category: "scope_too_large",
+        title: "Bucket rescope", evidencePaths: ["f.ts"], suggestedSplits: ["Split 1", "Split 2"], blocking: true,
+      });
+
+      // Item-11 notice: escalation addressed to the bucket owner appends a system_notice to the Director chat.
+      const notices = daemon.director.chats.getHistory(chat.session.id).filter((t) => t.role === "system_notice");
+      assert.ok(
+        notices.some(
+          (t) =>
+            t.content.includes(escF.id) &&
+            t.content.includes("P2/scope_too_large") &&
+            t.content.includes(bucketTask.id) &&
+            t.content.includes("resolve_escalation"),
+        ),
+        `Expected system_notice mentioning ${escF.id}, got: ${notices.map((n) => n.content).join(" | ")}`,
+      );
+
+      const snap = await client.request<WorkSnapshot>("work.snapshot", {
+        chatSessionId: chat.session.id,
+        repoRoot: repoDir,
+      });
+      const inboxEscIds = snap.inbox
+        .filter((i) => i.kind === "escalation")
+        .map((i) => i.ref.id)
+        .sort();
+      assert.deepEqual(inboxEscIds, [escA.id, escB.id].sort());
+      assert.equal(snap.inbox.some((i) => i.id === `inbox:task:${bucketTask.id}`), false);
+      const allEscIds = new Set(snap.escalations.map((e) => e.id));
+      for (const id of [escA.id, escB.id, escC.id, escD.id, escE.id, escF.id]) {
+        assert.ok(allEscIds.has(id), `Expected snapshot.escalations to contain ${id}`);
+      }
+
+      const resolved = await client.request<{ alreadyResolved: boolean }>("escalation.resolve", {
+        escalationId: escF.id,
+        reason: "re-split",
+        chatSessionId: chat.session.id,
+      });
+      assert.equal(resolved.alreadyResolved, false);
+      assert.equal(daemon.db.getEscalation(escF.id)?.status, "resolved");
+    } finally {
+      client.close();
+      await daemon.stop();
+      rmSync(repoDir, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
 });

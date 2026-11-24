@@ -4061,7 +4061,8 @@ export class HarnessDaemon {
           }
         }
         for (const e of escalations) {
-          if (e.status !== "open") continue;
+          // Only escalations a human must act on reach the inbox: open, human-addressed, and P0 or blocking.
+          if (e.status !== "open" || e.toTaskId !== null || !(e.severity === "P0" || e.blocking)) continue;
           const owningGoal = goalByRunId.get(e.runId);
           inbox.push({
             id: `inbox:esc:${e.id}`,
@@ -4102,6 +4103,8 @@ export class HarnessDaemon {
               createdAt: re.run.updatedAt,
             });
           }
+          // A Director bucket's task outcomes go to the Director through wait_tasks, not to the human.
+          if (isDirectorTaskContainer(re.run.id)) continue;
           for (const t of re.tasks) {
             if (t.status === "blocked" || (t.status === "failed" && re.run.status === "active")) {
               inbox.push({
