@@ -10,6 +10,7 @@ import { qualifyRemoteCliHints } from "../protocol/chat-events.js";
 import type { DaemonEventFrame, SessionControlState } from "../protocol/daemon-rpc.js";
 import { classifyChatLine, type ClassifiedChatLine } from "./chat-lines.js";
 import { ChatQueueModel, type ChatQueueReason, formatQueueItemState } from "./chat-queue.js";
+import { reconcileAssistantHistory } from "./chat-reconcile.js";
 import { createCommandAutocomplete, parseSlashCommand, renderHelp, type TuiMode } from "./commands.js";
 import {
   createTheme,
@@ -2010,7 +2011,6 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   type ReplayResult = {
     renderedAssistantCount: number;
     renderedToolCount: number;
-    detachedCovered: boolean;
   };
 
   const renderHistoryRows = (
@@ -2018,22 +2018,19 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     optsReplay?: {
       firstAssistantMeta?: string;
       liveRenderedUsers?: string[];
-      liveFrozenSegments?: string[];
       liveRenderedTools?: string[];
-      detachedText?: string;
+      skipAssistantIndices?: ReadonlySet<number>;
     },
   ): ReplayResult => {
     let nextAssistantMeta = optsReplay?.firstAssistantMeta;
     const skipUsers = optsReplay?.liveRenderedUsers;
-    const skipFrozen = optsReplay?.liveFrozenSegments;
     const skipTools = optsReplay?.liveRenderedTools;
-    const detachedTrimmed = optsReplay?.detachedText?.trim() ?? "";
+    const skipAssistantIndices = optsReplay?.skipAssistantIndices;
     let renderedAssistantCount = 0;
     let renderedToolCount = 0;
-    let detachedCovered = false;
-    let passedDetachedPosition = false;
 
-    for (const turn of rows) {
+    for (let i = 0; i < rows.length; i += 1) {
+      const turn = rows[i]!;
       if (typeof turn.seq === "number" && turn.seq > 0) {
         if (renderedSeqs.has(turn.seq)) continue;
         renderedSeqs.add(turn.seq);
@@ -2045,33 +2042,14 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
           continue;
         }
         shell.transcript.appendUserTurn(turn.content, turnTs);
-        // New user boundary first discovered in replay (not observed live).
-        passedDetachedPosition = true;
       } else if (turn.role === "assistant") {
+        if (skipAssistantIndices?.has(i)) continue;
         const content = turn.content;
-        const meta = nextAssistantMeta;
-        nextAssistantMeta = undefined;
-        if (skipFrozen && skipFrozen.length > 0 && skipFrozen[0]!.trim() === content.trim()) {
-          skipFrozen.shift();
-          continue;
-        }
         if (content.trim()) {
+          const meta = nextAssistantMeta;
+          nextAssistantMeta = undefined;
           shell.transcript.appendAssistantTurn(content, meta, turnTs);
           renderedAssistantCount += 1;
-          // Detached live text is covered only by a NEW assistant row at the exact position
-          // right after all live-observed boundaries, before any replay-discovered boundary.
-          if (
-            detachedTrimmed &&
-            !detachedCovered &&
-            !passedDetachedPosition &&
-            (skipTools?.length ?? 0) === 0 &&
-            (skipFrozen?.length ?? 0) === 0
-          ) {
-            if (content.trim().startsWith(detachedTrimmed)) {
-              detachedCovered = true;
-            }
-            passedDetachedPosition = true;
-          }
         }
       } else if (turn.role === "tool_output") {
         const display = parseToolDisplay(turn.display);
@@ -2086,8 +2064,6 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
           shell.transcript.appendToolOutputNote(turn.content || turn.toolName || "tool output", turnTs);
         }
         renderedToolCount += 1;
-        // New tool boundary first discovered in replay (not observed live).
-        passedDetachedPosition = true;
       } else if (turn.role === "system_notice") {
         const classified = classifyChatLine(
           { source: "replay", turn },
@@ -2101,7 +2077,6 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     return {
       renderedAssistantCount,
       renderedToolCount,
-      detachedCovered,
     };
   };
 
@@ -2413,48 +2388,58 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         }
       }
 
-      // 3. Replay fetched immutable rows without touching live state, skipping rows already rendered by seq or live turn.
+      // 3. Reconcile unseen persisted assistant rows against live-frozen text and the detached tail,
+      // then replay fetched rows without touching live state.
+      const unseenRows: ChatTurnRecord[] = [];
+      const seenBatchSeqs = new Set<number>();
+      for (const row of fetchedRows) {
+        if (typeof row.seq === "number" && row.seq > 0) {
+          if (renderedSeqs.has(row.seq) || seenBatchSeqs.has(row.seq)) continue;
+          seenBatchSeqs.add(row.seq);
+        }
+        unseenRows.push(row);
+      }
+
+      const reconciled = reconcileAssistantHistory({
+        frozen: wasActive ? turnFrozenSegments : [],
+        tail: wasActive ? prevSnap.text : "",
+        rows: unseenRows,
+        busy: reopened.busy,
+      });
+      if (wasActive) {
+        turnFrozenSegments.splice(0, turnFrozenSegments.length, ...reconciled.remainingFrozen);
+      }
+
       const replay =
-        fetchedRows.length > 0
-          ? renderHistoryRows(fetchedRows, {
+        unseenRows.length > 0
+          ? renderHistoryRows(unseenRows, {
               firstAssistantMeta:
                 wasActive && !hadLiveAssistantBeforeReplay ? (prevSnap.modelLabel ?? modelBadge()) : undefined,
               liveRenderedUsers: turnRenderedUsers,
-              liveFrozenSegments: turnFrozenSegments,
               liveRenderedTools: turnRenderedTools,
-              detachedText: wasActive ? prevSnap.text : undefined,
+              skipAssistantIndices: reconciled.skipIndices,
             })
-          : { renderedAssistantCount: 0, renderedToolCount: 0, detachedCovered: false };
+          : { renderedAssistantCount: 0, renderedToolCount: 0 };
       if (wasActive && replay.renderedAssistantCount > 0) {
         turnHasAssistantHeader = true;
       }
       syncedThroughSeq = Math.max(syncedThroughSeq, throughSeq);
 
-      // 4. Rebuild live tail or settle based on reopen snapshot and detached-segment coverage.
+      // 4. Rebuild live tail or settle using reconciled unpersisted tail remainder (R3).
       if (wasActive && !reopened.busy) {
-        const hasDetachedText = Boolean(prevSnap.text.trim());
         const hasRestartEvidence =
           cancelOrigin === "restart" ||
           Boolean(reconnect?.expectingRestart) ||
           reloadingBlocked ||
           pidChanged;
-        if (hasDetachedText) {
-          if (replay.detachedCovered) {
-            settleTurn(prevTurnId, {
-              cancelled: hasRestartEvidence,
-              cancelCause: hasRestartEvidence ? "restart" : undefined,
-              timestampMs: Date.now(),
-              discardLiveText: true,
-            });
-          } else {
-            settleTurn(prevTurnId, {
-              finalText: prevSnap.text,
-              cancelled: true,
-              cancelCause: hasRestartEvidence ? "restart" : "reconnect",
-              timestampMs: Date.now(),
-              discardLiveText: false,
-            });
-          }
+        if (reconciled.tailRemainder) {
+          settleTurn(prevTurnId, {
+            finalText: reconciled.tailRemainder,
+            cancelled: true,
+            cancelCause: hasRestartEvidence ? "restart" : "reconnect",
+            timestampMs: Date.now(),
+            discardLiveText: false,
+          });
         } else {
           const persistedTurnOutput =
             hadLiveAssistantBeforeReplay || replay.renderedAssistantCount > 0 || replay.renderedToolCount > 0;

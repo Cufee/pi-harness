@@ -180,6 +180,7 @@ function makeFakeTerminal(cols = 110, rows = 30) {
     writes,
     /** Final rendered terminal state (scrollback + viewport), NOT concatenated raw writes. */
     text: () => screen.text(),
+    lines: () => screen.lines(),
     /** Visible terminal viewport ONLY (last `rows` rows, excluding scrollback). */
     viewportText: () => screen.viewportText(),
     rawWrites: () => stripTerminalSequences(writes.join("")),
@@ -2974,5 +2975,653 @@ describe("goal-34 c3: Director chat assistant replies render exactly once", () =
     assert.equal(countOccurrences(fullOut, "LONG-LIVE-LINE-40"), 1, "Long reply line 40 must render exactly once");
     assert.ok(fullOut.includes("ESC-HUMAN-ALERT-1: Approve prod deploy"), "Immutable receipt remains in transcript");
     assert.ok(fullOut.includes("ESC-HUMAN-ALERT-4: Confirm rollback window"), "All human receipts remain in transcript");
+  });
+
+  /**
+   * Extracts rendered assistant text blocks from the final VT lines (between the banner rule
+   * and FixedDock rule), ignoring non-assistant elements (user cards, tool cards, receipts,
+   * timestamp dividers, and `◆ <model>` headers). Handles both Unicode and ASCII fallback glyphs.
+   */
+  function extractRenderedAssistantBlocks(screenLines: string[]): string[] {
+    const ruleIdx: number[] = [];
+    for (let i = 0; i < screenLines.length; i += 1) {
+      if (/^[─-]{20,}$/.test(screenLines[i]!.trim())) ruleIdx.push(i);
+    }
+    assert.ok(ruleIdx.length >= 2, `Expected banner and dock horizontal rules, found ${ruleIdx.length}`);
+    const bodyStart = ruleIdx[0]! + 1;
+    const bodyEnd = ruleIdx[1]!;
+
+    const blocks: string[] = [];
+    let current: string[] = [];
+    const flush = () => {
+      if (current.length > 0) {
+        blocks.push(current.join("\n"));
+        current = [];
+      }
+    };
+
+    for (let i = bodyStart; i < bodyEnd; i += 1) {
+      const raw = screenLines[i]!;
+      const trimmed = raw.trim();
+      if (!trimmed) {
+        flush();
+        continue;
+      }
+      // Timestamp divider
+      if (/^[─-]{2,} .+ [─-]{2,}$/.test(trimmed)) {
+        flush();
+        continue;
+      }
+      // User card rail (`▎` / `|`) or structured tool-output card inner rail (`│` / `|`)
+      if (/^\s*[▎│|]/.test(raw)) {
+        flush();
+        continue;
+      }
+      // Structured tool-output card frame (`╭─`, `╰─`, `├─`, `+-`, etc.)
+      if (/^[╭╰├┌└+][─-]/.test(trimmed)) {
+        flush();
+        continue;
+      }
+      // Tool note (`  ✓ ...` / `  v ...`)
+      if (/^  [✓v] /.test(raw)) {
+        flush();
+        continue;
+      }
+      // Single-line receipt (`  <glyph> [tag] ...`)
+      if (/^  [•✓✗✕!◆●○▸*vxo>] \[[a-z0-9_.-]+\]/i.test(raw)) {
+        flush();
+        continue;
+      }
+      // Assistant model attribution header (` ◆ <model>` / ` * <model>`)
+      if (/^ [◆*] /.test(raw)) {
+        flush();
+        continue;
+      }
+      current.push(trimmed);
+    }
+    flush();
+    return blocks;
+  }
+
+  /**
+   * Opens a fresh Director chat TUI against the exact persisted history (production-shaped
+   * `chat.open` returning the first page + `chat.history` for any later pages) and returns its
+   * rendered assistant blocks as the oracle for idle reopen reconciliation.
+   */
+  async function assertMatchesFreshHistoryOracle(opts: {
+    session: ChatSessionRecord;
+    persistedHistory: ChatTurnRecord[];
+    actualLines: string[];
+    expectedRemainderBlocks?: string[];
+    cols?: number;
+    rows?: number;
+    label: string;
+  }): Promise<{ actualBlocks: string[]; freshBlocks: string[]; freshText: string }> {
+    const cols = opts.cols ?? 120;
+    const rows = opts.rows ?? 30;
+    const pageSize = 50;
+    const throughSeq = opts.persistedHistory.reduce((max, r) => Math.max(max, r.seq), 0);
+    const { terminal, lines, text, sendInput } = makeFakeTerminal(cols, rows);
+    const freshMock = makeMockClient(async (op, params) => {
+      if (op === "chat.open") {
+        const firstPage = opts.persistedHistory.slice(0, pageSize);
+        const lastInPage = firstPage[firstPage.length - 1]?.seq ?? 0;
+        return {
+          session: opts.session,
+          history: firstPage,
+          historyNext: opts.persistedHistory.length > pageSize ? lastInPage : null,
+          historyThrough: throughSeq,
+          activeTurnId: null,
+          activeText: "",
+          activePartial: "",
+          tookOver: false,
+          busy: false,
+        };
+      }
+      if (op === "chat.history") {
+        const afterSeq = Number(params.afterSeq ?? 0);
+        const through = Number(params.throughSeq ?? throughSeq);
+        const slice = opts.persistedHistory.filter((r) => r.seq > afterSeq && r.seq <= through);
+        return { history: slice, historyNext: null };
+      }
+      if (op === "work.snapshot") return emptyWorkSnapshot();
+      if (op === "session.leave") return { daemonWillQuit: false };
+      return {};
+    });
+
+    const freshPromise = runDirectorChatTui({ client: freshMock.client, repoRoot: "/repo", terminal });
+    await waitFor(() => text().includes(opts.session.id), 3000, `${opts.label}: fresh TUI initial render`);
+    sendInput("\x1d");
+    await freshPromise;
+
+    const freshBlocks = extractRenderedAssistantBlocks(lines());
+    if (opts.persistedHistory.some((r) => r.role === "assistant" && r.content.trim())) {
+      assert.ok(freshBlocks.length > 0, `${opts.label}: fresh history oracle must extract non-empty assistant blocks`);
+    }
+    const actualBlocks = extractRenderedAssistantBlocks(opts.actualLines);
+    const expectedBlocks = [...freshBlocks, ...(opts.expectedRemainderBlocks ?? [])];
+    assert.deepEqual(
+      actualBlocks,
+      expectedBlocks,
+      `${opts.label}: assistant blocks after idle reopen must match fresh history load${opts.expectedRemainderBlocks?.length ? " + R3 remainder" : ""}`,
+    );
+    return { actualBlocks, freshBlocks, freshText: text() };
+  }
+
+  /** Production-shaped mock response builder for `chat.open` (returns first page of history). */
+  function makeProdChatOpen(
+    session: ChatSessionRecord,
+    history: ChatTurnRecord[],
+    overrides?: {
+      busy?: boolean;
+      activeTurnId?: string | null;
+      activeText?: string;
+      activePartial?: string;
+      control?: { sessionId: string; controllerClientId: string | null; hasControl: boolean; controlSeq: number };
+    },
+  ) {
+    const historyThrough = history.reduce((max, r) => Math.max(max, r.seq), 0);
+    return {
+      session,
+      history: [...history],
+      historyNext: null,
+      historyThrough,
+      activeTurnId: overrides?.activeTurnId ?? null,
+      activeText: overrides?.activeText ?? "",
+      activePartial: overrides?.activePartial ?? "",
+      tookOver: false,
+      busy: overrides?.busy ?? false,
+      ...(overrides?.control ? { control: overrides.control } : {}),
+    };
+  }
+
+  it("review-3 case 1 (rollover): tail AB with persisted rows A and B renders A and B once each and matches fresh history load", async () => {
+    const { terminal, lines, text, sendInput } = makeFakeTerminal(120, 30);
+    const session = makeChatSession("chat-34-r3-c1");
+    const history: ChatTurnRecord[] = [];
+    let openCount = 0;
+
+    const mock = makeMockClient(async (op, params) => {
+      if (op === "ping") return { pong: true, pid: process.pid, protocolRev: 8, releaseId: "rel-r3" };
+      if (op === "chat.open") {
+        openCount += 1;
+        return makeProdChatOpen(session, history, { busy: false });
+      }
+      if (op === "chat.history") {
+        const afterSeq = Number(params.afterSeq ?? 0);
+        const throughSeq = Number(params.throughSeq ?? Number.MAX_SAFE_INTEGER);
+        return {
+          history: history.filter((r) => r.seq > afterSeq && r.seq <= throughSeq),
+          historyNext: null,
+        };
+      }
+      if (op === "work.snapshot") return emptyWorkSnapshot();
+      if (op === "session.leave") return { daemonWillQuit: false };
+      return {};
+    });
+
+    const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+    await waitFor(() => text().includes(session.id), 3000, "initial render");
+
+    // Production live frames carry seq: 0; rollover flushes A silently with no boundary event.
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.turn.start",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r3-c1", reason: "goal.progress" },
+    });
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.delta",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r3-c1", delta: "ROLLOVER-SEG-A-R3C1" },
+    });
+    // Daemon persists A on context rollover without emitting any chat boundary event, then streams B.
+    history.push({
+      seq: 1,
+      chatSessionId: session.id,
+      role: "assistant",
+      content: "ROLLOVER-SEG-A-R3C1",
+      createdAt: Date.now(),
+    });
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.delta",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r3-c1", delta: "\n\nROLLOVER-SEG-B-R3C1" },
+    });
+    await waitFor(() => text().includes("ROLLOVER-SEG-B-R3C1"), 3000, "tail AB streamed");
+
+    // Disconnect; turn completes offline and persists B.
+    history.push({
+      seq: 2,
+      chatSessionId: session.id,
+      role: "assistant",
+      content: "ROLLOVER-SEG-B-R3C1",
+      createdAt: Date.now(),
+    });
+    mock.disconnect();
+    await waitFor(() => openCount >= 2 && text().includes("Reconnected to harnessd"), 5000, "reconnected idle");
+
+    sendInput("\x1d");
+    await runPromise;
+
+    const out = text();
+    await assertMatchesFreshHistoryOracle({
+      session,
+      persistedHistory: history,
+      actualLines: lines(),
+      label: "review-3 case 1 (rollover)",
+    });
+    assert.equal(countOccurrences(out, "ROLLOVER-SEG-A-R3C1"), 1, "segment A must render once");
+    assert.equal(countOccurrences(out, "ROLLOVER-SEG-B-R3C1"), 1, "segment B must render once");
+    assert.equal(out.includes("Turn ended while disconnected"), false, "no spurious early-end line");
+    assert.equal(out.includes("Turn ended early"), false, "no spurious restart early-end line");
+  });
+
+  it("review-3 case 2 (Pi last-response-only): tail AB with persisted row B renders B once, discards tail, and matches fresh history load", async () => {
+    const { terminal, lines, text, sendInput } = makeFakeTerminal(120, 30);
+    const session = makeChatSession("chat-34-r3-c2");
+    const history: ChatTurnRecord[] = [];
+    let openCount = 0;
+
+    const mock = makeMockClient(async (op, params) => {
+      if (op === "ping") return { pong: true, pid: process.pid, protocolRev: 8, releaseId: "rel-r3" };
+      if (op === "chat.open") {
+        openCount += 1;
+        return makeProdChatOpen(session, history, { busy: false });
+      }
+      if (op === "chat.history") {
+        const afterSeq = Number(params.afterSeq ?? 0);
+        const throughSeq = Number(params.throughSeq ?? Number.MAX_SAFE_INTEGER);
+        return {
+          history: history.filter((r) => r.seq > afterSeq && r.seq <= throughSeq),
+          historyNext: null,
+        };
+      }
+      if (op === "work.snapshot") return emptyWorkSnapshot();
+      if (op === "session.leave") return { daemonWillQuit: false };
+      return {};
+    });
+
+    const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+    await waitFor(() => text().includes(session.id), 3000, "initial render");
+
+    // Pi streams A, runs an ordinary tool without display (no freeze), then streams B.
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.turn.start",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r3-c2", reason: "goal.progress" },
+    });
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.delta",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r3-c2", delta: "PI-COMMENTARY-A-R3C2" },
+    });
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.tool",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r3-c2", id: "tool-ord-1", name: "list_goals", status: "completed" },
+    });
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.delta",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r3-c2", delta: "\n\nPI-FINAL-B-R3C2" },
+    });
+    await waitFor(() => text().includes("PI-FINAL-B-R3C2"), 3000, "tail AB streamed");
+
+    // Disconnect; Pi persists only its last provider response B.
+    history.push({
+      seq: 1,
+      chatSessionId: session.id,
+      role: "assistant",
+      content: "PI-FINAL-B-R3C2",
+      createdAt: Date.now(),
+    });
+    mock.disconnect();
+    await waitFor(() => openCount >= 2 && text().includes("Reconnected to harnessd"), 5000, "reconnected idle");
+
+    sendInput("\x1d");
+    await runPromise;
+
+    const out = text();
+    await assertMatchesFreshHistoryOracle({
+      session,
+      persistedHistory: history,
+      actualLines: lines(),
+      label: "review-3 case 2 (Pi last-response-only)",
+    });
+    assert.equal(countOccurrences(out, "PI-FINAL-B-R3C2"), 1, "persisted final response B must render once");
+    assert.equal(countOccurrences(out, "PI-COMMENTARY-A-R3C2"), 0, "unpersisted commentary A must be discarded with tail");
+    assert.equal(out.includes("Turn ended while disconnected"), false, "no spurious early-end line");
+  });
+
+  it("review-3 case 3 (viewer opening before user row): renders opening user card once and reply once for both full and prefix tails", async () => {
+    for (const variant of [
+      { label: "full-tail", streamed: "VIEWER-REPLY-FULL-R3C3", persisted: "VIEWER-REPLY-FULL-R3C3" },
+      { label: "prefix-tail", streamed: "VIEWER-REPLY-PRE", persisted: "VIEWER-REPLY-PREFIX-COMPLETE-R3C3" },
+    ]) {
+      const { terminal, lines, text, sendInput } = makeFakeTerminal(120, 30);
+      const session = makeChatSession(`chat-34-r3-c3-${variant.label}`);
+      const history: ChatTurnRecord[] = [];
+      let openCount = 0;
+
+      const mock = makeMockClient(async (op, params) => {
+        if (op === "ping") return { pong: true, pid: process.pid, protocolRev: 8, releaseId: "rel-r3" };
+        if (op === "chat.open") {
+          openCount += 1;
+          if (openCount === 1) {
+            // Viewer opens while another controller's turn is active BEFORE the opening user row is persisted.
+            return makeProdChatOpen(session, history, {
+              busy: true,
+              activeTurnId: "turn-r3-c3",
+              activeText: "",
+              activePartial: "",
+              control: {
+                sessionId: session.id,
+                controllerClientId: "other-controller",
+                hasControl: false,
+                controlSeq: 1,
+              },
+            });
+          }
+          return makeProdChatOpen(session, history, {
+            busy: false,
+            control: {
+              sessionId: session.id,
+              controllerClientId: "other-controller",
+              hasControl: false,
+              controlSeq: 1,
+            },
+          });
+        }
+        if (op === "chat.history") {
+          const afterSeq = Number(params.afterSeq ?? 0);
+          const throughSeq = Number(params.throughSeq ?? Number.MAX_SAFE_INTEGER);
+          return {
+            history: history.filter((r) => r.seq > afterSeq && r.seq <= throughSeq),
+            historyNext: null,
+          };
+        }
+        if (op === "work.snapshot") return emptyWorkSnapshot();
+        if (op === "session.leave") return { daemonWillQuit: false };
+        return {};
+      });
+
+      const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+      await waitFor(() => text().includes(session.id), 3000, `${variant.label}: initial render`);
+
+      // Viewer receives live deltas (seq: 0) with no prior live user card.
+      mock.emit({
+        kind: "event",
+        seq: 0,
+        runId: session.id,
+        taskId: session.id,
+        type: "chat.delta",
+        createdAt: Date.now(),
+        payload: { chatSessionId: session.id, turnId: "turn-r3-c3", delta: variant.streamed },
+      });
+      await waitFor(() => text().includes(variant.streamed), 3000, `${variant.label}: delta visible`);
+
+      // Disconnect; turn completes offline with opening user row (seq 1) and assistant reply (seq 2).
+      history.push(
+        { seq: 1, chatSessionId: session.id, role: "user", content: "VIEWER-PROMPT-R3C3", createdAt: Date.now() },
+        { seq: 2, chatSessionId: session.id, role: "assistant", content: variant.persisted, createdAt: Date.now() },
+      );
+      mock.disconnect();
+      await waitFor(() => openCount >= 2 && text().includes("Reconnected to harnessd"), 5000, `${variant.label}: reconnected idle`);
+
+      sendInput("\x1d");
+      await runPromise;
+
+      const out = text();
+      await assertMatchesFreshHistoryOracle({
+        session,
+        persistedHistory: history,
+        actualLines: lines(),
+        label: `review-3 case 3 (${variant.label})`,
+      });
+      assert.equal(countOccurrences(out, "VIEWER-PROMPT-R3C3"), 1, `${variant.label}: opening user card must render once`);
+      assert.equal(countOccurrences(out, variant.persisted), 1, `${variant.label}: assistant reply must render once`);
+      assert.equal(out.includes("Turn ended while disconnected"), false, `${variant.label}: no spurious early-end line`);
+    }
+  });
+
+  it("review-3 case 4 (rollover + live structured tool card): frozen AB skips persisted A and B so nothing renders again", async () => {
+    const { terminal, lines, text, sendInput } = makeFakeTerminal(120, 30);
+    const session = makeChatSession("chat-34-r3-c4");
+    const history: ChatTurnRecord[] = [];
+    let openCount = 0;
+
+    const toolDisplay = {
+      kind: "run_activity" as const,
+      data: { runId: "run-r3-c4", phase: "active", elapsedMs: 400, tasks: [] },
+    };
+
+    const mock = makeMockClient(async (op, params) => {
+      if (op === "ping") return { pong: true, pid: process.pid, protocolRev: 8, releaseId: "rel-r3" };
+      if (op === "chat.open") {
+        openCount += 1;
+        return makeProdChatOpen(session, history, { busy: false });
+      }
+      if (op === "chat.history") {
+        const afterSeq = Number(params.afterSeq ?? 0);
+        const throughSeq = Number(params.throughSeq ?? Number.MAX_SAFE_INTEGER);
+        return {
+          history: history.filter((r) => r.seq > afterSeq && r.seq <= throughSeq),
+          historyNext: null,
+        };
+      }
+      if (op === "work.snapshot") return emptyWorkSnapshot();
+      if (op === "session.leave") return { daemonWillQuit: false };
+      return {};
+    });
+
+    const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+    await waitFor(() => text().includes(session.id), 3000, "initial render");
+
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.turn.start",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r3-c4", reason: "goal.progress" },
+    });
+    // Stream A, daemon silently persists A on rollover, stream B, then live structured tool card freezes AB.
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.delta",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r3-c4", delta: "FROZEN-ROLLOVER-A-R3C4" },
+    });
+    history.push({
+      seq: 1,
+      chatSessionId: session.id,
+      role: "assistant",
+      content: "FROZEN-ROLLOVER-A-R3C4",
+      createdAt: Date.now(),
+    });
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.delta",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r3-c4", delta: "\n\nFROZEN-ROLLOVER-B-R3C4" },
+    });
+    history.push(
+      {
+        seq: 2,
+        chatSessionId: session.id,
+        role: "assistant",
+        content: "FROZEN-ROLLOVER-B-R3C4",
+        createdAt: Date.now(),
+      },
+      {
+        seq: 3,
+        chatSessionId: session.id,
+        role: "tool_output",
+        content: "run-r3-c4",
+        toolName: "present_result",
+        display: toolDisplay,
+        createdAt: Date.now(),
+      },
+    );
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.tool",
+      createdAt: Date.now(),
+      payload: {
+        chatSessionId: session.id,
+        turnId: "turn-r3-c4",
+        name: "present_result",
+        status: "completed",
+        display: toolDisplay,
+      },
+    });
+    await waitFor(() => text().includes("run-r3-c4"), 3000, "live tool card froze AB");
+
+    // Disconnect; turn ends right after the tool flush with no final assistant row.
+    mock.disconnect();
+    await waitFor(() => openCount >= 2 && text().includes("Reconnected to harnessd"), 5000, "reconnected idle");
+
+    sendInput("\x1d");
+    await runPromise;
+
+    const out = text();
+    await assertMatchesFreshHistoryOracle({
+      session,
+      persistedHistory: history,
+      actualLines: lines(),
+      label: "review-3 case 4 (rollover + live tool card)",
+    });
+    assert.equal(countOccurrences(out, "FROZEN-ROLLOVER-A-R3C4"), 1, "frozen A must not render again");
+    assert.equal(countOccurrences(out, "FROZEN-ROLLOVER-B-R3C4"), 1, "frozen B must not render again");
+    assert.equal(countOccurrences(out, "run-r3-c4"), 1, "live tool card must not render again");
+    assert.equal(out.includes("Turn ended while disconnected"), false, "no spurious early-end line");
+  });
+
+  it("review-3 case 5 (rollover + daemon crash before B persisted): renders A once and appends unpersisted remainder B once with interrupted note", async () => {
+    const { terminal, lines, text, sendInput } = makeFakeTerminal(120, 30);
+    const session = makeChatSession("chat-34-r3-c5");
+    const history: ChatTurnRecord[] = [];
+    let openCount = 0;
+    let daemonPid = process.pid;
+
+    const mock = makeMockClient(async (op, params) => {
+      if (op === "ping") return { pong: true, pid: daemonPid, protocolRev: 8, releaseId: "rel-r3" };
+      if (op === "chat.open") {
+        openCount += 1;
+        return makeProdChatOpen(session, history, { busy: false });
+      }
+      if (op === "chat.history") {
+        const afterSeq = Number(params.afterSeq ?? 0);
+        const throughSeq = Number(params.throughSeq ?? Number.MAX_SAFE_INTEGER);
+        return {
+          history: history.filter((r) => r.seq > afterSeq && r.seq <= throughSeq),
+          historyNext: null,
+        };
+      }
+      if (op === "work.snapshot") return emptyWorkSnapshot();
+      if (op === "session.leave") return { daemonWillQuit: false };
+      return {};
+    });
+
+    const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+    await waitFor(() => text().includes(session.id), 3000, "initial render");
+
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.turn.start",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r3-c5", reason: "goal.progress" },
+    });
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.delta",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r3-c5", delta: "CRASH-PERSISTED-A-R3C5" },
+    });
+    // Rollover persists A silently.
+    history.push({
+      seq: 1,
+      chatSessionId: session.id,
+      role: "assistant",
+      content: "CRASH-PERSISTED-A-R3C5",
+      createdAt: Date.now(),
+    });
+    // B streams to the TUI, then daemon dies before B is persisted.
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.delta",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r3-c5", delta: "\n\nCRASH-UNPERSISTED-B-R3C5" },
+    });
+    await waitFor(() => text().includes("CRASH-UNPERSISTED-B-R3C5"), 3000, "tail AB streamed");
+
+    daemonPid = process.pid + 1;
+    mock.disconnect();
+    await waitFor(() => openCount >= 2 && text().includes("Reconnected to harnessd"), 5000, "reconnected after crash");
+
+    sendInput("\x1d");
+    await runPromise;
+
+    const out = text();
+    await assertMatchesFreshHistoryOracle({
+      session,
+      persistedHistory: history,
+      actualLines: lines(),
+      expectedRemainderBlocks: ["CRASH-UNPERSISTED-B-R3C5"],
+      label: "review-3 case 5 (rollover + crash before B)",
+    });
+    assert.equal(countOccurrences(out, "CRASH-PERSISTED-A-R3C5"), 1, "persisted A must render once");
+    assert.equal(countOccurrences(out, "CRASH-UNPERSISTED-B-R3C5"), 1, "unpersisted remainder B must append once");
+    assert.ok(
+      out.includes("Turn ended while disconnected") || out.includes("Turn ended early: harnessd restarted"),
+      "must include quiet interrupted/restart note when appending unpersisted remainder",
+    );
   });
 });
