@@ -1619,7 +1619,7 @@ export class GoalEngine {
     }
     lines.push(
       "",
-      "Budget: reserve the last 30% of context for the verdict; you will be nudged at 70%.",
+      "Budget: reserve the last 30% of context for the verdict; you will be nudged at 70%. The review has a hard 10-minute wall-clock limit.",
       "",
       "Return a strict JSON verdict (or call submit_review_verdict) matching:",
       `{ "verdict": "approved" | "changes_requested" | "escalate_human", "criteriaResults": [{ "criterionId": "...", "passed": true|false, "evidence": "...", "remediation": "..." }], "blockingIssues": [], "summary": "..." }`,
