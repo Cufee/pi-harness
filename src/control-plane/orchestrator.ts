@@ -3439,17 +3439,20 @@ export class HarnessOrchestrator {
       model: explicit?.target?.model ?? latest.model,
       effort: explicit?.target?.effort ?? latest.effort,
     };
-    const prev = this.taskRolloverProgress.get(taskId);
-    const next = await this.computeRolloverFingerprint({
-      run,
-      task: latest,
-      worktreePath: wt?.path ?? null,
-      nextRoute,
-      prev,
-    });
-    if (this.rolloverFenceBroken(exec, taskId, fence)) return false;
-    const streak = prev && prev.fp === next.fp ? prev.streak + 1 : 1;
-    this.taskRolloverProgress.set(taskId, { fp: next.fp, streak, artHigh: next.artHigh, routes: next.routes });
+    let streak = 0;
+    if (explicit?.restart !== true) {
+      const prev = this.taskRolloverProgress.get(taskId);
+      const next = await this.computeRolloverFingerprint({
+        run,
+        task: latest,
+        worktreePath: wt?.path ?? null,
+        nextRoute,
+        prev,
+      });
+      if (this.rolloverFenceBroken(exec, taskId, fence)) return false;
+      streak = prev && prev.fp === next.fp ? prev.streak + 1 : 1;
+      this.taskRolloverProgress.set(taskId, { fp: next.fp, streak, artHigh: next.artHigh, routes: next.routes });
+    }
     if (streak >= 3) {
       const summary =
         "Stopped: 2 context windows in a row with nothing new (no commit, file change, added dossier content, child change, or newly read file). " +
