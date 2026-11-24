@@ -1,14 +1,15 @@
 import { lstatSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { EscalationRecord, TaskRecord } from "../control-plane/db.js";
+import type { EscalationRecord, RecentlyResolvedEscalation, TaskRecord } from "../control-plane/db.js";
 import { compactTaskHandoff } from "../control-plane/handoffs.js";
 import type { RunActivitySummary, TaskActivitySnapshot } from "../control-plane/telemetry.js";
 import type { GoalLiveProgress, GoalRecord, GoalReviewVerdict, GoalStatus, ReviewerDiagnostics } from "../goals/engine.js";
 import { isReviewInvalidated } from "../protocol/chat-events.js";
+import { serializeToolResult } from "../runners/mcp-bridge.js";
 import type { ToolDefinition } from "../runners/types.js";
 
 export const GOAL_GET_LIMITS = {
-  budgetChars: 40_000, // hard target for JSON.stringify(result); client limit is 50,000
+  budgetChars: 40_000, // hard target for serializeToolResult(result); client limit is 50,000
   descriptionExcerpt: 1_500,
   descriptionPage: 30_000,
   criterionDescription: 280,
@@ -22,7 +23,9 @@ export const GOAL_GET_LIMITS = {
   taskSummary: 240,
   tasksMax: 30,
   escalationTitle: 200,
+  escalationResolution: 240,
   escalationsMax: 20,
+  recentEscalationsMax: 10,
   nonGoal: 300,
   nonGoalsMax: 20,
   reviewsDefault: 1,
@@ -45,8 +48,9 @@ export const GOAL_GET_TOOL: ToolDefinition = {
   name: "goal_get",
   description:
     "Inspect a Goal. Default output is compact and always fits one tool result: goal header with a description excerpt and a path to the full text, " +
-    "every criterion with its id, kind, required flag and latest status, a compact summary of the latest review, the run's tasks (summaries and artifact paths) and activity, and open escalations. " +
-    "Narrow it with sections (goal, description, criteria, reviews, run, escalations); requesting a narrow section set (such as sections: ['criteria'] or ['reviews']) returns unclipped fields while within budget. " +
+    "every criterion with its id, kind, required flag and latest status (collapsing to {id, status} at the budget floor and paging via criteria_offset / criteriaPage.nextOffset only when criterion rows alone exceed budget), " +
+    "a compact summary of the latest review, the run's tasks (summaries and artifact paths) and activity, open/acked escalations (openEscalations), and recent escalation history (recentlyResolvedEscalations, newest 10 with status, clipped resolution, resolvedAt, and recentlyResolvedEscalationsPage.omitted for older ones). " +
+    "Narrow it with sections (goal, description, criteria, reviews, run, escalations); requesting a narrow section set (such as sections: ['criteria'], ['reviews'], or ['escalations']) returns unclipped fields while within budget. " +
     "Page older reviews with reviews_limit (default 1, max 10; only the newest returned review includes criteriaResults) and reviews_before (pass reviewsPage.nextBefore). " +
     "Read the full description with read_file on description.path, or sections: ['description'] with description_offset (pages up to 30000 JSON chars). Read task handoff artifacts with read_file on tasks[].artifactPaths (use run_status for full run telemetry). " +
     "Pass the returned presentation_id to present_result to show the Goal detail card.",
@@ -69,6 +73,11 @@ export const GOAL_GET_TOOL: ToolDefinition = {
         type: "number",
         description: "Character offset into the full description when sections includes description. Default 0.",
       },
+      criteria_offset: {
+        type: "number",
+        description:
+          "0-based index into criteria to start from when paging very large criterion lists (pass criteriaPage.nextOffset). Default 0.",
+      },
     },
   },
 };
@@ -79,6 +88,7 @@ export interface GoalGetOptions {
   reviewsLimit: number;
   reviewsBefore: string | null;
   descriptionOffset: number;
+  criteriaOffset: number;
 }
 
 /** Structural input matching `DirectorRuntime.goalDisplayData(goal)`. */
@@ -87,6 +97,10 @@ export interface GoalGetDetailInput {
   reviews: GoalReviewVerdict[];
   tasks: TaskRecord[];
   openEscalations: EscalationRecord[];
+  /** Recently resolved escalations on the goal's run (newest first), e.g. from `db.listRecentlyResolvedEscalations`. */
+  recentlyResolvedEscalations?: RecentlyResolvedEscalation[];
+  /** Total resolved escalations on the goal's run when larger than `recentlyResolvedEscalations.length`. */
+  resolvedEscalationsTotal?: number;
   activity: RunActivitySummary | null;
 }
 
@@ -147,12 +161,22 @@ export function parseGoalGetOptions(args: Record<string, unknown>): GoalGetOptio
     descriptionOffset = Math.floor(args.description_offset);
   }
 
+  let criteriaOffset = 0;
+  if (
+    typeof args.criteria_offset === "number" &&
+    Number.isFinite(args.criteria_offset) &&
+    args.criteria_offset >= 0
+  ) {
+    criteriaOffset = Math.floor(args.criteria_offset);
+  }
+
   return {
     sections,
     explicitSections,
     reviewsLimit,
     reviewsBefore,
     descriptionOffset,
+    criteriaOffset,
   };
 }
 
@@ -256,10 +280,10 @@ const TERMINAL_TASK_STATUSES = new Set<TaskRecord["status"]>([
   "returned_for_rescope",
 ]);
 
-function compactLiveProgress(lp: GoalLiveProgress | null | undefined): Record<string, unknown> | null {
+function compactLiveProgress(lp: GoalLiveProgress | null | undefined, phaseMax = 200): Record<string, unknown> | null {
   if (!lp) return null;
   return {
-    ...(lp.phase !== undefined ? { phase: lp.phase } : {}),
+    ...(lp.phase !== undefined ? { phase: clip(lp.phase, phaseMax) } : {}),
     ...(lp.summary !== undefined ? { summary: clip(lp.summary, 500) } : {}),
     ...(lp.verificationStatus !== undefined ? { verificationStatus: lp.verificationStatus } : {}),
     ...(lp.criteriaResults
@@ -304,10 +328,13 @@ interface ShrinkState {
   criterionCommand: number;
   includeCriterionCommand: boolean;
   criterionEvidence: number | null;
+  criteriaMinimal: boolean;
   latestReviewSummary: number;
   latestReviewEvidence: number | null;
   latestReviewRemediation: number | null;
   latestReviewGate: boolean;
+  gateFieldMax: number;
+  gateNoteMax: number;
   latestReviewBlockingMax: number;
   latestReviewBlockingIssue: number;
   descriptionExcerpt: number;
@@ -315,10 +342,14 @@ interface ShrinkState {
   nonGoalsMax: number;
   goalLastReviewSummary: number;
   goalTitleMax: number;
+  verifyRefMax: number;
+  liveProgressPhaseMax: number;
   dropLiveProgress: boolean;
   dropLiveProgressSummary: boolean;
   escalationsMax: number;
+  recentEscalationsMax: number;
   escalationTitle: number;
+  escalationResolution: number;
   diagnosticsMode: DiagnosticsMode;
   dropAcceptOverrides: boolean;
 }
@@ -328,6 +359,7 @@ function initialShrinkState(opts: GoalGetOptions, sectionSet: Set<GoalGetSection
   const unclipCriteria = isNarrow && sectionSet.has("criteria");
   const unclipLatestReview = isNarrow && sectionSet.has("reviews");
   const unclipTasks = isNarrow && sectionSet.has("run");
+  const unclipEscalations = isNarrow && sectionSet.has("escalations");
   return {
     tasksMax: GOAL_GET_LIMITS.tasksMax,
     taskSummary: unclipTasks ? Number.POSITIVE_INFINITY : GOAL_GET_LIMITS.taskSummary,
@@ -341,10 +373,13 @@ function initialShrinkState(opts: GoalGetOptions, sectionSet: Set<GoalGetSection
     criterionCommand: unclipCriteria ? Number.POSITIVE_INFINITY : GOAL_GET_LIMITS.criterionCommand,
     includeCriterionCommand: true,
     criterionEvidence: unclipCriteria ? Number.POSITIVE_INFINITY : GOAL_GET_LIMITS.evidence,
+    criteriaMinimal: false,
     latestReviewSummary: unclipLatestReview ? Number.POSITIVE_INFINITY : GOAL_GET_LIMITS.reviewSummary,
     latestReviewEvidence: unclipLatestReview ? Number.POSITIVE_INFINITY : GOAL_GET_LIMITS.evidence,
     latestReviewRemediation: unclipLatestReview ? Number.POSITIVE_INFINITY : GOAL_GET_LIMITS.remediation,
     latestReviewGate: true,
+    gateFieldMax: Number.POSITIVE_INFINITY,
+    gateNoteMax: unclipLatestReview ? Number.POSITIVE_INFINITY : GOAL_GET_LIMITS.evidence,
     latestReviewBlockingMax: unclipLatestReview ? Number.POSITIVE_INFINITY : GOAL_GET_LIMITS.blockingIssuesMax,
     latestReviewBlockingIssue: unclipLatestReview ? Number.POSITIVE_INFINITY : GOAL_GET_LIMITS.blockingIssue,
     descriptionExcerpt: GOAL_GET_LIMITS.descriptionExcerpt,
@@ -352,10 +387,14 @@ function initialShrinkState(opts: GoalGetOptions, sectionSet: Set<GoalGetSection
     nonGoalsMax: GOAL_GET_LIMITS.nonGoalsMax,
     goalLastReviewSummary: GOAL_GET_LIMITS.reviewSummary,
     goalTitleMax: Number.POSITIVE_INFINITY,
+    verifyRefMax: Number.POSITIVE_INFINITY,
+    liveProgressPhaseMax: 200,
     dropLiveProgress: false,
     dropLiveProgressSummary: false,
     escalationsMax: GOAL_GET_LIMITS.escalationsMax,
-    escalationTitle: GOAL_GET_LIMITS.escalationTitle,
+    recentEscalationsMax: GOAL_GET_LIMITS.recentEscalationsMax,
+    escalationTitle: unclipEscalations ? Number.POSITIVE_INFINITY : GOAL_GET_LIMITS.escalationTitle,
+    escalationResolution: unclipEscalations ? Number.POSITIVE_INFINITY : GOAL_GET_LIMITS.escalationResolution,
     diagnosticsMode: "full",
     dropAcceptOverrides: false,
   };
@@ -372,7 +411,7 @@ function sortReviewsNewestFirst(reviews: readonly GoalReviewVerdict[]): GoalRevi
 }
 
 export const GOAL_LIST_LIMITS = {
-  budgetChars: 20_000, // hard target for JSON.stringify(result)
+  budgetChars: 20_000, // hard target for serializeToolResult(result)
   titleMax: 160,
   limitDefault: 30,
   limitMax: 100,
@@ -572,19 +611,19 @@ export function buildGoalListResult(
 
   // Size guard step 1: shrink/clip titles before reducing the returned page count.
   for (const smallerTitleMax of [80, 40]) {
-    if (JSON.stringify(result).length <= effectiveBudget) break;
+    if (serializeToolResult(result).length <= effectiveBudget) break;
     titleMax = smallerTitleMax;
     result = render(projected.length, titleMax);
   }
 
   // Size guard step 2: reduce returned count to fit budget and advance nextCursor accordingly.
-  if (JSON.stringify(result).length > effectiveBudget) {
+  if (serializeToolResult(result).length > effectiveBudget) {
     let lo = 0;
     let hi = projected.length;
     while (lo < hi) {
       const mid = Math.ceil((lo + hi) / 2);
       const candidate = render(mid, titleMax);
-      if (JSON.stringify(candidate).length <= effectiveBudget) {
+      if (serializeToolResult(candidate).length <= effectiveBudget) {
         lo = mid;
       } else {
         hi = mid - 1;
@@ -662,6 +701,11 @@ export function buildGoalGetResult(
   const sortedEscalations = [...detail.openEscalations].sort(
     (a, b) => b.createdAt - a.createdAt || (b.id < a.id ? -1 : b.id > a.id ? 1 : 0),
   );
+  // Resolved escalation history ordered newest-first by resolvedAt (preserving input order on ties).
+  const sortedResolvedEscalations = [...(detail.recentlyResolvedEscalations ?? [])].sort(
+    (a, b) => (b.resolvedAt ?? 0) - (a.resolvedAt ?? 0),
+  );
+  const totalResolvedEscalations = Math.max(sortedResolvedEscalations.length, detail.resolvedEscalationsTotal ?? 0);
 
   const acceptOverrides = sortedReviews
     .filter((r) => r.source === "director_accept_override")
@@ -689,7 +733,7 @@ export function buildGoalGetResult(
             ? "read_file path, or goal_get sections:['description']"
             : "goal_get sections:['description']"
           : undefined;
-      const lp = state.dropLiveProgress ? null : compactLiveProgress(goal.liveProgress);
+      const lp = state.dropLiveProgress ? null : compactLiveProgress(goal.liveProgress, state.liveProgressPhaseMax);
       if (lp && state.dropLiveProgressSummary) delete lp.summary;
       out.goal = {
         id: goal.id,
@@ -697,7 +741,7 @@ export function buildGoalGetResult(
         title: renderedTitle,
         status: goal.status,
         verificationMode: goal.verificationMode ?? "auto",
-        verifyRef: goal.verifyRef ?? null,
+        verifyRef: goal.verifyRef != null ? clip(goal.verifyRef, state.verifyRefMax) : null,
         linkedRunId: goal.linkedRunId,
         reviewCycle: goal.reviewCycle,
         noProgressStreak: goal.noProgressStreak,
@@ -740,13 +784,21 @@ export function buildGoalGetResult(
     }
 
     if (hasCriteria) {
-      out.criteria = goal.criteria.map((c) => {
+      const criteriaOffset = opts.criteriaOffset ?? 0;
+      const slicedCriteria = goal.criteria.slice(criteriaOffset);
+      const renderedCriteria = slicedCriteria.map((c) => {
         const evaluated = latestEvalByCriterion.get(c.id);
         const status: "passed" | "failed" | "not_evaluated" = evaluated
           ? evaluated.passed
             ? "passed"
             : "failed"
           : "not_evaluated";
+        if (state.criteriaMinimal) {
+          return {
+            id: c.id,
+            status,
+          };
+        }
         const evidence =
           evaluated && state.criterionEvidence !== null && evaluated.evidence
             ? clip(evaluated.evidence, state.criterionEvidence)
@@ -764,6 +816,17 @@ export function buildGoalGetResult(
           ...(evidence !== undefined ? { evidence } : {}),
         };
       });
+      out.criteria = renderedCriteria;
+      out.criteriaPage = {
+        offset: criteriaOffset,
+        total: goal.criteria.length,
+        returned: renderedCriteria.length,
+        omitted: Math.max(0, goal.criteria.length - renderedCriteria.length),
+        nextOffset:
+          renderedCriteria.length > 0 && criteriaOffset + renderedCriteria.length < goal.criteria.length
+            ? criteriaOffset + renderedCriteria.length
+            : null,
+      };
     }
 
     if (hasReviews) {
@@ -802,7 +865,16 @@ export function buildGoalGetResult(
                 ? { remediation: clip(cr.remediation, state.latestReviewRemediation) }
                 : {}),
               ...(cr.gate && state.latestReviewGate
-                ? { gate: { ref: cr.gate.ref, sha: cr.gate.sha, source: cr.gate.source } }
+                ? {
+                    gate: {
+                      cwd: clip(cr.gate.cwd, state.gateFieldMax),
+                      ref: clip(cr.gate.ref, state.verifyRefMax),
+                      sha: cr.gate.sha,
+                      isolated: cr.gate.isolated,
+                      source: cr.gate.source,
+                      ...(cr.gate.note !== undefined ? { note: clip(cr.gate.note, state.gateNoteMax) } : {}),
+                    },
+                  }
                 : {}),
             })),
             ...(diagOut !== undefined ? { diagnostics: diagOut } : {}),
@@ -901,11 +973,29 @@ export function buildGoalGetResult(
         fromTaskId: e.fromTaskId,
         toTaskId: e.toTaskId,
         createdAt: e.createdAt,
+        ...(e.resolution != null ? { resolution: clip(e.resolution, state.escalationResolution) } : {}),
+        ...(e.ackedAt != null ? { ackedAt: e.ackedAt } : {}),
       }));
       out.escalationsPage = {
         total: detail.openEscalations.length,
         returned: selectedEscalations.length,
         omitted: Math.max(0, detail.openEscalations.length - selectedEscalations.length),
+      };
+      const selectedResolved = sortedResolvedEscalations.slice(0, state.recentEscalationsMax);
+      out.recentlyResolvedEscalations = selectedResolved.map((e) => ({
+        id: e.id,
+        fromTaskId: e.fromTaskId,
+        severity: e.severity,
+        category: e.category,
+        title: clip(e.title, state.escalationTitle),
+        status: "resolved" as const,
+        resolution: clip(e.resolution, state.escalationResolution),
+        resolvedAt: e.resolvedAt,
+      }));
+      out.recentlyResolvedEscalationsPage = {
+        total: totalResolvedEscalations,
+        returned: selectedResolved.length,
+        omitted: Math.max(0, totalResolvedEscalations - selectedResolved.length),
       };
     }
 
@@ -935,6 +1025,7 @@ export function buildGoalGetResult(
         state.latestReviewSummary = GOAL_GET_LIMITS.reviewSummary;
         state.latestReviewEvidence = GOAL_GET_LIMITS.evidence;
         state.latestReviewRemediation = GOAL_GET_LIMITS.remediation;
+        state.gateNoteMax = GOAL_GET_LIMITS.evidence;
         state.latestReviewBlockingMax = GOAL_GET_LIMITS.blockingIssuesMax;
         state.latestReviewBlockingIssue = GOAL_GET_LIMITS.blockingIssue;
         return true;
@@ -946,6 +1037,43 @@ export function buildGoalGetResult(
         if (!hasRun || Number.isFinite(state.taskSummary)) return false;
         state.taskSummary = GOAL_GET_LIMITS.taskSummary;
         state.taskArtifactsMax = 5;
+        return true;
+      },
+    },
+    {
+      label: "escalations.compact",
+      apply: () => {
+        if (
+          !hasEscalations ||
+          (Number.isFinite(state.escalationTitle) && Number.isFinite(state.escalationResolution))
+        ) {
+          return false;
+        }
+        state.escalationTitle = GOAL_GET_LIMITS.escalationTitle;
+        state.escalationResolution = GOAL_GET_LIMITS.escalationResolution;
+        return true;
+      },
+    },
+    {
+      label: "goal.header",
+      apply: () => {
+        const longTitle = goal.title.length > 240;
+        const longVerifyRef = hasGoal && (goal.verifyRef?.length ?? 0) > 240;
+        const longPhase = hasGoal && (goal.liveProgress?.phase?.length ?? 0) > 120;
+        const longGate =
+          hasReviews &&
+          pagedReviews.length > 0 &&
+          pagedReviews[0]!.criteriaResults.some(
+            (cr) =>
+              cr.gate != null &&
+              (cr.gate.ref.length > 240 || cr.gate.cwd.length > 300 || (cr.gate.note?.length ?? 0) > 240),
+          );
+        if (!longTitle && !longVerifyRef && !longPhase && !longGate) return false;
+        state.goalTitleMax = 240;
+        state.verifyRefMax = 240;
+        state.liveProgressPhaseMax = 120;
+        state.gateFieldMax = 300;
+        state.gateNoteMax = 240;
         return true;
       },
     },
@@ -976,9 +1104,11 @@ export function buildGoalGetResult(
     {
       label: "escalations",
       apply: () => {
-        if (!hasEscalations || sortedEscalations.length === 0) return false;
+        if (!hasEscalations || (sortedEscalations.length === 0 && sortedResolvedEscalations.length === 0)) return false;
         state.escalationsMax = Math.min(state.escalationsMax, 10);
+        state.recentEscalationsMax = Math.min(state.recentEscalationsMax, 5);
         state.escalationTitle = 100;
+        state.escalationResolution = 120;
         return true;
       },
     },
@@ -1044,12 +1174,24 @@ export function buildGoalGetResult(
         state.latestReviewSummary = 300;
         state.goalLastReviewSummary = 300;
         state.dropLiveProgressSummary = true;
+        state.liveProgressPhaseMax = 80;
         state.diagnosticsMode = "omit";
         state.dropAcceptOverrides = true;
-        if (hasEscalations && sortedEscalations.length > 0) {
+        if (hasEscalations && (sortedEscalations.length > 0 || sortedResolvedEscalations.length > 0)) {
           state.escalationsMax = Math.min(state.escalationsMax, 5);
+          state.recentEscalationsMax = Math.min(state.recentEscalationsMax, 3);
           state.escalationTitle = 80;
+          state.escalationResolution = 80;
         }
+        return true;
+      },
+    },
+    {
+      label: "criteria.minimal",
+      apply: () => {
+        if (!hasCriteria || goal.criteria.length === 0 || state.criteriaMinimal) return false;
+        state.criteriaMinimal = true;
+        state.dropLiveProgress = true;
         return true;
       },
     },
@@ -1057,14 +1199,14 @@ export function buildGoalGetResult(
 
   let result = render(state, truncated);
   for (const step of shrinkSteps) {
-    if (JSON.stringify(result).length <= effectiveBudget) break;
+    if (serializeToolResult(result).length <= effectiveBudget) break;
     if (!step.apply()) continue;
     truncated.push(step.label);
     result = render(state, truncated);
   }
 
   // Final hard wire-budget guarantee: never return a payload exceeding effectiveBudget (<= 40,000 chars).
-  if (JSON.stringify(result).length > effectiveBudget) {
+  if (serializeToolResult(result).length > effectiveBudget) {
     truncated.push("budget.cap");
     state.tasksMax = 0;
     state.includeTaskArtifacts = false;
@@ -1075,42 +1217,52 @@ export function buildGoalGetResult(
     state.nonGoalsMax = 0;
     state.descriptionExcerpt = 0;
     state.goalLastReviewSummary = 0;
+    state.goalTitleMax = Math.min(state.goalTitleMax, 200);
+    state.verifyRefMax = Math.min(state.verifyRefMax, 200);
+    state.liveProgressPhaseMax = 60;
     state.criterionDescription = 0;
     state.includeCriterionCommand = false;
     state.criterionEvidence = null;
+    state.criteriaMinimal = true;
     state.pagedReviewsCap = 1;
     state.latestReviewEvidence = null;
     state.latestReviewRemediation = null;
     state.latestReviewGate = false;
     state.latestReviewBlockingMax = 0;
     state.escalationsMax = Math.min(state.escalationsMax, 5);
+    state.recentEscalationsMax = Math.min(state.recentEscalationsMax, 3);
     state.escalationTitle = 60;
+    state.escalationResolution = 60;
     result = render(state, truncated);
 
-    if (hasDescription && JSON.stringify(result).length > effectiveBudget) {
+    if (hasDescription && serializeToolResult(result).length > effectiveBudget) {
       state.descriptionPageJsonBudget = 0;
-      const baseLen = JSON.stringify(render(state, truncated)).length;
+      const baseLen = serializeToolResult(render(state, truncated)).length;
       const room = Math.max(0, effectiveBudget - baseLen - 16);
       state.descriptionPageJsonBudget = room;
       result = render(state, truncated);
     }
 
-    if (JSON.stringify(result).length > effectiveBudget) {
-      state.goalTitleMax = 200;
+    if (serializeToolResult(result).length > effectiveBudget) {
+      state.goalTitleMax = 120;
+      state.verifyRefMax = 120;
       state.escalationsMax = 0;
+      state.recentEscalationsMax = 0;
       state.latestReviewSummary = 120;
       result = render(state, truncated);
     }
 
-    if (JSON.stringify(result).length > effectiveBudget) {
+    if (serializeToolResult(result).length > effectiveBudget) {
+      state.goalTitleMax = 60;
+      state.verifyRefMax = 60;
       state.latestReviewSummary = 0;
       result = render(state, truncated);
     }
 
-    // Absolute fallback for adversarial array sizes (e.g. thousands of criteria/results).
-    if (JSON.stringify(result).length > effectiveBudget) {
-      const trimArrayToBudget = (arr: unknown[]): void => {
-        if (arr.length === 0 || JSON.stringify(result).length <= effectiveBudget) return;
+    // Absolute fallback for adversarial array sizes (e.g. hundreds/thousands of criteria or results).
+    if (serializeToolResult(result).length > effectiveBudget) {
+      const trimArrayToBudget = (arr: unknown[], onResize?: (len: number) => void): void => {
+        if (arr.length === 0 || serializeToolResult(result).length <= effectiveBudget) return;
         let lo = 0;
         let hi = arr.length;
         const copy = [...arr];
@@ -1118,7 +1270,8 @@ export function buildGoalGetResult(
           const mid = Math.ceil((lo + hi) / 2);
           arr.length = 0;
           arr.push(...copy.slice(0, mid));
-          if (JSON.stringify(result).length <= effectiveBudget) {
+          onResize?.(mid);
+          if (serializeToolResult(result).length <= effectiveBudget) {
             lo = mid;
           } else {
             hi = mid - 1;
@@ -1126,14 +1279,31 @@ export function buildGoalGetResult(
         }
         arr.length = 0;
         arr.push(...copy.slice(0, lo));
+        onResize?.(lo);
       };
       if (Array.isArray(result.openEscalations)) {
-        trimArrayToBudget(result.openEscalations);
-        if (result.escalationsPage && typeof result.escalationsPage === "object") {
-          const ep = result.escalationsPage as { total: number; returned: number; omitted: number };
-          ep.returned = result.openEscalations.length;
-          ep.omitted = Math.max(0, ep.total - ep.returned);
-        }
+        const ep =
+          result.escalationsPage && typeof result.escalationsPage === "object"
+            ? (result.escalationsPage as { total: number; returned: number; omitted: number })
+            : null;
+        trimArrayToBudget(result.openEscalations, (len) => {
+          if (ep) {
+            ep.returned = len;
+            ep.omitted = Math.max(0, ep.total - len);
+          }
+        });
+      }
+      if (Array.isArray(result.recentlyResolvedEscalations)) {
+        const rp =
+          result.recentlyResolvedEscalationsPage && typeof result.recentlyResolvedEscalationsPage === "object"
+            ? (result.recentlyResolvedEscalationsPage as { total: number; returned: number; omitted: number })
+            : null;
+        trimArrayToBudget(result.recentlyResolvedEscalations, (len) => {
+          if (rp) {
+            rp.returned = len;
+            rp.omitted = Math.max(0, rp.total - len);
+          }
+        });
       }
       if (Array.isArray(result.reviews) && result.reviews.length > 0) {
         const firstRev = result.reviews[0] as { criteriaResults?: unknown[] };
@@ -1142,10 +1312,46 @@ export function buildGoalGetResult(
         }
       }
       if (Array.isArray(result.criteria)) {
-        trimArrayToBudget(result.criteria);
+        const cp =
+          result.criteriaPage && typeof result.criteriaPage === "object"
+            ? (result.criteriaPage as {
+                offset: number;
+                total: number;
+                returned: number;
+                omitted: number;
+                nextOffset: number | null;
+              })
+            : null;
+        trimArrayToBudget(result.criteria, (len) => {
+          if (cp) {
+            cp.returned = len;
+            cp.omitted = Math.max(0, cp.total - len);
+            cp.nextOffset = len > 0 && cp.offset + len < cp.total ? cp.offset + len : null;
+          }
+        });
       }
       if (Array.isArray(result.reviews)) {
-        trimArrayToBudget(result.reviews);
+        const rp =
+          result.reviewsPage && typeof result.reviewsPage === "object"
+            ? (result.reviewsPage as { total: number; returned: number; nextBefore: string | null })
+            : null;
+        trimArrayToBudget(result.reviews, (len) => {
+          if (rp) {
+            rp.returned = len;
+            if (len === 0) rp.nextBefore = null;
+          }
+        });
+      }
+    }
+
+    // Final guard for adversarial long path scalars (e.g. evidenceDir / description.path).
+    if (serializeToolResult(result).length > effectiveBudget) {
+      if (typeof result.evidenceDir === "string" && result.evidenceDir.length > 200) {
+        result.evidenceDir = clip(result.evidenceDir, 200);
+      }
+      const g = result.goal as { description?: { path?: string | null } } | undefined;
+      if (g?.description && typeof g.description.path === "string" && g.description.path.length > 200) {
+        g.description.path = clip(g.description.path, 200);
       }
     }
   }

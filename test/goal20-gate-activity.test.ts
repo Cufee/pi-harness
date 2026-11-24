@@ -181,6 +181,124 @@ describe("detectGitPush and looksLikeGitPush", () => {
     );
   });
 
+  it("ignores git fetch ref lines when chained with a rejected, up-to-date, or quiet push (P2 fetch-then-push)", () => {
+    // Fetch followed by rejected push (with From header) -> null.
+    assert.equal(
+      detectGitPush(
+        "git fetch && git push origin main",
+        [
+          "From https://github.com/x/y.git",
+          "   1234567..89abcde  main       -> origin/main",
+          "To https://github.com/x/y.git",
+          " ! [rejected]        main -> main (fetch first)",
+          "error: failed to push some refs to 'https://github.com/x/y.git'",
+        ].join("\n"),
+      ),
+      null,
+    );
+
+    // Fetch line without From header, followed by To + rejected push -> null.
+    assert.equal(
+      detectGitPush(
+        "git fetch && git push origin main",
+        [
+          "   1234567..89abcde  main -> origin/main",
+          "To origin",
+          " ! [rejected]        main -> main (fetch first)",
+          "error: failed to push some refs to 'origin'",
+        ].join("\n"),
+      ),
+      null,
+    );
+
+    // Fetch followed by Everything up-to-date (with and without From header) -> null.
+    assert.equal(
+      detectGitPush(
+        "git fetch && git push origin main",
+        "From origin\n   1234567..89abcde  main -> origin/main\nEverything up-to-date\n",
+      ),
+      null,
+    );
+    assert.equal(
+      detectGitPush(
+        "git fetch && git push origin main",
+        "   1234567..89abcde  main -> origin/main\nEverything up-to-date\n",
+      ),
+      null,
+    );
+
+    // Fetch followed by a real push update -> confirmed with only the push ref, never the fetch ref.
+    assert.deepEqual(
+      detectGitPush(
+        "git fetch && git push origin main",
+        [
+          "From origin",
+          "   1234567..89abcde  main -> origin/main",
+          "To origin",
+          "   89abcde..fedcba9  main -> main",
+        ].join("\n"),
+      ),
+      {
+        command: "git push origin main",
+        remote: "origin",
+        refs: ["89abcde..fedcba9 main -> main"],
+        confirmed: true,
+      },
+    );
+
+    // Fetch followed by quiet push with no push output -> unconfirmed (not falsely confirmed by fetch ref).
+    assert.deepEqual(
+      detectGitPush(
+        "git fetch && git push -q origin main",
+        "From origin\n   1234567..89abcde  main -> origin/main\n",
+      ),
+      {
+        command: "git push -q origin main",
+        remote: "origin",
+        refs: [],
+        confirmed: false,
+      },
+    );
+  });
+
+  it("treats standard git deletion lines ('- [deleted] topic') as confirmed ref updates, including partial rejections (P2 deletion)", () => {
+    const partialDelete = detectGitPush(
+      "git push origin :topic :main",
+      [
+        "To origin",
+        " - [deleted]         topic",
+        " ! [rejected]        main -> main (remote rejected)",
+        "error: failed to push some refs to 'origin'",
+      ].join("\n"),
+    );
+    assert.deepEqual(partialDelete, {
+      command: "git push origin :topic :main",
+      remote: "origin",
+      refs: ["[deleted] topic"],
+      confirmed: true,
+    });
+
+    const cleanDelete = detectGitPush(
+      "git push --delete origin topic",
+      "To origin\n - [deleted]         topic\n",
+    );
+    assert.deepEqual(cleanDelete, {
+      command: "git push --delete origin topic",
+      remote: "origin",
+      refs: ["[deleted] topic"],
+      confirmed: true,
+    });
+
+    // Pruned remote-tracking ref under From during fetch is NOT a push deletion.
+    assert.equal(
+      detectGitPush(
+        "git fetch --prune && git push origin main",
+        "From origin\n - [deleted]         (none)     -> origin/topic\nEverything up-to-date\n",
+      ),
+      null,
+    );
+  });
+
   it("returns confirmed=false when result output is missing or truncated without ref lines", () => {
     const missing = detectGitPush("git push origin main", undefined);
     assert.deepEqual(missing, {
