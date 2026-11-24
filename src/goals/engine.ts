@@ -168,6 +168,7 @@ export interface GoalRecord {
   noProgressStreak: number;
   lastProgressFingerprint: string | null;
   lastReviewSummary: string | null;
+  lastReviewerFailure?: ReviewerDiagnostics | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -234,6 +235,66 @@ export interface GoalAcceptOverrideAudit {
   acceptedAt: number;
 }
 
+export type ReviewerStopReason =
+  | "submitted"
+  | "end_turn_without_verdict"
+  | "max_turns"
+  | "context_limit"
+  | "timeout"
+  | "crash"
+  | "cancelled"
+  | "stale";
+
+export interface ReviewerDiagnostics {
+  reviewerTaskId: string;
+  runId: string;
+  profileId: string;
+  model: string;
+  attempts: number;
+  stopReason: ReviewerStopReason;
+  contextPct: number | null;
+  turnsUsed: number;
+  attemptFailures: string[];
+  rawOutputPaths: string[];
+  transcript: string;
+  goalVersion: number;
+  at: number;
+  infrastructure?: boolean;
+}
+
+/** Thrown when a review verdict arrives after a goal was achieved, cancelled, or amended past the reviewed version. */
+export class StaleReviewError extends Error {
+  readonly goalId: string;
+  readonly reviewedVersion: number | null;
+  readonly currentVersion: number | null;
+  readonly currentStatus: GoalStatus | null;
+  readonly verdict?: string;
+  staleEventRecorded?: boolean;
+
+  constructor(
+    goalId: string,
+    info: {
+      reviewedVersion?: number | null;
+      currentVersion?: number | null;
+      currentStatus?: GoalStatus | null;
+      verdict?: string;
+      reason?: string;
+    },
+  ) {
+    const msg =
+      info.reason ??
+      `Review for goal ${goalId}${info.reviewedVersion != null ? ` v${info.reviewedVersion}` : ""} is stale ` +
+        `(goal is now ${info.currentStatus ?? "unknown"}${info.currentVersion != null ? ` v${info.currentVersion}` : ""}); ignored`;
+    super(msg);
+    this.name = "StaleReviewError";
+    this.goalId = goalId;
+    this.reviewedVersion = info.reviewedVersion ?? null;
+    this.currentVersion = info.currentVersion ?? null;
+    this.currentStatus = info.currentStatus ?? null;
+    this.verdict = info.verdict;
+  }
+}
+
 export interface GoalReviewVerdict {
   id: string;
   goalId: string;
@@ -247,6 +308,7 @@ export interface GoalReviewVerdict {
   createdAt: number;
   source?: GoalReviewSource;
   audit?: GoalAcceptOverrideAudit | null;
+  diagnostics?: ReviewerDiagnostics | null;
 }
 
 export interface DeterministicGateResult {
@@ -276,6 +338,7 @@ CREATE TABLE IF NOT EXISTS goals (
   no_progress_streak INTEGER NOT NULL DEFAULT 0,
   last_progress_fingerprint TEXT,
   last_review_summary TEXT,
+  last_reviewer_failure_json TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -306,7 +369,8 @@ CREATE TABLE IF NOT EXISTS goal_reviews (
   progress_fingerprint TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   source TEXT NOT NULL DEFAULT 'review',
-  audit_json TEXT
+  audit_json TEXT,
+  diagnostics_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_goal_reviews_goal ON goal_reviews(goal_id, cycle);
 `;
@@ -401,6 +465,9 @@ export class GoalEngine {
     if (!cols.has("live_progress_json")) {
       this.db.exec("ALTER TABLE goals ADD COLUMN live_progress_json TEXT");
     }
+    if (!cols.has("last_reviewer_failure_json")) {
+      this.db.exec("ALTER TABLE goals ADD COLUMN last_reviewer_failure_json TEXT");
+    }
     const reviewCols = new Set(
       (this.db.prepare("PRAGMA table_info(goal_reviews)").all() as Array<{ name: string }>).map((c) => c.name),
     );
@@ -409,6 +476,9 @@ export class GoalEngine {
     }
     if (!reviewCols.has("audit_json")) {
       this.db.exec("ALTER TABLE goal_reviews ADD COLUMN audit_json TEXT");
+    }
+    if (!reviewCols.has("diagnostics_json")) {
+      this.db.exec("ALTER TABLE goal_reviews ADD COLUMN diagnostics_json TEXT");
     }
   }
 
@@ -443,6 +513,7 @@ export class GoalEngine {
       noProgressStreak: Number(r.no_progress_streak),
       lastProgressFingerprint: r.last_progress_fingerprint ? String(r.last_progress_fingerprint) : null,
       lastReviewSummary: r.last_review_summary ? String(r.last_review_summary) : null,
+      lastReviewerFailure: parseDiagnostics(r.last_reviewer_failure_json),
       createdAt: Number(r.created_at),
       updatedAt: Number(r.updated_at),
     };
@@ -852,7 +923,7 @@ export class GoalEngine {
         `UPDATE goals
          SET version = ?, title = ?, description = ?, criteria_json = ?, non_goals_json = ?,
              status = ?, review_cycle = 0, no_progress_streak = 0, last_progress_fingerprint = NULL,
-             live_progress_json = ?, updated_at = ?
+             last_reviewer_failure_json = NULL, live_progress_json = ?, updated_at = ?
          WHERE id = ?`,
       )
       .run(
@@ -1081,10 +1152,25 @@ export class GoalEngine {
       /** What produced this verdict; defaults to "review". */
       source?: GoalReviewSource;
       audit?: GoalAcceptOverrideAudit | null;
+      /** Guard against recording a stale verdict after goal_amend, goal_accept, or cancel. */
+      expectedVersion?: number;
+      diagnostics?: ReviewerDiagnostics | null;
     },
   ): { goal: GoalRecord; review: GoalReviewVerdict; circuitBreakerTripped?: string } {
     const goal = this.getGoal(goalIdStr);
     if (!goal) throw new Error(`Unknown goal ${goalIdStr}`);
+    if (
+      goal.status === "achieved" ||
+      goal.status === "cancelled" ||
+      (input.expectedVersion !== undefined && goal.version !== input.expectedVersion)
+    ) {
+      throw new StaleReviewError(goal.id, {
+        reviewedVersion: input.expectedVersion ?? goal.version,
+        currentVersion: goal.version,
+        currentStatus: goal.status,
+        verdict: input.verdict,
+      });
+    }
 
     const byId = new Map(input.criteriaResults.map((r) => [r.criterionId, r]));
     const unmetRequired: string[] = [];
@@ -1166,6 +1252,7 @@ export class GoalEngine {
     const now = Date.now();
     const source: GoalReviewSource = input.source ?? "review";
     const audit = input.audit ?? null;
+    const diagnostics = input.diagnostics ?? null;
     this.insertReviewRow({
       id: revId,
       goalId: goal.id,
@@ -1179,6 +1266,7 @@ export class GoalEngine {
       createdAt: now,
       source,
       audit,
+      diagnostics,
     });
 
     // A bounce back to executing starts a new verification epoch: drop the old claim in the same write.
@@ -1192,7 +1280,8 @@ export class GoalEngine {
       .prepare(
         `UPDATE goals
          SET status = ?, review_cycle = ?, no_progress_streak = ?,
-             last_progress_fingerprint = ?, last_review_summary = ?, live_progress_json = ?, updated_at = ?
+             last_progress_fingerprint = ?, last_review_summary = ?, last_reviewer_failure_json = NULL,
+             live_progress_json = ?, updated_at = ?
          WHERE id = ?`,
       )
       .run(
@@ -1219,6 +1308,7 @@ export class GoalEngine {
       createdAt: now,
       source,
       audit,
+      diagnostics,
     };
 
     const updatedGoal = this.getGoal(goal.id)!;
@@ -1226,13 +1316,32 @@ export class GoalEngine {
     return { goal: updatedGoal, review, circuitBreakerTripped };
   }
 
-  private insertReviewRow(r: GoalReviewVerdict & { source: GoalReviewSource; audit: GoalAcceptOverrideAudit | null }): void {
+  /** Persists diagnostics for a reviewer failure (no goal_reviews row) unless the goal moved on or settled. */
+  recordReviewerFailure(goalIdStr: string, diagnostics: ReviewerDiagnostics): GoalRecord | null {
+    const goal = this.getGoal(goalIdStr);
+    if (!goal) return null;
+    if (goal.version !== diagnostics.goalVersion || goal.status === "achieved" || goal.status === "cancelled") {
+      return null;
+    }
+    this.db
+      .prepare("UPDATE goals SET last_reviewer_failure_json = ?, updated_at = ? WHERE id = ?")
+      .run(JSON.stringify(diagnostics), Date.now(), goal.id);
+    return this.getGoal(goal.id);
+  }
+
+  private insertReviewRow(
+    r: GoalReviewVerdict & {
+      source: GoalReviewSource;
+      audit: GoalAcceptOverrideAudit | null;
+      diagnostics?: ReviewerDiagnostics | null;
+    },
+  ): void {
     this.db
       .prepare(
         `INSERT INTO goal_reviews(
           id, goal_id, goal_version, cycle, verdict, criteria_results_json,
-          blocking_issues_json, summary, progress_fingerprint, created_at, source, audit_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          blocking_issues_json, summary, progress_fingerprint, created_at, source, audit_json, diagnostics_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         r.id,
@@ -1247,6 +1356,7 @@ export class GoalEngine {
         r.createdAt,
         r.source,
         r.audit ? JSON.stringify(r.audit) : null,
+        r.diagnostics ? JSON.stringify(r.diagnostics) : null,
       );
   }
 
@@ -1284,7 +1394,11 @@ export class GoalEngine {
         .digest("hex")
         .slice(0, 16);
       const now = Date.now();
-      const row: GoalReviewVerdict & { source: GoalReviewSource; audit: GoalAcceptOverrideAudit | null } = {
+      const row: GoalReviewVerdict & {
+        source: GoalReviewSource;
+        audit: GoalAcceptOverrideAudit | null;
+        diagnostics: ReviewerDiagnostics | null;
+      } = {
         id: reviewId(this.db),
         goalId: goal.id,
         goalVersion: goal.version,
@@ -1297,13 +1411,14 @@ export class GoalEngine {
         createdAt: now,
         source: "director_accept_override",
         audit: input.audit,
+        diagnostics: null,
       };
       this.insertReviewRow(row);
       this.db
         .prepare(
           `UPDATE goals
            SET status = 'achieved', review_cycle = ?, no_progress_streak = 0,
-               last_progress_fingerprint = ?, last_review_summary = ?, updated_at = ?
+               last_progress_fingerprint = ?, last_review_summary = ?, last_reviewer_failure_json = NULL, updated_at = ?
            WHERE id = ?`,
         )
         .run(nextCycle, fingerprint, input.summary, now, goal.id);
@@ -1350,6 +1465,7 @@ export class GoalEngine {
       createdAt: Number(r.created_at),
       source: (typeof r.source === "string" && r.source ? r.source : "review") as GoalReviewSource,
       audit: parseAudit(r.audit_json),
+      diagnostics: parseDiagnostics(r.diagnostics_json),
     }));
   }
 
@@ -1360,6 +1476,8 @@ export class GoalEngine {
     diffPatch?: string,
     ctx?: {
       reviewerMaxTurns?: number;
+      contractPath?: string;
+      diffRange?: string;
       evidence?: { goalEvidenceDir: string; goalsDir: string; artifactsDir: string; runArtifactsDir?: string };
       coordinatorFailure?: {
         source: GoalProgressSource;
@@ -1369,25 +1487,50 @@ export class GoalEngine {
       };
     },
   ): string {
+    const DESC_CAP = 4096;
+    const CRITERION_DESC_CAP = 300;
+    const GATE_EVIDENCE_CAP = 240;
+    const passedDetIds = new Set(gateResult.results.filter((r) => r.passed).map((r) => r.criterionId));
+    const descriptionTruncated = goal.description.length > DESC_CAP;
+    const compactDescription = descriptionTruncated
+      ? `${goal.description.slice(0, DESC_CAP).trimEnd()}... [truncated at 4 KB${ctx?.contractPath ? `; full contract: ${ctx.contractPath}` : ""}]`
+      : goal.description;
+    let anyCriterionTruncated = false;
+    const criteriaLines = goal.criteria.map((c) => {
+      if (c.kind === "deterministic" && passedDetIds.has(c.id)) {
+        return `- [${c.id}] PASS (gate)`;
+      }
+      const singleLine = c.description.replace(/\s+/g, " ").trim();
+      const desc =
+        singleLine.length > CRITERION_DESC_CAP
+          ? ((anyCriterionTruncated = true), `${singleLine.slice(0, CRITERION_DESC_CAP).trimEnd()}...`)
+          : singleLine;
+      return `- [${c.id}] (${c.kind}${c.required ? ", REQUIRED" : ", optional"}): ${desc}${c.command ? ` [cmd: ${c.command}]` : ""}`;
+    });
+
     const lines = [
       `# Independent Skeptical Done-Review (Goal ${goal.id} v${goal.version}, Cycle ${goal.reviewCycle + 1}/${goal.budgets.maxReviewCycles})`,
       `Title: ${goal.title}`,
-      `Description: ${goal.description}`,
+      `Description: ${compactDescription}`,
+      ...(anyCriterionTruncated && !descriptionTruncated && ctx?.contractPath ? [`Full contract: ${ctx.contractPath}`] : []),
       "",
       "You are an INDEPENDENT, SKEPTICAL REVIEWER — NOT the generator.",
       "Inspect actual code, diffs, and test outputs. Focus on actionable correctness and contract failures; never approve stubbed implementations or unverified claims.",
       "",
       "## Acceptance Criteria (EVERY required criterion must have concrete evidence)",
-      ...goal.criteria.map(
-        (c) => `- [${c.id}] (${c.kind}${c.required ? ", REQUIRED" : ", optional"}): ${c.description}${c.command ? ` [cmd: ${c.command}]` : ""}`,
-      ),
+      ...criteriaLines,
     ];
     if (goal.nonGoals.length > 0) {
       lines.push("", "## Non-Goals (Out of Scope)", ...goal.nonGoals.map((ng) => `- ${ng}`));
     }
     lines.push("", "## Deterministic Gate Results");
     for (const r of gateResult.results) {
-      lines.push(`- [${r.criterionId}] ${r.passed ? "PASS" : "FAIL"}: ${r.evidence}`);
+      if (r.passed) {
+        lines.push(`- [${r.criterionId}] PASS (gate)`);
+      } else {
+        const evText = r.evidence.length > GATE_EVIDENCE_CAP ? `${r.evidence.slice(0, GATE_EVIDENCE_CAP).trimEnd()}...` : r.evidence;
+        lines.push(`- [${r.criterionId}] FAIL: ${evText}`);
+      }
     }
     const failure = ctx?.coordinatorFailure;
     if (failure) {
@@ -1414,18 +1557,21 @@ export class GoalEngine {
         `- Artifacts Root: ${ev.artifactsDir} (env HARNESS_ARTIFACTS_DIR)`,
       );
       if (ev.runArtifactsDir) lines.push(`- Run Artifacts Directory: ${ev.runArtifactsDir}`);
+      if (ctx?.contractPath) lines.push(`- Full Contract: ${ctx.contractPath}`);
     }
-    lines.push("", "## Git Diff Summary", diffStat || "(no diff)");
+    const diffRange = ctx?.diffRange?.trim() || "<base>..<ref>";
+    lines.push(
+      "",
+      "## Git Diff Summary",
+      diffStat || "(no diff)",
+      `Inspect specific hunks with \`git diff ${diffRange} -- <path>\`; do not cat whole files; read line ranges.`,
+    );
     if (diffPatch?.trim()) {
       lines.push("", "## Git Diff Patch (truncated if large)", "```diff", diffPatch.trim(), "```");
     }
-    if (ctx?.reviewerMaxTurns !== undefined) {
-      lines.push(
-        "",
-        `You may get one advisory progress check-in around ${ctx.reviewerMaxTurns} tool-call turns; the harness does not stop you by turn count. The review has a hard 10-minute wall-clock limit. Submit as soon as every required criterion has evidence; a changes_requested verdict with partial evidence is better than none.`,
-      );
-    }
     lines.push(
+      "",
+      "Budget: reserve the last 30% of context for the verdict; you will be nudged at 70%.",
       "",
       "Return a strict JSON verdict (or call submit_review_verdict) matching:",
       `{ "verdict": "approved" | "changes_requested" | "escalate_human", "criteriaResults": [{ "criterionId": "...", "passed": true|false, "evidence": "...", "remediation": "..." }], "blockingIssues": [], "summary": "..." }`,
@@ -1438,6 +1584,15 @@ function parseAudit(raw: unknown): GoalAcceptOverrideAudit | null {
   if (typeof raw !== "string" || !raw.trim()) return null;
   try {
     return JSON.parse(raw) as GoalAcceptOverrideAudit;
+  } catch {
+    return null;
+  }
+}
+
+function parseDiagnostics(raw: unknown): ReviewerDiagnostics | null {
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  try {
+    return JSON.parse(raw) as ReviewerDiagnostics;
   } catch {
     return null;
   }
