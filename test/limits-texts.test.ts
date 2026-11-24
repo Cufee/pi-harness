@@ -4,6 +4,7 @@ import { createConnection, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "bun:test";
+import { HARNESS_TEXT_COUNT_PATTERN } from "../src/advisories/rules.js";
 import { ModelCatalogCompiler } from "../src/catalog/compiler.js";
 import { providePython } from "../src/code-mode/python.js";
 import { codeExecTimeoutError, createCodeExecIpcServer, runCodeExec } from "../src/code-mode/runner.js";
@@ -12,6 +13,7 @@ import { loadConfig, type PiProfileConfig } from "../src/config.js";
 import { ControlPlaneDb } from "../src/control-plane/db.js";
 import { validateTaskHandoff } from "../src/control-plane/handoffs.js";
 import { HarnessOrchestrator } from "../src/control-plane/orchestrator.js";
+import { GoalEngine } from "../src/goals/engine.js";
 import { QuotaClient } from "../src/quota/client.js";
 import { PiRunner } from "../src/runners/pi-runner.js";
 
@@ -387,6 +389,62 @@ describe("slice T explanatory rejection texts (T5-2t, T5-6t)", () => {
           }),
         { message: /^\[harness blocked: handoff-sources\] .+ Why: .+ Allowed: .+/ },
       );
+    }
+  });
+});
+
+describe("goal-14 slice Z3 reviewer prompt (T5-4g)", () => {
+  it("T5-4g: buildReviewerPrompt states no turn/tool-call/token count and keeps the wall-clock sentence", () => {
+    const repoRoot = mkdtempSync(join(tmpdir(), "pi-harness-t54g-"));
+    const db = new ControlPlaneDb(":memory:");
+    try {
+      const goals = new GoalEngine(db.db);
+      const goal = goals.createGoal({
+        repoRoot,
+        title: "Verify reviewer prompt",
+        description: "Ensure buildReviewerPrompt emits no turn, tool-call, or token count.",
+        criteria: [
+          { id: "c1", description: "Typecheck passes", kind: "deterministic", command: "bun x tsc --noEmit", required: true },
+          { id: "c2", description: "Behavior matches spec", kind: "behavioral", required: true },
+        ],
+        nonGoals: ["Unrelated refactoring"],
+      });
+      const prompt = goals.buildReviewerPrompt(
+        goal,
+        {
+          allPassed: true,
+          results: [{ criterionId: "c1", passed: true, evidence: "tsc exited 0" }],
+          diffHash: "deadbeef",
+          location: { cwd: repoRoot, ref: "main", sha: "deadbeef", isolated: true, source: "run_base_branch" },
+        },
+        " src/goals/engine.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)",
+        "diff --git a/src/goals/engine.ts b/src/goals/engine.ts\n--- a/src/goals/engine.ts\n+++ b/src/goals/engine.ts",
+        {
+          reviewerMaxTurns: 30,
+          contractPath: join(repoRoot, ".harness", "goals", goal.id, "contract-v1.md"),
+          diffRange: "main..HEAD",
+          evidence: {
+            goalEvidenceDir: join(repoRoot, ".harness", "goals", goal.id),
+            goalsDir: join(repoRoot, ".harness", "goals"),
+            artifactsDir: join(repoRoot, ".harness", "artifacts"),
+            runArtifactsDir: join(repoRoot, ".harness", "artifacts", "run-1"),
+          },
+          coordinatorFailure: {
+            source: "coordinator",
+            summary: "Prior run flagged c2",
+            criteriaResults: [{ criterionId: "c2", passed: false, evidence: "missing check" }],
+            claimedAt: 1700000000000,
+          },
+        },
+      );
+      assert.ok(
+        !HARNESS_TEXT_COUNT_PATTERN.test(prompt),
+        `buildReviewerPrompt matched HARNESS_TEXT_COUNT_PATTERN: ${prompt.match(HARNESS_TEXT_COUNT_PATTERN)?.[0]}`,
+      );
+      assert.ok(prompt.includes("wall-clock"), "buildReviewerPrompt must retain the wall-clock limit sentence");
+    } finally {
+      db.close();
+      rmSync(repoRoot, { recursive: true, force: true });
     }
   });
 });
