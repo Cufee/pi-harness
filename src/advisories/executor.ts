@@ -4,7 +4,7 @@ import type { HarnessConfig } from "../config.js";
 import type { ControlPlaneDb, TaskRecord } from "../control-plane/db.js";
 import { findRunDossier } from "../control-plane/dossiers.js";
 import { ControlPlaneToolExecutor, type ToolRuntimeHooks } from "../control-plane/tools.js";
-import { legacyStoragePaths } from "../storage/paths.js";
+import { type StoragePaths, storagePaths } from "../storage/paths.js";
 import type { AdvisoryEngine } from "./engine.js";
 import { attachNotices } from "./message.js";
 import { roleOf } from "./roles.js";
@@ -87,7 +87,11 @@ function inspectCommandVerification(
   return { commandKey, outcome };
 }
 
-function extractInspectCommandPaths(args: Record<string, unknown>, workspaceRoot: string): string[] {
+function extractInspectCommandPaths(
+  args: Record<string, unknown>,
+  workspaceRoot: string,
+  storage: StoragePaths,
+): string[] {
   if (!Array.isArray(args.argv) || args.argv.length <= 1) return [];
   let realRoot: string;
   try {
@@ -119,7 +123,7 @@ function extractInspectCommandPaths(args: Record<string, unknown>, workspaceRoot
     }
     const rel = relative(realRoot, realCandidate).replaceAll("\\", "/");
     if (!rel || rel === "." || hasParentTraversalComponent(rel) || isAbsolute(rel)) continue;
-    if (legacyStoragePaths.isHarnessOwnedRelPath(rel)) continue;
+    if (storage.isHarnessOwnedRelPath(rel)) continue;
     if (!seen.has(rel)) {
       seen.add(rel);
       out.push(rel);
@@ -128,7 +132,11 @@ function extractInspectCommandPaths(args: Record<string, unknown>, workspaceRoot
   return out;
 }
 
-function extractArtifactReadPaths(args: Record<string, unknown>, workspaceRoot: string): string[] {
+function extractArtifactReadPaths(
+  args: Record<string, unknown>,
+  workspaceRoot: string,
+  storage: StoragePaths,
+): string[] {
   if (typeof args.path !== "string") return [];
   const trimmed = args.path.trim();
   if (!trimmed) return [];
@@ -157,12 +165,13 @@ function extractArtifactReadPaths(args: Record<string, unknown>, workspaceRoot: 
 
   const rel = relative(realRoot, realCandidate).replaceAll("\\", "/");
   if (!rel || rel === "." || hasParentTraversalComponent(rel) || isAbsolute(rel)) return [];
-  if (legacyStoragePaths.isHarnessOwnedRelPath(rel)) return [];
+  if (storage.isHarnessOwnedRelPath(rel)) return [];
   return [rel];
 }
 
 export class AdvisedToolExecutor extends ControlPlaneToolExecutor {
   private readonly advDb: ControlPlaneDb;
+  private readonly advConfig: HarnessConfig;
   private readonly adv: AdvisedExecutorOptions;
 
   constructor(
@@ -174,9 +183,13 @@ export class AdvisedToolExecutor extends ControlPlaneToolExecutor {
   ) {
     super(db, getCatalogCompiler, hooks, config);
     this.advDb = db;
+    this.advConfig = config;
     this.adv = adv;
   }
 
+  private get advStorage(): StoragePaths {
+    return storagePaths(this.advConfig);
+  }
   private deliverNotices(
     subjectId: string,
     notices: Notice[],
@@ -303,7 +316,7 @@ export class AdvisedToolExecutor extends ControlPlaneToolExecutor {
     if (name === "inspect_command") {
       try {
         const workspaceRoot = this.adv.workspaceRootFor?.(task) ?? subject.workspaceRoot;
-        const paths = extractInspectCommandPaths(args, workspaceRoot);
+        const paths = extractInspectCommandPaths(args, workspaceRoot, this.advStorage);
         if (paths.length > 0) {
           this.adv.engine.noteActivity(subject.id, paths);
         }
@@ -316,16 +329,25 @@ export class AdvisedToolExecutor extends ControlPlaneToolExecutor {
       }
     } else if (name === "artifact_read") {
       try {
+        const storage = this.advStorage;
         const run = typeof this.advDb.getRun === "function" ? this.advDb.getRun(runId) : null;
+        const runRef =
+          run && run.chatSessionId == null && typeof this.advDb.getRunChatSessionId === "function"
+            ? { ...run, chatSessionId: this.advDb.getRunChatSessionId(run.id) }
+            : run;
         const requested = typeof args.path === "string" ? args.path.trim() : "";
-        const foundDossier = run && requested ? findRunDossier(this.advDb, run, requested) : null;
+        const lookupPath =
+          runRef && requested
+            ? (storage.resolveLegacyPath(runRef.repoRoot, requested, runRef) ?? requested)
+            : "";
+        const foundDossier = runRef && lookupPath ? findRunDossier(this.advDb, runRef, lookupPath, storage) : null;
         if (foundDossier) {
           if (isOtherTaskDossier(this.advDb, runId, taskId, foundDossier.candidates)) {
             this.adv.engine.noteDossierRead(subject.id, foundDossier.rel ?? foundDossier.recordedPath);
           }
         } else {
           const workspaceRoot = this.adv.workspaceRootFor?.(task) ?? subject.workspaceRoot;
-          const paths = extractArtifactReadPaths(args, workspaceRoot);
+          const paths = extractArtifactReadPaths(args, workspaceRoot, storage);
           if (paths.length > 0) {
             this.adv.engine.noteActivity(subject.id, paths);
           }
