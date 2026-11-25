@@ -1,9 +1,19 @@
-import { accessSync, constants, lstatSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  accessSync,
+  constants,
+  lstatSync,
+  mkdtempSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { ensureTempDir, type AcpAdapterKind, type AcpProfileConfig } from "../config.js";
 import type { AgentTier, ArtifactRecord } from "../control-plane/db.js";
-import { isProtectedWritePath } from "./protected-paths.js";
+import { legacyStoragePaths } from "../storage/paths.js";
 import type { ToolPolicy } from "./types.js";
 
 export interface PreparedAcpSpawn {
@@ -542,13 +552,22 @@ const READ_ONLY_ARG_CHECKS: Record<string, (args: string[]) => boolean> = {
   git: isReadOnlyGitCommand,
 };
 
-/** Filesystem scope for path operands: the shell's working directory and the canonical allowed read roots. */
+/** Filesystem scope for path operands: the shell's working directory, canonical allowed read roots, and denied roots. */
 export interface ReadOnlyShellScope {
   cwd: string;
   readRoots: string[];
-  /** Read roots that refuse `.git` and `.harness/worktrees` when they are the first root admitting a path. */
+  /** Canonical directories refused even when covered by a broader read root (most-specific-root rule). */
+  deniedRoots?: string[];
+  /** Read roots that refuse `.git` and sibling worktree trees when they are the admitting root for a path. */
   protectedRoots?: string[];
 }
+
+export const OUTSIDE_READ_ROOTS_REASON = "path is outside allowed read roots (worktree.extraReadRoots) or protected";
+export const DENIED_HARNESS_STATE_REASON = "path is inside protected harness state";
+
+export type RootDecision =
+  | { allowed: true; root: string }
+  | { allowed: false; reason: "denied" | "outside"; root?: string };
 
 function isInsideRoot(root: string, path: string): boolean {
   const rel = relative(root, path);
@@ -556,15 +575,122 @@ function isInsideRoot(root: string, path: string): boolean {
 }
 
 /**
+ * Evaluates the most-specific-root rule against canonical allowed and denied root directories.
+ * Among all directories containing `targetPath`, the most specific (longest resolved) containing root decides;
+ * an allowed root wins a tie on the exact same directory.
+ */
+export function mostSpecificRootDecision(
+  targetPath: string,
+  allowedRoots: readonly string[],
+  deniedRoots: readonly string[] = [],
+): RootDecision {
+  const target = resolve(targetPath);
+  let bestAllowed: { root: string; resolved: string } | null = null;
+  for (const root of allowedRoots) {
+    if (!root) continue;
+    const resolvedRoot = resolve(root);
+    if (!isInsideRoot(resolvedRoot, target)) continue;
+    if (!bestAllowed || resolvedRoot.length > bestAllowed.resolved.length) {
+      bestAllowed = { root, resolved: resolvedRoot };
+    }
+  }
+  let bestDenied: { root: string; resolved: string } | null = null;
+  for (const root of deniedRoots) {
+    if (!root) continue;
+    const resolvedRoot = resolve(root);
+    if (!isInsideRoot(resolvedRoot, target)) continue;
+    if (!bestDenied || resolvedRoot.length > bestDenied.resolved.length) {
+      bestDenied = { root, resolved: resolvedRoot };
+    }
+  }
+  if (bestDenied && (!bestAllowed || bestDenied.resolved.length > bestAllowed.resolved.length)) {
+    return { allowed: false, reason: "denied", root: bestDenied.root };
+  }
+  if (bestAllowed) {
+    return { allowed: true, root: bestAllowed.root };
+  }
+  return { allowed: false, reason: "outside" };
+}
+
+function canonicalizeExistingOrAncestor(absPath: string): string {
+  const abs = resolve(absPath);
+  try {
+    return realpathSync(abs);
+  } catch {
+    const parent = dirname(abs);
+    return parent === abs ? abs : join(canonicalizeExistingOrAncestor(parent), basename(abs));
+  }
+}
+
+type ScopeCheckResult = { ok: true } | { ok: false; reason: string };
+
+function checkCanonicalPathInScope(canonical: string, scope: ReadOnlyShellScope): ScopeCheckResult {
+  const decision = mostSpecificRootDecision(canonical, scope.readRoots, scope.deniedRoots);
+  if (!decision.allowed) {
+    return {
+      ok: false,
+      reason: decision.reason === "denied" ? DENIED_HARNESS_STATE_REASON : OUTSIDE_READ_ROOTS_REASON,
+    };
+  }
+  if (
+    scope.protectedRoots?.includes(decision.root) &&
+    legacyStoragePaths.isProtectedWorktreePath(canonical, decision.root)
+  ) {
+    return { ok: false, reason: OUTSIDE_READ_ROOTS_REASON };
+  }
+  return { ok: true };
+}
+
+function checkBrokenSymlinkDenied(absPath: string, scope: ReadOnlyShellScope): ScopeCheckResult {
+  if (scope.deniedRoots?.length) {
+    try {
+      const linkTarget = readlinkSync(absPath);
+      const resolvedTarget = canonicalizeExistingOrAncestor(resolve(dirname(absPath), linkTarget));
+      const decision = mostSpecificRootDecision(resolvedTarget, scope.readRoots, scope.deniedRoots);
+      if (!decision.allowed && decision.reason === "denied") {
+        return { ok: false, reason: DENIED_HARNESS_STATE_REASON };
+      }
+    } catch {
+      // fall through to outside reason
+    }
+  }
+  return { ok: false, reason: OUTSIDE_READ_ROOTS_REASON };
+}
+
+function checkCwdInScope(scope: ReadOnlyShellScope): ScopeCheckResult {
+  const absCwd = resolve(scope.cwd);
+  let hasEntry = false;
+  try {
+    lstatSync(absCwd);
+    hasEntry = true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "ENOTDIR") {
+      return { ok: false, reason: OUTSIDE_READ_ROOTS_REASON };
+    }
+  }
+  if (hasEntry) {
+    let canonical: string;
+    try {
+      canonical = realpathSync(absCwd);
+    } catch {
+      return checkBrokenSymlinkDenied(absCwd, scope);
+    }
+    return checkCanonicalPathInScope(canonical, scope);
+  }
+  return checkCanonicalPathInScope(canonicalizeExistingOrAncestor(absCwd), scope);
+}
+
+/**
  * Every token is treated as a possible path: the whole token, the text after its first `=`, for options
  * the text from the first `/`, every attached short-option value, and for (quoted) glob characters
  * also the directory before the first glob. A `..` segment denies (the shell resolves it physically,
- * after symlinks). An existing candidate must
- * canonicalise inside a read root; a missing one reads nothing and is allowed.
+ * after symlinks). An existing candidate must canonicalise inside an allowed read root and outside any
+ * more-specific denied root; a missing candidate is refused if it would land inside a denied root, and
+ * otherwise reads nothing and is allowed.
  */
-function pathOperandsInsideRoots(args: string[], scope: ReadOnlyShellScope): boolean {
+function checkPathOperandsInScope(args: string[], scope: ReadOnlyShellScope): ScopeCheckResult {
   for (const arg of args) {
-    if (arg.startsWith("-") && /\.\.(?:\/|$)/.test(arg)) return false;
     const candidates = [arg];
     const eq = arg.indexOf("=");
     if (eq >= 0) candidates.push(arg.slice(eq + 1));
@@ -578,38 +704,63 @@ function pathOperandsInsideRoots(args: string[], scope: ReadOnlyShellScope): boo
       const glob = word.search(/[*?[]/);
       if (glob >= 0) candidates.push(word.slice(0, word.lastIndexOf("/", glob) + 1) || ".");
     }
+    let hasDotDotRefusal = arg.startsWith("-") && /\.\.(?:\/|$)/.test(arg);
     for (const candidate of candidates) {
       if (!candidate) continue;
-      if (candidate.split("/").includes("..")) return false;
+      if (candidate.split("/").includes("..")) {
+        if (scope.deniedRoots?.length) {
+          const resolved = canonicalizeExistingOrAncestor(resolve(scope.cwd, candidate));
+          const decision = mostSpecificRootDecision(resolved, scope.readRoots, scope.deniedRoots);
+          if (!decision.allowed && decision.reason === "denied") {
+            return { ok: false, reason: DENIED_HARNESS_STATE_REASON };
+          }
+        }
+        hasDotDotRefusal = true;
+        continue;
+      }
       const absolute = resolve(scope.cwd, candidate);
       try {
         lstatSync(absolute);
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
-        if (code === "ENOENT" || code === "ENOTDIR") continue;
-        return false;
+        if (code === "ENOENT" || code === "ENOTDIR") {
+          if (scope.deniedRoots?.length) {
+            const decision = mostSpecificRootDecision(
+              canonicalizeExistingOrAncestor(absolute),
+              scope.readRoots,
+              scope.deniedRoots,
+            );
+            if (!decision.allowed && decision.reason === "denied") {
+              return { ok: false, reason: DENIED_HARNESS_STATE_REASON };
+            }
+          }
+          continue;
+        }
+        return { ok: false, reason: OUTSIDE_READ_ROOTS_REASON };
       }
       let canonical: string;
       try {
         canonical = realpathSync(absolute);
       } catch {
-        return false;
+        return checkBrokenSymlinkDenied(absolute, scope);
       }
-      const admitting = scope.readRoots.find((root) => isInsideRoot(root, canonical));
-      if (!admitting) return false;
-      if (scope.protectedRoots?.includes(admitting) && isProtectedWritePath(admitting, canonical)) return false;
+      const verdict = checkCanonicalPathInScope(canonical, scope);
+      if (!verdict.ok) return verdict;
+    }
+    if (hasDotDotRefusal) {
+      return { ok: false, reason: OUTSIDE_READ_ROOTS_REASON };
     }
   }
-  return true;
+  return { ok: true };
 }
 
 /**
  * Validator for read-only shell inspection commands run by `read_only_workspace` ACP agents that send
  * permission callbacks (Codex, Gemini, Antigravity, OpenCode, Claude). Approves only when the token list
  * is exactly the argument vector the shell will run, every command word is a bare, known reader, and no
- * option that executes, writes, or redirects identity is present. With `scope`, every path operand must
- * also stay inside the allowed read roots. Unknown means deny. This gates harness approval only; it is
- * not an OS sandbox.
+ * option that executes, writes, or redirects identity is present. With `scope`, `scope.cwd` and every path
+ * operand must also stay inside the allowed read roots and outside more-specific denied roots. Unknown means
+ * deny. This gates harness approval only; it is not an OS sandbox.
  */
 export function isSafeReadOnlyShellCommand(rawCommand: string, scope?: ReadOnlyShellScope): boolean {
   // The shell splits words only on space, tab, and newline; JavaScript's \s and trim() also match other
@@ -618,6 +769,7 @@ export function isSafeReadOnlyShellCommand(rawCommand: string, scope?: ReadOnlyS
   if (!rawCommand.trim()) return false;
   const segments = splitShellSegments(rawCommand);
   if (!segments || segments.length === 0) return false;
+  if (scope && !checkCwdInScope(scope).ok) return false;
 
   for (const seg of segments) {
     const words = tokenizeSegment(seg);
@@ -635,7 +787,7 @@ export function isSafeReadOnlyShellCommand(rawCommand: string, scope?: ReadOnlyS
       const check = Object.hasOwn(READ_ONLY_ARG_CHECKS, bin) ? READ_ONLY_ARG_CHECKS[bin] : undefined;
       if (!check?.(args)) return false;
     }
-    if (scope && !pathOperandsInsideRoots(args, scope)) return false;
+    if (scope && !checkPathOperandsInScope(args, scope).ok) return false;
   }
   return true;
 }
@@ -797,7 +949,7 @@ export function isReadOnlyGitNetworkCommand(sub: string, args: string[]): boolea
 
 /**
  * Validator for `inspect_command` argv execution (no shell). Reuses `READ_ONLY_ARG_CHECKS`,
- * `isReadOnlyGitCommand`, `pathOperandsInsideRoots`, and `CONTROL_CHARS` from `isSafeReadOnlyShellCommand`.
+ * `isReadOnlyGitCommand`, `checkPathOperandsInScope`, and `CONTROL_CHARS` from `isSafeReadOnlyShellCommand`.
  */
 export function checkReadOnlyArgv(
   argv: string[],
@@ -820,6 +972,8 @@ export function checkReadOnlyArgv(
   if (args.some((a) => INSPECT_SHELL_OPERATORS.has(a))) {
     return { ok: false, reason: "no shell: pipes, redirection and chaining are not supported; run one command per call" };
   }
+  const cwdCheck = checkCwdInScope(scope);
+  if (!cwdCheck.ok) return cwdCheck;
 
   if (bin === "git") {
     let g = 0;
@@ -836,9 +990,8 @@ export function checkReadOnlyArgv(
     if (!READ_ONLY_ARG_CHECKS.git!(args)) {
       return { ok: false, reason: "git subcommand or option is not allowed in read-only mode" };
     }
-    if (!pathOperandsInsideRoots(args.slice(g + 1), scope)) {
-      return { ok: false, reason: "path operand is outside allowed read roots or targets a protected path" };
-    }
+    const operandCheck = checkPathOperandsInScope(args.slice(g + 1), scope);
+    if (!operandCheck.ok) return operandCheck;
     return { ok: true };
   }
 
@@ -878,9 +1031,8 @@ export function checkReadOnlyArgv(
       if (a === "--bail" || /^--bail=\d+$/.test(a) || a === "--only" || a === "--todo") continue;
       return { ok: false, reason: `bun test option '${a}' is not allowed in read-only mode` };
     }
-    if (!pathOperandsInsideRoots(pathArgs, scope)) {
-      return { ok: false, reason: "path operand is outside allowed read roots or targets a protected path" };
-    }
+    const operandCheck = checkPathOperandsInScope(pathArgs, scope);
+    if (!operandCheck.ok) return operandCheck;
     return { ok: true };
   }
 
@@ -925,9 +1077,8 @@ export function checkReadOnlyArgv(
     if (!hasNoEmit) {
       return { ok: false, reason: "bunx tsc requires --noEmit" };
     }
-    if (!pathOperandsInsideRoots(pathArgs, scope)) {
-      return { ok: false, reason: "path operand is outside allowed read roots or targets a protected path" };
-    }
+    const operandCheck = checkPathOperandsInScope(pathArgs, scope);
+    if (!operandCheck.ok) return operandCheck;
     const localTsc = join(scope.cwd, "node_modules", ".bin", "tsc");
     try {
       if (!statSync(localTsc).isFile()) {
@@ -942,9 +1093,8 @@ export function checkReadOnlyArgv(
   if (Object.hasOwn(READ_ONLY_ARG_CHECKS, bin) && !READ_ONLY_ARG_CHECKS[bin]!(args)) {
     return { ok: false, reason: `${bin} option is not allowed in read-only mode` };
   }
-  if (!pathOperandsInsideRoots(args, scope)) {
-    return { ok: false, reason: "path operand is outside allowed read roots or targets a protected path" };
-  }
+  const operandCheck = checkPathOperandsInScope(args, scope);
+  if (!operandCheck.ok) return operandCheck;
   return { ok: true };
 }
 
@@ -1020,6 +1170,48 @@ export function isAmpAcpProfile(profile: Pick<AcpProfileConfig, "id" | "adapter"
   return hay.includes("amp-acp") || /\bamp\b/.test(profile.id.toLowerCase());
 }
 
+export function isOpenCodeAcpProfile(profile: Pick<AcpProfileConfig, "id" | "adapter" | "command" | "args">): boolean {
+  if (profile.adapter !== "generic") return false;
+  const hay = [profile.id, profile.command, ...(profile.args ?? [])].join(" ").toLowerCase();
+  return /\bopencode\b/.test(hay);
+}
+
+export function isAntigravityAcpProfile(profile: Pick<AcpProfileConfig, "id" | "adapter" | "command" | "args">): boolean {
+  if (profile.adapter !== "generic") return false;
+  const hay = [profile.id, profile.command, ...(profile.args ?? [])].join(" ").toLowerCase();
+  return /\b(?:agy|antigravity)\b/.test(hay);
+}
+
+function normalizeDirectoryList(...lists: Array<readonly string[] | undefined>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const list of lists) {
+    if (!list) continue;
+    for (const raw of list) {
+      const trimmed = raw.trim();
+      if (!trimmed || seen.has(trimmed)) continue;
+      seen.add(trimmed);
+      out.push(trimmed);
+    }
+  }
+  return out;
+}
+
+function collectFlagValues(args: readonly string[], flag: string): Set<string> {
+  const values = new Set<string>();
+  const prefix = `${flag}=`;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === flag && i + 1 < args.length) {
+      values.add(args[i + 1]!);
+      i++;
+    } else if (a.startsWith(prefix)) {
+      values.add(a.slice(prefix.length));
+    }
+  }
+  return values;
+}
+
 export function prepareAcpSpawn(
   profile: AcpProfileConfig,
   opts: {
@@ -1027,6 +1219,10 @@ export function prepareAcpSpawn(
     toolPolicy: ToolPolicy;
     allowShellInReadOnly?: boolean;
     tier?: AgentTier;
+    /** Resolved absolute extra directories outside the workspace the agent may read. */
+    readDirectories?: string[];
+    /** Resolved absolute extra directories outside the workspace the agent may write (only applied in read_write_workspace). */
+    writeDirectories?: string[];
   },
 ): PreparedAcpSpawn {
   if (profile.enabled === false) throw new Error(`Runner profile "${profile.id}" is disabled.`);
@@ -1043,6 +1239,12 @@ export function prepareAcpSpawn(
   const args = [...(profile.args ?? [])];
   const tempDirs: string[] = [];
   let prependSystemPromptToTurn1 = false;
+  const writeDirs =
+    opts.toolPolicy === "read_write_workspace" ? normalizeDirectoryList(opts.writeDirectories) : [];
+  const grantedDirs =
+    opts.toolPolicy !== "control_plane_only"
+      ? normalizeDirectoryList(opts.readDirectories, writeDirs)
+      : [];
 
   if (profile.adapter === "claude") {
     if (opts.tier === 3) {
@@ -1082,14 +1284,30 @@ export function prepareAcpSpawn(
       // Codex CLI 0.170+ fails closed on MCP tools if `codex-code-mode-host` is absent and code_mode_host stays enabled.
       args.push("-c", "features.code_mode_host=false");
     }
-    env.CODEX_CONFIG = JSON.stringify({
+    const codexCfg: Record<string, unknown> = {
       ...existingCodexCfg,
       features: {
         ...existingFeatures,
         multi_agent: false,
         ...(disableCodeModeHost ? { code_mode_host: false } : {}),
       },
-    });
+    };
+    if (writeDirs.length > 0) {
+      const existingSandbox =
+        existingCodexCfg.sandbox_workspace_write &&
+        typeof existingCodexCfg.sandbox_workspace_write === "object" &&
+        !Array.isArray(existingCodexCfg.sandbox_workspace_write)
+          ? (existingCodexCfg.sandbox_workspace_write as Record<string, unknown>)
+          : {};
+      const existingWritableRoots = Array.isArray(existingSandbox.writable_roots)
+        ? existingSandbox.writable_roots.filter((v): v is string => typeof v === "string")
+        : [];
+      codexCfg.sandbox_workspace_write = {
+        ...existingSandbox,
+        writable_roots: normalizeDirectoryList(existingWritableRoots, writeDirs),
+      };
+    }
+    env.CODEX_CONFIG = JSON.stringify(codexCfg);
     env.DISABLE_MCP_CONFIG_FILTERING = "true";
     // Only lock Codex into OS Seatbelt read-only sandbox when shell verification is NOT requested;
     // disposable verification checkouts (`allowShellInReadOnly: true`) need `/tmp` and test runners to work.
@@ -1108,6 +1326,14 @@ export function prepareAcpSpawn(
       !args.some((a) => a === "--yolo" || a === "-y" || a.startsWith("--approval-mode"))
     ) {
       args.push("--approval-mode=yolo");
+    }
+    if (grantedDirs.length > 0) {
+      const existingIncluded = collectFlagValues(args, "--include-directories");
+      for (const dirPath of grantedDirs) {
+        if (!existingIncluded.has(dirPath)) {
+          args.push("--include-directories", dirPath);
+        }
+      }
     }
   } else {
     prependSystemPromptToTurn1 = true;
@@ -1165,6 +1391,50 @@ export function prepareAcpSpawn(
                 };
       writeFileSync(settingsPath, JSON.stringify(ampSettings, null, 2), "utf8");
       env.AMP_SETTINGS_FILE = settingsPath;
+    } else if (isOpenCodeAcpProfile(profile) && grantedDirs.length > 0) {
+      let existingOpenCodeCfg: Record<string, unknown> = {};
+      if (env.OPENCODE_CONFIG_CONTENT) {
+        try {
+          const parsed = JSON.parse(env.OPENCODE_CONFIG_CONTENT);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            existingOpenCodeCfg = parsed as Record<string, unknown>;
+          }
+        } catch {
+          // ignore invalid user OPENCODE_CONFIG_CONTENT JSON
+        }
+      }
+      const existingPermission =
+        existingOpenCodeCfg.permission &&
+        typeof existingOpenCodeCfg.permission === "object" &&
+        !Array.isArray(existingOpenCodeCfg.permission)
+          ? (existingOpenCodeCfg.permission as Record<string, unknown>)
+          : {};
+      const existingExternal = existingPermission.external_directory;
+      const mergedExternal: Record<string, unknown> =
+        existingExternal && typeof existingExternal === "object" && !Array.isArray(existingExternal)
+          ? { ...(existingExternal as Record<string, unknown>) }
+          : typeof existingExternal === "string"
+            ? { "*": existingExternal }
+            : {};
+      for (const dirPath of grantedDirs) {
+        const normalized = dirPath.replace(/\/+$/, "");
+        mergedExternal[normalized || "/"] = "allow";
+        mergedExternal[normalized ? `${normalized}/**` : "/**"] = "allow";
+      }
+      env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
+        ...existingOpenCodeCfg,
+        permission: {
+          ...existingPermission,
+          external_directory: mergedExternal,
+        },
+      });
+    } else if (isAntigravityAcpProfile(profile) && grantedDirs.length > 0) {
+      const existingAdded = collectFlagValues(args, "--add-dir");
+      for (const dirPath of grantedDirs) {
+        if (!existingAdded.has(dirPath)) {
+          args.push("--add-dir", dirPath);
+        }
+      }
     }
   }
 
@@ -1212,6 +1482,8 @@ export function buildNewSessionParams(
 
   const sessionCaps = (opts.agentCapabilities?.sessionCapabilities ?? {}) as Record<string, unknown>;
   let needsTurn1SystemPrompt = false;
+  const additionalDirs =
+    opts.toolPolicy !== "control_plane_only" ? normalizeDirectoryList(opts.additionalDirectories) : [];
 
   // Shim 1: System Prompt
   if (adapter === "claude" || adapter === "codex") {
@@ -1227,6 +1499,15 @@ export function buildNewSessionParams(
       };
     } else {
       needsTurn1SystemPrompt = true;
+    }
+  }
+
+  // Standard ACP NewSessionRequest.additionalDirectories:
+  // claude-agent-acp and codex-acp advertise and honour it unconditionally; gemini and generic adapters
+  // receive it only when they advertise sessionCapabilities.additionalDirectories (e.g. agy acp).
+  if (additionalDirs.length > 0) {
+    if (adapter === "claude" || adapter === "codex" || Boolean(sessionCaps.additionalDirectories)) {
+      params.additionalDirectories = additionalDirs;
     }
   }
 
@@ -1275,8 +1556,8 @@ export function buildNewSessionParams(
     claudeOptions.model = opts.model;
     if (effectiveEffort) claudeOptions.effort = effectiveEffort;
     // claude-agent-acp merges this SDK pass-through with ACP `additionalDirectories` into the SDK options.
-    if (opts.toolPolicy !== "control_plane_only" && opts.additionalDirectories?.length) {
-      claudeOptions.additionalDirectories = [...new Set(opts.additionalDirectories)];
+    if (additionalDirs.length > 0) {
+      claudeOptions.additionalDirectories = additionalDirs;
     }
 
     params._meta = {
