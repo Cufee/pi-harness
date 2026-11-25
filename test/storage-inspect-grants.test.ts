@@ -970,4 +970,273 @@ describe("ControlPlaneToolExecutor storage grants and legacy path mapping", () =
       db2.close();
     }
   });
+
+  it("data-dir layout (D3): maps relative legacy operands after GNU optional-value long options and names ending in whitespace", async () => {
+    process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
+    resetStoragePathsForTest();
+
+    const { root, repoRoot } = await initTempGitRepo("pi-tools-d3-operands-");
+    const stateDir = join(root, "state");
+    mkdirSync(stateDir, { recursive: true });
+
+    const base = loadConfig(repoRoot);
+    const config: HarnessConfig = {
+      ...base,
+      stateDir,
+      codeMode: "off",
+      worktree: {
+        ...base.worktree,
+        extraReadRoots: [],
+        extraWriteRoots: [],
+      },
+    };
+
+    const db = new ControlPlaneDb(":memory:");
+    const sp = storagePaths(config);
+    assert.equal(sp.layout, "data-dir");
+    const wtMgr = new WorktreeManager(db, repoRoot, config.worktree, { stateDir }, sp);
+    try {
+      const goals = new GoalEngine(db.db, undefined, undefined, undefined, undefined, sp);
+      const chatId = "chat-d3";
+      const goal = goals.createGoal({
+        chatSessionId: chatId,
+        repoRoot,
+        title: "Goal D3 operand mapping",
+        description: "Verify optional-value long options and trailing-whitespace filenames.",
+        criteria: [{ id: "c1", description: "Both operand shapes map", kind: "behavioral", required: true }],
+      });
+
+      const baseSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout;
+      const run = db.createRun({ goal: goal.title, repoRoot, baseBranch: "main", baseSha, chatSessionId: chatId });
+      goals.linkRunAndStart(goal.id, run.id);
+
+      const worker = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Worker D3",
+        objective: "Work in external worktree",
+        profileId: "pi:local",
+      });
+      const wt = await wtMgr.createForWorker(run.id, worker.id);
+      assert.ok(wt.path.startsWith(sp.dataRoot!), "worktree must be outside repoRoot");
+
+      const reader = db.createTask({
+        runId: run.id,
+        parentId: worker.id,
+        tier: 3,
+        kind: "research",
+        title: "Scout D3",
+        objective: "Inspect migrated files",
+        profileId: "pi:local",
+        readOnly: true,
+      });
+      db.updateTask(reader.id, { status: "running", worktreeId: wt.id });
+
+      const evDir = sp.ensureGoalEvidenceDir({ repoRoot, id: goal.id, chatSessionId: chatId })!;
+      const evFile = join(evDir, "proof.txt");
+      const relEvFile = `.harness/goals/${goal.id}/proof.txt`;
+      writeFileSync(evFile, "migrated proof\n", "utf8");
+
+      const spaceFile = join(evDir, "trailing-space ");
+      const relSpaceFile = `.harness/goals/${goal.id}/trailing-space `;
+      writeFileSync(spaceFile, "trailing space payload\n", "utf8");
+
+      const exec = makeExecutor(db, wtMgr, config);
+
+      // Bare `--color` takes its optional argument only with `=`, so the next word is the file operand.
+      const lsColor = (await exec.execute(run.id, reader.id, "inspect_command", {
+        argv: ["ls", "--color", relEvFile],
+      })) as { exit_code: number; stdout: string; argv: string[] };
+      assert.equal(lsColor.exit_code, 0);
+      assert.equal(lsColor.argv[2], evFile);
+      assert.ok(lsColor.stdout.includes("proof.txt"));
+
+      // File names ending in whitespace are still mapped rather than skipped by a trim-equality check.
+      const catSpace = (await exec.execute(run.id, reader.id, "inspect_command", {
+        argv: ["cat", relSpaceFile],
+      })) as { exit_code: number; stdout: string; argv: string[] };
+      assert.equal(catSpace.exit_code, 0);
+      assert.equal(catSpace.argv[1], spaceFile);
+      assert.equal(catSpace.stdout, "trailing space payload\n");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("both layouts (D4): a granted evidence dir replaced by a link to stateDir admits no state read in inspect_command or code_exec helpers while operator roots keep symlink resolution", async () => {
+    for (const layout of ["data-dir", "legacy"] as const) {
+      if (layout === "legacy") delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+      else process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
+      resetStoragePathsForTest();
+
+      const { root, repoRoot } = await initTempGitRepo(`pi-tools-d4-${layout}-`);
+      const stateDir = join(root, "state");
+      mkdirSync(stateDir, { recursive: true });
+      const stateSecret = join(stateDir, "config.json");
+      writeFileSync(stateSecret, '{"secret":"TOP_SECRET_STATE"}\n', "utf8");
+
+      const opReal = join(root, "op-real-docs");
+      const opLink = join(root, "op-link-docs");
+      mkdirSync(opReal, { recursive: true });
+      writeFileSync(join(opReal, "doc.txt"), "operator doc ok\n", "utf8");
+      symlinkSync(opReal, opLink);
+
+      const base = loadConfig(repoRoot);
+      const config: HarnessConfig = {
+        ...base,
+        stateDir,
+        codeMode: "hybrid",
+        worktree: {
+          ...base.worktree,
+          extraReadRoots: [opLink],
+          extraWriteRoots: [],
+        },
+      };
+
+      const db = new ControlPlaneDb(":memory:");
+      const sp = storagePaths(config);
+      assert.equal(sp.layout, layout);
+      const wtMgr = new WorktreeManager(db, repoRoot, config.worktree, { stateDir }, sp);
+      try {
+        const goals = new GoalEngine(db.db, undefined, undefined, undefined, undefined, sp);
+        const chatId = `chat-d4-${layout}`;
+        const goal = goals.createGoal({
+          chatSessionId: chatId,
+          repoRoot,
+          title: `Goal D4 ${layout}`,
+          description: "Verify redirected grant root is dropped.",
+          criteria: [{ id: "c1", description: "Redirected grant admits nothing", kind: "behavioral", required: true }],
+        });
+
+        const baseSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout;
+        const run = db.createRun({ goal: goal.title, repoRoot, baseBranch: "main", baseSha, chatSessionId: chatId });
+        goals.linkRunAndStart(goal.id, run.id);
+
+        const worker = db.createTask({
+          runId: run.id,
+          tier: 2,
+          kind: "worker",
+          title: "Worker D4",
+          objective: "Own worktree",
+          profileId: "pi:local",
+        });
+        const wt = await wtMgr.createForWorker(run.id, worker.id);
+
+        const writableExec = db.createTask({
+          runId: run.id,
+          parentId: worker.id,
+          tier: 3,
+          kind: "execute",
+          title: "Writable execute D4",
+          objective: "Test redirected grant root",
+          profileId: "pi:local",
+          readOnly: false,
+        });
+        db.updateTask(writableExec.id, { status: "running", worktreeId: wt.id });
+
+        const evDir = sp.ensureGoalEvidenceDir({
+          repoRoot,
+          id: goal.id,
+          chatSessionId: chatId,
+          linkedRunId: run.id,
+        })!;
+        assert.ok(existsSync(evDir), "evidence dir must exist at issuance");
+
+        // Capture grants issued while evDir is a real directory, then replace evDir with a symlink to stateDir.
+        const issuedGrants = sp.taskGrants({
+          run: { ...run, linkedGoalId: goal.id },
+          goal: { repoRoot, id: goal.id, chatSessionId: chatId, linkedRunId: run.id },
+          writable: true,
+          workspace: realpathSync(wt.path),
+        });
+        assert.ok(issuedGrants.extraWriteRoots?.includes(evDir), `expected issued grants to include ${evDir}`);
+
+        rmSync(evDir, { recursive: true, force: true });
+        symlinkSync(stateDir, evDir);
+
+        // Return the pre-replacement grants from taskGrants so resolveTaskReadRoots processes the now-redirected root.
+        const origTaskGrants = sp.taskGrants.bind(sp);
+        sp.taskGrants = () => issuedGrants;
+        try {
+          const ac = new AbortController();
+          const exec = makeExecutor(db, wtMgr, config, { signal: ac.signal });
+
+          // Direct inspect_command must refuse both direct stateDir path and path through the redirected evDir link.
+          for (const target of [stateSecret, join(evDir, "config.json")]) {
+            await assert.rejects(
+              () => exec.execute(run.id, writableExec.id, "inspect_command", { argv: ["cat", target] }),
+              (err: Error) => {
+                assert.match(err.message, /read-only-argv/);
+                if (layout === "data-dir") {
+                  assert.ok(
+                    err.message.includes(DENIED_HARNESS_STATE_REASON),
+                    `expected denied-state reason in ${layout}, got: ${err.message}`,
+                  );
+                }
+                return true;
+              },
+              `inspect_command (${layout}) must refuse ${target}`,
+            );
+          }
+
+          // code_exec inner file helpers (inspect_command and artifact_read with scriptSignal) must also refuse.
+          for (const target of [stateSecret, join(evDir, "config.json")]) {
+            await assert.rejects(
+              () => exec.execute(run.id, writableExec.id, "inspect_command", { argv: ["cat", target] }, ac.signal),
+              /read-only-argv/,
+              `code_exec inner inspect_command (${layout}) must refuse ${target}`,
+            );
+            await assert.rejects(
+              () => exec.execute(run.id, writableExec.id, "artifact_read", { path: target }, ac.signal),
+              /artifact-outside-workspace|dossier-not-indexed/,
+              `code_exec inner artifact_read (${layout}) must refuse ${target}`,
+            );
+          }
+
+          if (sandboxAvailable()) {
+            const codeRes = (await exec.execute(run.id, writableExec.id, "code_exec", {
+              code: `
+                import { artifact_read, inspect_command } from "harness";
+                const results = [];
+                for (const target of [${JSON.stringify(stateSecret)}, ${JSON.stringify(join(evDir, "config.json"))}]) {
+                  try {
+                    await inspect_command({ argv: ["cat", target] });
+                    results.push("leaked:inspect:" + target);
+                  } catch {
+                    results.push("refused:inspect");
+                  }
+                  try {
+                    await artifact_read({ path: target });
+                    results.push("leaked:artifact:" + target);
+                  } catch {
+                    results.push("refused:artifact");
+                  }
+                }
+                output(results);
+              `,
+            })) as { ok: boolean; value?: string[] };
+            assert.equal(codeRes.ok, true);
+            assert.deepEqual(codeRes.value, [
+              "refused:inspect",
+              "refused:artifact",
+              "refused:inspect",
+              "refused:artifact",
+            ]);
+          }
+
+          // Operator extraReadRoot outside stateDir/dataRoot/legacy storage keeps symlink resolution.
+          const opCat = (await exec.execute(run.id, writableExec.id, "inspect_command", {
+            argv: ["cat", join(opReal, "doc.txt")],
+          })) as { exit_code: number; stdout: string };
+          assert.equal(opCat.exit_code, 0);
+          assert.equal(opCat.stdout, "operator doc ok\n");
+        } finally {
+          sp.taskGrants = origTaskGrants;
+        }
+      } finally {
+        db.close();
+      }
+    }
+  });
 });

@@ -1,4 +1,4 @@
-import { realpathSync, rmSync, statSync } from "node:fs";
+import { lstatSync, realpathSync, rmSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { recommendModelsByTaskKind, type CompiledModelEntry, type ModelCatalogCompiler } from "../catalog/compiler.js";
 import { CODE_EXEC_TOOL_NAME, TOOL_SEARCH_TOOL_NAME, createCodeModeExecutor, effectiveCodeMode, exposedTools } from "../code-mode/index.js";
@@ -6,7 +6,8 @@ import type { HarnessConfig } from "../config.js";
 import { codeExecEventSink } from "../protocol/tool-display.js";
 import { checkReadOnlyArgv, isSafeGitRemoteUrl, parseReadOnlyGitNetworkCommand } from "../runners/acp-shims.js";
 import { toolPolicyForTask, type RunnerCallbacks, type ToolDefinition } from "../runners/types.js";
-import { storagePaths, type GoalRef, type RunRef, type StoragePaths } from "../storage/paths.js";
+import { canonicalPath, isEqualOrWithin } from "../storage/data-dir/fs-utils.js";
+import { legacyStoragePaths, storagePaths, type GoalRef, type RunRef, type StoragePaths } from "../storage/paths.js";
 import { filterTrustedPath, resolveGateEnv, resolveTrustedBinary, runArgv } from "../tools/gate-env.js";
 import type { KbKind } from "../kb/store.js";
 import type { BisectingMergeQueue } from "../worktree/merge-queue.js";
@@ -153,13 +154,20 @@ function derivedTitleNote(title: string): string {
   return `title was missing; derived '${title}'. Pass a short title next time.`;
 }
 
+function isMissingGoalsSchemaError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return /\bno such table:\s*(?:main\.)?goals\b|\bno such column:\s*(?:goals\.)?(?:id|chat_session_id|linked_run_id)\b/i.test(
+    err.message,
+  );
+}
+
 const SIMPLE_INSPECT_VALUE_FLAGS: Record<string, { short: string; long: ReadonlySet<string> }> = {
   cat: { short: "", long: new Set() },
   wc: { short: "", long: new Set() },
   head: { short: "nc", long: new Set(["--lines", "--bytes"]) },
   tail: {
     short: "ncs",
-    long: new Set(["--lines", "--bytes", "--sleep-interval", "--pid", "--max-unchanged-stats", "--follow"]),
+    long: new Set(["--lines", "--bytes", "--sleep-interval", "--pid", "--max-unchanged-stats"]),
   },
   ls: {
     short: "ITw",
@@ -174,8 +182,6 @@ const SIMPLE_INSPECT_VALUE_FLAGS: Record<string, { short: string; long: Readonly
       "--sort",
       "--time",
       "--time-style",
-      "--color",
-      "--hyperlink",
       "--indicator-style",
     ]),
   },
@@ -318,17 +324,20 @@ export class ControlPlaneToolExecutor {
 
   /** The goal linked to this run, if any (the goals table is absent in standalone control-plane databases). */
   private resolveLinkedGoalForRun(runId: string): { id: string; chatSessionId: string | null } | null {
+    if (this.hooks.resolveLinkedGoalForRun) {
+      const linked = this.hooks.resolveLinkedGoalForRun(runId);
+      return linked ? { id: linked.id, chatSessionId: linked.chatSessionId ? String(linked.chatSessionId) : null } : null;
+    }
     try {
-      if (this.hooks.resolveLinkedGoalForRun) {
-        const linked = this.hooks.resolveLinkedGoalForRun(runId);
-        return linked ? { id: linked.id, chatSessionId: linked.chatSessionId ? String(linked.chatSessionId) : null } : null;
-      }
       const row = this.db.db
         .prepare("SELECT id, chat_session_id FROM goals WHERE linked_run_id = ? LIMIT 1")
         .get(runId) as { id: string; chat_session_id?: string | null } | null;
       return row ? { id: row.id, chatSessionId: row.chat_session_id ? String(row.chat_session_id) : null } : null;
-    } catch {
-      return null;
+    } catch (err) {
+      if (isMissingGoalsSchemaError(err)) {
+        return null;
+      }
+      throw err;
     }
   }
 
@@ -348,6 +357,8 @@ export class ControlPlaneToolExecutor {
     });
     // Harness-computed task grants (which include operator global config.worktree.extraReadRoots/extraWriteRoots)
     // authorize external read roots; repository-configurable values and dossier symlinks outside realRoot are never promoted.
+    // Grant roots inside denied roots, state/data roots, or the repo's legacy storage root are fixed at issuance:
+    // if an existing root resolves away from its issued spelling, drop it rather than turning its symlink target into an allow.
     const canonicalizeRoots = (rawRoots: readonly string[] | undefined): string[] => {
       const resolved: string[] = [];
       for (const raw of rawRoots ?? []) {
@@ -364,12 +375,66 @@ export class ControlPlaneToolExecutor {
       }
       return resolved;
     };
-    const resolvedGrantedRoots = canonicalizeRoots([
+    const deniedRoots = canonicalizeRoots(grants.deniedRoots);
+    const fixedBoundaries: string[] = [...deniedRoots];
+    if (this.config.stateDir?.trim()) {
+      const stateCanon = canonicalPath(expandHomePath(this.config.stateDir.trim()));
+      if (!fixedBoundaries.includes(stateCanon)) fixedBoundaries.push(stateCanon);
+    }
+    if (this.storage.dataRoot && !fixedBoundaries.includes(this.storage.dataRoot)) {
+      fixedBoundaries.push(this.storage.dataRoot);
+    }
+    const legacyStorageRoot = legacyStoragePaths.projectDir(runRef.repoRoot);
+    if (!fixedBoundaries.includes(legacyStorageRoot)) {
+      fixedBoundaries.push(legacyStorageRoot);
+    }
+
+    const resolveGrantedRoots = (rawRoots: readonly string[] | undefined): string[] => {
+      const resolved: string[] = [];
+      for (const raw of rawRoots ?? []) {
+        const trimmed = raw.trim();
+        if (!trimmed) continue;
+        const expanded = resolve(expandHomePath(trimmed));
+        const inFixedBoundary = fixedBoundaries.some((boundary) => isEqualOrWithin(boundary, expanded));
+        if (inFixedBoundary) {
+          let exists = false;
+          try {
+            const st = lstatSync(expanded);
+            if (st.isSymbolicLink() || !st.isDirectory()) continue;
+            exists = true;
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "ENOENT") continue;
+          }
+          if (exists) {
+            let real: string;
+            try {
+              real = realpathSync(expanded);
+            } catch {
+              continue;
+            }
+            if (real !== expanded) continue;
+          } else if (canonicalPath(expanded) !== expanded) {
+            continue;
+          }
+          if (!resolved.includes(expanded)) resolved.push(expanded);
+          continue;
+        }
+        let canonical = expanded;
+        try {
+          canonical = realpathSync(expanded);
+        } catch {
+          // Non-existent operator root stays at expanded path.
+        }
+        if (!resolved.includes(canonical)) resolved.push(canonical);
+      }
+      return resolved;
+    };
+
+    const resolvedGrantedRoots = resolveGrantedRoots([
       ...grants.extraReadRoots,
       ...(grants.extraWriteRoots ?? []),
     ]);
     const readRoots = [realRoot, ...resolvedGrantedRoots.filter((r) => r !== realRoot)];
-    const deniedRoots = canonicalizeRoots(grants.deniedRoots);
     return { readRoots, deniedRoots };
   }
 
@@ -383,7 +448,7 @@ export class ControlPlaneToolExecutor {
     const bin = argv[0]!;
     const allowRelative = this.storage.layout === "data-dir";
     const mapOperand = (candidate: string): string => {
-      if (!candidate || candidate.trim() !== candidate) return candidate;
+      if (!candidate) return candidate;
       if (!allowRelative && !isAbsolute(candidate)) return candidate;
       if (candidate.split("/").includes("..") || candidate.split(sep).includes("..")) return candidate;
       return this.storage.resolveLegacyPath(runRef.repoRoot, candidate, runRef) ?? candidate;
