@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { describe, it } from "bun:test";
 
@@ -8,7 +8,8 @@ const SRC_DIR = join(REPO_ROOT_DIR, "src");
 
 /**
  * Files under `src/` (outside `src/storage/`) that still reference legacy storage literals or import
- * deprecated wrappers. Remove entries as each file is migrated to `src/storage/`.
+ * deprecated wrappers. Entries may already be converted; the goal-39 cleanup slice empties this
+ * list. Do not add entries.
  */
 const ALLOWED_UNCONVERTED_FILES: readonly string[] = [
   "src/config.ts",
@@ -79,18 +80,6 @@ describe("storage literal and deprecated-wrapper scan", () => {
       unexpected,
       [],
       `Found forbidden storage literals or deprecated wrapper imports in unlisted src/ files:\n${unexpected.join("\n")}`,
-    );
-
-    const stale: string[] = [];
-    for (const rel of ALLOWED_UNCONVERTED_FILES) {
-      if (!existsSync(join(REPO_ROOT_DIR, rel)) || !matchedFiles.has(rel)) {
-        stale.push(rel);
-      }
-    }
-    assert.deepEqual(
-      stale,
-      [],
-      `Stale entries in ALLOWED_UNCONVERTED_FILES no longer need an exemption (remove them):\n${stale.join("\n")}`,
     );
   });
 
