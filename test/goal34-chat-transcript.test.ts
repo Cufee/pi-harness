@@ -3907,4 +3907,148 @@ describe("goal-34 c3: Director chat assistant replies render exactly once", () =
     assert.equal(countOccurrences(out, "run-r4-b2"), 1, "live tool card must appear exactly once");
     assert.equal(out.includes("Turn ended while disconnected"), false, "no spurious early-end line");
   });
+
+  it("review-5 B3 (held initial ping + transport close 100ms after busy open): reconnects and renders OFFLINE-FINAL once", async () => {
+    const { terminal, lines, text, sendInput } = makeFakeTerminal(120, 30);
+    const session = makeChatSession("chat-34-r5-b3-disconnect");
+    const history: ChatTurnRecord[] = [
+      {
+        seq: 1,
+        chatSessionId: session.id,
+        role: "user",
+        content: "Check status",
+        createdAt: Date.now(),
+      },
+    ];
+    let busy = true;
+    let activeTurnId: string | null = "turn-r5-b3";
+    let openCount = 0;
+    let pingCount = 0;
+    const daemonPid = process.pid;
+
+    const mock = makeMockClient(async (op, params) => {
+      if (op === "ping") {
+        pingCount += 1;
+        if (pingCount === 1) {
+          // Hold the initial startup ping indefinitely until transport disconnect rejects it.
+          return await new Promise<never>(() => {});
+        }
+        return { pong: true, pid: daemonPid, protocolRev: 8, releaseId: "rel-r5" };
+      }
+      if (op === "chat.open") {
+        openCount += 1;
+        if (openCount === 1) {
+          // Schedule transport loss 100ms after initial chat.open while initial ping is held.
+          setTimeout(() => {
+            history.push({
+              seq: 2,
+              chatSessionId: session.id,
+              role: "assistant",
+              content: "OFFLINE-FINAL",
+              createdAt: Date.now(),
+            });
+            busy = false;
+            activeTurnId = null;
+            mock.disconnect();
+          }, 100);
+        }
+        return makeProdChatOpen(session, history, { busy, activeTurnId });
+      }
+      if (op === "chat.history") {
+        const afterSeq = Number(params.afterSeq ?? 0);
+        const throughSeq = Number(params.throughSeq ?? Number.MAX_SAFE_INTEGER);
+        return {
+          history: history.filter((r) => r.seq > afterSeq && r.seq <= throughSeq),
+          historyNext: null,
+        };
+      }
+      if (op === "work.snapshot") return emptyWorkSnapshot();
+      if (op === "session.leave") return { daemonWillQuit: false };
+      return {};
+    });
+
+    const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+    try {
+      await waitFor(
+        () => openCount >= 2 && text().includes("OFFLINE-FINAL"),
+        2000,
+        "reconnect after held initial ping disconnect",
+      );
+    } finally {
+      sendInput("\x1d");
+      await runPromise;
+    }
+
+    const out = text();
+    assert.equal(openCount, 2, "must reconnect with two chat.open calls");
+    assert.equal(mock.client.connected, true, "client must be reconnected");
+    assert.equal(countOccurrences(out, "OFFLINE-FINAL"), 1, "OFFLINE-FINAL must appear exactly once");
+    await assertMatchesFreshHistoryOracle({
+      session,
+      persistedHistory: history,
+      actualLines: lines(),
+      label: "review-5 B3 (held initial ping + disconnect)",
+    });
+  });
+
+  it("review-5 B3 (held initial ping without disconnect): renders banner and history without waiting on ping", async () => {
+    const { terminal, text, writes, sendInput } = makeFakeTerminal(120, 30);
+    const session = makeChatSession("chat-34-r5-b3-render");
+    const history: ChatTurnRecord[] = [
+      {
+        seq: 1,
+        chatSessionId: session.id,
+        role: "user",
+        content: "Initial prompt before held ping",
+        createdAt: Date.now(),
+      },
+      {
+        seq: 2,
+        chatSessionId: session.id,
+        role: "assistant",
+        content: "HISTORY-ROW-VISIBLE",
+        createdAt: Date.now(),
+      },
+    ];
+
+    const mock = makeMockClient(async (op) => {
+      if (op === "ping") {
+        // Hold the startup ping forever without answering.
+        return await new Promise<never>(() => {});
+      }
+      if (op === "chat.open") {
+        return makeProdChatOpen(session, history, { busy: false });
+      }
+      if (op === "work.snapshot") return emptyWorkSnapshot();
+      if (op === "session.leave") return { daemonWillQuit: false };
+      return {};
+    });
+
+    const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+    let renderErr: unknown = null;
+    try {
+      await waitFor(
+        () => writes.length > 0 && text().includes(session.id) && text().includes("HISTORY-ROW-VISIBLE"),
+        1500,
+        "initial banner and history render while ping is held",
+      );
+    } catch (err) {
+      renderErr = err;
+    } finally {
+      if (renderErr) {
+        // If startup is still stuck awaiting ping, disconnect unblocks it so Ctrl+] can exit cleanly.
+        mock.disconnect();
+        await waitFor(() => writes.length > 0, 500).catch(() => {});
+      }
+      sendInput("\x1d");
+      await runPromise.catch(() => {});
+    }
+    if (renderErr) throw renderErr;
+
+    const out = text();
+    assert.ok(writes.length > 0, "virtual terminal must receive output while ping is held");
+    assert.ok(out.includes(session.id), "banner must render while ping is held");
+    assert.ok(out.includes("Initial prompt before held ping"), "history user row must render while ping is held");
+    assert.ok(out.includes("HISTORY-ROW-VISIBLE"), "history assistant row must render while ping is held");
+  });
 });

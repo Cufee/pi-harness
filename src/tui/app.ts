@@ -1422,7 +1422,6 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
 
   let opened: ChatOpenResult;
   let fullHistory: ChatTurnRecord[];
-  let initialDaemonPid: number | null = null;
   try {
     opened = await opts.client.request<ChatOpenResult>("chat.open", {
       ...(opts.repoRoot ? { repoRoot: opts.repoRoot } : {}),
@@ -1432,14 +1431,6 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       ...(opts.preferLastProject ? { preferLastProject: true } : {}),
     });
     fullHistory = await loadAllChatHistory(opts.client, opened);
-    try {
-      const initialPing = await opts.client.request<ReconnectPing>("ping");
-      if (typeof initialPing?.pid === "number" && initialPing.pid > 0) {
-        initialDaemonPid = initialPing.pid;
-      }
-    } catch {
-      // Best-effort initial PID probe so first-reconnect crash detection sees pidChanged.
-    }
   } catch (err) {
     detachEvents();
     throw err;
@@ -1454,7 +1445,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   let incompatibleMessage: string | null = null;
   let incompatibleDraft = "";
   let stopped = false;
-  let lastDaemonPid: number | null = initialDaemonPid;
+  let lastDaemonPid: number | null = null;
   const selfReleaseId = currentRelease().releaseId;
   const notedMismatchReleases = new Set<string>();
   const settledTurns = new Set<string>();
@@ -2535,6 +2526,27 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   liveHandler = handleChatEvent;
   buffering = false;
   for (const ev of earlyBuffer.splice(0)) handleChatEvent(ev);
+
+  // Non-blocking startup PID probe (after reconnect is installed and initial history is rendered)
+  // so first-reconnect crash detection sees pidChanged without delaying first render or missing a close.
+  const startupProbeEpoch = opts.client.connectionEpoch;
+  void opts.client
+    .request<ReconnectPing>("ping")
+    .then((initialPing) => {
+      if (
+        !stopped &&
+        lastDaemonPid === null &&
+        opts.client.connected !== false &&
+        opts.client.connectionEpoch === startupProbeEpoch &&
+        typeof initialPing?.pid === "number" &&
+        initialPing.pid > 0
+      ) {
+        lastDaemonPid = initialPing.pid;
+      }
+    })
+    .catch(() => {
+      // Unanswered, rejected, or late startup probes change nothing.
+    });
 
   await shell.store.refresh();
   const action = await shell.waitAndCleanup();
