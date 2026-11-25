@@ -15,6 +15,8 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { promisify } from "node:util";
 import type { WorktreeConfig } from "../config.js";
 import type { ControlPlaneDb, WorktreeRecord } from "../control-plane/db.js";
+import { archiveRef, archiveRefPatterns, isArchiveRef, taskBranchName } from "../storage/names.js";
+import { createLegacyStoragePaths, type StoragePaths } from "../storage/paths.js";
 import { type GateRuntimeConfig, resolveGateEnv, runGateCommand } from "../tools/gate-env.js";
 
 export function canonicalPath(p: string): string {
@@ -100,17 +102,27 @@ export class WorktreeConcurrencyLimitError extends Error {
 }
 
 export class WorktreeManager {
+  private storage: StoragePaths;
+  private readonly injectedStorage: boolean;
+
   constructor(
     private readonly db: ControlPlaneDb,
     private readonly repoRoot: string,
     private config: WorktreeConfig,
     private gate: GateRuntimeConfig = {},
-  ) {}
+    storage?: StoragePaths,
+  ) {
+    this.injectedStorage = storage !== undefined;
+    this.storage = storage ?? createLegacyStoragePaths({ worktree: config });
+  }
 
   /** Applies live worktree config updates (e.g. `maxConcurrentWorkers`, `setupCommand`, `ciTimeoutMs`) and gate env settings. */
   updateConfig(next: WorktreeConfig, gate: GateRuntimeConfig = this.gate): void {
     this.config = next;
     this.gate = gate;
+    if (!this.injectedStorage) {
+      this.storage = createLegacyStoragePaths({ worktree: next });
+    }
   }
 
   get maxConcurrentWorkers(): number {
@@ -118,7 +130,7 @@ export class WorktreeManager {
   }
 
   get baseDir(): string {
-    return resolve(canonicalPath(this.repoRoot), this.config.dir ?? ".harness/worktrees");
+    return this.storage.managedWorktreeRoots(this.repoRoot)[0]!;
   }
 
   isGitRepo(): boolean {
@@ -208,7 +220,8 @@ export class WorktreeManager {
             .then((r) => r.stdout)
             .catch(async () => (await runGit(this.repoRoot, ["rev-parse", "HEAD"])).stdout)
         : (await runGit(this.repoRoot, ["rev-parse", "HEAD"])).stdout);
-    const baseBranchName = `harness/${runId}/${taskId}`;
+    const runRef = run ?? { id: runId, repoRoot: this.repoRoot };
+    const baseBranchName = taskBranchName(runRef, taskId);
     let branch = baseBranchName;
     let suffix = 1;
     while (
@@ -220,9 +233,10 @@ export class WorktreeManager {
       suffix++;
       branch = `${baseBranchName}-${suffix}`;
     }
-    const wtPath = join(this.baseDir, runId, suffix === 1 ? taskId : `${taskId}-${suffix}`);
+    const dirName = suffix === 1 ? taskId : `${taskId}-${suffix}`;
+    const wtPath = this.storage.worktreePath(runRef, dirName);
 
-    mkdirSync(join(this.baseDir, runId), { recursive: true });
+    mkdirSync(dirname(wtPath), { recursive: true });
     await runGit(this.repoRoot, ["worktree", "add", "--lock", "--reason", HARNESS_LOCK_REASON, "-b", branch, wtPath, sha]);
     const identity = captureCreationIdentity(wtPath, await this.commonDir());
 
@@ -266,8 +280,8 @@ export class WorktreeManager {
     name: string,
     sha: string,
   ): Promise<{ path: string; remove: () => Promise<void> }> {
-    const path = join(this.baseDir, kind, name);
-    mkdirSync(join(this.baseDir, kind), { recursive: true });
+    const path = this.storage.scratchPath(this.repoRoot, kind, name);
+    mkdirSync(dirname(path), { recursive: true });
     await runGit(this.repoRoot, ["worktree", "add", "--lock", "--reason", HARNESS_LOCK_REASON, "--detach", path, sha]);
     const identity = captureCreationIdentity(path, await this.commonDir());
     let consumed = false;
@@ -375,7 +389,7 @@ export class WorktreeManager {
   async isDirty(wtPath: string, opts?: { ignoreHarnessDir?: boolean }): Promise<boolean> {
     if (!existsSync(wtPath)) return false;
     const status = ["--no-optional-locks", "status", "--porcelain"];
-    const args = opts?.ignoreHarnessDir ? [...status, "--", ".", ":!.harness"] : status;
+    const args = opts?.ignoreHarnessDir ? [...status, "--", ".", this.storage.harnessDirtyPathspec()] : status;
     const { stdout } = await runGit(wtPath, args);
     return stdout.length > 0;
   }
@@ -386,7 +400,8 @@ export class WorktreeManager {
    */
   async snapshotToArchiveRef(wt: WorktreeRecord): Promise<string | null> {
     if (!existsSync(wt.path)) return null;
-    const ref = `refs/harness/archive/${wt.runId}/${wt.taskId}`;
+    const run = this.db.getRun(wt.runId);
+    const ref = archiveRef(run ?? { id: wt.runId }, wt.taskId);
     try {
       const dirty = await this.isDirty(wt.path);
       if (dirty) {
@@ -506,13 +521,14 @@ export class WorktreeManager {
       const key = canonicalPath(r.path);
       if (!byPath.has(key)) byPath.set(key, r);
     }
-    const base = canonicalPath(this.baseDir);
+    const managedRoots = this.storage.managedWorktreeRoots(this.repoRoot).map((r) => canonicalPath(r));
 
     const results: LiveWorktreeInfo[] = [];
     for (const entry of await this.listRegistrations()) {
       const abs = canonicalPath(entry.path);
-      if (!isWithin(base, abs)) continue;
-      if (SCRATCH_KINDS.has(relative(base, abs).split(sep)[0] ?? "")) continue;
+      const matchedRoot = managedRoots.find((r) => isWithin(r, abs));
+      if (!matchedRoot) continue;
+      if (SCRATCH_KINDS.has(relative(matchedRoot, abs).split(sep)[0] ?? "")) continue;
       const rec = byPath.get(abs) ?? null;
       if (runId && (!rec || rec.runId !== runId)) continue;
       const existsOnDisk = existsSync(abs);
@@ -589,18 +605,18 @@ export class WorktreeManager {
     // Deletion is guarded by the OID read here, so a concurrently refreshed ref survives.
     const retentionMs = (this.config.archiveRetentionDays ?? 7) * 86_400_000;
     const cutoffSec = Math.floor((Date.now() - retentionMs) / 1000);
-    const runPrefix = opts?.runId ? `refs/harness/archive/${opts.runId}/` : "refs/harness/archive/";
+    const patterns = archiveRefPatterns(opts?.runId);
     const justArchived = new Set(report.archivedRefs);
     try {
       const { stdout } = await runGit(this.repoRoot, [
         "for-each-ref",
         "--format=%(refname) %(objectname) %(committerdate:unix)",
-        opts?.runId ? `refs/harness/archive/${opts.runId}` : "refs/harness/archive",
+        ...patterns,
       ]);
       for (const line of stdout.split("\n")) {
         if (!line.trim()) continue;
         const [ref, oid, tsStr] = line.trim().split(/\s+/);
-        if (!ref || !oid || !ref.startsWith(runPrefix) || justArchived.has(ref)) continue;
+        if (!ref || !oid || !isArchiveRef(ref, opts?.runId) || justArchived.has(ref)) continue;
         const ts = Number(tsStr ?? 0);
         if (opts?.forceAll || (ts > 0 && ts < cutoffSec)) {
           try {

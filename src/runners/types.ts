@@ -137,10 +137,14 @@ export interface RunAgentRequest {
   externalMcpServers?: ExternalMcpServerConfig[];
   /** Extra directories prepended to PATH for shell-enabled ACP agents (bundled ast-grep / octofs). */
   extraPathDirs?: string[];
-  /** Additional allowed read-only directories outside `cwd` (e.g. main `.harness/goals`, `.harness/artifacts`, `extraReadRoots`). */
+  /** Additional allowed read-only directories outside `cwd` (e.g. goals, artifacts, and configured `extraReadRoots`). */
   extraReadRoots?: string[];
-  /** Additional allowed writable directories outside `cwd` (e.g. main `.harness/goals`, `extraWriteRoots`). */
+  /** Additional allowed writable directories outside `cwd` (e.g. goal evidence directories and configured `extraWriteRoots`). */
   extraWriteRoots?: string[];
+  /** Directories refused for both reads and writes even when covered by an allowed root. */
+  deniedRoots?: string[];
+  /** Allowed roots under which repository metadata and sibling worktrees are refused. */
+  protectedRoots?: string[];
   /** Extra environment variables for ACP agent subprocesses (e.g. `HARNESS_GOAL_EVIDENCE_DIR`); never overrides PATH. */
   extraEnv?: Record<string, string>;
   /** Permit shell execution (`Bash`/`shell_command`/`execute`) in `read_only_workspace` (used for verify/Done-Review in isolated checkouts). */

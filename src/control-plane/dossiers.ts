@@ -1,24 +1,31 @@
 import { createHash, randomUUID } from "node:crypto";
-import { type BigIntStats, constants, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { type BigIntStats, constants, closeSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ControlPlaneDb, RunRecord } from "./db.js";
 import { SUMMARY_LIMIT } from "./handoffs.js";
 import { scanMaxFileIndex, writeUniqueFile } from "./ids.js";
 import { REJECTIONS } from "../advisories/rejections.js";
+import { legacyStoragePaths, type StoragePaths } from "../storage/paths.js";
 
+/**
+ * @deprecated Use `StoragePaths.ensureDossierDir` instead.
+ * Ensures a dossier directory under the legacy artifacts root and returns its path.
+ */
 export function dossierDirectory(repoRoot: string, ...parts: string[]): string {
-  let path = realpathSync(repoRoot);
-  for (const part of [".harness", "artifacts", ...parts]) {
-    path = join(path, part);
-    if (!existsSync(path)) mkdirSync(path, { recursive: true });
-    if (!lstatSync(path).isDirectory()) throw new Error(`ENOTDIR: expected a non-symlink artifact directory: ${path}`);
-  }
-  return join(repoRoot, ".harness", "artifacts", ...parts);
+  return legacyStoragePaths.ensureDossierDir({ repoRoot, id: "" }, ...parts);
 }
 
-export function writeTaskDossier(db: ControlPlaneDb, run: RunRecord, taskId: string, name: string, content: string, summary: string) {
-  const dir = dossierDirectory(run.repoRoot, run.id, taskId);
+export function writeTaskDossier(
+  db: ControlPlaneDb,
+  run: RunRecord,
+  taskId: string,
+  name: string,
+  content: string,
+  summary: string,
+  storage: StoragePaths = legacyStoragePaths,
+) {
+  const dir = storage.ensureDossierDir(run, run.id, taskId);
   const safeName = basename(name).replace(/[^a-zA-Z0-9._-]/g, "_");
   if (!safeName || safeName === "." || safeName === "..") throw new Error("Invalid artifact name");
   const path = join(dir, safeName);
@@ -44,8 +51,9 @@ export function writeUniqueTaskDossier(
   ext: string,
   content: string,
   summary: string,
+  storage: StoragePaths = legacyStoragePaths,
 ) {
-  const dir = dossierDirectory(run.repoRoot, run.id, taskId);
+  const dir = storage.ensureDossierDir(run, run.id, taskId);
   const path = join(dir, writeUniqueFile(dir, stem, ext, content));
   try {
     return db.recordArtifact({ runId: run.id, taskId, kind: "dossier", path, summary });
@@ -57,17 +65,18 @@ export function writeUniqueTaskDossier(
 
 /**
  * Bounds a task summary to SUMMARY_LIMIT. A longer text is written in full to a new, never-overwritten
- * `.harness/artifacts/<taskId>-summary-<n>.md` file and the bounded text ends with a pointer to it. The caller
- * records `overflowPath` as a dossier artifact inside its own transaction.
+ * `<taskId>-summary-<n>.md` file in the run's artifacts directory and the bounded text ends with a pointer to it.
+ * The caller records `overflowPath` as a dossier artifact inside its own transaction.
  */
 export function spillSummaryOverflow(
   db: ControlPlaneDb,
   run: RunRecord,
   taskId: string,
   fullText: string,
+  storage: StoragePaths = legacyStoragePaths,
 ): { summary: string; overflowPath?: string; keptChars?: number; totalChars?: number } {
   if (fullText.length <= SUMMARY_LIMIT) return { summary: fullText };
-  const artifactsDir = dossierDirectory(run.repoRoot);
+  const artifactsDir = storage.ensureDossierDir(run);
   const stem = `${taskId}-summary`;
   const seqKey = `summary:${taskId}`;
   let allocateIndex: (() => number) | undefined;
@@ -81,12 +90,15 @@ export function spillSummaryOverflow(
     allocateIndex = () => db.nextArtifactSeq(seqKey);
   }
   const fileName = writeUniqueFile(artifactsDir, stem, ".md", fullText, allocateIndex);
-  const artifactPath = `.harness/artifacts/${fileName}`;
+  const overflowPath = resolve(artifactsDir, fileName);
+  const rel = relative(resolve(run.repoRoot), overflowPath);
+  const artifactPath =
+    !isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`) ? rel.split(sep).join("/") : overflowPath;
   const pointer = `\n\n[Full summary: ${artifactPath}]`;
   const kept = fullText.slice(0, SUMMARY_LIMIT - pointer.length).trimEnd();
   return {
     summary: kept + pointer,
-    overflowPath: resolve(run.repoRoot, artifactPath),
+    overflowPath,
     keptChars: kept.length,
     totalChars: fullText.length,
   };
@@ -107,13 +119,20 @@ function codeOutputName(name: string): { stem: string; ext: string } {
 }
 
 /**
- * Writes Code Mode output to a new, never-overwritten `spill-<runTag>-<stem>-<n><ext>` file under .harness/artifacts
- * and indexes it. runTag is a fixed-width hash of the run ID, so distinct runs never share a name prefix, and the
- * `spill-` prefix keeps other writers' names apart. n comes from one global durable sequence, seeded above any index
- * already on disk, and every attempted n is reserved before its file is created, so no name is ever reissued.
+ * Writes Code Mode output to a new, never-overwritten `spill-<runTag>-<stem>-<n><ext>` file in the run's artifacts
+ * directory and indexes it. runTag is a fixed-width hash of the run ID, so distinct runs never share a name prefix,
+ * and the `spill-` prefix keeps other writers' names apart. n comes from one global durable sequence, seeded above
+ * any index already on disk, and every attempted n is reserved before its file is created, so no name is ever reissued.
  */
-export function writeCodeOutput(db: ControlPlaneDb, run: RunRecord, taskId: string, name: string, json: string) {
-  const dir = dossierDirectory(run.repoRoot);
+export function writeCodeOutput(
+  db: ControlPlaneDb,
+  run: RunRecord,
+  taskId: string,
+  name: string,
+  json: string,
+  storage: StoragePaths = legacyStoragePaths,
+) {
+  const dir = storage.ensureDossierDir(run);
   const { stem, ext } = codeOutputName(name);
   const runTag = createHash("sha256").update(run.id).digest("hex").slice(0, 16);
   const scopedStem = `spill-${runTag}-${stem}`;
@@ -136,46 +155,16 @@ export function writeCodeOutput(db: ControlPlaneDb, run: RunRecord, taskId: stri
   }
 }
 
-/**
- * Lexical repo-relative path (`.harness/artifacts/...`) of abs, accepting either the raw or the canonical
- * form of repoRoot above `.harness`. Nothing below the repo root is canonicalized.
- */
-function artifactRel(repoRoot: string, abs: string): string | null {
-  const rawRoot = resolve(repoRoot);
-  let realRoot: string;
-  try {
-    realRoot = realpathSync(rawRoot);
-  } catch {
-    return null;
-  }
-  const marker = `${sep}.harness${sep}artifacts${sep}`;
-  for (let idx = abs.indexOf(marker); idx !== -1; idx = abs.indexOf(marker, idx + 1)) {
-    const prefix = abs.slice(0, idx) || sep;
-    let matches = prefix === rawRoot;
-    if (!matches) {
-      try {
-        matches = realpathSync(prefix) === realRoot;
-      } catch {
-        matches = false;
-      }
-    }
-    if (!matches) continue;
-    const rel = abs.slice(idx + 1);
-    if (rel.length <= marker.length - 1 || rel.includes("\0")) return null;
-    return rel;
-  }
-  return null;
-}
-
 /** Maps any alias (relative, raw-root absolute, or canonical-root absolute) of a dossier path to its index row. */
 export function findRunDossier(
   db: ControlPlaneDb,
   run: RunRecord,
   requested: string,
+  storage: StoragePaths = legacyStoragePaths,
 ): { recordedPath: string; rel: string | null; candidates: string[] } | null {
   const rawRoot = resolve(run.repoRoot);
   const abs = resolve(rawRoot, requested);
-  const rel = artifactRel(rawRoot, abs);
+  const rel = storage.artifactRel(run, abs);
   const candidates = [abs];
   if (rel !== null) {
     candidates.push(join(rawRoot, rel));
@@ -217,14 +206,14 @@ function readArtifact(
   path: string,
   maxChars: unknown,
   offset?: unknown,
-  opts?: { label?: string; pinned?: boolean; nonSymlinkError?: string },
+  opts?: { label?: string; pinned?: boolean; nonSymlinkRejection?: () => Error },
 ) {
   const label = opts?.label ?? path;
   let fd: number;
   try {
     fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ELOOP" && opts?.nonSymlinkError) throw new Error(opts.nonSymlinkError);
+    if ((error as NodeJS.ErrnoException).code === "ELOOP" && opts?.nonSymlinkRejection) throw opts.nonSymlinkRejection();
     throw error;
   }
   try {
@@ -239,7 +228,7 @@ function readArtifact(
       } catch {
         same = false;
       }
-      if (!same) throw new Error(opts.nonSymlinkError ?? `Dossier must be a non-symlink path under .harness/artifacts: ${label}`);
+      if (!same) throw opts.nonSymlinkRejection ? opts.nonSymlinkRejection() : REJECTIONS.dossierSymlink(label);
     }
     const raw = readFileSync(fd, "utf8");
     const max = typeof maxChars === "number" && Number.isFinite(maxChars) ? Math.max(1, Math.floor(maxChars)) : 32000;
@@ -318,9 +307,10 @@ export async function hashRunDossier(
   run: RunRecord,
   requested: string,
   opts?: { maxBytes?: number },
+  storage: StoragePaths = legacyStoragePaths,
 ): Promise<{ sha256: string; bytes: number } | null> {
   try {
-    const found = findRunDossier(db, run, requested);
+    const found = findRunDossier(db, run, requested, storage);
     if (!found || found.rel === null) return null;
     const realRoot = await realpath(run.repoRoot);
     const expected = join(realRoot, found.rel);
@@ -372,7 +362,12 @@ export async function hashRunDossier(
   }
 }
 
-export function readRunDossier(db: ControlPlaneDb, run: RunRecord, args: Record<string, unknown>) {
+export function readRunDossier(
+  db: ControlPlaneDb,
+  run: RunRecord,
+  args: Record<string, unknown>,
+  storage: StoragePaths = legacyStoragePaths,
+) {
   if (typeof args.path !== "string" || !args.path) {
     const rawTaskId = typeof args.task_id === "string" ? args.task_id.trim() : "";
     const taskId = rawTaskId
@@ -382,13 +377,13 @@ export function readRunDossier(db: ControlPlaneDb, run: RunRecord, args: Record<
       : undefined;
     return { artifacts: db.listArtifacts(run.id, taskId, 50, "dossier") };
   }
-  const found = findRunDossier(db, run, args.path);
+  const found = findRunDossier(db, run, args.path, storage);
   const shown = found?.recordedPath ?? resolve(run.repoRoot, args.path);
   if (!found) throw new Error(`No indexed dossier in this run: ${shown}`);
-  const nonSymlink = `Dossier must be a non-symlink path under .harness/artifacts: ${shown}`;
-  if (found.rel === null) throw new Error(nonSymlink);
+  const nonSymlinkRejection = () => REJECTIONS.dossierSymlink(shown);
+  if (found.rel === null) throw nonSymlinkRejection();
   // Built from the requested path, not from realpath(target): equality below holds only when no component
-  // from .harness down to the file is a symlink.
+  // from the artifacts root down to the file is a symlink.
   const realRoot = realpathSync(run.repoRoot);
   const expected = join(realRoot, found.rel);
   // A path indexed by several runs (under any root spelling, or a case alias of the same file) cannot prove which
@@ -396,15 +391,21 @@ export function readRunDossier(db: ControlPlaneDb, run: RunRecord, args: Record<
   if (hasAmbiguousDossierOwnership(db, run, { rel: found.rel, candidates: found.candidates }, realRoot, expected)) {
     throw new Error(`Dossier path has ambiguous multi-run ownership: ${shown}`);
   }
-  if (lstatSync(expected).isSymbolicLink() || realpathSync(expected) !== expected) throw new Error(nonSymlink);
-  return readArtifact(expected, args.max_chars, args.offset, { label: shown, pinned: true, nonSymlinkError: nonSymlink });
+  if (lstatSync(expected).isSymbolicLink() || realpathSync(expected) !== expected) throw nonSymlinkRejection();
+  return readArtifact(expected, args.max_chars, args.offset, { label: shown, pinned: true, nonSymlinkRejection });
 }
 
-export function readWorkspaceArtifact(root: string, requested: string, maxChars: unknown, offset?: unknown) {
+export function readWorkspaceArtifact(
+  root: string,
+  requested: string,
+  maxChars: unknown,
+  offset?: unknown,
+  storage: StoragePaths = legacyStoragePaths,
+) {
   const path = realpathSync(resolve(root, requested));
   const rel = relative(realpathSync(root), path);
   const parts = rel.toLowerCase().split(sep);
-  if (isAbsolute(rel) || parts[0] === ".." || parts.includes(".git") || parts.includes(".harness")) {
+  if (isAbsolute(rel) || parts[0] === ".." || parts.includes(".git") || storage.containsHarnessDirSegment(rel)) {
     throw REJECTIONS.artifactOutsideWorkspace(requested);
   }
   return readArtifact(path, maxChars, offset);

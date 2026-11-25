@@ -2,6 +2,7 @@ import { REJECTIONS } from "../advisories/rejections.js";
 import type { WorktreeConfig } from "../config.js";
 import type { ControlPlaneDb, MergeQueueRecord } from "../control-plane/db.js";
 import { KnowledgeMaintainer } from "../kb/maintainer.js";
+import { mergedRef as runMergedRefForRun } from "../storage/names.js";
 import {
   GateCommandError,
   GateConfigError,
@@ -18,9 +19,12 @@ export interface MergeOutcome {
   bouncedReason?: string;
 }
 
-/** Git ref storing the latest commit merged onto the target branch for a run. */
+/**
+ * @deprecated Use `mergedRef` from `src/storage/names.ts` instead.
+ * Git ref storing the latest commit merged onto the target branch for a run.
+ */
 export function runMergedRef(runId: string): string {
-  return `refs/harness/merged/${runId}`;
+  return runMergedRefForRun({ id: runId });
 }
 
 export interface MergeProcessOptions {
@@ -454,7 +458,8 @@ export class BisectingMergeQueue {
 
       // Update the advisory run merge ref with a single atomic CAS against the previously observed value.
       // On failure, leave the ref and any lock files untouched; merge.promoted is the durable source of truth.
-      const mergedRef = runMergedRef(next.runId);
+      const runForRef = this.db.getRun(next.runId);
+      const mergedRef = runMergedRefForRun(runForRef ?? { id: next.runId });
       const prevMergedRefSha = await runGit(this.repoRoot, ["rev-parse", "--verify", `${mergedRef}^{commit}`])
         .then((r) => r.stdout || null)
         .catch(() => null);

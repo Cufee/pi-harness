@@ -1,4 +1,5 @@
 import { basename, isAbsolute, relative, resolve } from "node:path";
+import { legacyStoragePaths } from "../storage/paths.js";
 import type { AdvisoryRule, Finding, ObservedCall, Role, RuleContext, ScopeFinding, Subject } from "./types.js";
 
 export const SCOPE_ROLES: ReadonlySet<Role> = new Set<Role>(["research", "plan", "verify", "execute"]);
@@ -582,7 +583,7 @@ const directorSelfReadingRule: AdvisoryRule<DirectorReadState> = {
 
     const rel = normalizeWorkspaceFile(rawPath, subject.workspaceRoot);
     if (!rel) return null;
-    if (rel === ".harness" || rel.startsWith(".harness/")) return null;
+    if (legacyStoragePaths.isHarnessOwnedRelPath(rel)) return null;
     if (matchesPathHints(rel, subject.brief.pathHints, subject.workspaceRoot)) return null;
 
     state.files.add(rel);

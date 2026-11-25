@@ -1,6 +1,8 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
+import { legacyStoragePaths } from "../storage/paths.js";
 
 /**
+ * @deprecated Use `StoragePaths.isProtectedWorktreePath` instead.
  * Write-protection predicate for harness-mediated structured writes (ACP fs/write_text_file and
  * edit/delete/move permission requests; usable by Director tools). Pure and synchronous.
  *
@@ -9,17 +11,14 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
  * effect. A target is protected when, case-insensitively:
  *  - any segment of its absolute path is `.git` (repository metadata and linked-worktree pointer
  *    files; no legitimate workspace sits below such a segment), or
- *  - relative to `root`, it contains the consecutive segments `.harness/worktrees` (sibling task
- *    checkouts). This rule is root-relative because every task workspace itself lives under
- *    `<repo>/.harness/worktrees`.
- * A custom `worktree.dir` is not covered by the second rule, and agents with shell access are not
- * contained by this check.
+ *  - relative to `root`, it enters the legacy sibling-worktree directory tree.
  */
 export function isProtectedWritePath(root: string, path: string): boolean {
-  const absolute = resolve(root, path);
-  if (absolute.split(sep).some((segment) => segment.toLowerCase() === ".git")) return true;
-  const rel = relative(resolve(root), absolute);
-  if (!rel || isAbsolute(rel) || rel === ".." || rel.startsWith(`..${sep}`)) return false;
-  const segments = rel.split(sep).map((segment) => segment.toLowerCase());
-  return segments.some((segment, i) => segment === ".harness" && segments[i + 1] === "worktrees");
+  const resolvedRoot = resolve(root);
+  const absolute = resolve(resolvedRoot, path);
+  const rel = relative(resolvedRoot, absolute);
+  if (!rel || isAbsolute(rel) || rel === ".." || rel.startsWith(`..${sep}`)) {
+    return absolute.split(sep).some((segment) => segment.toLowerCase() === ".git");
+  }
+  return legacyStoragePaths.isProtectedWorktreePath(absolute, resolvedRoot);
 }

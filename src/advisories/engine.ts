@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { isAbsolute, relative, resolve } from "node:path";
+import { legacyStoragePaths } from "../storage/paths.js";
 import { NativeEventParser } from "./native.js";
 import { deniedNotice } from "./rejections.js";
 import type {
@@ -162,7 +163,7 @@ export class AdvisoryEngine {
       const absPath = isAbsolute(slashPath) ? resolve(slashPath) : resolve(absRoot, slashPath);
       const rel = relative(absRoot, absPath).replaceAll("\\", "/");
       if (!rel || rel === "." || hasParentTraversalComponent(rel) || isAbsolute(rel)) continue;
-      if (rel === ".harness" || rel.startsWith(".harness/")) continue;
+      if (legacyStoragePaths.isHarnessOwnedRelPath(rel)) continue;
       st.activityPaths.add(rel);
     }
   }

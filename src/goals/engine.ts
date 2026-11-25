@@ -1,10 +1,11 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstatSync, mkdirSync, realpathSync } from "node:fs";
+import { realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { GoalsConfig } from "../config.js";
 import { friendlyIdCandidates, nextFriendlyId } from "../control-plane/ids.js";
+import { legacyStoragePaths, type StoragePaths } from "../storage/paths.js";
 import { type ResolvedGateEnv, resolveGateEnv, runGateCommand } from "../tools/gate-env.js";
 import { runGit } from "../worktree/manager.js";
 import {
@@ -36,34 +37,20 @@ function canonicalRepoPath(p: string): string {
   }
 }
 
-const GOAL_ID_SEGMENT = /^[a-zA-Z0-9._-]+$/;
-
-/** Per-goal evidence directory `<repo>/.harness/goals/<goalId>`; rejects ids that are not a single safe path segment. */
+/**
+ * @deprecated Use `StoragePaths.goalEvidenceDir` instead.
+ * Per-goal evidence directory; rejects ids that are not a single safe path segment.
+ */
 export function goalEvidenceDir(repoRoot: string, goalId: string): string {
-  if (!GOAL_ID_SEGMENT.test(goalId) || goalId === "." || goalId === "..") {
-    throw new Error(`Invalid goal id for evidence directory: ${JSON.stringify(goalId)}`);
-  }
-  return join(canonicalRepoPath(repoRoot), ".harness", "goals", goalId);
+  return legacyStoragePaths.goalEvidenceDir({ repoRoot, id: goalId });
 }
 
-/** Creates the goal evidence directory segment by segment, refusing symlinks or files; returns null on failure. */
+/**
+ * @deprecated Use `StoragePaths.ensureGoalEvidenceDir` instead.
+ * Creates the goal evidence directory segment by segment, refusing symlinks or files; returns null on failure.
+ */
 export function ensureGoalEvidenceDir(repoRoot: string, goalId: string): string | null {
-  try {
-    const target = goalEvidenceDir(repoRoot, goalId);
-    let p = canonicalRepoPath(repoRoot);
-    for (const segment of [".harness", "goals", goalId]) {
-      p = join(p, segment);
-      try {
-        mkdirSync(p);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      }
-      if (!lstatSync(p).isDirectory()) return null;
-    }
-    return target;
-  } catch {
-    return null;
-  }
+  return legacyStoragePaths.ensureGoalEvidenceDir({ repoRoot, id: goalId });
 }
 
 export type GoalStatus =
@@ -472,6 +459,7 @@ export class GoalEngine {
       /** Called after an amendment; supersedes verification_failed escalations and returns their ids. */
       onGoalAmended?: (goal: GoalRecord, delta: GoalAmendmentDelta) => string[];
     },
+    private readonly storage: StoragePaths = legacyStoragePaths,
   ) {
     this.stateDir = opts?.stateDir;
     this.onGoalSettled = opts?.onGoalSettled;
@@ -643,7 +631,7 @@ export class GoalEngine {
       .run(id, input.title.trim(), input.description.trim(), JSON.stringify(criteria), JSON.stringify(nonGoals), now);
 
     const created = this.getGoal(id)!;
-    ensureGoalEvidenceDir(created.repoRoot, created.id);
+    this.storage.ensureGoalEvidenceDir(created);
     return created;
   }
 
@@ -682,7 +670,7 @@ export class GoalEngine {
       .run(runId, Date.now(), g.id);
     this.clearQueuedProgress(g.id);
     this.clearStaleVerificationStatus(g.id, { clearBlockedPhase: true });
-    ensureGoalEvidenceDir(g.repoRoot, g.id);
+    this.storage.ensureGoalEvidenceDir(g);
     return this.getGoal(g.id)!;
   }
 
@@ -1141,7 +1129,7 @@ export class GoalEngine {
     }
     this.setStatus(goal.id, "verifying");
     // A rejected (e.g. symlinked) evidence directory is never advertised to gate commands.
-    const verifiedEvDir = ensureGoalEvidenceDir(goal.repoRoot, goal.id);
+    const verifiedEvDir = this.storage.ensureGoalEvidenceDir(goal);
 
     const gateCwd = opts?.cwd ?? goal.repoRoot;
     const targetRef = opts?.targetRef ?? "HEAD";

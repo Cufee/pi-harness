@@ -4,6 +4,7 @@ import type { HarnessConfig } from "../config.js";
 import type { ControlPlaneDb, TaskRecord } from "../control-plane/db.js";
 import { findRunDossier } from "../control-plane/dossiers.js";
 import { ControlPlaneToolExecutor, type ToolRuntimeHooks } from "../control-plane/tools.js";
+import { legacyStoragePaths } from "../storage/paths.js";
 import type { AdvisoryEngine } from "./engine.js";
 import { attachNotices } from "./message.js";
 import { roleOf } from "./roles.js";
@@ -118,7 +119,7 @@ function extractInspectCommandPaths(args: Record<string, unknown>, workspaceRoot
     }
     const rel = relative(realRoot, realCandidate).replaceAll("\\", "/");
     if (!rel || rel === "." || hasParentTraversalComponent(rel) || isAbsolute(rel)) continue;
-    if (rel === ".harness" || rel.startsWith(".harness/")) continue;
+    if (legacyStoragePaths.isHarnessOwnedRelPath(rel)) continue;
     if (!seen.has(rel)) {
       seen.add(rel);
       out.push(rel);
@@ -156,7 +157,7 @@ function extractArtifactReadPaths(args: Record<string, unknown>, workspaceRoot: 
 
   const rel = relative(realRoot, realCandidate).replaceAll("\\", "/");
   if (!rel || rel === "." || hasParentTraversalComponent(rel) || isAbsolute(rel)) return [];
-  if (rel === ".harness" || rel.startsWith(".harness/")) return [];
+  if (legacyStoragePaths.isHarnessOwnedRelPath(rel)) return [];
   return [rel];
 }
 
