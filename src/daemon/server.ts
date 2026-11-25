@@ -66,6 +66,8 @@ import { QuotaClient } from "../quota/client.js";
 import { ensureOctofs, resolveExternalMcpServers, shouldStageOctofs } from "../tools/native-tools.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
+import { runStorageMigrationPass } from "../storage/migrate.js";
+import { storagePaths } from "../storage/paths.js";
 import { canonicalPath, runGit } from "../worktree/manager.js";
 import { classifyAttention } from "../visibility/index.js";
 import { HotUpdateController } from "./hot-update.js";
@@ -309,7 +311,7 @@ const REVERSE_MESSAGES_ONLY_OPS: ReadonlySet<DaemonOp> = new Set<DaemonOp>([
 const OUTBOX_TTL_MS = 24 * 60 * 60_000;
 const PEER_HOP_WINDOW_MS = 30 * 60_000;
 
-async function probeUnixSocketState(sockPath: string, timeoutMs = 250): Promise<"live" | "stale" | "unknown"> {
+export async function probeUnixSocketState(sockPath: string, timeoutMs = 250): Promise<"live" | "stale" | "unknown"> {
   return await new Promise<"live" | "stale" | "unknown">((resolve) => {
     let settled = false;
     const done = (state: "live" | "stale" | "unknown") => {
@@ -1016,6 +1018,54 @@ export class HarnessDaemon {
       });
     } finally {
       startLock.release();
+    }
+
+    // Run one synchronous budgeted migration pass before reconcileStaleRunsOnStartup so
+    // previously-live tasks still look live in the DB and their units stay safely deferred.
+    try {
+      const storage = storagePaths(this.config);
+      const report = runStorageMigrationPass({
+        sqlite: this.db.db,
+        storage,
+        log: (line) => {
+          if (storage.layout !== "legacy") {
+            console.error(`[harnessd ${new Date().toISOString()}] ${line}`);
+          }
+        },
+      });
+      const t = report.totals;
+      const moved = t.migrated + t.merged + t.finished;
+      const removedEmptyDirs = report.repos.reduce((n, r) => n + r.removedEmptyDirs.length, 0);
+      const isNoop =
+        report.skipped ||
+        (moved === 0 &&
+          t.rowsRewritten === 0 &&
+          t.bridgesRemoved === 0 &&
+          t.deferred === 0 &&
+          t.remaining === 0 &&
+          t.newUnknownEntries === 0 &&
+          t.errors === 0 &&
+          removedEmptyDirs === 0 &&
+          !report.budgetExceeded);
+      if (!isNoop) {
+        const parts = [
+          `moved=${moved}`,
+          `deferred=${t.deferred}`,
+          `errors=${t.errors}`,
+          `budgetHit=${report.budgetExceeded}`,
+        ];
+        if (t.rowsRewritten > 0) parts.push(`rowsRewritten=${t.rowsRewritten}`);
+        if (t.bridgesRemoved > 0) parts.push(`bridgesRemoved=${t.bridgesRemoved}`);
+        if (t.remaining > 0) parts.push(`remaining=${t.remaining}`);
+        if (t.newUnknownEntries > 0) parts.push(`newUnknown=${t.newUnknownEntries}`);
+        if (removedEmptyDirs > 0) parts.push(`removedEmptyDirs=${removedEmptyDirs}`);
+        parts.push(`elapsedMs=${report.elapsedMs}`);
+        console.error(`[harnessd ${new Date().toISOString()}] storage migration: ${parts.join(" ")}`);
+      }
+    } catch (err) {
+      console.error(
+        `[harnessd ${new Date().toISOString()}] storage migration failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
 
     // Reconcile stale runs/goals AFTER the daemon socket is bound,

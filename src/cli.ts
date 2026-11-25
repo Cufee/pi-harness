@@ -1,14 +1,22 @@
 #!/usr/bin/env bun
-import { existsSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import type { Terminal } from "@earendil-works/pi-tui";
 import { ControlPlaneDb, type EscalationRecord } from "./control-plane/db.js";
 import { isDirectorTaskContainer } from "./control-plane/ids.js";
 import { findProjectContainingPath, type ProjectBrowseResult, type ProjectSummary } from "./control-plane/projects.js";
 import { classifyInterruptedTasks, formatRecoveryPlan } from "./control-plane/restart-recovery.js";
-import { ensureTempDir, loadConfig, type AcpProfileConfig } from "./config.js";
+import {
+  defaultStateDir,
+  ensureTempDir,
+  loadConfig,
+  readRepoConfig,
+  resolveConfig,
+  type AcpProfileConfig,
+  type HarnessConfig,
+} from "./config.js";
 import { loadOrCreateNodeId } from "./control-plane/session-messages.js";
 import type { GoalRecord } from "./goals/engine.js";
 import { qualifyRemoteCliHints } from "./protocol/chat-events.js";
@@ -17,8 +25,19 @@ import { ensureLocalDaemon, stopLocalDaemon } from "./daemon/launch.js";
 import { runDaemonReloadCli, tryReloadForDaemonRestart } from "./daemon/hot-update.js";
 import type { RemoteHostStatus } from "./daemon/peer.js";
 import { DaemonClient, runStdioSocketBridge } from "./daemon/remote.js";
-import { HarnessDaemon } from "./daemon/server.js";
+import { HarnessDaemon, probeUnixSocketState } from "./daemon/server.js";
+import { acquireStartLock } from "./daemon/start-lock.js";
 import { runSupervisor, type SuperviseOptions } from "./daemon/supervise.js";
+import {
+  DEFAULT_MIGRATION_BUDGET_MS,
+  formatStorageMigrationPlan,
+  planStorageMigration,
+  runStorageMigrationPass,
+  type StorageMigrationPlan,
+  type StorageMigrationReport,
+} from "./storage/migrate.js";
+import { discoverRepoRoots } from "./storage/migrate/db.js";
+import { storagePaths } from "./storage/paths.js";
 import { runDirectorChatTui, runNativeScrollbackTui, type TuiExitAction } from "./tui/app.js";
 import { formatAge, parseDurationMs } from "./tui/core/index.js";
 import { type FederatedProjectSummary, pickProjectTui } from "./tui/projects.js";
@@ -438,6 +457,7 @@ Usage:
   pi-harness daemon reload [--now] [--wait] [--check] [--target <dir>] [--from-install]
   pi-harness daemon reload --legacy [--yes] [--wait] [--previous <dir>] [--target <dir>] [--db <path>]
   pi-harness daemon recover --dry-run [--db <path>] [--json]
+  pi-harness migrate-storage [--dry-run] [--json]   Migrate legacy in-repo storage to the data dir (--dry-run plans read-only)
   pi-harness run "<goal>" [-p <project>] [--profile id] [--model id] [--effort level] [--detach] [--remote <alias|ssh://host>]
   pi-harness run resume <run-id> [--in 15m | --message "<msg>"] [--remote <alias|ssh://host>]
                                                     Alias for \`pi-harness resume\`; to start a new run whose goal begins
@@ -713,6 +733,321 @@ async function runInteractiveSessionLoop(
   }
 }
 
+function loadConfigReadOnly(repoRoot: string, dryRun: boolean): HarnessConfig {
+  const stateDir = resolve(defaultStateDir());
+  let globalCfg: Record<string, unknown> = {};
+  const globalPath = join(stateDir, "config.json");
+  if (existsSync(globalPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(globalPath, "utf8")) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        globalCfg = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Match loadConfig behavior on unreadable or malformed global config.
+    }
+  }
+  return resolveConfig(globalCfg, readRepoConfig(repoRoot), {
+    stateDir,
+    // Avoid defaultSocketPath()'s fallback mkdirSync on long temp paths during read-only dry-run.
+    ...(dryRun ? { socketPath: join(stateDir, "daemon.sock") } : {}),
+  });
+}
+
+export function formatStorageMigrationReport(report: StorageMigrationReport): string {
+  const lines: string[] = [];
+  lines.push(`Storage migration (layout: ${report.layout})`);
+
+  if (report.skipped) {
+    lines.push(report.skipReason ?? "Storage layout is 'legacy'; nothing will move.");
+    return lines.join("\n");
+  }
+
+  const t = report.totals;
+  const moved = t.migrated + t.merged + t.finished;
+  const removedEmptyDirs = report.repos.reduce((n, r) => n + r.removedEmptyDirs.length, 0);
+  const nothingToDo =
+    moved === 0 &&
+    t.rowsRewritten === 0 &&
+    t.bridgesCreated === 0 &&
+    t.bridgesRemoved === 0 &&
+    t.deferred === 0 &&
+    t.remaining === 0 &&
+    t.newUnknownEntries === 0 &&
+    t.errors === 0 &&
+    removedEmptyDirs === 0 &&
+    !report.budgetExceeded;
+
+  if (nothingToDo) {
+    const keptSuffix = t.bridgesKept > 0 ? ` (${t.bridgesKept} bridge(s) kept)` : "";
+    lines.push(`Nothing to migrate${keptSuffix}.`);
+    lines.push(
+      `Totals: 0 units moved (scanned ${t.reposScanned} repo(s), bridges_kept: ${t.bridgesKept}, errors: 0, elapsed: ${report.elapsedMs}ms)`,
+    );
+    return lines.join("\n");
+  }
+
+  for (const repo of report.repos) {
+    if (
+      repo.results.length === 0 &&
+      repo.remainingUnits.length === 0 &&
+      repo.unknownEntries.length === 0 &&
+      repo.removedEmptyDirs.length === 0 &&
+      repo.errors.length === 0
+    ) {
+      continue;
+    }
+    lines.push("");
+    lines.push(`Repository: ${repo.repoRoot}`);
+    lines.push(`  Project dir: ${repo.projectDir}`);
+
+    if (repo.results.length > 0) {
+      lines.push(`  Units (${repo.results.length}):`);
+      for (const r of repo.results) {
+        const idLabel = r.taskId ? `${r.id}/${r.taskId}` : r.id;
+        const details: string[] = [];
+        if (r.rowsRewritten > 0) details.push(`${r.rowsRewritten} row(s) rewritten`);
+        if (r.bridgesCreated > 0) details.push(`${r.bridgesCreated} bridge(s) created`);
+        if (r.bridgesRemoved > 0) details.push(`${r.bridgesRemoved} bridge(s) removed`);
+        const detailSuffix = details.length > 0 ? ` [${details.join(", ")}]` : "";
+        const reasonSuffix = r.reason ? ` (${r.reason})` : "";
+        lines.push(`    - [${r.outcome}] ${r.kind} ${idLabel}: ${r.legacyPath} -> ${r.destinationPath}${detailSuffix}${reasonSuffix}`);
+      }
+    }
+
+    if (repo.remainingUnits.length > 0) {
+      lines.push(`  Remaining due to budget (${repo.remainingUnits.length}):`);
+      for (const u of repo.remainingUnits) {
+        const idLabel = u.taskId ? `${u.id}/${u.taskId}` : u.id;
+        lines.push(`    - [${u.action}] ${u.kind} ${idLabel}: ${u.legacyPath}`);
+      }
+    }
+
+    if (repo.unknownEntries.length > 0) {
+      const newSet = new Set(repo.newUnknownEntries);
+      lines.push(`  Unknown entries (${repo.unknownEntries.length}):`);
+      for (const entry of repo.unknownEntries) {
+        lines.push(`    - ${entry}${newSet.has(entry) ? " [new]" : ""}`);
+      }
+    }
+
+    if (repo.removedEmptyDirs.length > 0) {
+      lines.push(`  Removed empty dirs: ${repo.removedEmptyDirs.length}`);
+    }
+
+    if (repo.errors.length > 0) {
+      lines.push(`  Errors (${repo.errors.length}):`);
+      for (const err of repo.errors) {
+        lines.push(`    - ${err.path ? `${err.path}: ` : ""}${err.message}`);
+      }
+    }
+  }
+
+  lines.push("");
+  const budgetTag = report.budgetExceeded ? ", budget reached" : "";
+  lines.push(
+    `Totals across ${t.reposScanned} repo(s): moved=${moved} (migrated: ${t.migrated}, merged: ${t.merged}, finished: ${t.finished}), rows_rewritten=${t.rowsRewritten}, bridges_created=${t.bridgesCreated}, bridges_removed=${t.bridgesRemoved}, bridges_kept=${t.bridgesKept}, deferred=${t.deferred}, remaining=${t.remaining}, errors=${t.errors}, elapsed=${report.elapsedMs}ms${budgetTag}`,
+  );
+
+  return lines.join("\n");
+}
+
+async function handleMigrateStorageCommand(
+  positional: string[],
+  flags: Record<string, string | boolean>,
+  repoRoot: string,
+  rawRemote: string | undefined,
+): Promise<number> {
+  const hasFlag = (k: string) => Object.prototype.hasOwnProperty.call(flags, k);
+  const usage = "Usage: pi-harness migrate-storage [--dry-run] [--json]";
+  if (positional.length > 1) {
+    throw new Error(usage);
+  }
+  if (hasFlag("remote")) {
+    throw new Error(`\`migrate-storage\` only runs locally; omit --remote (got --remote ${rawRemote}).`);
+  }
+  const allowed = new Set(["dry-run", "json", "repo"]);
+  for (const key of Object.keys(flags)) {
+    if (!allowed.has(key)) {
+      throw new Error(`Flag --${key} is not supported for 'migrate-storage'. ${usage}`);
+    }
+  }
+  if (hasFlag("dry-run") && typeof flags["dry-run"] !== "boolean") {
+    throw new Error(`--dry-run does not take a value. ${usage}`);
+  }
+  if (hasFlag("json") && typeof flags.json !== "boolean") {
+    throw new Error(`--json does not take a value. ${usage}`);
+  }
+
+  const dryRun = flags["dry-run"] === true;
+  const asJson = flags.json === true;
+  const config = loadConfigReadOnly(repoRoot, dryRun);
+  const storage = storagePaths(config);
+  const dbPath = join(config.stateDir, "control-plane.sqlite");
+
+  if (dryRun) {
+    if (!existsSync(dbPath)) {
+      const noopReason =
+        storage.layout === "legacy"
+          ? `Database not found at ${dbPath}; storage layout is 'legacy' and nothing will move.`
+          : `Database not found at ${dbPath}; nothing to migrate.`;
+      const emptyPlan: StorageMigrationPlan = {
+        layout: storage.layout,
+        noop: true,
+        noopReason,
+        generatedAt: Date.now(),
+        repos: [],
+        totals: {
+          totalUnits: 0,
+          migrate: 0,
+          merge: 0,
+          finishMigration: 0,
+          rewriteRows: 0,
+          removeBridge: 0,
+          keepBridge: 0,
+          deferred: 0,
+          unknownEntries: 0,
+          newUnknownEntries: 0,
+          pendingRowRewrites: 0,
+        },
+      };
+      console.log(asJson ? JSON.stringify(emptyPlan, null, 2) : formatStorageMigrationPlan(emptyPlan));
+      return 0;
+    }
+
+    const sqlite = new Database(dbPath, { readonly: true });
+    try {
+      const repoRoots =
+        storage.layout === "legacy" ? undefined : [...discoverRepoRoots(sqlite, undefined, storage), repoRoot];
+      const plan = planStorageMigration({ sqlite, storage }, repoRoots ? { repoRoots } : undefined);
+      console.log(asJson ? JSON.stringify(plan, null, 2) : formatStorageMigrationPlan(plan));
+      return 0;
+    } finally {
+      sqlite.close();
+    }
+  }
+
+  if (storage.layout === "legacy") {
+    const now = Date.now();
+    const skippedReport: StorageMigrationReport = {
+      layout: storage.layout,
+      skipped: true,
+      skipReason: "Storage layout is 'legacy'; nothing will move.",
+      startedAt: now,
+      finishedAt: now,
+      elapsedMs: 0,
+      budgetMs: DEFAULT_MIGRATION_BUDGET_MS,
+      budgetExceeded: false,
+      repos: [],
+      remainingUnits: [],
+      unknownEntries: [],
+      newUnknownEntries: [],
+      errors: [],
+      totals: {
+        reposScanned: 0,
+        migrated: 0,
+        merged: 0,
+        finished: 0,
+        rowsRewritten: 0,
+        bridgesCreated: 0,
+        bridgesRemoved: 0,
+        bridgesKept: 0,
+        deferred: 0,
+        remaining: 0,
+        unknownEntries: 0,
+        newUnknownEntries: 0,
+        errors: 0,
+      },
+    };
+    console.log(asJson ? JSON.stringify(skippedReport, null, 2) : formatStorageMigrationReport(skippedReport));
+    return 0;
+  }
+
+  const runningMessage =
+    `harnessd is running for ${config.stateDir}. ` +
+    `The running daemon migrates storage automatically at its next start; ` +
+    `restart it with \`pi-harness daemon restart\` (or stop it with \`pi-harness daemon stop\` first).`;
+  const unknownSocketMessage =
+    `Could not confirm whether harnessd is running on ${config.socketPath}. ` +
+    `Restart or stop the daemon (\`pi-harness daemon restart\`) before running \`pi-harness migrate-storage\`.`;
+
+  if (existsSync(config.socketPath)) {
+    const preState = await probeUnixSocketState(config.socketPath);
+    if (preState === "live") {
+      console.error(runningMessage);
+      return 1;
+    }
+    if (preState === "unknown") {
+      console.error(unknownSocketMessage);
+      return 1;
+    }
+  }
+
+  if (!existsSync(dbPath)) {
+    const now = Date.now();
+    const missingDbReport: StorageMigrationReport = {
+      layout: storage.layout,
+      skipped: true,
+      skipReason: `Database not found at ${dbPath}; nothing to migrate.`,
+      startedAt: now,
+      finishedAt: now,
+      elapsedMs: 0,
+      budgetMs: DEFAULT_MIGRATION_BUDGET_MS,
+      budgetExceeded: false,
+      repos: [],
+      remainingUnits: [],
+      unknownEntries: [],
+      newUnknownEntries: [],
+      errors: [],
+      totals: {
+        reposScanned: 0,
+        migrated: 0,
+        merged: 0,
+        finished: 0,
+        rowsRewritten: 0,
+        bridgesCreated: 0,
+        bridgesRemoved: 0,
+        bridgesKept: 0,
+        deferred: 0,
+        remaining: 0,
+        unknownEntries: 0,
+        newUnknownEntries: 0,
+        errors: 0,
+      },
+    };
+    console.log(asJson ? JSON.stringify(missingDbReport, null, 2) : formatStorageMigrationReport(missingDbReport));
+    return 0;
+  }
+
+  const startLock = await acquireStartLock(dirname(config.socketPath));
+  try {
+    if (existsSync(config.socketPath)) {
+      const sockState = await probeUnixSocketState(config.socketPath);
+      if (sockState === "live") {
+        console.error(runningMessage);
+        return 1;
+      }
+      if (sockState === "unknown") {
+        console.error(unknownSocketMessage);
+        return 1;
+      }
+    }
+
+    const sqlite = new Database(dbPath);
+    try {
+      sqlite.exec("PRAGMA busy_timeout = 5000;");
+      const repoRoots = [...discoverRepoRoots(sqlite, undefined, storage), repoRoot];
+      const report = runStorageMigrationPass({ sqlite, storage }, { repoRoots });
+      console.log(asJson ? JSON.stringify(report, null, 2) : formatStorageMigrationReport(report));
+      return report.errors.length > 0 ? 1 : 0;
+    } finally {
+      sqlite.close();
+    }
+  } finally {
+    startLock.release();
+  }
+}
+
 async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
   const { positional, flags } = parsed;
@@ -753,6 +1088,11 @@ async function main(): Promise<void> {
     repoRoot = realpathSync(rawRepoRoot);
   } catch {
     repoRoot = resolve(rawRepoRoot);
+  }
+  if (cmd === "migrate-storage") {
+    const code = await handleMigrateStorageCommand(positional, flags, repoRoot, rawRemote);
+    if (code !== 0) process.exit(code);
+    return;
   }
   const config = loadConfig(repoRoot, socketPathEnv ? { socketPath: resolve(socketPathEnv) } : undefined);
   const remoteSpec = resolveRemoteSpec(rawRemote, config.remotes);
