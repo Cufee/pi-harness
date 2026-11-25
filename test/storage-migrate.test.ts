@@ -992,8 +992,8 @@ describe("storage migration engine (core)", () => {
     }
   });
 
-  it("re-reads DB eligibility at the start of each unit rather than once per pass", () => {
-    const { repo, cpDb, storage } = createTestEnv("pi-mig-per-unit-db-");
+  it("reads tasks, runs, and goals once per pass into per-pass indexes for ownership decisions (F1)", () => {
+    const { repo, cpDb, storage } = createTestEnv("pi-mig-per-pass-db-");
     try {
       const r1 = cpDb.createRun({ goal: "Run 1", repoRoot: repo, baseBranch: "main", baseSha: "abc", chatSessionId: "chat-1" });
       const r2 = cpDb.createRun({ goal: "Run 2", repoRoot: repo, baseBranch: "main", baseSha: "abc", chatSessionId: "chat-1" });
@@ -1009,22 +1009,36 @@ describe("storage migration engine (core)", () => {
       writeFile(join(dir1, t1.id, "a.md"), "one");
       writeFile(join(dir2, t2.id, "b.md"), "two");
 
-      // While r1 is migrating, flip r2 back to active + t2 to running.
-      // Because eligibility is decided at the start of each unit, r2 must be deferred!
-      const report = runStorageMigrationPass({
-        sqlite: cpDb.db,
-        storage,
-        fault: (step, unit) => {
-          if (step === "after_rename_into_place" && unit.id === r1.id) {
-            cpDb.updateRunStatus(r2.id, "active");
-            cpDb.updateTask(t2.id, { status: "running" });
+      // Count SELECT scans of runs/tasks/goals during the pass: F1 requires reading each table once per pass.
+      let runsScans = 0;
+      let tasksScans = 0;
+      let goalsScans = 0;
+      const originalPrepare = cpDb.db.prepare.bind(cpDb.db);
+      const countedSqlite = new Proxy(cpDb.db, {
+        get(target, prop, receiver) {
+          if (prop === "prepare") {
+            return (sql: string) => {
+              if (sql.includes("FROM runs") && !sql.includes("LEFT JOIN runs")) runsScans++;
+              if (sql.includes("FROM tasks")) tasksScans++;
+              if (sql.includes("FROM goals")) goalsScans++;
+              return originalPrepare(sql);
+            };
           }
+          const value = Reflect.get(target, prop, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
         },
+      });
+
+      const report = runStorageMigrationPass({
+        sqlite: countedSqlite,
+        storage,
       });
       assert.equal(report.errors.length, 0);
       assert.equal(lstatSync(dir1).isSymbolicLink(), true, "r1 should have migrated");
-      assert.equal(lstatSync(dir2).isSymbolicLink(), false, "r2 became active before its turn and must be deferred");
-      assert.ok(report.repos[0]!.deferred.some((u) => u.id === r2.id));
+      assert.equal(lstatSync(dir2).isSymbolicLink(), true, "r2 should have migrated");
+      assert.equal(tasksScans, 1, `Expected tasks to be read once per pass, got ${tasksScans}`);
+      assert.ok(runsScans <= 2, `Expected runs to be indexed once (plus repo discovery), got ${runsScans}`);
+      assert.ok(goalsScans <= 2, `Expected goals to be indexed once (plus repo discovery), got ${goalsScans}`);
     } finally {
       cpDb.close();
     }

@@ -589,6 +589,286 @@ export function readTaskRow(sqlite: Database, taskId: string): TaskRowInfo | nul
 }
 
 /**
+ * Pass-level read-only index of `goals`, `runs`, `tasks`, and `chat_sessions`, loaded lazily once per table per pass.
+ * Avoids repeated per-unit and per-flat-file DB scans during discovery and ownership evaluation while failing closed on
+ * unexpected DB errors.
+ */
+export interface PassOwnershipIndex {
+  getGoal: (goalId: string) => GoalRowInfo | null;
+  getGoalsByLinkedRun: (runId: string) => GoalRowInfo[];
+  getRun: (runId: string) => RunRowInfo | null;
+  getTask: (taskId: string) => TaskRowInfo | null;
+  getLiveTasksForRun: (runId: string) => readonly TaskRowInfo[];
+  deriveRunChatSessionId: (runId: string) => string | null;
+}
+
+interface PassGoalsTableIndex {
+  byId: Map<string, GoalRowInfo>;
+  byLinkedRunId: Map<string, GoalRowInfo[]>;
+  error?: Error;
+}
+
+interface PassRunsTableIndex {
+  byId: Map<string, RunRowInfo>;
+  error?: Error;
+}
+
+interface PassTasksTableIndex {
+  byId: Map<string, TaskRowInfo>;
+  liveByRunId: Map<string, TaskRowInfo[]>;
+  error?: Error;
+}
+
+interface PassChatSessionsTableIndex {
+  ids: Set<string>;
+  error?: Error;
+}
+
+export function createPassOwnershipIndex(
+  sqlite: Database,
+  getHistoricalIndex: () => HistoricalRunGoalIndex,
+  checkBudget?: () => void,
+): PassOwnershipIndex {
+  let goalsCache: PassGoalsTableIndex | undefined;
+  let runsCache: PassRunsTableIndex | undefined;
+  let tasksCache: PassTasksTableIndex | undefined;
+  let chatSessionsCache: PassChatSessionsTableIndex | undefined;
+
+  const loadGoals = (): PassGoalsTableIndex => {
+    if (goalsCache) return goalsCache;
+    const byId = new Map<string, GoalRowInfo>();
+    const byLinkedRunId = new Map<string, GoalRowInfo[]>();
+    try {
+      const cols = getTableColumns(sqlite, "goals");
+      if (cols.has("id") && cols.has("status")) {
+        const selectLinked = cols.has("linked_run_id") ? "linked_run_id" : "NULL AS linked_run_id";
+        const selectChat = cols.has("chat_session_id") ? "chat_session_id" : "NULL AS chat_session_id";
+        const selectRepo = cols.has("repo_root") ? "repo_root" : "NULL AS repo_root";
+        const orderBy = cols.has("updated_at") ? "ORDER BY updated_at DESC, id ASC" : "ORDER BY id ASC";
+        const stmt = sqlite.prepare(
+          `SELECT id, status, ${selectLinked}, ${selectChat}, ${selectRepo} FROM goals ${orderBy}`,
+        );
+        let idx = 0;
+        for (const row of stmt.iterate() as Iterable<Record<string, unknown>>) {
+          if ((idx++ & 127) === 127) checkBudget?.();
+          const info: GoalRowInfo = {
+            id: String(row.id),
+            status: String(row.status),
+            linkedRunId: row.linked_run_id ? String(row.linked_run_id) : null,
+            chatSessionId: row.chat_session_id ? String(row.chat_session_id) : null,
+            repoRoot: row.repo_root ? String(row.repo_root) : null,
+          };
+          byId.set(info.id, info);
+          if (info.linkedRunId) {
+            let list = byLinkedRunId.get(info.linkedRunId);
+            if (!list) {
+              list = [];
+              byLinkedRunId.set(info.linkedRunId, list);
+            }
+            list.push(info);
+          }
+        }
+      }
+      goalsCache = { byId, byLinkedRunId };
+    } catch (err) {
+      if (err instanceof BudgetExceededError) throw err;
+      goalsCache = {
+        byId: new Map(),
+        byLinkedRunId: new Map(),
+        error: err instanceof Error ? err : new Error(String(err)),
+      };
+    }
+    return goalsCache;
+  };
+
+  const loadRuns = (): PassRunsTableIndex => {
+    if (runsCache) return runsCache;
+    const byId = new Map<string, RunRowInfo>();
+    try {
+      const cols = getTableColumns(sqlite, "runs");
+      if (cols.has("id") && cols.has("status")) {
+        const selectChat = cols.has("chat_session_id") ? "chat_session_id" : "NULL AS chat_session_id";
+        const selectRepo = cols.has("repo_root") ? "repo_root" : "NULL AS repo_root";
+        const stmt = sqlite.prepare(`SELECT id, status, ${selectChat}, ${selectRepo} FROM runs`);
+        let idx = 0;
+        for (const row of stmt.iterate() as Iterable<Record<string, unknown>>) {
+          if ((idx++ & 127) === 127) checkBudget?.();
+          const info: RunRowInfo = {
+            id: String(row.id),
+            status: String(row.status),
+            chatSessionId: row.chat_session_id ? String(row.chat_session_id) : null,
+            repoRoot: row.repo_root ? String(row.repo_root) : null,
+          };
+          byId.set(info.id, info);
+        }
+      }
+      runsCache = { byId };
+    } catch (err) {
+      if (err instanceof BudgetExceededError) throw err;
+      runsCache = {
+        byId: new Map(),
+        error: err instanceof Error ? err : new Error(String(err)),
+      };
+    }
+    return runsCache;
+  };
+
+  const loadTasks = (): PassTasksTableIndex => {
+    if (tasksCache) return tasksCache;
+    const byId = new Map<string, TaskRowInfo>();
+    const liveByRunId = new Map<string, TaskRowInfo[]>();
+    try {
+      const cols = getTableColumns(sqlite, "tasks");
+      if (cols.has("id") && cols.has("run_id") && cols.has("status")) {
+        const stmt = sqlite.prepare("SELECT id, run_id, status FROM tasks");
+        let idx = 0;
+        for (const row of stmt.iterate() as Iterable<{ id: string; run_id: string; status: string }>) {
+          if ((idx++ & 255) === 255) checkBudget?.();
+          const info: TaskRowInfo = {
+            id: String(row.id),
+            runId: String(row.run_id),
+            status: String(row.status),
+          };
+          byId.set(info.id, info);
+          if (!TERMINAL_TASK_STATUSES.has(info.status)) {
+            let list = liveByRunId.get(info.runId);
+            if (!list) {
+              list = [];
+              liveByRunId.set(info.runId, list);
+            }
+            list.push(info);
+          }
+        }
+        for (const list of liveByRunId.values()) {
+          if (list.length > 1) {
+            list.sort((a, b) => a.id.localeCompare(b.id));
+          }
+        }
+      }
+      tasksCache = { byId, liveByRunId };
+    } catch (err) {
+      if (err instanceof BudgetExceededError) throw err;
+      tasksCache = {
+        byId: new Map(),
+        liveByRunId: new Map(),
+        error: err instanceof Error ? err : new Error(String(err)),
+      };
+    }
+    return tasksCache;
+  };
+
+  const loadChatSessions = (): PassChatSessionsTableIndex => {
+    if (chatSessionsCache) return chatSessionsCache;
+    const ids = new Set<string>();
+    try {
+      const cols = getTableColumns(sqlite, "chat_sessions");
+      if (cols.has("id")) {
+        const stmt = sqlite.prepare("SELECT id FROM chat_sessions");
+        let idx = 0;
+        for (const row of stmt.iterate() as Iterable<{ id: unknown }>) {
+          if ((idx++ & 127) === 127) checkBudget?.();
+          if (row.id) ids.add(String(row.id));
+        }
+      }
+      chatSessionsCache = { ids };
+    } catch (err) {
+      if (err instanceof BudgetExceededError) throw err;
+      chatSessionsCache = {
+        ids: new Set(),
+        error: err instanceof Error ? err : new Error(String(err)),
+      };
+    }
+    return chatSessionsCache;
+  };
+
+  const getGoal = (goalId: string): GoalRowInfo | null => {
+    const idx = loadGoals();
+    if (idx.error) throw idx.error;
+    return idx.byId.get(goalId) ?? null;
+  };
+
+  const getGoalsByLinkedRun = (runId: string): GoalRowInfo[] => {
+    const gIdx = loadGoals();
+    if (gIdx.error) throw gIdx.error;
+    const direct = gIdx.byLinkedRunId.get(runId);
+    const out: GoalRowInfo[] = [];
+    const seenIds = new Set<string>();
+    if (direct) {
+      for (const g of direct) {
+        if (seenIds.has(g.id)) continue;
+        seenIds.add(g.id);
+        out.push(g);
+      }
+    }
+    if (!isDirectorTaskContainer(runId)) {
+      const hist = getHistoricalIndex();
+      if (hist.error) throw hist.error;
+      const histIds = hist.byRunId.get(runId);
+      if (histIds) {
+        for (const gid of histIds) {
+          if (seenIds.has(gid)) continue;
+          const g = gIdx.byId.get(gid);
+          if (g) {
+            seenIds.add(g.id);
+            out.push(g);
+          }
+        }
+      }
+    }
+    return out;
+  };
+
+  const getRun = (runId: string): RunRowInfo | null => {
+    const idx = loadRuns();
+    if (idx.error) throw idx.error;
+    return idx.byId.get(runId) ?? null;
+  };
+
+  const getTask = (taskId: string): TaskRowInfo | null => {
+    const idx = loadTasks();
+    if (idx.error) throw idx.error;
+    return idx.byId.get(taskId) ?? null;
+  };
+
+  const getLiveTasksForRun = (runId: string): readonly TaskRowInfo[] => {
+    const idx = loadTasks();
+    if (idx.error) throw idx.error;
+    return idx.liveByRunId.get(runId) ?? [];
+  };
+
+  const deriveRunChatSessionId = (runId: string): string | null => {
+    const run = getRun(runId);
+    if (run?.chatSessionId) return run.chatSessionId;
+
+    if (isDirectorTaskContainer(runId)) {
+      const owner = directorTaskRunOwner(runId);
+      if (owner) {
+        const chats = loadChatSessions();
+        if (chats.error) throw chats.error;
+        if (chats.ids.has(owner)) return owner;
+        const ownerGoal = getGoal(owner);
+        if (ownerGoal?.chatSessionId) return ownerGoal.chatSessionId;
+      }
+    }
+
+    const linkedGoals = getGoalsByLinkedRun(runId);
+    for (const goal of linkedGoals) {
+      if (goal.chatSessionId) return goal.chatSessionId;
+    }
+    return null;
+  };
+
+  return {
+    getGoal,
+    getGoalsByLinkedRun,
+    getRun,
+    getTask,
+    getLiveTasksForRun,
+    deriveRunChatSessionId,
+  };
+}
+
+/**
  * Pure read-only derivation of a run's owning chat session ID (never writes to SQLite).
  * Mirrors `ControlPlaneDb.getRunChatSessionId` using SELECTs only. Unexpected DB errors propagate.
  */
@@ -1227,7 +1507,9 @@ export function findAmbiguousRowIdsFromIndex(
   const out: string[] = [];
   const seenRowIds = new Set<string>();
   let idx = 0;
+  let memberIdx = 0;
   for (const m of members) {
+    if ((memberIdx++ & 127) === 127) checkBudget?.();
     const bucket = index.ambiguousByMemberKey.get(memberSpecBucketKey(m));
     if (!bucket) continue;
     for (const row of bucket) {
@@ -1260,7 +1542,9 @@ function matchingRowsFromIndex(
   const out: Array<{ row: ParsedLegacyArtifactRow; newPath: string }> = [];
   const seenRowIds = new Set<string>();
   let idx = 0;
+  let memberIdx = 0;
   for (const m of members) {
+    if ((memberIdx++ & 127) === 127) checkBudget?.();
     const bucket = index.legacyByMemberKey.get(memberSpecBucketKey(m));
     if (!bucket) continue;
     for (const row of bucket) {

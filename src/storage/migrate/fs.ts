@@ -214,6 +214,25 @@ export function fsyncDirChain(rootDir: string, leafDir: string): void {
 }
 
 /**
+ * Hard-links `srcPath` to `dstPath` without overwriting an existing destination and without unlinking `srcPath`.
+ * Callers on the same filesystem can then atomically replace `srcPath` with a prepared bridge symlink via `renameSync`,
+ * so `srcPath` never goes missing.
+ */
+export function linkFileNoOverwrite(srcPath: string, dstPath: string): "linked" | "exists" | "exdev" {
+  try {
+    linkSync(srcPath, dstPath);
+    return "linked";
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EEXIST") return "exists";
+    if (code === "EXDEV" || code === "EPERM" || code === "ENOTSUP" || code === "ENOSYS") {
+      return "exdev";
+    }
+    throw err;
+  }
+}
+
+/**
  * Moves a single regular file without overwriting an existing destination (`linkSync` then `unlinkSync`).
  * Returns `"moved"` on success, `"exists"` when `dstPath` already exists (`EEXIST`), or `"exdev"` when
  * cross-device / hard-links are unsupported and callers must use the staged copy path.
@@ -301,6 +320,7 @@ export interface RecordedBridgeEntry {
   legacyPath: string;
   target: string;
   createdAt: number;
+  kind?: StorageUnitKind;
 }
 
 export interface MigrationStateFile {
@@ -593,15 +613,90 @@ export function copyFileExclusive(srcPath: string, dstPath: string, mode?: numbe
   copyFileAndHashExclusive(srcPath, dstPath, mode, checkBudget);
 }
 
+export interface CollisionOwnerSpec {
+  kind: StorageUnitKind;
+  id: string;
+  taskId?: string;
+  destinationPath: string;
+}
+
+/**
+ * F4 (narrows D5): returns true when `entryPath` is, contains, or lies inside a unit directory
+ * of another unit (a run directory, a goal directory, or a bucket task directory).
+ * Preservation is allowed for the unit's own earlier copy and for plain note entries.
+ */
+export function isProtectedOtherUnitDirEntry(
+  projectDir: string,
+  entryPath: string,
+  st: Stats,
+  ownMember: CollisionOwnerSpec,
+): boolean {
+  if (!isWithin(projectDir, entryPath)) return true;
+  const rel = relative(projectDir, entryPath);
+  const segs = rel.split(sep).filter((s) => s.length > 0 && s !== ".");
+  if (segs.length === 0) return true;
+
+  if (segs[0] === "notes") return false;
+  if (segs[0] === "scratch") return st.isDirectory();
+  if (segs[0] !== "chats") return false;
+
+  // Container directories (`chats`, `chats/<chat>`, `chats/<chat>/{goals,artifacts,worktrees}`): never rename dirs.
+  if (segs.length <= 3) {
+    return st.isDirectory();
+  }
+
+  const area = segs[2]!;
+  if (area === "worktrees") return true;
+  if (area === "notes") return false;
+
+  if (area === "goals") {
+    const goalId = segs[3]!;
+    const isOwnGoal =
+      ownMember.kind === "goal" &&
+      ownMember.id === goalId &&
+      (entryPath === ownMember.destinationPath || isWithin(ownMember.destinationPath, entryPath));
+    if (isOwnGoal) return false;
+    return segs.length > 4 || st.isDirectory();
+  }
+
+  if (area === "artifacts") {
+    const first = segs[3]!;
+    if (isDirectorTaskContainer(first)) {
+      if (segs.length === 4) {
+        return st.isDirectory();
+      }
+      const taskId = segs[4]!;
+      const isOwnBucketTask =
+        ownMember.kind === "bucket_task" &&
+        ownMember.id === first &&
+        ownMember.taskId === taskId &&
+        (entryPath === ownMember.destinationPath || isWithin(ownMember.destinationPath, entryPath));
+      if (isOwnBucketTask) return false;
+      return segs.length > 5 || st.isDirectory();
+    }
+
+    const isOwnRun =
+      ownMember.kind === "run" &&
+      ownMember.id === first &&
+      (entryPath === ownMember.destinationPath || isWithin(ownMember.destinationPath, entryPath));
+    if (isOwnRun) return false;
+    return segs.length > 4 || st.isDirectory();
+  }
+
+  return false;
+}
+
 /**
  * Ensures parent directories of `targetPath` under `trustedRoot` exist segment-wise without following symlinks.
  * If a parent segment collides with an existing regular file (A5/D5), preserves that file under a `.pre-merge-<8hex>`
- * sibling via `preserveCollidingDestinationEntry`, creates the directory, and returns the preserved record(s).
+ * sibling via `preserveCollidingDestinationEntry` unless `canPreserve` rejects it (F4), creates the directory,
+ * and returns the preserved record(s).
  */
 export function ensureParentDirsUnderRoot(
   trustedRoot: string,
   targetPath: string,
   checkBudget?: () => void,
+  canPreserve?: (entryPath: string, st: Stats) => boolean,
 ): ShadowedFileRecord[] {
   const shadowed: ShadowedFileRecord[] = [];
   const parent = dirname(targetPath);
@@ -624,6 +719,9 @@ export function ensureParentDirsUnderRoot(
     } else if (st.isSymbolicLink()) {
       throw new Error(`Refusing to traverse symlink while creating destination: ${cur}`);
     } else if (st.isFile()) {
+      if (canPreserve && !canPreserve(cur, st)) {
+        throw new Error(`Refusing to relocate protected destination entry during collision: ${cur}`);
+      }
       const preservedPath = preserveCollidingDestinationEntry(cur, checkBudget);
       shadowed.push({ canonicalPath: cur, preservedPath });
       mkdirSync(cur);
@@ -1018,6 +1116,19 @@ export function verifyCopyMatches(
   }
 }
 
+/** True when `absPath` is a real regular file whose current `lstat` identity `(ino, size, mtimeNs)` equals `expected`. */
+function identityMatches(absPath: string, expected: FileIdentity): boolean {
+  const st = safeLstatBigInt(absPath);
+  if (!st) return false;
+  return (
+    !st.isSymbolicLink() &&
+    st.isFile() &&
+    st.ino.toString() === expected.ino &&
+    st.size.toString() === expected.size &&
+    st.mtimeNs.toString() === expected.mtimeNs
+  );
+}
+
 /** Unlinks `absPath` ONLY if its current `lstat` identity `(ino, size, mtimeNs)` equals `expected`. */
 function unlinkIfIdentityMatches(absPath: string, expected: FileIdentity): boolean {
   const st = safeLstatBigInt(absPath);
@@ -1241,22 +1352,38 @@ function preserveCollidingDestinationEntry(destEntry: string, checkBudget?: () =
 
 /**
  * Merges one real legacy file into `destFile`:
- * - missing at dest: copy without overwrite, verify, fsync parent, delete legacy only if identity unchanged
+ * - missing at dest: copy without overwrite, verify, fsync parent, finish legacy only if identity unchanged
  * - dest is a real dir (type collision): rename dest dir to `.pre-merge-<8hex>`, then install legacy file
- * - same hash: delete legacy only if identity unchanged
+ * - same hash: finish legacy only if identity unchanged
  * - different content: preserve dest as `<name>.pre-merge-<8hex>`, replace canonical name with legacy, fsync parent,
- *   verify, delete legacy only if identity unchanged
+ *   verify, finish legacy only if identity unchanged
+ * When `replaceLegacyWithBridge` is supplied (top-level single-file unit), the verified legacy file is atomically
+ * replaced by a prepared bridge symlink instead of unlinked, so the legacy pathname never goes missing.
  */
 function mergeSingleFile(
   legacyFile: string,
   destFile: string,
   checkBudget?: () => void,
+  replaceLegacyWithBridge?: () => void,
+  canPreserve?: (entryPath: string, st: Stats) => boolean,
 ): { shadowed: ShadowedFileRecord | null; unlinked: boolean } {
+  const finalizeLegacy = (identity: FileIdentity): boolean => {
+    if (replaceLegacyWithBridge) {
+      if (!identityMatches(legacyFile, identity)) return false;
+      replaceLegacyWithBridge();
+      return true;
+    }
+    return unlinkIfIdentityMatches(legacyFile, identity);
+  };
+
   const legacyHash = hashRegularFileWithIdentity(legacyFile, checkBudget);
   let destStat = safeLstat(destFile);
   let preservedCollision: ShadowedFileRecord | null = null;
 
   if (destStat !== null && !destStat.isSymbolicLink() && destStat.isDirectory()) {
+    if (canPreserve && !canPreserve(destFile, destStat)) {
+      throw new Error(`Destination collision: ${legacyFile} conflicts with another unit's directory at ${destFile}`);
+    }
     const preservedPath = preserveCollidingDestinationEntry(destFile, checkBudget);
     preservedCollision = { canonicalPath: destFile, preservedPath };
     destStat = safeLstat(destFile);
@@ -1274,7 +1401,7 @@ function mergeSingleFile(
       if (!placed) {
         // Concurrent creation at destFile; re-run conflict path.
         rmSync(temp, { force: true });
-        return mergeSingleFile(legacyFile, destFile, checkBudget);
+        return mergeSingleFile(legacyFile, destFile, checkBudget, replaceLegacyWithBridge, canPreserve);
       }
       fsyncDir(dirname(destFile));
     } finally {
@@ -1284,7 +1411,7 @@ function mergeSingleFile(
     if (verified.sha256 !== legacyHash.sha256 || verified.bytes !== legacyHash.bytes) {
       throw new Error(`Post-merge verification failed for ${destFile}`);
     }
-    const unlinked = unlinkIfIdentityMatches(legacyFile, legacyHash.identity);
+    const unlinked = finalizeLegacy(legacyHash.identity);
     return { shadowed: preservedCollision, unlinked };
   }
 
@@ -1296,7 +1423,7 @@ function mergeSingleFile(
   if (destHash.sha256 === legacyHash.sha256 && destHash.bytes === legacyHash.bytes) {
     fsyncFile(destFile);
     fsyncDir(dirname(destFile));
-    const unlinked = unlinkIfIdentityMatches(legacyFile, legacyHash.identity);
+    const unlinked = finalizeLegacy(legacyHash.identity);
     return { shadowed: null, unlinked };
   }
 
@@ -1318,20 +1445,36 @@ function mergeSingleFile(
   if (verifiedDest.sha256 !== legacyHash.sha256 || verifiedDest.bytes !== legacyHash.bytes) {
     throw new Error(`Post-conflict verification failed for ${destFile}`);
   }
-  const unlinked = unlinkIfIdentityMatches(legacyFile, legacyHash.identity);
+  const unlinked = finalizeLegacy(legacyHash.identity);
   return { shadowed: { canonicalPath: destFile, preservedPath }, unlinked };
+}
+
+export interface MergeBothExistOptions {
+  /**
+   * For a single-file unit (`!isDir`), atomically replaces the legacy file with its bridge symlink
+   * via rename of a prepared symlink instead of unlinking it first.
+   */
+  replaceSingleFileWithBridge?: () => void;
+  /**
+   * F4 guard: returns false when a colliding destination entry belongs to another unit's directory
+   * and must never be renamed by preservation.
+   */
+  canPreserve?: (entryPath: string, st: Stats) => boolean;
 }
 
 /**
  * Merges a real legacy path into an existing real destination path without losing any file.
  * Deletes legacy files only after their content is SHA-256 verified at the destination and their
  * `lstat` identity `(ino, size, mtimeNs)` is unchanged.
+ * Per F2, one unit's merge is one in-flight operation: `checkBudget` is checked only before the merge begins,
+ * never between children or before the legacy directory is removed and bridged.
  */
 export function mergeBothExist(
   legacyPath: string,
   destPath: string,
   isDir: boolean,
   checkBudget: () => void,
+  opts?: MergeBothExistOptions,
 ): MergeBothExistResult {
   checkBudget();
   const legStat = lstatSync(legacyPath);
@@ -1343,9 +1486,11 @@ export function mergeBothExist(
     if (!legStat.isFile() || (!dstStat.isFile() && !dstStat.isDirectory())) {
       throw new Error(`Type mismatch merging file unit ${legacyPath} -> ${destPath}`);
     }
-    checkBudget();
-    const res = mergeSingleFile(legacyPath, destPath, checkBudget);
-    const fullyMerged = res.unlinked && safeLstat(legacyPath) === null;
+    const res = mergeSingleFile(legacyPath, destPath, undefined, opts?.replaceSingleFileWithBridge, opts?.canPreserve);
+    const legAfter = safeLstat(legacyPath);
+    const fullyMerged = opts?.replaceSingleFileWithBridge
+      ? res.unlinked && Boolean(legAfter?.isSymbolicLink())
+      : res.unlinked && legAfter === null;
     return {
       shadowed: res.shadowed ? [res.shadowed] : [],
       fullyMerged,
@@ -1359,15 +1504,17 @@ export function mergeBothExist(
 
   const shadowed: ShadowedFileRecord[] = [];
   if (dstStat.isFile()) {
-    const preservedPath = preserveCollidingDestinationEntry(destPath, checkBudget);
+    if (opts?.canPreserve && !opts.canPreserve(destPath, dstStat)) {
+      throw new Error(`Destination collision: ${legacyPath} conflicts with protected entry at ${destPath}`);
+    }
+    const preservedPath = preserveCollidingDestinationEntry(destPath);
     shadowed.push({ canonicalPath: destPath, preservedPath });
     mkdirSync(destPath);
     fsyncDir(dirname(destPath));
   }
 
-  const walked = walkDirStrict(legacyPath, "", checkBudget);
+  const walked = walkDirStrict(legacyPath, "");
   for (const relDir of walked.dirs) {
-    checkBudget();
     const segs = relDir.split("/").filter((s) => s.length > 0);
     let cur = destPath;
     for (const seg of segs) {
@@ -1382,7 +1529,10 @@ export function mergeBothExist(
       } else if (st.isSymbolicLink()) {
         throw new Error(`Refusing to traverse symlink during merge: ${cur}`);
       } else if (st.isFile()) {
-        const preservedPath = preserveCollidingDestinationEntry(cur, checkBudget);
+        if (opts?.canPreserve && !opts.canPreserve(cur, st)) {
+          throw new Error(`Destination collision: ${legacyPath} conflicts with protected entry at ${cur}`);
+        }
+        const preservedPath = preserveCollidingDestinationEntry(cur);
         shadowed.push({ canonicalPath: cur, preservedPath });
         mkdirSync(cur);
         fsyncDir(dirname(cur));
@@ -1395,9 +1545,8 @@ export function mergeBothExist(
   let anyLeftover = false;
   const mergedRelPaths: string[] = [];
   for (const file of walked.files) {
-    checkBudget();
     const dstFile = join(destPath, ...file.relPath.split("/"));
-    const res = mergeSingleFile(file.absPath, dstFile, checkBudget);
+    const res = mergeSingleFile(file.absPath, dstFile, undefined, undefined, opts?.canPreserve);
     if (res.shadowed) shadowed.push(res.shadowed);
     if (res.unlinked) {
       mergedRelPaths.push(file.relPath);
@@ -1410,7 +1559,6 @@ export function mergeBothExist(
   // leave anything non-empty intact so the next pass merges new/modified entries.
   const dirsDeepestFirst = [...walked.dirs].sort((a, b) => b.split("/").length - a.split("/").length);
   for (let i = 0; i < dirsDeepestFirst.length; i++) {
-    if (i > 0) checkBudget();
     const dirAbs = join(legacyPath, ...dirsDeepestFirst[i]!.split("/"));
     try {
       rmdirSync(dirAbs);
@@ -1439,8 +1587,17 @@ export function mergeBothExist(
   return { shadowed, fullyMerged: !anyLeftover && safeLstat(legacyPath) === null, mergedRelPaths };
 }
 
-/** Creates a unit-level migration bridge symlink at `legacyPath` pointing to `destinationPath`. */
-export function createBridgeSymlink(legacyPath: string, destinationPath: string, canonRepo: string): void {
+/**
+ * Creates a unit-level migration bridge symlink at `legacyPath` pointing to `destinationPath`.
+ * When `opts.replaceFile` is true and `legacyPath` is an existing regular file, prepares a temporary
+ * symlink in the same directory and atomically swaps it over `legacyPath` via `renameSync`.
+ */
+export function createBridgeSymlink(
+  legacyPath: string,
+  destinationPath: string,
+  canonRepo: string,
+  opts?: { replaceFile?: boolean },
+): void {
   const existing = safeLstat(legacyPath);
   if (existing) {
     if (existing.isSymbolicLink()) {
@@ -1449,10 +1606,168 @@ export function createBridgeSymlink(legacyPath: string, destinationPath: string,
       if (resolvedTarget === destinationPath) return;
       throw new Error(`Existing symlink at ${legacyPath} points to ${resolvedTarget}, expected ${destinationPath}`);
     }
+    if (existing.isFile() && opts?.replaceFile) {
+      const tmpLink = join(dirname(legacyPath), `.${basename(legacyPath)}.bridge.${randomUUID()}.tmp`);
+      symlinkSync(destinationPath, tmpLink);
+      try {
+        renameSync(tmpLink, legacyPath);
+      } catch (err) {
+        rmSync(tmpLink, { force: true });
+        throw err;
+      }
+      return;
+    }
     throw new Error(`Refusing to replace existing non-symlink at ${legacyPath} with migration bridge`);
   }
   ensureParentDirsUnderRoot(canonRepo, legacyPath);
   symlinkSync(destinationPath, legacyPath);
+}
+
+export interface RepoBasePaths {
+  dataRoot: string;
+  projectKey: string;
+  projectDir: string;
+  notesDir: string;
+}
+
+/** Computes immutable data-dir base paths for `canonRepo` once per repo pass (avoids repeated realpathSync/sha256). */
+export function createRepoBasePaths(storage: StoragePaths, canonRepo: string): RepoBasePaths | null {
+  if (storage.layout !== "data-dir" || !storage.dataRoot) return null;
+  const projectKey = storage.projectKey(canonRepo);
+  const projectDir = join(storage.dataRoot, "projects", projectKey);
+  return {
+    dataRoot: storage.dataRoot,
+    projectKey,
+    projectDir,
+    notesDir: join(projectDir, "notes"),
+  };
+}
+
+export interface CachedUnitBaseDirs {
+  dataRoot: string;
+  projectKey: string;
+  projectDir: string;
+  notesDir: string;
+  ownerChat: string | null;
+  ownerSeg: string;
+  ownerGoalsDir: string;
+  ownerArtifactsDir: string;
+  legacyGoalsDir: string;
+  legacyArtifactsDir: string;
+  chatOrder?: readonly string[];
+  realNotesDir?: string | null;
+  realChatArtifactsDirs: Map<string, string | null>;
+  realChatGoalsDirs: Map<string, string | null>;
+}
+
+/** Precomputes per-(repo, ownerChat) destination base directories so multi-member units and discovery loops avoid repeated canonicalPath/sha256/readdir calls. */
+export function createCachedUnitBaseDirs(
+  storage: StoragePaths,
+  canonRepo: string,
+  ownerChat: string | null,
+  repoBase?: RepoBasePaths | null,
+): CachedUnitBaseDirs | null {
+  const base = repoBase ?? createRepoBasePaths(storage, canonRepo);
+  if (!base) return null;
+  const ownerSeg = storage.chatSegment(ownerChat);
+  const ownerChatDir = join(base.projectDir, "chats", ownerSeg);
+  const legacyChatDir = join(base.projectDir, "chats", "legacy");
+  return {
+    dataRoot: base.dataRoot,
+    projectKey: base.projectKey,
+    projectDir: base.projectDir,
+    notesDir: base.notesDir,
+    ownerChat,
+    ownerSeg,
+    ownerGoalsDir: join(ownerChatDir, "goals"),
+    ownerArtifactsDir: join(ownerChatDir, "artifacts"),
+    legacyGoalsDir: join(legacyChatDir, "goals"),
+    legacyArtifactsDir: join(legacyChatDir, "artifacts"),
+    realChatArtifactsDirs: new Map(),
+    realChatGoalsDirs: new Map(),
+  };
+}
+
+function getCachedChatOrder(cache: CachedUnitBaseDirs): readonly string[] {
+  if (!cache.chatOrder) {
+    cache.chatOrder = orderedProjectChatNames(cache.projectDir, cache.ownerSeg);
+  }
+  return cache.chatOrder;
+}
+
+function getRealNotesDir(cache: CachedUnitBaseDirs): string | null {
+  if (cache.realNotesDir === undefined) {
+    cache.realNotesDir = isRealDirUnderRoot(cache.dataRoot, ["projects", cache.projectKey, "notes"])
+      ? cache.notesDir
+      : null;
+  }
+  return cache.realNotesDir;
+}
+
+function isSinglePathSegment(seg: string): boolean {
+  return (
+    seg.length > 0 &&
+    seg !== "." &&
+    seg !== ".." &&
+    !seg.includes("/") &&
+    !seg.includes("\\") &&
+    !seg.includes("\0")
+  );
+}
+
+function getRealChatSubdir(cache: CachedUnitBaseDirs, chat: string, sub: "artifacts" | "goals"): string | null {
+  const map = sub === "artifacts" ? cache.realChatArtifactsDirs : cache.realChatGoalsDirs;
+  const hit = map.get(chat);
+  if (hit !== undefined) return hit;
+  const ok = isRealDirUnderRoot(cache.dataRoot, ["projects", cache.projectKey, "chats", chat, sub]);
+  const dir = ok ? join(cache.dataRoot, "projects", cache.projectKey, "chats", chat, sub) : null;
+  map.set(chat, dir);
+  return dir;
+}
+
+/** Fast equivalent of `unitDataDirDestination` using a per-(repo, ownerChat) `CachedUnitBaseDirs` when available. */
+export function cachedUnitDataDirDestination(
+  storage: StoragePaths,
+  canonRepo: string,
+  kind: StorageUnitKind,
+  id: string,
+  taskId: string | undefined,
+  chatSessionId: string | null,
+  cache?: CachedUnitBaseDirs | null,
+): string {
+  if (cache) {
+    if (kind === "note") {
+      if (isSinglePathSegment(id)) {
+        return join(cache.notesDir, id);
+      }
+      if (id && !id.includes("\0")) {
+        const parts = id.split("/");
+        if (parts.length > 0 && parts.every((s) => isSinglePathSegment(s))) {
+          return join(cache.notesDir, ...parts);
+        }
+      }
+    } else if (chatSessionId === cache.ownerChat || chatSessionId === null) {
+      const useOwner = chatSessionId === cache.ownerChat;
+      switch (kind) {
+        case "goal":
+          return join(useOwner ? cache.ownerGoalsDir : cache.legacyGoalsDir, id);
+        case "run":
+          return join(useOwner ? cache.ownerArtifactsDir : cache.legacyArtifactsDir, id);
+        case "bucket_task":
+          if (!taskId) throw new Error(`bucket_task unit requires taskId (run: ${id})`);
+          return join(useOwner ? cache.ownerArtifactsDir : cache.legacyArtifactsDir, id, taskId);
+        case "flat_artifact":
+          return join(useOwner ? cache.ownerArtifactsDir : cache.legacyArtifactsDir, id);
+      }
+    }
+  }
+  return unitDataDirDestination(storage, {
+    kind,
+    repoRoot: canonRepo,
+    id,
+    ...(taskId !== undefined ? { taskId } : {}),
+    chatSessionId,
+  });
 }
 
 /**
@@ -1468,36 +1783,23 @@ export function computeAllowedUnitDestinations(
   id: string,
   taskId: string | undefined,
   ownerChat: string | null,
+  cache?: CachedUnitBaseDirs | null,
 ): Set<string> {
   const allowed = new Set<string>();
   if (storage.layout !== "data-dir") return allowed;
   try {
-    allowed.add(
-      unitDataDirDestination(storage, {
-        kind,
-        repoRoot: canonRepo,
-        id,
-        ...(taskId !== undefined ? { taskId } : {}),
-        chatSessionId: ownerChat,
-      }),
-    );
+    allowed.add(cachedUnitDataDirDestination(storage, canonRepo, kind, id, taskId, ownerChat, cache));
   } catch {
     // Invalid unit id.
   }
-  try {
-    allowed.add(
-      unitDataDirDestination(storage, {
-        kind,
-        repoRoot: canonRepo,
-        id,
-        ...(taskId !== undefined ? { taskId } : {}),
-        chatSessionId: null,
-      }),
-    );
-  } catch {
-    // Invalid unit id.
+  if (kind !== "note") {
+    try {
+      allowed.add(cachedUnitDataDirDestination(storage, canonRepo, kind, id, taskId, null, cache));
+    } catch {
+      // Invalid unit id.
+    }
   }
-  const existing = findExistingDataDirUnit(storage, canonRepo, kind, id, taskId, ownerChat);
+  const existing = findExistingDataDirUnit(storage, canonRepo, kind, id, taskId, ownerChat, undefined, cache);
   if (existing) allowed.add(existing);
   return allowed;
 }
@@ -1512,6 +1814,7 @@ export function isValidBridgeTarget(
   legacyPath: string,
   bridgeTarget: string | null,
   unit: { kind: StorageUnitKind; id: string; taskId?: string; ownerChat: string | null },
+  cache?: CachedUnitBaseDirs | null,
 ): string | null {
   if (!bridgeTarget || storage.layout !== "data-dir") return null;
   const resolved = resolve(dirname(legacyPath), bridgeTarget);
@@ -1522,6 +1825,7 @@ export function isValidBridgeTarget(
     unit.id,
     unit.taskId,
     unit.ownerChat,
+    cache,
   );
   if (!allowed.has(resolved)) return null;
   // A6/D6: a bridge counts as migrated data only when its target physically exists with the expected type.
@@ -1540,36 +1844,79 @@ export function findExistingDataDirUnit(
   id: string,
   taskId: string | undefined,
   ownerChat: string | null,
+  cachedChatOrder?: readonly string[],
+  cache?: CachedUnitBaseDirs | null,
 ): string | null {
   if (storage.layout !== "data-dir" || !storage.dataRoot) return null;
-  const key = storage.projectKey(canonRepo);
-  const projectDir = storage.projectDir(canonRepo);
+  const key = cache?.projectKey ?? storage.projectKey(canonRepo);
 
   if (kind === "note") {
+    if (cache && isSinglePathSegment(id)) {
+      const notesDir = getRealNotesDir(cache);
+      if (!notesDir) return null;
+      const candidate = join(notesDir, id);
+      const st = safeLstat(candidate);
+      return st && !st.isSymbolicLink() && st.isFile() ? candidate : null;
+    }
     const parts = id.split("/").filter((s) => s.length > 0 && s !== ".");
     if (parts.length === 0 || parts.some((s) => s === "..")) return null;
+    if (cache) {
+      const notesDir = getRealNotesDir(cache);
+      if (!notesDir) return null;
+      if (isRealFileUnderRoot(notesDir, parts)) {
+        return join(notesDir, ...parts);
+      }
+      return null;
+    }
     if (isRealFileUnderRoot(storage.dataRoot, ["projects", key, "notes", ...parts])) {
       return join(storage.dataRoot, "projects", key, "notes", ...parts);
     }
     return null;
   }
 
-  const chatOrder = orderedProjectChatNames(projectDir, storage.chatSegment(ownerChat));
+  const chatOrder =
+    cachedChatOrder ??
+    (cache ? getCachedChatOrder(cache) : orderedProjectChatNames(storage.projectDir(canonRepo), storage.chatSegment(ownerChat)));
+  const safeId = isSinglePathSegment(id);
   for (const chat of chatOrder) {
     if (kind === "flat_artifact") {
-      if (isRealFileUnderRoot(storage.dataRoot, ["projects", key, "chats", chat, "artifacts", id])) {
+      if (cache && safeId) {
+        const dir = getRealChatSubdir(cache, chat, "artifacts");
+        if (!dir) continue;
+        const candidate = join(dir, id);
+        const st = safeLstat(candidate);
+        if (st && !st.isSymbolicLink() && st.isFile()) return candidate;
+      } else if (isRealFileUnderRoot(storage.dataRoot, ["projects", key, "chats", chat, "artifacts", id])) {
         return join(storage.dataRoot, "projects", key, "chats", chat, "artifacts", id);
       }
     } else if (kind === "goal") {
-      if (isRealDirUnderRoot(storage.dataRoot, ["projects", key, "chats", chat, "goals", id])) {
+      if (cache && safeId) {
+        const dir = getRealChatSubdir(cache, chat, "goals");
+        if (!dir) continue;
+        const candidate = join(dir, id);
+        const st = safeLstat(candidate);
+        if (st && !st.isSymbolicLink() && st.isDirectory()) return candidate;
+      } else if (isRealDirUnderRoot(storage.dataRoot, ["projects", key, "chats", chat, "goals", id])) {
         return join(storage.dataRoot, "projects", key, "chats", chat, "goals", id);
       }
     } else if (kind === "run") {
-      if (isRealDirUnderRoot(storage.dataRoot, ["projects", key, "chats", chat, "artifacts", id])) {
+      if (cache && safeId) {
+        const dir = getRealChatSubdir(cache, chat, "artifacts");
+        if (!dir) continue;
+        const candidate = join(dir, id);
+        const st = safeLstat(candidate);
+        if (st && !st.isSymbolicLink() && st.isDirectory()) return candidate;
+      } else if (isRealDirUnderRoot(storage.dataRoot, ["projects", key, "chats", chat, "artifacts", id])) {
         return join(storage.dataRoot, "projects", key, "chats", chat, "artifacts", id);
       }
     } else if (kind === "bucket_task" && taskId) {
-      if (isRealDirUnderRoot(storage.dataRoot, ["projects", key, "chats", chat, "artifacts", id, taskId])) {
+      if (cache && safeId && isSinglePathSegment(taskId)) {
+        const dir = getRealChatSubdir(cache, chat, "artifacts");
+        if (!dir) continue;
+        if (isRealDirUnderRoot(dir, [id, taskId])) {
+          return join(dir, id, taskId);
+        }
+      } else if (isRealDirUnderRoot(storage.dataRoot, ["projects", key, "chats", chat, "artifacts", id, taskId])) {
         return join(storage.dataRoot, "projects", key, "chats", chat, "artifacts", id, taskId);
       }
     }
@@ -1780,6 +2127,7 @@ export function readMigrationState(projectDir: string): MigrationStateFile {
               })),
           }))
       : [];
+    const VALID_BRIDGE_KINDS = new Set<StorageUnitKind>(["goal", "run", "bucket_task", "flat_artifact", "note"]);
     const bridges = Array.isArray(raw.bridges)
       ? raw.bridges
           .filter(
@@ -1795,6 +2143,9 @@ export function readMigrationState(projectDir: string): MigrationStateFile {
             legacyPath: b.legacyPath,
             target: b.target,
             createdAt: b.createdAt,
+            ...(typeof b.kind === "string" && VALID_BRIDGE_KINDS.has(b.kind as StorageUnitKind)
+              ? { kind: b.kind as StorageUnitKind }
+              : {}),
           }))
       : [];
     const budgetDeferredUnits = Array.isArray(raw.budgetDeferredUnits)
@@ -1948,13 +2299,6 @@ export function enumerateLegacyUnitsSafe(
 } {
   checkBudget?.();
   const hasExcluded = Boolean(excludedWorktreeRoots && excludedWorktreeRoots.length > 0);
-  if (!checkBudget && !hasExcluded) {
-    try {
-      return { units: storage.enumerateLegacyUnits(canonRepo), worktreeOverlaps: [], errors: [] };
-    } catch {
-      // Fall back to guarded per-subtree scanning so one unreadable dir never hides readable units.
-    }
-  }
 
   const units: DiscoveredLegacyUnit[] = [];
   const worktreeOverlaps: string[] = [];
@@ -2085,16 +2429,10 @@ export function enumerateLegacyUnitsSafe(
               destinationFor: makeDest("flat_artifact", entry.name),
             });
           } else if (isBridge) {
+            // F7: decide bridge kind from legacy unit kind (never from current target physical type).
             const bridgeTarget = readBridgeTargetSafe(entryPath);
-            let isDirTarget = false;
-            if (bridgeTarget) {
-              try {
-                isDirTarget = lstatSync(resolve(dirname(entryPath), bridgeTarget)).isDirectory();
-              } catch {
-                isDirTarget = !/\.[a-zA-Z0-9_-]{1,16}$/.test(entry.name);
-              }
-            }
-            const kind: StorageUnitKind = isDirTarget ? "run" : "flat_artifact";
+            const looksLikeRun = /^run-\d+$/.test(entry.name) || !/\.[a-zA-Z0-9_-]{1,16}$/.test(entry.name);
+            const kind: StorageUnitKind = looksLikeRun ? "run" : "flat_artifact";
             units.push({
               kind,
               repoRoot: canonRepo,
