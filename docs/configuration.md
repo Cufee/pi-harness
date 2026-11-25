@@ -60,6 +60,21 @@ Every other key can come from `.pi-harness.json`, including `profiles`, `externa
   - Remove a root when the work is done and confirm with `pi-harness daemon status`.
 - Manual worktrees: the harness runs `git worktree prune` when cleaning up its own worktrees, which drops metadata for any worktree whose directory is missing at that moment. Protect manual worktrees of the same repository that can be temporarily absent with `git worktree lock <path>`.
 
+### Adapter sandbox limits
+
+In `data-dir` layout, harness-managed tools (`inspect_command`, `artifact_read`, `read_file`, `write_note`) and ACP callbacks (`fs/*`, `session/request_permission`, and read-only shell validation) always enforce the task's granted roots and `deniedRoots` (state-dir internals, other chats, sibling worktrees, and scratch checkouts). Configured `worktree.extraReadRoots` and `worktree.extraWriteRoots` entries that resolve to or inside the state dir or data root are dropped in `data-dir` layout so they cannot bypass `deniedRoots`.
+
+Native adapter tools outside ACP callbacks depend on each adapter's own sandbox:
+
+| Adapter | Harness tools & ACP callbacks | Native file/edit tools | Native shell commands |
+| --- | --- | --- | --- |
+| `claude` (`claude-agent-acp`) | Enforced | Enforced: workspace scope admits only `cwd` and granted `additionalDirectories`; `read_only_workspace` disallows file-editing tools. | Read-only shell gated via `session/request_permission`; writable and `allowShellInReadOnly` sessions run shell in the agent CLI environment. |
+| `codex` (`codex-acp`) | Enforced | Enforced for writes: `read-only` mode blocks writes in strict read-only sessions; `workspace-write` mode keeps the OS `workspaceWrite` sandbox with harness-granted `writable_roots` (for writable workers and `allowShellInReadOnly` sessions). | OS `readOnly` / `workspaceWrite` sandbox restricts writes; OS-level reads outside granted roots follow the host OS sandbox. |
+| `gemini` (`gemini-cli`) | Enforced | Enforced: `WorkspaceContext` / `SandboxedFileSystemService` restricts reads and writes to `cwd` and `--include-directories`. | Follows Gemini CLI sandbox settings. |
+| `opencode` (`opencode acp`) | Enforced | Partially enforced when `OPENCODE_CONFIG_CONTENT` receives `deniedRoots` and `cwd` (`permission.external_directory`, `read`, and `edit` deny `deniedRoots` before allowing `cwd` and granted dirs, taking precedence over `/etc/opencode/opencode.json` `"**": "allow"`). | Unrestricted: OpenCode has no OS sandbox; shell commands (such as shell redirections) can bypass `external_directory` path rules. |
+| `antigravity` (`agy acp`) | Enforced | Not enforced: `agy acp` receives `--add-dir` / `additionalDirectories`, but its native `File` tool reads paths outside granted roots without sending `session/request_permission` even with `--sandbox` and `--dangerously-skip-permissions=false`. | `--sandbox` restricts terminal commands only; no directory-deny flag exists for native file tools. |
+| `amp-acp` | Enforced | Not enforced: `amp-acp` has no directory-root sandbox blocking reads or writes outside `cwd`, and never sends `session/request_permission`. `AMP_SETTINGS_FILE` disables write tools in read-only modes. | Unrestricted when shell is enabled; disabled in strict read-only and `control_plane_only` modes. |
+
 ## Reference
 
 ### Top level

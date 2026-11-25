@@ -215,6 +215,26 @@ export class StoragePaths {
     return this.pinnedDataRoot;
   }
 
+  /**
+   * True when a configured extra root (`worktree.extraReadRoots` / `extraWriteRoots`) is empty or,
+   * after `~` expansion and canonicalization, equals or lies inside the canonical state dir or data root.
+   * Ancestors of the state dir (such as `~`) return false so they stay allowed outside state-dir/data-dir,
+   * where the more specific denied root refuses state-dir internals and non-granted data-dir paths.
+   */
+  private isBlockedConfiguredRoot(raw: string): boolean {
+    const trimmed = raw.trim();
+    if (!trimmed) return true;
+    const canon = canonicalPath(expandHome(trimmed));
+    if (this.stateDirCanon && isEqualOrWithin(this.stateDirCanon, canon)) return true;
+    if (this.pinnedDataRoot && isEqualOrWithin(this.pinnedDataRoot, canon)) return true;
+    return false;
+  }
+
+  private filterConfiguredExtraRoots(roots: readonly string[] | undefined): string[] {
+    if (!roots?.length) return [];
+    return roots.filter((r) => !this.isBlockedConfiguredRoot(r));
+  }
+
   /** Finds an existing real directory under `<projectDir>/chats/<chat>/<subSegments>` in priority order. */
   private findExistingChatDir(repoRoot: string, ownerChat: string, subSegments: readonly string[]): { chat: string; path: string } | null {
     const dataRoot = this.requireDataRoot();
@@ -751,18 +771,19 @@ export class StoragePaths {
     if (runArtDir && existsSync(runArtDir) && !readRoots.some((r) => isEqualOrWithin(r, runArtDir))) {
       readRoots.push(runArtDir);
     }
-    readRoots.push(...(this.config.worktree?.extraReadRoots ?? []));
+    readRoots.push(...this.filterConfiguredExtraRoots(this.config.worktree?.extraReadRoots));
     const extraReadRoots = [...new Set(readRoots)];
 
+    const configuredWriteRoots = this.filterConfiguredExtraRoots(this.config.worktree?.extraWriteRoots);
     const extraWriteRoots = goal
       ? writable
-        ? [...new Set([...(goalEvDir ? [goalEvDir] : []), ...(this.config.worktree?.extraWriteRoots ?? [])])]
+        ? [...new Set([...(goalEvDir ? [goalEvDir] : []), ...configuredWriteRoots])]
         : undefined
       : [
           ...new Set([
             this.goalsDir(run),
             ...(hasLegacyGoals ? [legacyGoalsRoot] : []),
-            ...(this.config.worktree?.extraWriteRoots ?? []),
+            ...configuredWriteRoots,
           ]),
         ];
 
@@ -814,7 +835,7 @@ export class StoragePaths {
     if (isRealDirUnderRoot(root, [HARNESS_DIR, "notes"])) {
       allowed.push(join(root, HARNESS_DIR, "notes"));
     }
-    allowed.push(...resolvedExtraWriteRoots(this.config));
+    allowed.push(...resolvedExtraWriteRoots(this.config).filter((r) => !this.isBlockedConfiguredRoot(r)));
     return {
       root,
       allowedWriteRoots: [...new Set(allowed)],

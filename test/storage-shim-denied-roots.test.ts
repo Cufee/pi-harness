@@ -736,4 +736,91 @@ describe("ACP adapter directory wiring (prepareAcpSpawn and buildNewSessionParam
     });
     assert.equal(genericWithCapCtrl.params.additionalDirectories, undefined);
   });
+
+  it("wires OpenCode deniedRoots before cwd/granted allow rules for external_directory, read, and edit (esc-150)", () => {
+    const stateDir = "/tmp/pi-oc-state";
+    const worktree = `${stateDir}/data/projects/repo-123/chats/chat-1/worktrees/run-1/t-3`;
+    const evidence = `${stateDir}/data/projects/repo-123/chats/chat-1/goals/goal-1`;
+    const artifacts = `${stateDir}/data/projects/repo-123/chats/chat-1/artifacts/run-1`;
+
+    // Data-dir read_write_workspace: '**' precedes deny(stateDir), which precedes allow(worktree, grantedDirs);
+    // edit allows only worktree + writeDirectories, leaving read-only artifacts denied for edit.
+    const ocWrite = prepareAcpSpawn(opencodeProfile, {
+      systemPrompt: "Role",
+      toolPolicy: "read_write_workspace",
+      cwd: worktree,
+      readDirectories: [artifacts, evidence],
+      writeDirectories: [evidence],
+      deniedRoots: [stateDir],
+    });
+    const writeCfg = JSON.parse(ocWrite.env.OPENCODE_CONFIG_CONTENT!) as {
+      permission: {
+        external_directory: Record<string, string>;
+        read: Record<string, string>;
+        edit: Record<string, string>;
+      };
+    };
+    const extKeys = Object.keys(writeCfg.permission.external_directory);
+    assert.equal(extKeys[0], "**");
+    assert.equal(writeCfg.permission.external_directory["**"], "ask");
+    assert.equal(writeCfg.permission.external_directory[stateDir], "deny");
+    assert.equal(writeCfg.permission.external_directory[`${stateDir}/*`], "deny");
+    assert.equal(writeCfg.permission.external_directory[`${stateDir}/**`], "deny");
+    assert.equal(writeCfg.permission.external_directory[`${worktree}/*`], "allow");
+    assert.equal(writeCfg.permission.external_directory[`${evidence}/*`], "allow");
+    assert.equal(writeCfg.permission.external_directory[`${artifacts}/*`], "allow");
+    assert.ok(extKeys.indexOf("**") < extKeys.indexOf(`${stateDir}/*`));
+    assert.ok(extKeys.indexOf(`${stateDir}/**`) < extKeys.indexOf(worktree));
+    assert.ok(extKeys.indexOf(`${stateDir}/**`) < extKeys.indexOf(evidence));
+    assert.ok(extKeys.indexOf(`${stateDir}/**`) < extKeys.indexOf(artifacts));
+
+    const readKeys = Object.keys(writeCfg.permission.read);
+    assert.ok(readKeys.indexOf(`${stateDir}/**`) < readKeys.indexOf(worktree));
+    assert.ok(readKeys.indexOf(`${stateDir}/**`) < readKeys.indexOf(evidence));
+    assert.equal(writeCfg.permission.read[`${stateDir}/*`], "deny");
+    assert.equal(writeCfg.permission.read[`${worktree}/*`], "allow");
+
+    const editKeys = Object.keys(writeCfg.permission.edit);
+    assert.ok(editKeys.indexOf(`${stateDir}/**`) < editKeys.indexOf(worktree));
+    assert.ok(editKeys.indexOf(`${stateDir}/**`) < editKeys.indexOf(evidence));
+    assert.equal(writeCfg.permission.edit[`${stateDir}/*`], "deny");
+    assert.equal(writeCfg.permission.edit[`${worktree}/*`], "allow");
+    assert.equal(writeCfg.permission.edit[`${evidence}/*`], "allow");
+    assert.equal(writeCfg.permission.edit[artifacts], undefined);
+    ocWrite.cleanup();
+
+    // Data-dir read_only_workspace: edit is denied outright, while external_directory + read allow worktree and granted dirs.
+    const ocRo = prepareAcpSpawn(opencodeProfile, {
+      systemPrompt: "Role",
+      toolPolicy: "read_only_workspace",
+      cwd: worktree,
+      readDirectories: [evidence],
+      deniedRoots: [stateDir],
+    });
+    const roCfg = JSON.parse(ocRo.env.OPENCODE_CONFIG_CONTENT!) as {
+      permission: {
+        external_directory: Record<string, string>;
+        read: Record<string, string>;
+        edit: unknown;
+      };
+    };
+    assert.equal(roCfg.permission.edit, "deny");
+    assert.equal(roCfg.permission.external_directory[`${stateDir}/*`], "deny");
+    assert.equal(roCfg.permission.external_directory[`${worktree}/*`], "allow");
+    assert.equal(roCfg.permission.external_directory[`${evidence}/*`], "allow");
+    ocRo.cleanup();
+
+    // Legacy layout (no deniedRoots): leaves read/edit untouched and emits only external_directory allow entries.
+    const ocLegacy = prepareAcpSpawn(opencodeProfile, {
+      systemPrompt: "Role",
+      toolPolicy: "read_only_workspace",
+      cwd: worktree,
+      readDirectories: [evidence],
+    });
+    const legacyCfg = JSON.parse(ocLegacy.env.OPENCODE_CONFIG_CONTENT!) as {
+      permission: Record<string, unknown>;
+    };
+    assert.deepEqual(Object.keys(legacyCfg.permission), ["external_directory"]);
+    ocLegacy.cleanup();
+  });
 });

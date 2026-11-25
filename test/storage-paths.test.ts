@@ -502,4 +502,71 @@ describe("src/storage/paths (legacy layout)", () => {
       "Dossier must be a non-symlink path under .harness/artifacts: /repo/.harness/artifacts/x.",
     );
   });
+
+  it("data-dir directorNoteRoots and taskGrants drop configured extra roots at or inside stateDir or external dataRoot (esc-148)", () => {
+    const base = makeTempDir("pi-harness-paths-esc148-");
+    const repo = join(base, "repo");
+    const stateDir = join(base, "state");
+    const externalDataRoot = join(base, "ext-data");
+    const externalOk = join(base, "ok-notes");
+    const linkToState = join(base, "state-link");
+    mkdirSync(repo, { recursive: true });
+    mkdirSync(stateDir, { recursive: true });
+    mkdirSync(externalDataRoot, { recursive: true });
+    mkdirSync(externalOk, { recursive: true });
+    symlinkSync(stateDir, linkToState);
+
+    const probeSp = storagePaths({ stateDir, storage: { dataDir: externalDataRoot } }, { layout: "data-dir" });
+    const chatBGoals = probeSp.goalsDir({ repoRoot: repo, chatSessionId: "chat-b" });
+    const chatBWorktree = probeSp.worktreePath({ repoRoot: repo, id: "run-1", chatSessionId: "chat-b" }, "t-2");
+    const scratch = probeSp.scratchPath(repo, "_verify", "v1");
+
+    const cfg = {
+      stateDir,
+      storage: { dataDir: externalDataRoot },
+      worktree: {
+        extraReadRoots: [stateDir, externalDataRoot, chatBGoals, linkToState, base, externalOk],
+        extraWriteRoots: [stateDir, externalDataRoot, chatBGoals, chatBWorktree, scratch, linkToState, base, externalOk],
+      },
+    };
+    const sp = storagePaths(cfg, { layout: "data-dir" });
+    const owner = { repoRoot: repo, chatSessionId: "chat-a" };
+
+    const noteRoots = sp.directorNoteRoots(owner);
+    assert.deepEqual(noteRoots.allowedWriteRoots, [
+      sp.goalsDir(owner),
+      sp.notesDir(owner),
+      sp.projectNotesDir(repo),
+      base,
+      externalOk,
+    ]);
+
+    // directorReadPolicy still refuses state-dir internals, dataRoot, project.json, worktrees, and scratch.
+    assert.equal(sp.directorReadPolicy(repo, join(stateDir, "config.json")).ok, false);
+    assert.equal(sp.directorReadPolicy(repo, externalDataRoot).ok, false);
+    assert.equal(sp.directorReadPolicy(repo, join(sp.projectDir(repo), "project.json")).ok, false);
+    assert.equal(sp.directorReadPolicy(repo, chatBWorktree).ok, false);
+    assert.equal(sp.directorReadPolicy(repo, scratch).ok, false);
+
+    // taskGrants also drops roots at/inside stateDir or externalDataRoot, while keeping ancestor (`base`) and external (`externalOk`).
+    const grants = sp.taskGrants({
+      run: { repoRoot: repo, id: "run-1", chatSessionId: "chat-a" },
+      goal: { repoRoot: repo, id: "goal-1", chatSessionId: "chat-a" },
+      writable: true,
+    });
+    for (const blocked of [stateDir, externalDataRoot, chatBGoals, chatBWorktree, scratch, linkToState]) {
+      assert.equal(grants.extraReadRoots.includes(blocked), false, `extraReadRoots must drop ${blocked}`);
+      assert.equal(grants.extraWriteRoots?.includes(blocked), false, `extraWriteRoots must drop ${blocked}`);
+    }
+    assert.equal(grants.extraReadRoots.includes(base), true);
+    assert.equal(grants.extraReadRoots.includes(externalOk), true);
+    assert.equal(grants.extraWriteRoots?.includes(base), true);
+    assert.equal(grants.extraWriteRoots?.includes(externalOk), true);
+
+    // Legacy layout keeps configured roots unchanged.
+    const legacySp = storagePaths(cfg, { layout: "legacy" });
+    const legacyNoteRoots = legacySp.directorNoteRoots(owner);
+    assert.equal(legacyNoteRoots.allowedWriteRoots.includes(stateDir), true);
+    assert.equal(legacyNoteRoots.allowedWriteRoots.includes(externalDataRoot), true);
+  });
 });

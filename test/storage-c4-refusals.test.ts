@@ -691,80 +691,109 @@ describe("goal criterion c4: data-dir taskGrants refusal matrix across inspect_c
     }
   });
 
-  // Known src/ defect (esc-148): StoragePaths.taskGrants appends config.worktree.extraReadRoots verbatim,
-  // causing extraReadRoots=[stateDir] to tie with deniedRoots=[stateDir] in mostSpecificRootDecision (allowed wins ties).
-  // Flip it.failing -> it once StoragePaths.taskGrants filters stateDir/dataRoot out of configured extra roots.
-  it.failing("refuses all denied rows even when config worktree.extraReadRoots = [stateDir] (defect esc-148)", async () => {
+  it("refuses all denied rows even when config worktree.extraReadRoots or extraWriteRoots targets stateDir, dataRoot, or chat B (esc-148)", async () => {
     const fx = await createMatrixFixture([]);
-    const configWithStateRead: HarnessConfig = {
-      ...fx.config,
-      worktree: {
-        ...fx.config.worktree,
-        extraReadRoots: [fx.stateDir],
-        extraWriteRoots: [],
-      },
-    };
-    const sp = storagePaths(configWithStateRead, { layout: "data-dir" });
-    const runRecord = fx.db.getRun(fx.runAId)!;
-    const goals = new GoalEngine(fx.db.db, undefined, undefined, undefined, undefined, sp);
-    const goal = goals.listGoals()[0]!;
-    const grants = sp.taskGrants({
-      run: { repoRoot: fx.repoA, id: runRecord.id, chatSessionId: runRecord.chatSessionId },
-      goal: { repoRoot: fx.repoA, id: goal.id, chatSessionId: goal.chatSessionId },
-      writable: true,
-      workspace: fx.ownWtPath,
-    });
-    const execWithStateRead = new ControlPlaneToolExecutor(
-      fx.db,
-      () => {
-        throw new Error("unused");
-      },
-      {
-        spawnAndStartTask: async () => {
-          throw new Error("unused");
-        },
-        waitForChildren: async () => ({ children: [], wakeReason: "already_settled", inactiveTaskIds: [] }),
-        steerTask: async () => false,
-        cancelTask: async () => {},
-        scheduleRollover: async () => {},
-        getWorktreeManager: () => fx.wtMgr,
-        getMergeQueue: () => {
-          throw new Error("unused");
-        },
-        getTaskSignal: () => undefined,
-      },
-      configWithStateRead,
-    );
-
-    const refusalRows = fx.rows.filter((r) => r.expectRead === "deny");
     try {
-      const readRoots = [fx.ownWtPath, ...grants.extraReadRoots, ...(grants.extraWriteRoots ?? [])];
-      const scope: ReadOnlyShellScope = {
-        cwd: fx.ownWtPath,
-        readRoots,
-        deniedRoots: grants.deniedRoots,
-        protectedRoots: readRoots,
-      };
-      const acpRes = await runAcpMatrix(fx, grants, "read_write_workspace", refusalRows);
+      const dataRoot = join(fx.stateDir, "data");
+      const chatBDir = dirname(fx.rows.find((r) => r.id === "chat-b-goals-dir")!.target);
+      const runRecord = fx.db.getRun(fx.runAId)!;
+      const baseSp = storagePaths(fx.config, { layout: "data-dir" });
+      const goals = new GoalEngine(fx.db.db, undefined, undefined, undefined, undefined, baseSp);
+      const goal = goals.listGoals()[0]!;
+      const refusalReadRows = fx.rows.filter((r) => r.expectRead === "deny");
+      const refusalWriteRows = fx.rows.filter((r) => r.expectWrite === "deny");
 
-      const failures: string[] = [];
-      for (const row of refusalRows) {
-        const argv = row.isDir ? ["ls", row.target] : ["cat", row.target];
-        const shimVerdict = checkReadOnlyArgv(argv, scope);
-        if (shimVerdict.ok) failures.push(`checkReadOnlyArgv allowed ${row.id}`);
+      const cases: Array<{ label: string; extraReadRoots: string[]; extraWriteRoots: string[] }> = [
+        { label: "extraReadRoots=[stateDir]", extraReadRoots: [fx.stateDir], extraWriteRoots: [] },
+        { label: "extraReadRoots=[dataRoot]", extraReadRoots: [dataRoot], extraWriteRoots: [] },
+        { label: "extraReadRoots=[chatBDir]", extraReadRoots: [chatBDir], extraWriteRoots: [] },
+        { label: "extraWriteRoots=[stateDir]", extraReadRoots: [], extraWriteRoots: [fx.stateDir] },
+        { label: "extraWriteRoots=[dataRoot]", extraReadRoots: [], extraWriteRoots: [dataRoot] },
+        { label: "extraWriteRoots=[chatBDir]", extraReadRoots: [], extraWriteRoots: [chatBDir] },
+      ];
 
-        try {
-          await execWithStateRead.execute(fx.runAId, fx.readerTaskId, "inspect_command", { argv });
-          failures.push(`inspect_command allowed ${row.id}`);
-        } catch {
-          // expected refusal
+      for (const c of cases) {
+        const cfg: HarnessConfig = {
+          ...fx.config,
+          worktree: {
+            ...fx.config.worktree,
+            extraReadRoots: c.extraReadRoots,
+            extraWriteRoots: c.extraWriteRoots,
+          },
+        };
+        const sp = storagePaths(cfg, { layout: "data-dir" });
+        const grants = sp.taskGrants({
+          run: { repoRoot: fx.repoA, id: runRecord.id, chatSessionId: runRecord.chatSessionId },
+          goal: { repoRoot: fx.repoA, id: goal.id, chatSessionId: goal.chatSessionId },
+          writable: true,
+          workspace: fx.ownWtPath,
+        });
+        const execWithCfg = new ControlPlaneToolExecutor(
+          fx.db,
+          () => {
+            throw new Error("unused");
+          },
+          {
+            spawnAndStartTask: async () => {
+              throw new Error("unused");
+            },
+            waitForChildren: async () => ({ children: [], wakeReason: "already_settled", inactiveTaskIds: [] }),
+            steerTask: async () => false,
+            cancelTask: async () => {},
+            scheduleRollover: async () => {},
+            getWorktreeManager: () => fx.wtMgr,
+            getMergeQueue: () => {
+              throw new Error("unused");
+            },
+            getTaskSignal: () => undefined,
+          },
+          cfg,
+        );
+
+        const readRoots = [fx.ownWtPath, ...grants.extraReadRoots, ...(grants.extraWriteRoots ?? [])];
+        const scope: ReadOnlyShellScope = {
+          cwd: fx.ownWtPath,
+          readRoots,
+          deniedRoots: grants.deniedRoots,
+          protectedRoots: readRoots,
+        };
+        const acpRes = await runAcpMatrix(fx, grants, "read_write_workspace", refusalWriteRows);
+
+        for (const row of refusalReadRows) {
+          const argv = row.isDir ? ["ls", row.target] : ["cat", row.target];
+          const shimVerdict = checkReadOnlyArgv(argv, scope);
+          assert.equal(shimVerdict.ok, false, `${c.label}: checkReadOnlyArgv must refuse ${row.id}`);
+          assert.equal(shimVerdict.reason, DENIED_HARNESS_STATE_REASON);
+
+          await assert.rejects(
+            () => execWithCfg.execute(fx.runAId, fx.readerTaskId, "inspect_command", { argv }),
+            (err: Error) => {
+              assert.match(err.message, /read-only-argv/, `${c.label}: inspect_command refusal for ${row.id}`);
+              assert.ok(
+                err.message.includes(DENIED_HARNESS_STATE_REASON),
+                `${c.label}: inspect_command refusal for ${row.id} must name harness state, got: ${err.message}`,
+              );
+              return true;
+            },
+          );
+
+          const acpRow = acpRes.get(row.id)!;
+          assert.equal(acpRow.readOk, false, `${c.label}: AcpRunner read must refuse ${row.id}`);
+          assert.ok(acpRow.readErr?.includes(DENIED_HARNESS_STATE_REASON));
         }
 
-        const acpRow = acpRes.get(row.id)!;
-        if (acpRow.readOk) failures.push(`AcpRunner read allowed ${row.id}`);
-        if (acpRow.writeOk) failures.push(`AcpRunner write allowed ${row.id}`);
+        for (const row of refusalWriteRows) {
+          const acpRow = acpRes.get(row.id)!;
+          assert.equal(acpRow.writeOk, false, `${c.label}: AcpRunner write must refuse ${row.id}`);
+          assert.ok(
+            acpRow.writeErr?.includes(DENIED_HARNESS_STATE_REASON),
+            `${c.label}: AcpRunner write refusal for ${row.id} must name harness state, got: ${acpRow.writeErr}`,
+          );
+          if (row.writeTarget && row.writeTarget !== row.target) {
+            assert.equal(existsSync(row.writeTarget), false, `${c.label}: no file should be created for ${row.id}`);
+          }
+        }
       }
-      assert.deepEqual(failures, [], `extraReadRoots=[stateDir] bypassed refusals:\n${failures.join("\n")}`);
     } finally {
       fx.db.close();
     }

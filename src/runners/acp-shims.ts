@@ -1212,6 +1212,21 @@ function collectFlagValues(args: readonly string[], flag: string): Set<string> {
   return values;
 }
 
+function normalizeOpenCodePatternRoot(dirPath: string): string {
+  const normalized = dirPath.replace(/\/+$/, "");
+  return normalized || "/";
+}
+
+function setOpenCodeDirRules(target: Record<string, unknown>, dirPath: string, action: "allow" | "deny"): void {
+  const root = normalizeOpenCodePatternRoot(dirPath);
+  const patterns = root === "/" ? ["/", "/*", "/**"] : [root, `${root}/*`, `${root}/**`];
+  for (const pattern of patterns) {
+    // Delete first so JS object insertion order places this rule at the end (OpenCode evaluates last match wins).
+    delete target[pattern];
+    target[pattern] = action;
+  }
+}
+
 export function prepareAcpSpawn(
   profile: AcpProfileConfig,
   opts: {
@@ -1219,10 +1234,14 @@ export function prepareAcpSpawn(
     toolPolicy: ToolPolicy;
     allowShellInReadOnly?: boolean;
     tier?: AgentTier;
+    /** Resolved absolute workspace directory for the session. */
+    cwd?: string;
     /** Resolved absolute extra directories outside the workspace the agent may read. */
     readDirectories?: string[];
     /** Resolved absolute extra directories outside the workspace the agent may write (only applied in read_write_workspace). */
     writeDirectories?: string[];
+    /** Resolved absolute directories whose contents must be denied unless explicitly granted (data-dir layout). */
+    deniedRoots?: string[];
   },
 ): PreparedAcpSpawn {
   if (profile.enabled === false) throw new Error(`Runner profile "${profile.id}" is disabled.`);
@@ -1244,6 +1263,11 @@ export function prepareAcpSpawn(
   const grantedDirs =
     opts.toolPolicy !== "control_plane_only"
       ? normalizeDirectoryList(opts.readDirectories, writeDirs)
+      : [];
+  const deniedDirs = normalizeDirectoryList(opts.deniedRoots);
+  const workspaceDirs =
+    opts.toolPolicy !== "control_plane_only" && opts.cwd?.trim()
+      ? normalizeDirectoryList([opts.cwd])
       : [];
 
   if (profile.adapter === "claude") {
@@ -1391,7 +1415,7 @@ export function prepareAcpSpawn(
                 };
       writeFileSync(settingsPath, JSON.stringify(ampSettings, null, 2), "utf8");
       env.AMP_SETTINGS_FILE = settingsPath;
-    } else if (isOpenCodeAcpProfile(profile) && grantedDirs.length > 0) {
+    } else if (isOpenCodeAcpProfile(profile) && (grantedDirs.length > 0 || deniedDirs.length > 0)) {
       let existingOpenCodeCfg: Record<string, unknown> = {};
       if (env.OPENCODE_CONFIG_CONTENT) {
         try {
@@ -1416,18 +1440,79 @@ export function prepareAcpSpawn(
           : typeof existingExternal === "string"
             ? { "*": existingExternal }
             : {};
-      for (const dirPath of grantedDirs) {
-        const normalized = dirPath.replace(/\/+$/, "");
-        mergedExternal[normalized || "/"] = "allow";
-        mergedExternal[normalized ? `${normalized}/**` : "/**"] = "allow";
+
+      if (deniedDirs.length === 0) {
+        for (const dirPath of grantedDirs) {
+          const normalized = normalizeOpenCodePatternRoot(dirPath);
+          mergedExternal[normalized] = "allow";
+          mergedExternal[normalized === "/" ? "/**" : `${normalized}/**`] = "allow";
+        }
+        env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
+          ...existingOpenCodeCfg,
+          permission: {
+            ...existingPermission,
+            external_directory: mergedExternal,
+          },
+        });
+      } else {
+        // OpenCode merges managed config (/etc/opencode/opencode.json) over OPENCODE_CONFIG_CONTENT
+        // via in-place key updates and evaluates permission rules last-match-wins. Placing `"**"` first
+        // keeps any managed `"**": "allow"` rule ahead of our deny/allow rules so our rules win.
+        const orderedExternal: Record<string, unknown> = {
+          "**": typeof mergedExternal["**"] === "string" ? mergedExternal["**"] : "ask",
+          ...mergedExternal,
+        };
+        for (const dirPath of deniedDirs) {
+          setOpenCodeDirRules(orderedExternal, dirPath, "deny");
+        }
+        for (const dirPath of normalizeDirectoryList(workspaceDirs, grantedDirs)) {
+          setOpenCodeDirRules(orderedExternal, dirPath, "allow");
+        }
+
+        const existingRead = existingPermission.read;
+        const mergedRead: Record<string, unknown> =
+          existingRead && typeof existingRead === "object" && !Array.isArray(existingRead)
+            ? { ...(existingRead as Record<string, unknown>) }
+            : typeof existingRead === "string"
+              ? { "*": existingRead }
+              : { "*": "allow" };
+        for (const dirPath of deniedDirs) {
+          setOpenCodeDirRules(mergedRead, dirPath, "deny");
+        }
+        for (const dirPath of normalizeDirectoryList(workspaceDirs, grantedDirs)) {
+          setOpenCodeDirRules(mergedRead, dirPath, "allow");
+        }
+
+        let nextEdit: unknown;
+        if (opts.toolPolicy !== "read_write_workspace") {
+          nextEdit = "deny";
+        } else {
+          const existingEdit = existingPermission.edit;
+          const mergedEdit: Record<string, unknown> =
+            existingEdit && typeof existingEdit === "object" && !Array.isArray(existingEdit)
+              ? { ...(existingEdit as Record<string, unknown>) }
+              : typeof existingEdit === "string"
+                ? { "*": existingEdit }
+                : { "*": "allow" };
+          for (const dirPath of deniedDirs) {
+            setOpenCodeDirRules(mergedEdit, dirPath, "deny");
+          }
+          for (const dirPath of normalizeDirectoryList(workspaceDirs, writeDirs)) {
+            setOpenCodeDirRules(mergedEdit, dirPath, "allow");
+          }
+          nextEdit = mergedEdit;
+        }
+
+        env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
+          ...existingOpenCodeCfg,
+          permission: {
+            ...existingPermission,
+            external_directory: orderedExternal,
+            read: mergedRead,
+            edit: nextEdit,
+          },
+        });
       }
-      env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
-        ...existingOpenCodeCfg,
-        permission: {
-          ...existingPermission,
-          external_directory: mergedExternal,
-        },
-      });
     } else if (isAntigravityAcpProfile(profile) && grantedDirs.length > 0) {
       const existingAdded = collectFlagValues(args, "--add-dir");
       for (const dirPath of grantedDirs) {
@@ -1687,7 +1772,7 @@ export function buildPostSessionActions(
   adapter: AcpAdapterKind,
   sessionId: string,
   newSessionResponse: AcpModelState,
-  opts: { toolPolicy: ToolPolicy; model: string; effort?: string | null },
+  opts: { toolPolicy: ToolPolicy; model: string; effort?: string | null; allowShellInReadOnly?: boolean },
   modelConfigIds = new Set(["model"]),
 ): PostSessionAction[] {
   const actions: PostSessionAction[] = [];
@@ -1745,17 +1830,27 @@ export function buildPostSessionActions(
     }
   }
 
-  // Unattended approval / yolo mode for writable workers (`read_write_workspace`):
-  // if the ACP adapter advertises a `mode` option with a yolo/bypass value (Claude, Gemini, Antigravity, Codex),
-  // switch into it automatically so unattended runs never stall waiting on manual permission prompts.
+  // Unattended approval / sandbox mode selection:
+  // - Writable workers (`read_write_workspace`): switch into an advertised unattended mode so runs
+  //   never stall waiting on manual prompts. For Codex, prefer `workspace-write` over full-access so
+  //   codex-acp keeps the workspaceWrite OS sandbox (with harness-granted writable_roots) and uses
+  //   `approvals_reviewer: "user"` (accepted by managed configs that forbid `auto_review`), while
+  //   still matching older `full-access`/`full_access` and fallback `agent-full-access` when needed.
+  // - Codex `read_only_workspace` with shell enabled (Done-Reviewer / verify): `prepareAcpSpawn`
+  //   intentionally leaves `INITIAL_AGENT_MODE` unset, so codex-acp v2.11+ starts in default `"agent"`
+  //   (`approvals_reviewer: "auto_review"`). Switch `"agent"` -> `"workspace-write"` (same workspaceWrite
+  //   sandbox, `approvals_reviewer: "user"`) when advertised.
+  const modeOpt = configOptions.find((c) => c.category === "mode" || c.id === "mode");
+  const modeValues = selectValues(modeOpt);
   if (opts.toolPolicy === "read_write_workspace") {
-    const YOLO_PRIORITY = ["bypasspermissions", "yolo", "full-access", "full_access", "dontask", "auto"];
-    const modeOpt = configOptions.find((c) => c.category === "mode" || c.id === "mode");
-    const modeValues = selectValues(modeOpt);
+    const modePriority =
+      adapter === "codex"
+        ? ["workspace-write", "full-access", "full_access", "agent-full-access", "bypasspermissions", "yolo", "dontask", "auto"]
+        : ["bypasspermissions", "yolo", "full-access", "full_access", "dontask", "auto"];
     if (modeOpt && modeValues?.length) {
       const currentMode = String(modeOpt.currentValue ?? "").toLowerCase();
-      if (!YOLO_PRIORITY.includes(currentMode)) {
-        const picked = YOLO_PRIORITY.map((p) => modeValues.find((o) => o.value.toLowerCase() === p)).find(Boolean);
+      if (!modePriority.includes(currentMode)) {
+        const picked = modePriority.map((p) => modeValues.find((o) => o.value.toLowerCase() === p)).find(Boolean);
         if (picked && picked.value !== modeOpt.currentValue) {
           actions.push({
             method: "session/set_config_option",
@@ -1765,10 +1860,34 @@ export function buildPostSessionActions(
       }
     } else if (newSessionResponse.modes?.availableModes?.length) {
       const currentMode = String(newSessionResponse.modes.currentModeId ?? "").toLowerCase();
-      if (!YOLO_PRIORITY.includes(currentMode)) {
-        const picked = YOLO_PRIORITY.map((p) =>
+      if (!modePriority.includes(currentMode)) {
+        const picked = modePriority.map((p) =>
           newSessionResponse.modes!.availableModes!.find((m) => m.id.toLowerCase() === p),
         ).find(Boolean);
+        if (picked && picked.id !== newSessionResponse.modes.currentModeId) {
+          actions.push({
+            method: "session/set_mode",
+            params: { sessionId, modeId: picked.id },
+          });
+        }
+      }
+    }
+  } else if (adapter === "codex" && opts.toolPolicy === "read_only_workspace" && opts.allowShellInReadOnly !== false) {
+    if (modeOpt && modeValues?.length) {
+      const currentMode = String(modeOpt.currentValue ?? "").toLowerCase();
+      if (currentMode === "agent") {
+        const picked = modeValues.find((o) => o.value.toLowerCase() === "workspace-write");
+        if (picked && picked.value !== modeOpt.currentValue) {
+          actions.push({
+            method: "session/set_config_option",
+            params: { sessionId, configId: modeOpt.id, value: picked.value },
+          });
+        }
+      }
+    } else if (newSessionResponse.modes?.availableModes?.length) {
+      const currentMode = String(newSessionResponse.modes.currentModeId ?? "").toLowerCase();
+      if (currentMode === "agent") {
+        const picked = newSessionResponse.modes.availableModes.find((m) => m.id.toLowerCase() === "workspace-write");
         if (picked && picked.id !== newSessionResponse.modes.currentModeId) {
           actions.push({
             method: "session/set_mode",
