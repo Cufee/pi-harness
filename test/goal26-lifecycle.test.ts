@@ -2847,4 +2847,166 @@ describe("goal-26 lifecycle (runtime wiring)", () => {
       rmSync(stateDir, { recursive: true, force: true });
     }
   });
+
+  it("18. C5 P2: task-targeted queued amendment on a quota-paused run requires bypassQuota=true and preserves queue and quota timer on refusal", async () => {
+    const repoRoot = await makeTempRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-g26-lc-state-"));
+    const sockPath = join(stateDir, "d.sock");
+    const holdA = deferred<void>();
+    const holdB = deferred<void>();
+    const orchBGen2Started = deferred<void>();
+
+    try {
+      const baseCfg = loadConfig(repoRoot);
+      const config = withFixtureCatalog({
+        ...baseCfg,
+        goals: { ...baseCfg.goals, maxConcurrentGoals: 1, autoVerifyOnSettle: false },
+        events: { ...baseCfg.events, wakeDirectorOnGoalSettle: false },
+        stateDir,
+        socketPath: sockPath,
+      });
+      const daemon = new HarnessDaemon(config, {
+        dbPath: ":memory:",
+        customRunnerFactory: () => ({
+          run: async (req) => {
+            if (req.initialPrompt.includes("Goal A holds slot")) {
+              await Promise.race([
+                holdA.promise,
+                new Promise<void>((resolve) => req.signal.addEventListener("abort", () => resolve(), { once: true })),
+              ]);
+              return { text: "A done", stopReason: req.signal.aborted ? "cancelled" : "completed" };
+            }
+            orchBGen2Started.resolve();
+            await Promise.race([
+              holdB.promise,
+              new Promise<void>((resolve) => req.signal.addEventListener("abort", () => resolve(), { once: true })),
+            ]);
+            return { text: "B done", stopReason: req.signal.aborted ? "cancelled" : "completed" };
+          },
+        }),
+      });
+
+      await daemon.start();
+      try {
+        const chat = await daemon.director.createChat({ repoRoot });
+        const baseSha = (await runGit(repoRoot, ["rev-parse", "main"])).stdout;
+
+        // Goal A holds the only slot (cap = 1).
+        const goalA = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Goal A holds slot",
+          description: "Occupies maxConcurrentGoals=1",
+          criteria: [{ id: "c1", description: "Done", kind: "behavioral", required: true }],
+        });
+        const commitA = await daemon.director.commitGoalDetailed(goalA.id);
+        assert.equal(commitA.outcome, "started");
+
+        // Goal B: awaiting_human with completed Tier 1 and a paused_quota child worker.
+        const runB = daemon.db.createRun({ goal: "Goal B quota-paused", repoRoot, baseBranch: "main", baseSha });
+        const orchB = daemon.db.createTask({
+          runId: runB.id,
+          parentId: null,
+          tier: 1,
+          kind: "orchestrator",
+          title: "Orch B",
+          objective: "Goal B v1",
+          profileId: "pi:local",
+          model: "fixture",
+          goalVersion: 1,
+        });
+        const workerB = daemon.db.createTask({
+          runId: runB.id,
+          parentId: orchB.id,
+          tier: 2,
+          kind: "worker",
+          title: "Worker B paused_quota",
+          objective: "Subtask B",
+          profileId: "pi:local",
+          model: "fixture",
+          readOnly: true,
+          goalVersion: 1,
+        });
+        daemon.db.updateTask(orchB.id, { status: "completed", summary: "Handed off v1" });
+        daemon.db.updateTask(workerB.id, { status: "paused_quota", summary: "429 quota" });
+        daemon.db.updateRunStatus(runB.id, "paused_quota", "Quota exhausted");
+
+        const goalB = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Goal B awaiting_human quota child",
+          description: "Non-slot-holder amended while A holds cap=1",
+          criteria: [{ id: "c1", description: "Done", kind: "behavioral", required: true }],
+        });
+        daemon.director.goals.linkRunAndStart(goalB.id, runB.id);
+        daemon.director.goals.setStatus(goalB.id, "awaiting_human", "Paused on quota");
+
+        // Amend B while A holds the only slot -> queues a task-targeted Tier 1 resume.
+        const amendB = await daemon.director.amendGoal(goalB.id, {
+          rationale: "Append v2 requirement while cap=1 is full",
+          appendDescription: "Must wait in queue until slot opens",
+        });
+        assert.equal(amendB.delivery.delivered, false);
+        assert.equal(amendB.delivery.reason, "queued for a goal slot");
+
+        const qBefore = daemon.db.admissionQueue.get("goal", goalB.id);
+        assert.ok(qBefore, "amended goal B must be queued");
+        assert.equal(qBefore.position, 1);
+        assert.equal((qBefore.launchOpts as { resume?: { taskId?: string } } | null)?.resume?.taskId, orchB.id);
+        assert.equal(daemon.orchestrator.getEffectiveRun(runB.id)?.status, "paused_quota");
+
+        // Arm a scheduled quota retry on run B.
+        const quotaBefore = daemon.orchestrator.scheduleRunQuotaResume(runB.id, 60_000);
+        assert.equal(quotaBefore.mode, "user_timer");
+
+        // forceStartQueuedItem with bypassQuota:false MUST refuse and leave queue, goal, run, T1, and quota timer intact.
+        await assert.rejects(
+          () =>
+            daemon.director.forceStartQueuedItem({
+              lane: "goal",
+              targetId: goalB.id,
+              bypassQuota: false,
+              reason: "Should refuse task-targeted queued amendment on quota-paused run",
+            }),
+          /bypass_quota:\s*true/i,
+        );
+
+        const qAfterRefusal = daemon.db.admissionQueue.get("goal", goalB.id);
+        assert.ok(qAfterRefusal, "refused entry must remain in queue");
+        assert.equal(qAfterRefusal.position, qBefore.position, "refused entry position must remain unchanged");
+        assert.equal(qAfterRefusal.forceStart, false, "refused entry must not be marked forced");
+        assert.equal(daemon.director.goals.getGoal(goalB.id)?.status, "awaiting_human", "goal must not become executing");
+        assert.equal(daemon.orchestrator.getEffectiveRun(runB.id)?.status, "paused_quota", "run must remain paused_quota");
+        assert.equal(daemon.db.getTask(orchB.id)?.status, "completed");
+        assert.equal(daemon.db.getTask(orchB.id)?.generation, 1);
+        assert.deepEqual(
+          daemon.orchestrator.getRunQuotaStatus(runB.id),
+          quotaBefore,
+          "scheduled quota retry status must remain unchanged after refusal",
+        );
+
+        // With bypassQuota:true, force-start succeeds and launches Tier 1 gen 2 bound to v2.
+        const forced = (await daemon.director.forceStartQueuedItem({
+          lane: "goal",
+          targetId: goalB.id,
+          bypassQuota: true,
+          reason: "Explicit quota override for task-targeted amendment",
+        })) as { action: string; outcome: string; goal: { status: string } };
+        assert.equal(forced.action, "force_started_queued_goal");
+        assert.equal(forced.outcome, "resumed");
+        assert.equal(forced.goal.status, "executing");
+        assert.equal(daemon.db.admissionQueue.get("goal", goalB.id), null);
+        await orchBGen2Started.promise;
+        assert.equal(daemon.db.getTask(orchB.id)?.generation, 2);
+        assert.equal(daemon.db.getTask(orchB.id)?.goalVersion, 2);
+      } finally {
+        holdA.resolve();
+        holdB.resolve();
+        await daemon.stop();
+      }
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
 });

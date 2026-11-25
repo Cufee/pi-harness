@@ -3452,9 +3452,9 @@ export class DirectorRuntime {
         const isQuotaPaused = Boolean(
           run &&
             run.status !== "stopped" &&
-            (resumeOpts?.taskId
-              ? this.db.getTask(resumeOpts.taskId)?.status === "paused_quota"
-              : run.status === "paused_quota" || quotaSt || hasPausedQuota),
+            (run.status === "paused_quota" ||
+              quotaSt ||
+              (resumeOpts?.taskId ? this.db.getTask(resumeOpts.taskId)?.status === "paused_quota" : hasPausedQuota)),
         );
         if (isQuotaPaused && !input.bypassQuota) {
           throw new Error(
