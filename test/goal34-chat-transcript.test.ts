@@ -1742,13 +1742,14 @@ describe("goal-34 c3: Director chat assistant replies render exactly once", () =
     assert.equal(countOccurrences(finalScreen, "run-b3b"), 1, "run-b3b tool card must render once");
     assert.equal(countOccurrences(finalScreen, "FINAL-B3"), 1, "FINAL-B3 must render once");
 
-    // Part 2: non-busy reconnect must NOT discard unpersisted post-tool live text just because an earlier assistant row was fetched
+    // Part 2: non-busy reconnect after a daemon crash/restart must NOT discard unpersisted post-tool live text
     {
       const term2 = makeFakeTerminal(120, 30);
       const session2 = makeChatSession("chat-34-b3-nonbusy");
       let openCount2 = 0;
+      let daemonPid2 = process.pid;
       const mock2 = makeMockClient(async (op) => {
-        if (op === "ping") return { pong: true, pid: process.pid, protocolRev: 8, releaseId: "rel-b3b" };
+        if (op === "ping") return { pong: true, pid: daemonPid2, protocolRev: 8, releaseId: "rel-b3b" };
         if (op === "chat.open") {
           openCount2 += 1;
           if (openCount2 === 1) {
@@ -1845,6 +1846,7 @@ describe("goal-34 c3: Director chat assistant replies render exactly once", () =
       });
       await waitFor(() => term2.text().includes("UNPERSISTED-POST-TOOL-TAIL"), 3000, "post-tool tail streaming");
 
+      daemonPid2 = process.pid + 1;
       mock2.disconnect();
       await waitFor(() => term2.text().includes("Reconnected to harnessd"), 5000, "reconnected non-busy");
 
@@ -2379,14 +2381,15 @@ describe("goal-34 c3: Director chat assistant replies render exactly once", () =
       assert.equal(afterSecond.includes("Turn ended while disconnected"), false, "(d) still no early-end line");
     }
 
-    // (c) Real unpersisted post-tool tail after a LIVE tool card is preserved once.
+    // (c) Real unpersisted post-tool tail after a LIVE tool card is preserved once after a daemon restart.
     {
       const { terminal, text, sendInput } = makeFakeTerminal(120, 30);
       const session = makeChatSession("chat-34-r2b1-c");
       let openCount = 0;
+      let daemonPid = process.pid;
 
       const mock = makeMockClient(async (op) => {
-        if (op === "ping") return { pong: true, pid: process.pid, protocolRev: 8, releaseId: "rel-r2b1" };
+        if (op === "ping") return { pong: true, pid: daemonPid, protocolRev: 8, releaseId: "rel-r2b1" };
         if (op === "chat.open") {
           openCount += 1;
           return {
@@ -2470,6 +2473,7 @@ describe("goal-34 c3: Director chat assistant replies render exactly once", () =
       });
       await waitFor(() => text().includes("UNPERSISTED-TAIL-R2B1-C"), 3000, "post-tool tail streaming (c)");
 
+      daemonPid = process.pid + 1;
       mock.disconnect();
       await waitFor(() => text().includes("Reconnected to harnessd"), 5000, "reconnected (c)");
 
@@ -3046,12 +3050,18 @@ describe("goal-34 c3: Director chat assistant replies render exactly once", () =
   /**
    * Opens a fresh Director chat TUI against the exact persisted history (production-shaped
    * `chat.open` returning the first page + `chat.history` for any later pages) and returns its
-   * rendered assistant blocks as the oracle for idle reopen reconciliation.
+   * rendered assistant paragraphs as the oracle for idle reopen reconciliation.
+   *
+   * Note on scope: this oracle compares rendered assistant paragraphs (split by blank lines,
+   * headers, receipts, and cards) rather than immutable `AssistantCard` object boundaries, and
+   * mock fixtures omit unrelated rows the daemon would persist before deltas when those rows
+   * are equivalent as observed by the reconnecting client.
    */
   async function assertMatchesFreshHistoryOracle(opts: {
     session: ChatSessionRecord;
     persistedHistory: ChatTurnRecord[];
     actualLines: string[];
+    expectedPrefixBlocks?: string[];
     expectedRemainderBlocks?: string[];
     cols?: number;
     rows?: number;
@@ -3099,7 +3109,11 @@ describe("goal-34 c3: Director chat assistant replies render exactly once", () =
       assert.ok(freshBlocks.length > 0, `${opts.label}: fresh history oracle must extract non-empty assistant blocks`);
     }
     const actualBlocks = extractRenderedAssistantBlocks(opts.actualLines);
-    const expectedBlocks = [...freshBlocks, ...(opts.expectedRemainderBlocks ?? [])];
+    const expectedBlocks = [
+      ...(opts.expectedPrefixBlocks ?? []),
+      ...freshBlocks,
+      ...(opts.expectedRemainderBlocks ?? []),
+    ];
     assert.deepEqual(
       actualBlocks,
       expectedBlocks,
@@ -3620,8 +3634,277 @@ describe("goal-34 c3: Director chat assistant replies render exactly once", () =
     assert.equal(countOccurrences(out, "CRASH-PERSISTED-A-R3C5"), 1, "persisted A must render once");
     assert.equal(countOccurrences(out, "CRASH-UNPERSISTED-B-R3C5"), 1, "unpersisted remainder B must append once");
     assert.ok(
-      out.includes("Turn ended while disconnected") || out.includes("Turn ended early: harnessd restarted"),
-      "must include quiet interrupted/restart note when appending unpersisted remainder",
+      out.includes("Turn ended early: harnessd restarted"),
+      "must include quiet restart note when appending unpersisted remainder after daemon crash",
     );
+  });
+
+  it("review-4 blocker 1 (Pi commentary starts with final reply, same daemon pid): busy reopen then idle reopen matches fresh history load with no remainder", async () => {
+    const { terminal, lines, text, sendInput } = makeFakeTerminal(120, 30);
+    const session = makeChatSession("chat-34-r4-b1");
+    const history: ChatTurnRecord[] = [];
+    let openCount = 0;
+    let isBusy = false;
+    let activePartial = "";
+    const daemonPid = process.pid;
+
+    const mock = makeMockClient(async (op, params) => {
+      if (op === "ping") return { pong: true, pid: daemonPid, protocolRev: 8, releaseId: "rel-r4" };
+      if (op === "chat.open") {
+        openCount += 1;
+        return makeProdChatOpen(session, history, {
+          busy: isBusy,
+          activeTurnId: isBusy ? "turn-r4-b1" : null,
+          activeText: isBusy ? activePartial : "",
+          activePartial: isBusy ? activePartial : "",
+        });
+      }
+      if (op === "chat.history") {
+        const afterSeq = Number(params.afterSeq ?? 0);
+        const throughSeq = Number(params.throughSeq ?? Number.MAX_SAFE_INTEGER);
+        return {
+          history: history.filter((r) => r.seq > afterSeq && r.seq <= throughSeq),
+          historyNext: null,
+        };
+      }
+      if (op === "work.snapshot") return emptyWorkSnapshot();
+      if (op === "session.leave") return { daemonWillQuit: false };
+      return {};
+    });
+
+    const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+    await waitFor(() => text().includes(session.id), 3000, "initial render");
+
+    // Viewer sees turn.start(user), row 1 user, delta "Confirmed. I will check.", plain tool with no display.
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.turn.start",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r4-b1", reason: "user", text: "Check status and confirm." },
+    });
+    history.push({
+      seq: 1,
+      chatSessionId: session.id,
+      role: "user",
+      content: "Check status and confirm.",
+      createdAt: Date.now(),
+    });
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.delta",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r4-b1", delta: "Confirmed. I will check." },
+    });
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.tool",
+      createdAt: Date.now(),
+      payload: {
+        chatSessionId: session.id,
+        turnId: "turn-r4-b1",
+        id: "tool-list-models",
+        name: "list_models",
+        status: "completed",
+      },
+    });
+    await waitFor(() => text().includes("Confirmed. I will check."), 3000, "commentary streamed");
+
+    // First disconnect: busy reopen on the same turn seeded from activePartial (same daemon pid).
+    isBusy = true;
+    activePartial = "Confirmed. I will check.";
+    mock.disconnect();
+    await waitFor(() => openCount >= 2 && text().includes("Reconnected to harnessd"), 5000, "reconnected #1 busy");
+
+    // Second provider response streams "\n\nConfirmed.", then a passive goal.reviewed arrives.
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.delta",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r4-b1", delta: "\n\nConfirmed." },
+    });
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "goal.reviewed",
+      createdAt: Date.now(),
+      payload: {
+        goalId: "goal-r4-b1",
+        title: "Status verification",
+        verdict: "approve",
+        goalStatus: "verifying",
+      },
+    });
+    await waitFor(() => countOccurrences(text(), "Confirmed.") >= 2, 3000, "second Confirmed delta streamed");
+
+    // Second disconnect: Pi completes normally offline with one assistant row "Confirmed." (same daemon pid).
+    isBusy = false;
+    activePartial = "";
+    history.push({
+      seq: 2,
+      chatSessionId: session.id,
+      role: "assistant",
+      content: "Confirmed.",
+      createdAt: Date.now(),
+    });
+    mock.disconnect();
+    await waitFor(() => openCount >= 3, 5000, "reconnected #2 idle");
+    await new Promise((r) => setTimeout(r, 40));
+
+    sendInput("\x1d");
+    await runPromise;
+
+    const out = text();
+    await assertMatchesFreshHistoryOracle({
+      session,
+      persistedHistory: history,
+      actualLines: lines(),
+      label: "review-4 blocker 1 (Pi commentary starting with final reply)",
+    });
+    assert.deepEqual(
+      extractRenderedAssistantBlocks(lines()),
+      ["Confirmed."],
+      "assistant paragraphs must be exactly ['Confirmed.']",
+    );
+    assert.equal(out.includes("I will check."), false, "discarded commentary remainder must not append");
+    assert.equal(out.includes("Turn ended while disconnected"), false, "no spurious early-end line");
+  });
+
+  it("review-4 blocker 2 (overflow retry + live structured tool card + offline empty cancel): keeps live screen and adds nothing on idle reopen", async () => {
+    const { terminal, lines, text, sendInput } = makeFakeTerminal(120, 30);
+    const session = makeChatSession("chat-34-r4-b2");
+    const history: ChatTurnRecord[] = [];
+    let openCount = 0;
+    const daemonPid = process.pid;
+    const display = {
+      kind: "run_activity" as const,
+      data: { runId: "run-r4-b2", phase: "active", elapsedMs: 250, tasks: [] },
+    };
+
+    const mock = makeMockClient(async (op, params) => {
+      if (op === "ping") return { pong: true, pid: daemonPid, protocolRev: 8, releaseId: "rel-r4" };
+      if (op === "chat.open") {
+        openCount += 1;
+        return makeProdChatOpen(session, history, { busy: false });
+      }
+      if (op === "chat.history") {
+        const afterSeq = Number(params.afterSeq ?? 0);
+        const throughSeq = Number(params.throughSeq ?? Number.MAX_SAFE_INTEGER);
+        return {
+          history: history.filter((r) => r.seq > afterSeq && r.seq <= throughSeq),
+          historyNext: null,
+        };
+      }
+      if (op === "work.snapshot") return emptyWorkSnapshot();
+      if (op === "session.leave") return { daemonWillQuit: false };
+      return {};
+    });
+
+    const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+    await waitFor(() => text().includes(session.id), 3000, "initial render");
+
+    // User row 1; delta "Prompt is too long."; overflow retry drops partial with no row and no live boundary.
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.turn.start",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r4-b2", reason: "user", text: "Summarize run activity." },
+    });
+    history.push({
+      seq: 1,
+      chatSessionId: session.id,
+      role: "user",
+      content: "Summarize run activity.",
+      createdAt: Date.now(),
+    });
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.delta",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r4-b2", delta: "Prompt is too long." },
+    });
+    // Overflow retry streams "\n\nRETRIED-ANSWER", then presents a tool display.
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.delta",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r4-b2", delta: "\n\nRETRIED-ANSWER" },
+    });
+    // Daemon persists assistant(RETRIED-ANSWER) seq 2 and tool_output seq 3, then sends the live card.
+    history.push(
+      {
+        seq: 2,
+        chatSessionId: session.id,
+        role: "assistant",
+        content: "RETRIED-ANSWER",
+        createdAt: Date.now(),
+      },
+      {
+        seq: 3,
+        chatSessionId: session.id,
+        role: "tool_output",
+        content: "run-r4-b2",
+        toolName: "present_result",
+        display,
+        createdAt: Date.now(),
+      },
+    );
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.tool",
+      createdAt: Date.now(),
+      payload: {
+        chatSessionId: session.id,
+        turnId: "turn-r4-b2",
+        name: "present_result",
+        status: "completed",
+        display,
+      },
+    });
+    await waitFor(() => text().includes("run-r4-b2"), 3000, "live tool card froze overflow + retried text");
+
+    // Disconnect; turn is cancelled offline with an empty partial, so no final assistant row is persisted.
+    mock.disconnect();
+    await waitFor(() => openCount >= 2 && text().includes("Reconnected to harnessd"), 5000, "reconnected idle");
+
+    sendInput("\x1d");
+    await runPromise;
+
+    const out = text();
+    await assertMatchesFreshHistoryOracle({
+      session,
+      persistedHistory: history,
+      actualLines: lines(),
+      expectedPrefixBlocks: ["Prompt is too long."],
+      label: "review-4 blocker 2 (overflow retry + live tool card)",
+    });
+    assert.equal(countOccurrences(out, "RETRIED-ANSWER"), 1, "RETRIED-ANSWER must appear exactly once");
+    assert.equal(countOccurrences(out, "run-r4-b2"), 1, "live tool card must appear exactly once");
+    assert.equal(out.includes("Turn ended while disconnected"), false, "no spurious early-end line");
   });
 });
