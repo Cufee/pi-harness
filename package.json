@@ -19,6 +19,7 @@
     "test": "bun run typecheck && bun test test",
     "check:hot-update-install": "bun scripts/hot-update-install-check.ts",
     "check:storage-upgrade": "bun scripts/storage-upgrade-check.ts",
+    "check:storage-sandbox": "bun scripts/storage-sandbox-probe.ts",
     "start": "bun run src/cli.ts"
   },
   "dependencies": {
