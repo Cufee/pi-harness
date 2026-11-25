@@ -401,7 +401,7 @@ describe("Knowledge Base (FTS5 + Deterministic Git Pre-Check) & Cross-Run Coordi
     const nonGitDir = mkdtempSync(join(tmpdir(), "pi-harness-nongit-"));
     try {
       const db = new ControlPlaneDb(":memory:");
-      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const mgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 });
       const { baseBranch } = await mgr.resolveRepoInfo();
 
       const authEntry = db.kb.propose({

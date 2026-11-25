@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { loadConfig } from "../src/config.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import {
@@ -12,6 +12,7 @@ import {
   type ActiveReviewInfo,
 } from "../src/director/runtime.js";
 import type { GoalRecord, GoalReviewVerdict, ReviewerDiagnostics } from "../src/goals/engine.js";
+import { storagePaths } from "../src/storage/paths.js";
 import { runGit } from "../src/worktree/manager.js";
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
 
@@ -877,8 +878,9 @@ describe("goal-18 v5 criteria", () => {
 
         // Runtime fallback: when the goal's evidence path is blocked by a regular file (ensureGoalEvidenceDir -> null),
         // verifyAndReviewGoal still passes the full description and criterion tails inline to the reviewer.
-        const blockedEvidencePath = join(repoRoot, ".harness", "goals", goalNoContract.id);
+        const blockedEvidencePath = storagePaths(daemon.config).goalEvidenceDir(goalNoContract);
         rmSync(blockedEvidencePath, { recursive: true, force: true });
+        mkdirSync(dirname(blockedEvidencePath), { recursive: true });
         writeFileSync(blockedEvidencePath, "blocking-file-not-a-dir\n", "utf8");
         capturedPrompt = "";
         const savedCriteriaIds = [...criteriaIds];

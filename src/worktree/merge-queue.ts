@@ -19,14 +19,6 @@ export interface MergeOutcome {
   bouncedReason?: string;
 }
 
-/**
- * @deprecated Use `mergedRef` from `src/storage/names.ts` instead.
- * Git ref storing the latest commit merged onto the target branch for a run.
- */
-export function runMergedRef(runId: string): string {
-  return runMergedRefForRun({ id: runId });
-}
-
 export interface MergeProcessOptions {
   preserveLiveTask?: boolean;
   signal?: AbortSignal;

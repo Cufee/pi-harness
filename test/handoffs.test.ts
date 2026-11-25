@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { it } from "bun:test";
 import { ModelCatalogCompiler } from "../src/catalog/compiler.js";
 import { loadConfig } from "../src/config.js";
@@ -10,6 +10,7 @@ import { HarnessOrchestrator } from "../src/control-plane/orchestrator.js";
 import { buildImmutableSystemPrompt } from "../src/control-plane/prompts.js";
 import { toolsForTier } from "../src/control-plane/tools.js";
 import { QuotaClient } from "../src/quota/client.js";
+import { storagePaths } from "../src/storage/paths.js";
 
 it("requires structured sources for read-only handoffs and externalizes only oversized summaries", async () => {
   const repoRoot = mkdtempSync(join(tmpdir(), "pi-harness-handoff-"));
@@ -50,14 +51,19 @@ it("requires structured sources for read-only handoffs and externalizes only ove
       assert.equal(persisted.status, "completed");
       assert.equal(result.summary, persisted.summary);
       assert.deepEqual(result.sources, sources);
-      const paths = [providedPath];
+      const sp = storagePaths(config);
+      const resolvedProvidedPath = sp.resolveLegacyPath(repoRoot, providedPath, run) ?? providedPath;
+      const storedPaths = [providedPath];
+      const waitPaths = [resolvedProvidedPath];
       let overflowMeta: Record<string, unknown> = {};
       if (kind === "research") {
         const [artifact] = db.listArtifacts(run.id, child.id);
         assert.ok(artifact);
-        assert.match(artifact.path, /\.harness\/artifacts\/t-[\w]+-summary-.*\.md$/);
-        paths.push(artifact.path);
-        const pointer = relative(repoRoot, artifact.path);
+        assert.ok(artifact.path.startsWith(sp.artifactsDir(run) + "/"));
+        assert.match(artifact.path, /\/t-[\w]+-summary-.*\.md$/);
+        storedPaths.push(artifact.path);
+        waitPaths.push(artifact.path);
+        const pointer = sp.layout === "data-dir" ? artifact.path : relative(repoRoot, artifact.path);
         assert.ok(persisted.summary!.length <= 2000);
         assert.ok(persisted.summary!.endsWith(`[Full summary: ${pointer}]`));
         assert.deepEqual(await orch.toolExecutor.execute(run.id, parent.id, "artifact_read", { path: pointer }), {
@@ -77,12 +83,12 @@ it("requires structured sources for read-only handoffs and externalizes only ove
         assert.equal(persisted.summary, summary);
         assert.deepEqual(db.listArtifacts(run.id, child.id), []);
       }
-      assert.deepEqual(result.artifact_paths, paths);
+      assert.deepEqual(result.artifact_paths, storedPaths);
       // Older or runner-generated result JSON may also contain free-form transcript/log data.
       db.updateTask(child.id, { resultJson: JSON.stringify({ ...result, transcript: "private transcript", tool_logs: "raw logs" }) });
       children.push({
         id: child.id, title: kind, kind, status: "completed", summary: persisted.summary,
-        ...overflowMeta, sources, artifact_paths: paths, escalations: [],
+        ...overflowMeta, sources, artifact_paths: waitPaths, escalations: [],
       });
     }
 
@@ -118,7 +124,7 @@ it("requires structured sources for read-only handoffs and externalizes only ove
 
     writeFileSync(join(repoRoot, "source.ts"), "This file is not a dossier");
     await assert.rejects(() => orch.toolExecutor.execute(run.id, parent.id, "artifact_read", { path: "source.ts" }), /No indexed dossier/);
-    const link = join(repoRoot, ".harness", "artifacts", "redirect.md");
+    const link = join(storagePaths(config).artifactsDir(run), "redirect.md");
     symlinkSync(join(repoRoot, "source.ts"), link);
     db.recordArtifact({ runId: run.id, taskId: children[0]!.id, kind: "dossier", path: link, summary: "Redirect" });
     await assert.rejects(() => orch.toolExecutor.execute(run.id, parent.id, "artifact_read", { path: link }), /non-symlink/);
@@ -148,8 +154,8 @@ it("does not commit a scope send-back when summary overflow fails and records it
       suggested_splits: ["Split wait output", "Split send-back settlement"],
     });
 
-    mkdirSync(join(repoRoot, ".harness"), { recursive: true });
-    const artifactsDir = join(repoRoot, ".harness", "artifacts");
+    const artifactsDir = storagePaths(config).artifactsDir(run);
+    mkdirSync(dirname(artifactsDir), { recursive: true });
     writeFileSync(artifactsDir, "Block creation of the artifact directory");
     await assert.rejects(returnTask, /EEXIST|ENOTDIR/);
     assert.deepEqual(db.listEscalations(run.id), []);

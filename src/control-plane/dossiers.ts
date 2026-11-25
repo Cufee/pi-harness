@@ -8,14 +8,6 @@ import { REJECTIONS } from "../advisories/rejections.js";
 import { mostSpecificRootDecision } from "../runners/acp-shims.js";
 import { type DataDirArtifactInfo, hashFileSha256, legacyStoragePaths, type StoragePaths } from "../storage/paths.js";
 
-/**
- * @deprecated Use `StoragePaths.ensureDossierDir` instead.
- * Ensures a dossier directory under the legacy artifacts root and returns its path.
- */
-export function dossierDirectory(repoRoot: string, ...parts: string[]): string {
-  return legacyStoragePaths.ensureDossierDir({ repoRoot, id: "" }, ...parts);
-}
-
 export function writeTaskDossier(
   db: ControlPlaneDb,
   run: RunRecord,

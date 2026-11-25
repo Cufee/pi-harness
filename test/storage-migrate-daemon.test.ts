@@ -442,7 +442,7 @@ describe("daemon start storage migration pass", () => {
     const evBefore = hashTree(evDir);
     const runBefore = hashTree(runDir);
 
-    setLayoutEnv(undefined); // default legacy layout
+    setLayoutEnv("legacy");
     const cfg = makeDaemonConfig(repoDir, stateDir);
     const logCap = captureConsoleError();
     const daemon = new HarnessDaemon(cfg);

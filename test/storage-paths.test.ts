@@ -3,10 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { afterEach, describe, it } from "bun:test";
-import { dossierDirectory } from "../src/control-plane/dossiers.js";
-import { ensureGoalEvidenceDir, goalEvidenceDir } from "../src/goals/engine.js";
-import { isProtectedWritePath } from "../src/runners/protected-paths.js";
+import { afterEach, beforeEach, describe, it } from "bun:test";
 import {
   createLegacyStoragePaths,
   legacyStoragePaths,
@@ -24,8 +21,16 @@ function makeTempDir(prefix: string): string {
   return dir;
 }
 
-afterEach(() => {
+const initialStorageLayout = process.env.PI_HARNESS_STORAGE_LAYOUT;
+
+beforeEach(() => {
   delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+  resetStoragePathsForTest();
+});
+
+afterEach(() => {
+  if (initialStorageLayout === undefined) delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+  else process.env.PI_HARNESS_STORAGE_LAYOUT = initialStorageLayout;
   resetStoragePathsForTest();
   while (tempDirs.length > 0) {
     rmSync(tempDirs.pop()!, { recursive: true, force: true });
@@ -34,7 +39,7 @@ afterEach(() => {
 
 describe("src/storage/paths (legacy layout)", () => {
   it("resolves layout, requires stateDir for data-dir, caches per config object, and pins data root per stateDir", () => {
-    assert.equal(resolveStorageLayout(), "legacy");
+    assert.equal(resolveStorageLayout(), "data-dir");
     assert.equal(resolveStorageLayout("legacy"), "legacy");
     assert.equal(resolveStorageLayout("data-dir"), "data-dir");
     assert.throws(
@@ -44,10 +49,16 @@ describe("src/storage/paths (legacy layout)", () => {
 
     const cfg1: StoragePathsConfig = {};
     const cfg2: StoragePathsConfig = {};
-    assert.equal(storagePaths(cfg1), storagePaths(cfg1));
-    assert.notEqual(storagePaths(cfg1), storagePaths(cfg2));
+    assert.throws(() => storagePaths(cfg1), /requires config\.stateDir/i);
+    assert.equal(storagePaths(cfg1, { layout: "legacy" }), storagePaths(cfg1, { layout: "legacy" }));
+    assert.notEqual(storagePaths(cfg1, { layout: "legacy" }), storagePaths(cfg2, { layout: "legacy" }));
 
     assert.throws(() => storagePaths(cfg1, { layout: "data-dir" }), /requires config\.stateDir/i);
+
+    process.env.PI_HARNESS_STORAGE_LAYOUT = "legacy";
+    resetStoragePathsForTest();
+    assert.equal(resolveStorageLayout(), "legacy");
+    assert.equal(storagePaths({}).layout, "legacy");
 
     process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
     resetStoragePathsForTest();
@@ -111,7 +122,7 @@ describe("src/storage/paths (legacy layout)", () => {
         artifactsDir: "custom/artifacts",
       },
     };
-    const sp = storagePaths(cfg);
+    const sp = storagePaths(cfg, { layout: "legacy" });
     const owner = { repoRoot: repo, chatSessionId: "chat-7" };
     const goal = { repoRoot: repo, chatSessionId: "chat-7", id: "goal-42" };
     const run = { repoRoot: repo, chatSessionId: "chat-7", id: "run-9" };
@@ -158,13 +169,10 @@ describe("src/storage/paths (legacy layout)", () => {
   it("validates goal id segments strictly", () => {
     const repo = makeTempDir("pi-storage-goal-id-");
     assert.equal(legacyStoragePaths.goalEvidenceDir({ repoRoot: repo, id: "goal-1_a.2" }), `${repo}/.harness/goals/goal-1_a.2`);
-    assert.equal(goalEvidenceDir(repo, "goal-1_a.2"), `${repo}/.harness/goals/goal-1_a.2`);
 
     for (const badId of ["", ".", "..", "../escape", "a/b", "a\\b", "goal 1", "goal$1", "goal\0"]) {
       assert.throws(() => legacyStoragePaths.goalEvidenceDir({ repoRoot: repo, id: badId }), /Invalid goal id/);
-      assert.throws(() => goalEvidenceDir(repo, badId), /Invalid goal id/);
       assert.equal(legacyStoragePaths.ensureGoalEvidenceDir({ repoRoot: repo, id: badId }), null);
-      assert.equal(ensureGoalEvidenceDir(repo, badId), null);
     }
   });
 
@@ -231,11 +239,6 @@ describe("src/storage/paths (legacy layout)", () => {
       () => legacyStoragePaths.ensureDossierDir({ repoRoot: repoLeaf, id: "run-1" }, "..", "escape"),
       /ENOTDIR/,
     );
-
-    // Deprecated wrappers match StoragePaths behavior.
-    assert.equal(ensureGoalEvidenceDir(repoLeaf, "goal-broken"), null);
-    assert.equal(dossierDirectory(repoClean, "run-2", "t-2"), `${repoClean}/.harness/artifacts/run-2/t-2`);
-    assert.throws(() => dossierDirectory(repoLeaf, "run-file"), /ENOTDIR/);
   });
 
   it("computes taskGrants for goal writable, goal read-only, symlinked evidence dir, and non-goal runs", () => {
@@ -247,12 +250,15 @@ describe("src/storage/paths (legacy layout)", () => {
     mkdirSync(extraRead, { recursive: true });
     mkdirSync(extraWrite, { recursive: true });
 
-    const sp = storagePaths({
-      worktree: {
-        extraReadRoots: [extraRead, `${repo}/.harness/goals`],
-        extraWriteRoots: [extraWrite],
+    const sp = storagePaths(
+      {
+        worktree: {
+          extraReadRoots: [extraRead, `${repo}/.harness/goals`],
+          extraWriteRoots: [extraWrite],
+        },
       },
-    });
+      { layout: "legacy" },
+    );
     const run = { repoRoot: repo, id: "run-1" };
     const goal = { repoRoot: repo, id: "goal-7" };
 
@@ -374,10 +380,13 @@ describe("src/storage/paths (legacy layout)", () => {
     mkdirSync(noteExtra, { recursive: true });
     symlinkSync(noteExtra, noteExtraLink);
 
-    const sp = storagePaths({
-      stateDir,
-      worktree: { extraWriteRoots: [noteExtra, noteExtraLink, "  "] },
-    });
+    const sp = storagePaths(
+      {
+        stateDir,
+        worktree: { extraWriteRoots: [noteExtra, noteExtraLink, "  "] },
+      },
+      { layout: "legacy" },
+    );
 
     // directorNoteRoots
     assert.deepEqual(sp.directorNoteRoots({ repoRoot: repo }), {
@@ -422,14 +431,6 @@ describe("src/storage/paths (legacy layout)", () => {
     assert.equal(sp.isProtectedWorktreePath(`${repo}/.harness/worktrees/run-1/t-2/src/a.ts`, ownWt), true);
     assert.equal(sp.isProtectedWorktreePath(`${repo}/.harness/goals/goal-1/note.md`, ownWt), false);
 
-    // Deprecated isProtectedWritePath preserves root-relative behavior for outside paths.
-    assert.equal(isProtectedWritePath(ownWt, "src/index.ts"), false);
-    assert.equal(isProtectedWritePath(ownWt, ".git/HEAD"), true);
-    assert.equal(isProtectedWritePath(ownWt, "../t-2/src/a.ts"), false);
-    assert.equal(isProtectedWritePath(ownWt, "../t-2/.git/HEAD"), true);
-    assert.equal(isProtectedWritePath(repo, ".harness/worktrees/run-1/t-1/a.ts"), true);
-    assert.equal(isProtectedWritePath(repo, ".harness/goals/goal-1/note.md"), false);
-
     // isStateInternalPath
     assert.equal(legacyStoragePaths.isStateInternalPath(stateDir), false);
     assert.equal(sp.isStateInternalPath(stateDir), true);
@@ -456,51 +457,6 @@ describe("src/storage/paths (legacy layout)", () => {
     assert.equal(sp.containsHarnessDirSegment("src/index.ts"), false);
 
     assert.equal(sp.harnessDirtyPathspec(), ":!.harness");
-  });
-
-  it("produces exact legacy describe* strings for prompts, tool descriptions, and rejections", () => {
-    assert.equal(legacyStoragePaths.describeArtifactsRoot(), ".harness/artifacts");
-    assert.equal(legacyStoragePaths.describeGoalEvidenceDirTemplate(), "<repo>/.harness/goals/<goalId>");
-    assert.equal(
-      legacyStoragePaths.describeDirectorNoteLocation("/tmp/notes"),
-      ".harness/goals/, .harness/notes/, or a configured extra write root (/tmp/notes)",
-    );
-    assert.equal(
-      legacyStoragePaths.describeWriteNoteTool(),
-      "Logged Director note/report writer scoped strictly to `.harness/goals/`, `.harness/notes/`, or configured `extraWriteRoots` (never writes tracked repository source code).",
-    );
-    assert.equal(
-      legacyStoragePaths.describeWriteNoteTool([]),
-      "Logged Director note/report writer scoped strictly to `.harness/goals/`, `.harness/notes/` (no extraWriteRoots configured; never writes tracked repository source code).",
-    );
-    assert.equal(
-      legacyStoragePaths.describeWriteNoteTool(["/a", "/b"]),
-      "Logged Director note/report writer scoped strictly to `.harness/goals/`, `.harness/notes/`, or these configured extraWriteRoots: /a, /b (never writes tracked repository source code).",
-    );
-    assert.equal(
-      legacyStoragePaths.describeWriteNotePathParam(),
-      "Destination file under .harness/goals/, .harness/notes/, or extraWriteRoots.",
-    );
-    assert.equal(
-      legacyStoragePaths.describeWriteNotePathParam([]),
-      "Destination file under .harness/goals/, .harness/notes/ (no extraWriteRoots configured).",
-    );
-    assert.equal(
-      legacyStoragePaths.describeWriteNotePathParam(["/a", "/b"]),
-      "Destination file under .harness/goals/, .harness/notes/, or these configured extraWriteRoots: /a, /b.",
-    );
-    assert.equal(
-      legacyStoragePaths.describeDirectorNoteRootAlternative(),
-      "Write under .harness/goals, .harness/notes, or a configured worktree.extraWriteRoots path. Code changes go through goal_create and goal_commit.",
-    );
-    assert.equal(
-      legacyStoragePaths.describeDossierInvalidDirectoryReason(),
-      "Dossiers are stored only in regular directories under .harness/artifacts to keep run artifacts confined.",
-    );
-    assert.equal(
-      legacyStoragePaths.describeDossierSymlinkWhat("/repo/.harness/artifacts/x"),
-      "Dossier must be a non-symlink path under .harness/artifacts: /repo/.harness/artifacts/x.",
-    );
   });
 
   it("data-dir directorNoteRoots and taskGrants drop configured extra roots at or inside stateDir or external dataRoot (esc-148)", () => {
@@ -568,5 +524,46 @@ describe("src/storage/paths (legacy layout)", () => {
     const legacyNoteRoots = legacySp.directorNoteRoots(owner);
     assert.equal(legacyNoteRoots.allowedWriteRoots.includes(stateDir), true);
     assert.equal(legacyNoteRoots.allowedWriteRoots.includes(externalDataRoot), true);
+  });
+
+  it("resolveLegacyPath applies the both-exist union rule to one-component regular files directly under legacy goals/", () => {
+    const base = makeTempDir("pi-storage-flat-goal-file-");
+    const stateDir = join(base, "state");
+    const repo = join(base, "repo");
+    const outside = join(base, "outside.txt");
+    mkdirSync(stateDir, { recursive: true });
+    mkdirSync(join(repo, ".harness", "goals"), { recursive: true });
+    writeFileSync(outside, "secret\n", "utf8");
+
+    const sp = storagePaths({ stateDir }, { layout: "data-dir" });
+    const owner = { repoRoot: repo, chatSessionId: "chat-1" };
+
+    // Missing in both locations -> data-dir location as before.
+    const expectedMissing = join(sp.goalsDir(owner), "missing.md");
+    assert.equal(sp.resolveLegacyPath(repo, ".harness/goals/missing.md", owner), expectedMissing);
+
+    // Existing real regular file directly under .harness/goals/ wins over nonexistent data-dir location.
+    const legacyEv = join(repo, ".harness", "goals", "evidence.md");
+    writeFileSync(legacyEv, "legacy evidence\n", "utf8");
+    assert.equal(sp.resolveLegacyPath(repo, ".harness/goals/evidence.md", owner), legacyEv);
+    assert.equal(sp.resolveLegacyPath(repo, legacyEv, owner), legacyEv);
+
+    // When both legacy and data-dir files exist, legacy real file still wins (both-exist rule),
+    // including when addressed by the data-dir path.
+    const dataEv = join(sp.goalsDir(owner), "evidence.md");
+    mkdirSync(sp.goalsDir(owner), { recursive: true });
+    writeFileSync(dataEv, "data-dir evidence\n", "utf8");
+    assert.equal(sp.resolveLegacyPath(repo, ".harness/goals/evidence.md", owner), legacyEv);
+    assert.equal(sp.resolveLegacyPath(repo, dataEv, owner), legacyEv);
+
+    // When only a data-dir file exists, resolveLegacyPath finds the data-dir file.
+    const dataOnly = join(sp.goalsDir(owner), "only-data.md");
+    writeFileSync(dataOnly, "data only\n", "utf8");
+    assert.equal(sp.resolveLegacyPath(repo, ".harness/goals/only-data.md", owner), dataOnly);
+
+    // A symlink directly under .harness/goals/ fails the anchored real-file check and is not returned.
+    const symlinkEv = join(repo, ".harness", "goals", "linked.md");
+    symlinkSync(outside, symlinkEv);
+    assert.equal(sp.resolveLegacyPath(repo, ".harness/goals/linked.md", owner), join(sp.goalsDir(owner), "linked.md"));
   });
 });

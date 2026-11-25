@@ -22,7 +22,7 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
     const repo = await initTempRepo();
     try {
       const db = new ControlPlaneDb(":memory:");
-      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const mgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 });
       const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
       const run = db.createRun({ goal: "Add feature", repoRoot: repo, baseBranch, baseSha });
       const worker = db.createTask({
@@ -59,7 +59,7 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
     const repo = await initTempRepo();
     try {
       const db = new ControlPlaneDb(":memory:");
-      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", archiveRetentionDays: 7 });
+      const mgr = new WorktreeManager(db, repo, { archiveRetentionDays: 7 });
       const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
       const run = db.createRun({ goal: "Guard tests", repoRoot: repo, baseBranch, baseSha });
       const worker = db.createTask({
@@ -114,7 +114,7 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
       writeFileSync(join(repo, "bun.lock"), "# untracked lockfile\n", "utf8");
 
       const db = new ControlPlaneDb(":memory:");
-      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const mgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 });
       const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
       const run = db.createRun({ goal: "Merge with untracked lockfile", repoRoot: repo, baseBranch, baseSha });
       const worker = db.createTask({
@@ -155,7 +155,7 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
     const repo = await initTempRepo();
     try {
       const db = new ControlPlaneDb(":memory:");
-      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const mgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 });
       const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
       const run = db.createRun({ goal: "Concurrent merges", repoRoot: repo, baseBranch, baseSha });
 
@@ -238,7 +238,6 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
       const setupCmd = `printf '%s\\n' "$HARNESS_WORKTREE_PATH" >> "${logFile}" && printf 'bootstrapped' > .bootstrapped`;
 
       const mgr = new WorktreeManager(db, repo, {
-        dir: ".harness/worktrees",
         maxConcurrentWorkers: 4,
         setupCommand: setupCmd,
       });
@@ -276,7 +275,6 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
 
       // Failing setupCommand must clean up both the newly created worktree and branch
       const badMgr = new WorktreeManager(db, repo, {
-        dir: ".harness/worktrees",
         maxConcurrentWorkers: 4,
         setupCommand: "echo boom >&2 && exit 1",
       });
@@ -311,7 +309,7 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
     const repo = await initTempRepo();
     try {
       const db = new ControlPlaneDb(":memory:");
-      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const mgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 });
       const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
       const run = db.createRun({ goal: "Test integrity", repoRoot: repo, baseBranch, baseSha });
 
@@ -372,7 +370,7 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
     const repo = await initTempRepo();
     try {
       const db = new ControlPlaneDb(":memory:");
-      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const mgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 });
       const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
       const run = db.createRun({ goal: "Enforce write scopes", repoRoot: repo, baseBranch, baseSha });
 
@@ -425,7 +423,7 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
       assert.equal(readFileSync(join(repo, "src/c/ok.ts"), "utf8").trim(), "export const ok = 1;");
 
       // Also verify bounced worktrees count toward maxConcurrentWorkers and detached HEAD is rejected
-      const cappedMgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 1 });
+      const cappedMgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 1 });
       const wExtra = db.createTask({
         runId: run.id,
         tier: 2,
@@ -457,7 +455,7 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
       await runGit(repo, ["-c", "user.name=test", "-c", "user.email=test@local", "commit", "-m", "add private file"]);
 
       const db = new ControlPlaneDb(":memory:");
-      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const mgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 });
       const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
       const run = db.createRun({ goal: "Rename & cancel guards", repoRoot: repo, baseBranch, baseSha });
 
@@ -540,7 +538,7 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
     const repo = await initTempRepo();
     try {
       const db = new ControlPlaneDb(":memory:");
-      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const mgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 });
       const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
       const run = db.createRun({ goal: "Lock protection", repoRoot: repo, baseBranch, baseSha });
       const worker = db.createTask({
@@ -591,7 +589,7 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
     const repo = await initTempRepo();
     try {
       const db = new ControlPlaneDb(":memory:");
-      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const mgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 });
       const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
       const run = db.createRun({ goal: "Foreign lock", repoRoot: repo, baseBranch, baseSha });
       const worker = db.createTask({
@@ -636,7 +634,7 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
     const repo = await initTempRepo();
     try {
       const db = new ControlPlaneDb(":memory:");
-      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const mgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 });
       const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
       const run = db.createRun({ goal: "Legacy unlocked", repoRoot: repo, baseBranch, baseSha });
       const worker = db.createTask({
@@ -670,7 +668,7 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
     const repo = await initTempRepo();
     try {
       const db = new ControlPlaneDb(":memory:");
-      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const mgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 });
       const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
       const run = db.createRun({ goal: "Deleted checkout", repoRoot: repo, baseBranch, baseSha });
       const worker = db.createTask({
@@ -700,7 +698,7 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
     const repo = await initTempRepo();
     try {
       const db = new ControlPlaneDb(":memory:");
-      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const mgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 });
       const { baseSha } = await mgr.resolveRepoInfo();
 
       const s = await mgr.addScratchWorktree("_verify", "x", baseSha);
@@ -720,7 +718,7 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
     const repo = await initTempRepo();
     try {
       const db = new ControlPlaneDb(":memory:");
-      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 });
+      const mgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 });
       const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
       const run = db.createRun({ goal: "Mid-teardown lock", repoRoot: repo, baseBranch, baseSha });
       const worker = db.createTask({
@@ -803,7 +801,7 @@ describe("Git Worktrees, Bisecting Merge Queue, Test Integrity & Automated Clean
     const repo = await initTempRepo();
     try {
       const db = new ControlPlaneDb(":memory:");
-      const mgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 16 });
+      const mgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 16 });
       const { baseBranch, baseSha } = await mgr.resolveRepoInfo();
       const run = db.createRun({ goal: "T-mq write scope table", repoRoot: repo, baseBranch, baseSha });
       const mq = new BisectingMergeQueue(db, mgr, repo, {});

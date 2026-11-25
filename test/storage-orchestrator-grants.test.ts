@@ -90,15 +90,13 @@ function createOrchestratorEnv(root: string, repoRoot: string, runnerFactory: Cu
     codeMode: "off",
     worktree: {
       ...base.worktree,
-      // Contract: legacy layout ignores worktree.artifactsDir and uses fixed legacy path.
-      artifactsDir: ".ignored-custom-artifacts",
       extraReadRoots: [extraRead],
       extraWriteRoots: [extraWrite],
     },
   });
 
   const db = new ControlPlaneDb(":memory:");
-  const goals = new GoalEngine(db.db);
+  const goals = new GoalEngine(db.db, undefined, undefined, undefined, undefined, storagePaths(config));
   const quota = new QuotaClient();
   const catalog = new ModelCatalogCompiler(config, quota);
   const orch = new HarnessOrchestrator(db, config, catalog, quota, runnerFactory);

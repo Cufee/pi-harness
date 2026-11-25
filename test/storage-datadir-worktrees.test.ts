@@ -21,6 +21,7 @@ import { GoalEngine } from "../src/goals/engine.js";
 import { createLegacyStoragePaths, resetStoragePathsForTest, storagePaths } from "../src/storage/paths.js";
 import { runGit, WorktreeManager } from "../src/worktree/manager.js";
 
+const ORIGINAL_LAYOUT_ENV = process.env.PI_HARNESS_STORAGE_LAYOUT;
 const tempDirs: string[] = [];
 
 function makeTempDir(prefix: string): string {
@@ -39,7 +40,8 @@ async function initTempGitRepo(dir: string): Promise<void> {
 }
 
 afterEach(() => {
-  delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+  if (ORIGINAL_LAYOUT_ENV === undefined) delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+  else process.env.PI_HARNESS_STORAGE_LAYOUT = ORIGINAL_LAYOUT_ENV;
   resetStoragePathsForTest();
   while (tempDirs.length > 0) {
     rmSync(tempDirs.pop()!, { recursive: true, force: true });
@@ -60,8 +62,8 @@ describe("WorktreeManager and repo-cleanliness (data-dir layout)", () => {
 
     const db = new ControlPlaneDb(":memory:");
     try {
-      const legacySp = createLegacyStoragePaths({ worktree: { dir: ".harness/worktrees" } });
-      const legacyMgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 }, {}, legacySp);
+      const legacySp = createLegacyStoragePaths();
+      const legacyMgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 }, {}, legacySp);
       const { baseBranch, baseSha } = await legacyMgr.resolveRepoInfo();
 
       // 1. Pre-existing legacy worktree registered under <repo>/.harness/worktrees/
@@ -355,8 +357,8 @@ describe("WorktreeManager and repo-cleanliness (data-dir layout)", () => {
       // 7. Legacy layout remains unchanged (still allows symlinked worktrees root).
       mkdirSync(join(repo, ".harness"), { recursive: true });
       symlinkSync(outsideLegacy, join(repo, ".harness", "worktrees"));
-      const legacySp = createLegacyStoragePaths({ worktree: { dir: ".harness/worktrees" } });
-      const legacyMgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 }, {}, legacySp);
+      const legacySp = createLegacyStoragePaths();
+      const legacyMgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 }, {}, legacySp);
       const legacyRun = db.createRun({ goal: "Legacy symlink run", repoRoot: repo, baseBranch, baseSha, chatSessionId: "chat-4" });
       const legacyTask = db.createTask({
         runId: legacyRun.id,

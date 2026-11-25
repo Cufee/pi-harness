@@ -28,7 +28,7 @@ function makeTestConfig(repoDir: string, stateDir: string) {
   cfg.socketPath = join(stateDir, "d.sock");
   cfg.quotaEndpoint = undefined;
   cfg.catalog = { ttlHours: 24 };
-  cfg.worktree = { dir: ".harness/worktrees", archiveRetentionDays: 7, maxConcurrentWorkers: 4 };
+  cfg.worktree = { archiveRetentionDays: 7, maxConcurrentWorkers: 4 };
   cfg.codeMode = "off";
   cfg.profiles = [
     { id: "pi:local", kind: "pi", provider: "fixture", billing: "local", models: ["fixture"] },

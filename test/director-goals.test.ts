@@ -204,11 +204,12 @@ describe("Tier 0 Director, Run-Until-Done Goal Engine, Independent Done-Review &
 it("logs Director reads and delegates sourced research", async () => {
   const repoRoot = await makeTempRepo();
   const stateDir = mkdtempSync(join(tmpdir(), "director-isolation-"));
+  const outsideDir = mkdtempSync(join(tmpdir(), "director-outside-"));
   let childId = "";
   try {
     writeFileSync(join(repoRoot, "large.txt"), "é".repeat(2500));
-    writeFileSync(join(stateDir, "outside.txt"), "private");
-    symlinkSync(join(stateDir, "outside.txt"), join(repoRoot, "link.txt"));
+    writeFileSync(join(outsideDir, "outside.txt"), "private");
+    symlinkSync(join(outsideDir, "outside.txt"), join(repoRoot, "link.txt"));
     const config = withFixtureCatalog({ ...loadConfig(repoRoot), stateDir, socketPath: join(stateDir, "d.sock"), codeMode: "off" });
     const daemon = new HarnessDaemon(config, {
       dbPath: ":memory:",
@@ -264,6 +265,7 @@ it("logs Director reads and delegates sourced research", async () => {
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
     rmSync(stateDir, { recursive: true, force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
   }
 });
 

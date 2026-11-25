@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, it } from "bun:test";
@@ -7,10 +8,14 @@ import {
   defaultDataDir,
   diffHarnessConfig,
   findMisplacedConfigKeys,
+  getLegacyWorktreeDir,
+  loadConfig,
   resolveConfig,
+  saveGlobalConfig,
   serializeGlobalConfig,
   validateConfigRaw,
 } from "../src/config.js";
+import { storagePaths } from "../src/storage/paths.js";
 
 const tmpStateDir = join(tmpdir(), "pi-harness-config-keys-test");
 
@@ -39,10 +44,10 @@ describe("Unknown and misplaced config key detection", () => {
   });
 
   it("suggests on adjacent transposition for short keys", () => {
-    const res = findMisplacedConfigKeys({ worktree: { dri: "x" } }, "global");
+    const res = findMisplacedConfigKeys({ quotaEndpoint: { ulr: "x" } }, "global");
     assert.equal(res.length, 1);
-    assert.equal(res[0]!.path, "worktree.dri");
-    assert.equal(res[0]!.suggestion, "worktree.dir");
+    assert.equal(res[0]!.path, "quotaEndpoint.ulr");
+    assert.equal(res[0]!.suggestion, "quotaEndpoint.url");
   });
 
   it("omits suggestion when no known key is within threshold", () => {
@@ -94,15 +99,140 @@ describe("Unknown and misplaced config key detection", () => {
 
   it("never rejects unknown section keys and drops them when resolving config", () => {
     const raw = {
-      worktree: { dir: "wt", maxConcurentWorkers: 9 },
+      worktree: { gitAuthorName: "custom-bot", maxConcurentWorkers: 9 },
       quotaEndpoint: { ulr: "x" },
     };
     assert.deepEqual(validateConfigRaw(raw), []);
     const cfg = resolveConfig(raw, {}, { stateDir: tmpStateDir });
-    assert.equal(cfg.worktree.dir, "wt");
+    assert.equal(cfg.worktree.gitAuthorName, "custom-bot");
     assert.equal(cfg.worktree.maxConcurrentWorkers, 4);
     assert.equal("maxConcurentWorkers" in cfg.worktree, false);
     assert.equal(cfg.quotaEndpoint, undefined);
+  });
+
+  it("accepts removed worktree.dir and worktree.artifactsDir silently, keeps worktree.dir verbatim across save/load, and never exposes or adds it", () => {
+    const raw = {
+      worktree: { dir: " legacy-wt ", artifactsDir: ".harness/old-artifacts" },
+    };
+    assert.deepEqual(findMisplacedConfigKeys(raw, "global"), []);
+    assert.deepEqual(findMisplacedConfigKeys(raw, "repo"), []);
+    assert.deepEqual(validateConfigRaw(raw), []);
+
+    const cfg = resolveConfig(raw, {}, { stateDir: tmpStateDir });
+    assert.equal("dir" in cfg.worktree, false);
+    assert.equal("artifactsDir" in cfg.worktree, false);
+    assert.equal(getLegacyWorktreeDir(cfg), " legacy-wt ");
+    // Public JSON serialization of config (as returned by config.get) omits removed keys.
+    const jsonCfg = JSON.parse(JSON.stringify(cfg)) as { worktree: Record<string, unknown> };
+    assert.equal("dir" in jsonCfg.worktree, false);
+    assert.equal("artifactsDir" in jsonCfg.worktree, false);
+
+    // serializeGlobalConfig writes an existing global worktree.dir back verbatim and drops artifactsDir.
+    const serialized = JSON.parse(serializeGlobalConfig(cfg)) as { worktree: Record<string, unknown> };
+    assert.equal(serialized.worktree.dir, " legacy-wt ");
+    assert.equal("artifactsDir" in serialized.worktree, false);
+    assert.deepEqual(findMisplacedConfigKeys(serialized, "global"), []);
+    assert.deepEqual(validateConfigRaw(serialized), []);
+
+    // Clean config never adds worktree.dir on save.
+    const cleanCfg = resolveConfig({}, {}, { stateDir: tmpStateDir });
+    const cleanSerialized = JSON.parse(serializeGlobalConfig(cleanCfg)) as { worktree: Record<string, unknown> };
+    assert.equal("dir" in cleanSerialized.worktree, false);
+    assert.equal("artifactsDir" in cleanSerialized.worktree, false);
+
+    // Repo-only worktree.dir is honored internally without adding worktree.dir to global config.json on save.
+    const repoOnlyCfg = resolveConfig({}, { worktree: { dir: "repo-only-wt" } }, { stateDir: tmpStateDir });
+    assert.equal(getLegacyWorktreeDir(repoOnlyCfg), "repo-only-wt");
+    const repoOnlySerialized = JSON.parse(serializeGlobalConfig(repoOnlyCfg)) as { worktree: Record<string, unknown> };
+    assert.equal("dir" in repoOnlySerialized.worktree, false);
+
+    // When both global and repo files specify worktree.dir, repo wins for runtime resolution while global save preserves global verbatim.
+    const bothCfg = resolveConfig(
+      { worktree: { dir: "/global-wt" } },
+      { worktree: { dir: "repo-wt" } },
+      { stateDir: tmpStateDir },
+    );
+    assert.equal(getLegacyWorktreeDir(bothCfg), "repo-wt");
+    const bothSerialized = JSON.parse(serializeGlobalConfig(bothCfg)) as { worktree: Record<string, unknown> };
+    assert.equal(bothSerialized.worktree.dir, "/global-wt");
+
+    // A stray dir/artifactsDir placed on config.worktree (e.g. from a legacy config.update patch) cannot set or alter
+    // either serialized output or StoragePaths protection/placement.
+    const patchedClean = {
+      ...cleanCfg,
+      worktree: { ...cleanCfg.worktree, dir: "/injected-wt", artifactsDir: "/injected-art" },
+    } as typeof cleanCfg;
+    const patchedSerialized = JSON.parse(serializeGlobalConfig(patchedClean)) as { worktree: Record<string, unknown> };
+    assert.equal("dir" in patchedSerialized.worktree, false);
+    assert.equal("artifactsDir" in patchedSerialized.worktree, false);
+    const repo = join(tmpStateDir, "demo-repo");
+    const patchedSp = storagePaths(patchedClean, { layout: "data-dir" });
+    assert.equal(patchedSp.managedWorktreeRoots(repo).includes("/injected-wt"), false);
+
+    // Simulated orchestrator.updateConfig (Object.keys delete + Object.assign) clears the symbol when reload removes worktree.dir.
+    const mutableTarget = { ...cfg };
+    for (const key of Object.keys(mutableTarget)) {
+      if (!(key in cleanCfg)) delete (mutableTarget as unknown as Record<string, unknown>)[key];
+    }
+    Object.assign(mutableTarget, cleanCfg);
+    assert.equal(getLegacyWorktreeDir(mutableTarget), undefined);
+
+    // Storage uses the internal legacy value for protection/managed roots and legacy-layout base dir,
+    // without changing where data-dir layout places worktrees.
+    const ddSp = storagePaths(cfg, { layout: "data-dir" });
+    assert.ok(ddSp.worktreePath({ repoRoot: repo, id: "run-1", chatSessionId: "chat-1" }, "t-1").startsWith(cfg.storage.dataDir));
+    assert.ok(ddSp.managedWorktreeRoots(repo).includes(resolve(repo, " legacy-wt ")));
+    assert.equal(ddSp.isProtectedWorktreePath(resolve(repo, " legacy-wt ", "run-1", "t-2", "a.ts"), undefined, repo), true);
+
+    const legacySp = storagePaths(cfg, { layout: "legacy" });
+    assert.equal(
+      legacySp.worktreePath({ repoRoot: repo, id: "run-1", chatSessionId: "chat-1" }, "t-1"),
+      resolve(repo, " legacy-wt ", "run-1", "t-1"),
+    );
+
+    // Full disk round-trip: loadConfig -> saveGlobalConfig -> loadConfig preserves internal worktree.dir verbatim.
+    const diskRoot = mkdtempSync(join(tmpdir(), "pi-config-legacy-wt-save-"));
+    const prevHome = process.env.PI_HARNESS_HOME;
+    try {
+      const stateDir = join(diskRoot, "state");
+      const repoDir = join(diskRoot, "repo");
+      mkdirSync(stateDir, { recursive: true });
+      mkdirSync(repoDir, { recursive: true });
+      const customRoot = join(diskRoot, "custom-checkouts");
+      writeFileSync(
+        join(stateDir, "config.json"),
+        JSON.stringify({ worktree: { dir: customRoot, artifactsDir: ".harness/old", maxConcurrentWorkers: 3 } }, null, 2),
+        "utf8",
+      );
+      process.env.PI_HARNESS_HOME = stateDir;
+
+      const loaded = loadConfig(repoDir);
+      assert.equal("dir" in loaded.worktree, false);
+      assert.equal("artifactsDir" in loaded.worktree, false);
+      assert.equal(getLegacyWorktreeDir(loaded), customRoot);
+      assert.equal(loaded.worktree.maxConcurrentWorkers, 3);
+
+      // Edit another setting and save: worktree.dir survives verbatim on disk while artifactsDir is dropped.
+      const updated = { ...loaded, worktree: { ...loaded.worktree, maxConcurrentWorkers: 6 } };
+      saveGlobalConfig(updated);
+      const savedRaw = JSON.parse(readFileSync(join(stateDir, "config.json"), "utf8")) as {
+        worktree: Record<string, unknown>;
+      };
+      assert.equal(savedRaw.worktree.dir, customRoot);
+      assert.equal("artifactsDir" in savedRaw.worktree, false);
+      assert.equal(savedRaw.worktree.maxConcurrentWorkers, 6);
+
+      // Reload after save (simulating daemon restart or disk reload): internal legacy value is preserved.
+      const reloaded = loadConfig(repoDir);
+      assert.equal("dir" in reloaded.worktree, false);
+      assert.equal(getLegacyWorktreeDir(reloaded), customRoot);
+      assert.equal(reloaded.worktree.maxConcurrentWorkers, 6);
+      assert.ok(storagePaths(reloaded, { layout: "data-dir" }).managedWorktreeRoots(repoDir).includes(resolve(customRoot)));
+    } finally {
+      if (prevHome === undefined) delete process.env.PI_HARNESS_HOME;
+      else process.env.PI_HARNESS_HOME = prevHome;
+      rmSync(diskRoot, { recursive: true, force: true });
+    }
   });
 
   it("emits no warnings for a daemon-serialized clean config", () => {

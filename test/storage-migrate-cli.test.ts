@@ -297,7 +297,7 @@ describe("pi-harness migrate-storage CLI", () => {
     // 2. --dry-run while a daemon is running on the same stateDir (daemon in legacy mode keeps legacy files intact).
     const socketPath = join(stateDir, "daemon.sock");
     writeFileSync(join(stateDir, "config.json"), JSON.stringify({ socketPath }), "utf8");
-    delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+    process.env.PI_HARNESS_STORAGE_LAYOUT = "legacy";
     resetStoragePathsForTest();
     const daemonCfg = withFixtureCatalog({
       ...loadConfig(repoDir),
@@ -452,7 +452,7 @@ describe("pi-harness migrate-storage CLI", () => {
     assert.equal(existsSync(customDataDir), false, "--dry-run must not create custom dataDir");
   });
 
-  it("under default legacy layout --dry-run reports legacy noop and without --dry-run exits 1 without moving files", async () => {
+  it("under legacy layout lever --dry-run reports legacy noop and without --dry-run exits 1 without moving files", async () => {
     const { repoDir, baseSha } = initTempGitRepo("pi-mig-cli-leg-repo-");
     const stateDir = makeTempDir("pi-mig-cli-leg-state-");
     seedFixtureRepo(stateDir, repoDir, baseSha);
@@ -462,7 +462,7 @@ describe("pi-harness migrate-storage CLI", () => {
     const dryRes = await runCli(["migrate-storage", "--dry-run"], {
       stateDir,
       cwd: repoDir,
-      layout: undefined, // default legacy
+      layout: "legacy",
     });
     assert.equal(dryRes.code, 0, `stderr: ${dryRes.stderr}`);
     assert.match(dryRes.stdout, /legacy/i, dryRes.stdout);
@@ -470,7 +470,7 @@ describe("pi-harness migrate-storage CLI", () => {
     const liveRes = await runCli(["migrate-storage"], {
       stateDir,
       cwd: repoDir,
-      layout: undefined, // default legacy
+      layout: "legacy",
     });
     assert.equal(liveRes.code, 1, `expected exit 1 without --dry-run, got ${liveRes.code}`);
     assert.equal(liveRes.stdout, "");

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { loadConfig } from "../src/config.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import { GOAL_GET_LIMITS, GOAL_GET_SECTIONS } from "../src/director/goal-get.js";
@@ -595,7 +595,7 @@ describe("goal-20 integration: DirectorRuntime gate-activity events and compact 
         const goalOut = defaultResult.goal as { description: { chars: number; path: string | null } };
         assert.equal(goalOut.description.chars, 40_000);
         assert.ok(goalOut.description.path, "expected full description file path");
-        assert.equal(readFileSync(join(repoRoot, goalOut.description.path!), "utf8"), fullDescription);
+        assert.equal(readFileSync(resolve(repoRoot, goalOut.description.path!), "utf8"), fullDescription);
 
         // Verify paging through Director tool path.
         assert.ok(pagedResult, "expected paged goal_get result");

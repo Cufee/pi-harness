@@ -9,6 +9,7 @@ import type { CustomRunnerFactory } from "../src/control-plane/orchestrator.js";
 import { DaemonClient } from "../src/daemon/remote.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import { isSafeReadOnlyShellCommand } from "../src/runners/acp-shims.js";
+import { storagePaths } from "../src/storage/paths.js";
 import { runGit } from "../src/worktree/manager.js";
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
 
@@ -41,6 +42,8 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
     writeFileSync(join(repoRoot, "README.md"), "# repo\n", "utf8");
     mkdirSync(join(repoRoot, ".harness", "goals"), { recursive: true });
     writeFileSync(join(repoRoot, ".harness", "goals", "evidence.md"), "verified ok\n", "utf8");
+    mkdirSync(join(repoRoot, ".harness", "goals", "goal-ev"), { recursive: true });
+    writeFileSync(join(repoRoot, ".harness", "goals", "goal-ev", "evidence.md"), "nested goal evidence ok\n", "utf8");
     mkdirSync(extraDir, { recursive: true });
     writeFileSync(join(extraDir, "shared.txt"), "extra data\n", "utf8");
     await runGit(repoRoot, ["add", "README.md"]);
@@ -52,6 +55,10 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
           const readRes = await req.executeTool("read_file", {
             path: ".harness/goals/evidence.md",
             exception_reason: "Check goal evidence",
+          });
+          const nestedReadRes = await req.executeTool("read_file", {
+            path: ".harness/goals/goal-ev/evidence.md",
+            exception_reason: "Check nested goal evidence",
           });
           const extraReadRes = await req.executeTool("read_file", {
             path: join(extraDir, "shared.txt"),
@@ -68,7 +75,7 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
           } catch {
             rejectedSrcWrite = true;
           }
-          return { text: JSON.stringify({ readRes, extraReadRes, noteRes, rejectedSrcWrite }), stopReason: "completed" };
+          return { text: JSON.stringify({ readRes, nestedReadRes, extraReadRes, noteRes, rejectedSrcWrite }), stopReason: "completed" };
         }
         return { text: "ok", stopReason: "completed" };
       },
@@ -242,15 +249,22 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
       const dirRes = await daemon.director.sendChatMessage(chat.id, "CALL_DIRECTOR_TOOLS");
       const parsed = JSON.parse(dirRes.assistantTurn?.content ?? "{}") as {
         readRes: { content: string };
+        nestedReadRes: { content: string };
         extraReadRes: { content: string };
         noteRes: { written: boolean };
         rejectedSrcWrite: boolean;
       };
       assert.ok(parsed.readRes.content.includes("verified ok"));
+      assert.ok(parsed.nestedReadRes.content.includes("nested goal evidence ok"));
       assert.ok(parsed.extraReadRes.content.includes("extra data"));
       assert.equal(parsed.noteRes.written, true);
       assert.equal(parsed.rejectedSrcWrite, true);
-      assert.ok(existsSync(join(repoRoot, ".harness", "notes", "report.md")));
+      const sp = storagePaths(cfg);
+      const expectedNotePath =
+        sp.layout === "data-dir"
+          ? join(sp.projectNotesDir(repoRoot), "report.md")
+          : join(repoRoot, ".harness", "notes", "report.md");
+      assert.ok(existsSync(expectedNotePath));
     } finally {
       client.close();
       await daemon.stop();

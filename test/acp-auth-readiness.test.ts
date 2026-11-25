@@ -18,6 +18,7 @@ import {
 } from "../src/quota/client.js";
 import { ACP_AUTH_TEXT_RE, AcpProfileError, isAcpAuthError } from "../src/runners/acp-profile-error.js";
 import { buildNewSessionParams } from "../src/runners/acp-shims.js";
+import { storageText } from "../src/storage/text.js";
 
 function makeTwoProfileCatalog(quota: QuotaClient): {
   stateDir: string;
@@ -506,13 +507,14 @@ describe("ACP auth readiness, routing skips, profile errors, and prompt consiste
   });
 
   it("buildDirectorSystemPrompt lists extraWriteRoots and disables native Write/Edit in favor of write_note", () => {
+    const text = storageText();
     const withoutExtra = buildDirectorSystemPrompt("off");
-    assert.ok(withoutExtra.includes(".harness/goals/, .harness/notes/, or a configured extra write root (none configured)."));
+    assert.ok(withoutExtra.includes(text.directorNoteLocation("none configured")));
     assert.ok(withoutExtra.includes("Native Write and Edit tools are disabled in this session."));
     assert.ok(withoutExtra.includes("Ignore any inherited instruction to save memory or other files with the Write tool; save them with `write_note`"));
 
     const withExtra = buildDirectorSystemPrompt("collapsed", undefined, ["/srv/notes", "/tmp/reports"]);
-    assert.ok(withExtra.includes(".harness/goals/, .harness/notes/, or a configured extra write root (/srv/notes, /tmp/reports)."));
+    assert.ok(withExtra.includes(text.directorNoteLocation("/srv/notes, /tmp/reports")));
     assert.ok(withExtra.includes("Native Write and Edit tools are disabled in this session."));
   });
 

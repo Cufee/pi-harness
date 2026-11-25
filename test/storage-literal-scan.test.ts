@@ -11,16 +11,7 @@ const SRC_DIR = join(REPO_ROOT_DIR, "src");
  * deprecated wrappers. Entries may already be converted; the goal-39 cleanup slice empties this
  * list. Do not add entries.
  */
-const ALLOWED_UNCONVERTED_FILES: readonly string[] = [
-  "src/config.ts",
-  "src/control-plane/orchestrator.ts",
-  "src/control-plane/tools.ts",
-  "src/director/runtime.ts",
-  "src/director/session.ts",
-  "src/runners/acp-runner.ts",
-  "src/runners/acp-shims.ts",
-  "src/tool-descriptions/registry.ts",
-];
+const ALLOWED_UNCONVERTED_FILES: readonly string[] = [];
 
 const HARNESS_SEGMENT_RE = /(^|[^A-Za-z0-9_-])\.harness(?=$|[^A-Za-z0-9_-])/;
 const REFS_HARNESS_RE = /refs\/harness\b/;

@@ -2,12 +2,12 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { afterEach, describe, it } from "bun:test";
+import { afterEach, beforeEach, describe, it } from "bun:test";
 import { REJECTIONS } from "../src/advisories/rejections.js";
 import { HARNESS_TEXT_COUNT_PATTERN } from "../src/advisories/rules.js";
 import { buildDirectorSystemPrompt } from "../src/director/session.js";
 import { describeMergedRefFallback } from "../src/storage/names.js";
-import { createLegacyStoragePaths, resetStoragePathsForTest } from "../src/storage/paths.js";
+import { resetStoragePathsForTest } from "../src/storage/paths.js";
 import { storageText } from "../src/storage/text.js";
 import { describeTool, toolsForRole } from "../src/tool-descriptions/registry.js";
 
@@ -45,6 +45,11 @@ function assertOnlyOldPathsSentenceMentionsHarness(text: string, label: string):
 }
 
 describe("src/storage/text", () => {
+  beforeEach(() => {
+    delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+    resetStoragePathsForTest();
+  });
+
   afterEach(() => {
     restoreLayoutEnv();
   });
@@ -54,60 +59,64 @@ describe("src/storage/text", () => {
     assert.deepEqual(Object.keys(storageText("data-dir")).sort(), [...EXPECTED_HELPERS]);
   });
 
-  it("matches StoragePaths.describe*() byte-for-byte in legacy layout for static and dynamic inputs", () => {
-    const legacy = createLegacyStoragePaths();
+  it("produces exact legacy text for static and dynamic inputs and defaults to data-dir", () => {
     const text = storageText("legacy");
     const defaultText = storageText();
+    const dataDirText = storageText("data-dir");
 
-    assert.equal(text.artifactsRoot(), legacy.describeArtifactsRoot());
-    assert.equal(defaultText.artifactsRoot(), legacy.describeArtifactsRoot());
+    assert.equal(text.artifactsRoot(), ".harness/artifacts");
+    assert.equal(defaultText.artifactsRoot(), dataDirText.artifactsRoot());
 
-    assert.equal(text.goalEvidenceDirTemplate(), legacy.describeGoalEvidenceDirTemplate());
+    assert.equal(text.goalEvidenceDirTemplate(), "<repo>/.harness/goals/<goalId>");
     assert.equal(
       text.directorNoteLocation("none configured"),
-      legacy.describeDirectorNoteLocation("none configured"),
+      ".harness/goals/, .harness/notes/, or a configured extra write root (none configured)",
     );
     assert.equal(
       text.directorNoteLocation("/srv/notes, /tmp/reports"),
-      legacy.describeDirectorNoteLocation("/srv/notes, /tmp/reports"),
+      ".harness/goals/, .harness/notes/, or a configured extra write root (/srv/notes, /tmp/reports)",
     );
 
     // Static variants (omitted roots or omitted extraRoots; noteRoots ignored in legacy).
-    assert.equal(text.writeNoteTool(), legacy.describeWriteNoteTool());
-    assert.equal(text.writeNoteTool({}), legacy.describeWriteNoteTool());
-    assert.equal(text.writeNoteTool({ noteRoots: ["/data/p/chats/chat-1/notes"] }), legacy.describeWriteNoteTool());
-    assert.equal(text.writeNotePathParam(), legacy.describeWriteNotePathParam());
-    assert.equal(text.writeNotePathParam({}), legacy.describeWriteNotePathParam());
-    assert.equal(text.writeNotePathParam({ noteRoots: ["/data/p/chats/chat-1/notes"] }), legacy.describeWriteNotePathParam());
+    const staticTool =
+      "Logged Director note/report writer scoped strictly to `.harness/goals/`, `.harness/notes/`, or configured `extraWriteRoots` (never writes tracked repository source code).";
+    const staticParam = "Destination file under .harness/goals/, .harness/notes/, or extraWriteRoots.";
+    assert.equal(text.writeNoteTool(), staticTool);
+    assert.equal(text.writeNoteTool({}), staticTool);
+    assert.equal(text.writeNoteTool({ noteRoots: ["/data/p/chats/chat-1/notes"] }), staticTool);
+    assert.equal(text.writeNotePathParam(), staticParam);
+    assert.equal(text.writeNotePathParam({}), staticParam);
+    assert.equal(text.writeNotePathParam({ noteRoots: ["/data/p/chats/chat-1/notes"] }), staticParam);
 
     // Dynamic variants with empty and populated extraRoots; noteRoots ignored in legacy.
-    assert.equal(text.writeNoteTool({ extraRoots: [] }), legacy.describeWriteNoteTool([]));
-    assert.equal(
-      text.writeNoteTool({ noteRoots: ["/ignored"], extraRoots: [] }),
-      legacy.describeWriteNoteTool([]),
-    );
-    assert.equal(text.writeNoteTool({ extraRoots: ["/a", "/b"] }), legacy.describeWriteNoteTool(["/a", "/b"]));
-    assert.equal(
-      text.writeNoteTool({ noteRoots: ["/ignored"], extraRoots: ["/a", "/b"] }),
-      legacy.describeWriteNoteTool(["/a", "/b"]),
-    );
+    const emptyTool =
+      "Logged Director note/report writer scoped strictly to `.harness/goals/`, `.harness/notes/` (no extraWriteRoots configured; never writes tracked repository source code).";
+    const populatedTool =
+      "Logged Director note/report writer scoped strictly to `.harness/goals/`, `.harness/notes/`, or these configured extraWriteRoots: /a, /b (never writes tracked repository source code).";
+    assert.equal(text.writeNoteTool({ extraRoots: [] }), emptyTool);
+    assert.equal(text.writeNoteTool({ noteRoots: ["/ignored"], extraRoots: [] }), emptyTool);
+    assert.equal(text.writeNoteTool({ extraRoots: ["/a", "/b"] }), populatedTool);
+    assert.equal(text.writeNoteTool({ noteRoots: ["/ignored"], extraRoots: ["/a", "/b"] }), populatedTool);
 
-    assert.equal(text.writeNotePathParam({ extraRoots: [] }), legacy.describeWriteNotePathParam([]));
-    assert.equal(
-      text.writeNotePathParam({ noteRoots: ["/ignored"], extraRoots: [] }),
-      legacy.describeWriteNotePathParam([]),
-    );
-    assert.equal(text.writeNotePathParam({ extraRoots: ["/a", "/b"] }), legacy.describeWriteNotePathParam(["/a", "/b"]));
-    assert.equal(
-      text.writeNotePathParam({ noteRoots: ["/ignored"], extraRoots: ["/a", "/b"] }),
-      legacy.describeWriteNotePathParam(["/a", "/b"]),
-    );
+    const emptyParam = "Destination file under .harness/goals/, .harness/notes/ (no extraWriteRoots configured).";
+    const populatedParam =
+      "Destination file under .harness/goals/, .harness/notes/, or these configured extraWriteRoots: /a, /b.";
+    assert.equal(text.writeNotePathParam({ extraRoots: [] }), emptyParam);
+    assert.equal(text.writeNotePathParam({ noteRoots: ["/ignored"], extraRoots: [] }), emptyParam);
+    assert.equal(text.writeNotePathParam({ extraRoots: ["/a", "/b"] }), populatedParam);
+    assert.equal(text.writeNotePathParam({ noteRoots: ["/ignored"], extraRoots: ["/a", "/b"] }), populatedParam);
 
-    assert.equal(text.directorNoteRootAlternative(), legacy.describeDirectorNoteRootAlternative());
-    assert.equal(text.dossierInvalidDirectoryReason(), legacy.describeDossierInvalidDirectoryReason());
+    assert.equal(
+      text.directorNoteRootAlternative(),
+      "Write under .harness/goals, .harness/notes, or a configured worktree.extraWriteRoots path. Code changes go through goal_create and goal_commit.",
+    );
+    assert.equal(
+      text.dossierInvalidDirectoryReason(),
+      "Dossiers are stored only in regular directories under .harness/artifacts to keep run artifacts confined.",
+    );
     assert.equal(
       text.dossierSymlinkWhat("/repo/.harness/artifacts/run-1/t-1/note.md"),
-      legacy.describeDossierSymlinkWhat("/repo/.harness/artifacts/run-1/t-1/note.md"),
+      "Dossier must be a non-symlink path under .harness/artifacts: /repo/.harness/artifacts/run-1/t-1/note.md.",
     );
   });
 
@@ -206,8 +215,32 @@ describe("src/storage/text", () => {
   });
 
   it("wires registry write_note, goal_trigger_review, and Director system prompt for both layouts", () => {
-    // Legacy layout (default).
+    // Data-dir layout (default).
+    const dataDirText = storageText("data-dir");
+    const defaultWriteNote = toolsForRole("director").find((t) => t.name === "write_note");
+    assert.ok(defaultWriteNote);
+    assert.equal(describeTool("write_note", "director"), dataDirText.writeNoteTool());
+    assert.equal(defaultWriteNote.description, dataDirText.writeNoteTool());
+    const defaultPathDesc = (defaultWriteNote.inputSchema as { properties?: { path?: { description?: string } } }).properties
+      ?.path?.description;
+    assert.equal(defaultPathDesc, dataDirText.writeNotePathParam());
+    assert.ok(describeTool("goal_trigger_review", "director").includes(describeMergedRefFallback("data-dir")));
+
+    const dataDirPromptArg = buildDirectorSystemPrompt("off", undefined, ["/srv/notes"], "data-dir");
+    assert.ok(dataDirPromptArg.includes(dataDirText.directorNoteLocation("/srv/notes")));
+    assert.ok(dataDirPromptArg.includes(`\`${dataDirText.goalEvidenceDirTemplate()}\``));
+    assert.ok(!dataDirPromptArg.includes("<repo>/.harness/goals/<goalId>"));
+    assert.equal(buildDirectorSystemPrompt("off", undefined, ["/srv/notes"]), dataDirPromptArg);
+
+    // Legacy layout via explicit prompt argument and via emergency lever env.
     const legacyText = storageText("legacy");
+    const legacyPromptArg = buildDirectorSystemPrompt("off", undefined, ["/srv/notes"], "legacy");
+    assert.ok(legacyPromptArg.includes(legacyText.directorNoteLocation("/srv/notes")));
+    assert.ok(legacyPromptArg.includes(`\`${legacyText.goalEvidenceDirTemplate()}\``));
+
+    process.env.PI_HARNESS_STORAGE_LAYOUT = "legacy";
+    resetStoragePathsForTest();
+
     const legacyWriteNote = toolsForRole("director").find((t) => t.name === "write_note");
     assert.ok(legacyWriteNote);
     assert.equal(describeTool("write_note", "director"), legacyText.writeNoteTool());
@@ -217,31 +250,8 @@ describe("src/storage/text", () => {
     assert.equal(legacyPathDesc, legacyText.writeNotePathParam());
     assert.ok(describeTool("goal_trigger_review", "director").includes(describeMergedRefFallback("legacy")));
 
-    const legacyPrompt = buildDirectorSystemPrompt("off", undefined, ["/srv/notes"], "legacy");
-    assert.ok(legacyPrompt.includes(legacyText.directorNoteLocation("/srv/notes")));
-    assert.ok(legacyPrompt.includes(`\`${legacyText.goalEvidenceDirTemplate()}\``));
-
-    // Data-dir layout via explicit prompt argument.
-    const dataDirText = storageText("data-dir");
-    const dataDirPromptArg = buildDirectorSystemPrompt("off", undefined, ["/srv/notes"], "data-dir");
-    assert.ok(dataDirPromptArg.includes(dataDirText.directorNoteLocation("/srv/notes")));
-    assert.ok(dataDirPromptArg.includes(`\`${dataDirText.goalEvidenceDirTemplate()}\``));
-    assert.ok(!dataDirPromptArg.includes("<repo>/.harness/goals/<goalId>"));
-
-    // Data-dir layout via process-start env (resetStoragePathsForTest re-reads PI_HARNESS_STORAGE_LAYOUT).
-    process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
-    resetStoragePathsForTest();
-
-    const dataDirWriteNote = toolsForRole("director").find((t) => t.name === "write_note");
-    assert.ok(dataDirWriteNote);
-    assert.equal(describeTool("write_note", "director"), dataDirText.writeNoteTool());
-    assert.equal(dataDirWriteNote.description, dataDirText.writeNoteTool());
-    const dataDirPathDesc = (dataDirWriteNote.inputSchema as { properties?: { path?: { description?: string } } }).properties
-      ?.path?.description;
-    assert.equal(dataDirPathDesc, dataDirText.writeNotePathParam());
-
-    const dataDirPromptEnv = buildDirectorSystemPrompt("off", undefined, ["/srv/notes"]);
-    assert.equal(dataDirPromptEnv, dataDirPromptArg);
+    const legacyPromptEnv = buildDirectorSystemPrompt("off", undefined, ["/srv/notes"]);
+    assert.equal(legacyPromptEnv, legacyPromptArg);
   });
 
   it("selects data-dir registry and rejection text in a fresh process started with PI_HARNESS_STORAGE_LAYOUT=data-dir", () => {
@@ -275,23 +285,7 @@ describe("src/storage/text", () => {
     });
   });
 
-  it("produces legacy text from the three storage REJECTIONS by default and switches at call time", () => {
-    const legacy = createLegacyStoragePaths();
-    assert.equal(
-      REJECTIONS.directorNoteRoot("/repo/src/a.ts").notice.alternative,
-      legacy.describeDirectorNoteRootAlternative(),
-    );
-    assert.equal(
-      REJECTIONS.dossierInvalidDirectory("/repo/.harness/artifacts/x").notice.why,
-      legacy.describeDossierInvalidDirectoryReason(),
-    );
-    assert.equal(
-      REJECTIONS.dossierSymlink("/repo/.harness/artifacts/x").notice.what,
-      legacy.describeDossierSymlinkWhat("/repo/.harness/artifacts/x"),
-    );
-
-    process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
-    resetStoragePathsForTest();
+  it("produces data-dir text from the three storage REJECTIONS by default and switches at call time", () => {
     const dataDir = storageText("data-dir");
     assert.equal(
       REJECTIONS.directorNoteRoot("/repo/src/a.ts").notice.alternative,
@@ -304,6 +298,22 @@ describe("src/storage/text", () => {
     assert.equal(
       REJECTIONS.dossierSymlink("/data/artifacts/x").notice.what,
       dataDir.dossierSymlinkWhat("/data/artifacts/x"),
+    );
+
+    process.env.PI_HARNESS_STORAGE_LAYOUT = "legacy";
+    resetStoragePathsForTest();
+    const legacy = storageText("legacy");
+    assert.equal(
+      REJECTIONS.directorNoteRoot("/repo/src/a.ts").notice.alternative,
+      legacy.directorNoteRootAlternative(),
+    );
+    assert.equal(
+      REJECTIONS.dossierInvalidDirectory("/repo/.harness/artifacts/x").notice.why,
+      legacy.dossierInvalidDirectoryReason(),
+    );
+    assert.equal(
+      REJECTIONS.dossierSymlink("/repo/.harness/artifacts/x").notice.what,
+      legacy.dossierSymlinkWhat("/repo/.harness/artifacts/x"),
     );
   });
 

@@ -20,6 +20,7 @@ import { HarnessOrchestrator } from "../src/control-plane/orchestrator.js";
 import { buildHydrationTurn, buildImmutableSystemPrompt } from "../src/control-plane/prompts.js";
 import { buildRunActivitySummary } from "../src/control-plane/telemetry.js";
 import { buildGoalGetResult, parseGoalGetOptions } from "../src/director/goal-get.js";
+import { archiveRef, archiveRefPatterns } from "../src/storage/names.js";
 import { DirectorRuntime } from "../src/director/runtime.js";
 import { buildDirectorSystemPrompt } from "../src/director/session.js";
 import { QuotaClient } from "../src/quota/client.js";
@@ -1199,7 +1200,7 @@ describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () =>
           "#!/bin/sh",
           "while IFS= read -r line; do",
           '  case "$line" in',
-          '    *"refs/harness/archive/"*) exit 1 ;;',
+          '    *"refs/harness/archive/"*|*"refs/harness/"*"/archive/"*) exit 1 ;;',
           "  esac",
           "done",
           "exit 0",
@@ -1264,7 +1265,7 @@ describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () =>
       // Yield to allow any fire-and-forget async teardown in return_task's finally block to run.
       await new Promise((r) => setTimeout(r, 150));
 
-      const expectedArchiveRef = `refs/harness/archive/${run.id}/${mergedWorker.id}`;
+      const expectedArchiveRef = archiveRef(run, mergedWorker.id);
       const settledMerged = db.getTask(mergedWorker.id)!;
       assert.equal(settledMerged.status, "completed");
       const parsedMergedResult = JSON.parse(settledMerged.resultJson ?? "{}") as {
@@ -1299,7 +1300,7 @@ describe("Control Plane: DAG, Leases, Scope Send-Back, Rollover & Seance", () =>
       assert.equal(wtAfterSweep.archiveRef, expectedArchiveRef);
       assert.equal((await runGit(repoRoot, ["rev-parse", expectedArchiveRef])).stdout, postMergeHead);
       const containingRefs = (
-        await runGit(repoRoot, ["for-each-ref", "--format=%(refname)", "--contains", postMergeHead, "refs/harness/archive"])
+        await runGit(repoRoot, ["for-each-ref", "--format=%(refname)", "--contains", postMergeHead, ...archiveRefPatterns(run)])
       ).stdout
         .split(/\r?\n/)
         .filter(Boolean);

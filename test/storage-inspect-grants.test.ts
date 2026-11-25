@@ -14,10 +14,12 @@ import { DENIED_HARNESS_STATE_REASON } from "../src/runners/acp-shims.js";
 import { legacyStoragePaths, resetStoragePathsForTest, storagePaths } from "../src/storage/paths.js";
 import { runGit, WorktreeManager } from "../src/worktree/manager.js";
 
+const ORIGINAL_LAYOUT_ENV = process.env.PI_HARNESS_STORAGE_LAYOUT;
 const tempDirs: string[] = [];
 
 afterEach(() => {
-  delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+  if (ORIGINAL_LAYOUT_ENV === undefined) delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+  else process.env.PI_HARNESS_STORAGE_LAYOUT = ORIGINAL_LAYOUT_ENV;
   resetStoragePathsForTest();
   while (tempDirs.length > 0) {
     rmSync(tempDirs.pop()!, { recursive: true, force: true });
@@ -82,6 +84,8 @@ function makeExecutor(
 
 describe("ControlPlaneToolExecutor storage grants and legacy path mapping", () => {
   it("legacy layout: read-only worktree task reads granted goals/artifacts via inspect_command, refuses outside/.git/sibling worktree, and supports legacy relative artifact_read", async () => {
+    process.env.PI_HARNESS_STORAGE_LAYOUT = "legacy";
+    resetStoragePathsForTest();
     const { root, repoRoot } = await initTempGitRepo("pi-tools-grants-legacy-");
     const stateDir = join(root, "state");
     mkdirSync(stateDir, { recursive: true });
@@ -95,8 +99,6 @@ describe("ControlPlaneToolExecutor storage grants and legacy path mapping", () =
       codeMode: "off",
       worktree: {
         ...base.worktree,
-        // Ignored in legacy layout (fixed legacy path only).
-        artifactsDir: ".ignored-custom-artifacts",
         extraReadRoots: [],
         extraWriteRoots: [],
       },
@@ -261,7 +263,6 @@ describe("ControlPlaneToolExecutor storage grants and legacy path mapping", () =
       codeExec: { ...base.codeExec, maxOutputChars: 80 },
       worktree: {
         ...base.worktree,
-        artifactsDir: ".ignored-custom-artifacts",
         extraReadRoots: ["~"],
         extraWriteRoots: [extraWriteDir],
       },
@@ -1066,8 +1067,7 @@ describe("ControlPlaneToolExecutor storage grants and legacy path mapping", () =
 
   it("both layouts (D4): a granted evidence dir replaced by a link to stateDir admits no state read in inspect_command or code_exec helpers while operator roots keep symlink resolution", async () => {
     for (const layout of ["data-dir", "legacy"] as const) {
-      if (layout === "legacy") delete process.env.PI_HARNESS_STORAGE_LAYOUT;
-      else process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
+      process.env.PI_HARNESS_STORAGE_LAYOUT = layout;
       resetStoragePathsForTest();
 
       const { root, repoRoot } = await initTempGitRepo(`pi-tools-d4-${layout}-`);

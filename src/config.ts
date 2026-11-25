@@ -48,10 +48,6 @@ export interface QuotaEndpointConfig {
 }
 
 export interface WorktreeConfig {
-  /** Base dir relative to repo root (default `.harness/worktrees`) */
-  dir?: string;
-  /** Durable artifact dossier dir relative to repo root (default `.harness/artifacts`) */
-  artifactsDir?: string;
   /** Optional fast bootstrap command run inside newly created worktree */
   setupCommand?: string;
   /** Deterministic CI gate commands run by the bisecting merge queue */
@@ -419,12 +415,40 @@ export interface HarnessConfig {
   hotUpdate: HotUpdateConfig;
   storage: StorageConfig;
   retention: RetentionConfig;
+  /** @internal Effective legacy `worktree.dir` preserved from an existing config file; never exposed as a setting. */
+  [LEGACY_WORKTREE_DIR]?: string;
+  /** @internal Global-layer legacy `worktree.dir` preserved verbatim for `serializeGlobalConfig`. */
+  [LEGACY_GLOBAL_WORKTREE_DIR]?: string;
+}
+
+/** @internal Internal symbol carrying the effective legacy `worktree.dir` read from an existing config file. */
+export const LEGACY_WORKTREE_DIR: unique symbol = Symbol("pi-harness.legacyWorktreeDir");
+
+/** @internal Internal symbol carrying the global `config.json` legacy `worktree.dir` value for verbatim re-serialization. */
+const LEGACY_GLOBAL_WORKTREE_DIR: unique symbol = Symbol("pi-harness.legacyGlobalWorktreeDir");
+
+type InternalConfigSymbols = typeof LEGACY_WORKTREE_DIR | typeof LEGACY_GLOBAL_WORKTREE_DIR;
+
+/** @internal Reads the internal legacy `worktree.dir` preserved from an existing config file, if any. */
+export function getLegacyWorktreeDir(config: unknown): string | undefined {
+  if (!config || typeof config !== "object") return undefined;
+  const val = (config as { [LEGACY_WORKTREE_DIR]?: unknown })[LEGACY_WORKTREE_DIR];
+  return typeof val === "string" && val.length > 0 ? val : undefined;
+}
+
+function getLegacyGlobalWorktreeDir(config: unknown): string | undefined {
+  if (!config || typeof config !== "object") return undefined;
+  if (LEGACY_GLOBAL_WORKTREE_DIR in config) {
+    const val = (config as { [LEGACY_GLOBAL_WORKTREE_DIR]?: unknown })[LEGACY_GLOBAL_WORKTREE_DIR];
+    return typeof val === "string" && val.length > 0 ? val : undefined;
+  }
+  return getLegacyWorktreeDir(config);
 }
 
 /** Top-level keys whose value is a nested section (neither a string nor a list). */
 type ConfigSection = {
-  [K in keyof HarnessConfig]-?: NonNullable<HarnessConfig[K]> extends string | readonly unknown[] ? never : K;
-}[keyof HarnessConfig];
+  [K in Exclude<keyof HarnessConfig, InternalConfigSymbols>]-?: NonNullable<HarnessConfig[K]> extends string | readonly unknown[] ? never : K;
+}[Exclude<keyof HarnessConfig, InternalConfigSymbols>];
 
 /** Every key each section supports. Adding or removing a key in a section interface fails typecheck here. */
 const CONFIG_SECTION_KEYS: { [S in ConfigSection]: { [K in keyof NonNullable<HarnessConfig[S]>]-?: true } } = {
@@ -440,8 +464,6 @@ const CONFIG_SECTION_KEYS: { [S in ConfigSection]: { [K in keyof NonNullable<Har
     maxGenerations: true,
   },
   worktree: {
-    dir: true,
-    artifactsDir: true,
     setupCommand: true,
     ciCommands: true,
     ciTimeoutMs: true,
@@ -485,7 +507,7 @@ const CONFIG_SECTION_KEYS: { [S in ConfigSection]: { [K in keyof NonNullable<Har
 };
 
 /** Top-level keys a config file may set; stateDir always comes from the environment. */
-const CONFIG_TOP_LEVEL_KEYS: { [K in Exclude<keyof HarnessConfig, "stateDir">]-?: true } = {
+const CONFIG_TOP_LEVEL_KEYS: { [K in Exclude<keyof HarnessConfig, "stateDir" | InternalConfigSymbols>]-?: true } = {
   socketPath: true,
   profiles: true,
   remotes: true,
@@ -517,6 +539,12 @@ const GLOBAL_ONLY_CONFIG_KEYS: ReadonlySet<string> = new Set([
   "hotUpdate",
   "storage",
   "retention",
+]);
+
+/** Removed config keys that may still appear in existing config files; ignored silently without warnings. */
+const KNOWN_REMOVED_CONFIG_KEYS: ReadonlySet<string> = new Set([
+  "worktree.dir",
+  "worktree.artifactsDir",
 ]);
 
 const CONFIG_SECTIONS = Object.keys(CONFIG_SECTION_KEYS) as ConfigSection[];
@@ -622,6 +650,7 @@ export function findMisplacedConfigKeys(raw: unknown, layer: "global" | "repo"):
     if (!Object.hasOwn(raw, section) || !isPlainObject(value)) continue;
     for (const key of Object.keys(value)) {
       const path = `${section}.${key}`;
+      if (KNOWN_REMOVED_CONFIG_KEYS.has(path)) continue;
       if (SECTION_KEY_SETS[section].has(key)) {
         if (layer === "repo" && GLOBAL_ONLY_CONFIG_KEYS.has(path)) out.push({ path, supported: supported(path) });
         continue;
@@ -858,6 +887,27 @@ export function resolveConfig(
   // Startup stays tolerant of non-object roots; the reload and config.update boundaries reject them.
   if (!isPlainObject(globalCfg)) globalCfg = {};
   if (!isPlainObject(repoCfg)) repoCfg = {};
+  // Capture removed `worktree.dir` literally (no trim, no `~` expansion) before dropping unsupported keys,
+  // so storage can still recognize/protect existing checkouts, honor legacy layout under the emergency lever,
+  // and preserve an existing global `worktree.dir` verbatim across config saves without adding one when absent.
+  const rawGlobalLegacyWorktreeDir =
+    isPlainObject(globalCfg.worktree) && typeof globalCfg.worktree.dir === "string"
+      ? globalCfg.worktree.dir
+      : base
+        ? getLegacyGlobalWorktreeDir(base)
+        : undefined;
+  const legacyGlobalWorktreeDir =
+    rawGlobalLegacyWorktreeDir && rawGlobalLegacyWorktreeDir.length > 0 ? rawGlobalLegacyWorktreeDir : undefined;
+  const rawLegacyWorktreeDir =
+    isPlainObject(repoCfg.worktree) && typeof repoCfg.worktree.dir === "string"
+      ? repoCfg.worktree.dir
+      : isPlainObject(globalCfg.worktree) && typeof globalCfg.worktree.dir === "string"
+        ? globalCfg.worktree.dir
+        : base
+          ? getLegacyWorktreeDir(base)
+          : undefined;
+  const legacyWorktreeDir =
+    rawLegacyWorktreeDir && rawLegacyWorktreeDir.length > 0 ? rawLegacyWorktreeDir : undefined;
   globalCfg = dropUnsupportedSectionKeys(globalCfg);
   repoCfg = dropUnsupportedSectionKeys(repoCfg);
   const stateDir = runtime.stateDir;
@@ -896,8 +946,6 @@ export function resolveConfig(
           globalWorktree && "extraWriteRoots" in globalWorktree ? roots.extraWriteRoots : base.worktree.extraWriteRoots,
       }
     : {
-        dir: ".harness/worktrees",
-        artifactsDir: ".harness/artifacts",
         ciTimeoutMs: 300_000,
         gitAuthorName: "pi-harness",
         gitAuthorEmail: "harness@local",
@@ -1043,6 +1091,10 @@ export function resolveConfig(
     hotUpdate,
     storage,
     retention,
+    // Always define both symbols as own enumerable properties (even when undefined) so Object.assign
+    // in orchestrator.updateConfig overwrites/clears them consistently and StoragePaths trusts them authoritatively.
+    [LEGACY_WORKTREE_DIR]: legacyWorktreeDir,
+    [LEGACY_GLOBAL_WORKTREE_DIR]: legacyGlobalWorktreeDir,
   };
 }
 
@@ -1222,8 +1274,6 @@ export function validateConfigRaw(raw: unknown): string[] {
     maxGenerations: POS_INT,
   });
   const worktree = section("worktree", {
-    dir: NON_EMPTY,
-    artifactsDir: NON_EMPTY,
     gitAuthorName: NON_EMPTY,
     gitAuthorEmail: NON_EMPTY,
     setupCommand: STRING,
@@ -1435,6 +1485,12 @@ export function serializeGlobalConfig(config: HarnessConfig): string {
   if (config.retention.logMaxBytes !== DEFAULT_RETENTION_CONFIG.logMaxBytes) {
     retentionOut.logMaxBytes = config.retention.logMaxBytes;
   }
+  const { dir: _removedDir, artifactsDir: _removedArtifactsDir, ...worktreeOut } =
+    config.worktree as Record<string, unknown>;
+  const legacyGlobalWorktreeDir = getLegacyGlobalWorktreeDir(config);
+  if (legacyGlobalWorktreeDir !== undefined) {
+    worktreeOut.dir = legacyGlobalWorktreeDir;
+  }
   const serialized = {
     profiles: config.profiles,
     ...(config.remotes?.length ? { remotes: config.remotes } : {}),
@@ -1445,7 +1501,7 @@ export function serializeGlobalConfig(config: HarnessConfig): string {
     defaultWorkerProfile: config.defaultWorkerProfile,
     defaultTaskProfile: config.defaultTaskProfile,
     rollover: config.rollover,
-    worktree: config.worktree,
+    worktree: worktreeOut,
     goals: config.goals,
     events: config.events,
     catalog: config.catalog,

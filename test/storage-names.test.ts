@@ -14,7 +14,6 @@ import {
   taskBranchName,
 } from "../src/storage/names.js";
 import { resetStoragePathsForTest } from "../src/storage/paths.js";
-import { runMergedRef } from "../src/worktree/merge-queue.js";
 
 const initialStorageLayout = process.env.PI_HARNESS_STORAGE_LAYOUT;
 
@@ -33,7 +32,7 @@ afterEach(() => {
 
 describe("src/storage/names (legacy layout)", () => {
   beforeEach(() => {
-    delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+    process.env.PI_HARNESS_STORAGE_LAYOUT = "legacy";
     resetStoragePathsForTest();
   });
   it("builds exact legacy branch names, archive refs, merged refs, and ref patterns", () => {
@@ -48,7 +47,6 @@ describe("src/storage/names (legacy layout)", () => {
 
     assert.equal(mergedRef(run), "refs/harness/merged/run-30");
     assert.equal(mergedRef(bareRun, "legacy"), "refs/harness/merged/run-30");
-    assert.equal(runMergedRef("run-30"), "refs/harness/merged/run-30");
 
     assert.deepEqual(mergedRefCandidates(run), ["refs/harness/merged/run-30"]);
     assert.deepEqual(mergedRefCandidates(bareRun, "legacy"), ["refs/harness/merged/run-30"]);
@@ -202,9 +200,9 @@ describe("src/storage/names (data-dir layout)", () => {
     );
   });
 
-  it("activates data-dir names from PI_HARNESS_STORAGE_LAYOUT when no explicit layout is passed", () => {
+  it("uses data-dir names by default when PI_HARNESS_STORAGE_LAYOUT is unset or set to data-dir", () => {
     const run = { id: "run-30", chatSessionId: "chat-7" };
-    process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
+    delete process.env.PI_HARNESS_STORAGE_LAYOUT;
     resetStoragePathsForTest();
 
     assert.equal(taskBranchName(run, "t-1"), "harness/chat-7/run-30/t-1");
@@ -215,6 +213,9 @@ describe("src/storage/names (data-dir layout)", () => {
       "refs/harness/merged/run-30",
     ]);
     assert.equal(describeMergedRefTemplate(), "refs/harness/<chat>/merged/<runId>");
-    assert.equal(runMergedRef("run-30"), "refs/harness/legacy/merged/run-30");
+
+    process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
+    resetStoragePathsForTest();
+    assert.equal(mergedRef({ id: "run-30" }), "refs/harness/legacy/merged/run-30");
   });
 });

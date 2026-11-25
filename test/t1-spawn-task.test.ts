@@ -8,6 +8,7 @@ import { loadConfig } from "../src/config.js";
 import { ControlPlaneDb } from "../src/control-plane/db.js";
 import { HarnessOrchestrator } from "../src/control-plane/orchestrator.js";
 import { QuotaClient } from "../src/quota/client.js";
+import { storagePaths } from "../src/storage/paths.js";
 
 it.each(["research", "plan", "verify"] as const)("lets Tier 1 spawn and await a narrow, sourced %s task", async (kind) => {
   const repoRoot = mkdtempSync(join(tmpdir(), "pi-harness-t1-research-"));
@@ -112,8 +113,10 @@ it.each(["research", "plan", "verify"] as const)("lets Tier 1 spawn and await a 
       assert.equal(handoff.artifact_paths.length, 2);
       const path = handoff.artifact_paths.find(path => path !== dossierPath);
       assert.ok(path);
-      assert.ok(path.startsWith(join(repoRoot, ".harness", "artifacts") + "/"));
-      assert.ok(handoff.summary.includes(path.slice(repoRoot.length + 1)));
+      const sp = storagePaths(config);
+      assert.ok(path.startsWith(sp.artifactsDir(run) + "/"));
+      const expectedDisplay = sp.layout === "data-dir" ? path : path.slice(repoRoot.length + 1);
+      assert.ok(handoff.summary.includes(expectedDisplay));
       assert.deepEqual(await execute("artifact_read", { path }), { path, content: summary, truncated: false });
       expectedSummary = handoff.summary;
       artifactPaths.push(path);

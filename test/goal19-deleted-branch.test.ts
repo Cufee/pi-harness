@@ -6,7 +6,7 @@ import { describe, it } from "bun:test";
 import { loadConfig } from "../src/config.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import { runGit } from "../src/worktree/manager.js";
-import { runMergedRef } from "../src/worktree/merge-queue.js";
+import { mergedRef as runMergedRef } from "../src/storage/names.js";
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
 
 async function makeTempRepo(): Promise<string> {
@@ -76,7 +76,7 @@ describe("goal-19 v2: deleted base branch gate fallback and goal_accept resilien
         daemon.db.updateRunStatus(run1.id, "completed");
         daemon.director.goals.linkRunAndStart(g1.id, run1.id);
 
-        const mergedRef1 = runMergedRef(run1.id);
+        const mergedRef1 = runMergedRef({ ...run1, chatSessionId: g1.chatSessionId });
         await runGit(repoRoot, ["update-ref", mergedRef1, workSha]);
         await runGit(repoRoot, ["branch", "-D", "goal-base"]);
 
@@ -113,7 +113,7 @@ describe("goal-19 v2: deleted base branch gate fallback and goal_accept resilien
         const runExplicit = daemon.db.createRun({ goal: gExplicit.title, repoRoot, baseBranch: "goal-base", baseSha: mainSha });
         daemon.db.updateRunStatus(runExplicit.id, "completed");
         daemon.director.goals.linkRunAndStart(gExplicit.id, runExplicit.id);
-        await runGit(repoRoot, ["update-ref", runMergedRef(runExplicit.id), workSha]);
+        await runGit(repoRoot, ["update-ref", runMergedRef({ ...runExplicit, chatSessionId: gExplicit.chatSessionId }), workSha]);
 
         await assert.rejects(
           () => daemon.director.verifyAndReviewGoal(gExplicit.id),
@@ -258,7 +258,7 @@ describe("goal-19 v2: deleted base branch gate fallback and goal_accept resilien
         daemon.director.goals.linkRunAndStart(goal.id, run.id);
 
         // Ref stays stale at B1 while merge.promoted records B2, then base branch is deleted.
-        const mergedRef = runMergedRef(run.id);
+        const mergedRef = runMergedRef({ ...run, chatSessionId: goal.chatSessionId });
         await runGit(repoRoot, ["update-ref", mergedRef, b1Sha]);
         daemon.db.emitEvent(run.id, null, "merge.promoted", { mergedSha: b2Sha });
         await runGit(repoRoot, ["branch", "-D", "stale-base"]);
@@ -368,7 +368,7 @@ describe("goal-19 v2: deleted base branch gate fallback and goal_accept resilien
         daemon.db.updateRunStatus(run1.id, "completed");
         daemon.director.goals.linkRunAndStart(gImplicit.id, run1.id);
 
-        const mergedRef = runMergedRef(run1.id);
+        const mergedRef = runMergedRef({ ...run1, chatSessionId: gImplicit.chatSessionId });
         await runGit(repoRoot, ["update-ref", mergedRef, deliveredSha]);
         daemon.db.emitEvent(run1.id, null, "merge.promoted", { mergedSha: deliveredSha });
         await runGit(repoRoot, ["branch", "-D", "release"]);

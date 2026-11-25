@@ -7,7 +7,8 @@ import { loadConfig } from "../src/config.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import { normalizeReviewerVerdict, parseReviewerVerdictJson, ReviewerFailedError } from "../src/director/runtime.js";
 import { runGit } from "../src/worktree/manager.js";
-import { BisectingMergeQueue, runMergedRef } from "../src/worktree/merge-queue.js";
+import { BisectingMergeQueue } from "../src/worktree/merge-queue.js";
+import { mergedRef as runMergedRef } from "../src/storage/names.js";
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
 
 async function makeTempRepo(): Promise<string> {
@@ -280,7 +281,7 @@ describe("goal-18 Done-Review reliability", () => {
         daemon.db.enqueueMerge({ runId: runA.id, taskId: taskA.id, worktreeId: wtA.id, branch: wtA.branch });
         const mergedA = await mq.processNext(runA.id);
         assert.ok(mergedA?.mergedSha, "expected merge A to succeed");
-        const refA = (await runGit(repoRoot, ["rev-parse", "--verify", `${runMergedRef(runA.id)}^{commit}`])).stdout;
+        const refA = (await runGit(repoRoot, ["rev-parse", "--verify", `${runMergedRef(runA)}^{commit}`])).stdout;
         assert.equal(refA, mergedA.mergedSha);
 
         // Push Goal A's merge commit to origin/main.
@@ -697,7 +698,7 @@ describe("goal-18 Done-Review reliability", () => {
         const merged1 = await mq.processNext(run.id);
         assert.ok(merged1?.mergedSha);
 
-        const mergedRef = runMergedRef(run.id);
+        const mergedRef = runMergedRef(run);
         const refAfter1 = (await runGit(repoRoot, ["rev-parse", "--verify", `${mergedRef}^{commit}`])).stdout;
         assert.equal(refAfter1, merged1.mergedSha);
 
@@ -820,7 +821,7 @@ describe("goal-18 Done-Review reliability", () => {
         const mergedB1 = await mq.processNext(runB.id);
         assert.ok(mergedB1?.mergedSha);
 
-        const refB = runMergedRef(runB.id);
+        const refB = runMergedRef(runB);
         await runGit(repoRoot, ["pack-refs", "--all"]);
         const looseRefPathB = resolve(repoRoot, (await runGit(repoRoot, ["rev-parse", "--git-path", refB])).stdout);
         const packedRefsPath = resolve(repoRoot, (await runGit(repoRoot, ["rev-parse", "--git-path", "packed-refs"])).stdout);
@@ -938,7 +939,7 @@ describe("goal-18 Done-Review reliability", () => {
         const mergedA1 = await mq.processNext(runA.id);
         assert.ok(mergedA1?.mergedSha);
 
-        const refA = runMergedRef(runA.id);
+        const refA = runMergedRef(runA);
         await runGit(repoRoot, ["pack-refs", "--all"]);
         const looseRefPathA = resolve(repoRoot, (await runGit(repoRoot, ["rev-parse", "--git-path", refA])).stdout);
         const packedRefsPath = resolve(repoRoot, (await runGit(repoRoot, ["rev-parse", "--git-path", "packed-refs"])).stdout);
@@ -1033,7 +1034,7 @@ describe("goal-18 Done-Review reliability", () => {
         // Case 2: ref write fails on merge 1 due to pre-created lock (so refs/harness/merged/<runId> does not exist at all),
         // followed by pushing the promoted merge and merging another unpushed sibling onto local main.
         const runC = daemon.db.createRun({ goal: "Missing ref + sibling run C", repoRoot, baseBranch: "main", baseSha: mergedS1.mergedSha });
-        const refC = runMergedRef(runC.id);
+        const refC = runMergedRef(runC);
         const looseRefPathC = resolve(repoRoot, (await runGit(repoRoot, ["rev-parse", "--git-path", refC])).stdout);
         mkdirSync(dirname(looseRefPathC), { recursive: true });
         writeFileSync(`${looseRefPathC}.lock`, "locked\n", "utf8");

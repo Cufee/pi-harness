@@ -15,10 +15,14 @@ async function withDirector(
   script: (req: RunAgentRequest, bridge: DaemonClient) => Promise<void>,
   test: (daemon: HarnessDaemon, repoRoot: string, chatId: string) => Promise<void>,
 ): Promise<void> {
-  const repoRoot = mkdtempSync(join(tmpdir(), "director-code-"));
-  const socketPath = join(repoRoot, "d.sock");
+  const tmpBase = mkdtempSync(join(tmpdir(), "director-code-"));
+  const repoRoot = join(tmpBase, "repo");
+  const stateDir = join(tmpBase, "state");
+  mkdirSync(repoRoot, { recursive: true });
+  mkdirSync(stateDir, { recursive: true });
+  const socketPath = join(stateDir, "d.sock");
   const daemon = new HarnessDaemon(withFixtureCatalog({
-    ...loadConfig(repoRoot), stateDir: repoRoot, socketPath, codeMode: mode, codeExec: { maxOutputChars: 12 },
+    ...loadConfig(repoRoot), stateDir, socketPath, codeMode: mode, codeExec: { maxOutputChars: 12 },
   }), {
     dbPath: ":memory:",
     customRunnerFactory: () => ({
@@ -38,7 +42,7 @@ async function withDirector(
   } finally {
     bridge.close();
     await daemon.stop();
-    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(tmpBase, { recursive: true, force: true });
   }
 }
 

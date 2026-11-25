@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { REJECTIONS } from "../advisories/rejections.js";
-import type { WorktreeConfig } from "../config.js";
+import { getLegacyWorktreeDir, LEGACY_WORKTREE_DIR, type WorktreeConfig } from "../config.js";
 import { isDirectorTaskContainer } from "../control-plane/ids.js";
 import {
   canonicalPath,
@@ -82,8 +82,13 @@ export type ScratchKind = "_verify" | "_integration";
 
 export interface StoragePathsConfig {
   stateDir?: string;
-  worktree?: Pick<WorktreeConfig, "dir" | "extraReadRoots" | "extraWriteRoots">;
+  worktree?: Pick<WorktreeConfig, "extraReadRoots" | "extraWriteRoots"> & {
+    /** @internal Legacy `worktree.dir` override for tests and pre-existing fixtures. */
+    dir?: string;
+  };
   storage?: { dataDir?: string };
+  /** @internal Legacy `worktree.dir` preserved from an existing config file. */
+  [LEGACY_WORKTREE_DIR]?: string;
 }
 
 export interface StoragePathsOptions {
@@ -168,7 +173,7 @@ function resolvedExtraWriteRoots(config: StoragePathsConfig): string[] {
 
 function parseStorageLayout(raw: string | undefined, source: string): StorageLayout {
   const trimmed = raw?.trim();
-  if (!trimmed) return "legacy";
+  if (!trimmed) return "data-dir";
   if (trimmed === "legacy" || trimmed === "data-dir") return trimmed;
   throw new Error(`Invalid storage layout from ${source}: ${JSON.stringify(raw)} (expected "legacy" or "data-dir")`);
 }
@@ -262,13 +267,22 @@ export class StoragePaths {
     return roots.filter((r) => !this.isBlockedConfiguredRoot(r, customWorktreeRoot));
   }
 
+  /** Reads the internal legacy `worktree.dir` value preserved from an existing config file (or test fixture), if any. */
+  private legacyWorktreeDirRaw(): string | undefined {
+    if (LEGACY_WORKTREE_DIR in this.config) {
+      return getLegacyWorktreeDir(this.config);
+    }
+    const raw = this.config.worktree?.dir;
+    return typeof raw === "string" && raw.length > 0 ? raw : undefined;
+  }
+
   /**
-   * Returns the canonical custom legacy worktree root configured via `config.worktree.dir` when it differs
+   * Returns the canonical custom legacy worktree root preserved from `worktree.dir` when it differs
    * from `<repo>/.harness/worktrees` and does not cover the repository root itself; otherwise null.
    * Resolves `worktree.dir` literally against `canonRepo` (no trim, no `~` expansion), matching origin/main.
    */
   private customWorktreeRootFor(repoRoot: string): string | null {
-    const raw = this.config.worktree?.dir;
+    const raw = this.legacyWorktreeDirRaw();
     const canonRepo = canonicalPath(repoRoot);
     this.knownRepoRoots.add(canonRepo);
     if (!raw) return null;
@@ -281,7 +295,7 @@ export class StoragePaths {
 
   /** Collects all known custom legacy worktree roots for `isProtectedWorktreePath`. */
   private collectCustomWorktreeRoots(ownCanon?: string, repoRoot?: string): string[] {
-    const raw = this.config.worktree?.dir;
+    const raw = this.legacyWorktreeDirRaw();
     if (!raw) return [];
     const seen = new Set<string>();
     const out: string[] = [];
@@ -869,7 +883,7 @@ export class StoragePaths {
   private legacyWorktreeBaseDir(repoRoot: string): string {
     const canonRepo = canonicalPath(repoRoot);
     this.knownRepoRoots.add(canonRepo);
-    return resolve(canonRepo, this.config.worktree?.dir ?? join(HARNESS_DIR, "worktrees"));
+    return resolve(canonRepo, this.legacyWorktreeDirRaw() ?? join(HARNESS_DIR, "worktrees"));
   }
 
   /** Path for a worker worktree checkout. Always under data-dir in `data-dir` layout. */
@@ -896,7 +910,7 @@ export class StoragePaths {
       return [this.legacyWorktreeBaseDir(canonRepo)];
     }
     const roots: string[] = [this.projectDir(canonRepo), join(canonRepo, HARNESS_DIR, "worktrees")];
-    if (this.config.worktree?.dir) {
+    if (this.legacyWorktreeDirRaw()) {
       const custom = this.legacyWorktreeBaseDir(canonRepo);
       if (!roots.includes(custom)) roots.push(custom);
     }
@@ -1440,7 +1454,18 @@ export class StoragePaths {
       return resolveUnitFile(this, { kind: "note", repoRoot: realRoot, id: rest.join("/") }, "", unitOpts)?.path ?? null;
     }
     if (kind === "goals") {
-      if (rest.length < 2) return null;
+      if (rest.length === 0) return null;
+      if (rest.length === 1) {
+        const entry = rest[0]!;
+        if (isRealFileUnderRoot(realRoot, [HARNESS_DIR, "goals", entry])) {
+          return join(realRoot, HARNESS_DIR, "goals", entry);
+        }
+        if ((this.layout === "data-dir" || includeDataDir) && this.pinnedDataRoot) {
+          const foundFile = this.findExistingChatFile(realRoot, normalizeChatSegment(chatSessionId), ["goals", entry]);
+          if (foundFile) return foundFile.path;
+        }
+        return null;
+      }
       return (
         resolveUnitFile(
           this,
@@ -1802,64 +1827,6 @@ export class StoragePaths {
     const foundRun = this.findExistingChatDir(realRoot, ownerChat, ["artifacts", runId]);
     if (foundRun) return join(foundRun.path, ...subPath);
     return join(this.artifactsDir(ownerRef), runId, ...subPath);
-  }
-
-  /** Relative display label for the artifacts root directory. */
-  describeArtifactsRoot(): string {
-    return `${HARNESS_DIR}/artifacts`;
-  }
-
-  /** Display template for a goal's evidence directory in prompts. */
-  describeGoalEvidenceDirTemplate(): string {
-    return `<repo>/${HARNESS_DIR}/goals/<goalId>`;
-  }
-
-  /** Display text for allowed Director note locations in the Director system prompt. */
-  describeDirectorNoteLocation(extraWriteRootsLabel: string): string {
-    return `${HARNESS_DIR}/goals/, ${HARNESS_DIR}/notes/, or a configured extra write root (${extraWriteRootsLabel})`;
-  }
-
-  /** Tool description for the Director `write_note` tool (static when `extraRoots` is omitted, dynamic when supplied). */
-  describeWriteNoteTool(extraRoots?: readonly string[]): string {
-    if (extraRoots === undefined) {
-      return `Logged Director note/report writer scoped strictly to \`${HARNESS_DIR}/goals/\`, \`${HARNESS_DIR}/notes/\`, or configured \`extraWriteRoots\` (never writes tracked repository source code).`;
-    }
-    const hasRoots = extraRoots.length > 0;
-    const extraText = hasRoots
-      ? `or these configured extraWriteRoots: ${extraRoots.join(", ")}`
-      : "no extraWriteRoots configured";
-    return hasRoots
-      ? `Logged Director note/report writer scoped strictly to \`${HARNESS_DIR}/goals/\`, \`${HARNESS_DIR}/notes/\`, ${extraText} (never writes tracked repository source code).`
-      : `Logged Director note/report writer scoped strictly to \`${HARNESS_DIR}/goals/\`, \`${HARNESS_DIR}/notes/\` (${extraText}; never writes tracked repository source code).`;
-  }
-
-  /** Input-schema description for the `path` parameter of `write_note`. */
-  describeWriteNotePathParam(extraRoots?: readonly string[]): string {
-    if (extraRoots === undefined) {
-      return `Destination file under ${HARNESS_DIR}/goals/, ${HARNESS_DIR}/notes/, or extraWriteRoots.`;
-    }
-    const hasRoots = extraRoots.length > 0;
-    const extraText = hasRoots
-      ? `or these configured extraWriteRoots: ${extraRoots.join(", ")}`
-      : "no extraWriteRoots configured";
-    return hasRoots
-      ? `Destination file under ${HARNESS_DIR}/goals/, ${HARNESS_DIR}/notes/, ${extraText}.`
-      : `Destination file under ${HARNESS_DIR}/goals/, ${HARNESS_DIR}/notes/ (${extraText}).`;
-  }
-
-  /** Alternative guidance text for `REJECTIONS.directorNoteRoot`. */
-  describeDirectorNoteRootAlternative(): string {
-    return `Write under ${HARNESS_DIR}/goals, ${HARNESS_DIR}/notes, or a configured worktree.extraWriteRoots path. Code changes go through goal_create and goal_commit.`;
-  }
-
-  /** Reason text for `REJECTIONS.dossierInvalidDirectory`. */
-  describeDossierInvalidDirectoryReason(): string {
-    return `Dossiers are stored only in regular directories under ${HARNESS_DIR}/artifacts to keep run artifacts confined.`;
-  }
-
-  /** Primary refusal message for `REJECTIONS.dossierSymlink`. */
-  describeDossierSymlinkWhat(path: string): string {
-    return `Dossier must be a non-symlink path under ${HARNESS_DIR}/artifacts: ${path}.`;
   }
 }
 

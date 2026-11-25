@@ -78,10 +78,7 @@ describe("Director storage paths (legacy layout)", () => {
     const { root, repoRoot } = await makeTempGitRepo("pi-dir-legacy-");
     const stateDir = join(root, "state");
     mkdirSync(stateDir, { recursive: true });
-    // Deliberately configure a non-default legacy worktree.artifactsDir to prove it is ignored.
-    const config = makeConfig(repoRoot, stateDir, {
-      artifactsDir: ".harness/custom-ignored-artifacts",
-    });
+    const config = makeConfig(repoRoot, stateDir);
 
     const reviewerRequests: RunAgentRequest[] = [];
     const daemon = new HarnessDaemon(config, {

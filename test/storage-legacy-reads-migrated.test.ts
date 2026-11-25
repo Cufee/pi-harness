@@ -9,6 +9,7 @@ import { findRunDossier, hashRunDossier, readRunDossier, writeTaskDossier } from
 import { resolveDirectorReadablePath } from "../src/director/runtime.js";
 import { legacyStoragePaths, resetStoragePathsForTest, storagePaths } from "../src/storage/paths.js";
 
+const ORIGINAL_LAYOUT_ENV = process.env.PI_HARNESS_STORAGE_LAYOUT;
 const tempDirs: string[] = [];
 
 function makeTempDir(prefix: string): string {
@@ -23,7 +24,8 @@ function writeFile(absPath: string, content: string): void {
 }
 
 afterEach(() => {
-  delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+  if (ORIGINAL_LAYOUT_ENV === undefined) delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+  else process.env.PI_HARNESS_STORAGE_LAYOUT = ORIGINAL_LAYOUT_ENV;
   resetStoragePathsForTest();
   while (tempDirs.length > 0) {
     rmSync(tempDirs.pop()!, { recursive: true, force: true });

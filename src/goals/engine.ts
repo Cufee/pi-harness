@@ -37,22 +37,6 @@ function canonicalRepoPath(p: string): string {
   }
 }
 
-/**
- * @deprecated Use `StoragePaths.goalEvidenceDir` instead.
- * Per-goal evidence directory; rejects ids that are not a single safe path segment.
- */
-export function goalEvidenceDir(repoRoot: string, goalId: string): string {
-  return legacyStoragePaths.goalEvidenceDir({ repoRoot, id: goalId });
-}
-
-/**
- * @deprecated Use `StoragePaths.ensureGoalEvidenceDir` instead.
- * Creates the goal evidence directory segment by segment, refusing symlinks or files; returns null on failure.
- */
-export function ensureGoalEvidenceDir(repoRoot: string, goalId: string): string | null {
-  return legacyStoragePaths.ensureGoalEvidenceDir({ repoRoot, id: goalId });
-}
-
 export type GoalStatus =
   | "draft"
   | "executing"

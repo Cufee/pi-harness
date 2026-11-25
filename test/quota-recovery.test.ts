@@ -46,7 +46,7 @@ function quotaRunConfig(repoDir: string, stateDir: string) {
   cfg.quotaEndpoint = undefined;
   cfg.quotaRetry.autoResumeEnabled = true;
   cfg.catalog = { ttlHours: 24 };
-  cfg.worktree = { dir: ".harness/worktrees", archiveRetentionDays: 7, maxConcurrentWorkers: 2 };
+  cfg.worktree = { archiveRetentionDays: 7, maxConcurrentWorkers: 2 };
   cfg.codeMode = "off";
   cfg.profiles = [
     ...defaultProfiles().filter((profile) => ["acp:claude", "acp:codex"].includes(profile.id)),

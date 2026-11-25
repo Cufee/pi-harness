@@ -135,10 +135,10 @@ describe("git names in data-dir layout (real git repos)", () => {
     const db = new ControlPlaneDb(":memory:");
     try {
       // Phase 1: Legacy layout — create pre-flip runs and merge first commits (creating legacy merged refs).
-      delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+      process.env.PI_HARNESS_STORAGE_LAYOUT = "legacy";
       resetStoragePathsForTest();
-      const legacySp = storagePaths({ stateDir, worktree: { dir: ".harness/worktrees" } });
-      const legacyMgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 }, {}, legacySp);
+      const legacySp = storagePaths({ stateDir });
+      const legacyMgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 }, {}, legacySp);
       const legacyMq = new BisectingMergeQueue(db, legacyMgr, repo, {});
 
       const preFlipRun = db.createRun({
@@ -178,8 +178,8 @@ describe("git names in data-dir layout (real git repos)", () => {
       // Phase 2: Switch to data-dir layout.
       process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
       resetStoragePathsForTest();
-      const ddSp = storagePaths({ stateDir, worktree: { dir: ".harness/worktrees" } });
-      const ddMgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 }, {}, ddSp);
+      const ddSp = storagePaths({ stateDir });
+      const ddMgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 }, {}, ddSp);
       const ddMq = new BisectingMergeQueue(db, ddMgr, repo, {});
 
       // Merge a second commit on the pre-flip run in data-dir layout: legacy ref advances, no chat ref created.
@@ -409,10 +409,10 @@ describe("git names in data-dir layout (real git repos)", () => {
     const db = new ControlPlaneDb(":memory:");
     try {
       // Phase 1: Legacy layout — create a worktree with uncommitted work.
-      delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+      process.env.PI_HARNESS_STORAGE_LAYOUT = "legacy";
       resetStoragePathsForTest();
-      const legacySp = storagePaths({ stateDir, worktree: { dir: ".harness/worktrees" } });
-      const legacyMgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 }, {}, legacySp);
+      const legacySp = storagePaths({ stateDir });
+      const legacyMgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 }, {}, legacySp);
 
       const legacyRun = db.createRun({
         goal: "Pre-flip cycle",
@@ -436,8 +436,8 @@ describe("git names in data-dir layout (real git repos)", () => {
       // Phase 2: Switch to data-dir layout via env + resetStoragePathsForTest.
       process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
       resetStoragePathsForTest();
-      const ddSp = storagePaths({ stateDir, worktree: { dir: ".harness/worktrees" } });
-      const ddMgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 }, {}, ddSp);
+      const ddSp = storagePaths({ stateDir });
+      const ddMgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 }, {}, ddSp);
 
       // New worktree in data-dir uses chat-scoped branch and data-dir path; collision suffix stays intact.
       const ddRun = db.createRun({
@@ -535,10 +535,10 @@ describe("git names in data-dir layout (real git repos)", () => {
     const warnings: string[] = [];
     try {
       // Phase 1: Legacy layout creates the existing legacy merged ref.
-      delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+      process.env.PI_HARNESS_STORAGE_LAYOUT = "legacy";
       resetStoragePathsForTest();
-      const legacySp = storagePaths({ stateDir, worktree: { dir: ".harness/worktrees" } });
-      const legacyMgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 }, {}, legacySp);
+      const legacySp = storagePaths({ stateDir });
+      const legacyMgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 }, {}, legacySp);
       const legacyMq = new BisectingMergeQueue(db, legacyMgr, repo, {});
 
       const run = db.createRun({
@@ -572,8 +572,8 @@ describe("git names in data-dir layout (real git repos)", () => {
       // Phase 2: Data-dir layout promotes a second commit while git for-each-ref fails.
       process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
       resetStoragePathsForTest();
-      const ddSp = storagePaths({ stateDir, worktree: { dir: ".harness/worktrees" } });
-      const ddMgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 }, {}, ddSp);
+      const ddSp = storagePaths({ stateDir });
+      const ddMgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 }, {}, ddSp);
       const ddMq = new BisectingMergeQueue(db, ddMgr, repo, {});
 
       const task2 = db.createTask({
@@ -641,10 +641,10 @@ describe("git names in data-dir layout (real git repos)", () => {
     const warnings: string[] = [];
     try {
       // Phase 1: Legacy layout — pre-flip run with non-git-safe chat id 'weird.lock' and a queued merge.
-      delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+      process.env.PI_HARNESS_STORAGE_LAYOUT = "legacy";
       resetStoragePathsForTest();
-      const legacySp = storagePaths({ stateDir, worktree: { dir: ".harness/worktrees" } });
-      const legacyMgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 }, {}, legacySp);
+      const legacySp = storagePaths({ stateDir });
+      const legacyMgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 }, {}, legacySp);
 
       const weirdChatRun = db.createRun({
         goal: "Pre-flip weird chat run",
@@ -675,8 +675,8 @@ describe("git names in data-dir layout (real git repos)", () => {
       // Phase 2: Flip to data-dir layout.
       process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
       resetStoragePathsForTest();
-      const ddSp = storagePaths({ stateDir, worktree: { dir: ".harness/worktrees" } });
-      const ddMgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 }, {}, ddSp);
+      const ddSp = storagePaths({ stateDir });
+      const ddMgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 }, {}, ddSp);
       const ddMq = new BisectingMergeQueue(db, ddMgr, repo, {});
 
       // Queued merge for chat 'weird.lock' completes exactly once.
@@ -715,10 +715,10 @@ describe("git names in data-dir layout (real git repos)", () => {
       // a pre-flip run with id 'foo.' (valid as an interior legacy git branch segment, rejected by
       // the data-dir validator) still advances main, emits merge.ref_warning + merge.promoted, and
       // finishes the merge item exactly once.
-      delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+      process.env.PI_HARNESS_STORAGE_LAYOUT = "legacy";
       resetStoragePathsForTest();
-      const legacySp2 = storagePaths({ stateDir, worktree: { dir: ".harness/worktrees" } });
-      const legacyMgr2 = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 }, {}, legacySp2);
+      const legacySp2 = storagePaths({ stateDir });
+      const legacyMgr2 = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 }, {}, legacySp2);
       const invalidRunIdRun = db.createRun({
         id: "foo.",
         goal: "Pre-flip run with trailing-dot id",
@@ -748,8 +748,8 @@ describe("git names in data-dir layout (real git repos)", () => {
 
       process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
       resetStoragePathsForTest();
-      const ddSp2 = storagePaths({ stateDir, worktree: { dir: ".harness/worktrees" } });
-      const ddMgr2 = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 }, {}, ddSp2);
+      const ddSp2 = storagePaths({ stateDir });
+      const ddMgr2 = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 }, {}, ddSp2);
       const ddMq2 = new BisectingMergeQueue(db, ddMgr2, repo, {});
 
       console.warn = (...args: unknown[]) => {
