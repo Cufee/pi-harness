@@ -254,4 +254,144 @@ describe("goal/run partner ID wiring in data-dir layout (esc-155 Option A)", () 
       db.close();
     }
   });
+
+  it("propagates unexpected goals lookup errors without creating a run artifacts dir while still returning null for missing goals schema (D7)", async () => {
+    setLayoutEnv("data-dir");
+    const { root, repoRoot } = await initTempGitRepo("pi-fo2-partner-err-");
+    const stateDir = join(root, "state");
+    mkdirSync(stateDir, { recursive: true });
+
+    const base = loadConfig(repoRoot);
+    const config: HarnessConfig = withFixtureCatalog({
+      ...base,
+      stateDir,
+      storage: { dataDir: join(stateDir, "data") },
+      codeMode: "off",
+    });
+
+    const sp = storagePaths(config, { layout: "data-dir" });
+    const legacySp = createLegacyStoragePaths(config);
+    const headSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout.trim();
+    const chatSessionId = "chat-fo2-d7";
+    const dataChatDir = sp.chatDir({ repoRoot, chatSessionId });
+
+    const { captured, runnerFactory, releaseAll } = createCapturingRunner();
+    const db = new ControlPlaneDb(":memory:");
+    const legacyGoals = new GoalEngine(db.db, undefined, undefined, undefined, undefined, legacySp);
+    const quota = new QuotaClient();
+    const catalog = new ModelCatalogCompiler(config, quota);
+    const orch = new HarnessOrchestrator(db, config, catalog, quota, runnerFactory);
+
+    const standaloneDb = new ControlPlaneDb(":memory:");
+    const standaloneOrch = new HarnessOrchestrator(standaloneDb, config, catalog, quota, runnerFactory);
+
+    const missingColDb = new ControlPlaneDb(":memory:");
+    missingColDb.db.exec("CREATE TABLE goals (id TEXT PRIMARY KEY)");
+    const missingColOrch = new HarnessOrchestrator(missingColDb, config, catalog, quota, runnerFactory);
+
+    type PartnerLookupOrch = {
+      resolveLinkedGoalForRun(runId: string): { id: string; chatSessionId: string | null } | null;
+    };
+
+    try {
+      // 1. Unexpected DB error during goals lookup must propagate and must not launch or create a run artifacts dir.
+      const goal = legacyGoals.createGoal({
+        chatSessionId,
+        repoRoot,
+        title: "Legacy goal with failing lookup",
+        description: "Verify unexpected goals query errors fail closed.",
+        criteria: [{ id: "c1", description: "No split run dir on lookup error", kind: "behavioral", required: true }],
+      });
+      assert.equal(existsSync(legacySp.goalEvidenceDir(goal)), true);
+
+      const run = db.createRun({
+        repoRoot,
+        chatSessionId,
+        goal: goal.title,
+        baseBranch: "main",
+        baseSha: headSha,
+      });
+      db.db.prepare("UPDATE goals SET linked_run_id = ?, status = 'executing' WHERE id = ?").run(run.id, goal.id);
+
+      const orchProfileId = config.defaultOrchestratorProfile ?? config.profiles[0]!.id;
+      const rootTask = db.createTask({
+        runId: run.id,
+        tier: 1,
+        kind: "orchestrator",
+        title: "Root orchestrator",
+        objective: goal.title,
+        readOnly: true,
+        profileId: orchProfileId,
+      });
+
+      const legacyRunDir = legacySp.runArtifactsDir(run);
+      const dataDirRunDir = join(dataChatDir, "artifacts", run.id);
+      assert.equal(existsSync(legacyRunDir), false);
+      assert.equal(existsSync(dataDirRunDir), false);
+
+      const origPrepare = db.db.prepare.bind(db.db);
+      db.db.prepare = ((sql: string, ...rest: unknown[]) => {
+        if (/\bFROM\s+goals\b/i.test(sql)) {
+          throw new Error("SQLITE_IOERR: simulated goals read failure");
+        }
+        return (origPrepare as (...args: unknown[]) => unknown)(sql, ...rest);
+      }) as typeof db.db.prepare;
+
+      assert.throws(
+        () => (orch as unknown as PartnerLookupOrch).resolveLinkedGoalForRun(run.id),
+        /SQLITE_IOERR: simulated goals read failure/,
+      );
+
+      const failingTask = await orch.spawnAndStartTask({
+        runId: run.id,
+        parentId: rootTask.id,
+        tier: 2,
+        kind: "worker",
+        title: "Worker under failing goals lookup",
+        objective: "Must fail launch instead of running as unlinked",
+        readOnly: false,
+        writeScopes: ["README.md"],
+      });
+
+      await waitUntil(() => db.getTask(failingTask.id)?.status === "failed", 5000, "failing task to settle as failed");
+      assert.equal(captured.has(failingTask.id), false, "runner must not start when partner lookup throws");
+      assert.match(db.getTask(failingTask.id)?.summary ?? "", /simulated goals read failure/);
+      assert.equal(existsSync(legacyRunDir), false, "must not create legacy run artifacts dir on lookup failure");
+      assert.equal(existsSync(dataDirRunDir), false, "must not create data-dir run artifacts dir on lookup failure");
+
+      // 2. Standalone control-plane DB with no goals table returns null as before.
+      const standaloneRun = standaloneDb.createRun({
+        repoRoot,
+        chatSessionId,
+        goal: "Standalone run without goals table",
+        baseBranch: "main",
+        baseSha: headSha,
+      });
+      assert.equal(
+        (standaloneOrch as unknown as PartnerLookupOrch).resolveLinkedGoalForRun(standaloneRun.id),
+        null,
+      );
+
+      // 3. Database whose goals table lacks the expected column also returns null.
+      const missingColRun = missingColDb.createRun({
+        repoRoot,
+        chatSessionId,
+        goal: "Run with older goals schema",
+        baseBranch: "main",
+        baseSha: headSha,
+      });
+      assert.equal(
+        (missingColOrch as unknown as PartnerLookupOrch).resolveLinkedGoalForRun(missingColRun.id),
+        null,
+      );
+    } finally {
+      releaseAll();
+      orch.dispose();
+      standaloneOrch.dispose();
+      missingColOrch.dispose();
+      db.close();
+      standaloneDb.close();
+      missingColDb.close();
+    }
+  });
 });

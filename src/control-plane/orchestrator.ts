@@ -1133,15 +1133,22 @@ export class HarnessOrchestrator {
     return mq;
   }
 
-  /** The goal linked to this run, if any (the goals table is absent in standalone control-plane databases). */
+  /** The goal linked to this run, if any (the goals table or columns may be absent in standalone control-plane databases). */
   private resolveLinkedGoalForRun(runId: string): { id: string; chatSessionId: string | null } | null {
     try {
       const row = this.db.db
         .prepare("SELECT id, chat_session_id FROM goals WHERE linked_run_id = ? LIMIT 1")
         .get(runId) as { id: string; chat_session_id?: string | null } | null;
       return row ? { id: row.id, chatSessionId: row.chat_session_id ? String(row.chat_session_id) : null } : null;
-    } catch {
-      return null;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "";
+      if (
+        /\bno such table:\s*(?:main\.)?goals(?:\b|$)/i.test(msg) ||
+        /\bno such column:\s*(?:goals\.)?(?:id|chat_session_id|linked_run_id)(?:\b|$)/i.test(msg)
+      ) {
+        return null;
+      }
+      throw err;
     }
   }
 
