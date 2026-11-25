@@ -8,22 +8,21 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  readlinkSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, posix, resolve } from "node:path";
-import { Database } from "bun:sqlite";
 import { afterEach, describe, it } from "bun:test";
 import { formatHelp } from "../src/cli.js";
 import { loadConfig } from "../src/config.js";
 import { ControlPlaneDb } from "../src/control-plane/db.js";
 import { HarnessDaemon } from "../src/daemon/server.js";
 import { GoalEngine } from "../src/goals/engine.js";
-import type { StorageMigrationPlan, StorageMigrationReport } from "../src/storage/migrate.js";
-import { createLegacyStoragePaths, resetStoragePathsForTest, storagePaths } from "../src/storage/paths.js";
+import type { StorageMigrationPlan } from "../src/storage/migrate.js";
+import { createLegacyStoragePaths, resetStoragePathsForTest } from "../src/storage/paths.js";
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
 
 const CLI_PATH = resolve(import.meta.dir, "../src/cli.ts");
@@ -249,7 +248,9 @@ afterEach(async () => {
 
 describe("pi-harness migrate-storage CLI", () => {
   it("lists migrate-storage in help text", () => {
-    assert.ok(formatHelp().includes("pi-harness migrate-storage [--dry-run] [--json]"));
+    const help = formatHelp();
+    assert.ok(help.includes("pi-harness migrate-storage --dry-run [--json]"));
+    assert.match(help, /migrate-storage.*daemon start/i);
   });
 
   it("--dry-run prints every unit with its action, changes nothing on disk or in the DB, and works while a daemon is running", async () => {
@@ -333,15 +334,38 @@ describe("pi-harness migrate-storage CLI", () => {
     assert.equal(existsSync(missingStateDir), false, "--dry-run must not create missing stateDir");
   });
 
-  it("refuses without --dry-run when a daemon is running, names the restart command, and moves nothing", async () => {
-    const { repoDir, baseSha } = initTempGitRepo("pi-mig-cli-live-repo-");
-    const stateDir = makeTempDir("pi-mig-cli-live-state-");
-    seedFixtureRepo(stateDir, repoDir, baseSha);
+  it("without --dry-run moves nothing, changes nothing on disk or in the DB, and exits 1 with and without a running daemon", async () => {
+    const { repoDir, baseSha } = initTempGitRepo("pi-mig-cli-nowrite-repo-");
+    const stateDir = makeTempDir("pi-mig-cli-nowrite-state-");
+    const fx = seedFixtureRepo(stateDir, repoDir, baseSha);
 
+    const repoHashesBefore = hashTree(repoDir);
+    const dbBytesBefore = sha256(readFileSync(fx.dbPath));
+    const stateEntriesBefore = readdirSync(stateDir).sort();
+
+    // 1. No daemon running: must still refuse, move nothing, touch nothing, and exit 1.
+    for (const args of [["migrate-storage"], ["migrate-storage", "--json"]]) {
+      const res = await runCli(args, {
+        stateDir,
+        cwd: repoDir,
+        layout: "data-dir",
+      });
+      assert.equal(res.code, 1, `expected exit 1 for ${args.join(" ")}, got ${res.code}`);
+      assert.equal(res.stdout, "", `expected empty stdout for ${args.join(" ")}`);
+      assert.match(res.stderr, /automatically at daemon start/i, res.stderr);
+      assert.ok(res.stderr.includes("pi-harness daemon restart"), `expected restart hint in stderr, got: ${res.stderr}`);
+      assert.ok(res.stderr.includes("--dry-run"), `expected --dry-run hint in stderr, got: ${res.stderr}`);
+    }
+
+    assertHashMapEqual(hashTree(repoDir), repoHashesBefore, "nothing moved without daemon");
+    assert.equal(sha256(readFileSync(fx.dbPath)), dbBytesBefore, "DB file bytes changed without --dry-run");
+    assert.deepEqual(readdirSync(stateDir).sort(), stateEntriesBefore, "stateDir entries changed without --dry-run");
+    assert.equal(existsSync(join(stateDir, "data")), false);
+    assert.equal(existsSync(join(stateDir, "daemon.start.lock")), false);
+
+    // 2. Daemon running on the same stateDir: same refusal, nothing moved.
     const socketPath = join(stateDir, "daemon.sock");
     writeFileSync(join(stateDir, "config.json"), JSON.stringify({ socketPath }), "utf8");
-
-    // Start daemon in legacy layout so all legacy units remain unmigrated while daemon is live.
     delete process.env.PI_HARNESS_STORAGE_LAYOUT;
     resetStoragePathsForTest();
     const daemonCfg = withFixtureCatalog({
@@ -355,132 +379,80 @@ describe("pi-harness migrate-storage CLI", () => {
     activeDaemons.push(daemon);
     await daemon.start();
 
-    const repoHashesBefore = hashTree(repoDir);
-    const res = await runCli(["migrate-storage"], {
+    const repoHashesWithDaemon = hashTree(repoDir);
+    const resLive = await runCli(["migrate-storage"], {
       stateDir,
       cwd: repoDir,
       layout: "data-dir",
     });
-    assert.notEqual(res.code, 0, "expected non-zero exit when daemon is running");
-    assert.ok(res.stderr.includes("pi-harness daemon restart"), `expected restart hint in stderr, got: ${res.stderr}`);
-    assert.match(res.stderr, /next start/i);
-    assertHashMapEqual(hashTree(repoDir), repoHashesBefore, "nothing moved while daemon is running");
+    assert.equal(resLive.code, 1, `expected exit 1 while daemon is running, got ${resLive.code}`);
+    assert.equal(resLive.stdout, "");
+    assert.match(resLive.stderr, /automatically at daemon start/i, resLive.stderr);
+    assert.ok(resLive.stderr.includes("pi-harness daemon restart"), `expected restart hint in stderr, got: ${resLive.stderr}`);
+    assert.ok(resLive.stderr.includes("--dry-run"), `expected --dry-run hint in stderr, got: ${resLive.stderr}`);
+    assertHashMapEqual(hashTree(repoDir), repoHashesWithDaemon, "nothing moved while daemon is running");
     assert.equal(existsSync(join(stateDir, "data")), false);
   });
 
-  it("migrates eligible units when no daemon is running and reports nothing to do on a second run", async () => {
-    const { repoDir, baseSha } = initTempGitRepo("pi-mig-cli-run-repo-");
-    const stateDir = makeTempDir("pi-mig-cli-run-state-");
-    const dbPath = join(stateDir, "control-plane.sqlite");
-    const legacy = createLegacyStoragePaths({ stateDir });
+  it("--dry-run exits 1 naming config.json when global config cannot be read, parsed, or validated", async () => {
+    const { repoDir, baseSha } = initTempGitRepo("pi-mig-cli-badcfg-repo-");
+    const stateDir = makeTempDir("pi-mig-cli-badcfg-state-");
+    const fx = seedFixtureRepo(stateDir, repoDir, baseSha);
+    const configPath = join(stateDir, "config.json");
 
-    // Seed only eligible units (terminal goal + note) so second run has literally nothing to do.
-    const cpDb = new ControlPlaneDb(dbPath);
-    const goals = new GoalEngine(cpDb.db);
-    const gDone = goals.createGoal({
-      repoRoot: repoDir,
-      chatSessionId: "chat-run-1",
-      title: "Offline migrate goal",
-      description: "Migrated by CLI",
-      criteria: [{ id: "c1", description: "Done", kind: "behavioral" }],
+    const repoHashesBefore = hashTree(repoDir);
+    const dbBytesBefore = sha256(readFileSync(fx.dbPath));
+
+    const expectFailClosed = async (label: string, setup: () => void) => {
+      rmSync(configPath, { recursive: true, force: true });
+      setup();
+      const res = await runCli(["migrate-storage", "--dry-run"], {
+        stateDir,
+        cwd: repoDir,
+        layout: "data-dir",
+      });
+      assert.equal(res.code, 1, `${label}: expected exit 1, got ${res.code}, stdout=${res.stdout}`);
+      assert.equal(res.stdout, "", `${label}: expected empty stdout`);
+      assert.ok(res.stderr.includes(configPath), `${label}: stderr should name ${configPath}, got: ${res.stderr}`);
+      assert.equal(existsSync(join(stateDir, "data")), false, `${label}: must not create data dir`);
+    };
+
+    await expectFailClosed("malformed JSON", () => {
+      writeFileSync(configPath, "{ invalid json", "utf8");
     });
-    const rDone = cpDb.createRun({
-      goal: gDone.title,
-      repoRoot: repoDir,
-      baseBranch: "main",
-      baseSha,
-      chatSessionId: "chat-run-1",
+    await expectFailClosed("non-object JSON", () => {
+      writeFileSync(configPath, "[]", "utf8");
     });
-    goals.linkRunAndStart(gDone.id, rDone.id);
-    const tDone = cpDb.createTask({
-      runId: rDone.id,
-      tier: 1,
-      kind: "orchestrator",
-      title: "Done T1",
-      objective: "Done",
-      profileId: "fixture",
+    await expectFailClosed("invalid storage.dataDir", () => {
+      writeFileSync(configPath, JSON.stringify({ storage: { dataDir: "" } }), "utf8");
     });
-    cpDb.updateTask(tDone.id, { status: "completed", summary: "ok" });
-    cpDb.updateRunStatus(rDone.id, "completed");
-    goals.setStatus(gDone.id, "achieved");
-
-    const doneEvDir = legacy.goalEvidenceDir({ id: gDone.id, repoRoot: repoDir, chatSessionId: "chat-run-1" });
-    const doneRunDir = legacy.runArtifactsDir({ id: rDone.id, repoRoot: repoDir, chatSessionId: "chat-run-1" });
-    const doneDossier = join(doneRunDir, tDone.id, "out.md");
-    writeFile(join(doneEvDir, "check.txt"), "offline evidence\n");
-    writeFile(doneDossier, "# offline dossier\n");
-    const doneArt = cpDb.recordArtifact({
-      runId: rDone.id,
-      taskId: tDone.id,
-      kind: "dossier",
-      path: doneDossier,
-      summary: "Offline dossier",
+    await expectFailClosed("unreadable config path (directory)", () => {
+      mkdirSync(configPath);
     });
-    cpDb.db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
-    cpDb.db.close(true);
+    await expectFailClosed("broken symlink config path", () => {
+      symlinkSync(join(stateDir, "does-not-exist.json"), configPath);
+    });
 
-    const notePath = join(legacy.projectNotesDir(repoDir), "spec.md");
-    writeFile(notePath, "# offline note\n");
+    assertHashMapEqual(hashTree(repoDir), repoHashesBefore, "repo unchanged after bad-config --dry-run");
+    assert.equal(sha256(readFileSync(fx.dbPath)), dbBytesBefore, "DB unchanged after bad-config --dry-run");
 
-    const evHashBefore = hashTree(doneEvDir);
-    const runHashBefore = hashTree(doneRunDir);
-    const noteShaBefore = sha256(readFileSync(notePath));
-
-    // Run #1: migrates units offline under start lock.
-    const run1 = await runCli(["migrate-storage"], {
+    // Valid custom storage.dataDir still plans cleanly without creating the directory.
+    rmSync(configPath, { recursive: true, force: true });
+    const customDataDir = join(makeTempDir("pi-mig-cli-custom-"), "custom-data");
+    writeFileSync(configPath, JSON.stringify({ storage: { dataDir: customDataDir } }), "utf8");
+    const okRes = await runCli(["migrate-storage", "--dry-run", "--json"], {
       stateDir,
       cwd: repoDir,
       layout: "data-dir",
     });
-    assert.equal(run1.code, 0, `stderr: ${run1.stderr}`);
-    assert.match(run1.stdout, /moved=2\b/, run1.stdout);
-    assert.equal(existsSync(join(stateDir, "daemon.start.lock")), false, "start lock must be released");
-
-    const dataStorage = storagePaths({ stateDir }, { layout: "data-dir" });
-    const destEvDir = join(dataStorage.goalsDir({ repoRoot: repoDir, chatSessionId: "chat-run-1" }), gDone.id);
-    const destRunDir = join(dataStorage.artifactsDir({ repoRoot: repoDir, chatSessionId: "chat-run-1" }), rDone.id);
-    const destNote = join(dataStorage.projectNotesDir(repoDir), "spec.md");
-
-    assertHashMapEqual(hashTree(destEvDir), evHashBefore, "migrated evidence dir");
-    assertHashMapEqual(hashTree(destRunDir), runHashBefore, "migrated run dir");
-    assert.equal(sha256(readFileSync(destNote)), noteShaBefore);
-    assert.equal(lstatSync(doneEvDir).isSymbolicLink(), true);
-    assert.equal(readlinkSync(doneEvDir), destEvDir);
-    assert.equal(lstatSync(doneRunDir).isSymbolicLink(), true);
-    assert.equal(readlinkSync(doneRunDir), destRunDir);
-    assert.equal(lstatSync(notePath).isSymbolicLink(), true);
-    assert.equal(readlinkSync(notePath), destNote);
-
-    const checkDb = new Database(dbPath, { readonly: true });
-    try {
-      const row = checkDb.prepare("SELECT path FROM artifacts WHERE id = ?").get(doneArt.id) as { path: string };
-      assert.equal(row.path, join(destRunDir, tDone.id, "out.md"));
-    } finally {
-      checkDb.close();
-    }
-
-    // Run #2: idempotent, reports nothing to do.
-    const run2 = await runCli(["migrate-storage"], {
-      stateDir,
-      cwd: repoDir,
-      layout: "data-dir",
-    });
-    assert.equal(run2.code, 0, `stderr: ${run2.stderr}`);
-    assert.match(run2.stdout, /Nothing to migrate/i, run2.stdout);
-
-    const run2Json = await runCli(["migrate-storage", "--json"], {
-      stateDir,
-      cwd: repoDir,
-      layout: "data-dir",
-    });
-    assert.equal(run2Json.code, 0, `stderr: ${run2Json.stderr}`);
-    const report2 = JSON.parse(run2Json.stdout) as StorageMigrationReport;
-    assert.equal(report2.totals.migrated, 0);
-    assert.equal(report2.totals.errors, 0);
-    assert.equal(report2.totals.bridgesKept, 2);
+    assert.equal(okRes.code, 0, `stderr: ${okRes.stderr}`);
+    const plan = JSON.parse(okRes.stdout) as StorageMigrationPlan;
+    assert.equal(plan.repos.length, 1);
+    assert.ok(plan.repos[0]!.projectDir.startsWith(join(customDataDir, "projects")), plan.repos[0]!.projectDir);
+    assert.equal(existsSync(customDataDir), false, "--dry-run must not create custom dataDir");
   });
 
-  it("reports legacy layout and moves nothing for both --dry-run and live forms under default legacy layout", async () => {
+  it("under default legacy layout --dry-run reports legacy noop and without --dry-run exits 1 without moving files", async () => {
     const { repoDir, baseSha } = initTempGitRepo("pi-mig-cli-leg-repo-");
     const stateDir = makeTempDir("pi-mig-cli-leg-state-");
     seedFixtureRepo(stateDir, repoDir, baseSha);
@@ -500,9 +472,11 @@ describe("pi-harness migrate-storage CLI", () => {
       cwd: repoDir,
       layout: undefined, // default legacy
     });
-    assert.equal(liveRes.code, 0, `stderr: ${liveRes.stderr}`);
-    assert.match(liveRes.stdout, /legacy/i, liveRes.stdout);
-    assert.match(liveRes.stdout, /nothing will move/i, liveRes.stdout);
+    assert.equal(liveRes.code, 1, `expected exit 1 without --dry-run, got ${liveRes.code}`);
+    assert.equal(liveRes.stdout, "");
+    assert.match(liveRes.stderr, /automatically at daemon start/i, liveRes.stderr);
+    assert.ok(liveRes.stderr.includes("pi-harness daemon restart"), liveRes.stderr);
+    assert.ok(liveRes.stderr.includes("--dry-run"), liveRes.stderr);
 
     assertHashMapEqual(hashTree(repoDir), repoHashesBefore, "legacy CLI runs must not move anything");
     assert.equal(existsSync(join(stateDir, "data")), false);
