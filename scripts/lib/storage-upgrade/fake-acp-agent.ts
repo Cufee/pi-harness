@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { execFileSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -121,6 +122,31 @@ function detectRole(objectiveLine: string): string {
   return match?.[1] ?? "unknown";
 }
 
+function detectDossierName(objectiveLine: string, fallback: string): string {
+  const match = objectiveLine.match(/FAKE_DOSSIER=([a-zA-Z0-9._-]+)/);
+  return match?.[1] ?? fallback;
+}
+
+function recordHarnessEnv(role: string, mode: "fresh" | "resumed"): void {
+  try {
+    mkdirSync(fakeDir!, { recursive: true });
+    const snapshot = {
+      taskId: ownTaskId,
+      taskIdToken,
+      role,
+      mode,
+      cwd: process.cwd(),
+      HARNESS_GOAL_EVIDENCE_DIR: process.env.HARNESS_GOAL_EVIDENCE_DIR ?? null,
+      HARNESS_GOAL_ID: process.env.HARNESS_GOAL_ID ?? null,
+      HARNESS_GOALS_DIR: process.env.HARNESS_GOALS_DIR ?? null,
+      HARNESS_ARTIFACTS_DIR: process.env.HARNESS_ARTIFACTS_DIR ?? null,
+    };
+    writeFileSync(join(fakeDir!, `env-${role}-${mode}.json`), JSON.stringify(snapshot, null, 2) + "\n", "utf8");
+  } catch {
+    // ignore env recording failures during abrupt teardown
+  }
+}
+
 process.on("SIGTERM", () => {
   cancelled = true;
   wake();
@@ -192,16 +218,17 @@ const app = agent()
 
     try {
       if (currentRole === "g0_orchestrator") {
+        const dossierName = detectDossierName(objectiveLine, "g0-dossier.md");
         await callMcp("artifact_write", {
-          name: "g0-dossier.md",
-          content: "# G0 Legacy Dossier\nCreated by g0_orchestrator before storage upgrade.\n",
-          summary: "G0 legacy dossier written before upgrade",
+          name: dossierName,
+          content: `# ${dossierName}\nCreated by g0_orchestrator (${ownTaskId}).\n`,
+          summary: `${dossierName} written by g0_orchestrator`,
         });
         await client.notify("session/update", {
           sessionId,
           update: {
             sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: "G0 dossier written and completed." },
+            content: { type: "text", text: `G0 dossier ${dossierName} written and completed.` },
           },
         });
         return { stopReason: "end_turn" };
@@ -209,6 +236,9 @@ const app = agent()
 
       if (currentRole === "g1_orchestrator" || currentRole === "r2_orchestrator") {
         const isG1 = currentRole === "g1_orchestrator";
+        if (isG1) {
+          recordHarnessEnv(currentRole, currentMode);
+        }
         let childIds: string[] = [];
 
         if (!isResumed) {
@@ -308,6 +338,13 @@ const app = agent()
             childIds = children.map((c) => c.id).filter((id): id is string => typeof id === "string");
           }
           if (children.length > 0 && children.every((c) => c.status === "completed")) {
+            if (isG1 && isResumed) {
+              await callMcp("artifact_write", {
+                name: "g1-post-update-dossier.md",
+                content: "# G1 Post-Update Dossier\nWritten by resumed g1_orchestrator after hot update.\n",
+                summary: "G1 orchestrator dossier written after hot update",
+              });
+            }
             await client.notify("session/update", {
               sessionId,
               update: {
@@ -322,6 +359,7 @@ const app = agent()
       }
 
       if (currentRole === "g1_worker") {
+        recordHarnessEnv(currentRole, currentMode);
         const goFile = join(fakeDir, "go-g1");
         while (!cancelled && !sawRestartSteer && !existsSync(goFile)) {
           await sleepWakeable(200);
@@ -331,6 +369,14 @@ const app = agent()
           return { stopReason: "end_turn" };
         }
         if (cancelled) return { stopReason: "cancelled" };
+        if (isResumed && process.env.HARNESS_GOAL_EVIDENCE_DIR) {
+          mkdirSync(process.env.HARNESS_GOAL_EVIDENCE_DIR, { recursive: true });
+          writeFileSync(
+            join(process.env.HARNESS_GOAL_EVIDENCE_DIR, "g1-post-update-evidence.txt"),
+            `G1 worker post-update evidence from ${ownTaskId}\n`,
+            "utf8",
+          );
+        }
         await callMcp("return_task", {
           status: "completed",
           summary: "G1 worker completed after go-g1 signal",
@@ -341,6 +387,81 @@ const app = agent()
           update: {
             sessionUpdate: "agent_message_chunk",
             content: { type: "text", text: "G1 worker completed." },
+          },
+        });
+        return { stopReason: "end_turn" };
+      }
+
+      if (currentRole === "gnew_orchestrator") {
+        recordHarnessEnv(currentRole, currentMode);
+        await callMcp("artifact_write", {
+          name: "gnew-dossier.md",
+          content: "# G_NEW Data-Dir Dossier\nCreated on the new release in data-dir layout.\n",
+          summary: "G_NEW orchestrator dossier in data-dir layout",
+        });
+        const spawned = await callMcp("spawn_worker", {
+          title: "G_NEW data-dir worktree worker",
+          objective: "FAKE_ROLE=gnew_worker commit marker and submit_for_merge",
+          write_scopes: ["gnew-marker.txt"],
+          model: "fake-model",
+        });
+        spawnedCount += 1;
+        const cid =
+          typeof spawned.spawned === "string"
+            ? spawned.spawned
+            : typeof spawned.taskId === "string"
+              ? spawned.taskId
+              : typeof spawned.id === "string"
+                ? spawned.id
+                : "";
+        const childIds = cid ? [cid] : [];
+        while (!cancelled) {
+          const waitRes = await callMcp("wait_children", {
+            ...(childIds.length > 0 ? { ids: childIds } : {}),
+            mode: "all",
+            fallback_interval_s: 30,
+          });
+          const children = Array.isArray(waitRes.children)
+            ? (waitRes.children as Array<{ id?: string; status?: string }>)
+            : [];
+          if (children.length > 0 && children.every((c) => c.status === "completed")) {
+            await client.notify("session/update", {
+              sessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "gnew_orchestrator finished." },
+              },
+            });
+            return { stopReason: "end_turn" };
+          }
+        }
+        return { stopReason: "cancelled" };
+      }
+
+      if (currentRole === "gnew_worker") {
+        recordHarnessEnv(currentRole, currentMode);
+        if (process.env.HARNESS_GOAL_EVIDENCE_DIR) {
+          mkdirSync(process.env.HARNESS_GOAL_EVIDENCE_DIR, { recursive: true });
+          writeFileSync(
+            join(process.env.HARNESS_GOAL_EVIDENCE_DIR, "gnew-evidence.txt"),
+            `G_NEW worker evidence from ${ownTaskId}\n`,
+            "utf8",
+          );
+        }
+        writeFileSync(join(process.cwd(), "gnew-marker.txt"), `gnew commit from ${ownTaskId}\n`, "utf8");
+        execFileSync("git", ["add", "gnew-marker.txt"], { cwd: process.cwd(), stdio: "ignore" });
+        execFileSync("git", ["commit", "-m", "gnew worker commit"], { cwd: process.cwd(), stdio: "ignore" });
+        await callMcp("submit_for_merge", {});
+        await callMcp("return_task", {
+          status: "completed",
+          summary: "G_NEW worker committed gnew-marker.txt and merged",
+          sources: [{ path: "gnew-marker.txt", note: "committed and submitted for merge" }],
+        });
+        await client.notify("session/update", {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "G_NEW worker completed." },
           },
         });
         return { stopReason: "end_turn" };

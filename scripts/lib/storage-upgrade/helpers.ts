@@ -7,8 +7,11 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
+  statSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
@@ -189,20 +192,90 @@ export function pass(label: string, detail?: string): void {
   console.log(`[PASS] ${label}${detail ? ` — ${detail}` : ""}`);
 }
 
+export function fail(label: string, detail?: string): void {
+  console.error(`[FAIL] ${label}${detail ? ` — ${detail}` : ""}`);
+}
+
+export type PrevMode = "auto" | "origin" | "head";
+
 export interface PrevRefResolution {
   ref: string;
   sha: string;
-  rule: "env:STORAGE_UPGRADE_PREV_REF" | "parent-of-src/storage/paths.ts" | "fallback:HEAD";
+  rule:
+    | "env:STORAGE_UPGRADE_PREV_REF"
+    | "flag:--prev"
+    | "origin/main"
+    | "parent-of-src/storage/paths.ts"
+    | "explicit:HEAD"
+    | "fallback:HEAD";
+  hasStorageModule: boolean;
 }
 
-export function resolvePrevRef(repoRoot: string): PrevRefResolution {
-  const envRef = process.env.STORAGE_UPGRADE_PREV_REF?.trim();
-  if (envRef) {
-    const sha = execFileSync("git", ["rev-parse", "--verify", `${envRef}^{commit}`], {
+function refHasFile(repoRoot: string, ref: string, relPath: string): boolean {
+  try {
+    const out = execFileSync("git", ["ls-tree", "--name-only", ref, "--", relPath], {
       cwd: repoRoot,
       encoding: "utf8",
     }).trim();
-    return { ref: envRef, sha, rule: "env:STORAGE_UPGRADE_PREV_REF" };
+    return out.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function tryRevParseCommit(repoRoot: string, ref: string): string | null {
+  try {
+    return execFileSync("git", ["rev-parse", "--verify", `${ref}^{commit}`], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+export function resolvePrevRef(repoRoot: string, explicitFlag?: string): PrevRefResolution {
+  const flagRaw = explicitFlag?.trim();
+  const envRef = process.env.STORAGE_UPGRADE_PREV_REF?.trim();
+  const envMode = process.env.STORAGE_UPGRADE_PREV_MODE?.trim();
+  const requested = flagRaw || envRef || envMode || "auto";
+
+  if (requested === "head" || requested === "HEAD") {
+    const sha = execFileSync("git", ["rev-parse", "--verify", "HEAD^{commit}"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+    }).trim();
+    return {
+      ref: "HEAD",
+      sha,
+      rule: "explicit:HEAD",
+      hasStorageModule: refHasFile(repoRoot, "HEAD", "src/storage/paths.ts"),
+    };
+  }
+
+  if (requested !== "auto" && requested !== "origin") {
+    const sha = execFileSync("git", ["rev-parse", "--verify", `${requested}^{commit}`], {
+      cwd: repoRoot,
+      encoding: "utf8",
+    }).trim();
+    return {
+      ref: requested,
+      sha,
+      rule: flagRaw ? "flag:--prev" : "env:STORAGE_UPGRADE_PREV_REF",
+      hasStorageModule: refHasFile(repoRoot, requested, "src/storage/paths.ts"),
+    };
+  }
+
+  // Config (a): origin/main when present and predating src/storage/paths.ts, else parent of commit adding paths.ts.
+  const originSha = tryRevParseCommit(repoRoot, "origin/main");
+  if (originSha && !refHasFile(repoRoot, "origin/main", "src/storage/paths.ts")) {
+    return {
+      ref: "origin/main",
+      sha: originSha,
+      rule: "origin/main",
+      hasStorageModule: false,
+    };
   }
 
   const logOut = execFileSync("git", ["log", "--diff-filter=A", "--format=%H", "--", "src/storage/paths.ts"], {
@@ -221,14 +294,46 @@ export function resolvePrevRef(repoRoot: string): PrevRefResolution {
       cwd: repoRoot,
       encoding: "utf8",
     }).trim();
-    return { ref: parentRef, sha, rule: "parent-of-src/storage/paths.ts" };
+    return {
+      ref: parentRef,
+      sha,
+      rule: "parent-of-src/storage/paths.ts",
+      hasStorageModule: refHasFile(repoRoot, parentRef, "src/storage/paths.ts"),
+    };
   }
 
   const sha = execFileSync("git", ["rev-parse", "--verify", "HEAD^{commit}"], {
     cwd: repoRoot,
     encoding: "utf8",
   }).trim();
-  return { ref: "HEAD", sha, rule: "fallback:HEAD" };
+  return {
+    ref: "HEAD",
+    sha,
+    rule: "fallback:HEAD",
+    hasStorageModule: refHasFile(repoRoot, "HEAD", "src/storage/paths.ts"),
+  };
+}
+
+/**
+ * In PREV=HEAD + NEW=data-dir mode, pins the disposable temp copy under `checkoutPrevDir` (never REPO_ROOT)
+ * so it acts as a pre-flip legacy-only binary: it ignores PI_HARNESS_STORAGE_LAYOUT while preserving it in
+ * process.env across supervisor handover to NEW, and runs legacy on Phase 8 rollback.
+ */
+export function pinCheckoutPrevToLegacyLayout(checkoutPrevDir: string, root: string): boolean {
+  const pathsTs = join(checkoutPrevDir, "src", "storage", "paths.ts");
+  assertStrictlyUnderRoot("checkoutPrevDir/src/storage/paths.ts", pathsTs, root);
+  if (!existsSync(pathsTs)) return false;
+  const orig = readFileSync(pathsTs, "utf8");
+  const target = "return parseStorageLayout(processStorageLayoutRaw, ENV_STORAGE_LAYOUT);";
+  if (!orig.includes(target)) {
+    throw new Error(`Expected parseStorageLayout call not found in temp ${pathsTs}`);
+  }
+  const patched = orig.replace(
+    target,
+    'return "legacy"; // storage-upgrade-check: disposable checkout-prev pinned to pre-flip legacy layout',
+  );
+  writeFileSync(pathsTs, patched, "utf8");
+  return true;
 }
 
 export function materializeRefWithGitArchive(repoRoot: string, ref: string, destDir: string): void {
@@ -303,6 +408,130 @@ export function readRecordedFakePidsForTasks(fakeDir: string, taskIds: Iterable<
     }
   }
   return out;
+}
+
+export interface TreeSnapshot {
+  files: Record<string, string>;
+  symlinks: Record<string, string>;
+  dirs: string[];
+}
+
+/**
+ * Walks `rootDir` without following symlinks and returns sorted maps of relative paths to sha256 hashes (files),
+ * symlink targets (symlinks), and directory paths.
+ */
+export function snapshotTree(rootDir: string, opts?: { excludeTopLevel?: readonly string[] }): TreeSnapshot {
+  const files: Record<string, string> = {};
+  const symlinks: Record<string, string> = {};
+  const dirs: string[] = [];
+  if (!existsSync(rootDir)) return { files, symlinks, dirs };
+  const excluded = new Set(opts?.excludeTopLevel ?? []);
+
+  const walk = (dir: string) => {
+    const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      const rel = relative(rootDir, full).replaceAll("\\", "/");
+      const top = rel.split("/")[0] ?? "";
+      if (excluded.has(top)) continue;
+      const st = lstatSync(full);
+      if (st.isSymbolicLink()) {
+        symlinks[rel] = readlinkSync(full);
+      } else if (st.isDirectory()) {
+        dirs.push(rel);
+        walk(full);
+      } else if (st.isFile()) {
+        files[rel] = sha256File(full);
+      }
+    }
+  };
+  walk(rootDir);
+  return { files, symlinks, dirs };
+}
+
+/** Captures exact raw bytes (base64) of every `.gitignore` file under `repoRoot` (excluding `.git` and `.harness/worktrees`). */
+export function snapshotGitignoreBytes(repoRoot: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const walk = (dir: string) => {
+    const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      const rel = relative(repoRoot, full).replaceAll("\\", "/");
+      if (rel === ".git" || rel === ".harness/worktrees") continue;
+      const st = lstatSync(full);
+      if (st.isSymbolicLink()) continue;
+      if (st.isDirectory()) {
+        walk(full);
+      } else if (st.isFile() && entry.name === ".gitignore") {
+        out[rel] = readFileSync(full).toString("base64");
+      }
+    }
+  };
+  walk(repoRoot);
+  return out;
+}
+
+export function getLogFileSize(logPath: string): number {
+  try {
+    return statSync(logPath).size;
+  } catch {
+    return 0;
+  }
+}
+
+export interface MigrationSummaryLine {
+  raw: string;
+  moved: number;
+  deferred: number;
+  errors: number;
+  budgetHit: boolean;
+  rowsRewritten: number;
+  bridgesRemoved: number;
+  remaining: number;
+  elapsedMs: number;
+}
+
+export interface ParsedMigrationLog {
+  summaryLines: MigrationSummaryLine[];
+  failureLines: string[];
+  rawText: string;
+}
+
+export function parseMigrationLogSection(logPath: string, fromByteOffset: number): ParsedMigrationLog {
+  if (!existsSync(logPath)) return { summaryLines: [], failureLines: [], rawText: "" };
+  const buf = readFileSync(logPath);
+  const start = buf.length < fromByteOffset ? 0 : fromByteOffset;
+  const rawText = buf.subarray(start).toString("utf8");
+  const summaryLines: MigrationSummaryLine[] = [];
+  const failureLines: string[] = [];
+
+  const readInt = (body: string, key: string): number => {
+    const m = new RegExp(`(?:^|\\s)${key}=(\\d+)`).exec(body);
+    return m ? Number(m[1]) : 0;
+  };
+
+  for (const line of rawText.split(/\r?\n/)) {
+    const sumMatch = /\[harnessd [^\]]+\] storage migration: (.+)$/.exec(line);
+    if (sumMatch) {
+      const body = sumMatch[1]!;
+      summaryLines.push({
+        raw: line,
+        moved: readInt(body, "moved"),
+        deferred: readInt(body, "deferred"),
+        errors: readInt(body, "errors"),
+        budgetHit: /(?:^|\s)budgetHit=true/.test(body),
+        rowsRewritten: readInt(body, "rowsRewritten"),
+        bridgesRemoved: readInt(body, "bridgesRemoved"),
+        remaining: readInt(body, "remaining"),
+        elapsedMs: readInt(body, "elapsedMs"),
+      });
+      continue;
+    }
+    if (/\[harnessd [^\]]+\] storage migration failed:/.test(line)) {
+      failureLines.push(line);
+    }
+  }
+  return { summaryLines, failureLines, rawText };
 }
 
 export interface PhaseResult {
