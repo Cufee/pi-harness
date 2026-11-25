@@ -16,7 +16,7 @@ import { promisify } from "node:util";
 import type { WorktreeConfig } from "../config.js";
 import type { ControlPlaneDb, WorktreeRecord } from "../control-plane/db.js";
 import { archiveRef, archiveRefPatterns, isArchiveRef, taskBranchName } from "../storage/names.js";
-import { createLegacyStoragePaths, type StoragePaths } from "../storage/paths.js";
+import { createLegacyStoragePaths, type StorageLayout, type StoragePaths } from "../storage/paths.js";
 import { type GateRuntimeConfig, resolveGateEnv, runGateCommand } from "../tools/gate-env.js";
 
 export function canonicalPath(p: string): string {
@@ -103,7 +103,7 @@ export class WorktreeConcurrencyLimitError extends Error {
 
 export class WorktreeManager {
   private storage: StoragePaths;
-  private readonly injectedStorage: boolean;
+  private injectedStorage: boolean;
 
   constructor(
     private readonly db: ControlPlaneDb,
@@ -121,10 +121,16 @@ export class WorktreeManager {
     this.config = next;
     this.gate = gate;
     if (storage !== undefined) {
+      this.injectedStorage = true;
       this.storage = storage;
     } else if (!this.injectedStorage) {
       this.storage = createLegacyStoragePaths({ worktree: next });
     }
+  }
+
+  /** Layout override for git branch/ref names: matches an explicitly injected StoragePaths, otherwise resolves from env. */
+  gitNameLayout(): StorageLayout | undefined {
+    return this.injectedStorage ? this.storage.layout : undefined;
   }
 
   get maxConcurrentWorkers(): number {
@@ -222,9 +228,9 @@ export class WorktreeManager {
             .then((r) => r.stdout)
             .catch(async () => (await runGit(this.repoRoot, ["rev-parse", "HEAD"])).stdout)
         : (await runGit(this.repoRoot, ["rev-parse", "HEAD"])).stdout);
-    const runRef = run ?? { id: runId, repoRoot: this.repoRoot };
-    // Explicit "legacy" layout until worker W8 implements data-dir git names in src/storage/names.ts.
-    const baseBranchName = taskBranchName(runRef, taskId, "legacy");
+    const chatSessionId = run?.chatSessionId ?? this.db.getRunChatSessionId(run?.id ?? runId);
+    const runRef = { id: run?.id ?? runId, repoRoot: run?.repoRoot ?? this.repoRoot, chatSessionId };
+    const baseBranchName = taskBranchName(runRef, taskId, this.gitNameLayout());
     let branch = baseBranchName;
     let suffix = 1;
     while (
@@ -406,8 +412,9 @@ export class WorktreeManager {
   async snapshotToArchiveRef(wt: WorktreeRecord): Promise<string | null> {
     if (!existsSync(wt.path)) return null;
     const run = this.db.getRun(wt.runId);
-    // Explicit "legacy" layout until worker W8 implements data-dir git names in src/storage/names.ts.
-    const ref = archiveRef(run ?? { id: wt.runId }, wt.taskId, "legacy");
+    const chatSessionId = run?.chatSessionId ?? this.db.getRunChatSessionId(run?.id ?? wt.runId);
+    const runRef = { id: run?.id ?? wt.runId, repoRoot: run?.repoRoot ?? this.repoRoot, chatSessionId };
+    const ref = archiveRef(runRef, wt.taskId, this.gitNameLayout());
     try {
       const dirty = await this.isDirty(wt.path);
       if (dirty) {
@@ -614,8 +621,7 @@ export class WorktreeManager {
     // Deletion is guarded by the OID read here, so a concurrently refreshed ref survives.
     const retentionMs = (this.config.archiveRetentionDays ?? 7) * 86_400_000;
     const cutoffSec = Math.floor((Date.now() - retentionMs) / 1000);
-    // Explicit "legacy" layout until worker W8 implements data-dir git names in src/storage/names.ts.
-    const patterns = archiveRefPatterns(opts?.runId, "legacy");
+    const patterns = archiveRefPatterns(opts?.runId, this.gitNameLayout());
     const justArchived = new Set(report.archivedRefs);
     try {
       const { stdout } = await runGit(this.repoRoot, [

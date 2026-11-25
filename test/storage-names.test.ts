@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { afterEach, describe, it } from "bun:test";
+import { afterEach, beforeEach, describe, it } from "bun:test";
 import {
   archiveRef,
   archiveRefPatterns,
@@ -16,12 +16,26 @@ import {
 import { resetStoragePathsForTest } from "../src/storage/paths.js";
 import { runMergedRef } from "../src/worktree/merge-queue.js";
 
-afterEach(() => {
-  delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+const initialStorageLayout = process.env.PI_HARNESS_STORAGE_LAYOUT;
+
+function restoreStorageLayout(): void {
+  if (initialStorageLayout === undefined) {
+    delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+  } else {
+    process.env.PI_HARNESS_STORAGE_LAYOUT = initialStorageLayout;
+  }
   resetStoragePathsForTest();
+}
+
+afterEach(() => {
+  restoreStorageLayout();
 });
 
 describe("src/storage/names (legacy layout)", () => {
+  beforeEach(() => {
+    delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+    resetStoragePathsForTest();
+  });
   it("builds exact legacy branch names, archive refs, merged refs, and ref patterns", () => {
     const run = { id: "run-30", chatSessionId: "chat-4" };
     const bareRun = { id: "run-30" };
@@ -39,12 +53,18 @@ describe("src/storage/names (legacy layout)", () => {
     assert.deepEqual(mergedRefCandidates(run), ["refs/harness/merged/run-30"]);
     assert.deepEqual(mergedRefCandidates(bareRun, "legacy"), ["refs/harness/merged/run-30"]);
 
-    assert.deepEqual(archiveRefPatterns(), ["refs/harness/archive"]);
-    assert.deepEqual(archiveRefPatterns("run-30"), ["refs/harness/archive/run-30"]);
-    assert.deepEqual(archiveRefPatterns(run), ["refs/harness/archive/run-30"]);
+    assert.deepEqual(archiveRefPatterns(), ["refs/harness/archive/*/*", "refs/harness/*/archive/*/*"]);
+    assert.deepEqual(archiveRefPatterns("run-30"), [
+      "refs/harness/archive/run-30/*",
+      "refs/harness/*/archive/run-30/*",
+    ]);
+    assert.deepEqual(archiveRefPatterns(run), [
+      "refs/harness/archive/run-30/*",
+      "refs/harness/*/archive/run-30/*",
+    ]);
   });
 
-  it("recognizes archive refs and extracts their owning run id", () => {
+  it("recognizes archive refs of both legacy and chat shapes and extracts their owning run id", () => {
     assert.deepEqual(parseArchiveRef("refs/harness/archive/run-30/t-493"), {
       runId: "run-30",
       taskId: "t-493",
@@ -54,13 +74,54 @@ describe("src/storage/names (legacy layout)", () => {
     assert.equal(isArchiveRef("refs/harness/archive/run-30/t-493", "run-31"), false);
     assert.equal(archiveRefRunId("refs/harness/archive/run-30/t-493"), "run-30");
 
+    assert.deepEqual(parseArchiveRef("refs/harness/chat-7/archive/run-30/t-493"), {
+      runId: "run-30",
+      taskId: "t-493",
+      chatSessionId: "chat-7",
+    });
+    assert.deepEqual(parseArchiveRef("refs/harness/legacy/archive/run-30/t-493"), {
+      runId: "run-30",
+      taskId: "t-493",
+      chatSessionId: "legacy",
+    });
+    assert.equal(isArchiveRef("refs/harness/chat-7/archive/run-30/t-493"), true);
+    assert.equal(isArchiveRef("refs/harness/chat-7/archive/run-30/t-493", "run-30"), true);
+    assert.equal(isArchiveRef("refs/harness/chat-7/archive/run-30/t-493", "run-3"), false);
+    assert.equal(archiveRefRunId("refs/harness/chat-7/archive/run-30/t-493"), "run-30");
+
+    // Chat segments literally named "archive" or "merged" round-trip cleanly and never collide with merged refs.
+    const archiveChatRef = archiveRef({ id: "run-30", chatSessionId: "archive" }, "t-493", "data-dir");
+    assert.equal(archiveChatRef, "refs/harness/archive/archive/run-30/t-493");
+    assert.deepEqual(parseArchiveRef(archiveChatRef), {
+      runId: "run-30",
+      taskId: "t-493",
+      chatSessionId: "archive",
+    });
+    assert.equal(isArchiveRef(archiveChatRef, "run-30"), true);
+
+    const mergedChatRef = archiveRef({ id: "run-30", chatSessionId: "merged" }, "t-493", "data-dir");
+    assert.equal(mergedChatRef, "refs/harness/merged/archive/run-30/t-493");
+    assert.deepEqual(parseArchiveRef(mergedChatRef), {
+      runId: "run-30",
+      taskId: "t-493",
+      chatSessionId: "merged",
+    });
+    assert.equal(isArchiveRef(mergedChatRef, "run-30"), true);
+
     for (const nonArchive of [
       "",
       "refs/harness/archive",
       "refs/harness/archive/run-30",
       "refs/harness/archive/run-30/t-493/extra",
       "refs/harness/merged/run-30",
+      "refs/harness/chat-7/merged/run-30",
+      "refs/harness/legacy/merged/run-30",
+      "refs/harness/archive/merged/run-30",
+      "refs/harness/merged/merged/run-30",
+      "refs/harness/chat-7/archive/run-30",
+      "refs/harness/chat-7/archive/run-30/t-493/extra",
       "refs/heads/harness/run-30/t-493",
+      "refs/heads/harness/chat-7/run-30/t-493",
     ]) {
       assert.equal(parseArchiveRef(nonArchive), null, `expected null for ${JSON.stringify(nonArchive)}`);
       assert.equal(isArchiveRef(nonArchive), false, `expected false for ${JSON.stringify(nonArchive)}`);
@@ -83,20 +144,79 @@ describe("src/storage/names (legacy layout)", () => {
       "has no merged ref (refs/harness/merged/run-30; latest promoted commit was 1234567)",
     );
   });
+});
 
-  it("throws a clear not-implemented error when data-dir layout is requested", () => {
-    const run = { id: "run-30", chatSessionId: "chat-1" };
-    assert.throws(() => taskBranchName(run, "t-1", "data-dir"), /not implemented/i);
-    assert.throws(() => archiveRef(run, "t-1", "data-dir"), /not implemented/i);
-    assert.throws(() => mergedRef(run, "data-dir"), /not implemented/i);
-    assert.throws(() => mergedRefCandidates(run, "data-dir"), /not implemented/i);
-    assert.throws(() => archiveRefPatterns(run, "data-dir"), /not implemented/i);
-    assert.throws(() => describeMergedRefTemplate("data-dir"), /not implemented/i);
-    assert.throws(() => describeMergedRefFallback("data-dir"), /not implemented/i);
-    assert.throws(() => describeMissingMergedRef(run, null, "data-dir"), /not implemented/i);
+describe("src/storage/names (data-dir layout)", () => {
+  it("builds chat-scoped branch, archive ref, merged ref, and candidate lists", () => {
+    const chatRun = { id: "run-30", chatSessionId: "chat-7" };
+    const bareRun = { id: "run-30" };
+    const nullChatRun = { id: "run-30", chatSessionId: null };
+    const unsafeChatRun = { id: "run-30", chatSessionId: "../bad/chat" };
 
+    assert.equal(taskBranchName(chatRun, "t-493", "data-dir"), "harness/chat-7/run-30/t-493");
+    assert.equal(taskBranchName(bareRun, "t-493", "data-dir"), "harness/legacy/run-30/t-493");
+    assert.equal(taskBranchName(nullChatRun, "t-493", "data-dir"), "harness/legacy/run-30/t-493");
+    assert.equal(taskBranchName(unsafeChatRun, "t-493", "data-dir"), "harness/legacy/run-30/t-493");
+
+    assert.equal(archiveRef(chatRun, "t-493", "data-dir"), "refs/harness/chat-7/archive/run-30/t-493");
+    assert.equal(archiveRef(bareRun, "t-493", "data-dir"), "refs/harness/legacy/archive/run-30/t-493");
+    assert.equal(archiveRef(nullChatRun, "t-493", "data-dir"), "refs/harness/legacy/archive/run-30/t-493");
+
+    assert.equal(mergedRef(chatRun, "data-dir"), "refs/harness/chat-7/merged/run-30");
+    assert.equal(mergedRef(bareRun, "data-dir"), "refs/harness/legacy/merged/run-30");
+    assert.equal(mergedRef(nullChatRun, "data-dir"), "refs/harness/legacy/merged/run-30");
+
+    assert.deepEqual(mergedRefCandidates(chatRun, "data-dir"), [
+      "refs/harness/chat-7/merged/run-30",
+      "refs/harness/merged/run-30",
+    ]);
+    assert.deepEqual(mergedRefCandidates(bareRun, "data-dir"), [
+      "refs/harness/legacy/merged/run-30",
+      "refs/harness/merged/run-30",
+    ]);
+    assert.deepEqual(mergedRefCandidates(chatRun, "legacy"), ["refs/harness/merged/run-30"]);
+
+    assert.deepEqual(archiveRefPatterns(undefined, "data-dir"), [
+      "refs/harness/archive/*/*",
+      "refs/harness/*/archive/*/*",
+    ]);
+    assert.deepEqual(archiveRefPatterns(chatRun, "data-dir"), [
+      "refs/harness/archive/run-30/*",
+      "refs/harness/*/archive/run-30/*",
+    ]);
+
+    assert.equal(describeMergedRefTemplate("data-dir"), "refs/harness/<chat>/merged/<runId>");
+    assert.equal(
+      describeMergedRefFallback("data-dir"),
+      "If the run's base branch was deleted and verify_ref is unset, gates fall back to the run's last merged commit (refs/harness/<chat>/merged/<runId>); if neither exists, verification fails with remediation options.",
+    );
+    assert.equal(
+      describeMissingMergedRef(chatRun, null, "data-dir"),
+      "has no merged commit (refs/harness/chat-7/merged/run-30)",
+    );
+    assert.equal(
+      describeMissingMergedRef(chatRun, "abcdef1234567890", "data-dir"),
+      "has no merged ref (refs/harness/chat-7/merged/run-30; latest promoted commit was abcdef1)",
+    );
+    assert.equal(
+      describeMissingMergedRef(bareRun, null, "data-dir"),
+      "has no merged commit (refs/harness/legacy/merged/run-30)",
+    );
+  });
+
+  it("activates data-dir names from PI_HARNESS_STORAGE_LAYOUT when no explicit layout is passed", () => {
+    const run = { id: "run-30", chatSessionId: "chat-7" };
     process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
     resetStoragePathsForTest();
-    assert.throws(() => mergedRef(run), /not implemented/i);
+
+    assert.equal(taskBranchName(run, "t-1"), "harness/chat-7/run-30/t-1");
+    assert.equal(archiveRef(run, "t-1"), "refs/harness/chat-7/archive/run-30/t-1");
+    assert.equal(mergedRef(run), "refs/harness/chat-7/merged/run-30");
+    assert.deepEqual(mergedRefCandidates(run), [
+      "refs/harness/chat-7/merged/run-30",
+      "refs/harness/merged/run-30",
+    ]);
+    assert.equal(describeMergedRefTemplate(), "refs/harness/<chat>/merged/<runId>");
+    assert.equal(runMergedRef("run-30"), "refs/harness/legacy/merged/run-30");
   });
 });

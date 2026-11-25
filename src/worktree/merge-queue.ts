@@ -457,12 +457,44 @@ export class BisectingMergeQueue {
       }
 
       // Update the advisory run merge ref with a single atomic CAS against the previously observed value.
+      // Sticky writer: if the legacy merged ref already exists for this run, keep updating it so a fallback
+      // to the previous release never sees a stale legacy ref alongside a newer chat-scoped ref.
       // On failure, leave the ref and any lock files untouched; merge.promoted is the durable source of truth.
       const runForRef = this.db.getRun(next.runId);
-      const mergedRef = runMergedRefForRun(runForRef ?? { id: next.runId });
-      const prevMergedRefSha = await runGit(this.repoRoot, ["rev-parse", "--verify", `${mergedRef}^{commit}`])
-        .then((r) => r.stdout || null)
-        .catch(() => null);
+      const chatSessionId = runForRef?.chatSessionId ?? this.db.getRunChatSessionId(runForRef?.id ?? next.runId);
+      const runNameRef = { id: runForRef?.id ?? next.runId, chatSessionId };
+      const layout = this.worktrees.gitNameLayout();
+      const primaryRef = runMergedRefForRun(runNameRef, layout);
+      const legacyRef = runMergedRefForRun(runNameRef, "legacy");
+      let mergedRef = primaryRef;
+      let prevMergedRefSha: string | null = null;
+      if (primaryRef === legacyRef) {
+        prevMergedRefSha = await runGit(this.repoRoot, ["rev-parse", "--verify", `${legacyRef}^{commit}`])
+          .then((r) => r.stdout || null)
+          .catch(() => null);
+      } else {
+        const existingByRef = new Map<string, string>();
+        const { stdout: refLines } = await runGit(this.repoRoot, [
+          "for-each-ref",
+          "--format=%(refname) %(objectname)",
+          legacyRef,
+          primaryRef,
+        ]).catch(() => ({ stdout: "" }));
+        for (const line of refLines.split("\n")) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          const [refName, oid] = trimmed.split(/\s+/);
+          if (refName && oid) existingByRef.set(refName, oid);
+        }
+        const legacySha = existingByRef.get(legacyRef) ?? null;
+        if (legacySha) {
+          mergedRef = legacyRef;
+          prevMergedRefSha = legacySha;
+        } else {
+          mergedRef = primaryRef;
+          prevMergedRefSha = existingByRef.get(primaryRef) ?? null;
+        }
+      }
       let refUpdated = false;
       try {
         await runGit(this.repoRoot, ["update-ref", mergedRef, mergedSha, prevMergedRefSha ?? ""]);
