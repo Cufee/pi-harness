@@ -1,4 +1,4 @@
-import { legacyStoragePaths, resolveStorageLayout, type StorageLayout } from "./paths.js";
+import { resolveStorageLayout, type StorageLayout } from "./paths.js";
 
 /** Minimal run descriptor accepted by git-name builders (`RunRecord` and `RunRef` satisfy it structurally). */
 export interface RunNameRef {
@@ -15,32 +15,76 @@ export interface ParsedArchiveRef {
 const LEGACY_ARCHIVE_RE = /^refs\/harness\/archive\/([^/]+)\/([^/]+)$/;
 const CHAT_ARCHIVE_RE = /^refs\/harness\/([^/]+)\/archive\/([^/]+)\/([^/]+)$/;
 
+/**
+ * True when `seg` is a valid single git ref path component under `git check-ref-format` rules.
+ * Rejects empty strings, leading/trailing `.`, `.lock` suffix, `..`, `@{`, lone `@`, slashes,
+ * whitespace, ASCII control chars / DEL, and git-forbidden punctuation (`~`, `^`, `:`, `?`, `*`, `[`, `\`).
+ */
+export function isValidGitRefSegment(seg: string): boolean {
+  if (!seg || seg === "@") return false;
+  if (seg.startsWith(".") || seg.endsWith(".") || seg.endsWith(".lock")) return false;
+  if (seg.includes("..") || seg.includes("@{")) return false;
+  for (let i = 0; i < seg.length; i++) {
+    const code = seg.charCodeAt(i);
+    if (code <= 0x20 || code === 0x7f) return false;
+    const ch = seg[i]!;
+    if (
+      ch === "/" ||
+      ch === "\\" ||
+      ch === "~" ||
+      ch === "^" ||
+      ch === ":" ||
+      ch === "?" ||
+      ch === "*" ||
+      ch === "["
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function assertGitRefSegment(seg: string, label: string): string {
+  if (!isValidGitRefSegment(seg)) {
+    throw new Error(`Invalid git ref segment for ${label}: ${JSON.stringify(seg)}`);
+  }
+  return seg;
+}
+
 function chatSegmentFor(run: RunNameRef): string {
-  return legacyStoragePaths.chatSegment(run.chatSessionId);
+  if (run.chatSessionId === undefined || run.chatSessionId === null) {
+    return "legacy";
+  }
+  return assertGitRefSegment(run.chatSessionId, "chatSessionId");
 }
 
 /** Base branch name for a worker task checkout (callers append any collision suffix). */
 export function taskBranchName(run: RunNameRef, taskId: string, layout?: StorageLayout): string {
+  const runId = assertGitRefSegment(run.id, "run.id");
+  const safeTaskId = assertGitRefSegment(taskId, "taskId");
   if (resolveStorageLayout(layout) === "data-dir") {
-    return `harness/${chatSegmentFor(run)}/${run.id}/${taskId}`;
+    return `harness/${chatSegmentFor(run)}/${runId}/${safeTaskId}`;
   }
-  return `harness/${run.id}/${taskId}`;
+  return `harness/${runId}/${safeTaskId}`;
 }
 
 /** Safety archive git ref for a worktree snapshot. */
 export function archiveRef(run: RunNameRef, taskId: string, layout?: StorageLayout): string {
+  const runId = assertGitRefSegment(run.id, "run.id");
+  const safeTaskId = assertGitRefSegment(taskId, "taskId");
   if (resolveStorageLayout(layout) === "data-dir") {
-    return `refs/harness/${chatSegmentFor(run)}/archive/${run.id}/${taskId}`;
+    return `refs/harness/${chatSegmentFor(run)}/archive/${runId}/${safeTaskId}`;
   }
-  return `refs/harness/archive/${run.id}/${taskId}`;
+  return `refs/harness/archive/${runId}/${safeTaskId}`;
 }
 
 /** Primary git ref storing the latest merged commit for a run. */
 export function mergedRef(run: RunNameRef, layout?: StorageLayout): string {
+  const runId = assertGitRefSegment(run.id, "run.id");
   if (resolveStorageLayout(layout) === "data-dir") {
-    return `refs/harness/${chatSegmentFor(run)}/merged/${run.id}`;
+    return `refs/harness/${chatSegmentFor(run)}/merged/${runId}`;
   }
-  return `refs/harness/merged/${run.id}`;
+  return `refs/harness/merged/${runId}`;
 }
 
 /** Candidate merged git refs for a run in reader preference order. */
@@ -54,10 +98,10 @@ export function mergedRefCandidates(run: RunNameRef, layout?: StorageLayout): st
 /** Git `for-each-ref` patterns covering both legacy and chat-scoped safety archive refs, optionally scoped to one run. */
 export function archiveRefPatterns(run?: RunNameRef | string, layout?: StorageLayout): string[] {
   resolveStorageLayout(layout);
-  if (!run) {
+  if (run === undefined) {
     return ["refs/harness/archive/*/*", "refs/harness/*/archive/*/*"];
   }
-  const runId = typeof run === "string" ? run : run.id;
+  const runId = assertGitRefSegment(typeof run === "string" ? run : run.id, "run.id");
   return [`refs/harness/archive/${runId}/*`, `refs/harness/*/archive/${runId}/*`];
 }
 

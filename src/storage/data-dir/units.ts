@@ -52,11 +52,14 @@ export interface UnionUnitFileEntry {
 const HARNESS_DIR = ".harness";
 const KNOWN_LEGACY_HARNESS_ENTRIES = new Set(["goals", "artifacts", "notes", "worktrees"]);
 
+function isLiteralPosixSegment(seg: string): boolean {
+  return seg.length > 0 && seg !== "." && seg !== ".." && !seg.includes("/") && !seg.includes("\0");
+}
+
 function splitSafeRel(relPath: string): string[] | null {
-  const normalized = relPath.replaceAll("\\", "/").replace(/^\/+/, "");
-  if (!normalized || normalized.includes("\0")) return null;
-  const parts = normalized.split("/").filter((s) => s.length > 0 && s !== ".");
-  if (parts.length === 0 || parts.some((s) => s === "..")) return null;
+  if (!relPath || relPath.includes("\0")) return null;
+  const parts = relPath.split("/");
+  if (parts.length === 0 || parts.some((s) => !isLiteralPosixSegment(s))) return null;
   return parts;
 }
 
@@ -150,11 +153,10 @@ export function resolveUnitFile(
 
   if (unit.kind === "flat_artifact") {
     const fileName = relPath || unit.id;
-    const parts = splitSafeRel(fileName);
-    if (!parts || parts.length !== 1) return null;
-    if (isRealFileUnderRoot(canonRepo, [HARNESS_DIR, "artifacts", parts[0]!])) {
+    if (!isLiteralPosixSegment(fileName)) return null;
+    if (isRealFileUnderRoot(canonRepo, [HARNESS_DIR, "artifacts", fileName])) {
       return {
-        path: join(canonRepo, HARNESS_DIR, "artifacts", parts[0]!),
+        path: join(canonRepo, HARNESS_DIR, "artifacts", fileName),
         source: "legacy",
         unitDir: join(canonRepo, HARNESS_DIR, "artifacts"),
       };
@@ -164,9 +166,9 @@ export function resolveUnitFile(
       const projDir = storage.projectDir(canonRepo);
       const ownerChat = storage.chatSegment(unit.chatSessionId);
       for (const chat of orderedProjectChatNames(projDir, ownerChat)) {
-        if (isRealFileUnderRoot(storage.dataRoot, ["projects", key, "chats", chat, "artifacts", parts[0]!])) {
+        if (isRealFileUnderRoot(storage.dataRoot, ["projects", key, "chats", chat, "artifacts", fileName])) {
           return {
-            path: join(storage.dataRoot, "projects", key, "chats", chat, "artifacts", parts[0]!),
+            path: join(storage.dataRoot, "projects", key, "chats", chat, "artifacts", fileName),
             source: "data-dir",
             unitDir: join(storage.dataRoot, "projects", key, "chats", chat, "artifacts"),
           };
@@ -285,9 +287,8 @@ export function listUnitFiles(storage: StoragePaths, unit: StorageUnitRef): Unio
   }
 
   if (unit.kind === "flat_artifact") {
-    const parts = splitSafeRel(unit.id);
-    if (!parts || parts.length !== 1) return [];
-    const fileName = parts[0]!;
+    const fileName = unit.id;
+    if (!isLiteralPosixSegment(fileName)) return [];
     if (isRealFileUnderRoot(canonRepo, [HARNESS_DIR, "artifacts", fileName])) {
       record(fileName, join(canonRepo, HARNESS_DIR, "artifacts", fileName), "legacy");
     }

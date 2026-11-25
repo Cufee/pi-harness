@@ -156,7 +156,7 @@ describe("src/storage/names (data-dir layout)", () => {
     assert.equal(taskBranchName(chatRun, "t-493", "data-dir"), "harness/chat-7/run-30/t-493");
     assert.equal(taskBranchName(bareRun, "t-493", "data-dir"), "harness/legacy/run-30/t-493");
     assert.equal(taskBranchName(nullChatRun, "t-493", "data-dir"), "harness/legacy/run-30/t-493");
-    assert.equal(taskBranchName(unsafeChatRun, "t-493", "data-dir"), "harness/legacy/run-30/t-493");
+    assert.throws(() => taskBranchName(unsafeChatRun, "t-493", "data-dir"), /Invalid git ref segment/);
 
     assert.equal(archiveRef(chatRun, "t-493", "data-dir"), "refs/harness/chat-7/archive/run-30/t-493");
     assert.equal(archiveRef(bareRun, "t-493", "data-dir"), "refs/harness/legacy/archive/run-30/t-493");

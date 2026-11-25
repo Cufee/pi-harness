@@ -10,6 +10,7 @@ import {
   expandHome,
   hashFileSha256,
   hashFileSha256Sync,
+  isAnchoredDirPathUnderRoot,
   isEqualOrWithin,
   isRealDirUnderRoot,
   isRealFileUnderRoot,
@@ -65,10 +66,14 @@ export interface OwnerRef {
 
 export interface GoalRef extends OwnerRef {
   id: string;
+  /** Linked run id of this goal unit when known (`GoalRecord` satisfies this structurally). */
+  linkedRunId?: string | null;
 }
 
 export interface RunRef extends OwnerRef {
   id: string;
+  /** Linked goal id of this run's goal unit when known. */
+  linkedGoalId?: string | null;
 }
 
 export type ScratchKind = "_verify" | "_integration";
@@ -104,6 +109,16 @@ export interface DirectorNoteRoots {
 }
 
 export type DirectorReadDecision = { ok: true } | { ok: false; reason: string };
+
+export type DirectorWriteDecision = { ok: true } | { ok: false; reason: string };
+
+export interface DirectorWritePolicyOptions {
+  /**
+   * Goal IDs owned by `owner`'s chat that may still have live legacy goal dirs under `<repo>/.harness/goals/<id>`.
+   * When omitted in `data-dir` layout, no legacy goal dir is admitted (fail closed).
+   */
+  ownLegacyGoalIds?: readonly string[];
+}
 
 const HARNESS_DIR = ".harness";
 const GOAL_ID_SEGMENT = /^[a-zA-Z0-9._-]+$/;
@@ -186,6 +201,7 @@ function pinDataRootForConfig(config: StoragePathsConfig): string | null {
 export class StoragePaths {
   private readonly pinnedDataRoot: string | null;
   private readonly stateDirCanon: string | null;
+  private readonly knownRepoRoots = new Set<string>();
 
   constructor(
     private readonly config: StoragePathsConfig,
@@ -221,18 +237,73 @@ export class StoragePaths {
    * Ancestors of the state dir (such as `~`) return false so they stay allowed outside state-dir/data-dir,
    * where the more specific denied root refuses state-dir internals and non-granted data-dir paths.
    */
-  private isBlockedConfiguredRoot(raw: string): boolean {
+  private isBlockedConfiguredRoot(raw: string, customWorktreeRoot?: string | null): boolean {
     const trimmed = raw.trim();
     if (!trimmed) return true;
     const canon = canonicalPath(expandHome(trimmed));
     if (this.stateDirCanon && isEqualOrWithin(this.stateDirCanon, canon)) return true;
     if (this.pinnedDataRoot && isEqualOrWithin(this.pinnedDataRoot, canon)) return true;
+    if (customWorktreeRoot && isEqualOrWithin(customWorktreeRoot, canon)) return true;
     return false;
   }
 
-  private filterConfiguredExtraRoots(roots: readonly string[] | undefined): string[] {
+  private filterConfiguredExtraRoots(
+    roots: readonly string[] | undefined,
+    customWorktreeRoot?: string | null,
+  ): string[] {
     if (!roots?.length) return [];
-    return roots.filter((r) => !this.isBlockedConfiguredRoot(r));
+    return roots.filter((r) => !this.isBlockedConfiguredRoot(r, customWorktreeRoot));
+  }
+
+  /**
+   * Returns the canonical custom legacy worktree root configured via `config.worktree.dir` when it differs
+   * from `<repo>/.harness/worktrees` and does not cover the repository root itself; otherwise null.
+   */
+  private customWorktreeRootFor(repoRoot: string): string | null {
+    const raw = this.config.worktree?.dir?.trim();
+    const canonRepo = canonicalPath(repoRoot);
+    this.knownRepoRoots.add(canonRepo);
+    if (!raw) return null;
+    const expanded = raw === "~" || raw.startsWith("~/") ? expandHome(raw) : resolve(canonRepo, raw);
+    const canonCustom = canonicalPath(expanded);
+    const defaultLegacy = join(canonRepo, HARNESS_DIR, "worktrees");
+    if (canonCustom === defaultLegacy) return null;
+    if (isEqualOrWithin(canonCustom, canonRepo)) return null;
+    return canonCustom;
+  }
+
+  /** Collects all known custom legacy worktree roots for `isProtectedWorktreePath`. */
+  private collectCustomWorktreeRoots(ownCanon?: string, repoRoot?: string): string[] {
+    const raw = this.config.worktree?.dir?.trim();
+    if (!raw) return [];
+    const seen = new Set<string>();
+    const out: string[] = [];
+    const add = (candidate: string | null) => {
+      if (candidate && !seen.has(candidate)) {
+        seen.add(candidate);
+        out.push(candidate);
+      }
+    };
+    if (repoRoot !== undefined) {
+      add(this.customWorktreeRootFor(repoRoot));
+    }
+    if (isAbsolute(raw) || raw === "~" || raw.startsWith("~/")) {
+      const canonCustom = canonicalPath(expandHome(raw));
+      const overlapsRepo = [...this.knownRepoRoots].some((r) => isEqualOrWithin(canonCustom, r));
+      if (!overlapsRepo) add(canonCustom);
+    } else {
+      for (const knownRepo of this.knownRepoRoots) {
+        add(this.customWorktreeRootFor(knownRepo));
+      }
+      if (out.length === 0 && ownCanon !== undefined && !raw.startsWith("..")) {
+        const candidate = canonicalPath(resolve(ownCanon, raw));
+        const defaultLegacy = join(ownCanon, HARNESS_DIR, "worktrees");
+        if (candidate !== defaultLegacy && isWithin(ownCanon, candidate)) {
+          add(candidate);
+        }
+      }
+    }
+    return out;
   }
 
   /** Finds an existing real directory under `<projectDir>/chats/<chat>/<subSegments>` in priority order. */
@@ -326,11 +397,21 @@ export class StoragePaths {
       return join(this.goalsDir(goal), goal.id);
     }
     const canonRepo = canonicalPath(goal.repoRoot);
-    if (isRealDirUnderRoot(canonRepo, [HARNESS_DIR, "goals", goal.id])) {
+    const partnerRunId = goal.linkedRunId && !isDirectorTaskContainer(goal.linkedRunId) ? goal.linkedRunId : null;
+    const legacyGoalExists = isRealDirUnderRoot(canonRepo, [HARNESS_DIR, "goals", goal.id]);
+    const legacyRunExists = partnerRunId ? isRealDirUnderRoot(canonRepo, [HARNESS_DIR, "artifacts", partnerRunId]) : false;
+    if (legacyGoalExists || legacyRunExists) {
       return join(canonRepo, HARNESS_DIR, "goals", goal.id);
     }
-    const found = this.findExistingChatDir(canonRepo, normalizeChatSegment(goal.chatSessionId), ["goals", goal.id]);
+    const ownerChat = normalizeChatSegment(goal.chatSessionId);
+    const found = this.findExistingChatDir(canonRepo, ownerChat, ["goals", goal.id]);
     if (found) return found.path;
+    if (partnerRunId) {
+      const foundRun = this.findExistingChatDir(canonRepo, ownerChat, ["artifacts", partnerRunId]);
+      if (foundRun) {
+        return join(this.projectDir(canonRepo), "chats", foundRun.chat, "goals", goal.id);
+      }
+    }
     return join(this.goalsDir(goal), goal.id);
   }
 
@@ -342,12 +423,26 @@ export class StoragePaths {
       if (this.layout === "legacy") {
         return ensureDirsUnderRoot(canonRepo, [HARNESS_DIR, "goals", goal.id], () => null);
       }
-      // Per-unit rule: real legacy directory stays legacy (bridge symlinks are not real dirs).
-      if (isRealDirUnderRoot(canonRepo, [HARNESS_DIR, "goals", goal.id])) {
+      // Per-unit rule: if either legacy half exists as a real directory, the whole unit stays legacy
+      // (bridge symlinks are not real dirs). Create the missing legacy half first; fail closed on partner error.
+      const partnerRunId = goal.linkedRunId && !isDirectorTaskContainer(goal.linkedRunId) ? goal.linkedRunId : null;
+      const legacyGoalExists = isRealDirUnderRoot(canonRepo, [HARNESS_DIR, "goals", goal.id]);
+      const legacyRunExists = partnerRunId ? isRealDirUnderRoot(canonRepo, [HARNESS_DIR, "artifacts", partnerRunId]) : false;
+      if (legacyGoalExists || legacyRunExists) {
+        if (!legacyGoalExists) {
+          const createdGoal = ensureDirsUnderRoot(canonRepo, [HARNESS_DIR, "goals", goal.id], () => null);
+          if (!createdGoal) return null;
+        }
+        if (partnerRunId && !legacyRunExists) {
+          const createdRun = ensureDirsUnderRoot(canonRepo, [HARNESS_DIR, "artifacts", partnerRunId], () => null);
+          if (!createdRun) return null;
+        }
         return join(canonRepo, HARNESS_DIR, "goals", goal.id);
       }
       const ownerChat = normalizeChatSegment(goal.chatSessionId);
-      const existing = this.findExistingChatDir(canonRepo, ownerChat, ["goals", goal.id]);
+      const existing =
+        this.findExistingChatDir(canonRepo, ownerChat, ["goals", goal.id]) ??
+        (partnerRunId ? this.findExistingChatDir(canonRepo, ownerChat, ["artifacts", partnerRunId]) : null);
       const targetChat = existing?.chat ?? ownerChat;
       const proj = this.ensureDataProjectDirInternal(canonRepo, () => null);
       if (!proj) return null;
@@ -370,12 +465,24 @@ export class StoragePaths {
     const canonRepo = canonicalPath(run.repoRoot);
     const ownerChat = normalizeChatSegment(run.chatSessionId);
     // Director bucket runs have task-level units, not run-level units; the run dir itself lives in data-dir.
-    if (!isDirectorTaskContainer(run.id) && run.id && isRealDirUnderRoot(canonRepo, [HARNESS_DIR, "artifacts", run.id])) {
-      return join(canonRepo, HARNESS_DIR, "artifacts", run.id);
+    const isBucket = isDirectorTaskContainer(run.id);
+    const partnerGoalId = !isBucket && run.linkedGoalId && isValidGoalId(run.linkedGoalId) ? run.linkedGoalId : null;
+    if (!isBucket && run.id) {
+      const legacyRunExists = isRealDirUnderRoot(canonRepo, [HARNESS_DIR, "artifacts", run.id]);
+      const legacyGoalExists = partnerGoalId ? isRealDirUnderRoot(canonRepo, [HARNESS_DIR, "goals", partnerGoalId]) : false;
+      if (legacyRunExists || legacyGoalExists) {
+        return join(canonRepo, HARNESS_DIR, "artifacts", run.id);
+      }
     }
     if (run.id) {
       const found = this.findExistingChatDir(canonRepo, ownerChat, ["artifacts", run.id]);
       if (found) return found.path;
+      if (partnerGoalId) {
+        const foundGoal = this.findExistingChatDir(canonRepo, ownerChat, ["goals", partnerGoalId]);
+        if (foundGoal) {
+          return join(this.projectDir(canonRepo), "chats", foundGoal.chat, "artifacts", run.id);
+        }
+      }
     }
     return join(this.artifactsDir(run), run.id);
   }
@@ -431,14 +538,23 @@ export class StoragePaths {
     const ownerChat = normalizeChatSegment(run.chatSessionId);
     let useLegacy = false;
     let targetChat = ownerChat;
+    let partnerGoalToPin: string | null = null;
+    let partnerRunToPin: string | null = null;
 
     if (subSegments.length === 0) {
       // Flat spill / code-output file: next to runArtifactsDir(run) for run-level units, artifactsDir(owner) for bucket runs.
       if (run.id && !isDirectorTaskContainer(run.id)) {
-        if (isRealDirUnderRoot(realRepo, [HARNESS_DIR, "artifacts", run.id])) {
+        const partnerGoalId = run.linkedGoalId && isValidGoalId(run.linkedGoalId) ? run.linkedGoalId : null;
+        const legacyRunExists = isRealDirUnderRoot(realRepo, [HARNESS_DIR, "artifacts", run.id]);
+        const legacyGoalExists = partnerGoalId ? isRealDirUnderRoot(realRepo, [HARNESS_DIR, "goals", partnerGoalId]) : false;
+        if (legacyRunExists || legacyGoalExists) {
           useLegacy = true;
+          if (!legacyRunExists) partnerRunToPin = run.id;
+          if (partnerGoalId && !legacyGoalExists) partnerGoalToPin = partnerGoalId;
         } else {
-          const found = this.findExistingChatDir(realRepo, ownerChat, ["artifacts", run.id]);
+          const found =
+            this.findExistingChatDir(realRepo, ownerChat, ["artifacts", run.id]) ??
+            (partnerGoalId ? this.findExistingChatDir(realRepo, ownerChat, ["goals", partnerGoalId]) : null);
           if (found) targetChat = found.chat;
         }
       }
@@ -456,24 +572,44 @@ export class StoragePaths {
       }
     } else {
       const runId = subSegments[0]!;
-      if (isRealDirUnderRoot(realRepo, [HARNESS_DIR, "artifacts", runId])) {
+      const partnerGoalId =
+        run.linkedGoalId && isValidGoalId(run.linkedGoalId) && (!run.id || run.id === runId) ? run.linkedGoalId : null;
+      const legacyRunExists = isRealDirUnderRoot(realRepo, [HARNESS_DIR, "artifacts", runId]);
+      const legacyGoalExists = partnerGoalId ? isRealDirUnderRoot(realRepo, [HARNESS_DIR, "goals", partnerGoalId]) : false;
+      if (legacyRunExists || legacyGoalExists) {
         useLegacy = true;
+        if (partnerGoalId && !legacyGoalExists) partnerGoalToPin = partnerGoalId;
       } else {
-        const found = this.findExistingChatDir(realRepo, ownerChat, ["artifacts", runId]);
+        const found =
+          this.findExistingChatDir(realRepo, ownerChat, ["artifacts", runId]) ??
+          (partnerGoalId ? this.findExistingChatDir(realRepo, ownerChat, ["goals", partnerGoalId]) : null);
         if (found) targetChat = found.chat;
       }
     }
 
     if (useLegacy) {
-      return ensureDirsUnderRoot(realRepo, [HARNESS_DIR, "artifacts", ...subSegments], onInvalid)!;
+      if (partnerGoalToPin) {
+        const pinnedGoal = ensureDirsUnderRoot(realRepo, [HARNESS_DIR, "goals", partnerGoalToPin], onInvalid);
+        if (!pinnedGoal) throw onInvalid(join(realRepo, HARNESS_DIR, "goals", partnerGoalToPin));
+      }
+      if (partnerRunToPin) {
+        const pinnedRun = ensureDirsUnderRoot(realRepo, [HARNESS_DIR, "artifacts", partnerRunToPin], onInvalid);
+        if (!pinnedRun) throw onInvalid(join(realRepo, HARNESS_DIR, "artifacts", partnerRunToPin));
+      }
+      const created = ensureDirsUnderRoot(realRepo, [HARNESS_DIR, "artifacts", ...subSegments], onInvalid);
+      if (!created) throw onInvalid(join(realRepo, HARNESS_DIR, "artifacts", ...subSegments));
+      return created;
     }
 
-    const proj = this.ensureDataProjectDirInternal(realRepo, onInvalid)!;
-    return ensureDirsUnderRoot(
+    const proj = this.ensureDataProjectDirInternal(realRepo, onInvalid);
+    if (!proj) throw onInvalid(this.projectDir(realRepo));
+    const created = ensureDirsUnderRoot(
       proj.dataRoot,
       ["projects", proj.key, "chats", targetChat, "artifacts", ...subSegments],
       onInvalid,
-    )!;
+    );
+    if (!created) throw onInvalid(join(proj.dataRoot, "projects", proj.key, "chats", targetChat, "artifacts", ...subSegments));
+    return created;
   }
 
   /**
@@ -572,10 +708,9 @@ export class StoragePaths {
    * legacy real unit wins over data-dir, and data-dir-only files remain visible. Never follows symlinks.
    */
   resolveArtifactFile(run: RunRef, artifactSubPath: string): ResolvedUnitFile | null {
-    const normalized = artifactSubPath.replaceAll("\\", "/").replace(/^\/+/, "");
-    if (!normalized || normalized.includes("\0")) return null;
-    const parts = normalized.split("/").filter((s) => s.length > 0 && s !== ".");
-    if (parts.length === 0 || parts.some((s) => s === "..")) return null;
+    if (!artifactSubPath || artifactSubPath.includes("\0")) return null;
+    const parts = artifactSubPath.split("/");
+    if (parts.length === 0 || parts.some((s) => !s || s === "." || s === "..")) return null;
 
     if (parts.length === 1) {
       return resolveUnitFile(this, {
@@ -645,7 +780,11 @@ export class StoragePaths {
   }
 
   private legacyWorktreeBaseDir(repoRoot: string): string {
-    return resolve(canonicalPath(repoRoot), this.config.worktree?.dir ?? join(HARNESS_DIR, "worktrees"));
+    const canonRepo = canonicalPath(repoRoot);
+    this.knownRepoRoots.add(canonRepo);
+    const raw = this.config.worktree?.dir?.trim();
+    if (!raw) return join(canonRepo, HARNESS_DIR, "worktrees");
+    return raw === "~" || raw.startsWith("~/") ? expandHome(raw) : resolve(canonRepo, raw);
   }
 
   /** Path for a worker worktree checkout. Always under data-dir in `data-dir` layout. */
@@ -666,35 +805,72 @@ export class StoragePaths {
 
   /** Every root directory under which harness-managed worktrees for `repoRoot` may be registered. First entry is for new trees. */
   managedWorktreeRoots(repoRoot: string): string[] {
-    if (this.layout === "legacy") {
-      return [this.legacyWorktreeBaseDir(repoRoot)];
-    }
     const canonRepo = canonicalPath(repoRoot);
+    this.knownRepoRoots.add(canonRepo);
+    if (this.layout === "legacy") {
+      return [this.legacyWorktreeBaseDir(canonRepo)];
+    }
     const roots: string[] = [this.projectDir(canonRepo), join(canonRepo, HARNESS_DIR, "worktrees")];
     if (this.config.worktree?.dir?.trim()) {
-      const custom = resolve(canonRepo, this.config.worktree.dir.trim());
+      const custom = this.legacyWorktreeBaseDir(canonRepo);
       if (!roots.includes(custom)) roots.push(custom);
     }
     return roots;
   }
 
+  /** True when `absDir` exists as a real directory anchored under `canonRepo` or `dataRoot` (no symlink components). */
+  private isRealAnchoredHarnessDir(canonRepo: string, absDir: string): boolean {
+    if (isWithin(canonRepo, absDir)) {
+      const rel = relative(canonRepo, absDir);
+      return isRealDirUnderRoot(canonRepo, rel.split(sep));
+    }
+    if (this.pinnedDataRoot && isWithin(this.pinnedDataRoot, absDir)) {
+      const rel = relative(this.pinnedDataRoot, absDir);
+      return isRealDirUnderRoot(this.pinnedDataRoot, rel.split(sep));
+    }
+    return false;
+  }
+
+  /** Returns `join(dataRoot, "projects", key, ...subSegments)` only when every existing component below `dataRoot` is a real directory. */
+  private anchoredDataRootDir(canonRepo: string, subSegments: readonly string[]): string | null {
+    const dataCanon = this.requireDataRoot();
+    const key = this.projectKey(canonRepo);
+    const segs = ["projects", key, ...subSegments];
+    return isAnchoredDirPathUnderRoot(dataCanon, segs) ? join(dataCanon, ...segs) : null;
+  }
+
   /** Computes the runner request fragment (read/write roots, env, denied/protected roots) for a task. */
   taskGrants(input: TaskGrantsInput): TaskGrants {
     const { run, goal, writable } = input;
+    const canonRepo = canonicalPath(run.repoRoot);
+    const customWtRoot = this.customWorktreeRootFor(canonRepo);
     if (this.layout === "legacy") {
       const goalEvDir = goal ? this.ensureGoalEvidenceDir(goal) : null;
       const goalsRoot = this.goalsDir(run);
       const artifactsRoot = this.artifactsDir(run);
+      const goalsAnchored = isAnchoredDirPathUnderRoot(canonRepo, [HARNESS_DIR, "goals"]);
+      const artifactsAnchored = isAnchoredDirPathUnderRoot(canonRepo, [HARNESS_DIR, "artifacts"]);
+      const filterCustom = (roots: readonly string[] | undefined): string[] => {
+        if (!roots?.length) return [];
+        if (!customWtRoot) return [...roots];
+        return roots.filter((r) => {
+          const trimmed = r.trim();
+          return !trimmed || !isEqualOrWithin(customWtRoot, canonicalPath(expandHome(trimmed)));
+        });
+      };
       const extraReadRoots = [...new Set([
-        goalsRoot,
-        artifactsRoot,
-        ...(this.config.worktree?.extraReadRoots ?? []),
+        ...(goalsAnchored ? [goalsRoot] : []),
+        ...(artifactsAnchored ? [artifactsRoot] : []),
+        ...filterCustom(this.config.worktree?.extraReadRoots),
       ])];
       const extraWriteRoots = goal
         ? writable
-          ? [...(goalEvDir ? [goalEvDir] : []), ...(this.config.worktree?.extraWriteRoots ?? [])]
+          ? [...(goalEvDir ? [goalEvDir] : []), ...filterCustom(this.config.worktree?.extraWriteRoots)]
           : undefined
-        : [goalsRoot, ...(this.config.worktree?.extraWriteRoots ?? [])];
+        : [
+            ...(goalsAnchored ? [goalsRoot] : []),
+            ...filterCustom(this.config.worktree?.extraWriteRoots),
+          ];
       const extraEnv = goal
         ? {
             ...(goalEvDir ? { HARNESS_GOAL_EVIDENCE_DIR: goalEvDir } : {}),
@@ -707,81 +883,75 @@ export class StoragePaths {
         extraReadRoots,
         extraWriteRoots,
         extraEnv,
-        deniedRoots: [],
-        protectedRoots: [],
+        deniedRoots: customWtRoot ? [customWtRoot] : [],
+        protectedRoots: customWtRoot ? [customWtRoot] : [],
       };
     }
 
-    const canonRepo = canonicalPath(run.repoRoot);
     const isBucket = isDirectorTaskContainer(run.id);
 
-    // Addendum A4 pinning: when either legacy half of a goal unit exists as a real directory, create the other
-    // legacy half (segment-wise, refusing symlinks/non-dirs) so later calls that see only one half agree from disk.
-    if (goal && run.id && !isBucket) {
-      const validGoal = isValidGoalId(goal.id);
-      const legacyGoalExists = validGoal && isRealDirUnderRoot(canonRepo, [HARNESS_DIR, "goals", goal.id]);
-      const legacyRunExists = isRealDirUnderRoot(canonRepo, [HARNESS_DIR, "artifacts", run.id]);
-      if (legacyGoalExists && !legacyRunExists) {
-        try {
-          ensureDirsUnderRoot(canonRepo, [HARNESS_DIR, "artifacts", run.id], () => null);
-        } catch {
-          // Fail closed without throwing out of taskGrants.
-        }
-      } else if (legacyRunExists && !legacyGoalExists && validGoal) {
-        try {
-          ensureDirsUnderRoot(canonRepo, [HARNESS_DIR, "goals", goal.id], () => null);
-        } catch {
-          // Fail closed without throwing out of taskGrants.
-        }
-      }
-    }
+    // Bind both halves of a goal unit so ensureGoalEvidenceDir, goalEvidenceDir, and runArtifactsDir decide
+    // from both halves together and fail closed (never creating a split data-dir half) if a legacy partner fails.
+    const linkedGoal: GoalRef | null = goal
+      ? !isBucket && run.id
+        ? { ...goal, linkedRunId: goal.linkedRunId ?? run.id }
+        : goal
+      : null;
+    const linkedRun: RunRef =
+      !isBucket && goal && isValidGoalId(goal.id)
+        ? { ...run, linkedGoalId: run.linkedGoalId ?? goal.id }
+        : run;
 
-    const goalEvDir = goal ? this.ensureGoalEvidenceDir(goal) : null;
-    const envGoalsDir = goal
+    const goalEvDir = linkedGoal ? this.ensureGoalEvidenceDir(linkedGoal) : null;
+    const envGoalsDir = linkedGoal
       ? goalEvDir
         ? dirname(goalEvDir)
-        : isValidGoalId(goal.id)
-          ? dirname(this.goalEvidenceDir(goal))
-          : this.goalsDir(run)
-      : this.goalsDir(run);
-    const runArtDir = run.id && !isBucket ? this.runArtifactsDir(run) : null;
-    const envArtifactsDir = runArtDir ? dirname(runArtDir) : this.artifactsDir(run);
+        : isValidGoalId(linkedGoal.id)
+          ? dirname(this.goalEvidenceDir(linkedGoal))
+          : this.goalsDir(linkedRun)
+      : this.goalsDir(linkedRun);
+    const runArtDir = linkedRun.id && !isBucket ? this.runArtifactsDir(linkedRun) : null;
+    const envArtifactsDir = runArtDir ? dirname(runArtDir) : this.artifactsDir(linkedRun);
 
-    const legacyOwner: OwnerRef = { repoRoot: canonRepo, chatSessionId: null };
+    const ownerChat = normalizeChatSegment(run.chatSessionId);
     const legacyGoalsRoot = join(canonRepo, HARNESS_DIR, "goals");
     const legacyArtifactsRoot = join(canonRepo, HARNESS_DIR, "artifacts");
     const hasLegacyGoals = isRealDirUnderRoot(canonRepo, [HARNESS_DIR, "goals"]);
     const hasLegacyArtifacts = isRealDirUnderRoot(canonRepo, [HARNESS_DIR, "artifacts"]);
 
-    const readRoots: string[] = [
-      this.goalsDir(run),
-      this.artifactsDir(run),
-      this.notesDir(run),
-      this.projectNotesDir(canonRepo),
-      this.goalsDir(legacyOwner),
-      this.artifactsDir(legacyOwner),
-      this.notesDir(legacyOwner),
-    ];
+    const ownGoalsRoot = this.anchoredDataRootDir(canonRepo, ["chats", ownerChat, "goals"]);
+    const readRoots: string[] = [];
+    for (const candidate of [
+      ownGoalsRoot,
+      this.anchoredDataRootDir(canonRepo, ["chats", ownerChat, "artifacts"]),
+      this.anchoredDataRootDir(canonRepo, ["chats", ownerChat, "notes"]),
+      this.anchoredDataRootDir(canonRepo, ["notes"]),
+      this.anchoredDataRootDir(canonRepo, ["chats", "legacy", "goals"]),
+      this.anchoredDataRootDir(canonRepo, ["chats", "legacy", "artifacts"]),
+      this.anchoredDataRootDir(canonRepo, ["chats", "legacy", "notes"]),
+    ]) {
+      if (candidate) readRoots.push(candidate);
+    }
     if (hasLegacyGoals) readRoots.push(legacyGoalsRoot);
     if (hasLegacyArtifacts) readRoots.push(legacyArtifactsRoot);
-    // If the goal or run lives in another chat (e.g. transferred ownership), grant only that specific unit dir.
-    if (goalEvDir && !readRoots.some((r) => isEqualOrWithin(r, goalEvDir))) {
+    // If the goal or run lives in another chat (e.g. transferred ownership), grant only that specific anchored unit dir.
+    if (goalEvDir && this.isRealAnchoredHarnessDir(canonRepo, goalEvDir) && !readRoots.some((r) => isEqualOrWithin(r, goalEvDir))) {
       readRoots.push(goalEvDir);
     }
-    if (runArtDir && existsSync(runArtDir) && !readRoots.some((r) => isEqualOrWithin(r, runArtDir))) {
+    if (runArtDir && this.isRealAnchoredHarnessDir(canonRepo, runArtDir) && !readRoots.some((r) => isEqualOrWithin(r, runArtDir))) {
       readRoots.push(runArtDir);
     }
-    readRoots.push(...this.filterConfiguredExtraRoots(this.config.worktree?.extraReadRoots));
+    readRoots.push(...this.filterConfiguredExtraRoots(this.config.worktree?.extraReadRoots, customWtRoot));
     const extraReadRoots = [...new Set(readRoots)];
 
-    const configuredWriteRoots = this.filterConfiguredExtraRoots(this.config.worktree?.extraWriteRoots);
+    const configuredWriteRoots = this.filterConfiguredExtraRoots(this.config.worktree?.extraWriteRoots, customWtRoot);
     const extraWriteRoots = goal
       ? writable
         ? [...new Set([...(goalEvDir ? [goalEvDir] : []), ...configuredWriteRoots])]
         : undefined
       : [
           ...new Set([
-            this.goalsDir(run),
+            ...(ownGoalsRoot ? [ownGoalsRoot] : []),
             ...(hasLegacyGoals ? [legacyGoalsRoot] : []),
             ...configuredWriteRoots,
           ]),
@@ -800,42 +970,58 @@ export class StoragePaths {
     const dataCanon = this.requireDataRoot();
     const deniedRoots =
       dataCanon !== stateCanon && !isWithin(stateCanon, dataCanon) ? [stateCanon, dataCanon] : [stateCanon];
+    if (customWtRoot && !deniedRoots.some((d) => isEqualOrWithin(d, customWtRoot))) {
+      deniedRoots.push(customWtRoot);
+    }
 
     return {
       extraReadRoots,
       extraWriteRoots,
       extraEnv,
       deniedRoots,
-      protectedRoots: [],
+      protectedRoots: customWtRoot ? [customWtRoot] : [],
     };
   }
 
   /** Canonical repo root and writable note roots for the Director's `write_note` tool. */
   directorNoteRoots(owner: OwnerRef): DirectorNoteRoots {
+    const customWtRoot = this.customWorktreeRootFor(owner.repoRoot);
     if (this.layout === "legacy") {
       const root = realpathSync(owner.repoRoot);
+      const allowed: string[] = [];
+      if (isAnchoredDirPathUnderRoot(root, [HARNESS_DIR, "goals"])) {
+        allowed.push(join(root, HARNESS_DIR, "goals"));
+      }
+      if (isAnchoredDirPathUnderRoot(root, [HARNESS_DIR, "notes"])) {
+        allowed.push(join(root, HARNESS_DIR, "notes"));
+      }
+      allowed.push(
+        ...resolvedExtraWriteRoots(this.config).filter(
+          (r) => !customWtRoot || !isEqualOrWithin(customWtRoot, r),
+        ),
+      );
       return {
         root,
-        allowedWriteRoots: [
-          join(root, HARNESS_DIR, "goals"),
-          join(root, HARNESS_DIR, "notes"),
-          ...resolvedExtraWriteRoots(this.config),
-        ],
+        allowedWriteRoots: [...new Set(allowed)],
       };
     }
     const root = canonicalPath(owner.repoRoot);
-    const allowed: string[] = [
-      this.goalsDir(owner),
-      this.notesDir(owner),
-      this.projectNotesDir(root),
-    ];
+    const ownerChat = normalizeChatSegment(owner.chatSessionId);
+    const allowed: string[] = [];
+    for (const candidate of [
+      this.anchoredDataRootDir(root, ["chats", ownerChat, "goals"]),
+      this.anchoredDataRootDir(root, ["chats", ownerChat, "notes"]),
+      this.anchoredDataRootDir(root, ["notes"]),
+    ]) {
+      if (candidate) allowed.push(candidate);
+    }
     if (isRealDirUnderRoot(root, [HARNESS_DIR, "goals"])) {
       allowed.push(join(root, HARNESS_DIR, "goals"));
     }
     if (isRealDirUnderRoot(root, [HARNESS_DIR, "notes"])) {
       allowed.push(join(root, HARNESS_DIR, "notes"));
     }
-    allowed.push(...resolvedExtraWriteRoots(this.config).filter((r) => !this.isBlockedConfiguredRoot(r)));
+    allowed.push(...resolvedExtraWriteRoots(this.config).filter((r) => !this.isBlockedConfiguredRoot(r, customWtRoot)));
     return {
       root,
       allowedWriteRoots: [...new Set(allowed)],
@@ -846,6 +1032,10 @@ export class StoragePaths {
   directorReadPolicy(repoRoot: string, absPath: string): DirectorReadDecision {
     const root = canonicalPath(repoRoot);
     const target = canonicalPath(absPath);
+    const customWtRoot = this.customWorktreeRootFor(root);
+    if (customWtRoot && isEqualOrWithin(customWtRoot, target)) {
+      return { ok: false, reason: "task worktrees are protected" };
+    }
 
     if (this.layout === "data-dir") {
       if (hasGitSegment(target)) {
@@ -907,22 +1097,173 @@ export class StoragePaths {
   }
 
   /**
-   * True when `absPath` targets `.git` metadata or a protected worktree path.
-   * When `ownWorkspace` is given and `absPath` lies inside it, only segments below `ownWorkspace` trigger the
-   * worktree-segment check so a task may access files inside its own worktree checkout.
+   * Evaluates whether the Director (`owner`) may write to `absPath` (B9).
+   * Allowed in `data-dir` layout: owner's chat `notes/` and `goals/`, `projectNotesDir`, owner's own live legacy units
+   * (real legacy goal dirs listed in `opts.ownLegacyGoalIds` and existing real legacy notes files), and configured
+   * `extraWriteRoots` only when the target is outside `stateDir`, `dataRoot`, and `<repo>/.harness`.
+   * Everything else is refused with a reason that names the allowed roots. Does not alter `directorReadPolicy` (A6).
    */
-  isProtectedWorktreePath(absPath: string, ownWorkspace?: string): boolean {
+  directorWritePolicy(
+    owner: OwnerRef,
+    absPath: string,
+    opts?: DirectorWritePolicyOptions,
+  ): DirectorWriteDecision {
+    const root = canonicalPath(owner.repoRoot);
+    const customWtRoot = this.customWorktreeRootFor(root);
+    const legacyHarnessRoot = join(root, HARNESS_DIR);
+
+    const configuredExtraWriteRoots = resolvedExtraWriteRoots(this.config).filter((r) => {
+      if (this.layout === "data-dir") {
+        return !this.isBlockedConfiguredRoot(r, customWtRoot);
+      }
+      return !customWtRoot || !isEqualOrWithin(customWtRoot, r);
+    });
+
+    const allowedLabels: string[] = [];
+    const ownLegacyGoalDirs: string[] = [];
+    let ownNotesDir: string | null = null;
+    let ownGoalsDir: string | null = null;
+    let projNotesDir: string | null = null;
+    let legacyGoalsRoot: string | null = null;
+    let legacyNotesRoot: string | null = null;
+
+    if (this.layout === "data-dir") {
+      const ownerChat = normalizeChatSegment(owner.chatSessionId);
+      ownNotesDir = this.anchoredDataRootDir(root, ["chats", ownerChat, "notes"]);
+      ownGoalsDir = this.anchoredDataRootDir(root, ["chats", ownerChat, "goals"]);
+      projNotesDir = this.anchoredDataRootDir(root, ["notes"]);
+      if (ownNotesDir) allowedLabels.push(ownNotesDir);
+      if (ownGoalsDir) allowedLabels.push(ownGoalsDir);
+      if (projNotesDir) allowedLabels.push(projNotesDir);
+      for (const goalId of opts?.ownLegacyGoalIds ?? []) {
+        if (isValidGoalId(goalId) && isRealDirUnderRoot(root, [HARNESS_DIR, "goals", goalId])) {
+          const dir = join(root, HARNESS_DIR, "goals", goalId);
+          if (!ownLegacyGoalDirs.includes(dir)) {
+            ownLegacyGoalDirs.push(dir);
+            allowedLabels.push(dir);
+          }
+        }
+      }
+      if (isRealDirUnderRoot(root, [HARNESS_DIR, "notes"])) {
+        legacyNotesRoot = join(root, HARNESS_DIR, "notes");
+        allowedLabels.push(`${legacyNotesRoot} (existing files)`);
+      }
+    } else {
+      if (isAnchoredDirPathUnderRoot(root, [HARNESS_DIR, "goals"])) {
+        legacyGoalsRoot = join(root, HARNESS_DIR, "goals");
+        allowedLabels.push(legacyGoalsRoot);
+      }
+      if (isAnchoredDirPathUnderRoot(root, [HARNESS_DIR, "notes"])) {
+        legacyNotesRoot = join(root, HARNESS_DIR, "notes");
+        allowedLabels.push(legacyNotesRoot);
+      }
+    }
+    for (const extra of configuredExtraWriteRoots) {
+      if (!allowedLabels.includes(extra)) allowedLabels.push(extra);
+    }
+
+    const refuse = (prefix: string): DirectorWriteDecision => {
+      const rootsDesc = allowedLabels.length > 0 ? allowedLabels.join(", ") : "(none)";
+      return { ok: false, reason: `${prefix}; allowed write roots: ${rootsDesc}` };
+    };
+
+    if (!absPath || absPath.trim().length === 0 || absPath.includes("\0")) {
+      return refuse("Write path is invalid");
+    }
+
+    const absResolved = resolve(absPath);
+    const target = canonicalPath(absPath);
+
+    try {
+      if (lstatSync(absResolved).isSymbolicLink()) {
+        return refuse("Symlink write target is protected");
+      }
+    } catch {
+      // Non-existent target is fine; ancestors are checked via canonicalPath and anchored roots.
+    }
+
+    if (hasGitSegment(absResolved) || hasGitSegment(target)) {
+      return refuse(".git internals are protected");
+    }
+    if (
+      this.isProtectedWorktreePath(target, undefined, root) ||
+      this.isProtectedWorktreePath(absResolved, undefined, root)
+    ) {
+      return refuse("Task worktrees and scratch checkouts are protected");
+    }
+
+    if (this.layout === "data-dir") {
+      const dataCanon = this.requireDataRoot();
+
+      if (ownNotesDir && isEqualOrWithin(ownNotesDir, target)) return { ok: true };
+      if (ownGoalsDir && isEqualOrWithin(ownGoalsDir, target)) return { ok: true };
+      if (projNotesDir && isEqualOrWithin(projNotesDir, target)) return { ok: true };
+      for (const legGoalDir of ownLegacyGoalDirs) {
+        if (isEqualOrWithin(legGoalDir, target)) return { ok: true };
+      }
+      if (legacyNotesRoot && isWithin(legacyNotesRoot, target)) {
+        const relParts = relative(legacyNotesRoot, target).split(sep);
+        if (isRealFileUnderRoot(root, [HARNESS_DIR, "notes", ...relParts])) {
+          return { ok: true };
+        }
+      }
+
+      // Configured extraWriteRoots apply only when the target is outside stateDir, dataRoot, and <repo>/.harness.
+      if (
+        (this.stateDirCanon && (isEqualOrWithin(this.stateDirCanon, target) || isEqualOrWithin(this.stateDirCanon, absResolved)))
+      ) {
+        return refuse("Harness state-dir internals are protected");
+      }
+      if (isEqualOrWithin(dataCanon, target) || isEqualOrWithin(dataCanon, absResolved)) {
+        return refuse("Path is outside this Director's allowed data-dir write roots");
+      }
+      if (isEqualOrWithin(legacyHarnessRoot, target) || isEqualOrWithin(legacyHarnessRoot, absResolved)) {
+        return refuse("Path is outside this Director's allowed legacy write units");
+      }
+      if (configuredExtraWriteRoots.some((extra) => isEqualOrWithin(extra, target))) {
+        return { ok: true };
+      }
+      return refuse("Path is outside Director allowed write roots");
+    }
+
+    // Legacy layout
+    if (legacyGoalsRoot && isEqualOrWithin(legacyGoalsRoot, target)) return { ok: true };
+    if (legacyNotesRoot && isEqualOrWithin(legacyNotesRoot, target)) return { ok: true };
+    const inProtectedStorage =
+      (this.stateDirCanon !== null && isEqualOrWithin(this.stateDirCanon, target)) ||
+      (this.pinnedDataRoot !== null && isEqualOrWithin(this.pinnedDataRoot, target)) ||
+      isEqualOrWithin(legacyHarnessRoot, target);
+    if (!inProtectedStorage && configuredExtraWriteRoots.some((extra) => isEqualOrWithin(extra, target))) {
+      return { ok: true };
+    }
+    return refuse("Path is outside Director allowed write roots");
+  }
+
+  /**
+   * True when `absPath` targets `.git` metadata or a protected worktree path (including custom legacy `worktree.dir`).
+   * When `ownWorkspace` is given and `absPath` lies inside it, only segments/worktree roots strictly below `ownWorkspace`
+   * trigger protection so a task may access files inside its own worktree checkout.
+   */
+  isProtectedWorktreePath(absPath: string, ownWorkspace?: string, repoRoot?: string): boolean {
     const absolute = resolve(absPath);
     const absCanon = canonicalPath(absPath);
     if (hasGitSegment(absolute) || hasGitSegment(absCanon)) return true;
 
-    if (ownWorkspace !== undefined) {
-      const ownCanon = canonicalPath(ownWorkspace);
+    const ownCanon = ownWorkspace !== undefined ? canonicalPath(ownWorkspace) : undefined;
+    const customWtRoots = this.collectCustomWorktreeRoots(ownCanon, repoRoot);
+
+    if (ownCanon !== undefined) {
       const relCanon = relative(ownCanon, absCanon);
       if (relCanon === "") return false;
       if (!isAbsolute(relCanon) && relCanon !== ".." && !relCanon.startsWith(`..${sep}`)) {
         const segments = relCanon.split(sep).map((segment) => segment.toLowerCase());
-        return hasWorktreeSegmentPair(segments);
+        if (hasWorktreeSegmentPair(segments)) return true;
+        for (const wtRoot of customWtRoots) {
+          if (isWithin(ownCanon, wtRoot) && isEqualOrWithin(wtRoot, absCanon)) {
+            return true;
+          }
+        }
+        return false;
       }
     }
 
@@ -930,6 +1271,10 @@ export class StoragePaths {
     if (hasWorktreeSegmentPair(segments)) return true;
     const canonSegments = absCanon.split(sep).map((segment) => segment.toLowerCase());
     if (hasWorktreeSegmentPair(canonSegments)) return true;
+
+    for (const wtRoot of customWtRoots) {
+      if (isEqualOrWithin(wtRoot, absCanon)) return true;
+    }
 
     if (this.layout === "data-dir" && this.pinnedDataRoot && isWithin(this.pinnedDataRoot, absCanon)) {
       const parts = relative(this.pinnedDataRoot, absCanon).split(sep);
@@ -984,19 +1329,80 @@ export class StoragePaths {
   }
 
   /**
+   * Resolves an existing regular file under the both-exist union rule (legacy wins over data-dir) for a parsed
+   * `(kind, rest)` tuple below `notes/`, `goals/`, or `artifacts/`, or returns `null` when no file exists.
+   */
+  private resolveUnionFileForDataSubpath(
+    realRoot: string,
+    kind: string,
+    rest: readonly string[],
+    chatSessionId?: string | null,
+  ): string | null {
+    if (kind === "notes") {
+      if (rest.length === 0) return null;
+      return resolveUnitFile(this, { kind: "note", repoRoot: realRoot, id: rest.join("/") })?.path ?? null;
+    }
+    if (kind === "goals") {
+      if (rest.length < 2) return null;
+      return (
+        resolveUnitFile(
+          this,
+          { kind: "goal", repoRoot: realRoot, id: rest[0]!, chatSessionId },
+          rest.slice(1).join("/"),
+        )?.path ?? null
+      );
+    }
+    if (kind === "artifacts") {
+      if (rest.length === 0) return null;
+      if (rest.length === 1) {
+        return (
+          resolveUnitFile(this, {
+            kind: "flat_artifact",
+            repoRoot: realRoot,
+            id: rest[0]!,
+            chatSessionId,
+          })?.path ?? null
+        );
+      }
+      const runId = rest[0]!;
+      const sub = rest.slice(1);
+      if (isDirectorTaskContainer(runId)) {
+        if (sub.length < 2) return null;
+        return (
+          resolveUnitFile(
+            this,
+            { kind: "bucket_task", repoRoot: realRoot, id: runId, taskId: sub[0]!, chatSessionId },
+            sub.slice(1).join("/"),
+          )?.path ?? null
+        );
+      }
+      return (
+        resolveUnitFile(
+          this,
+          { kind: "run", repoRoot: realRoot, id: runId, chatSessionId },
+          sub.join("/"),
+        )?.path ?? null
+      );
+    }
+    return null;
+  }
+
+  /**
    * Maps a workspace-relative `.harness/{goals,notes,artifacts}/...` path, an absolute `<repo>/.harness/...` path,
    * or (in `data-dir` layout) an already-current data-dir path inside this project's allowed data dirs to its current
    * absolute location, or returns `null` if `rawPath` is not a data path for `repoRoot`.
    */
   resolveLegacyPath(repoRoot: string, rawPath: string, owner?: OwnerRef): string | null {
-    const trimmed = rawPath.trim();
-    if (!trimmed || trimmed.includes("\0") || trimmed === "~" || trimmed.startsWith("~/")) return null;
+    if (!rawPath || rawPath.trim().length === 0 || rawPath.includes("\0") || rawPath === "~" || rawPath.startsWith("~/")) {
+      return null;
+    }
     const rawRoot = resolve(repoRoot);
     const realRoot = canonicalPath(repoRoot);
 
-    // In data-dir layout, accept paths that are already inside this project's allowed data directories.
-    if (this.layout === "data-dir" && isAbsolute(trimmed) && this.pinnedDataRoot) {
-      const abs = resolve(trimmed);
+    // In data-dir layout, accept paths that are already inside this project's allowed data directories,
+    // still applying the both-exist union rule for existing files (B8: legacy file wins over data-dir copy).
+    if (this.layout === "data-dir" && isAbsolute(rawPath) && this.pinnedDataRoot) {
+      const abs = resolve(rawPath);
       const key = this.projectKey(realRoot);
       const projDir = join(this.pinnedDataRoot, "projects", key);
       let relFromProj: string | null = null;
@@ -1016,9 +1422,16 @@ export class StoragePaths {
         const parts = relFromProj.split(sep);
         if (parts.some((p) => !p || p === "." || p === "..")) return null;
         if (parts[0] === "notes") {
-          return join(projDir, ...parts);
+          const unionHit = this.resolveUnionFileForDataSubpath(realRoot, "notes", parts.slice(1), owner?.chatSessionId);
+          return unionHit ?? join(projDir, ...parts);
         }
         if (parts[0] === "chats" && parts.length >= 3 && Boolean(parts[1]) && LEGACY_DATA_SUBDIRS.has(parts[2]!)) {
+          const chat = parts[1]!;
+          const kind = parts[2]!;
+          if (kind === "goals" || kind === "artifacts") {
+            const unionHit = this.resolveUnionFileForDataSubpath(realRoot, kind, parts.slice(3), chat);
+            if (unionHit) return unionHit;
+          }
           return join(projDir, ...parts);
         }
         return null;
@@ -1027,15 +1440,15 @@ export class StoragePaths {
 
     // Parse legacy `.harness/{goals,notes,artifacts}/...` path (relative, absolute, or symlinked repo root spelling).
     let legacyParts: string[] | null = null;
-    if (!isAbsolute(trimmed)) {
-      const abs = resolve(rawRoot, trimmed);
+    if (!isAbsolute(rawPath)) {
+      const abs = resolve(rawRoot, rawPath);
       const rel = relative(rawRoot, abs);
       if (!rel || isAbsolute(rel) || rel === ".." || rel.startsWith(`..${sep}`)) return null;
       const parts = rel.split(sep);
       if (parts[0] !== HARNESS_DIR || !LEGACY_DATA_SUBDIRS.has(parts[1] ?? "")) return null;
       legacyParts = parts;
     } else {
-      const abs = resolve(trimmed);
+      const abs = resolve(rawPath);
       for (const root of [realRoot, rawRoot]) {
         const rel = relative(root, abs);
         if (!rel || isAbsolute(rel) || rel === ".." || rel.startsWith(`..${sep}`)) continue;
@@ -1062,11 +1475,15 @@ export class StoragePaths {
       return join(realRoot, ...legacyParts);
     }
 
-    // Map legacy path in data-dir layout per Addendum A5.
+    // Map legacy path in data-dir layout: existing files resolve via the both-exist union first (B8);
+    // directory preference applies only when the named file exists nowhere (creation placement).
     const kind = legacyParts[1]!;
     const rest = legacyParts.slice(2);
     const ownerRef: OwnerRef = { repoRoot: realRoot, chatSessionId: owner?.chatSessionId ?? null };
     const ownerChat = normalizeChatSegment(ownerRef.chatSessionId);
+
+    const unionHit = this.resolveUnionFileForDataSubpath(realRoot, kind, rest, ownerRef.chatSessionId);
+    if (unionHit) return unionHit;
 
     if (kind === "notes") {
       if (rest.length === 0) {

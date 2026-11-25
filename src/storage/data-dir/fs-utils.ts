@@ -56,13 +56,39 @@ export function isSafeSegment(seg: string): boolean {
 }
 
 /**
+ * True when every *existing* segment below `trustedRoot` along `segments` is a real directory (not a symlink or file).
+ * Missing trailing segments (ENOENT) stay allowed so non-existent grant roots remain granted lexically.
+ * Non-ENOENT lstat errors and invalid segments fail closed (false).
+ */
+export function isAnchoredDirPathUnderRoot(trustedRoot: string, segments: readonly string[]): boolean {
+  let cur = trustedRoot;
+  let missing = false;
+  for (const seg of segments) {
+    if (!seg || seg === "." || seg === ".." || seg.includes("/") || seg.includes("\0")) return false;
+    if (missing) continue;
+    cur = join(cur, seg);
+    try {
+      const st = lstatSync(cur);
+      if (st.isSymbolicLink() || !st.isDirectory()) return false;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        missing = true;
+        continue;
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * True when every segment below `trustedRoot` exists as a real directory (not a symlink or file).
  * Never follows symlinks below `trustedRoot`.
  */
 export function isRealDirUnderRoot(trustedRoot: string, segments: readonly string[]): boolean {
   let cur = trustedRoot;
   for (const seg of segments) {
-    if (!seg || seg === "." || seg === ".." || seg.includes("\0")) return false;
+    if (!seg || seg === "." || seg === ".." || seg.includes("/") || seg.includes("\0")) return false;
     cur = join(cur, seg);
     try {
       const st = lstatSync(cur);
@@ -82,7 +108,7 @@ export function isRealFileUnderRoot(trustedRoot: string, segments: readonly stri
   if (segments.length === 0) return false;
   if (segments.length > 1 && !isRealDirUnderRoot(trustedRoot, segments.slice(0, -1))) return false;
   const leafSeg = segments[segments.length - 1]!;
-  if (!leafSeg || leafSeg === "." || leafSeg === ".." || leafSeg.includes("\0")) return false;
+  if (!leafSeg || leafSeg === "." || leafSeg === ".." || leafSeg.includes("/") || leafSeg.includes("\0")) return false;
   const leafPath = join(trustedRoot, ...segments);
   try {
     const st = lstatSync(leafPath);
@@ -103,7 +129,7 @@ export function ensureDirsUnderRoot(
 ): string | null {
   let cur = trustedRoot;
   for (const segment of segments) {
-    if (!segment || segment === ".." || segment.includes("\0")) {
+    if (!segment || segment === "." || segment === ".." || segment.includes("/") || segment.includes("\0")) {
       const err = onInvalid(join(cur, segment));
       if (err) throw err;
       return null;
