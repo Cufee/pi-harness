@@ -2,18 +2,16 @@ import { spawn } from "node:child_process";
 import {
   closeSync,
   existsSync,
-  fstatSync,
   mkdirSync,
   openSync,
   readFileSync,
-  readSync,
   renameSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { spawnDaemonDetached } from "./launch.js";
+import { readRetentionLogMaxBytes, rotateLogIfOversized } from "../install/maintenance.js";
+import { prepareDaemonLogForSpawn, readDaemonLogTail, spawnDaemonDetached } from "./launch.js";
 import { killProcessGroups, listChildProcessGroups } from "./reap.js";
 import { readReleaseAt, type ReleaseTarget } from "./release.js";
 import { DaemonClient } from "./remote.js";
@@ -71,24 +69,6 @@ function formatServeCommand(rel: ReleaseTarget, stateDir: string | undefined, so
   }
   const cmd = `${shellQuote(rel.bunPath)} ${shellQuote(rel.cliPath)} daemon serve`;
   return envParts.length > 0 ? `${envParts.join(" ")} ${cmd}` : cmd;
-}
-
-function readLogTail(logPath: string, startOffset: number, maxChars = 2000): string {
-  try {
-    const fd = openSync(logPath, "r");
-    try {
-      const end = fstatSync(fd).size;
-      const start = Math.max(startOffset, end - 16_384);
-      if (end <= start) return "";
-      const buf = Buffer.alloc(end - start);
-      const bytesRead = readSync(fd, buf, 0, buf.length, start);
-      return buf.subarray(0, bytesRead).toString("utf8").trim().slice(-maxChars);
-    } finally {
-      closeSync(fd);
-    }
-  } catch {
-    return "";
-  }
 }
 
 function writeFallbackFileAtomically(fallbackFilePath: string, content: string): void {
@@ -273,6 +253,7 @@ export function spawnSupervisorDetached(self: ReleaseTarget, o: SuperviseOptions
   const logDir = dirname(o.socketPath);
   mkdirSync(logDir, { recursive: true });
   const logPath = join(logDir, "daemon.log");
+  rotateLogIfOversized(logPath, readRetentionLogMaxBytes(o.stateDir));
   const logFd = openSync(logPath, "a");
   const spawnCwd = existsSync(cwd) ? cwd : logDir;
   try {
@@ -467,14 +448,8 @@ export async function runSupervisor(o: SuperviseOptions): Promise<number> {
   if (o.overlayRoot) targetEnv.PI_HARNESS_OVERLAY_ROOT = o.overlayRoot;
   if (legacyStopAt !== undefined) targetEnv.PI_HARNESS_LEGACY_STOP_AT = String(legacyStopAt);
 
-  let targetLogStart = 0;
-  try {
-    targetLogStart = statSync(logPath).size;
-  } catch {
-    // daemon.log may not exist yet
-  }
-
   logSupervisor(`starting target release ${o.target.releaseId} (${o.target.releaseDir}), timeout=${targetBootTimeoutMs}ms`);
+  const targetLogStart = prepareDaemonLogForSpawn(logPath, o.stateDir);
   const targetAttempt = await startAndWaitForRelease(
     o.target,
     o.socketPath,
@@ -489,7 +464,7 @@ export async function runSupervisor(o: SuperviseOptions): Promise<number> {
   }
 
   const errorMsg = targetAttempt.error ?? `failed to start release ${o.target.releaseId}`;
-  const bootLogTail = readLogTail(logPath, targetLogStart, 2000);
+  const bootLogTail = readDaemonLogTail(logPath, targetLogStart, 2000);
   logSupervisor(`target release ${o.target.releaseId} failed to boot: ${errorMsg}`);
 
   if (targetAttempt.childPid && (!targetAttempt.childExited || isPidAlive(targetAttempt.childPid))) {

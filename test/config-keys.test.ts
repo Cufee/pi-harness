@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { describe, it } from "bun:test";
 import {
+  DEFAULT_RETENTION_CONFIG,
+  defaultDataDir,
+  diffHarnessConfig,
   findMisplacedConfigKeys,
   resolveConfig,
   serializeGlobalConfig,
@@ -105,5 +108,113 @@ describe("Unknown and misplaced config key detection", () => {
   it("emits no warnings for a daemon-serialized clean config", () => {
     const serialized = JSON.parse(serializeGlobalConfig(resolveConfig({}, {}, { stateDir: tmpStateDir })));
     assert.deepEqual(findMisplacedConfigKeys(serialized, "global"), []);
+  });
+});
+
+describe("storage and retention global-only config keys", () => {
+  it("applies defaults and omits them from serializeGlobalConfig", () => {
+    const cfg = resolveConfig({}, {}, { stateDir: tmpStateDir });
+    assert.equal(cfg.storage.dataDir, resolve(join(tmpStateDir, "data")));
+    assert.equal(cfg.storage.dataDir, defaultDataDir(tmpStateDir));
+    assert.equal(cfg.retention.installReleases, 3);
+    assert.equal(cfg.retention.logMaxBytes, 10_485_760);
+
+    const serialized = JSON.parse(serializeGlobalConfig(cfg)) as Record<string, unknown>;
+    assert.equal("storage" in serialized, false);
+    assert.equal("retention" in serialized, false);
+  });
+
+  it("accepts storage.dataDir, retention.installReleases, and retention.logMaxBytes globally", () => {
+    const raw = {
+      storage: { dataDir: "~/custom-harness-data" },
+      retention: { installReleases: 5, logMaxBytes: 2_097_152 },
+    };
+    assert.deepEqual(validateConfigRaw(raw), []);
+    assert.deepEqual(findMisplacedConfigKeys(raw, "global"), []);
+
+    const cfg = resolveConfig(raw, {}, { stateDir: tmpStateDir });
+    assert.equal(cfg.storage.dataDir, resolve(join(homedir(), "custom-harness-data")));
+    assert.equal(cfg.retention.installReleases, 5);
+    assert.equal(cfg.retention.logMaxBytes, 2_097_152);
+
+    const serialized = JSON.parse(serializeGlobalConfig(cfg)) as Record<string, unknown>;
+    assert.deepEqual(serialized.storage, { dataDir: resolve(join(homedir(), "custom-harness-data")) });
+    assert.deepEqual(serialized.retention, { installReleases: 5, logMaxBytes: 2_097_152 });
+  });
+
+  it("omits individual default retention fields while serializing non-default ones", () => {
+    const cfg = resolveConfig({ retention: { installReleases: 7 } }, {}, { stateDir: tmpStateDir });
+    const serialized = JSON.parse(serializeGlobalConfig(cfg)) as Record<string, unknown>;
+    assert.equal("storage" in serialized, false);
+    assert.deepEqual(serialized.retention, { installReleases: 7 });
+    assert.equal(cfg.retention.logMaxBytes, DEFAULT_RETENTION_CONFIG.logMaxBytes);
+  });
+
+  it("expands bare ~ and resolves relative storage.dataDir to an absolute path", () => {
+    const homeCfg = resolveConfig({ storage: { dataDir: "~" } }, {}, { stateDir: tmpStateDir });
+    assert.equal(homeCfg.storage.dataDir, resolve(homedir()));
+
+    const relCfg = resolveConfig({ storage: { dataDir: "relative-data-dir" } }, {}, { stateDir: tmpStateDir });
+    assert.equal(relCfg.storage.dataDir, resolve("relative-data-dir"));
+  });
+
+  it("ignores storage and retention in the repo layer and reports them as global-only", () => {
+    const repoOverlay = {
+      storage: { dataDir: "/tmp/untrusted-data" },
+      retention: { installReleases: 99, logMaxBytes: 123 },
+    };
+    const warnings = findMisplacedConfigKeys(repoOverlay, "repo");
+    assert.deepEqual(warnings, [
+      { path: "storage", supported: '"storage" in the global config.json' },
+      { path: "retention", supported: '"retention" in the global config.json' },
+    ]);
+
+    const misplacedNested = findMisplacedConfigKeys({ dataDir: "/x", installReleases: 1 }, "repo");
+    assert.deepEqual(misplacedNested, [
+      { path: "dataDir", supported: '"storage.dataDir" in the global config.json' },
+      { path: "installReleases", supported: '"retention.installReleases" in the global config.json' },
+    ]);
+
+    const cfg = resolveConfig({}, repoOverlay, { stateDir: tmpStateDir });
+    assert.equal(cfg.storage.dataDir, defaultDataDir(tmpStateDir));
+    assert.equal(cfg.retention.installReleases, 3);
+    assert.equal(cfg.retention.logMaxBytes, 10_485_760);
+  });
+
+  it("rejects invalid storage and retention values in validateConfigRaw and falls back safely in resolveConfig", () => {
+    assert.ok(validateConfigRaw({ storage: "bad" }).some((e) => e.includes("storage must be an object")));
+    assert.ok(validateConfigRaw({ storage: { dataDir: "" } }).some((e) => e.includes("storage.dataDir")));
+    assert.ok(validateConfigRaw({ storage: { dataDir: "   " } }).some((e) => e.includes("storage.dataDir")));
+    assert.ok(validateConfigRaw({ storage: { dataDir: "/tmp/a\0b" } }).some((e) => e.includes("storage.dataDir")));
+    assert.ok(validateConfigRaw({ retention: "bad" }).some((e) => e.includes("retention must be an object")));
+    assert.ok(validateConfigRaw({ retention: { installReleases: 0 } }).some((e) => e.includes("retention.installReleases")));
+    assert.ok(validateConfigRaw({ retention: { installReleases: -2 } }).some((e) => e.includes("retention.installReleases")));
+    assert.ok(validateConfigRaw({ retention: { installReleases: 1.5 } }).some((e) => e.includes("retention.installReleases")));
+    assert.ok(validateConfigRaw({ retention: { logMaxBytes: 0 } }).some((e) => e.includes("retention.logMaxBytes")));
+    assert.ok(validateConfigRaw({ retention: { logMaxBytes: 10.5 } }).some((e) => e.includes("retention.logMaxBytes")));
+
+    const cfg = resolveConfig(
+      { storage: { dataDir: "" }, retention: { installReleases: 0, logMaxBytes: -1 } },
+      {},
+      { stateDir: tmpStateDir },
+    );
+    assert.equal(cfg.storage.dataDir, defaultDataDir(tmpStateDir));
+    assert.equal(cfg.retention.installReleases, 3);
+    assert.equal(cfg.retention.logMaxBytes, 10_485_760);
+  });
+
+  it("diffs storage and retention changes without echoing storage.dataDir values", () => {
+    const prev = resolveConfig({}, {}, { stateDir: tmpStateDir });
+    const next = resolveConfig(
+      { storage: { dataDir: "/tmp/other-data" }, retention: { installReleases: 5, logMaxBytes: 4096 } },
+      {},
+      { stateDir: tmpStateDir },
+    );
+    const diff = diffHarnessConfig(prev, next);
+    assert.deepEqual(diff, [
+      { path: "storage.dataDir" },
+      { path: "retention.installReleases", from: 3, to: 5 },
+      { path: "retention.logMaxBytes", from: 10_485_760, to: 4096 },
+    ]);
   });
 });

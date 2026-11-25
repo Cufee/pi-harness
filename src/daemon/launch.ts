@@ -1,9 +1,41 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { readRetentionLogMaxBytes, rotateLogIfOversized } from "../install/maintenance.js";
 import { DAEMON_PROTOCOL_REV } from "../protocol/daemon-rpc.js";
 import { currentRelease, installedCurrent, type ReleaseTarget } from "./release.js";
 import { DaemonClient } from "./remote.js";
+
+/** Reads new bytes written to a daemon log since `startOffset`, resetting to 0 if the log rotated. */
+export function readDaemonLogTail(logPath: string, startOffset: number, maxChars = 2000): string {
+  try {
+    const fd = openSync(logPath, "r");
+    try {
+      const end = fstatSync(fd).size;
+      const effectiveStart = end < startOffset ? 0 : startOffset;
+      const start = Math.max(effectiveStart, end - 16_384);
+      if (end <= start) return "";
+      const buf = Buffer.alloc(end - start);
+      const bytesRead = readSync(fd, buf, 0, buf.length, start);
+      return buf.subarray(0, bytesRead).toString("utf8").trim().slice(-maxChars);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return "";
+  }
+}
+
+/** Rotates `daemon.log` if oversized and snapshots its byte offset before spawning a daemon. Never throws. */
+export function prepareDaemonLogForSpawn(logPath: string, stateDir?: string, maxBytes?: number): number {
+  const limit = maxBytes ?? readRetentionLogMaxBytes(stateDir);
+  rotateLogIfOversized(logPath, limit);
+  try {
+    return statSync(logPath).size;
+  } catch {
+    return 0;
+  }
+}
 
 export function spawnDaemonDetached(
   target: ReleaseTarget,
@@ -13,6 +45,7 @@ export function spawnDaemonDetached(
   const logDir = dirname(socketPath);
   mkdirSync(logDir, { recursive: true });
   const logPath = join(logDir, "daemon.log");
+  rotateLogIfOversized(logPath, readRetentionLogMaxBytes(env?.PI_HARNESS_HOME));
   const logFd = openSync(logPath, "a");
   let cwd = logDir;
   try {
@@ -111,12 +144,7 @@ export async function ensureLocalDaemon(socketPath: string): Promise<DaemonClien
   const logDir = dirname(socketPath);
   mkdirSync(logDir, { recursive: true });
   const logPath = join(logDir, "daemon.log");
-  let logStart = 0;
-  try {
-    logStart = statSync(logPath).size;
-  } catch {
-    // daemon.log does not exist yet
-  }
+  const logStart = prepareDaemonLogForSpawn(logPath);
   let exitStatus: string | null = null;
   const child = spawnDaemonDetached(target, socketPath);
   child.once("exit", (code, signal) => {
@@ -146,20 +174,7 @@ export async function ensureLocalDaemon(socketPath: string): Promise<DaemonClien
   throw new Error(`Timed out waiting for harnessd to listen on ${socketPath}`);
 
   function exitError(status: string): Error {
-    let logged = "";
-    try {
-      const fd = openSync(logPath, "r");
-      try {
-        const end = fstatSync(fd).size;
-        const start = Math.max(logStart, end - 16384);
-        const buf = Buffer.alloc(Math.max(0, end - start));
-        logged = buf.subarray(0, readSync(fd, buf, 0, buf.length, start)).toString("utf8").trim().slice(-2000);
-      } finally {
-        closeSync(fd);
-      }
-    } catch {
-      // An unreadable log must not hide the exit status.
-    }
+    const logged = readDaemonLogTail(logPath, logStart, 2000);
     return new Error(`harnessd exited (${status}) before listening on ${socketPath}: ${logged || `no output in ${logPath}`}`);
   }
 }

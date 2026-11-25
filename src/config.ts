@@ -206,6 +206,98 @@ export interface HotUpdateConfig {
   minIntervalSec: number;
 }
 
+export interface StorageConfig {
+  /** Root directory for harness-managed project and chat data (default `<stateDir>/data`). Applies at daemon start only. */
+  dataDir: string;
+}
+
+export interface RetentionConfig {
+  /** Number of installed releases kept during post-install pruning, counting current (positive integer, default 3). */
+  installReleases: number;
+  /** Maximum byte size for `daemon.log` and `install-audit.log` before rotating to `.1` (positive integer, default 10485760). */
+  logMaxBytes: number;
+}
+
+export const DEFAULT_RETENTION_CONFIG: RetentionConfig = {
+  installReleases: 3,
+  logMaxBytes: 10_485_760,
+};
+
+export function defaultDataDir(stateDir: string): string {
+  return resolve(join(stateDir, "data"));
+}
+
+function expandHomePath(rawPath: string): string {
+  if (rawPath === "~") return homedir();
+  if (rawPath.startsWith("~/")) return join(homedir(), rawPath.slice(2));
+  return rawPath;
+}
+
+export function normalizeStorageConfig(
+  raw: unknown,
+  fallback: StorageConfig,
+): { config: StorageConfig; warnings: string[] } {
+  const warnings: string[] = [];
+  const baseDir = resolve(expandHomePath(fallback.dataDir));
+  const base: StorageConfig = { dataDir: baseDir };
+
+  if (raw === undefined) return { config: base, warnings };
+  if (!isPlainObject(raw)) {
+    warnings.push("storage must be an object; using defaults");
+    return { config: base, warnings };
+  }
+
+  let dataDir = base.dataDir;
+  if ("dataDir" in raw && raw.dataDir !== undefined) {
+    if (typeof raw.dataDir === "string" && raw.dataDir.trim().length > 0 && !raw.dataDir.includes("\0")) {
+      dataDir = resolve(expandHomePath(raw.dataDir.trim()));
+    } else {
+      warnings.push("storage.dataDir must be a non-empty path string; using default");
+    }
+  }
+  return { config: { dataDir }, warnings };
+}
+
+export function normalizeRetentionConfig(
+  raw: unknown,
+  fallback: RetentionConfig = DEFAULT_RETENTION_CONFIG,
+): { config: RetentionConfig; warnings: string[] } {
+  const warnings: string[] = [];
+  const isPosInt = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v > 0;
+  const base: RetentionConfig = {
+    installReleases: isPosInt(fallback.installReleases)
+      ? fallback.installReleases
+      : DEFAULT_RETENTION_CONFIG.installReleases,
+    logMaxBytes: isPosInt(fallback.logMaxBytes) ? fallback.logMaxBytes : DEFAULT_RETENTION_CONFIG.logMaxBytes,
+  };
+
+  if (raw === undefined) return { config: base, warnings };
+  if (!isPlainObject(raw)) {
+    warnings.push("retention must be an object; using defaults");
+    return { config: base, warnings };
+  }
+
+  let installReleases = base.installReleases;
+  if ("installReleases" in raw && raw.installReleases !== undefined) {
+    if (isPosInt(raw.installReleases)) {
+      installReleases = raw.installReleases;
+    } else {
+      warnings.push(`retention.installReleases must be a positive integer; using ${base.installReleases}`);
+    }
+  }
+
+  let logMaxBytes = base.logMaxBytes;
+  if ("logMaxBytes" in raw && raw.logMaxBytes !== undefined) {
+    if (isPosInt(raw.logMaxBytes)) {
+      logMaxBytes = raw.logMaxBytes;
+    } else {
+      warnings.push(`retention.logMaxBytes must be a positive integer; using ${base.logMaxBytes}`);
+    }
+  }
+
+  return { config: { installReleases, logMaxBytes }, warnings };
+}
+
 export const HOT_UPDATE_DRAIN_TIMEOUT_MIN_SEC = 5;
 export const HOT_UPDATE_DRAIN_TIMEOUT_MAX_SEC = 600;
 export const HOT_UPDATE_MIN_INTERVAL_MIN_SEC = 0;
@@ -325,6 +417,8 @@ export interface HarnessConfig {
   quotaRetry: QuotaRetryConfig;
   quotaEndpoint?: QuotaEndpointConfig;
   hotUpdate: HotUpdateConfig;
+  storage: StorageConfig;
+  retention: RetentionConfig;
 }
 
 /** Top-level keys whose value is a nested section (neither a string nor a list). */
@@ -386,6 +480,8 @@ const CONFIG_SECTION_KEYS: { [S in ConfigSection]: { [K in keyof NonNullable<Har
   },
   quotaEndpoint: { url: true, headers: true, pollIntervalSec: true, timeoutMs: true, format: true },
   hotUpdate: { mode: true, drainTimeoutSec: true, minIntervalSec: true },
+  storage: { dataDir: true },
+  retention: { installReleases: true, logMaxBytes: true },
 };
 
 /** Top-level keys a config file may set; stateDir always comes from the environment. */
@@ -407,6 +503,8 @@ const CONFIG_TOP_LEVEL_KEYS: { [K in Exclude<keyof HarnessConfig, "stateDir">]-?
   quotaRetry: true,
   quotaEndpoint: true,
   hotUpdate: true,
+  storage: true,
+  retention: true,
 };
 
 /** Honored only in the global config.json; resolveConfig strips these from the repo layer. */
@@ -417,6 +515,8 @@ const GLOBAL_ONLY_CONFIG_KEYS: ReadonlySet<string> = new Set([
   "goals.gateShell",
   "goals.gateEnv",
   "hotUpdate",
+  "storage",
+  "retention",
 ]);
 
 const CONFIG_SECTIONS = Object.keys(CONFIG_SECTION_KEYS) as ConfigSection[];
@@ -495,8 +595,10 @@ export interface MisplacedConfigKey {
 export function findMisplacedConfigKeys(raw: unknown, layer: "global" | "repo"): MisplacedConfigKey[] {
   if (!isPlainObject(raw)) return [];
   const out: MisplacedConfigKey[] = [];
+  const isGlobalOnly = (target: string) =>
+    GLOBAL_ONLY_CONFIG_KEYS.has(target) || GLOBAL_ONLY_CONFIG_KEYS.has(target.split(".")[0]!);
   const supported = (target: string) =>
-    layer === "repo" && GLOBAL_ONLY_CONFIG_KEYS.has(target) ? `"${target}" in the global config.json` : `"${target}"`;
+    layer === "repo" && isGlobalOnly(target) ? `"${target}" in the global config.json` : `"${target}"`;
   const unknown = (path: string, key: string, section?: ConfigSection): MisplacedConfigKey => {
     const suggestion = suggestConfigKey(key, section);
     return suggestion
@@ -876,6 +978,22 @@ export function resolveConfig(
     console.error(`[harness] ${w}`);
   }
 
+  // Storage location and retention policy are operator-controlled and global-only.
+  const { config: storage, warnings: storageWarnings } = normalizeStorageConfig(
+    globalCfg.storage,
+    base ? base.storage : { dataDir: defaultDataDir(stateDir) },
+  );
+  for (const w of storageWarnings) {
+    console.error(`[harness] ${w}`);
+  }
+  const { config: retention, warnings: retentionWarnings } = normalizeRetentionConfig(
+    globalCfg.retention,
+    base ? base.retention : DEFAULT_RETENTION_CONFIG,
+  );
+  for (const w of retentionWarnings) {
+    console.error(`[harness] ${w}`);
+  }
+
   const profiles =
     Array.isArray(merged.profiles) && merged.profiles.length > 0 ? merged.profiles : (base?.profiles ?? defaultProfiles());
 
@@ -923,6 +1041,8 @@ export function resolveConfig(
         ? ((merged.quotaEndpoint as QuotaEndpointConfig | null | undefined) ?? undefined)
         : base?.quotaEndpoint,
     hotUpdate,
+    storage,
+    retention,
   };
 }
 
@@ -1160,6 +1280,13 @@ export function validateConfigRaw(raw: unknown): string[] {
       `a finite number in ${HOT_UPDATE_MIN_INTERVAL_MIN_SEC}..${HOT_UPDATE_MIN_INTERVAL_MAX_SEC}`,
     ],
   });
+  section("storage", {
+    dataDir: [(v) => isNonEmptyString(v) && !(v as string).includes("\0"), "a non-empty path string"],
+  });
+  section("retention", {
+    installReleases: POS_INT,
+    logMaxBytes: POS_INT,
+  });
   if ("quotaEndpoint" in doc && doc.quotaEndpoint !== null) {
     const endpoint = doc.quotaEndpoint;
     if (!isPlainObject(endpoint)) {
@@ -1204,7 +1331,18 @@ export function diffHarnessConfig(prev: HarnessConfig, next: HarnessConfig): Con
     changes.push(showValues ? { path: key, from: a, to: b } : { path: key });
   }
 
-  for (const key of ["codeExec", "rollover", "worktree", "goals", "events", "catalog", "quotaRetry", "hotUpdate"] as const) {
+  for (const key of [
+    "codeExec",
+    "rollover",
+    "worktree",
+    "goals",
+    "events",
+    "catalog",
+    "quotaRetry",
+    "hotUpdate",
+    "storage",
+    "retention",
+  ] as const) {
     const rawA: unknown = prev[key] ?? {};
     const rawB: unknown = next[key] ?? {};
     if (!isPlainObject(rawA) || !isPlainObject(rawB)) {
@@ -1286,6 +1424,17 @@ export function serializeGlobalConfig(config: HarnessConfig): string {
   if (config.hotUpdate.minIntervalSec !== DEFAULT_HOT_UPDATE_CONFIG.minIntervalSec) {
     hotUpdateOut.minIntervalSec = config.hotUpdate.minIntervalSec;
   }
+  const storageOut: Partial<StorageConfig> = {};
+  if (config.storage.dataDir !== defaultDataDir(config.stateDir)) {
+    storageOut.dataDir = config.storage.dataDir;
+  }
+  const retentionOut: Partial<RetentionConfig> = {};
+  if (config.retention.installReleases !== DEFAULT_RETENTION_CONFIG.installReleases) {
+    retentionOut.installReleases = config.retention.installReleases;
+  }
+  if (config.retention.logMaxBytes !== DEFAULT_RETENTION_CONFIG.logMaxBytes) {
+    retentionOut.logMaxBytes = config.retention.logMaxBytes;
+  }
   const serialized = {
     profiles: config.profiles,
     ...(config.remotes?.length ? { remotes: config.remotes } : {}),
@@ -1302,6 +1451,8 @@ export function serializeGlobalConfig(config: HarnessConfig): string {
     catalog: config.catalog,
     quotaRetry: config.quotaRetry,
     ...(Object.keys(hotUpdateOut).length > 0 ? { hotUpdate: hotUpdateOut } : {}),
+    ...(Object.keys(storageOut).length > 0 ? { storage: storageOut } : {}),
+    ...(Object.keys(retentionOut).length > 0 ? { retention: retentionOut } : {}),
     ...(config.socketPath !== defaultSocketPath(config.stateDir) ? { socketPath: config.socketPath } : {}),
     ...(config.quotaEndpoint ? { quotaEndpoint: config.quotaEndpoint } : {}),
   };

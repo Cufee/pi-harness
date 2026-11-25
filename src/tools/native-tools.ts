@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExternalMcpServerConfig } from "../config.js";
+import { cleanStaleStagingDirs } from "../install/maintenance.js";
 
 // Supply chain: pinned upstream GitHub Release archive SHA-256 digests for octofs.
 export const OCTOFS_VERSION = "0.26.0";
@@ -120,6 +121,7 @@ const inflightProvisions = new Map<string, Promise<string | null>>();
  * verified against its hardcoded SHA-256 digest before unpacking. Safe under concurrent callers.
  */
 export async function ensureOctofs(stateDir: string): Promise<string | null> {
+  cleanStaleStagingDirs(stateDir);
   const existing = resolveOctofsBin(stateDir);
   if (existing) return existing;
   const target = currentOctofsTarget();

@@ -7,15 +7,17 @@ This reference covers `pi-harness` configuration files, precedence, extra filesy
 - **Global file**: `$PI_HARNESS_HOME/config.json` (default `~/.pi-harness/config.json`). The state directory itself comes from the `PI_HARNESS_HOME` environment variable; a `stateDir` key in `config.json` does not set it (though a non-string value is still rejected on reload).
 - **Repository overlay**: `<repoRoot>/.pi-harness.json`.
 - **Precedence** (lowest to highest): built-in defaults, global file, repository overlay.
-- **Merge rules**: `codeExec`, `rollover`, `worktree`, `goals`, `events`, `catalog`, `quotaRetry`, and `hotUpdate` merge key by key. Scalars, arrays, and `quotaEndpoint` replace whole (`"quotaEndpoint": null` clears an inherited endpoint). An empty `profiles` array falls back to the built-in default profiles.
+- **Merge rules**: `codeExec`, `rollover`, `worktree`, `goals`, `events`, `catalog`, `quotaRetry`, `hotUpdate`, `storage`, and `retention` merge key by key. Scalars, arrays, and `quotaEndpoint` replace whole (`"quotaEndpoint": null` clears an inherited endpoint). An empty `profiles` array falls back to the built-in default profiles.
 - **Overlay snapshot**: `harnessd` loads one repository overlay once at startup (one overlay per daemon, not per project). `pi-harness daemon serve` reads it from its `--repo` path, or else its working directory; a daemon auto-spawned by any other command reads it from that command's working directory, not from the command's `--repo` flag. Editing `.pi-harness.json` requires a daemon restart from the intended directory.
-- **Global-only keys**: the repository overlay cannot set these six keys; values placed there are ignored:
+- **Global-only keys**: the repository overlay cannot set these keys; values placed there are ignored:
   - `worktree.extraReadRoots`
   - `worktree.extraWriteRoots`
   - `goals.gateShell`
   - `goals.gateEnv`
   - `remotes`
   - `hotUpdate`
+  - `storage`
+  - `retention`
 
 Every other key can come from `.pi-harness.json`, including `profiles`, `externalMcpServers`, `worktree.setupCommand`, and `worktree.ciCommands`, which execute commands; start `harnessd` only from repositories whose overlay you trust.
 
@@ -166,6 +168,16 @@ Global-only; values placed in `.pi-harness.json` are ignored with a `config warn
 
 At startup, out-of-range numeric values for `drainTimeoutSec` (`5..600`) and `minIntervalSec` (`0..86400`) are clamped to the nearest bound with a warning on stderr; non-numeric values, a non-object `hotUpdate`, and an unknown `mode` fall back to the default with a warning on stderr. On live config reload, out-of-range numbers, wrong types, and unknown `mode` values are rejected as a whole and previous settings stay active.
 
+### `storage` and `retention`
+
+Both sections are global-only; values placed in `.pi-harness.json` are ignored with a `config warning:`. Default values are omitted when `config.json` is serialized.
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `storage.dataDir` | `<stateDir>/data` | Non-empty path string (`~` and `~/...` expand against `HOME`, resolved to an absolute path). Takes effect at daemon start only; live config reloads do not move paths for a running daemon. |
+| `retention.installReleases` | `3` | Number of installed releases kept under `$PI_HARNESS_INSTALL_DIR/releases` during post-install pruning, counting the active release (positive integer). In-use releases, the previous release, and releases modified within the last 10 minutes are always kept even if that exceeds this count. |
+| `retention.logMaxBytes` | `10485760` | Maximum size in bytes (10 MiB) for `daemon.log` and `install-audit.log` before renaming to `.1` (positive integer). `daemon.log` rotates at daemon or supervisor spawn; `install-audit.log` rotates during post-install maintenance. |
+
 ### `quotaEndpoint`, `profiles`, `remotes`, and `externalMcpServers`
 
 | Key | Default | Notes |
@@ -186,10 +198,10 @@ At startup, out-of-range numeric values for `drainTimeoutSec` (`5..600`) and `mi
 
 | Takes effect | Settings |
 | --- | --- |
-| Immediately | `worktree` keys other than the roots (raising `maxConcurrentWorkers` starts queued workers); `goals.gateTimeoutMs`, `gateShell`, `gateEnv`, `autoVerifyOnSettle`, and `maxConcurrentGoals` (raising it starts queued goals); `remotes`; `quotaEndpoint`; `catalog`; `profiles`; `worktree.extraWriteRoots` for Director `write_note`; `events` for Director settlement and wait handlers (a wait already in progress keeps the value read when it started); `codeMode` and `codeExec` for an existing task's next MCP tool discovery (`tools/list`) and Code Mode dispatch; `externalMcpServers` for daemon config, `daemon status`, and background `octofs` staging; `quotaRetry.fallbackCooldownSec`, `maxCooldownSec`, `autoResumeEnabled`, and `earlyWakePollMs` when the next quota pause is handled (timers already armed are not reconfigured); `hotUpdate` for subsequent `daemon.reload` requests (an already armed schedule timer keeps its due time, the drain reads the `hotUpdate` settings that are current when the drain starts, and a drain already in progress keeps its deadline) |
+| Immediately | `worktree` keys other than the roots (raising `maxConcurrentWorkers` starts queued workers); `goals.gateTimeoutMs`, `gateShell`, `gateEnv`, `autoVerifyOnSettle`, and `maxConcurrentGoals` (raising it starts queued goals); `remotes`; `quotaEndpoint`; `catalog`; `profiles`; `worktree.extraWriteRoots` for Director `write_note`; `events` for Director settlement and wait handlers (a wait already in progress keeps the value read when it started); `codeMode` and `codeExec` for an existing task's next MCP tool discovery (`tools/list`) and Code Mode dispatch; `externalMcpServers` for daemon config, `daemon status`, and background `octofs` staging; `quotaRetry.fallbackCooldownSec`, `maxCooldownSec`, `autoResumeEnabled`, and `earlyWakePollMs` when the next quota pause is handled (timers already armed are not reconfigured); `hotUpdate` for subsequent `daemon.reload` requests (an already armed schedule timer keeps its due time, the drain reads the `hotUpdate` settings that are current when the drain starts, and a drain already in progress keeps its deadline); `retention` on the next daemon spawn or post-install maintenance pass |
 | When a task or goal is created | `goals.defaultMaxReviewCycles` and `defaultMaxNoProgressCycles` (copied into the new goal contract; existing goals keep theirs) |
 | At agent launch or generation (running sessions keep theirs) | `worktree.extraReadRoots`, `worktree.extraWriteRoots`; `externalMcpServers` entries for newly started ACP sessions; `codeMode` and `codeExec` initial prompt and runner tool list (later MCP tool discovery and Code Mode dispatches read the current mode and limits); `quotaRetry.nativeRetryTimeoutMs`; `rollover.orchestratorThreshold`, `workerThreshold`, and `maxGenerations`; default profiles |
-| Only after a daemon restart | state directory (`PI_HARNESS_HOME`), `socketPath`, the repository overlay |
+| Only after a daemon restart | state directory (`PI_HARNESS_HOME`), `socketPath`, `storage.dataDir`, the repository overlay |
 
 To change `socketPath` or `PI_HARNESS_HOME`, run `pi-harness daemon stop` while the old setting is still in effect, change the setting, then start the daemon at the new address: `pi-harness daemon restart` targets the newly configured address and leaves the old daemon running if the effective socket path changes. Start or restart from the intended overlay directory.
 

@@ -157,6 +157,11 @@ if [ ! -f "$REL/release.json" ] || [ "$(cat "$REL/release.json" 2>/dev/null || t
 fi
 
 # --- activate: current symlink, then launcher (each swapped atomically) -----
+PREV_ID=""
+if [ -L "$INSTALL_DIR/current" ]; then
+  PREV_ID=$("$BUN" -e 'const fs=require("node:fs"),p=require("node:path");try{const t=fs.readlinkSync(process.argv[1]).replace(/\/+$/,"");const b=p.basename(t);if(b&&b!=="."&&b!=="..")process.stdout.write(b);}catch{}' "$INSTALL_DIR/current" 2>/dev/null || true)
+  if [ "$PREV_ID" = "$ID" ]; then PREV_ID=""; fi
+fi
 rm -f "$INSTALL_DIR/current.new"
 ln -s "releases/$ID" "$INSTALL_DIR/current.new"
 "$BUN" -e 'require("node:fs").renameSync(process.argv[1], process.argv[2])' "$INSTALL_DIR/current.new" "$INSTALL_DIR/current"
@@ -181,15 +186,25 @@ printf '%s user=%s pid=%s release=%s src=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" 
 case ":$PATH:" in *":$BIN_DIR:"*) ;; *) log "add $BIN_DIR to PATH to run pi-harness by name" ;; esac
 
 rm -rf "$STAGE" "$LOCK"; trap - EXIT
+install_exit=0
 if [ "${PI_HARNESS_NO_RELOAD:-0}" != 1 ]; then
   set -- daemon reload --from-install
   if [ "${PI_HARNESS_RELOAD_WAIT:-}" = 1 ] || { [ -z "${PI_HARNESS_RELOAD_WAIT:-}" ] && [ -t 1 ]; }; then set -- "$@" --wait; fi
   rc=0; "$BUN" "$REL/src/cli.ts" "$@" || rc=$?
   case $rc in
     0) ;;
-    3) log "harnessd could not start release $ID and is back on the previous release (install succeeded; current still points to releases/$ID)"; exit 1 ;;
+    3) log "harnessd could not start release $ID and is back on the previous release (install succeeded; current still points to releases/$ID)"; install_exit=1 ;;
     *) log "warning: harnessd was not reloaded to release $ID (exit $rc). Run: pi-harness daemon reload" ;;
   esac
 else
   "$BUN" "$REL/src/cli.ts" daemon reload --from-install --check || true
 fi
+
+if [ -f "$REL/src/install/maintenance.ts" ]; then
+  if [ -n "$PREV_ID" ]; then
+    "$BUN" "$REL/src/install/maintenance.ts" --install-dir "$INSTALL_DIR" --state-dir "$STATE_DIR" --current "$ID" --previous "$PREV_ID" >&2 || true
+  else
+    "$BUN" "$REL/src/install/maintenance.ts" --install-dir "$INSTALL_DIR" --state-dir "$STATE_DIR" --current "$ID" >&2 || true
+  fi
+fi
+exit "$install_exit"
