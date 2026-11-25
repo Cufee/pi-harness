@@ -18,6 +18,7 @@
     "build": "bun run proto:gen && tsc -p tsconfig.json",
     "test": "bun run typecheck && bun test test",
     "check:hot-update-install": "bun scripts/hot-update-install-check.ts",
+    "check:storage-upgrade": "bun scripts/storage-upgrade-check.ts",
     "start": "bun run src/cli.ts"
   },
   "dependencies": {
