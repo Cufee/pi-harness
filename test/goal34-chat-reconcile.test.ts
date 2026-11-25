@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "bun:test";
 import {
-  matchLiveToolRows,
+  matchLiveBoundaryRows,
   reconcileAssistantHistory,
   type FrozenSegment,
   type LiveRenderedTool,
+  type LiveRenderedUser,
   type ReconcileRow,
 } from "../src/tui/chat-reconcile.js";
 
@@ -12,15 +13,19 @@ function row(role: ReconcileRow["role"], content: string, seq?: number): Reconci
   return seq !== undefined ? { role, content, seq } : { role, content };
 }
 
-function seg(text: string, afterLiveToolCount = 0): FrozenSegment {
-  return { text, afterLiveToolCount };
+function seg(text: string, afterBoundaryCount = 0): FrozenSegment {
+  return { text, afterBoundaryCount };
 }
 
 function liveTool(ordinal: number, fingerprint: string): LiveRenderedTool {
   return { ordinal, fingerprint };
 }
 
-describe("goal-34: pure reconnect assistant reconciliation (live-tool ack + R1-R3)", () => {
+function liveUser(content: string, boundaryOrdinal: number | null = null): LiveRenderedUser {
+  return { content, boundaryOrdinal };
+}
+
+describe("goal-34: pure reconnect assistant reconciliation (live-boundary ack + R1-R3)", () => {
   interface TableCase {
     name: string;
     frozen: FrozenSegment[];
@@ -29,11 +34,13 @@ describe("goal-34: pure reconnect assistant reconciliation (live-tool ack + R1-R
     busy: boolean;
     daemonRestarted: boolean;
     liveTools?: LiveRenderedTool[];
+    liveUsers?: LiveRenderedUser[];
     expectedRender: string[];
     expectedSkip: string[];
     expectedTailRemainder: string;
     expectedRemainingFrozen: FrozenSegment[];
     expectedSkipToolIndices?: number[];
+    expectedSkipUserIndices?: number[];
   }
 
   const cases: TableCase[] = [
@@ -520,7 +527,7 @@ describe("goal-34: pure reconnect assistant reconciliation (live-tool ack + R1-R
       expectedRemainingFrozen: [],
     },
     {
-      name: "R1 busy reopen preserves unconsumed frozen text and its afterLiveToolCount for a subsequent reconnect",
+      name: "R1 busy reopen preserves unconsumed frozen text and its afterBoundaryCount for a subsequent reconnect",
       frozen: [seg("Part A. Part B.", 2)],
       tail: "Tail",
       rows: [row("assistant", "Part A.", 1)],
@@ -531,6 +538,95 @@ describe("goal-34: pure reconnect assistant reconciliation (live-tool ack + R1-R
       expectedTailRemainder: "",
       expectedRemainingFrozen: [seg("Part B.", 2)],
     },
+
+    // Review-5 B1 (structural live-boundary acknowledgement for accepted steers + shared ordinal with tool cards)
+    {
+      name: "Live-steer ack: skips preceding assistant row even when not a prefix of frozen segment (overflow retry + accepted steer)",
+      frozen: [seg("Prompt is too long.\n\nRETRIED-ANSWER", 0)],
+      tail: "",
+      rows: [
+        row("user", "Check status", 1),
+        row("assistant", "\n\nRETRIED-ANSWER", 2),
+        row("user", "Keep going", 3),
+        row("assistant", "FINISHED", 4),
+      ],
+      busy: false,
+      daemonRestarted: false,
+      liveUsers: [liveUser("Check status", null), liveUser("Keep going", 1)],
+      expectedRender: ["FINISHED"],
+      expectedSkip: ["\n\nRETRIED-ANSWER"],
+      expectedTailRemainder: "",
+      expectedRemainingFrozen: [],
+      expectedSkipUserIndices: [0, 2],
+    },
+    {
+      name: "Live-steer ack: rows after last matched steer boundary still follow R1 and R2",
+      frozen: [
+        seg("Overflow.\n\nBefore steer 1", 0),
+        seg("After steer 1 prefix", 1),
+      ],
+      tail: "Final tail",
+      rows: [
+        row("user", "Check status", 1),
+        row("assistant", "Before steer 1", 2),
+        row("user", "Keep going", 3),
+        row("assistant", "After steer 1 prefix", 4),
+        row("assistant", "Final tail completed", 5),
+      ],
+      busy: false,
+      daemonRestarted: false,
+      liveUsers: [liveUser("Check status", null), liveUser("Keep going", 1)],
+      expectedRender: ["Final tail completed"],
+      expectedSkip: ["Before steer 1", "After steer 1 prefix"],
+      expectedTailRemainder: "",
+      expectedRemainingFrozen: [],
+      expectedSkipUserIndices: [0, 2],
+    },
+    {
+      name: "Live-boundary ack: tool boundary (ordinal 1) followed by steer boundary (ordinal 2) shares one ordinal counter",
+      frozen: [
+        seg("Overflow 1.\n\nSeg 1", 0),
+        seg("Overflow 2.\n\nSeg 2", 1),
+      ],
+      tail: "Seg 3",
+      rows: [
+        row("user", "Start", 1),
+        row("assistant", "Seg 1", 2),
+        row("tool_output", "card-1", 3),
+        row("assistant", "Seg 2", 4),
+        row("user", "Keep going", 5),
+        row("assistant", "Seg 3", 6),
+      ],
+      busy: false,
+      daemonRestarted: false,
+      liveTools: [liveTool(1, "card-1")],
+      liveUsers: [liveUser("Start", null), liveUser("Keep going", 2)],
+      expectedRender: ["Seg 3"],
+      expectedSkip: ["Seg 1", "Seg 2"],
+      expectedTailRemainder: "",
+      expectedRemainingFrozen: [],
+      expectedSkipToolIndices: [2],
+      expectedSkipUserIndices: [0, 4],
+    },
+    {
+      name: "Live-steer ack: unmatched offline steer and opening user row leave R1 in force",
+      frozen: [seg("Prompt is too long.\n\nRETRIED-ANSWER", 0)],
+      tail: "",
+      rows: [
+        row("user", "Check status", 1),
+        row("assistant", "RETRIED-ANSWER", 2),
+        row("user", "Offline steer", 3),
+        row("assistant", "FINISHED", 4),
+      ],
+      busy: false,
+      daemonRestarted: false,
+      liveUsers: [liveUser("Check status", null)],
+      expectedRender: ["RETRIED-ANSWER", "FINISHED"],
+      expectedSkip: [],
+      expectedTailRemainder: "",
+      expectedRemainingFrozen: [],
+      expectedSkipUserIndices: [0],
+    },
   ];
 
   for (const tc of cases) {
@@ -538,15 +634,16 @@ describe("goal-34: pure reconnect assistant reconciliation (live-tool ack + R1-R
       const frozenCopy = tc.frozen.map((s) => ({ ...s }));
       const rowsCopy = [...tc.rows];
       const liveToolsCopy = (tc.liveTools ?? []).map((t) => ({ ...t }));
+      const liveUsersCopy = (tc.liveUsers ?? []).map((u) => ({ ...u }));
 
-      const toolMatch = matchLiveToolRows(rowsCopy, liveToolsCopy, (r) => r.content);
+      const liveMatch = matchLiveBoundaryRows(rowsCopy, liveToolsCopy, liveUsersCopy, (r) => r.content);
       const res = reconcileAssistantHistory({
         frozen: frozenCopy,
         tail: tc.tail,
         rows: rowsCopy,
         busy: tc.busy,
         daemonRestarted: tc.daemonRestarted,
-        liveToolMatches: toolMatch.matches,
+        liveBoundaryMatches: liveMatch.matches,
       });
 
       assert.deepEqual(
@@ -564,9 +661,16 @@ describe("goal-34: pure reconnect assistant reconciliation (live-tool ack + R1-R
 
       if (tc.expectedSkipToolIndices) {
         assert.deepEqual(
-          [...toolMatch.skipToolIndices].sort((a, b) => a - b),
+          [...liveMatch.skipToolIndices].sort((a, b) => a - b),
           tc.expectedSkipToolIndices,
           "skipToolIndices mismatch",
+        );
+      }
+      if (tc.expectedSkipUserIndices) {
+        assert.deepEqual(
+          [...liveMatch.skipUserIndices].sort((a, b) => a - b),
+          tc.expectedSkipUserIndices,
+          "skipUserIndices mismatch",
         );
       }
 
@@ -578,6 +682,7 @@ describe("goal-34: pure reconnect assistant reconciliation (live-tool ack + R1-R
       assert.deepEqual(frozenCopy, tc.frozen, "frozen input must not be mutated");
       assert.deepEqual(rowsCopy, tc.rows, "rows input must not be mutated");
       assert.deepEqual(liveToolsCopy, tc.liveTools ?? [], "liveTools input must not be mutated");
+      assert.deepEqual(liveUsersCopy, tc.liveUsers ?? [], "liveUsers input must not be mutated");
     });
   }
 });

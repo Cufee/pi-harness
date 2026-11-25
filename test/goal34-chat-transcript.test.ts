@@ -4182,4 +4182,280 @@ describe("goal-34 c3: Director chat assistant replies render exactly once", () =
     );
     assert.equal(out.includes("Turn ended early"), false, "no spurious early-end note");
   });
+
+  it("review-5 B1 (overflow retry + accepted /now steer + offline completion): renders RETRIED-ANSWER and Keep going once each on idle reopen", async () => {
+    const { terminal, lines, text, sendInput, typeText } = makeFakeTerminal(120, 30);
+    const session = makeChatSession("chat-34-r5-b1");
+    const history: ChatTurnRecord[] = [];
+    let openCount = 0;
+    let pingCount = 0;
+    let turnId = "";
+    const daemonPid = process.pid;
+
+    const mock = makeMockClient(async (op, params) => {
+      if (op === "ping") {
+        pingCount += 1;
+        return { pong: true, pid: daemonPid, protocolRev: 8, releaseId: "rel-r5" };
+      }
+      if (op === "chat.open") {
+        openCount += 1;
+        return makeProdChatOpen(session, history, { busy: false });
+      }
+      if (op === "chat.history") {
+        const afterSeq = Number(params.afterSeq ?? 0);
+        const throughSeq = Number(params.throughSeq ?? Number.MAX_SAFE_INTEGER);
+        return {
+          history: history.filter((r) => r.seq > afterSeq && r.seq <= throughSeq),
+          historyNext: null,
+        };
+      }
+      if (op === "chat.send") {
+        turnId = String(params.turnId ?? "turn-r5-b1");
+        history.push({
+          seq: 1,
+          chatSessionId: session.id,
+          role: "user",
+          content: String(params.message ?? params.text ?? "Check status"),
+          createdAt: Date.now(),
+        });
+        return await new Promise<never>(() => {});
+      }
+      if (op === "chat.steer") {
+        // Accepted steer flushes post-overflow partial as assistant seq 2, then persists user seq 3.
+        history.push(
+          {
+            seq: 2,
+            chatSessionId: session.id,
+            role: "assistant",
+            content: "\n\nRETRIED-ANSWER",
+            createdAt: Date.now(),
+          },
+          {
+            seq: 3,
+            chatSessionId: session.id,
+            role: "user",
+            content: String(params.message ?? "Keep going"),
+            createdAt: Date.now(),
+          },
+        );
+        return { steered: true };
+      }
+      if (op === "work.snapshot") return emptyWorkSnapshot();
+      if (op === "session.leave") return { daemonWillQuit: false };
+      return {};
+    });
+
+    const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+    await waitFor(() => text().includes(session.id) && pingCount >= 1, 3000, "initial render and startup pid probe");
+
+    // 1. User sends "Check status" (seq 1).
+    typeText("Check status");
+    sendInput("\r");
+    await waitFor(() => Boolean(turnId), 3000, "chat.send dispatched");
+
+    // 2. Delta "Prompt is too long.", silent overflow reset on daemon, delta "\n\nRETRIED-ANSWER".
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.delta",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId, delta: "Prompt is too long." },
+    });
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.delta",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId, delta: "\n\nRETRIED-ANSWER" },
+    });
+    await waitFor(() => text().includes("RETRIED-ANSWER"), 3000, "retried delta streamed");
+
+    // 3. User queues "Keep going" and submits /now -> chat.steer returns steered:true.
+    typeText("Keep going");
+    sendInput("\r");
+    await waitFor(() => text().includes("Keep going"), 3000, "queued Keep going");
+    typeText("/now");
+    sendInput("\r");
+    await waitFor(
+      () => text().includes("Delivered live steering to Director"),
+      3000,
+      "steer accepted and frozen",
+    );
+
+    // 4. Disconnect; turn completes offline with assistant seq 4 "FINISHED"; idle reopen, same PID.
+    history.push({
+      seq: 4,
+      chatSessionId: session.id,
+      role: "assistant",
+      content: "FINISHED",
+      createdAt: Date.now(),
+    });
+    mock.disconnect();
+    await waitFor(
+      () => openCount >= 2 && text().includes("Reconnected to harnessd") && text().includes("FINISHED"),
+      5000,
+      "reconnected idle after steer",
+    );
+
+    sendInput("\x1d");
+    await runPromise;
+
+    const out = text();
+    const { actualBlocks } = await assertMatchesFreshHistoryOracle({
+      session,
+      persistedHistory: history,
+      actualLines: lines(),
+      expectedPrefixBlocks: ["Prompt is too long."],
+      label: "review-5 B1 (overflow retry + accepted /now steer)",
+    });
+    assert.deepEqual(
+      actualBlocks,
+      ["Prompt is too long.", "RETRIED-ANSWER", "FINISHED"],
+      "assistant paragraphs must be ['Prompt is too long.', 'RETRIED-ANSWER', 'FINISHED']",
+    );
+    assert.equal(countOccurrences(out, "RETRIED-ANSWER"), 1, "RETRIED-ANSWER must appear exactly once");
+    assert.equal(countOccurrences(out, "Keep going"), 1, "Keep going must appear exactly once");
+    assert.equal(countOccurrences(out, "FINISHED"), 1, "FINISHED must appear exactly once");
+    assert.equal(out.includes("Turn ended while disconnected"), false, "no spurious early-end line");
+    assert.equal(out.includes("Turn ended early"), false, "no spurious restart line");
+  });
+
+  it("review-5 B1 (chat.steered viewer path after overflow retry): renders RETRIED-ANSWER and Keep going once each on idle reopen", async () => {
+    const { terminal, lines, text, sendInput } = makeFakeTerminal(120, 30);
+    const session = makeChatSession("chat-34-r5-b1-viewer");
+    const history: ChatTurnRecord[] = [];
+    let openCount = 0;
+    let pingCount = 0;
+    const daemonPid = process.pid;
+
+    const mock = makeMockClient(async (op, params) => {
+      if (op === "ping") {
+        pingCount += 1;
+        return { pong: true, pid: daemonPid, protocolRev: 8, releaseId: "rel-r5" };
+      }
+      if (op === "chat.open") {
+        openCount += 1;
+        return makeProdChatOpen(session, history, {
+          busy: false,
+          control: { sessionId: session.id, controllerClientId: "other-client", hasControl: false, controlSeq: 1 },
+        });
+      }
+      if (op === "chat.history") {
+        const afterSeq = Number(params.afterSeq ?? 0);
+        const throughSeq = Number(params.throughSeq ?? Number.MAX_SAFE_INTEGER);
+        return {
+          history: history.filter((r) => r.seq > afterSeq && r.seq <= throughSeq),
+          historyNext: null,
+        };
+      }
+      if (op === "work.snapshot") return emptyWorkSnapshot();
+      if (op === "session.leave") return { daemonWillQuit: false };
+      return {};
+    });
+
+    const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+    await waitFor(() => text().includes(session.id) && pingCount >= 1, 3000, "initial viewer render");
+
+    // Viewer observes turn start, overflow + retried deltas, and chat.steered from the controller.
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.turn.start",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r5-b1-v", reason: "user", text: "Check status" },
+    });
+    history.push({
+      seq: 1,
+      chatSessionId: session.id,
+      role: "user",
+      content: "Check status",
+      createdAt: Date.now(),
+    });
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.delta",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r5-b1-v", delta: "Prompt is too long." },
+    });
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.delta",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId: "turn-r5-b1-v", delta: "\n\nRETRIED-ANSWER" },
+    });
+    history.push(
+      {
+        seq: 2,
+        chatSessionId: session.id,
+        role: "assistant",
+        content: "\n\nRETRIED-ANSWER",
+        createdAt: Date.now(),
+      },
+      {
+        seq: 3,
+        chatSessionId: session.id,
+        role: "user",
+        content: "Keep going",
+        createdAt: Date.now(),
+      },
+    );
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.steered",
+      createdAt: Date.now(),
+      payload: {
+        chatSessionId: session.id,
+        turnId: "turn-r5-b1-v",
+        role: "user",
+        message: "Keep going",
+        originClientId: "other-client",
+      },
+    });
+    await waitFor(() => text().includes("Keep going"), 3000, "viewer received chat.steered");
+
+    history.push({
+      seq: 4,
+      chatSessionId: session.id,
+      role: "assistant",
+      content: "FINISHED",
+      createdAt: Date.now(),
+    });
+    mock.disconnect();
+    await waitFor(
+      () => openCount >= 2 && text().includes("Reconnected to harnessd") && text().includes("FINISHED"),
+      5000,
+      "viewer reconnected idle after steer",
+    );
+
+    sendInput("\x1d");
+    await runPromise;
+
+    const out = text();
+    const { actualBlocks } = await assertMatchesFreshHistoryOracle({
+      session,
+      persistedHistory: history,
+      actualLines: lines(),
+      expectedPrefixBlocks: ["Prompt is too long."],
+      label: "review-5 B1 (chat.steered viewer path)",
+    });
+    assert.deepEqual(actualBlocks, ["Prompt is too long.", "RETRIED-ANSWER", "FINISHED"]);
+    assert.equal(countOccurrences(out, "RETRIED-ANSWER"), 1, "RETRIED-ANSWER must appear once on viewer");
+    assert.equal(countOccurrences(out, "Keep going"), 1, "Keep going must appear once on viewer");
+    assert.equal(countOccurrences(out, "FINISHED"), 1, "FINISHED must appear once on viewer");
+  });
 });

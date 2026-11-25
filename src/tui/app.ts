@@ -11,10 +11,11 @@ import type { DaemonEventFrame, SessionControlState } from "../protocol/daemon-r
 import { classifyChatLine, type ClassifiedChatLine } from "./chat-lines.js";
 import { ChatQueueModel, type ChatQueueReason, formatQueueItemState } from "./chat-queue.js";
 import {
-  matchLiveToolRows,
+  matchLiveBoundaryRows,
   reconcileAssistantHistory,
   type FrozenSegment,
   type LiveRenderedTool,
+  type LiveRenderedUser,
 } from "./chat-reconcile.js";
 import { createCommandAutocomplete, parseSlashCommand, renderHelp, type TuiMode } from "./commands.js";
 import {
@@ -1457,10 +1458,10 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   const unconfirmedMeta = new Map<string, { turnId: string | null; timestampMs: number }>();
   const MATCHING_TRANSCRIPT_HINT = "a matching message is in the transcript; drop if same";
   const renderedSeqs = new Set<number>();
-  const turnRenderedUsers: string[] = [];
+  const turnRenderedUsers: LiveRenderedUser[] = [];
   const turnFrozenSegments: FrozenSegment[] = [];
   const turnRenderedTools: LiveRenderedTool[] = [];
-  let turnLiveToolCount = 0;
+  let turnLiveBoundaryCount = 0;
   let turnHasAssistantHeader = false;
 
   const toolOutputFingerprint = (display: unknown): string => JSON.stringify(display);
@@ -1472,12 +1473,12 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     turnRenderedUsers.length = 0;
     turnFrozenSegments.length = 0;
     turnRenderedTools.length = 0;
-    turnLiveToolCount = 0;
+    turnLiveBoundaryCount = 0;
     turnHasAssistantHeader = false;
   };
   const recordFrozenText = (frozen: string | null) => {
     if (frozen && frozen.trim()) {
-      turnFrozenSegments.push({ text: frozen, afterLiveToolCount: turnLiveToolCount });
+      turnFrozenSegments.push({ text: frozen, afterBoundaryCount: turnLiveBoundaryCount });
       turnHasAssistantHeader = true;
     }
   };
@@ -1499,7 +1500,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       shell.queue.removeById(ps.itemId);
       if (!optsConfirm?.skipUserCard) {
         shell.transcript.appendUserTurn(ps.text, ps.timestampMs);
-        turnRenderedUsers.push(ps.text);
+        turnRenderedUsers.push({ content: ps.text, boundaryOrdinal: null });
       }
       shell.syncDock();
       return true;
@@ -1513,7 +1514,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         shell.queue.removeById(itemId);
         if (!optsConfirm?.skipUserCard) {
           shell.transcript.appendUserTurn(item.text, meta.timestampMs);
-          turnRenderedUsers.push(item.text);
+          turnRenderedUsers.push({ content: item.text, boundaryOrdinal: null });
         }
         shell.syncDock();
         return true;
@@ -1704,7 +1705,8 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         const steeredAt = Date.now();
         recordFrozenText(shell.transcript.freezeLiveText(steeredAt));
         shell.transcript.appendUserTurn(current.text, steeredAt);
-        turnRenderedUsers.push(current.text);
+        turnLiveBoundaryCount += 1;
+        turnRenderedUsers.push({ content: current.text, boundaryOrdinal: turnLiveBoundaryCount });
         shell.transcript.appendReceipt({
           tone: "info",
           tag: "steered",
@@ -2028,13 +2030,13 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     rows: ChatTurnRecord[],
     optsReplay?: {
       firstAssistantMeta?: string;
-      liveRenderedUsers?: string[];
+      skipUserIndices?: ReadonlySet<number>;
       skipToolIndices?: ReadonlySet<number>;
       skipAssistantIndices?: ReadonlySet<number>;
     },
   ): ReplayResult => {
     let nextAssistantMeta = optsReplay?.firstAssistantMeta;
-    const skipUsers = optsReplay?.liveRenderedUsers;
+    const skipUserIndices = optsReplay?.skipUserIndices;
     const skipToolIndices = optsReplay?.skipToolIndices;
     const skipAssistantIndices = optsReplay?.skipAssistantIndices;
     let renderedAssistantCount = 0;
@@ -2048,10 +2050,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       }
       const turnTs = sourceTimestampMs(turn.createdAt);
       if (turn.role === "user") {
-        if (skipUsers && skipUsers.length > 0 && skipUsers[0] === turn.content) {
-          skipUsers.shift();
-          continue;
-        }
+        if (skipUserIndices?.has(i)) continue;
         shell.transcript.appendUserTurn(turn.content, turnTs);
       } else if (turn.role === "assistant") {
         if (skipAssistantIndices?.has(i)) continue;
@@ -2149,7 +2148,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         resetTurnLiveTrackers();
         if (p.reason === "user" && typeof p.text === "string") {
           shell.transcript.appendUserTurn(p.text);
-          turnRenderedUsers.push(p.text);
+          turnRenderedUsers.push({ content: p.text, boundaryOrdinal: null });
         }
         shell.transcript.beginLiveTurn(modelBadge());
         shell.setStatus(true, "Director responding...");
@@ -2182,7 +2181,8 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
                 const steeredAt = evTs ?? Date.now();
                 recordFrozenText(shell.transcript.freezeLiveText(steeredAt));
                 shell.transcript.appendUserTurn(meta.text, steeredAt);
-                turnRenderedUsers.push(meta.text);
+                turnLiveBoundaryCount += 1;
+                turnRenderedUsers.push({ content: meta.text, boundaryOrdinal: turnLiveBoundaryCount });
                 shell.transcript.appendReceipt({
                   tone: "info",
                   tag: "steered",
@@ -2196,7 +2196,8 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
           } else if (fromOther && typeof p.message === "string") {
             recordFrozenText(shell.transcript.freezeLiveText(evTs));
             shell.transcript.appendUserTurn(p.message);
-            turnRenderedUsers.push(p.message);
+            turnLiveBoundaryCount += 1;
+            turnRenderedUsers.push({ content: p.message, boundaryOrdinal: turnLiveBoundaryCount });
             shell.session.tui.requestRender();
           }
         } else if (msg) {
@@ -2219,8 +2220,8 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         if (display) {
           recordFrozenText(shell.transcript.freezeLiveText(evTs));
           shell.transcript.appendToolOutput(display, evTs, { freeze: false });
-          turnLiveToolCount += 1;
-          turnRenderedTools.push({ ordinal: turnLiveToolCount, fingerprint: toolOutputFingerprint(display) });
+          turnLiveBoundaryCount += 1;
+          turnRenderedTools.push({ ordinal: turnLiveBoundaryCount, fingerprint: toolOutputFingerprint(display) });
           shell.session.tui.requestRender();
           return;
         }
@@ -2358,7 +2359,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       for (const row of fetchedRows) {
         if (typeof row.seq === "number" && row.seq > 0 && renderedSeqs.has(row.seq)) continue;
         if (row.role !== "user") continue;
-        if (pendingUsersCopy.length > 0 && pendingUsersCopy[0] === row.content) {
+        if (pendingUsersCopy.length > 0 && pendingUsersCopy[0]!.content === row.content) {
           pendingUsersCopy.shift();
         } else {
           unmatchedFetchedUsers.push(row.content);
@@ -2393,7 +2394,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
             unmatchedFetchedUsers.splice(replayRowIdx, 1);
           } else {
             shell.transcript.appendUserTurn(item.text, meta.timestampMs);
-            turnRenderedUsers.push(item.text);
+            turnRenderedUsers.push({ content: item.text, boundaryOrdinal: null });
           }
         } else {
           if (unmatchedFetchedUsers.includes(item.text)) {
@@ -2417,11 +2418,18 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         unseenRows.push(row);
       }
 
-      const toolMatch = wasActive
-        ? matchLiveToolRows(unseenRows, turnRenderedTools, rowToolFingerprint)
-        : { matches: [], skipToolIndices: new Set<number>(), remainingLiveTools: [] };
+      const liveMatch = wasActive
+        ? matchLiveBoundaryRows(unseenRows, turnRenderedTools, turnRenderedUsers, rowToolFingerprint)
+        : {
+            matches: [],
+            skipToolIndices: new Set<number>(),
+            skipUserIndices: new Set<number>(),
+            remainingLiveTools: [],
+            remainingLiveUsers: [...turnRenderedUsers],
+          };
       if (wasActive) {
-        turnRenderedTools.splice(0, turnRenderedTools.length, ...toolMatch.remainingLiveTools);
+        turnRenderedTools.splice(0, turnRenderedTools.length, ...liveMatch.remainingLiveTools);
+        turnRenderedUsers.splice(0, turnRenderedUsers.length, ...liveMatch.remainingLiveUsers);
       }
 
       const reconciled = reconcileAssistantHistory({
@@ -2430,7 +2438,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         rows: unseenRows,
         busy: reopened.busy,
         daemonRestarted,
-        liveToolMatches: toolMatch.matches,
+        liveBoundaryMatches: liveMatch.matches,
       });
       if (wasActive) {
         turnFrozenSegments.splice(0, turnFrozenSegments.length, ...reconciled.remainingFrozen);
@@ -2441,8 +2449,8 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
           ? renderHistoryRows(unseenRows, {
               firstAssistantMeta:
                 wasActive && !hadLiveAssistantBeforeReplay ? (prevSnap.modelLabel ?? modelBadge()) : undefined,
-              liveRenderedUsers: turnRenderedUsers,
-              skipToolIndices: toolMatch.skipToolIndices,
+              skipUserIndices: liveMatch.skipUserIndices,
+              skipToolIndices: liveMatch.skipToolIndices,
               skipAssistantIndices: reconciled.skipIndices,
             })
           : { renderedAssistantCount: 0, renderedToolCount: 0 };
@@ -2464,7 +2472,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         } else {
           const persistedTurnOutput =
             hadLiveAssistantBeforeReplay ||
-            toolMatch.matches.length > 0 ||
+            liveMatch.skipToolIndices.size > 0 ||
             replay.renderedAssistantCount > 0 ||
             replay.renderedToolCount > 0;
           const shouldReportEarlyEnd =
