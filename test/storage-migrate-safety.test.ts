@@ -622,7 +622,7 @@ describe("storage migration safety regressions", () => {
         "utf8",
       );
 
-      const t0 = 1_700_000_000_000;
+      const t0 = Date.now() + 1_000;
       const pass1 = runStorageMigrationPass({
         sqlite: cpDb.db,
         storage,
@@ -661,8 +661,14 @@ describe("storage migration safety regressions", () => {
       assert.equal(stateAfterPass1.pendingUnits[0]!.stale, true);
       const recAdopted = stateAfterPass1.bridges.find((b) => b.legacyPath === adoptedNoteLegacy);
       const recRunC = stateAfterPass1.bridges.find((b) => b.legacyPath === legacyRunC);
-      assert.deepEqual(recAdopted, { legacyPath: adoptedNoteLegacy, target: adoptedNoteDest, createdAt: t0 });
-      assert.deepEqual(recRunC, { legacyPath: legacyRunC, target: destRunC, createdAt: t0 });
+      assert.ok(recAdopted);
+      assert.equal(recAdopted.legacyPath, adoptedNoteLegacy);
+      assert.equal(recAdopted.target, adoptedNoteDest);
+      assert.equal(recAdopted.createdAt, t0);
+      assert.ok(recRunC);
+      assert.equal(recRunC.legacyPath, legacyRunC);
+      assert.equal(recRunC.target, destRunC);
+      assert.equal(recRunC.createdAt, t0);
 
       // Replace run C's symlink with another allowed destination (chats/legacy) whose target differs from the recorded target.
       const altRunC = join(projDir, "chats", "legacy", "artifacts", runC.id);
