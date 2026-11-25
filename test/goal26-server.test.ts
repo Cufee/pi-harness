@@ -1313,4 +1313,165 @@ describe("goal-26 server RPC wiring", () => {
       rmSync(stateDir, { recursive: true, force: true });
     }
   });
+
+  it("j) C4 P1-1: successive content amendments on a queued post-stop resume refresh to latest contract without losing queue position or tripping stop guard", async () => {
+    const repoRoot = await makeTempRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-g26-srv-state-"));
+    const sockPath = join(stateDir, "d.sock");
+    const holdA = deferred<void>();
+    const holdB = deferred<void>();
+    const holdC = deferred<void>();
+    const orchBStarted = deferred<string>();
+
+    try {
+      const baseCfg = loadConfig(repoRoot);
+      const config = withFixtureCatalog({
+        ...baseCfg,
+        goals: { ...baseCfg.goals, maxConcurrentGoals: 1, autoVerifyOnSettle: false },
+        events: { ...baseCfg.events, wakeDirectorOnGoalSettle: false },
+        stateDir,
+        socketPath: sockPath,
+      });
+      const daemon = new HarnessDaemon(config, {
+        dbPath: ":memory:",
+        customRunnerFactory: () => ({
+          run: async (req) => {
+            if (req.initialPrompt.includes("Goal B post-stop amend")) {
+              orchBStarted.resolve(req.initialPrompt);
+            }
+            const gate = req.initialPrompt.includes("Goal A holds slot")
+              ? holdA.promise
+              : req.initialPrompt.includes("Goal B post-stop amend")
+                ? holdB.promise
+                : holdC.promise;
+            await Promise.race([
+              gate,
+              new Promise<void>((resolve) => req.signal.addEventListener("abort", () => resolve(), { once: true })),
+            ]);
+            return { text: "done", stopReason: req.signal.aborted ? "cancelled" : "completed" };
+          },
+        }),
+      });
+
+      await daemon.start();
+      const client = new DaemonClient(sockPath);
+      await client.connect();
+      try {
+        const chat = await daemon.director.createChat({ repoRoot });
+        const baseSha = (await runGit(repoRoot, ["rev-parse", "main"])).stdout;
+
+        const goalA = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Goal A holds slot",
+          description: "Occupies maxConcurrentGoals=1",
+          criteria: [{ id: "c1", description: "Done", kind: "behavioral", required: true }],
+        });
+        const commitA = await daemon.director.commitGoalDetailed(goalA.id);
+        assert.equal(commitA.outcome, "started");
+        const runAId = commitA.goal.linkedRunId!;
+
+        // Goal B: linked run with failed Tier 1 gen 1.
+        const runB = daemon.db.createRun({ goal: "Goal B post-stop amend", repoRoot, baseBranch: "main", baseSha });
+        const orchB = daemon.db.createTask({
+          runId: runB.id,
+          parentId: null,
+          tier: 1,
+          kind: "orchestrator",
+          title: "Orch B",
+          objective: "Goal B post-stop amend",
+          profileId: "pi:local",
+          model: "fixture",
+        });
+        daemon.db.updateTask(orchB.id, { status: "failed", summary: "Initial failure" });
+        daemon.db.updateRunStatus(runB.id, "failed", "Initial failure");
+
+        const goalB = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Goal B post-stop amend",
+          description: "Base v1 description",
+          criteria: [{ id: "c1", description: "Done", kind: "behavioral", required: true }],
+        });
+        daemon.director.goals.linkRunAndStart(goalB.id, runB.id);
+        daemon.director.goals.setStatus(goalB.id, "awaiting_human", "Failed");
+
+        // 1) Stop B, then explicitly resume B -> queued at #1.
+        const stopB = await client.request<{ stopped: boolean }>("run.stop", {
+          runId: runB.id,
+          reason: "Stop before fresh resume",
+        });
+        assert.equal(stopB.stopped, true);
+        assert.equal(daemon.db.getRun(runB.id)?.status, "stopped");
+
+        const resumeB = await client.request<{ outcome: string; queuePosition?: number }>("run.resume", {
+          runId: runB.id,
+          note: "Fresh post-stop resume",
+        });
+        assert.equal(resumeB.outcome, "queued");
+        assert.equal(resumeB.queuePosition, 1);
+
+        // Queue Goal C behind B at #2 to prove B keeps its #1 position across amendment refreshes.
+        const goalC = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Goal C queued behind B",
+          description: "Should stay at #2 while B refreshes",
+          criteria: [{ id: "c1", description: "Done", kind: "behavioral", required: true }],
+        });
+        const commitC = await daemon.director.commitGoalDetailed(goalC.id);
+        assert.equal(commitC.outcome, "queued");
+        assert.equal(commitC.queuePosition, 2);
+
+        // 2) Two successive content amendments to B in separate milliseconds.
+        await new Promise((r) => setTimeout(r, 5));
+        const amendV2 = await daemon.director.amendGoal(goalB.id, {
+          rationale: "First queued amendment",
+          appendDescription: "Extra requirement v2",
+        });
+        assert.equal(amendV2.goal.version, 2);
+        assert.equal(amendV2.delivery.reason, "queued for a goal slot");
+
+        await new Promise((r) => setTimeout(r, 5));
+        const amendV3 = await daemon.director.amendGoal(goalB.id, {
+          rationale: "Second queued amendment",
+          appendDescription: "Final requirement v3",
+        });
+        assert.equal(amendV3.goal.version, 3);
+        assert.equal(amendV3.delivery.reason, "queued for a goal slot");
+
+        // Queue entry for B must stay at #1 (ahead of C) and point at goal_contract_v3.
+        const qEntryB = daemon.db.admissionQueue.get("goal", goalB.id);
+        const qEntryC = daemon.db.admissionQueue.get("goal", goalC.id);
+        assert.ok(qEntryB, "B must remain queued after successive amendments");
+        assert.equal(qEntryB.position, 1, "B must keep queue position #1 without moving behind C");
+        assert.equal(qEntryC?.position, 2, "C must remain at queue position #2");
+        const persistedNote = ((qEntryB.launchOpts as { resume?: { note?: string } } | null)?.resume?.note ?? "");
+        assert.match(persistedNote, /goal_contract_v3/, "persisted queue note must point to latest goal_contract_v3");
+
+        // 3) Stop A -> drain must resume B at gen 2 with the v3 amendment.
+        await client.request("run.stop", { runId: runAId, reason: "Free slot for amended post-stop resume" });
+        await waitFor(
+          () => daemon.director.goals.getGoal(goalB.id)?.status === "executing",
+          3_000,
+          "drain resumes amended post-stop goal B",
+        );
+        const launchedPrompt = await orchBStarted.promise;
+        assert.equal(daemon.db.getTask(orchB.id)?.generation, 2, "Tier 1 must resume to generation 2");
+        assert.equal(daemon.db.getTask(orchB.id)?.goalVersion, 3, "Tier 1 must bind goalVersion=3 on resume");
+        assert.equal(daemon.orchestrator.getEffectiveRun(runB.id)?.status, "active");
+        assert.match(launchedPrompt, /goal_contract_v3/, "gen-2 Tier 1 prompt must carry latest v3 amendment");
+        assert.match(launchedPrompt, /Final requirement v3/, "gen-2 Tier 1 prompt must carry v3 content");
+      } finally {
+        holdA.resolve();
+        holdB.resolve();
+        holdC.resolve();
+        client.close();
+        await daemon.stop();
+      }
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
 });

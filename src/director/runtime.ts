@@ -974,7 +974,8 @@ interface QueuedGoalResumeOpts {
   continueCompleted?: boolean;
   allowCompleted?: boolean;
   allowStopped?: boolean;
-  stoppedRunUpdatedAt?: number;
+  stoppedRunStopSeq?: number;
+  goalVersion?: number;
   quotaOnly?: boolean;
   taskId?: string;
   model?: string;
@@ -2728,7 +2729,7 @@ export class DirectorRuntime {
             (linked.status !== "active" && (linked.status !== "completed" || opts?.continueCompleted))),
     );
     const shouldResumeLinked = Boolean(linked && (linkedResumable || (!opts?.quotaOnly && linked.status === "active")));
-    const buildQueuedLaunchOpts = (): QueuedGoalLaunchOpts => {
+    const buildQueuedLaunchOpts = (g: GoalRecord): QueuedGoalLaunchOpts => {
       const allowStopped = Boolean(linked && linked.status === "stopped" && !opts?.quotaOnly);
       const resumeLaunchOpts: QueuedGoalResumeOpts | undefined = shouldResumeLinked
         ? {
@@ -2737,7 +2738,8 @@ export class DirectorRuntime {
             ...(opts?.trigger ? { trigger: opts.trigger } : {}),
             ...(opts?.continueCompleted ? { continueCompleted: true } : {}),
             ...(opts?.allowCompleted ? { allowCompleted: true } : {}),
-            ...(allowStopped && linked ? { allowStopped: true, stoppedRunUpdatedAt: linked.updatedAt } : {}),
+            ...(allowStopped && linked ? { allowStopped: true, stoppedRunStopSeq: this.db.getLatestRunStopSeq(linked.id) } : {}),
+            goalVersion: g.version,
             ...(opts?.quotaOnly ? { quotaOnly: true } : {}),
             ...(opts?.resumeTaskId ? { taskId: opts.resumeTaskId } : {}),
             ...(opts?.model ? { model: opts.model } : {}),
@@ -2763,19 +2765,32 @@ export class DirectorRuntime {
     const queued = this.db.admissionQueue.get("goal", goal.id);
     if (queued && !opts?.position && !opts?.forceStart) {
       const queuedResume = ((queued.launchOpts ?? null) as QueuedGoalLaunchOpts | null)?.resume;
+      const incomingNote = opts?.note?.trim() || undefined;
+      const isSameTaskAmendmentRefresh = Boolean(
+        opts?.resumeTaskId &&
+          opts?.allowCompleted &&
+          queuedResume?.taskId === opts.resumeTaskId &&
+          ((queuedResume.goalVersion ?? 0) < goal.version ||
+            (incomingNote !== undefined && incomingNote !== queuedResume.note) ||
+            queued.note !== goal.title),
+      );
       const shouldUpgradeQueuedIntent = Boolean(
         shouldResumeLinked &&
           !opts?.quotaOnly &&
-          (queuedResume?.quotaOnly || (opts?.resumeTaskId && opts?.allowCompleted && queuedResume?.taskId !== opts.resumeTaskId)),
+          (queuedResume?.quotaOnly ||
+            (opts?.resumeTaskId && opts?.allowCompleted && queuedResume?.taskId !== opts.resumeTaskId) ||
+            isSameTaskAmendmentRefresh),
       );
+      let position = queued.position;
       if (shouldUpgradeQueuedIntent && linked) {
-        this.db.admissionQueue.enqueue({
+        const updatedEntry = this.db.admissionQueue.enqueue({
           lane: "goal",
           repoRoot: goal.repoRoot,
           targetId: goal.id,
-          launchOpts: buildQueuedLaunchOpts(),
+          launchOpts: buildQueuedLaunchOpts(goal),
           note: goal.title,
         });
+        position = updatedEntry.position;
         this.queuedResumeEpochs.set(goal.id, {
           runId: linked.id,
           pauseEpoch: entryFence.pauseEpoch,
@@ -2784,8 +2799,8 @@ export class DirectorRuntime {
         this.syncQueuedGoalProgress();
       }
       return {
-        ...result(goal, "queued", `Goal ${goal.id} is already queued at #${queued.position}; nothing was enqueued again.`),
-        queuePosition: queued.position,
+        ...result(goal, "queued", `Goal ${goal.id} is already queued at #${position}; nothing was enqueued again.`),
+        queuePosition: position,
       };
     }
 
@@ -2836,7 +2851,7 @@ export class DirectorRuntime {
       }
 
       if (activeCount >= limit || queuedAhead.length > 0) {
-        const launchOpts = buildQueuedLaunchOpts();
+        const launchOpts = buildQueuedLaunchOpts(beforeAdmission);
         this.db.admissionQueue.enqueue({
           lane: "goal",
           repoRoot: goal.repoRoot,
@@ -3325,13 +3340,13 @@ export class DirectorRuntime {
             }
             if (linked?.status === "stopped") {
               const allowStopped = Boolean(launchOpts.resume?.allowStopped && !launchOpts.resume?.quotaOnly);
-              const stoppedTimestampChanged =
-                launchOpts.resume?.stoppedRunUpdatedAt !== undefined &&
-                linked.updatedAt !== launchOpts.resume.stoppedRunUpdatedAt;
+              const stoppedSeqChanged =
+                launchOpts.resume?.stoppedRunStopSeq !== undefined &&
+                this.db.getLatestRunStopSeq(linked.id) !== launchOpts.resume.stoppedRunStopSeq;
               const stoppedSinceRestart =
                 queuedEpoch === undefined &&
                 ((this.goalPauseEpoch.get(goal.id) ?? 0) > 0 || this.orchestrator.getRunStopEpoch(linked.id) > 0);
-              if (!allowStopped || stoppedTimestampChanged || stoppedSinceRestart) {
+              if (!allowStopped || stoppedSeqChanged || stoppedSinceRestart) {
                 // Never restart a stopped run from a pre-stop or stale queue entry (preserves goal-30 stop fences).
                 this.db.admissionQueue.remove("goal", next.targetId);
                 this.queuedResumeEpochs.delete(goal.id);
@@ -3425,12 +3440,29 @@ export class DirectorRuntime {
     const goal = this.goals.getGoal(targetId);
     if (!goal) throw new Error(`Unknown goal ${targetId}`);
 
-    // If the goal is queued in the admission queue, mark forced and launch immediately!
+    // If the goal is queued in the admission queue, verify quota override before marking forced and launching.
     const qEntry = this.db.admissionQueue.get("goal", goal.id);
     if (qEntry) {
-      this.db.admissionQueue.markForceStart("goal", goal.id);
       const launchOpts = (qEntry.launchOpts ?? {}) as QueuedGoalLaunchOpts;
       const resumeOpts = launchOpts.resume;
+      if (goal.linkedRunId) {
+        const run = this.orchestrator.getEffectiveRun(goal.linkedRunId) ?? this.db.getRun(goal.linkedRunId);
+        const quotaSt = this.orchestrator.getRunQuotaStatus(goal.linkedRunId);
+        const hasPausedQuota = this.db.listTasks(goal.linkedRunId).some((t) => t.status === "paused_quota");
+        const isQuotaPaused = Boolean(
+          run &&
+            run.status !== "stopped" &&
+            (resumeOpts?.taskId
+              ? this.db.getTask(resumeOpts.taskId)?.status === "paused_quota"
+              : run.status === "paused_quota" || quotaSt || hasPausedQuota),
+        );
+        if (isQuotaPaused && !input.bypassQuota) {
+          throw new Error(
+            `Goal ${goal.id} (${goal.linkedRunId}) is paused on quota; pass bypass_quota: true to force-start despite quota.`,
+          );
+        }
+      }
+      this.db.admissionQueue.markForceStart("goal", goal.id);
       const res = await this.commitGoalDetailed(goal.id, {
         profileId: resumeOpts?.profileId ?? launchOpts.profileId,
         model: resumeOpts?.model ?? launchOpts.model,
@@ -3473,11 +3505,43 @@ export class DirectorRuntime {
             warning,
           };
         }
+        const pauseEpochBefore = this.goalPauseEpoch.get(goal.id) ?? 0;
+        const runStopEpochBefore = this.orchestrator.getRunStopEpoch(goal.linkedRunId);
         const resumed = await this.orchestrator.resumeRunFromQuota(goal.linkedRunId, {
           trigger: "manual",
           userMessage: input.reason ?? "Force-started bypassing quota pause",
           bypassAdmission: true,
         });
+        const freshAfterResume = this.goals.getGoal(goal.id)!;
+        const pausedOrStoppedSince =
+          (this.goalPauseEpoch.get(goal.id) ?? 0) !== pauseEpochBefore ||
+          this.orchestrator.getRunStopEpoch(goal.linkedRunId) !== runStopEpochBefore ||
+          (goal.status !== "paused" && freshAfterResume.status === "paused") ||
+          freshAfterResume.status === "cancelled" ||
+          freshAfterResume.status === "achieved";
+        if (pausedOrStoppedSince) {
+          const liveRun = this.orchestrator.getEffectiveRun(goal.linkedRunId) ?? this.db.getRun(goal.linkedRunId);
+          if (liveRun && liveRun.status === "active") {
+            const stopReason =
+              freshAfterResume.status === "cancelled"
+                ? "Goal cancelled"
+                : freshAfterResume.status === "paused"
+                  ? "Goal paused"
+                  : "Stopped during force-start";
+            await this.orchestrator.stopRun(goal.linkedRunId, stopReason);
+          }
+          this.syncQueuedGoalProgress();
+          const settledGoal = this.goals.getGoal(goal.id) ?? freshAfterResume;
+          const settledRun =
+            this.orchestrator.getEffectiveRun(goal.linkedRunId) ?? this.db.getRun(goal.linkedRunId) ?? resumed.run;
+          return {
+            goal: settledGoal,
+            resumed: { resumed: false, resumedTaskIds: [], run: settledRun },
+            outcome: "stopped",
+            action: "force_start_stopped",
+            warning,
+          };
+        }
         if (resumed.resumed) {
           const orch = this.db.listTasks(goal.linkedRunId).find((t) => t.tier === 1 && t.profileId !== "director");
           if (orch && resumed.resumedTaskIds.includes(orch.id)) {
@@ -3491,7 +3555,7 @@ export class DirectorRuntime {
           }
           this.onRunResumed(goal.linkedRunId, run.status, true);
           const fresh = this.goals.getGoal(goal.id)!;
-          if (!["executing", "verifying", "reviewing", "cancelled", "achieved"].includes(fresh.status)) {
+          if (!["executing", "verifying", "reviewing", "cancelled", "achieved", "paused"].includes(fresh.status)) {
             this.goals.setStatus(goal.id, "executing", "Force-resumed from quota pause");
             this.bumpReviewInvalidationEpoch(goal.id);
           }

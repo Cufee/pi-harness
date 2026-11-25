@@ -1114,6 +1114,23 @@ export class ControlPlaneDb {
     return null;
   }
 
+  /** Sequence number of the latest `run.status` transition to `stopped` for `runId`, or 0 if never stopped. */
+  getLatestRunStopSeq(runId: string): number {
+    const rows = this.db
+      .prepare("SELECT seq, payload_json FROM events WHERE run_id = ? AND type = 'run.status' ORDER BY seq DESC")
+      .all(runId) as Array<{ seq: number; payload_json: string }>;
+    for (const row of rows) {
+      try {
+        if ((JSON.parse(row.payload_json) as { status?: string } | null)?.status === "stopped") {
+          return Number(row.seq);
+        }
+      } catch {
+        // Ignore malformed event payloads.
+      }
+    }
+    return 0;
+  }
+
   /** Re-points a run at another repository (used when a Director chat switches projects). */
   updateRunRepoInfo(runId: string, repoRoot: string, baseBranch: string, baseSha: string): void {
     this.db
