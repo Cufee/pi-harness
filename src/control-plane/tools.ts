@@ -153,6 +153,118 @@ function derivedTitleNote(title: string): string {
   return `title was missing; derived '${title}'. Pass a short title next time.`;
 }
 
+const SIMPLE_INSPECT_VALUE_FLAGS: Record<string, { short: string; long: ReadonlySet<string> }> = {
+  cat: { short: "", long: new Set() },
+  wc: { short: "", long: new Set() },
+  head: { short: "nc", long: new Set(["--lines", "--bytes"]) },
+  tail: {
+    short: "ncs",
+    long: new Set(["--lines", "--bytes", "--sleep-interval", "--pid", "--max-unchanged-stats", "--follow"]),
+  },
+  ls: {
+    short: "ITw",
+    long: new Set([
+      "--hide",
+      "--ignore",
+      "--tabsize",
+      "--width",
+      "--block-size",
+      "--format",
+      "--quoting-style",
+      "--sort",
+      "--time",
+      "--time-style",
+      "--color",
+      "--hyperlink",
+      "--indicator-style",
+    ]),
+  },
+  nl: {
+    short: "bdfhilnsvw",
+    long: new Set([
+      "--body-numbering",
+      "--section-delimiter",
+      "--footer-numbering",
+      "--header-numbering",
+      "--line-increment",
+      "--join-blank-lines",
+      "--number-format",
+      "--number-separator",
+      "--starting-line-number",
+      "--number-width",
+    ]),
+  },
+  stat: { short: "c", long: new Set(["--format", "--printf"]) },
+};
+
+const RG_SHORT_VALUE_FLAGS = "ABCEMTdgefjmrt";
+const RG_LONG_NON_PATH_VALUE_FLAGS = new Set([
+  "--after-context",
+  "--before-context",
+  "--context",
+  "--color",
+  "--colors",
+  "--context-separator",
+  "--dfa-size-limit",
+  "--encoding",
+  "--engine",
+  "--field-context-separator",
+  "--field-match-separator",
+  "--glob",
+  "--iglob",
+  "--hostname-bin",
+  "--max-columns",
+  "--max-count",
+  "--max-depth",
+  "--max-filesize",
+  "--path-separator",
+  "--pre",
+  "--pre-glob",
+  "--regex-size-limit",
+  "--regexp",
+  "--replace",
+  "--sort",
+  "--sortr",
+  "--threads",
+  "--type",
+  "--type-add",
+  "--type-clear",
+  "--type-not",
+]);
+const RG_LONG_PATH_VALUE_FLAGS = new Set(["--file", "--ignore-file"]);
+
+function shortClusterConsumesNext(arg: string, shortValueFlags: string): string | null {
+  for (let k = 1; k < arg.length; k++) {
+    const ch = arg[k]!;
+    if (shortValueFlags.includes(ch)) {
+      return k === arg.length - 1 ? ch : null;
+    }
+  }
+  return null;
+}
+
+function scanRgShortCluster(arg: string): {
+  setsExplicitPattern: boolean;
+  consumesNext: string | null;
+  attachedFileIdx: number;
+} {
+  let setsExplicitPattern = false;
+  for (let k = 1; k < arg.length; k++) {
+    const ch = arg[k]!;
+    if (!RG_SHORT_VALUE_FLAGS.includes(ch)) continue;
+    if (ch === "e" || ch === "f") setsExplicitPattern = true;
+    if (k === arg.length - 1) {
+      return { setsExplicitPattern, consumesNext: ch, attachedFileIdx: -1 };
+    }
+    return {
+      setsExplicitPattern,
+      consumesNext: null,
+      attachedFileIdx: ch === "f" ? k + 1 : -1,
+    };
+  }
+  return { setsExplicitPattern, consumesNext: null, attachedFileIdx: -1 };
+}
+
 export type TaskToolSubject = Pick<TaskRecord, "runId" | "tier" | "kind" | "profileId" | "title" | "readOnly">;
 
 export function toolsForTask(task: TaskToolSubject): ToolDefinition[] {
@@ -210,26 +322,201 @@ export class ControlPlaneToolExecutor {
     }
   }
 
-  /** Rewrites absolute legacy data-path operands in `inspect_command` argv via `storage.resolveLegacyPath`. */
-  private mapInspectLegacyArgv(argv: string[], runRef: RunRecord & RunRef): string[] {
-    return argv.map((arg, index) => {
-      if (index === 0) return arg;
-      if (isAbsolute(arg)) {
-        if (arg.split("/").includes("..") || arg.split(sep).includes("..")) return arg;
-        return this.storage.resolveLegacyPath(runRef.repoRoot, arg, runRef) ?? arg;
+  private resolveTaskReadRoots(
+    runRef: RunRecord & RunRef,
+    task: TaskRecord,
+    realRoot: string,
+  ): { readRoots: string[]; deniedRoots: string[] } {
+    const linkedGoal = this.resolveLinkedGoalForRun(runRef.id);
+    const goalRef = linkedGoal ? this.goalRef(runRef.repoRoot, linkedGoal) : null;
+    const writable = toolPolicyForTask(task.tier, task.kind, task.readOnly) === "read_write_workspace";
+    const grants = this.storage.taskGrants({
+      run: runRef,
+      goal: goalRef,
+      writable,
+      workspace: realRoot,
+    });
+    // Harness-computed task grants (which include operator global config.worktree.extraReadRoots/extraWriteRoots)
+    // authorize external read roots; repository-configurable values and dossier symlinks outside realRoot are never promoted.
+    const canonicalizeRoots = (rawRoots: readonly string[] | undefined): string[] => {
+      const resolved: string[] = [];
+      for (const raw of rawRoots ?? []) {
+        const trimmed = raw.trim();
+        if (!trimmed) continue;
+        const expanded = resolve(expandHomePath(trimmed));
+        let canonical = expanded;
+        try {
+          canonical = realpathSync(expanded);
+        } catch {
+          // Non-existent root stays at expanded path.
+        }
+        if (!resolved.includes(canonical)) resolved.push(canonical);
       }
-      if (arg.startsWith("-")) {
-        const eq = arg.indexOf("=");
-        if (eq > 0) {
-          const val = arg.slice(eq + 1);
-          if (isAbsolute(val) && !val.split("/").includes("..") && !val.split(sep).includes("..")) {
-            const mapped = this.storage.resolveLegacyPath(runRef.repoRoot, val, runRef);
-            if (mapped !== null) return `${arg.slice(0, eq + 1)}${mapped}`;
+      return resolved;
+    };
+    const resolvedGrantedRoots = canonicalizeRoots([
+      ...grants.extraReadRoots,
+      ...(grants.extraWriteRoots ?? []),
+    ]);
+    const readRoots = [realRoot, ...resolvedGrantedRoots.filter((r) => r !== realRoot)];
+    const deniedRoots = canonicalizeRoots(grants.deniedRoots);
+    return { readRoots, deniedRoots };
+  }
+
+  /**
+   * Rewrites legacy data-path operands in `inspect_command` argv via `storage.resolveLegacyPath`.
+   * Only operands classified as path operands for the command are mapped; search patterns and other
+   * non-path arguments are never rewritten. Relative legacy operands are mapped in data-dir layout only.
+   */
+  private mapInspectLegacyArgv(argv: string[], runRef: RunRecord & RunRef): string[] {
+    if (argv.length <= 1) return argv;
+    const bin = argv[0]!;
+    const allowRelative = this.storage.layout === "data-dir";
+    const mapOperand = (candidate: string): string => {
+      if (!candidate || candidate.trim() !== candidate) return candidate;
+      if (!allowRelative && !isAbsolute(candidate)) return candidate;
+      if (candidate.split("/").includes("..") || candidate.split(sep).includes("..")) return candidate;
+      return this.storage.resolveLegacyPath(runRef.repoRoot, candidate, runRef) ?? candidate;
+    };
+
+    const out = [...argv];
+
+    if (Object.hasOwn(SIMPLE_INSPECT_VALUE_FLAGS, bin)) {
+      const spec = SIMPLE_INSPECT_VALUE_FLAGS[bin]!;
+      let afterDashDash = false;
+      for (let i = 1; i < out.length; i++) {
+        const arg = out[i]!;
+        if (afterDashDash) {
+          out[i] = mapOperand(arg);
+          continue;
+        }
+        if (arg === "--") {
+          afterDashDash = true;
+          continue;
+        }
+        if (arg === "-" || !arg.startsWith("-")) {
+          if (arg !== "-") out[i] = mapOperand(arg);
+          continue;
+        }
+        if (arg.startsWith("--")) {
+          if (!arg.includes("=") && spec.long.has(arg)) i++;
+          continue;
+        }
+        if (shortClusterConsumesNext(arg, spec.short) !== null) i++;
+      }
+      return out;
+    }
+
+    if (bin === "rg") {
+      // Pass 1: detect explicit pattern flags (--files, -e/--regexp, -f/--file) before `--`, since clap allows them after positionals.
+      let hasExplicitPattern = false;
+      for (let i = 1; i < out.length; i++) {
+        const arg = out[i]!;
+        if (arg === "--") break;
+        if (arg === "-" || !arg.startsWith("-")) continue;
+        if (arg === "--files") {
+          hasExplicitPattern = true;
+          continue;
+        }
+        if (arg.startsWith("--")) {
+          const eq = arg.indexOf("=");
+          const flag = eq >= 0 ? arg.slice(0, eq) : arg;
+          if (flag === "--regexp" || flag === "--file") hasExplicitPattern = true;
+          if (eq < 0 && (RG_LONG_NON_PATH_VALUE_FLAGS.has(flag) || RG_LONG_PATH_VALUE_FLAGS.has(flag))) i++;
+          continue;
+        }
+        const cluster = scanRgShortCluster(arg);
+        if (cluster.setsExplicitPattern) hasExplicitPattern = true;
+        if (cluster.consumesNext !== null) i++;
+      }
+
+      // Pass 2: rewrite only file-flag operands (-f/--file/--ignore-file) and path positionals (skipping positional #0 when it is the pattern).
+      let afterDashDash = false;
+      let positionalIdx = 0;
+      for (let i = 1; i < out.length; i++) {
+        const arg = out[i]!;
+        if (afterDashDash || arg === "-" || !arg.startsWith("-")) {
+          const isPathPositional = hasExplicitPattern || positionalIdx > 0;
+          positionalIdx++;
+          if (isPathPositional && arg !== "-") out[i] = mapOperand(arg);
+          continue;
+        }
+        if (arg === "--") {
+          afterDashDash = true;
+          continue;
+        }
+        if (arg.startsWith("--")) {
+          const eq = arg.indexOf("=");
+          const flag = eq >= 0 ? arg.slice(0, eq) : arg;
+          if (RG_LONG_PATH_VALUE_FLAGS.has(flag)) {
+            if (eq >= 0) {
+              out[i] = `${arg.slice(0, eq + 1)}${mapOperand(arg.slice(eq + 1))}`;
+            } else if (i + 1 < out.length) {
+              out[i + 1] = mapOperand(out[i + 1]!);
+              i++;
+            }
+          } else if (eq < 0 && RG_LONG_NON_PATH_VALUE_FLAGS.has(flag)) {
+            i++;
           }
+          continue;
+        }
+        const cluster = scanRgShortCluster(arg);
+        if (cluster.attachedFileIdx >= 0) {
+          out[i] = `${arg.slice(0, cluster.attachedFileIdx)}${mapOperand(arg.slice(cluster.attachedFileIdx))}`;
+        } else if (cluster.consumesNext !== null) {
+          if (cluster.consumesNext === "f" && i + 1 < out.length) {
+            out[i + 1] = mapOperand(out[i + 1]!);
+          }
+          i++;
         }
       }
-      return arg;
-    });
+      return out;
+    }
+
+    if (bin === "bun" && out[1] === "test") {
+      for (let i = 2; i < out.length; i++) {
+        const arg = out[i]!;
+        if (arg === "--") {
+          for (let j = i + 1; j < out.length; j++) out[j] = mapOperand(out[j]!);
+          break;
+        }
+        if (!arg.startsWith("-")) {
+          out[i] = mapOperand(arg);
+          continue;
+        }
+        if (arg === "-t" || arg === "--test-name-pattern" || arg === "--timeout" || arg === "--rerun-each") {
+          i++;
+        }
+      }
+      return out;
+    }
+
+    if (bin === "bunx" && out[1] === "tsc") {
+      for (let i = 2; i < out.length; i++) {
+        const arg = out[i]!;
+        if (arg === "--pretty") {
+          if (out[i + 1] === "true" || out[i + 1] === "false") i++;
+          continue;
+        }
+        if (arg === "-p" || arg === "--project") {
+          if (i + 1 < out.length && !out[i + 1]!.startsWith("-")) {
+            out[i + 1] = mapOperand(out[i + 1]!);
+            i++;
+          }
+          continue;
+        }
+        if (arg.startsWith("--project=")) {
+          out[i] = `--project=${mapOperand(arg.slice("--project=".length))}`;
+          continue;
+        }
+        if (!arg.startsWith("-")) {
+          out[i] = mapOperand(arg);
+        }
+      }
+      return out;
+    }
+
+    return out;
   }
 
   tools(target: AgentTier | TaskToolSubject): ToolDefinition[] {
@@ -1133,7 +1420,14 @@ export class ControlPlaneToolExecutor {
         }
         const root = task.worktreeId ? this.db.getWorktree(task.worktreeId)?.path : run.repoRoot;
         if (!root) throw new Error("Task worktree unavailable");
-        return readWorkspaceArtifact(root, mappedPath, args.max_chars, args.offset, this.storage);
+        const policy =
+          this.storage.layout === "data-dir"
+            ? (() => {
+                const { readRoots, deniedRoots } = this.resolveTaskReadRoots(runRef, task, realpathSync(root));
+                return { allowedRoots: readRoots, deniedRoots };
+              })()
+            : undefined;
+        return readWorkspaceArtifact(root, mappedPath, args.max_chars, args.offset, this.storage, policy);
       }
 
       case "inspect_command": {
@@ -1165,39 +1459,7 @@ export class ControlPlaneToolExecutor {
           throw REJECTIONS.inspectCwd(requestedCwd);
         }
         const runRef = this.runRef(run);
-        const linkedGoal = this.resolveLinkedGoalForRun(run.id);
-        const goalRef = linkedGoal ? this.goalRef(run.repoRoot, linkedGoal) : null;
-        const writable = toolPolicyForTask(task.tier, task.kind, task.readOnly) === "read_write_workspace";
-        const grants = this.storage.taskGrants({
-          run: runRef,
-          goal: goalRef,
-          writable,
-          workspace: realRoot,
-        });
-        // Harness-computed task grants (which include operator global config.worktree.extraReadRoots/extraWriteRoots)
-        // authorize external read roots; repository-configurable values and dossier symlinks outside realRoot are never promoted.
-        const canonicalizeRoots = (rawRoots: readonly string[] | undefined): string[] => {
-          const resolved: string[] = [];
-          for (const raw of rawRoots ?? []) {
-            const trimmed = raw.trim();
-            if (!trimmed) continue;
-            const expanded = resolve(expandHomePath(trimmed));
-            let canonical = expanded;
-            try {
-              canonical = realpathSync(expanded);
-            } catch {
-              // Non-existent root stays at expanded path.
-            }
-            if (!resolved.includes(canonical)) resolved.push(canonical);
-          }
-          return resolved;
-        };
-        const resolvedGrantedRoots = canonicalizeRoots([
-          ...grants.extraReadRoots,
-          ...(grants.extraWriteRoots ?? []),
-        ]);
-        const readRoots = [realRoot, ...resolvedGrantedRoots.filter((r) => r !== realRoot)];
-        const deniedRoots = canonicalizeRoots(grants.deniedRoots);
+        const { readRoots, deniedRoots } = this.resolveTaskReadRoots(runRef, task, realRoot);
         const argv = this.mapInspectLegacyArgv(rawArgv, runRef);
         const verdict = checkReadOnlyArgv(argv, {
           cwd,

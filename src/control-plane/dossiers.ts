@@ -5,6 +5,7 @@ import type { ControlPlaneDb, RunRecord } from "./db.js";
 import { SUMMARY_LIMIT } from "./handoffs.js";
 import { scanMaxFileIndex, writeUniqueFile } from "./ids.js";
 import { REJECTIONS } from "../advisories/rejections.js";
+import { mostSpecificRootDecision } from "../runners/acp-shims.js";
 import { hashFileSha256, legacyStoragePaths, type StoragePaths } from "../storage/paths.js";
 
 /**
@@ -302,7 +303,7 @@ function resolveVerifiedDossierTarget(
   if (unionHit) {
     return {
       expected: unionHit.path,
-      shown: unionHit.source === "data-dir" ? unionHit.path : found.recordedPath,
+      shown: unionHit.path,
       realRoot,
     };
   }
@@ -470,12 +471,20 @@ export function readRunDossier(
   return readArtifact(target.expected, args.max_chars, args.offset, { label: shown, pinned: true, nonSymlinkRejection });
 }
 
+export interface WorkspaceArtifactPolicy {
+  /** Additional canonical allowed roots for the task (e.g. granted extraReadRoots and extraWriteRoots). */
+  allowedRoots?: readonly string[];
+  /** Canonical denied roots (rule A3, e.g. stateDir and dataRoot). */
+  deniedRoots?: readonly string[];
+}
+
 export function readWorkspaceArtifact(
   root: string,
   requested: string,
   maxChars: unknown,
   offset?: unknown,
   storage: StoragePaths = legacyStoragePaths,
+  policy?: WorkspaceArtifactPolicy,
 ) {
   // In data-dir layout, map legacy/data-dir paths before resolving symlinks so migration bridges are never followed.
   if (storage.layout === "data-dir") {
@@ -497,5 +506,21 @@ export function readWorkspaceArtifact(
   ) {
     throw REJECTIONS.artifactOutsideWorkspace(requested);
   }
-  return readArtifact(path, maxChars, offset);
+  if (storage.layout === "data-dir") {
+    if (storage.isStateInternalPath(path)) {
+      throw REJECTIONS.artifactOutsideWorkspace(requested);
+    }
+    const deniedRoots = policy?.deniedRoots ?? (storage.dataRoot ? [storage.dataRoot] : []);
+    if (deniedRoots.length > 0) {
+      const allowedRoots = [realRoot, ...(policy?.allowedRoots ?? [])];
+      const decision = mostSpecificRootDecision(path, allowedRoots, deniedRoots);
+      if (!decision.allowed) {
+        throw REJECTIONS.artifactOutsideWorkspace(requested);
+      }
+    }
+  }
+  return readArtifact(path, maxChars, offset, {
+    pinned: true,
+    nonSymlinkRejection: () => REJECTIONS.artifactOutsideWorkspace(requested),
+  });
 }

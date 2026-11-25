@@ -364,4 +364,48 @@ describe("dossiers, handoffs, and GoalEngine (data-dir layout)", () => {
       db.close();
     }
   });
+
+  it("returns the absolute winning legacy file path in readRunDossier when the DB row holds the data-dir path in a both-exist unit", () => {
+    const root = makeTempDir("pi-dd-winner-path-");
+    const stateDir = join(root, "state");
+    const repo = join(root, "repo");
+    mkdirSync(stateDir, { recursive: true });
+    mkdirSync(repo, { recursive: true });
+
+    const sp = storagePaths({ stateDir }, { layout: "data-dir" });
+    const db = new ControlPlaneDb(":memory:");
+    try {
+      const run = db.createRun({ goal: "Both-exist winner path", repoRoot: repo, baseBranch: "main", baseSha: "abc1234", chatSessionId: "chat-7" });
+      const task = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Worker",
+        objective: "Check winner path",
+        profileId: "acp:claude",
+      });
+
+      const legacyTaskDir = join(repo, ".harness", "artifacts", run.id, task.id);
+      const dataTaskDir = join(sp.artifactsDir(run), run.id, task.id);
+      mkdirSync(legacyTaskDir, { recursive: true });
+      mkdirSync(dataTaskDir, { recursive: true });
+
+      const legacyFile = join(legacyTaskDir, "winner.md");
+      const dataFile = join(dataTaskDir, "winner.md");
+      writeFileSync(legacyFile, "legacy-winning-bytes", "utf8");
+      writeFileSync(dataFile, "shadowed-datadir-bytes", "utf8");
+
+      // DB row records the data-dir path (e.g. post-migration row with a recreated legacy copy on disk).
+      db.recordArtifact({ runId: run.id, taskId: task.id, kind: "dossier", path: dataFile, summary: "Winner" });
+
+      const relLegacy = `.harness/artifacts/${run.id}/${task.id}/winner.md`;
+      for (const queryPath of [dataFile, legacyFile, relLegacy]) {
+        const res = readRunDossier(db, run, { path: queryPath }, sp) as { path: string; content: string };
+        assert.equal(res.content, "legacy-winning-bytes");
+        assert.equal(res.path, legacyFile, `expected winning file path for query ${queryPath}`);
+      }
+    } finally {
+      db.close();
+    }
+  });
 });

@@ -625,4 +625,349 @@ describe("ControlPlaneToolExecutor storage grants and legacy path mapping", () =
       db.close();
     }
   });
+
+  it("data-dir layout: maps workspace-relative legacy path operands in inspect_command from an external worktree without rewriting search patterns", async () => {
+    process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
+    resetStoragePathsForTest();
+
+    const { root, repoRoot } = await initTempGitRepo("pi-tools-rel-legacy-");
+    const stateDir = join(root, "state");
+    mkdirSync(stateDir, { recursive: true });
+
+    const base = loadConfig(repoRoot);
+    const config: HarnessConfig = {
+      ...base,
+      stateDir,
+      codeMode: "off",
+      worktree: {
+        ...base.worktree,
+        extraReadRoots: [],
+        extraWriteRoots: [],
+      },
+    };
+
+    const db = new ControlPlaneDb(":memory:");
+    const sp = storagePaths(config);
+    assert.equal(sp.layout, "data-dir");
+    const wtMgr = new WorktreeManager(db, repoRoot, config.worktree, { stateDir }, sp);
+    try {
+      const goals = new GoalEngine(db.db, undefined, undefined, undefined, undefined, sp);
+      const chatA = "chat-a";
+      const chatB = "chat-b";
+      const goalA = goals.createGoal({
+        chatSessionId: chatA,
+        repoRoot,
+        title: "Goal A relative inspect",
+        description: "Verify relative legacy operands from external worktree.",
+        criteria: [{ id: "c1", description: "Relative legacy path works", kind: "behavioral", required: true }],
+      });
+      const goalB = goals.createGoal({
+        chatSessionId: chatB,
+        repoRoot,
+        title: "Goal B other chat",
+        description: "Must be refused via relative legacy path too.",
+        criteria: [{ id: "c1", description: "Isolated", kind: "behavioral", required: true }],
+      });
+
+      const baseSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout;
+      const runA = db.createRun({ goal: goalA.title, repoRoot, baseBranch: "main", baseSha, chatSessionId: chatA });
+      goals.linkRunAndStart(goalA.id, runA.id);
+
+      const worker = db.createTask({
+        runId: runA.id,
+        tier: 2,
+        kind: "worker",
+        title: "Worker A",
+        objective: "Work in external worktree",
+        profileId: "pi:local",
+      });
+      const wt = await wtMgr.createForWorker(runA.id, worker.id);
+      assert.ok(wt.path.startsWith(sp.dataRoot!), "worktree must be outside repoRoot");
+
+      const reader = db.createTask({
+        runId: runA.id,
+        parentId: worker.id,
+        tier: 3,
+        kind: "research",
+        title: "Scout A",
+        objective: "Inspect relative legacy paths",
+        profileId: "pi:local",
+        readOnly: true,
+      });
+      db.updateTask(reader.id, { status: "running", worktreeId: wt.id });
+
+      const goalAEvDir = sp.ensureGoalEvidenceDir({ repoRoot, id: goalA.id, chatSessionId: chatA })!;
+      const goalAFile = join(goalAEvDir, "evidence-a.md");
+      const relGoalA = `.harness/goals/${goalA.id}/evidence-a.md`;
+      writeFileSync(goalAFile, `chat A relative evidence\nref: ${relGoalA}\n`, "utf8");
+
+      const dossierA = writeTaskDossier(db, runA, worker.id, "report-a.md", "chat A relative artifact\n", "Report A", sp);
+      const relDossierA = `.harness/artifacts/${runA.id}/${worker.id}/report-a.md`;
+
+      const goalBEvDir = sp.ensureGoalEvidenceDir({ repoRoot, id: goalB.id, chatSessionId: chatB })!;
+      const goalBFile = join(goalBEvDir, "secret-b.md");
+      writeFileSync(goalBFile, "chat B secret\n", "utf8");
+      const relGoalB = `.harness/goals/${goalB.id}/secret-b.md`;
+
+      // Put a file in the worktree that literally mentions the legacy relative path so rg pattern preservation is testable.
+      writeFileSync(join(wt.path, "src", "note-ref.ts"), `export const doc = "${relGoalA}";\n`, "utf8");
+
+      const exec = makeExecutor(db, wtMgr, config);
+
+      // 1. Relative legacy goal path maps to data-dir from external worktree root and subdirectory cwd.
+      const catRelGoal = (await exec.execute(runA.id, reader.id, "inspect_command", {
+        argv: ["cat", relGoalA],
+      })) as { exit_code: number; stdout: string; argv: string[] };
+      assert.equal(catRelGoal.exit_code, 0);
+      assert.equal(catRelGoal.stdout, `chat A relative evidence\nref: ${relGoalA}\n`);
+      assert.equal(catRelGoal.argv[1], goalAFile);
+
+      const catRelGoalFromSubdir = (await exec.execute(runA.id, reader.id, "inspect_command", {
+        argv: ["cat", `./${relGoalA}`],
+        cwd: "src",
+      })) as { exit_code: number; stdout: string; argv: string[] };
+      assert.equal(catRelGoalFromSubdir.exit_code, 0);
+      assert.equal(catRelGoalFromSubdir.argv[1], goalAFile);
+
+      // 2. Relative legacy artifact path maps to data-dir.
+      const catRelArt = (await exec.execute(runA.id, reader.id, "inspect_command", {
+        argv: ["cat", relDossierA],
+      })) as { exit_code: number; stdout: string; argv: string[] };
+      assert.equal(catRelArt.exit_code, 0);
+      assert.equal(catRelArt.stdout, "chat A relative artifact\n");
+      assert.equal(catRelArt.argv[1], dossierA.path);
+
+      // 3. Relative legacy path for another chat maps and is refused by the same grants.
+      await assert.rejects(
+        () => exec.execute(runA.id, reader.id, "inspect_command", { argv: ["cat", relGoalB] }),
+        (err: Error) => {
+          assert.match(err.message, /read-only-argv/);
+          assert.ok(err.message.includes(DENIED_HARNESS_STATE_REASON), `expected denied-state reason, got: ${err.message}`);
+          return true;
+        },
+      );
+
+      // 4. rg: path operand is mapped, while positional search pattern and -e pattern are never rewritten.
+      const rgPath = (await exec.execute(runA.id, reader.id, "inspect_command", {
+        argv: ["rg", "relative evidence", relGoalA],
+      })) as { exit_code: number; stdout: string; argv: string[] };
+      assert.equal(rgPath.exit_code, 0);
+      assert.equal(rgPath.argv[1], "relative evidence");
+      assert.equal(rgPath.argv[2], goalAFile);
+      assert.ok(rgPath.stdout.includes("chat A relative evidence"));
+
+      const rgPattern = (await exec.execute(runA.id, reader.id, "inspect_command", {
+        argv: ["rg", "-F", relGoalA, "src"],
+      })) as { exit_code: number; stdout: string; argv: string[] };
+      assert.equal(rgPattern.exit_code, 0);
+      assert.equal(rgPattern.argv[2], relGoalA);
+      assert.ok(rgPattern.stdout.includes("note-ref.ts"));
+
+      const rgExplicitPattern = (await exec.execute(runA.id, reader.id, "inspect_command", {
+        argv: ["rg", "-F", "-e", relGoalA, relGoalA],
+      })) as { exit_code: number; stdout: string; argv: string[] };
+      assert.equal(rgExplicitPattern.exit_code, 0);
+      assert.equal(rgExplicitPattern.argv[3], relGoalA);
+      assert.equal(rgExplicitPattern.argv[4], goalAFile);
+      assert.ok(rgExplicitPattern.stdout.includes(`ref: ${relGoalA}`));
+
+      const rgFiles = (await exec.execute(runA.id, reader.id, "inspect_command", {
+        argv: ["rg", "--files", `.harness/goals/${goalA.id}`],
+      })) as { exit_code: number; stdout: string; argv: string[] };
+      assert.equal(rgFiles.exit_code, 0);
+      assert.equal(rgFiles.argv[2], goalAEvDir);
+      assert.ok(rgFiles.stdout.includes("evidence-a.md"));
+    } finally {
+      db.close();
+    }
+  });
+
+  it("data-dir layout: workspace artifact_read fallback refuses state-dir and non-granted data paths nested inside repo while reading ordinary files", async () => {
+    process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
+    resetStoragePathsForTest();
+
+    // Topology 1: repoRoot contains stateDir (home-directory project).
+    const { root, repoRoot } = await initTempGitRepo("pi-tools-fallback-home-");
+    const stateDir = join(repoRoot, ".pi-harness-state");
+    mkdirSync(stateDir, { recursive: true });
+    const configFile = join(stateDir, "config.json");
+    const dbFile = join(stateDir, "control-plane.sqlite");
+    writeFileSync(configFile, '{"secret":true}\n', "utf8");
+    writeFileSync(dbFile, "SQLITE SECRET\n", "utf8");
+    const linkToConfig = join(repoRoot, "src", "link-to-config.json");
+    symlinkSync(configFile, linkToConfig);
+
+    const base = loadConfig(repoRoot);
+    const config: HarnessConfig = {
+      ...base,
+      stateDir,
+      storage: { dataDir: join(stateDir, "data") },
+      codeMode: "off",
+      worktree: {
+        ...base.worktree,
+        extraReadRoots: [],
+        extraWriteRoots: [],
+      },
+    };
+
+    const db = new ControlPlaneDb(":memory:");
+    const sp = storagePaths(config);
+    assert.equal(sp.layout, "data-dir");
+    const wtMgr = new WorktreeManager(db, repoRoot, config.worktree, { stateDir }, sp);
+    try {
+      const goals = new GoalEngine(db.db, undefined, undefined, undefined, undefined, sp);
+      const chatA = "chat-a";
+      const chatB = "chat-b";
+      const goalA = goals.createGoal({
+        chatSessionId: chatA,
+        repoRoot,
+        title: "Home repo goal A",
+        description: "Fallback denial check",
+        criteria: [{ id: "c1", description: "Refuse state/data", kind: "behavioral", required: true }],
+      });
+      const goalB = goals.createGoal({
+        chatSessionId: chatB,
+        repoRoot,
+        title: "Home repo goal B",
+        description: "Other chat",
+        criteria: [{ id: "c1", description: "Secret", kind: "behavioral", required: true }],
+      });
+      const baseSha = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout;
+      const runA = db.createRun({ goal: goalA.title, repoRoot, baseBranch: "main", baseSha, chatSessionId: chatA });
+      goals.linkRunAndStart(goalA.id, runA.id);
+
+      // Task WITHOUT a worktree: artifact_read fallback root is run.repoRoot.
+      const reader = db.createTask({
+        runId: runA.id,
+        tier: 3,
+        kind: "research",
+        title: "No-worktree scout",
+        objective: "Test workspace artifact fallback",
+        profileId: "pi:local",
+        readOnly: true,
+      });
+
+      // Populate non-granted data files inside stateDir/data: other chat, other project, project.json, sibling worktree.
+      const goalBEvDir = sp.ensureGoalEvidenceDir({ repoRoot, id: goalB.id, chatSessionId: chatB })!;
+      const otherChatFile = join(goalBEvDir, "secret-b.md");
+      writeFileSync(otherChatFile, "OTHER CHAT SECRET\n", "utf8");
+
+      const otherRepo = join(root, "other-repo");
+      mkdirSync(otherRepo, { recursive: true });
+      const otherProjNoteDir = sp.projectNotesDir(otherRepo);
+      mkdirSync(otherProjNoteDir, { recursive: true });
+      const otherProjFile = join(otherProjNoteDir, "other-secret.md");
+      writeFileSync(otherProjFile, "OTHER PROJECT SECRET\n", "utf8");
+
+      const projMetaFile = join(sp.projectDir(repoRoot), "project.json");
+      writeFileSync(projMetaFile, '{"repo":"home"}\n', "utf8");
+
+      const siblingWorker = db.createTask({
+        runId: runA.id,
+        tier: 2,
+        kind: "worker",
+        title: "Sibling worker",
+        objective: "Sibling worktree",
+        profileId: "pi:local",
+      });
+      const siblingWt = await wtMgr.createForWorker(runA.id, siblingWorker.id);
+      const siblingWtFile = join(siblingWt.path, "sibling-secret.ts");
+      writeFileSync(siblingWtFile, "export const secret = 1;\n", "utf8");
+
+      const exec = makeExecutor(db, wtMgr, config);
+
+      // Ordinary workspace file still reads cleanly.
+      const okRead = (await exec.execute(runA.id, reader.id, "artifact_read", {
+        path: "src/app.ts",
+      })) as { content: string };
+      assert.equal(okRead.content, "export const answer = 42;\n");
+
+      // State-dir internals, symlink into state-dir, other project, other chat, project.json, and sibling worktree are all refused.
+      const relFromRepo = (abs: string) => {
+        assert.ok(abs.startsWith(`${repoRoot}/`), `expected fixture path inside repoRoot: ${abs}`);
+        return abs.slice(repoRoot.length + 1);
+      };
+      for (const forbidden of [
+        relFromRepo(configFile),
+        relFromRepo(dbFile),
+        "src/link-to-config.json",
+        relFromRepo(otherChatFile),
+        relFromRepo(otherProjFile),
+        relFromRepo(projMetaFile),
+        relFromRepo(siblingWtFile),
+      ]) {
+        await assert.rejects(
+          () => exec.execute(runA.id, reader.id, "artifact_read", { path: forbidden }),
+          /artifact-outside-workspace/,
+          `expected refusal for ${forbidden}`,
+        );
+      }
+    } finally {
+      db.close();
+    }
+
+    // Topology 2: custom storage.dataDir inside repoRoot (separate from stateDir).
+    resetStoragePathsForTest();
+    const { root: root2, repoRoot: repo2 } = await initTempGitRepo("pi-tools-fallback-custom-data-");
+    const stateDir2 = join(root2, "external-state");
+    const customDataDir = join(repo2, "custom-harness-data");
+    mkdirSync(stateDir2, { recursive: true });
+    mkdirSync(customDataDir, { recursive: true });
+
+    const base2 = loadConfig(repo2);
+    const config2: HarnessConfig = {
+      ...base2,
+      stateDir: stateDir2,
+      storage: { dataDir: customDataDir },
+      codeMode: "off",
+      worktree: { ...base2.worktree, extraReadRoots: [], extraWriteRoots: [] },
+    };
+    const db2 = new ControlPlaneDb(":memory:");
+    const sp2 = storagePaths(config2);
+    const wtMgr2 = new WorktreeManager(db2, repo2, config2.worktree, { stateDir: stateDir2 }, sp2);
+    try {
+      const baseSha2 = (await runGit(repo2, ["rev-parse", "HEAD"])).stdout;
+      const run2 = db2.createRun({ goal: "Custom dataDir run", repoRoot: repo2, baseBranch: "main", baseSha: baseSha2, chatSessionId: "chat-1" });
+      const reader2 = db2.createTask({
+        runId: run2.id,
+        tier: 3,
+        kind: "research",
+        title: "No-worktree scout 2",
+        objective: "Check custom dataDir denial",
+        profileId: "pi:local",
+        readOnly: true,
+      });
+
+      const otherRepo2 = join(root2, "other-repo-2");
+      mkdirSync(otherRepo2, { recursive: true });
+      const otherProjDir2 = sp2.projectNotesDir(otherRepo2);
+      mkdirSync(otherProjDir2, { recursive: true });
+      const otherProjFile2 = join(otherProjDir2, "secret.md");
+      writeFileSync(otherProjFile2, "OTHER PROJECT CUSTOM DATA SECRET\n", "utf8");
+
+      const otherChatNotes2 = sp2.notesDir({ repoRoot: repo2, chatSessionId: "chat-other" });
+      mkdirSync(otherChatNotes2, { recursive: true });
+      const otherChatFile2 = join(otherChatNotes2, "secret.md");
+      writeFileSync(otherChatFile2, "OTHER CHAT CUSTOM DATA SECRET\n", "utf8");
+
+      const exec2 = makeExecutor(db2, wtMgr2, config2);
+      const ok2 = (await exec2.execute(run2.id, reader2.id, "artifact_read", { path: "src/app.ts" })) as { content: string };
+      assert.equal(ok2.content, "export const answer = 42;\n");
+
+      assert.ok(otherProjFile2.startsWith(`${repo2}/`));
+      assert.ok(otherChatFile2.startsWith(`${repo2}/`));
+      for (const forbidden of [
+        otherProjFile2.slice(repo2.length + 1),
+        otherChatFile2.slice(repo2.length + 1),
+      ]) {
+        await assert.rejects(
+          () => exec2.execute(run2.id, reader2.id, "artifact_read", { path: forbidden }),
+          /artifact-outside-workspace/,
+          `expected refusal for custom dataDir path ${forbidden}`,
+        );
+      }
+    } finally {
+      db2.close();
+    }
+  });
 });
