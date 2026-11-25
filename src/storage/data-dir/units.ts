@@ -1,8 +1,8 @@
 import { lstatSync, readdirSync, readlinkSync } from "node:fs";
-import { dirname, join, posix, resolve } from "node:path";
+import { dirname, join, posix, relative, resolve, sep } from "node:path";
 import { isDirectorTaskContainer } from "../../control-plane/ids.js";
 import type { OwnerRef, StoragePaths } from "../paths.js";
-import { canonicalPath, isRealDirUnderRoot, isRealFileUnderRoot } from "./fs-utils.js";
+import { canonicalPath, isRealDirUnderRoot, isRealFileUnderRoot, isSafeSegment, isWithin } from "./fs-utils.js";
 
 export type StorageUnitKind = "goal" | "run" | "bucket_task" | "note" | "flat_artifact";
 
@@ -124,8 +124,10 @@ export function resolveUnitFile(
   storage: StoragePaths,
   unit: StorageUnitRef,
   relPath = "",
+  opts?: { includeDataDir?: boolean },
 ): ResolvedUnitFile | null {
   const canonRepo = canonicalPath(unit.repoRoot);
+  const searchDataDir = Boolean(storage.dataRoot) && (storage.layout === "data-dir" || opts?.includeDataDir === true);
 
   // Single-file units: note and flat_artifact
   if (unit.kind === "note") {
@@ -138,7 +140,7 @@ export function resolveUnitFile(
         unitDir: join(canonRepo, HARNESS_DIR, "notes"),
       };
     }
-    if (storage.layout === "data-dir" && storage.dataRoot) {
+    if (searchDataDir && storage.dataRoot) {
       const key = storage.projectKey(canonRepo);
       if (isRealFileUnderRoot(storage.dataRoot, ["projects", key, "notes", ...parts])) {
         return {
@@ -161,9 +163,9 @@ export function resolveUnitFile(
         unitDir: join(canonRepo, HARNESS_DIR, "artifacts"),
       };
     }
-    if (storage.layout === "data-dir" && storage.dataRoot) {
+    if (searchDataDir && storage.dataRoot) {
       const key = storage.projectKey(canonRepo);
-      const projDir = storage.projectDir(canonRepo);
+      const projDir = join(storage.dataRoot, "projects", key);
       const ownerChat = storage.chatSegment(unit.chatSessionId);
       for (const chat of orderedProjectChatNames(projDir, ownerChat)) {
         if (isRealFileUnderRoot(storage.dataRoot, ["projects", key, "chats", chat, "artifacts", fileName])) {
@@ -205,9 +207,9 @@ export function resolveUnitFile(
   }
 
   // 2. Data-dir unit directory copies (owner chat, then chats/legacy, then other chats).
-  if (storage.layout === "data-dir" && storage.dataRoot) {
+  if (searchDataDir && storage.dataRoot) {
     const key = storage.projectKey(canonRepo);
-    const projDir = storage.projectDir(canonRepo);
+    const projDir = join(storage.dataRoot, "projects", key);
     const ownerChat = storage.chatSegment(unit.chatSessionId);
     for (const chat of orderedProjectChatNames(projDir, ownerChat)) {
       if (isRealDirUnderRoot(storage.dataRoot, ["projects", key, "chats", chat, ...unitSubSegments])) {
@@ -347,6 +349,123 @@ function readBridgeTarget(absPath: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Validates that the legacy unit path on disk is a migration bridge symlink pointing to that exact unit's
+ * location under this project's data dir (`<dataRoot>/projects/<key>/...`), with no symlinks on parent
+ * container directories below `<repoRoot>` or anywhere below `dataRoot`. Returns the canonical target path,
+ * or null when absent, not a symlink, or pointing anywhere else.
+ */
+export function resolveUnitBridgeTarget(storage: StoragePaths, unit: StorageUnitRef): string | null {
+  if (!storage.dataRoot) return null;
+  const canonRepo = canonicalPath(unit.repoRoot);
+  const key = storage.projectKey(canonRepo);
+  const dataProjDir = join(storage.dataRoot, "projects", key);
+
+  let legacyParentSegs: string[];
+  let legacyLeafSeg: string;
+  let expectFile: boolean;
+  let matchesRel: (rel: string[]) => boolean;
+
+  switch (unit.kind) {
+    case "goal":
+      if (!isLiteralPosixSegment(unit.id)) return null;
+      legacyParentSegs = [HARNESS_DIR, "goals"];
+      legacyLeafSeg = unit.id;
+      expectFile = false;
+      matchesRel = (rel) =>
+        rel.length === 4 && rel[0] === "chats" && isSafeSegment(rel[1]!) && rel[2] === "goals" && rel[3] === unit.id;
+      break;
+    case "run":
+      if (!isLiteralPosixSegment(unit.id) || isDirectorTaskContainer(unit.id)) return null;
+      legacyParentSegs = [HARNESS_DIR, "artifacts"];
+      legacyLeafSeg = unit.id;
+      expectFile = false;
+      matchesRel = (rel) =>
+        rel.length === 4 && rel[0] === "chats" && isSafeSegment(rel[1]!) && rel[2] === "artifacts" && rel[3] === unit.id;
+      break;
+    case "bucket_task":
+      if (
+        !isLiteralPosixSegment(unit.id) ||
+        !isDirectorTaskContainer(unit.id) ||
+        !unit.taskId ||
+        !isLiteralPosixSegment(unit.taskId)
+      ) {
+        return null;
+      }
+      legacyParentSegs = [HARNESS_DIR, "artifacts", unit.id];
+      legacyLeafSeg = unit.taskId;
+      expectFile = false;
+      matchesRel = (rel) =>
+        rel.length === 5 &&
+        rel[0] === "chats" &&
+        isSafeSegment(rel[1]!) &&
+        rel[2] === "artifacts" &&
+        rel[3] === unit.id &&
+        rel[4] === unit.taskId;
+      break;
+    case "flat_artifact":
+      if (!isLiteralPosixSegment(unit.id)) return null;
+      legacyParentSegs = [HARNESS_DIR, "artifacts"];
+      legacyLeafSeg = unit.id;
+      expectFile = true;
+      matchesRel = (rel) =>
+        rel.length === 4 && rel[0] === "chats" && isSafeSegment(rel[1]!) && rel[2] === "artifacts" && rel[3] === unit.id;
+      break;
+    case "note": {
+      const noteParts = splitSafeRel(unit.id);
+      if (!noteParts) return null;
+      legacyParentSegs = [HARNESS_DIR, "notes", ...noteParts.slice(0, -1)];
+      legacyLeafSeg = noteParts[noteParts.length - 1]!;
+      expectFile = true;
+      matchesRel = (rel) =>
+        rel.length === 1 + noteParts.length &&
+        rel[0] === "notes" &&
+        noteParts.every((part, idx) => rel[idx + 1] === part);
+      break;
+    }
+  }
+
+  if (!isRealDirUnderRoot(canonRepo, legacyParentSegs)) return null;
+  const legacyPath = join(canonRepo, ...legacyParentSegs, legacyLeafSeg);
+  let st;
+  try {
+    st = lstatSync(legacyPath);
+  } catch {
+    return null;
+  }
+  if (!st.isSymbolicLink()) return null;
+
+  const rawTarget = readBridgeTarget(legacyPath);
+  if (!rawTarget) return null;
+  const resolved = resolve(dirname(legacyPath), rawTarget);
+
+  let relFromProj: string | null = null;
+  if (isWithin(dataProjDir, resolved)) {
+    relFromProj = relative(dataProjDir, resolved);
+  } else {
+    const marker = `${sep}projects${sep}${key}${sep}`;
+    for (let idx = resolved.indexOf(marker); idx !== -1; idx = resolved.indexOf(marker, idx + 1)) {
+      const prefix = resolved.slice(0, idx) || sep;
+      if (canonicalPath(prefix) === storage.dataRoot) {
+        relFromProj = resolved.slice(idx + marker.length);
+        break;
+      }
+    }
+  }
+  if (!relFromProj || relFromProj.includes("\0")) return null;
+  const relParts = relFromProj.split(sep);
+  if (relParts.some((p) => !p || p === "." || p === "..")) return null;
+  if (!matchesRel(relParts)) return null;
+
+  const targetSegs = ["projects", key, ...relParts];
+  const existsAsExpected = expectFile
+    ? isRealFileUnderRoot(storage.dataRoot, targetSegs)
+    : isRealDirUnderRoot(storage.dataRoot, targetSegs);
+  if (!existsAsExpected) return null;
+
+  return join(storage.dataRoot, ...targetSegs);
 }
 
 /**

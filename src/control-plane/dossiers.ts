@@ -6,7 +6,7 @@ import { SUMMARY_LIMIT } from "./handoffs.js";
 import { scanMaxFileIndex, writeUniqueFile } from "./ids.js";
 import { REJECTIONS } from "../advisories/rejections.js";
 import { mostSpecificRootDecision } from "../runners/acp-shims.js";
-import { hashFileSha256, legacyStoragePaths, type StoragePaths } from "../storage/paths.js";
+import { type DataDirArtifactInfo, hashFileSha256, legacyStoragePaths, type StoragePaths } from "../storage/paths.js";
 
 /**
  * @deprecated Use `StoragePaths.ensureDossierDir` instead.
@@ -158,6 +158,16 @@ export function writeCodeOutput(
   }
 }
 
+/**
+ * True when a parsed data-dir artifact path under `<dataRoot>/projects/<key>/chats/<chat>/artifacts/` belongs
+ * to `run.id` (`artifacts/<runId>/...`) or is a flat spill directly under `artifacts/<file>`.
+ */
+function isAllowedLegacyDataDirArtifact(run: RunRecord, info: DataDirArtifactInfo): boolean {
+  const subParts = info.subPath.split(sep);
+  if (subParts.length === 1) return Boolean(subParts[0]);
+  return Boolean(run.id) && subParts[0] === run.id;
+}
+
 /** Maps any alias (relative, raw-root absolute, canonical-root absolute, or data-dir absolute) of a dossier path to its index row. */
 export function findRunDossier(
   db: ControlPlaneDb,
@@ -178,28 +188,47 @@ export function findRunDossier(
   const mapped = storage.layout === "data-dir" ? storage.resolveLegacyPath(run.repoRoot, requested, run) : null;
   const abs = resolve(rawRoot, requested);
   const directLegacyRel = storage.artifactRel(run, abs);
+  const directDataInfo = storage.dataDirArtifactInfo(run, abs);
+  const allowedLegacyDataInfo =
+    storage.layout === "legacy" && directDataInfo && isAllowedLegacyDataDirArtifact(run, directDataInfo)
+      ? directDataInfo
+      : null;
+  const legacyBridgeTarget =
+    storage.layout === "legacy" && directLegacyRel !== null
+      ? (() => {
+          const sub = storage.artifactSubPath(run, abs);
+          return sub ? storage.resolveLegacyArtifactBridge(run, sub) : null;
+        })()
+      : null;
   const artSub =
-    (mapped ? storage.artifactSubPath(run, mapped) : null) ??
-    storage.artifactSubPath(run, abs);
+    storage.layout === "data-dir"
+      ? (mapped ? storage.artifactSubPath(run, mapped) : null) ?? storage.artifactSubPath(run, abs)
+      : allowedLegacyDataInfo?.subPath ??
+        (legacyBridgeTarget ? storage.artifactSubPath(run, legacyBridgeTarget) : null) ??
+        (directLegacyRel !== null ? storage.artifactSubPath(run, abs) : null);
   const rel = directLegacyRel ?? (artSub ? storage.legacyArtifactRel(artSub) : null);
 
   const candidates: string[] = [];
   if (mapped) candidates.push(mapped);
+  if (legacyBridgeTarget) candidates.push(legacyBridgeTarget);
+  if (allowedLegacyDataInfo) candidates.push(allowedLegacyDataInfo.canonicalPath);
   candidates.push(abs);
 
   if (artSub && storage.layout === "data-dir") {
     const unionHit = storage.resolveArtifactFile(run, artSub);
     if (unionHit) candidates.push(unionHit.path);
   }
-  if (rel !== null) {
+  const allowLegacyRelCandidates = storage.layout === "data-dir" || directLegacyRel !== null;
+  if (rel !== null && allowLegacyRelCandidates) {
     candidates.push(join(rawRoot, rel));
     if (realRoot !== null) {
       candidates.push(join(realRoot, rel));
     }
   }
+  const legacyExpectedDataPath = legacyBridgeTarget ?? allowedLegacyDataInfo?.canonicalPath ?? null;
   if (typeof db.listDistinctDossierPaths === "function" && (rel !== null || artSub !== null)) {
     // Other runs or pre-migration rows may have recorded this file under another root spelling or chat path.
-    const suffix = rel !== null ? sep + rel : null;
+    const suffix = rel !== null && allowLegacyRelCandidates ? sep + rel : null;
     for (const path of db.listDistinctDossierPaths()) {
       if (suffix && realRoot !== null && path.endsWith(suffix)) {
         const prefix = path.slice(0, path.length - suffix.length) || sep;
@@ -215,6 +244,11 @@ export function findRunDossier(
       if (storage.layout === "data-dir" && artSub !== null) {
         const info = storage.dataDirArtifactInfo(run, path);
         if (info && info.subPath === artSub) {
+          candidates.push(path);
+        }
+      } else if (storage.layout === "legacy" && legacyExpectedDataPath !== null) {
+        const info = storage.dataDirArtifactInfo(run, path);
+        if (info && isAllowedLegacyDataDirArtifact(run, info) && info.canonicalPath === legacyExpectedDataPath) {
           candidates.push(path);
         }
       }
@@ -287,6 +321,14 @@ function resolveVerifiedDossierTarget(
 ): { expected: string; shown: string; realRoot: string } | null {
   const realRoot = realpathSync(run.repoRoot);
   if (storage.layout === "legacy") {
+    const dataInfo = storage.dataDirArtifactInfo(run, found.recordedPath);
+    if (dataInfo && isAllowedLegacyDataDirArtifact(run, dataInfo)) {
+      return {
+        expected: dataInfo.canonicalPath,
+        shown: dataInfo.canonicalPath,
+        realRoot,
+      };
+    }
     if (found.rel === null) return null;
     return {
       expected: join(realRoot, found.rel),
@@ -359,7 +401,7 @@ function hasAmbiguousDossierOwnership(
           // Unresolvable prefix; still fall through to inode check below.
         }
       }
-      if (storage.layout === "data-dir" && found.artSub) {
+      if (found.artSub) {
         const info = storage.dataDirArtifactInfo(run, p);
         if (info && info.subPath === found.artSub) {
           ownerPaths.add(p);

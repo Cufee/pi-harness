@@ -25,6 +25,7 @@ import {
   listUnitFiles,
   orderedProjectChatNames,
   type ResolvedUnitFile,
+  resolveUnitBridgeTarget,
   resolveUnitFile,
   type StorageUnitKind,
   type StorageUnitRef,
@@ -40,6 +41,7 @@ export {
   listLegacyUnknownEntries,
   listUnitFiles,
   type ResolvedUnitFile,
+  resolveUnitBridgeTarget,
   resolveUnitFile,
   type StorageUnitKind,
   type StorageUnitRef,
@@ -648,7 +650,7 @@ export class StoragePaths {
    * Nothing below `dataRoot` is followed as a symlink; returns null when outside the project's data-dir artifacts.
    */
   dataDirArtifactInfo(run: RunRef, absPath: string): DataDirArtifactInfo | null {
-    if (this.layout !== "data-dir" || !this.pinnedDataRoot) return null;
+    if (!this.pinnedDataRoot) return null;
     if (!isAbsolute(absPath) || absPath.includes("\0")) return null;
     const key = this.projectKey(run.repoRoot);
     const projDir = join(this.pinnedDataRoot, "projects", key);
@@ -681,6 +683,47 @@ export class StoragePaths {
       subPath,
       canonicalPath: join(projDir, "chats", chatSegment, "artifacts", ...subParts),
     };
+  }
+
+  /**
+   * Resolves a legacy artifact subpath (`<subPath>` below `.harness/artifacts/`) through a valid unit-level
+   * migration bridge symlink to the exact file path under `<dataRoot>/projects/<key>/chats/<chat>/artifacts/...`.
+   * Returns null unless the legacy unit path on disk is a valid bridge pointing to that unit's data-dir location
+   * (never follows arbitrary symlinks).
+   */
+  resolveLegacyArtifactBridge(run: RunRef, artifactSubPath: string): string | null {
+    if (!this.pinnedDataRoot || !artifactSubPath || artifactSubPath.includes("\0")) return null;
+    const parts = artifactSubPath.split(sep);
+    if (parts.length === 0 || parts.some((s) => !s || s === "." || s === "..")) return null;
+
+    if (parts.length === 1) {
+      return resolveUnitBridgeTarget(this, {
+        kind: "flat_artifact",
+        repoRoot: run.repoRoot,
+        id: parts[0]!,
+      });
+    }
+
+    const first = parts[0]!;
+    if (run.id && first !== run.id) return null;
+
+    if (isDirectorTaskContainer(first)) {
+      if (parts.length < 3) return null;
+      const unitTarget = resolveUnitBridgeTarget(this, {
+        kind: "bucket_task",
+        repoRoot: run.repoRoot,
+        id: first,
+        taskId: parts[1]!,
+      });
+      return unitTarget ? join(unitTarget, ...parts.slice(2)) : null;
+    }
+
+    const unitTarget = resolveUnitBridgeTarget(this, {
+      kind: "run",
+      repoRoot: run.repoRoot,
+      id: first,
+    });
+    return unitTarget ? join(unitTarget, ...parts.slice(1)) : null;
   }
 
   /**
@@ -1028,6 +1071,12 @@ export class StoragePaths {
     };
   }
 
+  /** True when the pinned data root already contains a real project directory for `repoRoot`. */
+  private hasProjectDataDir(repoRoot: string): boolean {
+    if (!this.pinnedDataRoot) return false;
+    return isRealDirUnderRoot(this.pinnedDataRoot, ["projects", this.projectKey(repoRoot)]);
+  }
+
   /** Evaluates whether the Director may read `absPath` relative to `repoRoot`. */
   directorReadPolicy(repoRoot: string, absPath: string): DirectorReadDecision {
     const root = canonicalPath(repoRoot);
@@ -1037,37 +1086,41 @@ export class StoragePaths {
       return { ok: false, reason: "task worktrees are protected" };
     }
 
-    if (this.layout === "data-dir") {
+    if (this.layout === "data-dir" || this.hasProjectDataDir(root)) {
       if (hasGitSegment(target)) {
         return { ok: false, reason: ".git internals are protected" };
       }
-      const dataCanon = this.requireDataRoot();
-      if (target === dataCanon) {
-        return { ok: false, reason: "harness data-dir root and metadata are protected" };
-      }
-      if (isWithin(dataCanon, target)) {
-        const parts = relative(dataCanon, target).split(sep);
-        if (hasWorktreeSegmentPair(parts.map((p) => p.toLowerCase()))) {
-          return { ok: false, reason: "task worktrees are protected" };
+      if (this.pinnedDataRoot) {
+        if (target === this.pinnedDataRoot) {
+          return { ok: false, reason: "harness data-dir root and metadata are protected" };
         }
-        // Addendum A6: allow projects/<any>/notes and projects/<any>/chats/<any>/{goals,artifacts,notes}.
-        if (parts[0] === "projects" && parts.length >= 3 && Boolean(parts[1]) && parts[2] === "notes") {
-          return { ok: true };
+        if (isWithin(this.pinnedDataRoot, target)) {
+          const parts = relative(this.pinnedDataRoot, target).split(sep);
+          if (hasWorktreeSegmentPair(parts.map((p) => p.toLowerCase()))) {
+            return { ok: false, reason: "task worktrees are protected" };
+          }
+          // Addendum A6: in data-dir layout allow projects/<any>/notes and projects/<any>/chats/<any>/{goals,artifacts,notes}.
+          // In legacy layout allow only this project's migrated A6 reach (projects/<key>/notes and projects/<key>/chats/*/{goals,artifacts,notes}).
+          const projectAllowed =
+            this.layout === "data-dir" ? Boolean(parts[1]) : parts[1] === this.projectKey(root);
+          if (parts[0] === "projects" && parts.length >= 3 && projectAllowed && parts[2] === "notes") {
+            return { ok: true };
+          }
+          if (
+            parts[0] === "projects" &&
+            parts.length >= 5 &&
+            projectAllowed &&
+            parts[2] === "chats" &&
+            Boolean(parts[3]) &&
+            LEGACY_DATA_SUBDIRS.has(parts[4]!)
+          ) {
+            return { ok: true };
+          }
+          if (parts[0] === "projects" && (parts[2] === "scratch" || (parts[2] === "chats" && parts[4] === "worktrees"))) {
+            return { ok: false, reason: "task worktrees and scratch checkouts are protected" };
+          }
+          return { ok: false, reason: "harness data-dir internals and metadata are protected" };
         }
-        if (
-          parts[0] === "projects" &&
-          parts.length >= 5 &&
-          Boolean(parts[1]) &&
-          parts[2] === "chats" &&
-          Boolean(parts[3]) &&
-          LEGACY_DATA_SUBDIRS.has(parts[4]!)
-        ) {
-          return { ok: true };
-        }
-        if (parts[0] === "projects" && (parts[2] === "scratch" || (parts[2] === "chats" && parts[4] === "worktrees"))) {
-          return { ok: false, reason: "task worktrees and scratch checkouts are protected" };
-        }
-        return { ok: false, reason: "harness data-dir internals and metadata are protected" };
       }
       if (this.stateDirCanon && (target === this.stateDirCanon || isWithin(this.stateDirCanon, target))) {
         return { ok: false, reason: "harness state-dir internals are protected" };
@@ -1337,10 +1390,12 @@ export class StoragePaths {
     kind: string,
     rest: readonly string[],
     chatSessionId?: string | null,
+    includeDataDir = false,
   ): string | null {
+    const unitOpts = includeDataDir ? { includeDataDir: true } : undefined;
     if (kind === "notes") {
       if (rest.length === 0) return null;
-      return resolveUnitFile(this, { kind: "note", repoRoot: realRoot, id: rest.join("/") })?.path ?? null;
+      return resolveUnitFile(this, { kind: "note", repoRoot: realRoot, id: rest.join("/") }, "", unitOpts)?.path ?? null;
     }
     if (kind === "goals") {
       if (rest.length < 2) return null;
@@ -1349,6 +1404,7 @@ export class StoragePaths {
           this,
           { kind: "goal", repoRoot: realRoot, id: rest[0]!, chatSessionId },
           rest.slice(1).join("/"),
+          unitOpts,
         )?.path ?? null
       );
     }
@@ -1356,12 +1412,17 @@ export class StoragePaths {
       if (rest.length === 0) return null;
       if (rest.length === 1) {
         return (
-          resolveUnitFile(this, {
-            kind: "flat_artifact",
-            repoRoot: realRoot,
-            id: rest[0]!,
-            chatSessionId,
-          })?.path ?? null
+          resolveUnitFile(
+            this,
+            {
+              kind: "flat_artifact",
+              repoRoot: realRoot,
+              id: rest[0]!,
+              chatSessionId,
+            },
+            "",
+            unitOpts,
+          )?.path ?? null
         );
       }
       const runId = rest[0]!;
@@ -1373,6 +1434,7 @@ export class StoragePaths {
             this,
             { kind: "bucket_task", repoRoot: realRoot, id: runId, taskId: sub[0]!, chatSessionId },
             sub.slice(1).join("/"),
+            unitOpts,
           )?.path ?? null
         );
       }
@@ -1381,6 +1443,7 @@ export class StoragePaths {
           this,
           { kind: "run", repoRoot: realRoot, id: runId, chatSessionId },
           sub.join("/"),
+          unitOpts,
         )?.path ?? null
       );
     }
@@ -1388,9 +1451,109 @@ export class StoragePaths {
   }
 
   /**
+   * True when a legacy `.harness/{goals,notes,artifacts}/...` path traverses a symlink that is NOT a valid
+   * migration bridge for that unit (e.g., a symlinked container directory or a unit symlink pointing outside
+   * this project's data-dir unit destination).
+   */
+  private hasForeignLegacyUnitSymlink(realRoot: string, kind: string, rest: readonly string[]): boolean {
+    const isSymlink = (segs: readonly string[]): boolean => {
+      try {
+        return lstatSync(join(realRoot, ...segs)).isSymbolicLink();
+      } catch {
+        return false;
+      }
+    };
+    const anyPrefixSymlink = (segs: readonly string[]): boolean => {
+      for (let i = 1; i <= segs.length; i++) {
+        if (isSymlink(segs.slice(0, i))) return true;
+      }
+      return false;
+    };
+
+    if (anyPrefixSymlink([HARNESS_DIR, kind])) return true;
+    if (rest.length === 0) return false;
+
+    if (kind === "notes") {
+      const parentSegs = [HARNESS_DIR, "notes", ...rest.slice(0, -1)];
+      if (anyPrefixSymlink(parentSegs)) return true;
+      const leafSegs = [HARNESS_DIR, "notes", ...rest];
+      if (isSymlink(leafSegs)) {
+        return resolveUnitBridgeTarget(this, { kind: "note", repoRoot: realRoot, id: rest.join("/") }) === null;
+      }
+      return false;
+    }
+
+    if (kind === "goals") {
+      const unitSegs = [HARNESS_DIR, "goals", rest[0]!];
+      if (isSymlink(unitSegs)) {
+        return resolveUnitBridgeTarget(this, { kind: "goal", repoRoot: realRoot, id: rest[0]! }) === null;
+      }
+      return anyPrefixSymlink([HARNESS_DIR, "goals", ...rest]);
+    }
+
+    if (kind === "artifacts") {
+      if (rest.length === 1) {
+        const entry = rest[0]!;
+        const unitSegs = [HARNESS_DIR, "artifacts", entry];
+        if (isSymlink(unitSegs)) {
+          const validFlat = resolveUnitBridgeTarget(this, { kind: "flat_artifact", repoRoot: realRoot, id: entry }) !== null;
+          const validRun =
+            !isDirectorTaskContainer(entry) &&
+            resolveUnitBridgeTarget(this, { kind: "run", repoRoot: realRoot, id: entry }) !== null;
+          return !validFlat && !validRun;
+        }
+        return false;
+      }
+      const runId = rest[0]!;
+      if (isDirectorTaskContainer(runId)) {
+        if (isSymlink([HARNESS_DIR, "artifacts", runId])) return true;
+        const taskId = rest[1]!;
+        const unitSegs = [HARNESS_DIR, "artifacts", runId, taskId];
+        if (isSymlink(unitSegs)) {
+          return (
+            resolveUnitBridgeTarget(this, { kind: "bucket_task", repoRoot: realRoot, id: runId, taskId }) === null
+          );
+        }
+        return anyPrefixSymlink([HARNESS_DIR, "artifacts", ...rest]);
+      }
+      const unitSegs = [HARNESS_DIR, "artifacts", runId];
+      if (isSymlink(unitSegs)) {
+        return resolveUnitBridgeTarget(this, { kind: "run", repoRoot: realRoot, id: runId }) === null;
+      }
+      return anyPrefixSymlink([HARNESS_DIR, "artifacts", ...rest]);
+    }
+
+    return false;
+  }
+
+  /**
+   * In legacy layout, resolves a migrated directory path below `.harness/{goals,artifacts,notes}/<...>` to its
+   * existing data-dir directory when no real legacy directory exists there.
+   */
+  private resolveLegacyMigratedDir(
+    realRoot: string,
+    kind: string,
+    rest: readonly string[],
+    chatSessionId?: string | null,
+  ): string | null {
+    if (!this.pinnedDataRoot || rest.length === 0) return null;
+    if (isRealDirUnderRoot(realRoot, [HARNESS_DIR, kind, ...rest])) return null;
+    if (kind === "notes") {
+      const key = this.projectKey(realRoot);
+      const segs = ["projects", key, "notes", ...rest];
+      return isRealDirUnderRoot(this.pinnedDataRoot, segs) ? join(this.pinnedDataRoot, ...segs) : null;
+    }
+    if (kind === "goals" || kind === "artifacts") {
+      const ownerChat = normalizeChatSegment(chatSessionId);
+      return this.findExistingChatDir(realRoot, ownerChat, [kind, ...rest])?.path ?? null;
+    }
+    return null;
+  }
+
+  /**
    * Maps a workspace-relative `.harness/{goals,notes,artifacts}/...` path, an absolute `<repo>/.harness/...` path,
-   * or (in `data-dir` layout) an already-current data-dir path inside this project's allowed data dirs to its current
-   * absolute location, or returns `null` if `rawPath` is not a data path for `repoRoot`.
+   * or an already-current data-dir path inside this project's allowed data dirs to its current absolute location,
+   * or returns `null` if `rawPath` is not a data path for `repoRoot`.
    */
   resolveLegacyPath(repoRoot: string, rawPath: string, owner?: OwnerRef): string | null {
     if (!rawPath || rawPath.trim().length === 0 || rawPath.includes("\0") || rawPath === "~" || rawPath.startsWith("~/")) {
@@ -1399,9 +1562,10 @@ export class StoragePaths {
     const rawRoot = resolve(repoRoot);
     const realRoot = canonicalPath(repoRoot);
 
-    // In data-dir layout, accept paths that are already inside this project's allowed data directories,
-    // still applying the both-exist union rule for existing files (B8: legacy file wins over data-dir copy).
-    if (this.layout === "data-dir" && isAbsolute(rawPath) && this.pinnedDataRoot) {
+    // Accept paths that are already inside this project's allowed data directories, still applying the
+    // both-exist union rule for existing files (B8: legacy file wins over data-dir copy). In legacy layout,
+    // only existing migrated files/dirs under this project's A6 reach match so writes and pre-migration paths stay unchanged.
+    if (isAbsolute(rawPath) && this.pinnedDataRoot && (this.layout === "data-dir" || this.hasProjectDataDir(realRoot))) {
       const abs = resolve(rawPath);
       const key = this.projectKey(realRoot);
       const projDir = join(this.pinnedDataRoot, "projects", key);
@@ -1422,17 +1586,39 @@ export class StoragePaths {
         const parts = relFromProj.split(sep);
         if (parts.some((p) => !p || p === "." || p === "..")) return null;
         if (parts[0] === "notes") {
-          const unionHit = this.resolveUnionFileForDataSubpath(realRoot, "notes", parts.slice(1), owner?.chatSessionId);
-          return unionHit ?? join(projDir, ...parts);
+          const unionHit = this.resolveUnionFileForDataSubpath(
+            realRoot,
+            "notes",
+            parts.slice(1),
+            owner?.chatSessionId,
+            this.layout === "legacy",
+          );
+          if (unionHit) return unionHit;
+          if (this.layout === "data-dir") return join(projDir, ...parts);
+          return isRealDirUnderRoot(this.pinnedDataRoot, ["projects", key, ...parts]) ? join(projDir, ...parts) : null;
         }
         if (parts[0] === "chats" && parts.length >= 3 && Boolean(parts[1]) && LEGACY_DATA_SUBDIRS.has(parts[2]!)) {
           const chat = parts[1]!;
           const kind = parts[2]!;
           if (kind === "goals" || kind === "artifacts") {
-            const unionHit = this.resolveUnionFileForDataSubpath(realRoot, kind, parts.slice(3), chat);
+            const unionHit = this.resolveUnionFileForDataSubpath(
+              realRoot,
+              kind,
+              parts.slice(3),
+              chat,
+              this.layout === "legacy",
+            );
             if (unionHit) return unionHit;
           }
-          return join(projDir, ...parts);
+          if (this.layout === "data-dir") return join(projDir, ...parts);
+          const dataSegs = ["projects", key, ...parts];
+          if (
+            (kind === "notes" && isRealFileUnderRoot(this.pinnedDataRoot, dataSegs)) ||
+            isRealDirUnderRoot(this.pinnedDataRoot, dataSegs)
+          ) {
+            return join(projDir, ...parts);
+          }
+          return null;
         }
         return null;
       }
@@ -1472,6 +1658,16 @@ export class StoragePaths {
 
     if (!legacyParts) return null;
     if (this.layout === "legacy") {
+      if (this.hasProjectDataDir(realRoot)) {
+        const kind = legacyParts[1]!;
+        const rest = legacyParts.slice(2);
+        if (!this.hasForeignLegacyUnitSymlink(realRoot, kind, rest)) {
+          const unionHit = this.resolveUnionFileForDataSubpath(realRoot, kind, rest, owner?.chatSessionId, true);
+          if (unionHit) return unionHit;
+          const dirHit = this.resolveLegacyMigratedDir(realRoot, kind, rest, owner?.chatSessionId);
+          if (dirHit) return dirHit;
+        }
+      }
       return join(realRoot, ...legacyParts);
     }
 
