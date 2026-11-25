@@ -37,7 +37,6 @@ import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { recordCostInvocation, summarizeCost } from "../cost/ledger.js";
 import { timerMatchesGoalSettlement, type TimerFireMeta, type TimerRecord } from "../control-plane/timers.js";
 import {
-  ensureGoalEvidenceDir,
   GoalEngine,
   parseGoalCriterionPatches,
   shouldRunIndependentReview,
@@ -76,11 +75,25 @@ import {
 import type { QuotaClient } from "../quota/client.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
-import { isProtectedWritePath } from "../runners/protected-paths.js";
 import type { RunnerCallbacks, RunnerExecutionHandle, ToolDefinition } from "../runners/types.js";
+import {
+  describeMergedRefFallback,
+  describeMissingMergedRef,
+  mergedRefCandidates,
+  type RunNameRef,
+} from "../storage/names.js";
+import {
+  legacyStoragePaths,
+  storagePaths,
+  type GoalRef,
+  type OwnerRef,
+  type RunRef,
+  type StorageLayout,
+  type StoragePaths,
+} from "../storage/paths.js";
+import { storageText, type WriteNoteTextRoots } from "../storage/text.js";
 import { nativeToolsPathDirs, resolveExternalMcpServers } from "../tools/native-tools.js";
 import { runGit } from "../worktree/manager.js";
-import { runMergedRef } from "../worktree/merge-queue.js";
 import {
   buildGateActivityEvent,
   detectGitPush,
@@ -133,30 +146,41 @@ function resolvedExtraWriteRoots(config: HarnessConfig): string[] {
   return resolved;
 }
 
-function directorNoteRoots(repoRoot: string, config: HarnessConfig): { root: string; allowedWriteRoots: string[] } {
-  const root = realpathSync(repoRoot);
-  return {
-    root,
-    allowedWriteRoots: [
-      join(root, ".harness", "goals"),
-      join(root, ".harness", "notes"),
-      ...resolvedExtraWriteRoots(config),
-    ],
-  };
+function mergedRefFallbackSentence(): string {
+  try {
+    return describeMergedRefFallback();
+  } catch {
+    return describeMergedRefFallback("legacy");
+  }
 }
 
-function writeNoteToolWithRoots(tool: ToolDefinition, extraRoots: string[]): ToolDefinition {
-  const hasRoots = extraRoots.length > 0;
-  const extraText = hasRoots
-    ? `or these configured extraWriteRoots: ${extraRoots.join(", ")}`
-    : "no extraWriteRoots configured";
+function runMergedRefCandidates(run: RunNameRef, layout?: StorageLayout): string[] {
+  try {
+    return mergedRefCandidates(run, layout);
+  } catch {
+    return mergedRefCandidates(run, "legacy");
+  }
+}
+
+function formatMissingMergedRef(run: RunNameRef, latestMergedSha?: string | null, layout?: StorageLayout): string {
+  try {
+    return describeMissingMergedRef(run, latestMergedSha, layout);
+  } catch {
+    return describeMissingMergedRef(run, latestMergedSha, "legacy");
+  }
+}
+
+function writeNoteToolWithRoots(
+  tool: ToolDefinition,
+  roots: WriteNoteTextRoots,
+  layout?: StorageLayout,
+): ToolDefinition {
+  const text = storageText(layout);
   const schema = tool.inputSchema as { properties?: Record<string, Record<string, unknown>> };
   const pathProp = schema.properties?.path;
   return {
     ...tool,
-    description: hasRoots
-      ? `Logged Director note/report writer scoped strictly to \`.harness/goals/\`, \`.harness/notes/\`, ${extraText} (never writes tracked repository source code).`
-      : `Logged Director note/report writer scoped strictly to \`.harness/goals/\`, \`.harness/notes/\` (${extraText}; never writes tracked repository source code).`,
+    description: text.writeNoteTool(roots),
     inputSchema: {
       ...tool.inputSchema,
       ...(schema.properties
@@ -167,9 +191,7 @@ function writeNoteToolWithRoots(tool: ToolDefinition, extraRoots: string[]): Too
                 ? {
                     path: {
                       ...pathProp,
-                      description: hasRoots
-                        ? `Destination file under .harness/goals/, .harness/notes/, ${extraText}.`
-                        : `Destination file under .harness/goals/, .harness/notes/ (${extraText}).`,
+                      description: text.writeNotePathParam(roots),
                     },
                   }
                 : {}),
@@ -500,13 +522,12 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   },
   {
     name: "write_note",
-    description:
-      "Logged Director note/report writer scoped strictly to `.harness/goals/`, `.harness/notes/`, or configured `extraWriteRoots` (never writes tracked repository source code).",
+    description: storageText().writeNoteTool(),
     inputSchema: {
       type: "object",
       required: ["path", "content", "reason"],
       properties: {
-        path: { type: "string", description: "Destination file under .harness/goals/, .harness/notes/, or extraWriteRoots." },
+        path: { type: "string", description: storageText().writeNotePathParam() },
         content: { type: "string", description: "Markdown/text content to write." },
         reason: { type: "string", description: "Concise logged reason for writing this note." },
       },
@@ -662,7 +683,7 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
     name: "goal_trigger_review",
     description:
-      "Verify and settle a Goal at the chosen verification depth (defaults to the Goal's verification_mode: 'auto' runs deterministic checks and only spawns an independent LLM reviewer when required behavioral/architectural criteria exist; 'deterministic' runs checks only; 'none' approves directly). If the run's base branch was deleted and verify_ref is unset, gates fall back to the run's last merged commit (refs/harness/merged/<runId>); if neither exists, verification fails with remediation options.",
+      `Verify and settle a Goal at the chosen verification depth (defaults to the Goal's verification_mode: 'auto' runs deterministic checks and only spawns an independent LLM reviewer when required behavioral/architectural criteria exist; 'deterministic' runs checks only; 'none' approves directly). ${mergedRefFallbackSentence()}`,
     inputSchema: {
       type: "object",
       required: ["goal_id"],
@@ -1172,6 +1193,7 @@ export class DirectorRuntime {
             .map((e) => e.id);
         },
       },
+      this.storage,
     );
     this.unsubRunEvents = this.db.onEvent((ev) => this.handleControlPlaneEvent(ev));
     this.unsubGoalQueue = this.db.admissionQueue.onChange((lane) => {
@@ -1180,6 +1202,48 @@ export class DirectorRuntime {
     this.db.timers.setOnFire((timer, wakeReason, meta) => {
       void this.handleTimerFired(timer, wakeReason, meta);
     });
+  }
+
+  private get storage(): StoragePaths {
+    return storagePaths(this.config);
+  }
+
+  private ownerRef(repoRoot: string, chatSessionId?: string | null): OwnerRef {
+    return { repoRoot, chatSessionId: chatSessionId ?? null };
+  }
+
+  private goalRef(goal: Pick<GoalRecord, "repoRoot" | "id" | "chatSessionId">): GoalRef {
+    return { repoRoot: goal.repoRoot, id: goal.id, chatSessionId: goal.chatSessionId };
+  }
+
+  private runRef(run: RunRecord): RunRecord & RunRef {
+    const chatSessionId = run.chatSessionId ?? this.db.getRunChatSessionId(run.id);
+    return chatSessionId === run.chatSessionId ? run : { ...run, chatSessionId };
+  }
+
+  private mapWaitTasksPaths(res: unknown): unknown {
+    if (this.storage.layout !== "data-dir" || !isPlainObject(res) || !Array.isArray(res.children)) return res;
+    const children = res.children.map((entry) => {
+      if (!isPlainObject(entry) || typeof entry.id !== "string") return entry;
+      const task = this.db.getTask(entry.id);
+      const run = task ? this.db.getRun(task.runId) : null;
+      if (!run) return entry;
+      const owner = this.runRef(run);
+      const mapPath = (p: string) => this.storage.resolveLegacyPath(run.repoRoot, p, owner) ?? p;
+      const artifactPaths = Array.isArray(entry.artifact_paths)
+        ? entry.artifact_paths.map((p) => (typeof p === "string" ? mapPath(p) : p))
+        : entry.artifact_paths;
+      const fullSummary =
+        isPlainObject(entry.full_summary) && typeof entry.full_summary.path === "string"
+          ? { ...entry.full_summary, path: mapPath(entry.full_summary.path) }
+          : entry.full_summary;
+      return {
+        ...entry,
+        ...(artifactPaths !== undefined ? { artifact_paths: artifactPaths } : {}),
+        ...(fullSummary !== undefined ? { full_summary: fullSummary } : {}),
+      };
+    });
+    return { ...res, children };
   }
 
   setWakeHandler(handler: (chatSessionId: string, event: ChatControlEvent) => void): void {
@@ -1339,7 +1403,14 @@ export class DirectorRuntime {
         ) {
           const owner = directorTaskRunOwner(ev.runId);
           if (owner && !this.seenTaskSettlements.has(`${child.id}:${child.generation}`)) {
-            const handoff = compactTaskHandoff(child);
+            const handoffRun = this.db.getRun(child.runId);
+            const handoff = compactTaskHandoff(
+              child,
+              [],
+              handoffRun
+                ? { repoRoot: handoffRun.repoRoot, chatSessionId: this.runRef(handoffRun).chatSessionId, storage: this.storage }
+                : undefined,
+            );
             const summary = (handoff.summary ?? child.summary ?? "").replace(/\s+/g, " ").trim().slice(0, 300);
             this.wakeHandler?.(owner, {
               kind: "task.settled",
@@ -2195,8 +2266,9 @@ export class DirectorRuntime {
       try {
         let orchestratorTask: { id: string };
         ({ run, orchestratorTask } = await this.orchestrator.startRun({
-          goal: goalRunObjective(launchedGoal).objective,
+          goal: goalRunObjective(launchedGoal, this.storage).objective,
           repoRoot: goal.repoRoot,
+          chatSessionId: launchedGoal.chatSessionId,
           profileId: opts?.profileId,
           model: opts?.model,
           effort: opts?.effort,
@@ -2209,7 +2281,7 @@ export class DirectorRuntime {
           },
           resolveGoal: () => {
             launchedGoal = this.goals.getGoal(goal.id) ?? launchedGoal;
-            const { title, objective } = goalRunObjective(launchedGoal);
+            const { title, objective } = goalRunObjective(launchedGoal, this.storage);
             return { goal: objective, taskTitle: title };
           },
         }));
@@ -2290,7 +2362,7 @@ export class DirectorRuntime {
       // An amendment that landed after the run's rows were created: deliver it to the live run, or hand the goal off.
       const latestAfterLaunch = this.goals.getGoal(goal.id);
       if (latestAfterLaunch && latestAfterLaunch.version > launchedGoal.version) {
-        const { title: updatedTitle, objective: updatedObjective } = goalRunObjective(latestAfterLaunch);
+        const { title: updatedTitle, objective: updatedObjective } = goalRunObjective(latestAfterLaunch, this.storage);
         this.db.updateRunGoal(run.id, updatedObjective);
         this.db.updateTask(orchestratorTaskId, {
           title: updatedTitle,
@@ -3280,7 +3352,7 @@ export class DirectorRuntime {
     return {
       ...res.goal,
       ...(qEntry ? { queued: true, queuePosition: qEntry.position } : {}),
-      evidenceDir: goalEvidenceDirOrNull(res.goal),
+      evidenceDir: goalEvidenceDirOrNull(res.goal, this.storage),
       runId: res.goal.linkedRunId,
       goalStatus: res.goal.status,
       outcome: res.outcome,
@@ -3757,7 +3829,7 @@ export class DirectorRuntime {
         "Acceptance Criteria:",
         criteriaSummary,
         ...(goal.nonGoals.length ? ["", "Non-Goals:", ...goal.nonGoals.map((n) => `- ${n}`)] : []),
-        ...evidenceDirLines(goal),
+        ...evidenceDirLines(goal, this.storage),
       ].join("\n");
       this.db.updateRunGoal(goal.linkedRunId, updatedObjective);
 
@@ -4546,7 +4618,7 @@ export class DirectorRuntime {
   private parkBlockedGoal(goal: GoalRecord, runId: string, blocker: ExplicitBlocker): void {
     this.goals.setStatus(goal.id, "awaiting_human", `Blocked: ${blocker.summary.slice(0, 240)}`);
     if (blocker.escalationId || !blocker.tier1Id) return;
-    const evidenceDir = goalEvidenceDirOrNull(goal);
+    const evidenceDir = goalEvidenceDirOrNull(goal, this.storage);
     this.suppressEscalationWakeRuns.add(runId);
     try {
       this.db.createEscalation({
@@ -4630,9 +4702,9 @@ export class DirectorRuntime {
    * explicit `verifyRef`), skips Git lookups and runs directly in `goal.repoRoot` (`source: "repo_root"`).
    * Otherwise resolves `run.baseBranch` strictly in branch namespaces (`refs/heads/<branch>`, then
    * `refs/remotes/origin/<branch>`), preferring this run's latest promoted merge commit from durable
-   * `merge.promoted` provenance (or legacy `refs/harness/merged/<runId>` when no provenance is recorded) when it
+   * `merge.promoted` provenance (or the run's merged ref when no provenance is recorded) when it
    * resolves and is an ancestor of the base branch tip. If `run.baseBranch` no longer exists locally or on origin,
-   * falls back to `refs/harness/merged/<runId>` (source `"merged_commit"`) only when it covers the run's latest
+   * falls back to the run's merged ref (source `"merged_commit"`) only when it covers the run's latest
    * promoted merge commit; if the ref is stale or missing (and HEAD is not that unborn branch), fails closed with
    * `VerifyCheckoutError` naming remedies. Without a verify ref or run base branch, verification runs in the
    * primary checkout and records that in `location`.
@@ -4728,9 +4800,16 @@ export class DirectorRuntime {
         let targetSha = resolvedSha;
         if (!explicit && run) {
           const latestMergedSha = this.getLatestRunMergedSha(run.id);
-          const candidateSha = latestMergedSha
-            ? await resolveCommit(latestMergedSha)
-            : await resolveCommit(runMergedRef(run.id));
+          let candidateSha = latestMergedSha ? await resolveCommit(latestMergedSha) : null;
+          if (!candidateSha && !latestMergedSha) {
+            for (const ref of runMergedRefCandidates(this.runRef(run), this.storage.layout)) {
+              const sha = await resolveCommit(ref);
+              if (sha) {
+                candidateSha = sha;
+                break;
+              }
+            }
+          }
           if (candidateSha) {
             const isAncestor = await runGit(goal.repoRoot, ["merge-base", "--is-ancestor", candidateSha, resolvedSha])
               .then(() => true)
@@ -4744,24 +4823,36 @@ export class DirectorRuntime {
           `Cannot verify goal ${goal.id}: verify_ref '${wanted}' does not resolve locally or on origin (fetched). goal_amend verify_ref to an existing branch or SHA, then goal_trigger_review; or goal_accept with override_deterministic: true.`,
         );
       } else {
-        const mergedRef = run ? runMergedRef(run.id) : null;
-        const mergedRefSha = mergedRef ? await resolveCommit(mergedRef) : null;
+        const runRef = run ? this.runRef(run) : null;
+        const candidates = runRef ? runMergedRefCandidates(runRef, this.storage.layout) : [];
         const latestMergedSha = run ? this.getLatestRunMergedSha(run.id) : null;
-        if (mergedRefSha && mergedRef && run) {
+        const existingCandidates: Array<{ ref: string; sha: string }> = [];
+        for (const ref of candidates) {
+          const sha = await resolveCommit(ref);
+          if (sha) existingCandidates.push({ ref, sha });
+        }
+        let chosen: { ref: string; sha: string } | null = null;
+        for (const cand of existingCandidates) {
           const coversLatestMerge =
             !latestMergedSha ||
-            mergedRefSha === latestMergedSha ||
-            (await runGit(goal.repoRoot, ["merge-base", "--is-ancestor", latestMergedSha, mergedRefSha])
+            cand.sha === latestMergedSha ||
+            (await runGit(goal.repoRoot, ["merge-base", "--is-ancestor", latestMergedSha, cand.sha])
               .then(() => true)
               .catch(() => false));
-          if (!coversLatestMerge) {
-            throw new VerifyCheckoutError(
-              `Cannot verify goal ${goal.id}: run base branch '${run.baseBranch}' no longer exists (not local, not on origin) and ${mergedRef} (${mergedRefSha.slice(0, 7)}) is stale (does not contain run ${run.id}'s latest promoted commit ${latestMergedSha!.slice(0, 7)}). Set goal_amend verify_ref to a branch or SHA with the work, then goal_trigger_review; or goal_accept with override_deterministic: true.`,
-            );
+          if (coversLatestMerge) {
+            chosen = cand;
+            break;
           }
-          await addScratch(mergedRefSha, mergedRef);
+        }
+        if (chosen && run) {
+          await addScratch(chosen.sha, chosen.ref);
           source = "merged_commit";
-          note = `base branch '${run.baseBranch}' no longer exists locally or on origin; verified run ${run.id}'s last merged commit ${mergedRefSha.slice(0, 7)} (${mergedRef}). To verify another ref, goal_amend verify_ref`;
+          note = `base branch '${run.baseBranch}' no longer exists locally or on origin; verified run ${run.id}'s last merged commit ${chosen.sha.slice(0, 7)} (${chosen.ref}). To verify another ref, goal_amend verify_ref`;
+        } else if (existingCandidates.length > 0 && run) {
+          const stale = existingCandidates[0]!;
+          throw new VerifyCheckoutError(
+            `Cannot verify goal ${goal.id}: run base branch '${run.baseBranch}' no longer exists (not local, not on origin) and ${stale.ref} (${stale.sha.slice(0, 7)}) is stale (does not contain run ${run.id}'s latest promoted commit ${latestMergedSha!.slice(0, 7)}). Set goal_amend verify_ref to a branch or SHA with the work, then goal_trigger_review; or goal_accept with override_deterministic: true.`,
+          );
         } else {
           // Keep existing unborn-branch behavior when HEAD equals run.baseBranch; fail closed otherwise.
           const headBranch = await runGit(goal.repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])
@@ -4771,9 +4862,7 @@ export class DirectorRuntime {
             source = "repo_root";
             refName = headBranch;
           } else {
-            const missingDetail = latestMergedSha
-              ? `has no merged ref (${runMergedRef(run!.id)}; latest promoted commit was ${latestMergedSha.slice(0, 7)})`
-              : `has no merged commit (${runMergedRef(run!.id)})`;
+            const missingDetail = formatMissingMergedRef(runRef!, latestMergedSha, this.storage.layout);
             throw new VerifyCheckoutError(
               `Cannot verify goal ${goal.id}: run base branch '${run!.baseBranch}' no longer exists (not local, not on origin) and run ${run!.id} ${missingDetail}. Set goal_amend verify_ref to a branch or SHA with the work, then goal_trigger_review; or goal_accept with override_deterministic: true.`,
             );
@@ -4844,7 +4933,10 @@ export class DirectorRuntime {
       return g;
     };
     const initial = checkAcceptable(this.goals.getGoal(goalId));
-    const evidence = rawPaths.map((p) => resolveDirectorEvidencePath(initial.repoRoot, p));
+    const evidenceOwner = this.ownerRef(initial.repoRoot, input.chatSessionId ?? initial.chatSessionId);
+    const evidence = rawPaths.map((p) =>
+      resolveDirectorEvidencePath(initial.repoRoot, p, { storage: this.storage, owner: evidenceOwner }),
+    );
 
     const running = this.activeReviews.get(initial.id);
     if (running) {
@@ -5637,55 +5729,6 @@ export class DirectorRuntime {
       }
 
       const reviewerMaxTurns = this.config.rollover.reviewerMaxTurns;
-      const goalsDir = join(goal.repoRoot, ".harness", "goals");
-      const artifactsDir = resolve(goal.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts");
-      // A rejected (e.g. symlinked) evidence directory is never advertised or granted to the reviewer.
-      const evidenceDir = ensureGoalEvidenceDir(goal.repoRoot, goal.id);
-      let contractPath: string | undefined;
-      if (evidenceDir !== null) {
-        try {
-          const fullContract = [
-            `# Goal ${goal.id} v${goal.version}: ${goal.title}`,
-            "",
-            "## Description",
-            goal.description,
-            "",
-            "## Acceptance Criteria",
-            ...goal.criteria.map(
-              (c) =>
-                `- [${c.id}] (${c.kind}${c.required ? ", REQUIRED" : ", optional"}): ${c.description}${c.command ? ` [cmd: ${c.command}]` : ""}`,
-            ),
-            ...(goal.nonGoals.length > 0 ? ["", "## Non-Goals", ...goal.nonGoals.map((ng) => `- ${ng}`)] : []),
-          ].join("\n");
-          const targetContract = join(evidenceDir, `contract-v${goal.version}-${randomUUID().slice(0, 8)}.md`);
-          const openFlags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0);
-          const fd = openSync(targetContract, openFlags, 0o600);
-          try {
-            writeFileSync(fd, `${fullContract}\n`, "utf8");
-          } finally {
-            closeSync(fd);
-          }
-          contractPath = targetContract;
-        } catch {
-          contractPath = undefined;
-        }
-      }
-      const reviewerPrompt = this.goals.buildReviewerPrompt(goal, gateResult, diffStat, diffPatch, {
-        reviewerMaxTurns,
-        contractPath,
-        diffRange,
-        ...(evidenceDir !== null
-          ? {
-              evidence: {
-                goalEvidenceDir: evidenceDir,
-                goalsDir,
-                artifactsDir,
-                ...(run ? { runArtifactsDir: join(artifactsDir, run.id) } : {}),
-              },
-            }
-          : {}),
-        ...(coordinatorFailure ? { coordinatorFailure } : {}),
-      });
       // Prefer an independent model family different from the authoring run's Tier 1/Tier 2 model
       const runTasks = run ? this.db.listTasks(run.id) : [];
       const authorModel =
@@ -5741,6 +5784,64 @@ export class DirectorRuntime {
       const cycle = goal.reviewCycle + 1;
       const reviewRun = run ?? await this.orchestrator.ensureDirectorTaskRun(goal.chatSessionId ?? goal.id, goal.repoRoot);
       assertCurrent();
+      const reviewRunRef = this.runRef(reviewRun);
+      const goalRef = this.goalRef(goal);
+      const reviewerGrants = this.storage.taskGrants({
+        run: reviewRunRef,
+        goal: goalRef,
+        writable: false,
+        workspace: verifyCwd,
+      });
+      // A rejected (e.g. symlinked) evidence directory is never advertised or granted to the reviewer.
+      const evidenceDir = reviewerGrants.extraEnv?.HARNESS_GOAL_EVIDENCE_DIR ?? null;
+      const goalsDir = reviewerGrants.extraEnv?.HARNESS_GOALS_DIR ?? this.storage.goalsDir(reviewRunRef);
+      const artifactsDir = reviewerGrants.extraEnv?.HARNESS_ARTIFACTS_DIR ?? this.storage.artifactsDir(reviewRunRef);
+      const runArtifactsDir = run ? this.storage.runArtifactsDir(reviewRunRef) : undefined;
+      let contractPath: string | undefined;
+      if (evidenceDir !== null) {
+        try {
+          const fullContract = [
+            `# Goal ${goal.id} v${goal.version}: ${goal.title}`,
+            "",
+            "## Description",
+            goal.description,
+            "",
+            "## Acceptance Criteria",
+            ...goal.criteria.map(
+              (c) =>
+                `- [${c.id}] (${c.kind}${c.required ? ", REQUIRED" : ", optional"}): ${c.description}${c.command ? ` [cmd: ${c.command}]` : ""}`,
+            ),
+            ...(goal.nonGoals.length > 0 ? ["", "## Non-Goals", ...goal.nonGoals.map((ng) => `- ${ng}`)] : []),
+          ].join("\n");
+          const targetContract = join(evidenceDir, `contract-v${goal.version}-${randomUUID().slice(0, 8)}.md`);
+          const openFlags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0);
+          const fd = openSync(targetContract, openFlags, 0o600);
+          try {
+            writeFileSync(fd, `${fullContract}\n`, "utf8");
+          } finally {
+            closeSync(fd);
+          }
+          contractPath = targetContract;
+        } catch {
+          contractPath = undefined;
+        }
+      }
+      const reviewerPrompt = this.goals.buildReviewerPrompt(goal, gateResult, diffStat, diffPatch, {
+        reviewerMaxTurns,
+        contractPath,
+        diffRange,
+        ...(evidenceDir !== null
+          ? {
+              evidence: {
+                goalEvidenceDir: evidenceDir,
+                goalsDir,
+                artifactsDir,
+                ...(runArtifactsDir ? { runArtifactsDir } : {}),
+              },
+            }
+          : {}),
+        ...(coordinatorFailure ? { coordinatorFailure } : {}),
+      });
       this.goals.setStatus(goal.id, "reviewing");
       const reviewerTask = this.db.createTask({
         runId: reviewRun.id,
@@ -5935,19 +6036,11 @@ export class DirectorRuntime {
               mcpBridgeEntrypoint,
               externalMcpServers: resolveExternalMcpServers(this.config.stateDir, this.config.externalMcpServers),
               extraPathDirs: nativeToolsPathDirs(this.config.stateDir),
-              extraReadRoots: [
-                goalsDir,
-                join(goal.repoRoot, ".harness", "artifacts"),
-                // The advertised (possibly nondefault) artifacts root must be readable too.
-                ...(artifactsDir !== join(goal.repoRoot, ".harness", "artifacts") ? [artifactsDir] : []),
-                ...(this.config.worktree.extraReadRoots ?? []),
-              ],
-              extraEnv: {
-                ...(evidenceDir !== null ? { HARNESS_GOAL_EVIDENCE_DIR: evidenceDir } : {}),
-                HARNESS_GOAL_ID: goal.id,
-                HARNESS_GOALS_DIR: goalsDir,
-                HARNESS_ARTIFACTS_DIR: artifactsDir,
-              },
+              extraReadRoots: reviewerGrants.extraReadRoots,
+              ...(reviewerGrants.extraWriteRoots !== undefined ? { extraWriteRoots: reviewerGrants.extraWriteRoots } : {}),
+              extraEnv: reviewerGrants.extraEnv,
+              deniedRoots: reviewerGrants.deniedRoots,
+              protectedRoots: reviewerGrants.protectedRoots,
               signal: attemptSignal,
               callbacks: {
                 onSessionId: (sid) => {
@@ -6018,11 +6111,12 @@ export class DirectorRuntime {
                   : "(empty)";
               const attemptDossier = writeTaskDossier(
                 this.db,
-                reviewRun,
+                reviewRunRef,
                 reviewerTask.id,
                 `reviewer-attempt-${attempt}.txt`,
                 rawContent,
                 `Done-Reviewer attempt ${attempt} raw output for ${goal.id} v${goal.version}`,
+                this.storage,
               );
               rawOutputPaths.push(attemptDossier.path);
             } catch {
@@ -6180,8 +6274,15 @@ export class DirectorRuntime {
             diagnostics: reviewerDiagnostics,
           });
           const summary = `${recorded.review.verdict}: ${recorded.review.summary}`.slice(0, 2000);
-          const dossier = writeTaskDossier(this.db, reviewRun, reviewerTask.id, "review.json",
-            JSON.stringify(recorded.review, null, 2), `Independent review of ${goal.id} v${goal.version}`);
+          const dossier = writeTaskDossier(
+            this.db,
+            reviewRunRef,
+            reviewerTask.id,
+            "review.json",
+            JSON.stringify(recorded.review, null, 2),
+            `Independent review of ${goal.id} v${goal.version}`,
+            this.storage,
+          );
           this.db.updateTask(reviewerTask.id, {
             status: "completed", summary,
             resultJson: JSON.stringify({
@@ -6198,7 +6299,7 @@ export class DirectorRuntime {
           try {
             const dossier = writeTaskDossier(
               this.db,
-              reviewRun,
+              reviewRunRef,
               reviewerTask.id,
               "review-stale.json",
               JSON.stringify(
@@ -6215,6 +6316,7 @@ export class DirectorRuntime {
                 2,
               ),
               `Stale review of ${goal.id} v${goal.version}`,
+              this.storage,
             );
             staleDossierPath = dossier.path;
           } catch {
@@ -6723,8 +6825,18 @@ export class DirectorRuntime {
       mode: effectiveCodeMode(this.config.codeMode),
       allowedTools: () => {
         const extraRoots = resolvedExtraWriteRoots(this.config);
+        const extraSet = new Set(extraRoots);
+        const owner = this.ownerRef(currentRepoRoot(), session.id);
+        let noteRoots: string[] | undefined;
+        try {
+          noteRoots = this.storage.directorNoteRoots(owner).allowedWriteRoots.filter((r) => !extraSet.has(r));
+        } catch {
+          noteRoots = undefined;
+        }
         return DIRECTOR_TOOLS.map((tool) =>
-          tool.name === "write_note" ? writeNoteToolWithRoots(tool, extraRoots) : tool,
+          tool.name === "write_note"
+            ? writeNoteToolWithRoots(tool, { noteRoots, extraRoots }, this.storage.layout)
+            : tool,
         );
       },
       directTools: DIRECTOR_DIRECT_TOOLS,
@@ -6786,14 +6898,14 @@ export class DirectorRuntime {
         }
         return result;
       },
-      artifactsDir: () => resolve(currentRepoRoot(), this.config.worktree.artifactsDir ?? ".harness/artifacts"),
+      artifactsDir: () => this.storage.artifactsDir(this.ownerRef(currentRepoRoot(), session.id)),
       pythonCacheDir: join(this.config.stateDir, "code-mode", "python"),
       saveOutput: async (name, json) => {
         signal.throwIfAborted();
         const run = await this.orchestrator.ensureDirectorTaskRun(session.id, currentRepoRoot());
         signal.throwIfAborted();
         const [coordinator] = this.db.listTasks(run.id, { parentId: null });
-        return writeCodeOutput(this.db, run, coordinator!.id, name, json);
+        return writeCodeOutput(this.db, this.runRef(run), coordinator!.id, name, json, this.storage);
       },
       signal,
       onToolEvent: onToolEvent && codeExecEventSink(onToolEvent),
@@ -7026,7 +7138,12 @@ export class DirectorRuntime {
           kind: "orchestrator",
           cwd: session.repoRoot,
           toolPolicy: "control_plane_only",
-          systemPrompt: buildDirectorSystemPrompt(mode, this.config.codeExec, resolvedExtraWriteRoots(this.config)),
+          systemPrompt: buildDirectorSystemPrompt(
+            mode,
+            this.config.codeExec,
+            resolvedExtraWriteRoots(this.config),
+            this.storage.layout,
+          ),
           initialPrompt: prompt,
           model: wireModel,
           effort: session.effort,
@@ -7188,18 +7305,28 @@ export class DirectorRuntime {
   private readDirectorArtifact(chatSessionId: string, repoRoot: string, args: Record<string, unknown>, signal?: AbortSignal) {
     if (typeof args.path === "string" && args.path.trim()) {
       const path = args.path;
-      const run = this.ownedDossierRuns(chatSessionId, repoRoot, true).find((r) => findRunDossier(this.db, r, path) !== null);
-      if (run) return readRunDossier(this.db, run, args);
+      const run = this.ownedDossierRuns(chatSessionId, repoRoot, true).find(
+        (r) => findRunDossier(this.db, this.runRef(r), path, this.storage) !== null,
+      );
+      if (run) return readRunDossier(this.db, this.runRef(run), args, this.storage);
     } else if (typeof args.task_id === "string" && args.task_id.trim()) {
       const task = this.db.getTask(args.task_id.trim());
       const run = task ? this.ownedDossierRuns(chatSessionId, repoRoot, true).find((r) => r.id === task.runId) : undefined;
-      if (run) return readRunDossier(this.db, run, args);
+      if (run) return readRunDossier(this.db, this.runRef(run), args, this.storage);
     } else {
       const ownedRuns = this.ownedDossierRuns(chatSessionId, repoRoot);
       if (ownedRuns.length > 0) {
         const byId = new Map<string, ArtifactRecord>();
         for (const run of ownedRuns) {
-          for (const artifact of this.db.listArtifacts(run.id, undefined, 50, "dossier")) byId.set(artifact.id, artifact);
+          const runRef = this.runRef(run);
+          for (const artifact of this.db.listArtifacts(run.id, undefined, 50, "dossier")) {
+            byId.set(
+              artifact.id,
+              this.storage.layout === "data-dir"
+                ? { ...artifact, path: this.storage.resolveLegacyPath(run.repoRoot, artifact.path, runRef) ?? artifact.path }
+                : artifact,
+            );
+          }
         }
         const artifacts = [...byId.values()].sort((a, b) => b.createdAt - a.createdAt).slice(0, 50);
         return { artifacts };
@@ -7236,7 +7363,9 @@ export class DirectorRuntime {
       case "wait_tasks": {
         const active = this.activeChats.get(chatSessionId);
         if (!active) {
-          const res = await this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, "wait_tasks", args, signal);
+          const res = this.mapWaitTasksPaths(
+            await this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, "wait_tasks", args, signal),
+          );
           this.recordSeenTaskSettlements(res);
           return res;
         }
@@ -7249,7 +7378,9 @@ export class DirectorRuntime {
         };
         active.waitInterrupts.add(onInterrupt);
         try {
-          const res = await this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, "wait_tasks", args, combinedSignal);
+          const res = this.mapWaitTasksPaths(
+            await this.orchestrator.executeDirectorTaskTool(chatSessionId, repoRoot, "wait_tasks", args, combinedSignal),
+          );
           this.recordSeenTaskSettlements(res);
           return res;
         } catch (err) {
@@ -7340,8 +7471,11 @@ export class DirectorRuntime {
         const content = String(args.content ?? "");
         const reason = String(args.reason ?? "").trim();
         if (!rawPath || !reason) throw new Error("write_note requires path and reason");
-        const { root, allowedWriteRoots } = directorNoteRoots(repoRoot, this.config);
-        const expandedTarget = rawPath.startsWith("~/") ? resolve(homedir(), rawPath.slice(2)) : resolve(root, rawPath);
+        const owner = this.ownerRef(repoRoot, chatSessionId);
+        const { root, allowedWriteRoots } = this.storage.directorNoteRoots(owner);
+        const mapped = this.storage.resolveLegacyPath(repoRoot, rawPath, owner);
+        const expandedTarget =
+          mapped ?? (rawPath.startsWith("~/") ? resolve(homedir(), rawPath.slice(2)) : resolve(root, rawPath));
         const matchedRoot = allowedWriteRoots.find((allowed) => {
           const rel = relative(allowed, expandedTarget);
           return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
@@ -7354,7 +7488,10 @@ export class DirectorRuntime {
           if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
             throw REJECTIONS.directorNoteRoot(rawPath);
           }
-          if (isProtectedWritePath(matchedRoot, path)) throw REJECTIONS.directorNoteRoot(rawPath);
+          if (this.storage.isProtectedWorktreePath(path, matchedRoot)) throw REJECTIONS.directorNoteRoot(rawPath);
+          if (this.storage.layout === "data-dir" && !this.storage.directorReadPolicy(root, path).ok) {
+            throw REJECTIONS.directorNoteRoot(rawPath);
+          }
         };
         checkTarget(expandedTarget);
         let ancestor = dirname(expandedTarget);
@@ -7421,7 +7558,7 @@ export class DirectorRuntime {
           });
           return this.goalCommitToolResult(res, presentGoal(res.goal));
         }
-        return { ...created, evidenceDir: goalEvidenceDirOrNull(created), presentation_id: presentGoal(created) };
+        return { ...created, evidenceDir: goalEvidenceDirOrNull(created, this.storage), presentation_id: presentGoal(created) };
       }
 
       case "goal_commit": {
@@ -7729,7 +7866,7 @@ export class DirectorRuntime {
         if (!g) throw new Error(`Unknown goal ${args.goal_id}`);
         const detail = this.goalDisplayData(g);
         const opts = parseGoalGetOptions(args);
-        const evidenceDir = goalEvidenceDirOrNull(g);
+        const evidenceDir = goalEvidenceDirOrNull(g, this.storage);
         const reviewDiagnostics = new Map(
           detail.reviews
             .filter((r) => r.diagnostics !== undefined)
@@ -7741,6 +7878,7 @@ export class DirectorRuntime {
           lastReviewerFailure: detail.goal.lastReviewerFailure ?? null,
           reviewDiagnostics,
           activeVerification: this.getActiveVerification(g.id),
+          storage: this.storage,
           reserveChars: 120,
         });
         return {
@@ -7858,7 +7996,10 @@ export class DirectorRuntime {
         if (startLine < 1) throw new Error("start_line must be 1 or greater");
         if (endLine !== undefined && endLine < startLine) throw new Error("end_line must not be less than start_line");
 
-        const { target, display: path } = resolveDirectorReadablePath(repoRoot, rawPath);
+        const { target, display: path } = resolveDirectorReadablePath(repoRoot, rawPath, {
+          storage: this.storage,
+          owner: this.ownerRef(repoRoot, chatSessionId),
+        });
 
         const pageBytes = Math.min(READ_FILE_MAX_PAGE_BYTES, Math.max(4, int(args.max_bytes) ?? READ_FILE_DEFAULT_PAGE_BYTES));
         const file = await openFile(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -8335,12 +8476,16 @@ function hasClaimProvenance(lp: GoalLiveProgress): boolean {
  * The goal's canonical evidence directory (created when possible), or null when it is not a safe segment or a
  * path component is not a real directory (e.g. a symlink). A rejected path is never advertised.
  */
-function goalEvidenceDirOrNull(goal: GoalRecord): string | null {
-  return ensureGoalEvidenceDir(goal.repoRoot, goal.id);
+function goalEvidenceDirOrNull(goal: GoalRecord, storage: StoragePaths = legacyStoragePaths): string | null {
+  return storage.ensureGoalEvidenceDir({
+    repoRoot: goal.repoRoot,
+    id: goal.id,
+    chatSessionId: goal.chatSessionId,
+  });
 }
 
 /** The Tier 1 assignment for a goal revision: its title line and full objective (criteria, non-goals, evidence dir). */
-function goalRunObjective(g: GoalRecord): { title: string; objective: string } {
+function goalRunObjective(g: GoalRecord, storage: StoragePaths = legacyStoragePaths): { title: string; objective: string } {
   const title = `Goal ${g.id} v${g.version}: ${g.title}`;
   const criteriaSummary = g.criteria
     .map((c) => `- [${c.id}] (${c.kind}${c.required ? "*" : ""}) ${c.description}${c.command ? ` [cmd: ${c.command}]` : ""}`)
@@ -8352,13 +8497,13 @@ function goalRunObjective(g: GoalRecord): { title: string; objective: string } {
     "Acceptance Criteria:",
     criteriaSummary,
     ...(g.nonGoals.length ? ["", "Non-Goals:", ...g.nonGoals.map((n) => `- ${n}`)] : []),
-    ...evidenceDirLines(g),
+    ...evidenceDirLines(g, storage),
   ].join("\n");
   return { title, objective };
 }
 
-function evidenceDirLines(goal: GoalRecord): string[] {
-  const dir = goalEvidenceDirOrNull(goal);
+function evidenceDirLines(goal: GoalRecord, storage: StoragePaths = legacyStoragePaths): string[] {
+  const dir = goalEvidenceDirOrNull(goal, storage);
   return dir
     ? ["", `Goal Evidence Directory: ${dir} (env HARNESS_GOAL_EVIDENCE_DIR). Write verification evidence for this goal there.`]
     : [];
@@ -8370,30 +8515,34 @@ function blockerDetail(blocker: ExplicitBlocker): string {
 }
 
 /**
- * Resolves a Director read path (repo-relative, absolute, or ~/) to its canonical target. Refuses `.git`,
- * task worktrees, and harness-internal state (repo `.harness/*` other than artifacts, goals and notes).
+ * Resolves a Director read path (repo-relative, absolute, or ~/) to its canonical target. Maps legacy
+ * harness data paths through the storage module, then enforces the storage Director read policy (refusing
+ * `.git`, task worktrees, scratch checkouts, and harness-internal state).
  */
-export function resolveDirectorReadablePath(repoRoot: string, rawPath: string): { target: string; inRepo: boolean; display: string } {
+export function resolveDirectorReadablePath(
+  repoRoot: string,
+  rawPath: string,
+  opts?: { storage?: StoragePaths; owner?: OwnerRef },
+): { target: string; inRepo: boolean; display: string } {
+  const storage = opts?.storage ?? legacyStoragePaths;
   const root = realpathSync(repoRoot);
-  const candidate = rawPath === "~" ? homedir()
-    : rawPath.startsWith("~/") ? resolve(homedir(), rawPath.slice(2))
-    : resolve(root, rawPath);
+  const mapped = storage.resolveLegacyPath(repoRoot, rawPath, opts?.owner);
+  const candidate =
+    mapped ??
+    (rawPath === "~"
+      ? homedir()
+      : rawPath.startsWith("~/")
+        ? resolve(homedir(), rawPath.slice(2))
+        : resolve(root, rawPath));
+  if (!storage.directorReadPolicy(root, candidate).ok) {
+    throw REJECTIONS.directorProtectedRead(rawPath);
+  }
   const target = realpathSync(candidate);
+  if (!storage.directorReadPolicy(root, target).ok) {
+    throw REJECTIONS.directorProtectedRead(rawPath);
+  }
   const relToRepo = relative(root, target);
   const inRepo = relToRepo !== ".." && !relToRepo.startsWith(`..${sep}`) && !isAbsolute(relToRepo);
-  if (inRepo) {
-    const parts = relToRepo.split(sep).map((p) => p.toLowerCase());
-    // Block .git and .harness/worktrees, while permitting .harness/goals, .harness/artifacts, and .harness/notes.
-    if (parts.includes(".git") || (parts[0] === ".harness" && !["artifacts", "goals", "notes"].includes(parts[1] ?? ""))) {
-      throw REJECTIONS.directorProtectedRead(rawPath);
-    }
-  } else {
-    // Check the whole canonical path so the veto holds wherever the file lives.
-    const parts = target.split(sep).map((p) => p.toLowerCase());
-    if (parts.includes(".git") || parts.some((p, i) => p === ".harness" && parts[i + 1] === "worktrees")) {
-      throw REJECTIONS.directorProtectedRead(rawPath);
-    }
-  }
   return { target, inRepo, display: inRepo ? relToRepo : target };
 }
 
@@ -8406,10 +8555,14 @@ export function buildReviewerSystemPrompt(): string {
 }
 
 /** goal_accept evidence: a readable regular file or directory under the same policy as read_file. */
-export function resolveDirectorEvidencePath(repoRoot: string, rawPath: string): GoalAcceptOverrideAudit["evidence"][number] {
+export function resolveDirectorEvidencePath(
+  repoRoot: string,
+  rawPath: string,
+  opts?: { storage?: StoragePaths; owner?: OwnerRef },
+): GoalAcceptOverrideAudit["evidence"][number] {
   let target: string;
   try {
-    ({ target } = resolveDirectorReadablePath(repoRoot, rawPath));
+    ({ target } = resolveDirectorReadablePath(repoRoot, rawPath, opts));
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR") throw new Error(`goal_accept evidence path does not exist: ${rawPath}`);

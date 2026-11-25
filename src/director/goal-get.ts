@@ -7,6 +7,7 @@ import type { GoalLiveProgress, GoalRecord, GoalReviewVerdict, GoalStatus, Revie
 import { isReviewInvalidated } from "../protocol/chat-events.js";
 import { serializeToolResult } from "../runners/mcp-bridge.js";
 import type { ToolDefinition } from "../runners/types.js";
+import type { StoragePaths } from "../storage/paths.js";
 
 export const GOAL_GET_LIMITS = {
   budgetChars: 40_000, // hard target for serializeToolResult(result); client limit is 50,000
@@ -139,6 +140,8 @@ export interface GoalGetContext {
   reviewDiagnostics?: ReadonlyMap<string, ReviewerDiagnostics | null>;
   /** Optional live verification state for this goal from the daemon (`DirectorRuntime.getActiveVerification`). */
   activeVerification?: GoalActiveVerification | null;
+  /** Optional storage instance for mapping legacy task artifact paths to current locations. */
+  storage?: StoragePaths;
   /** Optional wire overhead (e.g. `presentation_id`) reserved inside `budgetChars`. */
   reserveChars?: number;
 }
@@ -293,7 +296,7 @@ export function writeGoalDescriptionFile(
     if (rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)) {
       return rel.split(sep).join("/");
     }
-    return filePath;
+    return target;
   } catch {
     return null;
   }
@@ -953,8 +956,11 @@ export function buildGoalGetResult(
     if (hasRun) {
       const selectedTasks = sortedTasks.slice(0, state.tasksMax);
       const selectedTaskIds = new Set(selectedTasks.map((t) => t.id));
+      const handoffStorageCtx = ctx.storage
+        ? { repoRoot: ctx.repoRoot ?? goal.repoRoot, chatSessionId: goal.chatSessionId, storage: ctx.storage }
+        : undefined;
       out.tasks = selectedTasks.map((t) => {
-        const handoff = compactTaskHandoff(t, detail.openEscalations);
+        const handoff = compactTaskHandoff(t, detail.openEscalations, handoffStorageCtx);
         const artifactPaths =
           state.includeTaskArtifacts && Array.isArray(handoff.artifact_paths) && handoff.artifact_paths.length > 0
             ? handoff.artifact_paths.slice(0, state.taskArtifactsMax)
