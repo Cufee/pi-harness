@@ -41,11 +41,14 @@ export function spawnDaemonDetached(
   target: ReleaseTarget,
   socketPath: string,
   env?: Record<string, string>,
+  opts?: { rotateLog?: boolean },
 ): ChildProcess {
   const logDir = dirname(socketPath);
   mkdirSync(logDir, { recursive: true });
   const logPath = join(logDir, "daemon.log");
-  rotateLogIfOversized(logPath, readRetentionLogMaxBytes(env?.PI_HARNESS_HOME));
+  if (opts?.rotateLog !== false) {
+    rotateLogIfOversized(logPath, readRetentionLogMaxBytes(env?.PI_HARNESS_HOME));
+  }
   const logFd = openSync(logPath, "a");
   let cwd = logDir;
   try {
@@ -91,10 +94,29 @@ export async function stopLocalDaemon(socketPath: string): Promise<boolean> {
   }
 }
 
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function waitForPidExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isPidAlive(pid)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return !isPidAlive(pid);
+}
+
 export async function ensureLocalDaemon(socketPath: string): Promise<DaemonClient> {
   const selfRelease = currentRelease();
   const probe = new DaemonClient(socketPath);
   let needsRestart = false;
+  let oldPid: number | undefined;
   let mismatchError: Error | null = null;
   try {
     await probe.connect();
@@ -126,6 +148,7 @@ export async function ensureLocalDaemon(socketPath: string): Promise<DaemonClien
     } else {
       probe.close();
       needsRestart = true;
+      oldPid = typeof info.pid === "number" && info.pid > 0 ? info.pid : undefined;
       await stopLocalDaemon(socketPath);
     }
   } catch {
@@ -136,17 +159,30 @@ export async function ensureLocalDaemon(socketPath: string): Promise<DaemonClien
     throw mismatchError;
   }
 
+  let oldWriterStillAlive = false;
   if (needsRestart) {
-    await new Promise((r) => setTimeout(r, 150));
+    if (oldPid !== undefined) {
+      oldWriterStillAlive = !(await waitForPidExit(oldPid, 5_000));
+    } else {
+      await new Promise((r) => setTimeout(r, 150));
+    }
   }
 
   const target = installedCurrent(selfRelease) ?? selfRelease;
   const logDir = dirname(socketPath);
   mkdirSync(logDir, { recursive: true });
   const logPath = join(logDir, "daemon.log");
-  const logStart = prepareDaemonLogForSpawn(logPath);
+  const logStart = oldWriterStillAlive
+    ? (() => {
+        try {
+          return statSync(logPath).size;
+        } catch {
+          return 0;
+        }
+      })()
+    : prepareDaemonLogForSpawn(logPath);
   let exitStatus: string | null = null;
-  const child = spawnDaemonDetached(target, socketPath);
+  const child = spawnDaemonDetached(target, socketPath, undefined, { rotateLog: false });
   child.once("exit", (code, signal) => {
     exitStatus = signal ?? String(code);
   });

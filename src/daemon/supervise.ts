@@ -10,7 +10,6 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { readRetentionLogMaxBytes, rotateLogIfOversized } from "../install/maintenance.js";
 import { prepareDaemonLogForSpawn, readDaemonLogTail, spawnDaemonDetached } from "./launch.js";
 import { killProcessGroups, listChildProcessGroups } from "./reap.js";
 import { readReleaseAt, type ReleaseTarget } from "./release.js";
@@ -199,7 +198,7 @@ async function startAndWaitForRelease(
   oldPid?: number,
 ): Promise<BootAttemptResult> {
   let exitStatus: string | null = null;
-  const child = spawnDaemonDetached(release, socketPath, env);
+  const child = spawnDaemonDetached(release, socketPath, env, { rotateLog: false });
   child.once("exit", (code, signal) => {
     exitStatus = signal ?? String(code);
   });
@@ -253,7 +252,6 @@ export function spawnSupervisorDetached(self: ReleaseTarget, o: SuperviseOptions
   const logDir = dirname(o.socketPath);
   mkdirSync(logDir, { recursive: true });
   const logPath = join(logDir, "daemon.log");
-  rotateLogIfOversized(logPath, readRetentionLogMaxBytes(o.stateDir));
   const logFd = openSync(logPath, "a");
   const spawnCwd = existsSync(cwd) ? cwd : logDir;
   try {

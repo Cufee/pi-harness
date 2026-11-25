@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
   appendFileSync,
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -458,5 +459,90 @@ describe("maintenance orchestrator and CLI entry", () => {
     const cmdlines = listUserProcessCmdlines();
     assert.ok(Array.isArray(cmdlines));
     assert.ok(cmdlines.length > 0);
+  });
+
+  it("fails closed on unreadable same-user /proc entry, logs once to audit log, and still runs rotation and tools cleanup (I2)", () => {
+    if (process.platform !== "linux") return;
+    const root = makeTempRoot("pi-maint-proc-failclosed-");
+    const installDir = join(root, "install");
+    const stateDir = join(root, "state");
+    const procRoot = join(root, "proc");
+    mkdirSync(stateDir, { recursive: true });
+    mkdirSync(join(procRoot, "1001"), { recursive: true });
+    mkdirSync(join(procRoot, "1003"), { recursive: true });
+    writeFileSync(
+      join(stateDir, "config.json"),
+      JSON.stringify({ retention: { installReleases: 1, logMaxBytes: 10 } }),
+    );
+    createRelease(installDir, "r1", NOW - 4 * HOUR, "0.25.0");
+    const r2Dir = createRelease(installDir, "r2", NOW - 3 * HOUR, "0.26.0");
+    createRelease(installDir, "r3", NOW - 2 * HOUR, "0.26.0");
+    // 1001 is readable and references r2; 1003 has no cmdline (ENOENT, simulates a process that exited mid-scan).
+    writeFileSync(join(procRoot, "1001", "cmdline"), `/usr/bin/bun\0${r2Dir}/src/cli.ts\0`, "utf8");
+
+    // First pass: ENOENT on 1003 is tolerated (process gone), so r1 is pruned and nothing is written to install-audit.log.
+    const okRes = runInstallMaintenance({
+      installDir,
+      stateDir,
+      current: "r3",
+      now: () => NOW,
+      procRoot,
+    });
+    assert.equal(okRes.releases.skipped, null);
+    assert.deepEqual(okRes.releases.removed, ["r1"]);
+    assert.equal(existsSync(join(stateDir, "install-audit.log")), false);
+
+    // Add an old unused release r0 that would be pruned if process inventory succeeded,
+    // plus same-user process 1002 whose cmdline fails with EACCES (or EISDIR if running as root).
+    createRelease(installDir, "r0", NOW - 5 * HOUR, "0.25.0");
+    const blockedCmdline = join(procRoot, "1002", "cmdline");
+    mkdirSync(join(procRoot, "1002"), { recursive: true });
+    const isRoot = process.getuid?.() === 0;
+    if (isRoot) {
+      mkdirSync(blockedCmdline, { recursive: true });
+    } else {
+      writeFileSync(blockedCmdline, "/usr/bin/bun\0r0\0", "utf8");
+      chmodSync(blockedCmdline, 0o000);
+    }
+
+    try {
+      const auditLogPath = join(stateDir, "install-audit.log");
+      writeFileSync(auditLogPath, "0123456789abcdef\n", "utf8");
+
+      const staleStage = join(stateDir, "tools", ".staging", "octofs-stale");
+      mkdirSync(staleStage, { recursive: true });
+      utimesSync(staleStage, new Date(NOW - STAGING_MAX_AGE_MS - 1_000), new Date(NOW - STAGING_MAX_AGE_MS - 1_000));
+
+      const res = runInstallMaintenance({
+        installDir,
+        stateDir,
+        current: "r3",
+        now: () => NOW,
+        procRoot,
+      });
+
+      assert.equal(res.releases.skipped, "process_list_unreadable");
+      assert.deepEqual(res.releases.removed, []);
+      assert.equal(existsSync(join(installDir, "releases", "r0")), true, "r0 must not be pruned when inventory fails");
+      assert.equal(res.auditLogRotated, true, "audit log rotation must still run");
+      assert.equal(existsSync(`${auditLogPath}.1`), true);
+      assert.deepEqual(res.stagingRemoved, ["octofs-stale"], "tools staging cleanup must still run");
+
+      const auditLines = readFileSync(auditLogPath, "utf8").trim().split(/\r?\n/);
+      assert.equal(auditLines.length, 1, `expected exactly 1 audit line for skipped pruning, got:\n${auditLines.join("\n")}`);
+      assert.ok(auditLines[0]!.includes("1002"), `audit line should name failing pid: ${auditLines[0]}`);
+      assert.ok(
+        auditLines[0]!.includes(isRoot ? "EISDIR" : "EACCES"),
+        `audit line should include error code: ${auditLines[0]}`,
+      );
+    } finally {
+      if (!isRoot) {
+        try {
+          chmodSync(blockedCmdline, 0o600);
+        } catch {
+          // ignore
+        }
+      }
+    }
   });
 });

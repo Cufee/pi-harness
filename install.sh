@@ -156,15 +156,21 @@ if [ ! -f "$REL/release.json" ] || [ "$(cat "$REL/release.json" 2>/dev/null || t
   mv -f "$REL/.release.json.$$" "$REL/release.json"
 fi
 
-# --- activate: current symlink, then launcher (each swapped atomically) -----
-PREV_ID=""
+# --- activate: current symlink, rollback pair, then launcher (each swapped atomically) ---
+PRIOR_ID=""
 if [ -L "$INSTALL_DIR/current" ]; then
-  PREV_ID=$("$BUN" -e 'const fs=require("node:fs"),p=require("node:path");try{const t=fs.readlinkSync(process.argv[1]).replace(/\/+$/,"");const b=p.basename(t);if(b&&b!=="."&&b!=="..")process.stdout.write(b);}catch{}' "$INSTALL_DIR/current" 2>/dev/null || true)
-  if [ "$PREV_ID" = "$ID" ]; then PREV_ID=""; fi
+  PRIOR_ID=$("$BUN" -e 'const fs=require("node:fs"),p=require("node:path");try{const t=fs.readlinkSync(process.argv[1]).replace(/\/+$/,"");const b=p.basename(t);if(b&&b!=="."&&b!=="..")process.stdout.write(b);}catch{}' "$INSTALL_DIR/current" 2>/dev/null || true)
 fi
 rm -f "$INSTALL_DIR/current.new"
 ln -s "releases/$ID" "$INSTALL_DIR/current.new"
 "$BUN" -e 'require("node:fs").renameSync(process.argv[1], process.argv[2])' "$INSTALL_DIR/current.new" "$INSTALL_DIR/current"
+if [ -f "$REL/src/install/maintenance.ts" ]; then
+  if [ -n "$PRIOR_ID" ]; then
+    "$BUN" "$REL/src/install/maintenance.ts" --record-rollback-pair --install-dir "$INSTALL_DIR" --current "$ID" --prior-current "$PRIOR_ID"
+  else
+    "$BUN" "$REL/src/install/maintenance.ts" --record-rollback-pair --install-dir "$INSTALL_DIR" --current "$ID"
+  fi
+fi
 
 cat > "$BIN_DIR/.pi-harness.new" <<EOF
 #!/bin/sh
@@ -201,10 +207,6 @@ else
 fi
 
 if [ -f "$REL/src/install/maintenance.ts" ]; then
-  if [ -n "$PREV_ID" ]; then
-    "$BUN" "$REL/src/install/maintenance.ts" --install-dir "$INSTALL_DIR" --state-dir "$STATE_DIR" --current "$ID" --previous "$PREV_ID" >&2 || true
-  else
-    "$BUN" "$REL/src/install/maintenance.ts" --install-dir "$INSTALL_DIR" --state-dir "$STATE_DIR" --current "$ID" >&2 || true
-  fi
+  "$BUN" "$REL/src/install/maintenance.ts" --install-dir "$INSTALL_DIR" --state-dir "$STATE_DIR" --current "$ID" >&2 || true
 fi
 exit "$install_exit"

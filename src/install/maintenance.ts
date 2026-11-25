@@ -1,8 +1,12 @@
 import { spawnSync } from "node:child_process";
 import {
+  appendFileSync,
+  closeSync,
   existsSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   readlinkSync,
@@ -10,6 +14,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import {
@@ -21,9 +26,30 @@ import {
 
 export const RECENT_RELEASE_WINDOW_MS = 10 * 60 * 1000;
 export const STAGING_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+export const ROLLBACK_PAIR_FILENAME = "rollback-pair.json";
+
+export interface RollbackPair {
+  current: string;
+  previous: string | null;
+}
+
+export type ReadRollbackPairResult =
+  | { status: "ok"; pair: RollbackPair }
+  | { status: "missing" }
+  | { status: "invalid"; reason: string };
 
 export type ProcessCmdlineLister = () => string[] | null;
 export type ClockFn = () => number;
+
+export interface ProcessInventoryOptions {
+  procRoot?: string;
+  uid?: number;
+  platform?: NodeJS.Platform;
+}
+
+export type ProcessInventoryResult =
+  | { ok: true; cmdlines: string[] }
+  | { ok: false; reason: string };
 
 export interface PruneReleasesOptions {
   installDir: string;
@@ -31,11 +57,13 @@ export interface PruneReleasesOptions {
   previous?: string;
   keepCount: number;
   listProcesses?: ProcessCmdlineLister;
+  procRoot?: string;
   now?: ClockFn;
 }
 
 export interface PruneReleasesResult {
-  skipped: "no_releases_dir" | "lock_held" | "process_list_unreadable" | null;
+  skipped: "no_releases_dir" | "lock_held" | "process_list_unreadable" | "rollback_pair_unreadable" | null;
+  skipReason?: string;
   kept: string[];
   removed: string[];
 }
@@ -44,6 +72,7 @@ export interface CleanupOctofsOptions {
   installDir: string;
   stateDir: string;
   listProcesses?: ProcessCmdlineLister;
+  procRoot?: string;
 }
 
 export interface CleanupOctofsResult {
@@ -59,6 +88,7 @@ export interface InstallMaintenanceOptions {
   previous?: string;
   retention?: Partial<RetentionConfig>;
   listProcesses?: ProcessCmdlineLister;
+  procRoot?: string;
   now?: ClockFn;
 }
 
@@ -112,63 +142,126 @@ export function rotateLogIfOversized(logPath: string, maxBytes: number): boolean
   }
 }
 
+function isProcessGoneError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | null | undefined)?.code;
+  return code === "ENOENT" || code === "ESRCH";
+}
+
+function formatErrDetail(err: unknown): string {
+  const code = (err as NodeJS.ErrnoException | null | undefined)?.code;
+  const msg = err instanceof Error ? err.message : String(err);
+  if (code && !msg.includes(code)) return `${code}: ${msg}`;
+  return code || msg;
+}
+
 /**
- * Returns command lines of running processes for this user, or `null` when the process table cannot be read.
- * Linux reads `/proc/<pid>/cmdline`; other platforms run `ps -Ao pid=,args=`.
+ * Inspects running processes for this user, failing closed on any same-user read/stat error
+ * other than `ENOENT` or `ESRCH` (process exited mid-scan).
  */
-export function listUserProcessCmdlines(): string[] | null {
-  if (process.platform === "linux") {
+export function inspectUserProcessCmdlines(opts?: ProcessInventoryOptions): ProcessInventoryResult {
+  const platform = opts?.platform ?? process.platform;
+  if (platform === "linux") {
+    const procRoot = opts?.procRoot ?? "/proc";
+    const uid = opts?.uid !== undefined ? opts.uid : process.getuid?.();
+    let entries: string[];
     try {
-      const uid = process.getuid?.();
-      const entries = readdirSync("/proc");
-      const cmdlines: string[] = [];
-      let sawSelfOrReadable = false;
-      for (const entry of entries) {
-        if (!/^\d+$/.test(entry)) continue;
-        const procDir = `/proc/${entry}`;
-        if (uid !== undefined) {
-          try {
-            if (statSync(procDir).uid !== uid) continue;
-          } catch {
-            continue;
-          }
-        }
+      entries = readdirSync(procRoot);
+    } catch (err) {
+      return { ok: false, reason: `readdir ${procRoot} failed (${formatErrDetail(err)})` };
+    }
+    const cmdlines: string[] = [];
+    let sawSelfOrReadable = false;
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      const procDir = join(procRoot, entry);
+      if (uid !== undefined) {
         try {
-          const raw = readFileSync(`${procDir}/cmdline`, "utf8");
-          sawSelfOrReadable = true;
-          const cmd = raw.replace(/\0+/g, " ").trim();
-          if (cmd) cmdlines.push(cmd);
-        } catch {
-          // Process exited or permission denied between readdir and read.
+          if (statSync(procDir).uid !== uid) continue;
+        } catch (err) {
+          if (isProcessGoneError(err)) continue;
+          return { ok: false, reason: `stat ${procDir} failed (${formatErrDetail(err)})` };
         }
       }
-      return sawSelfOrReadable ? cmdlines : null;
-    } catch {
-      return null;
+      const cmdlinePath = join(procDir, "cmdline");
+      try {
+        const raw = readFileSync(cmdlinePath, "utf8");
+        sawSelfOrReadable = true;
+        const cmd = raw.replace(/\0+/g, " ").trim();
+        if (cmd) cmdlines.push(cmd);
+      } catch (err) {
+        if (isProcessGoneError(err)) continue;
+        return { ok: false, reason: `read ${cmdlinePath} failed (${formatErrDetail(err)})` };
+      }
     }
+    if (!sawSelfOrReadable) {
+      return { ok: false, reason: `no readable processes in ${procRoot}` };
+    }
+    return { ok: true, cmdlines };
   }
 
   try {
     const res = spawnSync("ps", ["-Ao", "pid=,args="], { encoding: "utf8", timeout: 5000 });
-    if (res.error || res.status !== 0 || typeof res.stdout !== "string") return null;
+    if (res.error) {
+      return { ok: false, reason: `ps failed (${formatErrDetail(res.error)})` };
+    }
+    if (res.status !== 0 || typeof res.stdout !== "string") {
+      return { ok: false, reason: `ps exited ${res.status ?? "null"}` };
+    }
     const cmdlines: string[] = [];
     for (const line of res.stdout.split(/\r?\n/)) {
       const match = line.match(/^\s*\d+\s+(.+)$/);
       if (match?.[1]) cmdlines.push(match[1].trim());
     }
-    return cmdlines.length > 0 ? cmdlines : null;
-  } catch {
-    return null;
+    if (cmdlines.length === 0) {
+      return { ok: false, reason: "ps returned no processes" };
+    }
+    return { ok: true, cmdlines };
+  } catch (err) {
+    return { ok: false, reason: `ps failed (${formatErrDetail(err)})` };
   }
 }
 
-function safeListProcesses(lister: ProcessCmdlineLister): string[] | null {
+/**
+ * Returns command lines of running processes for this user, or `null` when the process table cannot be read.
+ * Linux reads `/proc/<pid>/cmdline`; other platforms run `ps -Ao pid=,args=`.
+ */
+export function listUserProcessCmdlines(opts?: ProcessInventoryOptions): string[] | null {
+  const res = inspectUserProcessCmdlines(opts);
+  return res.ok ? res.cmdlines : null;
+}
+
+function safeInspectProcesses(
+  lister?: ProcessCmdlineLister,
+  procOpts?: ProcessInventoryOptions,
+): ProcessInventoryResult {
+  if (!lister) {
+    return inspectUserProcessCmdlines(procOpts);
+  }
   try {
     const list = lister();
-    return Array.isArray(list) ? list : null;
+    return Array.isArray(list) ? { ok: true, cmdlines: list } : { ok: false, reason: "process list unavailable" };
   } catch (err) {
-    console.error(`[pi-harness maintenance] process list error: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
+    const detail = err instanceof Error ? err.message : String(err);
+    console.error(`[pi-harness maintenance] process list error: ${detail}`);
+    return { ok: false, reason: detail };
+  }
+}
+
+function sanitizeAuditValue(value: string): string {
+  return value.replace(/[\r\n]+/g, " ").replace(/"/g, "'").trim();
+}
+
+function appendAuditLogLine(stateDir: string, nowMs: number, message: string): void {
+  try {
+    const resolvedStateDir = resolve(stateDir);
+    mkdirSync(resolvedStateDir, { recursive: true });
+    const auditLogPath = join(resolvedStateDir, "install-audit.log");
+    const ts = new Date(nowMs).toISOString();
+    appendFileSync(auditLogPath, `${ts} ${message}\n`, "utf8");
+  } catch (err) {
+    console.error(
+      `[pi-harness maintenance] failed to append install-audit.log: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 }
 
@@ -192,20 +285,131 @@ function cmdlinesReferencePath(cmdlines: string[], dirPath: string): boolean {
   return false;
 }
 
+function isValidReleaseId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value !== "." &&
+    value !== ".." &&
+    !value.includes("/") &&
+    !value.includes("\\")
+  );
+}
+
 function readCurrentSymlinkReleaseId(installDir: string): string | null {
   try {
     const target = readlinkSync(join(installDir, "current")).replace(/\/+$/, "");
     const id = basename(target);
-    return id && id !== "." && id !== ".." ? id : null;
+    return isValidReleaseId(id) ? id : null;
   } catch {
     return null;
   }
 }
 
+export function rollbackPairPath(installDir: string): string {
+  return join(resolve(installDir), ROLLBACK_PAIR_FILENAME);
+}
+
+/**
+ * Reads `<installDir>/rollback-pair.json`.
+ * Returns `missing` when absent (e.g. first upgrade from an older installer), `ok` when valid,
+ * or `invalid` when present on disk but unreadable or malformed.
+ */
+export function readRollbackPair(installDir: string): ReadRollbackPairResult {
+  const filePath = rollbackPairPath(installDir);
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return { status: "missing" };
+    }
+    return { status: "invalid", reason: err instanceof Error ? err.message : String(err) };
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!isPlainObject(parsed)) {
+      return { status: "invalid", reason: "root value is not a JSON object" };
+    }
+    if (!isValidReleaseId(parsed.current)) {
+      return { status: "invalid", reason: "invalid current release id" };
+    }
+    const prev = parsed.previous;
+    if (prev !== null && (!isValidReleaseId(prev) || prev === parsed.current)) {
+      return { status: "invalid", reason: "invalid previous release id" };
+    }
+    return { status: "ok", pair: { current: parsed.current, previous: prev } };
+  } catch (err) {
+    return { status: "invalid", reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Atomically updates `<installDir>/rollback-pair.json` at release activation (caller holds `<installDir>/.lock`).
+ * Preserves the recorded `previous` when reinstalling the same release id.
+ */
+export function recordRollbackPair(
+  installDir: string,
+  currentId: string,
+  priorCurrentId?: string | null,
+): RollbackPair {
+  if (!isValidReleaseId(currentId)) {
+    throw new Error(`Invalid release id: ${String(currentId)}`);
+  }
+  const resolvedInstallDir = resolve(installDir);
+  const existingRes = readRollbackPair(resolvedInstallDir);
+  const existing = existingRes.status === "ok" ? existingRes.pair : null;
+  const prior =
+    priorCurrentId !== undefined
+      ? isValidReleaseId(priorCurrentId)
+        ? priorCurrentId
+        : null
+      : readCurrentSymlinkReleaseId(resolvedInstallDir);
+
+  let previous: string | null = null;
+  if (prior && prior !== currentId) {
+    previous = prior;
+  } else if (existing && existing.current !== currentId) {
+    previous = existing.current;
+  } else if (existing?.previous && existing.previous !== currentId) {
+    previous = existing.previous;
+  }
+
+  const pair: RollbackPair = { current: currentId, previous };
+  const targetPath = rollbackPairPath(resolvedInstallDir);
+  const tmpPath = join(resolvedInstallDir, `.${ROLLBACK_PAIR_FILENAME}.tmp.${process.pid}.${Date.now()}`);
+  mkdirSync(resolvedInstallDir, { recursive: true });
+  let fd: number | null = null;
+  try {
+    fd = openSync(tmpPath, "w", 0o644);
+    writeFileSync(fd, `${JSON.stringify(pair, null, 2)}\n`, "utf8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    renameSync(tmpPath, targetPath);
+  } catch (err) {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // ignore close failure
+      }
+    }
+    try {
+      rmSync(tmpPath, { force: true });
+    } catch {
+      // ignore temp cleanup failure
+    }
+    throw err;
+  }
+  return pair;
+}
+
 /**
  * Prunes old release directories under `<installDir>/releases` while holding `<installDir>/.lock`.
- * Keeps current, previous (when present on disk), releases referenced by any running process,
- * releases modified within the last 10 minutes, and the newest remaining releases up to `keepCount`.
+ * Keeps the durable rollback pair (`<installDir>/rollback-pair.json`), the target of `current`,
+ * releases referenced by any running process, releases modified within the last 10 minutes,
+ * and the newest remaining releases up to `keepCount`.
  */
 export function pruneInstallReleases(opts: PruneReleasesOptions): PruneReleasesResult {
   const installDir = resolve(opts.installDir);
@@ -222,11 +426,24 @@ export function pruneInstallReleases(opts: PruneReleasesOptions): PruneReleasesR
   }
 
   try {
-    const listProcesses = opts.listProcesses ?? listUserProcessCmdlines;
-    const cmdlines = safeListProcesses(listProcesses);
-    if (cmdlines === null) {
-      return { skipped: "process_list_unreadable", kept: [], removed: [] };
+    const rollbackPairRes = readRollbackPair(installDir);
+    if (rollbackPairRes.status === "invalid") {
+      console.error(
+        `[pi-harness maintenance] skipping release pruning: unreadable ${ROLLBACK_PAIR_FILENAME} (${rollbackPairRes.reason})`,
+      );
+      return {
+        skipped: "rollback_pair_unreadable",
+        skipReason: rollbackPairRes.reason,
+        kept: [],
+        removed: [],
+      };
     }
+
+    const procRes = safeInspectProcesses(opts.listProcesses, opts.procRoot ? { procRoot: opts.procRoot } : undefined);
+    if (!procRes.ok) {
+      return { skipped: "process_list_unreadable", skipReason: procRes.reason, kept: [], removed: [] };
+    }
+    const cmdlines = procRes.cmdlines;
 
     const nowMs = (opts.now ?? Date.now)();
     const entries = readdirSync(releasesDir, { withFileTypes: true });
@@ -246,15 +463,24 @@ export function pruneInstallReleases(opts: PruneReleasesOptions): PruneReleasesR
     const existingIds = new Set(releases.map((r) => r.id));
     const keep = new Set<string>();
 
-    if (opts.current && existingIds.has(opts.current)) {
-      keep.add(opts.current);
-    }
     const currentSymlinkId = readCurrentSymlinkReleaseId(installDir);
     if (currentSymlinkId && existingIds.has(currentSymlinkId)) {
       keep.add(currentSymlinkId);
     }
-    if (opts.previous && existingIds.has(opts.previous)) {
-      keep.add(opts.previous);
+    if (rollbackPairRes.status === "ok") {
+      if (existingIds.has(rollbackPairRes.pair.current)) {
+        keep.add(rollbackPairRes.pair.current);
+      }
+      if (rollbackPairRes.pair.previous && existingIds.has(rollbackPairRes.pair.previous)) {
+        keep.add(rollbackPairRes.pair.previous);
+      }
+    } else {
+      if (opts.current && existingIds.has(opts.current)) {
+        keep.add(opts.current);
+      }
+      if (opts.previous && existingIds.has(opts.previous)) {
+        keep.add(opts.previous);
+      }
     }
 
     for (const rel of releases) {
@@ -399,11 +625,11 @@ export function cleanupOctofsVersions(opts: CleanupOctofsOptions): CleanupOctofs
       }
     }
 
-    const listProcesses = opts.listProcesses ?? listUserProcessCmdlines;
-    const cmdlines = safeListProcesses(listProcesses);
-    if (cmdlines === null) {
+    const procRes = safeInspectProcesses(opts.listProcesses, opts.procRoot ? { procRoot: opts.procRoot } : undefined);
+    if (!procRes.ok) {
       return { skipped: "process_list_unreadable", pinnedVersions: [...pinnedVersions], removed: [] };
     }
+    const cmdlines = procRes.cmdlines;
 
     const octofsRoots = new Set<string>([
       resolve(join(stateDir, "tools", "octofs")),
@@ -467,6 +693,7 @@ export function runInstallMaintenance(opts: InstallMaintenanceOptions): InstallM
       previous: opts.previous?.trim() || undefined,
       keepCount: retention.installReleases,
       listProcesses: opts.listProcesses,
+      procRoot: opts.procRoot,
       now: opts.now,
     });
   } catch (err) {
@@ -485,6 +712,17 @@ export function runInstallMaintenance(opts: InstallMaintenanceOptions): InstallM
     );
   }
 
+  if (releases.skipped === "process_list_unreadable") {
+    const reason = sanitizeAuditValue(releases.skipReason ?? "process_list_unreadable");
+    const nowMs = (opts.now ?? Date.now)();
+    console.error(`[pi-harness maintenance] skipping release pruning: ${reason}`);
+    appendAuditLogLine(
+      opts.stateDir,
+      nowMs,
+      `maintenance=prune_skipped skipped=process_list_unreadable reason="${reason}"`,
+    );
+  }
+
   let stagingRemoved: string[] = [];
   try {
     stagingRemoved = cleanStaleStagingDirs(opts.stateDir, { now: opts.now });
@@ -500,6 +738,7 @@ export function runInstallMaintenance(opts: InstallMaintenanceOptions): InstallM
       installDir: opts.installDir,
       stateDir: opts.stateDir,
       listProcesses: opts.listProcesses,
+      procRoot: opts.procRoot,
     });
   } catch (err) {
     console.error(
@@ -511,16 +750,27 @@ export function runInstallMaintenance(opts: InstallMaintenanceOptions): InstallM
 }
 
 function parseCliArgs(argv: string[]): {
+  recordRollbackPair?: boolean;
   installDir?: string;
   stateDir?: string;
   current?: string;
   previous?: string;
+  priorCurrent?: string;
 } {
-  const out: { installDir?: string; stateDir?: string; current?: string; previous?: string } = {};
+  const out: {
+    recordRollbackPair?: boolean;
+    installDir?: string;
+    stateDir?: string;
+    current?: string;
+    previous?: string;
+    priorCurrent?: string;
+  } = {};
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     const next = argv[i + 1];
-    if (arg === "--install-dir" && next !== undefined) {
+    if (arg === "--record-rollback-pair") {
+      out.recordRollbackPair = true;
+    } else if (arg === "--install-dir" && next !== undefined) {
       out.installDir = next;
       i++;
     } else if (arg === "--state-dir" && next !== undefined) {
@@ -531,6 +781,9 @@ function parseCliArgs(argv: string[]): {
       i++;
     } else if (arg === "--previous" && next !== undefined) {
       out.previous = next;
+      i++;
+    } else if (arg === "--prior-current" && next !== undefined) {
+      out.priorCurrent = next;
       i++;
     }
   }
@@ -558,6 +811,27 @@ export function runMaintenanceCli(argv: string[]): void {
 }
 
 if (import.meta.main) {
-  runMaintenanceCli(process.argv.slice(2));
-  process.exitCode = 0;
+  const cliArgs = process.argv.slice(2);
+  const parsed = parseCliArgs(cliArgs);
+  if (parsed.recordRollbackPair) {
+    try {
+      if (!parsed.installDir || !parsed.current) {
+        console.error(
+          "[pi-harness maintenance] --record-rollback-pair requires --install-dir and --current",
+        );
+        process.exitCode = 1;
+      } else {
+        recordRollbackPair(parsed.installDir, parsed.current, parsed.priorCurrent ?? null);
+        process.exitCode = 0;
+      }
+    } catch (err) {
+      console.error(
+        `[pi-harness maintenance] failed to record rollback pair: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      process.exitCode = 1;
+    }
+  } else {
+    runMaintenanceCli(cliArgs);
+    process.exitCode = 0;
+  }
 }
