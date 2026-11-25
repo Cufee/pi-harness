@@ -30,7 +30,14 @@ export const STAGING_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const ROLLBACK_PAIR_FILENAME = "rollback-pair.json";
 
 export interface RollbackPair {
-  current: string;
+  pending?: string;
+  current: string | null;
+  previous: string | null;
+}
+
+export interface InterruptedActivationInfo {
+  pending: string;
+  current: string | null;
   previous: string | null;
 }
 
@@ -76,6 +83,7 @@ export interface PruneReleasesResult {
     | "rollback_pair_missing"
     | null;
   skipReason?: string;
+  interruptedActivation?: InterruptedActivationInfo;
   kept: string[];
   removed: string[];
 }
@@ -339,7 +347,7 @@ function fsyncDir(dirPath: string): void {
   }
 }
 
-function hasOtherReleaseDirectory(installDir: string, currentId: string): boolean | null {
+function hasOtherReleaseDirectory(installDir: string, excludeIds: ReadonlySet<string>): boolean | null {
   const releasesDir = join(installDir, "releases");
   let entries;
   try {
@@ -351,7 +359,7 @@ function hasOtherReleaseDirectory(installDir: string, currentId: string): boolea
     return null;
   }
   for (const entry of entries) {
-    if (entry.name.startsWith(".") || entry.name === currentId) continue;
+    if (entry.name.startsWith(".") || excludeIds.has(entry.name)) continue;
     const dir = join(releasesDir, entry.name);
     try {
       const st = lstatSync(dir);
@@ -370,8 +378,9 @@ export function rollbackPairPath(installDir: string): string {
 
 /**
  * Reads `<installDir>/rollback-pair.json`.
- * Returns `missing` when absent (e.g. first upgrade from an older installer), `ok` when valid,
- * or `invalid` when present on disk but unreadable or malformed.
+ * Accepts both the two-field finalized record (`{ current, previous }`) written by earlier releases
+ * and the three-field pre-swap record (`{ pending, current, previous }`).
+ * Returns `missing` when absent, `ok` when valid, or `invalid` when unreadable or malformed.
  */
 export function readRollbackPair(installDir: string): ReadRollbackPairResult {
   const filePath = rollbackPairPath(installDir);
@@ -397,21 +406,146 @@ export function readRollbackPair(installDir: string): ReadRollbackPairResult {
     if (!isPlainObject(parsed)) {
       return { status: "invalid", reason: "root value is not a JSON object" };
     }
-    if (!isValidReleaseId(parsed.current)) {
+    const hasPending = Object.prototype.hasOwnProperty.call(parsed, "pending");
+    let pending: string | undefined;
+    if (hasPending) {
+      if (!isValidReleaseId(parsed.pending)) {
+        return { status: "invalid", reason: "invalid pending release id" };
+      }
+      pending = parsed.pending;
+    }
+    const current = parsed.current;
+    if (pending !== undefined) {
+      if (current !== null && !isValidReleaseId(current)) {
+        return { status: "invalid", reason: "invalid current release id" };
+      }
+    } else if (!isValidReleaseId(current)) {
       return { status: "invalid", reason: "invalid current release id" };
     }
     const prev = parsed.previous;
-    if (prev !== null && (!isValidReleaseId(prev) || prev === parsed.current)) {
+    if (prev !== null && (!isValidReleaseId(prev) || current === null || prev === current)) {
       return { status: "invalid", reason: "invalid previous release id" };
     }
-    return { status: "ok", pair: { current: parsed.current, previous: prev } };
+    const pair: RollbackPair =
+      pending !== undefined
+        ? { pending, current: current as string | null, previous: prev }
+        : { current: current as string, previous: prev };
+    return { status: "ok", pair };
   } catch (err) {
     return { status: "invalid", reason: err instanceof Error ? err.message : String(err) };
   }
 }
 
+function writeRollbackPairAtomic(resolvedInstallDir: string, pair: RollbackPair): void {
+  const targetPath = rollbackPairPath(resolvedInstallDir);
+  const tmpPath = join(resolvedInstallDir, `.${ROLLBACK_PAIR_FILENAME}.tmp.${process.pid}.${Date.now()}`);
+  mkdirSync(resolvedInstallDir, { recursive: true });
+  let fd: number | null = null;
+  try {
+    fd = openSync(tmpPath, "w", 0o644);
+    writeFileSync(fd, `${JSON.stringify(pair, null, 2)}\n`, "utf8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    renameSync(tmpPath, targetPath);
+    fsyncDir(resolvedInstallDir);
+  } catch (err) {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // ignore close failure
+      }
+    }
+    try {
+      rmSync(tmpPath, { force: true });
+    } catch {
+      // ignore temp cleanup failure
+    }
+    throw err;
+  }
+}
+
+function resolveMatchingPrevious(baseCurrent: string, existing: RollbackPair | null): string | null {
+  if (!existing) return null;
+  if (existing.current === baseCurrent) {
+    return existing.previous;
+  }
+  if (existing.pending === baseCurrent && existing.current !== null && existing.current !== baseCurrent) {
+    return existing.current;
+  }
+  if (existing.current !== null && existing.current !== baseCurrent) {
+    return existing.current;
+  }
+  if (existing.previous !== null && existing.previous !== baseCurrent) {
+    return existing.previous;
+  }
+  return null;
+}
+
 /**
- * Atomically updates `<installDir>/rollback-pair.json` at release activation (caller holds `<installDir>/.lock`).
+ * Atomically writes the pre-swap three-field activation record `{ pending, current, previous }`
+ * to `<installDir>/rollback-pair.json` (caller holds `<installDir>/.lock`).
+ * Starts from the resolved `current` symlink and its matching `previous` in the existing record,
+ * so an activation interrupted before the `current` swap never unpins the real previous release.
+ */
+export function recordPendingRollbackPair(
+  installDir: string,
+  pendingId: string,
+  priorCurrentId?: string | null,
+): RecordRollbackPairResult {
+  if (!isValidReleaseId(pendingId)) {
+    throw new Error(`Invalid release id: ${String(pendingId)}`);
+  }
+  const resolvedInstallDir = resolve(installDir);
+  const existingRes = readRollbackPair(resolvedInstallDir);
+  if (existingRes.status === "invalid") {
+    return {
+      status: "skipped_invalid",
+      reason: `unreadable ${ROLLBACK_PAIR_FILENAME} (${existingRes.reason})`,
+    };
+  }
+  const existing = existingRes.status === "ok" ? existingRes.pair : null;
+  const prior =
+    priorCurrentId !== undefined
+      ? isValidReleaseId(priorCurrentId)
+        ? priorCurrentId
+        : null
+      : readCurrentSymlinkReleaseId(resolvedInstallDir);
+
+  let baseCurrent: string | null = null;
+  let basePrevious: string | null = null;
+  if (prior !== null) {
+    baseCurrent = prior;
+    basePrevious = resolveMatchingPrevious(prior, existing);
+  } else if (existing && existing.current !== null) {
+    baseCurrent = existing.current;
+    basePrevious = existing.previous;
+  }
+
+  if (existingRes.status === "missing" && basePrevious === null) {
+    const exclude = new Set<string>([pendingId]);
+    if (baseCurrent !== null) exclude.add(baseCurrent);
+    const otherRelease = hasOtherReleaseDirectory(resolvedInstallDir, exclude);
+    if (otherRelease !== false) {
+      return {
+        status: "skipped_missing",
+        reason:
+          otherRelease === null
+            ? `missing ${ROLLBACK_PAIR_FILENAME} and unable to inspect releases directory`
+            : `missing ${ROLLBACK_PAIR_FILENAME} before activating ${pendingId} while other release directories exist`,
+      };
+    }
+  }
+
+  const pair: RollbackPair = { pending: pendingId, current: baseCurrent, previous: basePrevious };
+  writeRollbackPairAtomic(resolvedInstallDir, pair);
+  return { status: "written", pair };
+}
+
+/**
+ * Atomically finalizes `<installDir>/rollback-pair.json` to `{ current, previous }` after the
+ * `current` symlink swap (caller holds `<installDir>/.lock`).
  * Preserves the recorded `previous` when reinstalling the same release id.
  * Keeps an existing unreadable or malformed record untouched, and refuses to synthesize a `previous: null`
  * record when the record is missing and another release directory already exists.
@@ -443,14 +577,14 @@ export function recordRollbackPair(
   let previous: string | null = null;
   if (prior && prior !== currentId) {
     previous = prior;
-  } else if (existing && existing.current !== currentId) {
+  } else if (existing && existing.current !== null && existing.current !== currentId) {
     previous = existing.current;
   } else if (existing?.previous && existing.previous !== currentId) {
     previous = existing.previous;
   }
 
   if (existingRes.status === "missing" && previous === null) {
-    const otherRelease = hasOtherReleaseDirectory(resolvedInstallDir, currentId);
+    const otherRelease = hasOtherReleaseDirectory(resolvedInstallDir, new Set([currentId]));
     if (otherRelease !== false) {
       return {
         status: "skipped_missing",
@@ -463,33 +597,7 @@ export function recordRollbackPair(
   }
 
   const pair: RollbackPair = { current: currentId, previous };
-  const targetPath = rollbackPairPath(resolvedInstallDir);
-  const tmpPath = join(resolvedInstallDir, `.${ROLLBACK_PAIR_FILENAME}.tmp.${process.pid}.${Date.now()}`);
-  mkdirSync(resolvedInstallDir, { recursive: true });
-  let fd: number | null = null;
-  try {
-    fd = openSync(tmpPath, "w", 0o644);
-    writeFileSync(fd, `${JSON.stringify(pair, null, 2)}\n`, "utf8");
-    fsyncSync(fd);
-    closeSync(fd);
-    fd = null;
-    renameSync(tmpPath, targetPath);
-    fsyncDir(resolvedInstallDir);
-  } catch (err) {
-    if (fd !== null) {
-      try {
-        closeSync(fd);
-      } catch {
-        // ignore close failure
-      }
-    }
-    try {
-      rmSync(tmpPath, { force: true });
-    } catch {
-      // ignore temp cleanup failure
-    }
-    throw err;
-  }
+  writeRollbackPairAtomic(resolvedInstallDir, pair);
   return { status: "written", pair };
 }
 
@@ -565,16 +673,30 @@ export function pruneInstallReleases(opts: PruneReleasesOptions): PruneReleasesR
     }
 
     const keep = new Set<string>();
+    let interruptedActivation: InterruptedActivationInfo | undefined;
 
     if (currentSymlinkId && existingIds.has(currentSymlinkId)) {
       keep.add(currentSymlinkId);
     }
     if (rollbackPairRes.status === "ok") {
-      if (existingIds.has(rollbackPairRes.pair.current)) {
+      if (rollbackPairRes.pair.pending && existingIds.has(rollbackPairRes.pair.pending)) {
+        keep.add(rollbackPairRes.pair.pending);
+      }
+      if (rollbackPairRes.pair.current && existingIds.has(rollbackPairRes.pair.current)) {
         keep.add(rollbackPairRes.pair.current);
       }
       if (rollbackPairRes.pair.previous && existingIds.has(rollbackPairRes.pair.previous)) {
         keep.add(rollbackPairRes.pair.previous);
+      }
+      if (
+        rollbackPairRes.pair.pending !== undefined &&
+        rollbackPairRes.pair.current === currentSymlinkId
+      ) {
+        interruptedActivation = {
+          pending: rollbackPairRes.pair.pending,
+          current: rollbackPairRes.pair.current,
+          previous: rollbackPairRes.pair.previous,
+        };
       }
     } else {
       if (opts.current && existingIds.has(opts.current)) {
@@ -617,6 +739,7 @@ export function pruneInstallReleases(opts: PruneReleasesOptions): PruneReleasesR
 
     return {
       skipped: null,
+      ...(interruptedActivation ? { interruptedActivation } : {}),
       kept: releases.filter((r) => keep.has(r.id)).map((r) => r.id),
       removed,
     };
@@ -827,6 +950,20 @@ export function runInstallMaintenance(opts: InstallMaintenanceOptions): InstallM
       nowMs,
       `maintenance=prune_skipped skipped=${releases.skipped} reason="${reason}"`,
     );
+  } else if (releases.interruptedActivation) {
+    const ia = releases.interruptedActivation;
+    const nowMs = (opts.now ?? Date.now)();
+    const pending = sanitizeAuditValue(ia.pending);
+    const current = sanitizeAuditValue(ia.current ?? "none");
+    const previous = sanitizeAuditValue(ia.previous ?? "none");
+    console.error(
+      `[pi-harness maintenance] interrupted activation record detected (pending=${pending}, current=${current}, previous=${previous}); keeping all recorded releases`,
+    );
+    appendAuditLogLine(
+      opts.stateDir,
+      nowMs,
+      `maintenance=interrupted_activation pending=${pending} current=${current} previous=${previous}`,
+    );
   }
 
   let stagingRemoved: string[] = [];
@@ -859,6 +996,7 @@ function parseCliArgs(argv: string[]): {
   recordRollbackPair?: boolean;
   installDir?: string;
   stateDir?: string;
+  pending?: string;
   current?: string;
   previous?: string;
   priorCurrent?: string;
@@ -867,6 +1005,7 @@ function parseCliArgs(argv: string[]): {
     recordRollbackPair?: boolean;
     installDir?: string;
     stateDir?: string;
+    pending?: string;
     current?: string;
     previous?: string;
     priorCurrent?: string;
@@ -881,6 +1020,9 @@ function parseCliArgs(argv: string[]): {
       i++;
     } else if (arg === "--state-dir" && next !== undefined) {
       out.stateDir = next;
+      i++;
+    } else if (arg === "--pending" && next !== undefined) {
+      out.pending = next;
       i++;
     } else if (arg === "--current" && next !== undefined) {
       out.current = next;
@@ -921,13 +1063,20 @@ if (import.meta.main) {
   const parsed = parseCliArgs(cliArgs);
   if (parsed.recordRollbackPair) {
     try {
-      if (!parsed.installDir || !parsed.current) {
+      if (!parsed.installDir || (!parsed.pending && !parsed.current)) {
         console.error(
-          "[pi-harness maintenance] --record-rollback-pair requires --install-dir and --current",
+          "[pi-harness maintenance] --record-rollback-pair requires --install-dir and --current or --pending",
+        );
+        process.exitCode = 1;
+      } else if (parsed.pending && parsed.current) {
+        console.error(
+          "[pi-harness maintenance] --record-rollback-pair accepts either --pending or --current, not both",
         );
         process.exitCode = 1;
       } else {
-        const res = recordRollbackPair(parsed.installDir, parsed.current, parsed.priorCurrent);
+        const res = parsed.pending
+          ? recordPendingRollbackPair(parsed.installDir, parsed.pending, parsed.priorCurrent)
+          : recordRollbackPair(parsed.installDir, parsed.current!, parsed.priorCurrent);
         if (res.status !== "written") {
           console.error(`[pi-harness maintenance] skipping rollback pair update (${res.status}): ${res.reason}`);
         }

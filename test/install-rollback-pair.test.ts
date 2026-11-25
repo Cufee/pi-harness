@@ -65,6 +65,22 @@ if [ -n "\${PI_HARNESS_TEST_ABORT_BEFORE_PAIR_WRITE:-}" ]; then
     fi
   done
 fi
+if [ -n "\${PI_HARNESS_TEST_ABORT_BEFORE_CURRENT_SWAP:-}" ]; then
+  if [ "\${1:-}" = "-e" ] && printf '%s' "\${2:-}" | grep -q 'renameSync'; then
+    exit 98
+  fi
+fi
+if [ -n "\${PI_HARNESS_TEST_ABORT_BEFORE_FINALIZE:-}" ]; then
+  has_record=0
+  has_current=0
+  for arg in "$@"; do
+    [ "$arg" = "--record-rollback-pair" ] && has_record=1
+    [ "$arg" = "--current" ] && has_current=1
+  done
+  if [ "$has_record" = 1 ] && [ "$has_current" = 1 ]; then
+    exit 97
+  fi
+fi
 exec '${process.execPath}' "$@"
 `;
   for (const target of bunTargets) {
@@ -401,6 +417,245 @@ describe("durable rollback pair for release pruning (I1)", () => {
     assert.ok(
       auditText.includes("maintenance=prune_skipped") && auditText.includes("skipped=rollback_pair_missing"),
       `expected install-audit.log to record rollback_pair_missing skip, got:\n${auditText}`,
+    );
+  });
+
+  it("keeps the real previous release when activation is interrupted after the pair write and before the current swap (F5)", () => {
+    const root = makeTempRoot("pi-rollback-post-pair-abort-");
+    const stateDir = join(root, "state");
+    const installDir = join(root, "install");
+    const binDir = join(root, "bin");
+    mkdirSync(stateDir, { recursive: true });
+    mkdirSync(installDir, { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    seedOfflineInstallDir(installDir);
+
+    const env = {
+      PI_HARNESS_HOME: stateDir,
+      PI_HARNESS_INSTALL_DIR: installDir,
+      PI_HARNESS_BIN_DIR: binDir,
+    };
+
+    const HOUR = 60 * 60 * 1000;
+    const relA = "aaaaaaaaaaaa";
+    const relX = "xxxxxxxxxxxx";
+    const relADir = join(installDir, "releases", relA);
+    mkdirSync(join(relADir, "src", "tools"), { recursive: true });
+    writeFileSync(join(relADir, ".installed"), "");
+    writeFileSync(join(relADir, "src", "tools", "native-tools.ts"), `export const OCTOFS_VERSION = "${OCTOFS_VERSION}";\n`);
+    backdateRelease(installDir, relA, 5 * HOUR);
+    symlinkSync(`releases/${relA}`, join(installDir, "current"));
+
+    // Activate B from A so current -> B and rollback-pair.json is { current: B, previous: A }.
+    const checkoutB = join(root, "checkout-b");
+    makeMiniCheckout(checkoutB, "release-b");
+    const installB = runInstallSh(checkoutB, env);
+    assert.equal(installB.status, 0, `install B failed:\n${installB.stdout}\n${installB.stderr}`);
+    const relB = basename(readlinkSync(join(installDir, "current")));
+    const recordPath = join(installDir, "rollback-pair.json");
+    assert.deepEqual(JSON.parse(readFileSync(recordPath, "utf8")), { current: relB, previous: relA });
+
+    // Create another unpinned release X that is newer than A, and backdate A, X, B past the 10-minute recent window.
+    const relXDir = join(installDir, "releases", relX);
+    mkdirSync(join(relXDir, "src", "tools"), { recursive: true });
+    writeFileSync(join(relXDir, ".installed"), "");
+    writeFileSync(join(relXDir, "src", "tools", "native-tools.ts"), `export const OCTOFS_VERSION = "${OCTOFS_VERSION}";\n`);
+    backdateRelease(installDir, relA, 5 * HOUR);
+    backdateRelease(installDir, relX, 4 * HOUR);
+    backdateRelease(installDir, relB, 3 * HOUR);
+
+    const auditLogPath = join(stateDir, "install-audit.log");
+    rmSync(auditLogPath, { force: true });
+
+    // Attempt to activate C, aborting after the pre-swap record write and before swapping current from B.
+    const checkoutC = join(root, "checkout-c");
+    makeMiniCheckout(checkoutC, "release-c");
+    const interruptedC = runInstallSh(checkoutC, {
+      ...env,
+      PI_HARNESS_TEST_ABORT_BEFORE_CURRENT_SWAP: "1",
+    });
+    assert.notEqual(interruptedC.status, 0, "expected activation of C interrupted before current swap to fail");
+    assert.equal(
+      basename(readlinkSync(join(installDir, "current"))),
+      relB,
+      "current symlink must still point to B when aborted before swap",
+    );
+
+    const relC = readdirSync(join(installDir, "releases")).find((id) => id !== relA && id !== relB && id !== relX);
+    assert.ok(relC, "expected C to be unpacked under releases/");
+    backdateRelease(installDir, relC, 2 * HOUR);
+
+    // Run maintenance with default keepCount=3 while the lock is free.
+    const maint = spawnSync(
+      process.execPath,
+      [
+        join(installDir, "releases", relB, "src", "install", "maintenance.ts"),
+        "--install-dir",
+        installDir,
+        "--state-dir",
+        stateDir,
+        "--current",
+        relB,
+      ],
+      { encoding: "utf8", timeout: 15_000 },
+    );
+    assert.equal(maint.status, 0, maint.stderr);
+
+    assert.equal(existsSync(join(installDir, "releases", relA)), true, "real previous release A must be kept");
+    assert.equal(existsSync(join(installDir, "releases", relB)), true, "current release B must be kept");
+    assert.equal(existsSync(join(installDir, "releases", relC)), true, "pending release C must be kept");
+    assert.equal(existsSync(join(installDir, "releases", relX)), false, "unpinned release X should be pruned beyond keep=3");
+
+    // Maintenance must not rewrite the interrupted activation record, and must audit one line.
+    assert.deepEqual(JSON.parse(readFileSync(recordPath, "utf8")), {
+      pending: relC,
+      current: relB,
+      previous: relA,
+    });
+    const auditLines = readFileSync(auditLogPath, "utf8").trim().split(/\r?\n/);
+    assert.equal(auditLines.length, 1, `expected 1 audit line for interrupted activation, got:\n${auditLines.join("\n")}`);
+    assert.ok(
+      auditLines[0]!.includes("maintenance=interrupted_activation"),
+      `expected interrupted_activation audit line, got: ${auditLines[0]}`,
+    );
+
+    // A later activation starts from the resolved current symlink (B) and the record's matching previous (A).
+    const checkoutD = join(root, "checkout-d");
+    makeMiniCheckout(checkoutD, "release-d");
+    const interruptedD = runInstallSh(checkoutD, {
+      ...env,
+      PI_HARNESS_TEST_ABORT_BEFORE_CURRENT_SWAP: "1",
+    });
+    assert.notEqual(interruptedD.status, 0);
+    const relD = readdirSync(join(installDir, "releases")).find((id) => id !== relA && id !== relB && id !== relC);
+    assert.ok(relD, "expected D to be unpacked under releases/");
+    assert.deepEqual(JSON.parse(readFileSync(recordPath, "utf8")), {
+      pending: relD,
+      current: relB,
+      previous: relA,
+    });
+
+    // Interrupting D after the current swap and before finalize still pins D, B (real previous of D), and A.
+    const interruptedDFinalize = runInstallSh(checkoutD, {
+      ...env,
+      PI_HARNESS_TEST_ABORT_BEFORE_FINALIZE: "1",
+    });
+    assert.notEqual(interruptedDFinalize.status, 0);
+    assert.equal(basename(readlinkSync(join(installDir, "current"))), relD);
+    assert.deepEqual(JSON.parse(readFileSync(recordPath, "utf8")), {
+      pending: relD,
+      current: relB,
+      previous: relA,
+    });
+    const relY = "yyyyyyyyyyyy";
+    const relYDir = join(installDir, "releases", relY);
+    mkdirSync(join(relYDir, "src", "tools"), { recursive: true });
+    writeFileSync(join(relYDir, ".installed"), "");
+    writeFileSync(join(relYDir, "src", "tools", "native-tools.ts"), `export const OCTOFS_VERSION = "${OCTOFS_VERSION}";\n`);
+    backdateRelease(installDir, relA, 5 * HOUR);
+    backdateRelease(installDir, relB, 4 * HOUR);
+    backdateRelease(installDir, relC, 4 * HOUR);
+    backdateRelease(installDir, relY, 3 * HOUR);
+    backdateRelease(installDir, relD, 2 * HOUR);
+
+    const maintAfterSwap = spawnSync(
+      process.execPath,
+      [
+        join(installDir, "releases", relD, "src", "install", "maintenance.ts"),
+        "--install-dir",
+        installDir,
+        "--state-dir",
+        stateDir,
+        "--current",
+        relD,
+      ],
+      { encoding: "utf8", timeout: 15_000 },
+    );
+    assert.equal(maintAfterSwap.status, 0, maintAfterSwap.stderr);
+    assert.equal(existsSync(join(installDir, "releases", relD)), true, "new current D must be kept");
+    assert.equal(existsSync(join(installDir, "releases", relB)), true, "real previous B of D must be kept");
+    assert.equal(existsSync(join(installDir, "releases", relA)), true, "recorded previous A must be kept");
+    assert.equal(existsSync(join(installDir, "releases", relY)), false, "unpinned Y should be pruned beyond keep=3");
+    assert.deepEqual(JSON.parse(readFileSync(recordPath, "utf8")), {
+      pending: relD,
+      current: relB,
+      previous: relA,
+    });
+
+    // Completing D recovers B as D's previous and finalizes to the two-field record { current: D, previous: B }.
+    const completedD = runInstallSh(checkoutD, env);
+    assert.equal(completedD.status, 0, `completing D failed:\n${completedD.stdout}\n${completedD.stderr}`);
+    assert.equal(basename(readlinkSync(join(installDir, "current"))), relD);
+    const finalized = JSON.parse(readFileSync(recordPath, "utf8")) as Record<string, unknown>;
+    assert.deepEqual(finalized, { current: relD, previous: relB });
+    assert.equal("pending" in finalized, false);
+  });
+
+  it("finalizes to a two-field record on completed activation and prunes unpinned older releases as before (F5)", () => {
+    const root = makeTempRoot("pi-rollback-completed-");
+    const stateDir = join(root, "state");
+    const installDir = join(root, "install");
+    const binDir = join(root, "bin");
+    mkdirSync(stateDir, { recursive: true });
+    mkdirSync(installDir, { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    seedOfflineInstallDir(installDir);
+
+    const env = {
+      PI_HARNESS_HOME: stateDir,
+      PI_HARNESS_INSTALL_DIR: installDir,
+      PI_HARNESS_BIN_DIR: binDir,
+    };
+
+    const HOUR = 60 * 60 * 1000;
+    const relA = "aaaaaaaaaaaa";
+    const relX = "xxxxxxxxxxxx";
+    const relADir = join(installDir, "releases", relA);
+    mkdirSync(join(relADir, "src", "tools"), { recursive: true });
+    writeFileSync(join(relADir, ".installed"), "");
+    writeFileSync(join(relADir, "src", "tools", "native-tools.ts"), `export const OCTOFS_VERSION = "${OCTOFS_VERSION}";\n`);
+    backdateRelease(installDir, relA, 5 * HOUR);
+    symlinkSync(`releases/${relA}`, join(installDir, "current"));
+
+    const checkoutB = join(root, "checkout-b");
+    makeMiniCheckout(checkoutB, "release-b");
+    const installB = runInstallSh(checkoutB, env);
+    assert.equal(installB.status, 0, `install B failed:\n${installB.stdout}\n${installB.stderr}`);
+    const relB = basename(readlinkSync(join(installDir, "current")));
+
+    const relXDir = join(installDir, "releases", relX);
+    mkdirSync(join(relXDir, "src", "tools"), { recursive: true });
+    writeFileSync(join(relXDir, ".installed"), "");
+    writeFileSync(join(relXDir, "src", "tools", "native-tools.ts"), `export const OCTOFS_VERSION = "${OCTOFS_VERSION}";\n`);
+    backdateRelease(installDir, relA, 5 * HOUR);
+    backdateRelease(installDir, relX, 4 * HOUR);
+    backdateRelease(installDir, relB, 3 * HOUR);
+
+    const auditLogPath = join(stateDir, "install-audit.log");
+    rmSync(auditLogPath, { force: true });
+
+    const checkoutC = join(root, "checkout-c");
+    makeMiniCheckout(checkoutC, "release-c");
+    const installC = runInstallSh(checkoutC, env);
+    assert.equal(installC.status, 0, `install C failed:\n${installC.stdout}\n${installC.stderr}`);
+    const relC = basename(readlinkSync(join(installDir, "current")));
+
+    const recordPath = join(installDir, "rollback-pair.json");
+    const finalized = JSON.parse(readFileSync(recordPath, "utf8")) as Record<string, unknown>;
+    assert.deepEqual(finalized, { current: relC, previous: relB });
+    assert.equal("pending" in finalized, false);
+
+    // With default keep=3: C (current), B (previous), and X (newer than A) survive; oldest unpinned A is pruned.
+    assert.equal(existsSync(join(installDir, "releases", relC)), true, "current release C must be kept");
+    assert.equal(existsSync(join(installDir, "releases", relB)), true, "previous release B must be kept");
+    assert.equal(existsSync(join(installDir, "releases", relX)), true, "newer release X should fill keep=3");
+    assert.equal(existsSync(join(installDir, "releases", relA)), false, "superseded oldest release A should be pruned");
+
+    const auditText = readFileSync(auditLogPath, "utf8");
+    assert.equal(
+      auditText.includes("maintenance=interrupted_activation"),
+      false,
+      `completed activation must not log interrupted_activation:\n${auditText}`,
     );
   });
 });
