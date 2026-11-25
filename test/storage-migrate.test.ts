@@ -886,44 +886,62 @@ describe("storage migration engine (core)", () => {
       const runDir = join(repo, ".harness", "artifacts", run.id);
       for (let i = 1; i <= 5; i++) {
         const p = join(runDir, task.id, `file-${i}.txt`);
-        writeFile(p, `payload-${i}-`.repeat(50));
+        writeFile(p, `payload-${i}-`.repeat(15_000));
         cpDb.recordArtifact({ runId: run.id, taskId: task.id, kind: "dossier", path: p, summary: `File ${i}` });
       }
       const beforeHashes = hashTree(runDir);
 
-      // Fake clock: ticks forward by 20ms per check so budgetMs=100 expires after ~2 files during copyToStaging.
-      let clock = 1_000;
-      const fakeNow = () => {
-        clock += 20;
-        return clock;
+      // Fake clock: ticks forward by 10ms per check; fixed budgetMs=580 expires mid-copy after a subset of files
+      // and converges over repeated passes with the EXACT same budget using the private stage manifest.
+      const EQUAL_BUDGET_MS = 580;
+      const makePassClock = () => {
+        let clock = 1_000;
+        return () => {
+          clock += 10;
+          return clock;
+        };
       };
 
       const pass1 = runStorageMigrationPass(
-        { sqlite: cpDb.db, storage, now: fakeNow, forceCopy: true },
-        { budgetMs: 140 },
+        { sqlite: cpDb.db, storage, now: makePassClock(), forceCopy: true },
+        { budgetMs: EQUAL_BUDGET_MS },
       );
       assert.equal(pass1.budgetExceeded, true);
       assert.equal(pass1.errors.length, 0);
       assert.equal(pass1.remainingUnits.length, 1);
 
       const destDir = join(storage.projectDir(repo), "chats", "chat-8", "artifacts", run.id);
-      const stagingDir = `${destDir}.migrating`;
+      const stagingRoot = join(storage.projectDir(repo), ".migration-staging");
       assert.equal(existsSync(destDir), false, "Destination must not exist after mid-copy budget expiry");
-      assert.equal(existsSync(stagingDir), true, "Partial .migrating staging dir proves copy started");
-      const copiedCount = hashTree(stagingDir).size;
-      assert.equal(copiedCount, 2, `Expected partial copy to stop between files (2/5), got ${copiedCount}/5`);
+      assert.equal(existsSync(`${destDir}.migrating`), false, "Must never stage at public <dest>.migrating");
+      assert.equal(existsSync(stagingRoot), true, "Private .migration-staging dir proves copy started");
+      const stageOpIds = readdirSync(stagingRoot);
+      assert.equal(stageOpIds.length, 1);
+      const stagedPayload = join(stagingRoot, stageOpIds[0]!, "payload");
+      const copiedAfterPass1 = hashTree(stagedPayload).size;
+      assert.ok(
+        copiedAfterPass1 >= 1 && copiedAfterPass1 < 5,
+        `Expected partial copy to stop between files (1..4/5), got ${copiedAfterPass1}/5`,
+      );
       assertHashMapEqual(hashTree(runDir), beforeHashes, "legacy files untouched after budget expiry");
 
-      // Second pass with generous budget removes stale staging and finishes migration.
-      const pass2 = runStorageMigrationPass(
-        { sqlite: cpDb.db, storage, forceCopy: true },
-        { budgetMs: 30_000 },
-      );
-      assert.equal(pass2.budgetExceeded, false);
-      assert.equal(pass2.errors.length, 0);
-      assert.equal(pass2.remainingUnits.length, 0);
-      assert.equal(pass2.totals.migrated, 1);
-      assert.equal(existsSync(stagingDir), false);
+      // Repeated passes with the EXACT SAME budget resume from manifest.jsonl and converge cleanly.
+      let passes = 1;
+      let totalMigrated = pass1.totals.migrated;
+      let lastReport = pass1;
+      while (lastReport.budgetExceeded && passes < 10) {
+        passes++;
+        lastReport = runStorageMigrationPass(
+          { sqlite: cpDb.db, storage, now: makePassClock(), forceCopy: true },
+          { budgetMs: EQUAL_BUDGET_MS },
+        );
+        assert.equal(lastReport.errors.length, 0);
+        totalMigrated += lastReport.totals.migrated;
+      }
+      assert.equal(lastReport.budgetExceeded, false, "Must converge over repeated equal budgets");
+      assert.equal(lastReport.totals.remaining, 0);
+      assert.equal(totalMigrated, 1);
+      assert.equal(existsSync(stagingRoot), false);
       assertHashMapEqual(hashTree(destDir), beforeHashes, "full hash map after resumed copy");
       assert.equal(lstatSync(runDir).isSymbolicLink(), true);
       assert.equal(readlinkSync(runDir), destDir);

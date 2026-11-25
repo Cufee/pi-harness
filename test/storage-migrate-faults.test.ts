@@ -338,7 +338,12 @@ describe("storage migration fault injection & both-exist merge", () => {
 
         // Verify intermediate invariants at each step.
         if (step === "after_copy" || step === "after_verify") {
-          assert.equal(existsSync(`${f.destGoalDir}.migrating`), true);
+          assert.equal(existsSync(`${f.destGoalDir}.migrating`), false, "Must never stage at public <dest>.migrating");
+          const stagingRoot = join(f.storage.projectDir(f.repo), ".migration-staging");
+          assert.equal(existsSync(stagingRoot), true, "Expected private .migration-staging directory");
+          const stageDirs = readdirSync(stagingRoot);
+          assert.equal(stageDirs.length, 1, `Expected 1 recorded stage opId dir, got ${stageDirs.length}`);
+          assert.equal(existsSync(join(stagingRoot, stageDirs[0]!, "payload")), true);
           assert.equal(existsSync(f.destGoalDir), false);
           assertHashMapEqual(hashTree(f.goalDir), f.beforeGoalHashes, `${step}: legacy untouched`);
         } else if (step === "after_rename_into_place") {
