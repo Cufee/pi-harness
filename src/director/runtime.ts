@@ -2,10 +2,10 @@ import { randomUUID } from "node:crypto";
 import { accessSync, closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { open as openFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { attachNotices } from "../advisories/message.js";
-import { REJECTIONS } from "../advisories/rejections.js";
+import { REJECTIONS, rejection } from "../advisories/rejections.js";
 import { buildDirectorSubject } from "../advisories/subject.js";
 import type { Subject } from "../advisories/types.js";
 import {
@@ -76,6 +76,7 @@ import type { QuotaClient } from "../quota/client.js";
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
 import type { RunnerCallbacks, RunnerExecutionHandle, ToolDefinition } from "../runners/types.js";
+import { ensureDirsUnderRoot } from "../storage/data-dir/fs-utils.js";
 import {
   describeMergedRefFallback,
   describeMissingMergedRef,
@@ -1212,13 +1213,38 @@ export class DirectorRuntime {
     return { repoRoot, chatSessionId: chatSessionId ?? null };
   }
 
-  private goalRef(goal: Pick<GoalRecord, "repoRoot" | "id" | "chatSessionId">): GoalRef {
-    return { repoRoot: goal.repoRoot, id: goal.id, chatSessionId: goal.chatSessionId };
+  private goalRef(goal: Pick<GoalRecord, "repoRoot" | "id" | "chatSessionId" | "linkedRunId">): GoalRef {
+    return {
+      repoRoot: goal.repoRoot,
+      id: goal.id,
+      chatSessionId: goal.chatSessionId,
+      linkedRunId: goal.linkedRunId,
+    };
   }
 
-  private runRef(run: RunRecord): RunRecord & RunRef {
+  /** The goal linked to this run, if any (missing goals table/columns or no row means no partner; other DB errors propagate). */
+  private resolveLinkedGoalIdForRun(runId: string): string | null {
+    try {
+      const row = this.db.db
+        .prepare("SELECT id FROM goals WHERE linked_run_id = ? LIMIT 1")
+        .get(runId) as { id?: string } | null;
+      return row?.id ? String(row.id) : null;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "";
+      if (
+        /\bno such table:\s*(?:main\.)?goals(?:\b|$)/i.test(msg) ||
+        /\bno such column:\s*(?:goals\.)?(?:id|linked_run_id)(?:\b|$)/i.test(msg)
+      ) {
+        return null;
+      }
+      throw err;
+    }
+  }
+
+  private runRef(run: RunRecord, linkedGoalId?: string | null): RunRecord & RunRef {
     const chatSessionId = run.chatSessionId ?? this.db.getRunChatSessionId(run.id);
-    return chatSessionId === run.chatSessionId ? run : { ...run, chatSessionId };
+    const resolvedGoalId = linkedGoalId !== undefined ? linkedGoalId : this.resolveLinkedGoalIdForRun(run.id);
+    return { ...run, chatSessionId, linkedGoalId: resolvedGoalId };
   }
 
   private mapWaitTasksPaths(res: unknown): unknown {
@@ -5784,7 +5810,7 @@ export class DirectorRuntime {
       const cycle = goal.reviewCycle + 1;
       const reviewRun = run ?? await this.orchestrator.ensureDirectorTaskRun(goal.chatSessionId ?? goal.id, goal.repoRoot);
       assertCurrent();
-      const reviewRunRef = this.runRef(reviewRun);
+      const reviewRunRef = this.runRef(reviewRun, run ? goal.id : null);
       const goalRef = this.goalRef(goal);
       const reviewerGrants = this.storage.taskGrants({
         run: reviewRunRef,
@@ -7476,6 +7502,114 @@ export class DirectorRuntime {
         const mapped = this.storage.resolveLegacyPath(repoRoot, rawPath, owner);
         const expandedTarget =
           mapped ?? (rawPath.startsWith("~/") ? resolve(homedir(), rawPath.slice(2)) : resolve(root, rawPath));
+        if (this.storage.layout === "data-dir") {
+          const ownGoals = this.goals.listGoals({ repoRoot, chatSessionId });
+          const writePolicyOpts = { ownLegacyGoalIds: ownGoals.map((g) => g.id) };
+          const rejectWriteNote = (policyReason: string) =>
+            rejection(
+              "director-note-root",
+              `write_note cannot write ${rawPath}.`,
+              `${policyReason}.`,
+              storageText(this.storage.layout).directorNoteRootAlternative(),
+            );
+          const rootDirs = new Set<string>(allowedWriteRoots);
+          for (const g of ownGoals) {
+            try {
+              rootDirs.add(this.storage.goalEvidenceDir(g));
+            } catch {
+              // Ignore goals with non-directory-safe ids; directorWritePolicy also skips them.
+            }
+          }
+          const assertWritableFileTarget = (path: string) => {
+            const verdict = this.storage.directorWritePolicy(owner, path, writePolicyOpts);
+            if (!verdict.ok) {
+              throw rejectWriteNote(verdict.reason);
+            }
+            const resolvedPath = resolve(path);
+            if (rootDirs.has(resolvedPath)) {
+              const parentVerdict = this.storage.directorWritePolicy(owner, dirname(resolvedPath), writePolicyOpts);
+              const fallbackVerdict = parentVerdict.ok
+                ? this.storage.directorWritePolicy(owner, "", writePolicyOpts)
+                : parentVerdict;
+              throw rejectWriteNote(
+                fallbackVerdict.ok ? "Write target must be a file inside an allowed write root" : fallbackVerdict.reason,
+              );
+            }
+          };
+          assertWritableFileTarget(expandedTarget);
+          let ancestor = dirname(expandedTarget);
+          while (!lstatSync(ancestor, { throwIfNoEntry: false })) ancestor = dirname(ancestor);
+          const realAncestor = realpathSync(ancestor);
+          const target = resolve(realAncestor, relative(ancestor, expandedTarget));
+          assertWritableFileTarget(target);
+          const projectDir = this.storage.projectDir(repoRoot);
+          const relTargetFromProject = relative(projectDir, target);
+          const inProjectDir =
+            relTargetFromProject !== "" &&
+            relTargetFromProject !== ".." &&
+            !relTargetFromProject.startsWith(`..${sep}`) &&
+            !isAbsolute(relTargetFromProject);
+          const existing = lstatSync(target, { throwIfNoEntry: false });
+          if (existing) {
+            if (existing.isSymbolicLink()) {
+              const symlinkVerdict = this.storage.directorWritePolicy(owner, target, writePolicyOpts);
+              throw rejectWriteNote(symlinkVerdict.ok ? "Symlink write target is protected" : symlinkVerdict.reason);
+            }
+            assertWritableFileTarget(realpathSync(target));
+          }
+          if (inProjectDir) {
+            const ensuredProjectDir = this.storage.ensureProjectDir(repoRoot);
+            const relExpandedParent = relative(ensuredProjectDir, dirname(expandedTarget));
+            const relParent =
+              relExpandedParent !== "" &&
+              relExpandedParent !== ".." &&
+              !relExpandedParent.startsWith(`..${sep}`) &&
+              !isAbsolute(relExpandedParent)
+                ? relExpandedParent
+                : relative(ensuredProjectDir, dirname(target));
+            if (!relParent || relParent === ".." || relParent.startsWith(`..${sep}`) || isAbsolute(relParent)) {
+              const denied = this.storage.directorWritePolicy(owner, ensuredProjectDir, writePolicyOpts);
+              throw rejectWriteNote(denied.ok ? "Path is outside Director allowed write roots" : denied.reason);
+            }
+            const parentSegments = relParent.split(sep).filter(Boolean);
+            ensureDirsUnderRoot(ensuredProjectDir, parentSegments, () => {
+              const denied = this.storage.directorWritePolicy(owner, ensuredProjectDir, writePolicyOpts);
+              const rootsPart = !denied.ok && denied.reason.includes("; ")
+                ? denied.reason.slice(denied.reason.indexOf("; "))
+                : "";
+              return rejectWriteNote(`Symlink or non-directory parent is protected${rootsPart}`);
+            });
+          } else if (!existing) {
+            mkdirSync(dirname(target), { recursive: true });
+          }
+          assertWritableFileTarget(join(realpathSync(dirname(target)), basename(target)));
+          const fd = openSync(
+            target,
+            constants.O_WRONLY |
+              constants.O_NOFOLLOW |
+              constants.O_NONBLOCK |
+              (existing ? 0 : constants.O_CREAT | constants.O_EXCL),
+          );
+          try {
+            const actual = realpathSync(target);
+            assertWritableFileTarget(actual);
+            const opened = fstatSync(fd);
+            const current = statSync(actual);
+            if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== current.dev || opened.ino !== current.ino) {
+              throw new Error("write_note requires a regular file with a single link");
+            }
+            ftruncateSync(fd, 0);
+            writeFileSync(fd, content, "utf8");
+          } finally {
+            closeSync(fd);
+          }
+          this.chats.appendTurn(
+            chatSessionId,
+            "system_notice",
+            `Director write_note: ${rawPath} (${Buffer.byteLength(content, "utf8")} bytes). Reason: ${reason}`,
+          );
+          return { written: true, path: expandedTarget, bytes: Buffer.byteLength(content, "utf8") };
+        }
         const matchedRoot = allowedWriteRoots.find((allowed) => {
           const rel = relative(allowed, expandedTarget);
           return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
@@ -7489,9 +7623,6 @@ export class DirectorRuntime {
             throw REJECTIONS.directorNoteRoot(rawPath);
           }
           if (this.storage.isProtectedWorktreePath(path, matchedRoot)) throw REJECTIONS.directorNoteRoot(rawPath);
-          if (this.storage.layout === "data-dir" && !this.storage.directorReadPolicy(root, path).ok) {
-            throw REJECTIONS.directorNoteRoot(rawPath);
-          }
         };
         checkTarget(expandedTarget);
         let ancestor = dirname(expandedTarget);
@@ -8002,20 +8133,42 @@ export class DirectorRuntime {
         });
 
         const pageBytes = Math.min(READ_FILE_MAX_PAGE_BYTES, Math.max(4, int(args.max_bytes) ?? READ_FILE_DEFAULT_PAGE_BYTES));
-        const file = await openFile(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        let file: Awaited<ReturnType<typeof openFile>>;
         try {
-          const stat = await file.stat();
-          if (!stat.isFile()) throw new Error("Expected a regular file");
+          file = await openFile(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ELOOP") {
+            throw REJECTIONS.directorProtectedRead(rawPath);
+          }
+          throw error;
+        }
+        try {
+          const fdStat = await file.stat({ bigint: true });
+          if (!fdStat.isFile()) throw new Error("Expected a regular file");
+          // Confirm the opened file is still the one at the verified, symlink-free target (same pinned-open pattern as dossiers.ts).
+          let same = false;
+          try {
+            const pathStat = lstatSync(target, { bigint: true });
+            same =
+              !pathStat.isSymbolicLink() &&
+              fdStat.dev === pathStat.dev &&
+              fdStat.ino === pathStat.ino &&
+              realpathSync(target) === target;
+          } catch {
+            same = false;
+          }
+          if (!same) throw REJECTIONS.directorProtectedRead(rawPath);
+          const statSize = Number(fdStat.size);
           const log = (bytes: number, at: number) => {
             const event: ChatControlEvent = { kind: "director.read_file", path, bytes, ...(reason ? { reason } : {}), ...(at > 0 ? { offset: at } : {}) };
             this.chats.appendTurn(chatSessionId, "system_notice", formatChatEventSummary(event), undefined, event);
           };
 
           // Find the starting byte: a caller offset (negative counts back from end of file) or the start of start_line.
-          let reqOffset = offsetArg === undefined ? 0 : offsetArg < 0 ? Math.max(0, stat.size + offsetArg) : offsetArg;
+          let reqOffset = offsetArg === undefined ? 0 : offsetArg < 0 ? Math.max(0, statSize + offsetArg) : offsetArg;
           let totalLines: number | undefined;
           if (lineMode && startLine > 1) {
-            const scan = Buffer.allocUnsafe(Math.max(1, Math.min(READ_FILE_SCAN_BYTES, stat.size)));
+            const scan = Buffer.allocUnsafe(Math.max(1, Math.min(READ_FILE_SCAN_BYTES, statSize)));
             let line = 1;
             let pos = 0;
             let last = 0x0a;
@@ -8052,13 +8205,13 @@ export class DirectorRuntime {
               ...(lineMode ? { totalLines: totalLines ?? startLine - 1 } : {}),
             };
           };
-          if (reqOffset >= stat.size) return empty(stat.size);
+          if (reqOffset >= statSize) return empty(statSize);
 
-          const want = Math.min(pageBytes, stat.size - reqOffset);
+          const want = Math.min(pageBytes, statSize - reqOffset);
           const buf = Buffer.alloc(want);
           const { bytesRead: count } = await file.read(buf, 0, want, reqOffset);
           // A short read means the file ended (or was truncated) after stat; treat where it stopped as end of file.
-          const effectiveSize = count < want ? reqOffset + count : stat.size;
+          const effectiveSize = count < want ? reqOffset + count : statSize;
           if (count === 0) return empty(effectiveSize);
           // Skip continuation bytes when the caller's byte offset lands inside a multi-byte character.
           let skip = 0;
@@ -8481,6 +8634,7 @@ function goalEvidenceDirOrNull(goal: GoalRecord, storage: StoragePaths = legacyS
     repoRoot: goal.repoRoot,
     id: goal.id,
     chatSessionId: goal.chatSessionId,
+    linkedRunId: goal.linkedRunId,
   });
 }
 
@@ -8543,7 +8697,10 @@ export function resolveDirectorReadablePath(
   }
   const relToRepo = relative(root, target);
   const inRepo = relToRepo !== ".." && !relToRepo.startsWith(`..${sep}`) && !isAbsolute(relToRepo);
-  return { target, inRepo, display: inRepo ? relToRepo : target };
+  const isStoragePath =
+    storage.layout === "data-dir" &&
+    (mapped !== null || storage.resolveLegacyPath(repoRoot, target, opts?.owner) !== null);
+  return { target, inRepo, display: isStoragePath || !inRepo ? target : relToRepo };
 }
 
 /** System prompt for the independent read-only Done-Reviewer session. */

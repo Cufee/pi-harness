@@ -411,7 +411,7 @@ describe("Director storage paths (data-dir layout, criterion c8 pre- and post-mi
         path: ".harness/notes/shared-note.md",
       })) as { path: string; content: string };
       assert.equal(preReadNoteRel.content, "v1 legacy note\n");
-      assert.equal(preReadNoteRel.path, ".harness/notes/shared-note.md");
+      assert.equal(preReadNoteRel.path, legacyNotePath);
 
       const preReadEv = (await daemon.director.executeDirectorMcpTool(chat1.id, "read_file", {
         path: `.harness/goals/${goal1.id}/evidence.md`,
@@ -836,6 +836,137 @@ describe("Director storage paths (data-dir layout, criterion c8 pre- and post-mi
       assert.deepEqual(linkedReq.deniedRoots, [realpathSync(stateDir)]);
       assert.equal(existsSync(join(repoRoot, ".harness")), false, "no in-repo .harness dir should be created");
     } finally {
+      await daemon.stop();
+    }
+  });
+
+  it("W2: read_file returns the absolute current winner path for active legacy and both-exist units in data-dir layout while preserving legacy display", async () => {
+    const { root, repoRoot } = await makeTempGitRepo("pi-dir-w2-");
+    const stateDir = join(root, "state");
+    mkdirSync(stateDir, { recursive: true });
+    const config = makeConfig(repoRoot, stateDir);
+
+    // Seed active legacy note and both-exist goal unit (legacy + data-dir copies).
+    setLayoutEnv("data-dir");
+    const sp = storagePaths(config, { layout: "data-dir" });
+    const daemon = new HarnessDaemon(config, {
+      dbPath: ":memory:",
+      customRunnerFactory: () => ({
+        run: async () => ({ stopReason: "completed", text: "ok" }),
+      }),
+    });
+
+    try {
+      const chat = await daemon.director.createChat({ repoRoot });
+      const legacyNote = join(repoRoot, ".harness", "notes", "active.md");
+      const legacyGoalDir = join(repoRoot, ".harness", "goals", "goal-union");
+      const dataGoalDir = join(sp.goalsDir({ repoRoot, chatSessionId: chat.id }), "goal-union");
+      mkdirSync(dirname(legacyNote), { recursive: true });
+      mkdirSync(legacyGoalDir, { recursive: true });
+      mkdirSync(dataGoalDir, { recursive: true });
+      writeFileSync(legacyNote, "active legacy note\n", "utf8");
+      const legacyBoth = join(legacyGoalDir, "both.md");
+      const dataBoth = join(dataGoalDir, "both.md");
+      const dataOnly = join(dataGoalDir, "data-only.md");
+      writeFileSync(legacyBoth, "legacy winner\n", "utf8");
+      writeFileSync(dataBoth, "stale data copy\n", "utf8");
+      writeFileSync(dataOnly, "data-only winner\n", "utf8");
+
+      // Active legacy note: returns absolute legacy path in data-dir layout.
+      const noteRes = (await daemon.director.executeDirectorMcpTool(chat.id, "read_file", {
+        path: ".harness/notes/active.md",
+      })) as { path: string; content: string };
+      assert.equal(noteRes.content, "active legacy note\n");
+      assert.equal(noteRes.path, legacyNote);
+
+      // Both-exist conflict: legacy wins for all spellings, and returned path is the absolute legacy winner.
+      for (const query of [".harness/goals/goal-union/both.md", legacyBoth, dataBoth]) {
+        const res = (await daemon.director.executeDirectorMcpTool(chat.id, "read_file", {
+          path: query,
+        })) as { path: string; content: string };
+        assert.equal(res.content, "legacy winner\n", `expected legacy winner bytes for ${query}`);
+        assert.equal(res.path, legacyBoth, `expected absolute legacy winner path for ${query}`);
+      }
+
+      // Data-only file under an active legacy goal directory: returns data-dir bytes and absolute data-dir path.
+      const dataOnlyRes = (await daemon.director.executeDirectorMcpTool(chat.id, "read_file", {
+        path: ".harness/goals/goal-union/data-only.md",
+      })) as { path: string; content: string };
+      assert.equal(dataOnlyRes.content, "data-only winner\n");
+      assert.equal(dataOnlyRes.path, dataOnly);
+
+      // Ordinary tracked source file keeps repo-relative display.
+      const srcRes = (await daemon.director.executeDirectorMcpTool(chat.id, "read_file", {
+        path: "README.md",
+      })) as { path: string; content: string };
+      assert.equal(srcRes.path, "README.md");
+
+      // Legacy layout preserves relative display for in-repo legacy files.
+      const legacySp = createLegacyStoragePaths(config);
+      const legacyDisplay = resolveDirectorReadablePath(repoRoot, ".harness/goals/goal-union/both.md", {
+        storage: legacySp,
+        owner: { repoRoot, chatSessionId: chat.id },
+      });
+      assert.equal(legacyDisplay.display, ".harness/goals/goal-union/both.md");
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  it("W3: read_file pins the opened file identity and refuses concurrent parent-directory symlink replacement", async () => {
+    setLayoutEnv("data-dir");
+    const { root, repoRoot } = await makeTempGitRepo("pi-dir-w3-");
+    const stateDir = join(root, "state");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, "secret.txt"), "STATE_SECRET\n", "utf8");
+
+    const docsDir = join(repoRoot, "docs");
+    mkdirSync(docsDir, { recursive: true });
+    const docsFile = join(docsDir, "secret.txt");
+    writeFileSync(docsFile, "public\n", "utf8");
+
+    const config = makeConfig(repoRoot, stateDir);
+    const sp = storagePaths(config, { layout: "data-dir" });
+    const daemon = new HarnessDaemon(config, {
+      dbPath: ":memory:",
+      customRunnerFactory: () => ({
+        run: async () => ({ stopReason: "completed", text: "ok" }),
+      }),
+    });
+
+    const origPolicy = sp.directorReadPolicy.bind(sp);
+    let checksForTarget = 0;
+    let swapped = false;
+    sp.directorReadPolicy = (r: string, absPath: string) => {
+      const res = origPolicy(r, absPath);
+      if (res.ok && absPath === docsFile) {
+        checksForTarget += 1;
+        // Second check is after realpathSync(candidate) right before openFile(target, ...).
+        if (checksForTarget === 2 && !swapped) {
+          swapped = true;
+          renameSync(docsDir, join(repoRoot, "docs.orig"));
+          symlinkSync(stateDir, docsDir);
+        }
+      }
+      return res;
+    };
+
+    try {
+      const chat = await daemon.director.createChat({ repoRoot });
+      await assert.rejects(
+        () => daemon.director.executeDirectorMcpTool(chat.id, "read_file", { path: "docs/secret.txt" }),
+        (err: Error) => {
+          assert.match(err.message, /^\[harness blocked: director-protected-read\] /);
+          return true;
+        },
+      );
+      assert.equal(swapped, true, "parent directory swap must have been triggered before open");
+      const readTurns = daemon.director.chats
+        .getHistory(chat.id)
+        .filter((t) => t.event?.kind === "director.read_file");
+      assert.equal(readTurns.length, 0, "blocked pinned read must not log a read_file notice");
+    } finally {
+      sp.directorReadPolicy = origPolicy;
       await daemon.stop();
     }
   });
