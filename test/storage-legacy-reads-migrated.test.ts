@@ -326,9 +326,15 @@ describe("legacy-layout readers accept already-migrated data-dir units (FL / esc
       symlinkSync(dirname(dirname(fx.run2DossierDataAbs)), legacyRun1Dir);
       assert.throws(() => readRunDossier(db, run1, { path: fx.dossierLegacyRel }, legacySp), /dossier-not-indexed/);
 
-      // Without any bridge symlink, legacy spellings are refused as dossier-not-indexed while rewritten data-dir row still reads.
+      // Without a bridge symlink (e.g. after bridge expiry), the B8 union resolves legacy spellings and the
+      // rewritten data-dir row to the migrated data-dir copy (D7).
       rmSync(legacyRun1Dir);
-      assert.throws(() => readRunDossier(db, run1, { path: fx.dossierLegacyRel }, legacySp), /dossier-not-indexed/);
+      const relWithoutBridge = readRunDossier(db, run1, { path: fx.dossierLegacyRel }, legacySp) as {
+        path: string;
+        content: string;
+      };
+      assert.equal(relWithoutBridge.content, fx.dossierBody);
+      assert.equal(relWithoutBridge.path, fx.dossierDataAbs);
       assert.equal(
         (readRunDossier(db, run1, { path: fx.dossierDataAbs }, legacySp) as { content: string }).content,
         fx.dossierBody,
@@ -484,6 +490,147 @@ describe("legacy-layout readers accept already-migrated data-dir units (FL / esc
         legacySp.directorReadPolicy(cleanRepo, join(stateDir, "outside.txt")),
         legacyStoragePaths.directorReadPolicy(cleanRepo, join(stateDir, "outside.txt")),
       );
+    } finally {
+      fx.db.close();
+    }
+  });
+
+  it("L3 (A7): legacy-layout indexed dossier reads and hashes apply B8 union to rewritten rows (both-exist legacy wins, falls back to data-dir when removed)", async () => {
+    const fx = createMigratedFixture();
+    try {
+      const { db, legacySp, run1, bucketRun } = fx;
+      assert.equal(legacySp.layout, "legacy");
+
+      // Replace the migration bridges with real legacy directories/files carrying newer bytes.
+      const legacyRun1Dir = join(fx.repo, ".harness", "artifacts", run1.id);
+      rmSync(legacyRun1Dir);
+      const legacyDossierBody = "recreated real legacy run1 dossier bytes (newer)\n";
+      writeFile(fx.dossierLegacyAbs, legacyDossierBody);
+
+      rmSync(fx.spillLegacyAbs);
+      const legacySpillBody = "recreated real legacy flat spill bytes (newer)\n";
+      writeFile(fx.spillLegacyAbs, legacySpillBody);
+
+      const legacyBucketTaskDir = join(fx.repo, ".harness", "artifacts", bucketRun.id, fx.bucketTaskId);
+      rmSync(legacyBucketTaskDir);
+      const legacyBucketBody = "recreated real legacy bucket dossier bytes (newer)\n";
+      writeFile(fx.bucketLegacyAbs, legacyBucketBody);
+
+      const sha = (body: string) => ({
+        sha256: createHash("sha256").update(body).digest("hex"),
+        bytes: Buffer.byteLength(body, "utf8"),
+      });
+
+      // 1. Both-exist: legacy bytes win for rewritten absolute, absolute legacy, and relative legacy spellings.
+      const cases = [
+        {
+          label: "run dossier",
+          run: run1,
+          queries: [fx.dossierDataAbs, fx.dossierLegacyAbs, fx.dossierLegacyRel],
+          legacyAbs: fx.dossierLegacyAbs,
+          dataAbs: fx.dossierDataAbs,
+          legacyBody: legacyDossierBody,
+          dataBody: fx.dossierBody,
+        },
+        {
+          label: "flat spill",
+          run: run1,
+          queries: [fx.spillDataAbs, fx.spillLegacyAbs, fx.spillLegacyRel],
+          legacyAbs: fx.spillLegacyAbs,
+          dataAbs: fx.spillDataAbs,
+          legacyBody: legacySpillBody,
+          dataBody: fx.spillBody,
+        },
+        {
+          label: "bucket task dossier",
+          run: bucketRun,
+          queries: [fx.bucketDataAbs, fx.bucketLegacyAbs, fx.bucketLegacyRel],
+          legacyAbs: fx.bucketLegacyAbs,
+          dataAbs: fx.bucketDataAbs,
+          legacyBody: legacyBucketBody,
+          dataBody: fx.bucketBody,
+        },
+      ];
+
+      for (const c of cases) {
+        const expectedLegacyHash = sha(c.legacyBody);
+        for (const query of c.queries) {
+          const found = findRunDossier(db, c.run, query, legacySp);
+          assert.ok(found, `both-exist findRunDossier should match ${c.label} via ${query}`);
+          const read = readRunDossier(db, c.run, { path: query }, legacySp) as { path: string; content: string };
+          assert.equal(read.content, c.legacyBody, `both-exist read should return legacy bytes for ${c.label} via ${query}`);
+          assert.equal(read.path, c.legacyAbs, `both-exist read should return legacy path for ${c.label} via ${query}`);
+          assert.deepEqual(
+            await hashRunDossier(db, c.run, query, undefined, legacySp),
+            expectedLegacyHash,
+            `both-exist hash should return legacy hash for ${c.label} via ${query}`,
+          );
+        }
+      }
+
+      // 2. Hostile symlink at the legacy leaf inside a real legacy dir is never followed:
+      // legacy spellings are refused and direct rewritten data-dir row reads the data-dir copy.
+      const secretFile = join(fx.root, "leaf-secret.txt");
+      writeFile(secretFile, "LEAF SECRET DO NOT READ\n");
+      rmSync(fx.dossierLegacyAbs);
+      symlinkSync(secretFile, fx.dossierLegacyAbs);
+      for (const legacySpelling of [fx.dossierLegacyAbs, fx.dossierLegacyRel]) {
+        assert.equal(findRunDossier(db, run1, legacySpelling, legacySp), null);
+        assert.throws(() => readRunDossier(db, run1, { path: legacySpelling }, legacySp), /dossier-not-indexed/);
+        assert.equal(await hashRunDossier(db, run1, legacySpelling, undefined, legacySp), null);
+      }
+      const directDuringLeafLink = readRunDossier(db, run1, { path: fx.dossierDataAbs }, legacySp) as { path: string; content: string };
+      assert.equal(directDuringLeafLink.content, fx.dossierBody);
+      assert.equal(directDuringLeafLink.path, fx.dossierDataAbs);
+      assert.deepEqual(await hashRunDossier(db, run1, fx.dossierDataAbs, undefined, legacySp), sha(fx.dossierBody));
+
+      // 3. Remove the legacy files: all three spellings fall back to the data-dir bytes and hash.
+      rmSync(fx.dossierLegacyAbs);
+      rmSync(fx.spillLegacyAbs);
+      rmSync(fx.bucketLegacyAbs);
+      for (const c of cases) {
+        const expectedDataHash = sha(c.dataBody);
+        for (const query of c.queries) {
+          const found = findRunDossier(db, c.run, query, legacySp);
+          assert.ok(found, `post-removal findRunDossier should match ${c.label} via ${query}`);
+          const read = readRunDossier(db, c.run, { path: query }, legacySp) as { path: string; content: string };
+          assert.equal(read.content, c.dataBody, `post-removal read should return data-dir bytes for ${c.label} via ${query}`);
+          assert.equal(read.path, c.dataAbs, `post-removal read should return data-dir path for ${c.label} via ${query}`);
+          assert.deepEqual(
+            await hashRunDossier(db, c.run, query, undefined, legacySp),
+            expectedDataHash,
+            `post-removal hash should return data-dir hash for ${c.label} via ${query}`,
+          );
+        }
+      }
+
+      // Removing the entire legacy run directory still resolves all three spellings to data-dir bytes.
+      rmSync(legacyRun1Dir, { recursive: true, force: true });
+      for (const query of [fx.dossierDataAbs, fx.dossierLegacyAbs, fx.dossierLegacyRel]) {
+        const read = readRunDossier(db, run1, { path: query }, legacySp) as { path: string; content: string };
+        assert.equal(read.content, fx.dossierBody);
+        assert.equal(read.path, fx.dossierDataAbs);
+        assert.deepEqual(await hashRunDossier(db, run1, query, undefined, legacySp), sha(fx.dossierBody));
+      }
+
+      // 4. Multi-run ambiguous ownership is still refused across legacy and data-dir rows.
+      db.recordArtifact({ runId: fx.run2.id, taskId: fx.task2Id, kind: "dossier", path: fx.dossierLegacyAbs, summary: "Dup owner" });
+      for (const query of [fx.dossierDataAbs, fx.dossierLegacyAbs, fx.dossierLegacyRel]) {
+        assert.throws(() => readRunDossier(db, run1, { path: query }, legacySp), /dossier-ambiguous-owner/);
+        assert.equal(await hashRunDossier(db, run1, query, undefined, legacySp), null);
+      }
+
+      // 5. Project with nothing in the data dir stays unchanged.
+      const cleanRepo = join(fx.root, "clean-a7-repo");
+      mkdirSync(cleanRepo, { recursive: true });
+      const cleanRun = db.createRun({ goal: "Clean repo run", repoRoot: cleanRepo, baseBranch: "main", baseSha: "abc1234", chatSessionId: "chat-1" });
+      const cleanTask = db.createTask({ runId: cleanRun.id, tier: 2, kind: "worker", title: "W", objective: "Write", profileId: "acp:claude" });
+      const cleanArt = writeTaskDossier(db, cleanRun, cleanTask.id, "only-legacy.md", "clean legacy\n", "Clean", legacySp);
+      assert.equal(
+        (readRunDossier(db, cleanRun, { path: `.harness/artifacts/${cleanRun.id}/${cleanTask.id}/only-legacy.md` }, legacySp) as { content: string }).content,
+        "clean legacy\n",
+      );
+      assert.deepEqual(await hashRunDossier(db, cleanRun, cleanArt.path, undefined, legacySp), sha("clean legacy\n"));
     } finally {
       fx.db.close();
     }

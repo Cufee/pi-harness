@@ -732,6 +732,33 @@ export class StoragePaths {
   }
 
   /**
+   * True when the legacy `.harness/artifacts/<artifactSubPath>` path traverses any symlink that is not a valid
+   * unit-level migration bridge for `run`'s project (including symlinked container dirs, foreign unit symlinks,
+   * or symlinked entries inside a real unit dir).
+   */
+  hasForeignLegacyArtifactSymlink(run: RunRef, artifactSubPath: string): boolean {
+    if (!artifactSubPath || artifactSubPath.includes("\0")) return true;
+    const parts = artifactSubPath.split(sep);
+    if (parts.length === 0 || parts.some((s) => !s || s === "." || s === "..")) return true;
+    const realRoot = canonicalPath(run.repoRoot);
+    if (parts.length === 1) {
+      const isSymlink = (segs: readonly string[]): boolean => {
+        try {
+          return lstatSync(join(realRoot, ...segs)).isSymbolicLink();
+        } catch {
+          return false;
+        }
+      };
+      if (isSymlink([HARNESS_DIR]) || isSymlink([HARNESS_DIR, "artifacts"])) return true;
+      if (isSymlink([HARNESS_DIR, "artifacts", parts[0]!])) {
+        return resolveUnitBridgeTarget(this, { kind: "flat_artifact", repoRoot: realRoot, id: parts[0]! }) === null;
+      }
+      return false;
+    }
+    return this.hasForeignLegacyUnitSymlink(realRoot, "artifacts", parts);
+  }
+
+  /**
    * Extracts the path segment below `artifacts/` from either a legacy artifact path or a data-dir artifact path
    * belonging to `run`'s project, or returns null.
    */
@@ -755,18 +782,28 @@ export class StoragePaths {
    * Resolves a file inside an artifacts unit (run-level, bucket task-level, or flat spill) under the both-exist rule:
    * legacy real unit wins over data-dir, and data-dir-only files remain visible. Never follows symlinks.
    */
-  resolveArtifactFile(run: RunRef, artifactSubPath: string): ResolvedUnitFile | null {
+  resolveArtifactFile(
+    run: RunRef,
+    artifactSubPath: string,
+    opts?: { includeDataDir?: boolean },
+  ): ResolvedUnitFile | null {
     if (!artifactSubPath || artifactSubPath.includes("\0")) return null;
     const parts = artifactSubPath.split("/");
     if (parts.length === 0 || parts.some((s) => !s || s === "." || s === "..")) return null;
+    const unitOpts = opts?.includeDataDir ? { includeDataDir: true } : undefined;
 
     if (parts.length === 1) {
-      return resolveUnitFile(this, {
-        kind: "flat_artifact",
-        repoRoot: run.repoRoot,
-        id: parts[0]!,
-        chatSessionId: run.chatSessionId,
-      });
+      return resolveUnitFile(
+        this,
+        {
+          kind: "flat_artifact",
+          repoRoot: run.repoRoot,
+          id: parts[0]!,
+          chatSessionId: run.chatSessionId,
+        },
+        "",
+        unitOpts,
+      );
     }
 
     const first = parts[0]!;
@@ -782,6 +819,7 @@ export class StoragePaths {
           chatSessionId: run.chatSessionId,
         },
         parts.slice(2).join("/"),
+        unitOpts,
       );
     }
 
@@ -794,6 +832,7 @@ export class StoragePaths {
         chatSessionId: run.chatSessionId,
       },
       parts.slice(1).join("/"),
+      unitOpts,
     );
   }
 
@@ -1075,7 +1114,7 @@ export class StoragePaths {
   }
 
   /** True when the pinned data root already contains a real project directory for `repoRoot`. */
-  private hasProjectDataDir(repoRoot: string): boolean {
+  hasProjectDataDir(repoRoot: string): boolean {
     if (!this.pinnedDataRoot) return false;
     return isRealDirUnderRoot(this.pinnedDataRoot, ["projects", this.projectKey(repoRoot)]);
   }
