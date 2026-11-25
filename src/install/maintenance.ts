@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import {
   appendFileSync,
   closeSync,
+  constants,
   existsSync,
   fsyncSync,
   lstatSync,
@@ -38,6 +39,11 @@ export type ReadRollbackPairResult =
   | { status: "missing" }
   | { status: "invalid"; reason: string };
 
+export type RecordRollbackPairResult =
+  | { status: "written"; pair: RollbackPair }
+  | { status: "skipped_invalid"; reason: string }
+  | { status: "skipped_missing"; reason: string };
+
 export type ProcessCmdlineLister = () => string[] | null;
 export type ClockFn = () => number;
 
@@ -62,7 +68,13 @@ export interface PruneReleasesOptions {
 }
 
 export interface PruneReleasesResult {
-  skipped: "no_releases_dir" | "lock_held" | "process_list_unreadable" | "rollback_pair_unreadable" | null;
+  skipped:
+    | "no_releases_dir"
+    | "lock_held"
+    | "process_list_unreadable"
+    | "rollback_pair_unreadable"
+    | "rollback_pair_missing"
+    | null;
   skipReason?: string;
   kept: string[];
   removed: string[];
@@ -306,6 +318,52 @@ function readCurrentSymlinkReleaseId(installDir: string): string | null {
   }
 }
 
+function fsyncDir(dirPath: string): void {
+  let fd: number | null = null;
+  try {
+    fd = openSync(dirPath, constants.O_RDONLY);
+    fsyncSync(fd);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "EINVAL" && code !== "EROFS" && code !== "EBADF") {
+      throw err;
+    }
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // ignore close failure
+      }
+    }
+  }
+}
+
+function hasOtherReleaseDirectory(installDir: string, currentId: string): boolean | null {
+  const releasesDir = join(installDir, "releases");
+  let entries;
+  try {
+    entries = readdirSync(releasesDir, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return false;
+    }
+    return null;
+  }
+  for (const entry of entries) {
+    if (entry.name.startsWith(".") || entry.name === currentId) continue;
+    const dir = join(releasesDir, entry.name);
+    try {
+      const st = lstatSync(dir);
+      if (st.isDirectory()) return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") continue;
+      return null;
+    }
+  }
+  return false;
+}
+
 export function rollbackPairPath(installDir: string): string {
   return join(resolve(installDir), ROLLBACK_PAIR_FILENAME);
 }
@@ -317,14 +375,22 @@ export function rollbackPairPath(installDir: string): string {
  */
 export function readRollbackPair(installDir: string): ReadRollbackPairResult {
   const filePath = rollbackPairPath(installDir);
-  let raw: string;
   try {
-    raw = readFileSync(filePath, "utf8");
+    const st = lstatSync(filePath);
+    if (!st.isFile()) {
+      return { status: "invalid", reason: `${ROLLBACK_PAIR_FILENAME} is not a regular file` };
+    }
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
       return { status: "missing" };
     }
-    return { status: "invalid", reason: err instanceof Error ? err.message : String(err) };
+    return { status: "invalid", reason: formatErrDetail(err) };
+  }
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, "utf8");
+  } catch (err) {
+    return { status: "invalid", reason: formatErrDetail(err) };
   }
   try {
     const parsed: unknown = JSON.parse(raw);
@@ -347,17 +413,25 @@ export function readRollbackPair(installDir: string): ReadRollbackPairResult {
 /**
  * Atomically updates `<installDir>/rollback-pair.json` at release activation (caller holds `<installDir>/.lock`).
  * Preserves the recorded `previous` when reinstalling the same release id.
+ * Keeps an existing unreadable or malformed record untouched, and refuses to synthesize a `previous: null`
+ * record when the record is missing and another release directory already exists.
  */
 export function recordRollbackPair(
   installDir: string,
   currentId: string,
   priorCurrentId?: string | null,
-): RollbackPair {
+): RecordRollbackPairResult {
   if (!isValidReleaseId(currentId)) {
     throw new Error(`Invalid release id: ${String(currentId)}`);
   }
   const resolvedInstallDir = resolve(installDir);
   const existingRes = readRollbackPair(resolvedInstallDir);
+  if (existingRes.status === "invalid") {
+    return {
+      status: "skipped_invalid",
+      reason: `unreadable ${ROLLBACK_PAIR_FILENAME} (${existingRes.reason})`,
+    };
+  }
   const existing = existingRes.status === "ok" ? existingRes.pair : null;
   const prior =
     priorCurrentId !== undefined
@@ -375,6 +449,19 @@ export function recordRollbackPair(
     previous = existing.previous;
   }
 
+  if (existingRes.status === "missing" && previous === null) {
+    const otherRelease = hasOtherReleaseDirectory(resolvedInstallDir, currentId);
+    if (otherRelease !== false) {
+      return {
+        status: "skipped_missing",
+        reason:
+          otherRelease === null
+            ? `missing ${ROLLBACK_PAIR_FILENAME} and unable to inspect releases directory`
+            : `missing ${ROLLBACK_PAIR_FILENAME} on reinstall of ${currentId} while other release directories exist`,
+      };
+    }
+  }
+
   const pair: RollbackPair = { current: currentId, previous };
   const targetPath = rollbackPairPath(resolvedInstallDir);
   const tmpPath = join(resolvedInstallDir, `.${ROLLBACK_PAIR_FILENAME}.tmp.${process.pid}.${Date.now()}`);
@@ -387,6 +474,7 @@ export function recordRollbackPair(
     closeSync(fd);
     fd = null;
     renameSync(tmpPath, targetPath);
+    fsyncDir(resolvedInstallDir);
   } catch (err) {
     if (fd !== null) {
       try {
@@ -402,7 +490,7 @@ export function recordRollbackPair(
     }
     throw err;
   }
-  return pair;
+  return { status: "written", pair };
 }
 
 /**
@@ -428,9 +516,6 @@ export function pruneInstallReleases(opts: PruneReleasesOptions): PruneReleasesR
   try {
     const rollbackPairRes = readRollbackPair(installDir);
     if (rollbackPairRes.status === "invalid") {
-      console.error(
-        `[pi-harness maintenance] skipping release pruning: unreadable ${ROLLBACK_PAIR_FILENAME} (${rollbackPairRes.reason})`,
-      );
       return {
         skipped: "rollback_pair_unreadable",
         skipReason: rollbackPairRes.reason,
@@ -461,9 +546,26 @@ export function pruneInstallReleases(opts: PruneReleasesOptions): PruneReleasesR
     }
 
     const existingIds = new Set(releases.map((r) => r.id));
+    const currentSymlinkId = readCurrentSymlinkReleaseId(installDir);
+    if (rollbackPairRes.status === "missing") {
+      const effectiveCurrent = currentSymlinkId ?? opts.current;
+      const hasOtherRelease = releases.some((r) => r.id !== effectiveCurrent);
+      const hasExplicitDistinctPrevious =
+        isValidReleaseId(opts.previous) &&
+        opts.previous !== opts.current &&
+        (!currentSymlinkId || (currentSymlinkId === opts.current && opts.previous !== currentSymlinkId));
+      if (hasOtherRelease && !hasExplicitDistinctPrevious) {
+        return {
+          skipped: "rollback_pair_missing",
+          skipReason: `missing ${ROLLBACK_PAIR_FILENAME} while other release directories exist`,
+          kept: [],
+          removed: [],
+        };
+      }
+    }
+
     const keep = new Set<string>();
 
-    const currentSymlinkId = readCurrentSymlinkReleaseId(installDir);
     if (currentSymlinkId && existingIds.has(currentSymlinkId)) {
       keep.add(currentSymlinkId);
     }
@@ -712,14 +814,18 @@ export function runInstallMaintenance(opts: InstallMaintenanceOptions): InstallM
     );
   }
 
-  if (releases.skipped === "process_list_unreadable") {
-    const reason = sanitizeAuditValue(releases.skipReason ?? "process_list_unreadable");
+  if (
+    releases.skipped === "process_list_unreadable" ||
+    releases.skipped === "rollback_pair_unreadable" ||
+    releases.skipped === "rollback_pair_missing"
+  ) {
+    const reason = sanitizeAuditValue(releases.skipReason ?? releases.skipped);
     const nowMs = (opts.now ?? Date.now)();
     console.error(`[pi-harness maintenance] skipping release pruning: ${reason}`);
     appendAuditLogLine(
       opts.stateDir,
       nowMs,
-      `maintenance=prune_skipped skipped=process_list_unreadable reason="${reason}"`,
+      `maintenance=prune_skipped skipped=${releases.skipped} reason="${reason}"`,
     );
   }
 
@@ -821,7 +927,10 @@ if (import.meta.main) {
         );
         process.exitCode = 1;
       } else {
-        recordRollbackPair(parsed.installDir, parsed.current, parsed.priorCurrent ?? null);
+        const res = recordRollbackPair(parsed.installDir, parsed.current, parsed.priorCurrent);
+        if (res.status !== "written") {
+          console.error(`[pi-harness maintenance] skipping rollback pair update (${res.status}): ${res.reason}`);
+        }
         process.exitCode = 0;
       }
     } catch (err) {

@@ -23,6 +23,7 @@ import {
   parsePinnedOctofsVersion,
   pruneInstallReleases,
   RECENT_RELEASE_WINDOW_MS,
+  recordRollbackPair,
   rotateLogIfOversized,
   runInstallMaintenance,
   STAGING_MAX_AGE_MS,
@@ -74,6 +75,7 @@ describe("install release pruning", () => {
     createRelease(installDir, "r1", NOW - 4 * HOUR);
     createRelease(installDir, "r2", NOW - 3 * HOUR);
     createRelease(installDir, "r3", NOW - 2 * HOUR);
+    recordRollbackPair(installDir, "r3", "r2");
 
     const atN = pruneInstallReleases({
       installDir,
@@ -87,6 +89,7 @@ describe("install release pruning", () => {
     assert.deepEqual(atN.kept.sort(), ["r1", "r2", "r3"]);
 
     createRelease(installDir, "r4", NOW - 1 * HOUR);
+    recordRollbackPair(installDir, "r4", "r3");
     const atNPlus1 = pruneInstallReleases({
       installDir,
       current: "r4",
@@ -131,6 +134,7 @@ describe("install release pruning", () => {
     const r3 = createRelease(installDir, "r3", NOW - 4 * HOUR);
     createRelease(installDir, "r4", NOW - 3 * HOUR);
     createRelease(installDir, "r5", NOW - 2 * HOUR);
+    recordRollbackPair(installDir, "r5", "r3");
 
     const res = pruneInstallReleases({
       installDir,
@@ -155,6 +159,7 @@ describe("install release pruning", () => {
     createRelease(installDir, "recent-edge", NOW - RECENT_RELEASE_WINDOW_MS);
     createRelease(installDir, "recent-fresh", NOW - 60_000);
     createRelease(installDir, "current-rel", NOW - 2 * HOUR);
+    recordRollbackPair(installDir, "current-rel", "recent-fresh");
 
     const res = pruneInstallReleases({
       installDir,
@@ -423,6 +428,7 @@ describe("maintenance orchestrator and CLI entry", () => {
     createRelease(installDir, "r1", NOW - 4 * HOUR, "0.24.0");
     createRelease(installDir, "r2", NOW - 3 * HOUR, "0.25.0");
     createRelease(installDir, "r3", NOW - 2 * HOUR, "0.26.0");
+    recordRollbackPair(installDir, "r3", "r2");
 
     const octofsOld = join(installDir, "tools", "octofs", "0.24.0-x86_64-unknown-linux-musl");
     const octofsKept = join(installDir, "tools", "octofs", "0.25.0-x86_64-unknown-linux-musl");
@@ -477,6 +483,7 @@ describe("maintenance orchestrator and CLI entry", () => {
     createRelease(installDir, "r1", NOW - 4 * HOUR, "0.25.0");
     const r2Dir = createRelease(installDir, "r2", NOW - 3 * HOUR, "0.26.0");
     createRelease(installDir, "r3", NOW - 2 * HOUR, "0.26.0");
+    recordRollbackPair(installDir, "r3", "r2");
     // 1001 is readable and references r2; 1003 has no cmdline (ENOENT, simulates a process that exited mid-scan).
     writeFileSync(join(procRoot, "1001", "cmdline"), `/usr/bin/bun\0${r2Dir}/src/cli.ts\0`, "utf8");
 

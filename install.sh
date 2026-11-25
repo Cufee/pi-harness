@@ -156,14 +156,11 @@ if [ ! -f "$REL/release.json" ] || [ "$(cat "$REL/release.json" 2>/dev/null || t
   mv -f "$REL/.release.json.$$" "$REL/release.json"
 fi
 
-# --- activate: current symlink, rollback pair, then launcher (each swapped atomically) ---
+# --- activate: rollback pair, current symlink, then launcher (each swapped atomically) ---
 PRIOR_ID=""
 if [ -L "$INSTALL_DIR/current" ]; then
   PRIOR_ID=$("$BUN" -e 'const fs=require("node:fs"),p=require("node:path");try{const t=fs.readlinkSync(process.argv[1]).replace(/\/+$/,"");const b=p.basename(t);if(b&&b!=="."&&b!=="..")process.stdout.write(b);}catch{}' "$INSTALL_DIR/current" 2>/dev/null || true)
 fi
-rm -f "$INSTALL_DIR/current.new"
-ln -s "releases/$ID" "$INSTALL_DIR/current.new"
-"$BUN" -e 'require("node:fs").renameSync(process.argv[1], process.argv[2])' "$INSTALL_DIR/current.new" "$INSTALL_DIR/current"
 if [ -f "$REL/src/install/maintenance.ts" ]; then
   if [ -n "$PRIOR_ID" ]; then
     "$BUN" "$REL/src/install/maintenance.ts" --record-rollback-pair --install-dir "$INSTALL_DIR" --current "$ID" --prior-current "$PRIOR_ID"
@@ -171,6 +168,9 @@ if [ -f "$REL/src/install/maintenance.ts" ]; then
     "$BUN" "$REL/src/install/maintenance.ts" --record-rollback-pair --install-dir "$INSTALL_DIR" --current "$ID"
   fi
 fi
+rm -f "$INSTALL_DIR/current.new"
+ln -s "releases/$ID" "$INSTALL_DIR/current.new"
+"$BUN" -e 'require("node:fs").renameSync(process.argv[1], process.argv[2])' "$INSTALL_DIR/current.new" "$INSTALL_DIR/current"
 
 cat > "$BIN_DIR/.pi-harness.new" <<EOF
 #!/bin/sh

@@ -6,6 +6,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
   realpathSync,
@@ -56,6 +57,13 @@ if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then
 fi
 if [ "\${1:-}" = "install" ]; then
   exit 0
+fi
+if [ -n "\${PI_HARNESS_TEST_ABORT_BEFORE_PAIR_WRITE:-}" ]; then
+  for arg in "$@"; do
+    if [ "$arg" = "--record-rollback-pair" ]; then
+      exit 99
+    fi
+  done
 fi
 exec '${process.execPath}' "$@"
 `;
@@ -233,5 +241,166 @@ describe("durable rollback pair for release pruning (I1)", () => {
     assert.equal(existsSync(join(installDir, "releases", r3Id)), true, "live current R3 must be kept");
     assert.equal(existsSync(join(installDir, "releases", r2Id)), true, "live previous R2 must be kept");
     assert.equal(existsSync(join(installDir, "releases", r1Id)), false, "stale R1 should be pruned once superseded");
+  });
+
+  it("keeps corrupt rollback-pair.json unchanged, keeps every release, and audits the skip on same-id reinstall with retention=1 (A10)", () => {
+    const root = makeTempRoot("pi-rollback-corrupt-");
+    const stateDir = join(root, "state");
+    const installDir = join(root, "install");
+    const binDir = join(root, "bin");
+    mkdirSync(stateDir, { recursive: true });
+    mkdirSync(installDir, { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    seedOfflineInstallDir(installDir);
+
+    writeFileSync(join(stateDir, "config.json"), JSON.stringify({ retention: { installReleases: 1 } }), "utf8");
+
+    const env = {
+      PI_HARNESS_HOME: stateDir,
+      PI_HARNESS_INSTALL_DIR: installDir,
+      PI_HARNESS_BIN_DIR: binDir,
+    };
+
+    const oldMs = 2 * 60 * 60 * 1000;
+    const r0Id = "000000000000";
+    const r1Id = "111111111111";
+    for (const [id, age] of [
+      [r0Id, 3 * 60 * 60 * 1000],
+      [r1Id, oldMs],
+    ] as const) {
+      const relDir = join(installDir, "releases", id);
+      mkdirSync(join(relDir, "src", "tools"), { recursive: true });
+      writeFileSync(join(relDir, ".installed"), "");
+      writeFileSync(join(relDir, "src", "tools", "native-tools.ts"), `export const OCTOFS_VERSION = "${OCTOFS_VERSION}";\n`);
+      backdateRelease(installDir, id, age);
+    }
+    symlinkSync(`releases/${r1Id}`, join(installDir, "current"));
+
+    const checkoutV2 = join(root, "checkout-v2");
+    makeMiniCheckout(checkoutV2, "v2");
+    const first = runInstallSh(checkoutV2, env);
+    assert.equal(first.status, 0, `first install failed:\n${first.stdout}\n${first.stderr}`);
+    const r2Id = basename(readlinkSync(join(installDir, "current")));
+
+    // Recreate an extra old release R0 so we prove every release survives when pruning is skipped.
+    const r0Dir = join(installDir, "releases", r0Id);
+    mkdirSync(join(r0Dir, "src", "tools"), { recursive: true });
+    writeFileSync(join(r0Dir, ".installed"), "");
+    writeFileSync(join(r0Dir, "src", "tools", "native-tools.ts"), `export const OCTOFS_VERSION = "${OCTOFS_VERSION}";\n`);
+    backdateRelease(installDir, r0Id, 3 * 60 * 60 * 1000);
+    backdateRelease(installDir, r1Id, oldMs);
+    backdateRelease(installDir, r2Id, oldMs);
+
+    const recordPath = join(installDir, "rollback-pair.json");
+    const corruptRaw = "{corrupt-rollback-pair\n";
+    writeFileSync(recordPath, corruptRaw, "utf8");
+
+    const auditLogPath = join(stateDir, "install-audit.log");
+    rmSync(auditLogPath, { force: true });
+
+    const reinstall = runInstallSh(checkoutV2, env);
+    assert.equal(reinstall.status, 0, `reinstall with corrupt pair failed:\n${reinstall.stdout}\n${reinstall.stderr}`);
+    assert.equal(
+      readFileSync(recordPath, "utf8"),
+      corruptRaw,
+      "corrupt rollback-pair.json must be kept untouched and never replaced with previous: null",
+    );
+    assert.equal(existsSync(join(installDir, "releases", r0Id)), true, "R0 must be kept when pruning is skipped");
+    assert.equal(existsSync(join(installDir, "releases", r1Id)), true, "previous release R1 must be kept");
+    assert.equal(existsSync(join(installDir, "releases", r2Id)), true, "current release R2 must be kept");
+
+    const auditText = readFileSync(auditLogPath, "utf8");
+    assert.ok(
+      auditText.includes("maintenance=prune_skipped") && auditText.includes("skipped=rollback_pair_unreadable"),
+      `expected install-audit.log to record rollback_pair_unreadable skip, got:\n${auditText}`,
+    );
+  });
+
+  it("keeps the previous release when activation is interrupted before the pair write and then reinstalled with retention=1 (A10)", () => {
+    const root = makeTempRoot("pi-rollback-interrupted-");
+    const stateDir = join(root, "state");
+    const installDir = join(root, "install");
+    const binDir = join(root, "bin");
+    mkdirSync(stateDir, { recursive: true });
+    mkdirSync(installDir, { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    seedOfflineInstallDir(installDir);
+
+    writeFileSync(join(stateDir, "config.json"), JSON.stringify({ retention: { installReleases: 1 } }), "utf8");
+
+    const env = {
+      PI_HARNESS_HOME: stateDir,
+      PI_HARNESS_INSTALL_DIR: installDir,
+      PI_HARNESS_BIN_DIR: binDir,
+    };
+
+    const oldMs = 2 * 60 * 60 * 1000;
+    const r1Id = "111111111111";
+    const r1Dir = join(installDir, "releases", r1Id);
+    mkdirSync(join(r1Dir, "src", "tools"), { recursive: true });
+    writeFileSync(join(r1Dir, ".installed"), "");
+    writeFileSync(join(r1Dir, "src", "tools", "native-tools.ts"), `export const OCTOFS_VERSION = "${OCTOFS_VERSION}";\n`);
+    backdateRelease(installDir, r1Id, oldMs);
+    symlinkSync(`releases/${r1Id}`, join(installDir, "current"));
+
+    const checkoutV2 = join(root, "checkout-v2");
+    makeMiniCheckout(checkoutV2, "v2");
+
+    // 1. Interrupt activation right before --record-rollback-pair runs.
+    // Because the pair write runs before the current swap, current stays on R1 (old state).
+    const interrupted = runInstallSh(checkoutV2, {
+      ...env,
+      PI_HARNESS_TEST_ABORT_BEFORE_PAIR_WRITE: "1",
+    });
+    assert.notEqual(interrupted.status, 0, "expected interrupted activation to exit non-zero");
+
+    const recordPath = join(installDir, "rollback-pair.json");
+    assert.equal(existsSync(recordPath), false, "rollback-pair.json must not exist after abort before pair write");
+    assert.equal(
+      basename(readlinkSync(join(installDir, "current"))),
+      r1Id,
+      "interruption before the pair write must leave current pointing at the old release R1",
+    );
+
+    // Backdate all unpacked release dirs past the 10-minute recent window, then reinstall R2 with retention=1.
+    for (const relId of readdirSync(join(installDir, "releases"))) {
+      backdateRelease(installDir, relId, oldMs);
+    }
+
+    const reinstallAfterAbort = runInstallSh(checkoutV2, env);
+    assert.equal(
+      reinstallAfterAbort.status,
+      0,
+      `reinstall after interrupted activation failed:\n${reinstallAfterAbort.stdout}\n${reinstallAfterAbort.stderr}`,
+    );
+    const r2Id = basename(readlinkSync(join(installDir, "current")));
+    assert.notEqual(r2Id, r1Id);
+    assert.deepEqual(JSON.parse(readFileSync(recordPath, "utf8")), { current: r2Id, previous: r1Id });
+    assert.equal(existsSync(join(installDir, "releases", r1Id)), true, "previous release R1 must be kept");
+
+    // 2. Also simulate an already-swapped activation that died without a rollback-pair.json
+    // (current -> R2, releases/R1 and releases/R2 both exist and are old, record missing).
+    // A same-id reinstall with retention=1 must derive nothing, skip pruning, audit the skip, and keep R1.
+    rmSync(recordPath, { force: true });
+    backdateRelease(installDir, r1Id, oldMs);
+    backdateRelease(installDir, r2Id, oldMs);
+    const auditLogPath = join(stateDir, "install-audit.log");
+    rmSync(auditLogPath, { force: true });
+
+    const sameIdMissing = runInstallSh(checkoutV2, env);
+    assert.equal(
+      sameIdMissing.status,
+      0,
+      `same-id reinstall with missing pair failed:\n${sameIdMissing.stdout}\n${sameIdMissing.stderr}`,
+    );
+    assert.equal(existsSync(recordPath), false, "missing pair on same-id reinstall must not write a previous: null record");
+    assert.equal(existsSync(join(installDir, "releases", r1Id)), true, "previous release R1 must be kept when pair is missing");
+    assert.equal(existsSync(join(installDir, "releases", r2Id)), true, "current release R2 must be kept");
+
+    const auditText = readFileSync(auditLogPath, "utf8");
+    assert.ok(
+      auditText.includes("maintenance=prune_skipped") && auditText.includes("skipped=rollback_pair_missing"),
+      `expected install-audit.log to record rollback_pair_missing skip, got:\n${auditText}`,
+    );
   });
 });
