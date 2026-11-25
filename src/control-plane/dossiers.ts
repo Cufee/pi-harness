@@ -549,14 +549,28 @@ export function readWorkspaceArtifact(
     throw REJECTIONS.artifactOutsideWorkspace(requested);
   }
   if (storage.layout === "data-dir") {
-    if (storage.isStateInternalPath(path)) {
+    const deniedRoots = [
+      ...new Set([
+        ...(policy?.deniedRoots ?? []),
+        ...(storage.stateDir ? [storage.stateDir] : []),
+        ...(storage.dataRoot ? [storage.dataRoot] : []),
+      ]),
+    ];
+    const allowedRoots = [realRoot, ...(policy?.allowedRoots ?? [])];
+    const decision = mostSpecificRootDecision(path, allowedRoots, deniedRoots);
+    if (!decision.allowed) {
       throw REJECTIONS.artifactOutsideWorkspace(requested);
     }
-    const deniedRoots = policy?.deniedRoots ?? (storage.dataRoot ? [storage.dataRoot] : []);
-    if (deniedRoots.length > 0) {
-      const allowedRoots = [realRoot, ...(policy?.allowedRoots ?? [])];
-      const decision = mostSpecificRootDecision(path, allowedRoots, deniedRoots);
-      if (!decision.allowed) {
+    if (storage.isStateInternalPath(path)) {
+      const stateDir = storage.stateDir;
+      const relToState = stateDir !== null ? relative(stateDir, resolve(decision.root)) : "";
+      const moreSpecificThanState =
+        stateDir !== null &&
+        relToState !== "" &&
+        relToState !== ".." &&
+        !relToState.startsWith(`..${sep}`) &&
+        !isAbsolute(relToState);
+      if (!moreSpecificThanState) {
         throw REJECTIONS.artifactOutsideWorkspace(requested);
       }
     }

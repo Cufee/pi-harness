@@ -216,6 +216,11 @@ export class StoragePaths {
     this.pinnedDataRoot = pinDataRootForConfig(config);
   }
 
+  /** Canonical harness state directory when `config.stateDir` was supplied, otherwise null. */
+  get stateDir(): string | null {
+    return this.stateDirCanon;
+  }
+
   /** Pinned data root directory when `config.stateDir` was supplied, otherwise null. */
   get dataRoot(): string | null {
     return this.pinnedDataRoot;
@@ -260,14 +265,14 @@ export class StoragePaths {
   /**
    * Returns the canonical custom legacy worktree root configured via `config.worktree.dir` when it differs
    * from `<repo>/.harness/worktrees` and does not cover the repository root itself; otherwise null.
+   * Resolves `worktree.dir` literally against `canonRepo` (no trim, no `~` expansion), matching origin/main.
    */
   private customWorktreeRootFor(repoRoot: string): string | null {
-    const raw = this.config.worktree?.dir?.trim();
+    const raw = this.config.worktree?.dir;
     const canonRepo = canonicalPath(repoRoot);
     this.knownRepoRoots.add(canonRepo);
     if (!raw) return null;
-    const expanded = raw === "~" || raw.startsWith("~/") ? expandHome(raw) : resolve(canonRepo, raw);
-    const canonCustom = canonicalPath(expanded);
+    const canonCustom = canonicalPath(resolve(canonRepo, raw));
     const defaultLegacy = join(canonRepo, HARNESS_DIR, "worktrees");
     if (canonCustom === defaultLegacy) return null;
     if (isEqualOrWithin(canonCustom, canonRepo)) return null;
@@ -276,7 +281,7 @@ export class StoragePaths {
 
   /** Collects all known custom legacy worktree roots for `isProtectedWorktreePath`. */
   private collectCustomWorktreeRoots(ownCanon?: string, repoRoot?: string): string[] {
-    const raw = this.config.worktree?.dir?.trim();
+    const raw = this.config.worktree?.dir;
     if (!raw) return [];
     const seen = new Set<string>();
     const out: string[] = [];
@@ -289,8 +294,8 @@ export class StoragePaths {
     if (repoRoot !== undefined) {
       add(this.customWorktreeRootFor(repoRoot));
     }
-    if (isAbsolute(raw) || raw === "~" || raw.startsWith("~/")) {
-      const canonCustom = canonicalPath(expandHome(raw));
+    if (isAbsolute(raw)) {
+      const canonCustom = canonicalPath(raw);
       const overlapsRepo = [...this.knownRepoRoots].some((r) => isEqualOrWithin(canonCustom, r));
       if (!overlapsRepo) add(canonCustom);
     } else {
@@ -825,9 +830,7 @@ export class StoragePaths {
   private legacyWorktreeBaseDir(repoRoot: string): string {
     const canonRepo = canonicalPath(repoRoot);
     this.knownRepoRoots.add(canonRepo);
-    const raw = this.config.worktree?.dir?.trim();
-    if (!raw) return join(canonRepo, HARNESS_DIR, "worktrees");
-    return raw === "~" || raw.startsWith("~/") ? expandHome(raw) : resolve(canonRepo, raw);
+    return resolve(canonRepo, this.config.worktree?.dir ?? join(HARNESS_DIR, "worktrees"));
   }
 
   /** Path for a worker worktree checkout. Always under data-dir in `data-dir` layout. */
@@ -854,7 +857,7 @@ export class StoragePaths {
       return [this.legacyWorktreeBaseDir(canonRepo)];
     }
     const roots: string[] = [this.projectDir(canonRepo), join(canonRepo, HARNESS_DIR, "worktrees")];
-    if (this.config.worktree?.dir?.trim()) {
+    if (this.config.worktree?.dir) {
       const custom = this.legacyWorktreeBaseDir(canonRepo);
       if (!roots.includes(custom)) roots.push(custom);
     }
