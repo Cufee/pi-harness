@@ -2062,12 +2062,16 @@ describe("goal-14 slice A advisories", () => {
       ["inspect-cwd", REJECTIONS.inspectCwd("../other-worktree").notice],
       ["director-protected-read", REJECTIONS.directorProtectedRead(".git/config").notice],
       ["director-note-root", REJECTIONS.directorNoteRoot("src/index.ts").notice],
+      ["dossier-invalid-directory", REJECTIONS.dossierInvalidDirectory("/repo/.harness/artifacts").notice],
+      ["dossier-symlink", REJECTIONS.dossierSymlink("/repo/.harness/artifacts/link.md").notice],
+      ["dossier-not-indexed", REJECTIONS.dossierNotIndexed("/repo/.harness/artifacts/missing.md").notice],
+      ["dossier-ambiguous-owner", REJECTIONS.dossierAmbiguousOwner("/repo/.harness/artifacts/shared.md").notice],
       ["code-exec-timeout", REJECTIONS.codeExecTimeout(60, 180).notice],
       ["code-exec-ipc", REJECTIONS.codeExecIpc().notice],
       ["python-packages", REJECTIONS.pythonPackages(33).notice],
     ];
 
-    assert.equal(Object.keys(REJECTIONS).length, 27);
+    assert.equal(Object.keys(REJECTIONS).length, 31);
     for (const [label, notice] of rejectionSamples) {
       checkNotice(`REJECTIONS.${label}`, notice);
     }
