@@ -1,7 +1,8 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, watch, type FSWatcher } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { REJECTIONS } from "../advisories/rejections.js";
 import { ModelCatalogCompiler } from "../catalog/compiler.js";
 import {
   diffHarnessConfig,
@@ -21,7 +22,7 @@ import {
   type RunnerProfileConfig,
 } from "../config.js";
 import { ControlPlaneDb, type ReplayCursor, type EventRecord, type RunRecord } from "../control-plane/db.js";
-import { readRunDossier, readWorkspaceArtifact } from "../control-plane/dossiers.js";
+import { readRunDossier, readWorkspaceArtifact, type WorkspaceArtifactPolicy } from "../control-plane/dossiers.js";
 import { compactTaskHandoff } from "../control-plane/handoffs.js";
 import { directorTaskRunOwner } from "../control-plane/ids.js";
 import { canonicalProjectPath, type ProjectRecord } from "../control-plane/projects.js";
@@ -67,7 +68,7 @@ import { ensureOctofs, resolveExternalMcpServers, shouldStageOctofs } from "../t
 import { AcpRunner } from "../runners/acp-runner.js";
 import { PiRunner } from "../runners/pi-runner.js";
 import { runStorageMigrationPass } from "../storage/migrate.js";
-import { storagePaths } from "../storage/paths.js";
+import { storagePaths, type RunRef, type StoragePaths } from "../storage/paths.js";
 import { canonicalPath, runGit } from "../worktree/manager.js";
 import { classifyAttention } from "../visibility/index.js";
 import { HotUpdateController } from "./hot-update.js";
@@ -501,6 +502,15 @@ export class HarnessDaemon {
       stopAndHandOver: (target) => this.stopAndHandOver(target),
       log: (line) => console.error(`[harnessd ${new Date().toISOString()}] ${line}`),
     });
+  }
+
+  private get storage(): StoragePaths {
+    return storagePaths(this.config);
+  }
+
+  private runRef(run: RunRecord): RunRecord & RunRef {
+    const chatSessionId = run.chatSessionId ?? this.db.getRunChatSessionId(run.id);
+    return chatSessionId === run.chatSessionId ? run : { ...run, chatSessionId };
   }
 
   /**
@@ -1023,7 +1033,7 @@ export class HarnessDaemon {
     // Run one synchronous budgeted migration pass before reconcileStaleRunsOnStartup so
     // previously-live tasks still look live in the DB and their units stay safely deferred.
     try {
-      const storage = storagePaths(this.config);
+      const storage = this.storage;
       const report = runStorageMigrationPass({
         sqlite: this.db.db,
         storage,
@@ -4236,10 +4246,18 @@ export class HarnessDaemon {
         const messages = this.db.listMessagesForRun(task.runId, 50).filter((m) => m.fromTaskId === task.id || m.toTaskId === task.id);
         const children = this.db.listTasks(task.runId, { parentId: task.id });
         const writeScopes = this.db.listAssignedWriteScopes(task.runId, task.id);
+        const effectiveRun = run ? (this.orchestrator.getEffectiveRun(run.id) ?? run) : null;
+        const handoffStorageCtx = effectiveRun
+          ? {
+              repoRoot: effectiveRun.repoRoot,
+              chatSessionId: this.runRef(effectiveRun).chatSessionId,
+              storage: this.storage,
+            }
+          : undefined;
         return {
           task,
-          handoff: compactTaskHandoff(task, escalations),
-          run: run ? (this.orchestrator.getEffectiveRun(run.id) ?? run) : null,
+          handoff: compactTaskHandoff(task, escalations, handoffStorageCtx),
+          run: effectiveRun,
           escalations,
           artifacts,
           worktree,
@@ -4334,26 +4352,48 @@ export class HarnessDaemon {
       case "artifact.read": {
         const run = this.db.getRun(String(p.runId));
         if (!run) throw new Error(`Unknown run ${p.runId}`);
+        const runRef = this.runRef(run);
+        const storage = this.storage;
         const reqPath = typeof p.path === "string" && p.path ? p.path : undefined;
         const maxChars = typeof p.maxChars === "number" ? p.maxChars : 16_000;
         const offset = typeof p.offset === "number" ? p.offset : 0;
         try {
-          return readRunDossier(this.db, run, {
-            path: reqPath,
-            task_id: typeof p.taskId === "string" ? p.taskId : undefined,
-            max_chars: maxChars,
-            offset,
-          });
+          return readRunDossier(
+            this.db,
+            runRef,
+            {
+              path: reqPath,
+              task_id: typeof p.taskId === "string" ? p.taskId : undefined,
+              max_chars: maxChars,
+              offset,
+            },
+            storage,
+          );
         } catch (err) {
           if (!reqPath) throw err;
           // Allow reading any indexed non-dossier artifact belonging to this run safely within its workspace
           const indexed = this.db.listArtifacts(run.id, typeof p.taskId === "string" ? p.taskId : undefined, 200);
           const match = indexed.find((a) => a.path === reqPath);
           if (!match) throw err;
+          if (storage.layout === "data-dir") {
+            if (match.kind === "dossier") throw err;
+            const candidate = resolve(run.repoRoot, reqPath);
+            if (!storage.directorReadPolicy(run.repoRoot, candidate).ok) {
+              throw REJECTIONS.artifactOutsideWorkspace(reqPath);
+            }
+            const deniedRoots = [
+              ...(this.config.stateDir?.trim() ? [canonicalPath(this.config.stateDir)] : []),
+              ...(storage.dataRoot ? [storage.dataRoot] : []),
+            ];
+            const policy: WorkspaceArtifactPolicy = {
+              deniedRoots: [...new Set(deniedRoots)],
+            };
+            return readWorkspaceArtifact(run.repoRoot, reqPath, maxChars, offset, storage, policy);
+          }
           const task = this.db.getTask(match.taskId);
           const wt = task?.worktreeId ? this.db.getWorktree(task.worktreeId) : null;
           const root = wt && existsSync(wt.path) ? wt.path : run.repoRoot;
-          return readWorkspaceArtifact(root, reqPath, maxChars, offset);
+          return readWorkspaceArtifact(root, reqPath, maxChars, offset, storage);
         }
       }
 
