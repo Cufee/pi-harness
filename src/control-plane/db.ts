@@ -1,10 +1,17 @@
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
-import { basename, dirname, relative } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { Database } from "bun:sqlite";
 import { AdmissionQueue } from "./admission-queue.js";
 import { isReadOnlyKind } from "./handoffs.js";
-import { advanceSequenceFloor, friendlyIdCandidates, nextFriendlyId, nextSequenceValue } from "./ids.js";
+import {
+  advanceSequenceFloor,
+  directorTaskRunOwner,
+  friendlyIdCandidates,
+  isDirectorTaskContainer,
+  nextFriendlyId,
+  nextSequenceValue,
+} from "./ids.js";
 import { ProjectStore } from "./projects.js";
 import { SessionMessageStore } from "./session-messages.js";
 import { TimerManager } from "./timers.js";
@@ -57,6 +64,15 @@ export interface FallbackGitSummary {
   status?: string[];
 }
 
+function formatDisplayPath(repoRoot: string, targetPath: string): string {
+  const absTarget = resolve(repoRoot, targetPath);
+  const rel = relative(resolve(repoRoot), absTarget);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    return absTarget;
+  }
+  return rel;
+}
+
 export function formatFallbackSummary(input: {
   repoRoot: string;
   reason: string;
@@ -73,15 +89,12 @@ export function formatFallbackSummary(input: {
     ? `Git: ${git.branch ?? "?"} @ ${git.head?.slice(0, 12) ?? "?"}; committed since base: ${git.committed ?? "unknown"}; ` +
       `uncommitted: ${git.uncommitted ?? "unknown"}${git.status?.length ? ` (${git.status.length} changed path(s))` : ""}`
     : "Git: no worktree";
-  const displayPaths = paths.slice(0, 5).map((p) => {
-    const rel = relative(repoRoot, p);
-    return rel && !rel.startsWith("..") ? rel : p;
-  });
+  const displayPaths = paths.slice(0, 5).map((p) => formatDisplayPath(repoRoot, p));
   const more = paths.length > 5 ? `, +${paths.length - 5} more` : "";
   const artLine = paths.length
     ? `Artifacts: ${paths.length} indexed: ${displayPaths.join(", ")}${more}`
     : "Artifacts: 0 indexed";
-  const pointer = outputPath ? `\n[Full output: ${relative(repoRoot, outputPath)}]` : "";
+  const pointer = outputPath ? `\n[Full output: ${formatDisplayPath(repoRoot, outputPath)}]` : "";
   const fixed = `${header}\n${gitLine}\n${artLine}\nFinal output (unstructured excerpt):\n`;
   const budget = Math.max(0, Math.min(excerptLimit, SUMMARY_LIMIT - fixed.length - pointer.length));
   const outputClipped = Boolean(text) && text.length > budget;
@@ -174,6 +187,7 @@ export interface RunRecord {
   coordinationGroup: string | null;
   isolationMode: "standalone" | "coordinated";
   status: "active" | "paused_quota" | "completed" | "failed" | "stopped";
+  chatSessionId?: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -420,6 +434,7 @@ CREATE TABLE IF NOT EXISTS runs (
   coordination_group TEXT,
   isolation_mode TEXT NOT NULL DEFAULT 'standalone',
   status TEXT NOT NULL DEFAULT 'active',
+  chat_session_id TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -666,6 +681,12 @@ export class ControlPlaneDb {
     this.db = new Database(dbPath);
     this.db.exec("PRAGMA busy_timeout = 5000;");
     this.db.exec(SCHEMA);
+    const runColumns = new Set(
+      (this.db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    if (!runColumns.has("chat_session_id")) {
+      this.db.exec("ALTER TABLE runs ADD COLUMN chat_session_id TEXT;");
+    }
     const worktreeColumns = new Set(
       (this.db.prepare("PRAGMA table_info(worktrees)").all() as Array<{ name: string }>).map((c) => c.name),
     );
@@ -685,10 +706,161 @@ export class ControlPlaneDb {
       this.db.exec("ALTER TABLE artifacts ADD COLUMN origin TEXT;");
     }
     this.kb = new KnowledgeBaseStore(this.db);
-    this.timers = new TimerManager(this.db);
+    this.timers = new TimerManager(this.db, (runId) => this.getRunChatSessionId(runId));
     this.projects = new ProjectStore(this.db);
     this.sessionMessages = new SessionMessageStore(this.db);
     this.admissionQueue = new AdmissionQueue(this.db);
+    this.backfillChatOwnership();
+  }
+
+  private hasTable(name: string): boolean {
+    const row = this.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1")
+      .get(name);
+    return Boolean(row);
+  }
+
+  private deriveBucketChatSessionId(runId: string): string | null {
+    if (!isDirectorTaskContainer(runId)) return null;
+    const owner = directorTaskRunOwner(runId);
+    if (!owner) return null;
+    if (this.hasTable("chat_sessions")) {
+      try {
+        const chatRow = this.db
+          .prepare("SELECT id FROM chat_sessions WHERE id = ? LIMIT 1")
+          .get(owner) as { id?: string } | undefined;
+        if (chatRow?.id) return String(chatRow.id);
+      } catch {
+        // Ignore missing or incompatible chat_sessions table.
+      }
+    }
+    if (this.hasTable("goals")) {
+      try {
+        const goalRow = this.db
+          .prepare("SELECT chat_session_id FROM goals WHERE id = ? AND chat_session_id IS NOT NULL LIMIT 1")
+          .get(owner) as { chat_session_id?: string | null } | undefined;
+        if (goalRow?.chat_session_id) return String(goalRow.chat_session_id);
+      } catch {
+        // Ignore missing or incompatible goals table.
+      }
+    }
+    return null;
+  }
+
+  /** Populates missing chat_session_id values on runs, timers, and session_messages without failing DB open. */
+  private backfillChatOwnership(): void {
+    const bucketOwnerExpr = `CASE
+      WHEN runs.id GLOB 'director-tasks-?*.ws-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+      THEN substr(runs.id, 16, length(runs.id) - 31)
+      ELSE substr(runs.id, 16)
+    END`;
+
+    if (this.hasTable("chat_sessions")) {
+      try {
+        this.db.exec(`
+          UPDATE runs
+          SET chat_session_id = (
+            SELECT cs.id FROM chat_sessions cs
+            WHERE cs.id = ${bucketOwnerExpr}
+            LIMIT 1
+          )
+          WHERE chat_session_id IS NULL
+            AND id GLOB 'director-tasks-*'
+            AND EXISTS (
+              SELECT 1 FROM chat_sessions cs
+              WHERE cs.id = ${bucketOwnerExpr}
+            )
+        `);
+      } catch {
+        // Keep DB open non-throwing if chat_sessions has an unexpected shape.
+      }
+    }
+
+    if (this.hasTable("goals")) {
+      try {
+        this.db.exec(`
+          UPDATE runs
+          SET chat_session_id = (
+            SELECT g.chat_session_id FROM goals g
+            WHERE g.id = ${bucketOwnerExpr}
+              AND g.chat_session_id IS NOT NULL
+            LIMIT 1
+          )
+          WHERE chat_session_id IS NULL
+            AND id GLOB 'director-tasks-*'
+            AND EXISTS (
+              SELECT 1 FROM goals g
+              WHERE g.id = ${bucketOwnerExpr}
+                AND g.chat_session_id IS NOT NULL
+            )
+        `);
+      } catch {
+        // Keep DB open non-throwing if goals has an unexpected shape.
+      }
+
+      try {
+        this.db.exec(`
+          UPDATE runs
+          SET chat_session_id = (
+            SELECT g.chat_session_id FROM goals g
+            WHERE g.linked_run_id = runs.id
+              AND g.chat_session_id IS NOT NULL
+            ORDER BY g.updated_at DESC
+            LIMIT 1
+          )
+          WHERE chat_session_id IS NULL
+            AND EXISTS (
+              SELECT 1 FROM goals g
+              WHERE g.linked_run_id = runs.id
+                AND g.chat_session_id IS NOT NULL
+            )
+        `);
+      } catch {
+        // Keep DB open non-throwing if goals has an unexpected shape.
+      }
+    }
+
+    try {
+      this.db.exec(`
+        UPDATE timers
+        SET chat_session_id = CASE
+          WHEN owner_kind = 'chat' THEN owner_id
+          WHEN owner_kind = 'task' AND run_id IS NOT NULL THEN (
+            SELECT r.chat_session_id FROM runs r WHERE r.id = timers.run_id
+          )
+          ELSE NULL
+        END
+        WHERE chat_session_id IS NULL
+          AND (
+            owner_kind = 'chat'
+            OR (
+              owner_kind = 'task'
+              AND run_id IS NOT NULL
+              AND EXISTS (
+                SELECT 1 FROM runs r
+                WHERE r.id = timers.run_id AND r.chat_session_id IS NOT NULL
+              )
+            )
+          )
+      `);
+    } catch {
+      // Keep DB open non-throwing.
+    }
+
+    try {
+      this.db.exec(`
+        UPDATE session_messages
+        SET chat_session_id = CASE
+          WHEN direction = 'outbound' THEN from_session_id
+          WHEN direction = 'inbound' THEN to_session_id
+          ELSE NULL
+        END
+        WHERE chat_session_id IS NULL
+          AND direction IN ('outbound', 'inbound')
+      `);
+    } catch {
+      // Keep DB open non-throwing.
+    }
   }
 
   close(): void {
@@ -991,15 +1163,31 @@ export class ControlPlaneDb {
     baseSha: string;
     coordinationGroup?: string | null;
     isolationMode?: "standalone" | "coordinated";
+    chatSessionId?: string | null;
   }): RunRecord {
     const id = input.id ?? nextFriendlyId(this.db, "run", "runs");
     const now = Date.now();
     const isolation = input.isolationMode ?? (input.coordinationGroup ? "coordinated" : "standalone");
+    const explicitChat = typeof input.chatSessionId === "string" && input.chatSessionId.trim()
+      ? input.chatSessionId.trim()
+      : null;
+    const chatSessionId = explicitChat ?? this.deriveBucketChatSessionId(id);
     this.db
       .prepare(
-        "INSERT INTO runs(id, goal, repo_root, base_branch, base_sha, coordination_group, isolation_mode, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+        "INSERT INTO runs(id, goal, repo_root, base_branch, base_sha, coordination_group, isolation_mode, status, chat_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
       )
-      .run(id, input.goal, input.repoRoot, input.baseBranch, input.baseSha, input.coordinationGroup ?? null, isolation, now, now);
+      .run(
+        id,
+        input.goal,
+        input.repoRoot,
+        input.baseBranch,
+        input.baseSha,
+        input.coordinationGroup ?? null,
+        isolation,
+        chatSessionId,
+        now,
+        now,
+      );
     const run = this.getRun(id)!;
     this.emitEvent(id, null, "run.created", {
       goal: input.goal,
@@ -1011,13 +1199,7 @@ export class ControlPlaneDb {
     return run;
   }
 
-  getRun(id: string): RunRecord | null {
-    let r: Record<string, unknown> | undefined;
-    for (const candidate of friendlyIdCandidates(id, "run")) {
-      r = this.db.prepare("SELECT * FROM runs WHERE id = ?").get(candidate) as Record<string, unknown> | undefined;
-      if (r) break;
-    }
-    if (!r) return null;
+  private mapRun(r: Record<string, unknown>): RunRecord {
     return {
       id: String(r.id),
       goal: String(r.goal),
@@ -1027,27 +1209,54 @@ export class ControlPlaneDb {
       coordinationGroup: r.coordination_group ? String(r.coordination_group) : null,
       isolationMode: (r.isolation_mode ? String(r.isolation_mode) : "standalone") as RunRecord["isolationMode"],
       status: String(r.status) as RunRecord["status"],
+      chatSessionId: r.chat_session_id ? String(r.chat_session_id) : null,
       createdAt: Number(r.created_at),
       updatedAt: Number(r.updated_at),
     };
+  }
+
+  getRun(id: string): RunRecord | null {
+    let r: Record<string, unknown> | undefined;
+    for (const candidate of friendlyIdCandidates(id, "run")) {
+      r = this.db.prepare("SELECT * FROM runs WHERE id = ?").get(candidate) as Record<string, unknown> | undefined;
+      if (r) break;
+    }
+    return r ? this.mapRun(r) : null;
+  }
+
+  /** Returns the owning Director chat for a run, deriving and persisting it from bucket ownership or linked goals when unset. */
+  getRunChatSessionId(runId: string): string | null {
+    const run = this.getRun(runId);
+    const canonicalRunId = run?.id ?? runId;
+    if (run?.chatSessionId) return run.chatSessionId;
+
+    let derived = this.deriveBucketChatSessionId(canonicalRunId);
+    if (!derived && this.hasTable("goals")) {
+      try {
+        const row = this.db
+          .prepare(
+            "SELECT chat_session_id FROM goals WHERE linked_run_id = ? AND chat_session_id IS NOT NULL ORDER BY updated_at DESC LIMIT 1",
+          )
+          .get(canonicalRunId) as { chat_session_id?: string | null } | undefined;
+        if (row?.chat_session_id) derived = String(row.chat_session_id);
+      } catch {
+        // Ignore missing or incompatible goals table.
+      }
+    }
+
+    if (derived && run) {
+      this.db
+        .prepare("UPDATE runs SET chat_session_id = ? WHERE id = ? AND chat_session_id IS NULL")
+        .run(derived, run.id);
+    }
+    return derived;
   }
 
   listRuns(limit = 50, before?: { createdAt: number; id: string }): RunRecord[] {
     const rows = this.db
       .prepare(`SELECT * FROM runs ${before ? "WHERE (created_at, id) < (?, ?)" : ""} ORDER BY created_at DESC, id DESC LIMIT ?`)
       .all(...(before ? [before.createdAt, before.id, limit] : [limit])) as Record<string, unknown>[];
-    return rows.map((r) => ({
-      id: String(r.id),
-      goal: String(r.goal),
-      repoRoot: String(r.repo_root),
-      baseBranch: String(r.base_branch),
-      baseSha: String(r.base_sha),
-      coordinationGroup: r.coordination_group ? String(r.coordination_group) : null,
-      isolationMode: (r.isolation_mode ? String(r.isolation_mode) : "standalone") as RunRecord["isolationMode"],
-      status: String(r.status) as RunRecord["status"],
-      createdAt: Number(r.created_at),
-      updatedAt: Number(r.updated_at),
-    }));
+    return rows.map((r) => this.mapRun(r));
   }
 
   updateRunStatus(id: string, status: RunRecord["status"], reason?: string, cause?: string): void {

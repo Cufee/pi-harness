@@ -22,6 +22,7 @@ export interface SessionMessageRecord {
   hopCount: number;
   status: SessionMessageStatus;
   wakeStatus: SessionMessageWakeStatus;
+  chatSessionId?: string | null;
   error: string | null;
   createdAt: number;
   deliveredAt: number | null;
@@ -44,6 +45,7 @@ CREATE TABLE IF NOT EXISTS session_messages (
   hop_count INTEGER NOT NULL DEFAULT 1,
   status TEXT NOT NULL CHECK (status IN ('queued','delivered','failed')),
   wake_status TEXT NOT NULL DEFAULT 'none' CHECK (wake_status IN ('none','pending','done','tripped')),
+  chat_session_id TEXT,
   error TEXT,
   created_at INTEGER NOT NULL,
   delivered_at INTEGER
@@ -105,6 +107,9 @@ export class SessionMessageStore {
     if (!cols.has("wake_status")) {
       this.db.exec("ALTER TABLE session_messages ADD COLUMN wake_status TEXT NOT NULL DEFAULT 'none'");
     }
+    if (!cols.has("chat_session_id")) {
+      this.db.exec("ALTER TABLE session_messages ADD COLUMN chat_session_id TEXT");
+    }
   }
 
   private mapRow(r: Record<string, unknown>): SessionMessageRecord {
@@ -124,6 +129,7 @@ export class SessionMessageStore {
       hopCount: Number(r.hop_count ?? 1),
       status: String(r.status) as SessionMessageStatus,
       wakeStatus: (r.wake_status ? String(r.wake_status) : "none") as SessionMessageWakeStatus,
+      chatSessionId: r.chat_session_id ? String(r.chat_session_id) : null,
       error: r.error ? String(r.error) : null,
       createdAt: Number(r.created_at),
       deliveredAt: r.delivered_at != null ? Number(r.delivered_at) : null,
@@ -157,8 +163,8 @@ export class SessionMessageStore {
       .prepare(
         `INSERT INTO session_messages(
            id, direction, from_node, from_host, from_session_id, from_project_name,
-           to_node, to_host, to_session_id, body, reply_to_id, expect_reply, hop_count, status, wake_status, created_at
-         ) VALUES (?, 'outbound', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 'none', ?)`,
+           to_node, to_host, to_session_id, body, reply_to_id, expect_reply, hop_count, status, wake_status, chat_session_id, created_at
+         ) VALUES (?, 'outbound', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 'none', ?, ?)`,
       )
       .run(
         id,
@@ -173,6 +179,7 @@ export class SessionMessageStore {
         input.replyToId ?? null,
         input.expectReply === false ? 0 : 1,
         Math.max(1, input.hopCount ?? 1),
+        input.fromSessionId,
         now,
       );
     return this.getById(id)!;
@@ -203,8 +210,8 @@ export class SessionMessageStore {
       .prepare(
         `INSERT OR IGNORE INTO session_messages(
            id, direction, from_node, from_host, from_session_id, from_project_name,
-           to_node, to_host, to_session_id, body, reply_to_id, expect_reply, hop_count, status, wake_status, created_at, delivered_at
-         ) VALUES (?, 'inbound', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'delivered', ?, ?, ?)`,
+           to_node, to_host, to_session_id, body, reply_to_id, expect_reply, hop_count, status, wake_status, chat_session_id, created_at, delivered_at
+         ) VALUES (?, 'inbound', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'delivered', ?, ?, ?, ?)`,
       )
       .run(
         input.id,
@@ -220,6 +227,7 @@ export class SessionMessageStore {
         input.expectReply === false ? 0 : 1,
         Math.max(1, input.hopCount ?? 1),
         wakeStatus,
+        input.toSessionId,
         now,
         now,
       );

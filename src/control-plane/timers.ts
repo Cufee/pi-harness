@@ -16,6 +16,7 @@ export interface TimerRecord {
   ownerId: string;
   runId: string | null;
   goalId: string | null;
+  chatSessionId?: string | null;
   wakeAt: number;
   reason: string;
   wakeOnEvent: TimerWakeEvent;
@@ -48,6 +49,7 @@ CREATE TABLE IF NOT EXISTS timers (
   owner_id TEXT NOT NULL,
   run_id TEXT,
   goal_id TEXT,
+  chat_session_id TEXT,
   wake_at INTEGER NOT NULL,
   reason TEXT NOT NULL,
   wake_on_event TEXT NOT NULL DEFAULT 'none',
@@ -82,8 +84,17 @@ export class TimerManager {
   private disposed = false;
   private suspendMode: "none" | "startup" | "stopping" = "none";
 
-  constructor(private readonly db: Database) {
+  constructor(
+    private readonly db: Database,
+    private readonly resolveRunChatSessionId?: (runId: string) => string | null,
+  ) {
     this.db.exec(TIMER_SCHEMA);
+    const cols = new Set(
+      (this.db.prepare("PRAGMA table_info(timers)").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    if (!cols.has("chat_session_id")) {
+      this.db.exec("ALTER TABLE timers ADD COLUMN chat_session_id TEXT;");
+    }
   }
 
   setOnFire(cb: (timer: TimerRecord, wakeReason: string, meta: TimerFireMeta) => void): void {
@@ -194,13 +205,19 @@ export class TimerManager {
     const reason = input.reason.trim() || "Scheduled wakeup";
     const wakeOnEvent: TimerWakeEvent = input.wakeOnEvent ?? "none";
     const id = nextFriendlyId(this.db, "timer", "timers");
+    const chatSessionId =
+      input.ownerKind === "chat"
+        ? input.ownerId
+        : input.runId
+          ? this.resolveChatForRun(input.runId)
+          : null;
 
     this.db
       .prepare(
         `INSERT INTO timers(
-          id, owner_kind, owner_id, run_id, goal_id, wake_at, reason,
+          id, owner_kind, owner_id, run_id, goal_id, chat_session_id, wake_at, reason,
           wake_on_event, resume_goal, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
       )
       .run(
         id,
@@ -208,6 +225,7 @@ export class TimerManager {
         input.ownerId,
         input.runId ?? null,
         input.goalId ?? null,
+        chatSessionId,
         wakeAt,
         reason,
         wakeOnEvent,
@@ -400,6 +418,21 @@ export class TimerManager {
     return count;
   }
 
+  private resolveChatForRun(runId: string): string | null {
+    if (this.resolveRunChatSessionId) {
+      return this.resolveRunChatSessionId(runId);
+    }
+    try {
+      const row = this.db
+        .prepare("SELECT chat_session_id FROM runs WHERE id = ? LIMIT 1")
+        .get(runId) as { chat_session_id?: string | null } | undefined;
+      if (row?.chat_session_id) return String(row.chat_session_id);
+    } catch {
+      // Runs table may not exist when TimerManager is opened standalone.
+    }
+    return null;
+  }
+
   private mapRow(r: Record<string, unknown>): TimerRecord {
     return {
       id: String(r.id),
@@ -407,6 +440,7 @@ export class TimerManager {
       ownerId: String(r.owner_id),
       runId: r.run_id ? String(r.run_id) : null,
       goalId: r.goal_id ? String(r.goal_id) : null,
+      chatSessionId: r.chat_session_id ? String(r.chat_session_id) : null,
       wakeAt: Number(r.wake_at),
       reason: String(r.reason),
       wakeOnEvent: String(r.wake_on_event ?? "none") as TimerWakeEvent,
