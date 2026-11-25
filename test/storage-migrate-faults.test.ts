@@ -223,17 +223,18 @@ describe("storage migration fault injection & both-exist merge", () => {
         assert.ok(pass1.errors.length >= 1);
 
         // Verify intermediate state at the crash point.
-        if (step === "after_rename_into_place") {
+        if (step === "after_rename_into_place" || step === "before_bridge") {
           assert.equal(existsSync(f.destGoalDir), true);
           assert.equal(existsSync(f.goalDir), false);
-          // Rows were not rewritten yet.
+          // Rows were not rewritten yet (rename path bridges before row rewrite per D3).
           const rowA = f.cpDb.db.prepare("SELECT path FROM artifacts WHERE id = ?").get(f.artA.id) as { path: string };
           assert.ok(rowA.path.includes(".harness"));
         } else {
-          // Rows ARE rewritten, bridge NOT yet created.
+          // Rows ARE rewritten, and bridges were already created before row rewrite (D3).
           const rowA = f.cpDb.db.prepare("SELECT path FROM artifacts WHERE id = ?").get(f.artA.id) as { path: string };
           assert.equal(rowA.path, join(f.destRunDir, f.task.id, "dossier-a.md"));
-          assert.equal(existsSync(f.goalDir), false);
+          assert.equal(lstatSync(f.goalDir).isSymbolicLink(), true);
+          assert.equal(readlinkSync(f.goalDir), f.destGoalDir);
         }
 
         const pass2 = runStorageMigrationPass({ sqlite: f.cpDb.db, storage: f.storage, forceCopy: false });

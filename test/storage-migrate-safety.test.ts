@@ -333,9 +333,10 @@ describe("storage migration safety regressions", () => {
       }
       const beforeHashes = hashTree(runDir);
 
-      // Fixed equal budget: each pass has the same 650ms injected clock (ticks 10ms per check),
-      // so a single pass can only copy ~2 files, yet repeated equal passes converge via manifest.jsonl.
-      const EQUAL_BUDGET_MS = 650;
+      // Fixed equal budget: each pass has the same 780ms injected clock (ticks 10ms per check),
+      // so a single pass only copies a subset of files, yet repeated equal passes converge via manifest.jsonl
+      // (D2 hashes destination bytes in the same pass before deletion, and D4 checks budget during fsync/delete).
+      const EQUAL_BUDGET_MS = 780;
       const newPassClock = () => {
         let now = 5_000;
         return () => {
@@ -357,10 +358,10 @@ describe("storage migration safety regressions", () => {
           { budgetMs: EQUAL_BUDGET_MS },
         );
         assert.equal(report.errors.length, 0);
-        totalMigrated += report.totals.migrated;
+        totalMigrated += report.totals.migrated + report.totals.merged + report.totals.finished;
         lastReport = report;
         if (!report.budgetExceeded) break;
-        if (totalMigrated === 0) {
+        if (totalMigrated === 0 && existsSync(stagingRoot)) {
           const opIds = readdirSync(stagingRoot);
           assert.equal(opIds.length, 1, "Must reuse the same recorded opId across passes");
           const count = hashTree(join(stagingRoot, opIds[0]!, "payload")).size;
@@ -628,9 +629,9 @@ describe("storage migration safety regressions", () => {
         now: () => t0,
       });
 
-      // Stale pending entry was dropped with an error record and zero file changes.
+      // Stale pending entry was kept as stale with an error record and zero file changes (D6).
       assert.equal(pass1.errors.length, 1);
-      assert.match(pass1.errors[0]!.message, /Dropped mismatched pending journal entry note:stale\.md/);
+      assert.match(pass1.errors[0]!.message, /Kept stale pending journal entry note:stale\.md/);
       assert.equal(readFileSync(bogusDest, "utf8"), "do not touch\n");
       assert.equal(existsSync(join(repo, ".harness", "notes", "stale.md")), false);
 
@@ -652,10 +653,12 @@ describe("storage migration safety regressions", () => {
       assert.equal(readlinkSync(legacyRunC), destRunC);
 
       const stateAfterPass1 = JSON.parse(readFileSync(statePath, "utf8")) as {
-        pendingUnits: unknown[];
+        pendingUnits: Array<{ unitKey: string; stale?: boolean; staleReason?: string }>;
         bridges: Array<{ legacyPath: string; target: string; createdAt: number }>;
       };
-      assert.equal(stateAfterPass1.pendingUnits.length, 0);
+      assert.equal(stateAfterPass1.pendingUnits.length, 1);
+      assert.equal(stateAfterPass1.pendingUnits[0]!.unitKey, "note:stale.md");
+      assert.equal(stateAfterPass1.pendingUnits[0]!.stale, true);
       const recAdopted = stateAfterPass1.bridges.find((b) => b.legacyPath === adoptedNoteLegacy);
       const recRunC = stateAfterPass1.bridges.find((b) => b.legacyPath === legacyRunC);
       assert.deepEqual(recAdopted, { legacyPath: adoptedNoteLegacy, target: adoptedNoteDest, createdAt: t0 });

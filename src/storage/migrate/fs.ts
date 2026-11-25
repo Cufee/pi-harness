@@ -22,7 +22,7 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { basename, dirname, join, posix, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import { isDirectorTaskContainer } from "../../control-plane/ids.js";
 import {
   canonicalPath,
@@ -45,8 +45,60 @@ import type { OwnerRef, StoragePaths } from "../paths.js";
 const MAX_MIGRATE_HASH_BYTES = 1024 * 1024 * 1024 * 1024;
 const COPY_CHUNK_BYTES = 65_536;
 const MIGRATION_STATE_FILE = "migration-state.json";
+export const MIGRATION_CURSOR_FILE = "migration-cursor.json";
 export const MIGRATION_STAGING_DIR = ".migration-staging";
 export const STAGE_MANIFEST_FILE = "manifest.jsonl";
+export const STAGE_SINGLE_FILE_KEY = "payload";
+
+/**
+ * Returns true iff `relPath` is a strictly safe POSIX relative path:
+ * non-empty, relative (no leading `/`), no NUL byte, no empty segments, and no `.` or `..` components.
+ */
+export function isValidRelativePath(relPath: string): boolean {
+  if (relPath.length === 0 || relPath.includes("\0") || relPath.startsWith("/")) {
+    return false;
+  }
+  const parts = relPath.split("/");
+  for (const seg of parts) {
+    if (seg.length === 0 || seg === "." || seg === "..") {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isPathInsideDir(rootDir: string, candidatePath: string): boolean {
+  const rel = relative(resolve(rootDir), resolve(candidatePath));
+  return rel.length > 0 && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+/**
+ * Safely removes a relative file/subtree strictly inside `rootDir` without traversing symlinks.
+ * Rejects any path that fails `isValidRelativePath`, escapes `rootDir`, or crosses a symlinked parent.
+ */
+function removeRelativeInsideRootStrict(rootDir: string, relPath: string): void {
+  if (!isValidRelativePath(relPath)) {
+    throw new Error(`Refusing to remove invalid relative path: ${relPath}`);
+  }
+  const resolvedRoot = resolve(rootDir);
+  const segs = relPath.split("/");
+  let cur = resolvedRoot;
+  for (let i = 0; i < segs.length; i++) {
+    cur = join(cur, segs[i]!);
+    if (!isPathInsideDir(resolvedRoot, cur)) {
+      throw new Error(`Refusing to remove path outside stage root: ${relPath}`);
+    }
+    const st = safeLstat(cur);
+    if (st === null) return;
+    if (i < segs.length - 1) {
+      if (st.isSymbolicLink() || !st.isDirectory()) {
+        throw new Error(`Refusing to traverse non-directory or symlink while cleaning stage: ${cur}`);
+      }
+    } else {
+      rmSync(cur, { recursive: true, force: true });
+    }
+  }
+}
 const SAFE_STAGING_OP_ID_RE = /^[a-zA-Z0-9_-]{8,128}$/;
 
 export interface StageManifestEntry {
@@ -80,12 +132,16 @@ export interface LegacyDeleteResult {
   fullyDeleted: boolean;
   /** Number of unverified/modified entries left untouched at `legacyPath`. */
   leftoverEntries: number;
+  /** POSIX relative paths of files verified at destination and unlinked from legacy. */
+  deletedRelPaths: string[];
 }
 
 export interface MergeBothExistResult {
   shadowed: ShadowedFileRecord[];
   /** True when all legacy files were verified+unlinked and `legacyPath` was removed. */
   fullyMerged: boolean;
+  /** POSIX relative paths of files verified at destination and unlinked from legacy. */
+  mergedRelPaths: string[];
 }
 
 /** Fsyncs a directory so metadata updates (file creations, renames, unlinks) are durable before deleting sources. */
@@ -110,18 +166,97 @@ export function fsyncDir(dirPath: string): void {
   }
 }
 
+/** Fsyncs a regular file without following symlinks so its bytes are durable before deleting a source duplicate. */
+export function fsyncFile(absPath: string): void {
+  let fd: number | null = null;
+  try {
+    fd = openSync(absPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    fsyncSync(fd);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "EINVAL" && code !== "EROFS" && code !== "EBADF") {
+      throw err;
+    }
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Ignore close error.
+      }
+    }
+  }
+}
+
+/**
+ * Fsyncs `leafDir` and every ancestor directory up through `rootDir` and `dirname(rootDir)`
+ * so newly created destination directories and their parents are durable before any legacy deletion.
+ */
+export function fsyncDirChain(rootDir: string, leafDir: string): void {
+  const dirs: string[] = [];
+  let cur = resolve(leafDir);
+  const resolvedRoot = resolve(rootDir);
+  while (true) {
+    dirs.push(cur);
+    if (cur === resolvedRoot) break;
+    if (!isWithin(resolvedRoot, cur)) break;
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  const rootParent = dirname(resolvedRoot);
+  if (rootParent && rootParent !== resolvedRoot && dirs[dirs.length - 1] === resolvedRoot) {
+    dirs.push(rootParent);
+  }
+  for (const dir of dirs) {
+    fsyncDir(dir);
+  }
+}
+
+/**
+ * Moves a single regular file without overwriting an existing destination (`linkSync` then `unlinkSync`).
+ * Returns `"moved"` on success, `"exists"` when `dstPath` already exists (`EEXIST`), or `"exdev"` when
+ * cross-device / hard-links are unsupported and callers must use the staged copy path.
+ */
+export function moveFileNoOverwrite(srcPath: string, dstPath: string): "moved" | "exists" | "exdev" {
+  try {
+    linkSync(srcPath, dstPath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EEXIST") return "exists";
+    if (code === "EXDEV" || code === "EPERM" || code === "ENOTSUP" || code === "ENOSYS") {
+      return "exdev";
+    }
+    throw err;
+  }
+  try {
+    unlinkSync(srcPath);
+  } catch (unlinkErr) {
+    try {
+      unlinkSync(dstPath);
+    } catch {
+      // Keep original unlink error.
+    }
+    throw unlinkErr;
+  }
+  return "moved";
+}
+
 /** Fsyncs staged payload directories (deepest-first) and the private stage directory itself. */
 export function fsyncStageTree(
   stageDir: string,
   payloadPath: string,
   isDir: boolean,
   dirs: readonly string[] = [],
+  checkBudget?: () => void,
 ): void {
   if (isDir) {
     const deepestFirst = [...dirs].sort((a, b) => b.split("/").length - a.split("/").length);
-    for (const relDir of deepestFirst) {
-      fsyncDir(join(payloadPath, ...relDir.split("/")));
+    for (let i = 0; i < deepestFirst.length; i++) {
+      if (i > 0) checkBudget?.();
+      fsyncDir(join(payloadPath, ...deepestFirst[i]!.split("/")));
     }
+    if (deepestFirst.length > 0) checkBudget?.();
     fsyncDir(payloadPath);
   }
   fsyncDir(stageDir);
@@ -156,6 +291,10 @@ export interface PendingMigrationUnit {
   /** Owning chat session ID recorded when the pending entry was created (optional in older state files). */
   ownerChat?: string | null;
   members: PendingMigrationMember[];
+  /** True when the entry failed recomputation and is retained on disk as stale (never acted on, never dropped). */
+  stale?: boolean;
+  /** Reason the entry was marked stale. */
+  staleReason?: string;
 }
 
 export interface RecordedBridgeEntry {
@@ -170,6 +309,14 @@ export interface MigrationStateFile {
   pendingUnits: PendingMigrationUnit[];
   /** Provenance records for unit-level migration bridges created or adopted by the engine. */
   bridges?: RecordedBridgeEntry[];
+  /** Unit keys whose previous migration attempt hit the budget without completing (tried after all other units). */
+  budgetDeferredUnits?: string[];
+}
+
+export interface MigrationCursorFile {
+  version: 1;
+  /** Next canonical repository root to start from on the next migration pass (rotates across passes). */
+  nextRepoRoot: string | null;
 }
 
 export interface ShadowedFileRecord {
@@ -446,18 +593,46 @@ export function copyFileExclusive(srcPath: string, dstPath: string, mode?: numbe
   copyFileAndHashExclusive(srcPath, dstPath, mode, checkBudget);
 }
 
-/** Ensures parent directories of `targetPath` under `trustedRoot` exist segment-wise without following symlinks. */
-export function ensureParentDirsUnderRoot(trustedRoot: string, targetPath: string): void {
+/**
+ * Ensures parent directories of `targetPath` under `trustedRoot` exist segment-wise without following symlinks.
+ * If a parent segment collides with an existing regular file (A5/D5), preserves that file under a `.pre-merge-<8hex>`
+ * sibling via `preserveCollidingDestinationEntry`, creates the directory, and returns the preserved record(s).
+ */
+export function ensureParentDirsUnderRoot(
+  trustedRoot: string,
+  targetPath: string,
+  checkBudget?: () => void,
+): ShadowedFileRecord[] {
+  const shadowed: ShadowedFileRecord[] = [];
   const parent = dirname(targetPath);
-  if (parent === trustedRoot) return;
+  if (parent === trustedRoot) return shadowed;
   if (!isWithin(trustedRoot, parent)) {
     throw new Error(`Destination parent ${parent} is outside trusted root ${trustedRoot}`);
   }
   const rel = relative(trustedRoot, parent);
   const segments = rel.split(sep).filter((s) => s.length > 0 && s !== ".");
-  ensureDirsUnderRoot(trustedRoot, segments, (badPath) => {
-    return new Error(`Refusing to traverse symlink or non-directory while creating destination: ${badPath}`);
-  });
+  let cur = trustedRoot;
+  for (const seg of segments) {
+    if (seg === "." || seg === ".." || seg.includes("\0")) {
+      throw new Error(`Invalid directory segment while creating destination: ${join(cur, seg)}`);
+    }
+    cur = join(cur, seg);
+    const st = safeLstat(cur);
+    if (st === null) {
+      mkdirSync(cur);
+      fsyncDir(dirname(cur));
+    } else if (st.isSymbolicLink()) {
+      throw new Error(`Refusing to traverse symlink while creating destination: ${cur}`);
+    } else if (st.isFile()) {
+      const preservedPath = preserveCollidingDestinationEntry(cur, checkBudget);
+      shadowed.push({ canonicalPath: cur, preservedPath });
+      mkdirSync(cur);
+      fsyncDir(dirname(cur));
+    } else if (!st.isDirectory()) {
+      throw new Error(`Refusing to traverse non-directory while creating destination: ${cur}`);
+    }
+  }
+  return shadowed;
 }
 
 /** Generates a cryptographically random staging operation ID. */
@@ -538,44 +713,63 @@ export function listUnrecordedStagingEntries(projectDir: string, state: Migratio
   }
 }
 
-/** Reads valid manifest entries from `<stageDir>/manifest.jsonl`. Ignores any truncated trailing line. */
-export function readStageManifest(stageDir: string): Map<string, StageManifestEntry> {
+/**
+ * Reads and strictly validates manifest entries from `<stageDir>/manifest.jsonl`.
+ * Any invalid or non-confined relative path (or non-final corrupt line) throws so the stage stays untouchable.
+ * Only a truncated final line from an interrupted append is ignored.
+ */
+export function readStageManifest(stageDir: string, isDir?: boolean): Map<string, StageManifestEntry> {
   const out = new Map<string, StageManifestEntry>();
   const manifestPath = join(stageDir, STAGE_MANIFEST_FILE);
   const st = safeLstat(manifestPath);
-  if (!st || st.isSymbolicLink() || !st.isFile()) return out;
-  let text: string;
-  try {
-    text = readFileSync(manifestPath, "utf8");
-  } catch {
-    return out;
+  if (!st) return out;
+  if (st.isSymbolicLink() || !st.isFile()) {
+    throw new Error(`Invalid stage manifest (expected regular file): ${manifestPath}`);
   }
-  for (const line of text.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
+  const text = readFileSync(manifestPath, "utf8");
+  const nonEmptyLines = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  for (let i = 0; i < nonEmptyLines.length; i++) {
+    const line = nonEmptyLines[i]!;
+    let parsed: Partial<StageManifestEntry>;
     try {
-      const parsed = JSON.parse(trimmed) as Partial<StageManifestEntry>;
-      if (
-        parsed &&
-        typeof parsed === "object" &&
-        typeof parsed.relPath === "string" &&
-        typeof parsed.size === "string" &&
-        typeof parsed.mtimeNs === "string" &&
-        typeof parsed.ino === "string" &&
-        typeof parsed.sha256 === "string"
-      ) {
-        out.set(parsed.relPath, {
-          relPath: parsed.relPath,
-          size: parsed.size,
-          mtimeNs: parsed.mtimeNs,
-          ino: parsed.ino,
-          ...(typeof parsed.dev === "string" ? { dev: parsed.dev } : {}),
-          sha256: parsed.sha256,
-        });
-      }
+      parsed = JSON.parse(line) as Partial<StageManifestEntry>;
     } catch {
-      // Ignore truncated line left by an interrupted append.
+      // Only a truncated trailing line (last non-empty line, without trailing newline) may be ignored.
+      if (i === nonEmptyLines.length - 1 && !text.endsWith("\n")) {
+        break;
+      }
+      throw new Error(`Corrupt JSON line in stage manifest ${manifestPath}`);
     }
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      typeof parsed.relPath !== "string" ||
+      typeof parsed.size !== "string" ||
+      typeof parsed.mtimeNs !== "string" ||
+      typeof parsed.ino !== "string" ||
+      typeof parsed.sha256 !== "string"
+    ) {
+      throw new Error(`Malformed entry in stage manifest ${manifestPath}`);
+    }
+    if (!isValidRelativePath(parsed.relPath)) {
+      throw new Error(`Invalid relative path in stage manifest ${manifestPath}: ${JSON.stringify(parsed.relPath)}`);
+    }
+    if (isDir === false && parsed.relPath !== STAGE_SINGLE_FILE_KEY) {
+      throw new Error(
+        `Unexpected relative path for single-file stage manifest ${manifestPath}: ${JSON.stringify(parsed.relPath)}`,
+      );
+    }
+    out.set(parsed.relPath, {
+      relPath: parsed.relPath,
+      size: parsed.size,
+      mtimeNs: parsed.mtimeNs,
+      ino: parsed.ino,
+      ...(typeof parsed.dev === "string" ? { dev: parsed.dev } : {}),
+      sha256: parsed.sha256,
+    });
   }
   return out;
 }
@@ -618,6 +812,9 @@ export function copyToStaging(
 ): StagedCopyResult {
   const payloadPath = join(stageDir, "payload");
   const manifestPath = join(stageDir, STAGE_MANIFEST_FILE);
+
+  // Validate manifest BEFORE any touch or removal in the stage: an invalid entry leaves the stage untouchable.
+  const manifest = readStageManifest(stageDir, isDir);
   const existingPayload = safeLstat(payloadPath);
 
   // If an existing payload has the wrong file/dir type (e.g. reused after corruption), reset the private stage.
@@ -627,9 +824,8 @@ export function copyToStaging(
   ) {
     rmSync(payloadPath, { recursive: true, force: true });
     rmSync(manifestPath, { force: true });
+    manifest.clear();
   }
-
-  const manifest = readStageManifest(stageDir);
 
   if (!isDir) {
     checkBudget();
@@ -637,7 +833,7 @@ export function copyToStaging(
     if (srcStat.isSymbolicLink() || !srcStat.isFile()) {
       throw new Error(`Expected regular file at ${legacyPath}`);
     }
-    const prev = manifest.get("");
+    const prev = manifest.get(STAGE_SINGLE_FILE_KEY);
     const dstStat = safeLstatBigInt(payloadPath);
     if (
       prev &&
@@ -659,7 +855,7 @@ export function copyToStaging(
       throw new Error(`SHA-256 mismatch while staging file ${legacyPath}`);
     }
     const entry: StageManifestEntry = {
-      relPath: "",
+      relPath: STAGE_SINGLE_FILE_KEY,
       size: copied.size,
       mtimeNs: copied.mtimeNs,
       ino: copied.ino,
@@ -667,7 +863,7 @@ export function copyToStaging(
       sha256: copied.sha256,
     };
     appendStageManifestEntry(stageDir, entry);
-    manifest.set("", entry);
+    manifest.set(STAGE_SINGLE_FILE_KEY, entry);
     return { manifest, dirs: [] };
   }
 
@@ -727,13 +923,17 @@ export function copyToStaging(
     manifest.set(file.relPath, entry);
   }
 
-  // Drop manifest keys for files no longer in source (and clean any obsolete staged files inside our private payload).
+  // Drop manifest keys for files no longer in source (strictly confined inside our private payload).
+  let cleanIdx = 0;
   for (const key of [...manifest.keys()]) {
+    if (!isValidRelativePath(key)) {
+      throw new Error(`Refusing to remove invalid relative path from stage manifest: ${JSON.stringify(key)}`);
+    }
+    if ((cleanIdx++ & 63) === 63) checkBudget();
     if (!expectedFileSet.has(key)) {
+      checkBudget();
+      removeRelativeInsideRootStrict(payloadPath, key);
       manifest.delete(key);
-      if (key) {
-        rmSync(join(payloadPath, ...key.split("/")), { recursive: true, force: true });
-      }
     }
   }
 
@@ -741,10 +941,10 @@ export function copyToStaging(
 }
 
 /**
- * Verifies every regular file in `legacyPath` matches `targetPath`.
- * When `manifest` is provided (from `copyToStaging`, where every file was hashed and read-back verified
- * before appending to `manifest.jsonl`), entries whose source lstat identity is unchanged and whose target
- * file has the recorded size are verified without re-hashing the whole tree, keeping multi-pass progress bounded.
+ * Verifies every regular file in `legacyPath` matches `targetPath` by hashing the destination bytes
+ * in this pass and comparing against the source hash (never accepting a manifest entry on size and
+ * source identity alone). When no matching manifest entry exists for the current source identity,
+ * both source and destination are hashed in this pass.
  */
 export function verifyCopyMatches(
   legacyPath: string,
@@ -753,21 +953,23 @@ export function verifyCopyMatches(
   checkBudget?: () => void,
   manifest?: ReadonlyMap<string, StageManifestEntry>,
 ): void {
+  if (manifest) {
+    for (const key of manifest.keys()) {
+      if (!isValidRelativePath(key)) {
+        throw new Error(`Invalid relative path in stage manifest during verification: ${JSON.stringify(key)}`);
+      }
+    }
+  }
   if (!isDir) {
     checkBudget?.();
-    if (manifest) {
-      const entry = manifest.get("");
+    const entry = manifest?.get(STAGE_SINGLE_FILE_KEY);
+    if (entry) {
       const srcStat = lstatSync(legacyPath, { bigint: true });
-      const dstStat = lstatSync(targetPath, { bigint: true });
-      if (
-        entry &&
-        !srcStat.isSymbolicLink() &&
-        srcStat.isFile() &&
-        !dstStat.isSymbolicLink() &&
-        dstStat.isFile() &&
-        sourceMatchesManifestEntry(srcStat, entry) &&
-        dstStat.size.toString() === entry.size
-      ) {
+      if (!srcStat.isSymbolicLink() && srcStat.isFile() && sourceMatchesManifestEntry(srcStat, entry)) {
+        const dstHash = hashRegularFileStrict(targetPath, checkBudget);
+        if (dstHash.sha256 !== entry.sha256 || dstHash.bytes.toString() !== entry.size) {
+          throw new Error(`SHA-256 verification mismatch between ${legacyPath} and ${targetPath}`);
+        }
         return;
       }
     }
@@ -796,19 +998,14 @@ export function verifyCopyMatches(
       throw new Error(`Verification failed: ${file.relPath} missing at ${targetPath}`);
     }
     const dstFile = join(targetPath, ...file.relPath.split("/"));
-    if (manifest) {
-      const entry = manifest.get(file.relPath);
+    const entry = manifest?.get(file.relPath);
+    if (entry) {
       const srcStat = lstatSync(file.absPath, { bigint: true });
-      const dstStat = lstatSync(dstFile, { bigint: true });
-      if (
-        entry &&
-        !srcStat.isSymbolicLink() &&
-        srcStat.isFile() &&
-        !dstStat.isSymbolicLink() &&
-        dstStat.isFile() &&
-        sourceMatchesManifestEntry(srcStat, entry) &&
-        dstStat.size.toString() === entry.size
-      ) {
+      if (!srcStat.isSymbolicLink() && srcStat.isFile() && sourceMatchesManifestEntry(srcStat, entry)) {
+        const dstHash = hashRegularFileStrict(dstFile, checkBudget);
+        if (dstHash.sha256 !== entry.sha256 || dstHash.bytes.toString() !== entry.size) {
+          throw new Error(`SHA-256 verification mismatch for ${file.relPath} between ${legacyPath} and ${targetPath}`);
+        }
         continue;
       }
     }
@@ -848,44 +1045,60 @@ export function deleteVerifiedLegacy(
   isDir: boolean,
   manifest: ReadonlyMap<string, StageManifestEntry>,
   verifiedDirs: readonly string[] = [],
+  checkBudget?: () => void,
 ): LegacyDeleteResult {
+  for (const key of manifest.keys()) {
+    if (!isValidRelativePath(key)) {
+      throw new Error(`Invalid relative path in stage manifest during legacy deletion: ${JSON.stringify(key)}`);
+    }
+  }
   if (!isDir) {
-    const entry = manifest.get("");
-    if (!entry) return { fullyDeleted: false, leftoverEntries: 1 };
+    checkBudget?.();
+    const entry = manifest.get(STAGE_SINGLE_FILE_KEY);
+    if (!entry) return { fullyDeleted: false, leftoverEntries: 1, deletedRelPaths: [] };
     const st = safeLstatBigInt(legacyPath);
-    if (!st) return { fullyDeleted: true, leftoverEntries: 0 };
+    if (!st) return { fullyDeleted: true, leftoverEntries: 0, deletedRelPaths: [STAGE_SINGLE_FILE_KEY] };
     if (st.isSymbolicLink() || !st.isFile()) {
-      return { fullyDeleted: false, leftoverEntries: 1 };
+      return { fullyDeleted: false, leftoverEntries: 1, deletedRelPaths: [] };
     }
     if (sourceMatchesManifestEntry(st, entry)) {
       unlinkSync(legacyPath);
-      return { fullyDeleted: true, leftoverEntries: 0 };
+      return { fullyDeleted: true, leftoverEntries: 0, deletedRelPaths: [STAGE_SINGLE_FILE_KEY] };
     }
-    return { fullyDeleted: false, leftoverEntries: 1 };
+    return { fullyDeleted: false, leftoverEntries: 1, deletedRelPaths: [] };
   }
 
   const st = safeLstatBigInt(legacyPath);
-  if (!st) return { fullyDeleted: true, leftoverEntries: 0 };
+  if (!st) return { fullyDeleted: true, leftoverEntries: 0, deletedRelPaths: [...manifest.keys()] };
   if (st.isSymbolicLink() || !st.isDirectory()) {
-    return { fullyDeleted: false, leftoverEntries: 1 };
+    return { fullyDeleted: false, leftoverEntries: 1, deletedRelPaths: [] };
   }
 
   let leftoverEntries = 0;
+  const deletedRelPaths: string[] = [];
+  let delIdx = 0;
   for (const [relPath, entry] of manifest) {
-    if (!relPath) continue;
+    if (delIdx++ > 0) checkBudget?.();
     const abs = join(legacyPath, ...relPath.split("/"));
+    if (!isPathInsideDir(legacyPath, abs)) {
+      throw new Error(`Refusing to delete path outside legacy unit root: ${relPath}`);
+    }
     const unlinked = unlinkIfIdentityMatches(abs, {
       ino: entry.ino,
       size: entry.size,
       mtimeNs: entry.mtimeNs,
     });
-    if (!unlinked) {
+    if (unlinked) {
+      deletedRelPaths.push(relPath);
+    } else {
       leftoverEntries++;
     }
   }
 
   const dirsDeepestFirst = [...verifiedDirs].sort((a, b) => b.split("/").length - a.split("/").length);
-  for (const relDir of dirsDeepestFirst) {
+  for (let i = 0; i < dirsDeepestFirst.length; i++) {
+    if (i > 0) checkBudget?.();
+    const relDir = dirsDeepestFirst[i]!;
     const dirAbs = join(legacyPath, ...relDir.split("/"));
     try {
       rmdirSync(dirAbs);
@@ -904,14 +1117,14 @@ export function deleteVerifiedLegacy(
     rmdirSync(legacyPath);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") return { fullyDeleted: true, leftoverEntries: 0 };
+    if (code === "ENOENT") return { fullyDeleted: true, leftoverEntries: 0, deletedRelPaths };
     if (code === "ENOTEMPTY" || code === "EEXIST" || code === "ENOTDIR") {
-      return { fullyDeleted: false, leftoverEntries: Math.max(1, leftoverEntries) };
+      return { fullyDeleted: false, leftoverEntries: Math.max(1, leftoverEntries), deletedRelPaths };
     }
     throw err;
   }
 
-  return { fullyDeleted: true, leftoverEntries: 0 };
+  return { fullyDeleted: true, leftoverEntries: 0, deletedRelPaths };
 }
 
 /** Places a newly created temp file at `destFile` without overwriting an existing file. Returns false on EEXIST. */
@@ -1081,6 +1294,8 @@ function mergeSingleFile(
 
   const destHash = hashRegularFileStrict(destFile, checkBudget);
   if (destHash.sha256 === legacyHash.sha256 && destHash.bytes === legacyHash.bytes) {
+    fsyncFile(destFile);
+    fsyncDir(dirname(destFile));
     const unlinked = unlinkIfIdentityMatches(legacyFile, legacyHash.identity);
     return { shadowed: null, unlinked };
   }
@@ -1125,23 +1340,32 @@ export function mergeBothExist(
     throw new Error(`Cannot merge symlinks: ${legacyPath} -> ${destPath}`);
   }
   if (!isDir) {
-    if (!legStat.isFile() || !dstStat.isFile()) {
+    if (!legStat.isFile() || (!dstStat.isFile() && !dstStat.isDirectory())) {
       throw new Error(`Type mismatch merging file unit ${legacyPath} -> ${destPath}`);
     }
     checkBudget();
     const res = mergeSingleFile(legacyPath, destPath, checkBudget);
+    const fullyMerged = res.unlinked && safeLstat(legacyPath) === null;
     return {
       shadowed: res.shadowed ? [res.shadowed] : [],
-      fullyMerged: res.unlinked && safeLstat(legacyPath) === null,
+      fullyMerged,
+      mergedRelPaths: fullyMerged ? [STAGE_SINGLE_FILE_KEY] : [],
     };
   }
 
-  if (!legStat.isDirectory() || !dstStat.isDirectory()) {
+  if (!legStat.isDirectory() || (!dstStat.isDirectory() && !dstStat.isFile())) {
     throw new Error(`Type mismatch merging directory unit ${legacyPath} -> ${destPath}`);
   }
 
-  const walked = walkDirStrict(legacyPath, "", checkBudget);
   const shadowed: ShadowedFileRecord[] = [];
+  if (dstStat.isFile()) {
+    const preservedPath = preserveCollidingDestinationEntry(destPath, checkBudget);
+    shadowed.push({ canonicalPath: destPath, preservedPath });
+    mkdirSync(destPath);
+    fsyncDir(dirname(destPath));
+  }
+
+  const walked = walkDirStrict(legacyPath, "", checkBudget);
   for (const relDir of walked.dirs) {
     checkBudget();
     const segs = relDir.split("/").filter((s) => s.length > 0);
@@ -1169,19 +1393,25 @@ export function mergeBothExist(
   }
 
   let anyLeftover = false;
+  const mergedRelPaths: string[] = [];
   for (const file of walked.files) {
     checkBudget();
     const dstFile = join(destPath, ...file.relPath.split("/"));
     const res = mergeSingleFile(file.absPath, dstFile, checkBudget);
     if (res.shadowed) shadowed.push(res.shadowed);
-    if (!res.unlinked) anyLeftover = true;
+    if (res.unlinked) {
+      mergedRelPaths.push(file.relPath);
+    } else {
+      anyLeftover = true;
+    }
   }
 
   // Remove now-empty verified legacy subdirectories bottom-up, then legacyPath itself;
   // leave anything non-empty intact so the next pass merges new/modified entries.
   const dirsDeepestFirst = [...walked.dirs].sort((a, b) => b.split("/").length - a.split("/").length);
-  for (const relDir of dirsDeepestFirst) {
-    const dirAbs = join(legacyPath, ...relDir.split("/"));
+  for (let i = 0; i < dirsDeepestFirst.length; i++) {
+    if (i > 0) checkBudget();
+    const dirAbs = join(legacyPath, ...dirsDeepestFirst[i]!.split("/"));
     try {
       rmdirSync(dirAbs);
     } catch (err) {
@@ -1206,7 +1436,7 @@ export function mergeBothExist(
       }
     }
   }
-  return { shadowed, fullyMerged: !anyLeftover && safeLstat(legacyPath) === null };
+  return { shadowed, fullyMerged: !anyLeftover && safeLstat(legacyPath) === null, mergedRelPaths };
 }
 
 /** Creates a unit-level migration bridge symlink at `legacyPath` pointing to `destinationPath`. */
@@ -1293,7 +1523,13 @@ export function isValidBridgeTarget(
     unit.taskId,
     unit.ownerChat,
   );
-  return allowed.has(resolved) ? resolved : null;
+  if (!allowed.has(resolved)) return null;
+  // A6/D6: a bridge counts as migrated data only when its target physically exists with the expected type.
+  const targetStat = safeLstat(resolved);
+  if (!targetStat || targetStat.isSymbolicLink()) return null;
+  const expectDir = unit.kind === "goal" || unit.kind === "run" || unit.kind === "bucket_task";
+  if (expectDir ? !targetStat.isDirectory() : !targetStat.isFile()) return null;
+  return resolved;
 }
 
 /** Finds an existing real copy of a unit anywhere in `<projectDir>` (owner chat first, then legacy, then other chats). */
@@ -1522,6 +1758,8 @@ export function readMigrationState(projectDir: string): MigrationStateFile {
             ...(typeof u.taskId === "string" ? { taskId: u.taskId } : {}),
             ...(typeof u.repoRoot === "string" ? { repoRoot: u.repoRoot } : {}),
             ...(typeof u.ownerChat === "string" || u.ownerChat === null ? { ownerChat: u.ownerChat } : {}),
+            ...(u.stale === true ? { stale: true } : {}),
+            ...(typeof u.staleReason === "string" ? { staleReason: u.staleReason } : {}),
             members: u.members
               .filter(
                 (m): m is PendingMigrationMember =>
@@ -1559,7 +1797,16 @@ export function readMigrationState(projectDir: string): MigrationStateFile {
             createdAt: b.createdAt,
           }))
       : [];
-    return { version: 1, reportedUnknownEntries, pendingUnits, bridges };
+    const budgetDeferredUnits = Array.isArray(raw.budgetDeferredUnits)
+      ? raw.budgetDeferredUnits.filter((x): x is string => typeof x === "string" && x.length > 0)
+      : [];
+    return {
+      version: 1,
+      reportedUnknownEntries,
+      pendingUnits,
+      bridges,
+      ...(budgetDeferredUnits.length > 0 ? { budgetDeferredUnits } : {}),
+    };
   } catch {
     return empty;
   }
@@ -1578,11 +1825,15 @@ export function writeMigrationStateAtomic(projectDir: string, state: MigrationSt
       dedupBridges.set(b.legacyPath, { legacyPath: b.legacyPath, target: b.target, createdAt: b.createdAt });
     }
   }
+  const budgetDeferredUnits = [
+    ...new Set((state.budgetDeferredUnits ?? []).filter((x): x is string => typeof x === "string" && x.length > 0)),
+  ].sort();
   const normalized: MigrationStateFile = {
     version: 1,
     reportedUnknownEntries: [...new Set(state.reportedUnknownEntries)].sort(),
     pendingUnits: state.pendingUnits,
     bridges: [...dedupBridges.values()].sort((a, b) => a.legacyPath.localeCompare(b.legacyPath)),
+    ...(budgetDeferredUnits.length > 0 ? { budgetDeferredUnits } : {}),
   };
   const payload = Buffer.from(`${JSON.stringify(normalized, null, 2)}\n`, "utf8");
   const temp = join(projectDir, `.${MIGRATION_STATE_FILE}.${randomUUID()}.tmp`);
@@ -1608,6 +1859,63 @@ export function writeMigrationStateAtomic(projectDir: string, state: MigrationSt
   try {
     renameSync(temp, target);
     fsyncDir(projectDir);
+  } finally {
+    rmSync(temp, { force: true });
+  }
+}
+
+/** Reads `<dataRoot>/migration-cursor.json` without creating or writing anything. */
+export function readMigrationCursor(dataRoot: string): MigrationCursorFile {
+  const empty: MigrationCursorFile = { version: 1, nextRepoRoot: null };
+  const filePath = join(dataRoot, MIGRATION_CURSOR_FILE);
+  try {
+    const st = lstatSync(filePath);
+    if (st.isSymbolicLink() || !st.isFile()) return empty;
+    const raw = JSON.parse(readFileSync(filePath, "utf8")) as Partial<MigrationCursorFile>;
+    const nextRepoRoot =
+      typeof raw.nextRepoRoot === "string" && raw.nextRepoRoot.length > 0 ? raw.nextRepoRoot : null;
+    return { version: 1, nextRepoRoot };
+  } catch {
+    return empty;
+  }
+}
+
+/** Writes `<dataRoot>/migration-cursor.json` atomically via fsynced temp file + rename + directory fsync. */
+export function writeMigrationCursorAtomic(dataRoot: string, cursor: MigrationCursorFile): void {
+  mkdirSync(dataRoot, { recursive: true });
+  const target = join(dataRoot, MIGRATION_CURSOR_FILE);
+  const existing = safeLstat(target);
+  if (existing && (existing.isSymbolicLink() || !existing.isFile())) {
+    throw new Error(`Refusing to overwrite non-file migration cursor path: ${target}`);
+  }
+  const normalized: MigrationCursorFile = {
+    version: 1,
+    nextRepoRoot: typeof cursor.nextRepoRoot === "string" && cursor.nextRepoRoot.length > 0 ? cursor.nextRepoRoot : null,
+  };
+  const payload = Buffer.from(`${JSON.stringify(normalized, null, 2)}\n`, "utf8");
+  const temp = join(dataRoot, `.${MIGRATION_CURSOR_FILE}.${randomUUID()}.tmp`);
+  const fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  try {
+    let offset = 0;
+    while (offset < payload.length) {
+      const n = writeSync(fd, payload, offset, payload.length - offset);
+      if (n <= 0) throw new Error(`Short write persisting migration cursor ${temp}`);
+      offset += n;
+    }
+    fsyncSync(fd);
+  } catch (err) {
+    try {
+      closeSync(fd);
+    } catch {
+      // Keep original error.
+    }
+    rmSync(temp, { force: true });
+    throw err;
+  }
+  closeSync(fd);
+  try {
+    renameSync(temp, target);
+    fsyncDir(dataRoot);
   } finally {
     rmSync(temp, { force: true });
   }

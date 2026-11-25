@@ -886,14 +886,15 @@ describe("storage migration engine (core)", () => {
       const runDir = join(repo, ".harness", "artifacts", run.id);
       for (let i = 1; i <= 5; i++) {
         const p = join(runDir, task.id, `file-${i}.txt`);
-        writeFile(p, `payload-${i}-`.repeat(15_000));
+        writeFile(p, `payload-${i}-`.repeat(25_000));
         cpDb.recordArtifact({ runId: run.id, taskId: task.id, kind: "dossier", path: p, summary: `File ${i}` });
       }
       const beforeHashes = hashTree(runDir);
 
-      // Fake clock: ticks forward by 10ms per check; fixed budgetMs=580 expires mid-copy after a subset of files
-      // and converges over repeated passes with the EXACT same budget using the private stage manifest.
-      const EQUAL_BUDGET_MS = 580;
+      // Fake clock: ticks forward by 10ms per check; fixed budgetMs=680 expires mid-copy after a subset of files
+      // and converges over repeated passes with the EXACT same budget using the private stage manifest
+      // (D2 hashes destination bytes in the same pass before deletion, and D4 checks budget during fsync/delete).
+      const EQUAL_BUDGET_MS = 680;
       const makePassClock = () => {
         let clock = 1_000;
         return () => {
@@ -927,7 +928,7 @@ describe("storage migration engine (core)", () => {
 
       // Repeated passes with the EXACT SAME budget resume from manifest.jsonl and converge cleanly.
       let passes = 1;
-      let totalMigrated = pass1.totals.migrated;
+      let totalMigrated = pass1.totals.migrated + pass1.totals.merged + pass1.totals.finished;
       let lastReport = pass1;
       while (lastReport.budgetExceeded && passes < 10) {
         passes++;
@@ -936,7 +937,7 @@ describe("storage migration engine (core)", () => {
           { budgetMs: EQUAL_BUDGET_MS },
         );
         assert.equal(lastReport.errors.length, 0);
-        totalMigrated += lastReport.totals.migrated;
+        totalMigrated += lastReport.totals.migrated + lastReport.totals.merged + lastReport.totals.finished;
       }
       assert.equal(lastReport.budgetExceeded, false, "Must converge over repeated equal budgets");
       assert.equal(lastReport.totals.remaining, 0);

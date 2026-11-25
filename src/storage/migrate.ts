@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import { readlinkSync, renameSync, unlinkSync } from "node:fs";
+import { linkSync, readlinkSync, renameSync, unlinkSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { isDirectorTaskContainer } from "../control-plane/ids.js";
 import {
@@ -10,18 +10,22 @@ import {
 } from "./data-dir/units.js";
 import type { StorageLayout, StoragePaths } from "./paths.js";
 import {
+  buildHistoricalRunGoalIndex,
+  buildPassArtifactRowSnapshot,
   buildRepoArtifactRowIndex,
   countPendingRowRewritesFromIndex,
   deriveRunChatSessionIdReadOnly,
-  discoverRepoRoots,
   findAmbiguousRowIdsFromIndex,
   findFlatArtifactOwnerRowsFromIndex,
   findGoalsByLinkedRun,
   type GoalRowInfo,
+  hasAnyLegacyArtifactRowForRepo,
+  type HistoricalRunGoalIndex,
   listAllKnownRepoRoots,
   listRegisteredWorktreePaths,
   listTasksForRun,
   type ParsedLegacyArtifactRow,
+  type PassArtifactRowSnapshot,
   readGoalRow,
   readRunRow,
   readTaskRow,
@@ -43,19 +47,24 @@ import {
   ensurePrivateStageDir,
   enumerateLegacyUnitsSafe,
   findExistingDataDirUnit,
-  fsyncDir,
+  fsyncDirChain,
   fsyncStageTree,
   generateStagingOpId,
+  isRealDirUnderRoot,
   isValidBridgeTarget,
+  isValidRelativePath,
   isValidStagingOpId,
+  LEGACY_HARNESS_DIR,
   legacyPathForUnit,
   listUnrecordedStagingEntries,
   mergeBothExist,
   type MigrationStateFile,
+  moveFileNoOverwrite,
   overlapsAnyPath,
   type PendingMigrationMember,
   type PendingMigrationUnit,
   privateStagePayloadPath,
+  readMigrationCursor,
   readMigrationState,
   type RecordedBridgeEntry,
   removeRecordedStageDir,
@@ -63,6 +72,7 @@ import {
   type ShadowedFileRecord,
   verifyCopyMatches,
   verifyUnitReadable,
+  writeMigrationCursorAtomic,
   writeMigrationStateAtomic,
 } from "./migrate/fs.js";
 
@@ -76,11 +86,13 @@ export const BRIDGE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
 export type MigrationFaultStep =
   | "after_copy"
   | "after_verify"
+  | "before_rename_into_place"
   | "after_rename_into_place"
   | "after_legacy_delete"
   | "after_merge"
   | "after_row_rewrite"
-  | "before_bridge";
+  | "before_bridge"
+  | "after_bridge";
 
 /** Unit metadata passed to `deps.fault(step, unit)` during fault-injection tests. */
 export interface MigrationUnitFaultContext {
@@ -111,6 +123,8 @@ export interface StorageMigrationDeps {
   fault?: (step: MigrationFaultStep, unit: MigrationUnitFaultContext) => void;
   /** Test hook forcing the cross-filesystem staged copy + verify path instead of `renameSync`. */
   forceCopy?: boolean;
+  /** Optional bridge creator override (defaults to `createBridgeSymlink`; used in tests to simulate bridge creation failures). */
+  createBridge?: (legacyPath: string, destinationPath: string, canonRepo: string) => void;
 }
 
 export interface StorageMigrationOptions {
@@ -162,12 +176,23 @@ export interface PlannedMigrationUnit {
   members: PlannedMigrationMember[];
 }
 
+export interface StalePendingJournalEntry {
+  unitKey: string;
+  kind: StorageUnitKind;
+  id: string;
+  taskId?: string;
+  legacyPath?: string;
+  destinationPath?: string;
+  reason: string;
+}
+
 export interface RepoMigrationPlan {
   repoRoot: string;
   projectDir: string;
   units: PlannedMigrationUnit[];
   unknownEntries: string[];
   newUnknownEntries: string[];
+  stalePendingUnits?: StalePendingJournalEntry[];
   errors: MigrationErrorRecord[];
   totals: MigrationPlanTotals;
 }
@@ -383,6 +408,7 @@ function recoverMembersFromArtifactRows(
   canonRepo: string,
   legacyRows: readonly ParsedLegacyArtifactRow[],
   existingMemberKeys: ReadonlySet<string>,
+  historicalIndex: HistoricalRunGoalIndex,
   checkBudget?: () => void,
 ): MemberSeed[] {
   const recovered: MemberSeed[] = [];
@@ -414,10 +440,10 @@ function recoverMembersFromArtifactRows(
       } else if (row.subdir === "artifacts" && row.subParts[0]) {
         const first = row.subParts[0];
         if (isDirectorTaskContainer(first) && row.subParts[1]) {
-          const ownerChat = deriveRunChatSessionIdReadOnly(sqlite, first);
+          const ownerChat = deriveRunChatSessionIdReadOnly(sqlite, first, historicalIndex);
           tryAdd("bucket_task", first, row.subParts[1], ownerChat);
         } else if (row.subParts.length === 1) {
-          const ownerChat = row.runId ? deriveRunChatSessionIdReadOnly(sqlite, row.runId) : null;
+          const ownerChat = row.runId ? deriveRunChatSessionIdReadOnly(sqlite, row.runId, historicalIndex) : null;
           // Try flat_artifact first, then run dir.
           const flatDest = findExistingDataDirUnit(storage, canonRepo, "flat_artifact", first, undefined, ownerChat);
           if (flatDest) {
@@ -426,7 +452,7 @@ function recoverMembersFromArtifactRows(
             tryAdd("run", first, undefined, ownerChat);
           }
         } else {
-          const ownerChat = deriveRunChatSessionIdReadOnly(sqlite, first);
+          const ownerChat = deriveRunChatSessionIdReadOnly(sqlite, first, historicalIndex);
           tryAdd("run", first, undefined, ownerChat);
         }
       } else if (row.subdir === "notes" && row.subParts.length >= 1) {
@@ -446,9 +472,7 @@ function isSafePendingSegment(seg: string): boolean {
 
 function isSafePendingMemberIds(kind: StorageUnitKind, id: string, taskId?: string): boolean {
   if (kind === "note") {
-    if (!id || id.includes("\0")) return false;
-    const parts = id.split("/");
-    return parts.length > 0 && parts.every((p) => p.length > 0 && p !== "." && p !== "..");
+    return isValidRelativePath(id);
   }
   if (!isSafePendingSegment(id)) return false;
   if (kind === "bucket_task") {
@@ -461,25 +485,26 @@ function derivePendingUnitOwnerChat(
   sqlite: Database,
   artifactIndex: RepoArtifactRowIndex,
   pending: PendingMigrationUnit,
+  historicalIndex: HistoricalRunGoalIndex,
 ): string | null {
   if (pending.kind === "note") return null;
   if (pending.kind === "goal") {
     return readGoalRow(sqlite, pending.id)?.chatSessionId ?? null;
   }
   if (pending.kind === "run" || pending.kind === "bucket_task") {
-    return deriveRunChatSessionIdReadOnly(sqlite, pending.id);
+    return deriveRunChatSessionIdReadOnly(sqlite, pending.id, historicalIndex);
   }
-  const ownerRows = findFlatArtifactOwnerRowsFromIndex(artifactIndex, pending.id);
+  const ownerRows = findFlatArtifactOwnerRowsFromIndex(artifactIndex, pending.id).filter((o) => !o.ambiguous);
   const chats = new Set<string>();
   for (const owner of ownerRows) {
     if (!owner.runId) continue;
-    const linkedGoals = findGoalsByLinkedRun(sqlite, owner.runId);
+    const linkedGoals = findGoalsByLinkedRun(sqlite, owner.runId, historicalIndex);
     if (linkedGoals.length > 0) {
       for (const g of linkedGoals) {
         if (g.chatSessionId) chats.add(g.chatSessionId);
       }
     } else {
-      const chat = deriveRunChatSessionIdReadOnly(sqlite, owner.runId);
+      const chat = deriveRunChatSessionIdReadOnly(sqlite, owner.runId, historicalIndex);
       if (chat) chats.add(chat);
     }
   }
@@ -487,14 +512,16 @@ function derivePendingUnitOwnerChat(
 }
 
 /**
- * Collects every registered worktree path (from DB `worktrees`) and every managed worktree root
- * (`storage.managedWorktreeRoots(canonRepo)`), normalized as both resolved and canonical paths.
+ * Normalizes every registered worktree path from DB `worktrees` once per pass (resolved + canonical),
+ * checking `checkBudget` inside the canonicalization loop.
  */
-function collectExcludedWorktreeRoots(sqlite: Database, storage: StoragePaths, canonRepo: string): string[] {
-  const rawPaths = [...listRegisteredWorktreePaths(sqlite), ...storage.managedWorktreeRoots(canonRepo)];
+function buildRegisteredWorktreeRoots(sqlite: Database, checkBudget?: () => void): string[] {
+  const rawPaths = listRegisteredWorktreePaths(sqlite, checkBudget);
   const seen = new Set<string>();
   const out: string[] = [];
-  for (const raw of rawPaths) {
+  for (let i = 0; i < rawPaths.length; i++) {
+    if ((i & 31) === 0) checkBudget?.();
+    const raw = rawPaths[i]!;
     const resolved = resolve(raw);
     if (!seen.has(resolved)) {
       seen.add(resolved);
@@ -510,9 +537,85 @@ function collectExcludedWorktreeRoots(sqlite: Database, storage: StoragePaths, c
 }
 
 /**
+ * Combines pre-indexed registered worktree paths with `storage.managedWorktreeRoots(canonRepo)`,
+ * normalized as both resolved and canonical paths.
+ */
+function collectExcludedWorktreeRoots(
+  storage: StoragePaths,
+  canonRepo: string,
+  registeredWorktreeRoots: readonly string[],
+  checkBudget?: () => void,
+): string[] {
+  const seen = new Set<string>(registeredWorktreeRoots);
+  const out = [...registeredWorktreeRoots];
+  const managed = storage.managedWorktreeRoots(canonRepo);
+  for (let i = 0; i < managed.length; i++) {
+    if ((i & 31) === 31) checkBudget?.();
+    const raw = managed[i]!;
+    const resolved = resolve(raw);
+    if (!seen.has(resolved)) {
+      seen.add(resolved);
+      out.push(resolved);
+    }
+    const canon = canonicalPath(resolved);
+    if (!seen.has(canon)) {
+      seen.add(canon);
+      out.push(canon);
+    }
+  }
+  return out;
+}
+
+interface PassDbIndexes {
+  getHistoricalRunGoalIndex: () => HistoricalRunGoalIndex;
+  getPassArtifactSnapshot: () => PassArtifactRowSnapshot;
+  getRegisteredWorktreeRoots: () => string[];
+}
+
+function createPassDbIndexes(sqlite: Database, checkBudget?: () => void): PassDbIndexes {
+  let historicalIndex: HistoricalRunGoalIndex | undefined;
+  let artifactSnapshot: PassArtifactRowSnapshot | undefined;
+  let registeredWorktrees: string[] | undefined;
+
+  return {
+    getHistoricalRunGoalIndex: () => {
+      if (!historicalIndex) {
+        historicalIndex = buildHistoricalRunGoalIndex(sqlite, checkBudget);
+      }
+      return historicalIndex;
+    },
+    getPassArtifactSnapshot: () => {
+      if (!artifactSnapshot) {
+        artifactSnapshot = buildPassArtifactRowSnapshot(sqlite, checkBudget);
+      }
+      return artifactSnapshot;
+    },
+    getRegisteredWorktreeRoots: () => {
+      if (!registeredWorktrees) {
+        registeredWorktrees = buildRegisteredWorktreeRoots(sqlite, checkBudget);
+      }
+      return registeredWorktrees;
+    },
+  };
+}
+
+/** Rotates `candidates` so the pass starts at `nextRepoRoot` (or the next lexicographic entry if removed). */
+function rotateReposFromCursor(candidates: readonly string[], nextRepoRoot: string | null): string[] {
+  if (!nextRepoRoot || candidates.length <= 1) return [...candidates];
+  let idx = candidates.indexOf(nextRepoRoot);
+  if (idx === -1) {
+    idx = candidates.findIndex((r) => r.localeCompare(nextRepoRoot) >= 0);
+  }
+  if (idx <= 0) return [...candidates];
+  return [...candidates.slice(idx), ...candidates.slice(0, idx)];
+}
+
+/**
  * Validates pending journal entries by recomputing legacy and destination paths from
- * `(canonical repo, kind, ids, owner)`. Entries whose stored paths differ are dropped with an error
- * record and zero filesystem changes.
+ * `(canonical repo, kind, ids, owner)`:
+ * - Entries whose validation hits a DB error stay on disk (`deferredPending`) and take no part in this pass.
+ * - Entries that fail recomputation are kept on disk marked `stale: true` (`stalePending`), never acted on,
+ *   never dropped, and reported by `planStorageMigration` / `--dry-run`.
  */
 function validatePendingUnits(
   sqlite: Database,
@@ -521,19 +624,43 @@ function validatePendingUnits(
   state: MigrationStateFile,
   artifactIndex: RepoArtifactRowIndex,
   excludedWorktreeRoots: readonly string[],
+  historicalIndex: HistoricalRunGoalIndex,
   checkBudget?: () => void,
-): { validPending: PendingMigrationUnit[]; droppedErrors: MigrationErrorRecord[] } {
+): {
+  validPending: PendingMigrationUnit[];
+  deferredPending: PendingMigrationUnit[];
+  stalePending: PendingMigrationUnit[];
+  newlyStaleErrors: MigrationErrorRecord[];
+  dbErrors: MigrationErrorRecord[];
+} {
   const validPending: PendingMigrationUnit[] = [];
-  const droppedErrors: MigrationErrorRecord[] = [];
+  const deferredPending: PendingMigrationUnit[] = [];
+  const stalePending: PendingMigrationUnit[] = [];
+  const newlyStaleErrors: MigrationErrorRecord[] = [];
+  const dbErrors: MigrationErrorRecord[] = [];
+
+  const markStale = (pending: PendingMigrationUnit, reason: string, path?: string): void => {
+    stalePending.push({
+      ...pending,
+      stale: true,
+      staleReason: reason,
+    });
+    newlyStaleErrors.push({
+      repoRoot: canonRepo,
+      unitKey: pending.unitKey,
+      ...(path ? { path } : {}),
+      message: `Kept stale pending journal entry ${pending.unitKey}: ${reason}`,
+    });
+  };
 
   for (const pending of state.pendingUnits) {
     checkBudget?.();
+    if (pending.stale === true) {
+      stalePending.push(pending);
+      continue;
+    }
     if (pending.members.length === 0) {
-      droppedErrors.push({
-        repoRoot: canonRepo,
-        unitKey: pending.unitKey,
-        message: `Dropped invalid pending journal entry ${pending.unitKey}: no members recorded`,
-      });
+      markStale(pending, "no members recorded");
       continue;
     }
     if (pending.repoRoot !== undefined) {
@@ -544,32 +671,45 @@ function validatePendingUnits(
         recordedCanon = pending.repoRoot;
       }
       if (recordedCanon !== canonRepo) {
-        droppedErrors.push({
-          repoRoot: canonRepo,
-          unitKey: pending.unitKey,
-          path: pending.repoRoot,
-          message: `Dropped stale pending journal entry ${pending.unitKey}: recorded repoRoot (${pending.repoRoot}) does not match ${canonRepo}`,
-        });
+        markStale(pending, `recorded repoRoot (${pending.repoRoot}) does not match ${canonRepo}`, pending.repoRoot);
         continue;
       }
     }
 
+    if (!isSafePendingMemberIds(pending.kind, pending.id, pending.taskId)) {
+      markStale(
+        pending,
+        `unsafe unit identifier (${pending.kind}:${pending.id}${pending.taskId ? `:${pending.taskId}` : ""})`,
+      );
+      continue;
+    }
+    const unsafeMember = pending.members.find((m) => !isSafePendingMemberIds(m.kind, m.id, m.taskId));
+    if (unsafeMember) {
+      markStale(
+        pending,
+        `invalid member identifier (${unsafeMember.kind}:${unsafeMember.id}${unsafeMember.taskId ? `:${unsafeMember.taskId}` : ""})`,
+      );
+      continue;
+    }
+
     let ownerChat: string | null;
     try {
-      ownerChat = derivePendingUnitOwnerChat(sqlite, artifactIndex, pending);
+      ownerChat = derivePendingUnitOwnerChat(sqlite, artifactIndex, pending, historicalIndex);
     } catch (err) {
       if (err instanceof BudgetExceededError) throw err;
-      // Fail closed on unexpected DB errors: keep the pending entry intact rather than dropping a valid journal.
-      validPending.push(pending);
+      // A6/D6: fail closed on unexpected DB errors — keep on disk intact, and take NO part in this pass.
+      deferredPending.push(pending);
+      dbErrors.push({
+        repoRoot: canonRepo,
+        unitKey: pending.unitKey,
+        path: pending.members[0]?.legacyPath,
+        message: `Deferred pending journal entry ${pending.unitKey} due to DB validation error: ${err instanceof Error ? err.message : String(err)}`,
+      });
       continue;
     }
     let mismatchReason: string | null = null;
 
     for (const m of pending.members) {
-      if (!isSafePendingMemberIds(m.kind, m.id, m.taskId)) {
-        mismatchReason = `invalid member identifier (${m.kind}:${m.id}${m.taskId ? `:${m.taskId}` : ""})`;
-        break;
-      }
       let expectedLegacy: string;
       let expectedOwnerDest: string;
       let expectedLegacyChatDest: string;
@@ -615,18 +755,13 @@ function validatePendingUnits(
     }
 
     if (mismatchReason) {
-      droppedErrors.push({
-        repoRoot: canonRepo,
-        unitKey: pending.unitKey,
-        path: pending.members[0]?.legacyPath,
-        message: `Dropped mismatched pending journal entry ${pending.unitKey}: ${mismatchReason}`,
-      });
+      markStale(pending, mismatchReason, pending.members[0]?.legacyPath);
       continue;
     }
     validPending.push(pending);
   }
 
-  return { validPending, droppedErrors };
+  return { validPending, deferredPending, stalePending, newlyStaleErrors, dbErrors };
 }
 
 /** Discovers all logical unit seeds for a repository from disk, unrewritten artifact rows, and validated pending state. */
@@ -637,7 +772,9 @@ function discoverRepoUnitSeeds(
   validPendingUnits: readonly PendingMigrationUnit[],
   artifactIndex: RepoArtifactRowIndex,
   excludedWorktreeRoots: readonly string[],
+  historicalIndex: HistoricalRunGoalIndex,
   checkBudget?: () => void,
+  excludedPendingUnitKeys?: ReadonlySet<string>,
 ): { seeds: UnitSeed[]; worktreeOverlaps: string[]; enumerationErrors: MigrationErrorRecord[] } {
   checkBudget?.();
   const {
@@ -652,16 +789,38 @@ function discoverRepoUnitSeeds(
     message: e.message,
   }));
 
+  const runIdsInArtifactRows = new Set<string>();
+  for (const row of artifactIndex.legacyRows) {
+    if (row.subdir === "artifacts" && row.subParts.length >= 2 && !isDirectorTaskContainer(row.subParts[0]!)) {
+      runIdsInArtifactRows.add(row.subParts[0]!);
+    }
+  }
+
   const memberMap = new Map<string, MemberSeed>();
   const addDiscovered = (u: DiscoveredLegacyUnit) => {
     if (overlapsAnyPath(u.legacyPath, excludedWorktreeRoots)) {
       worktreeOverlapSet.add(u.legacyPath);
       return;
     }
-    const key = makeMemberKey(u.kind, u.id, u.taskId);
+    let kind: StorageUnitKind = u.kind;
+    // A6/D6: never misclassify a run-directory bridge whose target is a wrong-type regular file as a flat_artifact.
+    if (kind === "flat_artifact" && u.isBridge) {
+      let isKnownRun = /^run-\d+$/.test(u.id) || runIdsInArtifactRows.has(u.id);
+      if (!isKnownRun) {
+        try {
+          isKnownRun = readRunRow(sqlite, u.id) !== null;
+        } catch {
+          // On DB error, keep conservative classification; eligibility will fail closed.
+        }
+      }
+      if (isKnownRun) {
+        kind = "run";
+      }
+    }
+    const key = makeMemberKey(kind, u.id, u.taskId);
     if (!memberMap.has(key)) {
       memberMap.set(key, {
-        kind: u.kind,
+        kind,
         id: u.id,
         ...(u.taskId !== undefined ? { taskId: u.taskId } : {}),
         legacyPath: u.legacyPath,
@@ -681,6 +840,7 @@ function discoverRepoUnitSeeds(
     canonRepo,
     legacyRows,
     new Set(memberMap.keys()),
+    historicalIndex,
     checkBudget,
   )) {
     if (overlapsAnyPath(rec.legacyPath, excludedWorktreeRoots)) {
@@ -794,7 +954,7 @@ function discoverRepoUnitSeeds(
     let targetGoalId = runToGoalId.get(member.id);
     let linkedGoals: GoalRowInfo[];
     try {
-      linkedGoals = findGoalsByLinkedRun(sqlite, member.id);
+      linkedGoals = findGoalsByLinkedRun(sqlite, member.id, historicalIndex);
     } catch (err) {
       if (err instanceof BudgetExceededError) throw err;
       recordMemberDbError(member, err);
@@ -823,7 +983,7 @@ function discoverRepoUnitSeeds(
   for (const member of memberMap.values()) {
     if ((passIdx++ & 63) === 0) checkBudget?.();
     if (member.kind !== "flat_artifact") continue;
-    const ownerRows = findFlatArtifactOwnerRowsFromIndex(artifactIndex, member.id);
+    const ownerRows = findFlatArtifactOwnerRowsFromIndex(artifactIndex, member.id).filter((o) => !o.ambiguous);
     if (ownerRows.length === 0) continue;
     const matchedGoalIds = new Set<string>();
     const matchedRunIds = new Set<string>();
@@ -837,7 +997,7 @@ function discoverRepoUnitSeeds(
       let gid = runToGoalId.get(owner.runId);
       if (!gid) {
         try {
-          const linkedGoals = findGoalsByLinkedRun(sqlite, owner.runId);
+          const linkedGoals = findGoalsByLinkedRun(sqlite, owner.runId, historicalIndex);
           if (linkedGoals.length === 1) {
             gid = linkedGoals[0]!.id;
             runToGoalId.set(owner.runId, gid);
@@ -900,11 +1060,13 @@ function discoverRepoUnitSeeds(
     });
   }
 
-  const allSeeds = [...goalSeeds.values(), ...otherSeeds].sort((a, b) => {
-    const ko = UNIT_KIND_ORDER[a.kind] - UNIT_KIND_ORDER[b.kind];
-    if (ko !== 0) return ko;
-    return a.unitKey.localeCompare(b.unitKey);
-  });
+  const allSeeds = [...goalSeeds.values(), ...otherSeeds]
+    .filter((s) => !excludedPendingUnitKeys || !excludedPendingUnitKeys.has(s.unitKey))
+    .sort((a, b) => {
+      const ko = UNIT_KIND_ORDER[a.kind] - UNIT_KIND_ORDER[b.kind];
+      if (ko !== 0) return ko;
+      return a.unitKey.localeCompare(b.unitKey);
+    });
 
   return { seeds: allSeeds, worktreeOverlaps: [...worktreeOverlapSet].sort(), enumerationErrors };
 }
@@ -923,6 +1085,7 @@ function decideFlatArtifactOwnership(
   sqlite: Database,
   artifactIndex: RepoArtifactRowIndex,
   fileName: string,
+  historicalIndex: HistoricalRunGoalIndex,
 ): UnitOwnershipDecision {
   const ownerRows = findFlatArtifactOwnerRowsFromIndex(artifactIndex, fileName);
   if (ownerRows.length === 0) {
@@ -934,7 +1097,7 @@ function decideFlatArtifactOwnership(
     if (owner.taskId) {
       const taskRow = readTaskRow(sqlite, owner.taskId);
       if (taskRow && !TERMINAL_TASK_STATUSES.has(taskRow.status)) {
-        const ownerChat = owner.runId ? deriveRunChatSessionIdReadOnly(sqlite, owner.runId) : null;
+        const ownerChat = owner.runId ? deriveRunChatSessionIdReadOnly(sqlite, owner.runId, historicalIndex) : null;
         return {
           eligible: false,
           deferReason: `flat artifact ${fileName} belongs to live task ${owner.taskId} (${taskRow.status})`,
@@ -946,7 +1109,7 @@ function decideFlatArtifactOwnership(
     if (!owner.runId) continue;
 
     // Check linked goals for this run.
-    const linkedGoals = findGoalsByLinkedRun(sqlite, owner.runId);
+    const linkedGoals = findGoalsByLinkedRun(sqlite, owner.runId, historicalIndex);
     for (const g of linkedGoals) {
       if (!TERMINAL_GOAL_STATUSES.has(g.status)) {
         return {
@@ -955,7 +1118,7 @@ function decideFlatArtifactOwnership(
           ownerChat: g.chatSessionId ?? null,
         };
       }
-      candidateChats.add(g.chatSessionId ?? null);
+      if (!owner.ambiguous) candidateChats.add(g.chatSessionId ?? null);
     }
 
     if (isDirectorTaskContainer(owner.runId)) {
@@ -970,16 +1133,16 @@ function decideFlatArtifactOwnership(
           return {
             eligible: false,
             deferReason: `flat artifact ${fileName} belongs to bucket ${owner.runId} with live task(s): ${sample}`,
-            ownerChat: deriveRunChatSessionIdReadOnly(sqlite, owner.runId),
+            ownerChat: deriveRunChatSessionIdReadOnly(sqlite, owner.runId, historicalIndex),
           };
         }
       }
-      candidateChats.add(deriveRunChatSessionIdReadOnly(sqlite, owner.runId));
+      if (!owner.ambiguous) candidateChats.add(deriveRunChatSessionIdReadOnly(sqlite, owner.runId, historicalIndex));
       continue;
     }
 
     const runRow = readRunRow(sqlite, owner.runId);
-    const runChat = deriveRunChatSessionIdReadOnly(sqlite, owner.runId);
+    const runChat = deriveRunChatSessionIdReadOnly(sqlite, owner.runId, historicalIndex);
     if (runRow && linkedGoals.length === 0 && !TERMINAL_RUN_STATUSES.has(runRow.status)) {
       return {
         eligible: false,
@@ -1002,7 +1165,7 @@ function decideFlatArtifactOwnership(
       };
     }
 
-    if (linkedGoals.length === 0 && runRow) {
+    if (!owner.ambiguous && linkedGoals.length === 0 && runRow) {
       candidateChats.add(runChat);
     }
   }
@@ -1022,6 +1185,7 @@ function decideUnitOwnership(
   _storage: StoragePaths,
   seed: UnitSeed,
   artifactIndex: RepoArtifactRowIndex,
+  historicalIndex: HistoricalRunGoalIndex,
 ): UnitOwnershipDecision {
   if (seed.discoveryDbError) {
     return {
@@ -1046,7 +1210,7 @@ function decideUnitOwnership(
         runIds.add(primaryGoal.linkedRunId);
       }
       for (const rid of [...runIds]) {
-        for (const g of findGoalsByLinkedRun(sqlite, rid)) {
+        for (const g of findGoalsByLinkedRun(sqlite, rid, historicalIndex)) {
           goalIds.add(g.id);
         }
       }
@@ -1096,7 +1260,7 @@ function decideUnitOwnership(
       // Verify every attached flat spill file is also eligible across ALL of its indexed owners.
       for (const m of seed.members) {
         if (m.kind !== "flat_artifact") continue;
-        const flatDecision = decideFlatArtifactOwnership(sqlite, artifactIndex, m.id);
+        const flatDecision = decideFlatArtifactOwnership(sqlite, artifactIndex, m.id, historicalIndex);
         if (!flatDecision.eligible) {
           return {
             eligible: false,
@@ -1115,13 +1279,13 @@ function decideUnitOwnership(
 
     if (seed.kind === "run") {
       // Re-check whether a goal now links this run.
-      const linkedGoals = findGoalsByLinkedRun(sqlite, seed.id);
+      const linkedGoals = findGoalsByLinkedRun(sqlite, seed.id, historicalIndex);
       for (const g of linkedGoals) {
         if (!TERMINAL_GOAL_STATUSES.has(g.status)) {
           return {
             eligible: false,
             deferReason: `linked goal ${g.id} is non-terminal (${g.status})`,
-            ownerChat: g.chatSessionId ?? deriveRunChatSessionIdReadOnly(sqlite, seed.id),
+            ownerChat: g.chatSessionId ?? deriveRunChatSessionIdReadOnly(sqlite, seed.id, historicalIndex),
           };
         }
       }
@@ -1133,7 +1297,7 @@ function decideUnitOwnership(
         return { eligible: true, ownerChat: linkedGoalChat };
       }
 
-      const ownerChat = linkedGoalChat ?? deriveRunChatSessionIdReadOnly(sqlite, seed.id);
+      const ownerChat = linkedGoalChat ?? deriveRunChatSessionIdReadOnly(sqlite, seed.id, historicalIndex);
       if (!TERMINAL_RUN_STATUSES.has(runRow.status)) {
         return {
           eligible: false,
@@ -1169,7 +1333,7 @@ function decideUnitOwnership(
         // Unknown task id: ownerless -> eligible, destination chats/legacy.
         return { eligible: true, ownerChat: null };
       }
-      const ownerChat = deriveRunChatSessionIdReadOnly(sqlite, seed.id);
+      const ownerChat = deriveRunChatSessionIdReadOnly(sqlite, seed.id, historicalIndex);
       if (!TERMINAL_TASK_STATUSES.has(taskRow.status)) {
         return {
           eligible: false,
@@ -1181,7 +1345,7 @@ function decideUnitOwnership(
     }
 
     // flat_artifact (not attached to a goal unit)
-    return decideFlatArtifactOwnership(sqlite, artifactIndex, seed.id);
+    return decideFlatArtifactOwnership(sqlite, artifactIndex, seed.id, historicalIndex);
   } catch (err) {
     if (err instanceof BudgetExceededError) throw err;
     const msg = err instanceof Error ? err.message : String(err);
@@ -1231,11 +1395,12 @@ function evaluateUnit(
   nowMs: number,
   artifactIndex: RepoArtifactRowIndex,
   bridgeByLegacyPath: ReadonlyMap<string, RecordedBridgeEntry>,
+  historicalIndex: HistoricalRunGoalIndex,
   checkBudget?: () => void,
 ): PlannedMigrationUnit {
   checkBudget?.();
   const canonRepo = seed.repoRoot;
-  const ownership = decideUnitOwnership(sqlite, storage, seed, artifactIndex);
+  const ownership = decideUnitOwnership(sqlite, storage, seed, artifactIndex, historicalIndex);
 
   const plannedMembers: PlannedMigrationMember[] = [];
   let invalidSymlinkReason: string | undefined;
@@ -1323,6 +1488,9 @@ function evaluateUnit(
     const destExists = Boolean(
       dstStat && !dstStat.isSymbolicLink() && (expectDir ? dstStat.isDirectory() : dstStat.isFile()),
     );
+    const destOppositeType = Boolean(
+      dstStat && !dstStat.isSymbolicLink() && (expectDir ? dstStat.isFile() : dstStat.isDirectory()),
+    );
 
     plannedMembers.push({
       kind: m.kind,
@@ -1332,7 +1500,7 @@ function evaluateUnit(
       destinationPath,
       legacyState,
       destExists,
-      action: "keep_bridge",
+      action: destOppositeType && legacyState === "real" ? "merge" : "keep_bridge",
       ...(bridgeAgeMs !== undefined ? { bridgeAgeMs } : {}),
       ...(bridgeNeedsRecord ? { bridgeNeedsRecord: true } : {}),
     });
@@ -1346,8 +1514,10 @@ function evaluateUnit(
         ...(m.taskId !== undefined ? { taskId: m.taskId } : {}),
         destinationPath: m.destinationPath,
       }));
-  const pendingRowRewrites = rowSpecs.length > 0 ? countPendingRowRewritesFromIndex(artifactIndex, rowSpecs) : 0;
-  const ambiguousRowsSkipped = rowSpecs.length > 0 ? findAmbiguousRowIdsFromIndex(artifactIndex, rowSpecs).length : 0;
+  const pendingRowRewrites =
+    rowSpecs.length > 0 ? countPendingRowRewritesFromIndex(artifactIndex, rowSpecs, checkBudget) : 0;
+  const ambiguousRowsSkipped =
+    rowSpecs.length > 0 ? findAmbiguousRowIdsFromIndex(artifactIndex, rowSpecs, checkBudget).length : 0;
 
   // Assign per-member actions.
   for (const m of plannedMembers) {
@@ -1362,7 +1532,7 @@ function evaluateUnit(
       continue;
     }
     if (m.legacyState === "real") {
-      m.action = m.destExists ? "merge" : "migrate";
+      m.action = m.destExists || m.action === "merge" ? "merge" : "migrate";
     } else if (m.legacyState === "absent") {
       m.action = m.destExists ? "finish_migration" : "keep_bridge";
     } else if (m.legacyState === "bridge") {
@@ -1474,8 +1644,8 @@ function toPendingUnitRecord(
 }
 
 function upsertPendingUnit(projectDir: string, state: MigrationStateFile, unit: PlannedMigrationUnit): void {
-  const existing = state.pendingUnits.find((u) => u.unitKey === unit.unitKey);
-  const next = state.pendingUnits.filter((u) => u.unitKey !== unit.unitKey);
+  const existing = state.pendingUnits.find((u) => u.stale !== true && u.unitKey === unit.unitKey);
+  const next = state.pendingUnits.filter((u) => u.stale === true || u.unitKey !== unit.unitKey);
   next.push(toPendingUnitRecord(unit, existing));
   state.pendingUnits = next;
   writeMigrationStateAtomic(projectDir, state);
@@ -1492,7 +1662,7 @@ function ensureMemberStagingOpId(
   member: PlannedMigrationMember,
 ): string {
   const memberKey = makeMemberKey(member.kind, member.id, member.taskId);
-  let pending = state.pendingUnits.find((u) => u.unitKey === unit.unitKey);
+  let pending = state.pendingUnits.find((u) => u.stale !== true && u.unitKey === unit.unitKey);
   if (!pending) {
     pending = toPendingUnitRecord(unit);
     state.pendingUnits.push(pending);
@@ -1526,7 +1696,7 @@ function releaseMemberStage(
   member: PlannedMigrationMember,
 ): void {
   const memberKey = makeMemberKey(member.kind, member.id, member.taskId);
-  const pending = state.pendingUnits.find((u) => u.unitKey === unitKey);
+  const pending = state.pendingUnits.find((u) => u.stale !== true && u.unitKey === unitKey);
   const pendingMember = pending?.members.find((m) => makeMemberKey(m.kind, m.id, m.taskId) === memberKey);
   if (!pendingMember || !isValidStagingOpId(pendingMember.stagingOpId)) return;
   const opId = pendingMember.stagingOpId;
@@ -1537,7 +1707,7 @@ function releaseMemberStage(
 
 /** Removes any private stage dirs recorded for `unitKey` in `state.pendingUnits` before removing the pending record. */
 function cleanupRecordedUnitStages(projectDir: string, state: MigrationStateFile, unitKey: string): void {
-  const pending = state.pendingUnits.find((u) => u.unitKey === unitKey);
+  const pending = state.pendingUnits.find((u) => u.stale !== true && u.unitKey === unitKey);
   if (!pending) return;
   for (const m of pending.members) {
     if (isValidStagingOpId(m.stagingOpId)) {
@@ -1554,7 +1724,7 @@ function removePendingUnit(
   opts?: { deferWrite?: boolean },
 ): boolean {
   cleanupRecordedUnitStages(projectDir, state, unitKey);
-  const filtered = state.pendingUnits.filter((u) => u.unitKey !== unitKey);
+  const filtered = state.pendingUnits.filter((u) => u.stale === true || u.unitKey !== unitKey);
   if (filtered.length === state.pendingUnits.length) return false;
   state.pendingUnits = filtered;
   if (!opts?.deferWrite) {
@@ -1601,37 +1771,89 @@ export function planStorageMigration(
     };
   }
 
+  const passIndexes = createPassDbIndexes(deps.sqlite);
   let cachedKnownRepoRoots: ReadonlySet<string> | null | undefined;
-  let repoRoots: string[] = [];
+  let candidateRepos: string[] = [];
   const getKnownRepoRoots = (): ReadonlySet<string> | null => {
     if (cachedKnownRepoRoots !== undefined) return cachedKnownRepoRoots;
     try {
       const set = listAllKnownRepoRoots(deps.sqlite, opts?.repoRoots);
-      for (const r of repoRoots) set.add(r);
+      for (const r of candidateRepos) set.add(r);
       cachedKnownRepoRoots = set;
     } catch {
       cachedKnownRepoRoots = null;
     }
     return cachedKnownRepoRoots;
   };
-  repoRoots = discoverRepoRoots(deps.sqlite, opts?.repoRoots, deps.storage, undefined, getKnownRepoRoots);
+  if (opts?.repoRoots !== undefined) {
+    const seen = new Set<string>();
+    for (const raw of opts.repoRoots) {
+      if (!raw || raw.length === 0) continue;
+      const canon = canonicalPath(raw);
+      if (!seen.has(canon)) {
+        seen.add(canon);
+        candidateRepos.push(canon);
+      }
+    }
+  } else {
+    const known = listAllKnownRepoRoots(deps.sqlite);
+    cachedKnownRepoRoots = known;
+    candidateRepos = [...known].sort();
+  }
+
   const repos: RepoMigrationPlan[] = [];
   const totals = emptyPlanTotals();
   const allPlanAmbiguousRowIds = new Set<string>();
 
-  for (const canonRepo of repoRoots) {
+  for (const canonRepo of candidateRepos) {
     const projectDir = deps.storage.projectDir(canonRepo);
     const state = readMigrationState(projectDir);
-    const excludedWorktreeRoots = collectExcludedWorktreeRoots(deps.sqlite, deps.storage, canonRepo);
-    const artifactIndex = buildRepoArtifactRowIndex(deps.sqlite, canonRepo, deps.storage, undefined, getKnownRepoRoots);
-    const { validPending, droppedErrors } = validatePendingUnits(
+    if (opts?.repoRoots === undefined) {
+      const hasWork =
+        isRealDirUnderRoot(canonRepo, [LEGACY_HARNESS_DIR]) ||
+        state.pendingUnits.length > 0 ||
+        hasAnyLegacyArtifactRowForRepo(
+          deps.sqlite,
+          canonRepo,
+          undefined,
+          getKnownRepoRoots,
+          passIndexes.getPassArtifactSnapshot(),
+        );
+      if (!hasWork) continue;
+    }
+    const excludedWorktreeRoots = collectExcludedWorktreeRoots(
+      deps.storage,
+      canonRepo,
+      passIndexes.getRegisteredWorktreeRoots(),
+    );
+    const artifactIndex = buildRepoArtifactRowIndex(
+      deps.sqlite,
+      canonRepo,
+      deps.storage,
+      undefined,
+      getKnownRepoRoots,
+      passIndexes.getPassArtifactSnapshot(),
+    );
+    const historicalIndex = passIndexes.getHistoricalRunGoalIndex();
+    const { validPending, deferredPending, stalePending, newlyStaleErrors, dbErrors } = validatePendingUnits(
       deps.sqlite,
       deps.storage,
       canonRepo,
       state,
       artifactIndex,
       excludedWorktreeRoots,
+      historicalIndex,
     );
+    const stalePendingUnits: StalePendingJournalEntry[] = stalePending.map((p) => ({
+      unitKey: p.unitKey,
+      kind: p.kind,
+      id: p.id,
+      ...(p.taskId !== undefined ? { taskId: p.taskId } : {}),
+      ...(p.members[0]?.legacyPath ? { legacyPath: p.members[0].legacyPath } : {}),
+      ...(p.members[0]?.destinationPath ? { destinationPath: p.members[0].destinationPath } : {}),
+      reason: p.staleReason ?? "stale pending journal entry",
+    }));
+    const deferredPendingKeys = new Set(deferredPending.map((p) => p.unitKey));
     const { seeds, worktreeOverlaps, enumerationErrors } = discoverRepoUnitSeeds(
       deps.sqlite,
       deps.storage,
@@ -1639,6 +1861,9 @@ export function planStorageMigration(
       validPending,
       artifactIndex,
       excludedWorktreeRoots,
+      historicalIndex,
+      undefined,
+      deferredPendingKeys,
     );
     const units: PlannedMigrationUnit[] = [];
     const repoTotals = emptyPlanTotals();
@@ -1646,7 +1871,15 @@ export function planStorageMigration(
 
     for (const seed of seeds) {
       if (seed.members.length === 0) continue;
-      const evaluated = evaluateUnit(deps.sqlite, deps.storage, seed, generatedAt, artifactIndex, bridgeMap);
+      const evaluated = evaluateUnit(
+        deps.sqlite,
+        deps.storage,
+        seed,
+        generatedAt,
+        artifactIndex,
+        bridgeMap,
+        historicalIndex,
+      );
       // Drop stale pending entries that exist neither in legacy nor in data-dir.
       if (evaluated.members.every((m) => m.legacyState === "absent" && !m.destExists)) continue;
       units.push(evaluated);
@@ -1669,7 +1902,8 @@ export function planStorageMigration(
       units,
       unknownEntries,
       newUnknownEntries,
-      errors: [...droppedErrors, ...enumerationErrors],
+      ...(stalePendingUnits.length > 0 ? { stalePendingUnits } : {}),
+      errors: [...newlyStaleErrors, ...dbErrors, ...enumerationErrors],
       totals: repoTotals,
     });
     mergePlanTotals(totals, repoTotals);
@@ -1740,6 +1974,15 @@ export function formatStorageMigrationPlan(plan: StorageMigrationPlan): string {
       for (const entry of repo.unknownEntries) {
         const tag = newSet.has(entry) ? " [new]" : "";
         lines.push(`    - ${entry}${tag}`);
+      }
+    }
+
+    if (repo.stalePendingUnits && repo.stalePendingUnits.length > 0) {
+      lines.push(`  Stale pending journal entries (${repo.stalePendingUnits.length}):`);
+      for (const stale of repo.stalePendingUnits) {
+        const pathSuffix =
+          stale.legacyPath && stale.destinationPath ? `: ${stale.legacyPath} -> ${stale.destinationPath}` : "";
+        lines.push(`    - [stale] ${stale.unitKey}${pathSuffix} (${stale.reason})`);
       }
     }
 
@@ -1815,7 +2058,7 @@ function executeSingleUnit(
     destinationPath: m.destinationPath,
   }));
   const ambiguousRowsSkipped =
-    unit.action === "defer" ? 0 : findAmbiguousRowIdsFromIndex(artifactIndex, rowSpecs).length;
+    unit.action === "defer" ? 0 : findAmbiguousRowIdsFromIndex(artifactIndex, rowSpecs, checkBudget).length;
 
   if (unit.action === "defer") {
     return {
@@ -1840,7 +2083,7 @@ function executeSingleUnit(
 
   if (unit.action === "keep_bridge") {
     let stateModified = adoptUnrecordedBridges();
-    if (state.pendingUnits.some((u) => u.unitKey === unit.unitKey)) {
+    if (state.pendingUnits.some((u) => u.stale !== true && u.unitKey === unit.unitKey)) {
       storage.ensureProjectDir(canonRepo);
       if (removePendingUnit(projectDir, state, unit.unitKey, { deferWrite: Boolean(opts?.onStateDeferred) })) {
         stateModified = true;
@@ -1870,10 +2113,10 @@ function executeSingleUnit(
   }
 
   if (unit.action === "rewrite_rows") {
-    rowsRewritten = rewriteUnitArtifactRowsFromIndex(sqlite, artifactIndex, rowSpecs);
+    rowsRewritten = rewriteUnitArtifactRowsFromIndex(sqlite, artifactIndex, rowSpecs, checkBudget);
     fault?.("after_row_rewrite", makeFaultContext(unit, unit.members[0]!));
     let stateModified = adoptUnrecordedBridges();
-    if (state.pendingUnits.some((u) => u.unitKey === unit.unitKey)) {
+    if (state.pendingUnits.some((u) => u.stale !== true && u.unitKey === unit.unitKey)) {
       storage.ensureProjectDir(canonRepo);
       if (removePendingUnit(projectDir, state, unit.unitKey, { deferWrite: Boolean(opts?.onStateDeferred) })) {
         stateModified = true;
@@ -1902,10 +2145,11 @@ function executeSingleUnit(
   }
 
   if (unit.action === "remove_bridge") {
-    rowsRewritten = rewriteUnitArtifactRowsFromIndex(sqlite, artifactIndex, rowSpecs);
+    rowsRewritten = rewriteUnitArtifactRowsFromIndex(sqlite, artifactIndex, rowSpecs, checkBudget);
     let stateModified = adoptUnrecordedBridges();
     for (const member of unit.members) {
       if (member.action !== "remove_bridge") continue;
+      checkBudget();
       const recorded = bridgeMap.get(member.legacyPath);
       if (!recorded) continue;
       if (nowFn() - recorded.createdAt < BRIDGE_MAX_AGE_MS) continue;
@@ -1919,13 +2163,19 @@ function executeSingleUnit(
       }
       const resolvedTarget = resolve(dirname(member.legacyPath), rawTarget);
       if (resolvedTarget !== recorded.target) continue;
+      // A6/D6 defense-in-depth: never expire a dangling or wrong-type bridge symlink.
+      const targetStat = safeLstat(resolvedTarget);
+      if (!targetStat || targetStat.isSymbolicLink()) continue;
+      const expectDir = isDirUnitKind(member.kind);
+      if (expectDir ? !targetStat.isDirectory() : !targetStat.isFile()) continue;
       unlinkSync(member.legacyPath);
       if (removeBridgeRecord(bridgeMap, member.legacyPath)) {
         stateModified = true;
+        opts?.onStateDeferred?.();
       }
       bridgesRemoved++;
     }
-    if (state.pendingUnits.some((u) => u.unitKey === unit.unitKey)) {
+    if (state.pendingUnits.some((u) => u.stale !== true && u.unitKey === unit.unitKey)) {
       storage.ensureProjectDir(canonRepo);
       if (removePendingUnit(projectDir, state, unit.unitKey, { deferWrite: Boolean(opts?.onStateDeferred) })) {
         stateModified = true;
@@ -1968,16 +2218,82 @@ function executeSingleUnit(
     upsertPendingUnit(ensuredProjectDir, state, unit);
   }
 
-  // Step 1 & 2: move or merge every member that still has a real legacy entry on disk.
+  const createBridgeFn = deps.createBridge ?? createBridgeSymlink;
+  let bridgeStateModified = adoptUnrecordedBridges();
+  const bridgedMembers = new Set<string>();
+
+  const bridgeMember = (member: PlannedMigrationMember): void => {
+    const memberKey = makeMemberKey(member.kind, member.id, member.taskId);
+    const existing = safeLstat(member.legacyPath);
+    if (!existing) {
+      createBridgeFn(member.legacyPath, member.destinationPath, canonRepo);
+      let createdAt = nowFn();
+      if (!deps.now) {
+        const linkStat = safeLstat(member.legacyPath);
+        if (linkStat) {
+          createdAt = Math.min(createdAt, Math.floor(linkStat.mtimeMs));
+        }
+      }
+      if (upsertBridgeRecord(bridgeMap, member.legacyPath, member.destinationPath, createdAt)) {
+        bridgeStateModified = true;
+        opts?.onStateDeferred?.();
+      }
+      bridgesCreated++;
+      bridgedMembers.add(memberKey);
+    } else if (existing.isSymbolicLink()) {
+      // Idempotent check that an existing symlink points to destinationPath.
+      createBridgeFn(member.legacyPath, member.destinationPath, canonRepo);
+      if (upsertBridgeRecord(bridgeMap, member.legacyPath, member.destinationPath, nowFn())) {
+        bridgeStateModified = true;
+        opts?.onStateDeferred?.();
+      }
+      bridgedMembers.add(memberKey);
+    } else {
+      throw new Error(`Expected legacy path ${member.legacyPath} to be absent before creating bridge`);
+    }
+  };
+
+  const rollbackRenamedMember = (member: PlannedMigrationMember, isDir: boolean): void => {
+    if (safeLstat(member.legacyPath) !== null) return;
+    if (isDir) {
+      renameSync(member.destinationPath, member.legacyPath);
+      return;
+    }
+    try {
+      linkSync(member.destinationPath, member.legacyPath);
+      unlinkSync(member.destinationPath);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "EEXIST") return;
+      if (code === "EXDEV" || code === "EPERM" || code === "ENOTSUP" || code === "ENOSYS") {
+        if (safeLstat(member.legacyPath) === null) {
+          renameSync(member.destinationPath, member.legacyPath);
+        }
+        return;
+      }
+      throw err;
+    }
+  };
+
+  // Step 1 & 2: recover unbridged members (bridge first), then move or merge every member that still has a real legacy entry on disk.
   const bothExistMembers = new Set<string>();
+  const partialMovedRelPathsByMember = new Map<string, Set<string>>();
   for (const member of unit.members) {
     const isDir = isDirUnitKind(member.kind);
     const faultCtx = makeFaultContext(unit, member);
     const memberKey = makeMemberKey(member.kind, member.id, member.taskId);
 
+    if (member.action === "finish_migration") {
+      checkBudget();
+      fault?.("before_bridge", faultCtx);
+      bridgeMember(member);
+      fault?.("after_bridge", faultCtx);
+      continue;
+    }
+
     if (member.action === "migrate") {
       checkBudget();
-      ensureParentDirsUnderRoot(ensuredProjectDir, member.destinationPath);
+      shadowedFiles.push(...ensureParentDirsUnderRoot(ensuredProjectDir, member.destinationPath, checkBudget));
 
       // Re-check destination existence immediately before moving to avoid ever clobbering a concurrent file.
       const existingDest = safeLstat(member.destinationPath);
@@ -1987,21 +2303,60 @@ function executeSingleUnit(
         shadowedFiles.push(...mergeRes.shadowed);
         if (!mergeRes.fullyMerged) {
           bothExistMembers.add(memberKey);
+          partialMovedRelPathsByMember.set(memberKey, new Set(mergeRes.mergedRelPaths));
         }
         fault?.("after_merge", faultCtx);
       } else {
         let didRename = false;
+        let destAppearedDuringPlace = false;
         if (!forceCopy) {
-          try {
-            renameSync(member.legacyPath, member.destinationPath);
-            didRename = true;
-            method = method ?? "rename";
-          } catch (err) {
-            if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err;
+          fault?.("before_rename_into_place", faultCtx);
+          if (!isDir) {
+            const placed = moveFileNoOverwrite(member.legacyPath, member.destinationPath);
+            if (placed === "moved") {
+              didRename = true;
+              method = method ?? "rename";
+            } else if (placed === "exists") {
+              destAppearedDuringPlace = true;
+            }
+          } else {
+            try {
+              renameSync(member.legacyPath, member.destinationPath);
+              didRename = true;
+              method = method ?? "rename";
+            } catch (err) {
+              const code = (err as NodeJS.ErrnoException).code;
+              if (code === "EEXIST" || code === "ENOTEMPTY" || code === "ENOTDIR") {
+                destAppearedDuringPlace = true;
+              } else if (code !== "EXDEV") {
+                throw err;
+              }
+            }
           }
         }
-        if (didRename) {
+        if (destAppearedDuringPlace) {
+          method = "merge";
+          const mergeRes = mergeBothExist(member.legacyPath, member.destinationPath, isDir, checkBudget);
+          shadowedFiles.push(...mergeRes.shadowed);
+          if (!mergeRes.fullyMerged) {
+            bothExistMembers.add(memberKey);
+            partialMovedRelPathsByMember.set(memberKey, new Set(mergeRes.mergedRelPaths));
+          }
+          fault?.("after_merge", faultCtx);
+        } else if (didRename) {
           fault?.("after_rename_into_place", faultCtx);
+          fault?.("before_bridge", faultCtx);
+          try {
+            bridgeMember(member);
+          } catch (bridgeErr) {
+            try {
+              rollbackRenamedMember(member, isDir);
+            } catch {
+              // If rollback itself fails, the pending journal remains on disk for recovery.
+            }
+            throw bridgeErr;
+          }
+          fault?.("after_bridge", faultCtx);
         } else {
           method = "copy";
           const opId = ensureMemberStagingOpId(ensuredProjectDir, state, unit, member);
@@ -2012,16 +2367,54 @@ function executeSingleUnit(
           verifyCopyMatches(member.legacyPath, payloadPath, isDir, checkBudget, staged.manifest);
           fault?.("after_verify", faultCtx);
           checkBudget();
-          fsyncStageTree(stageDir, payloadPath, isDir, staged.dirs);
-          renameSync(payloadPath, member.destinationPath);
-          fsyncDir(dirname(member.destinationPath));
-          fault?.("after_rename_into_place", faultCtx);
-          const delRes = deleteVerifiedLegacy(member.legacyPath, isDir, staged.manifest, staged.dirs);
-          releaseMemberStage(ensuredProjectDir, state, unit.unitKey, member);
-          if (!delRes.fullyDeleted) {
-            bothExistMembers.add(memberKey);
+          fsyncStageTree(stageDir, payloadPath, isDir, staged.dirs, checkBudget);
+          fault?.("before_rename_into_place", faultCtx);
+          let copyDestCollided = false;
+          if (!isDir) {
+            const placed = moveFileNoOverwrite(payloadPath, member.destinationPath);
+            if (placed === "exists") {
+              copyDestCollided = true;
+            } else if (placed === "exdev") {
+              // payloadPath and destinationPath share projectDir; fallback only if linkSync is unsupported.
+              if (safeLstat(member.destinationPath) !== null) {
+                copyDestCollided = true;
+              } else {
+                renameSync(payloadPath, member.destinationPath);
+              }
+            }
+          } else {
+            try {
+              renameSync(payloadPath, member.destinationPath);
+            } catch (err) {
+              const code = (err as NodeJS.ErrnoException).code;
+              if (code === "EEXIST" || code === "ENOTEMPTY" || code === "ENOTDIR") {
+                copyDestCollided = true;
+              } else {
+                throw err;
+              }
+            }
           }
-          fault?.("after_legacy_delete", faultCtx);
+          if (copyDestCollided) {
+            releaseMemberStage(ensuredProjectDir, state, unit.unitKey, member);
+            method = "merge";
+            const mergeRes = mergeBothExist(member.legacyPath, member.destinationPath, isDir, checkBudget);
+            shadowedFiles.push(...mergeRes.shadowed);
+            if (!mergeRes.fullyMerged) {
+              bothExistMembers.add(memberKey);
+              partialMovedRelPathsByMember.set(memberKey, new Set(mergeRes.mergedRelPaths));
+            }
+            fault?.("after_merge", faultCtx);
+          } else {
+            fsyncDirChain(storage.dataRoot ?? ensuredProjectDir, dirname(member.destinationPath));
+            fault?.("after_rename_into_place", faultCtx);
+            releaseMemberStage(ensuredProjectDir, state, unit.unitKey, member);
+            const delRes = deleteVerifiedLegacy(member.legacyPath, isDir, staged.manifest, staged.dirs, checkBudget);
+            if (!delRes.fullyDeleted) {
+              bothExistMembers.add(memberKey);
+              partialMovedRelPathsByMember.set(memberKey, new Set(delRes.deletedRelPaths));
+            }
+            fault?.("after_legacy_delete", faultCtx);
+          }
         }
       }
     } else if (member.action === "merge") {
@@ -2031,51 +2424,45 @@ function executeSingleUnit(
       shadowedFiles.push(...mergeRes.shadowed);
       if (!mergeRes.fullyMerged) {
         bothExistMembers.add(memberKey);
+        partialMovedRelPathsByMember.set(memberKey, new Set(mergeRes.mergedRelPaths));
       }
       fault?.("after_merge", faultCtx);
     }
   }
 
-  // Step 3: One immediate SQLite transaction per unit rewrites artifacts.path rows for all members.
+  // Step 3: One immediate SQLite transaction per unit rewrites artifacts.path rows for moved/verified files only (A7/D7).
+  const effectiveRowSpecs: RowRewriteMemberSpec[] = [];
+  for (const spec of rowSpecs) {
+    const memberKey = makeMemberKey(spec.kind, spec.id, spec.taskId);
+    if (!bothExistMembers.has(memberKey)) {
+      effectiveRowSpecs.push(spec);
+    } else if (isDirUnitKind(spec.kind)) {
+      effectiveRowSpecs.push({
+        ...spec,
+        allowedRelPaths: partialMovedRelPathsByMember.get(memberKey) ?? new Set<string>(),
+      });
+    }
+    // Single-file members left behind in legacy (bothExistMembers) are omitted so their rows stay on legacy.
+  }
   const primaryFaultCtx = makeFaultContext(unit, unit.members[0]!);
-  rowsRewritten = rewriteUnitArtifactRowsFromIndex(sqlite, artifactIndex, rowSpecs);
+  rowsRewritten = rewriteUnitArtifactRowsFromIndex(sqlite, artifactIndex, effectiveRowSpecs, checkBudget);
   fault?.("after_row_rewrite", primaryFaultCtx);
 
-  // Step 4: Replace each converged legacy unit path with a unit-level symlink bridge.
+  // Step 4: Replace any remaining converged legacy unit paths (copy/merge paths) with unit-level symlink bridges.
   // Any member whose legacy entry changed after verification stays a real path (no bridge) for merge on the next pass.
-  fault?.("before_bridge", primaryFaultCtx);
-  let bridgeStateModified = adoptUnrecordedBridges();
-  for (const member of unit.members) {
+  const membersToBridge = unit.members.filter((member) => {
     if (member.action === "keep_bridge" || member.action === "rewrite_rows" || member.action === "remove_bridge") {
-      continue;
+      return false;
     }
     const memberKey = makeMemberKey(member.kind, member.id, member.taskId);
-    if (bothExistMembers.has(memberKey)) {
-      continue;
+    return !bothExistMembers.has(memberKey) && !bridgedMembers.has(memberKey);
+  });
+  if (membersToBridge.length > 0) {
+    fault?.("before_bridge", primaryFaultCtx);
+    for (const member of membersToBridge) {
+      bridgeMember(member);
     }
-    const existing = safeLstat(member.legacyPath);
-    if (!existing) {
-      createBridgeSymlink(member.legacyPath, member.destinationPath, canonRepo);
-      let createdAt = nowFn();
-      if (!deps.now) {
-        const linkStat = safeLstat(member.legacyPath);
-        if (linkStat) {
-          createdAt = Math.min(createdAt, Math.floor(linkStat.mtimeMs));
-        }
-      }
-      if (upsertBridgeRecord(bridgeMap, member.legacyPath, member.destinationPath, createdAt)) {
-        bridgeStateModified = true;
-      }
-      bridgesCreated++;
-    } else if (existing.isSymbolicLink()) {
-      // Idempotent check that an existing symlink points to destinationPath.
-      createBridgeSymlink(member.legacyPath, member.destinationPath, canonRepo);
-      if (upsertBridgeRecord(bridgeMap, member.legacyPath, member.destinationPath, nowFn())) {
-        bridgeStateModified = true;
-      }
-    } else {
-      throw new Error(`Expected legacy path ${member.legacyPath} to be absent before creating bridge`);
-    }
+    fault?.("after_bridge", primaryFaultCtx);
   }
 
   // Clear pending recovery record; defer the disk flush until the next unit's upsert or end-of-repo flush
@@ -2204,13 +2591,17 @@ export function runStorageMigrationPass(
     }
   };
 
+  const passIndexes = createPassDbIndexes(deps.sqlite, checkBudget);
+  const dataRoot = deps.storage.dataRoot;
+  const prevCursor = dataRoot ? readMigrationCursor(dataRoot) : { version: 1 as const, nextRepoRoot: null };
+
   let cachedKnownRepoRoots: ReadonlySet<string> | null | undefined;
-  let repoRoots: string[] = [];
+  let candidateRepos: string[] = [];
   const getKnownRepoRoots = (): ReadonlySet<string> | null => {
     if (cachedKnownRepoRoots !== undefined) return cachedKnownRepoRoots;
     try {
       const set = listAllKnownRepoRoots(deps.sqlite, opts?.repoRoots, checkBudget);
-      for (const r of repoRoots) set.add(r);
+      for (const r of candidateRepos) set.add(r);
       cachedKnownRepoRoots = set;
     } catch (err) {
       if (err instanceof BudgetExceededError) throw err;
@@ -2220,7 +2611,22 @@ export function runStorageMigrationPass(
     return cachedKnownRepoRoots;
   };
   try {
-    repoRoots = discoverRepoRoots(deps.sqlite, opts?.repoRoots, deps.storage, checkBudget, getKnownRepoRoots);
+    if (opts?.repoRoots !== undefined) {
+      const seen = new Set<string>();
+      for (const raw of opts.repoRoots) {
+        checkBudget();
+        if (!raw || raw.length === 0) continue;
+        const canon = canonicalPath(raw);
+        if (!seen.has(canon)) {
+          seen.add(canon);
+          candidateRepos.push(canon);
+        }
+      }
+    } else {
+      const known = listAllKnownRepoRoots(deps.sqlite, undefined, checkBudget);
+      cachedKnownRepoRoots = known;
+      candidateRepos = [...known].sort();
+    }
   } catch (err) {
     if (err instanceof BudgetExceededError) {
       budgetExceeded = true;
@@ -2234,20 +2640,68 @@ export function runStorageMigrationPass(
     }
   }
 
-  for (const canonRepo of repoRoots) {
+  const rotatedRepos = rotateReposFromCursor(candidateRepos, prevCursor.nextRepoRoot);
+  let budgetHitRepo: string | null = null;
+
+  for (const canonRepo of rotatedRepos) {
     if (budgetExceeded) break;
     try {
       checkBudget();
     } catch (err) {
       if (err instanceof BudgetExceededError) {
         budgetExceeded = true;
+        budgetHitRepo = canonRepo;
         break;
       }
       throw err;
     }
 
-    totals.reposScanned++;
     const projectDir = deps.storage.projectDir(canonRepo);
+    let state: MigrationStateFile;
+    let stateReadError: MigrationErrorRecord | null = null;
+    try {
+      state = readMigrationState(projectDir);
+    } catch (err) {
+      state = { version: 1, reportedUnknownEntries: [], pendingUnits: [] };
+      stateReadError = {
+        repoRoot: canonRepo,
+        path: projectDir,
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+
+    if (opts?.repoRoots === undefined) {
+      let hasWork = false;
+      try {
+        hasWork =
+          isRealDirUnderRoot(canonRepo, [LEGACY_HARNESS_DIR]) ||
+          state.pendingUnits.length > 0 ||
+          hasAnyLegacyArtifactRowForRepo(
+            deps.sqlite,
+            canonRepo,
+            checkBudget,
+            getKnownRepoRoots,
+            passIndexes.getPassArtifactSnapshot(),
+          );
+      } catch (err) {
+        if (err instanceof BudgetExceededError) {
+          budgetExceeded = true;
+          budgetHitRepo = canonRepo;
+          log(`[storage-migrate] wall-clock budget (${budgetMs}ms) reached while checking pending work in ${canonRepo}`);
+          break;
+        }
+        const record: MigrationErrorRecord = {
+          repoRoot: canonRepo,
+          message: err instanceof Error ? err.message : String(err),
+        };
+        allErrors.push(record);
+        log(`[storage-migrate] failed checking pending work for ${canonRepo}: ${record.message}`);
+        continue;
+      }
+      if (!hasWork) continue;
+    }
+
+    totals.reposScanned++;
     const repoReport: RepoMigrationReport = {
       repoRoot: canonRepo,
       projectDir,
@@ -2261,28 +2715,32 @@ export function runStorageMigrationPass(
       errors: [],
     };
     repoReports.push(repoReport);
-
-    let state: MigrationStateFile;
-    try {
-      state = readMigrationState(projectDir);
-    } catch (err) {
-      state = { version: 1, reportedUnknownEntries: [], pendingUnits: [] };
-      const record: MigrationErrorRecord = {
-        repoRoot: canonRepo,
-        path: projectDir,
-        message: err instanceof Error ? err.message : String(err),
-      };
-      repoReport.errors.push(record);
-      allErrors.push(record);
+    if (stateReadError) {
+      repoReport.errors.push(stateReadError);
+      allErrors.push(stateReadError);
     }
 
     let artifactIndex: RepoArtifactRowIndex;
+    let historicalIndex: HistoricalRunGoalIndex;
     let excludedWorktreeRoots: string[] = [];
     let worktreeOverlaps: string[] = [];
     let seeds: UnitSeed[] = [];
     try {
-      excludedWorktreeRoots = collectExcludedWorktreeRoots(deps.sqlite, deps.storage, canonRepo);
-      artifactIndex = buildRepoArtifactRowIndex(deps.sqlite, canonRepo, deps.storage, checkBudget, getKnownRepoRoots);
+      excludedWorktreeRoots = collectExcludedWorktreeRoots(
+        deps.storage,
+        canonRepo,
+        passIndexes.getRegisteredWorktreeRoots(),
+        checkBudget,
+      );
+      artifactIndex = buildRepoArtifactRowIndex(
+        deps.sqlite,
+        canonRepo,
+        deps.storage,
+        checkBudget,
+        getKnownRepoRoots,
+        passIndexes.getPassArtifactSnapshot(),
+      );
+      historicalIndex = passIndexes.getHistoricalRunGoalIndex();
       repoReport.ambiguousRowsSkipped = artifactIndex.ambiguousRows.length;
       if (artifactIndex.ambiguousRows.length > 0) {
         for (const row of artifactIndex.ambiguousRows) {
@@ -2292,22 +2750,24 @@ export function runStorageMigrationPass(
           `[storage-migrate] skipped ${artifactIndex.ambiguousRows.length} ambiguous relative artifact row(s) for ${canonRepo}`,
         );
       }
-      const { validPending, droppedErrors } = validatePendingUnits(
+      const { validPending, deferredPending, stalePending, newlyStaleErrors, dbErrors } = validatePendingUnits(
         deps.sqlite,
         deps.storage,
         canonRepo,
         state,
         artifactIndex,
         excludedWorktreeRoots,
+        historicalIndex,
         checkBudget,
       );
-      if (droppedErrors.length > 0) {
-        for (const errRec of droppedErrors) {
-          repoReport.errors.push(errRec);
-          allErrors.push(errRec);
-          log(`[storage-migrate] ${errRec.message}`);
-        }
-        state.pendingUnits = validPending;
+      for (const errRec of [...newlyStaleErrors, ...dbErrors]) {
+        repoReport.errors.push(errRec);
+        allErrors.push(errRec);
+        log(`[storage-migrate] ${errRec.message}`);
+      }
+      if (newlyStaleErrors.length > 0) {
+        // Keep deferredPending and stalePending on disk (never dropped); mark newly failed entries stale: true.
+        state.pendingUnits = [...validPending, ...deferredPending, ...stalePending];
         try {
           const ensured = deps.storage.ensureProjectDir(canonRepo);
           writeMigrationStateAtomic(ensured, state);
@@ -2321,6 +2781,7 @@ export function runStorageMigrationPass(
           allErrors.push(record);
         }
       }
+      const deferredPendingKeys = new Set(deferredPending.map((p) => p.unitKey));
       const discovered = discoverRepoUnitSeeds(
         deps.sqlite,
         deps.storage,
@@ -2328,7 +2789,9 @@ export function runStorageMigrationPass(
         validPending,
         artifactIndex,
         excludedWorktreeRoots,
+        historicalIndex,
         checkBudget,
+        deferredPendingKeys,
       );
       seeds = discovered.seeds;
       worktreeOverlaps = discovered.worktreeOverlaps;
@@ -2340,6 +2803,7 @@ export function runStorageMigrationPass(
     } catch (err) {
       if (err instanceof BudgetExceededError) {
         budgetExceeded = true;
+        budgetHitRepo = canonRepo;
         log(`[storage-migrate] wall-clock budget (${budgetMs}ms) reached during discovery in ${canonRepo}`);
         break;
       }
@@ -2351,6 +2815,21 @@ export function runStorageMigrationPass(
       allErrors.push(record);
       log(`[storage-migrate] failed discovering units for ${canonRepo}: ${record.message}`);
       continue;
+    }
+
+    // Try units whose previous attempt hit the budget without completing AFTER all other units of this pass.
+    const budgetDeferredSet = new Set<string>(state.budgetDeferredUnits ?? []);
+    if (budgetDeferredSet.size > 0) {
+      const normalSeeds: UnitSeed[] = [];
+      const deprioritizedSeeds: UnitSeed[] = [];
+      for (const s of seeds) {
+        if (budgetDeferredSet.has(s.unitKey)) {
+          deprioritizedSeeds.push(s);
+        } else {
+          normalSeeds.push(s);
+        }
+      }
+      seeds = [...normalSeeds, ...deprioritizedSeeds];
     }
 
     const countRemainingSeedsFrom = (startIndex: number): number => {
@@ -2368,13 +2847,14 @@ export function runStorageMigrationPass(
     let stateDirty = false;
     const flushPendingStateIfDirty = () => {
       if (preJournaledNoteKeys.size > 0) {
-        state.pendingUnits = state.pendingUnits.filter((u) => !preJournaledNoteKeys.has(u.unitKey));
+        state.pendingUnits = state.pendingUnits.filter((u) => u.stale === true || !preJournaledNoteKeys.has(u.unitKey));
         preJournaledNoteKeys.clear();
         stateDirty = true;
       }
       if (!stateDirty) return;
       try {
         syncBridgeMapToState(state, bridgeMap);
+        state.budgetDeferredUnits = [...budgetDeferredSet].sort();
         const ensured = deps.storage.ensureProjectDir(canonRepo);
         writeMigrationStateAtomic(ensured, state);
         stateDirty = false;
@@ -2401,10 +2881,20 @@ export function runStorageMigrationPass(
       } else {
         try {
           checkBudget();
-          evaluated = evaluateUnit(deps.sqlite, deps.storage, seed, nowFn(), artifactIndex, bridgeMap, checkBudget);
+          evaluated = evaluateUnit(
+            deps.sqlite,
+            deps.storage,
+            seed,
+            nowFn(),
+            artifactIndex,
+            bridgeMap,
+            historicalIndex,
+            checkBudget,
+          );
         } catch (err) {
           if (err instanceof BudgetExceededError) {
             budgetExceeded = true;
+            budgetHitRepo = canonRepo;
             unevaluatedRemaining += countRemainingSeedsFrom(i);
             log(`[storage-migrate] wall-clock budget (${budgetMs}ms) reached before evaluating ${seed.unitKey}`);
             break;
@@ -2424,13 +2914,16 @@ export function runStorageMigrationPass(
       // Skip stale pending units that no longer exist anywhere on disk.
       if (evaluated.members.every((m) => m.legacyState === "absent" && !m.destExists)) {
         try {
-          if (state.pendingUnits.some((u) => u.unitKey === seed.unitKey)) {
+          if (state.pendingUnits.some((u) => u.stale !== true && u.unitKey === seed.unitKey)) {
             syncBridgeMapToState(state, bridgeMap);
             const ensured = deps.storage.ensureProjectDir(canonRepo);
             removePendingUnit(ensured, state, seed.unitKey);
           }
         } catch {
           // Ignore cleanup errors for absent stale entries.
+        }
+        if (budgetDeferredSet.delete(seed.unitKey)) {
+          stateDirty = true;
         }
         continue;
       }
@@ -2468,6 +2961,7 @@ export function runStorageMigrationPass(
         continue;
       }
 
+      let startedUnitExecution = false;
       try {
         checkBudget();
         let alreadyJournaled = false;
@@ -2492,7 +2986,16 @@ export function runStorageMigrationPass(
                 ev = evaluated;
               } else {
                 checkBudget();
-                ev = evaluateUnit(deps.sqlite, deps.storage, s, nowFn(), artifactIndex, bridgeMap, checkBudget);
+                ev = evaluateUnit(
+                  deps.sqlite,
+                  deps.storage,
+                  s,
+                  nowFn(),
+                  artifactIndex,
+                  bridgeMap,
+                  historicalIndex,
+                  checkBudget,
+                );
                 evaluatedCache.set(j, ev);
               }
               if (ev.action === "migrate" || ev.action === "merge" || ev.action === "finish_migration") {
@@ -2515,10 +3018,13 @@ export function runStorageMigrationPass(
             }
             if (batch.length > 0) {
               syncBridgeMapToState(state, bridgeMap);
+              state.budgetDeferredUnits = [...budgetDeferredSet].sort();
               const ensured = deps.storage.ensureProjectDir(canonRepo);
-              const existingByKey = new Map(state.pendingUnits.map((u) => [u.unitKey, u]));
+              const existingByKey = new Map(
+                state.pendingUnits.filter((u) => u.stale !== true).map((u) => [u.unitKey, u]),
+              );
               const batchKeys = new Set(batch.map((b) => b.unitKey));
-              const nextPending = state.pendingUnits.filter((u) => !batchKeys.has(u.unitKey));
+              const nextPending = state.pendingUnits.filter((u) => u.stale === true || !batchKeys.has(u.unitKey));
               for (const b of batch) {
                 nextPending.push(toPendingUnitRecord(b, existingByKey.get(b.unitKey)));
                 if (b.unitKey !== evaluated.unitKey) {
@@ -2531,7 +3037,9 @@ export function runStorageMigrationPass(
               alreadyJournaled = batchKeys.has(evaluated.unitKey);
             }
           }
+          checkBudget();
         }
+        startedUnitExecution = true;
         const result = executeSingleUnit(deps, evaluated, projectDir, state, bridgeMap, artifactIndex, checkBudget, {
           onStateDeferred: () => {
             stateDirty = true;
@@ -2545,15 +3053,23 @@ export function runStorageMigrationPass(
         switch (result.outcome) {
           case "migrated":
             totals.migrated++;
+            if (budgetDeferredSet.delete(evaluated.unitKey)) stateDirty = true;
             break;
           case "merged":
             totals.merged++;
+            if (budgetDeferredSet.delete(evaluated.unitKey)) stateDirty = true;
             break;
           case "finished":
             totals.finished++;
+            if (budgetDeferredSet.delete(evaluated.unitKey)) stateDirty = true;
+            break;
+          case "rows_rewritten":
+          case "bridge_removed":
+            if (budgetDeferredSet.delete(evaluated.unitKey)) stateDirty = true;
             break;
           case "bridge_kept":
             totals.bridgesKept++;
+            if (budgetDeferredSet.delete(evaluated.unitKey)) stateDirty = true;
             break;
           case "both_exist":
             repoReport.remainingUnits.push(evaluated);
@@ -2565,6 +3081,11 @@ export function runStorageMigrationPass(
       } catch (err) {
         if (err instanceof BudgetExceededError) {
           budgetExceeded = true;
+          budgetHitRepo = canonRepo;
+          if (startedUnitExecution && !budgetDeferredSet.has(evaluated.unitKey)) {
+            budgetDeferredSet.add(evaluated.unitKey);
+            stateDirty = true;
+          }
           repoReport.remainingUnits.push(evaluated);
           allRemaining.push(evaluated);
           repoReport.results.push({
@@ -2618,6 +3139,16 @@ export function runStorageMigrationPass(
       }
     }
 
+    if (!budgetExceeded && budgetDeferredSet.size > 0) {
+      const activeKeys = new Set(seeds.map((s) => s.unitKey));
+      for (const k of [...budgetDeferredSet]) {
+        if (!activeKeys.has(k)) {
+          budgetDeferredSet.delete(k);
+          stateDirty = true;
+        }
+      }
+    }
+
     flushPendingStateIfDirty();
 
     if (budgetExceeded) break;
@@ -2644,6 +3175,7 @@ export function runStorageMigrationPass(
     } catch (err) {
       if (err instanceof BudgetExceededError) {
         budgetExceeded = true;
+        budgetHitRepo = canonRepo;
         break;
       }
       const record: MigrationErrorRecord = {
@@ -2654,14 +3186,15 @@ export function runStorageMigrationPass(
       allErrors.push(record);
     }
 
-    // Remove empty legacy container directories (never enters unit dirs, never runs when pending recovery exists).
-    if (!budgetExceeded && state.pendingUnits.length === 0) {
+    // Remove empty legacy container directories (never enters unit dirs, never runs when active pending recovery exists).
+    if (!budgetExceeded && state.pendingUnits.every((u) => u.stale === true)) {
       try {
         checkBudget();
         repoReport.removedEmptyDirs = cleanupEmptyLegacyDirs(canonRepo, checkBudget, excludedWorktreeRoots);
       } catch (err) {
         if (err instanceof BudgetExceededError) {
           budgetExceeded = true;
+          budgetHitRepo = canonRepo;
           break;
         }
         const record: MigrationErrorRecord = {
@@ -2671,6 +3204,30 @@ export function runStorageMigrationPass(
         repoReport.errors.push(record);
         allErrors.push(record);
       }
+    }
+  }
+
+  let nextCursor: string | null = prevCursor.nextRepoRoot;
+  if (budgetExceeded) {
+    if (budgetHitRepo !== null && candidateRepos.length > 1) {
+      const idx = candidateRepos.indexOf(budgetHitRepo);
+      nextCursor = idx >= 0 ? candidateRepos[(idx + 1) % candidateRepos.length]! : null;
+    } else if (candidateRepos.length <= 1) {
+      nextCursor = null;
+    }
+  } else {
+    nextCursor = null;
+  }
+  if (dataRoot && nextCursor !== prevCursor.nextRepoRoot) {
+    try {
+      writeMigrationCursorAtomic(dataRoot, { version: 1, nextRepoRoot: nextCursor });
+    } catch (err) {
+      const record: MigrationErrorRecord = {
+        path: dataRoot,
+        message: err instanceof Error ? err.message : String(err),
+      };
+      allErrors.push(record);
+      log(`[storage-migrate] failed writing migration repo cursor: ${record.message}`);
     }
   }
 
