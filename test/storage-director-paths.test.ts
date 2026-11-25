@@ -431,7 +431,8 @@ describe("Director storage paths (data-dir layout, criterion c8 pre- and post-mi
         tasks: Array<{ id: string; artifactPaths?: string[] }>;
       };
       assert.equal(preGoalGet.evidenceDir, legacyGoalDir);
-      assert.equal(preGoalGet.goal.description.path, `.harness/goals/${goal1.id}/goal-description-v1.md`);
+      assert.ok(isAbsolute(preGoalGet.goal.description.path!), `expected absolute description.path, got ${preGoalGet.goal.description.path}`);
+      assert.equal(preGoalGet.goal.description.path, join(legacyGoalDir, "goal-description-v1.md"));
       const preDescRead = (await daemon.director.executeDirectorMcpTool(chat1.id, "read_file", {
         path: preGoalGet.goal.description.path!,
       })) as { content: string };

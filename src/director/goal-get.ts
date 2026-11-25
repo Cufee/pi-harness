@@ -1,4 +1,17 @@
-import { lstatSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { EscalationRecord, RecentlyResolvedEscalation, TaskRecord } from "../control-plane/db.js";
 import { compactTaskHandoff } from "../control-plane/handoffs.js";
@@ -7,7 +20,7 @@ import type { GoalLiveProgress, GoalRecord, GoalReviewVerdict, GoalStatus, Revie
 import { isReviewInvalidated } from "../protocol/chat-events.js";
 import { serializeToolResult } from "../runners/mcp-bridge.js";
 import type { ToolDefinition } from "../runners/types.js";
-import type { StoragePaths } from "../storage/paths.js";
+import type { StorageLayout, StoragePaths } from "../storage/paths.js";
 
 export const GOAL_GET_LIMITS = {
   budgetChars: 40_000, // hard target for serializeToolResult(result); client limit is 50,000
@@ -262,36 +275,153 @@ function canonicalPath(p: string): string {
   }
 }
 
+function relativeSegmentsUnder(parent: string, child: string): string[] | null {
+  const rel = relative(parent, child);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    return null;
+  }
+  const segments = rel.split(sep);
+  if (segments.some((s) => !s || s === "." || s === ".." || s.includes("\0"))) {
+    return null;
+  }
+  return segments;
+}
+
+/**
+ * Verifies `dirPath` is a real directory (never a symlink) before writing.
+ * When `dirPath` is lexically under `repoRoot`, every component below `repoRoot` must also be a real directory.
+ * Missing directories are only created segment-by-segment under `repoRoot` when `allowCreateUnderRepo` is true.
+ */
+function verifyRealEvidenceDir(
+  dirPath: string,
+  repoRoot: string,
+  allowCreateUnderRepo: boolean,
+): string | null {
+  const canonRoot = canonicalPath(repoRoot);
+  const relSegments =
+    relativeSegmentsUnder(canonRoot, dirPath) ?? relativeSegmentsUnder(resolve(repoRoot), dirPath);
+
+  let exists = false;
+  try {
+    const st = lstatSync(dirPath);
+    if (st.isSymbolicLink() || !st.isDirectory()) return null;
+    exists = true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") return null;
+  }
+
+  if (relSegments) {
+    let cur = canonRoot;
+    for (const seg of relSegments) {
+      cur = join(cur, seg);
+      if (!exists) {
+        if (!allowCreateUnderRepo) return null;
+        try {
+          mkdirSync(cur);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "EEXIST") return null;
+        }
+      }
+      try {
+        const st = lstatSync(cur);
+        if (st.isSymbolicLink() || !st.isDirectory()) return null;
+      } catch {
+        return null;
+      }
+    }
+    return cur;
+  }
+
+  return exists ? dirPath : null;
+}
+
+/**
+ * Opens an existing entry without following symlinks and reports whether it is a regular file whose bytes
+ * equal `expected`. Returns `null` if the entry is a symlink or non-regular file, `false` if missing or different.
+ */
+function readRegularFileIfExactMatch(filePath: string, expected: Buffer): boolean | null {
+  let fd: number | null = null;
+  try {
+    fd = openSync(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const st = fstatSync(fd);
+    if (!st.isFile()) return null;
+    if (st.size !== expected.length) return false;
+    const buf = Buffer.allocUnsafe(expected.length + 1);
+    let totalRead = 0;
+    while (totalRead < buf.length) {
+      const n = readSync(fd, buf, totalRead, buf.length - totalRead, null);
+      if (n === 0) break;
+      totalRead += n;
+    }
+    return totalRead === expected.length && buf.subarray(0, totalRead).equals(expected);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return false;
+    if (code === "ELOOP") return null;
+    throw err;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
 /**
  * Writes `<evidenceDir>/goal-description-v<version>.md` when the goal's description exceeds `descriptionExcerpt`
- * and `evidenceDir` is non-null. Skips writing if an existing regular file already has the same byte length.
- * Returns the repo-relative path (or absolute path if `evidenceDir` is outside `repoRoot`), or `null`.
+ * and `evidenceDir` is a verified real directory. Keeps an existing regular file only when its bytes equal the
+ * description; otherwise replaces it atomically via an exclusive temporary file and rename.
+ * Returns the absolute path in `data-dir` layout, or the repo-relative path (falling back to absolute outside
+ * `repoRoot`) in `legacy` layout, or `null`.
  */
 export function writeGoalDescriptionFile(
   goal: Pick<GoalRecord, "version" | "description" | "repoRoot">,
   evidenceDir: string | null,
   repoRoot?: string | null,
+  layoutOrStorage?: StorageLayout | Pick<StoragePaths, "layout">,
 ): string | null {
   if (!evidenceDir || goal.description.length <= GOAL_GET_LIMITS.descriptionExcerpt) {
     return null;
   }
   try {
-    mkdirSync(evidenceDir, { recursive: true });
-    const filePath = join(evidenceDir, `goal-description-v${goal.version}.md`);
-    const expectedBytes = Buffer.byteLength(goal.description, "utf8");
+    const effectiveRepoRoot = repoRoot ?? goal.repoRoot;
+    const layout: StorageLayout =
+      typeof layoutOrStorage === "string" ? layoutOrStorage : (layoutOrStorage?.layout ?? "legacy");
+    const callerEnsured =
+      layout === "data-dir" || (typeof layoutOrStorage === "object" && layoutOrStorage !== null);
+    const verifiedDir = verifyRealEvidenceDir(resolve(evidenceDir), effectiveRepoRoot, !callerEnsured);
+    if (!verifiedDir) return null;
+
+    const filePath = join(verifiedDir, `goal-description-v${goal.version}.md`);
+    const expectedBuf = Buffer.from(goal.description, "utf8");
     let skipWrite = false;
     try {
       const st = lstatSync(filePath);
       if (st.isSymbolicLink() || !st.isFile()) return null;
-      if (st.size === expectedBytes) skipWrite = true;
+      if (st.size === expectedBuf.length) {
+        const match = readRegularFileIfExactMatch(filePath, expectedBuf);
+        if (match === null) return null;
+        skipWrite = match;
+      }
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
     if (!skipWrite) {
-      writeFileSync(filePath, goal.description, "utf8");
+      const tempPath = join(verifiedDir, `.goal-description-v${goal.version}.${randomUUID()}.tmp`);
+      let createdTemp = false;
+      try {
+        writeFileSync(tempPath, expectedBuf, { flag: "wx", mode: 0o600 });
+        createdTemp = true;
+        renameSync(tempPath, filePath);
+      } catch (err) {
+        if (createdTemp || (err as NodeJS.ErrnoException).code !== "EEXIST") {
+          rmSync(tempPath, { force: true });
+        }
+        throw err;
+      }
     }
-    const root = canonicalPath(repoRoot ?? goal.repoRoot);
     const target = canonicalPath(filePath);
+    if (layout === "data-dir") {
+      return target;
+    }
+    const root = canonicalPath(effectiveRepoRoot);
     const rel = relative(root, target);
     if (rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)) {
       return rel.split(sep).join("/");
@@ -686,7 +816,7 @@ export function buildGoalGetResult(
   const descriptionPath =
     ctx.descriptionPath !== undefined
       ? ctx.descriptionPath
-      : writeGoalDescriptionFile(goal, ctx.evidenceDir, ctx.repoRoot ?? goal.repoRoot);
+      : writeGoalDescriptionFile(goal, ctx.evidenceDir, ctx.repoRoot ?? goal.repoRoot, ctx.storage);
 
   // Version-aware total order newest-first: goalVersion desc, cycle desc, createdAt desc, id desc.
   const sortedReviews = sortReviewsNewestFirst(detail.reviews);
