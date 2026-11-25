@@ -76,10 +76,19 @@ import { PtyHost } from "./pty-host.js";
 import { listChildProcessGroups, reapChildProcessGroups } from "./reap.js";
 import { currentRelease, type ReleaseTarget } from "./release.js";
 import { acquireStartLock } from "./start-lock.js";
+import { computeStartPassBudget, MIN_START_PASS_BUDGET_MS } from "./start-pass-budget.js";
 import { spawnSupervisorDetached } from "./supervise.js";
 import { WakeupStore, type PendingWake } from "./wakeup-store.js";
 
 export { DAEMON_PROTOCOL_REV };
+
+function isInProcessTestRunner(): boolean {
+  return (
+    process.env.NODE_ENV === "test" &&
+    typeof Bun !== "undefined" &&
+    /(?:\.|_)(?:test|spec)\.[cm]?[jt]sx?$/.test(Bun.main)
+  );
+}
 
 function parseAttachControl(raw: unknown): SessionAttachControl {
   if (raw === undefined) return "take";
@@ -416,6 +425,7 @@ export class HarnessDaemon {
   private autoQuitWhenIdle = false;
   private hasCustomRunner = false;
   private startedAt = Date.now();
+  private readonly getBootUptimeMs: () => number;
 
   constructor(
     public config: HarnessConfig,
@@ -430,11 +440,15 @@ export class HarnessDaemon {
       recoveryStaggerMs?: number;
       disableReloadRpc?: boolean;
       onExit?: (code: number) => void;
+      bootUptimeMs?: () => number;
     },
   ) {
     this.overlayRoot = opts?.overlayRoot ?? opts?.repoRoot;
     this.disableReloadRpc = Boolean(opts?.disableReloadRpc);
     this.onExit = opts?.onExit ?? ((code) => process.exit(code));
+    this.getBootUptimeMs =
+      opts?.bootUptimeMs ??
+      (() => (isInProcessTestRunner() ? Date.now() - this.startedAt : process.uptime() * 1000));
     this.repoOverlay = readRepoConfig(opts?.repoRoot);
     this.repoConfigWarnings = formatMisplacedConfigWarnings(
       ".pi-harness.json",
@@ -1033,43 +1047,56 @@ export class HarnessDaemon {
     // previously-live tasks still look live in the DB and their units stay safely deferred.
     try {
       const storage = this.storage;
-      const report = runStorageMigrationPass({
-        sqlite: this.db.db,
-        storage,
-        log: (line) => {
-          if (storage.layout !== "legacy") {
-            console.error(`[harnessd ${new Date().toISOString()}] ${line}`);
-          }
-        },
+      const startPass = computeStartPassBudget({
+        uptimeMs: this.getBootUptimeMs(),
+        env: process.env,
       });
-      const t = report.totals;
-      const moved = t.migrated + t.merged + t.finished;
-      const removedEmptyDirs = report.repos.reduce((n, r) => n + r.removedEmptyDirs.length, 0);
-      const isNoop =
-        report.skipped ||
-        (moved === 0 &&
-          t.rowsRewritten === 0 &&
-          t.bridgesRemoved === 0 &&
-          t.deferred === 0 &&
-          t.remaining === 0 &&
-          t.newUnknownEntries === 0 &&
-          t.errors === 0 &&
-          removedEmptyDirs === 0 &&
-          !report.budgetExceeded);
-      if (!isNoop) {
-        const parts = [
-          `moved=${moved}`,
-          `deferred=${t.deferred}`,
-          `errors=${t.errors}`,
-          `budgetHit=${report.budgetExceeded}`,
-        ];
-        if (t.rowsRewritten > 0) parts.push(`rowsRewritten=${t.rowsRewritten}`);
-        if (t.bridgesRemoved > 0) parts.push(`bridgesRemoved=${t.bridgesRemoved}`);
-        if (t.remaining > 0) parts.push(`remaining=${t.remaining}`);
-        if (t.newUnknownEntries > 0) parts.push(`newUnknown=${t.newUnknownEntries}`);
-        if (removedEmptyDirs > 0) parts.push(`removedEmptyDirs=${removedEmptyDirs}`);
-        parts.push(`elapsedMs=${report.elapsedMs}`);
-        console.error(`[harnessd ${new Date().toISOString()}] storage migration: ${parts.join(" ")}`);
+      if (storage.layout !== "legacy" && startPass.skip) {
+        console.error(
+          `[harnessd ${new Date().toISOString()}] storage migration skipped: uptimeMs=${Math.round(startPass.uptimeMs)} bootWindowMs=${startPass.bootTimeoutMs} remainingWindowMs=${Math.round(startPass.remainingWindowMs)} (below ${MIN_START_PASS_BUDGET_MS}ms minimum; will retry at next start)`,
+        );
+      } else {
+        const report = runStorageMigrationPass(
+          {
+            sqlite: this.db.db,
+            storage,
+            log: (line) => {
+              if (storage.layout !== "legacy") {
+                console.error(`[harnessd ${new Date().toISOString()}] ${line}`);
+              }
+            },
+          },
+          startPass.skip ? undefined : { budgetMs: startPass.budgetMs },
+        );
+        const t = report.totals;
+        const moved = t.migrated + t.merged + t.finished;
+        const removedEmptyDirs = report.repos.reduce((n, r) => n + r.removedEmptyDirs.length, 0);
+        const isNoop =
+          report.skipped ||
+          (moved === 0 &&
+            t.rowsRewritten === 0 &&
+            t.bridgesRemoved === 0 &&
+            t.deferred === 0 &&
+            t.remaining === 0 &&
+            t.newUnknownEntries === 0 &&
+            t.errors === 0 &&
+            removedEmptyDirs === 0 &&
+            !report.budgetExceeded);
+        if (!isNoop) {
+          const parts = [
+            `moved=${moved}`,
+            `deferred=${t.deferred}`,
+            `errors=${t.errors}`,
+            `budgetHit=${report.budgetExceeded}`,
+          ];
+          if (t.rowsRewritten > 0) parts.push(`rowsRewritten=${t.rowsRewritten}`);
+          if (t.bridgesRemoved > 0) parts.push(`bridgesRemoved=${t.bridgesRemoved}`);
+          if (t.remaining > 0) parts.push(`remaining=${t.remaining}`);
+          if (t.newUnknownEntries > 0) parts.push(`newUnknown=${t.newUnknownEntries}`);
+          if (removedEmptyDirs > 0) parts.push(`removedEmptyDirs=${removedEmptyDirs}`);
+          parts.push(`elapsedMs=${report.elapsedMs}`);
+          console.error(`[harnessd ${new Date().toISOString()}] storage migration: ${parts.join(" ")}`);
+        }
       }
     } catch (err) {
       console.error(

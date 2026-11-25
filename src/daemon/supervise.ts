@@ -16,7 +16,16 @@ import { readReleaseAt, type ReleaseTarget } from "./release.js";
 import { DaemonClient } from "./remote.js";
 import { parsePositiveEnvMs, type DaemonPingInfo } from "./hot-update.js";
 
-const DEFAULT_BOOT_TIMEOUT_MS = 20_000;
+export const DEFAULT_BOOT_TIMEOUT_MS = 20_000;
+export const SUPERVISE_BOOT_TIMEOUT_ENV = "PI_HARNESS_SUPERVISE_BOOT_TIMEOUT_MS";
+export { parsePositiveEnvMs };
+
+export function resolveSupervisorBootTimeoutMs(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  return parsePositiveEnvMs(env[SUPERVISE_BOOT_TIMEOUT_ENV]) ?? DEFAULT_BOOT_TIMEOUT_MS;
+}
+
 const WAIT_OLD_PID_TIMEOUT_MS = 5_000;
 const LEGACY_STOP_TIMEOUT_DEFAULT_MS = 10_000;
 const LEGACY_STOP_TIMEOUT_RESTART_SAFE_MS = 30_000;
@@ -285,8 +294,7 @@ export async function runSupervisor(o: SuperviseOptions): Promise<number> {
     process.chdir(safeDir);
   }
 
-  const targetBootTimeoutMs =
-    o.bootTimeoutMs ?? parsePositiveEnvMs(process.env.PI_HARNESS_SUPERVISE_BOOT_TIMEOUT_MS) ?? DEFAULT_BOOT_TIMEOUT_MS;
+  const targetBootTimeoutMs = o.bootTimeoutMs ?? resolveSupervisorBootTimeoutMs(process.env);
   const logPath = join(dirname(o.socketPath), "daemon.log");
   const fallbackFilePath = join(dirname(o.socketPath), "reload-fallback.txt");
   try {
