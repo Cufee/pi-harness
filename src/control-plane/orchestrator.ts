@@ -1096,13 +1096,23 @@ export class HarnessOrchestrator {
     return storagePaths(this.config);
   }
 
-  private runRef(run: RunRecord): RunRecord & RunRef {
+  private runRef(run: RunRecord, linkedGoalId?: string | null): RunRecord & RunRef {
     const chatSessionId = run.chatSessionId ?? this.db.getRunChatSessionId(run.id);
-    return chatSessionId === run.chatSessionId ? run : { ...run, chatSessionId };
+    const resolvedGoalId = linkedGoalId !== undefined ? linkedGoalId : (this.resolveLinkedGoalForRun(run.id)?.id ?? null);
+    return { ...run, chatSessionId, linkedGoalId: resolvedGoalId };
   }
 
-  private goalRef(repoRoot: string, goal: { id: string; chatSessionId: string | null }): GoalRef {
-    return { repoRoot, id: goal.id, chatSessionId: goal.chatSessionId };
+  private goalRef(
+    repoRoot: string,
+    goal: { id: string; chatSessionId: string | null; linkedRunId?: string | null },
+    linkedRunId?: string | null,
+  ): GoalRef {
+    return {
+      repoRoot,
+      id: goal.id,
+      chatSessionId: goal.chatSessionId,
+      linkedRunId: linkedRunId !== undefined ? linkedRunId : (goal.linkedRunId ?? null),
+    };
   }
 
   getWorktreeManager(repoRoot: string): WorktreeManager {
@@ -2686,8 +2696,8 @@ export class HarnessOrchestrator {
       const scopedKbHints = task.tier === 2 ? this.db.kb.getScopedAmbientIndex(run.repoRoot, writeScopes, 5) : [];
 
       const linkedGoal = this.resolveLinkedGoalForRun(run.id);
-      const runRef = this.runRef(run);
-      const goalRef = linkedGoal ? this.goalRef(run.repoRoot, linkedGoal) : null;
+      const runRef = this.runRef(run, linkedGoal?.id ?? null);
+      const goalRef = linkedGoal ? this.goalRef(run.repoRoot, linkedGoal, run.id) : null;
       const grants = this.storage.taskGrants({
         run: runRef,
         goal: goalRef,
@@ -4530,13 +4540,13 @@ export class HarnessOrchestrator {
       if (linkedGoal) {
         let goalEvDir: string | null = null;
         try {
-          goalEvDir = this.storage.goalEvidenceDir(this.goalRef(run.repoRoot, linkedGoal));
+          goalEvDir = this.storage.goalEvidenceDir(this.goalRef(run.repoRoot, linkedGoal, run.id));
         } catch {
           goalEvDir = null;
         }
         writableExtraRoots = [...(goalEvDir ? [goalEvDir] : []), ...(this.config.worktree.extraWriteRoots ?? [])];
       } else {
-        writableExtraRoots = [this.storage.goalsDir(this.runRef(run)), ...(this.config.worktree.extraWriteRoots ?? [])];
+        writableExtraRoots = [this.storage.goalsDir(this.runRef(run, null)), ...(this.config.worktree.extraWriteRoots ?? [])];
       }
     }
     return buildSubject({

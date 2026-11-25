@@ -295,11 +295,21 @@ export class ControlPlaneToolExecutor {
 
   private runRef(run: RunRecord): RunRecord & RunRef {
     const chatSessionId = run.chatSessionId ?? this.db.getRunChatSessionId(run.id);
-    return chatSessionId === run.chatSessionId ? run : { ...run, chatSessionId };
+    const linkedGoalId = this.resolveLinkedGoalForRun(run.id)?.id ?? null;
+    return { ...run, chatSessionId, linkedGoalId };
   }
 
-  private goalRef(repoRoot: string, goal: { id: string; chatSessionId?: string | null }): GoalRef {
-    return { repoRoot, id: goal.id, chatSessionId: goal.chatSessionId ?? null };
+  private goalRef(
+    repoRoot: string,
+    goal: { id: string; chatSessionId?: string | null; linkedRunId?: string | null },
+    linkedRunId?: string | null,
+  ): GoalRef {
+    return {
+      repoRoot,
+      id: goal.id,
+      chatSessionId: goal.chatSessionId ?? null,
+      linkedRunId: linkedRunId !== undefined ? linkedRunId : (goal.linkedRunId ?? null),
+    };
   }
 
   private handoffStorageCtx(run: RunRecord & RunRef) {
@@ -308,11 +318,11 @@ export class ControlPlaneToolExecutor {
 
   /** The goal linked to this run, if any (the goals table is absent in standalone control-plane databases). */
   private resolveLinkedGoalForRun(runId: string): { id: string; chatSessionId: string | null } | null {
-    if (this.hooks.resolveLinkedGoalForRun) {
-      const linked = this.hooks.resolveLinkedGoalForRun(runId);
-      return linked ? { id: linked.id, chatSessionId: linked.chatSessionId ? String(linked.chatSessionId) : null } : null;
-    }
     try {
+      if (this.hooks.resolveLinkedGoalForRun) {
+        const linked = this.hooks.resolveLinkedGoalForRun(runId);
+        return linked ? { id: linked.id, chatSessionId: linked.chatSessionId ? String(linked.chatSessionId) : null } : null;
+      }
       const row = this.db.db
         .prepare("SELECT id, chat_session_id FROM goals WHERE linked_run_id = ? LIMIT 1")
         .get(runId) as { id: string; chat_session_id?: string | null } | null;
@@ -328,7 +338,7 @@ export class ControlPlaneToolExecutor {
     realRoot: string,
   ): { readRoots: string[]; deniedRoots: string[] } {
     const linkedGoal = this.resolveLinkedGoalForRun(runRef.id);
-    const goalRef = linkedGoal ? this.goalRef(runRef.repoRoot, linkedGoal) : null;
+    const goalRef = linkedGoal ? this.goalRef(runRef.repoRoot, linkedGoal, runRef.id) : null;
     const writable = toolPolicyForTask(task.tier, task.kind, task.readOnly) === "read_write_workspace";
     const grants = this.storage.taskGrants({
       run: runRef,

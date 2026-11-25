@@ -4,7 +4,7 @@ import { realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { GoalsConfig } from "../config.js";
-import { friendlyIdCandidates, isDirectorTaskContainer, nextFriendlyId } from "../control-plane/ids.js";
+import { friendlyIdCandidates, nextFriendlyId } from "../control-plane/ids.js";
 import { legacyStoragePaths, type StoragePaths } from "../storage/paths.js";
 import { type ResolvedGateEnv, resolveGateEnv, runGateCommand } from "../tools/gate-env.js";
 import { runGit } from "../worktree/manager.js";
@@ -681,26 +681,21 @@ export class GoalEngine {
     runId?: string | null,
   ): { goalEvidenceDir: string; goalsDir: string; artifactsDir: string; runArtifactsDir?: string } {
     const effectiveRunId = runId !== undefined ? runId : goal.linkedRunId;
-    let goalEvDir = this.storage.goalEvidenceDir(goal);
-    let goalsDir = dirname(goalEvDir);
+    const goalRef = runId !== undefined ? { ...goal, linkedRunId: effectiveRunId } : goal;
+    const goalEvDir = this.storage.goalEvidenceDir(goalRef);
+    const goalsDir = dirname(goalEvDir);
     if (!effectiveRunId) {
       const artifactsDir = join(dirname(goalsDir), "artifacts");
       return { goalEvidenceDir: goalEvDir, goalsDir, artifactsDir };
     }
-    const runRef = { id: effectiveRunId, repoRoot: goal.repoRoot, chatSessionId: goal.chatSessionId };
-    let runArtifactsDir = this.storage.runArtifactsDir(runRef);
-    let artifactsDir = dirname(runArtifactsDir);
-    if (this.storage.layout === "data-dir" && !isDirectorTaskContainer(effectiveRunId)) {
-      const legacyGoals = legacyStoragePaths.goalsDir(goal);
-      const legacyArtifacts = legacyStoragePaths.artifactsDir(goal);
-      if (goalsDir === legacyGoals && artifactsDir !== legacyArtifacts) {
-        artifactsDir = legacyArtifacts;
-        runArtifactsDir = join(legacyArtifacts, effectiveRunId);
-      } else if (artifactsDir === legacyArtifacts && goalsDir !== legacyGoals) {
-        goalsDir = legacyGoals;
-        goalEvDir = legacyStoragePaths.goalEvidenceDir(goal);
-      }
-    }
+    const runRef = {
+      id: effectiveRunId,
+      repoRoot: goal.repoRoot,
+      chatSessionId: goal.chatSessionId,
+      linkedGoalId: goal.id,
+    };
+    const runArtifactsDir = this.storage.runArtifactsDir(runRef);
+    const artifactsDir = dirname(runArtifactsDir);
     return { goalEvidenceDir: goalEvDir, goalsDir, artifactsDir, runArtifactsDir };
   }
 
@@ -712,8 +707,9 @@ export class GoalEngine {
       .run(runId, Date.now(), g.id);
     this.clearQueuedProgress(g.id);
     this.clearStaleVerificationStatus(g.id, { clearBlockedPhase: true });
-    this.storage.ensureGoalEvidenceDir(g);
-    return this.getGoal(g.id)!;
+    const updated = this.getGoal(g.id)!;
+    this.storage.ensureGoalEvidenceDir(updated);
+    return updated;
   }
 
   /**
