@@ -14,6 +14,7 @@ import {
   buildPostSessionActions,
   DENIED_HARNESS_STATE_REASON,
   extractArtifactsFromToolUpdate,
+  extractShellPathOperands,
   isAmpAcpProfile,
   isReadOnlyExternalMcpTool,
   isSafeReadOnlyShellCommand,
@@ -191,6 +192,25 @@ const SHELL_CWD_KEYS = [
   "Cwd",
 ] as const;
 
+const READ_DIR_KEYS = [
+  ...SHELL_CWD_KEYS,
+  "SearchPath",
+  "search_path",
+] as const;
+
+const READ_LOCATION_PATH_KEYS = [
+  "path",
+  "file_path",
+  "filePath",
+  "target_file",
+  "target_path",
+  "targetPath",
+  "TargetFile",
+  "AbsolutePath",
+  "notebook_path",
+  ...READ_DIR_KEYS,
+] as const;
+
 const WRITABLE_OTHER_PATH_KEYS = [
   "path",
   "file_path",
@@ -257,17 +277,19 @@ function isRemoteOctofsPath(raw: string): boolean {
 function collectRawInputObjects(rawInput: Record<string, unknown> | undefined): Record<string, unknown>[] {
   if (!rawInput) return [];
   const objects: Record<string, unknown>[] = [rawInput];
-  const args = rawInput.arguments;
-  if (args && typeof args === "object" && !Array.isArray(args)) {
-    objects.push(args as Record<string, unknown>);
-  } else if (typeof args === "string" && args.trim().startsWith("{")) {
-    try {
-      const parsed = JSON.parse(args);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        objects.push(parsed as Record<string, unknown>);
+  for (const nestedKey of ["arguments", "input", "args"] as const) {
+    const args = rawInput[nestedKey];
+    if (args && typeof args === "object" && !Array.isArray(args)) {
+      objects.push(args as Record<string, unknown>);
+    } else if (typeof args === "string" && args.trim().startsWith("{")) {
+      try {
+        const parsed = JSON.parse(args);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          objects.push(parsed as Record<string, unknown>);
+        }
+      } catch {
+        // ignore non-JSON arguments string
       }
-    } catch {
-      // ignore non-JSON arguments string
     }
   }
   return objects;
@@ -320,31 +342,29 @@ function extractExternalMcpTargets(
           }
         }
       }
-      if (isOctofs) {
-        if (Array.isArray(obj.ranges)) {
-          for (const range of obj.ranges) {
-            if (range && typeof range === "object" && !Array.isArray(range)) {
-              const rp = (range as { path?: unknown }).path;
-              if (typeof rp === "string") pushTarget(rp, false);
-            }
+      if (Array.isArray(obj.ranges)) {
+        for (const range of obj.ranges) {
+          if (range && typeof range === "object" && !Array.isArray(range)) {
+            const rp = (range as { path?: unknown }).path;
+            if (typeof rp === "string") pushTarget(rp, false);
           }
         }
-        if (Array.isArray(obj.edits)) {
-          for (const edit of obj.edits) {
-            if (edit && typeof edit === "object" && !Array.isArray(edit)) {
-              const ep = (edit as { path?: unknown }).path;
-              if (typeof ep === "string") pushTarget(ep, false);
-            }
+      }
+      if (Array.isArray(obj.edits)) {
+        for (const edit of obj.edits) {
+          if (edit && typeof edit === "object" && !Array.isArray(edit)) {
+            const ep = (edit as { path?: unknown }).path;
+            if (typeof ep === "string") pushTarget(ep, false);
           }
         }
-        if (Array.isArray(obj.operations)) {
-          for (const op of obj.operations) {
-            if (op && typeof op === "object" && !Array.isArray(op)) {
-              const copyFrom = (op as { copy_from?: unknown }).copy_from;
-              if (copyFrom && typeof copyFrom === "object" && !Array.isArray(copyFrom)) {
-                const cp = (copyFrom as { path?: unknown }).path;
-                if (typeof cp === "string") pushTarget(cp, false);
-              }
+      }
+      if (Array.isArray(obj.operations)) {
+        for (const op of obj.operations) {
+          if (op && typeof op === "object" && !Array.isArray(op)) {
+            const copyFrom = (op as { copy_from?: unknown }).copy_from;
+            if (copyFrom && typeof copyFrom === "object" && !Array.isArray(copyFrom)) {
+              const cp = (copyFrom as { path?: unknown }).path;
+              if (typeof cp === "string") pushTarget(cp, false);
             }
           }
         }
@@ -420,9 +440,9 @@ async function checkDeniedOrProtectedPath(
   deniedRoots: readonly string[],
   protectedRoots: readonly string[],
   rawPath: string,
-  opts: { checkProtectedWorktree: boolean },
+  opts: { checkProtectedWorktree: boolean; baseDir?: string },
 ): Promise<HarnessRejection | null> {
-  const lexical = resolvePermissionPath(workspace, rawPath);
+  const lexical = resolvePermissionPath(opts.baseDir ?? workspace, rawPath);
   const canonical = await canonicalizePermissionPath(lexical);
   const allowedSet = new Set(allowedRoots.map((r) => resolve(r)));
   const explicitProtectedDenied: string[] = [];
@@ -484,7 +504,7 @@ async function workspaceTarget(
   allowedRoots?: readonly string[],
   deniedRoots: readonly string[] = [],
 ): Promise<{ path: string; exists: boolean; admittingRoot: string }> {
-  const realRoot = await realpath(root);
+  const realRoot = resolve(root);
   const effectiveAllowed = allowedRoots?.length ? allowedRoots : [realRoot];
   const absolute = resolve(realRoot, requested);
   try {
@@ -546,18 +566,76 @@ async function workspaceTarget(
   return { path, exists: false, admittingRoot };
 }
 
+function expandRootPath(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  return trimmed === "~"
+    ? homedir()
+    : trimmed.startsWith("~/")
+      ? resolve(homedir(), trimmed.slice(2))
+      : resolve(trimmed);
+}
+
 async function resolveExtraRoots(rawRoots: string[] | undefined): Promise<string[]> {
   if (!rawRoots?.length) return [];
   const out: string[] = [];
   for (const raw of rawRoots) {
-    const trimmed = raw.trim();
-    if (!trimmed) continue;
-    const expanded = trimmed === "~" ? homedir() : trimmed.startsWith("~/") ? resolve(homedir(), trimmed.slice(2)) : resolve(trimmed);
+    const expanded = expandRootPath(raw);
+    if (!expanded) continue;
+    let resolvedRoot = expanded;
     try {
-      out.push(await realpath(expanded));
+      resolvedRoot = await realpath(expanded);
     } catch {
-      out.push(expanded);
+      resolvedRoot = expanded;
     }
+    if (!out.includes(resolvedRoot)) out.push(resolvedRoot);
+  }
+  return out;
+}
+
+/**
+ * Resolves task grant roots once per session (Addendum C1).
+ * Roots at or inside a denied root area (state dir, data root) or a repo's legacy storage root are
+ * fixed to their issued spelling and dropped when they exist (or have an existing ancestor) whose
+ * realpath differs from the issued spelling. Operator roots outside those areas keep `realpath` resolution.
+ */
+async function resolveSessionGrantRoots(
+  rawRoots: string[] | undefined,
+  protectedAreas: readonly string[],
+): Promise<string[]> {
+  if (!rawRoots?.length) return [];
+  const out: string[] = [];
+  for (const raw of rawRoots) {
+    const expanded = expandRootPath(raw);
+    if (!expanded) continue;
+    const inProtectedArea =
+      protectedAreas.some((area) => isInsideRoot(area, expanded)) ||
+      legacyStoragePaths.containsHarnessDirSegment(expanded);
+    if (inProtectedArea) {
+      const entry = await lstat(expanded).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT" || error.code === "ENOTDIR") return undefined;
+        return null;
+      });
+      if (entry === null) continue;
+      if (entry) {
+        if (entry.isSymbolicLink()) continue;
+        const real = await realpath(expanded).catch(() => null);
+        if (!real || real !== expanded) continue;
+        if (!out.includes(expanded)) out.push(expanded);
+      } else {
+        const canonicalMissing = await canonicalizeMissingPath(expanded);
+        if (canonicalMissing !== expanded) continue;
+        if (!out.includes(expanded)) out.push(expanded);
+      }
+      continue;
+    }
+    let resolvedRoot = expanded;
+    try {
+      resolvedRoot = await realpath(expanded);
+    } catch {
+      resolvedRoot = expanded;
+    }
+    if (!out.includes(resolvedRoot)) out.push(resolvedRoot);
   }
   return out;
 }
@@ -578,9 +656,9 @@ async function resolveAllowedTarget(
   deniedRoots: readonly string[] = [],
   protectedRoots: readonly string[] = [],
 ): Promise<{ path: string; exists: boolean; root: string }> {
-  const allowedRoots = await resolveExtraRoots([primaryRoot, ...extraRoots]);
-  const primaryCanonical = allowedRoots[0] ?? resolve(primaryRoot);
-  const allowedSet = new Set(allowedRoots.map((r) => resolve(r)));
+  const primaryCanonical = resolve(primaryRoot);
+  const allowedRoots = [...new Set([primaryCanonical, ...extraRoots.map((r) => resolve(r))])];
+  const allowedSet = new Set(allowedRoots);
   const explicitProtectedAllowed = new Set<string>();
   const explicitProtectedDenied: string[] = [];
   for (const pRoot of protectedRoots) {
@@ -681,9 +759,9 @@ async function openWorkspaceFile(
     deniedRoots,
     protectedRoots,
   );
-  const allowedRoots = await resolveExtraRoots([primaryRoot, ...extraRoots]);
-  const primaryCanonical = allowedRoots[0] ?? resolve(primaryRoot);
-  const allowedSet = new Set(allowedRoots.map((r) => resolve(r)));
+  const primaryCanonical = resolve(primaryRoot);
+  const allowedRoots = [...new Set([primaryCanonical, ...extraRoots.map((r) => resolve(r))])];
+  const allowedSet = new Set(allowedRoots);
   const explicitProtectedAllowed = new Set<string>();
   const explicitProtectedDenied: string[] = [];
   for (const pRoot of protectedRoots) {
@@ -1037,10 +1115,15 @@ export class AcpRunner {
       throw new Error(`Model ${req.model} is unavailable on ACP profile ${this.profile.id}`);
     }
     const workspace = await realpath(req.cwd);
-    const extraWriteRoots = await resolveExtraRoots(req.extraWriteRoots);
-    const extraReadRoots = await resolveExtraRoots([...(req.extraReadRoots ?? []), ...(req.extraWriteRoots ?? [])]);
+    const rawDeniedRoots = (req.deniedRoots ?? []).map(expandRootPath).filter(Boolean);
     const deniedRoots = await resolveExtraRoots(req.deniedRoots);
     const requestProtectedRoots = await resolveExtraRoots(req.protectedRoots);
+    const protectedGrantAreas = [...new Set([...deniedRoots, ...rawDeniedRoots])];
+    const extraWriteRoots = await resolveSessionGrantRoots(req.extraWriteRoots, protectedGrantAreas);
+    const extraReadRoots = await resolveSessionGrantRoots(
+      [...(req.extraReadRoots ?? []), ...(req.extraWriteRoots ?? [])],
+      protectedGrantAreas,
+    );
     const controlOnly = req.toolPolicy === "control_plane_only";
     const canWrite = req.toolPolicy === "read_write_workspace";
     const allowShell = canWrite || (req.toolPolicy === "read_only_workspace" && Boolean(req.allowShellInReadOnly));
@@ -2324,7 +2407,8 @@ export class AcpRunner {
           noFileLocations &&
           normalizedHarnessTool.length > 0 &&
           harnessToolNames.has(normalizedHarnessTool);
-        const normalizedExt = nonFileToolKind ? extractExternalMcp(rawCandidateName) : null;
+        const normalizedExt =
+          nonFileToolKind || toolKind === "read" ? extractExternalMcp(rawCandidateName) : null;
         const matchesNormalizedExternal =
           normalizedExt !== null &&
           (canWrite || isReadOnlyExternalMcpTool(normalizedExt.server, normalizedExt.tool));
@@ -2341,14 +2425,15 @@ export class AcpRunner {
         const claudeExtParsed = claudeToolName ? extractExternalMcp(claudeToolName) : null;
         const claudeExternalMcp =
           this.profile.adapter === "claude" &&
-          claude?.mcpServer?.name !== undefined &&
           !claudeUntrustedSource &&
-          externalMcpNames.has(claude.mcpServer.name) &&
-          (canWrite ||
-            isReadOnlyExternalMcpTool(
-              claude.mcpServer.name,
-              claudeExtParsed?.tool ?? claudeToolName ?? "",
-            ));
+          ((claude?.mcpServer?.name !== undefined &&
+            externalMcpNames.has(claude.mcpServer.name) &&
+            (canWrite ||
+              isReadOnlyExternalMcpTool(
+                claude.mcpServer.name,
+                claudeExtParsed?.tool ?? claudeToolName ?? "",
+              ))) ||
+            (claude?.mcpServer === undefined && matchesNormalizedExternal));
         // Allow Claude's built-in ToolSearch (required to load deferred MCP tools) and harness MCP calls across
         // any non-user/project/local MCP server source (`dynamic`, `sdk`, `acp`, `inline`, etc.) and any toolKind.
         const claudeToolSearch =
@@ -2416,7 +2501,9 @@ export class AcpRunner {
           hasHarnessBridge && (claudeHarnessMcp || codexHarnessMcp || geminiHarnessMcp || genericHarnessMcp);
         const matchedExternalMcp: { server: string; tool: string } | null = !controlOnly
           ? claudeExternalMcp
-            ? { server: claude!.mcpServer!.name!, tool: claudeExtParsed?.tool ?? claudeToolName ?? "" }
+            ? claude?.mcpServer?.name !== undefined
+              ? { server: claude.mcpServer.name, tool: claudeExtParsed?.tool ?? claudeToolName ?? "" }
+              : normalizedExt
             : codexExternalMcp
               ? toolKind === "execute" && p._meta?.is_mcp_tool_approval === true && codexDirectExternal
                 ? { server: codexRawServer!, tool: codexRawTool! }
@@ -2468,9 +2555,17 @@ export class AcpRunner {
             if (loc?.path) paths.push(loc.path);
           }
           if (rawInput) {
-            for (const key of ["path", "file_path", "filePath", "directory", "dir", "cwd", "target_file", "SearchPath"]) {
+            for (const key of READ_LOCATION_PATH_KEYS) {
               const val = rawInput[key];
               if (typeof val === "string" && val.trim()) paths.push(val.trim());
+            }
+            for (const key of WRITABLE_OTHER_PATH_ARRAY_KEYS) {
+              const val = rawInput[key];
+              if (Array.isArray(val)) {
+                for (const item of val) {
+                  if (typeof item === "string" && item.trim()) paths.push(item.trim());
+                }
+              }
             }
           }
           // The literal directory before the first glob metacharacter (`src/**/*.ts` -> `src`); a rooted glob
@@ -2518,7 +2613,7 @@ export class AcpRunner {
             if (/(?:^|[{,])\s*~/.test(pattern)) return false;
             if (/(?:^|[\\/{,])\.\.(?:[\\/},]|$)/.test(pattern)) return false;
             if (/[{,]\s*\//.test(pattern)) return false;
-            const baseValues = ["path", "directory", "dir", "cwd", "SearchPath"]
+            const baseValues = ["path", ...READ_DIR_KEYS]
               .map((key) => rawInput[key])
               .filter((v) => v !== undefined);
             if (baseValues.length > 1) return false; // several bases could disagree about where Glob searches
@@ -2640,7 +2735,6 @@ export class AcpRunner {
                 (v): v is string => typeof v === "string" && v.trim().length > 0,
               );
               const shellAllowedRoots = [workspace, ...extraReadRoots];
-              const checkProtectedWorktree = deniedRoots.length > 0 || requestProtectedRoots.length > 0;
               workspaceCall = true;
               for (const rawCwd of namedCwds) {
                 const denied = await checkDeniedOrProtectedPath(
@@ -2649,13 +2743,53 @@ export class AcpRunner {
                   deniedRoots,
                   requestProtectedRoots,
                   rawCwd,
-                  { checkProtectedWorktree },
+                  { checkProtectedWorktree: true },
                 );
                 if (denied) {
                   execDenialRule = "protected-path";
                   execDenialRejection = denied;
                   workspaceCall = false;
                   break;
+                }
+              }
+              if (workspaceCall) {
+                const effectiveCwd =
+                  namedCwds.length > 0
+                    ? await canonicalizePermissionPath(resolvePermissionPath(workspace, namedCwds[0]!))
+                    : workspace;
+                const explicitTargets: string[] = [];
+                for (const loc of p.toolCall?.locations ?? []) {
+                  if (typeof loc?.path === "string" && loc.path.trim().length > 0) {
+                    explicitTargets.push(loc.path.trim());
+                  }
+                }
+                for (const key of ["command", "cmd", "argv"] as const) {
+                  const val = rawInput?.[key];
+                  const cmdText =
+                    typeof val === "string" && key !== "argv"
+                      ? val
+                      : Array.isArray(val) && val.length > 0 && val.every((a) => typeof a === "string")
+                        ? unwrapShellArgv(val)
+                        : "";
+                  if (cmdText) {
+                    explicitTargets.push(...extractShellPathOperands(cmdText));
+                  }
+                }
+                for (const rawTarget of explicitTargets) {
+                  const denied = await checkDeniedOrProtectedPath(
+                    workspace,
+                    shellAllowedRoots,
+                    deniedRoots,
+                    requestProtectedRoots,
+                    rawTarget,
+                    { checkProtectedWorktree: true, baseDir: effectiveCwd },
+                  );
+                  if (denied) {
+                    execDenialRule = "protected-path";
+                    execDenialRejection = denied;
+                    workspaceCall = false;
+                    break;
+                  }
                 }
               }
             } else {
@@ -2976,6 +3110,7 @@ export class AcpRunner {
       const modelConfigIds = new Set(["model"]);
       const postActions = buildPostSessionActions(this.profile.adapter, sessionId, newSessionRes, {
         toolPolicy: req.toolPolicy,
+        allowShellInReadOnly: Boolean(req.allowShellInReadOnly),
         model: req.model,
         effort: req.effort,
       }, modelConfigIds);

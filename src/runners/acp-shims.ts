@@ -152,8 +152,9 @@ const NON_SHELL_WHITESPACE = /[^\S \t\n]/;
  * brace expansion, subshells and zsh glob qualifiers, unquoted glob characters, zsh `=cmd`
  * expansion, line continuations, background jobs, and control characters.
  */
-function splitShellSegments(cmd: string): string[] | null {
-  if (CONTROL_CHARS.test(cmd)) return null;
+function splitShellSegments(cmd: string, permissive = false): string[] | null {
+  if (!permissive && CONTROL_CHARS.test(cmd)) return null;
+  if (permissive && cmd.includes("\0")) return null;
   const segments: string[] = [];
   let cur = "";
   let inSingle = false;
@@ -168,20 +169,28 @@ function splitShellSegments(cmd: string): string[] | null {
     }
     if (inDouble) {
       if (ch === "\\" && next !== undefined) {
-        if (next === "\n") return null;
+        if (next === "\n") {
+          if (!permissive) return null;
+          i++;
+          continue;
+        }
         cur += ch + next;
         i++;
         continue;
       }
-      if (ch === "`") return null;
-      if (ch === "$" && next !== undefined && next !== '"' && !/\s/.test(next)) return null;
+      if (!permissive && ch === "`") return null;
+      if (!permissive && ch === "$" && next !== undefined && next !== '"' && !/\s/.test(next)) return null;
       cur += ch;
       if (ch === '"') inDouble = false;
       continue;
     }
     const wordStart = cur.length === 0 || /\s/.test(cur[cur.length - 1]!);
     if (ch === "\\" && next !== undefined) {
-      if (next === "\n") return null;
+      if (next === "\n") {
+        if (!permissive) return null;
+        i++;
+        continue;
+      }
       cur += ch + next;
       i++;
       continue;
@@ -193,6 +202,49 @@ function splitShellSegments(cmd: string): string[] | null {
     }
     if (ch === '"') {
       inDouble = true;
+      cur += ch;
+      continue;
+    }
+    if (permissive) {
+      if (wordStart && ch === "#") {
+        while (i < cmd.length && cmd[i] !== "\n") i++;
+        if (cur.trim()) segments.push(cur);
+        cur = "";
+        continue;
+      }
+      if (ch === "&" && next === ">") {
+        cur += " ";
+        i++;
+        if (cmd[i + 1] === ">") i++;
+        continue;
+      }
+      if (ch === ">" || ch === "<") {
+        cur += " ";
+        if (next === ch) {
+          i++;
+          if (ch === "<" && cmd[i + 1] === "<") i++;
+        } else if (next === "&" || next === "|") {
+          i++;
+        }
+        continue;
+      }
+      if (ch === "(" || ch === ")") {
+        if (cur.trim()) segments.push(cur);
+        cur = "";
+        continue;
+      }
+      if (ch === "|" || ch === ";" || ch === "\n") {
+        if (cur.trim()) segments.push(cur);
+        cur = "";
+        if (ch === "|" && next === "|") i++;
+        continue;
+      }
+      if (ch === "&") {
+        if (cur.trim()) segments.push(cur);
+        cur = "";
+        if (next === "&") i++;
+        continue;
+      }
       cur += ch;
       continue;
     }
@@ -234,7 +286,7 @@ function splitShellSegments(cmd: string): string[] | null {
     if (ch === "&") return null; // background execution
     cur += ch;
   }
-  if (inSingle || inDouble) return null;
+  if (!permissive && (inSingle || inDouble)) return null;
   if (cur.trim()) segments.push(cur);
   return segments;
 }
@@ -682,6 +734,68 @@ function checkCwdInScope(scope: ReadOnlyShellScope): ScopeCheckResult {
 }
 
 /**
+ * Derives candidate path substrings from one shell argument using the read-only shell operand
+ * classification: whole token, text after first `=`, text from first `/` on options, every attached
+ * short-option suffix, and directory prefix before the first glob metacharacter.
+ */
+function expandPathOperandCandidates(arg: string): string[] {
+  const candidates = [arg];
+  const eq = arg.indexOf("=");
+  if (eq >= 0) candidates.push(arg.slice(eq + 1));
+  const slash = arg.indexOf("/");
+  if (arg.startsWith("-") && slash >= 0) candidates.push(arg.slice(slash));
+  // A short-option cluster may end in an attached value at any position (`-nfFILE`).
+  if (/^-[^-]/.test(arg)) for (let k = 2; k < arg.length; k++) candidates.push(arg.slice(k));
+  // A word with glob characters may be treated as a pattern (check the directory before the glob)
+  // or as a literal name (check the whole word).
+  for (const word of [...candidates]) {
+    const glob = word.search(/[*?[]/);
+    if (glob >= 0) candidates.push(word.slice(0, word.lastIndexOf("/", glob) + 1) || ".");
+  }
+  return candidates;
+}
+
+/**
+ * Extracts explicit path operand candidates from a shell command using the same segment/token
+ * splitter and operand classifier as `isSafeReadOnlyShellCommand` (Addendum C7).
+ */
+export function extractShellPathOperands(rawCommand: string): string[] {
+  const segments = splitShellSegments(rawCommand, true);
+  if (!segments?.length) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (candidate: string) => {
+    if (!candidate || seen.has(candidate)) return;
+    seen.add(candidate);
+    out.push(candidate);
+  };
+  for (const seg of segments) {
+    const words = tokenizeSegment(seg);
+    let idx = 0;
+    while (idx < words.length && words[idx]!.assignment) idx++;
+    const tokens = words.map((w) => w.text);
+    const bin = tokens[idx];
+    if (bin === undefined) continue;
+    const args = tokens.slice(idx + 1);
+    if (
+      /^(?:\/(?:usr\/)?bin\/)?(?:sh|bash|zsh)$/.test(bin) &&
+      args.length >= 2 &&
+      /^-l?c$/.test(args[0]!)
+    ) {
+      for (const nested of extractShellPathOperands(args[1]!)) push(nested);
+      for (const extraArg of args.slice(2)) {
+        for (const candidate of expandPathOperandCandidates(extraArg)) push(candidate);
+      }
+      continue;
+    }
+    for (const arg of args) {
+      for (const candidate of expandPathOperandCandidates(arg)) push(candidate);
+    }
+  }
+  return out;
+}
+
+/**
  * Every token is treated as a possible path: the whole token, the text after its first `=`, for options
  * the text from the first `/`, every attached short-option value, and for (quoted) glob characters
  * also the directory before the first glob. A `..` segment denies (the shell resolves it physically,
@@ -691,19 +805,7 @@ function checkCwdInScope(scope: ReadOnlyShellScope): ScopeCheckResult {
  */
 function checkPathOperandsInScope(args: string[], scope: ReadOnlyShellScope): ScopeCheckResult {
   for (const arg of args) {
-    const candidates = [arg];
-    const eq = arg.indexOf("=");
-    if (eq >= 0) candidates.push(arg.slice(eq + 1));
-    const slash = arg.indexOf("/");
-    if (arg.startsWith("-") && slash >= 0) candidates.push(arg.slice(slash));
-    // A short-option cluster may end in an attached value at any position (`-nfFILE`).
-    if (/^-[^-]/.test(arg)) for (let k = 2; k < arg.length; k++) candidates.push(arg.slice(k));
-    // A word with glob characters reaching here was quoted: a tool may treat it as a pattern (check the
-    // directory before the glob) or as a literal name (check the whole word).
-    for (const word of [...candidates]) {
-      const glob = word.search(/[*?[]/);
-      if (glob >= 0) candidates.push(word.slice(0, word.lastIndexOf("/", glob) + 1) || ".");
-    }
+    const candidates = expandPathOperandCandidates(arg);
     let hasDotDotRefusal = arg.startsWith("-") && /\.\.(?:\/|$)/.test(arg);
     for (const candidate of candidates) {
       if (!candidate) continue;
@@ -1227,6 +1329,30 @@ function setOpenCodeDirRules(target: Record<string, unknown>, dirPath: string, a
   }
 }
 
+/**
+ * Emits OpenCode allow/deny directory rules in specificity order (shorter normalized root first;
+ * on equal roots, deny first and allow last so allowed wins a tie under OpenCode's last-match-wins evaluation).
+ */
+function applyOpenCodeSpecificityRules(
+  target: Record<string, unknown>,
+  allowDirs: readonly string[],
+  denyDirs: readonly string[],
+): void {
+  const entries: Array<{ root: string; action: "allow" | "deny" }> = [
+    ...denyDirs.map((dirPath) => ({ root: normalizeOpenCodePatternRoot(dirPath), action: "deny" as const })),
+    ...allowDirs.map((dirPath) => ({ root: normalizeOpenCodePatternRoot(dirPath), action: "allow" as const })),
+  ];
+  entries.sort((a, b) => {
+    if (a.root.length !== b.root.length) return a.root.length - b.root.length;
+    if (a.root !== b.root) return a.root < b.root ? -1 : 1;
+    if (a.action === b.action) return 0;
+    return a.action === "deny" ? -1 : 1;
+  });
+  for (const entry of entries) {
+    setOpenCodeDirRules(target, entry.root, entry.action);
+  }
+}
+
 export function prepareAcpSpawn(
   profile: AcpProfileConfig,
   opts: {
@@ -1462,12 +1588,8 @@ export function prepareAcpSpawn(
           "**": typeof mergedExternal["**"] === "string" ? mergedExternal["**"] : "ask",
           ...mergedExternal,
         };
-        for (const dirPath of deniedDirs) {
-          setOpenCodeDirRules(orderedExternal, dirPath, "deny");
-        }
-        for (const dirPath of normalizeDirectoryList(workspaceDirs, grantedDirs)) {
-          setOpenCodeDirRules(orderedExternal, dirPath, "allow");
-        }
+        const allowedReadDirs = normalizeDirectoryList(workspaceDirs, grantedDirs);
+        applyOpenCodeSpecificityRules(orderedExternal, allowedReadDirs, deniedDirs);
 
         const existingRead = existingPermission.read;
         const mergedRead: Record<string, unknown> =
@@ -1476,12 +1598,7 @@ export function prepareAcpSpawn(
             : typeof existingRead === "string"
               ? { "*": existingRead }
               : { "*": "allow" };
-        for (const dirPath of deniedDirs) {
-          setOpenCodeDirRules(mergedRead, dirPath, "deny");
-        }
-        for (const dirPath of normalizeDirectoryList(workspaceDirs, grantedDirs)) {
-          setOpenCodeDirRules(mergedRead, dirPath, "allow");
-        }
+        applyOpenCodeSpecificityRules(mergedRead, allowedReadDirs, deniedDirs);
 
         let nextEdit: unknown;
         if (opts.toolPolicy !== "read_write_workspace") {
@@ -1494,12 +1611,7 @@ export function prepareAcpSpawn(
               : typeof existingEdit === "string"
                 ? { "*": existingEdit }
                 : { "*": "allow" };
-          for (const dirPath of deniedDirs) {
-            setOpenCodeDirRules(mergedEdit, dirPath, "deny");
-          }
-          for (const dirPath of normalizeDirectoryList(workspaceDirs, writeDirs)) {
-            setOpenCodeDirRules(mergedEdit, dirPath, "allow");
-          }
+          applyOpenCodeSpecificityRules(mergedEdit, normalizeDirectoryList(workspaceDirs, writeDirs), deniedDirs);
           nextEdit = mergedEdit;
         }
 
@@ -1872,7 +1984,7 @@ export function buildPostSessionActions(
         }
       }
     }
-  } else if (adapter === "codex" && opts.toolPolicy === "read_only_workspace" && opts.allowShellInReadOnly !== false) {
+  } else if (adapter === "codex" && opts.toolPolicy === "read_only_workspace" && opts.allowShellInReadOnly === true) {
     if (modeOpt && modeValues?.length) {
       const currentMode = String(modeOpt.currentValue ?? "").toLowerCase();
       if (currentMode === "agent") {

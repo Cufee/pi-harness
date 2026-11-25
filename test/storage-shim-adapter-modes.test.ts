@@ -1,6 +1,20 @@
 import assert from "node:assert/strict";
-import { describe, it } from "bun:test";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, it } from "bun:test";
+import { agent } from "@agentclientprotocol/sdk/unstable";
+import type { AcpProfileConfig } from "../src/config.js";
+import { AcpRunner } from "../src/runners/acp-runner.js";
 import { buildPostSessionActions } from "../src/runners/acp-shims.js";
+
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  while (tempDirs.length > 0) {
+    rmSync(tempDirs.pop()!, { recursive: true, force: true });
+  }
+});
 
 const V2_11_CODEX_MODE_OPTIONS = [
   { value: "read-only", name: "Read-only" },
@@ -105,7 +119,7 @@ describe("buildPostSessionActions adapter mode selection (esc-149)", () => {
           { id: "mode", category: "mode", currentValue: "agent", options: V2_11_CODEX_MODE_OPTIONS },
         ],
       },
-      { toolPolicy: "read_only_workspace", model: "gpt-6-luna" },
+      { toolPolicy: "read_only_workspace", model: "gpt-6-luna", allowShellInReadOnly: true },
     );
     assert.deepEqual(doneReviewerActions, [
       {
@@ -126,6 +140,19 @@ describe("buildPostSessionActions adapter mode selection (esc-149)", () => {
       { toolPolicy: "read_only_workspace", model: "gpt-6-luna" },
     );
     assert.deepEqual(strictReadOnlyActions, []);
+
+    const omittedShellActions = buildPostSessionActions(
+      "codex",
+      "s-codex-omitted-shell",
+      {
+        configOptions: [
+          CODEX_MODEL_OPT,
+          { id: "mode", category: "mode", currentValue: "agent", options: V2_11_CODEX_MODE_OPTIONS },
+        ],
+      },
+      { toolPolicy: "read_only_workspace", model: "gpt-6-luna" },
+    );
+    assert.deepEqual(omittedShellActions, []);
 
     const explicitNoShellActions = buildPostSessionActions(
       "codex",
@@ -250,6 +277,111 @@ describe("buildPostSessionActions adapter mode selection (esc-149)", () => {
         method: "session/set_config_option",
         params: { sessionId: "s-claude", configId: "mode", value: "bypassPermissions" },
       },
+    ]);
+  });
+
+  it("D9(b) (C8): AcpRunner never requests workspace-write when Codex reports mode 'agent' for a shell-disabled read-only task", async () => {
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "codex-mode-guard-")));
+    tempDirs.push(cwd);
+
+    const codexProfile: AcpProfileConfig = {
+      id: "acp:codex",
+      kind: "acp",
+      adapter: "codex",
+      command: "unused",
+      billing: "subscription",
+    };
+
+    const runCodexCase = async (
+      allowShellInReadOnly: boolean | undefined,
+      useLegacyModes = false,
+    ) => {
+      const modeRequests: Array<{ method: string; value: string }> = [];
+      const fixture = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {} }))
+        .onRequest("session/new", async () =>
+          useLegacyModes
+            ? {
+                sessionId: "s-codex-legacy",
+                models: { currentModelId: "gpt-6-luna", availableModels: [{ modelId: "gpt-6-luna", name: "GPT-6 Luna" }] },
+                modes: { currentModeId: "agent", availableModes: V2_11_CODEX_LEGACY_MODES },
+              }
+            : {
+                sessionId: "s-codex-cfg",
+                configOptions: [
+                  { ...CODEX_MODEL_OPT, type: "select" as const, name: "Model" },
+                  {
+                    id: "mode",
+                    name: "Mode",
+                    type: "select" as const,
+                    category: "mode",
+                    currentValue: "agent",
+                    options: V2_11_CODEX_MODE_OPTIONS,
+                  },
+                ],
+              },
+        )
+        .onRequest("session/set_config_option", async ({ params }) => {
+          const p = params as unknown as { configId: string; value: string };
+          if (p.configId === "mode") modeRequests.push({ method: "session/set_config_option", value: p.value });
+          return {
+            configOptions: [
+              { ...CODEX_MODEL_OPT, type: "select" as const, name: "Model" },
+              {
+                id: "mode",
+                name: "Mode",
+                type: "select" as const,
+                category: "mode",
+                currentValue: p.value,
+                options: V2_11_CODEX_MODE_OPTIONS,
+              },
+            ],
+          };
+        })
+        .onRequest("session/set_mode", async ({ params }) => {
+          const p = params as unknown as { modeId: string };
+          modeRequests.push({ method: "session/set_mode", value: p.modeId });
+          return {};
+        })
+        .onRequest("session/prompt", async ({ client, params: { sessionId } }) => {
+          await client.notify("session/update", {
+            sessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "done" } },
+          });
+          return { stopReason: "end_turn" };
+        });
+
+      await new AcpRunner(codexProfile).run(
+        {
+          runId: "run-d9b",
+          taskId: "t-d9b",
+          tier: 3,
+          kind: "research",
+          cwd,
+          toolPolicy: "read_only_workspace",
+          ...(allowShellInReadOnly !== undefined ? { allowShellInReadOnly } : {}),
+          systemPrompt: "Strict read-only researcher",
+          initialPrompt: "Inspect only",
+          model: "gpt-6-luna",
+          maxTurns: 1,
+          tools: [],
+          executeTool: async () => ({}),
+          signal: new AbortController().signal,
+          callbacks: {},
+        },
+        fixture,
+      );
+      return modeRequests;
+    };
+
+    // Shell-disabled read-only task (explicit false, omitted, and legacy modes shape) must never request a writable mode.
+    assert.deepEqual(await runCodexCase(false), []);
+    assert.deepEqual(await runCodexCase(undefined), []);
+    assert.deepEqual(await runCodexCase(false, true), []);
+
+    // Shell-enabled read-only task (Done-Reviewer / verify) still switches agent -> workspace-write.
+    assert.deepEqual(await runCodexCase(true), [
+      { method: "session/set_config_option", value: "workspace-write" },
     ]);
   });
 });

@@ -823,4 +823,85 @@ describe("ACP adapter directory wiring (prepareAcpSpawn and buildNewSessionParam
     assert.deepEqual(Object.keys(legacyCfg.permission), ["external_directory"]);
     ocLegacy.cleanup();
   });
+
+  it("D9(a) (C8): orders OpenCode read, edit, and external_directory rules by specificity when workspace contains stateDir", () => {
+    const workspace = "/tmp/pi-oc-home";
+    const stateDir = `${workspace}/.pi-harness`;
+    const evidence = `${stateDir}/data/projects/repo-123/chats/chat-1/goals/goal-1`;
+    const artifacts = `${stateDir}/data/projects/repo-123/chats/chat-1/artifacts/run-1`;
+
+    // Evaluates OpenCode's last-match-wins wildcard pattern map against a path.
+    const matchesPattern = (pattern: string, targetPath: string): boolean => {
+      if (pattern === "*" || pattern === "**") return true;
+      if (pattern.endsWith("/**")) {
+        const prefix = pattern.slice(0, -3);
+        return targetPath === prefix || targetPath.startsWith(`${prefix}/`);
+      }
+      if (pattern.endsWith("/*")) {
+        const prefix = pattern.slice(0, -2);
+        if (!targetPath.startsWith(`${prefix}/`)) return false;
+        return !targetPath.slice(prefix.length + 1).includes("/");
+      }
+      return targetPath === pattern;
+    };
+    const evaluateLastMatch = (rules: Record<string, string>, targetPath: string): string | undefined => {
+      let verdict: string | undefined;
+      for (const [pattern, action] of Object.entries(rules)) {
+        if (matchesPattern(pattern, targetPath)) verdict = action;
+      }
+      return verdict;
+    };
+
+    const oc = prepareAcpSpawn(opencodeProfile, {
+      systemPrompt: "Role",
+      toolPolicy: "read_write_workspace",
+      cwd: workspace,
+      readDirectories: [artifacts, evidence],
+      writeDirectories: [evidence],
+      deniedRoots: [stateDir],
+    });
+    const cfg = JSON.parse(oc.env.OPENCODE_CONFIG_CONTENT!) as {
+      permission: {
+        external_directory: Record<string, string>;
+        read: Record<string, string>;
+        edit: Record<string, string>;
+      };
+    };
+
+    const stateFile = `${stateDir}/config.json`;
+    const evidenceFile = `${evidence}/brief.md`;
+    const artifactFile = `${artifacts}/out.md`;
+    const wsFile = `${workspace}/src/app.ts`;
+
+    // State file inside workspace must be refused for read, edit, and external_directory.
+    assert.equal(evaluateLastMatch(cfg.permission.read, stateFile), "deny");
+    assert.equal(evaluateLastMatch(cfg.permission.edit, stateFile), "deny");
+    assert.equal(evaluateLastMatch(cfg.permission.external_directory, stateFile), "deny");
+
+    // Granted evidence dir nested under stateDir must still be allowed for read, edit, and external_directory.
+    assert.equal(evaluateLastMatch(cfg.permission.read, evidenceFile), "allow");
+    assert.equal(evaluateLastMatch(cfg.permission.edit, evidenceFile), "allow");
+    assert.equal(evaluateLastMatch(cfg.permission.external_directory, evidenceFile), "allow");
+
+    // Read-only artifacts dir stays readable but denied for edit; ordinary workspace file stays allowed.
+    assert.equal(evaluateLastMatch(cfg.permission.read, artifactFile), "allow");
+    assert.equal(evaluateLastMatch(cfg.permission.edit, artifactFile), "deny");
+    assert.equal(evaluateLastMatch(cfg.permission.read, wsFile), "allow");
+    assert.equal(evaluateLastMatch(cfg.permission.edit, wsFile), "allow");
+    oc.cleanup();
+
+    // Tie on equal path (workspace === stateDir): deny first, allow last so allowed wins the tie.
+    const ocTie = prepareAcpSpawn(opencodeProfile, {
+      systemPrompt: "Role",
+      toolPolicy: "read_write_workspace",
+      cwd: stateDir,
+      deniedRoots: [stateDir],
+    });
+    const tieCfg = JSON.parse(ocTie.env.OPENCODE_CONFIG_CONTENT!) as {
+      permission: { read: Record<string, string>; edit: Record<string, string> };
+    };
+    assert.equal(evaluateLastMatch(tieCfg.permission.read, stateFile), "allow");
+    assert.equal(evaluateLastMatch(tieCfg.permission.edit, stateFile), "allow");
+    ocTie.cleanup();
+  });
 });

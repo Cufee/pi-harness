@@ -9,6 +9,7 @@ import type { AcpProfileConfig } from "../src/config.js";
 import { AcpRunner } from "../src/runners/acp-runner.js";
 import { DENIED_HARNESS_STATE_REASON, prepareAcpSpawn } from "../src/runners/acp-shims.js";
 import type { RunAgentRequest } from "../src/runners/types.js";
+import { legacyStoragePaths } from "../src/storage/paths.js";
 
 type ToolEvent = Parameters<NonNullable<RunAgentRequest["callbacks"]["onToolEvent"]>>[0];
 
@@ -1623,5 +1624,406 @@ app.connect(ndJsonStream(Writable.toWeb(process.stdout) as unknown as WritableSt
     for (const id of ["legacy-state", "legacy-other-chat", "legacy-sibling", "legacy-ws", "legacy-outside"]) {
       assert.equal(legacyRes.outcomes[id], "allow", `legacy layout: ${id} must stay approved`);
     }
+  });
+
+  it("D4 (C1): refuses reads and writes when a granted evidence dir is replaced by a symlink to stateDir after or before session start in both layouts", async () => {
+    const runReplacementCases = async (layout: "data-dir" | "legacy") => {
+      const fx = setupStateLayout();
+      const operatorTarget = makeTempDir(`acp-d4-op-target-${layout}-`);
+      const operatorLink = join(fx.home, `op-link-${layout}`);
+      const operatorFile = join(operatorTarget, "notes.txt");
+      writeFileSync(operatorFile, "operator-ok\n", "utf8");
+      symlinkSync(operatorTarget, operatorLink);
+
+      const grantDir =
+        layout === "data-dir"
+          ? fx.goalsDir
+          : legacyStoragePaths.goalEvidenceDir({ id: "goal-1", repoRoot: fx.workspace });
+      const deniedRoots = layout === "data-dir" ? [fx.stateDir] : [];
+      const cwd = layout === "data-dir" ? fx.wt1 : fx.workspace;
+      mkdirSync(grantDir, { recursive: true });
+      writeFileSync(join(grantDir, "brief.md"), "# Original\n", "utf8");
+
+      // Case 1: grant dir is a real dir at session start, then replaced by a symlink to stateDir mid-session.
+      let midReadErr = "";
+      let midWriteErr = "";
+      let opReadContent = "";
+      const midSessionFixture = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {} }))
+        .onRequest("session/new", async () => ({
+          sessionId: `s-d4-mid-${layout}`,
+          models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+        }))
+        .onRequest("session/prompt", async ({ client, params: { sessionId } }) => {
+          // Operator root outside denied/legacy storage still resolves normally.
+          const opRes = (await client.request("fs/read_text_file", {
+            sessionId,
+            path: join(operatorLink, "notes.txt"),
+          })) as { content: string };
+          opReadContent = opRes.content;
+
+          // Replace the granted evidence dir with a symlink pointing directly to stateDir after session root resolution.
+          rmSync(grantDir, { recursive: true, force: true });
+          symlinkSync(fx.stateDir, grantDir);
+
+          try {
+            await client.request("fs/read_text_file", {
+              sessionId,
+              path: join(grantDir, "config.json"),
+            });
+          } catch (err) {
+            midReadErr = errorDetail(err);
+          }
+
+          try {
+            await client.request("fs/write_text_file", {
+              sessionId,
+              path: join(grantDir, "injected.txt"),
+              content: "pwned\n",
+            });
+          } catch (err) {
+            midWriteErr = errorDetail(err);
+          }
+
+          await client.notify("session/update", {
+            sessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "done" } },
+          });
+          return { stopReason: "end_turn" };
+        });
+
+      await new AcpRunner(profile("claude")).run(
+        makeBaseRequest({
+          cwd,
+          toolPolicy: "read_write_workspace",
+          extraReadRoots: [grantDir, operatorLink],
+          extraWriteRoots: [grantDir],
+          ...(deniedRoots.length > 0 ? { deniedRoots } : {}),
+        }),
+        midSessionFixture,
+      );
+
+      assert.equal(opReadContent, "operator-ok\n", `${layout}: operator root outside storage must keep normal resolution`);
+      assert.ok(midReadErr, `${layout}: mid-session replaced grant dir must refuse read of stateDir/config.json`);
+      assert.ok(midWriteErr, `${layout}: mid-session replaced grant dir must refuse write under stateDir`);
+      if (layout === "data-dir") {
+        assert.ok(midReadErr.includes(DENIED_HARNESS_STATE_REASON), `${layout} mid read reason: ${midReadErr}`);
+        assert.ok(midWriteErr.includes(DENIED_HARNESS_STATE_REASON), `${layout} mid write reason: ${midWriteErr}`);
+      }
+      assert.equal(existsSync(join(fx.stateDir, "injected.txt")), false, `${layout}: mid-session write must not touch stateDir`);
+
+      // Case 2: grant dir is already replaced by a symlink to stateDir BEFORE session start; grant must be dropped.
+      let preReadErr = "";
+      let preWriteErr = "";
+      let seenAdditionalDirs: string[] | undefined;
+      const preSessionFixture = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {} }))
+        .onRequest("session/new", async ({ params }) => {
+          const meta = (params as { _meta?: { claudeCode?: { options?: { additionalDirectories?: string[] } } } })._meta;
+          seenAdditionalDirs = meta?.claudeCode?.options?.additionalDirectories;
+          return {
+            sessionId: `s-d4-pre-${layout}`,
+            models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+          };
+        })
+        .onRequest("session/prompt", async ({ client, params: { sessionId } }) => {
+          try {
+            await client.request("fs/read_text_file", {
+              sessionId,
+              path: join(grantDir, "config.json"),
+            });
+          } catch (err) {
+            preReadErr = errorDetail(err);
+          }
+
+          try {
+            await client.request("fs/write_text_file", {
+              sessionId,
+              path: join(grantDir, "pre-injected.txt"),
+              content: "pwned\n",
+            });
+          } catch (err) {
+            preWriteErr = errorDetail(err);
+          }
+
+          await client.notify("session/update", {
+            sessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "done" } },
+          });
+          return { stopReason: "end_turn" };
+        });
+
+      await new AcpRunner(profile("claude")).run(
+        makeBaseRequest({
+          cwd,
+          toolPolicy: "read_write_workspace",
+          extraReadRoots: [grantDir, operatorLink],
+          extraWriteRoots: [grantDir],
+          ...(deniedRoots.length > 0 ? { deniedRoots } : {}),
+        }),
+        preSessionFixture,
+      );
+
+      assert.ok(preReadErr, `${layout}: pre-session replaced grant dir must be dropped and refuse read`);
+      assert.ok(preWriteErr, `${layout}: pre-session replaced grant dir must be dropped and refuse write`);
+      assert.equal(existsSync(join(fx.stateDir, "pre-injected.txt")), false, `${layout}: pre-session write must not touch stateDir`);
+      assert.equal(
+        (seenAdditionalDirs ?? []).includes(fx.stateDir),
+        false,
+        `${layout}: dropped symlinked grant must not advertise stateDir in additionalDirectories: ${JSON.stringify(seenAdditionalDirs)}`,
+      );
+      assert.equal(
+        (seenAdditionalDirs ?? []).includes(grantDir),
+        false,
+        `${layout}: dropped symlinked grant must not remain in additionalDirectories: ${JSON.stringify(seenAdditionalDirs)}`,
+      );
+      assert.equal(
+        (seenAdditionalDirs ?? []).includes(operatorTarget),
+        true,
+        `${layout}: operator root outside storage must remain in additionalDirectories: ${JSON.stringify(seenAdditionalDirs)}`,
+      );
+    };
+
+    await runReplacementCases("data-dir");
+    await runReplacementCases("legacy");
+  });
+
+  it("D5 (C7): denies explicit shell operands/locations, dir_path native read/search, and kind=read name-only MCP calls without issuing them", async () => {
+    const fx = setupStateLayout();
+    const otherChatFile = join(fx.stateDir, "data", "projects", "p", "chats", "chat-2", "secret.txt");
+    mkdirSync(dirname(otherChatFile), { recursive: true });
+    writeFileSync(otherChatFile, "chat2-secret\n", "utf8");
+
+    type PermSpec = {
+      id: string;
+      toolCall: {
+        toolCallId: string;
+        name?: string;
+        title?: string;
+        kind: string;
+        locations?: Array<{ path: string }>;
+        rawInput?: Record<string, unknown>;
+      };
+    };
+
+    const runPermBatch = async (
+      adapter: AcpProfileConfig["adapter"],
+      reqOverrides: Partial<RunAgentRequest>,
+      specs: PermSpec[],
+    ) => {
+      const outcomes: Record<string, string> = {};
+      const issuedOps: string[] = [];
+      const events: ToolEvent[] = [];
+      const fixture = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {} }))
+        .onRequest("session/new", async () => ({
+          sessionId: `s-d5-${adapter}`,
+          models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+        }))
+        .onRequest("session/prompt", async ({ client, params: { sessionId } }) => {
+          for (const spec of specs) {
+            const outcome = permissionOutcome(
+              await client.request("session/request_permission", {
+                sessionId,
+                toolCall: spec.toolCall,
+                options: PERM_OPTIONS,
+              }),
+            );
+            outcomes[spec.id] = outcome;
+            if (outcome === "allow") {
+              issuedOps.push(spec.id);
+            }
+          }
+          await client.notify("session/update", {
+            sessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "done" } },
+          });
+          return { stopReason: "end_turn" };
+        });
+
+      await new AcpRunner(profile(adapter)).run(
+        makeBaseRequest({
+          cwd: fx.wt1,
+          toolPolicy: "read_write_workspace",
+          extraReadRoots: [fx.home, fx.goalsDir, fx.artifactsDir],
+          extraWriteRoots: [fx.goalsDir],
+          deniedRoots: [fx.stateDir],
+          callbacks: { onToolEvent: (ev) => events.push(ev) },
+          ...reqOverrides,
+        }),
+        fixture,
+      );
+      return { outcomes, issuedOps, events };
+    };
+
+    // (a) Shell requests when shell is enabled: explicit path operands and reported locations bound to cwd,
+    //     while recursive commands under an allowed ancestor stay unfiltered (B11).
+    const shellBatch = await runPermBatch("claude", {}, [
+      {
+        id: "sh-operand-sibling",
+        toolCall: {
+          toolCallId: "sh-operand-sibling",
+          title: "Bash",
+          kind: "execute",
+          rawInput: { command: "cat ../t-2/src/secret.ts" },
+        },
+      },
+      {
+        id: "sh-operand-cwd-bound",
+        toolCall: {
+          toolCallId: "sh-operand-cwd-bound",
+          title: "Bash",
+          kind: "execute",
+          rawInput: { command: "cat .pi-harness/config.json", cwd: fx.home },
+        },
+      },
+      {
+        id: "sh-location-denied",
+        toolCall: {
+          toolCallId: "sh-location-denied",
+          title: "Bash",
+          kind: "execute",
+          locations: [{ path: fx.cfgFile }],
+          rawInput: { command: "echo inspect", cwd: fx.wt1 },
+        },
+      },
+      {
+        id: "sh-allow-ws",
+        toolCall: {
+          toolCallId: "sh-allow-ws",
+          title: "Bash",
+          kind: "execute",
+          rawInput: { command: "cat src/worker.ts" },
+        },
+      },
+      {
+        id: "sh-allow-b11-recursive",
+        toolCall: {
+          toolCallId: "sh-allow-b11-recursive",
+          title: "Bash",
+          kind: "execute",
+          rawInput: { command: "grep -r hello .", cwd: fx.home },
+        },
+      },
+    ]);
+
+    for (const id of ["sh-operand-sibling", "sh-operand-cwd-bound", "sh-location-denied"]) {
+      assert.equal(shellBatch.outcomes[id], "deny", `D5(a) ${id} must be denied`);
+      assert.equal(shellBatch.issuedOps.includes(id), false, `D5(a) ${id} must not be issued`);
+      const ev = shellBatch.events.find((e) => e.id === id && e.status === "failed");
+      assert.equal(ev?.denied, "protected-path", `D5(a) ${id} denied rule`);
+      assert.ok(ev?.error?.includes(DENIED_HARNESS_STATE_REASON), `D5(a) ${id} reason: ${ev?.error}`);
+    }
+    for (const id of ["sh-allow-ws", "sh-allow-b11-recursive"]) {
+      assert.equal(shellBatch.outcomes[id], "allow", `D5(a) ${id} must be allowed`);
+      assert.equal(shellBatch.issuedOps.includes(id), true, `D5(a) ${id} should be issued`);
+    }
+
+    // (b) Native read or search carrying dir_path (no locations) must validate the directory like a file path.
+    const dirBatch = await runPermBatch("claude", {}, [
+      {
+        id: "search-dir-path-state",
+        toolCall: {
+          toolCallId: "search-dir-path-state",
+          title: "Search",
+          kind: "search",
+          rawInput: { dir_path: fx.stateDir, pattern: "secret" },
+        },
+      },
+      {
+        id: "read-dir-path-sibling",
+        toolCall: {
+          toolCallId: "read-dir-path-sibling",
+          title: "ListDir",
+          kind: "read",
+          rawInput: { dir_path: fx.wt2 },
+        },
+      },
+      {
+        id: "search-dir-path-goal-ok",
+        toolCall: {
+          toolCallId: "search-dir-path-goal-ok",
+          title: "Search",
+          kind: "search",
+          rawInput: { dir_path: fx.goalsDir, pattern: "Goal" },
+        },
+      },
+    ]);
+
+    for (const id of ["search-dir-path-state", "read-dir-path-sibling"]) {
+      assert.equal(dirBatch.outcomes[id], "deny", `D5(b) ${id} must be denied`);
+      assert.equal(dirBatch.issuedOps.includes(id), false, `D5(b) ${id} must not be issued`);
+      const ev = dirBatch.events.find((e) => e.id === id && e.status === "failed");
+      assert.equal(ev?.denied, "protected-path", `D5(b) ${id} denied rule`);
+      assert.ok(ev?.error?.includes(DENIED_HARNESS_STATE_REASON), `D5(b) ${id} reason: ${ev?.error}`);
+    }
+    assert.equal(dirBatch.outcomes["search-dir-path-goal-ok"], "allow");
+    assert.equal(dirBatch.issuedOps.includes("search-dir-path-goal-ok"), true);
+
+    // (c) Generic name-only MCP call reported with kind="read" must be classified as external
+    //     and inspect nested arguments/ranges via the FRc path.
+    const mcpBatch = await runPermBatch(
+      "generic",
+      {
+        tier: 3,
+        kind: "research",
+        toolPolicy: "read_only_workspace",
+        extraWriteRoots: undefined,
+        externalMcpServers: [{ name: "octofs", command: "unused", args: [] }],
+      },
+      [
+        {
+          id: "mcp-read-nested-ranges",
+          toolCall: {
+            toolCallId: "mcp-read-nested-ranges",
+            name: "mcp__octofs__view",
+            kind: "read",
+            rawInput: {
+              arguments: {
+                path: "src/worker.ts",
+                ranges: [{ path: fx.cfgFile, start: 1, end: 5 }],
+              },
+            },
+          },
+        },
+        {
+          id: "mcp-read-nested-other-chat",
+          toolCall: {
+            toolCallId: "mcp-read-nested-other-chat",
+            name: "octofs:view",
+            kind: "read",
+            rawInput: {
+              arguments: {
+                path: otherChatFile,
+              },
+            },
+          },
+        },
+        {
+          id: "mcp-read-allow-goal",
+          toolCall: {
+            toolCallId: "mcp-read-allow-goal",
+            name: "mcp__octofs__view",
+            kind: "read",
+            rawInput: {
+              arguments: {
+                path: fx.goalFile,
+                ranges: [{ path: "src/worker.ts", start: 1, end: 2 }],
+              },
+            },
+          },
+        },
+      ],
+    );
+
+    for (const id of ["mcp-read-nested-ranges", "mcp-read-nested-other-chat"]) {
+      assert.equal(mcpBatch.outcomes[id], "deny", `D5(c) ${id} must be denied`);
+      assert.equal(mcpBatch.issuedOps.includes(id), false, `D5(c) ${id} must not be issued`);
+      const ev = mcpBatch.events.find((e) => e.id === id && e.status === "failed");
+      assert.equal(ev?.denied, "protected-path", `D5(c) ${id} denied rule`);
+      assert.ok(ev?.error?.includes(DENIED_HARNESS_STATE_REASON), `D5(c) ${id} reason: ${ev?.error}`);
+    }
+    assert.equal(mcpBatch.outcomes["mcp-read-allow-goal"], "allow");
+    assert.equal(mcpBatch.issuedOps.includes("mcp-read-allow-goal"), true);
   });
 });
