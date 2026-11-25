@@ -532,4 +532,175 @@ describe("goal-42: broken ACP session detection (executor lost & unsolicited can
       rmSync(cwd, { recursive: true, force: true });
     }
   });
+
+  it("A3-P1: does not trigger acp_executor_lost on completed code_exec quoting Uncaught Error output, while still detecting real completed code_exec failure envelopes", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-g42-a3-p1-"));
+    try {
+      // Case A: Completed code_exec printing log text containing an Uncaught Error line (no thrown stack envelope)
+      // must NOT cancel the session or mark it acp_executor_lost.
+      const benignOutputs = [
+        {
+          id: "tc-code-exec-quoted-log",
+          rawOutput:
+            "2026-11-24 incident log\n" +
+            "Uncaught Error: No executor is connected to run mcp__harness__tree_view. Try again later.\n" +
+            "end of log\n",
+        },
+        {
+          id: "tc-code-exec-quoted-single-line",
+          rawOutput: "Uncaught Error: No executor is connected to run mcp__harness__tree_view. Try again later.\n",
+        },
+        {
+          id: "tc-code-exec-quoted-stack-in-log",
+          rawOutput:
+            "2026-11-24 incident log\n" +
+            "Uncaught Error: No executor is connected to run mcp__harness__tree_view. Try again later.\n" +
+            "    at callTool (code_exec:4:12)\n" +
+            "end of log\n",
+        },
+      ];
+
+      let benignCancelCount = 0;
+      const fakeBenign = agent()
+        .onRequest("initialize", async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: "amp-acp", version: "0.12.0" },
+          agentCapabilities: { sessionCapabilities: {} },
+        } as never))
+        .onRequest("session/new", async () => ({
+          sessionId: "S-g42-a3-p1-benign",
+          models: {
+            currentModelId: "anthropic/claude-opus-5-5",
+            availableModels: [{ modelId: "anthropic/claude-opus-5-5", name: "Opus" }],
+          },
+        } as never))
+        .onNotification("session/cancel", async () => {
+          benignCancelCount += 1;
+        })
+        .onRequest("session/prompt", async ({ client: acpClient }) => {
+          for (const sample of benignOutputs) {
+            await acpClient.notify("session/update", {
+              sessionId: "S-g42-a3-p1-benign",
+              update: { sessionUpdate: "tool_call", toolCallId: sample.id, title: "code_exec", status: "in_progress" },
+            } as never);
+            await acpClient.notify("session/update", {
+              sessionId: "S-g42-a3-p1-benign",
+              update: {
+                sessionUpdate: "tool_call_update",
+                toolCallId: sample.id,
+                status: "completed",
+                rawOutput: sample.rawOutput,
+              },
+            } as never);
+          }
+          await acpClient.notify("session/update", {
+            sessionId: "S-g42-a3-p1-benign",
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Printed quoted log lines." } },
+          } as never);
+          return { stopReason: "end_turn" } as never;
+        });
+
+      const benignRunner = new AcpRunner(AMP_PROFILE);
+      const benignRes = await benignRunner.run(
+        {
+          runId: "r-g42-a3-p1-benign",
+          taskId: "t-g42-a3-p1-benign",
+          tier: 1,
+          kind: "orchestrator",
+          cwd,
+          toolPolicy: "control_plane_only",
+          systemPrompt: "Orchestrator",
+          initialPrompt: "Inspect incident log via code_exec",
+          model: "anthropic/claude-opus-5-5",
+          tools: [],
+          executeTool: async () => ({}),
+          signal: new AbortController().signal,
+          callbacks: {},
+        },
+        fakeBenign,
+      );
+
+      assert.equal(benignCancelCount, 0, "completed code_exec quoting Uncaught Error log text must not send session/cancel");
+      assert.equal(benignRes.stopReason, "completed");
+      assert.equal(benignRes.errorCode, undefined);
+
+      // Case B: Real completed code_exec failure envelopes (leading uncaught error + '    at ' stack frames, or rawOutput.error)
+      // MUST still trigger acp_executor_lost.
+      const realFailures: Array<{ name: string; rawOutput: unknown }> = [
+        {
+          name: "completed code_exec with leading Uncaught Error stack trace",
+          rawOutput:
+            "Uncaught Error: No executor is connected to run mcp__harness__spawn_task. Try again later.\n" +
+            "    at callTool (code_exec:4:12)\n" +
+            "    at async main (code_exec:10:1)\n",
+        },
+        {
+          name: "completed code_exec with rawOutput.error field",
+          rawOutput: { error: "No executor is connected to run mcp__harness__tree_view. Try again later." },
+        },
+      ];
+
+      for (const tc of realFailures) {
+        let failCancelCount = 0;
+        const fakeFail = agent()
+          .onRequest("initialize", async () => ({
+            protocolVersion: 1,
+            agentInfo: { name: "amp-acp", version: "0.12.0" },
+            agentCapabilities: { sessionCapabilities: {} },
+          } as never))
+          .onRequest("session/new", async () => ({
+            sessionId: `S-g42-a3-p1-${tc.name}`,
+            models: {
+              currentModelId: "anthropic/claude-opus-5-5",
+              availableModels: [{ modelId: "anthropic/claude-opus-5-5", name: "Opus" }],
+            },
+          } as never))
+          .onNotification("session/cancel", async () => {
+            failCancelCount += 1;
+          })
+          .onRequest("session/prompt", async ({ client: acpClient }) => {
+            await acpClient.notify("session/update", {
+              sessionId: `S-g42-a3-p1-${tc.name}`,
+              update: { sessionUpdate: "tool_call", toolCallId: "tc-ce-real", title: "code_exec", status: "in_progress" },
+            } as never);
+            await acpClient.notify("session/update", {
+              sessionId: `S-g42-a3-p1-${tc.name}`,
+              update: {
+                sessionUpdate: "tool_call_update",
+                toolCallId: "tc-ce-real",
+                status: "completed",
+                rawOutput: tc.rawOutput,
+              },
+            } as never);
+            return { stopReason: "end_turn" } as never;
+          });
+
+        const failRunner = new AcpRunner(AMP_PROFILE);
+        const failRes = await failRunner.run(
+          {
+            runId: "r-g42-a3-p1-fail",
+            taskId: "t-g42-a3-p1-fail",
+            tier: 1,
+            kind: "orchestrator",
+            cwd,
+            toolPolicy: "control_plane_only",
+            systemPrompt: "Orchestrator",
+            initialPrompt: "Run code_exec",
+            model: "anthropic/claude-opus-5-5",
+            tools: [],
+            executeTool: async () => ({}),
+            signal: new AbortController().signal,
+            callbacks: {},
+          },
+          fakeFail,
+        );
+
+        assert.equal(failRes.stopReason, "error", `${tc.name}: expected stopReason='error'`);
+        assert.equal(failRes.errorCode, EXPECTED_EXECUTOR_LOST_CODE, `${tc.name}: expected acp_executor_lost`);
+        assert.ok(failCancelCount >= 1, `${tc.name}: expected session/cancel`);
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 });

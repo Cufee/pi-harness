@@ -764,4 +764,117 @@ describe("goal-42: Amp ACP steer queueing, default off, and explicit cancel", ()
       rmSync(cwd, { recursive: true, force: true });
     }
   });
+
+  it("A3-P2: preserves replacement permission-cancel outcome across steer handoff so cancelled stop is not misclassified as acp_executor_lost", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-g42-a3-p2-"));
+    try {
+      const seenPrompts: string[] = [];
+      let cancelCount = 0;
+      let observedPermOutcome: unknown;
+      let resolveTurn1!: (res: { stopReason: string }) => void;
+      const turn1Ready = Promise.withResolvers<void>();
+      const permAnswered = Promise.withResolvers<void>();
+      const releaseReplacement = Promise.withResolvers<void>();
+
+      const fakeAmp = agent()
+        .onRequest("initialize", async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: "amp-acp", version: "0.12.0" },
+          agentCapabilities: { sessionCapabilities: {} },
+        } as never))
+        .onRequest("session/new", async () => ({
+          sessionId: "S-g42-a3-p2",
+          models: {
+            currentModelId: "anthropic/claude-opus-5-5",
+            availableModels: [{ modelId: "anthropic/claude-opus-5-5", name: "Opus" }],
+          },
+        } as never))
+        .onNotification("session/cancel", async () => {
+          cancelCount += 1;
+        })
+        .onRequest("session/prompt", async ({ params, client: acpClient }) => {
+          const text = ((params as { prompt?: Array<{ text?: string }> }).prompt ?? []).map((b) => b.text ?? "").join("");
+          seenPrompts.push(text);
+          if (seenPrompts.length === 1) {
+            turn1Ready.resolve();
+            return (await new Promise<{ stopReason: string }>((r) => {
+              resolveTurn1 = r;
+            })) as never;
+          }
+          // Replacement echoes steer and requests permission offering only reject_once BEFORE old turn 1 settles.
+          await acpClient.notify("session/update", {
+            sessionId: "S-g42-a3-p2",
+            update: { sessionUpdate: "user_message_chunk", content: { type: "text", text } },
+          } as never);
+          observedPermOutcome = await acpClient.request("session/request_permission", {
+            sessionId: "S-g42-a3-p2",
+            toolCall: {
+              toolCallId: "tc-a3-p2-perm",
+              title: "Read",
+              kind: "read",
+              rawInput: { path: join(cwd, "README.md") },
+            },
+            options: [{ optionId: "deny", name: "Reject once", kind: "reject_once" }],
+          } as never);
+          permAnswered.resolve();
+          await releaseReplacement.promise;
+          return { stopReason: "cancelled" } as never;
+        });
+
+      let handle: RunnerExecutionHandle | undefined;
+      const runner = new AcpRunner(AMP_PROFILE);
+      const runPromise = runner.run(
+        {
+          runId: "r-g42-a3-p2",
+          taskId: "t-g42-a3-p2",
+          tier: 2,
+          kind: "worker",
+          cwd,
+          toolPolicy: "read_write_workspace",
+          systemPrompt: "Worker",
+          initialPrompt: "Idle turn before steer",
+          model: "anthropic/claude-opus-5-5",
+          extraEnv: { AMP_ACP_CANCEL_MODE: "steer" },
+          tools: [],
+          executeTool: async () => ({}),
+          signal: new AbortController().signal,
+          onHandle: (h) => {
+            handle = h;
+          },
+          callbacks: {},
+        },
+        fakeAmp,
+      );
+
+      await turn1Ready.promise;
+      assert.ok(handle);
+
+      // Opt-in steer while idle; replacement echoes steer and receives cancelled on reject_once-only permission.
+      const live = await handle.steer("STEER_PERMISSION_CANCEL");
+      assert.equal(live, true);
+      assert.equal(cancelCount, 1);
+
+      await permAnswered.promise;
+      assert.deepEqual(observedPermOutcome, { outcome: { outcome: "cancelled" } });
+
+      // Old prompt settles AFTER replacement already received cancelled permission outcome.
+      resolveTurn1({ stopReason: "cancelled" });
+      await Bun.sleep(25);
+
+      // Replacement now finishes with stopReason: "cancelled" because its permission request was cancelled.
+      releaseReplacement.resolve();
+
+      const res = await runPromise;
+      assert.equal(seenPrompts.length, 2);
+      assert.equal(cancelCount, 1);
+      assert.equal(res.stopReason, "cancelled");
+      assert.equal(
+        res.errorCode,
+        undefined,
+        "replacement permission-cancelled turn must not be misclassified as acp_executor_lost after handoff",
+      );
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 });

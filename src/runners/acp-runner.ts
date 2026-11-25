@@ -378,7 +378,8 @@ const EXECUTOR_LOST_START_RE =
   /^\s*(?:Uncaught\s+)?(?:(?:Tool|MCP|RPC)[^:\n]*:\s*)?(?:Error:\s*)?No executor is connected\b/i;
 const EXECUTOR_LOST_LINE_RE =
   /^\s*(?:Uncaught\s+)?(?:(?:Tool|MCP|RPC)[^:\n]*:\s*)?(?:Error:\s*)?No executor is connected\b/im;
-const EXECUTOR_LOST_UNCAUGHT_RE = /^\s*Uncaught\s+Error:\s*No executor is connected\b/im;
+const EXECUTOR_LOST_CODE_EXEC_STACK_RE =
+  /^\s*(?:Uncaught\s+)?Error:\s*No executor is connected\b[^\n]*(?:\r?\n[ \t]+at\s+\S[^\n]*)+\s*$/i;
 const EXECUTOR_LOST_TEST_NOISE_RE = /\b(?:AssertionError|bun test)\b|^\s*\d+\s*\|/m;
 const MCP_PREFIXED_TOOL_RE = /^mcp(?:__|_|[:/.])/i;
 
@@ -422,27 +423,26 @@ function isMcpOrCodeExecToolUpdate(
   return { isEligible: false, isCodeExec: false };
 }
 
-function collectToolUpdateOutputText(update: Record<string, unknown>): string {
+function collectUpdateValueText(val: unknown): string {
   const parts: string[] = [];
-  const collect = (val: unknown, depth = 0): void => {
-    if (depth > 4 || val == null) return;
-    if (typeof val === "string") {
-      if (val.trim()) parts.push(val);
+  const collect = (node: unknown, depth = 0): void => {
+    if (depth > 4 || node == null) return;
+    if (typeof node === "string") {
+      if (node.trim()) parts.push(node);
       return;
     }
-    if (Array.isArray(val)) {
-      for (const item of val) collect(item, depth + 1);
+    if (Array.isArray(node)) {
+      for (const item of node) collect(item, depth + 1);
       return;
     }
-    if (typeof val === "object") {
-      const obj = val as Record<string, unknown>;
+    if (typeof node === "object") {
+      const obj = node as Record<string, unknown>;
       for (const key of ["text", "error", "message", "stderr", "output", "result", "content"]) {
         if (key in obj) collect(obj[key], depth + 1);
       }
     }
   };
-  collect(update.rawOutput);
-  collect(update.content);
+  collect(val);
   return parts.join("\n").trim();
 }
 
@@ -464,38 +464,50 @@ function detectExecutorLostToolUpdate(
     provenance.externalMcpNames,
   );
   if (!isEligible) return null;
-  const text = collectToolUpdateOutputText(update);
-  if (!text || !EXECUTOR_LOST_RE.test(text) || EXECUTOR_LOST_TEST_NOISE_RE.test(text)) return null;
+  const candidates = [collectUpdateValueText(update.rawOutput), collectUpdateValueText(update.content)].filter(Boolean);
+  if (candidates.length === 0) return null;
+  const combinedText = candidates.join("\n");
+  if (!EXECUTOR_LOST_RE.test(combinedText) || EXECUTOR_LOST_TEST_NOISE_RE.test(combinedText)) return null;
   const rawOut = update.rawOutput;
-  const rawOutIsError = Boolean(
-    rawOut &&
-      typeof rawOut === "object" &&
-      ((rawOut as { isError?: unknown }).isError === true ||
-        typeof (rawOut as { error?: unknown }).error === "string"),
-  );
-  const isErrorShape = status === "failed" || rawOutIsError;
-  if (isErrorShape) {
-    const lineMatch = text.match(EXECUTOR_LOST_LINE_RE);
+  const rawOutObj = rawOut && typeof rawOut === "object" ? (rawOut as Record<string, unknown>) : null;
+  const rawOutErrorField =
+    rawOutObj && typeof rawOutObj.error === "string" && rawOutObj.error.trim().length > 0
+      ? rawOutObj.error.trim()
+      : null;
+  if (rawOutErrorField && EXECUTOR_LOST_RE.test(rawOutErrorField) && !EXECUTOR_LOST_TEST_NOISE_RE.test(rawOutErrorField)) {
+    const lineMatch = rawOutErrorField.match(EXECUTOR_LOST_LINE_RE);
     if (lineMatch) {
       const start = lineMatch.index ?? 0;
-      return text.slice(start, start + 220).trim();
+      return rawOutErrorField.slice(start, start + 220).trim();
     }
-    if (text.length <= 500) {
-      return text.slice(0, 220);
+    if (rawOutErrorField.length <= 500) {
+      return rawOutErrorField.slice(0, 220);
+    }
+  }
+  const isErrorShape = status === "failed" || rawOutObj?.isError === true;
+  if (isErrorShape) {
+    for (const text of candidates) {
+      const lineMatch = text.match(EXECUTOR_LOST_LINE_RE);
+      if (lineMatch) {
+        const start = lineMatch.index ?? 0;
+        return text.slice(start, start + 220).trim();
+      }
+      if (text.length <= 500 && EXECUTOR_LOST_RE.test(text)) {
+        return text.slice(0, 220);
+      }
     }
     return null;
   }
-  // Retain Amp's completed-MCP error shape (short error-only output starting with the executor-lost
-  // message) and code_exec uncaught stack traces without matching arbitrary tool output.
+  // For completed updates without an error envelope: non-code_exec MCP tools may return a short
+  // error-only message; code_exec must match a leading uncaught error with indented stack frames
+  // so quoted log text printed to stdout never kills a healthy session.
   if (status === "completed") {
-    if (text.length <= 500 && EXECUTOR_LOST_START_RE.test(text)) {
-      return text.slice(0, 220).trim();
-    }
-    if (isCodeExec) {
-      const uncaughtMatch = text.match(EXECUTOR_LOST_UNCAUGHT_RE);
-      if (uncaughtMatch) {
-        const start = uncaughtMatch.index ?? 0;
-        return text.slice(start, start + 220).trim();
+    for (const text of candidates) {
+      if (!isCodeExec && text.length <= 500 && EXECUTOR_LOST_START_RE.test(text)) {
+        return text.slice(0, 220).trim();
+      }
+      if (EXECUTOR_LOST_CODE_EXEC_STACK_RE.test(text)) {
+        return text.slice(0, 220).trim();
       }
     }
   }
@@ -725,6 +737,8 @@ export class AcpRunner {
       ackTimeoutDeferred: boolean;
       replacementInFlightToolCalls: Set<string>;
       replacementAnonymousInFlightToolCalls: number;
+      replacementPermissionCancelled: boolean;
+      replacementDeniedTools: string[];
       message: string;
       userEchoText: string;
       settleAck: (live: boolean) => void;
@@ -923,6 +937,8 @@ export class AcpRunner {
         ackTimeoutDeferred: false,
         replacementInFlightToolCalls: new Set<string>(),
         replacementAnonymousInFlightToolCalls: 0,
+        replacementPermissionCancelled: false,
+        replacementDeniedTools: [],
         message,
         userEchoText: "",
         settleAck: (live: boolean) => {
@@ -2159,6 +2175,9 @@ export class AcpRunner {
             ),
           );
           turnDeniedTools.push(deniedText);
+          if (steerHandoff.pending?.replacementSent) {
+            steerHandoff.pending.replacementDeniedTools.push(deniedText);
+          }
           allToolFailures.push(deniedText);
           req.callbacks.onToolEvent?.({
             id: callId,
@@ -2171,7 +2190,12 @@ export class AcpRunner {
             error: deniedText,
             denied: deniedRule,
           });
-          if (!denyOpt) turnPermissionCancelled = true;
+          if (!denyOpt) {
+            turnPermissionCancelled = true;
+            if (steerHandoff.pending?.replacementSent) {
+              steerHandoff.pending.replacementPermissionCancelled = true;
+            }
+          }
           return (
             denyOpt
               ? { outcome: { outcome: "selected", optionId: denyOpt.optionId } }
@@ -2183,6 +2207,9 @@ export class AcpRunner {
           return { outcome: { outcome: "selected", optionId: allowOpt.optionId } } as never;
         }
         turnPermissionCancelled = true;
+        if (steerHandoff.pending?.replacementSent) {
+          steerHandoff.pending.replacementPermissionCancelled = true;
+        }
         return { outcome: { outcome: "cancelled" } } as never;
       })
       .onRequest("fs/read_text_file", async ({ params }) => {
@@ -2434,7 +2461,7 @@ export class AcpRunner {
           steerHandoff.ack?.resumeDeferredAckTimeout?.();
         }
         turnFailedTools = [];
-        turnDeniedTools = [];
+        turnDeniedTools = resumingSteerHandoff ? [...resumingSteerHandoff.replacementDeniedTools] : [];
         turnSucceededTools = 0;
         turnToolCalls = 0;
         turnHarnessToolCallObserved = false;
@@ -2442,7 +2469,7 @@ export class AcpRunner {
         textSinceLastTool = "";
         steerHandoff.cancelIssuedForTurn = false;
         harnessCancelIssuedForTurn = false;
-        turnPermissionCancelled = false;
+        turnPermissionCancelled = Boolean(resumingSteerHandoff?.replacementPermissionCancelled);
 
         promptInFlight = true;
         try {
