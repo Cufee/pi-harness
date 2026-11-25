@@ -3,7 +3,7 @@ import { deniedNotice, HarnessRejection, rejection, REJECTIONS } from "../adviso
 import { toolEventPreview } from "../protocol/tool-display.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, realpath, stat } from "node:fs/promises";
+import { lstat, mkdir, open, readlink, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -180,6 +180,183 @@ async function canonicalizeMissingPath(absolute: string): Promise<string> {
   }
 }
 
+const SHELL_CWD_KEYS = [
+  "cwd",
+  "workdir",
+  "working_directory",
+  "workingDirectory",
+  "directory",
+  "dir",
+  "dir_path",
+  "Cwd",
+] as const;
+
+const WRITABLE_OTHER_PATH_KEYS = [
+  "path",
+  "file_path",
+  "filePath",
+  "target_file",
+  "target_path",
+  "targetPath",
+  "TargetFile",
+  "AbsolutePath",
+  "notebook_path",
+  "old_path",
+  "new_path",
+  "source",
+  "destination",
+  "directory",
+  "dir",
+  "dir_path",
+  "cwd",
+  "workdir",
+  "working_directory",
+  "workingDirectory",
+  "SearchPath",
+  "search_path",
+  "Cwd",
+] as const;
+
+const WRITABLE_OTHER_PATH_ARRAY_KEYS = ["paths", "files"] as const;
+
+function extractWritableOtherTargets(
+  locations: ReadonlyArray<{ path?: unknown }> | undefined,
+  rawInput: Record<string, unknown> | undefined,
+): string[] {
+  const targets: string[] = [];
+  for (const loc of locations ?? []) {
+    if (typeof loc?.path === "string" && loc.path.trim().length > 0) {
+      targets.push(loc.path.trim());
+    }
+  }
+  if (rawInput) {
+    for (const key of WRITABLE_OTHER_PATH_KEYS) {
+      const val = rawInput[key];
+      if (typeof val === "string" && val.trim().length > 0) {
+        targets.push(val.trim());
+      }
+    }
+    for (const key of WRITABLE_OTHER_PATH_ARRAY_KEYS) {
+      const val = rawInput[key];
+      if (Array.isArray(val)) {
+        for (const item of val) {
+          if (typeof item === "string" && item.trim().length > 0) {
+            targets.push(item.trim());
+          }
+        }
+      }
+    }
+  }
+  return targets;
+}
+
+function resolvePermissionPath(workspace: string, rawPath: string): string {
+  const trimmed = rawPath.trim();
+  if (trimmed === "~") return homedir();
+  if (trimmed.startsWith("~/")) return resolve(homedir(), trimmed.slice(2));
+  return isAbsolute(trimmed) ? resolve(trimmed) : resolve(workspace, trimmed);
+}
+
+/**
+ * Resolves a permission path to its canonical form, following intermediate and dangling symlinks
+ * so targets pointing into denied or protected roots cannot hide behind a missing leaf.
+ */
+async function canonicalizePermissionPath(absolute: string): Promise<string> {
+  const seen = new Set<string>();
+  let current = resolve(absolute);
+  for (let hops = 0; hops < 16; hops++) {
+    try {
+      return await realpath(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        return current;
+      }
+    }
+    const missing: string[] = [];
+    let cursor = current;
+    let followedLink: string | null = null;
+    while (true) {
+      const entry = await lstat(cursor).catch(() => undefined);
+      if (entry) {
+        if (entry.isSymbolicLink()) {
+          const linkTarget = await readlink(cursor).catch(() => undefined);
+          if (linkTarget) {
+            const resolvedParent = await realpath(dirname(cursor)).catch(() => dirname(cursor));
+            const next = resolve(resolvedParent, linkTarget, ...missing);
+            if (!seen.has(next)) {
+              seen.add(next);
+              followedLink = next;
+            }
+          }
+        }
+        if (!followedLink) {
+          const real = await realpath(cursor).catch(() => cursor);
+          return resolve(real, ...missing);
+        }
+        break;
+      }
+      const parent = dirname(cursor);
+      if (parent === cursor) return resolve(cursor, ...missing);
+      missing.unshift(basename(cursor));
+      cursor = parent;
+    }
+    if (!followedLink) return current;
+    current = followedLink;
+  }
+  return current;
+}
+
+/**
+ * Evaluates a permission-request path against denied roots (Rule A3) and protected paths while
+ * leaving unrelated outside paths (such as temp directories) approved.
+ */
+async function checkDeniedOrProtectedPath(
+  workspace: string,
+  allowedRoots: readonly string[],
+  deniedRoots: readonly string[],
+  protectedRoots: readonly string[],
+  rawPath: string,
+  opts: { checkProtectedWorktree: boolean },
+): Promise<HarnessRejection | null> {
+  const lexical = resolvePermissionPath(workspace, rawPath);
+  const canonical = await canonicalizePermissionPath(lexical);
+  const allowedSet = new Set(allowedRoots.map((r) => resolve(r)));
+  const explicitProtectedDenied: string[] = [];
+  for (const pRoot of protectedRoots) {
+    const resolvedPRoot = resolve(pRoot);
+    if (!allowedSet.has(resolvedPRoot)) {
+      explicitProtectedDenied.push(resolvedPRoot);
+    }
+  }
+
+  if (deniedRoots.length > 0) {
+    const decision = mostSpecificRootDecision(canonical, allowedRoots, deniedRoots);
+    if (!decision.allowed && decision.reason === "denied") {
+      return DENIED_HARNESS_STATE_ERROR(canonical, workspace);
+    }
+  }
+
+  if (explicitProtectedDenied.length > 0) {
+    const protDecision = mostSpecificRootDecision(canonical, allowedRoots, explicitProtectedDenied);
+    if (!protDecision.allowed && protDecision.reason === "denied") {
+      return REJECTIONS.protectedPath(canonical, workspace);
+    }
+  }
+
+  if (opts.checkProtectedWorktree) {
+    const decision = mostSpecificRootDecision(canonical, allowedRoots, []);
+    const ownRoot = decision.allowed ? decision.root : workspace;
+    if (
+      legacyStoragePaths.isProtectedWorktreePath(lexical, ownRoot) ||
+      legacyStoragePaths.isProtectedWorktreePath(canonical, ownRoot)
+    ) {
+      return REJECTIONS.protectedPath(canonical, workspace);
+    }
+  }
+
+  return null;
+}
+
 function requireWorkspacePath(
   root: string,
   path: string,
@@ -330,45 +507,40 @@ async function resolveAllowedTarget(
     }
   };
 
-  let firstErr: unknown;
-  for (const root of allowedRoots) {
-    const readProtectedForRoot =
-      protectReads === "all" ||
-      (protectReads === "extra" && root !== primaryCanonical) ||
-      explicitProtectedAllowed.has(resolve(root));
-    // Refuse protected targets before any side effect, checking the lexical path first and the canonical
-    // path once resolved. A protected or harness-state hit is final and never falls through to later roots.
-    const lexical = resolve(root, requested);
-    const lexicalDecision = mostSpecificRootDecision(lexical, allowedRoots, deniedRoots);
-    if (lexicalDecision.allowed) {
-      if (lexicalDecision.root === root) {
-        checkProtected(lexical, lexicalDecision.root, requested);
+  // Resolve relative inputs once against the primary workspace root so the same input cannot
+  // be retried against extra roots and match a different path than the adapter operates on.
+  const lexical = isAbsolute(requested) ? resolve(requested) : resolve(primaryCanonical, requested);
+  const readProtectedForPrimary =
+    protectReads === "all" ||
+    explicitProtectedAllowed.has(resolve(primaryCanonical));
+  // Refuse protected targets before any side effect, checking the lexical path first and the canonical
+  // path once resolved.
+  const lexicalDecision = mostSpecificRootDecision(lexical, allowedRoots, deniedRoots);
+  if (lexicalDecision.allowed) {
+    checkProtected(lexical, lexicalDecision.root, requested);
+  } else if (
+    lexicalDecision.reason !== "denied" &&
+    (protectWrites || readProtectedForPrimary) &&
+    lexical.split(sep).some((segment) => segment.toLowerCase() === ".git")
+  ) {
+    throw (protectWrites ? PROTECTED_WRITE_ERROR : PROTECTED_READ_ERROR)(requested, primaryCanonical);
+  }
+  let target: { path: string; exists: boolean; admittingRoot: string };
+  try {
+    target = await workspaceTarget(primaryCanonical, requested, allowNew, allowedRoots, deniedRoots);
+  } catch (err) {
+    if (isHarnessStateRejection(err)) throw err;
+    if (explicitProtectedDenied.length > 0) {
+      const canonicalMissing = await canonicalizeMissingPath(lexical);
+      const protDecision = mostSpecificRootDecision(canonicalMissing, allowedRoots, explicitProtectedDenied);
+      if (!protDecision.allowed && protDecision.reason === "denied") {
+        throw (protectWrites ? PROTECTED_WRITE_ERROR : PROTECTED_READ_ERROR)(canonicalMissing, primaryCanonical);
       }
-    } else if (
-      (protectWrites || readProtectedForRoot) &&
-      lexical.split(sep).some((segment) => segment.toLowerCase() === ".git")
-    ) {
-      throw (protectWrites ? PROTECTED_WRITE_ERROR : PROTECTED_READ_ERROR)(requested, root);
     }
-    let target: { path: string; exists: boolean; admittingRoot: string };
-    try {
-      target = await workspaceTarget(root, requested, allowNew, allowedRoots, deniedRoots);
-    } catch (err) {
-      if (isHarnessStateRejection(err)) throw err;
-      if (!firstErr) firstErr = err;
-      continue;
-    }
-    checkProtected(target.path, target.admittingRoot);
-    return { path: target.path, exists: target.exists, root: target.admittingRoot };
+    throw err;
   }
-  if (explicitProtectedDenied.length > 0 && isAbsolute(requested)) {
-    const canonicalMissing = await canonicalizeMissingPath(resolve(requested));
-    const protDecision = mostSpecificRootDecision(canonicalMissing, allowedRoots, explicitProtectedDenied);
-    if (!protDecision.allowed && protDecision.reason === "denied") {
-      throw (protectWrites ? PROTECTED_WRITE_ERROR : PROTECTED_READ_ERROR)(canonicalMissing, primaryCanonical);
-    }
-  }
-  throw firstErr ?? REJECTIONS.outsideRoots(requested, primaryCanonical);
+  checkProtected(target.path, target.admittingRoot);
+  return { path: target.path, exists: target.exists, root: target.admittingRoot };
 }
 
 const PROTECTED_WRITE_ERROR = (path: string, root: string) => REJECTIONS.protectedPath(path, root);
@@ -2227,7 +2399,7 @@ export class AcpRunner {
         // The shell's working directory: the workspace unless the call names one, which must itself be inside
         // an allowed read root. Returns undefined when the named directory is not provably inside.
         const resolveShellCwd = async (): Promise<string | undefined> => {
-          const named = ["cwd", "workdir", "directory", "dir"].map((key) => rawInput?.[key]).filter((v) => v !== undefined);
+          const named = SHELL_CWD_KEYS.map((key) => rawInput?.[key]).filter((v) => v !== undefined);
           if (named.length === 0) return workspace;
           if (named.length > 1 || typeof named[0] !== "string" || !named[0]) return undefined;
           try {
@@ -2247,6 +2419,8 @@ export class AcpRunner {
         let workspaceCall = false;
         let writeDenialRule: "protected-path" | "outside-roots" | undefined;
         let writeDenialRejection: HarnessRejection | undefined;
+        let execDenialRule: "protected-path" | undefined;
+        let execDenialRejection: HarnessRejection | undefined;
         // Allow native workspace reads/searches, read-only shell inspection commands, writes (when canWrite),
         // and full shell commands (when allowShell) for non-control-plane agents.
         if (!controlOnly && !claude?.mcpServer && !p._meta?.is_mcp_tool_approval && !geminiMcp) {
@@ -2274,7 +2448,28 @@ export class AcpRunner {
             }
           } else if (isExecute) {
             if (allowShell) {
+              const namedCwds = SHELL_CWD_KEYS.map((key) => rawInput?.[key]).filter(
+                (v): v is string => typeof v === "string" && v.trim().length > 0,
+              );
+              const shellAllowedRoots = [workspace, ...extraReadRoots];
+              const checkProtectedWorktree = deniedRoots.length > 0 || requestProtectedRoots.length > 0;
               workspaceCall = true;
+              for (const rawCwd of namedCwds) {
+                const denied = await checkDeniedOrProtectedPath(
+                  workspace,
+                  shellAllowedRoots,
+                  deniedRoots,
+                  requestProtectedRoots,
+                  rawCwd,
+                  { checkProtectedWorktree },
+                );
+                if (denied) {
+                  execDenialRule = "protected-path";
+                  execDenialRejection = denied;
+                  workspaceCall = false;
+                  break;
+                }
+              }
             } else {
               const cmd = extractShellCommand();
               const shellCwd = cmd.length > 0 ? await resolveShellCwd() : undefined;
@@ -2301,8 +2496,34 @@ export class AcpRunner {
             }
           } else if (toolKind === "think") {
             workspaceCall = true;
-          } else if (canWrite && (toolKind === "fetch" || toolKind === "other" || toolKind === undefined)) {
+          } else if (canWrite && toolKind === "fetch") {
             workspaceCall = true;
+          } else if (canWrite && (toolKind === "other" || toolKind === undefined)) {
+            const isReadOnlyOther = READ_ONLY_OTHER_TOOL_RE.test(rawCandidateName.trim());
+            const otherTargets = extractWritableOtherTargets(p.toolCall?.locations, rawInput);
+            const otherAllowedRoots = isReadOnlyOther ? [workspace, ...extraReadRoots] : [workspace, ...extraWriteRoots];
+            workspaceCall = true;
+            for (const rawTarget of otherTargets) {
+              const denied = await checkDeniedOrProtectedPath(
+                workspace,
+                otherAllowedRoots,
+                deniedRoots,
+                requestProtectedRoots,
+                rawTarget,
+                { checkProtectedWorktree: !isReadOnlyOther },
+              );
+              if (denied) {
+                if (isReadOnlyOther) {
+                  readDenialRule = "protected-path";
+                  readDenialRejection = denied;
+                } else {
+                  writeDenialRule = "protected-path";
+                  writeDenialRejection = denied;
+                }
+                workspaceCall = false;
+                break;
+              }
+            }
           } else if ((toolKind === "other" || toolKind === undefined) && READ_ONLY_OTHER_TOOL_RE.test(rawCandidateName.trim())) {
             workspaceCall = await validateReadLocations();
           }
@@ -2334,7 +2555,12 @@ export class AcpRunner {
             deniedRule = "read-only-mcp";
             deniedArgs = { ...deniedArgs, server: deniedExternalMcp.server, tool: deniedExternalMcp.tool };
           } else if (!controlOnly && !claude?.mcpServer && !p._meta?.is_mcp_tool_approval && !geminiMcp && isExecute) {
-            deniedRule = "read-only-shell";
+            if (execDenialRule) {
+              deniedRule = execDenialRule;
+              denialNoticeOverride = execDenialRejection;
+            } else {
+              deniedRule = "read-only-shell";
+            }
             const shellCmd = extractShellCommand();
             if (shellCmd) deniedArgs = { ...deniedArgs, command: shellCmd };
           } else if (!controlOnly && !claude?.mcpServer && !p._meta?.is_mcp_tool_approval && !geminiMcp && isWrite) {
@@ -2349,6 +2575,17 @@ export class AcpRunner {
           ) {
             deniedRule = readDenialRule ?? "outside-roots";
             denialNoticeOverride = readDenialRejection;
+          } else if (
+            !controlOnly &&
+            !claude?.mcpServer &&
+            !p._meta?.is_mcp_tool_approval &&
+            !geminiMcp &&
+            canWrite &&
+            (toolKind === "other" || toolKind === undefined) &&
+            writeDenialRule
+          ) {
+            deniedRule = writeDenialRule;
+            denialNoticeOverride = writeDenialRejection;
           } else {
             deniedRule = "tool-policy";
             deniedArgs = { ...deniedArgs, mode: req.toolPolicy };

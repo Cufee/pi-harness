@@ -762,4 +762,492 @@ app.connect(ndJsonStream(Writable.toWeb(process.stdout) as unknown as WritableSt
     assert.equal(toolEvents[0]?.denied, "outside-roots");
     assert.equal(toolEvents[0]?.error, expectedMsg);
   });
+
+  it("R3: resolves relative permission paths once against the workspace for shell cwd and writes instead of retrying extra roots", async () => {
+    const fx = setupStateLayout();
+    const outsideDir = makeTempDir("acp-r3-outside-");
+    const outsideFile = join(outsideDir, "secret.txt");
+    writeFileSync(outsideFile, "do-not-touch\n", "utf8");
+
+    // Create a subdir and a nested write root under extra roots so retrying relative inputs against extra roots
+    // would match a different path than the adapter's workspace cwd.
+    const extraOnlySubdir = join(fx.goalsDir, "only-in-extra");
+    mkdirSync(extraOnlySubdir, { recursive: true });
+    const nestedGoalDir = join(fx.goalsDir, "nested");
+    mkdirSync(nestedGoalDir, { recursive: true });
+    writeFileSync(join(extraOnlySubdir, "note.md"), "extra-note\n", "utf8");
+
+    // In workspace, `escape-link` is a symlink to an outside file, and `escape-dir` is a symlink to outsideDir.
+    symlinkSync(outsideFile, join(fx.workspace, "escape-link"));
+    symlinkSync(outsideDir, join(fx.workspace, "escape-dir"));
+    mkdirSync(join(fx.goalsDir, "escape-dir"), { recursive: true });
+
+    let roCwdExtraOnly = "";
+    let roCwdSymlinkEscape = "";
+    let roCwdWorkspaceSub = "";
+    let roCwdAbsExtra = "";
+    let rwEditSymlinkEscape = "";
+    let rwEditDotDotRetry = "";
+    let rwEditWorkspaceRel = "";
+    let rwEditAbsExtra = "";
+
+    const roFixture = agent()
+      .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {} }))
+      .onRequest("session/new", async () => ({
+        sessionId: "s-r3-ro",
+        models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+      }))
+      .onRequest("session/prompt", async ({ client, params: { sessionId } }) => {
+        roCwdExtraOnly = permissionOutcome(
+          await client.request("session/request_permission", {
+            sessionId,
+            toolCall: {
+              toolCallId: "r3-cwd-extra-only",
+              title: "Bash",
+              kind: "execute",
+              rawInput: { command: "ls", cwd: "only-in-extra" },
+            },
+            options: PERM_OPTIONS,
+          }),
+        );
+        roCwdSymlinkEscape = permissionOutcome(
+          await client.request("session/request_permission", {
+            sessionId,
+            toolCall: {
+              toolCallId: "r3-cwd-sym-escape",
+              title: "Bash",
+              kind: "execute",
+              rawInput: { command: "ls", cwd: "escape-dir" },
+            },
+            options: PERM_OPTIONS,
+          }),
+        );
+        roCwdWorkspaceSub = permissionOutcome(
+          await client.request("session/request_permission", {
+            sessionId,
+            toolCall: {
+              toolCallId: "r3-cwd-ws-sub",
+              title: "Bash",
+              kind: "execute",
+              rawInput: { command: "ls", cwd: "src" },
+            },
+            options: PERM_OPTIONS,
+          }),
+        );
+        roCwdAbsExtra = permissionOutcome(
+          await client.request("session/request_permission", {
+            sessionId,
+            toolCall: {
+              toolCallId: "r3-cwd-abs-extra",
+              title: "Bash",
+              kind: "execute",
+              rawInput: { command: "ls", cwd: extraOnlySubdir },
+            },
+            options: PERM_OPTIONS,
+          }),
+        );
+        await client.notify("session/update", {
+          sessionId,
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } },
+        });
+        return { stopReason: "end_turn" };
+      });
+
+    await new AcpRunner(profile("claude")).run(
+      makeBaseRequest({
+        cwd: fx.workspace,
+        tier: 3,
+        kind: "research",
+        toolPolicy: "read_only_workspace",
+        extraReadRoots: [fx.goalsDir],
+      }),
+      roFixture,
+    );
+
+    const rwFixture = agent()
+      .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {} }))
+      .onRequest("session/new", async () => ({
+        sessionId: "s-r3-rw",
+        models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+      }))
+      .onRequest("session/prompt", async ({ client, params: { sessionId } }) => {
+        // `escape-link` inside workspace points outside; retrying against extraWriteRoots would see a missing new file there.
+        rwEditSymlinkEscape = permissionOutcome(
+          await client.request("session/request_permission", {
+            sessionId,
+            toolCall: {
+              toolCallId: "r3-edit-sym",
+              title: "Edit",
+              kind: "edit",
+              locations: [{ path: "escape-link" }],
+              rawInput: { file_path: "escape-link" },
+            },
+            options: PERM_OPTIONS,
+          }),
+        );
+        // `../escaped.md` escapes workspace; retrying against nestedGoalDir would land inside fx.goalsDir.
+        rwEditDotDotRetry = permissionOutcome(
+          await client.request("session/request_permission", {
+            sessionId,
+            toolCall: {
+              toolCallId: "r3-edit-dotdot",
+              title: "Edit",
+              kind: "edit",
+              locations: [{ path: "../escaped.md" }],
+              rawInput: { file_path: "../escaped.md" },
+            },
+            options: PERM_OPTIONS,
+          }),
+        );
+        rwEditWorkspaceRel = permissionOutcome(
+          await client.request("session/request_permission", {
+            sessionId,
+            toolCall: {
+              toolCallId: "r3-edit-ws-rel",
+              title: "Edit",
+              kind: "edit",
+              locations: [{ path: "src/app.ts" }],
+              rawInput: { file_path: "src/app.ts" },
+            },
+            options: PERM_OPTIONS,
+          }),
+        );
+        rwEditAbsExtra = permissionOutcome(
+          await client.request("session/request_permission", {
+            sessionId,
+            toolCall: {
+              toolCallId: "r3-edit-abs-extra",
+              title: "Edit",
+              kind: "edit",
+              locations: [{ path: join(fx.goalsDir, "new-ev.md") }],
+              rawInput: { file_path: join(fx.goalsDir, "new-ev.md") },
+            },
+            options: PERM_OPTIONS,
+          }),
+        );
+        await client.notify("session/update", {
+          sessionId,
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } },
+        });
+        return { stopReason: "end_turn" };
+      });
+
+    await new AcpRunner(profile("claude")).run(
+      makeBaseRequest({
+        cwd: fx.workspace,
+        toolPolicy: "read_write_workspace",
+        extraWriteRoots: [nestedGoalDir, fx.goalsDir],
+      }),
+      rwFixture,
+    );
+
+    assert.equal(roCwdExtraOnly, "deny");
+    assert.equal(roCwdSymlinkEscape, "deny");
+    assert.equal(roCwdWorkspaceSub, "allow");
+    assert.equal(roCwdAbsExtra, "allow");
+    assert.equal(rwEditSymlinkEscape, "deny");
+    assert.equal(rwEditDotDotRetry, "deny");
+    assert.equal(rwEditWorkspaceRel, "allow");
+    assert.equal(rwEditAbsExtra, "allow");
+  });
+
+  it("R1: refuses execute permissions with explicit cwd in denied roots or protected worktrees/scratch for workers and shell-enabled read-only tasks", async () => {
+    const fx = setupStateLayout();
+    const otherChatGoals = join(fx.stateDir, "data", "projects", "p", "chats", "chat-2", "goals", "goal-2");
+    const scratchDir = join(fx.stateDir, "data", "projects", "p", "scratch", "_verify", "v-1");
+    const stateInstallDir = join(fx.stateDir, "install");
+    const outsideDir = makeTempDir("acp-r1-outside-");
+    mkdirSync(otherChatGoals, { recursive: true });
+    mkdirSync(scratchDir, { recursive: true });
+    mkdirSync(stateInstallDir, { recursive: true });
+    const stateSymlink = join(fx.wt1, "link-state");
+    symlinkSync(fx.stateDir, stateSymlink);
+
+    const runExecChecks = async (reqOverrides: Partial<RunAgentRequest>, checks: Array<{ id: string; rawInput?: Record<string, unknown> }>) => {
+      const outcomes: Record<string, string> = {};
+      const events: ToolEvent[] = [];
+      const fixture = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {} }))
+        .onRequest("session/new", async () => ({
+          sessionId: "s-r1",
+          models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+        }))
+        .onRequest("session/prompt", async ({ client, params: { sessionId } }) => {
+          for (const c of checks) {
+            outcomes[c.id] = permissionOutcome(
+              await client.request("session/request_permission", {
+                sessionId,
+                toolCall: {
+                  toolCallId: c.id,
+                  title: "Bash",
+                  kind: "execute",
+                  ...(c.rawInput ? { rawInput: c.rawInput } : {}),
+                },
+                options: PERM_OPTIONS,
+              }),
+            );
+          }
+          await client.notify("session/update", {
+            sessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } },
+          });
+          return { stopReason: "end_turn" };
+        });
+
+      await new AcpRunner(profile("claude")).run(
+        makeBaseRequest({
+          cwd: fx.wt1,
+          callbacks: { onToolEvent: (ev) => events.push(ev) },
+          ...reqOverrides,
+        }),
+        fixture,
+      );
+      return { outcomes, events };
+    };
+
+    const dataDirChecks = [
+      { id: "denied-state-root", rawInput: { command: "ls", cwd: fx.stateDir } },
+      { id: "denied-state-install", rawInput: { command: "ls", cwd: stateInstallDir } },
+      { id: "denied-other-chat", rawInput: { command: "ls", workdir: otherChatGoals } },
+      { id: "denied-sibling-wt", rawInput: { command: "ls", directory: fx.wt2 } },
+      { id: "denied-scratch", rawInput: { command: "ls", dir_path: scratchDir } },
+      { id: "denied-symlink", rawInput: { command: "ls", Cwd: stateSymlink } },
+      { id: "denied-relative-sibling", rawInput: { command: "ls", working_directory: "../t-2" } },
+      { id: "allow-no-cwd", rawInput: { command: "bun test" } },
+      { id: "allow-own-wt", rawInput: { command: "bun test", cwd: fx.wt1 } },
+      { id: "allow-own-sub", rawInput: { command: "bun test", cwd: "src" } },
+      { id: "allow-granted-goal", rawInput: { command: "ls", workdir: fx.goalsDir } },
+      { id: "allow-granted-art", rawInput: { command: "ls", workingDirectory: fx.artifactsDir } },
+      { id: "allow-outside-tmp", rawInput: { command: "ls", cwd: outsideDir } },
+    ];
+
+    // 1. Writable worker in data-dir layout
+    const workerRes = await runExecChecks(
+      {
+        toolPolicy: "read_write_workspace",
+        extraReadRoots: [fx.goalsDir, fx.artifactsDir],
+        extraWriteRoots: [fx.goalsDir],
+        deniedRoots: [fx.stateDir],
+      },
+      dataDirChecks,
+    );
+
+    // 2. Shell-enabled read-only verify / isolated Done-Reviewer in data-dir layout
+    const verifyRes = await runExecChecks(
+      {
+        tier: 3,
+        kind: "verify",
+        toolPolicy: "read_only_workspace",
+        allowShellInReadOnly: true,
+        extraReadRoots: [fx.goalsDir, fx.artifactsDir],
+        deniedRoots: [fx.stateDir],
+      },
+      dataDirChecks,
+    );
+
+    for (const [label, res] of [
+      ["worker", workerRes],
+      ["verify", verifyRes],
+    ] as const) {
+      for (const id of [
+        "denied-state-root",
+        "denied-state-install",
+        "denied-other-chat",
+        "denied-sibling-wt",
+        "denied-scratch",
+        "denied-symlink",
+        "denied-relative-sibling",
+      ]) {
+        assert.equal(res.outcomes[id], "deny", `${label}: ${id} must be denied`);
+      }
+      for (const id of [
+        "allow-no-cwd",
+        "allow-own-wt",
+        "allow-own-sub",
+        "allow-granted-goal",
+        "allow-granted-art",
+        "allow-outside-tmp",
+      ]) {
+        assert.equal(res.outcomes[id], "allow", `${label}: ${id} must be allowed`);
+      }
+      const failedEvents = res.events.filter((ev) => ev.status === "failed");
+      assert.equal(failedEvents.length, 7, `${label}: expected 7 failed events`);
+      for (const ev of failedEvents) {
+        assert.equal(ev.denied, "protected-path", `${label}: ${ev.id} denied rule`);
+        assert.ok(ev.error?.includes(DENIED_HARNESS_STATE_REASON), `${label}: ${ev.id} error must name harness state: ${ev.error}`);
+      }
+    }
+
+    // 3. Explicit protectedRoots sibling worktree (even when parent is granted and deniedRoots is omitted)
+    const protRes = await runExecChecks(
+      {
+        toolPolicy: "read_write_workspace",
+        extraReadRoots: [dirname(fx.wt2)],
+        protectedRoots: [fx.wt2],
+      },
+      [
+        { id: "prot-wt2", rawInput: { command: "ls", cwd: fx.wt2 } },
+        { id: "prot-outside", rawInput: { command: "ls", cwd: outsideDir } },
+      ],
+    );
+    assert.equal(protRes.outcomes["prot-wt2"], "deny");
+    assert.equal(protRes.outcomes["prot-outside"], "allow");
+    assert.equal(protRes.events.find((e) => e.id === "prot-wt2")?.denied, "protected-path");
+
+    // 4. Legacy layout (no deniedRoots, no protectedRoots): outside and workspace cwds stay approved
+    const legacyRes = await runExecChecks(
+      {
+        cwd: fx.workspace,
+        toolPolicy: "read_write_workspace",
+      },
+      [
+        { id: "legacy-none", rawInput: { command: "bun test" } },
+        { id: "legacy-ws", rawInput: { command: "bun test", cwd: fx.workspace } },
+        { id: "legacy-outside", rawInput: { command: "ls", cwd: outsideDir } },
+      ],
+    );
+    assert.equal(legacyRes.outcomes["legacy-none"], "allow");
+    assert.equal(legacyRes.outcomes["legacy-ws"], "allow");
+    assert.equal(legacyRes.outcomes["legacy-outside"], "allow");
+  });
+
+  it("R2: validates writable 'other' request target paths and locations against write rule A3 and protected paths while approving pathless requests", async () => {
+    const fx = setupStateLayout();
+    const otherChatFile = join(fx.stateDir, "data", "projects", "p", "chats", "chat-2", "goals", "goal-2", "brief.md");
+    const scratchFile = join(fx.stateDir, "data", "projects", "p", "scratch", "_verify", "v-1", "out.txt");
+    const gitConfig = join(fx.wt1, ".git", "config");
+    const outsideDir = makeTempDir("acp-r2-outside-");
+    const outsideFile = join(outsideDir, "scratch.txt");
+    mkdirSync(dirname(otherChatFile), { recursive: true });
+    mkdirSync(dirname(scratchFile), { recursive: true });
+    mkdirSync(dirname(gitConfig), { recursive: true });
+    writeFileSync(otherChatFile, "other-chat\n", "utf8");
+    writeFileSync(scratchFile, "scratch\n", "utf8");
+    writeFileSync(gitConfig, "[core]\n", "utf8");
+    writeFileSync(outsideFile, "outside\n", "utf8");
+    const leakLink = join(fx.wt1, "leak-cfg");
+    symlinkSync(fx.cfgFile, leakLink);
+
+    const runOtherChecks = async (
+      reqOverrides: Partial<RunAgentRequest>,
+      checks: Array<{
+        id: string;
+        title: string;
+        kind?: string;
+        locations?: Array<{ path: string }>;
+        rawInput?: Record<string, unknown>;
+      }>,
+    ) => {
+      const outcomes: Record<string, string> = {};
+      const events: ToolEvent[] = [];
+      const fixture = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {} }))
+        .onRequest("session/new", async () => ({
+          sessionId: "s-r2",
+          models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+        }))
+        .onRequest("session/prompt", async ({ client, params: { sessionId } }) => {
+          for (const c of checks) {
+            outcomes[c.id] = permissionOutcome(
+              await client.request("session/request_permission", {
+                sessionId,
+                toolCall: {
+                  toolCallId: c.id,
+                  title: c.title,
+                  ...(c.kind !== undefined ? { kind: c.kind } : {}),
+                  ...(c.locations ? { locations: c.locations } : {}),
+                  ...(c.rawInput ? { rawInput: c.rawInput } : {}),
+                },
+                options: PERM_OPTIONS,
+              }),
+            );
+          }
+          await client.notify("session/update", {
+            sessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } },
+          });
+          return { stopReason: "end_turn" };
+        });
+
+      await new AcpRunner(profile("claude")).run(
+        makeBaseRequest({
+          cwd: fx.wt1,
+          toolPolicy: "read_write_workspace",
+          callbacks: { onToolEvent: (ev) => events.push(ev) },
+          ...reqOverrides,
+        }),
+        fixture,
+      );
+      return { outcomes, events };
+    };
+
+    const dataDirRes = await runOtherChecks(
+      {
+        extraReadRoots: [fx.goalsDir, fx.artifactsDir],
+        extraWriteRoots: [fx.goalsDir],
+        deniedRoots: [fx.stateDir],
+      },
+      [
+        { id: "deny-state-loc", title: "custom_patch", kind: "other", locations: [{ path: fx.cfgFile }] },
+        { id: "deny-other-chat", title: "custom_patch", kind: "other", rawInput: { file_path: otherChatFile } },
+        { id: "deny-ro-artifact", title: "apply_patch", kind: "other", rawInput: { TargetFile: join(fx.artifactsDir, "tamper.md") } },
+        { id: "deny-sibling-wt", title: "custom_patch", kind: "other", rawInput: { path: fx.wt2File } },
+        { id: "deny-scratch", title: "custom_patch", kind: "other", rawInput: { destination: scratchFile } },
+        { id: "deny-git", title: "custom_patch", kind: "other", rawInput: { path: gitConfig } },
+        { id: "deny-relative-sibling", title: "custom_patch", kind: "other", rawInput: { file_path: "../t-2/src/secret.ts" } },
+        { id: "deny-symlink", title: "custom_patch", kind: "other", rawInput: { path: "leak-cfg" } },
+        { id: "deny-mixed-targets", title: "custom_patch", kind: "other", locations: [{ path: fx.wt1File }], rawInput: { paths: [fx.wt1File, fx.dbFile] } },
+        { id: "deny-undefined-kind", title: "patch_tool", rawInput: { file_path: fx.cfgFile } },
+        { id: "deny-ro-other-state", title: "list_dir", kind: "other", rawInput: { path: fx.stateDir } },
+        { id: "allow-no-paths", title: "custom_tool", kind: "other", rawInput: { query: "status" } },
+        { id: "allow-ws-target", title: "custom_patch", kind: "other", locations: [{ path: fx.wt1File }], rawInput: { file_path: "src/worker.ts" } },
+        { id: "allow-granted-write", title: "custom_patch", kind: "other", rawInput: { file_path: join(fx.goalsDir, "new-ev.md") } },
+        { id: "allow-outside", title: "custom_patch", kind: "other", rawInput: { file_path: outsideFile } },
+        { id: "allow-ro-other-artifact", title: "list_dir", kind: "other", rawInput: { path: fx.artifactsDir } },
+      ],
+    );
+
+    for (const id of [
+      "deny-state-loc",
+      "deny-other-chat",
+      "deny-ro-artifact",
+      "deny-sibling-wt",
+      "deny-scratch",
+      "deny-git",
+      "deny-relative-sibling",
+      "deny-symlink",
+      "deny-mixed-targets",
+      "deny-undefined-kind",
+      "deny-ro-other-state",
+    ]) {
+      assert.equal(dataDirRes.outcomes[id], "deny", `${id} must be denied`);
+      const ev = dataDirRes.events.find((e) => e.id === id);
+      assert.equal(ev?.denied, "protected-path", `${id} must report protected-path`);
+      if (id !== "deny-git") {
+        assert.ok(ev?.error?.includes(DENIED_HARNESS_STATE_REASON), `${id} error must name harness state: ${ev?.error}`);
+      }
+    }
+    for (const id of [
+      "allow-no-paths",
+      "allow-ws-target",
+      "allow-granted-write",
+      "allow-outside",
+      "allow-ro-other-artifact",
+    ]) {
+      assert.equal(dataDirRes.outcomes[id], "allow", `${id} must be allowed`);
+    }
+
+    // Legacy layout (no deniedRoots, no protectedRoots): pathless and outside-workspace 'other' requests stay approved.
+    const legacyRes = await runOtherChecks(
+      { cwd: fx.workspace },
+      [
+        { id: "legacy-no-paths", title: "custom_tool", kind: "other", rawInput: { query: "status" } },
+        { id: "legacy-outside", title: "custom_tool", kind: "other", rawInput: { file_path: outsideFile } },
+        { id: "legacy-ws", title: "custom_tool", kind: "other", rawInput: { file_path: fx.wsFile } },
+      ],
+    );
+    assert.equal(legacyRes.outcomes["legacy-no-paths"], "allow");
+    assert.equal(legacyRes.outcomes["legacy-outside"], "allow");
+    assert.equal(legacyRes.outcomes["legacy-ws"], "allow");
+  });
 });
