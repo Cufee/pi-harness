@@ -9,7 +9,7 @@ import type { AcpProfileConfig } from "../src/config.js";
 import { AcpRunner } from "../src/runners/acp-runner.js";
 import { DENIED_HARNESS_STATE_REASON, prepareAcpSpawn } from "../src/runners/acp-shims.js";
 import type { RunAgentRequest } from "../src/runners/types.js";
-import { legacyStoragePaths } from "../src/storage/paths.js";
+import { legacyStoragePaths, StoragePaths, type StorageLayout } from "../src/storage/paths.js";
 
 type ToolEvent = Parameters<NonNullable<RunAgentRequest["callbacks"]["onToolEvent"]>>[0];
 
@@ -2025,5 +2025,120 @@ app.connect(ndJsonStream(Writable.toWeb(process.stdout) as unknown as WritableSt
     }
     assert.equal(mcpBatch.outcomes["mcp-read-allow-goal"], "allow");
     assert.equal(mcpBatch.issuedOps.includes("mcp-read-allow-goal"), true);
+  });
+
+  it("FR3 (E1): admits ordinary workspace shell commands in both layouts and enforces write grants on explicit shell write targets in data-dir", async () => {
+    const runForLayout = async (layout: StorageLayout) => {
+      const home = makeTempDir(`acp-fr3-${layout}-`);
+      const repo = join(home, "repo");
+      const stateDir = join(home, ".pi-harness");
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(stateDir, { recursive: true });
+      const cfgFile = join(stateDir, "config.json");
+      writeFileSync(cfgFile, '{"secret":true}\n', "utf8");
+
+      const sp = new StoragePaths({ stateDir }, layout);
+      const run = { id: "run-1", repoRoot: repo, chatSessionId: "chat-1" };
+      const goal = { id: "goal-1", repoRoot: repo, chatSessionId: "chat-1", linkedRunId: "run-1" };
+
+      const wt1 = sp.worktreePath(run, "t-1");
+      const wt2 = sp.worktreePath(run, "t-2");
+      mkdirSync(join(wt1, "src"), { recursive: true });
+      mkdirSync(join(wt1, ".git"), { recursive: true });
+      mkdirSync(wt2, { recursive: true });
+      writeFileSync(join(wt1, "README.md"), "# Readme\n", "utf8");
+      writeFileSync(join(wt1, "src", "index.ts"), "export const foo = 1;\n", "utf8");
+      writeFileSync(join(wt1, ".git", "HEAD"), "ref: refs/heads/main\n", "utf8");
+      const siblingFile = join(wt2, "file");
+      writeFileSync(siblingFile, "sibling-secret\n", "utf8");
+
+      const projectNotesDir = sp.projectNotesDir(repo);
+      mkdirSync(projectNotesDir, { recursive: true });
+      const noteFile = join(projectNotesDir, "n.md");
+      writeFileSync(noteFile, "# Project note\n", "utf8");
+
+      const grants = sp.taskGrants({ run, goal, writable: true });
+      const ownEvidenceDir = grants.extraEnv?.HARNESS_GOAL_EVIDENCE_DIR ?? sp.goalEvidenceDir(goal);
+      mkdirSync(ownEvidenceDir, { recursive: true });
+      const evidenceOut = join(ownEvidenceDir, "out.txt");
+      if (layout === "data-dir") {
+        assert.ok(grants.extraReadRoots.includes(projectNotesDir), "data-dir worker must have read grant on project notes");
+        assert.ok(!(grants.extraWriteRoots ?? []).includes(projectNotesDir), "data-dir worker must not have write grant on project notes");
+        assert.ok((grants.extraWriteRoots ?? []).includes(ownEvidenceDir), "data-dir writable worker must have write grant on own evidence dir");
+      }
+
+      const specs: Array<{ id: string; command: string; expect: "allow" | "deny" }> = [
+        { id: "ls-ignore-git", command: "ls --ignore=.git", expect: "allow" },
+        { id: "cd-src-cat-readme", command: "cd src && cat ../README.md", expect: "allow" },
+        { id: "grep-exclude-dir-git", command: "grep -r --exclude-dir=.git foo .", expect: "allow" },
+        { id: "git-status", command: "git status", expect: "allow" },
+        { id: "cat-git-head", command: "cat .git/HEAD", expect: "allow" },
+      ];
+      if (layout === "data-dir") {
+        specs.push(
+          { id: "cat-project-notes", command: `cat "${noteFile}"`, expect: "allow" },
+          { id: "echo-own-evidence", command: `echo x > "${evidenceOut}"`, expect: "allow" },
+          { id: "cat-state-config", command: `cat "${cfgFile}"`, expect: "deny" },
+          { id: "cd-state-cat-config", command: `cd "${stateDir}" && cat config.json`, expect: "deny" },
+          { id: "echo-project-notes-ro", command: `echo x > "${noteFile}"`, expect: "deny" },
+          { id: "cat-sibling-wt", command: `cat "${siblingFile}"`, expect: "deny" },
+        );
+      }
+
+      const outcomes: Record<string, string> = {};
+      const events: ToolEvent[] = [];
+      const fixture = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {} }))
+        .onRequest("session/new", async () => ({
+          sessionId: `s-fr3-${layout}`,
+          models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+        }))
+        .onRequest("session/prompt", async ({ client, params: { sessionId } }) => {
+          for (const spec of specs) {
+            outcomes[spec.id] = permissionOutcome(
+              await client.request("session/request_permission", {
+                sessionId,
+                toolCall: {
+                  toolCallId: spec.id,
+                  title: "Bash",
+                  kind: "execute",
+                  rawInput: { command: spec.command },
+                },
+                options: PERM_OPTIONS,
+              }),
+            );
+          }
+          await client.notify("session/update", {
+            sessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "done" } },
+          });
+          return { stopReason: "end_turn" };
+        });
+
+      await new AcpRunner(profile("claude")).run(
+        makeBaseRequest({
+          cwd: wt1,
+          toolPolicy: "read_write_workspace",
+          extraReadRoots: grants.extraReadRoots,
+          extraWriteRoots: grants.extraWriteRoots,
+          deniedRoots: grants.deniedRoots,
+          protectedRoots: grants.protectedRoots,
+          callbacks: { onToolEvent: (ev) => events.push(ev) },
+        }),
+        fixture,
+      );
+
+      for (const spec of specs) {
+        assert.equal(outcomes[spec.id], spec.expect, `${layout}: ${spec.id} (${spec.command}) expected ${spec.expect}, got ${outcomes[spec.id]}`);
+        if (spec.expect === "deny") {
+          const ev = events.find((e) => e.id === spec.id && e.status === "failed");
+          assert.equal(ev?.denied, "protected-path", `${layout}: ${spec.id} denied rule`);
+          assert.ok(ev?.error?.includes(DENIED_HARNESS_STATE_REASON), `${layout}: ${spec.id} reason: ${ev?.error}`);
+        }
+      }
+    };
+
+    await runForLayout("legacy");
+    await runForLayout("data-dir");
   });
 });

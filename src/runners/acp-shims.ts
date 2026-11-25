@@ -9,7 +9,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { ensureTempDir, type AcpAdapterKind, type AcpProfileConfig } from "../config.js";
 import type { AgentTier, ArtifactRecord } from "../control-plane/db.js";
@@ -152,9 +152,8 @@ const NON_SHELL_WHITESPACE = /[^\S \t\n]/;
  * brace expansion, subshells and zsh glob qualifiers, unquoted glob characters, zsh `=cmd`
  * expansion, line continuations, background jobs, and control characters.
  */
-function splitShellSegments(cmd: string, permissive = false): string[] | null {
-  if (!permissive && CONTROL_CHARS.test(cmd)) return null;
-  if (permissive && cmd.includes("\0")) return null;
+function splitShellSegments(cmd: string): string[] | null {
+  if (CONTROL_CHARS.test(cmd)) return null;
   const segments: string[] = [];
   let cur = "";
   let inSingle = false;
@@ -169,28 +168,20 @@ function splitShellSegments(cmd: string, permissive = false): string[] | null {
     }
     if (inDouble) {
       if (ch === "\\" && next !== undefined) {
-        if (next === "\n") {
-          if (!permissive) return null;
-          i++;
-          continue;
-        }
+        if (next === "\n") return null;
         cur += ch + next;
         i++;
         continue;
       }
-      if (!permissive && ch === "`") return null;
-      if (!permissive && ch === "$" && next !== undefined && next !== '"' && !/\s/.test(next)) return null;
+      if (ch === "`") return null;
+      if (ch === "$" && next !== undefined && next !== '"' && !/\s/.test(next)) return null;
       cur += ch;
       if (ch === '"') inDouble = false;
       continue;
     }
     const wordStart = cur.length === 0 || /\s/.test(cur[cur.length - 1]!);
     if (ch === "\\" && next !== undefined) {
-      if (next === "\n") {
-        if (!permissive) return null;
-        i++;
-        continue;
-      }
+      if (next === "\n") return null;
       cur += ch + next;
       i++;
       continue;
@@ -202,49 +193,6 @@ function splitShellSegments(cmd: string, permissive = false): string[] | null {
     }
     if (ch === '"') {
       inDouble = true;
-      cur += ch;
-      continue;
-    }
-    if (permissive) {
-      if (wordStart && ch === "#") {
-        while (i < cmd.length && cmd[i] !== "\n") i++;
-        if (cur.trim()) segments.push(cur);
-        cur = "";
-        continue;
-      }
-      if (ch === "&" && next === ">") {
-        cur += " ";
-        i++;
-        if (cmd[i + 1] === ">") i++;
-        continue;
-      }
-      if (ch === ">" || ch === "<") {
-        cur += " ";
-        if (next === ch) {
-          i++;
-          if (ch === "<" && cmd[i + 1] === "<") i++;
-        } else if (next === "&" || next === "|") {
-          i++;
-        }
-        continue;
-      }
-      if (ch === "(" || ch === ")") {
-        if (cur.trim()) segments.push(cur);
-        cur = "";
-        continue;
-      }
-      if (ch === "|" || ch === ";" || ch === "\n") {
-        if (cur.trim()) segments.push(cur);
-        cur = "";
-        if (ch === "|" && next === "|") i++;
-        continue;
-      }
-      if (ch === "&") {
-        if (cur.trim()) segments.push(cur);
-        cur = "";
-        if (next === "&") i++;
-        continue;
-      }
       cur += ch;
       continue;
     }
@@ -286,7 +234,7 @@ function splitShellSegments(cmd: string, permissive = false): string[] | null {
     if (ch === "&") return null; // background execution
     cur += ch;
   }
-  if (!permissive && (inSingle || inDouble)) return null;
+  if (inSingle || inDouble) return null;
   if (cur.trim()) segments.push(cur);
   return segments;
 }
@@ -755,44 +703,1490 @@ function expandPathOperandCandidates(arg: string): string[] {
   return candidates;
 }
 
+/** An explicit path operand extracted from a shell command, bound to its role and command-local cwd (Addendum E1). */
+export interface ShellPathOperand {
+  path: string;
+  role: "read" | "write";
+  baseDir: string;
+}
+
+interface ShellLexWord {
+  kind: "word";
+  text: string;
+  assignment: boolean;
+  dynamic: boolean;
+  hasGlob: boolean;
+  quoted: boolean;
+}
+
+type ShellLexToken =
+  | ShellLexWord
+  | { kind: "redir"; role: "read" | "write" | "heredoc" | "herestring" | "fd_dup_out" | "fd_dup_in"; stripTabs?: boolean; hadExplicitFd?: boolean }
+  | { kind: "op"; op: "&&" | "||" | ";" | "|" | "\n" | "&" | "(" | ")" };
+
+interface ParsedShellSegment {
+  words: ShellLexWord[];
+  redirs: Array<{ role: "read" | "write"; target: ShellLexWord }>;
+  prevOp: string | null;
+  nextOp: string | null;
+  inSubshell: boolean;
+}
+
+function scanBalancedDelim(cmd: string, startIdx: number, openCh: string, closeCh: string): number {
+  let depth = 1;
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = startIdx; i < cmd.length; i++) {
+    const ch = cmd[i]!;
+    const next = cmd[i + 1];
+    if (inSingle) {
+      if (ch === "'") inSingle = false;
+      continue;
+    }
+    if (inDouble) {
+      if (ch === "\\" && next !== undefined) {
+        i++;
+        continue;
+      }
+      if (ch === '"') inDouble = false;
+      continue;
+    }
+    if (ch === "\\" && next !== undefined) {
+      i++;
+      continue;
+    }
+    if (ch === "'") {
+      inSingle = true;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+      continue;
+    }
+    if (ch === openCh) depth++;
+    else if (ch === closeCh) {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+function scanBacktickDelim(cmd: string, startIdx: number): number {
+  for (let i = startIdx; i < cmd.length; i++) {
+    const ch = cmd[i]!;
+    if (ch === "\\" && i + 1 < cmd.length) {
+      i++;
+      continue;
+    }
+    if (ch === "`") return i;
+  }
+  return -1;
+}
+
+function skipHeredocBodies(
+  cmd: string,
+  startIdx: number,
+  pending: Array<{ delim: string; stripTabs: boolean }>,
+): number {
+  let pos = startIdx;
+  for (const hd of pending) {
+    while (pos < cmd.length) {
+      const nl = cmd.indexOf("\n", pos);
+      const lineEnd = nl < 0 ? cmd.length : nl;
+      const line = cmd.slice(pos, lineEnd).replace(/\r$/, "");
+      pos = nl < 0 ? cmd.length : nl + 1;
+      const candidate = hd.stripTabs ? line.replace(/^\t+/, "") : line;
+      if (candidate === hd.delim) break;
+    }
+  }
+  return pos;
+}
+
 /**
- * Extracts explicit path operand candidates from a shell command using the same segment/token
- * splitter and operand classifier as `isSafeReadOnlyShellCommand` (Addendum C7).
+ * Tokenizes a shell command for shell-enabled explicit path classification (Addendum E1), preserving
+ * redirections, chain operators, subshell boundaries, heredocs, dynamic expansions, and globs.
+ * Returns null when quoting/substitution structure cannot be parsed safely.
  */
-export function extractShellPathOperands(rawCommand: string): string[] {
-  const segments = splitShellSegments(rawCommand, true);
-  if (!segments?.length) return [];
-  const out: string[] = [];
-  const seen = new Set<string>();
-  const push = (candidate: string) => {
-    if (!candidate || seen.has(candidate)) return;
-    seen.add(candidate);
-    out.push(candidate);
+function lexEnabledShell(cmd: string): ShellLexToken[] | null {
+  if (cmd.includes("\0")) return null;
+  const tokens: ShellLexToken[] = [];
+  const pendingHeredocs: Array<{ delim: string; stripTabs: boolean }> = [];
+  let awaitingHeredoc: { stripTabs: boolean } | null = null;
+
+  let cur = "";
+  let hasToken = false;
+  let quotedAt = -1;
+  let dynamic = false;
+  let unquotedGlob = false;
+  let inSingle = false;
+  let inDouble = false;
+
+  const markQuoted = () => {
+    hasToken = true;
+    if (quotedAt < 0) quotedAt = cur.length;
   };
-  for (const seg of segments) {
-    const words = tokenizeSegment(seg);
-    let idx = 0;
-    while (idx < words.length && words[idx]!.assignment) idx++;
-    const tokens = words.map((w) => w.text);
-    const bin = tokens[idx];
-    if (bin === undefined) continue;
-    const args = tokens.slice(idx + 1);
-    if (
-      /^(?:\/(?:usr\/)?bin\/)?(?:sh|bash|zsh)$/.test(bin) &&
-      args.length >= 2 &&
-      /^-l?c$/.test(args[0]!)
-    ) {
-      for (const nested of extractShellPathOperands(args[1]!)) push(nested);
-      for (const extraArg of args.slice(2)) {
-        for (const candidate of expandPathOperandCandidates(extraArg)) push(candidate);
+
+  const resetWord = () => {
+    cur = "";
+    hasToken = false;
+    quotedAt = -1;
+    dynamic = false;
+    unquotedGlob = false;
+  };
+
+  const flushWord = () => {
+    if (!hasToken) return;
+    const eq = cur.indexOf("=");
+    const assignment = /^[A-Za-z_][A-Za-z0-9_]*=/.test(cur) && (quotedAt < 0 || quotedAt > eq);
+    const isStandaloneBracketOrBrace = (cur === "[" || cur === "{") && quotedAt < 0;
+    const hasGlob = (!isStandaloneBracketOrBrace && unquotedGlob) || /[*?]/.test(cur);
+    const word: ShellLexWord = {
+      kind: "word",
+      text: cur,
+      assignment,
+      dynamic,
+      hasGlob,
+      quoted: quotedAt >= 0,
+    };
+    tokens.push(word);
+    if (awaitingHeredoc) {
+      pendingHeredocs.push({ delim: word.text, stripTabs: awaitingHeredoc.stripTabs });
+      awaitingHeredoc = null;
+    }
+    resetWord();
+  };
+
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i]!;
+    const next = cmd[i + 1];
+
+    if (inSingle) {
+      if (ch === "'") inSingle = false;
+      else cur += ch;
+      continue;
+    }
+
+    if (inDouble) {
+      if (ch === "\\" && next !== undefined) {
+        if (next === "\n") {
+          i++;
+          continue;
+        }
+        cur += "$`\"\\".includes(next) ? next : ch + next;
+        i++;
+        continue;
+      }
+      if (ch === '"') {
+        inDouble = false;
+        continue;
+      }
+      if (ch === "$" && next === "(") {
+        dynamic = true;
+        const end = scanBalancedDelim(cmd, i + 2, "(", ")");
+        if (end < 0) return null;
+        i = end;
+        continue;
+      }
+      if (ch === "$" && next === "{") {
+        dynamic = true;
+        const end = scanBalancedDelim(cmd, i + 2, "{", "}");
+        if (end < 0) return null;
+        i = end;
+        continue;
+      }
+      if (ch === "$" && next !== undefined && next !== '"' && !/\s/.test(next)) {
+        dynamic = true;
+        cur += ch;
+        continue;
+      }
+      if (ch === "`") {
+        dynamic = true;
+        const end = scanBacktickDelim(cmd, i + 1);
+        if (end < 0) return null;
+        i = end;
+        continue;
+      }
+      cur += ch;
+      continue;
+    }
+
+    if (ch === "\\" && next !== undefined) {
+      if (next === "\n") {
+        i++;
+        continue;
+      }
+      markQuoted();
+      cur += next;
+      i++;
+      continue;
+    }
+    if (ch === "'") {
+      markQuoted();
+      inSingle = true;
+      continue;
+    }
+    if (ch === '"') {
+      markQuoted();
+      inDouble = true;
+      continue;
+    }
+    if (!hasToken && ch === "#") {
+      while (i < cmd.length && cmd[i] !== "\n") i++;
+      i--; // let the loop process `\n` as a separator
+      continue;
+    }
+    if (ch === " " || ch === "\t" || ch === "\r") {
+      flushWord();
+      continue;
+    }
+    if (ch === "\n") {
+      flushWord();
+      awaitingHeredoc = null;
+      tokens.push({ kind: "op", op: "\n" });
+      if (pendingHeredocs.length > 0) {
+        const nextPos = skipHeredocBodies(cmd, i + 1, pendingHeredocs);
+        pendingHeredocs.length = 0;
+        i = nextPos - 1;
       }
       continue;
     }
-    for (const arg of args) {
-      for (const candidate of expandPathOperandCandidates(arg)) push(candidate);
+    // Dynamic expansions: $'...', $(...), ${...}, $VAR, `...`, <(...), >(...)
+    if (ch === "$") {
+      hasToken = true;
+      if (next === "'") {
+        markQuoted();
+        dynamic = true;
+        let closed = false;
+        for (let j = i + 2; j < cmd.length; j++) {
+          if (cmd[j] === "\\" && j + 1 < cmd.length) {
+            j++;
+            continue;
+          }
+          if (cmd[j] === "'") {
+            i = j;
+            closed = true;
+            break;
+          }
+        }
+        if (!closed) return null;
+        continue;
+      }
+      if (next === "(") {
+        dynamic = true;
+        const end = scanBalancedDelim(cmd, i + 2, "(", ")");
+        if (end < 0) return null;
+        i = end;
+        continue;
+      }
+      if (next === "{") {
+        dynamic = true;
+        const end = scanBalancedDelim(cmd, i + 2, "{", "}");
+        if (end < 0) return null;
+        i = end;
+        continue;
+      }
+      if (next !== undefined && /[A-Za-z_0-9@*#?$!-]/.test(next)) {
+        dynamic = true;
+      }
+      cur += ch;
+      continue;
+    }
+    if (ch === "`") {
+      hasToken = true;
+      dynamic = true;
+      const end = scanBacktickDelim(cmd, i + 1);
+      if (end < 0) return null;
+      i = end;
+      continue;
+    }
+    if ((ch === "<" || ch === ">") && next === "(") {
+      hasToken = true;
+      dynamic = true;
+      const end = scanBalancedDelim(cmd, i + 2, "(", ")");
+      if (end < 0) return null;
+      i = end;
+      continue;
+    }
+    // Redirections: &>, &>>, >, >>, >|, >&, <, <<, <<-, <<<, <&, <>
+    if (ch === "&" && next === ">") {
+      flushWord();
+      awaitingHeredoc = null;
+      tokens.push({ kind: "redir", role: "write", hadExplicitFd: false });
+      i++;
+      if (cmd[i + 1] === ">") i++;
+      continue;
+    }
+    if (ch === ">" || ch === "<") {
+      let hadExplicitFd = false;
+      if (hasToken && quotedAt < 0 && !dynamic && /^\d+$/.test(cur)) {
+        hadExplicitFd = true;
+        resetWord();
+      } else {
+        flushWord();
+      }
+      awaitingHeredoc = null;
+      if (ch === ">") {
+        if (next === ">" || next === "|") {
+          tokens.push({ kind: "redir", role: "write", hadExplicitFd });
+          i++;
+        } else if (next === "&") {
+          tokens.push({ kind: "redir", role: "fd_dup_out", hadExplicitFd });
+          i++;
+        } else {
+          tokens.push({ kind: "redir", role: "write", hadExplicitFd });
+        }
+      } else {
+        if (next === "<") {
+          if (cmd[i + 2] === "<") {
+            tokens.push({ kind: "redir", role: "herestring", hadExplicitFd });
+            i += 2;
+          } else if (cmd[i + 2] === "-") {
+            tokens.push({ kind: "redir", role: "heredoc", stripTabs: true, hadExplicitFd });
+            awaitingHeredoc = { stripTabs: true };
+            i += 2;
+          } else {
+            tokens.push({ kind: "redir", role: "heredoc", stripTabs: false, hadExplicitFd });
+            awaitingHeredoc = { stripTabs: false };
+            i++;
+          }
+        } else if (next === "&") {
+          tokens.push({ kind: "redir", role: "fd_dup_in", hadExplicitFd });
+          i++;
+        } else if (next === ">") {
+          tokens.push({ kind: "redir", role: "write", hadExplicitFd });
+          i++;
+        } else {
+          tokens.push({ kind: "redir", role: "read", hadExplicitFd });
+        }
+      }
+      continue;
+    }
+    // Chain and subshell operators
+    if (ch === "(" || ch === ")") {
+      flushWord();
+      awaitingHeredoc = null;
+      tokens.push({ kind: "op", op: ch });
+      continue;
+    }
+    if (ch === "|") {
+      flushWord();
+      awaitingHeredoc = null;
+      if (next === "|") {
+        tokens.push({ kind: "op", op: "||" });
+        i++;
+      } else if (next === "&") {
+        tokens.push({ kind: "op", op: "|" });
+        i++;
+      } else {
+        tokens.push({ kind: "op", op: "|" });
+      }
+      continue;
+    }
+    if (ch === "&") {
+      flushWord();
+      awaitingHeredoc = null;
+      if (next === "&") {
+        tokens.push({ kind: "op", op: "&&" });
+        i++;
+      } else {
+        tokens.push({ kind: "op", op: "&" });
+      }
+      continue;
+    }
+    if (ch === ";") {
+      flushWord();
+      awaitingHeredoc = null;
+      if (next === ";") {
+        i++;
+        if (cmd[i + 1] === "&") i++;
+      } else if (next === "&") {
+        i++;
+      }
+      tokens.push({ kind: "op", op: ";" });
+      continue;
+    }
+
+    if (ch === "*" || ch === "?" || ch === "[" || ch === "{") {
+      unquotedGlob = true;
+    }
+    cur += ch;
+    hasToken = true;
+  }
+
+  if (inSingle || inDouble) return null;
+  flushWord();
+  return tokens;
+}
+
+function groupShellSegments(tokens: ShellLexToken[]): ParsedShellSegment[] {
+  const segments: ParsedShellSegment[] = [];
+  let words: ShellLexWord[] = [];
+  let redirs: Array<{ role: "read" | "write"; target: ShellLexWord }> = [];
+  let prevOp: string | null = null;
+  let parenDepth = 0;
+
+  const flush = (nextOp: string | null) => {
+    if (words.length > 0 || redirs.length > 0) {
+      segments.push({ words, redirs, prevOp, nextOp, inSubshell: parenDepth > 0 });
+      words = [];
+      redirs = [];
+    }
+    prevOp = nextOp;
+  };
+
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i]!;
+    if (tok.kind === "op") {
+      if (tok.op === "(") {
+        flush("(");
+        parenDepth++;
+      } else if (tok.op === ")") {
+        flush(")");
+        parenDepth = Math.max(0, parenDepth - 1);
+      } else {
+        flush(tok.op);
+      }
+      continue;
+    }
+    if (tok.kind === "redir") {
+      const nextTok = tokens[i + 1];
+      if (nextTok?.kind === "word") {
+        i++;
+        if (tok.role === "read" || tok.role === "write") {
+          redirs.push({ role: tok.role, target: nextTok });
+        } else if (
+          tok.role === "fd_dup_out" &&
+          !tok.hadExplicitFd &&
+          nextTok.text !== "-" &&
+          !/^\d+-?$/.test(nextTok.text)
+        ) {
+          redirs.push({ role: "write", target: nextTok });
+        }
+      }
+      continue;
+    }
+    words.push(tok);
+  }
+  flush(null);
+  return segments;
+}
+
+function shortFlagConsumesNext(arg: string, valueFlags: string): boolean {
+  if (!/^-[^-]/.test(arg) || !valueFlags) return false;
+  for (let i = 1; i < arg.length; i++) {
+    if (valueFlags.includes(arg[i]!)) {
+      return i === arg.length - 1;
     }
   }
+  return false;
+}
+
+/** Long options known to take a separate argument word when written without `=`. Never includes `=`-only optional flags like `--color`. */
+const COMMON_VALUE_LONG_FLAGS = new Set([
+  "ignore",
+  "hide",
+  "exclude",
+  "exclude-dir",
+  "exclude-from",
+  "include",
+  "include-from",
+  "glob",
+  "iglob",
+  "regexp",
+  "file",
+  "format",
+  "pretty",
+  "output",
+  "target-directory",
+  "sort",
+  "sortr",
+  "type",
+  "type-not",
+  "type-add",
+  "type-clear",
+  "max-count",
+  "max-depth",
+  "max-filesize",
+  "max-columns",
+  "after-context",
+  "before-context",
+  "context",
+  "context-separator",
+  "field-context-separator",
+  "field-match-separator",
+  "lines",
+  "bytes",
+  "delimiter",
+  "fields",
+  "characters",
+  "message",
+  "author",
+  "committer",
+  "grep",
+  "since",
+  "after",
+  "until",
+  "before",
+  "skip",
+  "contains",
+  "no-contains",
+  "merged",
+  "no-merged",
+  "points-at",
+  "abbrev",
+  "unified",
+  "diff-filter",
+  "branch",
+  "track",
+  "onto",
+  "strategy",
+  "strategy-option",
+  "cleanup",
+  "date",
+  "trailer",
+  "expression",
+  "separator",
+  "field-separator",
+  "assign",
+  "mode",
+  "owner",
+  "group",
+  "reference",
+  "suffix",
+  "size",
+  "config",
+  "cwd",
+  "dir",
+  "directory",
+  "prefix",
+  "filter",
+  "pattern",
+  "name",
+  "path",
+  "label",
+  "encoding",
+  "engine",
+  "width",
+  "tabsize",
+  "quoting-style",
+  "time-style",
+  "block-size",
+  "indicator-style",
+  "binary-files",
+  "devices",
+  "directories",
+  "replace",
+  "threads",
+  "ignore-file",
+  "path-separator",
+  "key",
+  "temporary-directory",
+  "buffer-size",
+  "parallel",
+  "batch-size",
+  "compress-program",
+  "random-source",
+  "files0-from",
+  "skip-fields",
+  "skip-chars",
+  "check-chars",
+  "line-length",
+  "eval",
+  "print",
+  "require",
+  "preload",
+  "tmpdir",
+  "output-document",
+  "directory-prefix",
+  "output-dir",
+  "data",
+  "data-raw",
+  "data-binary",
+  "data-urlencode",
+  "header",
+  "request",
+  "user",
+  "user-agent",
+  "cookie",
+  "cookie-jar",
+  "form",
+  "upload-file",
+  "write-out",
+  "max-time",
+  "connect-timeout",
+  "resolve",
+  "cacert",
+  "cert",
+  "rsh",
+  "files-from",
+  "link-dest",
+  "compare-dest",
+  "copy-dest",
+  "backup-dir",
+  "bwlimit",
+  "max-size",
+  "min-size",
+  "chmod",
+  "chown",
+  "log-file",
+  "out-format",
+  "port",
+  "password-file",
+  "temp-dir",
+  "from-file",
+  "indent",
+]);
+
+/** Per-command short flags known to consume the next token when not carrying an attached value. */
+const COMMAND_VALUE_SHORT_FLAGS: Record<string, string> = {
+  ls: "ITw",
+  grep: "efmABCdD",
+  egrep: "efmABCdD",
+  fgrep: "efmABCdD",
+  rg: "efgtTmABCMjdEr",
+  head: "nc",
+  tail: "nc",
+  sort: "ktTSo",
+  cut: "dfcb",
+  uniq: "fsw",
+  diff: "UCIxXLSW",
+  sed: "efl",
+  awk: "Fvf",
+  gawk: "Fvf",
+  mawk: "Fvf",
+  nawk: "Fvf",
+  cp: "tS",
+  mv: "tS",
+  ln: "tS",
+  install: "tmogS",
+  rsync: "efT",
+  mkdir: "m",
+  touch: "drt",
+  truncate: "sr",
+  shred: "ns",
+  mktemp: "p",
+  tar: "fCTXI",
+  xargs: "ILnPsdaE",
+  tree: "LPIo",
+  jq: "fL",
+  curl: "oHdXuAebcFTwmK",
+  wget: "OPUTt",
+  node: "epr",
+  bun: "epr",
+  python: "cm",
+  python3: "cm",
+  git: "mFnSGLobBUsXCc",
+};
+
+/** Commands whose positional arguments are text, shell state, or remote specs rather than local file paths. */
+const NO_PATH_ARG_BINS = new Set([
+  "echo",
+  "printf",
+  "true",
+  "false",
+  "sleep",
+  "export",
+  "unset",
+  "local",
+  "declare",
+  "typeset",
+  "readonly",
+  "alias",
+  "unalias",
+  "set",
+  "shift",
+  "return",
+  "exit",
+  "kill",
+  "wait",
+  "pwd",
+  "id",
+  "whoami",
+  "uname",
+  "date",
+  "hostname",
+  "which",
+  "type",
+  "hash",
+  "jobs",
+  "fg",
+  "bg",
+  "ulimit",
+  "umask",
+  "trap",
+  "eval",
+  "ssh",
+  "scp",
+  "docker",
+  "podman",
+  "kubectl",
+]);
+
+const SHELL_CONTROL_OPENERS = new Set(["if", "for", "while", "until", "case"]);
+const SHELL_CONTROL_CLOSERS = new Set(["fi", "done", "esac"]);
+const SHELL_LEADING_KEYWORDS = new Set(["!", "if", "then", "elif", "else", "do", "while", "until", "time", "{"]);
+const ALL_WRITE_POSITIONAL_BINS = new Set(["rm", "rmdir", "unlink", "mkdir", "touch", "truncate", "shred", "mktemp", "sponge"]);
+const DEST_WRITE_BINS = new Set(["cp", "mv", "ln", "install", "rsync"]);
+
+function resolveCdTarget(currentCwd: string | null, rawDir: string): string | null {
+  if (rawDir === "~") return homedir();
+  if (rawDir.startsWith("~/")) return resolve(homedir(), rawDir.slice(2));
+  if (isAbsolute(rawDir)) return resolve(rawDir);
+  if (currentCwd === null) return null;
+  return resolve(currentCwd, rawDir);
+}
+
+function isAbsOrTildePath(raw: string): boolean {
+  return isAbsolute(raw) || raw === "~" || raw.startsWith("~/");
+}
+
+function extractShellPathOperandsInternal(
+  rawCommand: string,
+  initialCwd: string | null,
+  fallbackCwd: string,
+  depth: number,
+): ShellPathOperand[] {
+  if (depth > 4) return [];
+  const tokens = lexEnabledShell(rawCommand);
+  if (!tokens?.length) return [];
+  const segments = groupShellSegments(tokens);
+  if (!segments.length) return [];
+
+  const out: ShellPathOperand[] = [];
+  const seen = new Set<string>();
+  const emitWord = (word: ShellLexWord | undefined, role: "read" | "write", baseDir: string | null) => {
+    if (!word || !word.text || word.text === "-") return;
+    if (word.dynamic || word.hasGlob) return;
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(word.text)) return;
+    const absOrTilde = isAbsOrTildePath(word.text);
+    if (!absOrTilde && baseDir === null) return;
+    const effectiveBase = baseDir ?? fallbackCwd;
+    const key = `${role}\0${effectiveBase}\0${word.text}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ path: word.text, role, baseDir: effectiveBase });
+  };
+  const emitRaw = (raw: string, role: "read" | "write", baseDir: string | null, dynamic = false, hasGlob = false) => {
+    if (!raw || raw === "-" || dynamic || hasGlob || /[*?]/.test(raw)) return;
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw)) return;
+    const absOrTilde = isAbsOrTildePath(raw);
+    if (!absOrTilde && baseDir === null) return;
+    const effectiveBase = baseDir ?? fallbackCwd;
+    const key = `${role}\0${effectiveBase}\0${raw}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ path: raw, role, baseDir: effectiveBase });
+  };
+
+  let localCwd: string | null = initialCwd;
+  const dirStack: Array<string | null> = [];
+  let inControlFlow = 0;
+
+  for (const seg of segments) {
+    let segmentCwd: string | null = seg.inSubshell ? null : localCwd;
+    let idx = 0;
+
+    // Strip leading shell control keywords and assignments
+    while (idx < seg.words.length) {
+      const w = seg.words[idx]!;
+      if (!w.quoted && SHELL_CONTROL_OPENERS.has(w.text)) {
+        inControlFlow++;
+      } else if (!w.quoted && SHELL_CONTROL_CLOSERS.has(w.text)) {
+        inControlFlow = Math.max(0, inControlFlow - 1);
+      }
+      if (!w.quoted && SHELL_LEADING_KEYWORDS.has(w.text)) {
+        idx++;
+        continue;
+      }
+      if (w.assignment) {
+        idx++;
+        continue;
+      }
+      break;
+    }
+
+    // Unwrap transparent command wrappers (`command`, `builtin`, `exec`, `nohup`, `nice`, `timeout`, `stdbuf`, `env`)
+    let skipPositionalBecauseWrapper = false;
+    while (idx < seg.words.length) {
+      const w = seg.words[idx]!;
+      if (w.dynamic) break;
+      const name = basename(w.text);
+      if (name === "command") {
+        idx++;
+        while (idx < seg.words.length && seg.words[idx]!.text.startsWith("-")) {
+          const flag = seg.words[idx]!.text;
+          idx++;
+          if (flag === "--") break;
+          if (flag === "-v" || flag === "-V") skipPositionalBecauseWrapper = true;
+        }
+        continue;
+      }
+      if (name === "builtin" || name === "nohup") {
+        idx++;
+        if (seg.words[idx]?.text === "--") idx++;
+        continue;
+      }
+      if (name === "exec") {
+        idx++;
+        while (idx < seg.words.length && seg.words[idx]!.text.startsWith("-")) {
+          const flag = seg.words[idx]!.text;
+          idx++;
+          if (flag === "--") break;
+          if (flag === "-a" && idx < seg.words.length) idx++;
+        }
+        continue;
+      }
+      if (name === "nice") {
+        idx++;
+        while (idx < seg.words.length && seg.words[idx]!.text.startsWith("-")) {
+          const flag = seg.words[idx]!.text;
+          idx++;
+          if (flag === "--") break;
+          if ((flag === "-n" || flag === "--adjustment") && idx < seg.words.length) idx++;
+        }
+        continue;
+      }
+      if (name === "timeout") {
+        idx++;
+        while (idx < seg.words.length && seg.words[idx]!.text.startsWith("-")) {
+          const flag = seg.words[idx]!.text;
+          idx++;
+          if (flag === "--") break;
+          if ((flag === "-s" || flag === "-k" || flag === "--signal" || flag === "--kill-after") && idx < seg.words.length) {
+            idx++;
+          }
+        }
+        if (idx < seg.words.length) idx++; // duration argument
+        continue;
+      }
+      if (name === "stdbuf") {
+        idx++;
+        while (idx < seg.words.length && seg.words[idx]!.text.startsWith("-")) {
+          const flag = seg.words[idx]!.text;
+          idx++;
+          if (flag === "--") break;
+          if (/^-[ioe]$/.test(flag) || flag === "--input" || flag === "--output" || flag === "--error") {
+            if (idx < seg.words.length) idx++;
+          }
+        }
+        continue;
+      }
+      if (name === "env") {
+        idx++;
+        while (idx < seg.words.length) {
+          const ew = seg.words[idx]!;
+          if (ew.text === "--") {
+            idx++;
+            break;
+          }
+          if (ew.text.startsWith("-") && ew.text !== "-") {
+            idx++;
+            if (ew.text === "-C" || ew.text === "--chdir") {
+              segmentCwd = null;
+              if (idx < seg.words.length) idx++;
+            } else if (ew.text.startsWith("-C") || ew.text.startsWith("--chdir=")) {
+              segmentCwd = null;
+            } else if (ew.text === "-u" || ew.text === "--unset" || ew.text === "-S" || ew.text === "--split-string") {
+              if (idx < seg.words.length) idx++;
+            }
+            continue;
+          }
+          if (ew.assignment || /^[A-Za-z_][A-Za-z0-9_]*=/.test(ew.text)) {
+            idx++;
+            continue;
+          }
+          break;
+        }
+        continue;
+      }
+      break;
+    }
+
+    const cmdWord = seg.words[idx];
+    const args = cmdWord ? seg.words.slice(idx + 1) : [];
+    const binName = cmdWord && !cmdWord.dynamic ? basename(cmdWord.text) : "";
+
+    // Check segment-level cwd-changing flags (`git -C`, `make -C`, `tar -C`, `bun --cwd`, `npm --prefix`, etc.)
+    if (binName === "git") {
+      for (let i = 0; i < args.length; i++) {
+        const t = args[i]!.text;
+        if (!t.startsWith("-")) break;
+        if (t === "-C" || t === "--work-tree" || t === "--git-dir") {
+          segmentCwd = null;
+          i++;
+          continue;
+        }
+        if (t.startsWith("-C") || t.startsWith("--work-tree=") || t.startsWith("--git-dir=")) {
+          segmentCwd = null;
+          continue;
+        }
+        if (t === "-c" || t === "--namespace" || t === "--super-prefix" || t === "--exec-path" || t === "--config-env") {
+          i++;
+        }
+      }
+    } else if (binName === "make" || binName === "gmake" || binName === "tar" || binName === "pnpm") {
+      for (const a of args) {
+        if (a.text === "--") break;
+        if (
+          a.text === "-C" ||
+          a.text.startsWith("-C") ||
+          a.text === "--directory" ||
+          a.text.startsWith("--directory=") ||
+          (binName === "pnpm" && (a.text === "--dir" || a.text.startsWith("--dir=")))
+        ) {
+          segmentCwd = null;
+          break;
+        }
+      }
+    } else if (binName === "bun" || binName === "yarn" || binName === "npm") {
+      for (const a of args) {
+        if (a.text === "--") break;
+        if (
+          a.text === "--cwd" ||
+          a.text.startsWith("--cwd=") ||
+          (binName === "npm" && (a.text === "--prefix" || a.text.startsWith("--prefix=") || a.text === "-C"))
+        ) {
+          segmentCwd = null;
+          break;
+        }
+      }
+    }
+
+    // Always evaluate redirections for this segment (redirection targets are write-role for > / >> / &>, read-role for <)
+    for (const redir of seg.redirs) {
+      emitWord(redir.target, redir.role, segmentCwd);
+    }
+
+    if (!cmdWord || cmdWord.dynamic || skipPositionalBecauseWrapper) continue;
+    if (
+      !cmdWord.quoted &&
+      (cmdWord.text === "for" ||
+        cmdWord.text === "case" ||
+        cmdWord.text === "function" ||
+        cmdWord.text === "}" ||
+        SHELL_CONTROL_CLOSERS.has(cmdWord.text))
+    ) {
+      continue;
+    }
+
+    // Nested shell invocation (`sh -c '...'`, `bash -lc '...'`, `zsh -c '...'`): analyze script starting at segmentCwd
+    if (binName === "sh" || binName === "bash" || binName === "zsh" || binName === "dash" || binName === "ksh") {
+      let scriptWord: ShellLexWord | undefined;
+      for (let i = 0; i < args.length; i++) {
+        const t = args[i]!.text;
+        if (t === "--") break;
+        if (t === "-o" || t === "+o") {
+          i++;
+          continue;
+        }
+        if (/^-[A-Za-z]*c$/.test(t)) {
+          scriptWord = args[i + 1];
+          break;
+        }
+        if (!t.startsWith("-") && !t.startsWith("+")) break;
+      }
+      if (scriptWord && !scriptWord.dynamic) {
+        for (const nested of extractShellPathOperandsInternal(scriptWord.text, segmentCwd, fallbackCwd, depth + 1)) {
+          const key = `${nested.role}\0${nested.baseDir}\0${nested.path}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            out.push(nested);
+          }
+        }
+      }
+      continue;
+    }
+
+    // Track `cd`, `pushd`, `popd` for command-local cwd (Rule E1b)
+    if (binName === "cd" || binName === "pushd" || binName === "popd") {
+      const canMutateOuterCwd = !seg.inSubshell && seg.prevOp !== "|" && seg.nextOp !== "|" && seg.nextOp !== "&";
+      const branchUncertain = inControlFlow > 0 || seg.prevOp === "||" || seg.nextOp === "||";
+      if (binName === "popd") {
+        if (canMutateOuterCwd) {
+          if (branchUncertain) {
+            localCwd = null;
+            dirStack.length = 0;
+          } else if (dirStack.length > 0) {
+            localCwd = dirStack.pop()!;
+          } else {
+            localCwd = null;
+          }
+        }
+        continue;
+      }
+      const targets: ShellLexWord[] = [];
+      let afterDashDash = false;
+      for (const a of args) {
+        if (!afterDashDash && a.text === "--") {
+          afterDashDash = true;
+          continue;
+        }
+        if (!afterDashDash && a.text.startsWith("-") && a.text !== "-") continue;
+        targets.push(a);
+      }
+      const target = targets.length === 1 ? targets[0] : undefined;
+      const isLiteralDir =
+        target !== undefined &&
+        !target.dynamic &&
+        !target.hasGlob &&
+        target.text !== "-" &&
+        !(binName === "pushd" && /^[+-]\d+$/.test(target.text));
+      if (isLiteralDir) {
+        emitWord(target, "read", segmentCwd);
+      }
+      if (canMutateOuterCwd) {
+        if (branchUncertain || !isLiteralDir) {
+          localCwd = null;
+          if (binName === "pushd") dirStack.length = 0;
+        } else {
+          if (binName === "pushd") dirStack.push(localCwd);
+          localCwd = resolveCdTarget(localCwd, target.text);
+        }
+      }
+      continue;
+    }
+
+    if (NO_PATH_ARG_BINS.has(binName)) continue;
+
+    // `dd`: `of=<path>` is write-role, `if=<path>` is read-role
+    if (binName === "dd") {
+      for (const a of args) {
+        if (a.text.startsWith("of=")) {
+          emitRaw(a.text.slice(3), "write", segmentCwd, a.dynamic, a.hasGlob);
+        } else if (a.text.startsWith("if=")) {
+          emitRaw(a.text.slice(3), "read", segmentCwd, a.dynamic, a.hasGlob);
+        }
+      }
+      continue;
+    }
+
+    // `find`: path operands appear only before the first expression/predicate token
+    if (binName === "find") {
+      let i = 0;
+      while (i < args.length) {
+        const t = args[i]!.text;
+        if (t === "-H" || t === "-L" || t === "-P" || /^-O\d+$/.test(t)) {
+          i++;
+          continue;
+        }
+        if (t === "-D") {
+          i += 2;
+          continue;
+        }
+        break;
+      }
+      while (i < args.length) {
+        const w = args[i]!;
+        if (w.text.startsWith("-") || w.text === "(" || w.text === ")" || w.text === "!" || w.text === ",") break;
+        emitWord(w, "read", segmentCwd);
+        i++;
+      }
+      continue;
+    }
+
+    // `git`: skip global options, subcommand name, and option values; handle `-o`/`--output` as write-role
+    if (binName === "git") {
+      let i = 0;
+      while (i < args.length) {
+        const t = args[i]!.text;
+        if (!t.startsWith("-")) break;
+        i++;
+        if (t === "-C" || t === "-c" || t === "--git-dir" || t === "--work-tree" || t === "--namespace" || t === "--super-prefix" || t === "--exec-path" || t === "--config-env") {
+          i++;
+        }
+      }
+      const sub = args[i]?.text;
+      if (!sub) continue;
+      i++;
+      const subPositionals: ShellLexWord[] = [];
+      let afterDashDash = false;
+      let gitGrepHasPatternFlag = false;
+      for (; i < args.length; i++) {
+        const w = args[i]!;
+        if (!afterDashDash && w.text === "--") {
+          afterDashDash = true;
+          continue;
+        }
+        if (!afterDashDash && w.text.startsWith("-") && w.text !== "-") {
+          if (w.text === "-e" || w.text === "-f" || w.text.startsWith("--file=")) gitGrepHasPatternFlag = true;
+          if (w.text === "-o" || w.text === "--output") {
+            emitWord(args[i + 1], "write", segmentCwd);
+            i++;
+            continue;
+          }
+          if (w.text.startsWith("--output=")) {
+            emitRaw(w.text.slice("--output=".length), "write", segmentCwd, w.dynamic, w.hasGlob);
+            continue;
+          }
+          if (w.text.startsWith("--")) {
+            const name = w.text.slice(2);
+            if (!name.includes("=") && COMMON_VALUE_LONG_FLAGS.has(name)) i++;
+          } else if (shortFlagConsumesNext(w.text, COMMAND_VALUE_SHORT_FLAGS.git!)) {
+            i++;
+          }
+          continue;
+        }
+        subPositionals.push(w);
+      }
+      const startPos = sub === "grep" && !gitGrepHasPatternFlag ? 1 : 0;
+      for (let p = startPos; p < subPositionals.length; p++) {
+        emitWord(subPositionals[p], "read", segmentCwd);
+      }
+      continue;
+    }
+
+    // `grep` / `egrep` / `fgrep` / `rg`: drop first positional pattern when neither `-e` nor `-f` was given
+    if (binName === "grep" || binName === "egrep" || binName === "fgrep" || binName === "rg") {
+      const shortValFlags = COMMAND_VALUE_SHORT_FLAGS[binName]!;
+      let hasPatternFlag = false;
+      let afterDashDash = false;
+      const positionals: ShellLexWord[] = [];
+      for (let i = 0; i < args.length; i++) {
+        const w = args[i]!;
+        if (!afterDashDash && w.text === "--") {
+          afterDashDash = true;
+          continue;
+        }
+        if (!afterDashDash && w.text.startsWith("-") && w.text !== "-") {
+          if (w.text.startsWith("--")) {
+            const name = w.text.slice(2).split("=")[0]!;
+            if (name === "regexp" || name === "file") hasPatternFlag = true;
+            if (!w.text.includes("=") && COMMON_VALUE_LONG_FLAGS.has(name)) i++;
+          } else {
+            if (hasShortFlag(w.text, "ef")) hasPatternFlag = true;
+            if (shortFlagConsumesNext(w.text, shortValFlags)) i++;
+          }
+          continue;
+        }
+        positionals.push(w);
+      }
+      const startPos = hasPatternFlag ? 0 : 1;
+      for (let p = startPos; p < positionals.length; p++) {
+        emitWord(positionals[p], "read", segmentCwd);
+      }
+      continue;
+    }
+
+    // `sed`: `-i`/`--in-place` makes file operands write-role; drop first positional script when no `-e`/`-f`
+    if (binName === "sed") {
+      let inPlace = false;
+      let hasScriptFlag = false;
+      let afterDashDash = false;
+      const positionals: ShellLexWord[] = [];
+      for (let i = 0; i < args.length; i++) {
+        const w = args[i]!;
+        if (!afterDashDash && w.text === "--") {
+          afterDashDash = true;
+          continue;
+        }
+        if (!afterDashDash && w.text.startsWith("-") && w.text !== "-") {
+          if (w.text.startsWith("--")) {
+            const name = w.text.slice(2).split("=")[0]!;
+            if (name === "in-place") inPlace = true;
+            if (name === "expression" || name === "file") hasScriptFlag = true;
+            if (!w.text.includes("=") && COMMON_VALUE_LONG_FLAGS.has(name)) i++;
+          } else {
+            if (hasShortFlag(w.text, "i")) inPlace = true;
+            if (hasShortFlag(w.text, "ef")) hasScriptFlag = true;
+            if (shortFlagConsumesNext(w.text, COMMAND_VALUE_SHORT_FLAGS.sed!)) i++;
+          }
+          continue;
+        }
+        positionals.push(w);
+      }
+      const startPos = hasScriptFlag ? 0 : 1;
+      const role = inPlace ? "write" : "read";
+      for (let p = startPos; p < positionals.length; p++) {
+        emitWord(positionals[p], role, segmentCwd);
+      }
+      continue;
+    }
+
+    // `awk` / `gawk` / `mawk` / `nawk`: drop first positional program when no `-f` and skip `var=val` assignments
+    if (binName === "awk" || binName === "gawk" || binName === "mawk" || binName === "nawk") {
+      let hasProgFile = false;
+      let afterDashDash = false;
+      const positionals: ShellLexWord[] = [];
+      for (let i = 0; i < args.length; i++) {
+        const w = args[i]!;
+        if (!afterDashDash && w.text === "--") {
+          afterDashDash = true;
+          continue;
+        }
+        if (!afterDashDash && w.text.startsWith("-") && w.text !== "-") {
+          if (w.text.startsWith("--")) {
+            const name = w.text.slice(2).split("=")[0]!;
+            if (name === "file") hasProgFile = true;
+            if (!w.text.includes("=") && COMMON_VALUE_LONG_FLAGS.has(name)) i++;
+          } else {
+            if (hasShortFlag(w.text, "f")) hasProgFile = true;
+            if (shortFlagConsumesNext(w.text, COMMAND_VALUE_SHORT_FLAGS.awk!)) i++;
+          }
+          continue;
+        }
+        positionals.push(w);
+      }
+      const startPos = hasProgFile ? 0 : 1;
+      for (let p = startPos; p < positionals.length; p++) {
+        if (positionals[p]!.assignment) continue;
+        emitWord(positionals[p], "read", segmentCwd);
+      }
+      continue;
+    }
+
+    // `jq`: drop first positional filter when no `-f`, handle 2-arg `--arg*` flags
+    if (binName === "jq") {
+      let hasFilterFile = false;
+      let afterDashDash = false;
+      const positionals: ShellLexWord[] = [];
+      for (let i = 0; i < args.length; i++) {
+        const w = args[i]!;
+        if (!afterDashDash && w.text === "--") {
+          afterDashDash = true;
+          continue;
+        }
+        if (!afterDashDash && w.text.startsWith("-") && w.text !== "-") {
+          if (
+            w.text === "--arg" ||
+            w.text === "--argjson" ||
+            w.text === "--slurpfile" ||
+            w.text === "--rawfile" ||
+            w.text === "--argfile"
+          ) {
+            i += 2;
+            continue;
+          }
+          if (w.text.startsWith("--")) {
+            const name = w.text.slice(2).split("=")[0]!;
+            if (name === "from-file") hasFilterFile = true;
+            if (!w.text.includes("=") && COMMON_VALUE_LONG_FLAGS.has(name)) i++;
+          } else {
+            if (hasShortFlag(w.text, "f")) hasFilterFile = true;
+            if (shortFlagConsumesNext(w.text, COMMAND_VALUE_SHORT_FLAGS.jq!)) i++;
+          }
+          continue;
+        }
+        positionals.push(w);
+      }
+      const startPos = hasFilterFile ? 0 : 1;
+      for (let p = startPos; p < positionals.length; p++) {
+        emitWord(positionals[p], "read", segmentCwd);
+      }
+      continue;
+    }
+
+    // `tee`: every file operand is write-role (Rule E1d)
+    if (binName === "tee") {
+      let afterDashDash = false;
+      for (let i = 0; i < args.length; i++) {
+        const w = args[i]!;
+        if (!afterDashDash && w.text === "--") {
+          afterDashDash = true;
+          continue;
+        }
+        if (!afterDashDash && w.text.startsWith("-") && w.text !== "-") continue;
+        emitWord(w, "write", segmentCwd);
+      }
+      continue;
+    }
+
+    // Destination-based write commands (`cp`, `mv`, `ln`, `install`, `rsync`)
+    if (DEST_WRITE_BINS.has(binName)) {
+      const shortValFlags = COMMAND_VALUE_SHORT_FLAGS[binName] ?? "";
+      let targetDirWord: ShellLexWord | undefined;
+      let targetDirRaw: { raw: string; dynamic: boolean; hasGlob: boolean } | undefined;
+      let installDirMode = false;
+      let afterDashDash = false;
+      const positionals: ShellLexWord[] = [];
+      for (let i = 0; i < args.length; i++) {
+        const w = args[i]!;
+        if (!afterDashDash && w.text === "--") {
+          afterDashDash = true;
+          continue;
+        }
+        if (!afterDashDash && w.text.startsWith("-") && w.text !== "-") {
+          if (binName === "install" && (w.text === "-d" || w.text === "--directory")) {
+            installDirMode = true;
+            continue;
+          }
+          if (w.text === "-t" || w.text === "--target-directory") {
+            targetDirWord = args[i + 1];
+            i++;
+            continue;
+          }
+          if (w.text.startsWith("--target-directory=")) {
+            targetDirRaw = { raw: w.text.slice("--target-directory=".length), dynamic: w.dynamic, hasGlob: w.hasGlob };
+            continue;
+          }
+          if (w.text.startsWith("--")) {
+            const name = w.text.slice(2);
+            if (!name.includes("=") && COMMON_VALUE_LONG_FLAGS.has(name)) i++;
+          } else if (shortFlagConsumesNext(w.text, shortValFlags)) {
+            i++;
+          }
+          continue;
+        }
+        positionals.push(w);
+      }
+      if (targetDirWord) emitWord(targetDirWord, "write", segmentCwd);
+      if (targetDirRaw) emitRaw(targetDirRaw.raw, "write", segmentCwd, targetDirRaw.dynamic, targetDirRaw.hasGlob);
+      if (binName === "mv" || installDirMode) {
+        for (const p of positionals) emitWord(p, "write", segmentCwd);
+      } else if (targetDirWord || targetDirRaw) {
+        for (const p of positionals) emitWord(p, "read", segmentCwd);
+      } else if (positionals.length >= 2) {
+        for (let p = 0; p < positionals.length - 1; p++) emitWord(positionals[p], "read", segmentCwd);
+        emitWord(positionals[positionals.length - 1], "write", segmentCwd);
+      } else if (positionals.length === 1) {
+        emitWord(positionals[0], "read", segmentCwd);
+      }
+      continue;
+    }
+
+    // All-positional write commands (`rm`, `rmdir`, `unlink`, `mkdir`, `touch`, `truncate`, `shred`, `mktemp`, `sponge`)
+    if (ALL_WRITE_POSITIONAL_BINS.has(binName)) {
+      const shortValFlags = COMMAND_VALUE_SHORT_FLAGS[binName] ?? "";
+      let afterDashDash = false;
+      for (let i = 0; i < args.length; i++) {
+        const w = args[i]!;
+        if (!afterDashDash && w.text === "--") {
+          afterDashDash = true;
+          continue;
+        }
+        if (!afterDashDash && w.text.startsWith("-") && w.text !== "-") {
+          if (binName === "mktemp" && (w.text === "-p" || w.text === "--tmpdir")) {
+            emitWord(args[i + 1], "write", segmentCwd);
+            i++;
+            continue;
+          }
+          if (binName === "mktemp" && w.text.startsWith("--tmpdir=")) {
+            emitRaw(w.text.slice("--tmpdir=".length), "write", segmentCwd, w.dynamic, w.hasGlob);
+            continue;
+          }
+          if (w.text.startsWith("--")) {
+            const name = w.text.slice(2);
+            if (!name.includes("=") && COMMON_VALUE_LONG_FLAGS.has(name)) i++;
+          } else if (shortFlagConsumesNext(w.text, shortValFlags)) {
+            i++;
+          }
+          continue;
+        }
+        emitWord(w, "write", segmentCwd);
+      }
+      continue;
+    }
+
+    // `chmod` / `chown` / `chgrp`: drop mode/owner first positional unless `--reference`, rest are write-role
+    if (binName === "chmod" || binName === "chown" || binName === "chgrp") {
+      let hasReference = false;
+      let afterDashDash = false;
+      const positionals: ShellLexWord[] = [];
+      for (let i = 0; i < args.length; i++) {
+        const w = args[i]!;
+        if (!afterDashDash && w.text === "--") {
+          afterDashDash = true;
+          continue;
+        }
+        if (!afterDashDash && w.text.startsWith("-") && w.text !== "-") {
+          if (w.text === "--reference") {
+            hasReference = true;
+            i++;
+          } else if (w.text.startsWith("--reference=")) {
+            hasReference = true;
+          }
+          continue;
+        }
+        positionals.push(w);
+      }
+      const startPos = hasReference ? 0 : 1;
+      for (let p = startPos; p < positionals.length; p++) {
+        emitWord(positionals[p], "write", segmentCwd);
+      }
+      continue;
+    }
+
+    // `curl` / `wget`: output flags are write-role, URLs are skipped
+    if (binName === "curl" || binName === "wget") {
+      const shortValFlags = COMMAND_VALUE_SHORT_FLAGS[binName]!;
+      for (let i = 0; i < args.length; i++) {
+        const w = args[i]!;
+        if (w.text === "--") break;
+        if (!w.text.startsWith("-")) continue;
+        if (
+          (binName === "curl" && (w.text === "-o" || w.text === "--output" || w.text === "--output-dir")) ||
+          (binName === "wget" && (w.text === "-O" || w.text === "-P" || w.text === "--output-document" || w.text === "--directory-prefix"))
+        ) {
+          emitWord(args[i + 1], "write", segmentCwd);
+          i++;
+          continue;
+        }
+        for (const prefix of ["--output=", "--output-dir=", "--output-document=", "--directory-prefix="]) {
+          if (w.text.startsWith(prefix)) {
+            emitRaw(w.text.slice(prefix.length), "write", segmentCwd, w.dynamic, w.hasGlob);
+            break;
+          }
+        }
+        if (w.text.startsWith("--")) {
+          const name = w.text.slice(2);
+          if (!name.includes("=") && COMMON_VALUE_LONG_FLAGS.has(name)) i++;
+        } else if (shortFlagConsumesNext(w.text, shortValFlags)) {
+          i++;
+        }
+      }
+      continue;
+    }
+
+    // Generic commands (`cat`, `ls`, `head`, `tail`, `sort`, `uniq`, `tree`, `wc`, `diff`, `bun`, `node`, etc.)
+    const shortValFlags = COMMAND_VALUE_SHORT_FLAGS[binName] ?? "";
+    let afterDashDash = false;
+    const positionals: ShellLexWord[] = [];
+    for (let i = 0; i < args.length; i++) {
+      const w = args[i]!;
+      if (!afterDashDash && w.text === "--") {
+        afterDashDash = true;
+        continue;
+      }
+      if (!afterDashDash && w.text.startsWith("-") && w.text !== "-") {
+        if ((binName === "sort" || binName === "tree") && (w.text === "-o" || w.text === "--output")) {
+          emitWord(args[i + 1], "write", segmentCwd);
+          i++;
+          continue;
+        }
+        if ((binName === "sort" || binName === "tree") && w.text.startsWith("--output=")) {
+          emitRaw(w.text.slice("--output=".length), "write", segmentCwd, w.dynamic, w.hasGlob);
+          continue;
+        }
+        if (w.text.startsWith("--")) {
+          const name = w.text.slice(2);
+          if (!name.includes("=") && COMMON_VALUE_LONG_FLAGS.has(name)) i++;
+        } else if (shortFlagConsumesNext(w.text, shortValFlags)) {
+          i++;
+        }
+        continue;
+      }
+      positionals.push(w);
+    }
+    if (binName === "uniq" && positionals.length >= 2) {
+      emitWord(positionals[0], "read", segmentCwd);
+      emitWord(positionals[1], "write", segmentCwd);
+    } else {
+      for (const p of positionals) {
+        emitWord(p, "read", segmentCwd);
+      }
+    }
+  }
+
   return out;
+}
+
+/**
+ * Extracts explicit path operands from a shell-enabled command with command-local cwd tracking and
+ * read/write role classification (Addendum E1). Option tokens/values, globs, and dynamic/unparseable
+ * segments are skipped rather than falsely classified as paths.
+ */
+export function extractShellPathOperands(rawCommand: string, initialCwd: string): ShellPathOperand[] {
+  return extractShellPathOperandsInternal(rawCommand, initialCwd, initialCwd, 0);
 }
 
 /**

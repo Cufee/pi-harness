@@ -430,6 +430,19 @@ async function canonicalizePermissionPath(absolute: string): Promise<string> {
   return current;
 }
 
+function stripGitSegments(absPath: string): string {
+  const normalized = resolve(absPath);
+  const parts = normalized.split(sep);
+  let changed = false;
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i]!.toLowerCase() === ".git") {
+      parts[i] = "_git_allowed";
+      changed = true;
+    }
+  }
+  return changed ? parts.join(sep) : normalized;
+}
+
 /**
  * Evaluates a permission-request path against denied roots (Rule A3) and protected paths while
  * leaving unrelated outside paths (such as temp directories) approved.
@@ -440,7 +453,7 @@ async function checkDeniedOrProtectedPath(
   deniedRoots: readonly string[],
   protectedRoots: readonly string[],
   rawPath: string,
-  opts: { checkProtectedWorktree: boolean; baseDir?: string },
+  opts: { checkProtectedWorktree: boolean; baseDir?: string; allowOwnWorkspaceGit?: boolean },
 ): Promise<HarnessRejection | null> {
   const lexical = resolvePermissionPath(opts.baseDir ?? workspace, rawPath);
   const canonical = await canonicalizePermissionPath(lexical);
@@ -470,9 +483,11 @@ async function checkDeniedOrProtectedPath(
   if (opts.checkProtectedWorktree) {
     const decision = mostSpecificRootDecision(canonical, allowedRoots, []);
     const ownRoot = decision.allowed ? decision.root : workspace;
+    const lexCheck = opts.allowOwnWorkspaceGit ? stripGitSegments(lexical) : lexical;
+    const canonCheck = opts.allowOwnWorkspaceGit ? stripGitSegments(canonical) : canonical;
     if (
-      legacyStoragePaths.isProtectedWorktreePath(lexical, ownRoot) ||
-      legacyStoragePaths.isProtectedWorktreePath(canonical, ownRoot)
+      legacyStoragePaths.isProtectedWorktreePath(lexCheck, ownRoot) ||
+      legacyStoragePaths.isProtectedWorktreePath(canonCheck, ownRoot)
     ) {
       return REJECTIONS.protectedPath(canonical, workspace);
     }
@@ -2731,64 +2746,69 @@ export class AcpRunner {
             }
           } else if (isExecute) {
             if (allowShell) {
-              const namedCwds = SHELL_CWD_KEYS.map((key) => rawInput?.[key]).filter(
-                (v): v is string => typeof v === "string" && v.trim().length > 0,
-              );
-              const shellAllowedRoots = [workspace, ...extraReadRoots];
               workspaceCall = true;
-              for (const rawCwd of namedCwds) {
-                const denied = await checkDeniedOrProtectedPath(
-                  workspace,
-                  shellAllowedRoots,
-                  deniedRoots,
-                  requestProtectedRoots,
-                  rawCwd,
-                  { checkProtectedWorktree: true },
+              if (deniedRoots.length > 0 || requestProtectedRoots.length > 0) {
+                const namedCwds = SHELL_CWD_KEYS.map((key) => rawInput?.[key]).filter(
+                  (v): v is string => typeof v === "string" && v.trim().length > 0,
                 );
-                if (denied) {
-                  execDenialRule = "protected-path";
-                  execDenialRejection = denied;
-                  workspaceCall = false;
-                  break;
-                }
-              }
-              if (workspaceCall) {
-                const effectiveCwd =
-                  namedCwds.length > 0
-                    ? await canonicalizePermissionPath(resolvePermissionPath(workspace, namedCwds[0]!))
-                    : workspace;
-                const explicitTargets: string[] = [];
-                for (const loc of p.toolCall?.locations ?? []) {
-                  if (typeof loc?.path === "string" && loc.path.trim().length > 0) {
-                    explicitTargets.push(loc.path.trim());
-                  }
-                }
-                for (const key of ["command", "cmd", "argv"] as const) {
-                  const val = rawInput?.[key];
-                  const cmdText =
-                    typeof val === "string" && key !== "argv"
-                      ? val
-                      : Array.isArray(val) && val.length > 0 && val.every((a) => typeof a === "string")
-                        ? unwrapShellArgv(val)
-                        : "";
-                  if (cmdText) {
-                    explicitTargets.push(...extractShellPathOperands(cmdText));
-                  }
-                }
-                for (const rawTarget of explicitTargets) {
+                const shellReadAllowedRoots = [workspace, ...extraReadRoots];
+                const shellWriteAllowedRoots = canWrite ? [workspace, ...extraWriteRoots] : [workspace];
+                for (const rawCwd of namedCwds) {
                   const denied = await checkDeniedOrProtectedPath(
                     workspace,
-                    shellAllowedRoots,
+                    shellReadAllowedRoots,
                     deniedRoots,
                     requestProtectedRoots,
-                    rawTarget,
-                    { checkProtectedWorktree: true, baseDir: effectiveCwd },
+                    rawCwd,
+                    { checkProtectedWorktree: true, allowOwnWorkspaceGit: true },
                   );
                   if (denied) {
                     execDenialRule = "protected-path";
                     execDenialRejection = denied;
                     workspaceCall = false;
                     break;
+                  }
+                }
+                if (workspaceCall) {
+                  const effectiveCwd =
+                    namedCwds.length > 0
+                      ? await canonicalizePermissionPath(resolvePermissionPath(workspace, namedCwds[0]!))
+                      : workspace;
+                  const explicitTargets: Array<{ path: string; role: "read" | "write"; baseDir: string }> = [];
+                  for (const loc of p.toolCall?.locations ?? []) {
+                    if (typeof loc?.path === "string" && loc.path.trim().length > 0) {
+                      explicitTargets.push({ path: loc.path.trim(), role: "read", baseDir: effectiveCwd });
+                    }
+                  }
+                  for (const key of ["command", "cmd", "argv"] as const) {
+                    const val = rawInput?.[key];
+                    const cmdText =
+                      typeof val === "string" && key !== "argv"
+                        ? val
+                        : Array.isArray(val) && val.length > 0 && val.every((a) => typeof a === "string")
+                          ? unwrapShellArgv(val)
+                          : "";
+                    if (cmdText) {
+                      explicitTargets.push(...extractShellPathOperands(cmdText, effectiveCwd));
+                    }
+                  }
+                  for (const target of explicitTargets) {
+                    const targetAllowedRoots =
+                      target.role === "write" ? shellWriteAllowedRoots : shellReadAllowedRoots;
+                    const denied = await checkDeniedOrProtectedPath(
+                      workspace,
+                      targetAllowedRoots,
+                      deniedRoots,
+                      requestProtectedRoots,
+                      target.path,
+                      { checkProtectedWorktree: true, baseDir: target.baseDir, allowOwnWorkspaceGit: true },
+                    );
+                    if (denied) {
+                      execDenialRule = "protected-path";
+                      execDenialRejection = denied;
+                      workspaceCall = false;
+                      break;
+                    }
                   }
                 }
               }
