@@ -257,7 +257,8 @@ describe("daemon RPC storage paths (artifact.read and task.get)", () => {
     assert.deepEqual(taskDetail.handoff.artifact_paths, [expectedMigratedAbs]);
     assert.equal(taskDetail.handoff.full_summary?.path, expectedMigratedAbs);
 
-    // 4. Workspace fallback allows ordinary repo files and refuses state-dir internals, data-dir metadata, and worktree/scratch paths.
+    // 4. Workspace fallback resolves indexed rows against the owning task's worktree and refuses sibling worktrees,
+    // scratch checkouts, data-dir metadata, and state-dir internals.
     const stateSecret = join(stateDir, "config.json");
     writeFile(stateSecret, '{"token":"secret"}\n');
     const stateLinkInRepo = join(repoDir, "link-to-state-config.json");
@@ -267,8 +268,16 @@ describe("daemon RPC storage paths (artifact.read and task.get)", () => {
     writeFile(projectMeta, '{"repoRoot":"test"}\n');
 
     const taskWtDir = ddStorage.worktreePath({ id: bothExistRunId, repoRoot: repoDir, chatSessionId: "chat-2" }, bothExistTaskId);
-    const taskWtFile = join(taskWtDir, "wt-secret.txt");
-    writeFile(taskWtFile, "worktree secret\n");
+    const taskWtReadme = join(taskWtDir, "README.md");
+    writeFile(taskWtReadme, "# Worktree README\n");
+    const taskWtFile = join(taskWtDir, "wt-own.txt");
+    writeFile(taskWtFile, "own worktree content\n");
+
+    const siblingWtFile = join(
+      ddStorage.worktreePath({ id: bothExistRunId, repoRoot: repoDir, chatSessionId: "chat-2" }, "t-sibling"),
+      "wt-secret.txt",
+    );
+    writeFile(siblingWtFile, "sibling worktree secret\n");
 
     const scratchFile = join(ddStorage.scratchPath(repoDir, "_verify", "s-1"), "scratch-secret.txt");
     writeFile(scratchFile, "scratch secret\n");
@@ -290,7 +299,7 @@ describe("daemon RPC storage paths (artifact.read and task.get)", () => {
           baseSha,
         });
 
-        for (const p of ["README.md", stateSecret, stateLinkInRepo, projectMeta, taskWtFile, scratchFile, legacyWtFile]) {
+        for (const p of ["README.md", taskWtFile, stateSecret, stateLinkInRepo, projectMeta, siblingWtFile, scratchFile, legacyWtFile]) {
           cpDb.recordArtifact({
             runId: bothExistRunId,
             taskId: bothExistTaskId,
@@ -308,10 +317,17 @@ describe("daemon RPC storage paths (artifact.read and task.get)", () => {
       runId: bothExistRunId,
       path: "README.md",
     });
-    assert.equal(readmeRes.content, "# Daemon RPC Storage Test\n");
-    assert.equal(readmeRes.path, join(repoDir, "README.md"));
+    assert.equal(readmeRes.content, "# Worktree README\n");
+    assert.equal(readmeRes.path, taskWtReadme);
 
-    for (const forbidden of [stateSecret, stateLinkInRepo, projectMeta, taskWtFile, scratchFile, legacyWtFile]) {
+    const ownWtRes = await client.request<{ path: string; content: string }>("artifact.read", {
+      runId: bothExistRunId,
+      path: taskWtFile,
+    });
+    assert.equal(ownWtRes.content, "own worktree content\n");
+    assert.equal(ownWtRes.path, taskWtFile);
+
+    for (const forbidden of [stateSecret, stateLinkInRepo, projectMeta, siblingWtFile, scratchFile, legacyWtFile]) {
       await assert.rejects(
         () =>
           client.request("artifact.read", {
@@ -417,5 +433,138 @@ describe("daemon RPC storage paths (artifact.read and task.get)", () => {
     } finally {
       legacyClient.close();
     }
+  });
+
+  it("artifact.read fallback reads the owning task's worktree in both layouts and refuses escapes into state dir (D10)", async () => {
+    const assertWorktreeReads = async (
+      layout: "legacy" | "data-dir",
+      repoDir: string,
+      stateDir: string,
+      dbPath: string,
+      runId: string,
+      wtDir: string,
+      escapePaths: readonly string[],
+    ) => {
+      setLayoutEnv(layout);
+      const cfg = makeDaemonConfig(repoDir, stateDir);
+      assert.equal(storagePaths(cfg).layout, layout);
+      const daemon = new HarnessDaemon(cfg, { dbPath });
+      activeDaemons.push(daemon);
+      await daemon.start();
+      const client = new DaemonClient(cfg.socketPath);
+      await client.connect();
+      try {
+        const readmeRes = await client.request<{ path: string; content: string }>("artifact.read", {
+          runId,
+          path: "README.md",
+        });
+        assert.equal(readmeRes.content, "# Worktree README bytes\n", `${layout}: expected worktree README bytes`);
+        assert.equal(readmeRes.path, join(wtDir, "README.md"), `${layout}: expected worktree README path`);
+
+        const onlyWtRes = await client.request<{ path: string; content: string }>("artifact.read", {
+          runId,
+          path: "wt-only.txt",
+        });
+        assert.equal(onlyWtRes.content, "only in worktree\n", `${layout}: expected worktree-only file`);
+        assert.equal(onlyWtRes.path, join(wtDir, "wt-only.txt"), `${layout}: expected worktree-only path`);
+
+        for (const escaped of escapePaths) {
+          await assert.rejects(
+            () =>
+              client.request("artifact.read", {
+                runId,
+                path: escaped,
+              }),
+            /artifact-outside-workspace/,
+            `${layout}: expected refusal for ${escaped}`,
+          );
+        }
+      } finally {
+        client.close();
+        await daemon.stop();
+        activeDaemons.pop();
+      }
+    };
+
+    const seedWorktreeRun = (
+      layout: "legacy" | "data-dir",
+      repoDir: string,
+      baseSha: string,
+      stateDir: string,
+      dbPath: string,
+    ) => {
+      setLayoutEnv(layout);
+      const cfg = makeDaemonConfig(repoDir, stateDir);
+      const sp = storagePaths(cfg);
+      const stateSecret = join(stateDir, "state-secret.json");
+      writeFile(stateSecret, '{"token":"secret"}\n');
+
+      const cpDb = new ControlPlaneDb(dbPath);
+      try {
+        const run = cpDb.createRun({
+          goal: `Worktree fallback (${layout})`,
+          repoRoot: repoDir,
+          baseBranch: "main",
+          baseSha,
+          chatSessionId: "chat-d10",
+        });
+        const task = cpDb.createTask({
+          runId: run.id,
+          tier: 2,
+          kind: "worker",
+          title: "Worktree worker",
+          objective: "Hold worktree files",
+          profileId: "pi:local",
+        });
+        cpDb.updateTask(task.id, { status: "completed", summary: "Done" });
+        cpDb.updateRunStatus(run.id, "completed");
+
+        const wtDir = sp.worktreePath(run, task.id);
+        writeFile(join(wtDir, "README.md"), "# Worktree README bytes\n");
+        writeFile(join(wtDir, "wt-only.txt"), "only in worktree\n");
+        symlinkSync(stateSecret, join(wtDir, "escape-link.json"));
+
+        const escapeRel = relative(wtDir, stateSecret);
+        const siblingWtFile = join(sp.worktreePath(run, "t-sibling"), "sibling.txt");
+        writeFile(siblingWtFile, "sibling worktree bytes\n");
+
+        cpDb.recordWorktree({
+          runId: run.id,
+          taskId: task.id,
+          branch: `harness/d10/${layout}`,
+          path: wtDir,
+          baseSha,
+        });
+
+        const escapePaths = [escapeRel, "escape-link.json", stateSecret, siblingWtFile];
+        for (const p of ["README.md", "wt-only.txt", ...escapePaths]) {
+          cpDb.recordArtifact({
+            runId: run.id,
+            taskId: task.id,
+            kind: "read",
+            path: p,
+            summary: `Indexed ${p}`,
+          });
+        }
+        return { runId: run.id, wtDir, escapePaths };
+      } finally {
+        cpDb.close();
+      }
+    };
+
+    // 1. Pre-flip indexed row + legacy worktree queried in legacy layout, then queried unchanged in data-dir layout.
+    const { repoDir: preFlipRepo, baseSha: preFlipSha } = initTempGitRepo("pi-rpc-d10-preflip-repo-");
+    const preFlipState = makeTempDir("pi-rpc-d10-preflip-state-");
+    const preFlipDb = join(preFlipState, "control-plane.sqlite");
+    const preFlip = seedWorktreeRun("legacy", preFlipRepo, preFlipSha, preFlipState, preFlipDb);
+    await assertWorktreeReads("legacy", preFlipRepo, preFlipState, preFlipDb, preFlip.runId, preFlip.wtDir, preFlip.escapePaths);
+    await assertWorktreeReads("data-dir", preFlipRepo, preFlipState, preFlipDb, preFlip.runId, preFlip.wtDir, preFlip.escapePaths);
+
+    // 2. Native data-dir worktree (under <stateDir>/data/.../worktrees/...) queried in data-dir layout.
+    const { repoDir: ddRepo, baseSha: ddSha } = initTempGitRepo("pi-rpc-d10-datadir-repo-");
+    const ddState = makeTempDir("pi-rpc-d10-datadir-state-");
+    const ddDb = join(ddState, "control-plane.sqlite");
+    const dd = seedWorktreeRun("data-dir", ddRepo, ddSha, ddState, ddDb);
+    await assertWorktreeReads("data-dir", ddRepo, ddState, ddDb, dd.runId, dd.wtDir, dd.escapePaths);
   });
 });

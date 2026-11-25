@@ -1,8 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, watch, type FSWatcher } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { dirname, join, resolve } from "node:path";
-import { REJECTIONS } from "../advisories/rejections.js";
+import { dirname, join } from "node:path";
 import { ModelCatalogCompiler } from "../catalog/compiler.js";
 import {
   diffHarnessConfig,
@@ -4375,12 +4374,11 @@ export class HarnessDaemon {
           const indexed = this.db.listArtifacts(run.id, typeof p.taskId === "string" ? p.taskId : undefined, 200);
           const match = indexed.find((a) => a.path === reqPath);
           if (!match) throw err;
+          const task = this.db.getTask(match.taskId);
+          const wt = task?.worktreeId ? this.db.getWorktree(task.worktreeId) : null;
+          const root = wt && existsSync(wt.path) ? wt.path : run.repoRoot;
           if (storage.layout === "data-dir") {
             if (match.kind === "dossier") throw err;
-            const candidate = resolve(run.repoRoot, reqPath);
-            if (!storage.directorReadPolicy(run.repoRoot, candidate).ok) {
-              throw REJECTIONS.artifactOutsideWorkspace(reqPath);
-            }
             const deniedRoots = [
               ...(this.config.stateDir?.trim() ? [canonicalPath(this.config.stateDir)] : []),
               ...(storage.dataRoot ? [storage.dataRoot] : []),
@@ -4388,11 +4386,8 @@ export class HarnessDaemon {
             const policy: WorkspaceArtifactPolicy = {
               deniedRoots: [...new Set(deniedRoots)],
             };
-            return readWorkspaceArtifact(run.repoRoot, reqPath, maxChars, offset, storage, policy);
+            return readWorkspaceArtifact(root, reqPath, maxChars, offset, storage, policy);
           }
-          const task = this.db.getTask(match.taskId);
-          const wt = task?.worktreeId ? this.db.getWorktree(task.worktreeId) : null;
-          const root = wt && existsSync(wt.path) ? wt.path : run.repoRoot;
           return readWorkspaceArtifact(root, reqPath, maxChars, offset, storage);
         }
       }
