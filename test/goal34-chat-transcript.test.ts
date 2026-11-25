@@ -4051,4 +4051,135 @@ describe("goal-34 c3: Director chat assistant replies render exactly once", () =
     assert.ok(out.includes("Initial prompt before held ping"), "history user row must render while ping is held");
     assert.ok(out.includes("HISTORY-ROW-VISIBLE"), "history assistant row must render while ping is held");
   });
+
+  it("review-5 B2 (draining + disconnect + same-PID idle reopen): discards Pi commentary remainder with no restart note", async () => {
+    const { terminal, lines, text, sendInput, typeText } = makeFakeTerminal(120, 30);
+    const session = makeChatSession("chat-34-r5-b2");
+    const history: ChatTurnRecord[] = [];
+    let openCount = 0;
+    let pingCount = 0;
+    let turnId = "";
+    const daemonPid = process.pid;
+
+    const mock = makeMockClient(async (op, params) => {
+      if (op === "ping") {
+        pingCount += 1;
+        return { pong: true, pid: daemonPid, protocolRev: 8, releaseId: "rel-r5" };
+      }
+      if (op === "chat.open") {
+        openCount += 1;
+        return makeProdChatOpen(session, history, { busy: false });
+      }
+      if (op === "chat.history") {
+        const afterSeq = Number(params.afterSeq ?? 0);
+        const throughSeq = Number(params.throughSeq ?? Number.MAX_SAFE_INTEGER);
+        return {
+          history: history.filter((r) => r.seq > afterSeq && r.seq <= throughSeq),
+          historyNext: null,
+        };
+      }
+      if (op === "chat.send") {
+        turnId = String(params.turnId ?? "turn-r5-b2");
+        history.push({
+          seq: 1,
+          chatSessionId: session.id,
+          role: "user",
+          content: String(params.message ?? params.text ?? "Check status"),
+          createdAt: Date.now(),
+        });
+        // Hold chat.send open while the turn streams until disconnect rejects it.
+        return await new Promise<never>(() => {});
+      }
+      if (op === "work.snapshot") return emptyWorkSnapshot();
+      if (op === "session.leave") return { daemonWillQuit: false };
+      return {};
+    });
+
+    const runPromise = runDirectorChatTui({ client: mock.client, repoRoot: "/repo", terminal });
+    await waitFor(() => text().includes(session.id) && pingCount >= 1, 3000, "initial render and startup pid probe");
+
+    // One controller sends "Check status" (user seq 1).
+    typeText("Check status");
+    sendInput("\r");
+    await waitFor(() => Boolean(turnId), 3000, "chat.send dispatched");
+
+    // Pi commentary delta, plain list_models tool with no display, second delta "\n\nConfirmed.".
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.delta",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId, delta: "Confirmed. I will check." },
+    });
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.tool",
+      createdAt: Date.now(),
+      payload: {
+        chatSessionId: session.id,
+        turnId,
+        id: "tool-list-models-r5-b2",
+        name: "list_models",
+        status: "completed",
+      },
+    });
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: session.id,
+      taskId: session.id,
+      type: "chat.delta",
+      createdAt: Date.now(),
+      payload: { chatSessionId: session.id, turnId, delta: "\n\nConfirmed." },
+    });
+    await waitFor(() => text().includes("Confirmed. I will check."), 3000, "deltas streamed");
+
+    // Daemon broadcasts reload draining, then transport drops; turn completes offline on the same daemon process.
+    mock.emit({
+      kind: "event",
+      seq: 0,
+      runId: "",
+      taskId: null,
+      type: "daemon.reload",
+      createdAt: Date.now(),
+      payload: {
+        phase: "draining",
+        fromReleaseId: "rel-r5",
+        toReleaseId: "rel-r5-next",
+        deadlineAt: Date.now() + 30_000,
+      },
+    });
+    history.push({
+      seq: 2,
+      chatSessionId: session.id,
+      role: "assistant",
+      content: "Confirmed.",
+      createdAt: Date.now(),
+    });
+    mock.disconnect();
+    await waitFor(() => openCount >= 2 && text().includes("Reconnected to harnessd"), 5000, "reconnected idle on same pid");
+
+    sendInput("\x1d");
+    await runPromise;
+
+    const out = text();
+    const { actualBlocks } = await assertMatchesFreshHistoryOracle({
+      session,
+      persistedHistory: history,
+      actualLines: lines(),
+      label: "review-5 B2 (draining + same-PID idle reopen)",
+    });
+    assert.deepEqual(actualBlocks, ["Confirmed."], "assistant paragraphs must be exactly ['Confirmed.']");
+    assert.equal(
+      out.includes("Turn ended early: harnessd restarted"),
+      false,
+      "same-PID reconnect after draining must not print restart note",
+    );
+    assert.equal(out.includes("Turn ended early"), false, "no spurious early-end note");
+  });
 });

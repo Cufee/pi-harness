@@ -2321,16 +2321,20 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         throw new Error("Disconnected from harnessd");
       }
 
-      const pidChanged =
-        lastDaemonPid !== null && typeof ping.pid === "number" && ping.pid > 0 && ping.pid !== lastDaemonPid;
-      if (typeof ping.pid === "number" && ping.pid > 0) {
-        lastDaemonPid = ping.pid;
+      const prevDaemonPid = lastDaemonPid;
+      const nextDaemonPid = typeof ping.pid === "number" && ping.pid > 0 ? ping.pid : null;
+      if (nextDaemonPid !== null) {
+        lastDaemonPid = nextDaemonPid;
       }
-      const hasRestartEvidence =
-        cancelOrigin === "restart" ||
-        Boolean(reconnect?.expectingRestart) ||
-        reloadingBlocked ||
-        pidChanged;
+      // When both pre-disconnect and reconnect daemon PIDs are known, process identity decides
+      // whether harnessd actually restarted (a draining daemon with the same PID ended any
+      // completed turn itself). Fall back to intent signals only when either PID is unknown.
+      const intentRestartEvidence =
+        cancelOrigin === "restart" || Boolean(reconnect?.expectingRestart) || reloadingBlocked;
+      const daemonRestarted =
+        prevDaemonPid !== null && nextDaemonPid !== null
+          ? nextDaemonPid !== prevDaemonPid
+          : intentRestartEvidence;
 
       chatSession = reopened.session;
       activeProject = reopened.project ?? activeProject;
@@ -2425,7 +2429,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         tail: wasActive ? prevSnap.text : "",
         rows: unseenRows,
         busy: reopened.busy,
-        daemonRestarted: hasRestartEvidence,
+        daemonRestarted,
         liveToolMatches: toolMatch.matches,
       });
       if (wasActive) {
@@ -2464,10 +2468,10 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
             replay.renderedAssistantCount > 0 ||
             replay.renderedToolCount > 0;
           const shouldReportEarlyEnd =
-            hasRestartEvidence || (!unconfirmedTurnNotDelivered && !persistedTurnOutput);
+            daemonRestarted || (!unconfirmedTurnNotDelivered && !persistedTurnOutput);
           settleTurn(prevTurnId, {
             cancelled: shouldReportEarlyEnd,
-            cancelCause: shouldReportEarlyEnd ? (hasRestartEvidence ? "restart" : "reconnect") : undefined,
+            cancelCause: shouldReportEarlyEnd ? (daemonRestarted ? "restart" : "reconnect") : undefined,
             timestampMs: Date.now(),
             discardLiveText: true,
           });
