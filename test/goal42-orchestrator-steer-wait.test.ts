@@ -178,7 +178,6 @@ describe("goal-42 Slice B: orchestrator delivers steers & goal amendments via bl
     });
 
     const handleSteerCalls: string[] = [];
-    const handleInjectLiveCalls: string[] = [];
     const handleCancelCalls: string[] = [];
     const waitResults: Array<Record<string, unknown>> = [];
     let orchTaskId = "";
@@ -195,10 +194,6 @@ describe("goal-42 Slice B: orchestrator delivers steers & goal amendments via bl
           req.onHandle?.({
             steer: async (msg) => {
               handleSteerCalls.push(msg);
-              return true;
-            },
-            injectLive: async (msg) => {
-              handleInjectLiveCalls.push(msg);
               return true;
             },
             turnOpen: () => true,
@@ -270,7 +265,6 @@ describe("goal-42 Slice B: orchestrator delivers steers & goal amendments via bl
       );
 
       assert.equal(handleSteerCalls.length, 0, "handle.steer must NOT be called while task is inside wait_timer");
-      assert.equal(handleInjectLiveCalls.length, 0, "handle.injectLive must NOT be called while task is inside wait_timer");
 
       assert.equal(waitResults[0]!.wakeReason, "steered");
       assert.deepEqual(waitResults[0]!.steeringMessages, ["Direct steer during wait_timer"]);

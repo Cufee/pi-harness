@@ -4383,7 +4383,16 @@ export class HarnessOrchestrator {
         return true;
       }
       const t = this.db.getTask(taskId);
-      if (!t || TERMINAL_TASK_STATUSES.has(t.status)) return true;
+      if (
+        !t ||
+        t.status === "completed" ||
+        t.status === "returned_for_rescope" ||
+        t.status === "cancelled" ||
+        t.status === "failed" ||
+        t.status === "blocked"
+      ) {
+        return true;
+      }
       const run = this.db.getRun(t.runId);
       return Boolean(run && run.status === "stopped" && !isDirectorTaskContainer(t.runId));
     };

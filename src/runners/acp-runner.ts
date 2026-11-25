@@ -998,7 +998,7 @@ export class AcpRunner {
                 return;
               }
               // Cancel the unacknowledged replacement so it cannot deliver later alongside harness fallback.
-              if (sessionId && activeConnection === conn && !stopped && !req.signal.aborted && !rolloverTriggered) {
+              if (sessionId && activeConnection === conn && !req.signal.aborted && !rolloverTriggered) {
                 steerAckTimedOut = true;
                 harnessCancelIssuedForTurn = true;
                 void conn.agent.notify("session/cancel", { sessionId }).catch(() => {});
