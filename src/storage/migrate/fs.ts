@@ -1259,6 +1259,56 @@ function linkTempWithoutOverwrite(tempPath: string, destFile: string): boolean {
   }
 }
 
+/** Maximum POSIX filename component length in UTF-8 bytes. */
+const MAX_FILENAME_BYTES = 255;
+
+/** Pattern for fixed-length temporary symlinks created before atomic single-file bridge replacement. */
+export const BRIDGE_TEMP_NAME_RE = /^\.pi-harness-bridge-[0-9a-f]{32}\.tmp$/;
+
+/** Returns true iff `name` matches the exact temporary symlink name pattern created by `createBridgeSymlink`. */
+export function isBridgeTempLinkName(name: string): boolean {
+  return BRIDGE_TEMP_NAME_RE.test(name);
+}
+
+function truncateUtf8Bytes(input: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(input, "utf8") <= maxBytes) return input;
+  let out = "";
+  let used = 0;
+  for (const ch of input) {
+    const chBytes = Buffer.byteLength(ch, "utf8");
+    if (used + chBytes > maxBytes) break;
+    out += ch;
+    used += chBytes;
+  }
+  return out;
+}
+
+/**
+ * Builds a sibling `.pre-merge-<8hex>` path for a preserved destination entry, keeping the full name
+ * when it fits within 255 UTF-8 bytes and shortening the stem on UTF-8 code-point boundaries otherwise.
+ */
+function buildPreservedSiblingPath(entryPath: string, shortHex: string, suffixNum?: number): string {
+  const dir = dirname(entryPath);
+  const name = basename(entryPath);
+  const tail = suffixNum !== undefined ? `.pre-merge-${shortHex}.${suffixNum}` : `.pre-merge-${shortHex}`;
+  const tailBytes = Buffer.byteLength(tail, "utf8");
+  if (Buffer.byteLength(name, "utf8") + tailBytes <= MAX_FILENAME_BYTES) {
+    return join(dir, `${name}${tail}`);
+  }
+  const maxBaseBytes = Math.max(1, MAX_FILENAME_BYTES - tailBytes);
+  const dotIdx = name.lastIndexOf(".");
+  const ext = dotIdx > 0 ? name.slice(dotIdx) : "";
+  const extBytes = Buffer.byteLength(ext, "utf8");
+  if (ext.length > 0 && extBytes <= 16 && maxBaseBytes > extBytes) {
+    const stem = truncateUtf8Bytes(name.slice(0, dotIdx), maxBaseBytes - extBytes);
+    if (stem.length > 0) {
+      return join(dir, `${stem}${ext}${tail}`);
+    }
+  }
+  return join(dir, `${truncateUtf8Bytes(name, maxBaseBytes)}${tail}`);
+}
+
 /** Picks a crash-safe `.pre-merge-<8hex>` sibling path for a shadowed destination file. */
 function preserveShadowedDestination(
   destFile: string,
@@ -1266,8 +1316,7 @@ function preserveShadowedDestination(
   checkBudget?: () => void,
 ): string {
   const shortHex = destHash.sha256.slice(0, 8);
-  const baseCandidate = `${destFile}.pre-merge-${shortHex}`;
-  let candidate = baseCandidate;
+  let candidate = buildPreservedSiblingPath(destFile, shortHex);
   let suffix = 2;
 
   while (true) {
@@ -1281,12 +1330,12 @@ function preserveShadowedDestination(
           return candidate;
         }
       }
-      candidate = `${baseCandidate}.${suffix}`;
+      candidate = buildPreservedSiblingPath(destFile, shortHex, suffix);
       suffix++;
       continue;
     }
 
-    const temp = join(dirname(destFile), `.${basename(destFile)}.pre-merge.${randomUUID()}.tmp`);
+    const temp = join(dirname(destFile), `.pi-harness-premerge-${randomBytes(16).toString("hex")}.tmp`);
     copyFileExclusive(destFile, temp, undefined, checkBudget);
     try {
       const tempHash = hashRegularFileStrict(temp, checkBudget);
@@ -1337,12 +1386,11 @@ function preserveCollidingDestinationEntry(destEntry: string, checkBudget?: () =
     throw new Error(`Refusing to relocate non-regular/non-directory destination entry during merge: ${destEntry}`);
   }
 
-  const baseCandidate = `${destEntry}.pre-merge-${shortHex}`;
-  let candidate = baseCandidate;
+  let candidate = buildPreservedSiblingPath(destEntry, shortHex);
   let suffix = 2;
   while (safeLstat(candidate) !== null) {
     checkBudget?.();
-    candidate = `${baseCandidate}.${suffix}`;
+    candidate = buildPreservedSiblingPath(destEntry, shortHex, suffix);
     suffix++;
   }
   renameSync(destEntry, candidate);
@@ -1376,6 +1424,32 @@ function mergeSingleFile(
     return unlinkIfIdentityMatches(legacyFile, identity);
   };
 
+  // G1: same inode (same dev and ino) means identical bytes by definition; skip hashing and finish directly.
+  const legacyStatBig = lstatSync(legacyFile, { bigint: true });
+  if (legacyStatBig.isSymbolicLink() || !legacyStatBig.isFile()) {
+    throw new Error(`Failed to verify SHA-256 hash of regular file: ${legacyFile}`);
+  }
+  const initialDestStatBig = safeLstatBigInt(destFile);
+  if (
+    initialDestStatBig !== null &&
+    !initialDestStatBig.isSymbolicLink() &&
+    initialDestStatBig.isFile() &&
+    legacyStatBig.dev === initialDestStatBig.dev &&
+    legacyStatBig.ino === initialDestStatBig.ino
+  ) {
+    if (realpathSync(resolve(legacyFile)) === realpathSync(resolve(destFile))) {
+      throw new Error(`Refusing to merge identical path ${legacyFile} into itself`);
+    }
+    fsyncFile(destFile);
+    fsyncDir(dirname(destFile));
+    const unlinked = finalizeLegacy({
+      ino: legacyStatBig.ino.toString(),
+      size: legacyStatBig.size.toString(),
+      mtimeNs: legacyStatBig.mtimeNs.toString(),
+    });
+    return { shadowed: null, unlinked };
+  }
+
   const legacyHash = hashRegularFileWithIdentity(legacyFile, checkBudget);
   let destStat = safeLstat(destFile);
   let preservedCollision: ShadowedFileRecord | null = null;
@@ -1390,7 +1464,7 @@ function mergeSingleFile(
   }
 
   if (destStat === null) {
-    const temp = join(dirname(destFile), `.${basename(destFile)}.merge-tmp.${randomUUID()}.tmp`);
+    const temp = join(dirname(destFile), `.pi-harness-merge-${randomBytes(16).toString("hex")}.tmp`);
     copyFileExclusive(legacyFile, temp, undefined, checkBudget);
     try {
       const tempHash = hashRegularFileStrict(temp, checkBudget);
@@ -1429,7 +1503,7 @@ function mergeSingleFile(
 
   // Conflict: preserve shadowed dest file first, then atomically replace canonical name with legacy content.
   const preservedPath = preserveShadowedDestination(destFile, destHash, checkBudget);
-  const legacyTemp = join(dirname(destFile), `.${basename(destFile)}.merge-tmp.${randomUUID()}.tmp`);
+  const legacyTemp = join(dirname(destFile), `.pi-harness-merge-${randomBytes(16).toString("hex")}.tmp`);
   copyFileExclusive(legacyFile, legacyTemp, undefined, checkBudget);
   try {
     const tempHash = hashRegularFileStrict(legacyTemp, checkBudget);
@@ -1464,10 +1538,10 @@ export interface MergeBothExistOptions {
 
 /**
  * Merges a real legacy path into an existing real destination path without losing any file.
- * Deletes legacy files only after their content is SHA-256 verified at the destination and their
- * `lstat` identity `(ino, size, mtimeNs)` is unchanged.
- * Per F2, one unit's merge is one in-flight operation: `checkBudget` is checked only before the merge begins,
- * never between children or before the legacy directory is removed and bridged.
+ * Same-inode file pairs skip hashing and finish directly. Otherwise legacy files are removed or replaced
+ * only after their content is SHA-256 verified at the destination and their `lstat` identity is unchanged.
+ * For single-file merges, hashing honors `checkBudget` (a budget stop leaves both names in place).
+ * For directory merges, `checkBudget` is checked only before the merge begins, never between children.
  */
 export function mergeBothExist(
   legacyPath: string,
@@ -1486,7 +1560,7 @@ export function mergeBothExist(
     if (!legStat.isFile() || (!dstStat.isFile() && !dstStat.isDirectory())) {
       throw new Error(`Type mismatch merging file unit ${legacyPath} -> ${destPath}`);
     }
-    const res = mergeSingleFile(legacyPath, destPath, undefined, opts?.replaceSingleFileWithBridge, opts?.canPreserve);
+    const res = mergeSingleFile(legacyPath, destPath, checkBudget, opts?.replaceSingleFileWithBridge, opts?.canPreserve);
     const legAfter = safeLstat(legacyPath);
     const fullyMerged = opts?.replaceSingleFileWithBridge
       ? res.unlinked && Boolean(legAfter?.isSymbolicLink())
@@ -1607,7 +1681,7 @@ export function createBridgeSymlink(
       throw new Error(`Existing symlink at ${legacyPath} points to ${resolvedTarget}, expected ${destinationPath}`);
     }
     if (existing.isFile() && opts?.replaceFile) {
-      const tmpLink = join(dirname(legacyPath), `.${basename(legacyPath)}.bridge.${randomUUID()}.tmp`);
+      const tmpLink = join(dirname(legacyPath), `.pi-harness-bridge-${randomBytes(16).toString("hex")}.tmp`);
       symlinkSync(destinationPath, tmpLink);
       try {
         renameSync(tmpLink, legacyPath);
@@ -2076,6 +2150,8 @@ export function cleanupEmptyLegacyDirs(
   return removed;
 }
 
+const VALID_BRIDGE_KINDS = new Set<StorageUnitKind>(["goal", "run", "bucket_task", "flat_artifact", "note"]);
+
 /** Reads `<projectDir>/migration-state.json` without creating or writing anything. */
 export function readMigrationState(projectDir: string): MigrationStateFile {
   const empty: MigrationStateFile = { version: 1, reportedUnknownEntries: [], pendingUnits: [], bridges: [] };
@@ -2127,7 +2203,6 @@ export function readMigrationState(projectDir: string): MigrationStateFile {
               })),
           }))
       : [];
-    const VALID_BRIDGE_KINDS = new Set<StorageUnitKind>(["goal", "run", "bucket_task", "flat_artifact", "note"]);
     const bridges = Array.isArray(raw.bridges)
       ? raw.bridges
           .filter(
@@ -2173,7 +2248,14 @@ export function writeMigrationStateAtomic(projectDir: string, state: MigrationSt
   const dedupBridges = new Map<string, RecordedBridgeEntry>();
   for (const b of state.bridges ?? []) {
     if (typeof b.legacyPath === "string" && typeof b.target === "string" && Number.isFinite(b.createdAt)) {
-      dedupBridges.set(b.legacyPath, { legacyPath: b.legacyPath, target: b.target, createdAt: b.createdAt });
+      dedupBridges.set(b.legacyPath, {
+        legacyPath: b.legacyPath,
+        target: b.target,
+        createdAt: b.createdAt,
+        ...(typeof b.kind === "string" && VALID_BRIDGE_KINDS.has(b.kind as StorageUnitKind)
+          ? { kind: b.kind as StorageUnitKind }
+          : {}),
+      });
     }
   }
   const budgetDeferredUnits = [
@@ -2281,6 +2363,34 @@ function readBridgeTargetSafe(absPath: string): string | null {
 }
 
 /**
+ * Removes leftover fixed-length temporary bridge symlinks left behind by an interrupted pass.
+ * Never removes entries whose basename does not match `BRIDGE_TEMP_NAME_RE` or that are not symlinks.
+ */
+export function cleanupLeftoverBridgeTempLinks(
+  paths: readonly string[],
+  checkBudget?: () => void,
+  excludedRoots?: readonly string[],
+): number {
+  let removed = 0;
+  for (let i = 0; i < paths.length; i++) {
+    if (i > 0) checkBudget?.();
+    const absPath = paths[i]!;
+    if (!isBridgeTempLinkName(basename(absPath))) continue;
+    if (excludedRoots && excludedRoots.length > 0 && overlapsAnyPath(absPath, excludedRoots)) continue;
+    const st = safeLstat(absPath);
+    if (!st || !st.isSymbolicLink()) continue;
+    try {
+      unlinkSync(absPath);
+      removed++;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT") throw err;
+    }
+  }
+  return removed;
+}
+
+/**
  * Fault-tolerant enumeration of legacy units under `<canonRepo>/.harness`:
  * prefers `storage.enumerateLegacyUnits`, and falls back to per-entry guarded scanning if a chmod-000 subdirectory
  * makes full enumeration throw, reporting the unreadable path without losing other units.
@@ -2296,6 +2406,7 @@ export function enumerateLegacyUnitsSafe(
   units: DiscoveredLegacyUnit[];
   worktreeOverlaps: string[];
   errors: Array<{ path: string; message: string }>;
+  leftoverBridgeTempLinks: string[];
 } {
   checkBudget?.();
   const hasExcluded = Boolean(excludedWorktreeRoots && excludedWorktreeRoots.length > 0);
@@ -2303,8 +2414,9 @@ export function enumerateLegacyUnitsSafe(
   const units: DiscoveredLegacyUnit[] = [];
   const worktreeOverlaps: string[] = [];
   const errors: Array<{ path: string; message: string }> = [];
+  const leftoverBridgeTempLinks: string[] = [];
   if (!isRealDirUnderRoot(canonRepo, [LEGACY_HARNESS_DIR])) {
-    return { units, worktreeOverlaps, errors };
+    return { units, worktreeOverlaps, errors, leftoverBridgeTempLinks };
   }
 
   const makeDest = (kind: StorageUnitKind, id: string, taskId?: string) => (owner?: OwnerRef) =>
@@ -2408,6 +2520,10 @@ export function enumerateLegacyUnitsSafe(
             worktreeOverlaps.push(entryPath);
             continue;
           }
+          if (isBridge && isBridgeTempLinkName(entry.name)) {
+            leftoverBridgeTempLinks.push(entryPath);
+            continue;
+          }
           if (entry.isDirectory()) {
             units.push({
               kind: "run",
@@ -2429,18 +2545,17 @@ export function enumerateLegacyUnitsSafe(
               destinationFor: makeDest("flat_artifact", entry.name),
             });
           } else if (isBridge) {
-            // F7: decide bridge kind from legacy unit kind (never from current target physical type).
+            // Actual bridge kind ("run" vs "flat_artifact") is resolved in discoverRepoUnitSeeds
+            // from persisted journal/bridge records or DB provenance, never from target type or extension.
             const bridgeTarget = readBridgeTargetSafe(entryPath);
-            const looksLikeRun = /^run-\d+$/.test(entry.name) || !/\.[a-zA-Z0-9_-]{1,16}$/.test(entry.name);
-            const kind: StorageUnitKind = looksLikeRun ? "run" : "flat_artifact";
             units.push({
-              kind,
+              kind: "flat_artifact",
               repoRoot: canonRepo,
               id: entry.name,
               legacyPath: entryPath,
               isBridge: true,
               bridgeTarget,
-              destinationFor: makeDest(kind, entry.name),
+              destinationFor: makeDest("flat_artifact", entry.name),
             });
           }
         }
@@ -2484,6 +2599,10 @@ export function enumerateLegacyUnitsSafe(
               worktreeOverlaps.push(entryPath);
               continue;
             }
+            if (isBridge && isBridgeTempLinkName(entry.name)) {
+              leftoverBridgeTempLinks.push(entryPath);
+              continue;
+            }
             units.push({
               kind: "note",
               repoRoot: canonRepo,
@@ -2500,7 +2619,7 @@ export function enumerateLegacyUnitsSafe(
     }
   }
 
-  return { units, worktreeOverlaps, errors };
+  return { units, worktreeOverlaps, errors, leftoverBridgeTempLinks };
 }
 
 export { canonicalPath, isEqualOrWithin, isRealDirUnderRoot, isRealFileUnderRoot, isWithin };

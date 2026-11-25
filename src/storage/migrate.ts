@@ -40,6 +40,7 @@ import {
   cachedUnitDataDirDestination,
   canonicalPath,
   cleanupEmptyLegacyDirs,
+  cleanupLeftoverBridgeTempLinks,
   copyToStaging,
   createBridgeSymlink,
   createCachedUnitBaseDirs,
@@ -323,6 +324,8 @@ interface MemberSeed {
   taskId?: string;
   legacyPath: string;
   recoveredDestinationPath?: string;
+  /** True when an artifact symlink has no persisted kind, DB provenance, or legacy bridge record. */
+  indeterminateBridgeKind?: boolean;
 }
 
 interface UnitSeed {
@@ -844,12 +847,18 @@ function discoverRepoUnitSeeds(
   excludedPendingUnitKeys?: ReadonlySet<string>,
   recordedBridges?: ReadonlyMap<string, RecordedBridgeEntry>,
   repoBase?: RepoBasePaths | null,
-): { seeds: UnitSeed[]; worktreeOverlaps: string[]; enumerationErrors: MigrationErrorRecord[] } {
+): {
+  seeds: UnitSeed[];
+  worktreeOverlaps: string[];
+  enumerationErrors: MigrationErrorRecord[];
+  leftoverBridgeTempLinks: string[];
+} {
   checkBudget?.();
   const {
     units: discovered,
     worktreeOverlaps: enumOverlaps,
     errors: enumErrs,
+    leftoverBridgeTempLinks,
   } = enumerateLegacyUnitsSafe(storage, canonRepo, checkBudget, excludedWorktreeRoots);
   const worktreeOverlapSet = new Set<string>(enumOverlaps);
   const enumerationErrors: MigrationErrorRecord[] = enumErrs.map((e) => ({
@@ -879,26 +888,36 @@ function discoverRepoUnitSeeds(
     }
   }
 
-  const classifyArtifactBridgeKind = (legacyPath: string, name: string): "run" | "flat_artifact" => {
+  const classifyArtifactBridgeKind = (
+    legacyPath: string,
+    name: string,
+  ): { kind: "run" | "flat_artifact"; indeterminate?: boolean } => {
     const pendingKind = pendingKindByLegacyPath.get(legacyPath);
-    if (pendingKind === "run" || pendingKind === "flat_artifact") return pendingKind;
+    if (pendingKind === "run" || pendingKind === "flat_artifact") return { kind: pendingKind };
 
-    const recordedKind = recordedBridges?.get(legacyPath)?.kind;
-    if (recordedKind === "run" || recordedKind === "flat_artifact") return recordedKind;
+    const recorded = recordedBridges?.get(legacyPath);
+    if (recorded?.kind === "run" || recorded?.kind === "flat_artifact") return { kind: recorded.kind };
 
-    if (runIdsInArtifactRows.has(name)) return "run";
-    if (flatNamesInArtifactRows.has(name)) return "flat_artifact";
+    if (runIdsInArtifactRows.has(name)) return { kind: "run" };
+    if (flatNamesInArtifactRows.has(name)) return { kind: "flat_artifact" };
 
     try {
-      if (ownershipIndex.getRun(name) !== null) return "run";
+      if (ownershipIndex.getRun(name) !== null) return { kind: "run" };
     } catch (err) {
       if (err instanceof BudgetExceededError) throw err;
-      // On DB error, fall through to legacy name classification; eligibility will fail closed.
+      // On DB error, fall through; eligibility will fail closed.
     }
 
-    if (/^run-\d+$/.test(name)) return "run";
-    if (/\.[a-zA-Z0-9_-]{1,16}$/.test(name)) return "flat_artifact";
-    return "run";
+    // Legacy bridge records written by earlier passes without a persisted `kind`:
+    // fall back to name inference; evaluateUnit / isValidBridgeTarget still verifies
+    // the target's physical type matches the inferred kind, else it is a wrong-type bridge.
+    if (recorded !== undefined && recorded.kind === undefined) {
+      if (/^run-\d+$/.test(name)) return { kind: "run" };
+      if (/\.[a-zA-Z0-9_-]{1,16}$/.test(name)) return { kind: "flat_artifact" };
+      return { kind: "run" };
+    }
+
+    return { kind: "flat_artifact", indeterminate: true };
   };
 
   const memberMap = new Map<string, MemberSeed>();
@@ -908,9 +927,12 @@ function discoverRepoUnitSeeds(
       return;
     }
     let kind: StorageUnitKind = u.kind;
-    // F7 (and A6/D6): decide bridge kind from the legacy unit kind, never from the current type of the target.
+    let indeterminateBridgeKind = false;
+    // Resolve artifact bridge kind from persisted records / DB provenance, never from target type or extension.
     if (u.isBridge && (kind === "run" || kind === "flat_artifact")) {
-      kind = classifyArtifactBridgeKind(u.legacyPath, u.id);
+      const classified = classifyArtifactBridgeKind(u.legacyPath, u.id);
+      kind = classified.kind;
+      indeterminateBridgeKind = classified.indeterminate === true;
     }
     const key = makeMemberKey(kind, u.id, u.taskId);
     if (!memberMap.has(key)) {
@@ -919,6 +941,7 @@ function discoverRepoUnitSeeds(
         id: u.id,
         ...(u.taskId !== undefined ? { taskId: u.taskId } : {}),
         legacyPath: u.legacyPath,
+        ...(indeterminateBridgeKind ? { indeterminateBridgeKind: true } : {}),
       });
     }
   };
@@ -1167,7 +1190,12 @@ function discoverRepoUnitSeeds(
       return a.unitKey.localeCompare(b.unitKey);
     });
 
-  return { seeds: allSeeds, worktreeOverlaps: [...worktreeOverlapSet].sort(), enumerationErrors };
+  return {
+    seeds: allSeeds,
+    worktreeOverlaps: [...worktreeOverlapSet].sort(),
+    enumerationErrors,
+    leftoverBridgeTempLinks,
+  };
 }
 
 interface UnitOwnershipDecision {
@@ -1223,7 +1251,18 @@ function decideFlatArtifactOwnership(
     }
 
     if (isDirectorTaskContainer(owner.runId)) {
-      if (!owner.taskId) {
+      const bucketChat = ownershipIndex.deriveRunChatSessionId(owner.runId);
+      if (owner.ambiguous) {
+        const bucketRunRow = ownershipIndex.getRun(owner.runId);
+        if (bucketRunRow && !TERMINAL_RUN_STATUSES.has(bucketRunRow.status)) {
+          return {
+            eligible: false,
+            deferReason: `flat artifact ${fileName} belongs to non-terminal bucket run ${owner.runId} (${bucketRunRow.status})`,
+            ownerChat: bucketChat,
+          };
+        }
+      }
+      if (owner.ambiguous || !owner.taskId) {
         const liveTasks = ownershipIndex.getLiveTasksForRun(owner.runId);
         if (liveTasks.length > 0) {
           const sample = liveTasks
@@ -1233,11 +1272,11 @@ function decideFlatArtifactOwnership(
           return {
             eligible: false,
             deferReason: `flat artifact ${fileName} belongs to bucket ${owner.runId} with live task(s): ${sample}`,
-            ownerChat: ownershipIndex.deriveRunChatSessionId(owner.runId),
+            ownerChat: bucketChat,
           };
         }
       }
-      if (!owner.ambiguous) candidateChats.add(ownershipIndex.deriveRunChatSessionId(owner.runId));
+      if (!owner.ambiguous) candidateChats.add(bucketChat);
       continue;
     }
 
@@ -1484,6 +1523,11 @@ function upsertBridgeRecord(
   return true;
 }
 
+/** Effective creation timestamp for bridge expiry: later of recorded `createdAt` and symlink `lstat` mtime. */
+function effectiveBridgeCreatedAt(recordedCreatedAt: number, linkStat: { mtimeMs: number }): number {
+  return Number.isFinite(linkStat.mtimeMs) ? Math.max(recordedCreatedAt, linkStat.mtimeMs) : recordedCreatedAt;
+}
+
 function removeBridgeRecord(bridgeMap: Map<string, RecordedBridgeEntry>, legacyPath: string): boolean {
   return bridgeMap.delete(legacyPath);
 }
@@ -1531,43 +1575,48 @@ function evaluateUnit(
 
     if (legStat) {
       if (legStat.isSymbolicLink()) {
-        let rawTarget: string | null = null;
-        try {
-          rawTarget = readlinkSync(m.legacyPath);
-        } catch {
-          rawTarget = null;
-        }
-        validBridgeDest = isValidBridgeTarget(
-          storage,
-          canonRepo,
-          m.legacyPath,
-          rawTarget,
-          {
-            kind: m.kind,
-            id: m.id,
-            ...(m.taskId !== undefined ? { taskId: m.taskId } : {}),
-            ownerChat: ownership.ownerChat,
-          },
-          baseDirs,
-        );
-        if (validBridgeDest) {
-          const recorded = bridgeByLegacyPath.get(m.legacyPath);
-          if (recorded && recorded.target !== validBridgeDest) {
-            // Symlink target differs from the recorded bridge provenance: leave alone, report, never rewrite rows.
-            validBridgeDest = null;
-            legacyState = "invalid_symlink";
-            invalidSymlinkReason ??= `bridge symlink at ${m.legacyPath} target differs from recorded target (${recorded.target})`;
-          } else if (recorded) {
-            legacyState = "bridge";
-            bridgeAgeMs = Math.max(0, nowMs - recorded.createdAt);
-          } else {
-            legacyState = "bridge";
-            bridgeAgeMs = 0;
-            bridgeNeedsRecord = true;
-          }
-        } else {
+        if (m.indeterminateBridgeKind) {
           legacyState = "invalid_symlink";
-          invalidSymlinkReason ??= `legacy symlink at ${m.legacyPath} is not a valid migration bridge for ${m.kind}:${m.id}`;
+          invalidSymlinkReason ??= `legacy symlink at ${m.legacyPath} has no recorded legacy unit kind`;
+        } else {
+          let rawTarget: string | null = null;
+          try {
+            rawTarget = readlinkSync(m.legacyPath);
+          } catch {
+            rawTarget = null;
+          }
+          validBridgeDest = isValidBridgeTarget(
+            storage,
+            canonRepo,
+            m.legacyPath,
+            rawTarget,
+            {
+              kind: m.kind,
+              id: m.id,
+              ...(m.taskId !== undefined ? { taskId: m.taskId } : {}),
+              ownerChat: ownership.ownerChat,
+            },
+            baseDirs,
+          );
+          if (validBridgeDest) {
+            const recorded = bridgeByLegacyPath.get(m.legacyPath);
+            if (recorded && recorded.target !== validBridgeDest) {
+              // Symlink target differs from the recorded bridge provenance: leave alone, report, never rewrite rows.
+              validBridgeDest = null;
+              legacyState = "invalid_symlink";
+              invalidSymlinkReason ??= `bridge symlink at ${m.legacyPath} target differs from recorded target (${recorded.target})`;
+            } else if (recorded) {
+              legacyState = "bridge";
+              bridgeAgeMs = Math.max(0, nowMs - effectiveBridgeCreatedAt(recorded.createdAt, legStat));
+            } else {
+              legacyState = "bridge";
+              bridgeAgeMs = 0;
+              bridgeNeedsRecord = true;
+            }
+          } else {
+            legacyState = "invalid_symlink";
+            invalidSymlinkReason ??= `legacy symlink at ${m.legacyPath} is not a valid migration bridge for ${m.kind}:${m.id}`;
+          }
         }
       } else if (expectDir ? legStat.isDirectory() : legStat.isFile()) {
         legacyState = "real";
@@ -2315,9 +2364,9 @@ function executeSingleUnit(
       checkBudget();
       const recorded = bridgeMap.get(member.legacyPath);
       if (!recorded) continue;
-      if (nowFn() - recorded.createdAt < BRIDGE_MAX_AGE_MS) continue;
       const st = safeLstat(member.legacyPath);
       if (!st?.isSymbolicLink()) continue;
+      if (nowFn() - effectiveBridgeCreatedAt(recorded.createdAt, st) < BRIDGE_MAX_AGE_MS) continue;
       let rawTarget: string | null = null;
       try {
         rawTarget = readlinkSync(member.legacyPath);
@@ -2483,7 +2532,7 @@ function executeSingleUnit(
       member.legacyPath,
       member.destinationPath,
       isDir,
-      () => {},
+      isDir ? () => {} : checkBudget,
       {
         canPreserve,
         ...(!isDir
@@ -3013,6 +3062,9 @@ export function runStorageMigrationPass(
         repoReport.errors.push(e);
         allErrors.push(e);
         log(`[storage-migrate] enumeration error in ${e.path ?? canonRepo}: ${e.message}`);
+      }
+      if (discovered.leftoverBridgeTempLinks.length > 0) {
+        cleanupLeftoverBridgeTempLinks(discovered.leftoverBridgeTempLinks, checkBudget, excludedWorktreeRoots);
       }
     } catch (err) {
       if (err instanceof BudgetExceededError) {

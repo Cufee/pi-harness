@@ -430,7 +430,7 @@ describe("storage migration safety round-3 regressions (F1-F4, F6-F7)", () => {
         const legacyNote = join(repo, LEGACY_HARNESS_DIR, "notes", "recreated.md");
         writeFile(legacyNote, "v1\n");
 
-        const t0 = 1_000_000;
+        const t0 = Date.now() + 1_000;
         const pass1 = runStorageMigrationPass(
           { sqlite: cpDb.db, storage, now: () => t0 },
           { repoRoots: [repo] },
