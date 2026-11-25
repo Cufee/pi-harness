@@ -37,7 +37,7 @@ import { formatFallbackSummary, settleTaskMinimalFallback, SUMMARY_LIMIT } from 
 import { applyRecoveryPhaseA, classifyInterruptedTasks, relaunchInterruptedTasks } from "./restart-recovery.js";
 import { directorTaskRunId, directorTaskRunOwner, isDirectorTaskContainer } from "./ids.js";
 import { canonicalProjectPath } from "./projects.js";
-import { ensureGoalEvidenceDir, goalEvidenceDir } from "../goals/engine.js";
+import { legacyStoragePaths, storagePaths, type GoalRef, type RunRef, type StoragePaths } from "../storage/paths.js";
 
 const TASK_AGENT_ROLES = ["orchestrator", "worker", "research", "plan", "verify", "execute"] as const;
 // Exclude Director-only tools (notably read_file) so task-agent native read_file events are not misclassified as harness calls.
@@ -319,11 +319,16 @@ function hasParentTraversalComponent(p: string): boolean {
 }
 
 /** Total bytes over distinct contents (sha256) of safe, pinned run dossiers. Missing, unsafe, or unreadable files add nothing. */
-async function distinctContentBytes(db: ControlPlaneDb, run: RunRecord, paths: string[]): Promise<number> {
+async function distinctContentBytes(
+  db: ControlPlaneDb,
+  run: RunRecord,
+  paths: string[],
+  storage: StoragePaths,
+): Promise<number> {
   const seen = new Set<string>();
   let total = 0;
   for (const p of paths) {
-    const hashed = await hashRunDossier(db, run, p);
+    const hashed = await hashRunDossier(db, run, p, undefined, storage);
     if (!hashed || seen.has(hashed.sha256)) continue;
     seen.add(hashed.sha256);
     total += hashed.bytes;
@@ -339,7 +344,7 @@ async function hashUntrackedFiles(worktreePath: string): Promise<string> {
   if (!raw) return "";
   const relPaths = raw
     .split("\0")
-    .filter((p) => p.length > 0 && p !== ".harness" && !p.startsWith(".harness/"))
+    .filter((p) => p.length > 0 && !legacyStoragePaths.isHarnessOwnedRelPath(p))
     .sort();
   if (relPaths.length === 0) return "";
 
@@ -1087,10 +1092,23 @@ export class HarnessOrchestrator {
     };
   }
 
+  private get storage(): StoragePaths {
+    return storagePaths(this.config);
+  }
+
+  private runRef(run: RunRecord): RunRecord & RunRef {
+    const chatSessionId = run.chatSessionId ?? this.db.getRunChatSessionId(run.id);
+    return chatSessionId === run.chatSessionId ? run : { ...run, chatSessionId };
+  }
+
+  private goalRef(repoRoot: string, goal: { id: string; chatSessionId: string | null }): GoalRef {
+    return { repoRoot, id: goal.id, chatSessionId: goal.chatSessionId };
+  }
+
   getWorktreeManager(repoRoot: string): WorktreeManager {
     let mgr = this.worktreeManagers.get(repoRoot);
     if (!mgr) {
-      mgr = new WorktreeManager(this.db, repoRoot, this.config.worktree, this.gateRuntimeConfig());
+      mgr = new WorktreeManager(this.db, repoRoot, this.config.worktree, this.gateRuntimeConfig(), this.storage);
       this.worktreeManagers.set(repoRoot, mgr);
     }
     return mgr;
@@ -1106,10 +1124,12 @@ export class HarnessOrchestrator {
   }
 
   /** The goal linked to this run, if any (the goals table is absent in standalone control-plane databases). */
-  private resolveLinkedGoalForRun(runId: string): { id: string } | null {
+  private resolveLinkedGoalForRun(runId: string): { id: string; chatSessionId: string | null } | null {
     try {
-      const row = this.db.db.prepare("SELECT id FROM goals WHERE linked_run_id = ? LIMIT 1").get(runId) as { id: string } | null;
-      return row ?? null;
+      const row = this.db.db
+        .prepare("SELECT id, chat_session_id FROM goals WHERE linked_run_id = ? LIMIT 1")
+        .get(runId) as { id: string; chat_session_id?: string | null } | null;
+      return row ? { id: row.id, chatSessionId: row.chat_session_id ? String(row.chat_session_id) : null } : null;
     } catch {
       return null;
     }
@@ -1219,6 +1239,7 @@ export class HarnessOrchestrator {
   async startRun(input: {
     goal: string;
     repoRoot: string;
+    chatSessionId?: string | null;
     profileId?: string;
     model?: string;
     effort?: string;
@@ -1242,7 +1263,7 @@ export class HarnessOrchestrator {
     if (this.launchFenceBroken(input.repoRoot, fence)) throw new RunStartStoppedError(input.repoRoot);
     const resolved = input.resolveGoal ? input.resolveGoal() : { goal: input.goal };
     const goal = resolved.goal;
-    const run = this.db.createRun({ goal, repoRoot: input.repoRoot, baseBranch, baseSha });
+    const run = this.db.createRun({ goal, repoRoot: input.repoRoot, baseBranch, baseSha, chatSessionId: input.chatSessionId });
     if (input.onRunCreated) {
       try {
         input.onRunCreated(run);
@@ -2665,10 +2686,14 @@ export class HarnessOrchestrator {
       const scopedKbHints = task.tier === 2 ? this.db.kb.getScopedAmbientIndex(run.repoRoot, writeScopes, 5) : [];
 
       const linkedGoal = this.resolveLinkedGoalForRun(run.id);
-      // Fail closed: a goal evidence dir that fails validation (e.g. a symlinked segment) is never advertised or granted.
-      const goalEvDir = linkedGoal ? ensureGoalEvidenceDir(run.repoRoot, linkedGoal.id) : null;
-      const goalsRoot = join(run.repoRoot, ".harness", "goals");
-      const artifactsRoot = resolve(run.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts");
+      const runRef = this.runRef(run);
+      const goalRef = linkedGoal ? this.goalRef(run.repoRoot, linkedGoal) : null;
+      const grants = this.storage.taskGrants({
+        run: runRef,
+        goal: goalRef,
+        writable: toolPolicy === "read_write_workspace",
+        workspace: cwd,
+      });
 
       // Steering accepted while no session could take it opens this generation's first turn.
       const earlySteers = this.drainPendingSteers(task.id);
@@ -2687,7 +2712,7 @@ export class HarnessOrchestrator {
         worktreePath: wt?.path ?? null,
         worktreeBranch: wt?.branch ?? null,
         quotaResumeNote,
-        goalEvidenceDir: goalEvDir ?? undefined,
+        goalEvidenceDir: grants.extraEnv?.HARNESS_GOAL_EVIDENCE_DIR,
       });
       exec.promptBuilt = true;
       // Steers queued for an earlier iteration of this execution are already in the task row this prompt was built from.
@@ -2770,27 +2795,11 @@ export class HarnessOrchestrator {
         mcpBridgeEntrypoint,
         externalMcpServers: resolveExternalMcpServers(this.config.stateDir, this.config.externalMcpServers),
         extraPathDirs: nativeToolsPathDirs(this.config.stateDir),
-        extraReadRoots: [...new Set([
-          goalsRoot,
-          join(run.repoRoot, ".harness", "artifacts"),
-          artifactsRoot,
-          ...(this.config.worktree.extraReadRoots ?? []),
-        ])],
-        // A goal-linked run may write only its own verified goal evidence directory (plus operator roots), never
-        // every goal's and never an unverified path.
-        extraWriteRoots: linkedGoal
-          ? toolPolicy === "read_write_workspace"
-            ? [...(goalEvDir ? [goalEvDir] : []), ...(this.config.worktree.extraWriteRoots ?? [])]
-            : undefined
-          : [goalsRoot, ...(this.config.worktree.extraWriteRoots ?? [])],
-        extraEnv: linkedGoal
-          ? {
-              ...(goalEvDir ? { HARNESS_GOAL_EVIDENCE_DIR: goalEvDir } : {}),
-              HARNESS_GOAL_ID: linkedGoal.id,
-              HARNESS_GOALS_DIR: goalsRoot,
-              HARNESS_ARTIFACTS_DIR: artifactsRoot,
-            }
-          : undefined,
+        extraReadRoots: grants.extraReadRoots,
+        extraWriteRoots: grants.extraWriteRoots,
+        extraEnv: grants.extraEnv,
+        deniedRoots: grants.deniedRoots,
+        protectedRoots: grants.protectedRoots,
         allowShellInReadOnly: task.kind === "verify",
         isTaskSettled,
         missingReturnWrapUpPrompt: task.tier !== 1 ? buildMissingReturnWrapUpPrompt(task.tier, task.kind) : undefined,
@@ -3243,7 +3252,7 @@ export class HarnessOrchestrator {
           let spill: { summary: string; overflowPath?: string; keptChars?: number; totalChars?: number } | null = null;
           let spillError = "";
           try {
-            spill = spillSummaryOverflow(this.db, run, task.id, finalReply);
+            spill = spillSummaryOverflow(this.db, this.runRef(run), task.id, finalReply, this.storage);
           } catch (err) {
             spillError = err instanceof Error ? err.message : String(err);
           }
@@ -3505,8 +3514,9 @@ export class HarnessOrchestrator {
         try {
           // A new, never-overwritten name: the task may have written its own artifact under any name.
           outputPath = writeUniqueTaskDossier(
-            this.db, run, task.id, `output-gen${gen}`, ".md", text,
+            this.db, this.runRef(run), task.id, `output-gen${gen}`, ".md", text,
             readOnly ? "Unstructured task output" : "Full final output (no return_task)",
+            this.storage,
           ).path;
         } catch {
           outputPath = null;
@@ -3933,7 +3943,7 @@ export class HarnessOrchestrator {
     }
 
     const agentDossierPaths = this.db.listAgentDossierPaths(run.id, task.id);
-    const artHigh = Math.max(prev?.artHigh ?? 0, await distinctContentBytes(this.db, run, agentDossierPaths));
+    const artHigh = Math.max(prev?.artHigh ?? 0, await distinctContentBytes(this.db, this.runRef(run), agentDossierPaths, this.storage));
 
     const allRunTasks = this.db.listTasks(run.id);
     const byParent = new Map<string, TaskRecord[]>();
@@ -4520,13 +4530,13 @@ export class HarnessOrchestrator {
       if (linkedGoal) {
         let goalEvDir: string | null = null;
         try {
-          goalEvDir = goalEvidenceDir(run.repoRoot, linkedGoal.id);
+          goalEvDir = this.storage.goalEvidenceDir(this.goalRef(run.repoRoot, linkedGoal));
         } catch {
           goalEvDir = null;
         }
         writableExtraRoots = [...(goalEvDir ? [goalEvDir] : []), ...(this.config.worktree.extraWriteRoots ?? [])];
       } else {
-        writableExtraRoots = [join(run.repoRoot, ".harness", "goals"), ...(this.config.worktree.extraWriteRoots ?? [])];
+        writableExtraRoots = [this.storage.goalsDir(this.runRef(run)), ...(this.config.worktree.extraWriteRoots ?? [])];
       }
     }
     return buildSubject({
