@@ -160,6 +160,17 @@ interface MigrationStartTiming {
   failureCount: number;
 }
 
+function acceptedLimit(label: string, detail?: string): void {
+  console.log(`[ACCEPTED LIMIT] ${label}${detail ? ` — ${detail}` : ""}`);
+}
+
+interface AcceptedLimitRecord {
+  phaseId: number;
+  phaseName: string;
+  label: string;
+  detail: string;
+}
+
 class CheckCollector {
   readonly failures: Array<{ label: string; error: string }> = [];
 
@@ -356,6 +367,40 @@ export async function assertDataDirAfterUpdate(ctx: DataDirAfterUpdateContext): 
     assert.equal(readFileSync(noteDestPath, "utf8"), noteContent, "migrated note content mismatch");
     assertBridgeSymlink("note bridge", notePath, noteDestPath);
     pass("Legacy note migrated to project notes dir with bridge", `${notePath} -> ${noteDestPath}`);
+  });
+
+  await checks.run("migration-state.json records bridge provenance with no leftover private staging dirs", () => {
+    const statePath = join(projectDir, "migration-state.json");
+    assert.ok(existsSync(statePath), `expected migration-state.json at ${statePath}`);
+    const state = JSON.parse(readFileSync(statePath, "utf8")) as {
+      version?: number;
+      pendingUnits?: unknown[];
+      bridges?: Array<{ legacyPath?: string; target?: string; createdAt?: number }>;
+    };
+    assert.equal(state.version, 1, `unexpected migration-state.json version: ${state.version}`);
+    assert.deepEqual(state.pendingUnits ?? [], [], `expected empty pendingUnits after clean pass, got ${JSON.stringify(state.pendingUnits)}`);
+    const bridges = state.bridges ?? [];
+    const expectedBridges: Array<[string, string, string]> = [
+      ["G0 evidence", g0.evidenceDir, g0DestEvidenceDir],
+      ["G0 run artifacts", join(canonicalRepoDir, ".harness", "artifacts", g0.runId), g0DestRunDir],
+      ["legacy note", notePath, noteDestPath],
+    ];
+    for (const [label, legacyP, targetP] of expectedBridges) {
+      const rec = bridges.find((b) => b.legacyPath === legacyP && b.target === targetP);
+      assert.ok(rec, `migration-state.json missing bridge record for ${label}: ${legacyP} -> ${targetP}`);
+      assert.ok(typeof rec.createdAt === "number" && rec.createdAt > 0, `invalid bridge createdAt for ${label}`);
+    }
+    const stagingDir = join(projectDir, ".migration-staging");
+    assert.equal(existsSync(stagingDir), false, `unexpected leftover private staging dir at ${stagingDir}`);
+    const projectTree = snapshotTree(projectDir);
+    const legacyMigrating = [...Object.keys(projectTree.files), ...projectTree.dirs].filter((p) =>
+      p.endsWith(".migrating"),
+    );
+    assert.deepEqual(legacyMigrating, [], `unexpected legacy .migrating entries under ${projectDir}: ${JSON.stringify(legacyMigrating)}`);
+    pass(
+      "migration-state.json recorded all bridge provenance records with zero leftover staging dirs",
+      `bridges=${bridges.length}`,
+    );
   });
 
   // Old & new paths through running daemon RPCs:
@@ -1078,23 +1123,23 @@ export async function assertIdempotentRerun(ctx: IdempotentRerunContext): Promis
     pass("migrate-storage --dry-run exited 0 with 0 units to migrate/merge and changed nothing");
   });
 
-  await checks.run("migrate-storage without --dry-run refuses while daemon runs (non-zero exit) and changes nothing", async () => {
+  await checks.run("migrate-storage without --dry-run never moves files (exits 1, directs to daemon restart) and changes nothing", async () => {
     const beforeLive = captureState();
     const liveRes = await runCommand(launcherPath, ["migrate-storage"], {
       cwd: canonicalRepoDir,
       env: layoutEnv,
-      label: `PI_HARNESS_STORAGE_LAYOUT=data-dir ${launcherPath} migrate-storage (while daemon running)`,
+      label: `PI_HARNESS_STORAGE_LAYOUT=data-dir ${launcherPath} migrate-storage (without --dry-run)`,
     });
-    assert.notEqual(liveRes.code, 0, "expected migrate-storage without --dry-run to exit non-zero while daemon runs");
+    assert.equal(liveRes.code, 1, `expected migrate-storage without --dry-run to exit 1, got ${liveRes.code}`);
     assert.ok(
-      liveRes.stderr.includes("harnessd is running") || liveRes.stderr.includes("daemon restart"),
-      `expected daemon-running refusal in stderr, got: ${liveRes.stderr}`,
+      liveRes.stderr.includes("daemon start") && liveRes.stderr.includes("daemon restart"),
+      `expected daemon-start / daemon-restart guidance in stderr, got: ${liveRes.stderr}`,
     );
     const afterLive = captureState();
-    assert.deepEqual(afterLive.data, beforeLive.data, "refused migrate-storage mutated data dir");
-    assert.deepEqual(afterLive.legacy, beforeLive.legacy, "refused migrate-storage mutated legacy root");
-    assert.deepEqual(afterLive.artifacts, beforeLive.artifacts, "refused migrate-storage mutated artifacts rows");
-    pass("migrate-storage refused while daemon runs and changed nothing", `exit=${liveRes.code}`);
+    assert.deepEqual(afterLive.data, beforeLive.data, "migrate-storage without --dry-run mutated data dir");
+    assert.deepEqual(afterLive.legacy, beforeLive.legacy, "migrate-storage without --dry-run mutated legacy root");
+    assert.deepEqual(afterLive.artifacts, beforeLive.artifacts, "migrate-storage without --dry-run mutated artifacts rows");
+    pass("migrate-storage without --dry-run exited 1, directed to daemon restart, and changed nothing", `exit=${liveRes.code}`);
   });
 }
 
@@ -1248,6 +1293,7 @@ async function main(): Promise<void> {
       ];
 
   const allSoftFailures: Array<{ phaseId: number; phaseName: string; label: string; error: string }> = [];
+  const acceptedLimits: AcceptedLimitRecord[] = [];
 
   const runPhase = async <T>(id: number, fn: (checks: CheckCollector) => Promise<T>): Promise<T> => {
     const entry = phases.find((p) => p.id === id)!;
@@ -1298,6 +1344,8 @@ async function main(): Promise<void> {
   };
 
   let relPrev = "";
+  let prevHasStorageModule = false;
+  let prevRefLabel = "";
   let pidPrev = 0;
   let relNew = "";
   let pidNew = 0;
@@ -1386,6 +1434,8 @@ async function main(): Promise<void> {
     // -----------------------------------------------------------------------
     await runPhase(2, async () => {
       const prev = resolvePrevRef(REPO_ROOT, prevFlag);
+      prevHasStorageModule = prev.hasStorageModule;
+      prevRefLabel = `${prev.ref} (${prev.sha.slice(0, 12)})`;
       console.log(
         `resolved PREV ref: ${prev.ref} (${prev.sha.slice(0, 12)}) via rule=${prev.rule} hasStorageModule=${prev.hasStorageModule}`,
       );
@@ -2266,25 +2316,78 @@ async function main(): Promise<void> {
       pass("R2 completed on relPrev with zero failed tasks", `run=${r2RunId} tasks=${finalR2.tasks.length}`);
 
       // Verify relPrev reads G0's dossier through artifact.read RPC.
-      await checks.run("PREV release reads G0 dossier through artifact.read RPC (rewritten row or bridge)", async () => {
-        if (!isDataDir) {
+      // - Legacy mode: relPrev must read G0's legacy path.
+      // - Data-dir mode with PREV=HEAD (hasStorageModule): legacy-layout reader must read G0's migrated dossier
+      //   across rewritten-row, legacy-bridge-abs, and legacy-bridge-rel paths (esc-154 fixed by FL).
+      // - Data-dir mode with pre-storage PREV (e.g. origin/main, !hasStorageModule): artifact.list and native
+      //   filesystem reads through the bridge must pass; artifact.read on rewritten rows is a documented accepted
+      //   limit (esc-154) and is reported as [ACCEPTED LIMIT] rather than pass or failure.
+      if (!isDataDir) {
+        await checks.run("PREV release reads G0 dossier through artifact.read RPC", async () => {
           const g0ReadBack = await rpc<{ content?: string }>(socketPath, "artifact.read", {
             runId: g0.runId,
             path: g0.artifactPath,
           });
           assert.equal(g0ReadBack.content, g0.artifactContent, "relPrev artifact.read for G0 content mismatch");
           pass("PREV release read G0 artifact through daemon artifact.read RPC", `run=${g0.runId} path=${g0.artifactPath}`);
-          return;
-        }
+        });
+      } else if (prevHasStorageModule) {
+        await checks.run(
+          "PREV release (legacy layout with storage module) reads migrated G0 dossier via artifact.read RPC (all 3 path forms)",
+          async () => {
+            const g0RelBridge = `.harness/artifacts/${g0.runId}/${relative(join(canonicalRepoDir, ".harness", "artifacts", g0.runId), g0.artifactPath).replaceAll("\\", "/")}`;
+            for (const [label, path] of [
+              ["rewritten-row", g0NewArtifactPath],
+              ["legacy-bridge-abs", g0.artifactPath],
+              ["legacy-bridge-rel", g0RelBridge],
+            ] as const) {
+              const res = await rpc<{ content?: string }>(socketPath, "artifact.read", {
+                runId: g0.runId,
+                path,
+              });
+              assert.equal(
+                res.content,
+                g0.artifactContent,
+                `relPrev artifact.read(${label}=${path}) content mismatch`,
+              );
+            }
+            pass(
+              "PREV release read migrated G0 dossier through artifact.read RPC across rewritten, bridge-abs, and bridge-rel paths",
+              `run=${g0.runId}`,
+            );
+          },
+        );
+      } else {
+        await checks.run(
+          "Pre-storage PREV lists migrated G0 artifact row and native filesystem reads succeed through legacy bridge",
+          async () => {
+            const listed = await rpc<Array<{ id: string; path: string }>>(socketPath, "artifact.list", {
+              runId: g0.runId,
+            });
+            assert.ok(
+              listed.some((a) => a.path === g0NewArtifactPath),
+              `expected artifact.list on pre-storage PREV to include rewritten row ${g0NewArtifactPath}, got ${JSON.stringify(listed)}`,
+            );
+            assert.equal(
+              readFileSync(g0.artifactPath, "utf8"),
+              g0.artifactContent,
+              `native filesystem read through legacy bridge ${g0.artifactPath} failed`,
+            );
+            pass(
+              "Pre-storage PREV listed rewritten G0 artifact row and native read through bridge succeeded",
+              `run=${g0.runId} bridge=${g0.artifactPath}`,
+            );
+          },
+        );
+
+        const g0RelBridge = `.harness/artifacts/${g0.runId}/${relative(join(canonicalRepoDir, ".harness", "artifacts", g0.runId), g0.artifactPath).replaceAll("\\", "/")}`;
         const candidates = [
           { label: "rewritten-row", path: g0NewArtifactPath },
           { label: "legacy-bridge-abs", path: g0.artifactPath },
-          {
-            label: "legacy-bridge-rel",
-            path: `.harness/artifacts/${g0.runId}/${relative(join(canonicalRepoDir, ".harness", "artifacts", g0.runId), g0.artifactPath).replaceAll("\\", "/")}`,
-          },
+          { label: "legacy-bridge-rel", path: g0RelBridge },
         ];
         const errors: string[] = [];
+        let matchedVia: string | null = null;
         for (const c of candidates) {
           try {
             const res = await rpc<{ content?: string }>(socketPath, "artifact.read", {
@@ -2292,16 +2395,28 @@ async function main(): Promise<void> {
               path: c.path,
             });
             if (res.content === g0.artifactContent) {
-              pass("PREV release read migrated G0 dossier through artifact.read RPC", `via=${c.label} path=${c.path}`);
-              return;
+              matchedVia = `${c.label} (${c.path})`;
+              break;
             }
             errors.push(`${c.label}: content mismatch`);
           } catch (err) {
             errors.push(`${c.label}: ${err instanceof Error ? err.message : String(err)}`);
           }
         }
-        throw new Error(`relPrev could not read migrated G0 dossier via any path (${errors.join(" | ")})`);
-      });
+        if (matchedVia) {
+          pass("Pre-storage PREV unexpectedly read migrated G0 dossier via artifact.read RPC", matchedVia);
+        } else {
+          const detail = `PREV=${prevRefLabel} lacks src/storage/paths.ts; old release lists rows and native bridge reads work, while artifact.read cannot read migrated rows until upgraded again (${errors.join(" | ")})`;
+          const label = "Pre-storage PREV artifact.read on migrated G0 dossier (esc-154 documented accepted limit)";
+          acceptedLimit(label, detail);
+          acceptedLimits.push({
+            phaseId: rollbackPhaseId,
+            phaseName: phases.find((p) => p.id === rollbackPhaseId)!.name,
+            label,
+            detail,
+          });
+        }
+      }
 
       if (!isDataDir) return;
 
@@ -2493,6 +2608,13 @@ async function main(): Promise<void> {
     }
   }
 
+  if (acceptedLimits.length > 0) {
+    console.log("\n=== Documented Accepted Limits ===");
+    for (const lim of acceptedLimits) {
+      console.log(`- Phase ${lim.phaseId} (${lim.phaseName}) | ${lim.label}: ${lim.detail}`);
+    }
+  }
+
   if (allSoftFailures.length > 0) {
     console.log("\n=== Recorded Assertion Failures ===");
     for (const f of allSoftFailures) {
@@ -2509,7 +2631,13 @@ async function main(): Promise<void> {
     console.error("\n=== STORAGE UPGRADE CHECK FAILED ===");
     process.exit(1);
   }
-  console.log("\n=== ALL PHASES PASSED ===");
+  if (acceptedLimits.length > 0) {
+    console.log(
+      `\n=== ALL PHASES PASSED (${acceptedLimits.length} documented accepted limit; reported above, not counted as pass or failure) ===`,
+    );
+  } else {
+    console.log("\n=== ALL PHASES PASSED ===");
+  }
 }
 
 main().catch((err) => {
