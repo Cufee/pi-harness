@@ -2082,8 +2082,10 @@ describe("goal-34 c3: Director chat assistant replies render exactly once", () =
     await new Promise((r) => setTimeout(r, 40));
     assert.equal(text().includes("BUFFERED-INTERNAL-SF9"), false, "Internal line hidden by default");
 
-    // Open Work Navigator (`Ctrl+G`), press `i` to enable showInternal, then `Esc` to return to chat
+    // Open Work Navigator (`Ctrl+G`), select Inbox (`1`, since the `i` toggle is only guaranteed on the Inbox tab), press `i` to enable showInternal, then `Esc` to return to chat
     sendInput("\x07");
+    await new Promise((r) => setTimeout(r, 40));
+    sendInput("1");
     await new Promise((r) => setTimeout(r, 40));
     sendInput("i");
     await new Promise((r) => setTimeout(r, 40));
