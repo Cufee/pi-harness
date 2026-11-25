@@ -947,8 +947,10 @@ export class AcpRunner {
       toolPolicy: req.toolPolicy,
       allowShellInReadOnly: Boolean(req.allowShellInReadOnly),
       tier: req.tier,
+      cwd: workspace,
       readDirectories: extraReadRoots,
       writeDirectories: canWrite ? extraWriteRoots : undefined,
+      deniedRoots,
     });
     if ((allowShell || !controlOnly) && req.extraPathDirs?.length) {
       const existingPath = prepared.env.PATH ?? process.env.PATH ?? "";

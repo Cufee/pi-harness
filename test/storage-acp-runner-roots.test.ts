@@ -7,7 +7,7 @@ import { agent } from "@agentclientprotocol/sdk/unstable";
 import { REJECTIONS } from "../src/advisories/rejections.js";
 import type { AcpProfileConfig } from "../src/config.js";
 import { AcpRunner } from "../src/runners/acp-runner.js";
-import { DENIED_HARNESS_STATE_REASON } from "../src/runners/acp-shims.js";
+import { DENIED_HARNESS_STATE_REASON, prepareAcpSpawn } from "../src/runners/acp-shims.js";
 import type { RunAgentRequest } from "../src/runners/types.js";
 
 type ToolEvent = Parameters<NonNullable<RunAgentRequest["callbacks"]["onToolEvent"]>>[0];
@@ -1249,5 +1249,134 @@ app.connect(ndJsonStream(Writable.toWeb(process.stdout) as unknown as WritableSt
     assert.equal(legacyRes.outcomes["legacy-no-paths"], "allow");
     assert.equal(legacyRes.outcomes["legacy-outside"], "allow");
     assert.equal(legacyRes.outcomes["legacy-ws"], "allow");
+  });
+
+  it("forwards resolved cwd and deniedRoots to prepareAcpSpawn in data-dir layout and keeps legacy spawn env unchanged", async () => {
+    const fx = setupStateLayout();
+    const wtLink = join(fx.home, "wt1-link");
+    symlinkSync(fx.wt1, wtLink);
+
+    const fakeScript = join(fx.home, "capture-opencode-spawn.ts");
+    const captureDataDir = join(fx.home, "opencode-data-dir.json");
+    const captureLegacyDirs = join(fx.home, "opencode-legacy-dirs.json");
+    const captureLegacyEmpty = join(fx.home, "opencode-legacy-empty.json");
+    writeFileSync(
+      fakeScript,
+      `import { writeFileSync } from "node:fs";
+import { Readable, Writable } from "node:stream";
+import { agent, ndJsonStream } from "@agentclientprotocol/sdk/unstable";
+
+writeFileSync(
+  process.env.CAPTURE_OUT!,
+  JSON.stringify({ opencodeConfig: process.env.OPENCODE_CONFIG_CONTENT ?? null }),
+);
+const app = agent()
+  .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {} }))
+  .onRequest("session/new", async () => ({
+    sessionId: "s-opencode-spawn",
+    models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+  }))
+  .onRequest("session/prompt", async ({ client, params: { sessionId } }) => {
+    await client.notify("session/update", {
+      sessionId,
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } },
+    });
+    return { stopReason: "end_turn" };
+  });
+app.connect(ndJsonStream(Writable.toWeb(process.stdout) as unknown as WritableStream<Uint8Array>, Readable.toWeb(process.stdin) as unknown as ReadableStream<Uint8Array>));
+`,
+      "utf8",
+    );
+    chmodSync(fakeScript, 0o755);
+
+    const makeOpenCodeProfile = (captureOut: string): AcpProfileConfig =>
+      profile("generic", {
+        id: "acp:opencode",
+        command: process.execPath,
+        args: [fakeScript],
+        env: { CAPTURE_OUT: captureOut },
+      });
+
+    // Data-dir layout: AcpRunner forwards resolved cwd (fx.wt1, not symlink wtLink) and deniedRoots (fx.stateDir).
+    await new AcpRunner(makeOpenCodeProfile(captureDataDir)).run(
+      makeBaseRequest({
+        cwd: wtLink,
+        toolPolicy: "read_write_workspace",
+        extraReadRoots: [fx.artifactsDir],
+        extraWriteRoots: [fx.goalsDir],
+        deniedRoots: [fx.stateDir],
+      }),
+    );
+    const dataDirCaptured = JSON.parse(readFileSync(captureDataDir, "utf8")) as { opencodeConfig: string | null };
+    assert.ok(dataDirCaptured.opencodeConfig, "data-dir OpenCode spawn must set OPENCODE_CONFIG_CONTENT");
+    const dataDirCfg = JSON.parse(dataDirCaptured.opencodeConfig) as {
+      permission: {
+        external_directory: Record<string, string>;
+        read: Record<string, string>;
+        edit: Record<string, string>;
+      };
+    };
+    const extKeys = Object.keys(dataDirCfg.permission.external_directory);
+    assert.equal(extKeys[0], "**");
+    assert.equal(dataDirCfg.permission.external_directory[fx.stateDir], "deny");
+    assert.equal(dataDirCfg.permission.external_directory[`${fx.stateDir}/**`], "deny");
+    assert.equal(dataDirCfg.permission.external_directory[fx.wt1], "allow");
+    assert.equal(dataDirCfg.permission.external_directory[wtLink], undefined);
+    assert.ok(extKeys.indexOf(`${fx.stateDir}/**`) < extKeys.indexOf(fx.wt1));
+    assert.ok(extKeys.indexOf(`${fx.stateDir}/**`) < extKeys.indexOf(fx.artifactsDir));
+    assert.ok(extKeys.indexOf(`${fx.stateDir}/**`) < extKeys.indexOf(fx.goalsDir));
+
+    const readKeys = Object.keys(dataDirCfg.permission.read);
+    assert.equal(dataDirCfg.permission.read[`${fx.stateDir}/**`], "deny");
+    assert.equal(dataDirCfg.permission.read[`${fx.wt1}/**`], "allow");
+    assert.ok(readKeys.indexOf(`${fx.stateDir}/**`) < readKeys.indexOf(fx.wt1));
+
+    const editKeys = Object.keys(dataDirCfg.permission.edit);
+    assert.equal(dataDirCfg.permission.edit[`${fx.stateDir}/**`], "deny");
+    assert.equal(dataDirCfg.permission.edit[`${fx.wt1}/**`], "allow");
+    assert.equal(dataDirCfg.permission.edit[`${fx.goalsDir}/**`], "allow");
+    assert.equal(dataDirCfg.permission.edit[fx.artifactsDir], undefined);
+    assert.ok(editKeys.indexOf(`${fx.stateDir}/**`) < editKeys.indexOf(fx.wt1));
+
+    // Legacy layout (no deniedRoots): OPENCODE_CONFIG_CONTENT is byte-identical to prepareAcpSpawn without cwd/deniedRoots.
+    const legacyDirsProfile = makeOpenCodeProfile(captureLegacyDirs);
+    await new AcpRunner(legacyDirsProfile).run(
+      makeBaseRequest({
+        cwd: fx.workspace,
+        toolPolicy: "read_write_workspace",
+        extraReadRoots: [fx.artifactsDir],
+        extraWriteRoots: [fx.goalsDir],
+      }),
+    );
+    const expectedLegacyDirs = prepareAcpSpawn(legacyDirsProfile, {
+      systemPrompt: "Test role",
+      toolPolicy: "read_write_workspace",
+      allowShellInReadOnly: false,
+      tier: 2,
+      readDirectories: [fx.artifactsDir, fx.goalsDir],
+      writeDirectories: [fx.goalsDir],
+    });
+    const legacyDirsCaptured = JSON.parse(readFileSync(captureLegacyDirs, "utf8")) as { opencodeConfig: string | null };
+    assert.equal(legacyDirsCaptured.opencodeConfig, expectedLegacyDirs.env.OPENCODE_CONFIG_CONTENT ?? null);
+    expectedLegacyDirs.cleanup();
+
+    const legacyEmptyProfile = makeOpenCodeProfile(captureLegacyEmpty);
+    await new AcpRunner(legacyEmptyProfile).run(
+      makeBaseRequest({
+        cwd: fx.workspace,
+        toolPolicy: "read_write_workspace",
+      }),
+    );
+    const expectedLegacyEmpty = prepareAcpSpawn(legacyEmptyProfile, {
+      systemPrompt: "Test role",
+      toolPolicy: "read_write_workspace",
+      allowShellInReadOnly: false,
+      tier: 2,
+      readDirectories: [],
+      writeDirectories: [],
+    });
+    const legacyEmptyCaptured = JSON.parse(readFileSync(captureLegacyEmpty, "utf8")) as { opencodeConfig: string | null };
+    assert.equal(legacyEmptyCaptured.opencodeConfig, expectedLegacyEmpty.env.OPENCODE_CONFIG_CONTENT ?? null);
+    expectedLegacyEmpty.cleanup();
   });
 });
