@@ -1379,4 +1379,249 @@ app.connect(ndJsonStream(Writable.toWeb(process.stdout) as unknown as WritableSt
     assert.equal(legacyEmptyCaptured.opencodeConfig, expectedLegacyEmpty.env.OPENCODE_CONFIG_CONTENT ?? null);
     expectedLegacyEmpty.cleanup();
   });
+
+  it("FRc: external MCP calls (octofs) refuse denied roots and protected worktrees in data-dir layout while approving allowed/outside/legacy calls", async () => {
+    const fx = setupStateLayout();
+    const otherChatGoals = join(fx.stateDir, "data", "projects", "p", "chats", "chat-2", "goals", "goal-2");
+    const otherChatFile = join(otherChatGoals, "secret.txt");
+    mkdirSync(otherChatGoals, { recursive: true });
+    writeFileSync(otherChatFile, "chat-2-secret\n", "utf8");
+    const outsideDir = makeTempDir("acp-frc-outside-");
+    const outsideFile = join(outsideDir, "outside.txt");
+    writeFileSync(outsideFile, "outside-ok\n", "utf8");
+    const stateSymlink = join(fx.wt1, "link-config.json");
+    symlinkSync(fx.cfgFile, stateSymlink);
+
+    type McpCheck = {
+      id: string;
+      /** When set, emits a Codex `session/update` tool_call first and sends a bare correlated permission request. */
+      codexTracked?: { server: string; tool: string; args?: Record<string, unknown> };
+      perm: Record<string, unknown>;
+    };
+
+    const runChecks = async (
+      adapter: AcpProfileConfig["adapter"],
+      reqOverrides: Partial<RunAgentRequest>,
+      checks: McpCheck[],
+    ) => {
+      const outcomes: Record<string, string> = {};
+      const events: ToolEvent[] = [];
+      const fixture = agent()
+        .onRequest("initialize", async () => ({ protocolVersion: 1, agentCapabilities: {} }))
+        .onRequest("session/new", async () => ({
+          sessionId: "s-frc",
+          models: { currentModelId: "opus", availableModels: [{ modelId: "opus", name: "Opus" }] },
+        }))
+        .onRequest("session/prompt", async ({ client, params: { sessionId } }) => {
+          for (const c of checks) {
+            if (c.codexTracked) {
+              await client.notify("session/update", {
+                sessionId,
+                update: {
+                  sessionUpdate: "tool_call",
+                  toolCallId: c.id,
+                  title: `mcp.${c.codexTracked.server}.${c.codexTracked.tool}`,
+                  kind: "execute",
+                  status: "in_progress",
+                  rawInput: {
+                    server: c.codexTracked.server,
+                    tool: c.codexTracked.tool,
+                    ...(c.codexTracked.args ? { arguments: c.codexTracked.args } : {}),
+                  },
+                  _meta: { is_mcp_tool_call: true },
+                },
+              });
+            }
+            outcomes[c.id] = permissionOutcome(
+              await client.request("session/request_permission", {
+                sessionId,
+                options: PERM_OPTIONS,
+                ...c.perm,
+              } as never),
+            );
+          }
+          await client.notify("session/update", {
+            sessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } },
+          });
+          return { stopReason: "end_turn" };
+        });
+
+      await new AcpRunner(profile(adapter)).run(
+        makeBaseRequest({
+          cwd: fx.wt1,
+          externalMcpServers: [{ name: "octofs", command: "octofs", args: ["mcp"], enabled: true }],
+          callbacks: { onToolEvent: (ev) => events.push(ev) },
+          ...reqOverrides,
+        }),
+        fixture,
+      );
+      return { outcomes, events };
+    };
+
+    const claudeView = (id: string, rawInput: Record<string, unknown>): McpCheck => ({
+      id,
+      perm: {
+        toolCall: {
+          toolCallId: id,
+          title: "mcp__octofs__view",
+          kind: "other",
+          rawInput,
+          _meta: { claudeCode: { toolName: "mcp__octofs__view", mcpServer: { name: "octofs", source: "sdk" } } },
+        },
+      },
+    });
+
+    const codexDirectView = (id: string, args: Record<string, unknown>): McpCheck => ({
+      id,
+      perm: {
+        _meta: { is_mcp_tool_approval: true },
+        toolCall: {
+          toolCallId: id,
+          title: "mcp.octofs.view",
+          kind: "execute",
+          rawInput: { server: "octofs", tool: "view", arguments: args },
+        },
+      },
+    });
+
+    const codexTrackedCall = (id: string, tool: string, args?: Record<string, unknown>): McpCheck => ({
+      id,
+      codexTracked: { server: "octofs", tool, args },
+      perm: {
+        _meta: { is_mcp_tool_approval: true },
+        toolCall: {
+          toolCallId: id,
+          kind: "execute",
+          status: "pending",
+        },
+      },
+    });
+
+    // 1. Data-dir layout, read-only Tier 3 task (Claude shape: direct rawInput)
+    const claudeDataDir = await runChecks(
+      "claude",
+      {
+        tier: 3,
+        kind: "research",
+        toolPolicy: "read_only_workspace",
+        extraReadRoots: [fx.goalsDir, fx.artifactsDir],
+        deniedRoots: [fx.stateDir],
+      },
+      [
+        claudeView("deny-state-file", { path: fx.cfgFile }),
+        claudeView("deny-other-chat", { path: otherChatFile }),
+        claudeView("deny-sibling-wt", { path: fx.wt2File }),
+        claudeView("deny-relative-sibling", { path: "../t-2/src/secret.ts" }),
+        claudeView("deny-symlink-state", { path: stateSymlink }),
+        claudeView("deny-pipe-multi", { path: `src/worker.ts|${otherChatFile}` }),
+        claudeView("deny-ranges-path", { path: "src/worker.ts", ranges: [{ path: fx.wt2File, start: 1, end: 5 }] }),
+        claudeView("allow-ws-rel", { path: "src/worker.ts" }),
+        claudeView("allow-ws-abs", { path: fx.wt1File }),
+        claudeView("allow-granted-goal", { path: fx.goalFile }),
+        claudeView("allow-granted-art", { path: fx.artifactFile }),
+        claudeView("allow-outside", { path: outsideFile }),
+        claudeView("allow-remote-ssh", { path: "ssh://devbox/etc/hosts" }),
+        claudeView("allow-no-path", { flags: "s" }),
+      ],
+    );
+
+    const claudeDeniedIds = [
+      "deny-state-file",
+      "deny-other-chat",
+      "deny-sibling-wt",
+      "deny-relative-sibling",
+      "deny-symlink-state",
+      "deny-pipe-multi",
+      "deny-ranges-path",
+    ];
+    for (const id of claudeDeniedIds) {
+      assert.equal(claudeDataDir.outcomes[id], "deny", `claude data-dir: ${id} must be refused`);
+      const ev = claudeDataDir.events.find((e) => e.id === id && e.status === "failed");
+      assert.equal(ev?.denied, "protected-path", `claude data-dir: ${id} denied rule`);
+      assert.ok(
+        ev?.error?.includes(DENIED_HARNESS_STATE_REASON),
+        `claude data-dir: ${id} must report harness-state reason, got: ${ev?.error}`,
+      );
+    }
+    for (const id of [
+      "allow-ws-rel",
+      "allow-ws-abs",
+      "allow-granted-goal",
+      "allow-granted-art",
+      "allow-outside",
+      "allow-remote-ssh",
+      "allow-no-path",
+    ]) {
+      assert.equal(claudeDataDir.outcomes[id], "allow", `claude data-dir: ${id} must be approved`);
+    }
+
+    // 2. Data-dir layout, Codex shape: both direct request_permission and correlated tool_call -> bare request_permission,
+    //    covering read-only (`view`) and write-decision (`text_edit`, where read-only artifactsDir is refused for writes).
+    const codexDataDir = await runChecks(
+      "codex",
+      {
+        toolPolicy: "read_write_workspace",
+        extraReadRoots: [fx.goalsDir, fx.artifactsDir],
+        extraWriteRoots: [fx.goalsDir],
+        deniedRoots: [fx.stateDir],
+      },
+      [
+        codexDirectView("codex-direct-deny-state", { path: fx.cfgFile }),
+        codexDirectView("codex-direct-allow-art", { path: fx.artifactFile }),
+        codexTrackedCall("codex-tracked-deny-view-state", "view", { path: fx.cfgFile }),
+        codexTrackedCall("codex-tracked-deny-edit-state", "text_edit", { command: "create", path: fx.cfgFile, content: "x" }),
+        codexTrackedCall("codex-tracked-deny-edit-ro-art", "text_edit", { command: "create", path: fx.artifactFile, content: "x" }),
+        codexTrackedCall("codex-tracked-deny-edit-sibling", "text_edit", { command: "create", path: "../t-2/escape.txt", content: "x" }),
+        codexTrackedCall("codex-tracked-allow-edit-goal", "text_edit", { command: "create", path: fx.goalFile, content: "ok" }),
+        codexTrackedCall("codex-tracked-allow-edit-ws", "text_edit", { command: "create", path: "src/new.ts", content: "ok" }),
+        codexTrackedCall("codex-tracked-allow-edit-outside", "text_edit", { command: "create", path: outsideFile, content: "ok" }),
+      ],
+    );
+
+    for (const id of [
+      "codex-direct-deny-state",
+      "codex-tracked-deny-view-state",
+      "codex-tracked-deny-edit-state",
+      "codex-tracked-deny-edit-ro-art",
+      "codex-tracked-deny-edit-sibling",
+    ]) {
+      assert.equal(codexDataDir.outcomes[id], "deny", `codex data-dir: ${id} must be refused`);
+      const ev = codexDataDir.events.find((e) => e.id === id && e.status === "failed");
+      assert.equal(ev?.denied, "protected-path", `codex data-dir: ${id} denied rule`);
+      assert.ok(
+        ev?.error?.includes(DENIED_HARNESS_STATE_REASON),
+        `codex data-dir: ${id} must report harness-state reason, got: ${ev?.error}`,
+      );
+    }
+    for (const id of [
+      "codex-direct-allow-art",
+      "codex-tracked-allow-edit-goal",
+      "codex-tracked-allow-edit-ws",
+      "codex-tracked-allow-edit-outside",
+    ]) {
+      assert.equal(codexDataDir.outcomes[id], "allow", `codex data-dir: ${id} must be approved`);
+    }
+
+    // 3. Legacy layout (deniedRoots empty): approves all octofs view calls as today
+    const legacyRes = await runChecks(
+      "claude",
+      {
+        cwd: fx.workspace,
+        tier: 3,
+        kind: "research",
+        toolPolicy: "read_only_workspace",
+      },
+      [
+        claudeView("legacy-state", { path: fx.cfgFile }),
+        claudeView("legacy-other-chat", { path: otherChatFile }),
+        claudeView("legacy-sibling", { path: fx.wt2File }),
+        claudeView("legacy-ws", { path: fx.wsFile }),
+        claudeView("legacy-outside", { path: outsideFile }),
+      ],
+    );
+    for (const id of ["legacy-state", "legacy-other-chat", "legacy-sibling", "legacy-ws", "legacy-outside"]) {
+      assert.equal(legacyRes.outcomes[id], "allow", `legacy layout: ${id} must stay approved`);
+    }
+  });
 });

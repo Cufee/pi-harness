@@ -250,6 +250,110 @@ function extractWritableOtherTargets(
   return targets;
 }
 
+function isRemoteOctofsPath(raw: string): boolean {
+  return /^(?:ssh|sftp):\/\//i.test(raw);
+}
+
+function collectRawInputObjects(rawInput: Record<string, unknown> | undefined): Record<string, unknown>[] {
+  if (!rawInput) return [];
+  const objects: Record<string, unknown>[] = [rawInput];
+  const args = rawInput.arguments;
+  if (args && typeof args === "object" && !Array.isArray(args)) {
+    objects.push(args as Record<string, unknown>);
+  } else if (typeof args === "string" && args.trim().startsWith("{")) {
+    try {
+      const parsed = JSON.parse(args);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        objects.push(parsed as Record<string, unknown>);
+      }
+    } catch {
+      // ignore non-JSON arguments string
+    }
+  }
+  return objects;
+}
+
+function extractExternalMcpTargets(
+  serverName: string,
+  locationsList: ReadonlyArray<ReadonlyArray<{ path?: unknown }> | undefined>,
+  rawInputs: ReadonlyArray<Record<string, unknown> | undefined>,
+): string[] {
+  const isOctofs = serverName.trim().toLowerCase() === "octofs";
+  const targets: string[] = [];
+  const seen = new Set<string>();
+  const pushTarget = (raw: string, allowPipeSplit: boolean) => {
+    const parts = allowPipeSplit ? raw.split("|") : [raw];
+    for (const part of parts) {
+      const trimmed = part.trim();
+      if (!trimmed) continue;
+      if (isOctofs && isRemoteOctofsPath(trimmed)) continue;
+      if (!seen.has(trimmed)) {
+        seen.add(trimmed);
+        targets.push(trimmed);
+      }
+    }
+  };
+
+  for (const locations of locationsList) {
+    for (const loc of locations ?? []) {
+      if (typeof loc?.path === "string") {
+        pushTarget(loc.path, isOctofs);
+      }
+    }
+  }
+
+  for (const rawInput of rawInputs) {
+    for (const obj of collectRawInputObjects(rawInput)) {
+      for (const key of WRITABLE_OTHER_PATH_KEYS) {
+        const val = obj[key];
+        if (typeof val === "string") {
+          pushTarget(val, isOctofs && key === "path");
+        }
+      }
+      for (const key of WRITABLE_OTHER_PATH_ARRAY_KEYS) {
+        const val = obj[key];
+        if (Array.isArray(val)) {
+          for (const item of val) {
+            if (typeof item === "string") {
+              pushTarget(item, false);
+            }
+          }
+        }
+      }
+      if (isOctofs) {
+        if (Array.isArray(obj.ranges)) {
+          for (const range of obj.ranges) {
+            if (range && typeof range === "object" && !Array.isArray(range)) {
+              const rp = (range as { path?: unknown }).path;
+              if (typeof rp === "string") pushTarget(rp, false);
+            }
+          }
+        }
+        if (Array.isArray(obj.edits)) {
+          for (const edit of obj.edits) {
+            if (edit && typeof edit === "object" && !Array.isArray(edit)) {
+              const ep = (edit as { path?: unknown }).path;
+              if (typeof ep === "string") pushTarget(ep, false);
+            }
+          }
+        }
+        if (Array.isArray(obj.operations)) {
+          for (const op of obj.operations) {
+            if (op && typeof op === "object" && !Array.isArray(op)) {
+              const copyFrom = (op as { copy_from?: unknown }).copy_from;
+              if (copyFrom && typeof copyFrom === "object" && !Array.isArray(copyFrom)) {
+                const cp = (copyFrom as { path?: unknown }).path;
+                if (typeof cp === "string") pushTarget(cp, false);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return targets;
+}
+
 function resolvePermissionPath(workspace: string, rawPath: string): string {
   const trimmed = rawPath.trim();
   if (trimmed === "~") return homedir();
@@ -1015,7 +1119,15 @@ export class AcpRunner {
     }
     const externalMcpNames = new Set(externalMcpEntries.map((s) => s.name));
     const codexHarnessCalls = new Set<string>();
-    const codexExternalCalls = new Set<string>();
+    const codexExternalCalls = new Map<
+      string,
+      {
+        server: string;
+        tool: string;
+        rawInput?: Record<string, unknown>;
+        locations?: Array<{ path?: unknown }>;
+      }
+    >();
     const quotaTimeoutMs = Math.max(0, req.quotaRetryTimeoutMs ?? DEFAULT_QUOTA_RETRY_TIMEOUT_MS);
     const startupTimeoutMs = Math.max(0, req.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS);
     const idleTimeoutMs = Math.max(0, req.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS);
@@ -2017,7 +2129,27 @@ export class AcpRunner {
               if (input.server === "harness" && harnessToolNames.has(input.tool)) {
                 codexHarnessCalls.add(callId);
               } else if (externalMcpNames.has(input.server) && (canWrite || isReadOnlyExternalMcpTool(input.server, input.tool))) {
-                codexExternalCalls.add(callId);
+                codexExternalCalls.set(callId, {
+                  server: input.server,
+                  tool: input.tool,
+                  rawInput:
+                    update.rawInput && typeof update.rawInput === "object" && !Array.isArray(update.rawInput)
+                      ? (update.rawInput as Record<string, unknown>)
+                      : undefined,
+                  locations: Array.isArray(update.locations)
+                    ? (update.locations as Array<{ path?: unknown }>)
+                    : undefined,
+                });
+              }
+            }
+          } else if (this.profile.adapter === "codex" && callId && kind === "tool_call_update") {
+            const tracked = codexExternalCalls.get(callId);
+            if (tracked) {
+              if (update.rawInput && typeof update.rawInput === "object" && !Array.isArray(update.rawInput)) {
+                tracked.rawInput = update.rawInput as Record<string, unknown>;
+              }
+              if (Array.isArray(update.locations) && update.locations.length > 0) {
+                tracked.locations = update.locations as Array<{ path?: unknown }>;
               }
             }
           }
@@ -2244,11 +2376,14 @@ export class AcpRunner {
           p._meta?.is_mcp_tool_approval === true &&
           callId !== undefined &&
           codexHarnessCalls.has(callId);
-        const codexTrackedExternal =
+        const trackedCodexExternal =
+          this.profile.adapter === "codex" &&
           toolKind === "execute" &&
           p._meta?.is_mcp_tool_approval === true &&
-          callId !== undefined &&
-          codexExternalCalls.has(callId);
+          callId !== undefined
+            ? codexExternalCalls.get(callId)
+            : undefined;
+        const codexTrackedExternal = trackedCodexExternal !== undefined;
         const codexHarnessMcp =
           this.profile.adapter === "codex" &&
           ((toolKind === "execute" && p._meta?.is_mcp_tool_approval === true && codexDirectHarness) ||
@@ -2279,8 +2414,51 @@ export class AcpRunner {
 
         const harnessMcpAllowed =
           hasHarnessBridge && (claudeHarnessMcp || codexHarnessMcp || geminiHarnessMcp || genericHarnessMcp);
-        const externalMcpAllowed =
-          !controlOnly && (claudeExternalMcp || codexExternalMcp || geminiExternalMcp || genericExternalMcp);
+        const matchedExternalMcp: { server: string; tool: string } | null = !controlOnly
+          ? claudeExternalMcp
+            ? { server: claude!.mcpServer!.name!, tool: claudeExtParsed?.tool ?? claudeToolName ?? "" }
+            : codexExternalMcp
+              ? toolKind === "execute" && p._meta?.is_mcp_tool_approval === true && codexDirectExternal
+                ? { server: codexRawServer!, tool: codexRawTool! }
+                : trackedCodexExternal
+                  ? { server: trackedCodexExternal.server, tool: trackedCodexExternal.tool }
+                  : normalizedExt
+              : geminiExternalMcp
+                ? geminiMcp?.server_name !== undefined && externalMcpNames.has(geminiMcp.server_name)
+                  ? { server: geminiMcp.server_name, tool: geminiMcp.tool_name ?? "" }
+                  : normalizedExt
+                : genericExternalMcp
+                  ? normalizedExt
+                  : null
+          : null;
+        let externalMcpAllowed = matchedExternalMcp !== null;
+        let externalMcpDenialRule: "protected-path" | undefined;
+        let externalMcpDenialRejection: HarnessRejection | undefined;
+        if (externalMcpAllowed && matchedExternalMcp && deniedRoots.length > 0) {
+          const mcpReadOnly = isReadOnlyExternalMcpTool(matchedExternalMcp.server, matchedExternalMcp.tool);
+          const mcpAllowedRoots = mcpReadOnly ? [workspace, ...extraReadRoots] : [workspace, ...extraWriteRoots];
+          const mcpTargets = extractExternalMcpTargets(
+            matchedExternalMcp.server,
+            [trackedCodexExternal?.locations, p.toolCall?.locations],
+            [trackedCodexExternal?.rawInput, rawInput],
+          );
+          for (const rawTarget of mcpTargets) {
+            const denied = await checkDeniedOrProtectedPath(
+              workspace,
+              mcpAllowedRoots,
+              deniedRoots,
+              requestProtectedRoots,
+              rawTarget,
+              { checkProtectedWorktree: true },
+            );
+            if (denied) {
+              externalMcpDenialRule = "protected-path";
+              externalMcpDenialRejection = denied;
+              externalMcpAllowed = false;
+              break;
+            }
+          }
+        }
 
         let readDenialRule: "protected-path" | "outside-roots" | undefined;
         let readDenialRejection: HarnessRejection | undefined;
@@ -2425,7 +2603,15 @@ export class AcpRunner {
         let execDenialRejection: HarnessRejection | undefined;
         // Allow native workspace reads/searches, read-only shell inspection commands, writes (when canWrite),
         // and full shell commands (when allowShell) for non-control-plane agents.
-        if (!controlOnly && !claude?.mcpServer && !p._meta?.is_mcp_tool_approval && !geminiMcp) {
+        // Never fall through to workspaceCall for external MCP tool calls.
+        if (
+          !controlOnly &&
+          !claude?.mcpServer &&
+          !p._meta?.is_mcp_tool_approval &&
+          !geminiMcp &&
+          !normalizedExt &&
+          !externalMcpDenialRejection
+        ) {
           if (isRead) {
             workspaceCall = await validateReadLocations();
           } else if (canWrite && isWrite) {
@@ -2544,16 +2730,24 @@ export class AcpRunner {
                 ? { server: claude.mcpServer.name, tool: claudeExtParsed?.tool ?? claudeToolName ?? deniedLabel }
                 : this.profile.adapter === "codex" && codexRawServer && codexRawTool && externalMcpNames.has(codexRawServer)
                   ? { server: codexRawServer, tool: codexRawTool }
-                  : this.profile.adapter === "gemini" &&
-                      geminiMcp?.server_name !== undefined &&
-                      externalMcpNames.has(geminiMcp.server_name)
-                    ? { server: geminiMcp.server_name, tool: geminiMcp.tool_name ?? deniedLabel }
-                    : normalizedExt
+                  : trackedCodexExternal
+                    ? { server: trackedCodexExternal.server, tool: trackedCodexExternal.tool }
+                    : this.profile.adapter === "gemini" &&
+                        geminiMcp?.server_name !== undefined &&
+                        externalMcpNames.has(geminiMcp.server_name)
+                      ? { server: geminiMcp.server_name, tool: geminiMcp.tool_name ?? deniedLabel }
+                      : normalizedExt
               : null;
           let deniedRule: string;
           let denialNoticeOverride: HarnessRejection | undefined;
           let deniedArgs: Record<string, unknown> = { ...(rawInput ?? {}) };
-          if (deniedExternalMcp) {
+          if (externalMcpDenialRejection) {
+            deniedRule = externalMcpDenialRule ?? "protected-path";
+            denialNoticeOverride = externalMcpDenialRejection;
+            if (deniedExternalMcp) {
+              deniedArgs = { ...deniedArgs, server: deniedExternalMcp.server, tool: deniedExternalMcp.tool };
+            }
+          } else if (deniedExternalMcp) {
             deniedRule = "read-only-mcp";
             deniedArgs = { ...deniedArgs, server: deniedExternalMcp.server, tool: deniedExternalMcp.tool };
           } else if (!controlOnly && !claude?.mcpServer && !p._meta?.is_mcp_tool_approval && !geminiMcp && isExecute) {
