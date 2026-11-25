@@ -526,7 +526,7 @@ describe("storage path module review fixes (P1-P7)", () => {
     assert.equal(sp.directorWritePolicy(owner, escapeLink, opts).ok, false);
   });
 
-  it("P6: names.ts validates every git ref segment against git check-ref-format rules and rejects invalid segments", () => {
+  it("P6/D2: names.ts validates run/task segments in data-dir and normalizes unsafe chat ids to legacy without throwing", () => {
     const invalidSegments = [
       "",
       ".",
@@ -551,25 +551,25 @@ describe("storage path module review fixes (P1-P7)", () => {
     ];
 
     for (const bad of invalidSegments) {
-      assert.throws(
-        () => taskBranchName({ id: "run-1", chatSessionId: bad }, "t-1", "data-dir"),
-        /Invalid git ref segment/,
-        `expected invalid chatSessionId ${JSON.stringify(bad)} to throw in taskBranchName`,
+      assert.equal(
+        taskBranchName({ id: "run-1", chatSessionId: bad }, "t-1", "data-dir"),
+        "harness/legacy/run-1/t-1",
+        `expected invalid chatSessionId ${JSON.stringify(bad)} to fall back to legacy in taskBranchName`,
       );
-      assert.throws(
-        () => archiveRef({ id: "run-1", chatSessionId: bad }, "t-1", "data-dir"),
-        /Invalid git ref segment/,
-        `expected invalid chatSessionId ${JSON.stringify(bad)} to throw in archiveRef`,
+      assert.equal(
+        archiveRef({ id: "run-1", chatSessionId: bad }, "t-1", "data-dir"),
+        "refs/harness/legacy/archive/run-1/t-1",
+        `expected invalid chatSessionId ${JSON.stringify(bad)} to fall back to legacy in archiveRef`,
       );
-      assert.throws(
-        () => mergedRef({ id: "run-1", chatSessionId: bad }, "data-dir"),
-        /Invalid git ref segment/,
-        `expected invalid chatSessionId ${JSON.stringify(bad)} to throw in mergedRef`,
+      assert.equal(
+        mergedRef({ id: "run-1", chatSessionId: bad }, "data-dir"),
+        "refs/harness/legacy/merged/run-1",
+        `expected invalid chatSessionId ${JSON.stringify(bad)} to fall back to legacy in mergedRef`,
       );
-      assert.throws(
-        () => mergedRefCandidates({ id: "run-1", chatSessionId: bad }, "data-dir"),
-        /Invalid git ref segment/,
-        `expected invalid chatSessionId ${JSON.stringify(bad)} to throw in mergedRefCandidates`,
+      assert.deepEqual(
+        mergedRefCandidates({ id: "run-1", chatSessionId: bad }, "data-dir"),
+        ["refs/harness/legacy/merged/run-1", "refs/harness/merged/run-1"],
+        `expected invalid chatSessionId ${JSON.stringify(bad)} to fall back to legacy in mergedRefCandidates`,
       );
       assert.throws(
         () => taskBranchName({ id: bad, chatSessionId: "chat-1" }, "t-1", "data-dir"),
@@ -587,6 +587,9 @@ describe("storage path module review fixes (P1-P7)", () => {
         `expected invalid runId ${JSON.stringify(bad)} to throw in archiveRefPatterns`,
       );
     }
+
+    // Storage-unsafe chat IDs (such as '+' rejected by StoragePaths.chatSegment) also fall back to legacy.
+    assert.equal(taskBranchName({ id: "run-1", chatSessionId: "chat+1" }, "t-1", "data-dir"), "harness/legacy/run-1/t-1");
 
     // Normal generated IDs and null/undefined chatSessionId remain unaffected.
     assert.equal(taskBranchName({ id: "run-30", chatSessionId: "chat-4" }, "t-590", "data-dir"), "harness/chat-4/run-30/t-590");

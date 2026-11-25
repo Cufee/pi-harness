@@ -12,6 +12,7 @@ import {
   archiveRefPatterns,
   isArchiveRef,
   mergedRef,
+  mergedRefCandidates,
   parseArchiveRef,
   taskBranchName,
 } from "../src/storage/names.js";
@@ -626,5 +627,197 @@ describe("git names in data-dir layout (real git repos)", () => {
       console.warn = origWarn;
       db.close();
     }
+  });
+
+  it("D2(a): completes a pre-flip queued merge with chat id 'weird.lock' exactly once in data-dir and creates later worker branches", async () => {
+    const root = makeTempDir("pi-git-names-d2-weird-chat-");
+    const stateDir = join(root, "state");
+    const repo = join(root, "repo");
+    mkdirSync(stateDir, { recursive: true });
+    const initSha = await initTempGitRepo(repo);
+
+    const db = new ControlPlaneDb(":memory:");
+    const origWarn = console.warn;
+    const warnings: string[] = [];
+    try {
+      // Phase 1: Legacy layout — pre-flip run with non-git-safe chat id 'weird.lock' and a queued merge.
+      delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+      resetStoragePathsForTest();
+      const legacySp = storagePaths({ stateDir, worktree: { dir: ".harness/worktrees" } });
+      const legacyMgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 }, {}, legacySp);
+
+      const weirdChatRun = db.createRun({
+        goal: "Pre-flip weird chat run",
+        repoRoot: repo,
+        baseBranch: "main",
+        baseSha: initSha,
+        chatSessionId: "weird.lock",
+      });
+      const task1 = db.createTask({
+        runId: weirdChatRun.id,
+        tier: 2,
+        kind: "worker",
+        title: "Pre-flip queued worker",
+        objective: "Add weird.txt",
+        profileId: "acp:claude",
+      });
+      const wt1 = await legacyMgr.createForWorker(weirdChatRun.id, task1.id, initSha);
+      writeFileSync(join(wt1.path, "weird.txt"), "from pre-flip\n", "utf8");
+      await runGit(wt1.path, ["add", "weird.txt"]);
+      await runGit(wt1.path, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "pre-flip weird chat"]);
+      const queued = db.enqueueMerge({
+        runId: weirdChatRun.id,
+        taskId: task1.id,
+        worktreeId: wt1.id,
+        branch: wt1.branch,
+      });
+
+      // Phase 2: Flip to data-dir layout.
+      process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
+      resetStoragePathsForTest();
+      const ddSp = storagePaths({ stateDir, worktree: { dir: ".harness/worktrees" } });
+      const ddMgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 }, {}, ddSp);
+      const ddMq = new BisectingMergeQueue(db, ddMgr, repo, {});
+
+      // Queued merge for chat 'weird.lock' completes exactly once.
+      const res1 = await ddMq.processNext(weirdChatRun.id);
+      assert.ok(res1?.mergedSha, "expected mergedSha for weird.lock run");
+      assert.equal(res1.item.status, "merged");
+      assert.equal((await runGit(repo, ["rev-parse", "main"])).stdout, res1.mergedSha);
+      assert.equal(db.getMergeQueueItem(queued.id)?.status, "merged");
+      assert.deepEqual(db.listPendingMerges(weirdChatRun.id), []);
+      assert.equal(await ddMq.processNext(weirdChatRun.id), null);
+
+      const expectedMergedRef = `refs/harness/legacy/merged/${weirdChatRun.id}`;
+      assert.equal(await refSha(repo, expectedMergedRef), res1.mergedSha);
+      const weirdPromoted = db
+        .getEventsSince(weirdChatRun.id, 0)
+        .filter((e) => e.type === "merge.promoted" && e.taskId === task1.id);
+      assert.equal(weirdPromoted.length, 1);
+      assert.equal((weirdPromoted[0]!.payload as Record<string, unknown>).mergedSha, res1.mergedSha);
+      assert.equal((weirdPromoted[0]!.payload as Record<string, unknown>).ref, expectedMergedRef);
+      assert.equal((weirdPromoted[0]!.payload as Record<string, unknown>).refUpdated, true);
+
+      // A later worker of the same 'weird.lock' run gets a valid branch in data-dir layout.
+      const task2 = db.createTask({
+        runId: weirdChatRun.id,
+        tier: 2,
+        kind: "worker",
+        title: "Post-flip worker for weird.lock run",
+        objective: "Follow-up work",
+        profileId: "acp:claude",
+      });
+      const wt2 = await ddMgr.createForWorker(weirdChatRun.id, task2.id);
+      assert.equal(wt2.branch, `harness/legacy/${weirdChatRun.id}/${task2.id}`);
+      assert.ok(await refSha(repo, `refs/heads/${wt2.branch}`), "later worker branch must exist in git");
+
+      // Also verify the merge-queue advisory-skip path when merged-ref naming fails in data-dir:
+      // a pre-flip run with id 'foo.' (valid as an interior legacy git branch segment, rejected by
+      // the data-dir validator) still advances main, emits merge.ref_warning + merge.promoted, and
+      // finishes the merge item exactly once.
+      delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+      resetStoragePathsForTest();
+      const legacySp2 = storagePaths({ stateDir, worktree: { dir: ".harness/worktrees" } });
+      const legacyMgr2 = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 }, {}, legacySp2);
+      const invalidRunIdRun = db.createRun({
+        id: "foo.",
+        goal: "Pre-flip run with trailing-dot id",
+        repoRoot: repo,
+        baseBranch: "main",
+        baseSha: res1.mergedSha,
+        chatSessionId: "chat-7",
+      });
+      const taskInvalidRun = db.createTask({
+        runId: invalidRunIdRun.id,
+        tier: 2,
+        kind: "worker",
+        title: "Pre-flip trailing-dot run worker",
+        objective: "Add dot-run.txt",
+        profileId: "acp:claude",
+      });
+      const wtInvalidRun = await legacyMgr2.createForWorker(invalidRunIdRun.id, taskInvalidRun.id, res1.mergedSha);
+      writeFileSync(join(wtInvalidRun.path, "dot-run.txt"), "dot run\n", "utf8");
+      await runGit(wtInvalidRun.path, ["add", "dot-run.txt"]);
+      await runGit(wtInvalidRun.path, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "dot run commit"]);
+      const queuedInvalidRun = db.enqueueMerge({
+        runId: invalidRunIdRun.id,
+        taskId: taskInvalidRun.id,
+        worktreeId: wtInvalidRun.id,
+        branch: wtInvalidRun.branch,
+      });
+
+      process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
+      resetStoragePathsForTest();
+      const ddSp2 = storagePaths({ stateDir, worktree: { dir: ".harness/worktrees" } });
+      const ddMgr2 = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 }, {}, ddSp2);
+      const ddMq2 = new BisectingMergeQueue(db, ddMgr2, repo, {});
+
+      console.warn = (...args: unknown[]) => {
+        warnings.push(args.map((a) => String(a)).join(" "));
+      };
+      let resInvalid;
+      try {
+        resInvalid = await ddMq2.processNext(invalidRunIdRun.id);
+      } finally {
+        console.warn = origWarn;
+      }
+      assert.ok(resInvalid?.mergedSha);
+      assert.equal(resInvalid.item.status, "merged");
+      assert.equal((await runGit(repo, ["rev-parse", "main"])).stdout, resInvalid.mergedSha);
+      assert.equal(db.getMergeQueueItem(queuedInvalidRun.id)?.status, "merged");
+      assert.equal(await ddMq2.processNext(invalidRunIdRun.id), null);
+
+      const invalidEvents = db.getEventsSince(invalidRunIdRun.id, 0);
+      const refWarn = invalidEvents.find((e) => e.type === "merge.ref_warning" && e.taskId === taskInvalidRun.id);
+      assert.ok(refWarn, "expected advisory merge.ref_warning when merged-ref naming fails");
+      assert.equal((refWarn.payload as Record<string, unknown>).ref, null);
+      const promotedInvalid = invalidEvents.filter((e) => e.type === "merge.promoted" && e.taskId === taskInvalidRun.id);
+      assert.equal(promotedInvalid.length, 1);
+      assert.equal((promotedInvalid[0]!.payload as Record<string, unknown>).mergedSha, resInvalid.mergedSha);
+      assert.equal((promotedInvalid[0]!.payload as Record<string, unknown>).ref, null);
+      assert.equal((promotedInvalid[0]!.payload as Record<string, unknown>).refUpdated, false);
+      assert.ok(warnings.length > 0);
+    } finally {
+      console.warn = origWarn;
+      db.close();
+    }
+  });
+
+  it("D2(b): legacy-layout builders return origin/main names for run and task ids rejected by data-dir", () => {
+    const runId = "run.lock";
+    const taskId = "task.lock";
+    const run = { id: runId, chatSessionId: "weird.lock" };
+
+    // Legacy layout passes run and task ids through unchanged, matching origin/main.
+    assert.equal(taskBranchName(run, taskId, "legacy"), `harness/${runId}/${taskId}`);
+    assert.equal(archiveRef(run, taskId, "legacy"), `refs/harness/archive/${runId}/${taskId}`);
+    assert.equal(mergedRef(run, "legacy"), `refs/harness/merged/${runId}`);
+    assert.deepEqual(mergedRefCandidates(run, "legacy"), [`refs/harness/merged/${runId}`]);
+    assert.deepEqual(archiveRefPatterns(runId, "legacy"), [
+      `refs/harness/archive/${runId}/*`,
+      `refs/harness/*/archive/${runId}/*`,
+    ]);
+    assert.deepEqual(archiveRefPatterns(run, "legacy"), [
+      `refs/harness/archive/${runId}/*`,
+      `refs/harness/*/archive/${runId}/*`,
+    ]);
+    // Empty string remains the unfiltered pattern argument in legacy layout, matching origin/main.
+    assert.deepEqual(archiveRefPatterns("", "legacy"), [
+      "refs/harness/archive/*/*",
+      "refs/harness/*/archive/*/*",
+    ]);
+    assert.deepEqual(archiveRefPatterns({ id: "" }, "legacy"), [
+      "refs/harness/archive/*/*",
+      "refs/harness/*/archive/*/*",
+    ]);
+
+    // Data-dir layout still validates run and task ids, while falling back to 'legacy' for chat ids.
+    assert.throws(() => taskBranchName(run, "t-1", "data-dir"), /Invalid git ref segment/);
+    assert.throws(() => taskBranchName({ id: "run-1", chatSessionId: "weird.lock" }, taskId, "data-dir"), /Invalid git ref segment/);
+    assert.throws(() => archiveRef(run, "t-1", "data-dir"), /Invalid git ref segment/);
+    assert.throws(() => mergedRef(run, "data-dir"), /Invalid git ref segment/);
+    assert.throws(() => archiveRefPatterns(runId, "data-dir"), /Invalid git ref segment/);
+    assert.throws(() => archiveRefPatterns("", "data-dir"), /Invalid git ref segment/);
+    assert.equal(taskBranchName({ id: "run-1", chatSessionId: "chat+1" }, "t-1", "data-dir"), "harness/legacy/run-1/t-1");
   });
 });

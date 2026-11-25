@@ -1,4 +1,4 @@
-import { resolveStorageLayout, type StorageLayout } from "./paths.js";
+import { legacyStoragePaths, resolveStorageLayout, type StorageLayout } from "./paths.js";
 
 /** Minimal run descriptor accepted by git-name builders (`RunRecord` and `RunRef` satisfy it structurally). */
 export interface RunNameRef {
@@ -52,39 +52,37 @@ function assertGitRefSegment(seg: string, label: string): string {
 }
 
 function chatSegmentFor(run: RunNameRef): string {
-  if (run.chatSessionId === undefined || run.chatSessionId === null) {
-    return "legacy";
-  }
-  return assertGitRefSegment(run.chatSessionId, "chatSessionId");
+  const segment = legacyStoragePaths.chatSegment(run.chatSessionId);
+  return isValidGitRefSegment(segment) ? segment : "legacy";
 }
 
 /** Base branch name for a worker task checkout (callers append any collision suffix). */
 export function taskBranchName(run: RunNameRef, taskId: string, layout?: StorageLayout): string {
-  const runId = assertGitRefSegment(run.id, "run.id");
-  const safeTaskId = assertGitRefSegment(taskId, "taskId");
   if (resolveStorageLayout(layout) === "data-dir") {
+    const runId = assertGitRefSegment(run.id, "run.id");
+    const safeTaskId = assertGitRefSegment(taskId, "taskId");
     return `harness/${chatSegmentFor(run)}/${runId}/${safeTaskId}`;
   }
-  return `harness/${runId}/${safeTaskId}`;
+  return `harness/${run.id}/${taskId}`;
 }
 
 /** Safety archive git ref for a worktree snapshot. */
 export function archiveRef(run: RunNameRef, taskId: string, layout?: StorageLayout): string {
-  const runId = assertGitRefSegment(run.id, "run.id");
-  const safeTaskId = assertGitRefSegment(taskId, "taskId");
   if (resolveStorageLayout(layout) === "data-dir") {
+    const runId = assertGitRefSegment(run.id, "run.id");
+    const safeTaskId = assertGitRefSegment(taskId, "taskId");
     return `refs/harness/${chatSegmentFor(run)}/archive/${runId}/${safeTaskId}`;
   }
-  return `refs/harness/archive/${runId}/${safeTaskId}`;
+  return `refs/harness/archive/${run.id}/${taskId}`;
 }
 
 /** Primary git ref storing the latest merged commit for a run. */
 export function mergedRef(run: RunNameRef, layout?: StorageLayout): string {
-  const runId = assertGitRefSegment(run.id, "run.id");
   if (resolveStorageLayout(layout) === "data-dir") {
+    const runId = assertGitRefSegment(run.id, "run.id");
     return `refs/harness/${chatSegmentFor(run)}/merged/${runId}`;
   }
-  return `refs/harness/merged/${runId}`;
+  return `refs/harness/merged/${run.id}`;
 }
 
 /** Candidate merged git refs for a run in reader preference order. */
@@ -97,12 +95,19 @@ export function mergedRefCandidates(run: RunNameRef, layout?: StorageLayout): st
 
 /** Git `for-each-ref` patterns covering both legacy and chat-scoped safety archive refs, optionally scoped to one run. */
 export function archiveRefPatterns(run?: RunNameRef | string, layout?: StorageLayout): string[] {
-  resolveStorageLayout(layout);
+  const resolvedLayout = resolveStorageLayout(layout);
   if (run === undefined) {
     return ["refs/harness/archive/*/*", "refs/harness/*/archive/*/*"];
   }
-  const runId = assertGitRefSegment(typeof run === "string" ? run : run.id, "run.id");
-  return [`refs/harness/archive/${runId}/*`, `refs/harness/*/archive/${runId}/*`];
+  const rawRunId = typeof run === "string" ? run : run.id;
+  if (resolvedLayout === "data-dir") {
+    const runId = assertGitRefSegment(rawRunId, "run.id");
+    return [`refs/harness/archive/${runId}/*`, `refs/harness/*/archive/${runId}/*`];
+  }
+  if (!rawRunId) {
+    return ["refs/harness/archive/*/*", "refs/harness/*/archive/*/*"];
+  }
+  return [`refs/harness/archive/${rawRunId}/*`, `refs/harness/*/archive/${rawRunId}/*`];
 }
 
 /** Parses a harness safety archive ref (legacy or chat-scoped) into its identifiers, or returns null when it is not one. */

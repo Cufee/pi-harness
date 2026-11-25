@@ -669,7 +669,7 @@ export class WorktreeManager {
       for (const line of stdout.split("\n")) {
         if (!line.trim()) continue;
         const [ref, oid, tsStr] = line.trim().split(/\s+/);
-        if (!ref || !oid || !isArchiveRef(ref, opts?.runId) || justArchived.has(ref)) continue;
+        if (!ref || !oid || !isArchiveRef(ref, opts?.runId || undefined) || justArchived.has(ref)) continue;
         const ts = Number(tsStr ?? 0);
         if (opts?.forceAll || (ts > 0 && ts < cutoffSec)) {
           try {

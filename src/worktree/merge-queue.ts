@@ -410,6 +410,24 @@ export class BisectingMergeQueue {
         return await abortMerge("Merge aborted before ref promotion: task cancelled.");
       }
 
+      // Build every ref name the item needs before advancing targetBranch.
+      // Any error building advisory merged-ref names is deferred to the post-promotion advisory
+      // warning path so it can never abort promotion or skip merge.promoted / finishMergeItem.
+      const targetBranchRef = `refs/heads/${targetBranch}`;
+      let primaryRef: string | null = null;
+      let legacyRef: string | null = null;
+      let refNamingError: string | null = null;
+      try {
+        const runForRef = this.db.getRun(next.runId);
+        const chatSessionId = runForRef?.chatSessionId ?? this.db.getRunChatSessionId(runForRef?.id ?? next.runId);
+        const runNameRef = { id: runForRef?.id ?? next.runId, chatSessionId };
+        const layout = this.worktrees.gitNameLayout();
+        primaryRef = runMergedRefForRun(runNameRef, layout);
+        legacyRef = runMergedRefForRun(runNameRef, "legacy");
+      } catch (nameErr) {
+        refNamingError = nameErr instanceof Error ? nameErr.message : String(nameErr);
+      }
+
       // Advance target branch safely without ever leaving the checked-out working tree out of sync with HEAD!
       const { stdout: headBranch } = await runGit(this.repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"]);
       const { stdout: mergedSha } = await runGit(intPath, ["rev-parse", "HEAD"]);
@@ -443,7 +461,7 @@ export class BisectingMergeQueue {
       } else {
         // Target branch is not currently checked out — atomic CAS update-ref is safe
         try {
-          await runGit(this.repoRoot, ["update-ref", `refs/heads/${targetBranch}`, mergedSha, targetSha]);
+          await runGit(this.repoRoot, ["update-ref", targetBranchRef, mergedSha, targetSha]);
         } catch (refErr) {
           const detail = refErr instanceof Error ? refErr.message : String(refErr);
           return this.bounce(
@@ -459,18 +477,31 @@ export class BisectingMergeQueue {
       // Update the advisory run merge ref with a single atomic CAS against the previously observed value.
       // Sticky writer: if the legacy merged ref already exists for this run, keep updating it so a fallback
       // to the previous release never sees a stale legacy ref alongside a newer chat-scoped ref.
-      // On failure, leave the ref and any lock files untouched; merge.promoted is the durable source of truth.
-      const runForRef = this.db.getRun(next.runId);
-      const chatSessionId = runForRef?.chatSessionId ?? this.db.getRunChatSessionId(runForRef?.id ?? next.runId);
-      const runNameRef = { id: runForRef?.id ?? next.runId, chatSessionId };
-      const layout = this.worktrees.gitNameLayout();
-      const primaryRef = runMergedRefForRun(runNameRef, layout);
-      const legacyRef = runMergedRefForRun(runNameRef, "legacy");
+      // On any naming, enumeration, or update failure, leave refs untouched and record the advisory skip;
+      // merge.promoted and finishMergeItem always run once targetBranch has advanced.
       let mergedRef: string | null = primaryRef;
       let prevMergedRefSha: string | null = null;
       let refUpdated = false;
       let skipRefUpdate = false;
-      if (primaryRef === legacyRef) {
+      const recordRefWarning = (ref: string | null, warning: string): void => {
+        console.warn(warning);
+        ciLogs.push(warning);
+        this.db.emitEvent(next.runId, next.taskId, "merge.ref_warning", {
+          mergeId: next.id,
+          ref,
+          mergedSha,
+          warning,
+        });
+      };
+
+      if (refNamingError !== null || !primaryRef || !legacyRef) {
+        skipRefUpdate = true;
+        mergedRef = null;
+        recordRefWarning(
+          null,
+          `[merge-queue] Failed to build merged ref name before updating to ${mergedSha.slice(0, 8)} (${refNamingError ?? "missing ref name"}); skipping ref update (merge.promoted records ${mergedSha.slice(0, 8)}).`,
+        );
+      } else if (primaryRef === legacyRef) {
         prevMergedRefSha = await runGit(this.repoRoot, ["rev-parse", "--verify", `${legacyRef}^{commit}`])
           .then((r) => r.stdout || null)
           .catch(() => null);
@@ -504,15 +535,10 @@ export class BisectingMergeQueue {
           skipRefUpdate = true;
           mergedRef = null;
           const enumDetail = enumErr instanceof Error ? enumErr.message : String(enumErr);
-          const warning = `[merge-queue] Failed to enumerate merged refs (${legacyRef}, ${primaryRef}) before updating to ${mergedSha.slice(0, 8)} (${enumDetail}); skipping ref update (merge.promoted records ${mergedSha.slice(0, 8)}).`;
-          console.warn(warning);
-          ciLogs.push(warning);
-          this.db.emitEvent(next.runId, next.taskId, "merge.ref_warning", {
-            mergeId: next.id,
-            ref: null,
-            mergedSha,
-            warning,
-          });
+          recordRefWarning(
+            null,
+            `[merge-queue] Failed to enumerate merged refs (${legacyRef}, ${primaryRef}) before updating to ${mergedSha.slice(0, 8)} (${enumDetail}); skipping ref update (merge.promoted records ${mergedSha.slice(0, 8)}).`,
+          );
         }
       }
       if (!skipRefUpdate && mergedRef) {
@@ -521,15 +547,10 @@ export class BisectingMergeQueue {
           refUpdated = true;
         } catch (refErr) {
           const refDetail = refErr instanceof Error ? refErr.message : String(refErr);
-          const warning = `[merge-queue] Failed to update ${mergedRef} to ${mergedSha.slice(0, 8)} (${refDetail}); leaving ref untouched (merge.promoted records ${mergedSha.slice(0, 8)}).`;
-          console.warn(warning);
-          ciLogs.push(warning);
-          this.db.emitEvent(next.runId, next.taskId, "merge.ref_warning", {
-            mergeId: next.id,
-            ref: mergedRef,
-            mergedSha,
-            warning,
-          });
+          recordRefWarning(
+            mergedRef,
+            `[merge-queue] Failed to update ${mergedRef} to ${mergedSha.slice(0, 8)} (${refDetail}); leaving ref untouched (merge.promoted records ${mergedSha.slice(0, 8)}).`,
+          );
         }
       }
 
