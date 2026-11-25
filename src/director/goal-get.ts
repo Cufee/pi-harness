@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
+  type BigIntStats,
   closeSync,
   constants,
   fstatSync,
@@ -10,6 +11,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -287,62 +289,156 @@ function relativeSegmentsUnder(parent: string, child: string): string[] | null {
   return segments;
 }
 
+interface VerifiedEvidenceDir {
+  path: string;
+  realpath: string;
+  dev: bigint;
+  ino: bigint;
+}
+
+/** Optional test hooks for `writeGoalDescriptionFile` to exercise concurrent directory/file swaps. */
+export interface WriteGoalDescriptionHooks {
+  /** Invoked after verifying the evidence directory and before opening its directory fd. */
+  afterVerifyDir?: () => void;
+  /** Invoked after opening the pinned directory fd and before opening an existing file for comparison. */
+  beforeCompareOpen?: () => void;
+  /** Invoked before creating the exclusive temporary file. */
+  beforeTempCreate?: () => void;
+  /** Invoked after creating the temporary file and before renaming it into place. */
+  beforeRename?: () => void;
+  /** Forces the non-`/proc/self/fd` identity re-check fallback even when `/proc/self/fd` exists. */
+  disableProcSelfFd?: boolean;
+}
+
+function verifySegmentsUnderAnchor(
+  anchor: string,
+  segments: readonly string[],
+  allowCreate: boolean,
+  leafAlreadyExists: boolean,
+): VerifiedEvidenceDir | null {
+  let cur = anchor;
+  let leafStat: BigIntStats | null = null;
+  for (const seg of segments) {
+    cur = join(cur, seg);
+    if (!leafAlreadyExists) {
+      if (!allowCreate) return null;
+      try {
+        mkdirSync(cur);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") return null;
+      }
+    }
+    try {
+      const st = lstatSync(cur, { bigint: true });
+      if (st.isSymbolicLink() || !st.isDirectory()) return null;
+      leafStat = st;
+    } catch {
+      return null;
+    }
+  }
+  if (!leafStat) return null;
+  try {
+    const rp = realpathSync(cur);
+    if (rp !== cur) return null;
+    return { path: cur, realpath: rp, dev: leafStat.dev, ino: leafStat.ino };
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Verifies `dirPath` is a real directory (never a symlink) before writing.
- * When `dirPath` is lexically under `repoRoot`, every component below `repoRoot` must also be a real directory.
- * Missing directories are only created segment-by-segment under `repoRoot` when `allowCreateUnderRepo` is true.
+ * Verifies `dirPath` is a real directory (never a symlink) before writing and captures its identity (`dev`, `ino`, `realpath`).
+ * When `dirPath` is lexically under `repoRoot` (or `dataRoot`, when supplied), every component below that anchor
+ * must also be a real directory. Missing directories are only created segment-by-segment under `repoRoot` when
+ * `allowCreateUnderRepo` is true.
  */
 function verifyRealEvidenceDir(
   dirPath: string,
   repoRoot: string,
   allowCreateUnderRepo: boolean,
-): string | null {
+  dataRoot?: string | null,
+): VerifiedEvidenceDir | null {
   const canonRoot = canonicalPath(repoRoot);
   const relSegments =
     relativeSegmentsUnder(canonRoot, dirPath) ?? relativeSegmentsUnder(resolve(repoRoot), dirPath);
 
-  let exists = false;
+  let initialStat: BigIntStats | null = null;
   try {
-    const st = lstatSync(dirPath);
+    const st = lstatSync(dirPath, { bigint: true });
     if (st.isSymbolicLink() || !st.isDirectory()) return null;
-    exists = true;
+    initialStat = st;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") return null;
   }
 
   if (relSegments) {
-    let cur = canonRoot;
-    for (const seg of relSegments) {
-      cur = join(cur, seg);
-      if (!exists) {
-        if (!allowCreateUnderRepo) return null;
-        try {
-          mkdirSync(cur);
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== "EEXIST") return null;
-        }
-      }
-      try {
-        const st = lstatSync(cur);
-        if (st.isSymbolicLink() || !st.isDirectory()) return null;
-      } catch {
-        return null;
-      }
-    }
-    return cur;
+    return verifySegmentsUnderAnchor(canonRoot, relSegments, allowCreateUnderRepo, initialStat !== null);
   }
 
-  return exists ? dirPath : null;
+  if (!initialStat) return null;
+
+  if (dataRoot) {
+    const canonDataRoot = canonicalPath(dataRoot);
+    const dataSegments =
+      relativeSegmentsUnder(canonDataRoot, dirPath) ?? relativeSegmentsUnder(resolve(dataRoot), dirPath);
+    if (dataSegments) {
+      return verifySegmentsUnderAnchor(canonDataRoot, dataSegments, false, true);
+    }
+  }
+
+  try {
+    const rp = realpathSync(dirPath);
+    const recheck = lstatSync(dirPath, { bigint: true });
+    if (
+      recheck.isSymbolicLink() ||
+      !recheck.isDirectory() ||
+      recheck.dev !== initialStat.dev ||
+      recheck.ino !== initialStat.ino
+    ) {
+      return null;
+    }
+    return { path: dirPath, realpath: rp, dev: initialStat.dev, ino: initialStat.ino };
+  } catch {
+    return null;
+  }
+}
+
+function isSameVerifiedDir(verified: VerifiedEvidenceDir): boolean {
+  try {
+    const st = lstatSync(verified.path, { bigint: true });
+    if (st.isSymbolicLink() || !st.isDirectory()) return false;
+    if (st.dev !== verified.dev || st.ino !== verified.ino) return false;
+    return realpathSync(verified.path) === verified.realpath;
+  } catch {
+    return false;
+  }
+}
+
+function procSelfFdDirPath(dirFd: number, verified: VerifiedEvidenceDir): string | null {
+  const fdPath = `/proc/self/fd/${dirFd}`;
+  try {
+    const st = statSync(fdPath, { bigint: true });
+    if (!st.isDirectory() || st.dev !== verified.dev || st.ino !== verified.ino) {
+      return null;
+    }
+    return fdPath;
+  } catch {
+    return null;
+  }
 }
 
 /**
- * Opens an existing entry without following symlinks and reports whether it is a regular file whose bytes
- * equal `expected`. Returns `null` if the entry is a symlink or non-regular file, `false` if missing or different.
+ * Opens an existing entry without following symlinks or blocking on FIFOs and reports whether it is a regular
+ * file whose bytes equal `expected`. Returns `null` if the entry is a symlink or non-regular file, `false` if
+ * missing or different.
  */
 function readRegularFileIfExactMatch(filePath: string, expected: Buffer): boolean | null {
   let fd: number | null = null;
   try {
-    fd = openSync(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    fd = openSync(
+      filePath,
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+    );
     const st = fstatSync(fd);
     if (!st.isFile()) return null;
     if (st.size !== expected.length) return false;
@@ -357,7 +453,15 @@ function readRegularFileIfExactMatch(filePath: string, expected: Buffer): boolea
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ENOENT") return false;
-    if (code === "ELOOP") return null;
+    if (
+      code === "ELOOP" ||
+      code === "EISDIR" ||
+      code === "ENXIO" ||
+      code === "EOPNOTSUPP" ||
+      code === "ENODEV"
+    ) {
+      return null;
+    }
     throw err;
   } finally {
     if (fd !== null) closeSync(fd);
@@ -366,8 +470,10 @@ function readRegularFileIfExactMatch(filePath: string, expected: Buffer): boolea
 
 /**
  * Writes `<evidenceDir>/goal-description-v<version>.md` when the goal's description exceeds `descriptionExcerpt`
- * and `evidenceDir` is a verified real directory. Keeps an existing regular file only when its bytes equal the
- * description; otherwise replaces it atomically via an exclusive temporary file and rename.
+ * and `evidenceDir` is a verified real directory. Pins the verified directory via an opened `O_DIRECTORY | O_NOFOLLOW`
+ * descriptor (using `/proc/self/fd/<fd>/<name>` when available, otherwise re-checking `(dev, ino, realpath)` before
+ * comparison, temp creation, and rename). Keeps an existing regular file only when its bytes equal the description;
+ * otherwise replaces it atomically via an exclusive 0600 temporary file and rename.
  * Returns the absolute path in `data-dir` layout, or the repo-relative path (falling back to absolute outside
  * `repoRoot`) in `legacy` layout, or `null`.
  */
@@ -375,49 +481,83 @@ export function writeGoalDescriptionFile(
   goal: Pick<GoalRecord, "version" | "description" | "repoRoot">,
   evidenceDir: string | null,
   repoRoot?: string | null,
-  layoutOrStorage?: StorageLayout | Pick<StoragePaths, "layout">,
+  layoutOrStorage?: StorageLayout | (Pick<StoragePaths, "layout"> & { readonly dataRoot?: string | null }),
+  hooks?: WriteGoalDescriptionHooks,
 ): string | null {
   if (!evidenceDir || goal.description.length <= GOAL_GET_LIMITS.descriptionExcerpt) {
     return null;
   }
+  let dirFd: number | null = null;
   try {
     const effectiveRepoRoot = repoRoot ?? goal.repoRoot;
     const layout: StorageLayout =
       typeof layoutOrStorage === "string" ? layoutOrStorage : (layoutOrStorage?.layout ?? "legacy");
+    const dataRoot =
+      typeof layoutOrStorage === "object" && layoutOrStorage !== null ? (layoutOrStorage.dataRoot ?? null) : null;
     const callerEnsured =
       layout === "data-dir" || (typeof layoutOrStorage === "object" && layoutOrStorage !== null);
-    const verifiedDir = verifyRealEvidenceDir(resolve(evidenceDir), effectiveRepoRoot, !callerEnsured);
+    const verifiedDir = verifyRealEvidenceDir(resolve(evidenceDir), effectiveRepoRoot, !callerEnsured, dataRoot);
     if (!verifiedDir) return null;
 
-    const filePath = join(verifiedDir, `goal-description-v${goal.version}.md`);
-    const expectedBuf = Buffer.from(goal.description, "utf8");
-    let skipWrite = false;
-    try {
-      const st = lstatSync(filePath);
-      if (st.isSymbolicLink() || !st.isFile()) return null;
-      if (st.size === expectedBuf.length) {
-        const match = readRegularFileIfExactMatch(filePath, expectedBuf);
-        if (match === null) return null;
-        skipWrite = match;
-      }
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    hooks?.afterVerifyDir?.();
+
+    const dirOpenFlags = constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0);
+    dirFd = openSync(verifiedDir.path, dirOpenFlags);
+    const dirFdStat = fstatSync(dirFd, { bigint: true });
+    if (
+      !dirFdStat.isDirectory() ||
+      dirFdStat.dev !== verifiedDir.dev ||
+      dirFdStat.ino !== verifiedDir.ino
+    ) {
+      return null;
     }
+
+    const procFdDir = hooks?.disableProcSelfFd ? null : procSelfFdDirPath(dirFd, verifiedDir);
+    const opDir = procFdDir ?? verifiedDir.path;
+
+    const fileName = `goal-description-v${goal.version}.md`;
+    const opFilePath = join(opDir, fileName);
+    const expectedBuf = Buffer.from(goal.description, "utf8");
+
+    hooks?.beforeCompareOpen?.();
+    if (!procFdDir && !isSameVerifiedDir(verifiedDir)) {
+      return null;
+    }
+    const match = readRegularFileIfExactMatch(opFilePath, expectedBuf);
+    if (match === null) return null;
+    const skipWrite = match;
+
     if (!skipWrite) {
-      const tempPath = join(verifiedDir, `.goal-description-v${goal.version}.${randomUUID()}.tmp`);
+      const tempPath = join(opDir, `.goal-description-v${goal.version}.${randomUUID()}.tmp`);
       let createdTemp = false;
       try {
+        hooks?.beforeTempCreate?.();
+        if (!procFdDir && !isSameVerifiedDir(verifiedDir)) {
+          return null;
+        }
         writeFileSync(tempPath, expectedBuf, { flag: "wx", mode: 0o600 });
         createdTemp = true;
-        renameSync(tempPath, filePath);
+
+        hooks?.beforeRename?.();
+        if (!procFdDir && !isSameVerifiedDir(verifiedDir)) {
+          return null;
+        }
+        renameSync(tempPath, opFilePath);
       } catch (err) {
-        if (createdTemp || (err as NodeJS.ErrnoException).code !== "EEXIST") {
+        if (
+          (createdTemp || (err as NodeJS.ErrnoException).code !== "EEXIST") &&
+          (procFdDir !== null || isSameVerifiedDir(verifiedDir))
+        ) {
           rmSync(tempPath, { force: true });
         }
         throw err;
       }
     }
-    const target = canonicalPath(filePath);
+
+    if (!isSameVerifiedDir(verifiedDir)) {
+      return null;
+    }
+    const target = join(verifiedDir.realpath, fileName);
     if (layout === "data-dir") {
       return target;
     }
@@ -429,6 +569,14 @@ export function writeGoalDescriptionFile(
     return target;
   } catch {
     return null;
+  } finally {
+    if (dirFd !== null) {
+      try {
+        closeSync(dirFd);
+      } catch {
+        // Ignore close error on cleanup path.
+      }
+    }
   }
 }
 
