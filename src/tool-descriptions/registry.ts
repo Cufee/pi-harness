@@ -1,6 +1,19 @@
 import { REJECTIONS, type HarnessRejection } from "../advisories/rejections.js";
 import type { Role } from "../advisories/types.js";
 import type { ToolDefinition } from "../runners/types.js";
+import { describeMergedRefFallback } from "../storage/names.js";
+import { storageText } from "../storage/text.js";
+
+function mergedRefFallbackSentence(): string {
+  try {
+    return describeMergedRefFallback();
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("not implemented yet")) {
+      return describeMergedRefFallback("legacy");
+    }
+    throw err;
+  }
+}
 
 export type Schema = Record<string, unknown>;
 export type PerRole<T> = { default: T } & Partial<Record<Role, T>>;
@@ -1507,15 +1520,21 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     name: "write_note",
     roles: ["director"],
     description: {
-      default:
-        "Logged Director note/report writer scoped strictly to `.harness/goals/`, `.harness/notes/`, or configured `extraWriteRoots` (never writes tracked repository source code).",
+      get default(): string {
+        return storageText().writeNoteTool();
+      },
     },
     inputSchema: {
       default: {
         type: "object",
         required: ["path", "content", "reason"],
         properties: {
-          path: { type: "string", description: "Destination file under .harness/goals/, .harness/notes/, or extraWriteRoots." },
+          path: {
+            type: "string",
+            get description(): string {
+              return storageText().writeNotePathParam();
+            },
+          },
           content: { type: "string", description: "Markdown/text content to write." },
           reason: { type: "string", description: "Concise logged reason for writing this note." },
         },
@@ -1727,8 +1746,9 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     name: "goal_trigger_review",
     roles: ["director"],
     description: {
-      default:
-        "Verify and settle a Goal at the chosen verification depth (defaults to the Goal's verification_mode: 'auto' runs deterministic checks and only spawns an independent LLM reviewer when required behavioral/architectural criteria exist; 'deterministic' runs checks only; 'none' approves directly). If the run's base branch was deleted and verify_ref is unset, gates fall back to the run's last merged commit (refs/harness/merged/<runId>); if neither exists, verification fails with remediation options.",
+      get default(): string {
+        return `Verify and settle a Goal at the chosen verification depth (defaults to the Goal's verification_mode: 'auto' runs deterministic checks and only spawns an independent LLM reviewer when required behavioral/architectural criteria exist; 'deterministic' runs checks only; 'none' approves directly). ${mergedRefFallbackSentence()}`;
+      },
     },
     inputSchema: {
       default: {

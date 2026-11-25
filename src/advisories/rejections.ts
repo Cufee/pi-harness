@@ -1,4 +1,4 @@
-import { legacyStoragePaths } from "../storage/paths.js";
+import { storageText } from "../storage/text.js";
 import { formatNotice } from "./message.js";
 import type { Notice } from "./types.js";
 
@@ -258,7 +258,7 @@ export const REJECTIONS = {
       "director-note-root",
       `write_note cannot write ${path}.`,
       "The Director only writes notes under allowed note roots, never tracked source.",
-      legacyStoragePaths.describeDirectorNoteRootAlternative(),
+      storageText().directorNoteRootAlternative(),
     );
   },
 
@@ -266,7 +266,7 @@ export const REJECTIONS = {
     return rejection(
       "dossier-invalid-directory",
       `ENOTDIR: expected a non-symlink artifact directory at ${path}.`,
-      legacyStoragePaths.describeDossierInvalidDirectoryReason(),
+      storageText().dossierInvalidDirectoryReason(),
       `Remove or rename the conflicting file or symlink at ${path}, or use a clean artifact directory.`,
     );
   },
@@ -274,7 +274,7 @@ export const REJECTIONS = {
   dossierSymlink(path: string): HarnessRejection {
     return rejection(
       "dossier-symlink",
-      legacyStoragePaths.describeDossierSymlinkWhat(path),
+      storageText().dossierSymlinkWhat(path),
       "Symlinks and redirected paths cannot be confined to this run's dossier tree.",
       "Call artifact_read with no path to list regular indexed dossiers of this run, then read one of those paths.",
     );
