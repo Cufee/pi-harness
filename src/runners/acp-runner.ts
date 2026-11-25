@@ -1,5 +1,5 @@
 import { contextWarningText, formatNotice } from "../advisories/message.js";
-import { deniedNotice, HarnessRejection, REJECTIONS } from "../advisories/rejections.js";
+import { deniedNotice, HarnessRejection, rejection, REJECTIONS } from "../advisories/rejections.js";
 import { toolEventPreview } from "../protocol/tool-display.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { constants } from "node:fs";
@@ -12,10 +12,12 @@ import { interpolateEnv, type AcpProfileConfig } from "../config.js";
 import {
   buildNewSessionParams,
   buildPostSessionActions,
+  DENIED_HARNESS_STATE_REASON,
   extractArtifactsFromToolUpdate,
   isAmpAcpProfile,
   isReadOnlyExternalMcpTool,
   isSafeReadOnlyShellCommand,
+  mostSpecificRootDecision,
   prepareAcpSpawn,
   reportedModels,
   reportedModelSatisfies,
@@ -41,7 +43,7 @@ export {
   isStructuredAuthFailureCode,
   type AcpProfileErrorKind,
 } from "./acp-profile-error.js";
-import { isProtectedWritePath } from "./protected-paths.js";
+import { legacyStoragePaths } from "../storage/paths.js";
 import { detectQuotaErrorText } from "./quota-detect.js";
 import { ACP_EXECUTOR_LOST_ERROR_CODE, MAX_RUNNER_STEER_CONTINUATIONS, validateRunPolicy } from "./types.js";
 import type {
@@ -142,26 +144,88 @@ function withTimeout<T>(
   });
 }
 
-function requireWorkspacePath(root: string, path: string): void {
+const DENIED_HARNESS_STATE_ERROR = (path: string, root: string): HarnessRejection =>
+  rejection(
+    "protected-path",
+    `${path} is denied: ${DENIED_HARNESS_STATE_REASON}.`,
+    "Harness state directories, databases, configuration, and ungranted data-dir paths are protected.",
+    `Work inside ${root} or your granted directories.`,
+  );
+
+function isHarnessStateRejection(err: unknown): err is HarnessRejection {
+  return err instanceof HarnessRejection && err.notice.what.includes(DENIED_HARNESS_STATE_REASON);
+}
+
+function isInsideRoot(root: string, path: string): boolean {
   const rel = relative(root, path);
-  if (isAbsolute(rel) || rel === ".." || rel.startsWith(`..${sep}`)) {
-    throw REJECTIONS.outsideRoots(path, root);
+  return !isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`);
+}
+
+async function canonicalizeMissingPath(absolute: string): Promise<string> {
+  const missing: string[] = [];
+  let cursor = absolute;
+  while (true) {
+    try {
+      const real = await realpath(cursor);
+      return resolve(real, ...missing);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        return resolve(cursor, ...missing);
+      }
+    }
+    const parent = dirname(cursor);
+    if (parent === cursor) return resolve(cursor, ...missing);
+    missing.unshift(basename(cursor));
+    cursor = parent;
   }
 }
 
-async function workspaceTarget(root: string, requested: string, allowNew: boolean) {
+function requireWorkspacePath(
+  root: string,
+  path: string,
+  allowedRoots: readonly string[] = [root],
+  deniedRoots: readonly string[] = [],
+): string {
+  const decision = mostSpecificRootDecision(path, allowedRoots, deniedRoots);
+  if (!decision.allowed) {
+    if (decision.reason === "denied") {
+      throw DENIED_HARNESS_STATE_ERROR(path, root);
+    }
+    throw REJECTIONS.outsideRoots(path, root);
+  }
+  return decision.root;
+}
+
+async function workspaceTarget(
+  root: string,
+  requested: string,
+  allowNew: boolean,
+  allowedRoots?: readonly string[],
+  deniedRoots: readonly string[] = [],
+): Promise<{ path: string; exists: boolean; admittingRoot: string }> {
   const realRoot = await realpath(root);
+  const effectiveAllowed = allowedRoots?.length ? allowedRoots : [realRoot];
   const absolute = resolve(realRoot, requested);
   try {
     const path = await realpath(absolute);
-    requireWorkspacePath(realRoot, path);
-    return { path, exists: true };
+    const admittingRoot = requireWorkspacePath(realRoot, path, effectiveAllowed, deniedRoots);
+    return { path, exists: true, admittingRoot };
   } catch (error) {
-    if (!allowNew || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    if (!allowNew) {
+      if (deniedRoots.length > 0) {
+        const canonicalMissing = await canonicalizeMissingPath(absolute);
+        const decision = mostSpecificRootDecision(canonicalMissing, effectiveAllowed, deniedRoots);
+        if (!decision.allowed && decision.reason === "denied") {
+          throw DENIED_HARNESS_STATE_ERROR(canonicalMissing, realRoot);
+        }
+      }
+      throw error;
+    }
   }
 
   // Walk up parent directories until an existing ancestor is found, ensuring no intermediate
-  // symlink escapes `realRoot` and no dangling symlink occupies the target path.
+  // symlink escapes allowed roots and no dangling symlink occupies the target path.
   const missingSegments: string[] = [];
   let cursor = absolute;
   let existingAncestor: string | null = null;
@@ -176,7 +240,6 @@ async function workspaceTarget(root: string, requested: string, allowNew: boolea
         throw new Error("ACP filesystem target is not a new workspace file");
       }
       existingAncestor = await realpath(cursor);
-      requireWorkspacePath(realRoot, existingAncestor);
       break;
     }
     const parent = dirname(cursor);
@@ -188,12 +251,18 @@ async function workspaceTarget(root: string, requested: string, allowNew: boolea
   }
 
   const path = resolve(existingAncestor, ...missingSegments);
-  requireWorkspacePath(realRoot, path);
+  const admittingRoot = requireWorkspacePath(realRoot, path, effectiveAllowed, deniedRoots);
+  if (!isInsideRoot(admittingRoot, existingAncestor)) {
+    const admittingExists = await lstat(admittingRoot).then(() => true, () => false);
+    if (admittingExists || !isInsideRoot(existingAncestor, admittingRoot)) {
+      requireWorkspacePath(realRoot, existingAncestor, effectiveAllowed, deniedRoots);
+    }
+  }
   if (await lstat(path).catch((error: NodeJS.ErrnoException) => {
     if (error.code !== "ENOENT") throw error;
     return undefined;
   })) throw new Error("ACP filesystem target is not a new workspace file");
-  return { path, exists: false };
+  return { path, exists: false, admittingRoot };
 }
 
 async function resolveExtraRoots(rawRoots: string[] | undefined): Promise<string[]> {
@@ -213,7 +282,7 @@ async function resolveExtraRoots(rawRoots: string[] | undefined): Promise<string
 }
 
 /**
- * Which allowed roots veto reads of `.git` and `.harness/worktrees` (same predicate as writes):
+ * Which allowed roots veto reads of `.git` and sibling worktrees (same predicate as writes):
  * `extra` only the extra roots, `all` the primary root too.
  */
 type ReadProtection = "none" | "extra" | "all";
@@ -225,26 +294,81 @@ async function resolveAllowedTarget(
   allowNew: boolean,
   protectWrites = false,
   protectReads: ReadProtection = "none",
+  deniedRoots: readonly string[] = [],
+  protectedRoots: readonly string[] = [],
 ): Promise<{ path: string; exists: boolean; root: string }> {
+  const allowedRoots = await resolveExtraRoots([primaryRoot, ...extraRoots]);
+  const primaryCanonical = allowedRoots[0] ?? resolve(primaryRoot);
+  const allowedSet = new Set(allowedRoots.map((r) => resolve(r)));
+  const explicitProtectedAllowed = new Set<string>();
+  const explicitProtectedDenied: string[] = [];
+  for (const pRoot of protectedRoots) {
+    const resolvedPRoot = resolve(pRoot);
+    if (allowedSet.has(resolvedPRoot)) {
+      explicitProtectedAllowed.add(resolvedPRoot);
+    } else {
+      explicitProtectedDenied.push(resolvedPRoot);
+    }
+  }
+
+  const checkProtected = (targetPath: string, admittingRoot: string, displayPath = targetPath) => {
+    if (explicitProtectedDenied.length > 0) {
+      const protDecision = mostSpecificRootDecision(targetPath, allowedRoots, explicitProtectedDenied);
+      if (!protDecision.allowed && protDecision.reason === "denied") {
+        throw (protectWrites ? PROTECTED_WRITE_ERROR : PROTECTED_READ_ERROR)(displayPath, admittingRoot);
+      }
+    }
+    const readProtected =
+      protectReads === "all" ||
+      (protectReads === "extra" && admittingRoot !== primaryCanonical) ||
+      explicitProtectedAllowed.has(resolve(admittingRoot));
+    if (protectWrites && legacyStoragePaths.isProtectedWorktreePath(targetPath, admittingRoot)) {
+      throw PROTECTED_WRITE_ERROR(displayPath, admittingRoot);
+    }
+    if (readProtected && legacyStoragePaths.isProtectedWorktreePath(targetPath, admittingRoot)) {
+      throw PROTECTED_READ_ERROR(displayPath, admittingRoot);
+    }
+  };
+
   let firstErr: unknown;
-  for (const root of [primaryRoot, ...extraRoots]) {
-    const readProtected = protectReads === "all" || (protectReads === "extra" && root !== primaryRoot);
+  for (const root of allowedRoots) {
+    const readProtectedForRoot =
+      protectReads === "all" ||
+      (protectReads === "extra" && root !== primaryCanonical) ||
+      explicitProtectedAllowed.has(resolve(root));
     // Refuse protected targets before any side effect, checking the lexical path first and the canonical
-    // path once resolved. A protected hit is final and never falls through to later roots.
-    if (protectWrites && isProtectedWritePath(root, requested)) throw PROTECTED_WRITE_ERROR(requested, root);
-    if (readProtected && isProtectedWritePath(root, requested)) throw PROTECTED_READ_ERROR(requested, root);
-    let target: { path: string; exists: boolean };
+    // path once resolved. A protected or harness-state hit is final and never falls through to later roots.
+    const lexical = resolve(root, requested);
+    const lexicalDecision = mostSpecificRootDecision(lexical, allowedRoots, deniedRoots);
+    if (lexicalDecision.allowed) {
+      if (lexicalDecision.root === root) {
+        checkProtected(lexical, lexicalDecision.root, requested);
+      }
+    } else if (
+      (protectWrites || readProtectedForRoot) &&
+      lexical.split(sep).some((segment) => segment.toLowerCase() === ".git")
+    ) {
+      throw (protectWrites ? PROTECTED_WRITE_ERROR : PROTECTED_READ_ERROR)(requested, root);
+    }
+    let target: { path: string; exists: boolean; admittingRoot: string };
     try {
-      target = await workspaceTarget(root, requested, allowNew);
+      target = await workspaceTarget(root, requested, allowNew, allowedRoots, deniedRoots);
     } catch (err) {
+      if (isHarnessStateRejection(err)) throw err;
       if (!firstErr) firstErr = err;
       continue;
     }
-    if (protectWrites && isProtectedWritePath(root, target.path)) throw PROTECTED_WRITE_ERROR(target.path, root);
-    if (readProtected && isProtectedWritePath(root, target.path)) throw PROTECTED_READ_ERROR(target.path, root);
-    return { ...target, root };
+    checkProtected(target.path, target.admittingRoot);
+    return { path: target.path, exists: target.exists, root: target.admittingRoot };
   }
-  throw firstErr ?? REJECTIONS.outsideRoots(requested, primaryRoot);
+  if (explicitProtectedDenied.length > 0 && isAbsolute(requested)) {
+    const canonicalMissing = await canonicalizeMissingPath(resolve(requested));
+    const protDecision = mostSpecificRootDecision(canonicalMissing, allowedRoots, explicitProtectedDenied);
+    if (!protDecision.allowed && protDecision.reason === "denied") {
+      throw (protectWrites ? PROTECTED_WRITE_ERROR : PROTECTED_READ_ERROR)(canonicalMissing, primaryCanonical);
+    }
+  }
+  throw firstErr ?? REJECTIONS.outsideRoots(requested, primaryCanonical);
 }
 
 const PROTECTED_WRITE_ERROR = (path: string, root: string) => REJECTIONS.protectedPath(path, root);
@@ -252,7 +376,7 @@ const PROTECTED_READ_ERROR = (path: string, root: string) => REJECTIONS.protecte
 
 /**
  * Read protection for a policy: writers keep unrestricted reads; read-only agents never read `.git` or
- * `.harness/worktrees` through extra roots, nor through the primary root unless the workspace is itself a
+ * sibling worktrees through extra roots, nor through the primary root unless the workspace is itself a
  * linked git worktree (a task or `_verify` checkout, whose `.git` is a file) so a reviewer can inspect its own
  * checkout.
  */
@@ -268,22 +392,57 @@ async function openWorkspaceFile(
   requested: string,
   write: boolean,
   protectReads: ReadProtection = "none",
+  deniedRoots: readonly string[] = [],
+  protectedRoots: readonly string[] = [],
 ) {
-  const { path: target, exists, root } = await resolveAllowedTarget(primaryRoot, extraRoots, requested, write, write, protectReads);
+  const { path: target, exists, root } = await resolveAllowedTarget(
+    primaryRoot,
+    extraRoots,
+    requested,
+    write,
+    write,
+    protectReads,
+    deniedRoots,
+    protectedRoots,
+  );
+  const allowedRoots = await resolveExtraRoots([primaryRoot, ...extraRoots]);
+  const primaryCanonical = allowedRoots[0] ?? resolve(primaryRoot);
+  const allowedSet = new Set(allowedRoots.map((r) => resolve(r)));
+  const explicitProtectedAllowed = new Set<string>();
+  const explicitProtectedDenied: string[] = [];
+  for (const pRoot of protectedRoots) {
+    const resolvedPRoot = resolve(pRoot);
+    if (allowedSet.has(resolvedPRoot)) {
+      explicitProtectedAllowed.add(resolvedPRoot);
+    } else {
+      explicitProtectedDenied.push(resolvedPRoot);
+    }
+  }
   if (write && !exists) {
     await mkdir(dirname(target), { recursive: true });
     const actualParent = await realpath(dirname(target));
-    requireWorkspacePath(root, actualParent);
+    requireWorkspacePath(root, actualParent, allowedRoots, deniedRoots);
   }
   const flags = (write ? constants.O_WRONLY : constants.O_RDONLY) | constants.O_NOFOLLOW |
     constants.O_NONBLOCK | (exists ? 0 : constants.O_CREAT | constants.O_EXCL);
   const file = await open(target, flags);
   try {
     const actual = await realpath(target);
-    requireWorkspacePath(root, actual);
-    if (write && isProtectedWritePath(root, actual)) throw PROTECTED_WRITE_ERROR(actual, root);
-    if (!write && (protectReads === "all" || (protectReads === "extra" && root !== primaryRoot)) &&
-        isProtectedWritePath(root, actual)) throw PROTECTED_READ_ERROR(actual, root);
+    const actualRoot = requireWorkspacePath(root, actual, allowedRoots, deniedRoots);
+    if (explicitProtectedDenied.length > 0) {
+      const protDecision = mostSpecificRootDecision(actual, allowedRoots, explicitProtectedDenied);
+      if (!protDecision.allowed && protDecision.reason === "denied") {
+        throw (write ? PROTECTED_WRITE_ERROR : PROTECTED_READ_ERROR)(actual, actualRoot);
+      }
+    }
+    if (write && legacyStoragePaths.isProtectedWorktreePath(actual, actualRoot)) throw PROTECTED_WRITE_ERROR(actual, actualRoot);
+    if (
+      !write &&
+      (protectReads === "all" ||
+        (protectReads === "extra" && actualRoot !== primaryCanonical) ||
+        explicitProtectedAllowed.has(resolve(actualRoot))) &&
+      legacyStoragePaths.isProtectedWorktreePath(actual, actualRoot)
+    ) throw PROTECTED_READ_ERROR(actual, actualRoot);
     const opened = await file.stat();
     const current = await stat(actual);
     if (!opened.isFile() || (write && opened.nlink !== 1) || opened.dev !== current.dev || opened.ino !== current.ino) {
@@ -604,6 +763,8 @@ export class AcpRunner {
     const workspace = await realpath(req.cwd);
     const extraWriteRoots = await resolveExtraRoots(req.extraWriteRoots);
     const extraReadRoots = await resolveExtraRoots([...(req.extraReadRoots ?? []), ...(req.extraWriteRoots ?? [])]);
+    const deniedRoots = await resolveExtraRoots(req.deniedRoots);
+    const requestProtectedRoots = await resolveExtraRoots(req.protectedRoots);
     const controlOnly = req.toolPolicy === "control_plane_only";
     const canWrite = req.toolPolicy === "read_write_workspace";
     const allowShell = canWrite || (req.toolPolicy === "read_only_workspace" && Boolean(req.allowShellInReadOnly));
@@ -614,6 +775,8 @@ export class AcpRunner {
       toolPolicy: req.toolPolicy,
       allowShellInReadOnly: Boolean(req.allowShellInReadOnly),
       tier: req.tier,
+      readDirectories: extraReadRoots,
+      writeDirectories: canWrite ? extraWriteRoots : undefined,
     });
     if ((allowShell || !controlOnly) && req.extraPathDirs?.length) {
       const existingPath = prepared.env.PATH ?? process.env.PATH ?? "";
@@ -1946,6 +2109,7 @@ export class AcpRunner {
           !controlOnly && (claudeExternalMcp || codexExternalMcp || geminiExternalMcp || genericExternalMcp);
 
         let readDenialRule: "protected-path" | "outside-roots" | undefined;
+        let readDenialRejection: HarnessRejection | undefined;
         const validateReadLocations = async (): Promise<boolean> => {
           const paths: string[] = [];
           for (const loc of p.toolCall?.locations ?? []) {
@@ -1975,10 +2139,11 @@ export class AcpRunner {
             if (rawPath.startsWith("~")) return false; // never expanded here, so its target is unprovable
             if (hasGlob(rawPath) && /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(rawPath)) return false;
             try {
-              await resolveAllowedTarget(workspace, extraReadRoots, bindToWorkspace(extractGlobPrefix(rawPath)), true, false, readProtection);
+              await resolveAllowedTarget(workspace, extraReadRoots, bindToWorkspace(extractGlobPrefix(rawPath)), true, false, readProtection, deniedRoots, requestProtectedRoots);
             } catch (err) {
               if (err instanceof HarnessRejection && err.notice.rule === "protected-path") {
                 readDenialRule = "protected-path";
+                if (isHarnessStateRejection(err)) readDenialRejection = err;
               }
               return false;
             }
@@ -2011,7 +2176,7 @@ export class AcpRunner {
                 const base = baseValues[0];
                 if (typeof base !== "string" || !base.trim() || base.trim().startsWith("~")) return false;
                 effectiveBase = (
-                  await resolveAllowedTarget(workspace, extraReadRoots, bindToWorkspace(base.trim()), true, false, readProtection)
+                  await resolveAllowedTarget(workspace, extraReadRoots, bindToWorkspace(base.trim()), true, false, readProtection, deniedRoots, requestProtectedRoots)
                 ).path;
               }
               const prefix = extractGlobPrefix(pattern);
@@ -2022,10 +2187,13 @@ export class AcpRunner {
                 true,
                 false,
                 readProtection,
+                deniedRoots,
+                requestProtectedRoots,
               );
             } catch (err) {
               if (err instanceof HarnessRejection && err.notice.rule === "protected-path") {
                 readDenialRule = "protected-path";
+                if (isHarnessStateRejection(err)) readDenialRejection = err;
               }
               return false;
             }
@@ -2063,7 +2231,7 @@ export class AcpRunner {
           if (named.length === 0) return workspace;
           if (named.length > 1 || typeof named[0] !== "string" || !named[0]) return undefined;
           try {
-            const target = await resolveAllowedTarget(workspace, extraReadRoots, named[0], false, false, readProtection);
+            const target = await resolveAllowedTarget(workspace, extraReadRoots, named[0], false, false, readProtection, deniedRoots, requestProtectedRoots);
             return (await stat(target.path)).isDirectory() ? target.path : undefined;
           } catch {
             return undefined;
@@ -2078,6 +2246,7 @@ export class AcpRunner {
         const isExecute = toolKind === "execute";
         let workspaceCall = false;
         let writeDenialRule: "protected-path" | "outside-roots" | undefined;
+        let writeDenialRejection: HarnessRejection | undefined;
         // Allow native workspace reads/searches, read-only shell inspection commands, writes (when canWrite),
         // and full shell commands (when allowShell) for non-control-plane agents.
         if (!controlOnly && !claude?.mcpServer && !p._meta?.is_mcp_tool_approval && !geminiMcp) {
@@ -2093,12 +2262,13 @@ export class AcpRunner {
               }
               for (const target of targets) {
                 if (typeof target !== "string" || !target.trim()) throw new Error("unprovable write target");
-                await resolveAllowedTarget(workspace, extraWriteRoots, target, toolKind === "edit" || toolKind === "move", true);
+                await resolveAllowedTarget(workspace, extraWriteRoots, target, toolKind === "edit" || toolKind === "move", true, "none", deniedRoots, requestProtectedRoots);
               }
               workspaceCall = targets.length > 0;
             } catch (err) {
               if (err instanceof HarnessRejection && (err.notice.rule === "protected-path" || err.notice.rule === "outside-roots")) {
                 writeDenialRule = err.notice.rule;
+                if (isHarnessStateRejection(err)) writeDenialRejection = err;
               }
               workspaceCall = false;
             }
@@ -2108,13 +2278,25 @@ export class AcpRunner {
             } else {
               const cmd = extractShellCommand();
               const shellCwd = cmd.length > 0 ? await resolveShellCwd() : undefined;
+              const shellReadRoots = [workspace, ...extraReadRoots];
+              const shellReadRootSet = new Set(shellReadRoots);
+              const computedProtectedRoots =
+                readProtection === "all"
+                  ? shellReadRoots
+                  : readProtection === "extra"
+                    ? extraReadRoots.filter((root) => root !== workspace)
+                    : [];
+              const extraShellProtected = requestProtectedRoots.filter((root) => shellReadRootSet.has(root));
+              const extraShellDenied = requestProtectedRoots.filter((root) => !shellReadRootSet.has(root));
               workspaceCall =
                 shellCwd !== undefined &&
                 isSafeReadOnlyShellCommand(cmd, {
                   cwd: shellCwd,
-                  readRoots: [workspace, ...extraReadRoots],
-                  protectedRoots:
-                    readProtection === "all" ? [workspace, ...extraReadRoots] : readProtection === "extra" ? extraReadRoots.filter((root) => root !== workspace) : [],
+                  readRoots: shellReadRoots,
+                  ...(deniedRoots.length > 0 || extraShellDenied.length > 0
+                    ? { deniedRoots: [...new Set([...deniedRoots, ...extraShellDenied])] }
+                    : {}),
+                  protectedRoots: [...new Set([...computedProtectedRoots, ...extraShellProtected])],
                 });
             }
           } else if (toolKind === "think") {
@@ -2146,6 +2328,7 @@ export class AcpRunner {
                     : normalizedExt
               : null;
           let deniedRule: string;
+          let denialNoticeOverride: HarnessRejection | undefined;
           let deniedArgs: Record<string, unknown> = { ...(rawInput ?? {}) };
           if (deniedExternalMcp) {
             deniedRule = "read-only-mcp";
@@ -2156,6 +2339,7 @@ export class AcpRunner {
             if (shellCmd) deniedArgs = { ...deniedArgs, command: shellCmd };
           } else if (!controlOnly && !claude?.mcpServer && !p._meta?.is_mcp_tool_approval && !geminiMcp && isWrite) {
             deniedRule = canWrite ? (writeDenialRule ?? "protected-path") : "read-only-write";
+            if (canWrite) denialNoticeOverride = writeDenialRejection;
           } else if (
             !controlOnly &&
             !claude?.mcpServer &&
@@ -2164,15 +2348,18 @@ export class AcpRunner {
             (isRead || ((toolKind === "other" || toolKind === undefined) && READ_ONLY_OTHER_TOOL_RE.test(rawCandidateName.trim())))
           ) {
             deniedRule = readDenialRule ?? "outside-roots";
+            denialNoticeOverride = readDenialRejection;
           } else {
             deniedRule = "tool-policy";
             deniedArgs = { ...deniedArgs, mode: req.toolPolicy };
           }
           const deniedText = formatNotice(
-            deniedNotice(
-              { denied: deniedRule, name: deniedLabel, args: deniedArgs, paths: deniedPaths },
-              { workspaceRoot: workspace },
-            ),
+            denialNoticeOverride
+              ? denialNoticeOverride.notice
+              : deniedNotice(
+                  { denied: deniedRule, name: deniedLabel, args: deniedArgs, paths: deniedPaths },
+                  { workspaceRoot: workspace },
+                ),
           );
           turnDeniedTools.push(deniedText);
           if (steerHandoff.pending?.replacementSent) {
@@ -2218,7 +2405,7 @@ export class AcpRunner {
           throw new Error(`Read denied: agent is running in ${policyModeDesc} mode`);
         }
         const p = params as unknown as { path: string; line?: number; limit?: number };
-        const file = await openWorkspaceFile(workspace, extraReadRoots, p.path, false, readProtection);
+        const file = await openWorkspaceFile(workspace, extraReadRoots, p.path, false, readProtection, deniedRoots, requestProtectedRoots);
         let raw: string;
         try {
           raw = await file.readFile("utf8");
@@ -2246,7 +2433,7 @@ export class AcpRunner {
         if (!sessionId || params.sessionId !== sessionId || !canWrite) {
           throw REJECTIONS.readOnlyWrite(typeof p?.path === "string" && p.path.trim() ? p.path : workspace);
         }
-        const file = await openWorkspaceFile(workspace, extraWriteRoots, p.path, true);
+        const file = await openWorkspaceFile(workspace, extraWriteRoots, p.path, true, "none", deniedRoots, requestProtectedRoots);
         try {
           await file.truncate(0);
           await file.writeFile(p.content, "utf8");
@@ -2325,6 +2512,11 @@ export class AcpRunner {
       }
       mcpServers.push(...externalMcpEntries);
 
+      const additionalDirectories =
+        this.profile.adapter === "codex" && canWrite
+          ? [...new Set(extraWriteRoots)]
+          : [...new Set([...extraReadRoots, ...extraWriteRoots])];
+
       const { params: newSessionParams, needsTurn1SystemPrompt } = buildNewSessionParams(this.profile.adapter, {
         cwd: req.cwd,
         systemPrompt: req.systemPrompt,
@@ -2335,7 +2527,7 @@ export class AcpRunner {
         effort: req.effort,
         mcpServers,
         agentCapabilities,
-        additionalDirectories: [...new Set([...extraReadRoots, ...extraWriteRoots])],
+        additionalDirectories,
       });
 
       sessionStartMs = Date.now();
