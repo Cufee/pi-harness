@@ -1,10 +1,10 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { GoalsConfig } from "../config.js";
-import { friendlyIdCandidates, nextFriendlyId } from "../control-plane/ids.js";
+import { friendlyIdCandidates, isDirectorTaskContainer, nextFriendlyId } from "../control-plane/ids.js";
 import { legacyStoragePaths, type StoragePaths } from "../storage/paths.js";
 import { type ResolvedGateEnv, resolveGateEnv, runGateCommand } from "../tools/gate-env.js";
 import { runGit } from "../worktree/manager.js";
@@ -660,6 +660,48 @@ export class GoalEngine {
     }
     sql += " ORDER BY updated_at DESC";
     return (this.db.prepare(sql).all(...params) as Record<string, unknown>[]).map((r) => this.mapGoal(r));
+  }
+
+  /** Returns the goal's evidence directory under the configured storage layout. */
+  evidenceDir(goal: GoalRecord): string {
+    return this.storage.goalEvidenceDir(goal);
+  }
+
+  /** Ensures the goal's evidence directory exists under the configured storage layout; returns null on failure. */
+  ensureEvidenceDir(goal: GoalRecord): string | null {
+    return this.storage.ensureGoalEvidenceDir(goal);
+  }
+
+  /**
+   * Computes the unit's real evidence dir, goals dir, artifacts dir, and optional run artifacts dir.
+   * Keeps goal and run halves consistent on one root when either half still lives at the legacy location.
+   */
+  evidenceLocations(
+    goal: GoalRecord,
+    runId?: string | null,
+  ): { goalEvidenceDir: string; goalsDir: string; artifactsDir: string; runArtifactsDir?: string } {
+    const effectiveRunId = runId !== undefined ? runId : goal.linkedRunId;
+    let goalEvDir = this.storage.goalEvidenceDir(goal);
+    let goalsDir = dirname(goalEvDir);
+    if (!effectiveRunId) {
+      const artifactsDir = join(dirname(goalsDir), "artifacts");
+      return { goalEvidenceDir: goalEvDir, goalsDir, artifactsDir };
+    }
+    const runRef = { id: effectiveRunId, repoRoot: goal.repoRoot, chatSessionId: goal.chatSessionId };
+    let runArtifactsDir = this.storage.runArtifactsDir(runRef);
+    let artifactsDir = dirname(runArtifactsDir);
+    if (this.storage.layout === "data-dir" && !isDirectorTaskContainer(effectiveRunId)) {
+      const legacyGoals = legacyStoragePaths.goalsDir(goal);
+      const legacyArtifacts = legacyStoragePaths.artifactsDir(goal);
+      if (goalsDir === legacyGoals && artifactsDir !== legacyArtifacts) {
+        artifactsDir = legacyArtifacts;
+        runArtifactsDir = join(legacyArtifacts, effectiveRunId);
+      } else if (artifactsDir === legacyArtifacts && goalsDir !== legacyGoals) {
+        goalsDir = legacyGoals;
+        goalEvDir = legacyStoragePaths.goalEvidenceDir(goal);
+      }
+    }
+    return { goalEvidenceDir: goalEvDir, goalsDir, artifactsDir, runArtifactsDir };
   }
 
   linkRunAndStart(goalIdStr: string, runId: string): GoalRecord {
@@ -1566,7 +1608,7 @@ export class GoalEngine {
       reviewerMaxTurns?: number;
       contractPath?: string;
       diffRange?: string;
-      evidence?: { goalEvidenceDir: string; goalsDir: string; artifactsDir: string; runArtifactsDir?: string };
+      evidence?: { goalEvidenceDir: string; goalsDir: string; artifactsDir: string; runArtifactsDir?: string } | "auto";
       coordinatorFailure?: {
         source: GoalProgressSource;
         summary?: string;
@@ -1638,7 +1680,7 @@ export class GoalEngine {
         "Confirm or refute each reported failure with your own evidence. Do not approve unless every reported failure is refuted or fixed; say which in the summary.",
       );
     }
-    const ev = ctx?.evidence;
+    const ev = ctx?.evidence === "auto" ? this.evidenceLocations(goal) : ctx?.evidence;
     if (ev) {
       lines.push(
         "",

@@ -33,7 +33,7 @@ afterEach(() => {
 });
 
 describe("src/storage/paths (legacy layout)", () => {
-  it("resolves layout, rejects data-dir as not implemented, caches per config object, and pins data root per stateDir", () => {
+  it("resolves layout, requires stateDir for data-dir, caches per config object, and pins data root per stateDir", () => {
     assert.equal(resolveStorageLayout(), "legacy");
     assert.equal(resolveStorageLayout("legacy"), "legacy");
     assert.equal(resolveStorageLayout("data-dir"), "data-dir");
@@ -47,13 +47,20 @@ describe("src/storage/paths (legacy layout)", () => {
     assert.equal(storagePaths(cfg1), storagePaths(cfg1));
     assert.notEqual(storagePaths(cfg1), storagePaths(cfg2));
 
-    assert.throws(() => storagePaths(cfg1, { layout: "data-dir" }), /not implemented/i);
+    assert.throws(() => storagePaths(cfg1, { layout: "data-dir" }), /requires config\.stateDir/i);
 
     process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
     resetStoragePathsForTest();
     assert.equal(resolveStorageLayout(), "data-dir");
-    assert.throws(() => storagePaths({}), /not implemented/i);
+    assert.throws(() => storagePaths({}), /requires config\.stateDir/i);
     assert.equal(storagePaths({}, { layout: "legacy" }).layout, "legacy");
+
+    const stateForEnv = makeTempDir("pi-storage-env-state-");
+    const envCfg: StoragePathsConfig = { stateDir: stateForEnv };
+    assert.equal(storagePaths(envCfg).layout, "data-dir");
+    assert.equal(storagePaths(envCfg), storagePaths(envCfg));
+    assert.equal(storagePaths(envCfg, { layout: "legacy" }).layout, "legacy");
+    assert.notEqual(storagePaths(envCfg), storagePaths(envCfg, { layout: "legacy" }));
 
     process.env.PI_HARNESS_STORAGE_LAYOUT = "invalid-mode";
     resetStoragePathsForTest();
@@ -76,10 +83,16 @@ describe("src/storage/paths (legacy layout)", () => {
     assert.equal(first.isStateInternalPath(join(dataA, "projects", "p")), false);
     assert.equal(second.isStateInternalPath(join(dataA, "projects", "p")), false);
     assert.equal(second.isStateInternalPath(join(dataB, "projects", "p")), true);
+    assert.equal(first.dataRoot, dataA);
+    assert.equal(second.dataRoot, dataA);
+
+    const dataDirSecond = storagePaths({ stateDir, storage: { dataDir: dataB } }, { layout: "data-dir" });
+    assert.equal(dataDirSecond.dataRoot, dataA);
 
     resetStoragePathsForTest();
     const afterReset = storagePaths({ stateDir, storage: { dataDir: dataB } });
     assert.equal(afterReset.isStateInternalPath(join(dataB, "projects", "p")), false);
+    assert.equal(afterReset.dataRoot, dataB);
   });
 
   it("computes every legacy path against hand-written expectations and ignores worktree.artifactsDir", () => {

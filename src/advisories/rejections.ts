@@ -280,6 +280,24 @@ export const REJECTIONS = {
     );
   },
 
+  dossierNotIndexed(path: string): HarnessRejection {
+    return rejection(
+      "dossier-not-indexed",
+      `No indexed dossier in this run at ${path}.`,
+      "artifact_read only opens dossiers indexed for the current run, never unindexed files or another run's dossiers.",
+      "Call artifact_read with no path or task_id to list indexed dossiers of this run, then read one of those paths.",
+    );
+  },
+
+  dossierAmbiguousOwner(path: string): HarnessRejection {
+    return rejection(
+      "dossier-ambiguous-owner",
+      `Dossier path has ambiguous multi-run ownership: ${path}.`,
+      "A path indexed by multiple runs cannot prove which run's bytes it currently holds.",
+      "Call artifact_read with no path to pick a regular dossier indexed only by this run, or write a new dossier with artifact_write.",
+    );
+  },
+
   codeExecTimeout(seconds: number, maxSeconds: number): HarnessRejection {
     return rejection(
       "code-exec-timeout",

@@ -1,4 +1,5 @@
 import { REJECTIONS, rejection } from "../advisories/rejections.js";
+import type { OwnerRef, StoragePaths } from "../storage/paths.js";
 import {
   buildMinimalFallbackResultJson,
   formatFallbackSummary,
@@ -139,23 +140,50 @@ export function validateTaskHandoff(kind: TaskKind, args: Record<string, unknown
   };
 }
 
-function matchRecordedArtifactPath(pointerPath: string, artifactPaths: unknown): string | null {
+export interface CompactHandoffStorageContext {
+  repoRoot: string;
+  chatSessionId?: string | null;
+  storage?: StoragePaths;
+}
+
+function resolveHandoffDataPath(rawPath: string, ctx?: CompactHandoffStorageContext): string {
+  if (!ctx?.storage || ctx.storage.layout !== "data-dir") return rawPath;
+  const owner: OwnerRef = { repoRoot: ctx.repoRoot, chatSessionId: ctx.chatSessionId };
+  return ctx.storage.resolveLegacyPath(ctx.repoRoot, rawPath, owner) ?? rawPath;
+}
+
+function matchRecordedArtifactPath(
+  pointerPath: string,
+  artifactPaths: unknown,
+  ctx?: CompactHandoffStorageContext,
+): string | null {
   if (!Array.isArray(artifactPaths) || artifactPaths.length === 0) return null;
   const trimmed = pointerPath.trim().replaceAll("\\", "/").replace(/^\.\//, "");
   if (!trimmed || trimmed.split("/").includes("..")) return null;
   const isRel = !trimmed.startsWith("/");
+  const resolvedPointer = ctx?.storage?.layout === "data-dir" ? resolveHandoffDataPath(pointerPath, ctx) : null;
   for (const raw of artifactPaths) {
     if (typeof raw !== "string") continue;
     const candidate = raw.trim().replaceAll("\\", "/").replace(/^\.\//, "");
     if (!candidate) continue;
     if (candidate === trimmed || (isRel && candidate.endsWith(`/${trimmed}`))) {
-      return raw;
+      return resolveHandoffDataPath(raw, ctx);
+    }
+    if (resolvedPointer !== null) {
+      const resolvedCandidate = resolveHandoffDataPath(raw, ctx);
+      if (resolvedCandidate === resolvedPointer) {
+        return resolvedCandidate;
+      }
     }
   }
   return null;
 }
 
-export function compactTaskHandoff(task: TaskRecord, escalations: EscalationRecord[] = []) {
+export function compactTaskHandoff(
+  task: TaskRecord,
+  escalations: EscalationRecord[] = [],
+  storageCtx?: CompactHandoffStorageContext,
+) {
   const result = task.resultJson ? JSON.parse(task.resultJson) : null;
   const paused = task.status === "paused_quota" || task.summary?.startsWith("Paused (quota):");
   const unstructured = typeof result?.text === "string" && typeof result?.summary !== "string";
@@ -181,25 +209,29 @@ export function compactTaskHandoff(task: TaskRecord, escalations: EscalationReco
         ? "Task ended without a structured handoff or a final reply."
         : "Task ended without a structured handoff.";
   }
-  const artifactPaths = paused ? [] : result?.artifact_paths ?? result?.artifactPaths ?? fallback?.artifact_paths ?? [];
+  const rawArtifactPaths = paused ? [] : result?.artifact_paths ?? result?.artifactPaths ?? fallback?.artifact_paths ?? [];
+  const artifactPaths =
+    storageCtx?.storage?.layout === "data-dir" && Array.isArray(rawArtifactPaths)
+      ? rawArtifactPaths.map((entry) => (typeof entry === "string" ? resolveHandoffDataPath(entry, storageCtx) : entry))
+      : rawArtifactPaths;
   let overflow: { path: string; next_offset: number; total_chars?: number } | null = null;
   if (!paused) {
     const meta = result?.summary_overflow;
     if (meta && typeof meta === "object" && typeof meta.path === "string" && meta.path) {
       overflow = {
-        path: meta.path,
+        path: resolveHandoffDataPath(meta.path, storageCtx),
         next_offset: typeof meta.next_offset === "number" && Number.isFinite(meta.next_offset) ? meta.next_offset : 0,
         ...(typeof meta.total_chars === "number" && Number.isFinite(meta.total_chars) ? { total_chars: meta.total_chars } : {}),
       };
     } else if (fallback) {
       if (fallback.output_truncated !== false) {
         const m = /\n\[Full output: ([^\]]+)\]$/.exec(fallback.summary);
-        const matched = m?.[1] ? matchRecordedArtifactPath(m[1], artifactPaths) : null;
+        const matched = m?.[1] ? matchRecordedArtifactPath(m[1], artifactPaths, storageCtx) : null;
         if (matched) overflow = { path: matched, next_offset: 0 };
       }
     } else if (typeof task.summary === "string") {
       const m = /\n\n\[Full summary: ([^\]]+)\]$/.exec(task.summary);
-      const matched = m?.[1] ? matchRecordedArtifactPath(m[1], artifactPaths) : null;
+      const matched = m?.[1] ? matchRecordedArtifactPath(m[1], artifactPaths, storageCtx) : null;
       if (matched) overflow = { path: matched, next_offset: 0 };
     }
   }

@@ -117,10 +117,12 @@ export class WorktreeManager {
   }
 
   /** Applies live worktree config updates (e.g. `maxConcurrentWorkers`, `setupCommand`, `ciTimeoutMs`) and gate env settings. */
-  updateConfig(next: WorktreeConfig, gate: GateRuntimeConfig = this.gate): void {
+  updateConfig(next: WorktreeConfig, gate: GateRuntimeConfig = this.gate, storage?: StoragePaths): void {
     this.config = next;
     this.gate = gate;
-    if (!this.injectedStorage) {
+    if (storage !== undefined) {
+      this.storage = storage;
+    } else if (!this.injectedStorage) {
       this.storage = createLegacyStoragePaths({ worktree: next });
     }
   }
@@ -221,7 +223,8 @@ export class WorktreeManager {
             .catch(async () => (await runGit(this.repoRoot, ["rev-parse", "HEAD"])).stdout)
         : (await runGit(this.repoRoot, ["rev-parse", "HEAD"])).stdout);
     const runRef = run ?? { id: runId, repoRoot: this.repoRoot };
-    const baseBranchName = taskBranchName(runRef, taskId);
+    // Explicit "legacy" layout until worker W8 implements data-dir git names in src/storage/names.ts.
+    const baseBranchName = taskBranchName(runRef, taskId, "legacy");
     let branch = baseBranchName;
     let suffix = 1;
     while (
@@ -234,6 +237,7 @@ export class WorktreeManager {
       branch = `${baseBranchName}-${suffix}`;
     }
     const dirName = suffix === 1 ? taskId : `${taskId}-${suffix}`;
+    this.storage.ensureProjectDir(this.repoRoot);
     const wtPath = this.storage.worktreePath(runRef, dirName);
 
     mkdirSync(dirname(wtPath), { recursive: true });
@@ -280,6 +284,7 @@ export class WorktreeManager {
     name: string,
     sha: string,
   ): Promise<{ path: string; remove: () => Promise<void> }> {
+    this.storage.ensureProjectDir(this.repoRoot);
     const path = this.storage.scratchPath(this.repoRoot, kind, name);
     mkdirSync(dirname(path), { recursive: true });
     await runGit(this.repoRoot, ["worktree", "add", "--lock", "--reason", HARNESS_LOCK_REASON, "--detach", path, sha]);
@@ -358,7 +363,7 @@ export class WorktreeManager {
    * so workers and CI gates (`tsc`, `bun test`) work on turn 1 without redundant installs.
    */
   async linkIgnoredNodeModules(wtPath: string): Promise<void> {
-    const srcNm = join(this.repoRoot, "node_modules");
+    const srcNm = join(canonicalPath(this.repoRoot), "node_modules");
     const dstNm = join(wtPath, "node_modules");
     if (!existsSync(srcNm) || existsSync(dstNm)) return;
     try {
@@ -401,7 +406,8 @@ export class WorktreeManager {
   async snapshotToArchiveRef(wt: WorktreeRecord): Promise<string | null> {
     if (!existsSync(wt.path)) return null;
     const run = this.db.getRun(wt.runId);
-    const ref = archiveRef(run ?? { id: wt.runId }, wt.taskId);
+    // Explicit "legacy" layout until worker W8 implements data-dir git names in src/storage/names.ts.
+    const ref = archiveRef(run ?? { id: wt.runId }, wt.taskId, "legacy");
     try {
       const dirty = await this.isDirty(wt.path);
       if (dirty) {
@@ -528,7 +534,10 @@ export class WorktreeManager {
       const abs = canonicalPath(entry.path);
       const matchedRoot = managedRoots.find((r) => isWithin(r, abs));
       if (!matchedRoot) continue;
-      if (SCRATCH_KINDS.has(relative(matchedRoot, abs).split(sep)[0] ?? "")) continue;
+      const relParts = relative(matchedRoot, abs).split(sep);
+      if (SCRATCH_KINDS.has(relParts[0] ?? "") || (relParts[0] === "scratch" && SCRATCH_KINDS.has(relParts[1] ?? ""))) {
+        continue;
+      }
       const rec = byPath.get(abs) ?? null;
       if (runId && (!rec || rec.runId !== runId)) continue;
       const existsOnDisk = existsSync(abs);
@@ -605,7 +614,8 @@ export class WorktreeManager {
     // Deletion is guarded by the OID read here, so a concurrently refreshed ref survives.
     const retentionMs = (this.config.archiveRetentionDays ?? 7) * 86_400_000;
     const cutoffSec = Math.floor((Date.now() - retentionMs) / 1000);
-    const patterns = archiveRefPatterns(opts?.runId);
+    // Explicit "legacy" layout until worker W8 implements data-dir git names in src/storage/names.ts.
+    const patterns = archiveRefPatterns(opts?.runId, "legacy");
     const justArchived = new Set(report.archivedRefs);
     try {
       const { stdout } = await runGit(this.repoRoot, [
