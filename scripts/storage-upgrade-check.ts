@@ -14,11 +14,14 @@ import {
   readlinkSync,
   realpathSync,
   renameSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Database } from "bun:sqlite";
+import { runStorageMigrationPass } from "../src/storage/migrate.js";
 import { mergedRef, taskBranchName } from "../src/storage/names.js";
 import { storagePaths, type StorageLayout, type StoragePaths } from "../src/storage/paths.js";
 import {
@@ -1143,6 +1146,662 @@ export async function assertIdempotentRerun(ctx: IdempotentRerunContext): Promis
   });
 }
 
+export interface AutoFallbackHalfFinishedContext {
+  checks: CheckCollector;
+  root: string;
+  homeDir: string;
+  installDir: string;
+  canonicalRepoDir: string;
+  checkoutPrevDir: string;
+  fakeDir: string;
+  socketPath: string;
+  dbPath: string;
+  launcherPath: string;
+  daemonLogPath: string;
+  layoutEnv: Record<string, string>;
+  prevLayoutEnv: Record<string, string>;
+  storage: StoragePaths;
+  relPrev: string;
+  relNew: string;
+  extraDaemonPids: number[];
+  migrationTimings: MigrationStartTiming[];
+  currentDaemonPid: () => number;
+  setCurrentDaemonPid: (pid: number) => void;
+}
+
+export async function assertAutoFallbackHalfFinishedMove(ctx: AutoFallbackHalfFinishedContext): Promise<void> {
+  const {
+    checks,
+    root,
+    homeDir,
+    installDir,
+    canonicalRepoDir,
+    checkoutPrevDir,
+    fakeDir,
+    socketPath,
+    dbPath,
+    launcherPath,
+    daemonLogPath,
+    layoutEnv,
+    prevLayoutEnv,
+    storage,
+    relPrev,
+    relNew,
+  } = ctx;
+
+  const projectDir = storage.projectDir(canonicalRepoDir);
+  const statePath = join(projectDir, "migration-state.json");
+  const readPendingState = () =>
+    JSON.parse(readFileSync(statePath, "utf8")) as {
+      version?: number;
+      pendingUnits?: Array<{ unitKey?: string; stale?: boolean; staleReason?: string }>;
+      bridges?: Array<{ legacyPath?: string; target?: string; createdAt?: number }>;
+    };
+
+  // (a) Switch to PREV (origin/main), seed a settled unit set (goal evidence dir, run artifacts dir with indexed dossier,
+  //     and a project note), stop PREV, and drive runStorageMigrationPass in-process with the 'after_bridge' fault step.
+  const switchToPrev = await runCommand("sh", ["install.sh"], {
+    cwd: checkoutPrevDir,
+    env: { ...prevLayoutEnv, PI_HARNESS_RELOAD_WAIT: "1" },
+    label: `PI_HARNESS_RELOAD_WAIT=1 PI_HARNESS_STORAGE_LAYOUT=legacy sh install.sh (switch to PREV ${relPrev} for half-finished fallback phase)`,
+  });
+  assert.equal(switchToPrev.code, 0, `switch-to-PREV install.sh failed with exit ${switchToPrev.code}`);
+  assert.equal(basename(readlinkSync(join(installDir, "current"))), relPrev, "expected current at relPrev");
+
+  const pingPrevSeed = await rpc<{ pid: number; releaseId: string }>(socketPath, "ping");
+  assert.equal(pingPrevSeed.releaseId, relPrev, `expected PREV ${relPrev}, got ${pingPrevSeed.releaseId}`);
+  ctx.extraDaemonPids.push(pingPrevSeed.pid);
+  ctx.setCurrentDaemonPid(pingPrevSeed.pid);
+  pass("Switched to PREV release to seed settled legacy unit set", `pid=${pingPrevSeed.pid} releaseId=${relPrev}`);
+
+  const gAutoFb = await seedCompletedGoalViaRpc({
+    socketPath,
+    canonicalRepoDir,
+    chatTitle: "storage-upgrade-autofb",
+    goalTitle: "G_AUTOFB settled legacy goal for half-finished automatic fallback",
+    goalDescription: "Settled legacy goal driven into after_bridge state before forced automatic fallback.",
+    dossierName: "gautofb-dossier.md",
+    evidenceFilename: "gautofb-evidence.txt",
+    evidenceContent: "G_AUTOFB evidence bytes preserved across automatic fallback.\n",
+    accept: true,
+    expectLegacyPaths: true,
+  });
+
+  const autoFbNoteRel = ".harness/notes/autofb-note.md";
+  const autoFbNotePath = join(canonicalRepoDir, ".harness", "notes", "autofb-note.md");
+  const autoFbNoteContent = "# Auto-Fallback Note\nProject note bytes preserved across automatic fallback.\n";
+  await rpc(socketPath, "tool.call", {
+    taskId: gAutoFb.chatSessionId,
+    name: "write_note",
+    args: {
+      path: autoFbNoteRel,
+      content: autoFbNoteContent,
+      reason: "Seed project note for automatic fallback on half-finished move",
+    },
+  });
+  assert.ok(
+    existsSync(autoFbNotePath) && !lstatSync(autoFbNotePath).isSymbolicLink(),
+    `expected real legacy note file at ${autoFbNotePath}`,
+  );
+
+  const gAutoFbLegacyRunDir = join(canonicalRepoDir, ".harness", "artifacts", gAutoFb.runId);
+  const gAutoFbDestEvDir = storage.unitDataDirDestination({
+    kind: "goal",
+    repoRoot: canonicalRepoDir,
+    id: gAutoFb.goalId,
+    chatSessionId: gAutoFb.chatSessionId,
+  });
+  const gAutoFbDestRunDir = storage.unitDataDirDestination({
+    kind: "run",
+    repoRoot: canonicalRepoDir,
+    id: gAutoFb.runId,
+    chatSessionId: gAutoFb.chatSessionId,
+  });
+  const autoFbNoteDest = storage.unitDataDirDestination({
+    kind: "note",
+    repoRoot: canonicalRepoDir,
+    id: basename(autoFbNotePath),
+  });
+  assertStrictlyUnderRoot("gAutoFbDestEvDir", gAutoFbDestEvDir, root);
+  assertStrictlyUnderRoot("gAutoFbDestRunDir", gAutoFbDestRunDir, root);
+  assertStrictlyUnderRoot("autoFbNoteDest", autoFbNoteDest, root);
+
+  const gAutoFbPreEvHashes = snapshotTree(gAutoFb.evidenceDir).files;
+  const gAutoFbPreRunHashes = snapshotTree(gAutoFbLegacyRunDir).files;
+  const autoFbNoteHash = sha256File(autoFbNotePath);
+  const gAutoFbPreRows = queryArtifacts(dbPath, gAutoFb.runId);
+  assert.ok(gAutoFbPreRows.length >= 1, `expected >=1 artifact row for ${gAutoFb.runId}`);
+  assert.ok(
+    gAutoFbPreRows.every((r) => r.path.startsWith(gAutoFbLegacyRunDir + sep)),
+    `expected all G_AUTOFB artifact rows under legacy run dir ${gAutoFbLegacyRunDir}`,
+  );
+  pass(
+    "Seeded settled legacy unit set on PREV",
+    `goal=${gAutoFb.goalId} run=${gAutoFb.runId} note=${basename(autoFbNotePath)} rows=${gAutoFbPreRows.length}`,
+  );
+
+  // Stop PREV cleanly so no daemon holds SQLite while driving runStorageMigrationPass in-process.
+  const stopPrevRes = await runCommand(launcherPath, ["daemon", "stop"], {
+    cwd: dirname(socketPath),
+    env: prevLayoutEnv,
+    label: `PI_HARNESS_STORAGE_LAYOUT=legacy ${launcherPath} daemon stop (drive engine after_bridge fault in-process)`,
+  });
+  assert.equal(stopPrevRes.code, 0, `daemon stop failed with exit ${stopPrevRes.code}`);
+  await pollUntil(() => !isPidAlive(pingPrevSeed.pid), 10_000, `PREV daemon pid ${pingPrevSeed.pid} exited`);
+
+  const goalUnitKey = `goal:${gAutoFb.goalId}`;
+  const noteUnitKey = `note:${basename(autoFbNotePath)}`;
+  const faultedUnits: string[] = [];
+  const migDb = new Database(dbPath);
+  migDb.exec("PRAGMA busy_timeout = 5000;");
+  let halfPassErrors = 0;
+  try {
+    const halfPass = runStorageMigrationPass(
+      {
+        sqlite: migDb,
+        storage,
+        fault: (step, unitCtx) => {
+          if (
+            step === "after_bridge" &&
+            ((unitCtx.kind === "goal" && unitCtx.id === gAutoFb.goalId && unitCtx.memberKind === "run") ||
+              (unitCtx.kind === "note" && unitCtx.id === basename(autoFbNotePath)))
+          ) {
+            faultedUnits.push(`${unitCtx.unitKey}:${unitCtx.memberKind}`);
+            throw new Error(`Simulated crash at after_bridge before row rewrite for ${unitCtx.unitKey} (${unitCtx.memberKind})`);
+          }
+        },
+      },
+      { repoRoots: [canonicalRepoDir] },
+    );
+    halfPassErrors = halfPass.errors.length;
+  } finally {
+    migDb.close();
+  }
+
+  await checks.run("Engine after_bridge fault produced half-finished state (renamed + bridged, pending journal, unrewritten rows)", () => {
+    assert.ok(
+      faultedUnits.includes(`${goalUnitKey}:run`),
+      `expected after_bridge fault on ${goalUnitKey}:run, got ${JSON.stringify(faultedUnits)}`,
+    );
+    assert.ok(
+      faultedUnits.includes(`${noteUnitKey}:note`),
+      `expected after_bridge fault on ${noteUnitKey}:note, got ${JSON.stringify(faultedUnits)}`,
+    );
+    assert.equal(halfPassErrors, 2, `expected exactly 2 faulted unit errors from after_bridge pass, got ${halfPassErrors}`);
+
+    assertRealDir("gAutoFbDestEvDir", gAutoFbDestEvDir);
+    assertRealDir("gAutoFbDestRunDir", gAutoFbDestRunDir);
+    assert.ok(lstatSync(autoFbNoteDest).isFile() && !lstatSync(autoFbNoteDest).isSymbolicLink());
+    assertDirHashMapEquals("G_AUTOFB dest evidence dir", gAutoFbDestEvDir, gAutoFbPreEvHashes);
+    assertDirHashMapEquals("G_AUTOFB dest run dir", gAutoFbDestRunDir, gAutoFbPreRunHashes);
+    assert.equal(sha256File(autoFbNoteDest), autoFbNoteHash, "autofb-note.md sha256 mismatch at dest");
+
+    assertBridgeSymlink("G_AUTOFB evidence bridge", gAutoFb.evidenceDir, gAutoFbDestEvDir);
+    assertBridgeSymlink("G_AUTOFB run bridge", gAutoFbLegacyRunDir, gAutoFbDestRunDir);
+    assertBridgeSymlink("autofb-note bridge", autoFbNotePath, autoFbNoteDest);
+
+    const rowsAfterFault = queryArtifacts(dbPath, gAutoFb.runId);
+    assert.deepEqual(rowsAfterFault, gAutoFbPreRows, "G_AUTOFB artifacts rows must still name legacy paths after after_bridge fault");
+
+    const stateAfterFault = readPendingState();
+    const pendingKeys = (stateAfterFault.pendingUnits ?? []).filter((u) => u.stale !== true).map((u) => u.unitKey);
+    assert.ok(pendingKeys.includes(goalUnitKey), `expected pending journal entry ${goalUnitKey}, got ${JSON.stringify(pendingKeys)}`);
+    assert.ok(pendingKeys.includes(noteUnitKey), `expected pending journal entry ${noteUnitKey}, got ${JSON.stringify(pendingKeys)}`);
+    pass(
+      "In-process engine fault (after_bridge) left goal + note renamed & bridged with pending journal and legacy artifact rows",
+      `faulted=[${faultedUnits.join(",")}] pending=${pendingKeys.length}`,
+    );
+  });
+
+  // (b) Start PREV (origin/main) with PI_HARNESS_SUPERVISE_BOOT_TIMEOUT_MS=1 (and explicit PI_HARNESS_STORAGE_LAYOUT=data-dir),
+  //     start a live run on PREV, then run the real installer for NEW so the supervisor gives up and falls back to PREV automatically.
+  const forcedTimeoutEnv: Record<string, string> = {
+    ...layoutEnv,
+    PI_HARNESS_SUPERVISE_BOOT_TIMEOUT_MS: "1",
+  };
+  console.log(
+    `\n$ PI_HARNESS_STORAGE_LAYOUT=${layoutEnv.PI_HARNESS_STORAGE_LAYOUT} PI_HARNESS_SUPERVISE_BOOT_TIMEOUT_MS=1 ${launcherPath} daemon serve (detached -> ${daemonLogPath})`,
+  );
+  const prevLogFd = openSync(daemonLogPath, "a");
+  try {
+    const child = spawn(launcherPath, ["daemon", "serve"], {
+      detached: true,
+      stdio: ["ignore", prevLogFd, prevLogFd],
+      cwd: dirname(socketPath),
+      env: cleanTestEnv(forcedTimeoutEnv),
+    });
+    child.unref();
+  } finally {
+    closeSync(prevLogFd);
+  }
+  const pingPrevBeforeFallback = await waitForPing(
+    socketPath,
+    (p) => typeof p?.pid === "number" && p.pid > 0 && p.releaseId === relPrev,
+    15_000,
+  );
+  const pidPrevBeforeFallback = pingPrevBeforeFallback.pid as number;
+  ctx.extraDaemonPids.push(pidPrevBeforeFallback);
+  ctx.setCurrentDaemonPid(pidPrevBeforeFallback);
+  pass(
+    "Started PREV daemon with forced 1ms supervisor boot timeout for automatic-fallback test",
+    `pid=${pidPrevBeforeFallback} releaseId=${relPrev}`,
+  );
+
+  // Start a fresh live run R_AUTOFB on PREV before attempting the upgrade to NEW.
+  const goR2Path = join(fakeDir, "go-r2");
+  rmSync(goR2Path, { force: true });
+  const createdAutoFbRun = await rpc<{ run: { id: string } }>(socketPath, "run.create", {
+    goal: "FAKE_ROLE=r2_orchestrator verify automatic fallback on half-finished move",
+    repoRoot: canonicalRepoDir,
+  });
+  const rAutoFbRunId = createdAutoFbRun.run.id;
+
+  const preAutoFbRun = await pollUntil(
+    async () => {
+      const runGet = await rpc<{
+        run: { status: string };
+        tasks: Array<{ id: string; tier: number; status: string; generation: number }>;
+      }>(socketPath, "run.get", { runId: rAutoFbRunId });
+      const orch = runGet.tasks.find((t) => t.tier === 1);
+      const child = runGet.tasks.find((t) => t.tier === 3);
+      if (!orch || !child || child.status !== "running") return null;
+      const livePids = readRecordedFakePidsForTasks(fakeDir, [orch.id, child.id]).filter((pid) => isPidAlive(pid));
+      if (livePids.length < 2) return null;
+      return {
+        orchId: orch.id,
+        orchGen: orch.generation,
+        childId: child.id,
+        taskIds: runGet.tasks.map((t) => t.id).sort(),
+        livePids,
+      };
+    },
+    20_000,
+    "R_AUTOFB live run active on PREV with blocking child and live fake PIDs",
+  );
+  const rAutoFbMaxEventSeq = queryDb(
+    dbPath,
+    (db) => (db.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM events").get() as { m: number }).m,
+  );
+  pass(
+    "Started live run R_AUTOFB on PREV before forced-fallback upgrade",
+    `run=${rAutoFbRunId} orch=${preAutoFbRun.orchId} (gen=${preAutoFbRun.orchGen}) child=${preAutoFbRun.childId}`,
+  );
+
+  const installForcedFallback = await runCommand("sh", ["install.sh"], {
+    cwd: REPO_ROOT,
+    env: { ...forcedTimeoutEnv, PI_HARNESS_RELOAD_WAIT: "1" },
+    label: `PI_HARNESS_RELOAD_WAIT=1 PI_HARNESS_STORAGE_LAYOUT=${layoutEnv.PI_HARNESS_STORAGE_LAYOUT} PI_HARNESS_SUPERVISE_BOOT_TIMEOUT_MS=1 sh install.sh (expect automatic fallback to PREV ${relPrev})`,
+  });
+
+  // (c) Assert automatic fallback happened, live run resumed cleanly, native reads work through bridges, rows still legacy.
+  let pidFallbackPrev = 0;
+  await checks.run("Supervisor gave up on NEW health check and automatically fell back to PREV (origin/main)", async () => {
+    assert.equal(
+      installForcedFallback.code,
+      1,
+      `expected install.sh to exit 1 after reload fallback (rc=3), got ${installForcedFallback.code}`,
+    );
+    assert.ok(
+      installForcedFallback.stdout.includes("is back on the previous release"),
+      `expected fallback notice in install.sh stdout:\n${installForcedFallback.stdout}`,
+    );
+    const pingFallback = await rpc<{
+      pid: number;
+      releaseId: string;
+      reload?: { lastError?: { targetReleaseId?: string; error?: string } | null };
+    }>(socketPath, "ping");
+    pidFallbackPrev = pingFallback.pid;
+    ctx.extraDaemonPids.push(pidFallbackPrev);
+    ctx.setCurrentDaemonPid(pidFallbackPrev);
+    assert.equal(pingFallback.releaseId, relPrev, `expected fallback PREV release ${relPrev}, got ${pingFallback.releaseId}`);
+    assert.notEqual(pidFallbackPrev, pidPrevBeforeFallback, `expected fallback PREV to be a new PID (was ${pidPrevBeforeFallback})`);
+    assert.equal(
+      pingFallback.reload?.lastError?.targetReleaseId,
+      relNew,
+      `expected reload.lastError.targetReleaseId=${relNew}, got ${JSON.stringify(pingFallback.reload?.lastError)}`,
+    );
+    assert.ok(
+      typeof pingFallback.reload?.lastError?.error === "string" && pingFallback.reload.lastError.error.length > 0,
+      `expected non-empty reload.lastError.error, got ${JSON.stringify(pingFallback.reload?.lastError)}`,
+    );
+    pass(
+      "Supervisor automatically fell back to PREV release after target boot timeout",
+      `pid ${pidPrevBeforeFallback} -> ${pidFallbackPrev} releaseId=${pingFallback.releaseId} error=${pingFallback.reload?.lastError?.error}`,
+    );
+  });
+
+  await checks.run("Live run R_AUTOFB resumed on fallback PREV with same task IDs, zero failures, and zero duplicate spawns", async () => {
+    const midRun = await rpc<{
+      run: { status: string };
+      tasks: Array<{ id: string; status: string; generation: number }>;
+    }>(socketPath, "run.get", { runId: rAutoFbRunId });
+    assert.equal(midRun.run.status, "active", `expected R_AUTOFB active after fallback, got ${midRun.run.status}`);
+    assert.deepEqual(
+      midRun.tasks.map((t) => t.id).sort(),
+      preAutoFbRun.taskIds,
+      "R_AUTOFB task IDs changed across automatic fallback",
+    );
+    assert.equal(
+      midRun.tasks.find((t) => t.id === preAutoFbRun.orchId)?.generation,
+      preAutoFbRun.orchGen,
+      "R_AUTOFB orchestrator generation changed across automatic fallback",
+    );
+    for (const t of midRun.tasks) {
+      assert.notEqual(t.status, "failed", `R_AUTOFB task ${t.id} failed after fallback`);
+      assert.notEqual(t.status, "cancelled", `R_AUTOFB task ${t.id} cancelled after fallback`);
+    }
+    await pollUntil(
+      () => preAutoFbRun.livePids.every((pid) => !isPidAlive(pid)),
+      5_000,
+      "pre-fallback R_AUTOFB fake agent PIDs reaped",
+    );
+
+    console.log(`\n$ write ${goR2Path}`);
+    writeFileSync(goR2Path, "go\n", "utf8");
+    await pollUntil(
+      async () => {
+        const r = await rpc<{ run: { status: string } }>(socketPath, "run.get", { runId: rAutoFbRunId });
+        return r.run.status === "completed";
+      },
+      20_000,
+      "R_AUTOFB completed on fallback PREV",
+    );
+
+    const finalRun = await rpc<{
+      run: { status: string };
+      tasks: Array<{ id: string; status: string; generation: number }>;
+    }>(socketPath, "run.get", { runId: rAutoFbRunId });
+    assert.equal(finalRun.run.status, "completed");
+    assert.deepEqual(
+      finalRun.tasks.map((t) => t.id).sort(),
+      preAutoFbRun.taskIds,
+      "R_AUTOFB final task IDs changed (duplicate task check)",
+    );
+    const failed = finalRun.tasks.filter((t) => t.status === "failed" || t.status === "cancelled");
+    assert.equal(failed.length, 0, `unexpected failed/cancelled tasks in R_AUTOFB: ${JSON.stringify(failed)}`);
+
+    const statusEvents = queryDb(
+      dbPath,
+      (db) =>
+        db
+          .prepare("SELECT payload_json FROM events WHERE seq > ? AND run_id = ? AND type = 'task.status'")
+          .all(rAutoFbMaxEventSeq, rAutoFbRunId) as Array<{ payload_json: string }>,
+    );
+    for (const ev of statusEvents) {
+      const payload = JSON.parse(ev.payload_json) as { to?: string; status?: string };
+      const to = payload.to ?? payload.status;
+      assert.notEqual(to, "failed", `unexpected failed task.status event in R_AUTOFB: ${ev.payload_json}`);
+      assert.notEqual(to, "cancelled", `unexpected cancelled task.status event in R_AUTOFB: ${ev.payload_json}`);
+    }
+
+    const orchLogLines = await pollUntil(
+      () => {
+        const p = join(fakeDir, "sessions.log");
+        if (!existsSync(p)) return null;
+        const lines = readFileSync(p, "utf8")
+          .split(/\r?\n/)
+          .filter((l) => l.startsWith(`${preAutoFbRun.orchId}@`) || l.startsWith(`${preAutoFbRun.orchId} `));
+        return lines.some((l) => l.includes("r2_orchestrator resumed spawned=0")) ? lines : null;
+      },
+      5_000,
+      `sessions.log records ${preAutoFbRun.orchId} resumed spawned=0`,
+    );
+    assert.equal(
+      orchLogLines.filter((l) => l.includes("r2_orchestrator fresh spawned=1")).length,
+      1,
+      `expected exactly one fresh spawn for ${preAutoFbRun.orchId}, got:\n${orchLogLines.join("\n")}`,
+    );
+    assert.equal(
+      orchLogLines.filter((l) => l.includes("r2_orchestrator resumed spawned=0")).length,
+      1,
+      `expected exactly one resumed session with spawned=0 for ${preAutoFbRun.orchId}, got:\n${orchLogLines.join("\n")}`,
+    );
+    pass(
+      "R_AUTOFB resumed and completed on fallback PREV with identical task IDs, zero failures, and zero duplicates",
+      `run=${rAutoFbRunId} tasks=[${preAutoFbRun.taskIds.join(",")}]`,
+    );
+  });
+
+  await checks.run("Native fs reads of saved legacy paths (note, evidence, dossier) return exact bytes through bridges", () => {
+    assertBridgeSymlink("autofb-note bridge after fallback", autoFbNotePath, autoFbNoteDest);
+    assertBridgeSymlink("G_AUTOFB evidence bridge after fallback", gAutoFb.evidenceDir, gAutoFbDestEvDir);
+    assertBridgeSymlink("G_AUTOFB run bridge after fallback", gAutoFbLegacyRunDir, gAutoFbDestRunDir);
+
+    assert.equal(readFileSync(autoFbNotePath, "utf8"), autoFbNoteContent, "native read of legacy note path mismatch");
+    assert.equal(readFileSync(gAutoFb.evidenceFile, "utf8"), gAutoFb.evidenceContent, "native read of legacy evidence path mismatch");
+    assert.equal(readFileSync(gAutoFb.artifactPath, "utf8"), gAutoFb.artifactContent, "native read of legacy dossier path mismatch");
+    pass(
+      "Native fs reads through legacy bridges returned exact bytes for note, evidence file, and dossier",
+      `${basename(autoFbNotePath)}, ${basename(gAutoFb.evidenceFile)}, ${basename(gAutoFb.artifactPath)}`,
+    );
+  });
+
+  await checks.run("G_AUTOFB artifacts rows still name legacy paths and pending journal entries remain intact after fallback", () => {
+    const rowsAfterFallback = queryArtifacts(dbPath, gAutoFb.runId);
+    assert.deepEqual(rowsAfterFallback, gAutoFbPreRows, "G_AUTOFB artifacts rows changed unexpectedly during fallback");
+    for (const row of rowsAfterFallback) {
+      assert.ok(
+        row.path.startsWith(gAutoFbLegacyRunDir + sep),
+        `expected legacy artifact path under ${gAutoFbLegacyRunDir}, got ${row.path}`,
+      );
+    }
+    const stateAfterFallback = readPendingState();
+    const pendingKeys = (stateAfterFallback.pendingUnits ?? []).filter((u) => u.stale !== true).map((u) => u.unitKey);
+    assert.ok(pendingKeys.includes(goalUnitKey), `pending journal entry ${goalUnitKey} lost during fallback`);
+    assert.ok(pendingKeys.includes(noteUnitKey), `pending journal entry ${noteUnitKey} lost during fallback`);
+    pass(
+      "G_AUTOFB artifacts rows still name legacy paths and pending journal entries remain on disk",
+      `rows=${rowsAfterFallback.length} pending=[${pendingKeys.join(",")}]`,
+    );
+  });
+
+  // (d) Install NEW again normally: first restart PREV without PI_HARNESS_SUPERVISE_BOOT_TIMEOUT_MS (origin/main's
+  //     supervisor inherits process.env into the fallback daemon), then run real install.sh for NEW so the migration pass
+  //     finishes the journal, nothing is lost, and a second start is a no-op.
+  const stopFallbackPrev = await runCommand(launcherPath, ["daemon", "stop"], {
+    cwd: dirname(socketPath),
+    env: prevLayoutEnv,
+    label: `PI_HARNESS_STORAGE_LAYOUT=legacy ${launcherPath} daemon stop (clear forced boot timeout env on PREV)`,
+  });
+  assert.equal(stopFallbackPrev.code, 0, `stop fallback PREV failed with exit ${stopFallbackPrev.code}`);
+  await pollUntil(() => !isPidAlive(ctx.currentDaemonPid()), 10_000, `fallback PREV pid ${ctx.currentDaemonPid()} exited`);
+
+  const prevReleaseDir = join(installDir, "releases", relPrev);
+  const prevBun = join(prevReleaseDir, ".bun");
+  const prevCli = join(prevReleaseDir, "src", "cli.ts");
+  console.log(
+    `\n$ PI_HARNESS_STORAGE_LAYOUT=${layoutEnv.PI_HARNESS_STORAGE_LAYOUT} ${prevBun} ${prevCli} daemon serve (detached -> ${daemonLogPath})`,
+  );
+  const cleanPrevLogFd = openSync(daemonLogPath, "a");
+  try {
+    const child = spawn(prevBun, [prevCli, "daemon", "serve"], {
+      detached: true,
+      stdio: ["ignore", cleanPrevLogFd, cleanPrevLogFd],
+      cwd: dirname(socketPath),
+      env: cleanTestEnv(layoutEnv),
+    });
+    child.unref();
+  } finally {
+    closeSync(cleanPrevLogFd);
+  }
+  const pingPrevClean = await waitForPing(
+    socketPath,
+    (p) => typeof p?.pid === "number" && p.pid > 0 && p.releaseId === relPrev,
+    15_000,
+  );
+  const pidPrevClean = pingPrevClean.pid as number;
+  ctx.extraDaemonPids.push(pidPrevClean);
+  ctx.setCurrentDaemonPid(pidPrevClean);
+  pass("Restarted PREV cleanly without forced boot timeout override", `pid=${pidPrevClean} releaseId=${relPrev}`);
+
+  const preNormalUpgradeDataTree = snapshotTree(join(homeDir, "data"));
+  const logOffsetNormalUpgrade = getLogFileSize(daemonLogPath);
+  const installNewNormal = await runCommand("sh", ["install.sh"], {
+    cwd: REPO_ROOT,
+    env: { ...layoutEnv, PI_HARNESS_RELOAD_WAIT: "1" },
+    label: `PI_HARNESS_RELOAD_WAIT=1 PI_HARNESS_STORAGE_LAYOUT=${layoutEnv.PI_HARNESS_STORAGE_LAYOUT} sh install.sh (normal upgrade to NEW ${relNew} to finish journal)`,
+  });
+  assert.equal(installNewNormal.code, 0, `normal re-install of NEW failed with exit ${installNewNormal.code}`);
+  assert.equal(basename(readlinkSync(join(installDir, "current"))), relNew, `expected current at ${relNew}`);
+
+  const pingNewFinished = await rpc<{ pid: number; releaseId: string; reload?: { previousReleaseId?: string } }>(
+    socketPath,
+    "ping",
+  );
+  const pidNewFinished = pingNewFinished.pid;
+  ctx.extraDaemonPids.push(pidNewFinished);
+  ctx.setCurrentDaemonPid(pidNewFinished);
+  assert.equal(pingNewFinished.releaseId, relNew, `expected NEW ${relNew}, got ${pingNewFinished.releaseId}`);
+  assert.notEqual(pidNewFinished, pidPrevClean, `expected daemon PID to change from ${pidPrevClean}`);
+  assert.equal(pingNewFinished.reload?.previousReleaseId, relPrev, `expected previousReleaseId=${relPrev}`);
+  pass(
+    "Normal NEW install hot-updated cleanly from PREV",
+    `pid ${pidPrevClean} (${relPrev}) -> pid ${pidNewFinished} (${relNew})`,
+  );
+
+  await checks.run("Normal NEW start finished the half-finished journal (rows rewritten, pendingUnits empty, nothing lost)", async () => {
+    const parsed = parseMigrationLogSection(daemonLogPath, logOffsetNormalUpgrade);
+    assert.equal(parsed.failureLines.length, 0, `unexpected migration failure lines: ${parsed.failureLines.join("; ")}`);
+    assert.equal(
+      parsed.summaryLines.length,
+      1,
+      `expected 1 migration summary line finishing journal, got ${parsed.summaryLines.length}:\n${parsed.rawText}`,
+    );
+    const summary = parsed.summaryLines[0]!;
+    assert.equal(summary.errors, 0, `expected errors=0: ${summary.raw}`);
+    assert.ok(
+      summary.rowsRewritten >= gAutoFbPreRows.length,
+      `expected rowsRewritten>=${gAutoFbPreRows.length}, got: ${summary.raw}`,
+    );
+    ctx.migrationTimings.push({
+      label: "Phase 10 finish half-finished journal",
+      pid: pidNewFinished,
+      summary,
+      failureCount: parsed.failureLines.length,
+    });
+
+    // Artifact rows rewritten to data-dir destination.
+    const postRows = queryArtifacts(dbPath, gAutoFb.runId);
+    assert.equal(postRows.length, gAutoFbPreRows.length, "G_AUTOFB artifact row count changed");
+    for (const pre of gAutoFbPreRows) {
+      const post = postRows.find((r) => r.id === pre.id);
+      assert.ok(post, `missing rewritten G_AUTOFB artifact row ${pre.id}`);
+      const expectedNewPath = join(gAutoFbDestRunDir, relative(gAutoFbLegacyRunDir, pre.path));
+      assert.equal(post.path, expectedNewPath, `G_AUTOFB artifact ${pre.id} not rewritten to data-dir`);
+      assert.ok(existsSync(post.path), `rewritten G_AUTOFB artifact missing on disk: ${post.path}`);
+    }
+
+    // Pending journal cleared, bridge records present, no stale entries.
+    const stateAfterFinish = readPendingState();
+    assert.deepEqual(
+      stateAfterFinish.pendingUnits ?? [],
+      [],
+      `expected empty pendingUnits after journal finish, got ${JSON.stringify(stateAfterFinish.pendingUnits)}`,
+    );
+    const bridges = stateAfterFinish.bridges ?? [];
+    for (const [label, legacyP, targetP] of [
+      ["G_AUTOFB evidence", gAutoFb.evidenceDir, gAutoFbDestEvDir],
+      ["G_AUTOFB run", gAutoFbLegacyRunDir, gAutoFbDestRunDir],
+      ["autofb-note", autoFbNotePath, autoFbNoteDest],
+    ] as const) {
+      assert.ok(
+        bridges.some((b) => b.legacyPath === legacyP && b.target === targetP),
+        `migration-state.json missing bridge record for ${label}: ${legacyP} -> ${targetP}`,
+      );
+    }
+
+    // Files intact at destination and readable through bridges and artifact.read RPC.
+    assertDirHashMapEquals("G_AUTOFB evidence dir after finish", gAutoFbDestEvDir, gAutoFbPreEvHashes);
+    assertDirHashMapEquals("G_AUTOFB run dir after finish", gAutoFbDestRunDir, gAutoFbPreRunHashes);
+    assert.equal(sha256File(autoFbNoteDest), autoFbNoteHash, "autofb-note.md sha256 mismatch after finish");
+    assertBridgeSymlink("G_AUTOFB evidence bridge after finish", gAutoFb.evidenceDir, gAutoFbDestEvDir);
+    assertBridgeSymlink("G_AUTOFB run bridge after finish", gAutoFbLegacyRunDir, gAutoFbDestRunDir);
+    assertBridgeSymlink("autofb-note bridge after finish", autoFbNotePath, autoFbNoteDest);
+
+    const gAutoFbRelInRun = relative(gAutoFbLegacyRunDir, gAutoFb.artifactPath);
+    const gAutoFbNewArtPath = join(gAutoFbDestRunDir, gAutoFbRelInRun);
+    const gAutoFbOldRelArt = `.harness/artifacts/${gAutoFb.runId}/${gAutoFbRelInRun.replaceAll("\\", "/")}`;
+    for (const [label, p] of [
+      ["newAbs", gAutoFbNewArtPath],
+      ["oldAbs", gAutoFb.artifactPath],
+      ["oldRel", gAutoFbOldRelArt],
+    ] as const) {
+      const res = await rpc<{ content?: string }>(socketPath, "artifact.read", { runId: gAutoFb.runId, path: p });
+      assert.equal(res.content, gAutoFb.artifactContent, `artifact.read(${label}=${p}) mismatch after finish`);
+    }
+
+    // Nothing earlier under data dir was lost or altered.
+    const postFinishDataTree = snapshotTree(join(homeDir, "data"));
+    for (const [relPath, sha] of Object.entries(preNormalUpgradeDataTree.files)) {
+      if (basename(relPath) === "migration-state.json" || basename(relPath) === "migration-cursor.json") continue;
+      assert.equal(
+        postFinishDataTree.files[relPath],
+        sha,
+        `data-dir file changed or lost during journal finish: ${relPath}`,
+      );
+    }
+
+    pass(
+      "Normal NEW start finished the journal cleanly (rows rewritten, pendingUnits=[], zero data loss)",
+      summary.raw,
+    );
+  });
+
+  // Second start is a complete no-op.
+  await checks.run("Second NEW start after finishing journal is a complete no-op", async () => {
+    const dataDir = join(homeDir, "data");
+    const legacyRoot = join(canonicalRepoDir, ".harness");
+    const capture = () => ({
+      data: snapshotTree(dataDir),
+      legacy: snapshotTree(legacyRoot, { excludeTopLevel: ["worktrees"] }),
+      artifacts: queryArtifacts(dbPath),
+      migrationState: readFileSync(statePath, "utf8"),
+    });
+    const beforeSecond = capture();
+    const logOffsetSecond = getLogFileSize(daemonLogPath);
+    const restartRes = await runCommand(launcherPath, ["daemon", "restart"], {
+      cwd: dirname(socketPath),
+      env: layoutEnv,
+      label: `PI_HARNESS_STORAGE_LAYOUT=${layoutEnv.PI_HARNESS_STORAGE_LAYOUT} ${launcherPath} daemon restart (Phase 10 second-start no-op check)`,
+    });
+    assert.equal(restartRes.code, 0, `second-start daemon restart failed with exit ${restartRes.code}`);
+
+    const pingSecond = await waitForPing(
+      socketPath,
+      (p) => typeof p?.pid === "number" && p.pid !== pidNewFinished && p.releaseId === relNew,
+      15_000,
+    );
+    const pidSecond = pingSecond.pid as number;
+    ctx.extraDaemonPids.push(pidSecond);
+    ctx.setCurrentDaemonPid(pidSecond);
+
+    const parsedSecond = parseMigrationLogSection(daemonLogPath, logOffsetSecond);
+    ctx.migrationTimings.push({
+      label: "Phase 10 second-start no-op",
+      pid: pidSecond,
+      summary: parsedSecond.summaryLines[0] ?? null,
+      failureCount: parsedSecond.failureLines.length,
+    });
+    assert.equal(
+      parsedSecond.failureLines.length,
+      0,
+      `unexpected migration failure lines on second start: ${parsedSecond.failureLines.join("; ")}`,
+    );
+    assert.equal(
+      parsedSecond.summaryLines.length,
+      0,
+      `expected no-op second start with 0 migration summary lines, got: ${parsedSecond.summaryLines.map((s) => s.raw).join("; ")}`,
+    );
+
+    const afterSecond = capture();
+    assert.deepEqual(afterSecond.data, beforeSecond.data, "data dir changed on second start");
+    assert.deepEqual(afterSecond.legacy, beforeSecond.legacy, "legacy root/bridges changed on second start");
+    assert.deepEqual(afterSecond.artifacts, beforeSecond.artifacts, "artifacts rows changed on second start");
+    assert.equal(afterSecond.migrationState, beforeSecond.migrationState, "migration-state.json changed on second start");
+    pass("Second NEW start was a complete no-op (0 migration log lines, identical disk/DB/state)", `pid=${pidSecond}`);
+  });
+}
+
 async function seedCompletedGoalViaRpc(opts: {
   socketPath: string;
   canonicalRepoDir: string;
@@ -1232,6 +1891,8 @@ async function main(): Promise<void> {
   const startedAt = Date.now();
   const { layout, prevFlag, keepTemp } = parseCliArgs(process.argv.slice(2));
   const isDataDir = layout === "data-dir";
+  const resolvedPrev = resolvePrevRef(REPO_ROOT, prevFlag);
+  const includeAutoFallbackPhase = isDataDir && !resolvedPrev.hasStorageModule;
 
   const root = realpathSync(mkdtempSync(join(tmpdir(), "su-check-")));
   const homeDir = join(root, "home");
@@ -1278,7 +1939,12 @@ async function main(): Promise<void> {
         { id: 7, name: "Settle, crash-resume & idempotency", status: "SKIP", durationMs: 0 },
         { id: 8, name: "New data (data-dir)", status: "SKIP", durationMs: 0 },
         { id: 9, name: "Fallback round trip", status: "SKIP", durationMs: 0 },
-        { id: 10, name: "Cleanup", status: "SKIP", durationMs: 0 },
+        ...(includeAutoFallbackPhase
+          ? [
+              { id: 10, name: "Automatic fallback on a half-finished move", status: "SKIP" as const, durationMs: 0 },
+              { id: 11, name: "Cleanup", status: "SKIP" as const, durationMs: 0 },
+            ]
+          : [{ id: 10, name: "Cleanup", status: "SKIP" as const, durationMs: 0 }]),
       ]
     : [
         { id: 1, name: "Sandbox", status: "SKIP", durationMs: 0 },
@@ -1337,10 +2003,15 @@ async function main(): Promise<void> {
     PI_HARNESS_BIN_DIR: binDir,
     XDG_RUNTIME_DIR: root,
   };
-  // Set PI_HARNESS_STORAGE_LAYOUT explicitly in both modes so results are identical before and after the default flips.
+  // Set PI_HARNESS_STORAGE_LAYOUT explicitly in every mode and for every PREV checkout so results are identical
+  // regardless of which layout is the code default in src/storage/paths.ts.
   const layoutEnv: Record<string, string> = {
     ...baseEnv,
     PI_HARNESS_STORAGE_LAYOUT: layout,
+  };
+  const prevLayoutEnv: Record<string, string> = {
+    ...baseEnv,
+    PI_HARNESS_STORAGE_LAYOUT: "legacy",
   };
 
   let relPrev = "";
@@ -1433,7 +2104,7 @@ async function main(): Promise<void> {
     // Phase 2: Previous release
     // -----------------------------------------------------------------------
     await runPhase(2, async () => {
-      const prev = resolvePrevRef(REPO_ROOT, prevFlag);
+      const prev = resolvedPrev;
       prevHasStorageModule = prev.hasStorageModule;
       prevRefLabel = `${prev.ref} (${prev.sha.slice(0, 12)})`;
       console.log(
@@ -1450,11 +2121,12 @@ async function main(): Promise<void> {
       // daemon.reload RPC spawns the supervisor from PREV's process.env rather than install.sh's env, so PREV must carry
       // PI_HARNESS_STORAGE_LAYOUT=data-dir for NEW to inherit it on handover while PREV itself behaves as pre-flip legacy
       // (both on initial start and on rollback). Pin only the disposable temp copy under checkoutPrevDir (never REPO_ROOT).
+      // Replacing resolveStorageLayout's env read with `return "legacy"` works identically for both code defaults.
       if (isDataDir && prev.hasStorageModule) {
         const pinned = pinCheckoutPrevToLegacyLayout(checkoutPrevDir, root);
         assert.equal(pinned, true, "expected temp checkout-prev/src/storage/paths.ts to be pinned to legacy");
         console.log(
-          "pinned disposable checkout-prev/src/storage/paths.ts to legacy layout (simulating pre-flip binary while preserving PI_HARNESS_STORAGE_LAYOUT=data-dir across daemon.reload supervisor handover)",
+          "pinned disposable checkout-prev/src/storage/paths.ts to legacy layout (works with either code default; preserves PI_HARNESS_STORAGE_LAYOUT=data-dir across daemon.reload supervisor handover)",
         );
       }
 
@@ -1471,7 +2143,7 @@ async function main(): Promise<void> {
 
       const installPrev = await runCommand("sh", ["install.sh"], {
         cwd: checkoutPrevDir,
-        env: { ...baseEnv, PI_HARNESS_STORAGE_LAYOUT: "legacy" },
+        env: prevLayoutEnv,
         label: `PI_HARNESS_STORAGE_LAYOUT=legacy sh install.sh (PREV ${prev.ref})`,
       });
       assert.equal(installPrev.code, 0, `PREV install.sh failed with exit ${installPrev.code}`);
@@ -2241,8 +2913,8 @@ async function main(): Promise<void> {
       const pidBeforeRollback = currentDaemonPid;
       const rollbackInstall = await runCommand("sh", ["install.sh"], {
         cwd: checkoutPrevDir,
-        env: { ...baseEnv, PI_HARNESS_STORAGE_LAYOUT: "legacy", PI_HARNESS_RELOAD_WAIT: "1" },
-        label: `PI_HARNESS_RELOAD_WAIT=1 sh install.sh (rollback to PREV ${relPrev})`,
+        env: { ...prevLayoutEnv, PI_HARNESS_RELOAD_WAIT: "1" },
+        label: `PI_HARNESS_RELOAD_WAIT=1 PI_HARNESS_STORAGE_LAYOUT=legacy sh install.sh (rollback to PREV ${relPrev})`,
       });
       assert.equal(rollbackInstall.code, 0, `rollback install.sh failed with exit ${rollbackInstall.code}`);
 
@@ -2540,8 +3212,8 @@ async function main(): Promise<void> {
         const postReupgradeDataTree = snapshotTree(join(homeDir, "data"));
         assert.ok(preRollbackDataTree, "missing preRollbackDataTree");
         for (const [relPath, sha] of Object.entries(preRollbackDataTree.files)) {
-          // migration-state.json legitimately updates across passes.
-          if (basename(relPath) === "migration-state.json") continue;
+          // migration-state.json and migration-cursor.json legitimately update across passes.
+          if (basename(relPath) === "migration-state.json" || basename(relPath) === "migration-cursor.json") continue;
           assert.equal(
             postReupgradeDataTree.files[relPath],
             sha,
@@ -2564,6 +3236,38 @@ async function main(): Promise<void> {
         );
       });
     });
+
+    // -----------------------------------------------------------------------
+    // Phase 10 (data-dir + --prev=origin only): Automatic fallback on a half-finished move
+    // -----------------------------------------------------------------------
+    if (includeAutoFallbackPhase) {
+      await runPhase(10, async (checks) => {
+        await assertAutoFallbackHalfFinishedMove({
+          checks,
+          root,
+          homeDir,
+          installDir,
+          canonicalRepoDir,
+          checkoutPrevDir,
+          fakeDir,
+          socketPath,
+          dbPath,
+          launcherPath,
+          daemonLogPath,
+          layoutEnv,
+          prevLayoutEnv,
+          storage: dataDirStorage,
+          relPrev,
+          relNew,
+          extraDaemonPids,
+          migrationTimings,
+          currentDaemonPid: () => currentDaemonPid,
+          setCurrentDaemonPid: (pid) => {
+            currentDaemonPid = pid;
+          },
+        });
+      });
+    }
   } catch (err) {
     runError = err;
     console.error(`\n[FAIL] ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
@@ -2571,7 +3275,7 @@ async function main(): Promise<void> {
     // -----------------------------------------------------------------------
     // Final Phase: Cleanup (always runs, on success and failure)
     // -----------------------------------------------------------------------
-    const cleanupPhaseId = isDataDir ? 10 : 9;
+    const cleanupPhaseId = isDataDir ? (includeAutoFallbackPhase ? 11 : 10) : 9;
     try {
       await runPhase(cleanupPhaseId, async () => {
         await doCleanup();
