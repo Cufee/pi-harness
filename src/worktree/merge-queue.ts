@@ -466,50 +466,71 @@ export class BisectingMergeQueue {
       const layout = this.worktrees.gitNameLayout();
       const primaryRef = runMergedRefForRun(runNameRef, layout);
       const legacyRef = runMergedRefForRun(runNameRef, "legacy");
-      let mergedRef = primaryRef;
+      let mergedRef: string | null = primaryRef;
       let prevMergedRefSha: string | null = null;
+      let refUpdated = false;
+      let skipRefUpdate = false;
       if (primaryRef === legacyRef) {
         prevMergedRefSha = await runGit(this.repoRoot, ["rev-parse", "--verify", `${legacyRef}^{commit}`])
           .then((r) => r.stdout || null)
           .catch(() => null);
       } else {
-        const existingByRef = new Map<string, string>();
-        const { stdout: refLines } = await runGit(this.repoRoot, [
-          "for-each-ref",
-          "--format=%(refname) %(objectname)",
-          legacyRef,
-          primaryRef,
-        ]).catch(() => ({ stdout: "" }));
-        for (const line of refLines.split("\n")) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          const [refName, oid] = trimmed.split(/\s+/);
-          if (refName && oid) existingByRef.set(refName, oid);
-        }
-        const legacySha = existingByRef.get(legacyRef) ?? null;
-        if (legacySha) {
-          mergedRef = legacyRef;
-          prevMergedRefSha = legacySha;
-        } else {
-          mergedRef = primaryRef;
-          prevMergedRefSha = existingByRef.get(primaryRef) ?? null;
+        try {
+          const existingByRef = new Map<string, string>();
+          const { stdout: refLines } = await runGit(this.repoRoot, [
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            legacyRef,
+            primaryRef,
+          ]);
+          for (const line of refLines.split("\n")) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            const [refName, oid] = trimmed.split(/\s+/);
+            if (refName && oid) existingByRef.set(refName, oid);
+          }
+          const legacySha = existingByRef.get(legacyRef) ?? null;
+          if (legacySha) {
+            mergedRef = legacyRef;
+            prevMergedRefSha = legacySha;
+          } else {
+            mergedRef = primaryRef;
+            prevMergedRefSha = existingByRef.get(primaryRef) ?? null;
+          }
+        } catch (enumErr) {
+          // Do not treat a failed enumeration as "no legacy ref": creating primaryRef beside an
+          // existing legacy ref would split the sticky ref. Skip the advisory update and rely on
+          // merge.promoted as the durable source of truth.
+          skipRefUpdate = true;
+          mergedRef = null;
+          const enumDetail = enumErr instanceof Error ? enumErr.message : String(enumErr);
+          const warning = `[merge-queue] Failed to enumerate merged refs (${legacyRef}, ${primaryRef}) before updating to ${mergedSha.slice(0, 8)} (${enumDetail}); skipping ref update (merge.promoted records ${mergedSha.slice(0, 8)}).`;
+          console.warn(warning);
+          ciLogs.push(warning);
+          this.db.emitEvent(next.runId, next.taskId, "merge.ref_warning", {
+            mergeId: next.id,
+            ref: null,
+            mergedSha,
+            warning,
+          });
         }
       }
-      let refUpdated = false;
-      try {
-        await runGit(this.repoRoot, ["update-ref", mergedRef, mergedSha, prevMergedRefSha ?? ""]);
-        refUpdated = true;
-      } catch (refErr) {
-        const refDetail = refErr instanceof Error ? refErr.message : String(refErr);
-        const warning = `[merge-queue] Failed to update ${mergedRef} to ${mergedSha.slice(0, 8)} (${refDetail}); leaving ref untouched (merge.promoted records ${mergedSha.slice(0, 8)}).`;
-        console.warn(warning);
-        ciLogs.push(warning);
-        this.db.emitEvent(next.runId, next.taskId, "merge.ref_warning", {
-          mergeId: next.id,
-          ref: mergedRef,
-          mergedSha,
-          warning,
-        });
+      if (!skipRefUpdate && mergedRef) {
+        try {
+          await runGit(this.repoRoot, ["update-ref", mergedRef, mergedSha, prevMergedRefSha ?? ""]);
+          refUpdated = true;
+        } catch (refErr) {
+          const refDetail = refErr instanceof Error ? refErr.message : String(refErr);
+          const warning = `[merge-queue] Failed to update ${mergedRef} to ${mergedSha.slice(0, 8)} (${refDetail}); leaving ref untouched (merge.promoted records ${mergedSha.slice(0, 8)}).`;
+          console.warn(warning);
+          ciLogs.push(warning);
+          this.db.emitEvent(next.runId, next.taskId, "merge.ref_warning", {
+            mergeId: next.id,
+            ref: mergedRef,
+            mergedSha,
+            warning,
+          });
+        }
       }
 
       // Record durable merge provenance before marking the item merged; this is the source of truth

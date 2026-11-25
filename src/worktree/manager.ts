@@ -15,6 +15,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { promisify } from "node:util";
 import type { WorktreeConfig } from "../config.js";
 import type { ControlPlaneDb, WorktreeRecord } from "../control-plane/db.js";
+import { ensureDirsUnderRoot } from "../storage/data-dir/fs-utils.js";
 import { archiveRef, archiveRefPatterns, isArchiveRef, taskBranchName } from "../storage/names.js";
 import { createLegacyStoragePaths, type StorageLayout, type StoragePaths } from "../storage/paths.js";
 import { type GateRuntimeConfig, resolveGateEnv, runGateCommand } from "../tools/gate-env.js";
@@ -243,10 +244,10 @@ export class WorktreeManager {
       branch = `${baseBranchName}-${suffix}`;
     }
     const dirName = suffix === 1 ? taskId : `${taskId}-${suffix}`;
-    this.storage.ensureProjectDir(this.repoRoot);
+    const projectDir = this.storage.ensureProjectDir(runRef.repoRoot);
     const wtPath = this.storage.worktreePath(runRef, dirName);
 
-    mkdirSync(dirname(wtPath), { recursive: true });
+    this.ensureWorktreeParentDir(projectDir, wtPath);
     await runGit(this.repoRoot, ["worktree", "add", "--lock", "--reason", HARNESS_LOCK_REASON, "-b", branch, wtPath, sha]);
     const identity = captureCreationIdentity(wtPath, await this.commonDir());
 
@@ -290,9 +291,9 @@ export class WorktreeManager {
     name: string,
     sha: string,
   ): Promise<{ path: string; remove: () => Promise<void> }> {
-    this.storage.ensureProjectDir(this.repoRoot);
+    const projectDir = this.storage.ensureProjectDir(this.repoRoot);
     const path = this.storage.scratchPath(this.repoRoot, kind, name);
-    mkdirSync(dirname(path), { recursive: true });
+    this.ensureWorktreeParentDir(projectDir, path);
     await runGit(this.repoRoot, ["worktree", "add", "--lock", "--reason", HARNESS_LOCK_REASON, "--detach", path, sha]);
     const identity = captureCreationIdentity(path, await this.commonDir());
     let consumed = false;
@@ -313,6 +314,42 @@ export class WorktreeManager {
         }
       },
     };
+  }
+
+  /**
+   * Ensures parent directories for a worktree or scratch checkout exist.
+   * In `data-dir` layout, walks segment by segment below the verified `projectDir`, refusing any
+   * symlink or non-directory component (including a pre-existing symlink or non-directory leaf).
+   * Legacy layout keeps its existing recursive parent creation.
+   */
+  private ensureWorktreeParentDir(projectDir: string, targetPath: string): void {
+    const parent = dirname(targetPath);
+    if (this.storage.layout !== "data-dir") {
+      mkdirSync(parent, { recursive: true });
+      return;
+    }
+    if (!isWithin(projectDir, targetPath)) {
+      throw new Error(`Refusing to create worktree outside project directory: ${targetPath}`);
+    }
+    if (parent !== projectDir) {
+      if (!isWithin(projectDir, parent)) {
+        throw new Error(`Refusing to create worktree parent outside project directory: ${parent}`);
+      }
+      const segments = relative(projectDir, parent)
+        .split(sep)
+        .filter((s) => s.length > 0 && s !== ".");
+      ensureDirsUnderRoot(projectDir, segments, (badPath) => {
+        return new Error(`Refusing to create worktree through symlink or non-directory path: ${badPath}`);
+      });
+    }
+    try {
+      const leafStat = lstatSync(targetPath);
+      if (leafStat.isSymbolicLink() || !leafStat.isDirectory()) {
+        throw new Error(`Refusing to create worktree at symlink or non-directory path: ${targetPath}`);
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
   }
 
   /** Canonical absolute path of this repository's common Git directory. */

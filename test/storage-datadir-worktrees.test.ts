@@ -1,5 +1,16 @@
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "bun:test";
@@ -206,6 +217,162 @@ describe("WorktreeManager and repo-cleanliness (data-dir layout)", () => {
       await scratch.remove();
       db.db.prepare("UPDATE tasks SET status = 'completed' WHERE id = ?").run(task.id);
       await mgr.sweep();
+    } finally {
+      db.close();
+    }
+  });
+
+  it("refuses symlinked or non-directory components below projectDir for worker and scratch worktrees in data-dir layout without modifying link targets, while leaving legacy layout unchanged (G2)", async () => {
+    const root = makeTempDir("pi-dd-wt-symlink-");
+    const stateDir = join(root, "state");
+    const repo = join(root, "repo");
+    const outsideWorktrees = join(root, "outside-worktrees");
+    const outsideVerify = join(root, "outside-verify");
+    const outsideIntegration = join(root, "outside-integration");
+    const outsideScratch = join(root, "outside-scratch");
+    const outsideLeaf = join(root, "outside-leaf");
+    const outsideScratchLeaf = join(root, "outside-scratch-leaf");
+    const outsideLegacy = join(root, "outside-legacy");
+    for (const dir of [
+      stateDir,
+      outsideWorktrees,
+      outsideVerify,
+      outsideIntegration,
+      outsideScratch,
+      outsideLeaf,
+      outsideScratchLeaf,
+      outsideLegacy,
+    ]) {
+      mkdirSync(dir, { recursive: true });
+    }
+    await initTempGitRepo(repo);
+
+    const ddSp = storagePaths({ stateDir }, { layout: "data-dir" });
+    const db = new ControlPlaneDb(":memory:");
+    try {
+      const ddMgr = new WorktreeManager(db, repo, { maxConcurrentWorkers: 4 }, {}, ddSp);
+      const { baseBranch, baseSha } = await ddMgr.resolveRepoInfo();
+      const projDir = ddSp.ensureProjectDir(repo);
+
+      // 1. Symlinked parent at chats/chat-1/worktrees refuses worker worktree creation and leaves target empty.
+      const run1 = db.createRun({ goal: "Symlink parent run", repoRoot: repo, baseBranch, baseSha, chatSessionId: "chat-1" });
+      const task1 = db.createTask({
+        runId: run1.id,
+        tier: 2,
+        kind: "worker",
+        title: "Worker 1",
+        objective: "Should be refused",
+        profileId: "acp:claude",
+      });
+      mkdirSync(join(projDir, "chats", "chat-1"), { recursive: true });
+      const badWtParent = join(projDir, "chats", "chat-1", "worktrees");
+      symlinkSync(outsideWorktrees, badWtParent);
+      await assert.rejects(
+        () => ddMgr.createForWorker(run1.id, task1.id, baseSha),
+        (err: unknown) => err instanceof Error && err.message.includes(badWtParent),
+      );
+      assert.deepEqual(readdirSync(outsideWorktrees), []);
+      assert.equal(db.listWorktrees(run1.id).length, 0);
+
+      // 2. Non-directory file at chats/chat-2/worktrees refuses worker worktree creation.
+      const run2 = db.createRun({ goal: "File parent run", repoRoot: repo, baseBranch, baseSha, chatSessionId: "chat-2" });
+      const task2 = db.createTask({
+        runId: run2.id,
+        tier: 2,
+        kind: "worker",
+        title: "Worker 2",
+        objective: "Should be refused",
+        profileId: "acp:claude",
+      });
+      mkdirSync(join(projDir, "chats", "chat-2"), { recursive: true });
+      const fileWtParent = join(projDir, "chats", "chat-2", "worktrees");
+      writeFileSync(fileWtParent, "not a directory\n", "utf8");
+      await assert.rejects(
+        () => ddMgr.createForWorker(run2.id, task2.id, baseSha),
+        (err: unknown) => err instanceof Error && err.message.includes(fileWtParent),
+      );
+      assert.equal(db.listWorktrees(run2.id).length, 0);
+
+      // 3. Symlinked scratch/_verify and scratch/_integration parents refuse scratch creation and leave targets empty.
+      mkdirSync(join(projDir, "scratch"), { recursive: true });
+      const badVerifyDir = join(projDir, "scratch", "_verify");
+      const badIntegrationDir = join(projDir, "scratch", "_integration");
+      symlinkSync(outsideVerify, badVerifyDir);
+      symlinkSync(outsideIntegration, badIntegrationDir);
+      await assert.rejects(
+        () => ddMgr.addScratchWorktree("_verify", "v1", baseSha),
+        (err: unknown) => err instanceof Error && err.message.includes(badVerifyDir),
+      );
+      assert.deepEqual(readdirSync(outsideVerify), []);
+      await assert.rejects(
+        () => ddMgr.addScratchWorktree("_integration", "i1", baseSha),
+        (err: unknown) => err instanceof Error && err.message.includes(badIntegrationDir),
+      );
+      assert.deepEqual(readdirSync(outsideIntegration), []);
+
+      // 4. Symlinked scratch leaf refuses scratch creation and leaves target empty.
+      rmSync(badVerifyDir, { force: true });
+      mkdirSync(badVerifyDir, { recursive: true });
+      const badScratchLeaf = join(badVerifyDir, "leaf-link");
+      symlinkSync(outsideScratchLeaf, badScratchLeaf);
+      await assert.rejects(
+        () => ddMgr.addScratchWorktree("_verify", "leaf-link", baseSha),
+        (err: unknown) => err instanceof Error && err.message.includes(badScratchLeaf),
+      );
+      assert.deepEqual(readdirSync(outsideScratchLeaf), []);
+
+      // 5. Symlinked top-level scratch dir refuses scratch creation and leaves target empty.
+      rmSync(join(projDir, "scratch"), { recursive: true, force: true });
+      const badScratchRoot = join(projDir, "scratch");
+      symlinkSync(outsideScratch, badScratchRoot);
+      await assert.rejects(
+        () => ddMgr.addScratchWorktree("_verify", "v2", baseSha),
+        (err: unknown) => err instanceof Error && err.message.includes(badScratchRoot),
+      );
+      assert.deepEqual(readdirSync(outsideScratch), []);
+
+      // 6. Symlinked worker leaf refuses worker worktree creation and leaves target empty.
+      const run3 = db.createRun({ goal: "Symlink leaf run", repoRoot: repo, baseBranch, baseSha, chatSessionId: "chat-3" });
+      const task3 = db.createTask({
+        runId: run3.id,
+        tier: 2,
+        kind: "worker",
+        title: "Worker 3",
+        objective: "Should be refused at leaf",
+        profileId: "acp:claude",
+      });
+      const run3Parent = join(projDir, "chats", "chat-3", "worktrees", run3.id);
+      mkdirSync(run3Parent, { recursive: true });
+      const badLeaf = join(run3Parent, task3.id);
+      symlinkSync(outsideLeaf, badLeaf);
+      await assert.rejects(
+        () => ddMgr.createForWorker(run3.id, task3.id, baseSha),
+        (err: unknown) => err instanceof Error && err.message.includes(badLeaf),
+      );
+      assert.deepEqual(readdirSync(outsideLeaf), []);
+      assert.equal(db.listWorktrees(run3.id).length, 0);
+
+      // 7. Legacy layout remains unchanged (still allows symlinked worktrees root).
+      mkdirSync(join(repo, ".harness"), { recursive: true });
+      symlinkSync(outsideLegacy, join(repo, ".harness", "worktrees"));
+      const legacySp = createLegacyStoragePaths({ worktree: { dir: ".harness/worktrees" } });
+      const legacyMgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 }, {}, legacySp);
+      const legacyRun = db.createRun({ goal: "Legacy symlink run", repoRoot: repo, baseBranch, baseSha, chatSessionId: "chat-4" });
+      const legacyTask = db.createTask({
+        runId: legacyRun.id,
+        tier: 2,
+        kind: "worker",
+        title: "Legacy worker",
+        objective: "Legacy unchanged",
+        profileId: "acp:claude",
+      });
+      const legacyWt = await legacyMgr.createForWorker(legacyRun.id, legacyTask.id, baseSha);
+      assert.equal(existsSync(legacyWt.path), true);
+      const legacyScratch = await legacyMgr.addScratchWorktree("_verify", "legacy-v1", baseSha);
+      assert.equal(existsSync(legacyScratch.path), true);
+      await legacyScratch.remove();
+      db.db.prepare("UPDATE tasks SET status = 'completed' WHERE id = ?").run(legacyTask.id);
+      await legacyMgr.sweep();
     } finally {
       db.close();
     }

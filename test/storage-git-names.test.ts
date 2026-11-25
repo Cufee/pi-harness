@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, it } from "bun:test";
 import { ControlPlaneDb } from "../src/control-plane/db.js";
@@ -496,6 +496,134 @@ describe("git names in data-dir layout (real git repos)", () => {
       assert.equal(await refSha(repo, expectedLegacyArchive), null);
       assert.equal(await refSha(repo, expectedDdArchive), null);
     } finally {
+      db.close();
+    }
+  });
+
+  it("skips merged-ref update and logs a warning without failing promotion when for-each-ref fails (G1)", async () => {
+    const root = makeTempDir("pi-git-names-enum-fail-");
+    const stateDir = join(root, "state");
+    const repo = join(root, "repo");
+    const shimBin = join(root, "shim-bin");
+    mkdirSync(stateDir, { recursive: true });
+    mkdirSync(shimBin, { recursive: true });
+    const initSha = await initTempGitRepo(repo);
+
+    const realGit = Bun.which("git");
+    assert.ok(realGit, "git executable must be on PATH");
+    const fakeGit = join(shimBin, "git");
+    const escapedRealGit = realGit.replace(/'/g, "'\\''");
+    writeFileSync(
+      fakeGit,
+      [
+        "#!/bin/sh",
+        'if [ "$1" = "for-each-ref" ]; then',
+        '  echo "fatal: simulated for-each-ref failure" >&2',
+        "  exit 128",
+        "fi",
+        `exec '${escapedRealGit}' "$@"`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    chmodSync(fakeGit, 0o755);
+
+    const db = new ControlPlaneDb(":memory:");
+    const origPath = process.env.PATH;
+    const origWarn = console.warn;
+    const warnings: string[] = [];
+    try {
+      // Phase 1: Legacy layout creates the existing legacy merged ref.
+      delete process.env.PI_HARNESS_STORAGE_LAYOUT;
+      resetStoragePathsForTest();
+      const legacySp = storagePaths({ stateDir, worktree: { dir: ".harness/worktrees" } });
+      const legacyMgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 }, {}, legacySp);
+      const legacyMq = new BisectingMergeQueue(db, legacyMgr, repo, {});
+
+      const run = db.createRun({
+        goal: "Sticky ref enum failure",
+        repoRoot: repo,
+        baseBranch: "main",
+        baseSha: initSha,
+        chatSessionId: "chat-7",
+      });
+      const task1 = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Merge 1",
+        objective: "Add f1.txt",
+        profileId: "acp:claude",
+      });
+      const wt1 = await legacyMgr.createForWorker(run.id, task1.id, initSha);
+      writeFileSync(join(wt1.path, "f1.txt"), "one\n", "utf8");
+      await runGit(wt1.path, ["add", "f1.txt"]);
+      await runGit(wt1.path, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "merge 1"]);
+      db.enqueueMerge({ runId: run.id, taskId: task1.id, worktreeId: wt1.id, branch: wt1.branch });
+      const res1 = await legacyMq.processNext(run.id);
+      assert.ok(res1?.mergedSha);
+
+      const legacyMerged = mergedRef(run, "legacy");
+      const chatMerged = mergedRef(run, "data-dir");
+      assert.equal(await refSha(repo, legacyMerged), res1.mergedSha);
+      assert.equal(await refSha(repo, chatMerged), null);
+
+      // Phase 2: Data-dir layout promotes a second commit while git for-each-ref fails.
+      process.env.PI_HARNESS_STORAGE_LAYOUT = "data-dir";
+      resetStoragePathsForTest();
+      const ddSp = storagePaths({ stateDir, worktree: { dir: ".harness/worktrees" } });
+      const ddMgr = new WorktreeManager(db, repo, { dir: ".harness/worktrees", maxConcurrentWorkers: 4 }, {}, ddSp);
+      const ddMq = new BisectingMergeQueue(db, ddMgr, repo, {});
+
+      const task2 = db.createTask({
+        runId: run.id,
+        tier: 2,
+        kind: "worker",
+        title: "Merge 2",
+        objective: "Add f2.txt",
+        profileId: "acp:claude",
+      });
+      const wt2 = await ddMgr.createForWorker(run.id, task2.id);
+      writeFileSync(join(wt2.path, "f2.txt"), "two\n", "utf8");
+      await runGit(wt2.path, ["add", "f2.txt"]);
+      await runGit(wt2.path, ["-c", "user.name=t", "-c", "user.email=t@local", "commit", "-m", "merge 2"]);
+      db.enqueueMerge({ runId: run.id, taskId: task2.id, worktreeId: wt2.id, branch: wt2.branch });
+
+      console.warn = (...args: unknown[]) => {
+        warnings.push(args.map((a) => String(a)).join(" "));
+      };
+      process.env.PATH = `${shimBin}${delimiter}${origPath ?? ""}`;
+      let res2;
+      try {
+        res2 = await ddMq.processNext(run.id);
+      } finally {
+        process.env.PATH = origPath;
+        console.warn = origWarn;
+      }
+
+      // Promotion succeeds and advances main, while existing legacy ref stays untouched and no competing ref is created.
+      assert.equal(res2?.item.status, "merged");
+      assert.ok(res2?.mergedSha);
+      assert.notEqual(res2.mergedSha, res1.mergedSha);
+      assert.equal((await runGit(repo, ["rev-parse", "main"])).stdout, res2.mergedSha);
+      assert.equal(await refSha(repo, legacyMerged), res1.mergedSha);
+      assert.equal(await refSha(repo, chatMerged), null);
+
+      assert.ok(
+        warnings.some((w) => w.includes(legacyMerged) && w.includes(chatMerged)),
+        `expected ref enumeration warning naming refs, got: ${JSON.stringify(warnings)}`,
+      );
+      const events = db.getEventsSince(run.id, 0);
+      const refWarning = events.find((e) => e.type === "merge.ref_warning" && e.taskId === task2.id);
+      assert.ok(refWarning, "expected merge.ref_warning event");
+      assert.equal((refWarning.payload as Record<string, unknown>).mergedSha, res2.mergedSha);
+      const promoted = events.find((e) => e.type === "merge.promoted" && e.taskId === task2.id);
+      assert.ok(promoted, "expected merge.promoted event");
+      assert.equal((promoted.payload as Record<string, unknown>).mergedSha, res2.mergedSha);
+      assert.equal((promoted.payload as Record<string, unknown>).refUpdated, false);
+    } finally {
+      process.env.PATH = origPath;
+      console.warn = origWarn;
       db.close();
     }
   });
