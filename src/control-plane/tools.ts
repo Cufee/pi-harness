@@ -1,12 +1,12 @@
 import { realpathSync, rmSync, statSync } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { recommendModelsByTaskKind, type CompiledModelEntry, type ModelCatalogCompiler } from "../catalog/compiler.js";
 import { CODE_EXEC_TOOL_NAME, TOOL_SEARCH_TOOL_NAME, createCodeModeExecutor, effectiveCodeMode, exposedTools } from "../code-mode/index.js";
 import type { HarnessConfig } from "../config.js";
 import { codeExecEventSink } from "../protocol/tool-display.js";
 import { checkReadOnlyArgv, isSafeGitRemoteUrl, parseReadOnlyGitNetworkCommand } from "../runners/acp-shims.js";
-import { isProtectedWritePath } from "../runners/protected-paths.js";
-import type { RunnerCallbacks, ToolDefinition } from "../runners/types.js";
+import { toolPolicyForTask, type RunnerCallbacks, type ToolDefinition } from "../runners/types.js";
+import { storagePaths, type GoalRef, type RunRef, type StoragePaths } from "../storage/paths.js";
 import { filterTrustedPath, resolveGateEnv, resolveTrustedBinary, runArgv } from "../tools/gate-env.js";
 import type { KbKind } from "../kb/store.js";
 import type { BisectingMergeQueue } from "../worktree/merge-queue.js";
@@ -129,6 +129,8 @@ export interface ToolRuntimeHooks {
   onToolsListed?: (taskId: string) => void;
   /** Returns an auth warning advisory when the spawned profile recently failed authentication, or null. */
   profileAuthAdvisory?: (profileId: string) => string | null;
+  /** Resolves the goal linked to a run, if any. */
+  resolveLinkedGoalForRun?: (runId: string) => { id: string; chatSessionId?: string | null } | null;
 }
 
 function mergeWarnings(...items: Array<string | null | undefined>): string | null {
@@ -174,6 +176,61 @@ export class ControlPlaneToolExecutor {
     private readonly hooks: ToolRuntimeHooks,
     private readonly config: HarnessConfig,
   ) {}
+
+  private get storage(): StoragePaths {
+    return storagePaths(this.config);
+  }
+
+  private runRef(run: RunRecord): RunRecord & RunRef {
+    const chatSessionId = run.chatSessionId ?? this.db.getRunChatSessionId(run.id);
+    return chatSessionId === run.chatSessionId ? run : { ...run, chatSessionId };
+  }
+
+  private goalRef(repoRoot: string, goal: { id: string; chatSessionId?: string | null }): GoalRef {
+    return { repoRoot, id: goal.id, chatSessionId: goal.chatSessionId ?? null };
+  }
+
+  private handoffStorageCtx(run: RunRecord & RunRef) {
+    return { repoRoot: run.repoRoot, chatSessionId: run.chatSessionId, storage: this.storage };
+  }
+
+  /** The goal linked to this run, if any (the goals table is absent in standalone control-plane databases). */
+  private resolveLinkedGoalForRun(runId: string): { id: string; chatSessionId: string | null } | null {
+    if (this.hooks.resolveLinkedGoalForRun) {
+      const linked = this.hooks.resolveLinkedGoalForRun(runId);
+      return linked ? { id: linked.id, chatSessionId: linked.chatSessionId ? String(linked.chatSessionId) : null } : null;
+    }
+    try {
+      const row = this.db.db
+        .prepare("SELECT id, chat_session_id FROM goals WHERE linked_run_id = ? LIMIT 1")
+        .get(runId) as { id: string; chat_session_id?: string | null } | null;
+      return row ? { id: row.id, chatSessionId: row.chat_session_id ? String(row.chat_session_id) : null } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Rewrites absolute legacy data-path operands in `inspect_command` argv via `storage.resolveLegacyPath`. */
+  private mapInspectLegacyArgv(argv: string[], runRef: RunRecord & RunRef): string[] {
+    return argv.map((arg, index) => {
+      if (index === 0) return arg;
+      if (isAbsolute(arg)) {
+        if (arg.split("/").includes("..") || arg.split(sep).includes("..")) return arg;
+        return this.storage.resolveLegacyPath(runRef.repoRoot, arg, runRef) ?? arg;
+      }
+      if (arg.startsWith("-")) {
+        const eq = arg.indexOf("=");
+        if (eq > 0) {
+          const val = arg.slice(eq + 1);
+          if (isAbsolute(val) && !val.split("/").includes("..") && !val.split(sep).includes("..")) {
+            const mapped = this.storage.resolveLegacyPath(runRef.repoRoot, val, runRef);
+            if (mapped !== null) return `${arg.slice(0, eq + 1)}${mapped}`;
+          }
+        }
+      }
+      return arg;
+    });
+  }
 
   tools(target: AgentTier | TaskToolSubject): ToolDefinition[] {
     const raw = typeof target === "number" ? toolsForTier(target) : toolsForTask(target);
@@ -246,6 +303,11 @@ export class ControlPlaneToolExecutor {
     }
     if (mode !== "off" && (name === CODE_EXEC_TOOL_NAME || name === TOOL_SEARCH_TOOL_NAME)) {
       const signal = callerTaskSignal;
+      const runRef = this.runRef(run);
+      const codeExecArtifactsDir =
+        runRef.id && !isDirectorTaskContainer(runRef.id)
+          ? dirname(this.storage.runArtifactsDir(runRef))
+          : this.storage.artifactsDir(runRef);
       const res = await createCodeModeExecutor({
         ...this.config.codeExec,
         mode,
@@ -262,9 +324,9 @@ export class ControlPlaneToolExecutor {
           }
           return this.execute(runId, taskId, inner, input, execSignal ?? signal);
         },
-        artifactsDir: resolve(run.repoRoot, this.config.worktree.artifactsDir ?? ".harness/artifacts"),
+        artifactsDir: codeExecArtifactsDir,
         pythonCacheDir: join(this.config.stateDir, "code-mode", "python"),
-        saveOutput: (name, json) => writeCodeOutput(this.db, run, taskId, name, json),
+        saveOutput: (outName, json) => writeCodeOutput(this.db, runRef, taskId, outName, json, this.storage),
         signal,
         onToolEvent: this.createCodeExecEventSink(runId, taskId, callerGeneration),
       }).execute(name, args);
@@ -318,6 +380,8 @@ export class ControlPlaneToolExecutor {
   ): Promise<unknown> {
     switch (name) {
       case "tree_view": {
+        const runRef = this.runRef(run);
+        const handoffCtx = this.handoffStorageCtx(runRef);
         const includeSettled = args.include_settled !== false;
         const tasks = this.db
           .listTasks(runId)
@@ -341,7 +405,7 @@ export class ControlPlaneToolExecutor {
             gen: t.generation,
             goalVersion: t.goalVersion ?? null,
             ctxPct: t.contextSize > 0 ? Math.round((t.contextUsed / t.contextSize) * 100) : null,
-            summary: compactTaskHandoff(t).summary,
+            summary: compactTaskHandoff(t, [], handoffCtx).summary,
           })),
           openEscalations: escalations,
           ...(recentlyResolvedEscalations.length > 0 ? { recentlyResolvedEscalations } : {}),
@@ -358,9 +422,18 @@ export class ControlPlaneToolExecutor {
       case "task_get": {
         const target = this.db.getTask(String(args.task_id));
         if (!target || target.runId !== runId) throw new Error(`Unknown task ${args.task_id}`);
+        const runRef = this.runRef(run);
+        const rawArtifacts = this.db.listArtifacts(runId, target.id, 30, "dossier");
+        const artifacts =
+          this.storage.layout === "data-dir"
+            ? rawArtifacts.map((a) => ({
+                ...a,
+                path: this.storage.resolveLegacyPath(runRef.repoRoot, a.path, runRef) ?? a.path,
+              }))
+            : rawArtifacts;
         return {
-          task: compactTaskHandoff(target),
-          artifacts: this.db.listArtifacts(runId, target.id, 30, "dossier"),
+          task: compactTaskHandoff(target, [], this.handoffStorageCtx(runRef)),
+          artifacts,
           escalations: this.db.listEscalations(runId).filter((e) => e.fromTaskId === target.id || e.toTaskId === target.id),
         };
       }
@@ -579,8 +652,9 @@ export class ControlPlaneToolExecutor {
               hint: "Steering received while you waited (steeringMessages, oldest first). Apply it before waiting again.",
             }
           : {};
+        const handoffCtx = this.handoffStorageCtx(this.runRef(run));
         return {
-          children: settled.map((child) => compactTaskHandoff(child, escalations)),
+          children: settled.map((child) => compactTaskHandoff(child, escalations, handoffCtx)),
           ...(waitRes.wakeReason !== "event" && waitRes.wakeReason !== "already_settled"
             ? {
                 wakeReason: waitRes.wakeReason,
@@ -808,7 +882,7 @@ export class ControlPlaneToolExecutor {
         let overflowPath: string | undefined;
         let summaryOverflow: { path: string; next_offset: number; total_chars: number } | undefined;
         if (summary.length > SUMMARY_LIMIT) {
-          const spill = spillSummaryOverflow(this.db, run, taskId, summary);
+          const spill = spillSummaryOverflow(this.db, this.runRef(run), taskId, summary, this.storage);
           summary = spill.summary;
           overflowPath = spill.overflowPath;
           if (overflowPath) {
@@ -1013,33 +1087,53 @@ export class ControlPlaneToolExecutor {
       }
 
       case "query_predecessor": {
+        const runRef = this.runRef(run);
         const rawQuery = String(args.query ?? "").trim();
         const q = rawQuery.toLowerCase();
         const limit = typeof args.limit === "number" && Number.isFinite(args.limit) ? Math.max(1, Math.min(50, Math.floor(args.limit))) : 12;
         const matches = this.db.searchPredecessorHistory(runId, taskId, rawQuery, limit);
         const tokens = q.split(/\s+/).filter(Boolean);
-        const arts = this.db
+        const rawArts = this.db
           .listArtifacts(runId, taskId, 100)
           .filter((a) => {
             const hay = `${a.path} ${a.summary}`.toLowerCase();
             return tokens.length > 0 && tokens.some((tok) => hay.includes(tok));
           })
           .slice(0, limit);
+        const arts =
+          this.storage.layout === "data-dir"
+            ? rawArts.map((a) => ({
+                ...a,
+                path: this.storage.resolveLegacyPath(runRef.repoRoot, a.path, runRef) ?? a.path,
+              }))
+            : rawArts;
         return { matchingEvents: matches, matchingArtifacts: arts };
       }
 
       case "artifact_write": {
-        const art = writeTaskDossier(this.db, run, taskId, String(args.name), String(args.content), String(args.summary));
+        const art = writeTaskDossier(
+          this.db,
+          this.runRef(run),
+          taskId,
+          String(args.name),
+          String(args.content),
+          String(args.summary),
+          this.storage,
+        );
         return { artifactId: art.id, path: art.path };
       }
 
       case "artifact_read": {
-        if (task.tier === 1 || typeof args.path !== "string" || !args.path || findRunDossier(this.db, run, args.path) !== null) {
-          return readRunDossier(this.db, run, args);
+        const runRef = this.runRef(run);
+        const rawPath = typeof args.path === "string" && args.path ? args.path : null;
+        const mappedPath = rawPath ? (this.storage.resolveLegacyPath(runRef.repoRoot, rawPath, runRef) ?? rawPath) : null;
+        const readArgs = mappedPath !== null && mappedPath !== args.path ? { ...args, path: mappedPath } : args;
+        if (task.tier === 1 || !mappedPath || findRunDossier(this.db, runRef, mappedPath, this.storage) !== null) {
+          return readRunDossier(this.db, runRef, readArgs, this.storage);
         }
         const root = task.worktreeId ? this.db.getWorktree(task.worktreeId)?.path : run.repoRoot;
         if (!root) throw new Error("Task worktree unavailable");
-        return readWorkspaceArtifact(root, args.path, args.max_chars, args.offset);
+        return readWorkspaceArtifact(root, mappedPath, args.max_chars, args.offset, this.storage);
       }
 
       case "inspect_command": {
@@ -1049,7 +1143,7 @@ export class ControlPlaneToolExecutor {
         if (args.cwd !== undefined && typeof args.cwd !== "string") {
           throw new Error("inspect_command cwd must be a string");
         }
-        const argv = args.argv as string[];
+        const rawArgv = args.argv as string[];
         const root = task.worktreeId ? this.db.getWorktree(task.worktreeId)?.path : run.repoRoot;
         if (!root) throw new Error("Task workspace unavailable");
         const realRoot = realpathSync(root);
@@ -1065,28 +1159,52 @@ export class ControlPlaneToolExecutor {
           isAbsolute(relCwd) ||
           relCwd === ".." ||
           relCwd.startsWith(`..${sep}`) ||
-          isProtectedWritePath(realRoot, cwd) ||
+          this.storage.isProtectedWorktreePath(cwd, realRoot) ||
           !statSync(cwd).isDirectory()
         ) {
           throw REJECTIONS.inspectCwd(requestedCwd);
         }
-        // Only operator global config (config.worktree.extraReadRoots) may authorize external read roots;
-        // repository-configurable artifactsDir and dossier symlinks outside realRoot are never promoted.
-        const resolvedExtraReadRoots: string[] = [];
-        for (const raw of this.config.worktree.extraReadRoots ?? []) {
-          const trimmed = raw.trim();
-          if (!trimmed) continue;
-          const expanded = resolve(expandHomePath(trimmed));
-          let canonical = expanded;
-          try {
-            canonical = realpathSync(expanded);
-          } catch {
-            // Non-existent root stays at expanded path.
+        const runRef = this.runRef(run);
+        const linkedGoal = this.resolveLinkedGoalForRun(run.id);
+        const goalRef = linkedGoal ? this.goalRef(run.repoRoot, linkedGoal) : null;
+        const writable = toolPolicyForTask(task.tier, task.kind, task.readOnly) === "read_write_workspace";
+        const grants = this.storage.taskGrants({
+          run: runRef,
+          goal: goalRef,
+          writable,
+          workspace: realRoot,
+        });
+        // Harness-computed task grants (which include operator global config.worktree.extraReadRoots/extraWriteRoots)
+        // authorize external read roots; repository-configurable values and dossier symlinks outside realRoot are never promoted.
+        const canonicalizeRoots = (rawRoots: readonly string[] | undefined): string[] => {
+          const resolved: string[] = [];
+          for (const raw of rawRoots ?? []) {
+            const trimmed = raw.trim();
+            if (!trimmed) continue;
+            const expanded = resolve(expandHomePath(trimmed));
+            let canonical = expanded;
+            try {
+              canonical = realpathSync(expanded);
+            } catch {
+              // Non-existent root stays at expanded path.
+            }
+            if (!resolved.includes(canonical)) resolved.push(canonical);
           }
-          if (!resolvedExtraReadRoots.includes(canonical)) resolvedExtraReadRoots.push(canonical);
-        }
-        const readRoots = [realRoot, ...resolvedExtraReadRoots.filter((r) => r !== realRoot)];
-        const verdict = checkReadOnlyArgv(argv, { cwd, readRoots, protectedRoots: readRoots });
+          return resolved;
+        };
+        const resolvedGrantedRoots = canonicalizeRoots([
+          ...grants.extraReadRoots,
+          ...(grants.extraWriteRoots ?? []),
+        ]);
+        const readRoots = [realRoot, ...resolvedGrantedRoots.filter((r) => r !== realRoot)];
+        const deniedRoots = canonicalizeRoots(grants.deniedRoots);
+        const argv = this.mapInspectLegacyArgv(rawArgv, runRef);
+        const verdict = checkReadOnlyArgv(argv, {
+          cwd,
+          readRoots,
+          deniedRoots,
+          protectedRoots: readRoots,
+        });
         if (!verdict.ok) {
           throw REJECTIONS.readOnlyArgv(argv[0] ?? "", verdict.reason);
         }
@@ -1279,12 +1397,13 @@ export class ControlPlaneToolExecutor {
           ].join("\n");
           outputPath = writeUniqueTaskDossier(
             this.db,
-            run,
+            runRef,
             taskId,
             "inspect-output",
             ".txt",
             fullOutput,
             "inspect_command output",
+            this.storage,
           ).path;
         }
         return {
