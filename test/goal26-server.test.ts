@@ -1064,4 +1064,253 @@ describe("goal-26 server RPC wiring", () => {
       rmSync(stateDir, { recursive: true, force: true });
     }
   });
+
+  it("h) C3 P1-b: fresh run.resume queued after run.stop is honored when slot opens (while pre-stop intent stays dropped)", async () => {
+    const repoRoot = await makeTempRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-g26-srv-state-"));
+    const sockPath = join(stateDir, "d.sock");
+    const holdA = deferred<void>();
+    const holdB = deferred<void>();
+    const orchBStarted = deferred<void>();
+
+    try {
+      const baseCfg = loadConfig(repoRoot);
+      const config = withFixtureCatalog({
+        ...baseCfg,
+        goals: { ...baseCfg.goals, maxConcurrentGoals: 1, autoVerifyOnSettle: false },
+        events: { ...baseCfg.events, wakeDirectorOnGoalSettle: false },
+        stateDir,
+        socketPath: sockPath,
+      });
+      const daemon = new HarnessDaemon(config, {
+        dbPath: ":memory:",
+        customRunnerFactory: () => ({
+          run: async (req) => {
+            if (req.initialPrompt.includes("Goal A holds slot")) {
+              await Promise.race([
+                holdA.promise,
+                new Promise<void>((resolve) => req.signal.addEventListener("abort", () => resolve(), { once: true })),
+              ]);
+              return { text: "done A", stopReason: req.signal.aborted ? "cancelled" : "completed" };
+            }
+            orchBStarted.resolve();
+            await Promise.race([
+              holdB.promise,
+              new Promise<void>((resolve) => req.signal.addEventListener("abort", () => resolve(), { once: true })),
+            ]);
+            return { text: "done B", stopReason: req.signal.aborted ? "cancelled" : "completed" };
+          },
+        }),
+      });
+
+      await daemon.start();
+      const client = new DaemonClient(sockPath);
+      await client.connect();
+      try {
+        const chat = await daemon.director.createChat({ repoRoot });
+        const baseSha = (await runGit(repoRoot, ["rev-parse", "main"])).stdout;
+
+        const goalA = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Goal A holds slot",
+          description: "Occupies maxConcurrentGoals=1",
+          criteria: [{ id: "c1", description: "Done", kind: "behavioral", required: true }],
+        });
+        const commitA = await daemon.director.commitGoalDetailed(goalA.id);
+        assert.equal(commitA.outcome, "started");
+        const runAId = commitA.goal.linkedRunId!;
+
+        // Goal B: awaiting_human with failed run.
+        const runB = daemon.db.createRun({ goal: "Goal B stop then re-resume", repoRoot, baseBranch: "main", baseSha });
+        const orchB = daemon.db.createTask({
+          runId: runB.id,
+          parentId: null,
+          tier: 1,
+          kind: "orchestrator",
+          title: "Orch B",
+          objective: "Goal B",
+          profileId: "pi:local",
+          model: "fixture",
+        });
+        daemon.db.updateTask(orchB.id, { status: "failed", summary: "Boom" });
+        daemon.db.updateRunStatus(runB.id, "failed");
+        const goalB = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Goal B awaiting human",
+          description: "Stopped then explicitly resumed while cap=1 is full",
+          criteria: [{ id: "c1", description: "Done", kind: "behavioral", required: true }],
+        });
+        daemon.director.goals.linkRunAndStart(goalB.id, runB.id);
+        daemon.director.goals.setStatus(goalB.id, "awaiting_human", "Failed");
+
+        // 1) Queue B, then run.stop B (drops pre-stop intent).
+        const firstResume = await client.request<{ outcome: string; queuePosition?: number }>("run.resume", {
+          runId: runB.id,
+          note: "Pre-stop resume",
+        });
+        assert.equal(firstResume.outcome, "queued");
+        assert.equal(firstResume.queuePosition, 1);
+
+        const stopB = await client.request<{ stopped: boolean }>("run.stop", {
+          runId: runB.id,
+          reason: "Stop before fresh resume",
+        });
+        assert.equal(stopB.stopped, true);
+        assert.equal(daemon.db.getRun(runB.id)?.status, "stopped");
+        assert.equal(daemon.db.admissionQueue.get("goal", goalB.id), null);
+
+        // 2) Issue a NEW explicit run.resume B AFTER run.stop B returns, while A still holds the slot.
+        const secondResume = await client.request<{ outcome: string; queuePosition?: number }>("run.resume", {
+          runId: runB.id,
+          note: "Fresh post-stop resume",
+        });
+        assert.equal(secondResume.outcome, "queued");
+        assert.equal(secondResume.queuePosition, 1);
+        assert.ok(daemon.db.admissionQueue.get("goal", goalB.id));
+
+        // 3) Free Goal A's slot -> drain MUST honor the post-stop explicit resume!
+        await client.request("run.stop", { runId: runAId, reason: "Free slot for post-stop resume" });
+        await waitFor(
+          () => daemon.director.goals.getGoal(goalB.id)?.status === "executing",
+          3_000,
+          "drain honors fresh post-stop run.resume",
+        );
+        await orchBStarted.promise;
+        assert.equal(daemon.db.getTask(orchB.id)?.generation, 2, "Tier 1 must resume to generation 2");
+        assert.equal(daemon.orchestrator.getEffectiveRun(runB.id)?.status, "active");
+      } finally {
+        holdA.resolve();
+        holdB.resolve();
+        client.close();
+        await daemon.stop();
+      }
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("i) C3 P1-c: queued quota recovery drops without restarting an unrelated failed Tier 1 after the only paused_quota worker is cancelled", async () => {
+    const repoRoot = await makeTempRepo();
+    const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-g26-srv-state-"));
+    const sockPath = join(stateDir, "d.sock");
+    const holdA = deferred<void>();
+    const holdOther = deferred<void>();
+    const launchedTaskIds: string[] = [];
+
+    try {
+      const baseCfg = loadConfig(repoRoot);
+      const config = withFixtureCatalog({
+        ...baseCfg,
+        goals: { ...baseCfg.goals, maxConcurrentGoals: 1, autoVerifyOnSettle: false },
+        events: { ...baseCfg.events, wakeDirectorOnGoalSettle: false },
+        stateDir,
+        socketPath: sockPath,
+      });
+      const daemon = new HarnessDaemon(config, {
+        dbPath: ":memory:",
+        customRunnerFactory: () => ({
+          run: async (req) => {
+            launchedTaskIds.push(req.taskId);
+            const gate = req.initialPrompt.includes("Goal A holds slot") ? holdA.promise : holdOther.promise;
+            await Promise.race([
+              gate,
+              new Promise<void>((resolve) => req.signal.addEventListener("abort", () => resolve(), { once: true })),
+            ]);
+            return { text: "done", stopReason: req.signal.aborted ? "cancelled" : "completed" };
+          },
+        }),
+      });
+
+      await daemon.start();
+      const client = new DaemonClient(sockPath);
+      await client.connect();
+      try {
+        const chat = await daemon.director.createChat({ repoRoot });
+        const baseSha = (await runGit(repoRoot, ["rev-parse", "main"])).stdout;
+
+        const goalA = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Goal A holds slot",
+          description: "Occupies maxConcurrentGoals=1",
+          criteria: [{ id: "c1", description: "Done", kind: "behavioral", required: true }],
+        });
+        const commitA = await daemon.director.commitGoalDetailed(goalA.id);
+        assert.equal(commitA.outcome, "started");
+        const runAId = commitA.goal.linkedRunId!;
+
+        // Goal B: awaiting_human with FAILED Tier 1 and one paused_quota worker.
+        const runB = daemon.db.createRun({ goal: "Goal B failed T1 + quota worker", repoRoot, baseBranch: "main", baseSha });
+        const orchB = daemon.db.createTask({
+          runId: runB.id,
+          parentId: null,
+          tier: 1,
+          kind: "orchestrator",
+          title: "Orch B failed",
+          objective: "Goal B",
+          profileId: "pi:local",
+          model: "fixture",
+        });
+        const workerB = daemon.db.createTask({
+          runId: runB.id,
+          parentId: orchB.id,
+          tier: 2,
+          kind: "worker",
+          title: "Worker B paused_quota",
+          objective: "Subtask B",
+          profileId: "pi:local",
+          model: "fixture",
+          readOnly: true,
+        });
+        daemon.db.updateTask(orchB.id, { status: "failed", summary: "Prior unrelated failure" });
+        daemon.db.updateTask(workerB.id, { status: "paused_quota", summary: "429 quota" });
+        daemon.db.updateRunStatus(runB.id, "paused_quota", "Quota exhausted");
+
+        const goalB = daemon.director.goals.createGoal({
+          chatSessionId: chat.id,
+          repoRoot,
+          title: "Goal B quota recovery with failed T1",
+          description: "Cancelling the only paused worker must drop queued quota recovery without retrying failed T1",
+          criteria: [{ id: "c1", description: "Done", kind: "behavioral", required: true }],
+        });
+        daemon.director.goals.linkRunAndStart(goalB.id, runB.id);
+        daemon.director.goals.setStatus(goalB.id, "awaiting_human", "Paused on quota");
+
+        // 1) Queue B via quota recovery while A holds the slot.
+        const autoRes = await daemon.orchestrator.resumeRunFromQuota(runB.id, { trigger: "auto_timer" });
+        assert.equal(autoRes.resumed, false);
+        assert.equal(daemon.db.admissionQueue.get("goal", goalB.id)?.position, 1);
+
+        // 2) Cancel B's only paused_quota worker via task.cancel RPC.
+        const cancelRes = await client.request<{ cancelled: boolean }>("task.cancel", {
+          taskId: workerB.id,
+          reason: "No longer needed",
+        });
+        assert.equal(cancelRes.cancelled, true);
+        assert.equal(daemon.db.getTask(workerB.id)?.status, "cancelled");
+
+        // 3) Free Goal A's slot -> drain MUST drop the empty quota-recovery entry without starting failed T1!
+        await client.request("run.stop", { runId: runAId, reason: "Free slot" });
+        await new Promise((r) => setTimeout(r, 200));
+
+        assert.equal(daemon.db.admissionQueue.get("goal", goalB.id), null, "empty quota-recovery intent must be dropped");
+        assert.equal(daemon.db.getTask(workerB.id)?.status, "cancelled");
+        assert.equal(daemon.db.getTask(orchB.id)?.status, "failed", "unrelated failed Tier 1 must NOT be restarted");
+        assert.equal(daemon.db.getTask(orchB.id)?.generation, 1, "unrelated failed Tier 1 must stay generation 1");
+        assert.equal(launchedTaskIds.includes(orchB.id), false, "failed Tier 1 must never launch");
+        assert.equal(daemon.director.goals.getGoal(goalB.id)?.status, "awaiting_human");
+      } finally {
+        holdA.resolve();
+        holdOther.resolve();
+        client.close();
+        await daemon.stop();
+      }
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
 });

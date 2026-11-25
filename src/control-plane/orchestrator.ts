@@ -780,6 +780,10 @@ export class HarnessOrchestrator {
     this.stopEpoch.set(key, (this.stopEpoch.get(key) ?? 0) + 1);
   }
 
+  getRunStopEpoch(runId: string): number {
+    return this.stopEpoch.get(runId) ?? 0;
+  }
+
   /** Runs one worktree allocation/teardown for a task after every earlier one for that task has finished. */
   private runWorktreeOp<T>(taskId: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.worktreeOps.get(taskId) ?? Promise.resolve();
