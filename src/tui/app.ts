@@ -10,7 +10,12 @@ import { qualifyRemoteCliHints } from "../protocol/chat-events.js";
 import type { DaemonEventFrame, SessionControlState } from "../protocol/daemon-rpc.js";
 import { classifyChatLine, type ClassifiedChatLine } from "./chat-lines.js";
 import { ChatQueueModel, type ChatQueueReason, formatQueueItemState } from "./chat-queue.js";
-import { reconcileAssistantHistory } from "./chat-reconcile.js";
+import {
+  matchLiveToolRows,
+  reconcileAssistantHistory,
+  type FrozenSegment,
+  type LiveRenderedTool,
+} from "./chat-reconcile.js";
 import { createCommandAutocomplete, parseSlashCommand, renderHelp, type TuiMode } from "./commands.js";
 import {
   createTheme,
@@ -1417,6 +1422,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
 
   let opened: ChatOpenResult;
   let fullHistory: ChatTurnRecord[];
+  let initialDaemonPid: number | null = null;
   try {
     opened = await opts.client.request<ChatOpenResult>("chat.open", {
       ...(opts.repoRoot ? { repoRoot: opts.repoRoot } : {}),
@@ -1426,6 +1432,14 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       ...(opts.preferLastProject ? { preferLastProject: true } : {}),
     });
     fullHistory = await loadAllChatHistory(opts.client, opened);
+    try {
+      const initialPing = await opts.client.request<ReconnectPing>("ping");
+      if (typeof initialPing?.pid === "number" && initialPing.pid > 0) {
+        initialDaemonPid = initialPing.pid;
+      }
+    } catch {
+      // Best-effort initial PID probe so first-reconnect crash detection sees pidChanged.
+    }
   } catch (err) {
     detachEvents();
     throw err;
@@ -1440,7 +1454,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   let incompatibleMessage: string | null = null;
   let incompatibleDraft = "";
   let stopped = false;
-  let lastDaemonPid: number | null = null;
+  let lastDaemonPid: number | null = initialDaemonPid;
   const selfReleaseId = currentRelease().releaseId;
   const notedMismatchReleases = new Set<string>();
   const settledTurns = new Set<string>();
@@ -1453,20 +1467,26 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
   const MATCHING_TRANSCRIPT_HINT = "a matching message is in the transcript; drop if same";
   const renderedSeqs = new Set<number>();
   const turnRenderedUsers: string[] = [];
-  const turnFrozenSegments: string[] = [];
-  const turnRenderedTools: string[] = [];
+  const turnFrozenSegments: FrozenSegment[] = [];
+  const turnRenderedTools: LiveRenderedTool[] = [];
+  let turnLiveToolCount = 0;
   let turnHasAssistantHeader = false;
 
   const toolOutputFingerprint = (display: unknown): string => JSON.stringify(display);
+  const rowToolFingerprint = (turn: ChatTurnRecord): string => {
+    const display = parseToolDisplay(turn.display);
+    return display ? toolOutputFingerprint(display) : (turn.content || turn.toolName || "tool output");
+  };
   const resetTurnLiveTrackers = () => {
     turnRenderedUsers.length = 0;
     turnFrozenSegments.length = 0;
     turnRenderedTools.length = 0;
+    turnLiveToolCount = 0;
     turnHasAssistantHeader = false;
   };
   const recordFrozenText = (frozen: string | null) => {
     if (frozen && frozen.trim()) {
-      turnFrozenSegments.push(frozen);
+      turnFrozenSegments.push({ text: frozen, afterLiveToolCount: turnLiveToolCount });
       turnHasAssistantHeader = true;
     }
   };
@@ -2018,13 +2038,13 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     optsReplay?: {
       firstAssistantMeta?: string;
       liveRenderedUsers?: string[];
-      liveRenderedTools?: string[];
+      skipToolIndices?: ReadonlySet<number>;
       skipAssistantIndices?: ReadonlySet<number>;
     },
   ): ReplayResult => {
     let nextAssistantMeta = optsReplay?.firstAssistantMeta;
     const skipUsers = optsReplay?.liveRenderedUsers;
-    const skipTools = optsReplay?.liveRenderedTools;
+    const skipToolIndices = optsReplay?.skipToolIndices;
     const skipAssistantIndices = optsReplay?.skipAssistantIndices;
     let renderedAssistantCount = 0;
     let renderedToolCount = 0;
@@ -2052,12 +2072,8 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
           renderedAssistantCount += 1;
         }
       } else if (turn.role === "tool_output") {
+        if (skipToolIndices?.has(i)) continue;
         const display = parseToolDisplay(turn.display);
-        const fp = display ? toolOutputFingerprint(display) : (turn.content || turn.toolName || "tool output");
-        if (skipTools && skipTools.length > 0 && skipTools[0] === fp) {
-          skipTools.shift();
-          continue;
-        }
         if (display) {
           shell.transcript.appendToolOutput(display, turnTs, { freeze: false });
         } else {
@@ -2212,7 +2228,8 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         if (display) {
           recordFrozenText(shell.transcript.freezeLiveText(evTs));
           shell.transcript.appendToolOutput(display, evTs, { freeze: false });
-          turnRenderedTools.push(toolOutputFingerprint(display));
+          turnLiveToolCount += 1;
+          turnRenderedTools.push({ ordinal: turnLiveToolCount, fingerprint: toolOutputFingerprint(display) });
           shell.session.tui.requestRender();
           return;
         }
@@ -2318,6 +2335,11 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
       if (typeof ping.pid === "number" && ping.pid > 0) {
         lastDaemonPid = ping.pid;
       }
+      const hasRestartEvidence =
+        cancelOrigin === "restart" ||
+        Boolean(reconnect?.expectingRestart) ||
+        reloadingBlocked ||
+        pidChanged;
 
       chatSession = reopened.session;
       activeProject = reopened.project ?? activeProject;
@@ -2400,11 +2422,20 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
         unseenRows.push(row);
       }
 
+      const toolMatch = wasActive
+        ? matchLiveToolRows(unseenRows, turnRenderedTools, rowToolFingerprint)
+        : { matches: [], skipToolIndices: new Set<number>(), remainingLiveTools: [] };
+      if (wasActive) {
+        turnRenderedTools.splice(0, turnRenderedTools.length, ...toolMatch.remainingLiveTools);
+      }
+
       const reconciled = reconcileAssistantHistory({
         frozen: wasActive ? turnFrozenSegments : [],
         tail: wasActive ? prevSnap.text : "",
         rows: unseenRows,
         busy: reopened.busy,
+        daemonRestarted: hasRestartEvidence,
+        liveToolMatches: toolMatch.matches,
       });
       if (wasActive) {
         turnFrozenSegments.splice(0, turnFrozenSegments.length, ...reconciled.remainingFrozen);
@@ -2416,7 +2447,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
               firstAssistantMeta:
                 wasActive && !hadLiveAssistantBeforeReplay ? (prevSnap.modelLabel ?? modelBadge()) : undefined,
               liveRenderedUsers: turnRenderedUsers,
-              liveRenderedTools: turnRenderedTools,
+              skipToolIndices: toolMatch.skipToolIndices,
               skipAssistantIndices: reconciled.skipIndices,
             })
           : { renderedAssistantCount: 0, renderedToolCount: 0 };
@@ -2427,22 +2458,20 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
 
       // 4. Rebuild live tail or settle using reconciled unpersisted tail remainder (R3).
       if (wasActive && !reopened.busy) {
-        const hasRestartEvidence =
-          cancelOrigin === "restart" ||
-          Boolean(reconnect?.expectingRestart) ||
-          reloadingBlocked ||
-          pidChanged;
         if (reconciled.tailRemainder) {
           settleTurn(prevTurnId, {
             finalText: reconciled.tailRemainder,
             cancelled: true,
-            cancelCause: hasRestartEvidence ? "restart" : "reconnect",
+            cancelCause: "restart",
             timestampMs: Date.now(),
             discardLiveText: false,
           });
         } else {
           const persistedTurnOutput =
-            hadLiveAssistantBeforeReplay || replay.renderedAssistantCount > 0 || replay.renderedToolCount > 0;
+            hadLiveAssistantBeforeReplay ||
+            toolMatch.matches.length > 0 ||
+            replay.renderedAssistantCount > 0 ||
+            replay.renderedToolCount > 0;
           const shouldReportEarlyEnd =
             hasRestartEvidence || (!unconfirmedTurnNotDelivered && !persistedTurnOutput);
           settleTurn(prevTurnId, {
