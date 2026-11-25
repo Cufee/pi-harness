@@ -68,6 +68,7 @@ import {
   overlapsAnyPath,
   type PendingMigrationMember,
   type PendingMigrationUnit,
+  PreservedPathExhaustedError,
   privateStagePayloadPath,
   readMigrationCursor,
   readMigrationState,
@@ -835,6 +836,32 @@ function validatePendingUnits(
   return { validPending, deferredPending, stalePending, newlyStaleErrors, dbErrors };
 }
 
+/**
+ * Collects every legacy path protected from leftover temp-link cleanup (G7):
+ * recorded bridges in `migration-state.json` and every member legacy path named by any pending journal entry.
+ */
+function collectProtectedBridgePaths(
+  state: MigrationStateFile,
+  recordedBridges?: ReadonlyMap<string, RecordedBridgeEntry>,
+): Set<string> {
+  const protectedPaths = new Set<string>();
+  if (recordedBridges) {
+    for (const legacyPath of recordedBridges.keys()) {
+      protectedPaths.add(resolve(legacyPath));
+    }
+  } else if (state.bridges) {
+    for (const b of state.bridges) {
+      protectedPaths.add(resolve(b.legacyPath));
+    }
+  }
+  for (const pending of state.pendingUnits) {
+    for (const m of pending.members) {
+      protectedPaths.add(resolve(m.legacyPath));
+    }
+  }
+  return protectedPaths;
+}
+
 /** Discovers all logical unit seeds for a repository from disk, unrewritten artifact rows, and validated pending state. */
 function discoverRepoUnitSeeds(
   storage: StoragePaths,
@@ -847,6 +874,7 @@ function discoverRepoUnitSeeds(
   excludedPendingUnitKeys?: ReadonlySet<string>,
   recordedBridges?: ReadonlyMap<string, RecordedBridgeEntry>,
   repoBase?: RepoBasePaths | null,
+  protectedBridgePaths?: ReadonlySet<string>,
 ): {
   seeds: UnitSeed[];
   worktreeOverlaps: string[];
@@ -854,12 +882,23 @@ function discoverRepoUnitSeeds(
   leftoverBridgeTempLinks: string[];
 } {
   checkBudget?.();
+  let effectiveProtected = protectedBridgePaths;
+  if (!effectiveProtected) {
+    const derived = new Set<string>();
+    if (recordedBridges) {
+      for (const legacyPath of recordedBridges.keys()) derived.add(resolve(legacyPath));
+    }
+    for (const pending of validPendingUnits) {
+      for (const m of pending.members) derived.add(resolve(m.legacyPath));
+    }
+    effectiveProtected = derived;
+  }
   const {
     units: discovered,
     worktreeOverlaps: enumOverlaps,
     errors: enumErrs,
     leftoverBridgeTempLinks,
-  } = enumerateLegacyUnitsSafe(storage, canonRepo, checkBudget, excludedWorktreeRoots);
+  } = enumerateLegacyUnitsSafe(storage, canonRepo, checkBudget, excludedWorktreeRoots, effectiveProtected);
   const worktreeOverlapSet = new Set<string>(enumOverlaps);
   const enumerationErrors: MigrationErrorRecord[] = enumErrs.map((e) => ({
     repoRoot: canonRepo,
@@ -2056,6 +2095,7 @@ export function planStorageMigration(
     }));
     const deferredPendingKeys = new Set(deferredPending.map((p) => p.unitKey));
     const bridgeMap = buildBridgeMap(state);
+    const protectedBridgePaths = collectProtectedBridgePaths(state, bridgeMap);
     const { seeds, worktreeOverlaps, enumerationErrors } = discoverRepoUnitSeeds(
       deps.storage,
       canonRepo,
@@ -2067,6 +2107,7 @@ export function planStorageMigration(
       deferredPendingKeys,
       bridgeMap,
       repoBase,
+      protectedBridgePaths,
     );
     const units: PlannedMigrationUnit[] = [];
     const repoTotals = emptyPlanTotals();
@@ -3044,6 +3085,8 @@ export function runStorageMigrationPass(
         }
       }
       const deferredPendingKeys = new Set(deferredPending.map((p) => p.unitKey));
+      const initialBridgeMap = buildBridgeMap(state);
+      const protectedBridgePaths = collectProtectedBridgePaths(state, initialBridgeMap);
       const discovered = discoverRepoUnitSeeds(
         deps.storage,
         canonRepo,
@@ -3053,8 +3096,9 @@ export function runStorageMigrationPass(
         ownershipIndex,
         checkBudget,
         deferredPendingKeys,
-        buildBridgeMap(state),
+        initialBridgeMap,
         repoBase,
+        protectedBridgePaths,
       );
       seeds = discovered.seeds;
       worktreeOverlaps = discovered.worktreeOverlaps;
@@ -3064,7 +3108,12 @@ export function runStorageMigrationPass(
         log(`[storage-migrate] enumeration error in ${e.path ?? canonRepo}: ${e.message}`);
       }
       if (discovered.leftoverBridgeTempLinks.length > 0) {
-        cleanupLeftoverBridgeTempLinks(discovered.leftoverBridgeTempLinks, checkBudget, excludedWorktreeRoots);
+        cleanupLeftoverBridgeTempLinks(
+          discovered.leftoverBridgeTempLinks,
+          checkBudget,
+          excludedWorktreeRoots,
+          protectedBridgePaths,
+        );
       }
     } catch (err) {
       if (err instanceof BudgetExceededError) {
@@ -3391,6 +3440,38 @@ export function runStorageMigrationPass(
           unevaluatedRemaining += countRemainingSeedsFrom(i + 1);
           log(`[storage-migrate] wall-clock budget (${budgetMs}ms) reached while processing ${evaluated.unitKey}`);
           break;
+        }
+        if (err instanceof PreservedPathExhaustedError) {
+          const message = err.message;
+          const record: MigrationErrorRecord = {
+            repoRoot: canonRepo,
+            unitKey: evaluated.unitKey,
+            path: err.entryPath,
+            message,
+          };
+          repoReport.errors.push(record);
+          allErrors.push(record);
+          repoReport.deferred.push({ ...evaluated, action: "defer", reason: message });
+          totals.deferred++;
+          repoReport.results.push({
+            unitKey: evaluated.unitKey,
+            kind: evaluated.kind,
+            id: evaluated.id,
+            ...(evaluated.taskId !== undefined ? { taskId: evaluated.taskId } : {}),
+            repoRoot: canonRepo,
+            legacyPath: evaluated.legacyPath,
+            destinationPath: evaluated.destinationPath,
+            action: "defer",
+            outcome: "deferred",
+            reason: message,
+            rowsRewritten: 0,
+            bridgesCreated: 0,
+            bridgesRemoved: 0,
+            shadowedFiles: [],
+            members: evaluated.members,
+          });
+          log(`[storage-migrate] deferred unit ${evaluated.unitKey}: ${message}`);
+          continue;
         }
         const message = err instanceof Error ? err.message : String(err);
         const record: MigrationErrorRecord = {

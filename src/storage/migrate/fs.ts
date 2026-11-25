@@ -1284,88 +1284,119 @@ function truncateUtf8Bytes(input: string, maxBytes: number): string {
   return out;
 }
 
-/**
- * Builds a sibling `.pre-merge-<8hex>` path for a preserved destination entry, keeping the full name
- * when it fits within 255 UTF-8 bytes and shortening the stem on UTF-8 code-point boundaries otherwise.
- */
-function buildPreservedSiblingPath(entryPath: string, shortHex: string, suffixNum?: number): string {
-  const dir = dirname(entryPath);
-  const name = basename(entryPath);
-  const tail = suffixNum !== undefined ? `.pre-merge-${shortHex}.${suffixNum}` : `.pre-merge-${shortHex}`;
-  const tailBytes = Buffer.byteLength(tail, "utf8");
-  if (Buffer.byteLength(name, "utf8") + tailBytes <= MAX_FILENAME_BYTES) {
-    return join(dir, `${name}${tail}`);
+/** Maximum attempts to allocate a non-colliding `.pre-merge-*` sibling path before deferring without overwriting. */
+const MAX_PRESERVED_PATH_ATTEMPTS = 32;
+
+/** Thrown when a non-colliding preserved-conflict path cannot be allocated within bounded retries. */
+export class PreservedPathExhaustedError extends Error {
+  readonly entryPath: string;
+  readonly attempts: number;
+  constructor(entryPath: string, attempts: number) {
+    super(
+      `Unable to allocate non-colliding preserved-conflict path for ${entryPath} after ${attempts} attempts; deferring without overwriting`,
+    );
+    this.name = "PreservedPathExhaustedError";
+    this.entryPath = entryPath;
+    this.attempts = attempts;
   }
-  const maxBaseBytes = Math.max(1, MAX_FILENAME_BYTES - tailBytes);
-  const dotIdx = name.lastIndexOf(".");
-  const ext = dotIdx > 0 ? name.slice(dotIdx) : "";
-  const extBytes = Buffer.byteLength(ext, "utf8");
-  if (ext.length > 0 && extBytes <= 16 && maxBaseBytes > extBytes) {
-    const stem = truncateUtf8Bytes(name.slice(0, dotIdx), maxBaseBytes - extBytes);
-    if (stem.length > 0) {
-      return join(dir, `${stem}${ext}${tail}`);
-    }
-  }
-  return join(dir, `${truncateUtf8Bytes(name, maxBaseBytes)}${tail}`);
 }
 
-/** Picks a crash-safe `.pre-merge-<8hex>` sibling path for a shadowed destination file. */
+/**
+ * Builds a sibling `.pre-merge-<8hex>` (or `.pre-merge-<8hex>-<rand8>`) path for a preserved destination entry,
+ * keeping the full name when it fits within 255 UTF-8 bytes and shortening the stem on UTF-8 code-point boundaries
+ * otherwise. Returns `null` if the resulting path would equal `entryPath` itself (G8).
+ */
+function buildPreservedSiblingPath(
+  entryPath: string,
+  shortHex: string,
+  randomSuffix?: string,
+): string | null {
+  const dir = dirname(entryPath);
+  const name = basename(entryPath);
+  const tail = randomSuffix !== undefined ? `.pre-merge-${shortHex}-${randomSuffix}` : `.pre-merge-${shortHex}`;
+  const tailBytes = Buffer.byteLength(tail, "utf8");
+  let candidateName: string;
+  if (Buffer.byteLength(name, "utf8") + tailBytes <= MAX_FILENAME_BYTES) {
+    candidateName = `${name}${tail}`;
+  } else {
+    const maxBaseBytes = Math.max(1, MAX_FILENAME_BYTES - tailBytes);
+    const dotIdx = name.lastIndexOf(".");
+    const ext = dotIdx > 0 ? name.slice(dotIdx) : "";
+    const extBytes = Buffer.byteLength(ext, "utf8");
+    if (ext.length > 0 && extBytes <= 16 && maxBaseBytes > extBytes) {
+      const stem = truncateUtf8Bytes(name.slice(0, dotIdx), maxBaseBytes - extBytes);
+      candidateName = stem.length > 0 ? `${stem}${ext}${tail}` : `${truncateUtf8Bytes(name, maxBaseBytes)}${tail}`;
+    } else {
+      candidateName = `${truncateUtf8Bytes(name, maxBaseBytes)}${tail}`;
+    }
+  }
+  if (candidateName === name) return null;
+  const candidate = join(dir, candidateName);
+  if (candidate === entryPath || resolve(candidate) === resolve(entryPath)) return null;
+  return candidate;
+}
+
+/**
+ * Preserves a shadowed destination file at a fresh, non-existing `.pre-merge-<8hex>` sibling path
+ * using non-overwriting placement (`linkTempWithoutOverwrite`). Never returns `destFile` itself or
+ * reuses an existing entry; on a clash, retries with a new random suffix up to `MAX_PRESERVED_PATH_ATTEMPTS`
+ * times and throws `PreservedPathExhaustedError` without overwriting anything (G8).
+ */
 function preserveShadowedDestination(
   destFile: string,
   destHash: { sha256: string; bytes: number },
   checkBudget?: () => void,
 ): string {
   const shortHex = destHash.sha256.slice(0, 8);
-  let candidate = buildPreservedSiblingPath(destFile, shortHex);
-  let suffix = 2;
-
-  while (true) {
-    checkBudget?.();
-    const existing = safeLstat(candidate);
-    if (existing) {
-      if (!existing.isSymbolicLink() && existing.isFile()) {
-        const existingHash = hashRegularFileStrict(candidate, checkBudget);
-        if (existingHash.sha256 === destHash.sha256 && existingHash.bytes === destHash.bytes) {
-          // Already preserved with identical content (idempotent resume after crash).
-          return candidate;
-        }
-      }
-      candidate = buildPreservedSiblingPath(destFile, shortHex, suffix);
-      suffix++;
-      continue;
+  const resolvedDestFile = resolve(destFile);
+  const temp = join(dirname(destFile), `.pi-harness-premerge-${randomBytes(16).toString("hex")}.tmp`);
+  copyFileExclusive(destFile, temp, undefined, checkBudget);
+  let placedCandidate: string | null = null;
+  try {
+    const tempHash = hashRegularFileStrict(temp, checkBudget);
+    if (tempHash.sha256 !== destHash.sha256 || tempHash.bytes !== destHash.bytes) {
+      throw new Error(`SHA-256 verification failed while preserving shadowed file ${destFile}`);
     }
-
-    const temp = join(dirname(destFile), `.pi-harness-premerge-${randomBytes(16).toString("hex")}.tmp`);
-    copyFileExclusive(destFile, temp, undefined, checkBudget);
-    try {
-      const tempHash = hashRegularFileStrict(temp, checkBudget);
-      if (tempHash.sha256 !== destHash.sha256 || tempHash.bytes !== destHash.bytes) {
-        throw new Error(`SHA-256 verification failed while preserving shadowed file ${destFile}`);
+    for (let attempt = 0; attempt < MAX_PRESERVED_PATH_ATTEMPTS; attempt++) {
+      checkBudget?.();
+      const randomSuffix = attempt === 0 ? undefined : randomBytes(4).toString("hex");
+      const candidate = buildPreservedSiblingPath(destFile, shortHex, randomSuffix);
+      if (candidate === null || candidate === destFile || resolve(candidate) === resolvedDestFile) {
+        continue;
       }
       if (!linkTempWithoutOverwrite(temp, candidate)) {
         continue;
       }
       fsyncDir(dirname(candidate));
-    } finally {
-      rmSync(temp, { force: true });
+      placedCandidate = candidate;
+      break;
     }
-    const verified = hashRegularFileStrict(candidate, checkBudget);
-    if (verified.sha256 !== destHash.sha256 || verified.bytes !== destHash.bytes) {
-      throw new Error(`Post-link verification failed for shadowed file ${candidate}`);
-    }
-    return candidate;
+  } finally {
+    rmSync(temp, { force: true });
   }
+  if (placedCandidate === null) {
+    throw new PreservedPathExhaustedError(destFile, MAX_PRESERVED_PATH_ATTEMPTS);
+  }
+  const verified = hashRegularFileStrict(placedCandidate, checkBudget);
+  if (verified.sha256 !== destHash.sha256 || verified.bytes !== destHash.bytes) {
+    throw new Error(`Post-link verification failed for shadowed file ${placedCandidate}`);
+  }
+  return placedCandidate;
 }
 
 /**
  * Moves a colliding destination entry (a directory where legacy has a file, or a file where legacy has a directory)
- * to a non-colliding `.pre-merge-<8hex>` sibling via atomic rename. Nothing is deleted.
+ * to a fresh, non-existing `.pre-merge-<8hex>` sibling without overwriting any entry (G8).
+ * Regular files use `linkTempWithoutOverwrite` before unlinking `destEntry`; directories check non-existence and
+ * retry on collision errors with fresh random suffixes up to `MAX_PRESERVED_PATH_ATTEMPTS` before throwing
+ * `PreservedPathExhaustedError`. Nothing is overwritten or deleted.
  */
 function preserveCollidingDestinationEntry(destEntry: string, checkBudget?: () => void): string {
   const st = lstatSync(destEntry);
   if (st.isSymbolicLink()) {
     throw new Error(`Refusing to relocate symlink destination entry during merge: ${destEntry}`);
   }
+  const resolvedDestEntry = resolve(destEntry);
   let shortHex: string;
   if (st.isFile()) {
     shortHex = hashRegularFileStrict(destEntry, checkBudget).sha256.slice(0, 8);
@@ -1386,16 +1417,38 @@ function preserveCollidingDestinationEntry(destEntry: string, checkBudget?: () =
     throw new Error(`Refusing to relocate non-regular/non-directory destination entry during merge: ${destEntry}`);
   }
 
-  let candidate = buildPreservedSiblingPath(destEntry, shortHex);
-  let suffix = 2;
-  while (safeLstat(candidate) !== null) {
+  for (let attempt = 0; attempt < MAX_PRESERVED_PATH_ATTEMPTS; attempt++) {
     checkBudget?.();
-    candidate = buildPreservedSiblingPath(destEntry, shortHex, suffix);
-    suffix++;
+    const randomSuffix = attempt === 0 ? undefined : randomBytes(4).toString("hex");
+    const candidate = buildPreservedSiblingPath(destEntry, shortHex, randomSuffix);
+    if (candidate === null || candidate === destEntry || resolve(candidate) === resolvedDestEntry) {
+      continue;
+    }
+    if (st.isFile()) {
+      if (!linkTempWithoutOverwrite(destEntry, candidate)) {
+        continue;
+      }
+      fsyncDir(dirname(candidate));
+      unlinkSync(destEntry);
+      fsyncDir(dirname(destEntry));
+      return candidate;
+    }
+    if (safeLstat(candidate) !== null) {
+      continue;
+    }
+    try {
+      renameSync(destEntry, candidate);
+      fsyncDir(dirname(destEntry));
+      return candidate;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "EEXIST" || code === "ENOTEMPTY" || code === "ENOTDIR") {
+        continue;
+      }
+      throw err;
+    }
   }
-  renameSync(destEntry, candidate);
-  fsyncDir(dirname(destEntry));
-  return candidate;
+  throw new PreservedPathExhaustedError(destEntry, MAX_PRESERVED_PATH_ATTEMPTS);
 }
 
 /**
@@ -2363,19 +2416,23 @@ function readBridgeTargetSafe(absPath: string): string | null {
 }
 
 /**
- * Removes leftover fixed-length temporary bridge symlinks left behind by an interrupted pass.
- * Never removes entries whose basename does not match `BRIDGE_TEMP_NAME_RE` or that are not symlinks.
+ * Removes leftover fixed-length temporary bridge symlinks left behind by an interrupted pass (G7).
+ * Removes an entry only when its basename matches `BRIDGE_TEMP_NAME_RE`, it is a symlink,
+ * it does not overlap an excluded worktree root, and it is not listed in `protectedPaths`
+ * (bridges recorded in `migration-state.json` or legacy paths named by pending journal entries).
  */
 export function cleanupLeftoverBridgeTempLinks(
   paths: readonly string[],
   checkBudget?: () => void,
   excludedRoots?: readonly string[],
+  protectedPaths?: ReadonlySet<string>,
 ): number {
   let removed = 0;
   for (let i = 0; i < paths.length; i++) {
     if (i > 0) checkBudget?.();
     const absPath = paths[i]!;
     if (!isBridgeTempLinkName(basename(absPath))) continue;
+    if (protectedPaths && (protectedPaths.has(absPath) || protectedPaths.has(resolve(absPath)))) continue;
     if (excludedRoots && excludedRoots.length > 0 && overlapsAnyPath(absPath, excludedRoots)) continue;
     const st = safeLstat(absPath);
     if (!st || !st.isSymbolicLink()) continue;
@@ -2396,12 +2453,15 @@ export function cleanupLeftoverBridgeTempLinks(
  * makes full enumeration throw, reporting the unreadable path without losing other units.
  * Any candidate path that equals, contains, or lies inside `excludedWorktreeRoots` is never returned as a unit;
  * it is collected in `worktreeOverlaps` so it is reported as an unknown leftover and left untouched.
+ * Any symlink matching `BRIDGE_TEMP_NAME_RE` is collected in `leftoverBridgeTempLinks` only when it is NOT in
+ * `protectedBridgePaths` (recorded bridges or pending journal paths); protected bridges remain normal units (G7).
  */
 export function enumerateLegacyUnitsSafe(
   storage: StoragePaths,
   canonRepo: string,
   checkBudget?: () => void,
   excludedWorktreeRoots?: readonly string[],
+  protectedBridgePaths?: ReadonlySet<string>,
 ): {
   units: DiscoveredLegacyUnit[];
   worktreeOverlaps: string[];
@@ -2520,7 +2580,11 @@ export function enumerateLegacyUnitsSafe(
             worktreeOverlaps.push(entryPath);
             continue;
           }
-          if (isBridge && isBridgeTempLinkName(entry.name)) {
+          if (
+            isBridge &&
+            isBridgeTempLinkName(entry.name) &&
+            !(protectedBridgePaths?.has(entryPath) || protectedBridgePaths?.has(resolve(entryPath)))
+          ) {
             leftoverBridgeTempLinks.push(entryPath);
             continue;
           }
@@ -2599,7 +2663,11 @@ export function enumerateLegacyUnitsSafe(
               worktreeOverlaps.push(entryPath);
               continue;
             }
-            if (isBridge && isBridgeTempLinkName(entry.name)) {
+            if (
+              isBridge &&
+              isBridgeTempLinkName(entry.name) &&
+              !(protectedBridgePaths?.has(entryPath) || protectedBridgePaths?.has(resolve(entryPath)))
+            ) {
               leftoverBridgeTempLinks.push(entryPath);
               continue;
             }
