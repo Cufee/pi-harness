@@ -17,16 +17,8 @@ import type {
   SnapshotWorktreeEntry,
 } from "../src/protocol/daemon-rpc.js";
 import { runDirectorChatTui } from "../src/tui/app.js";
-import {
-  createTheme,
-  FixedDock,
-  ModalScreen,
-  Navigator,
-  stripTerminalSequences,
-  visibleWidth,
-} from "../src/tui/core/index.js";
-import { WorkStore, type WorkSnapshot } from "../src/tui/store.js";
-import { WorkNavigatorScreen } from "../src/tui/work-navigator.js";
+import { stripTerminalSequences } from "../src/tui/core/index.js";
+import type { WorkSnapshot } from "../src/tui/store.js";
 
 function maybeWriteEvidence(filename: string, content: string): void {
   if (process.env.GOAL37_WRITE_EVIDENCE !== "1") return;
@@ -247,303 +239,6 @@ function makePopulatedSnapshot(): WorkSnapshot {
 }
 
 describe("goal-37: default views show goals, not machinery", () => {
-  it("hides Runs, Timers, and Worktrees by default and reveals/hides them globally with 'i'", async () => {
-    const theme = createTheme({ color: false, ascii: false });
-    const { terminal } = makeFakeTerminal(120, 24);
-    const tui = new ModalScreen(terminal);
-    const nav = new Navigator(tui, terminal, theme);
-    const ctx = { navigator: nav, theme, requestRender: () => {}, writeTerminal: () => {} };
-
-    const snap = makePopulatedSnapshot();
-    const mock = makeMockClient(async (op) => {
-      if (op === "work.snapshot") return snap;
-      return {};
-    });
-    const store = new WorkStore(mock.client, { chatSessionId: "chat-37", repoRoot: "/repo" });
-    await store.refresh();
-    assert.equal(store.showInternal, false);
-
-    // Wire a FixedDock via store.subscribe (mirroring app.ts syncDock) to observe global showInternal propagation
-    const initHud = store.buildLiveHud();
-    const dock = new FixedDock(tui, theme, {
-      onSubmit: () => {},
-      initialState: {
-        slots: initHud.slots,
-        idleBanner: "[pi-harness] · chat-37 · Director Chat",
-        agentCounts: initHud.agentCounts,
-        hudItems: initHud.hudItems,
-        hudSecondaryLine: initHud.hudSecondaryLine,
-        activeGoalsCount: initHud.activeGoalsCount,
-        needYouCount: store.state.inbox.length,
-        showInternal: store.showInternal,
-        busy: false,
-        phaseText: "Ready",
-        rightStatus: "director · opus",
-        queuedCount: 0,
-        hints: [{ key: "Ctrl+G", label: "Work" }],
-      },
-    });
-    const observedShowInternal: boolean[] = [];
-    const syncDock = () => {
-      observedShowInternal.push(store.showInternal);
-      const hud = store.buildLiveHud();
-      dock.update({
-        slots: hud.slots,
-        agentCounts: hud.agentCounts,
-        hudItems: hud.hudItems,
-        hudSecondaryLine: hud.hudSecondaryLine,
-        activeGoalsCount: hud.activeGoalsCount,
-        needYouCount: store.state.inbox.length,
-        showInternal: store.showInternal,
-      });
-    };
-    const unsubStore = store.subscribe(syncDock);
-
-    const renderDock = () => dock.render(120).map(stripTerminalSequences).join("\n");
-    const dockBeforeToggle = renderDock();
-    assert.ok(dockBeforeToggle.includes("1 need you"), "Default dock must show simplified '1 need you' count");
-    assert.equal(dockBeforeToggle.includes("1 esc"), false, "Default dock must not show internal '1 esc' count");
-
-    const deps = { client: mock.client, store, repoRoot: "/repo" };
-    const workNav = new WorkNavigatorScreen(deps);
-    nav.push(workNav);
-    assert.equal(workNav.currentTab, "goals");
-
-    // 1. Default navigator hides Runs, Timers, Worktrees and advertises 1-3 + i show internal
-    const defaultPlain = workNav.render(120, 24, theme).map(stripTerminalSequences).join("\n");
-    maybeWriteEvidence("navigator-default.txt", defaultPlain);
-
-    assert.ok(defaultPlain.includes("1:Inbox"), "Default navigator must show Inbox tab");
-    assert.ok(defaultPlain.includes("2:Goals"), "Default navigator must show Goals tab");
-    assert.ok(defaultPlain.includes("3:Escalations"), "Default navigator must show Escalations tab");
-    assert.equal(defaultPlain.includes("Runs"), false, "Default navigator must hide Runs tab");
-    assert.equal(defaultPlain.includes("Timers"), false, "Default navigator must hide Timers tab");
-    assert.equal(defaultPlain.includes("Worktrees"), false, "Default navigator must hide Worktrees tab");
-    assert.ok(defaultPlain.includes("1-3"), "Default navigator hint must show 1-3");
-    assert.ok(defaultPlain.includes("i show internal"), "Default navigator must show 'i' hint on Goals tab");
-
-    // Pressing "3" selects Escalations; Right wraps to Inbox (skipping Runs/Timers/Worktrees)
-    workNav.handleInput("3", ctx);
-    assert.equal(workNav.currentTab, "escalations");
-    workNav.handleInput("\x1b[C", ctx);
-    assert.equal(workNav.currentTab, "inbox");
-    // Number 4-6 fall through when only 3 tabs are visible
-    workNav.handleInput("4", ctx);
-    assert.equal(workNav.currentTab, "inbox");
-
-    // Return to Goals and press 'i' (proves global toggle outside Inbox propagates via store subscriber to dock)
-    workNav.handleInput("2", ctx);
-    assert.equal(workNav.currentTab, "goals");
-    const subscriberCallsBeforeShow = observedShowInternal.length;
-    workNav.handleInput("i", ctx);
-    assert.equal(store.showInternal, true);
-    await waitFor(
-      () => observedShowInternal.length > subscriberCallsBeforeShow,
-      1000,
-      "store subscriber notified on 'i' showInternal toggle",
-    );
-    assert.equal(
-      observedShowInternal[observedShowInternal.length - 1],
-      true,
-      "store subscriber must observe store.showInternal === true after 'i' toggle",
-    );
-    const dockAfterShow = renderDock();
-    assert.ok(dockAfterShow.includes("1 esc"), "Dock counts row must reflect showInternal full breakdown ('1 esc') after 'i'");
-    assert.equal(dockAfterShow.includes("1 need you"), false, "Dock counts row must leave simplified '1 need you' mode when showInternal is true");
-
-    const internalPlain = workNav.render(120, 24, theme).map(stripTerminalSequences).join("\n");
-    maybeWriteEvidence("navigator-showInternal.txt", internalPlain);
-
-    assert.ok(internalPlain.includes("3:Runs"), "showInternal navigator must show Runs tab");
-    assert.ok(internalPlain.includes("5:Timers"), "showInternal navigator must show Timers tab");
-    assert.ok(internalPlain.includes("6:Worktrees"), "showInternal navigator must show Worktrees tab");
-    assert.ok(internalPlain.includes("1-6"), "showInternal navigator hint must show 1-6");
-    assert.ok(internalPlain.includes("i hide internal"), "showInternal navigator must show 'i hide internal'");
-
-    // "6" selects Worktrees; pressing 'i' again falls back to Goals, hides internal tabs, and restores default dock counts
-    workNav.handleInput("6", ctx);
-    assert.equal(workNav.currentTab, "worktrees");
-    const subscriberCallsBeforeHide = observedShowInternal.length;
-    workNav.handleInput("i", ctx);
-    assert.equal(store.showInternal, false);
-    assert.equal(workNav.currentTab, "goals");
-    await waitFor(
-      () => observedShowInternal.length > subscriberCallsBeforeHide,
-      1000,
-      "store subscriber notified on 'i' hide internal toggle",
-    );
-    assert.equal(
-      observedShowInternal[observedShowInternal.length - 1],
-      false,
-      "store subscriber must observe store.showInternal === false after hiding internal",
-    );
-    const dockAfterHide = renderDock();
-    assert.ok(dockAfterHide.includes("1 need you"), "Dock counts row must return to simplified '1 need you' after hiding internal");
-    assert.equal(dockAfterHide.includes("1 esc"), false, "Dock counts row must hide internal '1 esc' after hiding internal");
-
-    const afterHidePlain = workNav.render(120, 24, theme).map(stripTerminalSequences).join("\n");
-    assert.equal(afterHidePlain.includes("Worktrees"), false, "Worktrees tab must disappear after hiding internal");
-    assert.equal(afterHidePlain.includes("Runs"), false, "Runs tab must disappear after hiding internal");
-    assert.equal(afterHidePlain.includes("Timers"), false, "Timers tab must disappear after hiding internal");
-
-    unsubStore();
-    store.dispose();
-  });
-
-  it("keeps an explicitly opened internal tab pinned while other internal tabs stay hidden", async () => {
-    const theme = createTheme({ color: false, ascii: false });
-    const { terminal } = makeFakeTerminal(120, 24);
-    const tui = new ModalScreen(terminal);
-    const nav = new Navigator(tui, terminal, theme);
-
-    const snap = makePopulatedSnapshot();
-    const mock = makeMockClient(async (op) => {
-      if (op === "work.snapshot") return snap;
-      return {};
-    });
-    const store = new WorkStore(mock.client, { chatSessionId: "chat-37", repoRoot: "/repo" });
-    await store.refresh();
-    assert.equal(store.showInternal, false);
-
-    const pinnedNav = new WorkNavigatorScreen({ client: mock.client, store, repoRoot: "/repo" }, "runs");
-    nav.push(pinnedNav);
-    assert.equal(pinnedNav.currentTab, "runs");
-
-    const pinnedPlain = pinnedNav.render(120, 24, theme).map(stripTerminalSequences).join("\n");
-    assert.ok(pinnedPlain.includes("Runs"), "Pinned Runs tab must remain visible");
-    assert.equal(pinnedPlain.includes("Timers"), false, "Non-pinned Timers tab must remain hidden");
-    assert.equal(pinnedPlain.includes("Worktrees"), false, "Non-pinned Worktrees tab must remain hidden");
-    assert.ok(pinnedPlain.includes("1-4"), "Hint must reflect 4 visible tabs (3 default + 1 pinned)");
-
-    store.dispose();
-  });
-
-  it("renders simplified dock counts by default and full breakdown with showInternal", () => {
-    const theme = createTheme({ color: false, ascii: false });
-    const { terminal } = makeFakeTerminal(120, 30);
-    const tui = new ModalScreen(terminal);
-
-    const dock = new FixedDock(tui, theme, {
-      onSubmit: () => {},
-      initialState: {
-        slots: [],
-        idleBanner: "[pi-harness] · chat-37 · Director Chat",
-        agentCounts: {
-          active: 0,
-          waiting: 0,
-          blocked: 0,
-          paused: 0,
-          queued: 0,
-          failed: 0,
-          openEscalations: 0,
-          activeMerges: 0,
-        },
-        activeGoalsCount: 0,
-        needYouCount: 0,
-        showInternal: false,
-        busy: false,
-        phaseText: "Ready",
-        rightStatus: "director · opus",
-        queuedCount: 0,
-        hints: [{ key: "Ctrl+G", label: "Work" }],
-      },
-    });
-
-    // 1. Default idle state
-    const idleLines = dock.render(100);
-    const expectedHeight = idleLines.length;
-    const idlePlain = idleLines.map(stripTerminalSequences).join("\n");
-    assert.ok(idlePlain.includes("Agents: 0 active"), "Default idle dock must keep 'Agents: 0 active'");
-    assert.ok(idlePlain.includes("Ctrl+G Work"), "Default idle dock right hint must point to Ctrl+G Work");
-    assert.equal(idlePlain.includes("Ctrl+T Runs"), false, "Default idle dock must not point to hidden Ctrl+T Runs");
-
-    // 2. Default busy state: active + need you + goals, no internal counts
-    dock.update({
-      agentCounts: {
-        active: 3,
-        waiting: 1,
-        blocked: 2,
-        paused: 2,
-        queued: 2,
-        failed: 1,
-        openEscalations: 1,
-        activeMerges: 2,
-      },
-      needYouCount: 1,
-      activeGoalsCount: 2,
-      showInternal: false,
-      busy: true,
-      phaseText: "Coordinating goals…",
-    });
-
-    for (const w of [60, 100, 140]) {
-      const lines = dock.render(w);
-      assert.equal(lines.length, expectedHeight, `Default dock height must stay constant at width ${w}`);
-      for (const l of lines) {
-        assert.ok(visibleWidth(l) <= w, `Default dock overflowed width ${w}: got ${visibleWidth(l)}`);
-      }
-    }
-
-    const defaultDockPlain = dock.render(120).map(stripTerminalSequences).join("\n");
-    maybeWriteEvidence("dock-default.txt", defaultDockPlain);
-
-    assert.ok(defaultDockPlain.includes("3 active"), "Default dock must show active count");
-    assert.ok(defaultDockPlain.includes("1 need you"), "Default dock must show need-you count");
-    assert.ok(defaultDockPlain.includes("2 goals"), "Default dock must show goal count");
-    assert.equal(defaultDockPlain.includes("blocked"), false, "Default dock must hide blocked count");
-    assert.equal(defaultDockPlain.includes("queued"), false, "Default dock must hide queued count");
-    assert.equal(defaultDockPlain.includes("failed"), false, "Default dock must hide failed count");
-    assert.equal(defaultDockPlain.includes("merges"), false, "Default dock must hide merges count");
-
-    // 3. Default state with 0 active and >0 needYou keeps "0 active · N need you"
-    dock.update({
-      agentCounts: {
-        active: 0,
-        waiting: 0,
-        blocked: 2,
-        paused: 0,
-        queued: 1,
-        failed: 1,
-        openEscalations: 1,
-        activeMerges: 0,
-      },
-      needYouCount: 2,
-      activeGoalsCount: 1,
-      showInternal: false,
-    });
-    const needOnlyPlain = dock.render(100).map(stripTerminalSequences).join("\n");
-    assert.ok(needOnlyPlain.includes("0 active"), "Default dock keeps '0 active' when only need-you is non-zero");
-    assert.ok(needOnlyPlain.includes("2 need you"), "Default dock shows need-you count when active is 0");
-    assert.ok(needOnlyPlain.includes("1 goal"), "Default dock shows singular goal count");
-    assert.equal(needOnlyPlain.includes("blocked"), false, "Default dock still hides internal counts");
-
-    // 4. showInternal true: full agent breakdown restored
-    dock.update({
-      agentCounts: {
-        active: 3,
-        waiting: 1,
-        blocked: 2,
-        paused: 2,
-        queued: 2,
-        failed: 1,
-        openEscalations: 1,
-        activeMerges: 2,
-      },
-      needYouCount: 1,
-      activeGoalsCount: 2,
-      showInternal: true,
-    });
-
-    const internalDockPlain = dock.render(120).map(stripTerminalSequences).join("\n");
-    maybeWriteEvidence("dock-showInternal.txt", internalDockPlain);
-
-    assert.ok(internalDockPlain.includes("3 active"), "showInternal dock must show active count");
-    assert.ok(internalDockPlain.includes("2 blocked"), "showInternal dock must show blocked count");
-    assert.ok(internalDockPlain.includes("2 queued"), "showInternal dock must show queued count");
-    assert.ok(internalDockPlain.includes("1 failed"), "showInternal dock must show failed count");
-    assert.ok(internalDockPlain.includes("2 merges"), "showInternal dock must show merges count");
-  });
-
   it("collapses per-turn chat tools receipt to a count and preserves full tool details in Ctrl+X inspector", async () => {
     const { terminal, writes, text, since, sendInput, typeText } = makeFakeTerminal(120, 30);
     const session = makeChatSession("chat-37-tools");
@@ -691,7 +386,7 @@ describe("goal-37: default views show goals, not machinery", () => {
 
     sendInput("\x1b"); // Close inspector
 
-    // Also verify a turn with a failed tool renders "N call · K failed" and /internal updates dock counts
+    // Also verify a turn with a failed tool renders "N call · K failed" and /internal toggles internal chat lines
     const writesBeforeFailTurn = writes.length;
     typeText("Run failing tool");
     sendInput("\r");
@@ -741,14 +436,14 @@ describe("goal-37: default views show goals, not machinery", () => {
       "failed tool receipt rendered",
     );
 
-    // Toggle /internal and confirm dock refreshes to show full internal breakdown (1 esc from snap)
+    // Toggle /internal and confirm it reports that internal chat lines are now shown
     const writesBeforeInternal = writes.length;
     typeText("/internal");
     sendInput("\r");
     await waitFor(
-      () => since(writesBeforeInternal).includes("1 esc"),
+      () => since(writesBeforeInternal).includes("Internal lines: shown"),
       3000,
-      "/internal refreshes dock to show internal agent breakdown",
+      "/internal shows internal chat lines",
     );
 
     sendInput("\x1d"); // Detach cleanly

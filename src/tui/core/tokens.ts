@@ -306,7 +306,7 @@ export function createTheme(opts?: { color?: boolean; ascii?: boolean }): Theme 
   };
 }
 
-/** Single canonical status -> tone mapping used across Dock, Work Navigator, Inspectors, and Transcript. */
+/** Single canonical status -> tone mapping used across Dock, the work tree, Inspectors, and Transcript. */
 export function statusTone(status: string): Tone {
   switch (status.toLowerCase()) {
     case "achieved":

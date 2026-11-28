@@ -13,7 +13,7 @@ import type { DaemonClient } from "../daemon/remote.js";
 import type { GoalActiveVerification } from "../director/goal-get.js";
 import type { GoalRecord, GoalReviewVerdict, GoalRevisionRecord } from "../goals/engine.js";
 import type { DaemonEventFrame, InboxItem, SnapshotWorktreeEntry } from "../protocol/daemon-rpc.js";
-import type { AgentStateCounts, AttentionSlot, LiveHudItem, TuiEntityRef as EntityRef } from "./core/index.js";
+import type { TuiEntityRef as EntityRef } from "./core/index.js";
 
 export interface AttachableSession {
   id: string;
@@ -84,7 +84,7 @@ const EMPTY_SNAPSHOT: WorkSnapshot = {
   internalAttention: [],
 };
 
-const WORK_EVENT_PREFIXES = ["goal.", "escalation.", "merge.", "timer.", "quota.", "worktree."];
+const WORK_EVENT_PREFIXES = ["goal.", "escalation.", "quota."];
 const WORK_EVENT_EXACT = new Set([
   "run.status",
   "run.created",
@@ -94,40 +94,97 @@ const WORK_EVENT_EXACT = new Set([
   "agent.timer_sleep",
   "agent.rollover",
 ]);
-const ACTIVE_GOAL_STATUSES = new Set<GoalRecord["status"]>([
-  "executing",
-  "verifying",
-  "reviewing",
-  "awaiting_human",
-  "paused",
-]);
 
-const TASK_ACTIVITY_PRIORITY: Record<TaskRecord["status"], number> = {
-  running: 0,
-  merging: 1,
-  draining: 2,
-  waiting_children: 3,
-  blocked: 4,
-  returned_for_rescope: 5,
-  paused_quota: 6,
-  ready: 7,
-  pending: 8,
-  failed: 9,
-  completed: 10,
-  cancelled: 11,
+/** How a goal, run, or agent shows in the work tree: `active` and `blocked` rows are shown by default. */
+export type WorkState = "blocked" | "active" | "queued" | "done";
+
+export interface WorkTreeNode {
+  kind: "goal" | "run" | "task";
+  id: string;
+  title: string;
+  status: string;
+  state: WorkState;
+  /** `T1/execute · model` for agents; empty for goals and runs. */
+  agent: string;
+  /** What is happening right now, or what the item is waiting on. */
+  activity: string;
+  updatedAt: number;
+  ref: EntityRef;
+  children: WorkTreeNode[];
+}
+
+export interface WorkSummary {
+  active: number;
+  blocked: number;
+  /** The first blocked item, so the dock can name it. */
+  firstBlocked: WorkTreeNode | null;
+}
+
+const GOAL_STATE: Record<GoalRecord["status"], WorkState> = {
+  draft: "queued",
+  executing: "active",
+  verifying: "active",
+  reviewing: "active",
+  awaiting_human: "blocked",
+  paused: "blocked",
+  achieved: "done",
+  cancelled: "done",
 };
 
-export interface LiveHudSummary {
-  slots: AttentionSlot[];
-  agentCounts: AgentStateCounts;
-  hudItems: LiveHudItem[];
-  hudSecondaryLine: string | null;
-  activeGoalsCount: number;
+const TASK_STATE: Record<TaskRecord["status"], WorkState> = {
+  running: "active",
+  merging: "active",
+  draining: "active",
+  waiting_children: "active",
+  blocked: "blocked",
+  returned_for_rescope: "blocked",
+  paused_quota: "blocked",
+  pending: "queued",
+  ready: "queued",
+  completed: "done",
+  failed: "done",
+  cancelled: "done",
+};
+
+const RUN_STATE: Record<RunRecord["status"], WorkState> = {
+  active: "active",
+  paused_quota: "blocked",
+  completed: "done",
+  failed: "done",
+  stopped: "done",
+};
+
+const STATE_ORDER: Record<WorkState, number> = { blocked: 0, active: 1, queued: 2, done: 3 };
+
+function isShownByDefault(state: WorkState): boolean {
+  return state === "active" || state === "blocked";
+}
+
+function sortNodes(nodes: WorkTreeNode[]): WorkTreeNode[] {
+  return nodes.sort((a, b) => STATE_ORDER[a.state] - STATE_ORDER[b.state] || b.updatedAt - a.updatedAt);
+}
+
+/** An open escalation that waits on a person; the Director relays it, the tree only marks the item blocked. */
+function openHumanEscalation(run: SnapshotRunEntry | undefined): EscalationRecord | undefined {
+  return run?.escalations.find((e) => e.status !== "resolved" && (e.blocking || e.severity === "P0"));
+}
+
+/**
+ * Keeps a node when it, or anything under it, passes the filter. With `all` unset, only active and
+ * blocked items pass, so finished, queued, and failed work drops out of the tree.
+ */
+function filterTree(nodes: WorkTreeNode[], all: boolean): WorkTreeNode[] {
+  const out: WorkTreeNode[] = [];
+  for (const node of nodes) {
+    const children = filterTree(node.children, all);
+    if (all || isShownByDefault(node.state) || children.length > 0) out.push({ ...node, children });
+  }
+  return out;
 }
 
 /**
  * Normalized client-side state store fed by `work.snapshot` and debounced live daemon events.
- * Shared by Dock, Work Navigator, Inspectors, and Go-To-Anything palette.
+ * Shared by the dock, the work tree, and inspectors.
  */
 export class WorkStore {
   private snapshot: WorkSnapshot = EMPTY_SNAPSHOT;
@@ -138,7 +195,6 @@ export class WorkStore {
   private disposed = false;
   private detachEvent: (() => void) | null = null;
   lastError: string | null = null;
-  showInternal = false;
 
   constructor(
     private readonly client: DaemonClient,
@@ -250,500 +306,157 @@ export class WorkStore {
     return this.snapshot.runs.find((r) => r.run.id === runId);
   }
 
-  getEscalation(id: string): EscalationRecord | undefined {
-    return this.snapshot.escalations.find((e) => e.id === id);
-  }
-
-  getTimer(id: string): TimerRecord | undefined {
-    return this.snapshot.timers.find((t) => t.id === id);
-  }
-
-  getWorktree(id: string): SnapshotWorktreeEntry | undefined {
-    return this.snapshot.worktrees.find((w) => w.id === id || w.path === id);
-  }
-
-  getMerge(id: string): MergeQueueRecord | undefined {
-    return this.snapshot.merges.find((m) => m.id === id);
-  }
-
-  get openEscalationsCount(): number {
-    return this.snapshot.escalations.filter((e) => e.status === "open").length;
-  }
-
-  get unresolvedEscalationsCount(): number {
-    return this.snapshot.escalations.filter((e) => e.status === "open" || e.status === "acked").length;
-  }
-
-  get pendingTimersCount(): number {
-    return this.snapshot.timers.filter((t) => t.status === "pending").length;
-  }
-
   /**
-   * Computes exact live agent counts across states plus open escalations and active merges.
-   * Excludes synthetic `director` placeholder tasks; ignores stale queued/blocked/failed/paused
-   * tasks belonging to historical completed/stopped/failed runs not tied to an active goal.
+   * Builds the goal → run → agent tree. Agents nest strictly by `parentId`, whatever their tier or kind,
+   * so a run with a lone Tier 1 agent and a Tier 1 agent with Tier 3 children both render as they are.
+   * Synthetic `director` placeholder tasks are skipped and their children move up a level.
+   * With `all` unset, only active and blocked items (and the parents that lead to them) are kept.
    */
-  getAgentCounts(): AgentStateCounts {
-    const activeGoalIds = new Set(
-      this.snapshot.goals
-        .filter((e) => ACTIVE_GOAL_STATUSES.has(e.goal.status))
-        .map((e) => e.goal.id),
-    );
+  buildWorkTree(opts: { all?: boolean } = {}): WorkTreeNode[] {
+    const linkedRunIds = new Set<string>();
+    const roots: WorkTreeNode[] = [];
 
+    for (const { goal } of this.snapshot.goals) {
+      const run = goal.linkedRunId ? this.getRunEntry(goal.linkedRunId) : undefined;
+      if (goal.linkedRunId) linkedRunIds.add(goal.linkedRunId);
+      const humanEsc = openHumanEscalation(run);
+      const quotaPaused = run?.run.status === "paused_quota" || Boolean(run?.quotaPause);
+      const ownState = GOAL_STATE[goal.status] ?? "queued";
+      const state: WorkState = ownState === "done" ? "done" : humanEsc || quotaPaused ? "blocked" : ownState;
+      roots.push({
+        kind: "goal",
+        id: goal.id,
+        title: goal.title,
+        status: humanEsc && ownState !== "blocked" ? "blocked" : quotaPaused && ownState !== "blocked" ? "paused_quota" : goal.status,
+        state,
+        agent: "",
+        activity: this.describeGoalActivity(goal, run, humanEsc),
+        updatedAt: Math.max(goal.updatedAt, run?.run.updatedAt ?? 0),
+        ref: { kind: "goal", id: goal.id, runId: goal.linkedRunId ?? undefined, label: `${goal.id} ${goal.title}` },
+        children: run ? this.buildTaskNodes(run) : [],
+      });
+    }
+
+    for (const run of this.snapshot.runs) {
+      if (linkedRunIds.has(run.run.id) || (run.goalId && this.getGoalEntry(run.goalId))) continue;
+      const isDirectorContainer = run.run.id.startsWith("director-tasks-");
+      const quotaPaused = Boolean(run.quotaPause);
+      roots.push({
+        kind: "run",
+        id: run.run.id,
+        title: isDirectorContainer ? "Director subagents" : (run.run.goal.split("\n")[0] ?? run.run.id).trim(),
+        status: quotaPaused && run.run.status === "active" ? "paused_quota" : run.run.status,
+        state: quotaPaused && run.run.status === "active" ? "blocked" : RUN_STATE[run.run.status] ?? "done",
+        agent: "",
+        activity: run.quotaPause ? `quota paused: ${run.quotaPause.reason}` : "",
+        updatedAt: run.run.updatedAt,
+        ref: { kind: "run", id: run.run.id, label: run.run.id },
+        children: this.buildTaskNodes(run),
+      });
+    }
+
+    const tree = opts.all ? roots : filterTree(roots, false);
+    const sortDeep = (nodes: WorkTreeNode[]): WorkTreeNode[] => {
+      for (const n of nodes) sortDeep(n.children);
+      return sortNodes(nodes);
+    };
+    return sortDeep(tree);
+  }
+
+  /** Counts active agents and blocked items in the default (active + blocked) tree. */
+  workSummary(): WorkSummary {
     let active = 0;
-    let waiting = 0;
     let blocked = 0;
-    let paused = 0;
-    let queued = 0;
-    let failed = 0;
-
-    for (const entry of this.snapshot.runs) {
-      const isLiveRun =
-        entry.run.status === "active" ||
-        entry.run.status === "paused_quota" ||
-        (entry.goalId != null && activeGoalIds.has(entry.goalId));
-      let hasPausedQuotaTask = false;
-
-      for (const t of entry.tasks) {
-        if (t.profileId === "director") continue;
-        if (t.status === "running" || t.status === "draining" || t.status === "merging") {
+    let firstBlocked: WorkTreeNode | null = null;
+    const walk = (nodes: WorkTreeNode[]) => {
+      for (const n of nodes) {
+        if (n.state === "blocked") {
+          blocked++;
+          firstBlocked ??= n;
+        } else if (n.state === "active" && n.kind === "task") {
           active++;
+        }
+        walk(n.children);
+      }
+    };
+    walk(this.buildWorkTree());
+    return { active, blocked, firstBlocked };
+  }
+
+  /** True when any goal, run, or agent is in flight (drives gentle live polling of the snapshot). */
+  hasLiveWork(): boolean {
+    const walk = (nodes: WorkTreeNode[]): boolean =>
+      nodes.some((n) => n.state === "active" || n.state === "blocked" || walk(n.children));
+    return walk(this.buildWorkTree());
+  }
+
+  private buildTaskNodes(run: SnapshotRunEntry): WorkTreeNode[] {
+    const activityById = new Map((run.activity?.tasks ?? []).map((t) => [t.id, t]));
+    const ids = new Set(run.tasks.map((t) => t.id));
+    const childrenOf = new Map<string | null, TaskRecord[]>();
+    for (const t of run.tasks) {
+      const parent = t.parentId && ids.has(t.parentId) ? t.parentId : null;
+      const list = childrenOf.get(parent) ?? [];
+      list.push(t);
+      childrenOf.set(parent, list);
+    }
+    const build = (parentId: string | null): WorkTreeNode[] => {
+      const out: WorkTreeNode[] = [];
+      for (const t of childrenOf.get(parentId) ?? []) {
+        if (t.profileId === "director") {
+          out.push(...build(t.id));
           continue;
         }
-        if (!isLiveRun) continue;
-        switch (t.status) {
-          case "waiting_children":
-            waiting++;
-            break;
-          case "blocked":
-          case "returned_for_rescope":
-            blocked++;
-            break;
-          case "paused_quota":
-            paused++;
-            hasPausedQuotaTask = true;
-            break;
-          case "pending":
-          case "ready":
-            queued++;
-            break;
-          case "failed":
-            failed++;
-            break;
-          default:
-            break;
-        }
-      }
-
-      if (entry.run.status === "paused_quota" && !hasPausedQuotaTask) {
-        paused++;
-      }
-    }
-
-    const liveRunIds = new Set(
-      this.snapshot.runs
-        .filter((r) => r.run.status === "active" || r.run.status === "paused_quota")
-        .map((r) => r.run.id),
-    );
-    // Count only the escalations the server surfaced in the human inbox.
-    const openEscalations = this.snapshot.inbox.filter((i) => i.kind === "escalation").length;
-    let activeMerges = 0;
-    let bouncedMerges = 0;
-    for (const m of this.snapshot.merges) {
-      if (m.status === "merged") continue;
-      if (!liveRunIds.has(m.runId)) continue;
-      activeMerges++;
-      if (m.status === "conflict" || m.status === "ci_failed") bouncedMerges++;
-    }
-
-    return {
-      active,
-      waiting,
-      blocked,
-      paused,
-      queued,
-      failed,
-      openEscalations,
-      activeMerges,
-      bouncedMerges,
-    };
-  }
-
-  /** True when any goal, run, or agent is currently in flight (used for gentle live HUD telemetry polling). */
-  hasLiveWork(): boolean {
-    if (this.snapshot.goals.some((e) => ACTIVE_GOAL_STATUSES.has(e.goal.status))) return true;
-    if (this.snapshot.runs.some((r) => r.run.status === "active" || r.run.status === "paused_quota")) return true;
-    const c = this.getAgentCounts();
-    return c.active + c.waiting + c.blocked + c.paused + c.queued + c.openEscalations + c.activeMerges > 0;
-  }
-
-  private getPrioritizedRunTasks(run: SnapshotRunEntry): Array<{
-    id: string;
-    tier: number;
-    kind: TaskRecord["kind"];
-    title: string;
-    status: TaskRecord["status"];
-    currentAction: string | null;
-  }> {
-    const fromActivity: Array<{
-      id: string;
-      tier: number;
-      kind: TaskRecord["kind"];
-      title: string;
-      status: TaskRecord["status"];
-      currentAction: string | null;
-    }> = run.activity?.tasks
-      ? run.activity.tasks.map((t: TaskActivitySnapshot) => ({
+        const live = activityById.get(t.id);
+        out.push({
+          kind: "task",
           id: t.id,
-          tier: t.tier,
-          kind: t.kind,
           title: t.title,
           status: t.status,
-          currentAction: t.currentAction,
-        }))
-      : run.tasks
-          .filter((t) => t.profileId !== "director")
-          .map((t) => ({
-            id: t.id,
-            tier: t.tier,
-            kind: t.kind,
-            title: t.title,
-            status: t.status,
-            currentAction: null,
-          }));
-
-    return fromActivity
-      .filter((t) => t.status !== "completed" && t.status !== "cancelled")
-      .sort((a, b) => (TASK_ACTIVITY_PRIORITY[a.status] ?? 99) - (TASK_ACTIVITY_PRIORITY[b.status] ?? 99));
+          state: TASK_STATE[t.status] ?? "queued",
+          agent: `T${t.tier}/${t.kind}${t.model ? ` · ${t.model}` : ""}`,
+          activity: describeTaskActivity(t, live),
+          updatedAt: t.updatedAt,
+          ref: { kind: "task", id: t.id, runId: t.runId, label: `${t.id} ${t.title}` },
+          children: build(t.id),
+        });
+      }
+      return out;
+    };
+    return build(null);
   }
 
-  private formatTaskBrief(t: {
-    tier: number;
-    kind: TaskRecord["kind"];
-    title: string;
-    status: TaskRecord["status"];
-    currentAction: string | null;
-  }): string {
-    const role = `T${t.tier}/${t.kind}`;
-    const base = `${role} ${t.title}`;
-    if (t.currentAction) return `${base} — ${t.currentAction}`;
-    if (t.status === "waiting_children") return `${base} — waiting on children`;
-    if (t.status === "blocked") return `${base} — blocked`;
-    if (t.status === "returned_for_rescope") return `${base} — rescope needed`;
-    if (t.status === "paused_quota") return `${base} — paused (quota)`;
-    if (t.status === "ready" || t.status === "pending") return `${base} — queued`;
-    return base;
-  }
-
-  private describeRunActivity(run?: SnapshotRunEntry): string {
-    if (!run) return "";
-    const openEsc = run.escalations.find((e) => e.status === "open");
-    if (openEsc) return `Esc ${openEsc.severity}: ${openEsc.title}`;
-    if (run.quotaPause) return `quota paused: ${run.quotaPause.reason}`;
-    const liveTasks = this.getPrioritizedRunTasks(run);
-    if (liveTasks.length > 0) {
-      return this.formatTaskBrief(liveTasks[0]!);
-    }
-    const phase = run.activity?.phase;
-    if (phase && phase !== "idle" && phase !== "completed" && phase !== "stopped") {
-      return phase;
-    }
-    return "";
-  }
-
-  private describeGoalActivity(goal: GoalRecord, run?: SnapshotRunEntry): string {
-    if (goal.status === "awaiting_human") {
-      return goal.lastReviewSummary || "awaiting human input";
-    }
-    const openEsc = run?.escalations.find((e) => e.status === "open");
-    if (openEsc) return `Esc ${openEsc.severity}: ${openEsc.title}`;
+  private describeGoalActivity(goal: GoalRecord, run: SnapshotRunEntry | undefined, humanEsc: EscalationRecord | undefined): string {
+    if (goal.status === "awaiting_human") return `needs your input: ${goal.lastReviewSummary || "reply in the Director chat"}`;
+    if (goal.status === "paused") return "paused";
+    if (humanEsc) return `needs your input: ${humanEsc.title}`;
     if (run?.quotaPause) return `quota paused: ${run.quotaPause.reason}`;
-
     const lp = goal.liveProgress;
     const phase = lp?.phase?.trim() || "";
     const summary = lp?.summary?.trim() || "";
-    if (phase && summary) {
-      return summary.toLowerCase().startsWith(phase.toLowerCase()) ? summary : `${phase}: ${summary}`;
-    }
-    if (summary) return summary;
-    if (phase) {
-      const topTask = run ? this.getPrioritizedRunTasks(run)[0] : undefined;
-      return topTask ? `${phase} · ${this.formatTaskBrief(topTask)}` : phase;
-    }
-
-    const runAct = this.describeRunActivity(run);
-    if (runAct) return runAct;
-
-    if (goal.status === "reviewing" && goal.reviewCycle > 0) {
-      return `review cycle ${goal.reviewCycle}`;
-    }
-    return goal.lastReviewSummary || goal.status;
+    if (phase && summary) return summary.toLowerCase().startsWith(phase.toLowerCase()) ? summary : `${phase}: ${summary}`;
+    if (summary || phase) return summary || phase;
+    if (goal.status === "reviewing" && goal.reviewCycle > 0) return `review cycle ${goal.reviewCycle}`;
+    return goal.lastReviewSummary || "";
   }
+}
 
-  /**
-   * Builds numbered attention slots for quick-jump (`Alt+1`..`Alt+5`):
-   *  - Open P0/P1 escalations and `awaiting_human` goals appear FIRST so blockers are always 1 keypress away.
-   *  - Active/verifying/reviewing/paused goals follow, up to 5 compact slots.
-   */
-  buildAttentionSlots(maxSlots = 5): AttentionSlot[] {
-    const slots: AttentionSlot[] = [];
-    const seenKeys = new Set<string>();
-
-    const pushSlot = (item: Omit<AttentionSlot, "slot">) => {
-      if (slots.length >= maxSlots) return;
-      const key = `${item.ref.kind}:${item.ref.id}`;
-      if (seenKeys.has(key)) return;
-      seenKeys.add(key);
-      slots.push({ slot: slots.length + 1, ...item });
-    };
-
-    // 1. Open escalations & awaiting_human goals from severity-sorted inbox
-    for (const item of this.snapshot.inbox) {
-      if (item.kind === "escalation" || item.kind === "goal_awaiting_human" || item.kind === "quota_paused") {
-        const ref: EntityRef = {
-          kind: item.ref.kind,
-          id: item.ref.id,
-          runId: item.ref.runId,
-          goalId: item.ref.goalId,
-          label: item.ref.label ?? item.title,
-        };
-        pushSlot({
-          label: item.ref.id,
-          status: item.severity === "P0" ? "p0" : item.kind === "goal_awaiting_human" ? "awaiting_human" : "p1",
-          badge: item.kind === "escalation" ? item.severity : item.kind === "goal_awaiting_human" ? "input" : "quota",
-          ref,
-        });
-      }
-    }
-
-    // 2. Active goals (executing / verifying / reviewing / awaiting_human / paused)
-    for (const entry of this.snapshot.goals) {
-      const g = entry.goal;
-      if (!ACTIVE_GOAL_STATUSES.has(g.status)) continue;
-      const run = g.linkedRunId ? this.getRunEntry(g.linkedRunId) : undefined;
-      const openEsc = run ? run.escalations.filter((e) => e.status === "open").length : 0;
-      const runningTasks = run
-        ? run.tasks.filter(
-            (t) => t.profileId !== "director" && (t.status === "running" || t.status === "draining" || t.status === "merging"),
-          ).length
-        : 0;
-      const badge = openEsc > 0 ? `!${openEsc}` : runningTasks > 0 ? `${runningTasks}w` : g.status;
-      pushSlot({
-        label: `${g.id} ${g.title.slice(0, 18)}`,
-        status: openEsc > 0 ? "blocked" : g.status,
-        badge,
-        ref: { kind: "goal", id: g.id, runId: g.linkedRunId ?? undefined, label: `${g.id} ${g.title}` },
-      });
-    }
-
-    // 3. Standalone active runs not bound to a goal
-    for (const r of this.snapshot.runs) {
-      if (r.goalId) continue;
-      if (r.run.id.startsWith("director-tasks-")) continue;
-      if (r.run.status !== "active" && r.run.status !== "paused_quota") continue;
-      const running = r.tasks.filter(
-        (t) => t.profileId !== "director" && (t.status === "running" || t.status === "draining" || t.status === "merging"),
-      ).length;
-      pushSlot({
-        label: r.run.id,
-        status: r.run.status,
-        badge: running > 0 ? `${running}w` : r.run.status,
-        ref: { kind: "run", id: r.run.id, label: r.run.id },
-      });
-    }
-
-    return slots;
-  }
-
-  /**
-   * Builds the complete live HUD model for `FixedDock`:
-   *  - Exact `slots` (`Alt+1`..`Alt+5`),
-   *  - Exact `agentCounts` across all task states + escalations/merges,
-   *  - Ordered `hudItems` with live "what is happening right now" descriptions,
-   *  - Optional `hudSecondaryLine` showing live worker/subagent activity when a single goal/run is active.
-   */
-  buildLiveHud(): LiveHudSummary {
-    const slots = this.buildAttentionSlots(5);
-    const slotByKey = new Map(slots.map((s) => [`${s.ref.kind}:${s.ref.id}`, s.slot]));
-    const agentCounts = this.getAgentCounts();
-    const activeGoalsCount = this.snapshot.goals.filter((e) => ACTIVE_GOAL_STATUSES.has(e.goal.status)).length;
-
-    const hudItems: LiveHudItem[] = [];
-    const seenKeys = new Set<string>();
-    const pushItem = (item: Omit<LiveHudItem, "slot">) => {
-      const key = `${item.ref.kind}:${item.ref.id}`;
-      if (seenKeys.has(key)) return;
-      seenKeys.add(key);
-      hudItems.push({ ...item, slot: slotByKey.get(key) });
-    };
-
-    const quotaSurfacedGoalIds = new Set<string>();
-
-    // 1. Urgent inbox items first (matches Alt+1..5 slot ordering)
-    for (const item of this.snapshot.inbox) {
-      if (item.kind === "escalation") {
-        const esc = this.getEscalation(item.ref.id);
-        const ref: EntityRef = {
-          kind: item.ref.kind,
-          id: item.ref.id,
-          runId: item.ref.runId,
-          goalId: item.ref.goalId,
-          label: item.ref.label ?? item.title,
-        };
-        pushItem({
-          kind: "escalation",
-          id: item.ref.id,
-          status: item.severity === "P0" ? "p0" : "p1",
-          title: esc?.title ?? item.title,
-          badge: item.severity,
-          activity: item.detail,
-          ref,
-        });
-      } else if (item.kind === "goal_awaiting_human") {
-        const goalEntry = this.getGoalEntry(item.goalId ?? item.ref.id);
-        const g = goalEntry?.goal;
-        const ref: EntityRef = {
-          kind: "goal",
-          id: g?.id ?? item.ref.id,
-          runId: g?.linkedRunId ?? item.ref.runId,
-          goalId: g?.id ?? item.goalId ?? undefined,
-          label: item.ref.label ?? item.title,
-        };
-        pushItem({
-          kind: "goal",
-          id: g?.id ?? item.ref.id,
-          status: "awaiting_human",
-          title: g?.title ?? item.title,
-          badge: "input",
-          activity: g?.lastReviewSummary ?? item.detail,
-          ref,
-        });
-      } else if (item.kind === "quota_paused") {
-        const linkedGoal = item.goalId ? this.getGoalEntry(item.goalId)?.goal : undefined;
-        if (item.goalId) quotaSurfacedGoalIds.add(item.goalId);
-        const ref: EntityRef = {
-          kind: item.ref.kind,
-          id: item.ref.id,
-          runId: item.ref.runId,
-          goalId: item.ref.goalId,
-          label: item.ref.label ?? item.title,
-        };
-        pushItem({
-          kind: "run",
-          id: item.ref.id,
-          status: "paused_quota",
-          title: linkedGoal ? linkedGoal.title : "Quota paused",
-          badge: "quota",
-          activity: item.detail,
-          ref,
-        });
-      }
-    }
-
-    // 2. Active/in-flight goals with live progress / active task telemetry
-    //    Put goals not already represented by a quota_paused inbox row first so both HUD rows show distinct work.
-    const activeGoalEntries = this.snapshot.goals
-      .filter((e) => ACTIVE_GOAL_STATUSES.has(e.goal.status))
-      .sort((a, b) => Number(quotaSurfacedGoalIds.has(a.goal.id)) - Number(quotaSurfacedGoalIds.has(b.goal.id)));
-    for (const entry of activeGoalEntries) {
-      const g = entry.goal;
-      const run = g.linkedRunId ? this.getRunEntry(g.linkedRunId) : undefined;
-      const openEsc = run ? run.escalations.filter((e) => e.status === "open").length : 0;
-      const runningTasks = run
-        ? run.tasks.filter(
-            (t) => t.profileId !== "director" && (t.status === "running" || t.status === "draining" || t.status === "merging"),
-          ).length
-        : 0;
-      const badge = openEsc > 0 ? `!${openEsc}` : runningTasks > 0 ? `${runningTasks}w` : g.status;
-      pushItem({
-        kind: "goal",
-        id: g.id,
-        status: openEsc > 0 ? "blocked" : g.status,
-        title: g.title,
-        badge,
-        activity: this.describeGoalActivity(g, run),
-        ref: { kind: "goal", id: g.id, runId: g.linkedRunId ?? undefined, label: `${g.id} ${g.title}` },
-      });
-    }
-
-    // 3. Standalone active runs not bound to a goal
-    for (const r of this.snapshot.runs) {
-      if (r.goalId) continue;
-      if (r.run.id.startsWith("director-tasks-")) continue;
-      if (r.run.status !== "active" && r.run.status !== "paused_quota") continue;
-      const running = r.tasks.filter(
-        (t) => t.profileId !== "director" && (t.status === "running" || t.status === "draining" || t.status === "merging"),
-      ).length;
-      pushItem({
-        kind: "run",
-        id: r.run.id,
-        status: r.run.status,
-        title: (r.run.goal.split("\n")[0] ?? r.run.id).trim(),
-        badge: running > 0 ? `${running}w` : r.run.status,
-        activity: this.describeRunActivity(r) || r.run.status,
-        ref: { kind: "run", id: r.run.id, label: r.run.id },
-      });
-    }
-
-    // 4. Fallback: ad-hoc subagents spawned inside `director-tasks-*` when no formal goals/runs occupy the HUD
-    if (hudItems.length === 0) {
-      for (const r of this.snapshot.runs) {
-        if (!r.run.id.startsWith("director-tasks-")) continue;
-        if (r.run.status !== "active" && r.run.status !== "paused_quota") continue;
-        for (const t of this.getPrioritizedRunTasks(r)) {
-          pushItem({
-            kind: "task",
-            id: t.id,
-            status: t.status,
-            title: t.title,
-            badge: `T${t.tier}/${t.kind}`,
-            activity: t.currentAction ?? t.status,
-            ref: { kind: "task", id: t.id, runId: r.run.id, label: `${t.id} ${t.title}` },
-          });
-        }
-      }
-    }
-
-    // Secondary detail line when only 1 item is active so HUD row 2 shows live worker/criteria progress
-    let hudSecondaryLine: string | null = null;
-    if (hudItems.length === 1) {
-      const only = hudItems[0]!;
-      const run = only.ref.runId
-        ? this.getRunEntry(only.ref.runId)
-        : only.ref.kind === "run"
-          ? this.getRunEntry(only.ref.id)
-          : undefined;
-      if (run) {
-        const liveTasks = this.getPrioritizedRunTasks(run);
-        if (liveTasks.length >= 2) {
-          hudSecondaryLine = liveTasks
-            .slice(0, 2)
-            .map((t) => this.formatTaskBrief(t))
-            .join(" · ");
-        } else if (liveTasks.length === 1) {
-          const brief = this.formatTaskBrief(liveTasks[0]!);
-          if (!only.activity || !only.activity.includes(liveTasks[0]!.title)) {
-            hudSecondaryLine = brief;
-          }
-        }
-      }
-      if (!hudSecondaryLine && only.kind === "goal") {
-        const goal = this.getGoalEntry(only.id)?.goal;
-        if (goal && goal.criteria.length > 0) {
-          const passed = goal.liveProgress?.criteriaResults?.filter((r) => r.passed).length ?? 0;
-          const cyclePart = goal.reviewCycle > 0 ? ` · review cycle ${goal.reviewCycle}` : "";
-          hudSecondaryLine = `Criteria ${passed}/${goal.criteria.length}${cyclePart}`;
-        }
-      }
-    }
-
-    return {
-      slots,
-      agentCounts,
-      hudItems,
-      hudSecondaryLine,
-      activeGoalsCount,
-    };
+function describeTaskActivity(t: TaskRecord, live: TaskActivitySnapshot | undefined): string {
+  if (live?.currentAction && TASK_STATE[t.status] === "active") return live.currentAction;
+  switch (t.status) {
+    case "waiting_children":
+      return "waiting on its agents";
+    case "blocked":
+      return t.summary ? `blocked: ${t.summary}` : "blocked";
+    case "returned_for_rescope":
+      return t.summary ? `returned for rescope: ${t.summary}` : "returned for rescope";
+    case "paused_quota":
+      return "paused (quota)";
+    case "pending":
+    case "ready":
+      return "queued";
+    default:
+      return t.summary ?? live?.currentAction ?? "";
   }
 }
 

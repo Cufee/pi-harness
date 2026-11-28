@@ -440,11 +440,10 @@ describe("TUI v2 Core Primitives", () => {
     const during = tr.render(80);
     assert.deepEqual(during.slice(0, before.length), before, "Frozen blocks above tail must NEVER mutate");
 
-    // 2. FixedDock: constant row count across idle, 5 attention slots, busy spinner, queued, and transient hint
+    // 2. FixedDock: constant row count across idle, active/blocked work row, busy spinner, queued, and transient hint
     const dock = new FixedDock(tui, theme, {
       onSubmit: () => {},
       initialState: {
-        slots: [],
         idleBanner: "Ready",
         busy: false,
         phaseText: "Ready",
@@ -458,17 +457,15 @@ describe("TUI v2 Core Primitives", () => {
     assert.ok(idleLines.some((l) => stripTerminalSequences(l).startsWith("› ")), "Composer must show › prompt cue");
 
     dock.update({
-      slots: [
-        { slot: 1, label: "esc-1", status: "p0", badge: "P0", ref: { kind: "escalation", id: "esc-1", label: "esc-1" } },
-        { slot: 2, label: "goal-2", status: "executing", badge: "2w", ref: { kind: "goal", id: "goal-2", label: "goal-2" } },
-      ],
+      work: { active: 2, blocked: 1, blockedLabel: "goal-2 needs your input" },
       busy: true,
       phaseText: "Running goal_get...",
       queuedCount: 3,
     });
     const busyLines = dock.render(80);
     assert.equal(busyLines.length, idleH, `FixedDock height must stay constant (idle=${idleH}, busy=${busyLines.length})`);
-    assert.ok(busyLines.some((l) => stripTerminalSequences(l).includes("[Alt+1]")));
+    assert.ok(busyLines.some((l) => stripTerminalSequences(l).includes("2 active")));
+    assert.ok(busyLines.some((l) => stripTerminalSequences(l).includes("1 blocked")));
 
     dock.update({ transientHint: "Press Esc again to stop active turn" });
     assert.equal(dock.render(80).length, idleH, "Transient hint must not change dock height");
@@ -513,7 +510,6 @@ describe("TUI v2 Core Primitives", () => {
       },
       onSubmit: () => {},
       initialState: {
-        slots: [],
         idleBanner: "Ready",
         busy: false,
         phaseText: "Ready",
@@ -556,7 +552,8 @@ describe("TUI v2 Core Primitives", () => {
     ring.push({ kind: "goal", id: "g1", label: "g1" });
     ring.push({ kind: "escalation", id: "e1", label: "e1" });
     assert.equal(ring.latest()?.id, "e1");
-    assert.equal(parseSlashCommand("/esc")?.name, "escalations");
+    assert.equal(parseSlashCommand("/goals")?.name, "work");
+    assert.equal(parseSlashCommand("/tree")?.name, "work");
     assert.equal(parseSlashCommand("/stop urgent")?.name, "stop");
     assert.equal(parseSlashCommand("/stop urgent")?.args, "urgent");
     assert.equal(parseDurationMs("1h30m"), 5_400_000);
@@ -564,9 +561,7 @@ describe("TUI v2 Core Primitives", () => {
     assert.equal(parseDurationMs("1h garbage"), null);
     const help = renderHelp("chat").join("\n");
     assert.ok(help.includes("Ctrl+G"));
-    assert.ok(help.includes("Ctrl+T"));
     assert.ok(help.includes("Ctrl+,"));
-    assert.ok(help.includes("Ctrl+O"));
     assert.ok(help.includes("Ctrl+X"));
     assert.ok(help.includes("/stop"));
   });

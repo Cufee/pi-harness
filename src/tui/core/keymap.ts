@@ -63,7 +63,7 @@ export interface EntityRef extends WireEntityRef {
 
 /**
  * Ordered ring of every entity recently surfaced in the transcript or live feed.
- * Powers `Ctrl+X` (inspect latest surfaced entity), `[` / `]` stepping, and Go-To-Anything.
+ * Powers `Ctrl+X` (inspect latest surfaced entity).
  */
 export class RecentRefsRing {
   private readonly items: EntityRef[] = [];
@@ -87,10 +87,6 @@ export class RecentRefsRing {
 
   latest(): EntityRef | undefined {
     return this.items[this.items.length - 1];
-  }
-
-  allNewestFirst(): EntityRef[] {
-    return [...this.items].reverse();
   }
 
   step(delta: -1 | 1): EntityRef | undefined {

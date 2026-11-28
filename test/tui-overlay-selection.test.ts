@@ -12,7 +12,6 @@ import {
   ModalScreen,
   Navigator,
   normalizeSelection,
-  RecentRefsRing,
   type Screen,
   type ScreenContext,
   snapCellRange,
@@ -22,12 +21,11 @@ import {
   visibleWidth,
 } from "../src/tui/core/index.js";
 import {
-  EscalationInspectorScreen,
   type InspectorDeps,
   openEntityInspector,
   TaskInspectorScreen,
 } from "../src/tui/inspectors.js";
-import { GoToPaletteScreen, KbDetailScreen } from "../src/tui/pickers.js";
+import { KbDetailScreen } from "../src/tui/pickers.js";
 import type { WorkStore } from "../src/tui/store.js";
 
 function makeFakeTerminal(cols = 100, rows = 26) {
@@ -470,77 +468,6 @@ describe("Shared Navigator overlay text selection", () => {
 
     const afterPlain = compositeVisible(tui, terminal).map((l) => stripTerminalSequences(l)).join("\n");
     assert.ok(afterPlain.includes("Copied 5 chars"), `Expected "Copied 5 chars" notice in:\n${afterPlain}`);
-
-    nav.closeAll();
-    tui.stop();
-  });
-
-  it("drag-copies text from a real EscalationInspectorScreen (non-transcript modal)", async () => {
-    const theme = createTheme({ color: true, ascii: false });
-    const { terminal, writes, sendInput } = makeFakeTerminal(100, 26);
-    const tui = new ModalScreen(terminal);
-    const nav = new Navigator(tui, terminal, theme);
-
-    const now = Date.now();
-    const deps: InspectorDeps = {
-      repoRoot: "/tmp/repo",
-      store: {
-        getEscalation: () => undefined,
-      } as unknown as WorkStore,
-      client: {
-        async request(method: string) {
-          assert.equal(method, "escalation.get");
-          return {
-            escalation: {
-              id: "esc-42",
-              runId: "run-34",
-              fromTaskId: "t-512",
-              toTaskId: "t-507",
-              severity: "P1",
-              category: "interface_mismatch",
-              title: "Need schema alignment",
-              summary: "Schema fields differ.",
-              blocking: true,
-              status: "open",
-              resolution: null,
-              evidencePaths: ["src/tui/core/frame.ts"],
-              attempted: [],
-              suggestedSplits: [],
-              createdAt: now - 10_000,
-              updatedAt: now - 2_000,
-            },
-            fromTask: null,
-            goal: null,
-          };
-        },
-      } as unknown as DaemonClient,
-    };
-
-    const screen = new EscalationInspectorScreen("esc-42", deps);
-    tui.start();
-    nav.push(screen);
-    await new Promise((r) => setTimeout(r, 0));
-
-    const visible = compositeVisible(tui, terminal);
-    const idRowY = visible.findIndex((l) => {
-      const p = stripTerminalSequences(l);
-      return p.includes("Escalation ID") && p.includes("esc-42");
-    });
-    assert.ok(idRowY >= 0, "EscalationInspectorScreen must render the Escalation ID row");
-
-    const plainIdRow = stripTerminalSequences(visible[idRowY]!);
-    const startX = colOf(plainIdRow, "esc-42");
-    const endX = startX + "esc-42".length - 1;
-
-    writes.length = 0;
-    dragCells(sendInput, startX, idRowY, endX, idRowY);
-
-    const copied = extractOsc52Payloads(writes);
-    assert.equal(copied.length, 1);
-    assert.equal(copied[0], "esc-42");
-
-    const afterPlain = compositeVisible(tui, terminal).map((l) => stripTerminalSequences(l)).join("\n");
-    assert.ok(afterPlain.includes("Copied 6 chars"), `Expected "Copied 6 chars" notice in:\n${afterPlain}`);
 
     nav.closeAll();
     tui.stop();
@@ -1219,33 +1146,5 @@ describe("Shared Navigator overlay text selection", () => {
 
     nav.closeAll();
     tui.stop();
-  });
-
-  it("keeps the selected command visible in GoToPaletteScreen at 72x7 (two-row minimum for ordinary bodies)", () => {
-    const theme = createTheme({ color: false, ascii: false });
-    const deps: InspectorDeps = {
-      repoRoot: "/tmp/repo",
-      store: {
-        state: {
-          inbox: [],
-          goals: [],
-          runs: [],
-          escalations: [],
-          timers: [],
-          worktrees: [],
-          merges: [],
-        },
-      } as unknown as WorkStore,
-      client: {} as unknown as DaemonClient,
-    };
-    const palette = new GoToPaletteScreen(deps, new RecentRefsRing(), [
-      { id: "cmd:settings", label: "Open Settings", detail: "Configure models", run: () => {} },
-    ]);
-
-    const rendered = palette.render(72, 7, theme);
-    assert.ok(rendered.length <= 7);
-    const plain = rendered.map((l) => stripTerminalSequences(l)).join("\n");
-    assert.ok(plain.includes("/ "), `Expected filter row visible at 72x7 in:\n${plain}`);
-    assert.ok(plain.includes("Open Settings"), `Expected selected command visible at 72x7 in:\n${plain}`);
   });
 });

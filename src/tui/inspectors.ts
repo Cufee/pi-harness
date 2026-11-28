@@ -10,7 +10,6 @@ import type {
   TaskRecord,
   WorktreeRecord,
 } from "../control-plane/db.js";
-import type { TimerRecord } from "../control-plane/timers.js";
 import type { DaemonClient } from "../daemon/remote.js";
 import type { GoalRecord, GoalReviewVerdict, GoalRevisionRecord } from "../goals/engine.js";
 import type { DaemonEventFrame } from "../protocol/daemon-rpc.js";
@@ -38,7 +37,6 @@ import {
   parseMouseWheel,
   renderTranscriptBlock,
   sanitizeLine,
-  sanitizeText,
   type Screen,
   type ScreenContext,
   statusBadge,
@@ -49,7 +47,6 @@ import {
   type ViewBlock,
   Viewport,
   wrap,
-  yankText,
 } from "./core/index.js";
 import { LiveTranscriptModel } from "./live-transcript.js";
 import { QuotaWaitPickerScreen } from "./quota-wait-picker.js";
@@ -70,9 +67,6 @@ export interface InspectorDeps {
  */
 export function openEntityInspector(ref: EntityRef, deps: InspectorDeps, ctx: ScreenContext): void {
   switch (ref.kind) {
-    case "escalation":
-      ctx.navigator.push(new EscalationInspectorScreen(ref.id, deps));
-      return;
     case "goal":
       ctx.navigator.push(new GoalInspectorScreen(ref.id, deps));
       return;
@@ -84,15 +78,6 @@ export function openEntityInspector(ref: EntityRef, deps: InspectorDeps, ctx: Sc
       return;
     case "artifact":
       ctx.navigator.push(new ArtifactInspectorScreen(ref.runId ?? "", ref.id, deps));
-      return;
-    case "timer":
-      ctx.navigator.push(new TimerInspectorScreen(ref.id, deps));
-      return;
-    case "worktree":
-      ctx.navigator.push(new WorktreeInspectorScreen(ref.id, deps));
-      return;
-    case "merge":
-      ctx.navigator.push(new MergeInspectorScreen(ref.id, deps));
       return;
     case "transcript":
       ctx.navigator.push(
@@ -140,207 +125,6 @@ function handleViewportScrollKeys(
     return true;
   }
   return false;
-}
-
-/* ─────────────────────────── Escalation Inspector ─────────────────────────── */
-
-interface EscalationDetailData {
-  escalation: EscalationRecord;
-  run: RunRecord | null;
-  fromTask: TaskRecord | null;
-  goal: GoalRecord | null;
-}
-
-export class EscalationInspectorScreen implements Screen {
-  readonly variant = "sheet" as const;
-  readonly title: string;
-  private readonly frame = new Frame();
-  private nav: Navigator | null = null;
-  private readonly viewport = new Viewport();
-  private data: EscalationDetailData | null = null;
-  private loading = true;
-  private error: string | null = null;
-
-  constructor(
-    private readonly escalationId: string,
-    private readonly deps: InspectorDeps,
-  ) {
-    this.title = escalationId;
-  }
-
-  onShow(ctx: ScreenContext): void {
-    this.nav = ctx.navigator;
-    void this.load(ctx);
-  }
-
-  private async load(ctx: ScreenContext): Promise<void> {
-    this.loading = true;
-    this.error = null;
-    ctx.requestRender();
-    try {
-      this.data = await this.deps.client.request<EscalationDetailData>("escalation.get", {
-        escalationId: this.escalationId,
-      });
-    } catch (err) {
-      this.error = err instanceof Error ? err.message : String(err);
-    } finally {
-      this.loading = false;
-      ctx.requestRender();
-    }
-  }
-
-  render(width: number, maxHeight: number, theme: Theme): string[] {
-    const esc = this.data?.escalation ?? this.deps.store.getEscalation(this.escalationId);
-    const hints: Hint[] = [
-      { key: "r", label: "resolve" },
-      { key: "a", label: "ack" },
-      { key: "t", label: "task" },
-      ...(this.data?.goal ? [{ key: "g", label: "goal" }] : []),
-      { key: "y", label: "copy" },
-      { key: "Home/End", label: "top/bot" },
-      { key: "Esc", label: "back" },
-    ];
-
-    return this.frame.render({
-      width,
-      maxHeight,
-      theme,
-      breadcrumbs: this.nav?.breadcrumbs ?? [this.escalationId],
-      rightHeader: esc ? statusBadge(esc.status, theme) : undefined,
-      hints,
-      renderBody: (innerW, bodyH) => {
-        if (this.loading && !esc) return [theme.muted("Loading escalation...")];
-        if (this.error && !esc) return [theme.danger(`Failed to load: ${this.error}`)];
-        if (!esc) return [theme.muted("Escalation not found.")];
-
-        const lines: string[] = [
-          `${tag(esc.severity, esc.severity === "P0" ? "danger" : "warn", theme)} ${tag(esc.category, "info", theme)} ${esc.blocking ? tag("BLOCKING", "danger", theme) : ""}`,
-          theme.bold(sanitizeLine(esc.title)),
-          "",
-          kvRow("Escalation ID", esc.id, innerW, theme),
-          kvRow("Status", statusBadge(esc.status, theme), innerW, theme),
-          kvRow("Run", esc.runId, innerW, theme),
-          kvRow(
-            "From Task",
-            `${esc.fromTaskId}${this.data?.fromTask ? ` (${this.data.fromTask.status} · ${sanitizeLine(this.data.fromTask.title)})` : ""}`,
-            innerW,
-            theme,
-          ),
-          ...(this.data?.goal
-            ? [kvRow("Goal", `${this.data.goal.id} v${this.data.goal.version}: ${sanitizeLine(this.data.goal.title)}`, innerW, theme)]
-            : []),
-          kvRow("Created", `${formatClock(esc.createdAt)} (${formatAge(esc.createdAt)})`, innerW, theme),
-          ...(esc.resolution ? [kvRow("Resolution", theme.ok(sanitizeLine(esc.resolution)), innerW, theme)] : []),
-          ...(esc.evidencePaths.length > 0
-            ? ["", divider(innerW, theme, "Evidence Paths"), ...esc.evidencePaths.map((p) => clamp(`  - ${sanitizeLine(p)}`, innerW))]
-            : []),
-          ...(esc.attempted.length > 0
-            ? ["", divider(innerW, theme, "Attempted"), ...esc.attempted.flatMap((a) => wrap(`  - ${sanitizeText(a)}`, innerW))]
-            : []),
-          ...(esc.suggestedSplits.length > 0
-            ? ["", divider(innerW, theme, "Suggested Splits"), ...esc.suggestedSplits.flatMap((s) => wrap(`  - ${sanitizeText(s)}`, innerW))]
-            : []),
-        ];
-
-        return this.viewport.render(lines, innerW, bodyH, theme);
-      },
-    });
-  }
-
-  handleInput(data: string, ctx: ScreenContext): void {
-    if (this.frame.handleInlineInput(data, ctx.requestRender)) return;
-    if (isPopKey(data, ctx)) {
-      ctx.navigator.pop();
-      return;
-    }
-
-    const esc = this.data?.escalation ?? this.deps.store.getEscalation(this.escalationId);
-
-    // Bind `g` to open linked Goal BEFORE viewport scroll (Home/End handles top/bottom scroll)
-    if (data === "g" && this.data?.goal) {
-      ctx.navigator.push(new GoalInspectorScreen(this.data.goal.id, this.deps));
-      return;
-    }
-
-    if (handleViewportScrollKeys(data, this.viewport, { allowG: false })) {
-      ctx.requestRender();
-      return;
-    }
-
-    if (!esc) return;
-
-    if (data === "r") {
-      this.frame.askPrompt({
-        label: "Resolution note",
-        initialValue: "Resolved by user",
-        onSubmit: async (note) => {
-          try {
-            const res = await this.deps.client.request<{ alreadyResolved?: boolean; deliveredTo?: string[] }>(
-              "escalation.resolve",
-              {
-                escalationId: esc.id,
-                reason: note,
-              },
-            );
-            if (res?.alreadyResolved) {
-              this.frame.setNotice(`${esc.id} was already resolved`, "info");
-            } else {
-              const delivered = res?.deliveredTo?.length ? ` (sent to ${res.deliveredTo.join(", ")})` : "";
-              this.frame.setNotice(`Resolved ${esc.id}${delivered}`, "ok");
-            }
-            await Promise.all([this.load(ctx), this.deps.store.refresh()]);
-          } catch (err) {
-            this.frame.setNotice(`Resolve failed: ${err instanceof Error ? err.message : String(err)}`, "danger");
-            ctx.requestRender();
-          }
-        },
-      });
-      ctx.requestRender();
-      return;
-    }
-
-    if (data === "a") {
-      this.frame.askPrompt({
-        label: "Acknowledge note (stays unresolved)",
-        initialValue: "Acknowledged by user",
-        onSubmit: async (note) => {
-          try {
-            await this.deps.client.request("escalation.ack", {
-              escalationId: esc.id,
-              resolution: note,
-              resolve: false,
-            });
-            this.frame.setNotice(`Acknowledged ${esc.id}`, "info");
-            await Promise.all([this.load(ctx), this.deps.store.refresh()]);
-          } catch (err) {
-            this.frame.setNotice(`Acknowledge failed: ${err instanceof Error ? err.message : String(err)}`, "danger");
-            ctx.requestRender();
-          }
-        },
-      });
-      ctx.requestRender();
-      return;
-    }
-
-    if (data === "t" && esc.fromTaskId) {
-      ctx.navigator.push(new TaskInspectorScreen(esc.fromTaskId, this.deps));
-      return;
-    }
-
-    if (data === "y") {
-      const text = [
-        `${esc.id} [${esc.severity}/${esc.category}] ${esc.title}`,
-        `Run: ${esc.runId} · Task: ${esc.fromTaskId} · Status: ${esc.status}`,
-        ...(esc.evidencePaths.length > 0 ? [`Evidence: ${esc.evidencePaths.join(", ")}`] : []),
-        ...(esc.attempted.length > 0 ? [`Attempted:\n- ${esc.attempted.join("\n- ")}`] : []),
-        ...(esc.suggestedSplits.length > 0 ? [`Suggested Splits:\n- ${esc.suggestedSplits.join("\n- ")}`] : []),
-        ...(esc.resolution ? [`Resolution: ${esc.resolution}`] : []),
-      ].join("\n");
-      const ok = yankText(text, ctx.writeTerminal);
-      this.frame.setNotice(ok ? "Copied escalation to clipboard" : "Clipboard unavailable", ok ? "ok" : "warn");
-      ctx.requestRender();
-    }
-  }
 }
 
 /* ───────────────────────────── Goal Inspector ─────────────────────────────── */
@@ -518,7 +302,6 @@ export class GoalInspectorScreen implements Screen {
     const entry = this.getEntry();
     const g = entry?.goal;
     const run = g?.linkedRunId ? this.deps.store.getRunEntry(g.linkedRunId) : undefined;
-    const openEscs = run ? run.escalations.filter((e) => e.status === "open" || e.status === "acked") : [];
     const canResume = g ? isGoalResumable(g, run?.run.status) : false;
     const canAccept = Boolean(g && g.status !== "draft" && g.status !== "achieved" && g.status !== "cancelled");
 
@@ -541,7 +324,6 @@ export class GoalInspectorScreen implements Screen {
           ? [{ key: "p", label: "pause" }]
           : []),
       ...(run ? [{ key: "R", label: "run" }] : []),
-      ...(openEscs.length > 0 ? [{ key: "e", label: `esc(${openEscs.length})` }] : []),
       ...(g && g.status !== "achieved" && g.status !== "cancelled" ? [{ key: "x", label: "cancel" }] : []),
       { key: "Esc", label: "back" },
     ];
@@ -571,9 +353,6 @@ export class GoalInspectorScreen implements Screen {
           kvRow("Review Cycles", String(g.reviewCycle), innerW, theme),
           ...(g.liveProgress?.summary ? [kvRow("Progress", sanitizeLine(g.liveProgress.summary), innerW, theme)] : []),
           kvRow("Updated", `${formatClock(g.updatedAt)} (${formatAge(g.updatedAt)})`, innerW, theme),
-          ...(openEscs.length > 0
-            ? [kvRow("Unresolved Esc", theme.danger(`${openEscs.length} — press 'e' to inspect`), innerW, theme)]
-            : []),
           "",
           divider(innerW, theme, "Description"),
           ...renderTranscriptBlock({ kind: "text", format: "markdown", text: g.description || g.title }, proseW, theme),
@@ -787,13 +566,6 @@ export class GoalInspectorScreen implements Screen {
     if (data === "R" && g.linkedRunId) {
       ctx.navigator.push(new RunInspectorScreen(g.linkedRunId, this.deps));
       return;
-    }
-
-    if (data === "e" && run) {
-      const firstOpen =
-        run.escalations.find((e) => e.status === "open") ??
-        run.escalations.find((e) => e.status === "acked");
-      if (firstOpen) ctx.navigator.push(new EscalationInspectorScreen(firstOpen.id, this.deps));
     }
   }
 }
@@ -1182,8 +954,6 @@ export class TaskInspectorScreen implements Screen {
       { key: "s", label: "steer" },
       { key: "u", label: "resume" },
       ...(this.data?.artifacts.length ? [{ key: "a", label: `artifacts(${this.data.artifacts.length})` }] : []),
-      ...(this.data?.escalations.length ? [{ key: "e", label: `esc(${this.data.escalations.length})` }] : []),
-      ...(this.data?.worktree ? [{ key: "w", label: "worktree" }] : []),
       { key: "x", label: "cancel" },
       { key: "Esc", label: "back" },
     ];
@@ -1239,13 +1009,6 @@ export class TaskInspectorScreen implements Screen {
           lines.push("", divider(innerW, theme, `Child Tasks (${this.data.children.length})`));
           for (const ch of this.data.children.slice(0, 10)) {
             lines.push(clamp(`  ${statusBadge(ch.status, theme)} ${theme.bold(ch.id)} ${tag(`T${ch.tier}/${ch.kind}`, "muted", theme)} ${sanitizeLine(ch.title)}`, innerW));
-          }
-        }
-
-        if (this.data.escalations.length > 0) {
-          lines.push("", divider(innerW, theme, `Escalations (${this.data.escalations.length})`));
-          for (const e of this.data.escalations) {
-            lines.push(clamp(`  ${statusBadge(e.status, theme)} ${e.id} [${e.severity}] ${sanitizeLine(e.title)}`, innerW));
           }
         }
 
@@ -1362,15 +1125,6 @@ export class TaskInspectorScreen implements Screen {
       return;
     }
 
-    if (data === "e" && this.data.escalations.length > 0) {
-      const target =
-        this.data.escalations.find((e) => e.status === "open") ??
-        this.data.escalations.find((e) => e.status === "acked") ??
-        this.data.escalations[0]!;
-      ctx.navigator.push(new EscalationInspectorScreen(target.id, this.deps));
-      return;
-    }
-
     if (data === "a" && this.data.artifacts.length > 0) {
       if (this.data.artifacts.length === 1) {
         ctx.navigator.push(new ArtifactInspectorScreen(t.runId, this.data.artifacts[0]!.path, this.deps));
@@ -1378,10 +1132,6 @@ export class TaskInspectorScreen implements Screen {
         ctx.navigator.push(new ArtifactPickerScreen(t.runId, this.data.artifacts, this.deps));
       }
       return;
-    }
-
-    if (data === "w" && this.data.worktree) {
-      ctx.navigator.push(new WorktreeInspectorScreen(this.data.worktree.id, this.deps));
     }
   }
 }
@@ -1532,261 +1282,6 @@ class ArtifactInspectorScreen implements Screen {
     }
     if (isPopKey(data, ctx)) {
       ctx.navigator.pop();
-    }
-  }
-}
-
-/* ───────────────────────────── Timer Inspector ────────────────────────────── */
-
-class TimerInspectorScreen implements Screen {
-  readonly variant = "dialog" as const;
-  readonly title: string;
-  private readonly frame = new Frame();
-  private nav: Navigator | null = null;
-
-  constructor(
-    private readonly timerId: string,
-    private readonly deps: InspectorDeps,
-  ) {
-    this.title = timerId;
-  }
-
-  onShow(ctx: ScreenContext): void {
-    this.nav = ctx.navigator;
-  }
-
-  render(width: number, maxHeight: number, theme: Theme): string[] {
-    const timer = this.deps.store.getTimer(this.timerId);
-    const hints: Hint[] = [
-      ...(timer?.status === "pending" ? [{ key: "x", label: "cancel timer" }] : []),
-      { key: "Esc", label: "back" },
-    ];
-    return this.frame.render({
-      width,
-      maxHeight,
-      theme,
-      breadcrumbs: this.nav?.breadcrumbs ?? [this.timerId],
-      rightHeader: timer ? statusBadge(timer.status, theme) : undefined,
-      hints,
-      renderBody: (innerW) => {
-        if (!timer) return [theme.muted("Timer not found.")];
-        return [
-          kvRow("Timer ID", timer.id, innerW, theme),
-          kvRow("Status", statusBadge(timer.status, theme), innerW, theme),
-          kvRow("Owner", `${timer.ownerKind}:${timer.ownerId}`, innerW, theme),
-          kvRow("Wake At", `${new Date(timer.wakeAt).toLocaleTimeString()} (${formatCountdown(timer.wakeAt)})`, innerW, theme),
-          ...(timer.wakeOnEvent ? [kvRow("Wake Event", timer.wakeOnEvent, innerW, theme)] : []),
-          ...(timer.runId ? [kvRow("Run", timer.runId, innerW, theme)] : []),
-          "",
-          divider(innerW, theme, "Reason"),
-          ...wrap(sanitizeText(timer.reason), innerW),
-        ];
-      },
-    });
-  }
-
-  handleInput(data: string, ctx: ScreenContext): void {
-    if (this.frame.handleInlineInput(data, ctx.requestRender)) return;
-    if (isPopKey(data, ctx)) {
-      ctx.navigator.pop();
-      return;
-    }
-    const timer = this.deps.store.getTimer(this.timerId);
-    if (data === "x" && timer?.status === "pending") {
-      this.frame.askConfirm({
-        message: `Cancel timer ${timer.id}?`,
-        onConfirm: async () => {
-          await this.deps.client.request("timer.cancel", { timerId: timer.id });
-          this.frame.setNotice(`Cancelled ${timer.id}`, "warn");
-          await this.deps.store.refresh();
-        },
-      });
-      ctx.requestRender();
-    }
-  }
-}
-
-/* ──────────────────────────── Worktree Inspector ──────────────────────────── */
-
-interface WorktreeDetailData {
-  worktree: WorktreeRecord;
-  run: RunRecord | null;
-  task: TaskRecord | null;
-  existsOnDisk: boolean;
-  gitStatus: string;
-  diffStat: string;
-}
-
-class WorktreeInspectorScreen implements Screen {
-  readonly variant = "sheet" as const;
-  readonly title: string;
-  private readonly frame = new Frame();
-  private nav: Navigator | null = null;
-  private readonly viewport = new Viewport();
-  private data: WorktreeDetailData | null = null;
-  private loading = true;
-
-  constructor(
-    private readonly worktreeId: string,
-    private readonly deps: InspectorDeps,
-  ) {
-    this.title = worktreeId;
-  }
-
-  onShow(ctx: ScreenContext): void {
-    this.nav = ctx.navigator;
-    void this.load(ctx);
-  }
-
-  private async load(ctx: ScreenContext): Promise<void> {
-    this.loading = true;
-    ctx.requestRender();
-    try {
-      this.data = await this.deps.client.request<WorktreeDetailData>("worktrees.get", { worktreeId: this.worktreeId });
-    } catch {
-      this.data = null;
-    } finally {
-      this.loading = false;
-      ctx.requestRender();
-    }
-  }
-
-  render(width: number, maxHeight: number, theme: Theme): string[] {
-    const wt = this.data?.worktree ?? this.deps.store.getWorktree(this.worktreeId);
-    const hints: Hint[] = [
-      ...(wt?.taskId ? [{ key: "t", label: "task" }] : []),
-      ...(wt?.id ? [{ key: "x", label: "archive & remove" }] : []),
-      { key: "Esc", label: "back" },
-    ];
-    return this.frame.render({
-      width,
-      maxHeight,
-      theme,
-      breadcrumbs: this.nav?.breadcrumbs ?? [wt?.id ?? this.worktreeId],
-      rightHeader: wt ? statusBadge(wt.status, theme) : undefined,
-      hints,
-      renderBody: (innerW, bodyH) => {
-        if (this.loading && !wt) return [theme.muted("Loading worktree...")];
-        if (!wt) return [theme.muted("Worktree not found.")];
-        const onDisk = this.data?.existsOnDisk ?? ("existsOnDisk" in wt ? wt.existsOnDisk : false);
-        const lines: string[] = [
-          kvRow("Worktree ID", wt.id ?? "(untracked)", innerW, theme),
-          kvRow("Status", statusBadge(wt.status, theme), innerW, theme),
-          kvRow("Branch", wt.branch, innerW, theme),
-          kvRow("Path", middleEllipsis(wt.path, Math.max(16, innerW - 18)), innerW, theme),
-          kvRow("On Disk", onDisk ? theme.ok("yes") : theme.muted("no"), innerW, theme),
-          kvRow("Run / Task", `${wt.runId ?? "—"} / ${wt.taskId ?? "—"}`, innerW, theme),
-          ...(this.data?.gitStatus ? ["", divider(innerW, theme, "git status --short"), ...wrap(sanitizeText(this.data.gitStatus), innerW)] : []),
-          ...(this.data?.diffStat ? ["", divider(innerW, theme, "git diff --stat"), ...wrap(sanitizeText(this.data.diffStat), innerW)] : []),
-        ];
-        return this.viewport.render(lines, innerW, bodyH, theme);
-      },
-    });
-  }
-
-  handleInput(data: string, ctx: ScreenContext): void {
-    if (this.frame.handleInlineInput(data, ctx.requestRender)) return;
-    if (isPopKey(data, ctx)) {
-      ctx.navigator.pop();
-      return;
-    }
-    if (handleViewportScrollKeys(data, this.viewport)) {
-      ctx.requestRender();
-      return;
-    }
-    const wt = this.data?.worktree ?? this.deps.store.getWorktree(this.worktreeId);
-    if (!wt) return;
-    if (data === "t" && wt.taskId) {
-      ctx.navigator.push(new TaskInspectorScreen(wt.taskId, this.deps));
-      return;
-    }
-    if (data === "x" && wt.id) {
-      const targetId = wt.id;
-      this.frame.askConfirm({
-        message: `Archive branch ${wt.branch} and remove worktree ${targetId}?`,
-        onConfirm: async () => {
-          await this.deps.client.request("worktrees.clean", { repoRoot: this.deps.repoRoot, worktreeId: targetId });
-          this.frame.setNotice(`Archived & removed ${targetId}`, "ok");
-          await this.deps.store.refresh();
-          if (ctx.navigator.current === this) ctx.navigator.pop();
-        },
-      });
-      ctx.requestRender();
-    }
-  }
-}
-
-/* ───────────────────────────── Merge Inspector ────────────────────────────── */
-
-class MergeInspectorScreen implements Screen {
-  readonly variant = "sheet" as const;
-  readonly title: string;
-  private readonly frame = new Frame();
-  private nav: Navigator | null = null;
-  private readonly viewport = new Viewport();
-
-  constructor(
-    private readonly mergeId: string,
-    private readonly deps: InspectorDeps,
-  ) {
-    this.title = mergeId;
-  }
-
-  onShow(ctx: ScreenContext): void {
-    this.nav = ctx.navigator;
-  }
-
-  render(width: number, maxHeight: number, theme: Theme): string[] {
-    const m = this.deps.store.getMerge(this.mergeId);
-    const hints: Hint[] = [
-      ...(m?.taskId ? [{ key: "t", label: "task" }] : []),
-      { key: "y", label: "copy log" },
-      { key: "Esc", label: "back" },
-    ];
-    return this.frame.render({
-      width,
-      maxHeight,
-      theme,
-      breadcrumbs: this.nav?.breadcrumbs ?? [this.mergeId],
-      rightHeader: m ? statusBadge(m.status, theme) : undefined,
-      hints,
-      renderBody: (innerW, bodyH) => {
-        if (!m) return [theme.muted("Merge queue item not found.")];
-        const lines: string[] = [
-          kvRow("Merge ID", m.id, innerW, theme),
-          kvRow("Status", statusBadge(m.status, theme), innerW, theme),
-          kvRow("Branch", m.branch, innerW, theme),
-          kvRow("Run / Task", `${m.runId} / ${m.taskId}`, innerW, theme),
-          kvRow("Worktree", m.worktreeId, innerW, theme),
-          "",
-          divider(innerW, theme, "Merge Log"),
-          ...wrap(sanitizeText(m.log ?? "(no log recorded)"), innerW),
-        ];
-        return this.viewport.render(lines, innerW, bodyH, theme);
-      },
-    });
-  }
-
-  handleInput(data: string, ctx: ScreenContext): void {
-    if (this.frame.handleInlineInput(data, ctx.requestRender)) return;
-    if (isPopKey(data, ctx)) {
-      ctx.navigator.pop();
-      return;
-    }
-    if (handleViewportScrollKeys(data, this.viewport)) {
-      ctx.requestRender();
-      return;
-    }
-    const m = this.deps.store.getMerge(this.mergeId);
-    if (!m) return;
-    if (data === "t" && m.taskId) {
-      ctx.navigator.push(new TaskInspectorScreen(m.taskId, this.deps));
-      return;
-    }
-    if (data === "y" && m.log) {
-      yankText(m.log, ctx.writeTerminal);
-      this.frame.setNotice("Copied merge log", "ok");
-      ctx.requestRender();
     }
   }
 }

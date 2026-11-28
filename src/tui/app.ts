@@ -40,10 +40,8 @@ import { type InspectorDeps, openEntityInspector } from "./inspectors.js";
 import { foldAgentEvent } from "./live-transcript.js";
 import {
   EffortPickerScreen,
-  GoToPaletteScreen,
   KbBrowserScreen,
   ModelPickerScreen,
-  type QuickActionItem,
   QuotaCostScreen,
   SessionSwitcherScreen,
   SettingsScreen,
@@ -54,7 +52,7 @@ import { RemotesScreen } from "./remotes.js";
 import { consumeReplay } from "./replay.js";
 import { type AttachableSession, WorkStore } from "./store.js";
 import { extractDisplay, parseToolDisplay } from "./tool-output/index.js";
-import { WorkNavigatorScreen, type WorkTabId } from "./work-navigator.js";
+import { WorkTreeScreen } from "./work-tree.js";
 
 export type TuiExitAction =
   | { kind: "exit" }
@@ -161,9 +159,9 @@ interface SharedShellContext {
  *
  * Guarantees:
  *  - Strictly append-only immutable transcript above the live tail (never triggers pi-tui scrollback wipes).
- *  - Constant-height dock (separator + attention strip + status bar + UndoableEditor + 1-line hint strip).
+ *  - Constant-height dock (separator + work row + status bar + UndoableEditor + 1-line hint strip).
  *  - Zero main-screen mouse tracking (native terminal scrollback & mouse-drag copy always work).
- *  - Every surfaced entity is directly reachable via `Ctrl+G`, `Ctrl+T`, `Ctrl+O`, `Ctrl+,`, `Ctrl+X`, or `Alt+1..5`.
+ *  - Every surfaced entity is directly reachable via `Ctrl+G`, `Ctrl+,`, or `Ctrl+X`.
  */
 function createSharedShell(spec: SharedShellContext) {
   const theme = createTheme();
@@ -186,7 +184,8 @@ function createSharedShell(spec: SharedShellContext) {
   let lastControlSeq = spec.initialControl?.controlSeq ?? 0;
   const READ_ONLY_RECEIPT = "Read-only: take control first (Ctrl+Y or /take).";
   const queue = new ChatQueueModel();
-  // Shares goal-33's `store.showInternal` flag (default false) with the Work Navigator.
+  // Internal (harness bookkeeping) chat lines stay hidden until `/internal` shows them.
+  let showInternal = false;
   const MAX_HIDDEN_INTERNAL_LINES = 200;
   const hiddenInternalLines: Array<{ line: ClassifiedChatLine; timestampMs?: number | null }> = [];
   const MAX_PINNED_ALERTS = 20;
@@ -266,7 +265,7 @@ function createSharedShell(spec: SharedShellContext) {
       }
       return true;
     }
-    if (store.showInternal) {
+    if (showInternal) {
       if (line.ref) recentRefs.push(line.ref);
       transcript.appendReceipt({
         glyph: resolveLineGlyph(line.glyph),
@@ -285,7 +284,7 @@ function createSharedShell(spec: SharedShellContext) {
     return false;
   };
   const flushHiddenInternalLines = (): number => {
-    if (!store.showInternal || hiddenInternalLines.length === 0) return 0;
+    if (!showInternal || hiddenInternalLines.length === 0) return 0;
     const buffered = hiddenInternalLines.splice(0);
     for (const entry of buffered) {
       if (entry.line.ref) recentRefs.push(entry.line.ref);
@@ -381,9 +380,9 @@ function createSharedShell(spec: SharedShellContext) {
     );
   };
 
-  const openWork = (tab?: WorkTabId) => {
+  const openWork = () => {
     inspectorDeps.repoRoot = currentRepoRoot();
-    navigator.push(new WorkNavigatorScreen(inspectorDeps, tab));
+    navigator.push(new WorkTreeScreen(inspectorDeps));
   };
 
   const openEntity = (ref: EntityRef) => {
@@ -537,34 +536,9 @@ function createSharedShell(spec: SharedShellContext) {
     session.tui.requestRender();
   };
 
-  const openPalette = () => {
-    const actions: QuickActionItem[] = [
-      { id: "projects", label: "/projects", detail: "Select, Create, Clone or Switch Local & Remote Projects (Ctrl+P)", pinned: true, run: () => openProjects() },
-      { id: "remotes", label: "/remotes", detail: "Manage Remote SSH Peer Hosts & Switch Host", pinned: true, run: () => openRemotes() },
-      { id: "settings", label: "/settings", detail: "ACP CLIs, Enabled Models & Defaults (Ctrl+,)", pinned: true, run: () => openSettings() },
-      ...(spec.onModelUpdated ? [{ id: "model", label: "/model", detail: "Select Model & Enable/Disable Models", pinned: true, run: () => openModels() }] : []),
-      ...(spec.onEffortUpdated ? [{ id: "effort", label: "/effort", detail: "Set Reasoning Effort", pinned: true, run: () => openEffort() }] : []),
-      { id: "work", label: "/work", detail: "Open Work Navigator (Ctrl+G)", pinned: true, run: () => openWork() },
-      { id: "inbox", label: "/inbox", detail: "Open Inbox (escalations & blockers)", pinned: true, run: () => openWork("inbox") },
-      { id: "escalations", label: "/escalations", detail: "Open Escalations tab", pinned: true, run: () => openWork("escalations") },
-      { id: "quota", label: "/quota", detail: "View Quota Capacity & Spend", pinned: true, run: () => openQuota() },
-      { id: "cost", label: "/cost", detail: "View Reported Spend Ledger", pinned: true, run: () => openQuota() },
-      { id: "sessions", label: "/sessions", detail: "Switch Chat / Run Session", pinned: true, run: () => openSessions() },
-      { id: "kb", label: "/kb", detail: "Browse Knowledge Base", pinned: true, run: () => openKb() },
-      { id: "stop", label: "/stop", detail: "Stop ALL active runs & agents", pinned: true, run: () => void stopAllAgents() },
-      { id: "goals", label: "/goals", detail: "Open Goals tab", pinned: false, run: () => openWork("goals") },
-      { id: "runs", label: "/runs", detail: "Open Runs tab (Ctrl+T)", pinned: false, run: () => openWork("runs") },
-      { id: "timers", label: "/timers", detail: "Open Timers tab", pinned: false, run: () => openWork("timers") },
-      { id: "worktrees", label: "/worktrees", detail: "Open Worktrees & Merges tab", pinned: false, run: () => openWork("worktrees") },
-    ];
-    navigator.push(new GoToPaletteScreen(inspectorDeps, recentRefs, actions));
-  };
-
   const dockHints: Hint[] = [
     { key: "Ctrl+P", label: "Projects" },
     { key: "Ctrl+G", label: "Work" },
-    { key: "Ctrl+T", label: "Runs" },
-    { key: "Ctrl+O", label: "Go" },
     { key: "Ctrl+,", label: "Settings" },
     { key: "Ctrl+X", label: "Inspect" },
     { key: "/stop", label: "Stop all" },
@@ -574,7 +548,7 @@ function createSharedShell(spec: SharedShellContext) {
   const readOnlyHints: Hint[] = [
     { key: "Ctrl+Y", label: "Take control" },
     { key: "Ctrl+P", label: "Projects" },
-    { key: "Ctrl+O", label: "Go" },
+    { key: "Ctrl+G", label: "Work" },
     { key: "/sessions", label: "Switch" },
     { key: "/quit", label: "Detach" },
   ];
@@ -813,30 +787,8 @@ function createSharedShell(spec: SharedShellContext) {
         session.tui.requestRender();
         return true;
       }
-      case "work": {
-        const tab = (["inbox", "goals", "runs", "escalations", "timers", "worktrees"] as const).find(
-          (t) => t === parsed.args.toLowerCase(),
-        );
-        openWork(tab);
-        return true;
-      }
-      case "inbox":
-        openWork("inbox");
-        return true;
-      case "escalations":
-        openWork("escalations");
-        return true;
-      case "goals":
-        openWork("goals");
-        return true;
-      case "runs":
-        openWork("runs");
-        return true;
-      case "timers":
-        openWork("timers");
-        return true;
-      case "worktrees":
-        openWork("worktrees");
+      case "work":
+        openWork();
         return true;
       case "stop":
         await stopAllAgents(parsed.args || undefined);
@@ -903,12 +855,7 @@ function createSharedShell(spec: SharedShellContext) {
           spec.client.request<DaemonStatusResult>("status").catch(() => null),
           store.refresh(),
         ]);
-        const s = store.state;
-        const activeGoals = s.goals.filter((g) =>
-          ["executing", "verifying", "reviewing", "awaiting_human"].includes(g.goal.status),
-        ).length;
-        const unresolvedEsc = store.unresolvedEscalationsCount;
-        const activeRuns = s.runs.filter((r) => r.run.status === "active" || r.run.status === "paused_quota").length;
+        const work = store.workSummary();
         const enabledClis = (daemonSt?.profiles ?? []).filter((p) => p.enabled).map((p) => p.id);
         const curModel = spec.getCurrentModel?.();
         const modelStr = curModel
@@ -925,9 +872,9 @@ function createSharedShell(spec: SharedShellContext) {
         });
         appendLiveReceipt({
           glyph: theme.glyphs.bullet,
-          tone: unresolvedEsc > 0 ? "warn" : "info",
+          tone: work.blocked > 0 ? "warn" : "info",
           tag: "work",
-          text: `${activeGoals} active goal(s) · ${activeRuns} active run(s) · ${unresolvedEsc} unresolved escalation(s) · ${s.inbox.length} inbox item(s) — Ctrl+G Work`,
+          text: `${work.active} active agent(s) · ${work.blocked} blocked — Ctrl+G Work`,
         });
         session.tui.requestRender();
         return true;
@@ -962,7 +909,7 @@ function createSharedShell(spec: SharedShellContext) {
       }
       case "resume": {
         if (!spec.runId) {
-          openWork("runs");
+          openWork();
           return true;
         }
         try {
@@ -1093,18 +1040,18 @@ function createSharedShell(spec: SharedShellContext) {
         return true;
       }
       case "internal": {
-        store.showInternal = !store.showInternal;
-        const pendingCount = store.showInternal ? hiddenInternalLines.length : 0;
+        showInternal = !showInternal;
+        const pendingCount = showInternal ? hiddenInternalLines.length : 0;
         appendLiveReceipt({
           tone: "info",
           tag: "internal",
-          text: store.showInternal
+          text: showInternal
             ? pendingCount > 0
               ? `Internal lines: shown (${pendingCount} earlier hidden line${pendingCount === 1 ? "" : "s"} appended below).`
               : "Internal lines: shown."
             : "Internal lines: hidden (use /internal to show).",
         });
-        if (store.showInternal) flushHiddenInternalLines();
+        if (showInternal) flushHiddenInternalLines();
         syncDock();
         return true;
       }
@@ -1130,17 +1077,15 @@ function createSharedShell(spec: SharedShellContext) {
     }
   };
 
-  const initialHud = store.buildLiveHud();
+  const dockWork = () => {
+    const w = store.workSummary();
+    const b = w.firstBlocked;
+    return { active: w.active, blocked: w.blocked, blockedLabel: b ? `${b.id} ${b.activity || b.status}` : null };
+  };
   dock = new FixedDock(session.tui, theme, {
     autocomplete: createCommandAutocomplete(spec.mode),
     initialState: {
-      slots: initialHud.slots,
-      agentCounts: initialHud.agentCounts,
-      hudItems: initialHud.hudItems,
-      hudSecondaryLine: initialHud.hudSecondaryLine,
-      activeGoalsCount: initialHud.activeGoalsCount,
-      needYouCount: store.state.inbox.length,
-      showInternal: store.showInternal,
+      work: dockWork(),
       idleBanner: spec.getIdleBanner(),
       busy: false,
       phaseText: effectivePhaseText(),
@@ -1189,15 +1134,8 @@ function createSharedShell(spec: SharedShellContext) {
   });
 
   const syncDock = () => {
-    const hud = store.buildLiveHud();
     dock.update({
-      slots: hud.slots,
-      agentCounts: hud.agentCounts,
-      hudItems: hud.hudItems,
-      hudSecondaryLine: hud.hudSecondaryLine,
-      activeGoalsCount: hud.activeGoalsCount,
-      needYouCount: store.state.inbox.length,
-      showInternal: store.showInternal,
+      work: dockWork(),
       idleBanner: spec.getIdleBanner(),
       busy,
       phaseText: effectivePhaseText(),
@@ -1257,14 +1195,6 @@ function createSharedShell(spec: SharedShellContext) {
     }
     if (matchesKey(data, "ctrl+g")) {
       openWork();
-      return { consume: true };
-    }
-    if (matchesKey(data, "ctrl+t")) {
-      openWork("runs");
-      return { consume: true };
-    }
-    if (matchesKey(data, "ctrl+o")) {
-      openPalette();
       return { consume: true };
     }
     if (matchesKey(data, "ctrl+,")) {
@@ -1335,18 +1265,6 @@ function createSharedShell(spec: SharedShellContext) {
           session.tui.requestRender();
         });
         return { consume: true };
-      }
-    }
-
-    // Alt+1..Alt+5 jump straight into numbered dock attention slot (supports legacy ESC+digit, Kitty CSI u, and modifyOtherKeys)
-    const altKeys = ["alt+1", "alt+2", "alt+3", "alt+4", "alt+5"] as const;
-    for (let i = 0; i < altKeys.length; i++) {
-      if (matchesKey(data, altKeys[i]!)) {
-        const slot = dock.slots[i];
-        if (slot) {
-          openEntity(slot.ref);
-          return { consume: true };
-        }
       }
     }
 
@@ -1960,7 +1878,7 @@ export async function runDirectorChatTui(opts: DirectorChatTuiOptions): Promise<
     getRightStatus: modelBadge,
     getIdleBanner: () => {
       const pTag = activeProject ? `[${activeProject.name}] · ` : "";
-      return `${pTag}${chatSession.id} · ${sanitizeLine(chatSession.title || "Director Chat")} (Ctrl+P Projects · Ctrl+G Work · Ctrl+O Go)`;
+      return `${pTag}${chatSession.id} · ${sanitizeLine(chatSession.title || "Director Chat")} (Ctrl+P Projects · Ctrl+G Work)`;
     },
     onUserSubmit: dispatchPrompt,
     onSteerQueued: tryDeliverQueuedBySteer,
@@ -2809,7 +2727,7 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
   shell.transcript.appendBanner(
     `${runRemotePrefix}Attached Run · ${runId}${boundTaskId ? ` / ${boundTaskId}` : ""}`,
     attached.run?.status ?? "active",
-    `Ctrl+G Work · Ctrl+T Runs · /remotes · /resume · /stop`,
+    `Ctrl+G Work · /remotes · /resume · /stop`,
   );
   if (opts.initialNotice) {
     shell.transcript.appendReceipt({ tone: opts.initialNotice.tone, tag: "host", text: opts.initialNotice.text });
@@ -2906,15 +2824,11 @@ export async function runNativeScrollbackTui(opts: NativeScrollbackTuiOptions): 
 
     if (ev.type === "escalation.created") {
       flushRunTail();
-      const escId = String(p.id ?? p.escalationId ?? "");
-      const ref: EntityRef = { kind: "escalation", id: escId, runId: ev.runId, label: `${escId} ${String(p.title ?? "")}` };
-      if (escId) shell.recordRef(ref);
       shell.transcript.appendReceipt({
         glyph: shell.theme.glyphs.warn,
         tone: "danger",
-        tag: escId || "escalation",
+        tag: String(p.id ?? p.escalationId ?? "") || "escalation",
         text: String(p.title ?? "Escalation"),
-        ref: escId ? ref : undefined,
       });
       shell.session.tui.requestRender();
       return;

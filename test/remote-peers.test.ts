@@ -311,7 +311,6 @@ describe("Symmetric PeerLink, Federated Projects/Sessions & Two-Way Messaging", 
       const dock = new FixedDock(tui, theme, {
         onSubmit: () => {},
         initialState: {
-          slots: [],
           idleBanner: "Idle",
           busy: false,
           phaseText: "Ready",
@@ -422,7 +421,6 @@ describe("Symmetric PeerLink, Federated Projects/Sessions & Two-Way Messaging", 
     const narrowDock = new FixedDock(tui, theme, {
       onSubmit: () => {},
       initialState: {
-        slots: [],
         idleBanner: "Idle",
         busy: false,
         phaseText: "Ready",

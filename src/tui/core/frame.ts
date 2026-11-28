@@ -32,7 +32,7 @@ export interface FramePrompt {
 }
 
 /**
- * Unified tab navigation helper shared by every tabbed screen (Work Navigator, Settings, Model Picker, Goal Inspector).
+ * Unified tab navigation helper shared by every tabbed screen (Settings, Model Picker, Goal Inspector).
  * Supports Left/Right arrows (`←`/`→`), `Tab` / `Shift+Tab`, and `1`..`9` direct selection.
  * Callers MUST NOT invoke this while a list's `/` filter or an inline prompt/confirm is active!
  */

@@ -23,7 +23,8 @@ CLI-first, daemonized **Tier 0 Interactive Director + 3-Tier Multi-Agent Coding 
   - Generated directly via `@bufbuild/protoc-gen-es` (`bun run proto:gen`). Models shared vs. separate multi-window quota buckets (e.g., Antigravity Gemini vs. Opus 5.5, Claude 5h ∩ 7d ∩ 7d-Opus, Copilot multipliers, API spend caps) merged with passive ACP rate-limit signals.
 - **Native-Scrollback TUI Primitives & Zero-Port Remote Daemon (`src/tui/primitives/`, `src/daemon/`)**:
   - Persistent `harnessd` survives terminal close; thin `@earendil-works/pi-tui` (`TuiMainScreen`) client renders width-safe, memoized native-scrollback cards (`< 4ms` daemon handshake, `< 0.02ms`/frame memoized redraws) and attaches remotely over `ssh://host`.
-  - Interactive overlays: `/model` (searchable tabular catalog), `/effort`, `/quota`, `/goals`, `/runs`, `/worktrees`, `/kb`, `/settings` (`Ctrl+,`), `Ctrl+O` Command Palette, `Ctrl+T` DFS Agent Tree Switcher, `Ctrl+C`/`Ctrl+D` clean exit, and `Ctrl+]` tmux-style detach.
+  - One work view: `Ctrl+G` (or `/work`) opens the goal & agent tree, each goal with the agents working on it nested by parent. It shows active and blocked items by default; `a` shows all work. Anything that needs you is asked in the Director chat, not in a separate inbox.
+  - Other overlays: `/model` (searchable tabular catalog), `/effort`, `/quota`, `/kb`, `/settings` (`Ctrl+,`), `Ctrl+C`/`Ctrl+D` clean exit, and `Ctrl+]` tmux-style detach.
 
 ## Install
 

@@ -16,12 +16,10 @@ import {
   createTheme,
   ModalScreen,
   Navigator,
-  RecentRefsRing,
   stripTerminalSequences,
   visibleWidth,
 } from "../src/tui/core/index.js";
 import {
-  EscalationInspectorScreen,
   GoalInspectorScreen,
   LiveTranscriptScreen,
   RunInspectorScreen,
@@ -29,7 +27,6 @@ import {
 } from "../src/tui/inspectors.js";
 import {
   EffortPickerScreen,
-  GoToPaletteScreen,
   KbBrowserScreen,
   ModelPickerScreen,
   QuotaCostScreen,
@@ -38,7 +35,6 @@ import {
   SettingsScreen,
 } from "../src/tui/pickers.js";
 import { WorkStore, type WorkSnapshot } from "../src/tui/store.js";
-import { WorkNavigatorScreen } from "../src/tui/work-navigator.js";
 import { withFixtureCatalog } from "./fixtures/launch-config.js";
 
 function initTempGitRepo(): string {
@@ -122,7 +118,7 @@ function makeMockClient(
 }
 
 describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
-  it("exposes all surfaced entities via work.snapshot, streams live escalation events, supports Left/Right tabs, aligned tables, and resolves escalations via Navigator", async () => {
+  it("exposes all surfaced entities via work.snapshot, streams live escalation events, and drills into goal/run/task inspectors", async () => {
     assert.equal(DAEMON_PROTOCOL_REV, 8);
     const repoDir = initTempGitRepo();
     const stateDir = mkdtempSync(join(tmpdir(), "pi-harness-tuiv2-state-"));
@@ -292,68 +288,24 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
         writeTerminal: () => {},
       };
 
-      const workNav = new WorkNavigatorScreen(deps, "escalations");
-      nav.push(workNav);
-      await new Promise((r) => setTimeout(r, 30));
-
-      // Acked escalation MUST still be visible under default "unresolved" Escalations view!
-      const escTabLines = workNav.render(100, 24, theme).map(stripTerminalSequences);
-      assert.ok(escTabLines.some((l) => l.includes("STATUS") && l.includes("TITLE")), "Must render sticky aligned headers");
-      assert.ok(escTabLines.some((l) => l.includes("Blocked on schema approval")), "Acked escalation must remain visible");
-
-      // Re-open escalation for Inbox & resolve test
+      // Re-open escalation for the resolve test
       daemon.db.db.prepare("UPDATE escalations SET status = 'open' WHERE id = ?").run(esc.id);
       await store.refresh();
 
-      // Test Left/Right arrow tab switching on WorkNavigatorScreen
-      workNav.setTab("inbox");
-      assert.equal(workNav.currentTab, "inbox");
-      workNav.handleInput("\x1b[C", screenCtx); // Right arrow -> goals
-      assert.equal(workNav.currentTab, "goals");
-      workNav.handleInput("\x1b[D", screenCtx); // Left arrow -> inbox
-      assert.equal(workNav.currentTab, "inbox");
-
-      // While `/` filter is active, Left/Right arrows MUST NOT switch tabs!
-      workNav.handleInput("/", screenCtx);
-      workNav.handleInput("\x1b[C", screenCtx);
-      assert.equal(workNav.currentTab, "inbox");
-      workNav.handleInput("\x1b", screenCtx); // Exit filter
-
-      // Width sweep across 60, 80, 120
-      for (const w of [60, 80, 120]) {
-        const lines = workNav.render(w, 24, theme);
-        assert.ok(lines.length <= 24);
-        assert.ok(lines.some((l) => l.includes("Inbox")));
-        assert.ok(lines.some((l) => l.includes("Blocked on schema approval")));
-        for (const l of lines) assert.ok(visibleWidth(l) <= w, `WorkNavigator overflowed ${w}`);
-      }
-
-      // Press Enter on top Inbox item -> drills into EscalationInspectorScreen with dynamic breadcrumbs!
-      nav.current!.handleInput("\r", screenCtx);
-      assert.deepEqual(nav.breadcrumbs, ["Work", esc.id]);
-      await new Promise((r) => setTimeout(r, 40));
-
-      const escLines = nav.current!.render(90, 24, theme).map(stripTerminalSequences);
-      assert.ok(escLines.some((l) => l.includes(`Work ▸ ${esc.id}`)), "Must use dynamic navigator.breadcrumbs");
-      assert.ok(escLines.some((l) => l.includes("Blocked on schema approval")));
-
-      // Verify `g` opens linked Goal (no collision with scroll-to-top!)
-      nav.current!.handleInput("g", screenCtx);
-      assert.deepEqual(nav.breadcrumbs, ["Work", esc.id, goal.id]);
-      // Test Left/Right tab switching on GoalInspectorScreen
+      // GoalInspectorScreen opens with breadcrumbs and Left/Right tab switching
+      nav.push(new GoalInspectorScreen(goal.id, deps));
+      assert.deepEqual(nav.breadcrumbs, [goal.id]);
       nav.current!.handleInput("\x1b[C", screenCtx); // Overview -> Tasks
       const goalTasksLines = nav.current!.render(90, 24, theme).map(stripTerminalSequences);
       assert.ok(goalTasksLines.some((l) => l.includes("Build core primitives")));
-      // Backspace pops when depth > 1
-      nav.current!.handleInput("\x7f", screenCtx);
-      assert.deepEqual(nav.breadcrumbs, ["Work", esc.id]);
+      nav.pop();
 
-      // Press 'r' -> type answer -> Enter -> resolves escalation live via escalation.resolve!
-      nav.current!.handleInput("r", screenCtx);
-      nav.current!.handleInput("\x15", screenCtx); // Clear default text
-      for (const ch of "Approved rev 6") nav.current!.handleInput(ch, screenCtx);
-      nav.current!.handleInput("\r", screenCtx);
-      await new Promise((r) => setTimeout(r, 60));
+      // Resolve the escalation via escalation.resolve RPC
+      const firstResolve = await client.request<{ alreadyResolved?: boolean }>("escalation.resolve", {
+        escalationId: esc.id,
+        reason: "Approved rev 6",
+      });
+      assert.equal(firstResolve.alreadyResolved ?? false, false);
       assert.equal(daemon.db.getEscalation(esc.id)?.status, "resolved");
       assert.equal(daemon.db.getEscalation(esc.id)?.resolution, "Approved rev 6");
 
@@ -375,12 +327,12 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
       assert.equal(chatNotices.length, 1);
       assert.ok(chatNotices[0]!.content.includes("Approved rev 6"));
 
-      // Re-resolving reports alreadyResolved notice without duplicating audit event or chat notice
-      nav.current!.handleInput("r", screenCtx);
-      nav.current!.handleInput("\r", screenCtx);
-      await new Promise((r) => setTimeout(r, 60));
-      const alreadyRendered = nav.current!.render(100, 24, theme).map(stripTerminalSequences).join("\n");
-      assert.ok(alreadyRendered.includes(`${esc.id} was already resolved`));
+      // Re-resolving reports alreadyResolved without duplicating audit event or chat notice
+      const secondResolve = await client.request<{ alreadyResolved?: boolean }>("escalation.resolve", {
+        escalationId: esc.id,
+        reason: "Approved rev 6",
+      });
+      assert.equal(secondResolve.alreadyResolved, true);
       assert.equal(
         daemon.director.chats
           .getHistory(chat.session.id)
@@ -406,18 +358,6 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
       // Cancel timer via RPC
       await client.request("timer.cancel", { timerId: timer.id });
       assert.equal(daemon.db.timers.get(timer.id)?.status, "cancelled");
-
-      // Verify GoToPaletteScreen puts pinned commands at the top and renders cleanly at 60/80/120
-      const palette = new GoToPaletteScreen(deps, new RecentRefsRing(), [
-        { id: "settings", label: "/settings", detail: "ACP CLIs & Models", pinned: true, run: () => {} },
-        { id: "model", label: "/model", detail: "Select Model", pinned: true, run: () => {} },
-      ]);
-      for (const w of [60, 80, 120]) {
-        const palLines = palette.render(w, 18, theme);
-        assert.ok(palLines.length <= 18);
-        assert.ok(palLines.some((l) => stripTerminalSequences(l).includes("/settings")));
-        for (const l of palLines) assert.ok(visibleWidth(l) <= w, `Palette overflowed ${w}`);
-      }
 
       store.dispose();
     } finally {
@@ -879,11 +819,6 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
     assert.equal(resumeCall?.params.note, "Continue");
     assert.equal("message" in (resumeCall?.params ?? {}), false);
 
-    // 4. WorkNavigatorScreen Worktrees tab renders real SnapshotWorktreeEntry (dirty)
-    const wtNav = new WorkNavigatorScreen(deps, "worktrees");
-    nav.push(wtNav);
-    const wtText = wtNav.render(100, 20, theme).join("\n");
-    assert.ok(wtText.includes("wt-1") && wtText.includes("dirty"));
     store.dispose();
   });
 
@@ -1246,7 +1181,7 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
     assert.ok(mock.calls.some((c) => c.op === "session.leave"));
   });
 
-  it("verifies EscalationInspector 'a' ack distinct from resolve, WorkNavigator 'R' escalation.resolve, and GoalInspector 'A' goal.accept", async () => {
+  it("verifies GoalInspector 'A' goal.accept", async () => {
     const theme = createTheme({ color: false, ascii: false });
     const { terminal } = makeFakeTerminal(120, 30);
     const tui = new ModalScreen(terminal);
@@ -1296,7 +1231,6 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
       revisions: [],
     });
 
-    let resolveCount = 0;
     let failAccept = false;
     const mock = makeMockClient(async (op) => {
       if (op === "work.snapshot") {
@@ -1318,19 +1252,6 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
           inbox: [],
         } satisfies WorkSnapshot;
       }
-      if (op === "escalation.get") {
-        return { escalation: escRecord, run: null, fromTask: null, goal: null };
-      }
-      if (op === "escalation.ack") {
-        return { ...escRecord, status: "acked" };
-      }
-      if (op === "escalation.resolve") {
-        resolveCount += 1;
-        if (resolveCount === 1) {
-          return { escalation: { ...escRecord, status: "resolved" }, alreadyResolved: false, deliveredTo: ["t-1"] };
-        }
-        return { escalation: { ...escRecord, status: "resolved" }, alreadyResolved: true, deliveredTo: [] };
-      }
       if (op === "goal.accept") {
         if (failAccept) throw new Error("deterministic gate c1 failed");
         return { ok: true };
@@ -1342,52 +1263,7 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
     await store.refresh();
     const deps = { client: mock.client, store, repoRoot: "/repo" };
 
-    // 1. EscalationInspector 'a' stays on escalation.ack with resolve: false
-    const escScreen = new EscalationInspectorScreen("esc-1", deps);
-    nav.push(escScreen);
-    await new Promise((r) => setTimeout(r, 20));
-    escScreen.handleInput("a", ctx);
-    escScreen.handleInput("\x15", ctx);
-    for (const ch of "Investigating issue") escScreen.handleInput(ch, ctx);
-    escScreen.handleInput("\r", ctx);
-    await new Promise((r) => setTimeout(r, 20));
-
-    const ackCalls = mock.calls.filter((c) => c.op === "escalation.ack");
-    assert.equal(ackCalls.length, 1);
-    assert.deepEqual(ackCalls[0]!.params, {
-      escalationId: "esc-1",
-      resolution: "Investigating issue",
-      resolve: false,
-    });
-    assert.equal(mock.calls.filter((c) => c.op === "escalation.resolve").length, 0);
-    nav.pop();
-
-    // 2. WorkNavigator 'R' sends escalation.resolve with typed reason (no escalation.ack)
-    mock.calls.length = 0;
-    const workNav = new WorkNavigatorScreen(deps, "escalations");
-    nav.push(workNav);
-    workNav.handleInput("R", ctx);
-    workNav.handleInput("\x15", ctx);
-    for (const ch of "Use SQLite") workNav.handleInput(ch, ctx);
-    workNav.handleInput("\r", ctx);
-    await new Promise((r) => setTimeout(r, 20));
-
-    const navResolveCalls = mock.calls.filter((c) => c.op === "escalation.resolve");
-    assert.equal(navResolveCalls.length, 1);
-    assert.deepEqual(navResolveCalls[0]!.params, { escalationId: "esc-1", reason: "Use SQLite" });
-    assert.equal(mock.calls.filter((c) => c.op === "escalation.ack").length, 0);
-    const firstResolveRender = workNav.render(120, 24, theme).map(stripTerminalSequences).join("\n");
-    assert.ok(firstResolveRender.includes("Resolved esc-1 (sent to t-1)"));
-
-    // Second 'R' returning alreadyResolved shows info notice
-    workNav.handleInput("R", ctx);
-    workNav.handleInput("\r", ctx);
-    await new Promise((r) => setTimeout(r, 20));
-    const alreadyRender = workNav.render(120, 24, theme).map(stripTerminalSequences).join("\n");
-    assert.ok(alreadyRender.includes("esc-1 was already resolved"));
-    nav.pop();
-
-    // 3. GoalInspector 'A' sends goal.accept with reason + evidencePaths, no overrideDeterministic
+    // 1. GoalInspector 'A' sends goal.accept with reason + evidencePaths, no overrideDeterministic
     mock.calls.length = 0;
     const execGoalScreen = new GoalInspectorScreen("goal-exec", deps);
     nav.push(execGoalScreen);
@@ -1433,7 +1309,7 @@ describe("TUI v2 Reachability, WorkSnapshot & Inspector Drill-Down", () => {
     assert.ok(failRender.includes("Accept failed: deterministic gate c1 failed"));
     nav.pop();
 
-    // 4. GoalInspector 'A' is NOT offered or handled for achieved, draft, or cancelled goals
+    // 2. GoalInspector 'A' is NOT offered or handled for achieved, draft, or cancelled goals
     for (const blockedGoalId of ["goal-done", "goal-draft", "goal-cancelled"]) {
       mock.calls.length = 0;
       const screen = new GoalInspectorScreen(blockedGoalId, deps);

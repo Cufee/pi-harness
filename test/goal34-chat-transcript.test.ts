@@ -1013,7 +1013,7 @@ describe("goal-34 c3: Director chat assistant replies render exactly once", () =
       await runPromise;
 
       const out = text();
-      const dockSplit = out.indexOf("Agents:");
+      const dockSplit = out.indexOf("Ctrl+G work");
       const transcriptPart = dockSplit >= 0 ? out.slice(0, dockSplit) : out;
       assert.equal(
         countOccurrences(out, reply),
@@ -2034,7 +2034,7 @@ describe("goal-34 c3: Director chat assistant replies render exactly once", () =
     }
   });
 
-  it("should-fix 9: Work Navigator 'i' toggle flushes buffered internal lines on return to chat, and unrelated cancel does not print steer_cancelled", async () => {
+  it("should-fix 9: /internal toggle flushes buffered internal lines into chat, and unrelated cancel does not print steer_cancelled", async () => {
     const { terminal, text, sendInput, typeText } = makeFakeTerminal(120, 30);
     const session = makeChatSession("chat-34-sf9");
     let resolveSend!: () => void;
@@ -2082,18 +2082,13 @@ describe("goal-34 c3: Director chat assistant replies render exactly once", () =
     await new Promise((r) => setTimeout(r, 40));
     assert.equal(text().includes("BUFFERED-INTERNAL-SF9"), false, "Internal line hidden by default");
 
-    // Open Work Navigator (`Ctrl+G`), select Inbox (`1`, since the `i` toggle is only guaranteed on the Inbox tab), press `i` to enable showInternal, then `Esc` to return to chat
-    sendInput("\x07");
-    await new Promise((r) => setTimeout(r, 40));
-    sendInput("1");
-    await new Promise((r) => setTimeout(r, 40));
-    sendInput("i");
-    await new Promise((r) => setTimeout(r, 40));
-    sendInput("\x1b");
+    // `/internal` shows internal lines and flushes the buffered one into the transcript
+    typeText("/internal");
+    sendInput("\r");
     await waitFor(
       () => text().includes("BUFFERED-INTERNAL-SF9"),
       3000,
-      "buffered internal line flushed when returning to chat after Work Navigator 'i' toggle",
+      "buffered internal line flushed after /internal toggle",
     );
 
     // Toggle /internal back OFF before testing unrelated cancel racing an in-flight steer

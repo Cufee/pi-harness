@@ -381,7 +381,6 @@ describe("goal-34 c2: ChatQueueModel pure unit tests", () => {
     const dock = new FixedDock(fakeTui, theme, {
       onSubmit: () => {},
       initialState: {
-        slots: [],
         idleBanner: "Ready",
         busy: true,
         phaseText: "Director responding...",
@@ -393,7 +392,7 @@ describe("goal-34 c2: ChatQueueModel pure unit tests", () => {
     });
 
     const emptyLines = dock.render(100);
-    assert.equal(emptyLines.length, 9, "Empty queue must keep baseline 9-row FixedDock height");
+    assert.equal(emptyLines.length, 7, "Empty queue must keep baseline 7-row FixedDock height");
 
     const q = new ChatQueueModel();
     q.enqueue("First queued item", { state: "sending", reason: "after_turn" });
@@ -411,8 +410,8 @@ describe("goal-34 c2: ChatQueueModel pure unit tests", () => {
 
     dock.update({ queuedCount: q.queuedLength, queuedItems: q.list() });
     const fullLines = dock.render(100).map((l) => stripTerminalSequences(l));
-    // At 30 terminal rows (9 baseline dock + 6 transcript reserve -> 15 rows available), all 7 items fit directly!
-    assert.equal(fullLines.length, 9 + 7);
+    // At 30 terminal rows (7 baseline dock + 6 transcript reserve -> 17 rows available), all 7 items fit directly!
+    assert.equal(fullLines.length, 7 + 7);
     const joined = fullLines.join("\n");
     assert.ok(joined.includes("1 sending"));
     assert.ok(joined.includes("First queued item"));
@@ -426,12 +425,11 @@ describe("goal-34 c2: ChatQueueModel pure unit tests", () => {
     assert.ok(joined.includes("Seventh queued item"));
     assert.ok(joined.includes("Alt+S /now · Ctrl+R edit · Alt+Q drop"));
 
-    // On a short 17-row terminal (8 baseline dock + 6 reserve -> 3 strip rows), overflow shows `+N more · /queue`
-    const shortTui = { terminal: { columns: 100, rows: 17 }, requestRender() {} } as unknown as TUI;
+    // On a short 16-row terminal (7 baseline dock + 6 reserve -> 3 strip rows), overflow shows `+N more · /queue`
+    const shortTui = { terminal: { columns: 100, rows: 16 }, requestRender() {} } as unknown as TUI;
     const shortDock = new FixedDock(shortTui, theme, {
       onSubmit: () => {},
       initialState: {
-        slots: [],
         idleBanner: "Ready",
         busy: true,
         phaseText: "Working",
@@ -442,7 +440,7 @@ describe("goal-34 c2: ChatQueueModel pure unit tests", () => {
       },
     });
     const shortLines = shortDock.render(100).map((l) => stripTerminalSequences(l));
-    assert.equal(shortLines.length, 8 + 3, "Short terminal uses 2 visible items + 1 overflow row");
+    assert.equal(shortLines.length, 7 + 3, "Short terminal uses 2 visible items + 1 overflow row");
     assert.ok(shortLines.join("\n").includes("+5 more · /queue"));
   });
 });
@@ -917,7 +915,7 @@ describe("goal-34 c2: runDirectorChatTui pinned queue strip end-to-end", () => {
   });
 
   it("should-fix 7: /queue lists every item with 1-based position and state, even when strip overflows", async () => {
-    const { terminal, text, sendInput, typeText } = makeFakeTerminal(120, 17);
+    const { terminal, text, sendInput, typeText } = makeFakeTerminal(120, 16);
     const session = makeChatSession("chat-q34-sf7");
     let resolveSend!: () => void;
     const sendGate = new Promise<void>((r) => (resolveSend = r));
@@ -964,7 +962,7 @@ describe("goal-34 c2: runDirectorChatTui pinned queue strip end-to-end", () => {
     });
     await waitFor(() => text().includes("Streaming..."), 3000, "confirmed");
 
-    // Queue 5 items on a 17-row terminal -> strip overflows with "+3 more · /queue"
+    // Queue 5 items on a 16-row terminal -> strip overflows with "+3 more · /queue"
     for (const label of ["ITEM-ONE", "ITEM-TWO", "ITEM-THREE", "ITEM-FOUR", "ITEM-FIVE"]) {
       typeText(label);
       sendInput("\r");

@@ -23,8 +23,8 @@ export interface TableListItem<T> {
 }
 
 /**
- * Uniform keyboard + mouse-wheel list & aligned-table component used across Work Navigator tabs,
- * Go-To-Anything palette, Settings, Model/Session/KB pickers, and drill-down sub-lists.
+ * Uniform keyboard + mouse-wheel list & aligned-table component used across the work tree,
+ * Settings, Model/Session/KB pickers, and drill-down sub-lists.
  *
  * Features:
  *  - Optional `columns: ColumnSpec[]` renders a sticky header + `─` rule above the scrollable viewport
