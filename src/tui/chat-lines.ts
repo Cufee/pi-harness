@@ -433,6 +433,25 @@ export function classifyControlEvent(
       };
     }
 
+    case "thread.request": {
+      const title = ensureSafeText(event.title, "request", event.kind);
+      const needsUser = event.requestKind === "user_question";
+      const text =
+        event.requestKind === "user_question"
+          ? `Question for you: ${title}`
+          : event.requestKind === "routed_work"
+            ? `Sent back as out of scope: ${title}`
+            : `Request ${humanizeTokens(event.outcome ?? "triaged")}: ${title}`;
+      return {
+        audience: needsUser || event.outcome === "declined" || event.outcome === "answered" ? "human" : "internal",
+        tag: ensureSafeTag(event.goalId ?? event.runId, "goal", event.kind),
+        text,
+        tone: needsUser ? "warn" : "dim",
+        glyph: needsUser ? "pause" : "bullet",
+        ref: event.goalId ? goalRef(event.goalId, event.runId) : undefined,
+      };
+    }
+
     case "task.settled": {
       const title = ensureSafeText(event.title, "task", event.kind);
       const status = humanizeTokens(event.status);

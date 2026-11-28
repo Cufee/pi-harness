@@ -145,6 +145,29 @@ export type ChatControlEvent =
       toolCallId?: string;
     }
   | {
+      /**
+       * A lead thread's request changed state. phase "created": the lead asked the user a question (user_question)
+       * or sent work back as outside its goal (routed_work). phase "triaged": the lead decided a request the Director
+       * forwarded (user_request).
+       */
+      kind: "thread.request";
+      requestId: string;
+      requestKind: "user_request" | "user_question" | "routed_work";
+      phase: "created" | "triaged";
+      /** phase "triaged": accepted, delegated, answered, or declined. */
+      outcome?: "accepted" | "delegated" | "answered" | "declined";
+      goalId: string | null;
+      runId: string;
+      taskId: string;
+      title: string;
+      /** The question, the routed work, or the forwarded request (<=2,000 chars). */
+      body: string;
+      /** phase "triaged": the lead's note or answer (<=2,000 chars). */
+      resolution?: string;
+      /** outcome "declined": the routed_work request the Director must reschedule or drop. */
+      routedRequestId?: string;
+    }
+  | {
       /** Goal lifecycle events queued during a busy Director turn, coalesced and delivered in one turn (oldest first). */
       kind: "goal.events_batch";
       events: GoalLifecycleChatEvent[];
@@ -408,6 +431,35 @@ export function parseChatControlEvent(raw: unknown): ChatControlEvent | null {
         ...(r.partial === true ? { partial: true } : {}),
       };
     }
+    case "thread.request": {
+      const requestKind = r.requestKind;
+      const phase = r.phase;
+      if (
+        typeof r.requestId !== "string" ||
+        typeof r.runId !== "string" ||
+        typeof r.taskId !== "string" ||
+        typeof r.title !== "string" ||
+        (requestKind !== "user_request" && requestKind !== "user_question" && requestKind !== "routed_work") ||
+        (phase !== "created" && phase !== "triaged")
+      ) {
+        return null;
+      }
+      const outcome = r.outcome;
+      return {
+        kind: "thread.request",
+        requestId: r.requestId,
+        requestKind,
+        phase,
+        ...(outcome === "accepted" || outcome === "delegated" || outcome === "answered" || outcome === "declined" ? { outcome } : {}),
+        goalId: typeof r.goalId === "string" ? r.goalId : null,
+        runId: r.runId,
+        taskId: r.taskId,
+        title: r.title.replace(/\s+/g, " ").trim().slice(0, 200),
+        body: typeof r.body === "string" ? r.body.trim().slice(0, 2000) : "",
+        ...(typeof r.resolution === "string" && r.resolution.trim() ? { resolution: r.resolution.trim().slice(0, 2000) } : {}),
+        ...(typeof r.routedRequestId === "string" ? { routedRequestId: r.routedRequestId } : {}),
+      };
+    }
     case "goal.gate_activity": {
       const gate = r.gate;
       const activity = r.activity;
@@ -581,6 +633,14 @@ export function formatChatEventSummary(event: ChatControlEvent, opts?: { remoteH
               : "";
       return `Goal ${event.goalId} v${event.goalVersion} ${gatePhrase}, but task ${event.taskId} pushed${remotePart}${pushDetail}.`;
     }
+    case "thread.request": {
+      const where = event.goalId ? `Goal ${event.goalId}` : `Run ${event.runId}`;
+      const title = event.title.replace(/\s+/g, " ").trim();
+      if (event.requestKind === "user_question") return `${where} asks the user (${event.requestId}): ${title}`;
+      if (event.requestKind === "routed_work") return `${where} sent work back as outside its goal (${event.requestId}): ${title}`;
+      const note = event.resolution ? `: ${event.resolution.replace(/\s+/g, " ").trim().slice(0, 300)}` : "";
+      return `${where} ${event.outcome ?? "triaged"} request ${event.requestId} ("${title}")${note}`;
+    }
     case "goal.events_batch":
       return `${event.events.length} goal updates: ${event.events.map((e) => formatChatEventSummary(e, opts)).join("; ")}`;
     case "session.message_received": {
@@ -695,6 +755,38 @@ export function formatChatEventForModel(event: ChatControlEvent): string {
         summary,
         `The orchestrator keeps working while the goal waits on a human. Decide whether this matches the open decision: let it continue, steer it with steer_task / steer_run, pause it with goal_pause, or tell the user. Inspect with goal_get({ goal_id: "${event.goalId}" }).`,
       ].join("\n");
+    case "thread.request": {
+      const where = event.goalId ? `goal ${event.goalId}` : `run ${event.runId}`;
+      if (event.requestKind === "user_question") {
+        return [
+          `The lead thread of ${where} needs an answer from the user (${event.requestId}):`,
+          event.body,
+          "",
+          `Ask the user this question in your reply, in their terms, with the options and the lead's recommendation. The thread keeps working on what does not depend on it. When the user answers, call resolve_request({ request_id: "${event.requestId}", outcome: "user_answered", note: "<their answer>" }). Do not answer for the user; if the conversation already contains their answer, pass that.`,
+        ].join("\n");
+      }
+      if (event.requestKind === "routed_work") {
+        return [
+          `The lead thread of ${where} sent this work back as outside its goal (${event.requestId}): ${event.title}`,
+          event.body,
+          "",
+          `It is yours to place: create a goal for it, add it to another goal with send_request, or ask the user when it is unclear whether they want it. Then call resolve_request({ request_id: "${event.requestId}", outcome: "rescheduled" | "dropped", note }). Tell the user what you did with it.`,
+        ].join("\n");
+      }
+      const head = `The lead thread of ${where} ${event.outcome ?? "triaged"} request ${event.requestId} ("${event.title}").`;
+      if (event.outcome === "answered") {
+        return [head, `Its answer: ${event.resolution ?? ""}`, "", "Relay the answer to the user in your own words."].join("\n");
+      }
+      if (event.outcome === "declined") {
+        return [
+          head,
+          `Its reason: ${event.resolution ?? ""}`,
+          "",
+          `The request is not lost: it is now routed work${event.routedRequestId ? ` ${event.routedRequestId}` : ""} for you to place. Create a goal for it, send it to a goal it fits, or ask the user; then call resolve_request({ request_id: "${event.routedRequestId ?? "<routed id>"}", outcome: "rescheduled" | "dropped", note }). Tell the user where their request went.`,
+        ].join("\n");
+      }
+      return [head, event.resolution ? `Its note: ${event.resolution}` : ""].filter(Boolean).join("\n");
+    }
     case "goal.events_batch":
       return ["Handle these goal updates together in one turn:", ...event.events.map((e) => formatChatEventForModel(e))].join("\n\n");
     case "session.message_received": {

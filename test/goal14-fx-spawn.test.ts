@@ -211,9 +211,13 @@ describe("goal-14 fix FX-SPAWN", () => {
       assert.ok(fact.includes("inspect_command"));
     }
 
-    // Role-specific writable options
-    assert.ok(describeTool("spawn_task", "orchestrator").includes("spawn_worker"));
+    // Role-specific writable options. The lead thread may hand the work to an execute subagent or a Worker, or run it itself.
+    assert.ok(
+      describeTool("spawn_task", "orchestrator").includes("Give that work to a kind execute task or a Worker, or run it yourself when you have a shell."),
+    );
     assert.ok(describeTool("spawn_task", "worker").includes("kind execute task"));
+    // A Worker cannot start Workers: its fact must not offer one (the lead's does, so spawn_worker alone no longer tells them apart).
+    assert.ok(!toolFact("worker", "spawn_task", "readOnlyNoShell").includes("a Worker"));
     assert.ok(!describeTool("spawn_task", "worker").includes("spawn_worker"));
     assert.ok(describeTool("spawn_task", "director").includes("goal"));
     assert.ok(!describeTool("spawn_task", "director").includes("spawn_worker"));

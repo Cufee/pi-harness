@@ -80,6 +80,17 @@ export interface GoalsConfig {
   /** Max concurrent in-progress goals per repository (default 4; additional committed goals wait in the admission queue). */
   maxConcurrentGoals?: number;
   /**
+   * Whether a goal's lead thread (Tier 1) gets its own git worktree and may edit and merge itself (default true).
+   * false keeps the lead a read-only planner that must delegate every change.
+   */
+  leadWritable?: boolean;
+  /**
+   * How many times in a row the harness reopens a lead thread's turn that ended with unfinished plan steps,
+   * untriaged requests, or unmerged work and no change since the last check (default 3). Ends are never blocked
+   * while the lead waits on the user or on running children.
+   */
+  leadTurnEndChecks?: number;
+  /**
    * Absolute path of the shell that runs verification gates with `-c` (default `/bin/sh`).
    * Global `config.json` / `config.update` only; ignored in repo `.pi-harness.json`. Invalid values fail gates closed.
    */
@@ -480,6 +491,8 @@ const CONFIG_SECTION_KEYS: { [S in ConfigSection]: { [K in keyof NonNullable<Har
     gateTimeoutMs: true,
     autoVerifyOnSettle: true,
     maxConcurrentGoals: true,
+    leadWritable: true,
+    leadTurnEndChecks: true,
     gateShell: true,
     gateEnv: true,
   },
@@ -974,6 +987,8 @@ export function resolveConfig(
           gateTimeoutMs: 180_000,
           autoVerifyOnSettle: true,
           maxConcurrentGoals: 4,
+          leadWritable: true,
+          leadTurnEndChecks: 3,
         }),
     ...(globalGoalsRest as Partial<GoalsConfig>),
     ...(repoGoals as Partial<GoalsConfig>),
@@ -1292,6 +1307,8 @@ export function validateConfigRaw(raw: unknown): string[] {
     gateTimeoutMs: POS_INT,
     maxConcurrentGoals: POS_INT,
     autoVerifyOnSettle: BOOLEAN,
+    leadWritable: BOOLEAN,
+    leadTurnEndChecks: POS_INT,
   });
   if (goalsSection) errors.push(...normalizeGateConfig(goalsSection).issues);
   section("events", { fallbackWakeupIntervalSec: POSITIVE, wakeDirectorOnGoalSettle: BOOLEAN });

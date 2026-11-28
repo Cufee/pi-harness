@@ -4,7 +4,6 @@ import type { AdvisoryRule, Finding, ObservedCall, Role, RuleContext, ScopeFindi
 
 export const SCOPE_ROLES: ReadonlySet<Role> = new Set<Role>(["research", "plan", "verify", "execute"]);
 
-export const SCOPE_REARM_AREA_GROWTH = 6;
 export const SCOPE_REARM_SPIN_CALLS = 12;
 
 export const BRIEF_COUNT_PATTERNS: readonly RegExp[] = [
@@ -52,7 +51,6 @@ const VOLATILE_RESULT_KEYS: ReadonlySet<string> = new Set([
 
 const MAX_DISPLAY_PATH_CHARS = 48;
 const MAX_DISPLAY_SCOPE_CHARS = 32;
-const MAX_DISPLAY_SAMPLE_CHARS = 32;
 const MAX_DISPLAY_ID_CHARS = 32;
 const MAX_DISPLAY_MATCH_CHARS = 48;
 
@@ -129,14 +127,6 @@ function formatScopeList(scopes: readonly string[]): string {
     maxItems: 3,
     maxWords: 3,
     maxItemChars: MAX_DISPLAY_SCOPE_CHARS,
-  });
-}
-
-function formatSampleList(items: readonly string[]): string {
-  return formatBoundedList(items, {
-    maxItems: 3,
-    maxWords: 4,
-    maxItemChars: MAX_DISPLAY_SAMPLE_CHARS,
   });
 }
 
@@ -295,7 +285,6 @@ const workerEditOutsideScopeRule: AdvisoryRule<WorkerEditState> = {
 // 2. scope-too-large (6.2)
 interface ScopeRuleState {
   hasFired: boolean;
-  areasAtFire: number;
   scoredCallsAtFire: number;
   lastFinding: ScopeFinding | null;
   seenNonEditCall: boolean;
@@ -314,7 +303,6 @@ const scopeTooLargeRule: AdvisoryRule<ScopeRuleState> = {
   priority: 80,
   init: () => ({
     hasFired: false,
-    areasAtFire: 0,
     scoredCallsAtFire: 0,
     lastFinding: null,
     seenNonEditCall: false,
@@ -377,14 +365,15 @@ const scopeTooLargeRule: AdvisoryRule<ScopeRuleState> = {
     }
 
     const suppressRepeated = state.editIntervened || state.sawDifferentResult;
+    // Reading widely is never reported: an agent decides for itself whether an assignment should be split, and
+    // pushing it to hand back partial work costs the context it has built. Only spinning (the same call repeated,
+    // or reads that find nothing new) is.
     const finding: ScopeFinding = {
-      ...(rawFinding.widening ? { widening: rawFinding.widening } : {}),
       ...(rawFinding.repeated && !suppressRepeated ? { repeated: rawFinding.repeated } : {}),
       ...(rawFinding.stale ? { stale: rawFinding.stale } : {}),
     };
 
-    const reasonKeys: Array<"widening" | "repeated" | "stale"> = [];
-    if (finding.widening) reasonKeys.push("widening");
+    const reasonKeys: Array<"repeated" | "stale"> = [];
     if (finding.repeated) reasonKeys.push("repeated");
     if (finding.stale) reasonKeys.push("stale");
     if (reasonKeys.length === 0) {
@@ -395,11 +384,7 @@ const scopeTooLargeRule: AdvisoryRule<ScopeRuleState> = {
 
     const primaryReason = reasonKeys[0]!;
     let what: string;
-    if (primaryReason === "widening" && finding.widening) {
-      const areas = formatSampleList(finding.widening.areas);
-      const topics = formatSampleList(finding.widening.topics);
-      what = `You have opened ${finding.widening.areas.length} areas (${areas}) and searched ${finding.widening.topics.length} unrelated topics (${topics}).`;
-    } else if (primaryReason === "repeated" && finding.repeated) {
+    if (primaryReason === "repeated" && finding.repeated) {
       const tool = clipSnippet(finding.repeated.tool, 1, MAX_DISPLAY_ID_CHARS) || "tool";
       what = `You repeated the same ${tool} call ${finding.repeated.times} times.`;
     } else {
@@ -409,9 +394,9 @@ const scopeTooLargeRule: AdvisoryRule<ScopeRuleState> = {
     return {
       key: "scope",
       what,
-      why: "This usually means the task exceeds one bounded assignment.",
+      why: "This usually means you are stuck, not that the assignment is too large.",
       alternative:
-        "If you are still answering one bounded question, continue. Otherwise save findings with artifact_write, then call return_task with status scope_too_large, partial: true, artifact_paths, and suggested_splits, one per open area.",
+        "If you are making progress, continue. Otherwise try a different approach. If nothing works, save what you found with artifact_write and call return_task with status blocked, saying what you tried and what is missing.",
       data: {
         reasons: reasonKeys,
         finding,
@@ -425,18 +410,12 @@ const scopeTooLargeRule: AdvisoryRule<ScopeRuleState> = {
     rearm(state, ctx) {
       if (!ctx.scope || !state.hasFired || !state.lastFinding) return false;
       const marks = ctx.scope.marks();
-      const areaGrew =
-        Boolean(state.lastFinding.widening) && marks.areas >= state.areasAtFire + SCOPE_REARM_AREA_GROWTH;
-      const spunAgain =
-        Boolean(state.lastFinding.repeated || state.lastFinding.stale) &&
-        marks.scoredCalls >= state.scoredCallsAtFire + SCOPE_REARM_SPIN_CALLS;
-      return areaGrew || spunAgain;
+      return marks.scoredCalls >= state.scoredCallsAtFire + SCOPE_REARM_SPIN_CALLS;
     },
   },
   fired(state, ctx) {
     if (!ctx.scope) return;
     const marks = ctx.scope.marks();
-    state.areasAtFire = marks.areas;
     state.scoredCallsAtFire = marks.scoredCalls;
     state.hasFired = true;
     if (state.lastFinding?.stale) {
@@ -1470,7 +1449,7 @@ const readOnlyBriefNeedsShellRule: AdvisoryRule<null> = {
         ? `Put that run in a goal, or steer ${displayChildId} with steer_task to inspect only.`
         : subject.role === "worker"
           ? `Use a kind execute task or run it yourself, or steer ${displayChildId} with steer_child to inspect only.`
-          : `Give that command to a Worker with spawn_worker, or steer ${displayChildId} with steer_child to inspect only.`;
+          : `Run it yourself when you have a shell, give it to a kind execute task or to a Worker with spawn_worker, or steer ${displayChildId} with steer_child to inspect only.`;
 
     return {
       key: childId,

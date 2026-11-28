@@ -420,7 +420,7 @@ function validateInboxInvocation(positional: string[], flags: Record<string, str
 }
 
 export function formatHelp(): string {
-  return `pi-harness — CLI-first, daemonized interactive Director + 3-tier multi-agent coding harness
+  return `pi-harness — CLI-first, daemonized interactive Director + multi-agent coding harness
 
 Usage:
   pi-harness [--resume] [-p <project>] [--remote <alias|ssh://host>]

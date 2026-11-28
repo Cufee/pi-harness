@@ -9,6 +9,7 @@ import { ControlPlaneDb } from "../src/control-plane/db.js";
 import { HarnessOrchestrator } from "../src/control-plane/orchestrator.js";
 import { QuotaClient } from "../src/quota/client.js";
 import { storagePaths } from "../src/storage/paths.js";
+import { toolsForRole } from "../src/tool-descriptions/index.js";
 
 it.each(["research", "plan", "verify"] as const)("lets Tier 1 spawn and await a narrow, sourced %s task", async (kind) => {
   const repoRoot = mkdtempSync(join(tmpdir(), "pi-harness-t1-research-"));
@@ -82,9 +83,16 @@ it.each(["research", "plan", "verify"] as const)("lets Tier 1 spawn and await a 
     }
     const spawnTool = orch.toolExecutor.tools(1).find(tool => tool.name === "spawn_task")!;
     const properties = spawnTool.inputSchema.properties as Record<string, { enum?: string[] }>;
-    assert.deepEqual(properties.kind?.enum?.toSorted(), ["plan", "research", "verify"]);
-    assert.deepEqual(Object.keys(properties).toSorted(), ["effort", "kind", "model", "objective", "profile_id", "title"]);
+    // The lead thread's spawn_task has the same schema Workers have, including kind execute.
+    assert.deepEqual(properties.kind?.enum?.toSorted(), ["execute", "plan", "research", "verify"]);
+    assert.deepEqual(
+      Object.keys(properties).toSorted(),
+      ["criteria", "depends_on", "effort", "kind", "model", "objective", "profile_id", "read_only", "title"],
+    );
+    assert.deepEqual(spawnTool.inputSchema, toolsForRole("worker").find(tool => tool.name === "spawn_task")!.inputSchema);
     const assignment = { title: "Read deployment notes", objective: "Find how deployment starts" };
+    // This parent is a read-only lead: it has no worktree for an execute task to edit, so kind execute is still rejected.
+    assert.equal(parent.readOnly, true);
     await assert.rejects(() => execute("spawn_task", { ...assignment, kind: "execute" }), /\[harness blocked: spawn-execute-needs-worker\]/);
     assert.equal(catalogCalls, 0);
     assert.deepEqual(db.listTasks(run.id, { parentId: parent.id }), []);

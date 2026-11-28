@@ -4,10 +4,19 @@ import type { ToolDisplayPayload } from "../protocol/tool-display.js";
 
 export type ToolPolicy = "control_plane_only" | "read_only_workspace" | "read_write_workspace";
 
+/**
+ * A lead thread (Tier 1) and a Worker (Tier 2) edit in their own worktree unless created read-only; a Tier 3
+ * execute task edits in its parent's. Research, plan, and verify tasks never write.
+ */
 export function toolPolicyForTask(tier: AgentTier, kind: TaskKind, readOnly = false): ToolPolicy {
-  if (tier === 1) return "read_only_workspace";
-  if (!readOnly && (tier === 2 || (tier === 3 && kind === "execute"))) return "read_write_workspace";
+  if (readOnly) return "read_only_workspace";
+  if (tier === 1 || tier === 2 || (tier === 3 && kind === "execute")) return "read_write_workspace";
   return "read_only_workspace";
+}
+
+/** True for a task that owns a git worktree of its own: a writable lead thread or Worker. */
+export function ownsWorktree(task: { tier: AgentTier; kind: TaskKind; readOnly: boolean }): boolean {
+  return (task.tier === 1 || task.tier === 2) && toolPolicyForTask(task.tier, task.kind, task.readOnly) === "read_write_workspace";
 }
 
 /** A charge exactly as the provider or adapter reported it; never estimated from token prices. */
@@ -164,6 +173,12 @@ export interface RunAgentRequest {
    * when a turn ends naturally; a non-empty result opens the next turn with that text instead of ending the run.
    */
   drainPendingSteers?: () => string[];
+  /**
+   * Called when a turn ends naturally with no steering queued and the task unsettled. A non-empty string opens the
+   * next turn with that text instead of ending the run. A lead thread's turn-end check uses it; the caller bounds
+   * how often it returns text.
+   */
+  turnEndCheck?: () => Promise<string | null>;
 }
 
 /** Steering continuation turns the orchestrator reserves per task generation (drains are never refused). */

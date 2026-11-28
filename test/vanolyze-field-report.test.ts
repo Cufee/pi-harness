@@ -272,7 +272,7 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
     }
   });
 
-  it("writes partial fallbacks on error/cancel, accepts return_task partial:true with artifacts, and nudges only Tier 3 on widening scope", async () => {
+  it("writes partial fallbacks on error/cancel, accepts return_task partial:true with artifacts, never nudges on widening scope, and nudges only Tier 3 on spinning", async () => {
     const root = realpathSync(mkdtempSync("/tmp/pi-goal13-handoff-"));
     const repoRoot = join(root, "repo");
     const stateDir = join(root, "state");
@@ -307,6 +307,19 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
           kind: "read",
           status: "completed",
           args: JSON.stringify({ path: `cloud/mod${i}/service.go` }),
+        });
+      }
+    };
+
+    // Spinning: the same read three times in a row.
+    const emitSpinning = (onToolEvent?: Parameters<typeof emitWidening>[0]) => {
+      for (let i = 0; i < 3; i++) {
+        onToolEvent?.({
+          id: `spin-${i}`,
+          name: "read",
+          kind: "read",
+          status: "completed",
+          args: JSON.stringify({ path: "cloud/mod0/handler.go" }),
         });
       }
     };
@@ -351,8 +364,9 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
           });
           return { text: "done", stopReason: "completed" };
         }
-        if (req.initialPrompt.includes("CASE_WIDEN")) {
-          emitWidening(req.callbacks.onToolEvent);
+        if (req.initialPrompt.includes("CASE_WIDEN") || req.initialPrompt.includes("CASE_SPIN")) {
+          if (req.initialPrompt.includes("CASE_SPIN")) emitSpinning(req.callbacks.onToolEvent);
+          else emitWidening(req.callbacks.onToolEvent);
           const dossier = (await req.executeTool("artifact_write", {
             name: "widen.md",
             content: "Survey",
@@ -461,7 +475,7 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
       assert.ok(partialHandoff.summary?.startsWith("[Partial] Verified area A"));
       assert.ok(partialHandoff.artifact_paths.some((p: string) => p.endsWith("partial-dossier.md")));
 
-      // 4. T3-8: Tier 3 widening onToolEvent -> emits agent.advisory (scope-too-large, tool_result) and attaches harness_advisory
+      // 4. T3-8: Tier 3 widening onToolEvent -> silent: no agent.advisory, no harness_advisory, no nudge, no steer
       const widenT3 = await daemon.orchestrator.spawnAndStartTask({
         runId: run.id,
         parentId: parent.id,
@@ -474,13 +488,45 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
         model: "fixture/fixture",
       });
       await waitSettled(widenT3.id);
-      const t3Events = daemon.db.getEventsSince(run.id, 0, widenT3.id);
+      const widenT3Events = daemon.db.getEventsSince(run.id, 0, widenT3.id);
+      assert.equal(
+        widenT3Events.some((e) => e.type === "agent.advisory"),
+        false,
+        "Tier 3 widening sequence must not emit agent.advisory",
+      );
+      assert.ok(widenDossierResults.has(widenT3.id));
+      assert.equal(widenDossierResults.get(widenT3.id)?.harness_advisory, undefined);
+      assert.equal(
+        widenT3Events.some((e) => e.type === "agent.scope_nudge"),
+        false,
+        "Tier 3 widening sequence must not emit legacy agent.scope_nudge",
+      );
+      assert.equal(
+        widenT3Events.some((e) => e.type === "agent.steered"),
+        false,
+        "Tier 3 widening sequence must not emit agent.steered",
+      );
+
+      // 5. Tier 3 spinning onToolEvent -> emits agent.advisory (scope-too-large, tool_result) and attaches harness_advisory
+      const spinT3 = await daemon.orchestrator.spawnAndStartTask({
+        runId: run.id,
+        parentId: parent.id,
+        tier: 3,
+        kind: "research",
+        title: "Spinning T3",
+        objective: "CASE_SPIN",
+        readOnly: true,
+        profileId: "pi:local",
+        model: "fixture/fixture",
+      });
+      await waitSettled(spinT3.id);
+      const t3Events = daemon.db.getEventsSince(run.id, 0, spinT3.id);
       const t3Advisories = t3Events.filter((e) => e.type === "agent.advisory");
-      assert.equal(t3Advisories.length, 1, "Tier 3 widening sequence must emit exactly one agent.advisory");
+      assert.equal(t3Advisories.length, 1, "Tier 3 spinning sequence must emit exactly one agent.advisory");
       const t3AdvPayload = t3Advisories[0]!.payload as { rule?: string; delivery?: string; text?: string };
       assert.equal(t3AdvPayload.rule, "scope-too-large");
       assert.equal(t3AdvPayload.delivery, "tool_result");
-      const t3DossierResult = widenDossierResults.get(widenT3.id);
+      const t3DossierResult = widenDossierResults.get(spinT3.id);
       assert.ok(
         Array.isArray(t3DossierResult?.harness_advisory) &&
           t3DossierResult.harness_advisory.some((m) => m.startsWith("[harness advisory: scope-too-large]")),
@@ -489,45 +535,51 @@ describe("Mac-Server Field Report Fixes (Items 2, 4-9, 11-15, 17-22, 27-29)", ()
       assert.equal(
         t3Events.some((e) => e.type === "agent.scope_nudge"),
         false,
-        "Tier 3 widening sequence must not emit legacy agent.scope_nudge",
+        "Tier 3 spinning sequence must not emit legacy agent.scope_nudge",
       );
       assert.equal(
         t3Events.some((e) => e.type === "agent.steered"),
         false,
-        "Tier 3 widening sequence must not emit agent.steered for an advisory",
+        "Tier 3 spinning sequence must not emit agent.steered for an advisory",
       );
 
-      // 5. Same widening sequence on Tier 2 -> no advisory, no agent.scope_nudge, and no steer
-      const widenT2 = await daemon.orchestrator.spawnAndStartTask({
-        runId: run.id,
-        parentId: parent.id,
-        tier: 2,
-        kind: "worker",
-        title: "Widening T2",
-        objective: "CASE_WIDEN",
-        readOnly: false,
-        writeScopes: ["README.md"],
-        profileId: "pi:local",
-        model: "fixture/fixture",
-      });
-      await waitSettled(widenT2.id);
-      const t2Events = daemon.db.getEventsSince(run.id, 0, widenT2.id);
-      assert.equal(
-        t2Events.some((e) => e.type === "agent.advisory"),
-        false,
-        "Tier 2 worker must not receive Tier 3 scope-too-large advisories",
-      );
-      assert.equal(widenDossierResults.get(widenT2.id)?.harness_advisory, undefined);
-      assert.equal(
-        t2Events.some((e) => e.type === "agent.scope_nudge"),
-        false,
-        "Tier 2 worker must not emit legacy agent.scope_nudge",
-      );
-      assert.equal(
-        t2Events.some((e) => e.type === "agent.steered"),
-        false,
-        "Tier 2 worker must not be steered by scope check",
-      );
+      // 6. Same widening and spinning sequences on Tier 2 -> no advisory, no agent.scope_nudge, and no steer
+      for (const [label, objective] of [
+        ["widening", "CASE_WIDEN"],
+        ["spinning", "CASE_SPIN"],
+      ] as const) {
+        const t2 = await daemon.orchestrator.spawnAndStartTask({
+          runId: run.id,
+          parentId: parent.id,
+          tier: 2,
+          kind: "worker",
+          title: `${label} T2`,
+          objective,
+          readOnly: false,
+          writeScopes: ["README.md"],
+          profileId: "pi:local",
+          model: "fixture/fixture",
+        });
+        await waitSettled(t2.id);
+        const t2Events = daemon.db.getEventsSince(run.id, 0, t2.id);
+        assert.equal(
+          t2Events.some((e) => e.type === "agent.advisory"),
+          false,
+          `Tier 2 worker must not receive Tier 3 scope-too-large advisories (${label})`,
+        );
+        assert.ok(widenDossierResults.has(t2.id));
+        assert.equal(widenDossierResults.get(t2.id)?.harness_advisory, undefined);
+        assert.equal(
+          t2Events.some((e) => e.type === "agent.scope_nudge"),
+          false,
+          `Tier 2 worker must not emit legacy agent.scope_nudge (${label})`,
+        );
+        assert.equal(
+          t2Events.some((e) => e.type === "agent.steered"),
+          false,
+          `Tier 2 worker must not be steered by scope check (${label})`,
+        );
+      }
     } finally {
       cancelGate.resolve();
       await daemon.stop();

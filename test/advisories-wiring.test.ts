@@ -502,23 +502,14 @@ describe("goal-14 slice B1: orchestrator advisory wiring", () => {
         });
 
         if (req.tier === 3) {
-          const topics = ["cortexsdk", "nats", "listdevices", "commissioning"];
-          for (let i = 0; i < 4; i++) {
-            req.callbacks.onToolEvent?.({
-              id: `g-${i}`,
-              name: "grep",
-              kind: "search",
-              status: "completed",
-              args: JSON.stringify({ pattern: topics[i], path: `cloud/mod${i}/handler.go` }),
-            });
-          }
-          for (let i = 4; i < 9; i++) {
+          // scope-too-large reports spinning only (reading widely is silent): the same read three times in a row.
+          for (let i = 0; i < 3; i++) {
             req.callbacks.onToolEvent?.({
               id: `r-${i}`,
               name: "read",
               kind: "read",
               status: "completed",
-              args: JSON.stringify({ path: `cloud/mod${i}/service.go` }),
+              args: JSON.stringify({ path: "cloud/mod0/handler.go" }),
             });
           }
           await steerSeen.promise;

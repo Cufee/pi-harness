@@ -50,11 +50,20 @@ export const REJECTIONS = {
     );
   },
 
-  spawnExecuteNeedsWorker(): HarnessRejection {
+  /** An execute subagent edits its parent's worktree; the Director and a read-only lead thread have none. */
+  spawnExecuteNeedsWorker(parent: "director" | "lead" = "lead"): HarnessRejection {
+    if (parent === "director") {
+      return rejection(
+        "spawn-execute-needs-worker",
+        "The Director's spawn_task only permits research, plan, and verify; kind execute was rejected.",
+        "An execute task edits its parent's worktree, and the Director has none.",
+        "Put implementation in a goal with goal_create. spawn_task accepts research, plan, and verify here.",
+      );
+    }
     return rejection(
       "spawn-execute-needs-worker",
-      "Tier 1 spawn_task only permits research, plan, and verify; kind execute was rejected.",
-      "Writes need a worktree and write leases, and only a Worker holds them.",
+      "spawn_task only permits research, plan, and verify for a read-only lead thread; kind execute was rejected.",
+      "An execute task edits its parent's worktree, and a lead thread that is read-only in this run has none.",
       "Use spawn_worker with write_scopes for implementation. spawn_task accepts research, plan, and verify here.",
     );
   },

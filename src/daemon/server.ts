@@ -1729,11 +1729,15 @@ export class HarnessDaemon {
         const status = deriveRunStatus(raw, tasks, this.orchestrator.isRunActiveInMemory(raw.id));
         const run = status === raw.status ? raw : { ...raw, status };
         const escalations = this.db.listEscalations(run.id);
+        const lead = tasks.find((t) => t.tier === 1 && t.profileId !== "director");
         return {
           run,
           goalId: goalByRunId.get(run.id)?.id ?? null,
           tasks,
           escalations,
+          // The lead thread's plan and the requests still open between it, the Director, and the user.
+          leadPlan: lead ? this.db.threads.getPlan(lead.id) : null,
+          requests: this.db.threads.listRequests({ runId: run.id, status: "open", limit: 50 }),
           quotaPause: this.orchestrator.getRunQuotaStatus(run.id),
           activity: buildRunActivitySummary(this.db, run.id),
         };
@@ -1773,6 +1777,7 @@ export class HarnessDaemon {
       ev.type.startsWith("escalation.") ||
       ev.type.startsWith("merge.") ||
       ev.type.startsWith("timer.") ||
+      ev.type.startsWith("thread.") ||
       ev.type === "run.status" ||
       ev.type === "run.created" ||
       ev.type === "task.created" ||

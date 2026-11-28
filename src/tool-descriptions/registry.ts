@@ -75,7 +75,7 @@ function returnTaskInputSchema(
     partial: {
       type: "boolean",
       description:
-        "Set true when handing back incomplete work, for example after a [harness advisory: scope-too-large] advisory. Summarize what is done, cite what you verified, list what remains.",
+        "Set true when handing back incomplete work. Summarize what is done, cite what you verified, list what remains.",
     },
     sources: {
       type: "array",
@@ -120,13 +120,13 @@ function returnTaskInputSchema(
 }
 
 const PARTIAL_RETURN_FACT =
-  "A task may return early with a partial handoff and proposed splits after a [harness advisory: scope-too-large] advisory.";
+  "A task that cannot finish hands back a partial result that says what is done and what remains; use it as input for your next step.";
 
 const READ_ONLY_NO_SHELL_BASE =
   "Research, plan, and verify tasks have no shell. They can run only the read-only inspect_command allowlist (git reads, rg, file reads, bun test, bunx tsc --noEmit), so they cannot run builds, installs, package scripts, or other commands.";
 
 const READ_ONLY_NO_SHELL_FACT: PerRole<string> = {
-  default: `${READ_ONLY_NO_SHELL_BASE} Give that work to a Worker with spawn_worker.`,
+  default: `${READ_ONLY_NO_SHELL_BASE} Give that work to a kind execute task or a Worker, or run it yourself when you have a shell.`,
   worker: `${READ_ONLY_NO_SHELL_BASE} Give that work to a writable kind execute task or run it yourself.`,
   director: `${READ_ONLY_NO_SHELL_BASE} Put that work in a goal.`,
 };
@@ -199,7 +199,7 @@ const GOAL_TOOL_DENIED: Partial<Record<Role, { why: string; alternative: string 
   },
   worker: {
     why: "Goal lifecycle tools belong to the interactive Director.",
-    alternative: "Use report_goal_progress for verified criteria, or return_task to report back to your Orchestrator.",
+    alternative: "Use report_goal_progress for verified criteria, or return_task to report back to your lead thread.",
   },
   research: {
     why: "Goal lifecycle tools belong to the interactive Director.",
@@ -317,7 +317,7 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     },
     description: {
       default:
-        "Spawn a Tier 2 Worker in its own isolated git worktree with disjoint write_scopes. Workers dynamically manage sub-tasks and submit via the merge queue. {fact:noCounts}",
+        "Start a Worker thread (Tier 2) in its own git worktree for a slice that can run alongside your own work, with write_scopes no other thread edits. The Worker plans and delivers its slice, may start subagents, and merges through the merge queue. It sees only your brief. {fact:noCounts}",
     },
     inputSchema: {
       default: {
@@ -344,23 +344,23 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     },
     whenDenied: {
       worker: {
-        why: "Only a Tier 1 Orchestrator creates isolated Worker worktrees and write leases.",
-        alternative: "Use spawn_task for sub-tasks inside your worktree, or return_task with scope_too_large if the slice must split.",
+        why: "Only a lead thread starts Worker threads with their own worktrees and write leases.",
+        alternative: "Use spawn_task for subagents inside your worktree. If part of your slice needs its own Worker, say so with report_issue or in return_task.",
       },
       research: {
-        why: "Spawning Workers is reserved for a Tier 1 Orchestrator, which assigns worktrees and write leases.",
+        why: "Starting Worker threads is reserved for a lead thread, which assigns worktrees and write leases.",
         alternative: "Describe the implementation slice you need in return_task so your parent can assign it.",
       },
       plan: {
-        why: "Spawning Workers is reserved for a Tier 1 Orchestrator, which assigns worktrees and write leases.",
+        why: "Starting Worker threads is reserved for a lead thread, which assigns worktrees and write leases.",
         alternative: "Describe the implementation slice you need in return_task so your parent can assign it.",
       },
       verify: {
-        why: "Spawning Workers is reserved for a Tier 1 Orchestrator, which assigns worktrees and write leases.",
+        why: "Starting Worker threads is reserved for a lead thread, which assigns worktrees and write leases.",
         alternative: "Describe the implementation slice you need in return_task so your parent can assign it.",
       },
       execute: {
-        why: "Spawning Workers is reserved for a Tier 1 Orchestrator, which assigns worktrees and write leases.",
+        why: "Starting Worker threads is reserved for a lead thread, which assigns worktrees and write leases.",
         alternative: "Describe the implementation slice you need in return_task so your parent can assign it.",
       },
       director: {
@@ -383,27 +383,13 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     },
     description: {
       default:
-        "Spawn a read-only Tier 3 research, plan, or verify task sized to one bounded question or deliverable. Read its handoff with wait_children. {fact:readOnlyNoShell} {fact:noCounts} {fact:partialReturn}",
-      worker:
-        "Spawn a Tier 3 Task Agent (research, plan, execute, or verify) inside your worktree, sized to one bounded question or deliverable. Read its handoff with wait_children. Tasks compact context in place on Pi and Claude runners so long single-question reads continue, and one that ends without return_task still leaves a partial handoff. {fact:readOnlyNoShell} {fact:noCounts} {fact:partialReturn}",
+        "Start a subagent (Tier 3) in your workspace: research, plan, or verify (read-only), or execute (edits your worktree, so only a thread that has a worktree can start one). It sees only your brief, works alone, and hands back a summary with sources. Read its handoff with wait_children. A subagent compacts its context in place, so a long assignment stays one task, and one that ends without handing back still leaves a partial handoff. {fact:readOnlyNoShell} {fact:noCounts} {fact:partialReturn}",
       director:
-        "Spawn a read-only Tier 3 research, plan, or verify task sized to one bounded question or deliverable. When your turn ends and events.wakeDirectorOnGoalSettle is enabled (default on), the daemon wakes this chat when a task you spawned completes, fails, blocks, or returns for re-scope (not on cancel or quota pause); results you already read with wait_tasks do not wake you again. {fact:readOnlyNoShell} {fact:noCounts} {fact:partialReturn}",
+        "Start a read-only subagent (Tier 3): research, plan, or verify. It sees only your brief, works alone, and hands back a summary with sources. When your turn ends and events.wakeDirectorOnGoalSettle is enabled (default on), the daemon wakes this chat when a task you spawned completes, fails, blocks, or returns for re-scope (not on cancel or quota pause); results you already read with wait_tasks do not wake you again. {fact:readOnlyNoShell} {fact:noCounts} {fact:partialReturn}",
     },
     mentions: [{ tool: "inspect_command", as: "child" }],
     inputSchema: {
       default: {
-        type: "object",
-        required: ["kind", "objective", "model"],
-        properties: {
-          kind: { type: "string", enum: ["research", "plan", "verify"] },
-          profile_id: { type: "string" },
-          title: { type: "string", description: "Short task title; derived from objective if omitted." },
-          objective: { type: "string" },
-          model: { type: "string" },
-          effort: { type: "string" },
-        },
-      },
-      worker: {
         type: "object",
         required: ["kind", "objective", "model"],
         properties: {
@@ -418,22 +404,34 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
           depends_on: { type: "array", items: { type: "string" } },
         },
       },
+      director: {
+        type: "object",
+        required: ["kind", "objective", "model"],
+        properties: {
+          kind: { type: "string", enum: ["research", "plan", "verify"] },
+          profile_id: { type: "string" },
+          title: { type: "string", description: "Short task title; derived from objective if omitted." },
+          objective: { type: "string" },
+          model: { type: "string" },
+          effort: { type: "string" },
+        },
+      },
     },
     whenDenied: {
       research: {
-        why: "Spawning is reserved for orchestrators and Workers, which hold the leases for child work.",
+        why: "Starting subagents is reserved for lead threads and Workers, which own the worktree a subagent runs in.",
         alternative: "Describe the follow-up you need in return_task. Your parent decides whether to start it.",
       },
       plan: {
-        why: "Spawning is reserved for orchestrators and Workers, which hold the leases for child work.",
+        why: "Starting subagents is reserved for lead threads and Workers, which own the worktree a subagent runs in.",
         alternative: "Describe the follow-up you need in return_task. Your parent decides whether to start it.",
       },
       verify: {
-        why: "Spawning is reserved for orchestrators and Workers, which hold the leases for child work.",
+        why: "Starting subagents is reserved for lead threads and Workers, which own the worktree a subagent runs in.",
         alternative: "Describe the follow-up you need in return_task. Your parent decides whether to start it.",
       },
       execute: {
-        why: "Spawning is reserved for orchestrators and Workers, which hold the leases for child work.",
+        why: "Starting subagents is reserved for lead threads and Workers, which own the worktree a subagent runs in.",
         alternative: "Describe the follow-up you need in return_task. Your parent decides whether to start it.",
       },
       reviewer: {
@@ -595,13 +593,13 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
       },
       scopeSendBack: {
         default:
-          "Status scope_too_large sends the task back for re-scoping; add suggested_splits, one per open area, when you can.",
+          "Status scope_too_large is your call, never required by size: use it when the assignment turned out to be several unrelated deliverables, and add suggested_splits when you can. One large coherent assignment stays one task.",
         research:
-          "Status scope_too_large sends the task back for re-scoping; pass sources, or partial: true with artifact_paths, and add suggested_splits, one per open area, when you can.",
+          "Status scope_too_large is your call, never required by size: use it when the assignment turned out to be several unrelated questions; pass sources, or partial: true with artifact_paths, and add suggested_splits when you can. One large coherent assignment stays one task.",
         plan:
-          "Status scope_too_large sends the task back for re-scoping; pass sources, or partial: true with artifact_paths, and add suggested_splits, one per open area, when you can.",
+          "Status scope_too_large is your call, never required by size: use it when the assignment turned out to be several unrelated questions; pass sources, or partial: true with artifact_paths, and add suggested_splits when you can. One large coherent assignment stays one task.",
         verify:
-          "Status scope_too_large sends the task back for re-scoping; pass sources, or partial: true with artifact_paths, and add suggested_splits, one per open area, when you can.",
+          "Status scope_too_large is your call, never required by size: use it when the assignment turned out to be several unrelated questions; pass sources, or partial: true with artifact_paths, and add suggested_splits when you can. One large coherent assignment stays one task.",
       },
       externalDeliverable: {
         default:
@@ -906,9 +904,11 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
   },
   {
     name: "worktree_status",
-    roles: ["worker"],
+    roles: ["orchestrator", "worker"],
+    listed: ({ role, readOnly }) => role !== "orchestrator" || !readOnly,
     description: {
       default: "Inspect git branch, dirty state, and merge-queue status for this Worker's isolated worktree.",
+      orchestrator: "Inspect git branch, dirty state, and merge-queue status of your worktree.",
     },
     inputSchema: {
       default: { type: "object", properties: {} },
@@ -916,9 +916,17 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
   },
   {
     name: "submit_for_merge",
-    roles: ["worker"],
+    roles: ["orchestrator", "worker"],
+    listed: ({ role, readOnly }) => role !== "orchestrator" || !readOnly,
+    facts: {
+      leadResubmit: {
+        default: "You can submit more than once: after a merge your worktree continues from the merged base branch.",
+      },
+    },
     description: {
       default: "Enqueue this Worker's committed worktree branch into the deterministic bisecting merge queue.",
+      orchestrator:
+        "Merge your committed worktree branch into the run's base branch through the merge queue, which runs the configured checks and bounces the branch on a conflict or a failed check. {fact:leadResubmit}",
     },
     inputSchema: {
       default: {
@@ -928,10 +936,6 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
       },
     },
     whenDenied: {
-      orchestrator: {
-        why: "Orchestrators are read-only planners without a Worker worktree.",
-        alternative: "Assign code changes to a Worker with spawn_worker; the Worker calls submit_for_merge.",
-      },
       research: {
         why: "This task is read-only and has no Worker worktree to merge.",
         alternative: "Report your findings in return_task so your parent can act on them.",
@@ -1873,7 +1877,7 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     roles: ["director"],
     description: {
       default:
-        "Inspect run and subagent telemetry. Pass the returned presentation_id to present_result to show the Run Activity card.",
+        "Inspect run and subagent telemetry, and the lead thread's plan (leadPlan: its scope and where each step stands). Pass the returned presentation_id to present_result to show the Run Activity card.",
     },
     inputSchema: {
       default: {
@@ -2002,6 +2006,193 @@ const RAW_TOOL_REGISTRY: readonly ToolEntry[] = [
     },
   },
 
+  // ---- Lead-thread planning and the request ledger ----
+  {
+    name: "update_plan",
+    roles: ["orchestrator", "worker"],
+    facts: {
+      turnEndCheck: {
+        default:
+          "When your turn ends, the harness reopens it while plan steps are open, forwarded requests are untriaged, child tasks are running, work is uncommitted or unmerged, or required criteria have no reported result.",
+      },
+      survivesRollover: {
+        default: "The harness shows you the plan again after a context rollover or a resume.",
+      },
+    },
+    description: {
+      default:
+        "Record or replace your plan: your scope and the steps that deliver it. Send the whole list each time, including finished steps. {fact:survivesRollover}",
+      orchestrator:
+        "Record or replace your plan: your scope and the steps that deliver the goal. Send the whole list each time, including finished steps. {fact:survivesRollover} {fact:turnEndCheck}",
+    },
+    inputSchema: {
+      default: {
+        type: "object",
+        required: ["steps"],
+        properties: {
+          scope: { type: "string", description: "What you took on and what you left out, in a sentence or two. Kept from the last call when omitted." },
+          delivery: {
+            type: "string",
+            enum: ["merge", "external", "none"],
+            description:
+              "How the work reaches the user. merge (default): on the run's base branch. external: pushed or published elsewhere; name it in delivery_note. none: no repository change.",
+          },
+          delivery_note: { type: "string", description: "Required for delivery external: remote and branch, PR URL, or artifact path." },
+          steps: {
+            type: "array",
+            items: {
+              type: "object",
+              required: ["title"],
+              properties: {
+                id: { type: "string", description: "Short stable id such as s1. Keep ids across updates." },
+                title: { type: "string" },
+                status: { type: "string", enum: ["pending", "in_progress", "done", "dropped"] },
+                owner: { type: "string", description: "self (default) or the id of the child task that owns the step." },
+                criteria: { type: "array", items: { type: "string" }, description: "Ids of the acceptance criteria this step serves." },
+                note: { type: "string", description: "Evidence for done, or the reason for dropped (required for dropped)." },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+  {
+    name: "triage_request",
+    roles: ["orchestrator"],
+    description: {
+      default:
+        "Decide a request the Director forwarded from the user (req-N). accept: it belongs to this goal and you will do it; amend your plan. delegate: it belongs to this goal and a child task you already started takes it; pass task_id. answer: it is a question; put the answer in note and the Director relays it. decline: it is outside this goal's scope or would put the goal at risk; say why in note and the Director reschedules it.",
+    },
+    inputSchema: {
+      default: {
+        type: "object",
+        required: ["request_id", "decision", "note"],
+        properties: {
+          request_id: { type: "string" },
+          decision: { type: "string", enum: ["accept", "delegate", "answer", "decline"] },
+          note: { type: "string", description: "What you will do, your answer, or why this is out of scope and what you suggest instead." },
+          task_id: { type: "string", description: "For delegate: the child task that takes the request." },
+        },
+      },
+    },
+  },
+  {
+    name: "ask_user",
+    roles: ["orchestrator"],
+    facts: {
+      nonBlocking: {
+        default: "Your task keeps running: continue with the work that does not depend on the answer.",
+      },
+      reasked: {
+        default: "The Director asks the user and keeps asking until there is an answer; the harness then resumes or steers you with it.",
+      },
+    },
+    description: {
+      default:
+        "Ask the user a question only they can answer, or a decision that would be expensive to reverse if guessed. {fact:reasked} {fact:nonBlocking}",
+    },
+    inputSchema: {
+      default: {
+        type: "object",
+        required: ["question"],
+        properties: {
+          question: { type: "string", description: "One question, answerable without reading this thread." },
+          options: { type: "array", items: { type: "string" }, description: "The concrete answers you can act on, when there are a few." },
+          context: { type: "string", description: "Why it matters and what you recommend." },
+        },
+      },
+    },
+  },
+  {
+    name: "route_to_director",
+    roles: ["orchestrator"],
+    description: {
+      default:
+        "Send work back to the Director as outside this goal: something you found or were asked for that should be scheduled on its own. The Director reschedules or drops it; you do not do it and it does not hold this goal.",
+    },
+    inputSchema: {
+      default: {
+        type: "object",
+        required: ["title", "detail"],
+        properties: {
+          title: { type: "string" },
+          detail: { type: "string", description: "What the work is, what you already know about it (files, evidence), and how to verify it." },
+          reason: { type: "string", description: "Why it does not belong to this goal." },
+        },
+      },
+    },
+  },
+  {
+    name: "send_request",
+    roles: ["director"],
+    facts: {
+      triage: {
+        default:
+          "The lead decides each request: it accepts it into its plan, delegates it, answers it, or declines it as outside its goal.",
+      },
+      declinedComesBack: {
+        default: "You are woken when a lead answers or declines; a declined request comes back to you as routed work to reschedule.",
+      },
+    },
+    description: {
+      default:
+        "Forward what the user asked for mid-flight to the lead thread of a running goal, as a tracked request. {fact:triage} {fact:declinedComesBack}",
+    },
+    inputSchema: {
+      default: {
+        type: "object",
+        required: ["goal_id", "message"],
+        properties: {
+          goal_id: { type: "string" },
+          title: { type: "string", description: "Short title; derived from the message if omitted." },
+          message: { type: "string", description: "The user's requirement or question in their words, plus what the lead cannot know from its own thread." },
+        },
+      },
+    },
+  },
+  {
+    name: "resolve_request",
+    roles: ["director"],
+    facts: {
+      answerDelivered: {
+        default: "The harness delivers a user_answered note to the lead that asked, resuming it if it had stopped to wait.",
+      },
+    },
+    description: {
+      default:
+        "Close a request that waits on you. A question a lead asked the user: outcome user_answered with the user's answer in note, or withdrawn when it no longer matters. {fact:answerDelivered} Work a lead routed back: outcome rescheduled once a goal covers it (name the goal in note), or dropped with the reason.",
+    },
+    inputSchema: {
+      default: {
+        type: "object",
+        required: ["request_id", "outcome", "note"],
+        properties: {
+          request_id: { type: "string" },
+          outcome: { type: "string", enum: ["user_answered", "withdrawn", "rescheduled", "dropped"] },
+          note: { type: "string" },
+        },
+      },
+    },
+  },
+  {
+    name: "list_requests",
+    roles: ["director"],
+    description: {
+      default:
+        "List the requests of this chat's goals: questions that wait on the user, work that lead threads routed back to you, and requests you forwarded to lead threads.",
+    },
+    inputSchema: {
+      default: {
+        type: "object",
+        properties: {
+          status: { type: "string", enum: ["open", "resolved", "all"], description: "Default open." },
+          goal_id: { type: "string" },
+        },
+      },
+    },
+  },
+
   // ---- Reviewer-only tool ----
   {
     name: "submit_review_verdict",
@@ -2108,8 +2299,9 @@ const VALIDATED = validateRegistry(RAW_TOOL_REGISTRY);
 
 export const TOOL_REGISTRY: readonly ToolEntry[] = RAW_TOOL_REGISTRY;
 
+/** Without a task to ask, list what the role gets by default: a lead thread is writable unless goals.leadWritable is off. */
 function defaultReadOnlyForRole(role: Role): boolean {
-  return role !== "worker" && role !== "execute";
+  return role !== "orchestrator" && role !== "worker" && role !== "execute";
 }
 
 export function toolsForRole(role: Role, ctx?: { readOnly: boolean }): ToolDefinition[] {

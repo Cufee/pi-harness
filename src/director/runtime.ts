@@ -19,7 +19,8 @@ import { vendorSuccessors } from "../catalog/lifecycle.js";
 import { createCodeModeExecutor, effectiveCodeMode } from "../code-mode/index.js";
 import type { HarnessConfig } from "../config.js";
 import { resolveLaunchRoute } from "../control-plane/launch-route.js";
-import { compactTaskHandoff, isReadOnlyKind, toolsForTier } from "../control-plane/tools.js";
+import { compactTaskHandoff, isReadOnlyKind } from "../control-plane/tools.js";
+import { toolsForRole } from "../tool-descriptions/registry.js";
 import { findRunDossier, readRunDossier, writeCodeOutput, writeTaskDossier } from "../control-plane/dossiers.js";
 import type { AdmissionLane, QueuePositionInput } from "../control-plane/admission-queue.js";
 import type { ArtifactRecord, ControlPlaneDb, EscalationRecord, EventRecord, RunRecord } from "../control-plane/db.js";
@@ -32,6 +33,14 @@ import {
   type SteerTaskResult,
 } from "../control-plane/orchestrator.js";
 import { directorTaskRunOwner } from "../control-plane/ids.js";
+import {
+  collectDirectorOpenItems,
+  formatDirectorOpenItemsBanner,
+  formatForwardedRequest,
+  formatUserAnswer,
+  formatWaitingOnUserFooter,
+  shouldAppendWaitingFooter,
+} from "./requests.js";
 import { canonicalProjectPath, type ProjectRecord } from "../control-plane/projects.js";
 import { buildRunActivitySummary } from "../control-plane/telemetry.js";
 import { recordCostInvocation, summarizeCost } from "../cost/ledger.js";
@@ -382,6 +391,8 @@ export function formatAmendmentDelta(
 const VERIFY_REF_DESC =
   "Branch, tag, origin/<branch> or SHA whose tree deterministic gates and the Done-Reviewer verify. Set it when the goal's work is pushed to a branch other than the run's base branch, which happens when workers push their own branch instead of merging through the queue. Resolves a local ref first, then origin/<ref>, fetching from origin if needed. Fails if it still does not resolve. Default: the run's base branch.";
 
+const DIRECTOR_REQUEST_TOOLS: readonly string[] = ["send_request", "resolve_request", "list_requests"];
+
 const DIRECTOR_TOOLS: ToolDefinition[] = [
   {
     name: "goal_create",
@@ -731,14 +742,16 @@ const DIRECTOR_TOOLS: ToolDefinition[] = [
       },
     },
   },
-  ...toolsForTier(1)
+  // The request ledger between the user, this Director, and the lead threads (text and schemas live in the registry).
+  ...toolsForRole("director").filter((tool) => DIRECTOR_REQUEST_TOOLS.includes(tool.name)),
+  ...toolsForRole("director")
     .filter((tool) => ["spawn_task", "wait_tasks", "wait_children", "cancel_task", "artifact_read"].includes(tool.name))
     .map((tool) => {
       if (tool.name === "spawn_task") {
         return {
           ...tool,
           description:
-            "Spawn a read-only Tier 3 research, plan, or verify task. No turn limit. When your turn ends and events.wakeDirectorOnGoalSettle is enabled (default on), the daemon wakes this chat when a task you spawned completes, fails, blocks, or returns for re-scope (not on cancel or quota pause); results you already read with wait_tasks do not wake you again. A task may return early with partial: true or scope_too_large and suggested splits after a harness scope check.",
+            "Spawn a read-only Tier 3 research, plan, or verify task. No turn limit. When your turn ends and events.wakeDirectorOnGoalSettle is enabled (default on), the daemon wakes this chat when a task you spawned completes, fails, blocks, or returns for re-scope (not on cancel or quota pause); results you already read with wait_tasks do not wake you again. A task that cannot finish hands back a partial result that says what is done and what remains.",
         };
       }
       if (tool.name === "wait_tasks" || tool.name === "wait_children") {
@@ -1345,6 +1358,33 @@ export class DirectorRuntime {
     this.wakeHandler?.(timer.ownerId, event);
   }
 
+  /**
+   * Hands text to a lead thread: steered into its live session, or, when it has ended its turn, resumed in place
+   * with the text as its resume note (through goal admission when the goal no longer holds a slot).
+   */
+  private async deliverToLead(leadTaskId: string, text: string): Promise<{ delivered: boolean; mode: string; detail?: string }> {
+    const task = this.db.getTask(leadTaskId);
+    if (!task) return { delivered: false, mode: "unknown_task" };
+    const steer = await this.orchestrator.steerTaskDetailed(task.id, text).catch(() => null);
+    if (steer?.steered) return { delivered: true, mode: steer.mode };
+    try {
+      this.assertRunGoalNotTerminal(task.runId);
+      const goal = this.goalForRun(task.runId);
+      if (!goal || this.isGoalOccupyingSlot(goal)) {
+        const priorRunStatus = this.orchestrator.getEffectiveRun(task.runId)?.status;
+        const res = await this.orchestrator.resumeTaskDetailed(task.id, { allowCompleted: true, note: text });
+        this.onRunResumed(res.task.runId, priorRunStatus, res.outcome === "resumed");
+        const delivered = res.outcome === "resumed" || res.noteDelivered === true;
+        return { delivered, mode: `resume:${res.outcome}`, ...(delivered ? {} : { detail: res.message }) };
+      }
+      const res = await this.commitGoalDetailed(goal.id, { resumeTaskId: task.id, allowCompleted: true, continueCompleted: true, note: text });
+      const delivered = res.outcome === "resumed" || res.taskResult?.outcome === "resumed" || res.taskResult?.noteDelivered === true;
+      return { delivered, mode: `goal:${res.outcome}`, ...(delivered ? {} : { detail: res.message }) };
+    } catch (err) {
+      return { delivered: false, mode: "failed", detail: (err instanceof Error ? err.message : String(err)).slice(0, 300) };
+    }
+  }
+
   private goalForRun(runId: string): GoalRecord | null {
     const row = this.db.db
       .prepare("SELECT id FROM goals WHERE linked_run_id = ? ORDER BY updated_at DESC LIMIT 1")
@@ -1565,6 +1605,36 @@ export class DirectorRuntime {
             toolCallId,
           }),
         );
+      }
+      return;
+    }
+
+    // Request ledger: a lead asked the user, sent work back, or decided a forwarded request. The owning Director chat
+    // is woken for everything it must act on or relay; an accepted or delegated request is only recorded.
+    if (ev.type === "thread.request") {
+      const p = ev.payload as { requestId?: string; phase?: string; outcome?: string; routedRequestId?: string } | null;
+      const request = p?.requestId ? this.db.threads.getRequest(p.requestId) : null;
+      if (!request?.chatSessionId || !this.chats.getSession(request.chatSessionId)) return;
+      const outcome = p?.outcome;
+      const event: ChatControlEvent = {
+        kind: "thread.request",
+        requestId: request.id,
+        requestKind: request.kind,
+        phase: p?.phase === "triaged" ? "triaged" : "created",
+        ...(outcome === "accepted" || outcome === "delegated" || outcome === "answered" || outcome === "declined" ? { outcome } : {}),
+        goalId: request.goalId,
+        runId: request.runId,
+        taskId: request.taskId,
+        title: request.title,
+        body: request.body.slice(0, 2000),
+        ...(request.resolution ? { resolution: request.resolution.slice(0, 2000) } : {}),
+        ...(typeof p?.routedRequestId === "string" ? { routedRequestId: p.routedRequestId } : {}),
+      };
+      const informational = outcome === "accepted" || outcome === "delegated";
+      if (this.wakeHandler && wakeOnSettle && !informational) {
+        this.wakeHandler(request.chatSessionId, event);
+      } else {
+        this.chats.appendTurn(request.chatSessionId, "system_notice", formatChatEventSummary(event), undefined, event);
       }
       return;
     }
@@ -4623,7 +4693,19 @@ export class DirectorRuntime {
     const phaseBlocked = Boolean(lp && isBlockedPhase(lp.phase) && (!hasClaimProvenance(lp) || isCurrentClaim(goal, lp)));
     const tasks = this.db.listTasks(runId);
     const blockedTasks = tasks.filter((t) => t.profileId !== "director" && t.status === "blocked" && !isReadOnlyKind(t.kind));
-    if (!phaseBlocked && blockedTasks.length === 0) return null;
+    if (!phaseBlocked && blockedTasks.length === 0) {
+      // A lead that ended its turn with a question still open is waiting on the user, not done: never verify it as finished.
+      const questions = this.db.threads.listRequests({ runId, kind: "user_question", status: "open" });
+      if (questions.length === 0) return null;
+      const lead = tasks.find((t) => t.tier === 1 && t.profileId !== "director");
+      return {
+        summary: `waiting on the user: ${questions.map((q) => `${q.id} (${q.title.slice(0, 120)})`).join("; ")}`,
+        remediation: [],
+        escalationId: null,
+        tier1Id: lead?.id ?? null,
+        waitingOnUser: true,
+      };
+    }
     const blockedIds = new Set(blockedTasks.map((t) => t.id));
     const escalation = this.db
       .listEscalations(runId, "open")
@@ -4643,7 +4725,7 @@ export class DirectorRuntime {
   /** Hands a blocked goal to a human: no gates, awaiting_human, and one blocking escalation (reused when present). */
   private parkBlockedGoal(goal: GoalRecord, runId: string, blocker: ExplicitBlocker): void {
     this.goals.setStatus(goal.id, "awaiting_human", `Blocked: ${blocker.summary.slice(0, 240)}`);
-    if (blocker.escalationId || !blocker.tier1Id) return;
+    if (blocker.escalationId || !blocker.tier1Id || blocker.waitingOnUser) return;
     const evidenceDir = goalEvidenceDirOrNull(goal, this.storage);
     this.suppressEscalationWakeRuns.add(runId);
     try {
@@ -7130,7 +7212,8 @@ export class DirectorRuntime {
       const currentTurnBlock = typedEvent
         ? `Control-plane event (${typedEvent.kind}):\n${formatChatEventForModel(typedEvent)}`
         : `User: ${userMessage}`;
-      const prompt = `${contextTranscript ? `Prior conversation:\n${contextTranscript}\n\n` : ""}Workspace: ${session.repoRoot}${goalBanner}\n\n${currentTurnBlock}`;
+      const openItemsBanner = formatDirectorOpenItemsBanner(collectDirectorOpenItems(this.db, chatSessionId, allSessionGoals));
+      const prompt = `${contextTranscript ? `Prior conversation:\n${contextTranscript}\n\n` : ""}Workspace: ${session.repoRoot}${goalBanner}${openItemsBanner ? `\n\n${openItemsBanner}` : ""}\n\n${currentTurnBlock}`;
 
       const mode = effectiveCodeMode(this.config.codeMode);
       const executor = this.directorExecutor(session, abort.signal, onToolEvent, turn);
@@ -7217,6 +7300,20 @@ export class DirectorRuntime {
         content = `Stopped after tool failure without a final response:\n${res.toolFailures.map((f) => `- ${f}`).join("\n")}`;
       } else if (!content && !active.flushedText) {
         content = "(done)";
+      }
+
+      // Whatever still waits on the user after this turn's tool calls is restated under the reply by the harness,
+      // so a question is asked again on every reply to the user until it is answered.
+      const stillOpen = collectDirectorOpenItems(
+        this.db,
+        chatSessionId,
+        this.goals.listGoals({ repoRoot: this.chats.getSession(chatSessionId)?.repoRoot ?? session.repoRoot, chatSessionId }),
+      );
+      if (res.stopReason !== "quota_paused" && shouldAppendWaitingFooter(stillOpen, { isUserTurn: turnRole === "user" })) {
+        const footer = formatWaitingOnUserFooter(stillOpen);
+        content = content && content !== "(done)" ? `${content}\n\n${footer}` : footer;
+        this.db.threads.markPrompted(stillOpen.questions.map((q) => q.id));
+        onDelta?.(`\n\n${footer}`);
       }
 
       active.partial = content;
@@ -8339,7 +8436,100 @@ export class DirectorRuntime {
         const run = this.orchestrator.getEffectiveRun(runId);
         if (!run) throw new Error(`Unknown run ${runId}`);
         const activity = buildRunActivitySummary(this.db, runId);
-        return { run, activity, presentation_id: offerPresentation(() => buildRunActivityDisplay(activity)) };
+        const lead = this.db.listTasks(runId).find((t) => t.tier === 1 && t.profileId !== "director");
+        const plan = lead ? this.db.threads.getPlan(lead.id) : null;
+        return {
+          run,
+          activity,
+          // The lead thread's own plan: what it took on and where each step stands.
+          ...(plan
+            ? { leadPlan: { taskId: plan.taskId, revision: plan.revision, scope: plan.scope, delivery: plan.delivery, steps: plan.steps.slice(0, 40) } }
+            : {}),
+          presentation_id: offerPresentation(() => buildRunActivityDisplay(activity)),
+        };
+      }
+
+      case "send_request": {
+        const g = this.goals.getGoal(String(args.goal_id));
+        if (!g) throw new Error(`Unknown goal ${args.goal_id}`);
+        if (g.status === "achieved" || g.status === "cancelled") {
+          throw new Error(`Goal ${g.id} is ${g.status}; its lead thread takes no more requests. Create a new goal for this work.`);
+        }
+        if (!g.linkedRunId) throw new Error(`Goal ${g.id} has no run yet. Put the requirement in the goal with goal_amend, then commit it.`);
+        const lead = this.db.listTasks(g.linkedRunId).find((t) => t.tier === 1 && t.profileId !== "director");
+        if (!lead) throw new Error(`Goal ${g.id} has no lead thread`);
+        const message = typeof args.message === "string" ? args.message.trim() : "";
+        if (!message) throw new Error("message is required");
+        const request = this.db.threads.createRequest({
+          kind: "user_request",
+          runId: g.linkedRunId,
+          taskId: lead.id,
+          chatSessionId,
+          goalId: g.id,
+          title: typeof args.title === "string" && args.title.trim() ? args.title : message.split("\n")[0]!,
+          body: message,
+        });
+        const delivery = await this.deliverToLead(lead.id, formatForwardedRequest(request));
+        return {
+          request: request.id,
+          goal_id: g.id,
+          lead_task_id: lead.id,
+          delivery,
+          next: delivery.delivered
+            ? "The lead decides the request. You are woken when it answers or declines; tell the user it was forwarded and end your turn."
+            : "The request is recorded and the lead sees it when it next starts a turn, but it is not running now. Resume the goal with resume_run or goal_commit so it gets triaged.",
+        };
+      }
+
+      case "resolve_request": {
+        const request = this.db.threads.getRequest(String(args.request_id ?? ""));
+        if (!request || request.chatSessionId !== chatSessionId) throw new Error(`Unknown request ${String(args.request_id ?? "")} in this chat`);
+        const outcome = String(args.outcome ?? "");
+        const note = typeof args.note === "string" ? args.note.trim() : "";
+        if (!note) throw new Error("note is required: the user's answer, the goal that now covers the work, or the reason it was dropped.");
+        if (request.kind === "user_request") {
+          throw new Error(`Request ${request.id} was forwarded to a lead thread; the lead decides it with its own triage, not you.`);
+        }
+        const allowed = request.kind === "user_question" ? ["user_answered", "withdrawn"] : ["rescheduled", "dropped"];
+        if (!allowed.includes(outcome)) {
+          throw new Error(`Request ${request.id} is a ${request.kind}; outcome must be ${allowed.join(" or ")}.`);
+        }
+        const resolved = this.db.threads.resolveRequest(request.id, {
+          outcome: outcome as "user_answered" | "withdrawn" | "rescheduled" | "dropped",
+          resolution: note,
+        });
+        if (outcome !== "user_answered") return { request: resolved.id, outcome };
+        const delivery = await this.deliverToLead(request.taskId, formatUserAnswer(request, note));
+        return {
+          request: resolved.id,
+          outcome,
+          delivery,
+          ...(delivery.delivered
+            ? {}
+            : { next: `The answer is recorded but did not reach the lead (${delivery.detail ?? delivery.mode}). Resume it with resume_run({ goal_id }) and pass the answer as note.` }),
+        };
+      }
+
+      case "list_requests": {
+        const status = args.status === "resolved" || args.status === "all" ? args.status : "open";
+        const rows = this.db.threads
+          .listRequests({ chatSessionId, ...(status === "all" ? {} : { status }) })
+          .filter((r) => args.goal_id === undefined || r.goalId === String(args.goal_id));
+        return {
+          requests: rows.map((r) => ({
+            id: r.id,
+            kind: r.kind,
+            status: r.status,
+            outcome: r.outcome,
+            goal_id: r.goalId,
+            lead_task_id: r.taskId,
+            title: r.title,
+            body: r.body.slice(0, 1200),
+            resolution: r.resolution,
+            ...(r.originId ? { origin: r.originId } : {}),
+            ...(r.kind === "user_question" ? { shown_to_user: r.promptCount } : {}),
+          })),
+        };
       }
 
       case "steer_run": {
@@ -8619,6 +8809,8 @@ interface ExplicitBlocker {
   /** An open blocking escalation already raised by a blocked task; reused instead of creating another. */
   escalationId: string | null;
   tier1Id: string | null;
+  /** The lead ended its turn waiting on answers to its own questions; they are already tracked, so no escalation is raised. */
+  waitingOnUser?: boolean;
 }
 
 function hasClaimProvenance(lp: GoalLiveProgress): boolean {

@@ -78,7 +78,13 @@ const DIRECTOR_EXPECTED = [
   "session_create",
   "session_send",
   "session_read",
+  "send_request",
+  "resolve_request",
+  "list_requests",
 ] as const;
+
+// The lead thread (role "orchestrator"). worktree_status and submit_for_merge are hidden from a read-only lead's listing.
+const LEAD_WORKTREE_TOOLS: readonly string[] = ["worktree_status", "submit_for_merge"];
 
 const ORCHESTRATOR_EXPECTED = [
   "tree_view",
@@ -122,6 +128,12 @@ const ORCHESTRATOR_EXPECTED = [
   "queue_list",
   "queue_reorder",
   "queue_force_start",
+  "worktree_status",
+  "submit_for_merge",
+  "update_plan",
+  "triage_request",
+  "ask_user",
+  "route_to_director",
 ] as const;
 
 const WORKER_EXPECTED = [
@@ -157,6 +169,7 @@ const WORKER_EXPECTED = [
   "cancel_timer",
   "queue_list",
   "queue_reorder",
+  "update_plan",
 ] as const;
 
 const TIER3_EXPECTED = [
@@ -216,8 +229,12 @@ describe("tool-descriptions registry", () => {
 
     const base = { runId: "run-1", profileId: "acp:claude", title: "Task" };
     assert.deepEqual(
-      toolsForTask({ ...base, tier: 1, kind: "orchestrator", readOnly: true }),
+      toolsForTask({ ...base, tier: 1, kind: "orchestrator", readOnly: false }),
       toolsForRole("orchestrator"),
+    );
+    assert.deepEqual(
+      toolsForTask({ ...base, tier: 1, kind: "orchestrator", readOnly: true }),
+      toolsForRole("orchestrator", { readOnly: true }),
     );
     assert.deepEqual(
       toolsForTask({ ...base, tier: 2, kind: "worker", readOnly: false }),
@@ -296,7 +313,16 @@ describe("tool-descriptions registry", () => {
 
   it("T4-2 no tool lost", () => {
     assert.deepEqual(sorted(toolsForRole("director").map((t) => t.name)), sorted(DIRECTOR_EXPECTED));
-    assert.deepEqual(sorted(toolsForRole("orchestrator").map((t) => t.name)), sorted(ORCHESTRATOR_EXPECTED));
+    // A writable lead thread lists everything it owns; a read-only one loses only its two worktree tools from the listing.
+    assert.deepEqual(
+      sorted(toolsForRole("orchestrator", { readOnly: false }).map((t) => t.name)),
+      sorted(ORCHESTRATOR_EXPECTED),
+    );
+    assert.deepEqual(
+      sorted(toolsForRole("orchestrator", { readOnly: true }).map((t) => t.name)),
+      sorted(ORCHESTRATOR_EXPECTED.filter((name) => !LEAD_WORKTREE_TOOLS.includes(name))),
+    );
+    assert.deepEqual(sorted(allowedToolNames("orchestrator")), sorted(ORCHESTRATOR_EXPECTED));
     assert.deepEqual(sorted(toolsForRole("worker").map((t) => t.name)), sorted(WORKER_EXPECTED));
     assert.deepEqual(sorted(toolsForRole("research").map((t) => t.name)), sorted(TIER3_EXPECTED));
     assert.deepEqual(sorted(toolsForRole("plan").map((t) => t.name)), sorted(TIER3_EXPECTED));
@@ -320,8 +346,14 @@ describe("tool-descriptions registry", () => {
       const allowed = allowedToolNames(role);
       const lacking = allNames.filter((name) => !allowed.has(name));
       const lackingSet = new Set(lacking);
-      // Use readOnly: true for execute so inspect_command is also audited under execute.
-      const listed = role === "execute" ? toolsForRole(role, { readOnly: true }) : toolsForRole(role);
+      // Use readOnly: true for execute so inspect_command is also audited under execute, and readOnly: false for the
+      // lead thread so its worktree tools (hidden from a read-only lead) are audited too.
+      const listed =
+        role === "execute"
+          ? toolsForRole(role, { readOnly: true })
+          : role === "orchestrator"
+            ? toolsForRole(role, { readOnly: false })
+            : toolsForRole(role);
 
       for (const tool of listed) {
         const entry = byName.get(tool.name);
@@ -729,9 +761,19 @@ describe("tool-descriptions registry", () => {
     assert.ok(goalDenied instanceof HarnessRejection);
     assert.ok(goalDenied.notice.why.includes("Director"));
 
-    const mergeDenied = notYourTool("submit_for_merge", "orchestrator");
+    // submit_for_merge is the lead thread's own tool now, so the registry holds no denial for it; a read-only Tier 3
+    // role still gets a role-specific one, and the lead still gets role-specific text for a tool it lacks.
+    assert.ok(allowedToolNames("orchestrator").has("submit_for_merge"));
+    assert.equal(registryByName().get("submit_for_merge")?.whenDenied?.orchestrator, undefined);
+    const mergeDenied = notYourTool("submit_for_merge", "research");
     assert.ok(mergeDenied instanceof HarnessRejection);
-    assert.ok(mergeDenied.notice.alternative.includes("spawn_worker"));
+    assert.ok(!mergeDenied.notice.why.includes("This role's tool list does not include it."));
+    assert.ok(mergeDenied.notice.alternative.includes("return_task"));
+
+    const leadDenied = notYourTool("goal_create", "orchestrator");
+    assert.ok(leadDenied instanceof HarnessRejection);
+    assert.ok(leadDenied.notice.why.includes("Director"));
+    assert.ok(leadDenied.notice.alternative.includes("report_goal_progress"));
 
     const fallbackDenied = notYourTool("kb_archive", "research");
     assert.ok(fallbackDenied instanceof HarnessRejection);

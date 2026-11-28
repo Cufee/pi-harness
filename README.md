@@ -1,16 +1,18 @@
 # pi-harness
 
-CLI-first, daemonized **Tier 0 Interactive Director + 3-Tier Multi-Agent Coding Harness** built on **Bun**, **`@earendil-works/pi`**, and **ACP (Agent Client Protocol)**.
+CLI-first, daemonized **multi-agent coding harness** (a Director that talks to you, and autonomous lead threads that deliver goals) built on **Bun**, **`@earendil-works/pi`**, and **ACP (Agent Client Protocol)**.
 
 ## Architecture Highlights
 
 - **Tier 0 Interactive Director & Dynamic Goal Engine (`src/director/`, `src/goals/`)**:
   - Zero-arg `pi-harness` opens a persistent conversational chat to design, steer, and launch versioned **Goal Contracts** (`v1 → v2` mid-flight amendments without discarding unaffected work).
   - Run-until-done loop combining `$0`-token deterministic shell gates, **Independent Skeptical Done-Review** with mechanical anti-sycophancy validation, and diff-hash / oscillation circuit breakers.
-- **3-Tier Dynamic Hierarchy (`src/control-plane/`)**:
-  - **Tier 1 Orchestrator**: Decomposes goals into disjoint write-scope Worker slices, handles `P1` escalations and `scope_too_large` send-backs, and performs **Clean Relay Rollovers** at 72% context utilization by default (`rollover.orchestratorThreshold`) (hydrated deterministically from SQLite + Anchored Handoff + `query_predecessor` Seance).
-  - **Tier 2 Workers**: Own isolated git worktrees, delegate dynamically to Tier 3 Task Agents or execute tightly-coupled edits directly, choose models/efforts via `list_models`, roll over cleanly at 78% context by default (`rollover.workerThreshold`), and integrate via a deterministic **Bors-style bisecting merge queue**.
-  - **Tier 3 Task Agents**: Small, zero-compaction windows (`research`, `plan`, `execute`, `verify`) returning pass-by-reference artifacts + compact summaries, with mandatory `return_task("scope_too_large")` and `report_issue(...)` tooling.
+- **Director, Lead Threads, Workers, and Subagents (`src/control-plane/`, [docs/agent-model.md](docs/agent-model.md))**:
+  - **Tier 0 Director**: the one thread the user talks to. It answers what it can, starts a lead thread per goal, forwards mid-flight user input to the lead as tracked requests, relays what leads report, and places work a lead sent back. The harness restates every unanswered question under each Director reply until it is answered.
+  - **Tier 1 Lead thread**: owns one goal. It scopes and plans it (`update_plan`), then does the work itself in its own git worktree or delegates parts of it, and merges through the merge queue. It triages forwarded requests (`triage_request`: accept, delegate, answer, or decline as out of scope), asks the user through the Director (`ask_user`), and sends out-of-scope work back (`route_to_director`). When its turn ends, the harness checks the plan, the request ledger, child tasks, git, and the reported criteria, and reopens the turn while anything is open.
+  - **Tier 2 Workers**: started by a lead for slices that can run in parallel. Each owns an isolated git worktree and write scopes, may start subagents, rolls over cleanly at 78% context by default (`rollover.workerThreshold`), and integrates via a deterministic **Bors-style bisecting merge queue**.
+  - **Tier 3 Subagents**: `research`, `plan`, `execute`, and `verify` tasks inside their parent's worktree. They compact context in place, return pass-by-reference artifacts and a compact summary, and are never pushed to hand back partial work because of size.
+  - Lead threads perform **Clean Relay Rollovers** at 72% context utilization by default (`rollover.orchestratorThreshold`), hydrated from SQLite (task tree, plan, open requests), the Anchored Handoff, and the `query_predecessor` Seance.
 - **ACP-First External CLIs + Native `pi` Lane (`src/runners/`)**:
   - Manage your own CLIs & subscription auth out of band (`claude-agent-acp`, `codex-acp`, `gemini --acp`, `opencode acp`, `amp --acp`, `agy acp`, or custom ACP CLIs configured live in `/settings`).
   - Implements verified per-adapter ACP shims (`src/runners/acp-shims.ts`), live `usage_update` rollover telemetry, passive quota harvesting, and universal Harness MCP tool bridging (`src/runners/mcp-bridge.ts`).

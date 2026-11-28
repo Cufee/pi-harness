@@ -208,6 +208,8 @@ export class WorktreeManager {
       if (!run) return false;
       if (canonicalPath(run.repoRoot) !== repoCanon) return false;
       const ownerTask = this.db.getTask(w.taskId);
+      // A lead thread's own worktree never takes a Worker slot.
+      if (ownerTask?.tier === 1) return false;
       if (ownerTask && INACTIVE_OWNER_TASK_STATUSES.has(ownerTask.status)) return false;
       // Terminal runs free their slots unless the owner task is still live or quota-paused
       // (a resumed task can run before its run's stored status flips back to active).
@@ -279,6 +281,26 @@ export class WorktreeManager {
       baseSha: sha,
       creationIdentityJson: serializeCreationIdentity(identity),
     });
+  }
+
+  /**
+   * Puts a lead thread's merged worktree back to work: fast-forwards its branch to the base branch (which now
+   * contains the branch) and marks the worktree active again, so the lead can keep committing and submit again.
+   * A worktree that cannot fast-forward (it is dirty in a conflicting way) is still reactivated; the lead merges
+   * the base branch itself.
+   */
+  async rearmAfterMerge(worktreeId: string, baseBranch: string): Promise<{ syncedTo: string | null }> {
+    const wt = this.db.getWorktree(worktreeId);
+    if (!wt || wt.cleanedAt != null || !existsSync(wt.path)) return { syncedTo: null };
+    let syncedTo: string | null = null;
+    try {
+      await runGit(wt.path, ["merge", "--ff-only", baseBranch]);
+      syncedTo = (await runGit(wt.path, ["rev-parse", "HEAD"])).stdout.trim();
+    } catch {
+      syncedTo = null;
+    }
+    this.db.updateWorktree(wt.id, { status: "active" });
+    return { syncedTo };
   }
 
   /**

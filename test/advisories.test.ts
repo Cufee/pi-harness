@@ -147,16 +147,9 @@ describe("goal-14 slice A advisories", () => {
       onObserve: (call) => {
         if (call.status === "completed") completedCount += 1;
       },
-      evaluate: () =>
-        completedCount >= 5
-          ? {
-              widening: {
-                areas: ["src/a", "src/b", "src/c", "src/d", "src/e", "src/f", "src/g", "src/h"],
-                topics: ["auth", "billing", "cache", "metrics"],
-              },
-            }
-          : null,
-      marks: () => ({ areas: completedCount >= 5 ? 8 : completedCount, scoredCalls: completedCount }),
+      // The rule reports spinning only, so the source signals reads that found nothing new.
+      evaluate: () => (completedCount >= 5 ? { stale: { reads: completedCount } } : null),
+      marks: () => ({ areas: completedCount, scoredCalls: completedCount }),
     });
     const { engine } = makeEngine({ createScopeSource: () => scopeSource });
     const subject = buildSubject({
@@ -192,7 +185,7 @@ describe("goal-14 slice A advisories", () => {
     assert.equal(notices.length, 1);
     const notice = notices[0]!;
     assert.equal(notice.rule, "scope-too-large");
-    assert.ok(notice.what.length > 0);
+    assert.equal(notice.what, "Your last 5 reads found nothing new.");
     assert.ok(notice.why.length > 0);
     assert.ok(notice.alternative.length > 0);
     assert.ok(formatNotice(notice).startsWith("[harness advisory: scope-too-large]"));
@@ -1030,17 +1023,13 @@ describe("goal-14 slice A advisories", () => {
       assert.equal(engine.take(s.id).length, 3);
     }
 
-    // (c) scope finding held for 20 events with marks unchanged, then areas +6 -> 1, then 2nd, never 3rd
+    // (c) spinning finding held for 20 events with marks unchanged -> 1; areas +6 alone -> none (reading widely never
+    //     re-arms); scored calls +12 -> 2nd; never a 3rd
     {
       let areas = 8;
       let scoredCalls = 12;
       const scopeSource = createFakeScopeSource({
-        evaluate: () => ({
-          widening: {
-            areas: Array.from({ length: areas }, (_, i) => `src/a${i}`),
-            topics: ["t1", "t2", "t3", "t4"],
-          },
-        }),
+        evaluate: () => ({ stale: { reads: 12 } }),
         marks: () => ({ areas, scoredCalls }),
       });
       const { engine } = makeEngine({ createScopeSource: () => scopeSource });
@@ -1056,16 +1045,23 @@ describe("goal-14 slice A advisories", () => {
       }
       assert.equal(engine.take(s.id).length, 1);
 
-      // areas +6 -> 2nd notice
+      // areas +6 with no further spinning -> no repeat notice
       areas += 6;
-      scoredCalls += 6;
       engine.observeEvent(s, { id: "r-20", name: "read", kind: "read", status: "completed" });
+      assert.equal(engine.take(s.id).length, 0);
+
+      // scored calls +11 -> still none; +12 -> 2nd notice
+      scoredCalls += 11;
+      engine.observeEvent(s, { id: "r-21", name: "read", kind: "read", status: "completed" });
+      assert.equal(engine.take(s.id).length, 0);
+      scoredCalls += 1;
+      engine.observeEvent(s, { id: "r-22", name: "read", kind: "read", status: "completed" });
       assert.equal(engine.take(s.id).length, 1);
 
-      // areas +6 again -> never a 3rd in the same generation
+      // scored calls +12 again -> never a 3rd in the same generation
       areas += 6;
-      scoredCalls += 6;
-      engine.observeEvent(s, { id: "r-21", name: "read", kind: "read", status: "completed" });
+      scoredCalls += 12;
+      engine.observeEvent(s, { id: "r-23", name: "read", kind: "read", status: "completed" });
       assert.equal(engine.take(s.id).length, 0);
     }
 
@@ -1795,59 +1791,64 @@ describe("goal-14 slice A advisories", () => {
       checkNotice("worker-edit-outside-scope", n);
     }
 
-    // 2. scope-too-large (A3 wording, A8 single-reason what + full data.reasons)
+    // 2. scope-too-large (A3 wording, A8 single-reason what + full data.reasons). Only spinning is reported: a widening
+    //    finding alone is silent, and widening next to a spinning reason is dropped from the text and from data.
+    const wideningFinding = {
+      areas: ["src/control-plane", "src/runners", "src/worktree", "src/director", "src/goals", "src/code-mode", "src/daemon", "src/cli"],
+      topics: ["authToken", "mergeQueue", "scopeNudge", "toolRegistry"],
+    };
+    {
+      const records: AdvisoryRecord[] = [];
+      const { engine } = makeEngine({
+        createScopeSource: () => createFakeScopeSource({ evaluate: () => ({ widening: wideningFinding }) }),
+        records,
+      });
+      const s = buildSubject({
+        task: makeTaskRecord({ id: "b-scope-too-large widening", tier: 3, kind: "research", readOnly: true }),
+        workspaceRoot: WORKSPACE,
+        writeScopes: [],
+        writableExtraRoots: [],
+      });
+      assert.equal(engine.observeEvent(s, { id: "1", name: "read", kind: "read", status: "completed" }), false);
+      assert.equal(engine.take(s.id).length, 0, "scope-too-large must stay silent on widening alone");
+      assert.equal(records.length, 0);
+    }
+
     const scopeFindings: Array<{
       label: string;
       finding: ScopeFinding;
-      expectedWhatPrefix: string;
+      expectedWhat: string;
       expectedReasons: string[];
     }> = [
       {
-        label: "scope-too-large widening",
-        finding: {
-          widening: {
-            areas: ["src/control-plane", "src/runners", "src/worktree", "src/director", "src/goals", "src/code-mode", "src/daemon", "src/cli"],
-            topics: ["authToken", "mergeQueue", "scopeNudge", "toolRegistry"],
-          },
-        },
-        expectedWhatPrefix: "You have opened 8 areas (",
-        expectedReasons: ["widening"],
-      },
-      {
         label: "scope-too-large repeated",
         finding: { repeated: { tool: "inspect_command", times: 5 } },
-        expectedWhatPrefix: "You repeated the same inspect_command call 5 times.",
+        expectedWhat: "You repeated the same inspect_command call 5 times.",
         expectedReasons: ["repeated"],
       },
       {
         label: "scope-too-large stale",
         finding: { stale: { reads: 12 } },
-        expectedWhatPrefix: "Your last 12 reads found nothing new.",
+        expectedWhat: "Your last 12 reads found nothing new.",
         expectedReasons: ["stale"],
       },
       {
         label: "scope-too-large widening+repeated",
         finding: {
-          widening: {
-            areas: ["src/control-plane", "src/runners", "src/worktree", "src/director", "src/goals", "src/code-mode", "src/daemon", "src/cli"],
-            topics: ["authToken", "mergeQueue", "scopeNudge", "toolRegistry"],
-          },
+          widening: wideningFinding,
           repeated: { tool: "inspect_command", times: 5 },
         },
-        expectedWhatPrefix: "You have opened 8 areas (",
-        expectedReasons: ["widening", "repeated"],
+        expectedWhat: "You repeated the same inspect_command call 5 times.",
+        expectedReasons: ["repeated"],
       },
       {
         label: "scope-too-large widening+stale",
         finding: {
-          widening: {
-            areas: ["src/control-plane", "src/runners", "src/worktree", "src/director", "src/goals", "src/code-mode", "src/daemon", "src/cli"],
-            topics: ["authToken", "mergeQueue", "scopeNudge", "toolRegistry"],
-          },
+          widening: wideningFinding,
           stale: { reads: 12 },
         },
-        expectedWhatPrefix: "You have opened 8 areas (",
-        expectedReasons: ["widening", "stale"],
+        expectedWhat: "Your last 12 reads found nothing new.",
+        expectedReasons: ["stale"],
       },
       {
         label: "scope-too-large repeated+stale",
@@ -1855,24 +1856,21 @@ describe("goal-14 slice A advisories", () => {
           repeated: { tool: "inspect_command", times: 5 },
           stale: { reads: 12 },
         },
-        expectedWhatPrefix: "You repeated the same inspect_command call 5 times.",
+        expectedWhat: "You repeated the same inspect_command call 5 times.",
         expectedReasons: ["repeated", "stale"],
       },
       {
         label: "scope-too-large widening+repeated+stale",
         finding: {
-          widening: {
-            areas: ["src/control-plane", "src/runners", "src/worktree", "src/director", "src/goals", "src/code-mode", "src/daemon", "src/cli"],
-            topics: ["authToken", "mergeQueue", "scopeNudge", "toolRegistry"],
-          },
+          widening: wideningFinding,
           repeated: { tool: "inspect_command", times: 5 },
           stale: { reads: 12 },
         },
-        expectedWhatPrefix: "You have opened 8 areas (",
-        expectedReasons: ["widening", "repeated", "stale"],
+        expectedWhat: "You repeated the same inspect_command call 5 times.",
+        expectedReasons: ["repeated", "stale"],
       },
     ];
-    for (const { label, finding, expectedWhatPrefix, expectedReasons } of scopeFindings) {
+    for (const { label, finding, expectedWhat, expectedReasons } of scopeFindings) {
       const records: AdvisoryRecord[] = [];
       const { engine } = makeEngine({
         createScopeSource: () => createFakeScopeSource({ evaluate: () => finding }),
@@ -1889,14 +1887,20 @@ describe("goal-14 slice A advisories", () => {
       const [n] = notices;
       assert.ok(n, `expected notice for ${label}`);
       checkNotice(label, n);
-      assert.ok(n.what.startsWith(expectedWhatPrefix), `${label} unexpected what: ${n.what}`);
       // A8: single sentence in what (no second reason appended)
+      assert.equal(n.what, expectedWhat, `${label} unexpected what: ${n.what}`);
       assert.equal(n.what.split(". ").length, 1, `${label} what should carry one reason: ${n.what}`);
-      assert.equal(n.why, "This usually means the task exceeds one bounded assignment.");
-      assert.ok(n.alternative.includes("status scope_too_large, partial: true, artifact_paths, and suggested_splits"));
+      assert.equal(n.why, "This usually means you are stuck, not that the assignment is too large.");
+      assert.ok(n.alternative.startsWith("If you are making progress, continue. Otherwise try a different approach."));
+      assert.ok(n.alternative.includes("artifact_write"));
+      assert.ok(n.alternative.includes("return_task with status blocked, saying what you tried and what is missing"));
+      // The notice never pushes the agent to hand back partial work or to split the assignment.
+      assert.doesNotMatch(formatNotice(n), /scope_too_large|partial|suggested_splits|areas|topics/);
       engine.delivered(s.id, notices, "tool_result");
       assert.equal(records.length, 1);
-      assert.deepEqual((records[0]!.data as { reasons: string[] }).reasons, expectedReasons);
+      const data = records[0]!.data as { reasons: string[]; finding: ScopeFinding };
+      assert.deepEqual(data.reasons, expectedReasons);
+      assert.equal(data.finding.widening, undefined, `${label} data must not carry a widening finding`);
     }
 
     // 3. read-only-finding-escalation (parent and human recipients)
@@ -2034,6 +2038,7 @@ describe("goal-14 slice A advisories", () => {
         }).notice,
       ],
       ["spawn-execute-needs-worker", REJECTIONS.spawnExecuteNeedsWorker().notice],
+      ["spawn-execute-needs-worker director", REJECTIONS.spawnExecuteNeedsWorker("director").notice],
       ["write-scopes-required", REJECTIONS.writeScopesRequired().notice],
       ["write-scopes-blanket", REJECTIONS.writeScopesBlanket(["**", "*"], "main").notice],
       ["draining", REJECTIONS.draining("spawn_worker").notice],
@@ -2166,7 +2171,16 @@ describe("goal-14 slice A advisories", () => {
     });
 
     const topics = ["cortexsdk", "nats", "listdevices", "commissioning"];
-    // 4 topics + 7 areas -> 0 notices
+    const repeatRead = (id: string) =>
+      engine.observeEvent(subject, {
+        id,
+        name: "read",
+        kind: "read",
+        status: "completed",
+        args: JSON.stringify({ path: "cloud/mod0/handler.go" }),
+      });
+
+    // Reading widely (4 topics + 26 areas) never fires and uses up none of the generation's notices.
     for (let i = 0; i < 4; i++) {
       engine.observeEvent(subject, {
         id: `g1-g-${i}`,
@@ -2176,94 +2190,55 @@ describe("goal-14 slice A advisories", () => {
         args: JSON.stringify({ pattern: topics[i], path: `cloud/mod${i}/handler.go` }),
       });
     }
-    for (let i = 4; i < 7; i++) {
-      engine.observeEvent(subject, {
+    for (let i = 4; i < 26; i++) {
+      const pending = engine.observeEvent(subject, {
         id: `g1-r-${i}`,
         name: "read",
         kind: "read",
         status: "completed",
         args: JSON.stringify({ path: `cloud/mod${i}/service.go` }),
       });
+      assert.equal(pending, false, `unexpected notice after area ${i + 1}`);
     }
     assert.equal(engine.take(subject.id).length, 0);
 
-    // 8th area -> 1st notice
-    engine.observeEvent(subject, {
-      id: "g1-r-7",
-      name: "read",
-      kind: "read",
-      status: "completed",
-      args: JSON.stringify({ path: "cloud/mod7/service.go" }),
-    });
+    // The same read twice -> 0 notices; 3rd time -> 1st notice
+    repeatRead("g1-rep-0");
+    repeatRead("g1-rep-1");
+    assert.equal(engine.take(subject.id).length, 0);
+    repeatRead("g1-rep-2");
     const first = engine.take(subject.id);
     assert.equal(first.length, 1);
     assert.equal(first[0]!.rule, "scope-too-large");
+    assert.equal(first[0]!.what, "You repeated the same read call 3 times.");
 
-    // Areas 9..13 (+1..+5) -> no repeat notice
-    for (let i = 8; i < 13; i++) {
-      engine.observeEvent(subject, {
-        id: `g1-r-${i}`,
-        name: "read",
-        kind: "read",
-        status: "completed",
-        args: JSON.stringify({ path: `cloud/mod${i}/service.go` }),
-      });
-    }
+    // Repeats 4..14 (+1..+11 scored calls) -> no repeat notice
+    for (let r = 3; r < 14; r++) repeatRead(`g1-rep-${r}`);
     assert.equal(engine.take(subject.id).length, 0);
 
-    // 14th area (mod13 -> +6 areas since 8) -> 2nd notice
-    engine.observeEvent(subject, {
-      id: "g1-r-13",
-      name: "read",
-      kind: "read",
-      status: "completed",
-      args: JSON.stringify({ path: "cloud/mod13/service.go" }),
-    });
+    // 15th repeat (+12 scored calls since the 1st notice) -> 2nd notice
+    repeatRead("g1-rep-14");
     const second = engine.take(subject.id);
     assert.equal(second.length, 1);
     assert.equal(second[0]!.rule, "scope-too-large");
+    assert.equal(second[0]!.what, "You repeated the same read call 15 times.");
 
-    // 12 more areas and repeats -> never a 3rd in the same generation
-    for (let i = 14; i < 26; i++) {
+    // 24 more repeats and 12 more areas -> never a 3rd in the same generation
+    for (let r = 15; r < 39; r++) repeatRead(`g1-rep-${r}`);
+    for (let i = 26; i < 38; i++) {
       engine.observeEvent(subject, {
         id: `g1-r-${i}`,
         name: "read",
         kind: "read",
         status: "completed",
         args: JSON.stringify({ path: `cloud/mod${i}/service.go` }),
-      });
-    }
-    for (let r = 0; r < 5; r++) {
-      engine.observeEvent(subject, {
-        id: `g1-rep-${r}`,
-        name: "read",
-        kind: "read",
-        status: "completed",
-        args: JSON.stringify({ path: "cloud/mod0/handler.go" }),
       });
     }
     assert.equal(engine.take(subject.id).length, 0);
 
     // New generation may fire again
     engine.generationEnded(subject.id);
-    for (let i = 0; i < 4; i++) {
-      engine.observeEvent(subject, {
-        id: `g2-g-${i}`,
-        name: "grep",
-        kind: "search",
-        status: "completed",
-        args: JSON.stringify({ pattern: topics[i], path: `cloud/mod${i}/handler.go` }),
-      });
-    }
-    for (let i = 4; i < 8; i++) {
-      engine.observeEvent(subject, {
-        id: `g2-r-${i}`,
-        name: "read",
-        kind: "read",
-        status: "completed",
-        args: JSON.stringify({ path: `cloud/mod${i}/service.go` }),
-      });
-    }
+    for (let r = 0; r < 3; r++) repeatRead(`g2-rep-${r}`);
     const gen2 = engine.take(subject.id);
     assert.equal(gen2.length, 1);
     assert.equal(gen2[0]!.rule, "scope-too-large");
@@ -2332,9 +2307,14 @@ describe("goal-14 slice A advisories", () => {
     assert.equal(engine.take(staleSub.id).length, 0);
   });
 
-  it("T3-8u: real ScopeNudgeMonitor widening trace produces one scope-too-large notice without blocking calls", () => {
+  it("T3-8u: real ScopeNudgeMonitor widening trace produces no scope-too-large notice and never blocks calls; a repeated call still produces one", () => {
+    let monitor: ScopeNudgeMonitor | null = null;
     const { engine } = makeEngine({
-      createScopeSource: (s) => (SCOPE_ROLES.has(s.role) ? new ScopeNudgeMonitor({ workspaceRoot: s.workspaceRoot }) : null),
+      createScopeSource: (s) => {
+        if (!SCOPE_ROLES.has(s.role)) return null;
+        monitor = new ScopeNudgeMonitor({ workspaceRoot: s.workspaceRoot });
+        return monitor;
+      },
     });
     const subject = buildSubject({
       task: makeTaskRecord({ id: "t-real-widen", tier: 3, kind: "research", readOnly: true }),
@@ -2365,24 +2345,38 @@ describe("goal-14 slice A advisories", () => {
     const executedIds: string[] = [];
     for (const ev of events) {
       executedIds.push(ev.id);
-      engine.observeEvent(subject, ev);
+      assert.equal(engine.observeEvent(subject, ev), false, `unexpected pending notice after ${ev.id}`);
     }
 
     // Engine never alters or blocks the observed call sequence
     assert.deepEqual(events, snapshotBefore);
     assert.equal(executedIds.length, events.length);
 
+    // The monitor still sees the trace as widening (10 areas, 4 unrelated topics); the rule reports none of it.
+    const widening = (monitor as ScopeNudgeMonitor | null)?.evaluate()?.widening;
+    assert.equal(widening?.areas.length, 10);
+    assert.equal(widening?.topics.length, 4);
+    assert.equal(engine.take(subject.id).length, 0);
+
+    // Spinning on the same subject is still reported, with wording that does not ask for a partial hand-back.
+    const repeat = { name: "read", kind: "read", status: "completed", args: JSON.stringify({ path: "cloud/mod9/service.go" }) };
+    assert.equal(engine.observeEvent(subject, { id: "w-rep-1", ...repeat }), false);
+    assert.equal(engine.observeEvent(subject, { id: "w-rep-2", ...repeat }), true);
+
     const notices = engine.take(subject.id);
     assert.equal(notices.length, 1);
     const notice = notices[0]!;
     assert.equal(notice.rule, "scope-too-large");
-    assert.ok(notice.what.includes("8 areas"));
-    assert.ok(notice.what.includes("4 unrelated topics"));
-    assert.equal(notice.why, "This usually means the task exceeds one bounded assignment.");
-    assert.ok(notice.alternative.includes("scope_too_large"));
-    assert.ok(notice.alternative.includes("partial: true"));
-    assert.ok(notice.alternative.includes("artifact_paths"));
-    assert.ok(notice.alternative.includes("suggested_splits"));
+    assert.equal(notice.what, "You repeated the same read call 3 times.");
+    assert.ok(!notice.what.includes("areas"));
+    assert.ok(!notice.what.includes("topics"));
+    assert.equal(notice.why, "This usually means you are stuck, not that the assignment is too large.");
+    assert.ok(notice.alternative.startsWith("If you are making progress, continue. Otherwise try a different approach."));
+    assert.ok(notice.alternative.includes("artifact_write"));
+    assert.ok(notice.alternative.includes("return_task with status blocked"));
+    assert.ok(!notice.alternative.includes("scope_too_large"));
+    assert.ok(!notice.alternative.includes("partial: true"));
+    assert.ok(!notice.alternative.includes("suggested_splits"));
     assert.ok(countWords(notice) <= WORD_BUDGET);
     assert.match(formatNotice(notice), /^\[harness advisory: scope-too-large\] .+ Why: .+ Instead: .+$/);
   });

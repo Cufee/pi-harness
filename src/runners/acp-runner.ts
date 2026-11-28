@@ -3545,6 +3545,24 @@ export class AcpRunner {
             continue;
           }
         }
+        if (
+          rawStop !== "cancelled" &&
+          req.turnEndCheck &&
+          !wrapUpAttempted &&
+          !pendingRolloverWarning &&
+          !req.isTaskSettled?.() &&
+          steerContinuations < MAX_RUNNER_STEER_CONTINUATIONS
+        ) {
+          const followUp = await req.turnEndCheck().catch(() => null);
+          if (followUp && !req.signal.aborted) {
+            steerContinuations += 1;
+            nextPromptText = followUp;
+            if (accumulatedText.length > 0) needsParagraphBreak = true;
+            // Does not consume the failure-recovery budget.
+            recoveryAttempt -= 1;
+            continue;
+          }
+        }
         if (rawStop !== "cancelled" && !req.isTaskSettled?.() && pendingRolloverWarning) {
           nextPromptText = pendingRolloverWarning;
           pendingRolloverWarning = null;

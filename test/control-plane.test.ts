@@ -51,33 +51,62 @@ describe("Tier role instructions", () => {
     assert.match(prompt, /never duplicate a rendered table/i);
   });
 
-  it("assigns implementation and research to distinct tiers", () => {
+  it("lets the T1 lead do the work itself and delegate when it helps, and keeps a read-only lead to planning", () => {
     const prompt = buildImmutableSystemPrompt(1, "orchestrator", "off");
-    assert.match(prompt, /read-only file\/search access.*never editing files or running mutating commands/i);
-    assert.match(prompt, /1 cohesive Tier 2 Worker/i);
-    assert.match(prompt, /implementation to Tier 2 Workers with disjoint write_scopes.*Blackboard/i);
-    assert.match(prompt, /always choose a concrete model ID from `list_models`/i);
-    assert.match(prompt, /spawn_task.*read-only research, planning, and verification/i);
-    assert.match(prompt, /wait_children.*summaries.*sources.*artifact_paths.*artifact_read.*more detail/i);
+    assert.match(prompt, /^You are a LEAD THREAD in pi-harness \(Tier 1\)/);
+    // The lead works in its own worktree and does the work itself by default.
+    assert.match(prompt, /own git worktree: you can read, edit, run commands, and commit there/i);
+    assert.match(prompt, /do the work yourself by default.*hand a step to someone else only when it helps/i);
+    assert.doesNotMatch(prompt, /read-only file\/search access/i);
+    assert.doesNotMatch(prompt, /never editing files/i);
+    // Delegation is the exception: no decomposition for its own sake, Workers only for steps that can run side by side.
+    assert.match(prompt, /complexity alone is not a reason to delegate.*do not hand off one coherent change in pieces/i);
+    assert.match(prompt, /do not touch the same files.*Worker thread with `spawn_worker`.*own worktree and merges its own slice.*shared types or interfaces first/i);
+    assert.match(prompt, /choose a concrete model for every child from `list_models`.*never guess a model ID/i);
+    assert.match(prompt, /subagent with `spawn_task` \(kind research, plan, execute, or verify\); it runs inside your worktree/i);
+    assert.match(prompt, /`spawn_task` with kind verify, and scale that to risk/i);
+    assert.match(prompt, /wait_children.*read handoffs first \(summary, sources, `artifact_paths`\).*artifact_read.*only when you need it/i);
+    assert.match(prompt, /commit in your worktree.*on the base branch with `submit_for_merge`/i);
     assert.match(prompt, /kb_search.*kb_propose.*kb_promote.*kb_archive.*kb_flag_stale/i);
 
-    // Tier 1 is read-only workspace by default, allows narrowing to control_plane_only (Director), and forbids writes.
-    assert.equal(toolPolicyForTask(1, "orchestrator"), "read_only_workspace");
+    // The read-only variant keeps the old separation: it reads and plans, and every change goes to someone else.
+    const readOnlyPrompt = buildImmutableSystemPrompt(1, "orchestrator", "off", undefined, { readOnlyLead: true });
+    assert.match(readOnlyPrompt, /^You are a LEAD THREAD in pi-harness \(Tier 1\)/);
+    assert.match(readOnlyPrompt, /read-only in this run: you can read and search the workspace but not edit it or run shell commands, so every change goes to a Worker thread\./i);
+    assert.match(readOnlyPrompt, /keep the understanding yourself and hand out the changes/i);
+    assert.match(readOnlyPrompt, /subagent with `spawn_task` \(kind research, plan, or verify\)/i);
+    assert.match(readOnlyPrompt, /Worker thread with `spawn_worker`.*own worktree and merges its own slice/i);
+    assert.match(readOnlyPrompt, /Workers merge their own slices/);
+    assert.doesNotMatch(readOnlyPrompt, /do the work yourself by default/i);
+    assert.doesNotMatch(readOnlyPrompt, /you can read, edit, run commands, and commit/i);
+    assert.doesNotMatch(readOnlyPrompt, /kind research, plan, execute, or verify/i);
+    assert.doesNotMatch(readOnlyPrompt, /submit_for_merge|worktree_status/);
+
+    // Tier 1 is read-write in its own worktree by default and read-only when created read-only. Its runner request may
+    // narrow to read_only_workspace or control_plane_only (Director). Research stays on a tier that can never write.
+    assert.equal(toolPolicyForTask(1, "orchestrator"), "read_write_workspace");
+    assert.equal(toolPolicyForTask(1, "orchestrator", true), "read_only_workspace");
+    assert.equal(toolPolicyForTask(3, "research"), "read_only_workspace");
     const baseReq = {
       runId: "r", taskId: "t", tier: 1 as const, kind: "orchestrator" as const, cwd: "/tmp",
       systemPrompt: "sys", initialPrompt: "init", model: "opus", maxTurns: 1,
       tools: [], executeTool: async () => ({}), signal: new AbortController().signal, callbacks: {},
     };
+    validateRunPolicy({ ...baseReq, toolPolicy: "read_write_workspace" });
     validateRunPolicy({ ...baseReq, toolPolicy: "read_only_workspace" });
     validateRunPolicy({ ...baseReq, toolPolicy: "control_plane_only" });
-    assert.throws(() => validateRunPolicy({ ...baseReq, toolPolicy: "read_write_workspace" }), /Invalid tool policy/);
+    assert.throws(
+      () => validateRunPolicy({ ...baseReq, tier: 3, kind: "research", toolPolicy: "read_write_workspace" }),
+      /Invalid tool policy/,
+    );
   });
 
   it("gives T2 ownership of a scoped worktree and independent verification", () => {
     const prompt = buildImmutableSystemPrompt(2, "worker", "off");
     assert.match(prompt, /isolated git worktree.*only within your assigned write scopes/i);
-    assert.match(prompt, /read-only Tier 3.*research.*explore/i);
-    assert.match(prompt, /independent read-only Tier 3.*verify.*before submitting/i);
+    assert.match(prompt, /do the work yourself by default/i);
+    assert.match(prompt, /read-only subagent \(`spawn_task`, `kind: 'research'`\) when exploring a large unfamiliar area/i);
+    assert.match(prompt, /independent read-only `verify` subagent before submitting/i);
     assert.match(prompt, /list_models.*model.*effort/i);
     assert.match(prompt, /wait_children.*summaries.*sources.*artifact_paths.*artifact_read.*more detail/i);
     assert.match(prompt, /return_task.*2,000 characters.*structured sources.*artifact_paths/i);

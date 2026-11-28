@@ -931,6 +931,17 @@ export class PiRunner {
               continue;
             }
           }
+          if (!wrapUpAttempted && req.turnEndCheck && !req.isTaskSettled?.() && steerContinuations < MAX_RUNNER_STEER_CONTINUATIONS) {
+            const followUp = await req.turnEndCheck().catch(() => null);
+            if (cancelled || runAbort.signal.aborted) {
+              return { text: lastText, stopReason: cancelledStopReason(), usage: lastUsage };
+            }
+            if (followUp) {
+              steerContinuations += 1;
+              steeringQueue.push(followUp);
+              continue;
+            }
+          }
           if (!wrapUpAttempted && req.missingReturnWrapUpPrompt && !req.isTaskSettled?.()) {
             wrapUpAttempted = true;
             wrapUpTurnsLeft = 3;

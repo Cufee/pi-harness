@@ -1,7 +1,7 @@
 {
   "name": "pi-harness",
   "version": "0.1.0",
-  "description": "CLI-first, daemonized 3-tier multi-agent coding harness built on pi and ACP with native-scrollback TUI, automated git worktrees, live model catalog, and quota-aware routing.",
+  "description": "CLI-first, daemonized multi-agent coding harness (a Director, autonomous lead threads, and the agents they spawn) built on pi and ACP with native-scrollback TUI, automated git worktrees, live model catalog, and quota-aware routing.",
   "private": true,
   "type": "module",
   "engines": {

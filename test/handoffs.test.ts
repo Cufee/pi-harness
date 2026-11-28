@@ -218,7 +218,12 @@ it("keeps read-only report_issue non-blocking and auto-resolves agent-addressed 
       assert.equal(db.getTask(child.id)?.status, "running");
       const roPrompt = buildImmutableSystemPrompt(3, kind, "off");
       assert.match(roPrompt, /non-blocking and you keep working/);
-      assert.doesNotMatch(roPrompt, /ends your task/);
+      // The read-only prompt never says that reporting an issue ends the task. (Its rule 3 says "no count ends your
+      // task", which is about size, so the check is scoped to the issue-reporting rule and the execute-only fact.)
+      const issueRule = roPrompt.split("\n").find((line) => line.includes("ISSUE REPORTING")) ?? "";
+      assert.ok(issueRule.includes("report_issue"));
+      assert.doesNotMatch(issueRule, /ends? your task/);
+      assert.doesNotMatch(roPrompt, /P0 and P1 end your task/);
 
       // Explicit blocking: true is forced non-blocking for read-only kinds; task stays running.
       const forcedRes = (await orch.toolExecutor.execute(run.id, child.id, "report_issue", {

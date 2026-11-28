@@ -12,7 +12,7 @@ import { isContextOverflowError, isOverflowTurnText } from "../runners/context-o
 import { PiRunner } from "../runners/pi-runner.js";
 import { formatQuotaPauseSummary } from "../runners/quota-detect.js";
 import { ScopeNudgeMonitor } from "../runners/scope-nudge.js";
-import { ACP_EXECUTOR_LOST_ERROR_CODE, MAX_STEER_CONTINUATIONS, toolPolicyForTask } from "../runners/types.js";
+import { ACP_EXECUTOR_LOST_ERROR_CODE, MAX_STEER_CONTINUATIONS, ownsWorktree, toolPolicyForTask } from "../runners/types.js";
 import { recordCostInvocation } from "../cost/ledger.js";
 import { resolveLaunchRoute } from "./launch-route.js";
 import type { RunAgentRequest, RunAgentResult, RunnerCallbacks, RunnerExecutionHandle } from "../runners/types.js";
@@ -34,6 +34,7 @@ import { hashRunDossier, spillSummaryOverflow, writeUniqueTaskDossier } from "./
 import { ControlPlaneToolExecutor, compactTaskHandoff, isReadOnlyKind, validateTaskHandoff } from "./tools.js";
 import { allToolNames, allowedToolNames } from "../tool-descriptions/registry.js";
 import { formatFallbackSummary, settleTaskMinimalFallback, SUMMARY_LIMIT } from "./handoffs.js";
+import { evaluateLeadTurnEnd, formatLeadTurnEndMessage, formatUnfinishedSummary, type LeadTurnEndState } from "./lead-check.js";
 import { applyRecoveryPhaseA, classifyInterruptedTasks, relaunchInterruptedTasks } from "./restart-recovery.js";
 import { directorTaskRunId, directorTaskRunOwner, isDirectorTaskContainer } from "./ids.js";
 import { canonicalProjectPath } from "./projects.js";
@@ -466,6 +467,8 @@ export class HarnessOrchestrator {
   private instanceNonce: string | undefined;
   /** Accepted steering not yet delivered (FIFO per task, at most MAX_PENDING_STEERS). */
   private pendingSteers = new Map<string, string[]>();
+  /** Per lead task: the last turn-end check's list, how often it came back unchanged, and checks run this generation. */
+  private leadChecks = new Map<string, { fingerprint: string; unchanged: number; total: number; open: string[] }>();
   /** Goal version to bind onto a task once its queued amendment steer is actually drained. */
   private amendBindOnDrain = new Map<string, number>();
   /** Authoritative reason passed to cancelTask, consumed when task.status transitions to cancelled. */
@@ -1297,8 +1300,10 @@ export class HarnessOrchestrator {
       kind: "orchestrator",
       title: `Orchestrator: ${(resolved.taskTitle ?? goal.split("\n")[0] ?? goal).slice(0, 72)}`,
       objective: goal,
-      criteria: "Decompose into disjoint Tier 2 Workers, resolve escalations, verify integration on base branch.",
-      readOnly: true,
+      criteria: this.config.goals.leadWritable === false
+        ? "Plan the work, delegate every change, resolve escalations, and verify the integrated result on the base branch."
+        : "Scope the goal, plan it, then deliver it: do the work yourself or delegate parts of it, and leave the result merged and verified on the base branch.",
+      readOnly: this.config.goals.leadWritable === false,
       profileId: profile.id,
       model,
       effort: input.effort ?? null,
@@ -2136,7 +2141,8 @@ export class HarnessOrchestrator {
     if (opts?.validateBeforeActivate && !opts.validateBeforeActivate()) throw preconditionFailed();
     try {
       if (toolPolicy === "read_write_workspace") {
-        if (wt && wt.status === "merged") {
+        // A lead thread outlives its merges: it keeps its worktree and continues on top of what it merged.
+        if (wt && wt.status === "merged" && task.tier !== 1) {
           throw new Error(
             `Cannot resume worker ${task.id}: its worktree ${wt.id} was already merged. Its changes are integrated; spawn a new worker for follow-up work.`,
           );
@@ -2149,7 +2155,7 @@ export class HarnessOrchestrator {
             if (wt && wt.runId === run.id) archivedFrom = { worktreeId: wt.id, ref: wt.archiveRef };
             try {
               wt = await this.runWorktreeOp(task.id, () =>
-                wtMgr.createForWorker(run.id, task.id, undefined, { force: Boolean(opts?.forceStart) }),
+                wtMgr.createForWorker(run.id, task.id, undefined, { force: Boolean(opts?.forceStart) || task.tier === 1 }),
               );
               createdWorktreeId = wt.id;
             } catch (err) {
@@ -2607,6 +2613,20 @@ export class HarnessOrchestrator {
 
       let wt = task.worktreeId ? this.db.getWorktree(task.worktreeId) : null;
       const toolPolicy = toolPolicyForTask(task.tier, task.kind, task.readOnly);
+      // A writable lead thread works in its own worktree. It is allocated outside the Worker slot queue: a lead that
+      // held a slot while its own Workers waited for one would deadlock the run.
+      if (task.tier === 1 && toolPolicy === "read_write_workspace" && (!wt || wt.runId !== task.runId || wt.cleanedAt || !existsSync(wt.path))) {
+        const wtMgr = this.getWorktreeManager(run.repoRoot);
+        if (wtMgr.isGitRepo()) {
+          this.allocatingWorktrees.add(task.id);
+          try {
+            wt = await this.runWorktreeOp(task.id, () => wtMgr.createForWorker(run.id, task.id, undefined, { force: true }));
+          } finally {
+            this.allocatingWorktrees.delete(task.id);
+          }
+          if (exec.abort.signal.aborted) return;
+        }
+      }
       // Deferred worktree & write-lease activation for Tier 2 Workers that started `pending` on `depends_on`
       if (task.tier === 2 && toolPolicy === "read_write_workspace") {
         if (!this.db.listActiveWriteScopes(run.id, task.id).length && this.db.listAssignedWriteScopes(run.id, task.id).length) {
@@ -2697,7 +2717,10 @@ export class HarnessOrchestrator {
       // Continuation reservations belong to one generation; queued steers are kept and open this one's first turn.
       this.steerContinuations.delete(task.id);
       this.steerReservedBatches.delete(task.id);
-      const systemPrompt = buildImmutableSystemPrompt(task.tier, task.kind, this.config.codeMode, this.config.codeExec);
+      this.leadChecks.delete(task.id);
+      const systemPrompt = buildImmutableSystemPrompt(task.tier, task.kind, this.config.codeMode, this.config.codeExec, {
+        readOnlyLead: task.tier === 1 && toolPolicy !== "read_write_workspace",
+      });
       const writeScopes = task.tier === 2 ? this.db.listActiveWriteScopes(run.id, task.id)
         : task.tier === 3 && task.parentId ? this.db.listActiveWriteScopes(run.id, task.parentId) : [];
       const scopedKbHints = task.tier === 2 ? this.db.kb.getScopedAmbientIndex(run.repoRoot, writeScopes, 5) : [];
@@ -2730,6 +2753,8 @@ export class HarnessOrchestrator {
         worktreeBranch: wt?.branch ?? null,
         quotaResumeNote,
         goalEvidenceDir: grants.extraEnv?.HARNESS_GOAL_EVIDENCE_DIR,
+        plan: this.db.threads.getPlan(task.id),
+        openRequests: task.tier === 1 ? this.db.threads.listRequests({ taskId: task.id, status: "open" }) : [],
       });
       exec.promptBuilt = true;
       // Steers queued for an earlier iteration of this execution are already in the task row this prompt was built from.
@@ -2820,6 +2845,9 @@ export class HarnessOrchestrator {
         allowShellInReadOnly: task.kind === "verify",
         isTaskSettled,
         missingReturnWrapUpPrompt: task.tier !== 1 ? buildMissingReturnWrapUpPrompt(task.tier, task.kind) : undefined,
+        ...(task.tier === 1 && !isDirectorTaskContainer(run.id)
+          ? { turnEndCheck: () => (isCurrent() ? this.leadTurnEndCheck(run, task.id, runnerGen) : Promise.resolve(null)) }
+          : {}),
         drainPendingSteers: () => (isCurrent() ? this.drainPendingSteers(task.id) : []),
         signal: exec.generationSignal,
         onHandle: (h) => {
@@ -3263,6 +3291,12 @@ export class HarnessOrchestrator {
           await this.settleWithoutReturn(exec, runnerGen, latest, run, wt, res, "completed", res.text.slice(0, 1000) || "Completed");
           return;
         }
+        // What the last turn-end check still listed is recorded with the lead's reply, never dropped.
+        const unfinished = formatUnfinishedSummary(this.leadChecks.get(task.id)?.open ?? []);
+        this.leadChecks.delete(task.id);
+        if (unfinished) res.text = `${res.text.trim()}\n\n${unfinished}`.trim();
+        await this.retireLeadWorktree(run, latest).catch(() => {});
+        if (!isCurrent()) return;
         const finalReply = res.text.trim();
         if (finalReply.length > SUMMARY_LIMIT) {
           // Tier 1's natural reply is its handoff: keep the full text readable from a dossier, bound the summary.
@@ -3436,6 +3470,111 @@ export class HarnessOrchestrator {
         }
       }
     }
+  }
+
+  /** Git state of a lead's own worktree, or null when it has none. */
+  private async leadWorktreeState(
+    run: RunRecord,
+    task: TaskRecord,
+  ): Promise<{ id: string; branch: string; dirty: boolean; unmergedCommits: boolean; mergeStatus: string } | null> {
+    const wt = task.worktreeId ? this.db.getWorktree(task.worktreeId) : null;
+    if (!wt || wt.taskId !== task.id || wt.cleanedAt || !existsSync(wt.path)) return null;
+    const wtMgr = this.getWorktreeManager(run.repoRoot);
+    const dirty = await wtMgr.isDirty(wt.path).catch(() => false);
+    const head = await runGit(wt.path, ["rev-parse", "HEAD"]).then((r) => r.stdout.trim()).catch(() => null);
+    const unmergedCommits =
+      head != null &&
+      head !== wt.baseSha &&
+      !(await runGit(run.repoRoot, ["merge-base", "--is-ancestor", head, run.baseBranch]).then(
+        () => true,
+        () => false,
+      ));
+    return { id: wt.id, branch: wt.branch, dirty, unmergedCommits, mergeStatus: wt.status };
+  }
+
+  /** Required criteria of the goal linked to a run, with the result last reported for each. */
+  private linkedGoalCriteria(runId: string): LeadTurnEndState["criteria"] {
+    try {
+      const row = this.db.db
+        .prepare("SELECT criteria_json, live_progress_json FROM goals WHERE linked_run_id = ? LIMIT 1")
+        .get(runId) as { criteria_json: string; live_progress_json: string | null } | null;
+      if (!row) return [];
+      const criteria = JSON.parse(row.criteria_json) as Array<{ id: string; description: string; required?: boolean }>;
+      const results = row.live_progress_json
+        ? ((JSON.parse(row.live_progress_json) as { criteriaResults?: Array<{ criterionId: string; passed: boolean }> }).criteriaResults ?? [])
+        : [];
+      return criteria
+        .filter((c) => c.required !== false)
+        .map((c) => {
+          const result = results.find((r) => r.criterionId === c.id);
+          return { id: c.id, description: c.description, reported: result ? (result.passed ? "passed" : "failed") : "none" } as const;
+        });
+    } catch {
+      // No goals table (standalone control-plane database) or unreadable progress: nothing to check.
+      return [];
+    }
+  }
+
+  /**
+   * A lead thread's turn-end check (see lead-check.ts). Returns the text that reopens the turn, or null when the
+   * lead may end: nothing is open, it waits on the user and was already told once, or the same list came back
+   * unchanged `goals.leadTurnEndChecks` times.
+   */
+  private async leadTurnEndCheck(run: RunRecord, taskId: string, generation: number): Promise<string | null> {
+    const task = this.db.getTask(taskId);
+    if (!task || task.generation !== generation || task.tier !== 1) return null;
+    if (this.stoppingRuns.has(run.id) || this.quiescing || this.pendingRollovers.has(taskId)) return null;
+    const requests = this.db.threads.listRequests({ taskId, status: "open" });
+    const openQuestions = requests.filter((r) => r.kind === "user_question");
+    const worktree = await this.leadWorktreeState(run, task);
+    const verdict = evaluateLeadTurnEnd({
+      plan: this.db.threads.getPlan(taskId),
+      untriagedRequests: requests.filter((r) => r.kind === "user_request"),
+      openQuestions,
+      liveChildren: this.db
+        .listTasks(run.id, { parentId: taskId })
+        .filter((c) => ["running", "ready", "pending", "draining", "waiting_children", "merging"].includes(c.status))
+        .map((c) => ({ id: c.id, title: c.title, status: c.status })),
+      worktree,
+      baseBranch: run.baseBranch,
+      criteria: this.linkedGoalCriteria(run.id),
+    });
+    const prior = this.leadChecks.get(taskId);
+    if (verdict.open.length === 0) {
+      this.leadChecks.delete(taskId);
+      return null;
+    }
+    const unchanged = prior && prior.fingerprint === verdict.fingerprint ? prior.unchanged + 1 : 0;
+    const total = (prior?.total ?? 0) + 1;
+    this.leadChecks.set(taskId, { fingerprint: verdict.fingerprint, unchanged, total, open: verdict.open });
+    const limit = Math.max(1, this.config.goals.leadTurnEndChecks ?? 3);
+    // Waiting on the user is a legitimate place to stop: say it once, then let the turn end.
+    const allowed = verdict.waitingOnUser ? 1 : limit;
+    const gaveUp = unchanged >= allowed || total > limit * 6;
+    this.db.emitEvent(run.id, taskId, "lead.turn_end_check", {
+      open: verdict.open,
+      waitingOnUser: verdict.waitingOnUser,
+      unchanged,
+      outcome: gaveUp ? (verdict.waitingOnUser ? "waiting_on_user" : "ended_unfinished") : "reopened",
+    });
+    if (gaveUp) return null;
+    return formatLeadTurnEndMessage(verdict, { openQuestions, checksLeft: allowed - unchanged });
+  }
+
+  /** Removes a finished lead's worktree once nothing in it is unmerged; a later resume starts a fresh one from base. */
+  private async retireLeadWorktree(run: RunRecord, task: TaskRecord): Promise<void> {
+    const state = await this.leadWorktreeState(run, task);
+    if (!state || state.dirty || state.unmergedCommits || state.mergeStatus === "queued" || state.mergeStatus === "bounced") return;
+    const hasLiveUsers = this.db
+      .listTasks(run.id, { parentId: task.id })
+      .some((c) => c.worktreeId === state.id && ["running", "ready", "pending", "draining", "waiting_children", "merging", "paused_quota"].includes(c.status));
+    if (hasLiveUsers) return;
+    await this.runWorktreeOp(task.id, () =>
+      this.getWorktreeManager(run.repoRoot).teardown(state.id, {
+        archiveBeforeRemove: false,
+        finalStatus: state.mergeStatus === "merged" ? "merged" : "archived",
+      }),
+    );
   }
 
   /**
@@ -4770,13 +4909,13 @@ export class HarnessOrchestrator {
     const cancelled = exec?.handle ? exec.handle.cancel(reason).catch(() => {}) : Promise.resolve();
     // Queued on the task's worktree chain now (synchronously), after any in-flight allocation: a worktree allocated
     // mid-cancel is torn down once it exists, and a later resume waits for this teardown before touching the worktree.
-    if (before?.tier === 2) {
+    if (before && ownsWorktree(before)) {
       const teardown = this.runWorktreeOp(taskId, async () => {
         await cancelled;
         const task = this.db.getTask(taskId);
         // A resume that already started a newer generation owns the worktree now.
         if (!task?.worktreeId || task.generation !== before.generation || task.status === "merging") return;
-        // NEVER tear down a parent's worktree when cancelling an inherited Tier 3 child (tier 2 only here), and
+        // NEVER tear down a parent's worktree when cancelling an inherited Tier 3 child (worktree owners only here), and
         // never while a merge is actively draining it.
         const run = this.db.getRun(task.runId);
         const wt = this.db.getWorktree(task.worktreeId);

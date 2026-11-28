@@ -392,7 +392,9 @@ describe("goal-14 fix FX-ADV", () => {
       assert.deepEqual(records[0]!.data, { path: longTarget, writeScopes: manyLongScopes });
     }
 
-    // 2. scope-too-large widening with long whitespace-containing areas and topics.
+    // 2. scope-too-large no longer interpolates areas or topics: a widening finding with long whitespace-containing
+    //    areas and topics is silent, and a spinning finding (long whitespace-containing tool name) stays within budget
+    //    while data keeps the full tool name and the full areas and topics.
     {
       const longAreas = Array.from(
         { length: 8 },
@@ -402,40 +404,73 @@ describe("goal-14 fix FX-ADV", () => {
         { length: 5 },
         (_, i) => `authentication token rotation policy topic ${i + 1} implementation details`,
       );
-      const { engine, records } = makeEngine({
-        createScopeSource: () =>
-          createFakeScopeSource({
-            evaluate: () => ({ widening: { areas: longAreas, topics: longTopics } }),
-            signals: () => ({
-              distinctAreas: longAreas,
-              newAreasInWindow: 8,
-              searchTopics: longTopics,
-              repeatStreak: 0,
-              staleStreak: 0,
+      const longTool = "mcp workspace file reader with a very long whitespace containing display name";
+      const signals = () => ({
+        distinctAreas: longAreas,
+        newAreasInWindow: 8,
+        searchTopics: longTopics,
+        repeatStreak: 0,
+        staleStreak: 0,
+      });
+      const scopeSubject = (id: string) =>
+        buildSubject({
+          task: makeTaskRecord({ id, tier: 3, kind: "research", readOnly: true }),
+          workspaceRoot: WORKSPACE,
+          writeScopes: [],
+          writableExtraRoots: [],
+        });
+
+      // 2a. Widening alone: no notice, nothing recorded.
+      {
+        const { engine, records } = makeEngine({
+          createScopeSource: () =>
+            createFakeScopeSource({ evaluate: () => ({ widening: { areas: longAreas, topics: longTopics } }), signals }),
+        });
+        const subject = scopeSubject("t-fxa2-scope-widening");
+        assert.equal(engine.observeEvent(subject, { id: "s-1", name: "read", kind: "read", status: "completed" }), false);
+        assert.equal(engine.take(subject.id).length, 0);
+        assert.equal(records.length, 0);
+      }
+
+      // 2b. Widening plus a repeated call: one notice about the repeat only.
+      {
+        const { engine, records } = makeEngine({
+          createScopeSource: () =>
+            createFakeScopeSource({
+              evaluate: () => ({
+                widening: { areas: longAreas, topics: longTopics },
+                repeated: { tool: longTool, times: 3 },
+              }),
+              signals,
             }),
-          }),
-      });
-      const subject = buildSubject({
-        task: makeTaskRecord({ id: "t-fxa2-scope", tier: 3, kind: "research", readOnly: true }),
-        workspaceRoot: WORKSPACE,
-        writeScopes: [],
-        writableExtraRoots: [],
-      });
+        });
+        const subject = scopeSubject("t-fxa2-scope");
+        engine.observeEvent(subject, { id: "s-1", name: "read", kind: "read", status: "completed" });
+        const notices = engine.take(subject.id);
+        assert.equal(notices.length, 1);
+        const notice = notices[0]!;
+        assert.equal(notice.rule, "scope-too-large");
+        assert.ok(
+          countWords(notice) <= WORD_BUDGET,
+          `scope-too-large repeated exceeded ${WORD_BUDGET} words (${countWords(notice)}): ${formatNotice(notice)}`,
+        );
+        assert.match(formatNotice(notice), advisoryFormat);
+        assert.ok(!formatNotice(notice).includes(longTool), "long tool name must be clipped in the notice text");
+        for (const text of [...longAreas, ...longTopics]) {
+          assert.ok(!formatNotice(notice).includes(text), `notice text must not interpolate "${text}"`);
+        }
 
-      engine.observeEvent(subject, { id: "s-1", name: "read", kind: "read", status: "completed" });
-      const notices = engine.take(subject.id);
-      assert.equal(notices.length, 1);
-      const notice = notices[0]!;
-      assert.ok(
-        countWords(notice) <= WORD_BUDGET,
-        `scope-too-large widening exceeded ${WORD_BUDGET} words (${countWords(notice)}): ${formatNotice(notice)}`,
-      );
-      assert.match(formatNotice(notice), advisoryFormat);
-
-      engine.delivered(subject.id, notices, "tool_result");
-      const data = records[0]!.data as { finding: ScopeFinding };
-      assert.deepEqual(data.finding.widening?.areas, longAreas);
-      assert.deepEqual(data.finding.widening?.topics, longTopics);
+        engine.delivered(subject.id, notices, "tool_result");
+        const data = records[0]!.data as {
+          reasons: string[];
+          finding: ScopeFinding;
+          signals: { distinctAreas: string[]; searchTopics: string[] };
+        };
+        assert.deepEqual(data.reasons, ["repeated"]);
+        assert.deepEqual(data.finding, { repeated: { tool: longTool, times: 3 } });
+        assert.deepEqual(data.signals.distinctAreas, longAreas);
+        assert.deepEqual(data.signals.searchTopics, longTopics);
+      }
     }
   });
 

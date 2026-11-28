@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { Database } from "bun:sqlite";
 import { AdmissionQueue } from "./admission-queue.js";
+import { ThreadStateStore } from "./thread-state.js";
 import { isReadOnlyKind } from "./handoffs.js";
 import {
   advanceSequenceFloor,
@@ -672,6 +673,8 @@ export class ControlPlaneDb {
   readonly projects: ProjectStore;
   readonly sessionMessages: SessionMessageStore;
   readonly admissionQueue: AdmissionQueue;
+  /** Lead-thread plans and the user/Director/lead request ledger. */
+  readonly threads: ThreadStateStore;
   private listeners = new Set<(event: EventRecord) => void>();
 
   constructor(dbPath: string) {
@@ -710,6 +713,7 @@ export class ControlPlaneDb {
     this.projects = new ProjectStore(this.db);
     this.sessionMessages = new SessionMessageStore(this.db);
     this.admissionQueue = new AdmissionQueue(this.db);
+    this.threads = new ThreadStateStore(this.db);
     this.backfillChatOwnership();
   }
 

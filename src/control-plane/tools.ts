@@ -45,7 +45,8 @@ import {
   type GoalProgressSource,
 } from "../goals/live-progress.js";
 import type { SteerTaskResult } from "./orchestrator.js";
-import { REJECTIONS, rejection } from "../advisories/rejections.js";
+import { openPlanSteps, parsePlanSteps } from "./thread-state.js";
+import { type HarnessRejection, REJECTIONS, rejection } from "../advisories/rejections.js";
 import { roleOf } from "../advisories/roles.js";
 import { allowedToolNames, notYourTool, toolsForRole } from "../tool-descriptions/index.js";
 import { allowedToolsForRole } from "../tool-descriptions/registry.js";
@@ -285,6 +286,13 @@ export function toolsForTier(tier: AgentTier): ToolDefinition[] {
   if (tier === 1) return toolsForRole("orchestrator");
   if (tier === 2) return toolsForRole("worker");
   return toolsForRole("execute", { readOnly: true });
+}
+
+function readOnlyLeadHasNoWorktree(tool: string): HarnessRejection {
+  return REJECTIONS.notYourTool(tool, "read-only lead", {
+    why: "This lead thread is read-only in this run, so it has no worktree to inspect or merge.",
+    alternative: "Workers merge their own slices with submit_for_merge. Start one with spawn_worker for a change, and check the result on the base branch.",
+  });
 }
 
 export class ControlPlaneToolExecutor {
@@ -946,9 +954,9 @@ export class ControlPlaneToolExecutor {
       case "spawn_task": {
         const kind = String(args.kind);
         const readOnlyKind = isReadOnlyKind(kind);
-        const fromOrchestrator = task.tier === 1;
-        if (fromOrchestrator && kind === "execute") {
-          throw REJECTIONS.spawnExecuteNeedsWorker();
+        // A read-only lead has no worktree for an execute task to edit.
+        if (task.tier === 1 && kind === "execute" && toolPolicyForTask(task.tier, task.kind, task.readOnly) !== "read_write_workspace") {
+          throw REJECTIONS.spawnExecuteNeedsWorker(roleOf(task) === "director" ? "director" : "lead");
         }
         if (!readOnlyKind && kind !== "execute") throw new Error(`Unknown spawn_task kind: ${kind}`);
         if (task.status === "draining") throw REJECTIONS.draining("spawn_task");
@@ -1799,6 +1807,7 @@ export class ControlPlaneToolExecutor {
       }
 
       case "worktree_status": {
+        if (!task.worktreeId && task.tier === 1) throw readOnlyLeadHasNoWorktree(name);
         if (!task.worktreeId) throw new Error("This task has no assigned worktree");
         const wt = this.db.getWorktree(task.worktreeId);
         if (!wt) throw new Error(`Worktree ${task.worktreeId} missing`);
@@ -1808,6 +1817,7 @@ export class ControlPlaneToolExecutor {
       }
 
       case "submit_for_merge": {
+        if (!task.worktreeId && task.tier === 1) throw readOnlyLeadHasNoWorktree(name);
         if (!task.worktreeId) throw new Error("This task has no assigned worktree");
         const wt = this.db.getWorktree(task.worktreeId);
         if (!wt) throw new Error(`Worktree ${task.worktreeId} missing`);
@@ -1821,11 +1831,153 @@ export class ControlPlaneToolExecutor {
         const outcome = await this.hooks
           .getMergeQueue(run.repoRoot)
           .submitAndDrain(runId, item.id, { preserveLiveTask: true, signal: mergeSig });
+        // A lead thread outlives its merges: its worktree continues from the merged base branch.
+        let leadNote: string | undefined;
+        if (task.tier === 1 && outcome.item.status === "merged") {
+          const { syncedTo } = await mgr.rearmAfterMerge(wt.id, run.baseBranch);
+          leadNote = syncedTo
+            ? `Merged. Your worktree now continues from ${run.baseBranch} at ${syncedTo.slice(0, 8)}; commit further work there and submit again.`
+            : `Merged. Your worktree could not fast-forward to ${run.baseBranch}; run \`git merge ${run.baseBranch}\` in it before further work.`;
+        }
         return {
           mergeId: item.id,
           status: outcome.item.status,
           mergedSha: outcome.mergedSha,
           bouncedReason: outcome.bouncedReason,
+          ...(leadNote ? { note: leadNote } : {}),
+        };
+      }
+
+      case "update_plan": {
+        const steps = parsePlanSteps(args.steps);
+        const delivery = args.delivery === undefined ? undefined : String(args.delivery);
+        if (delivery !== undefined && delivery !== "merge" && delivery !== "external" && delivery !== "none") {
+          throw new Error(`delivery "${delivery}" is not one of merge, external, none`);
+        }
+        const plan = this.db.threads.setPlan({
+          taskId,
+          runId,
+          scope: typeof args.scope === "string" ? args.scope : undefined,
+          delivery,
+          deliveryNote: typeof args.delivery_note === "string" ? args.delivery_note : undefined,
+          steps,
+        });
+        this.db.emitEvent(runId, taskId, "thread.plan", { revision: plan.revision, steps: plan.steps.length, open: openPlanSteps(plan).length });
+        const open = openPlanSteps(plan);
+        return {
+          recorded: true,
+          revision: plan.revision,
+          open: open.map((s) => s.id),
+          ...(task.tier === 1 && !plan.scope ? { note: "No scope is recorded. Pass scope once: what you took on and what you left out." } : {}),
+        };
+      }
+
+      case "triage_request": {
+        const request = this.db.threads.getRequest(String(args.request_id ?? ""));
+        if (!request || request.kind !== "user_request" || request.taskId !== taskId) {
+          const mine = this.db.threads.listRequests({ taskId, kind: "user_request", status: "open" }).map((r) => r.id);
+          throw new Error(
+            `Unknown request ${String(args.request_id ?? "")} for this thread. ${mine.length ? `Open requests: ${mine.join(", ")}.` : "No request is open."}`,
+          );
+        }
+        const decision = String(args.decision ?? "");
+        const note = typeof args.note === "string" ? args.note.trim() : "";
+        if (!note) throw new Error("note is required: say what you will do, give your answer, or say why this is out of scope.");
+        const outcomes = { accept: "accepted", delegate: "delegated", answer: "answered", decline: "declined" } as const;
+        if (!(decision in outcomes)) throw new Error(`decision "${decision}" is not one of accept, delegate, answer, decline`);
+        const outcome = outcomes[decision as keyof typeof outcomes];
+        let delegatedTaskId: string | null = null;
+        if (outcome === "delegated") {
+          const child = this.db.getTask(String(args.task_id ?? ""));
+          if (!child || child.runId !== runId || child.parentId !== taskId) {
+            throw new Error("decision delegate needs task_id: the child task you started for this request. Start it first, then triage.");
+          }
+          delegatedTaskId = child.id;
+        }
+        const resolved = this.db.transaction(() => {
+          const done = this.db.threads.resolveRequest(request.id, { outcome, resolution: note, delegatedTaskId });
+          // A declined request does not disappear: it goes back to the Director as work to reschedule.
+          const routed =
+            outcome === "declined"
+              ? this.db.threads.createRequest({
+                  kind: "routed_work",
+                  runId,
+                  taskId,
+                  chatSessionId: done.chatSessionId,
+                  goalId: done.goalId,
+                  title: done.title,
+                  body: `${done.body}\n\nDeclined by the lead thread: ${note}`,
+                  originId: done.id,
+                })
+              : null;
+          return { done, routed };
+        });
+        this.db.emitEvent(runId, taskId, "thread.request", {
+          requestId: resolved.done.id,
+          requestKind: "user_request",
+          phase: "triaged",
+          outcome,
+          ...(resolved.routed ? { routedRequestId: resolved.routed.id } : {}),
+        });
+        return {
+          request: resolved.done.id,
+          outcome,
+          ...(outcome === "accepted" ? { next: "Amend your plan with update_plan so the request has a step." } : {}),
+          ...(resolved.routed ? { routedToDirector: resolved.routed.id } : {}),
+        };
+      }
+
+      case "ask_user": {
+        const question = typeof args.question === "string" ? args.question.trim() : "";
+        if (!question) throw new Error("question is required");
+        const options = Array.isArray(args.options) ? args.options.map((o) => String(o).trim()).filter(Boolean).slice(0, 8) : [];
+        const context = typeof args.context === "string" ? args.context.trim() : "";
+        const runRef = this.runRef(run);
+        const body = [
+          question,
+          ...(options.length ? ["", "Options:", ...options.map((o, i) => `${i + 1}. ${o}`)] : []),
+          ...(context ? ["", `Context: ${context}`] : []),
+        ].join("\n");
+        const request = this.db.threads.createRequest({
+          kind: "user_question",
+          runId,
+          taskId,
+          chatSessionId: runRef.chatSessionId ?? null,
+          goalId: runRef.linkedGoalId ?? null,
+          title: question,
+          body,
+        });
+        this.db.emitEvent(runId, taskId, "thread.request", { requestId: request.id, requestKind: "user_question", phase: "created" });
+        return {
+          request: request.id,
+          routedTo: request.chatSessionId ? `director:${request.chatSessionId}` : "operator",
+          next: "Keep working on what does not depend on the answer. The harness delivers the answer to you when the user gives it.",
+          ...(request.chatSessionId
+            ? {}
+            : { warning: `This run has no Director chat. The operator answers with \`pi-harness resume ${runId} --message "<answer>"\`.` }),
+        };
+      }
+
+      case "route_to_director": {
+        const detail = typeof args.detail === "string" ? args.detail.trim() : "";
+        if (!detail) throw new Error("detail is required: what the work is and what you already know about it");
+        const reason = typeof args.reason === "string" ? args.reason.trim() : "";
+        const runRef = this.runRef(run);
+        const { title } = deriveTitle(args.title, [detail], "Untitled routed work");
+        const request = this.db.threads.createRequest({
+          kind: "routed_work",
+          runId,
+          taskId,
+          chatSessionId: runRef.chatSessionId ?? null,
+          goalId: runRef.linkedGoalId ?? null,
+          title,
+          body: reason ? `${detail}\n\nWhy it is outside the goal: ${reason}` : detail,
+        });
+        this.db.emitEvent(runId, taskId, "thread.request", { requestId: request.id, requestKind: "routed_work", phase: "created" });
+        return {
+          request: request.id,
+          routedTo: request.chatSessionId ? `director:${request.chatSessionId}` : "operator",
+          next: "This work is no longer yours. Drop any plan step for it and continue with the goal.",
         };
       }
 

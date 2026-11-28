@@ -232,7 +232,7 @@ it("logs Director reads and delegates sourced research", async () => {
           assert.equal(Buffer.byteLength(snippet.content), 5000);
           assert.equal(snippet.truncated, false);
           const assignment = { title: "Locate status", objective: "Read status.txt", model: req.model };
-          await assert.rejects(req.executeTool("spawn_task", { ...assignment, kind: "execute" }), /only permits/);
+          await assert.rejects(req.executeTool("spawn_task", { ...assignment, kind: "execute" }), /The Director's spawn_task only permits research, plan, and verify.*Put implementation in a goal/s);
           const child = await req.executeTool("spawn_task", { ...assignment, kind: "research" }) as { spawned: string };
           childId = child.spawned;
           const result = await req.executeTool("wait_tasks", { ids: [childId], timeout_s: 2 });
